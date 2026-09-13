@@ -24,14 +24,6 @@ const { computePremiseEvidence } = require('../candidate-premise-check.js');
 const { signatureForClarificationTask } = require('../pipeline-forensics.js');
 const { appendHistoryEvent } = require('../task-history.js');
 
-function readIfExists(filePath) {
-  try {
-    return fs.readFileSync(filePath, 'utf8');
-  } catch {
-    return null;
-  }
-}
-
 const MAX_ARCH_REVIEW_TASK_CHARS = 4000;
 
 const MAX_FETCHED_FILE_CHARS = 8000;
@@ -66,10 +58,6 @@ const MIN_ANCHOR_SYMBOL_CHARS = 4;
 // of it.
 const QUOTED_SYMBOL_RE = /`([^`]{3,80})`/g;
 
-function quotedSymbolsFromSection(section) {
-  return [...(section || '').matchAll(QUOTED_SYMBOL_RE)].map((m) => m[1]).filter(Boolean);
-}
-
 // 2026-08-27 (Grimmethy: "we should be looking for code content instead of the line
 // itself"): a `Snippet:` field, when present, is a deterministic pass-through of the
 // REAL code text observability-review.js/performance-review.js/function-length-review.js
@@ -80,28 +68,10 @@ function quotedSymbolsFromSection(section) {
 // between the fence markers.
 const SNIPPET_FIELD_RE = /^Snippet:\s*\n```\n([\s\S]*?)\n```/m;
 
-function snippetFromSection(section) {
-  const m = (section || '').match(SNIPPET_FIELD_RE);
-  return m ? m[1] : null;
-}
-
-function stripWhitespace(s) {
-  return s.replace(/\s+/g, '');
-}
-
 // Maps an index into stripWhitespace(content) back to the corresponding index in the
 // real content, by walking content and counting non-whitespace chars until reaching
 // targetStrippedCount of them. O(content.length); fine at this pipeline's file sizes
 // (low hundreds of KB at most).
-function realIndexForStrippedIndex(content, targetStrippedCount) {
-  let count = 0;
-  for (let i = 0; i < content.length; i++) {
-    if (count === targetStrippedCount) return i;
-    if (!/\s/.test(content[i])) count++;
-  }
-  return content.length;
-}
-
 // Exact match first (fast path, the common case for a snippet that hasn't been touched
 // since it was captured). Falls back to a whitespace-tolerant match -- real code
 // reformatted by an unrelated change (re-indented, re-wrapped, a stray space added or
@@ -113,23 +83,6 @@ function realIndexForStrippedIndex(content, targetStrippedCount) {
 // code, e.g. observability-fix-ac-26's paraphrased `catch (err)` vs the real bare `catch
 // {` -- that's a real, accepted gap (see windowFetchedFileContent's own header), not
 // something a formatting-only tolerance should try to paper over.
-function findFuzzyMatch(content, snippet) {
-  const trimmed = (snippet || '').trim();
-  if (!trimmed) return null;
-  const idx = content.indexOf(trimmed);
-  if (idx !== -1) return { index: idx, length: trimmed.length };
-
-  const strippedSnippet = stripWhitespace(trimmed);
-  if (!strippedSnippet) return null;
-  const strippedContent = stripWhitespace(content);
-  const strippedIdx = strippedContent.indexOf(strippedSnippet);
-  if (strippedIdx === -1) return null;
-
-  const realStart = realIndexForStrippedIndex(content, strippedIdx);
-  const realEnd = realIndexForStrippedIndex(content, strippedIdx + strippedSnippet.length);
-  return { index: realStart, length: Math.max(realEnd - realStart, 1) };
-}
-
 // Candidate prose reliably says "at line NNN" / "lines NNN-MMM" even when its own
 // backtick-quoted code snippet has drifted from the real file (paraphrased rather than
 // copy-pasted -- see windowFetchedFileContent's own header for why that quote match can
@@ -137,16 +90,6 @@ function findFuzzyMatch(content, snippet) {
 // to center a window on, and matches this doc format's own convention of citing the
 // start of a block ("lines 1255-1270" for a try, "line 1271" for its catch).
 const LINE_CITATION_RE = /\blines?\s+(\d+)/i;
-
-function windowAroundIndex(content, idx, matchLen, maxChars) {
-  const half = Math.floor(maxChars / 2);
-  const from = Math.max(0, idx - half);
-  const to = Math.min(content.length, idx + matchLen + half);
-  const windowed = content.slice(from, to);
-  const prefix = from > 0 ? '...[truncated]...\n' : '';
-  const suffix = to < content.length ? '\n...[truncated]' : '';
-  return `${prefix}${windowed}${suffix}`;
-}
 
 // 2026-08-27 (Grimmethy, investigating a fresh round of blocked observability_fix/
 // arch_review tasks after the AC-3 grounding-staleness fix): a flat truncation from byte 0
@@ -188,62 +131,6 @@ function windowAroundIndex(content, idx, matchLen, maxChars) {
 // EVERY one of its occurrences (a helper name sits at its definition AND its call sites --
 // a multi-part candidate needs all of them), unless the symbol is so common it is noise;
 // (2) a cited line number. De-duped to one hit per ~200-char neighbourhood.
-function collectAnchorHits(content, section) {
-  const hits = [];
-  const seen = new Set();
-  const push = (index, length, rank) => {
-    if (index == null || index < 0) return;
-    const bucket = Math.round(index / 200);
-    if (seen.has(bucket)) return;
-    seen.add(bucket);
-    hits.push({ index, length: Math.max(length || 0, 1), rank });
-  };
-
-  const snippet = snippetFromSection(section);
-  if (snippet) {
-    const match = findFuzzyMatch(content, snippet);
-    if (match) push(match.index, match.length, 0);
-  }
-
-  // The fenced Snippet: block's own triple backticks otherwise confuse QUOTED_SYMBOL_RE's
-  // single-backtick pairing (a real bug, caught by direct test) -- strip it first.
-  const prose = (section || '').replace(SNIPPET_FIELD_RE, '');
-
-  for (const symbol of quotedSymbolsFromSection(prose)) {
-    if (symbol.length < MIN_ANCHOR_SYMBOL_CHARS) continue;
-    const occ = [];
-    let from = 0;
-    for (;;) {
-      const i = content.indexOf(symbol, from);
-      if (i === -1 || occ.length > MAX_ANCHOR_OCCURRENCES) break;
-      occ.push(i);
-      from = i + symbol.length;
-    }
-    if (occ.length === 0) continue;
-    if (occ.length > MAX_ANCHOR_OCCURRENCES) {
-      // Too generic to trust as a real anchor, but a weak/last-resort single-window
-      // fallback beats blind head-truncation -- rank 3 is never eligible for the
-      // multi-region path (see windowFetchedFileContent), only its zero-strong-hits
-      // fallback.
-      push(occ[0], symbol.length, 3);
-      continue;
-    }
-    for (const i of occ) push(i, symbol.length, 1);
-  }
-
-  const lineMatch = prose.match(LINE_CITATION_RE);
-  if (lineMatch) {
-    const lineNum = Number(lineMatch[1]);
-    const lines = content.split('\n');
-    if (lineNum >= 1 && lineNum <= lines.length) {
-      const idx = lines.slice(0, lineNum - 1).join('\n').length + (lineNum > 1 ? 1 : 0);
-      push(idx, 0, 2);
-    }
-  }
-
-  return hits.sort((a, b) => a.rank - b.rank || a.index - b.index);
-}
-
 const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable anchor found '
   + "for this candidate's cited code -- this window is a best-effort guess and may not "
   + 'contain the real target. If you cannot find the described code here, respond with a '
@@ -255,68 +142,6 @@ const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable an
 // usedSnippetFuzzyMatch is true only when the frozen candidate Snippet still fuzzy-matches
 // the CURRENT file content (rank 0) -- this is the "has grounding gone stale since this
 // task was generated" signal context-trim-sweep.js re-checks on every retry.
-function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_CHARS) {
-  if (content.length <= maxChars) {
-    return { text: content, confidence: 'strong', anchorCount: 0, usedSnippetFuzzyMatch: false };
-  }
-
-  const allHits = collectAnchorHits(content, section);
-  const usedSnippetFuzzyMatch = allHits.some((h) => h.rank === 0);
-  const strongHits = allHits.filter((h) => h.rank < 3).slice(0, MAX_ANCHOR_REGIONS);
-
-  if (strongHits.length === 0) {
-    const weakHit = allHits.find((h) => h.rank === 3);
-    if (weakHit) {
-      return {
-        text: LOW_CONFIDENCE_GROUNDING_NOTE + windowAroundIndex(content, weakHit.index, weakHit.length, maxChars),
-        confidence: 'weak',
-        anchorCount: 1,
-        usedSnippetFuzzyMatch: false,
-      };
-    }
-    return {
-      text: LOW_CONFIDENCE_GROUNDING_NOTE + `${content.slice(0, maxChars)}\n...[truncated]`,
-      confidence: 'none',
-      anchorCount: 0,
-      usedSnippetFuzzyMatch: false,
-    };
-  }
-  if (strongHits.length === 1) {
-    return {
-      text: windowAroundIndex(content, strongHits[0].index, strongHits[0].length, maxChars),
-      confidence: 'strong',
-      anchorCount: 1,
-      usedSnippetFuzzyMatch,
-    };
-  }
-
-  // Equal share of a shared budget, capped at the single-window size, floored so each
-  // window is still worth showing.
-  const totalBudget = Math.min(MAX_FETCHED_FILE_TOTAL_CHARS, Math.max(maxChars, content.length));
-  const perRegion = Math.max(MIN_REGION_CHARS, Math.min(maxChars, Math.floor(totalBudget / strongHits.length)));
-  const half = Math.floor(perRegion / 2);
-
-  const ranges = strongHits
-    .map((h) => ({ from: Math.max(0, h.index - half), to: Math.min(content.length, h.index + h.length + half) }))
-    .sort((a, b) => a.from - b.from);
-
-  const merged = [];
-  for (const r of ranges) {
-    const last = merged[merged.length - 1];
-    if (last && r.from <= last.to + 40) last.to = Math.max(last.to, r.to);
-    else merged.push({ ...r });
-  }
-
-  const out = [];
-  if (merged[0].from > 0) out.push('...[truncated]...');
-  merged.forEach((r, i) => {
-    out.push(content.slice(r.from, r.to));
-    if (i < merged.length - 1) out.push('...[gap]...');
-    else if (r.to < content.length) out.push('...[truncated]');
-  });
-  return { text: out.join('\n'), confidence: 'strong', anchorCount: strongHits.length, usedSnippetFuzzyMatch };
-}
-
 // Shared by arch_review (candidatesPath=archReviewCandidatesPath) and arch_import_review
 // (candidatesPath=archImportCandidatesPath) -- both consume an identically-shaped
 // "### AC-NNN · Title / Strength: ... / Files: ..." candidates doc and turn the oldest
