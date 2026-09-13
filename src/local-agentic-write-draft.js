@@ -428,6 +428,30 @@ async function draftAdhocViaLocalAgenticWrite(task, {
     };
   }
 
+  // Scope-complexity gate (pre-plan, before the first model call): a task that is
+  // structurally too broad for one tier-3 pass (anchor app.py + 3+ endpoint paths or
+  // subsystems -- see scopeComplexityGate's own header) is decomposed up front instead of
+  // burning the full LOCAL_AGENTIC_WRITE_MAX_TURNS budget on read-only orientation and only
+  // landing in the post-exhaustion backstop below. Default-on kill switch, mirroring
+  // isEnabled(): opt out by setting the env var in the check below to the string 'false'.
+  if (process.env.AGENT_MANAGER_SCOPE_GATE !== 'false') {
+    const gate = scopeComplexityGate(task);
+    if (gate && gate.shouldDecompose) {
+      const split = await runDecomposePass(task, {
+        mode: 'preliminary',
+        priorAttemptBlock: gate.reason,
+      });
+      // >= 2 subTasks -> this is a real decompose, return the same shape the post-exhaustion
+      // backstop uses. A null split or a 0/1-subTask split means the split wasn't usable, so
+      // we deliberately fall through to the normal tier-3 path rather than misrouting.
+      if (split && split.subTasks && split.subTasks.length >= 2) {
+        task.adhocResolution = 'decompose';
+        task.subTaskProposals = split.subTasks;
+        return { succeeded: true, blocked: false, resolution: 'decompose' };
+      }
+    }
+  }
+
   const prompt = buildWriteAgenticPrompt(task);
   const started = Date.now();
 
