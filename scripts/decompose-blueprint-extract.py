@@ -145,6 +145,19 @@ def main(argv):
                     local_bound.add(sub.name)
                 elif isinstance(sub, ast.arg):
                     local_bound.add(sub.arg)
+        # Real incident, 2026-09-13: a return/param type annotation (`-> Path`, `x: dict`)
+        # is NOT part of n.body -- it lives on n.returns / arg.annotation -- so a name used
+        # ONLY in an annotation was invisible here, carried no import, and crashed at
+        # def-time (`NameError: name 'Path' is not defined`) the moment app.py imported the
+        # new module. Annotations can't assign (Store), so every Name found here is a read.
+        annotation_nodes = [n.returns] if n.returns else []
+        for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs + ([n.args.vararg] if n.args.vararg else []) + ([n.args.kwarg] if n.args.kwarg else []):
+            if a.annotation:
+                annotation_nodes.append(a.annotation)
+        for ann in annotation_nodes:
+            for sub in ast.walk(ann):
+                if isinstance(sub, ast.Name):
+                    read.add(sub.id)
         for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs:
             local_bound.add(a.arg)
         if n.args.vararg:
