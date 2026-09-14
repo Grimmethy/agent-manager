@@ -162,6 +162,16 @@ while :; do
     coordinator_result="$(node "${PACKAGE_SRC_DIR}/coordinator-sweep.js" 2>>"${HOME_LOGS}/coordinator-sweep.log")"
     printf '[watchdog] coordinator-sweep: %s\n' "$coordinator_result" >&2
 
+    # One-time historical backfill (2026-09-14, screaminggoatclubmt: "should we be
+    # archiving this pile of adhoc tasks?" -> "Fold it into the watchdog sweep."):
+    # coordinator-sweep above only fixes a hub still sitting in coordinating/ at the
+    # moment it runs -- this relabels + archives the 28 real hubs that were already
+    # (mis)closed into done/'s top level as 'merged' before that fix landed. Idempotent
+    # and cheap (one readdir) once the historical pile is cleared, so safe to leave
+    # running every tick indefinitely rather than pull back out.
+    rejected_hub_backfill_result="$(node "${PACKAGE_SRC_DIR}/rejected-hub-disposition-backfill.js" 2>>"${HOME_LOGS}/rejected-hub-disposition-backfill.log")"
+    printf '[watchdog] rejected-hub-disposition-backfill: %s\n' "$rejected_hub_backfill_result" >&2
+
     # Blocked-cluster sweep (2026-09-12, screaminggoatclubmt: "we have 4 separate instances
     # with a bespoke solution each... a way to combine these patterns"): the concrete,
     # buildable half of that question -- normalizes queue/blocked/'s blockedReason text
