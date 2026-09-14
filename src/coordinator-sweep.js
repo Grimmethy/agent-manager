@@ -284,7 +284,22 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
         detail: 'coordinator hub: plan rejected at creation, no sub-tasks were ever filed',
       } : undefined);
       appendHistoryEvent(parent, 'done', parent.doneMarker);
-      moveToDone(file, doneDir, name, parent);
+      // 2026-09-14, screaminggoatclubmt: "fold it into the watchdog sweep" -- file
+      // straight into done/_archived_no_action/ instead of done/'s top level for the
+      // rejected-at-creation case: it produced zero real work, so there is nothing for a
+      // human to review or a dependent to wait on, the exact "no action" meaning this
+      // folder already carries elsewhere (staleness-auto-archive.js's own DENY-vote and
+      // archive-recommendation paths file directly here the same way, with no human
+      // click in between -- established precedent for an automated sweep to use this
+      // folder, not only the dashboard's own Archive button). Otherwise these hubs would
+      // just sit in done/'s top level for up to done-archive.js's 30-day retention window
+      // before its generic time-based pass finally moved them. The genuine
+      // all-children-succeeded case is unaffected -- it still lands in done/ normally.
+      const destDir = rejectedAtCreation ? path.join(doneDir, '_archived_no_action') : doneDir;
+      if (rejectedAtCreation) {
+        appendHistoryEvent(parent, 'archived', 'Auto-archived: coordinator hub rejected at creation, no sub-tasks were ever filed -- nothing to review or wait on');
+      }
+      moveToDone(file, destDir, name, parent);
       summary.checked += 1;
       summary.completed += 1;
       continue;
