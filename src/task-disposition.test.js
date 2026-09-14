@@ -239,3 +239,97 @@ test('a superseded tail is respected as terminal -- the sweep never re-opens it'
 test('TERMINAL_STAGES is the closed vocabulary', () => {
   assert.deepEqual([...TERMINAL_STAGES].sort(), ['abandoned', 'applied-direct', 'dismissed', 'filed', 'merged', 'noop', 'pending-merge', 'superseded']);
 });
+
+// --- realGit / buildShipContext against REAL git (2026-09-14 root-cause) --------------
+// Every test above uses a fake `ctx()` and never exercises realGit or buildShipContext
+// against actual git -- which is exactly how this bug went uncaught: execFileSync's
+// stock 1MB stdout cap silently truncated (as ENOBUFS, swallowed by the bare catch)
+// buildShipContext's own unbounded `git log origin/<main> --format=%H%x00%B%x00%x00`
+// once this real repo's full commit-body history grew past 1MB, leaving onMainIds
+// permanently empty -- every task on the reconcile sweep fell through to a false
+// `abandoned: branch gone, work lost` verdict once its throwaway branch was cleaned up
+// post-merge, as normal. Confirmed live: a real commit on origin/master with a correct
+// `Task: <id> (` trailer was invisible to onMainIds.has() purely from this.
+{
+  const { execFileSync: realExecFileSync } = require('child_process');
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { realGit, buildShipContext } = require('./task-disposition.js');
+
+  function makeRepoWithBigHistory() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-disposition-realgit-test-'));
+    const git = (args) => realExecFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: 'pipe' });
+    git(['init', '-q', '-b', 'main']);
+    git(['config', 'user.email', 'test@example.com']);
+    git(['config', 'user.name', 'Test']);
+    // A single ~2MB commit body reproduces the real failure shape at a fraction of the
+    // real 1.5MB+ history that first exposed it -- comfortably over the 1MB default cap
+    // this fix removes, comfortably under the 64MB ceiling it replaces it with. Written
+    // to a file and passed via -F rather than -m: a 2MB argv string blows the OS's own
+    // ARG_MAX (E2BIG), a real but unrelated limit to the one under test here.
+    const bigBody = 'x'.repeat(2 * 1024 * 1024);
+    const msgPath = path.join(dir, '..', `commit-msg-${path.basename(dir)}.txt`);
+    fs.writeFileSync(msgPath, `Real commit\n\n${bigBody}\n\nTask: realgit-big-commit-0 (adhoc/manual)`);
+    fs.writeFileSync(path.join(dir, 'f.txt'), 'x');
+    git(['add', 'f.txt']);
+    git(['commit', '-q', '-F', msgPath]);
+    fs.rmSync(msgPath, { force: true });
+    // No real "origin" remote for this throwaway repo -- alias origin/main to main so
+    // buildShipContext's `origin/<mainBranch>` queries resolve against this same history.
+    git(['update-ref', 'refs/remotes/origin/main', 'refs/heads/main']);
+    return dir;
+  }
+
+  test('realGit returns full output for a ~2MB git log body (would ENOBUFS under the old 1MB default)', () => {
+    const dir = makeRepoWithBigHistory();
+    try {
+      const out = realGit(dir, ['log', '-1', '--format=%B']);
+      assert.ok(out.length > 2 * 1024 * 1024, `expected >2MB of output, got ${out.length} bytes`);
+      assert.match(out, /Task: realgit-big-commit-0/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('buildShipContext finds a real commit trailer past the old 1MB default cap', () => {
+    const dir = makeRepoWithBigHistory();
+    try {
+      const ctxReal = buildShipContext(dir, { mainBranch: 'main' });
+      assert.ok(ctxReal.onMainIds.has('realgit-big-commit-0'), 'onMainIds must not be silently empty');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('realGit logs a distinct warning (not silent) when a real ENOBUFS is hit, and still returns \'\' rather than throwing', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-disposition-realgit-enobufs-'));
+    const prevError = console.error;
+    const logged = [];
+    console.error = (...args) => logged.push(args.join(' '));
+    // task-disposition.js's `const { execFileSync } = require('child_process')` captures
+    // its own reference at require time -- mutating child_process.execFileSync only takes
+    // effect on a FRESH require done after the mutation (same pitfall/fix as claude-
+    // client.test.js's requireFreshClaudeClient), not on the module this file already
+    // required at the top for the tests above.
+    const child_process = require('child_process');
+    const real = child_process.execFileSync;
+    child_process.execFileSync = () => {
+      const err = new Error('spawnSync git ENOBUFS');
+      err.code = 'ENOBUFS';
+      throw err;
+    };
+    try {
+      delete require.cache[require.resolve('./task-disposition.js')];
+      const { realGit: freshRealGit } = require('./task-disposition.js');
+      const out = freshRealGit(dir, ['log', 'origin/main', '--format=%H%x00%B%x00%x00']);
+      assert.equal(out, '', 'still returns empty string, same contract as any other failure');
+      assert.ok(logged.some((l) => l.includes('maxBuffer')), 'an ENOBUFS must be logged distinctly, not silently swallowed');
+    } finally {
+      child_process.execFileSync = real;
+      delete require.cache[require.resolve('./task-disposition.js')];
+      console.error = prevError;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
