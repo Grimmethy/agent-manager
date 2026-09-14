@@ -1942,6 +1942,9 @@ async function finalizeCandidateFulfillment(task, {
       try {
         premise = await entry.premiseCheck(task, { call: resolvedLocalCall, maybeLockedOn });
       } catch (e) {
+        // AC-170: log the swallowed premiseCheck exception so operators can see it.
+        // entry.name / entry.sourceName are not confirmed present; fall back to constructor name.
+        console.error(`[premiseCheck] task=${task.id || task.name || 'unknown'} source=${entry.name || entry.sourceName || entry.constructor?.name || 'unknown-source'} error=${e?.message ?? String(e)}`, e?.stack);
         premise = null; // advisory mechanism -- a throwing premiseCheck must never block a real split
       }
       if (premise && premise.verdict === 'invalid-premise') {
