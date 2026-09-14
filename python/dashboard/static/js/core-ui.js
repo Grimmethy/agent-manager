@@ -338,6 +338,35 @@ async function loadMoreCompletedTasks() {
   if (activeTab === 'workers') await renderWorkers();
 }
 
+// 2026-09-14, screaminggoatclubmt: "the 'All tasks completed' section has stalled. Last
+// update 23 hours ago" -- root-caused live: the FIRST-load guard in renderWorkers below
+// (`if (!completedTasksLog.length ...) loadMoreCompletedTasks()`) only ever fires ONCE
+// per page load, and loadMoreCompletedTasks only ever APPENDS OLDER pages to the end via
+// the `before` cursor (real scroll-triggered pagination). Nothing ever re-checked for
+// NEWER completions -- confirmed live: /api/tasks/completed itself was current to the
+// minute (real backend, real recent completions), the dashboard's OWN accumulated JS
+// state (completedTasksLog, module-level, survives every 5s #main rebuild by design --
+// see its own header comment) was just never topped up with them. A tab left open for
+// 23h shows exactly what was true when it first loaded the section, forever.
+//
+// Fetches the newest page (no `before` cursor) and PREPENDS whatever isn't already in
+// completedTasksLog (deduped by taskId) -- never touches completedTasksNextCursor /
+// completedTasksExhausted, so the scroll-triggered "load older" pagination this doesn't
+// touch keeps working exactly as before. Called only on the real 5s poll cycle
+// (renderWorkers(isPoll===true) below), not on every action-triggered re-render.
+async function refreshNewestCompletedTasks() {
+  try {
+    const data = await fetchJson('/api/tasks/completed?limit=25');
+    const rows = data.tasks || [];
+    if (!rows.length) return;
+    const known = new Set(completedTasksLog.map((t) => t.taskId));
+    const fresh = rows.filter((t) => !known.has(t.taskId));
+    if (fresh.length) completedTasksLog = fresh.concat(completedTasksLog);
+  } catch (e) {
+    // best-effort -- the next 5s poll retries; the existing list just stays as-is.
+  }
+}
+
 // isPoll (2026-09-07, Grimmethy: "please fix the dropdown reset on poll thing, that
 // is extraordinarily irritating and has bit me several times"): the 5s refresh()
 // cycle (index.html's renderMain(), 'workers' branch) used to call this unconditionally,
@@ -357,6 +386,10 @@ async function renderWorkers(isPoll) {
     if (active && (active.classList.contains('worker-type-select') || active.classList.contains('worker-task-select'))) {
       return;
     }
+    // Top up the completed-tasks log with anything newer than what's already loaded --
+    // see refreshNewestCompletedTasks's own header note. Only on the real poll cycle,
+    // not every action-triggered re-render (assign-task, filter click, expand/collapse).
+    await refreshNewestCompletedTasks();
   }
   // run-log vs recent-tasks (2026-09-08, Grimmethy: "This looks like it's only showing
   // fully completed tasks. I want to see a log of every time an agent is run and the
