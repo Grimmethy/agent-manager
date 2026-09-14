@@ -17,7 +17,9 @@
 const fs = require('fs');
 const path = require('path');
 
-const PATH_EXT_RE = /[A-Za-z0-9_.\-/\\]+\.(?:js|jsx|ts|tsx|py|json|md|csv)\b/g;
+// (?!\s*:\s*\d) rejects a match where a ":NNN" line-number suffix follows, so
+// "foo.js:310" is not silently truncated to the bare path "foo.js".
+const PATH_EXT_RE = /[A-Za-z0-9_.\-/\\]+\.(?:js|jsx|ts|tsx|py|json|md|csv)\b(?!\s*:\s*\d)/g;
 const RELATIONSHIP_RE = /`([^`]+)`\s+(?:imports?|calls?|reads?\s+from|uses?)\s+`?([A-Za-z0-9_.]+)`?/gi;
 
 function extractFilePaths(text) {
