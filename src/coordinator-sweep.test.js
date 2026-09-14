@@ -333,6 +333,34 @@ test('a hub with no sub-tasks is also stamped mergedAt when completed out', () =
   coordinatorSweep({ pipelineDir: dir });
   const done = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'hub-empty.json'), 'utf8'));
   assert.ok(done.mergedAt);
+  // No coordinatorBlocked marker -- this is the legitimate "orphaned, cleaned up
+  // elsewhere" case, so it keeps the real `merged` disposition.
+  assert.equal(done.terminalDisposition, 'merged');
+  assert.equal(done.history[done.history.length - 2].stage, 'merged');
+});
+
+// 2026-09-14, screaminggoatclubmt: "fix the mislabeling" -- a hub that file-decompose-to-
+// hub.js's fileBlockedHub() filed with `coordinatorBlocked` set and `subTasks: []` from
+// creation (validatePlan() found a hard problem, zero children were EVER attempted) must
+// not read as `merged` just because it also has zero sub-tasks. Confirmed live: 33 real
+// `Decompose <file> -- plan needs revision` records in queue/done/ carried this exact bug.
+test('a hub rejected at creation (coordinatorBlocked, zero sub-tasks ever filed) is stamped noop, not merged', () => {
+  const dir = makePipeline();
+  write(dir, 'coordinating', {
+    id: 'hub-rejected', status: 'coordinating', history: [], subTasks: [],
+    coordinatorBlocked: { signature: 'plan-invalid:src/x.js: some hard problem', since: new Date().toISOString(), children: [], escalated: false },
+  });
+  coordinatorSweep({ pipelineDir: dir });
+  const done = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'hub-rejected.json'), 'utf8'));
+  // Still stamped mergedAt -- stampHubMerged's own reasoning (isDependencySatisfied()
+  // needs it to clear any dependsOn sibling) applies here too, even though a rejected
+  // hub is very unlikely to have any dependent in practice.
+  assert.ok(done.mergedAt);
+  assert.equal(done.terminalDisposition, 'noop');
+  const mergedEvent = done.history.find((e) => e.stage === 'merged');
+  assert.equal(mergedEvent, undefined, 'no history event should claim this hub merged');
+  const noopEvent = done.history.find((e) => e.stage === 'noop');
+  assert.ok(noopEvent, 'a noop history event should record the rejection');
 });
 
 test('sweep on a missing coordinating/ dir is a clean no-op', () => {
