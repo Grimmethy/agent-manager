@@ -16,6 +16,7 @@ const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
+const { normalizeDiffOutput } = require('./group-b-worktree-diff.js');
 const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
 const { writeSideFindingInbox } = require('./side-finding.js');
 
@@ -346,7 +347,18 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   const bestEffortDiff = () => {
     try {
       runGit(['add', '-A'], worktreeDir);
-      return runGit(['diff', '--cached'], worktreeDir).trim() || undefined;
+      // --full-index --binary: see group-b-worktree-diff.js's own note (2026-09-14) --
+      // without both flags together, `git apply` refuses a binary patch outright (or
+      // fails with "missing binary patch data") if git's own heuristic ever decides a
+      // produced file is binary (a literal NUL byte in otherwise-ordinary source content
+      // is enough), even though the file itself is perfectly normal text. Costs nothing
+      // for the common text-patch case.
+      // normalizeDiffOutput (not a bare .trim()): see its own header note -- a bare
+      // .trim() strips the trailing blank line a `GIT binary patch` section structurally
+      // requires (corrupt binary patch at apply time), and for an ordinary text diff
+      // fails to restore the exactly-one trailing newline `git apply` needs (the
+      // original 2026-09-08 incident this shared helper exists to fix).
+      return normalizeDiffOutput(runGit(['diff', '--cached', '--full-index', '--binary'], worktreeDir)) || undefined;
     } catch {
       return undefined;
     }
@@ -639,12 +651,16 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   let rawDiff = '';
   try {
     runGit(['add', '-A'], worktreeDir);
-    rawDiff = runGit(['diff', '--cached'], worktreeDir);
+    // --full-index --binary: see group-b-worktree-diff.js's own note (2026-09-14).
+    rawDiff = runGit(['diff', '--cached', '--full-index', '--binary'], worktreeDir);
   } catch (e) {
     return { succeeded: false, reason: `could not capture git diff from the worktree: ${e.message}`, ...meta };
   }
 
-  const trimmedDiff = rawDiff.trim();
+  // normalizeDiffOutput, not a bare .trim() -- see group-b-worktree-diff.js's own header
+  // note (2026-09-14): a bare .trim() corrupts a `GIT binary patch` section's
+  // structurally-required trailing blank line.
+  const trimmedDiff = normalizeDiffOutput(rawDiff);
 
   // Is the diff actually the change the task asked for, or a token gesture (an ADR instead
   // of the code, an unrequested delete, a file the task explicitly forbids)? A "valid diff

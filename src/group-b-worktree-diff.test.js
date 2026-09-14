@@ -61,6 +61,41 @@ test('captureGroupBDiffInWorktree handles a create', () => {
   assert.equal(fs.existsSync(path.join(repoDir, 'new-file.txt')), false);
 });
 
+// 2026-09-14, screaminggoatclubmt: "please dig into it" -- root-caused live: a real
+// decompose of local-draft.js extracted runCritiqueAndRevision (which deliberately
+// embeds a literal NUL byte as a guaranteed-unique string-key separator, `${a}\0${b}`,
+// perfectly valid JS) into its own small new file -- git's own binary-content heuristic
+// classified that NEW file as binary, and the captured `git diff --cached` (no
+// --full-index/--binary) produced a patch `git apply` later refused outright: "cannot
+// apply binary patch to '...' without full index line". This proves the fix for real:
+// captures a diff for a NUL-containing new file, then actually APPLIES that exact diff
+// to a completely separate fresh checkout (not just asserting the patch text LOOKS
+// right) and checks the result is byte-for-byte identical, NUL included.
+test('captureGroupBDiffInWorktree: a created file containing a literal NUL byte (git classifies it as binary) produces a diff that actually applies elsewhere, byte-for-byte', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const content = 'function f() {\n  const seen = new Set(["a\0b"]);\n  return seen;\n}\nmodule.exports = { f };\n';
+  const implementResponse = JSON.stringify({ mode: 'create', file: 'nul-fixture.js', content });
+
+  const diff = captureGroupBDiffInWorktree({
+    repoRoot: repoDir, pipelineDir: repoDir, implementResponse, worktreeSuffix: 'test-nul-binary',
+  });
+
+  assert.match(diff, /GIT binary patch/, 'sanity: this fixture really does trip git\'s binary-content heuristic');
+  // The bug's exact fingerprint: a binary patch with an ABBREVIATED index line has no
+  // '..' between two full 40-char hashes.
+  assert.match(diff, /^index [0-9a-f]{40}\.\.[0-9a-f]{40}/m, 'index line must carry full (not abbreviated) SHAs for a binary patch to be appliable');
+
+  // Apply the exact captured diff to a totally separate, freshly-cloned checkout --
+  // proves it works end to end, not just that the patch text looks plausible.
+  const applyTargetDir = fs.mkdtempSync(path.join(os.tmpdir(), 'groupb-worktree-apply-target-'));
+  git(['clone', repoDir, applyTargetDir]);
+  const patchFile = path.join(os.tmpdir(), `nul-fixture-${Date.now()}.patch`);
+  fs.writeFileSync(patchFile, diff);
+  git(['apply', patchFile], applyTargetDir);
+  const applied = fs.readFileSync(path.join(applyTargetDir, 'nul-fixture.js'));
+  assert.equal(applied.toString('binary'), content, 'applied content must byte-for-byte match, NUL included');
+});
+
 test('captureGroupBDiffInWorktree cleans up the worktree and branch even on success', () => {
   const { repoDir } = makeRepoWithOrigin();
   const implementResponse = JSON.stringify({ mode: 'edit', file: 'tracked.txt', find: 'v1', replace: 'v2' });
