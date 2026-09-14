@@ -14,16 +14,25 @@ from flask import Blueprint, abort, jsonify, request
 brain_dump_bp = Blueprint("brain-dump-bp", __name__)
 
 
-@brain_dump_bp.route("/api/brain-dump")
-def api_brain_dump():
-    """Brain Dump tab's left pane. Defaults to everything not yet actioned (captured +
-    sorted) PLUS any actioned entry whose downstream task actually needs a human
-    (blocked/needs-clarification) -- confirmed live 2026-08-16: every one of a real
-    user's actioned entries had silently blocked, invisible under the old default filter
-    (which excluded every actioned entry unconditionally, cleanly-completed or not) same
-    as under the old flat "queued" badge. A genuinely still-in-progress or successfully
-    completed actioned entry stays hidden by default -- only ?status=actioned/all
-    surfaces those -- since there's nothing for a human to act on there.
+def _filtered_brain_dump_view(*, machine):
+    """Shared status-filter logic behind both /api/brain-dump and /api/filed-findings --
+    identical unprocessed/processed/all semantics, the only difference is which half of
+    the `raisedBy` split each endpoint serves. Factored out 2026-09-14 (Grimmethy: "Brain
+    dump needs to go back to human input only. All automatically generated tasks need to
+    go into a separate filing tab") when the Brain Dump tab split into two: Brain Dump
+    stays exactly what its name says -- a place for a human to jot a note -- and every
+    entry a pipeline sweep raises on its own (`raisedBy` set: side-finding-sweep.js,
+    pipeline_debrief's Now-What items, concept-research, etc.) moves to Filed Findings so
+    it never crowds out a human's own captures again.
+
+    Defaults to everything not yet actioned (captured + sorted) PLUS any actioned entry
+    whose downstream task actually needs a human (blocked/needs-clarification) --
+    confirmed live 2026-08-16: every one of a real user's actioned entries had silently
+    blocked, invisible under the old default filter (which excluded every actioned entry
+    unconditionally, cleanly-completed or not) same as under the old flat "queued" badge.
+    A genuinely still-in-progress or successfully completed actioned entry stays hidden
+    by default -- only ?status=actioned/all surfaces those -- since there's nothing for a
+    human to act on there.
     ?status=<value> narrows to one status, ?status=all returns the full history.
 
     BUG FIXED 2026-08-21 (Grimmethy: "Entry #129 is visible in both the processed and
@@ -38,6 +47,7 @@ def api_brain_dump():
     read as processed."""
     from app import BRAIN_DUMP_NEEDS_ATTENTION_STATES, _brain_dump_entries_with_task_status
     entries = _brain_dump_entries_with_task_status()
+    entries = [e for e in entries if bool(e.get("raisedBy")) == machine]
 
     # `suppressed` entries (a human marked the finding obsolete/invalid) are hidden from
     # every view except ?status=all, so a stale recurring machine finding can be retired
@@ -58,9 +68,26 @@ def api_brain_dump():
             e for e in entries
             if e.get("status") != "actioned" or e.get("taskStatus") in BRAIN_DUMP_NEEDS_ATTENTION_STATES
         ]
-    entries = sorted(entries, key=lambda e: e.get("capturedAt") or "", reverse=True)
+    return sorted(entries, key=lambda e: e.get("capturedAt") or "", reverse=True)
 
-    return jsonify(entries)
+
+@brain_dump_bp.route("/api/brain-dump")
+def api_brain_dump():
+    """Brain Dump tab's left pane -- human-captured notes ONLY (no `raisedBy`). See
+    _filtered_brain_dump_view's own header for the full filter semantics and the
+    2026-09-14 split that created this endpoint's current scope."""
+    return jsonify(_filtered_brain_dump_view(machine=False))
+
+
+@brain_dump_bp.route("/api/filed-findings")
+def api_filed_findings():
+    """Filed Findings tab's left pane -- every entry a pipeline sweep raised on its own
+    (`raisedBy` set: side-finding-sweep.js, pipeline_debrief's Now-What items,
+    concept-research, blocked-cluster-sweep, ...), split out of Brain Dump 2026-09-14 so
+    a human's own notes never get crowded out by machine-filed volume (764 of 999 live
+    entries were machine-raised at time of writing). Same filter semantics as
+    /api/brain-dump -- see _filtered_brain_dump_view's own header."""
+    return jsonify(_filtered_brain_dump_view(machine=True))
 
 
 @brain_dump_bp.route("/api/brain-dump/capture", methods=["POST"])

@@ -453,6 +453,12 @@ function renderBrainDumpCard(entry) {
       ? `<span class="clickable" data-open-task="${escapeAttr(entry.raisedBy.taskId)}" style="cursor:pointer;display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px" title="Flagged automatically while working on ${escapeAttr(entry.raisedBy.taskId)} -- click to open that task">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`
       : `<span style="display:inline-block;margin-left:6px;padding:1px 5px;border:1px solid var(--muted);border-radius:3px;color:var(--muted);font-size:11px" title="Flagged automatically while working on a ${escapeAttr(entry.raisedBy.source || 'pipeline')} task (no task link available)">🤖 ${escapeHtml(entry.raisedBy.source || 'pipeline')}</span>`)
     : '';
+  // Suppress only makes sense for a machine-raised entry (retire a stale/obsolete
+  // finding a sweep keeps re-flagging) -- a human's own Brain Dump note is deleted, not
+  // suppressed, so this button is entry.raisedBy-gated the same way raisedByBadge is.
+  const suppressBtn = entry.raisedBy && !entry.suppressed
+    ? `<button class="secondary" data-suppress="${escapeAttr(entry.id)}" title="Retire this finding -- future sweeps stop re-raising it, but the record stays (reversible, see ?status=all)">Suppress</button>`
+    : '';
   return `
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
       <div class="row">
@@ -467,10 +473,11 @@ function renderBrainDumpCard(entry) {
         <span>${queuedBadge}</span>
         <span>
           <button class="secondary" data-prioritize="${escapeAttr(entry.id)}" title="Queue this entry for drafting right away instead of waiting on the normal sort/priority order">Process now</button>
-          <button class="secondary" data-bd-send-to-chat="${escapeAttr(entry.id)}" title="Send this entry to the System Chat panel as a message -- no AI call, works even while the local model is busy">Send to Chat</button>
+          ${entry.raisedBy ? '' : `<button class="secondary" data-bd-send-to-chat="${escapeAttr(entry.id)}" title="Send this entry to the System Chat panel as a message -- no AI call, works even while the local model is busy">Send to Chat</button>`}
           <button class="secondary" data-copy="${escapeAttr(entry.id)}" data-copy-text="${escapeAttr(entry.rawText)}" title="Copy this entry's raw text to the clipboard">Copy</button>
-          <button class="secondary" data-edit="${escapeAttr(entry.id)}" title="Edit this entry's raw text">Edit</button>
-          <button class="secondary" data-delete="${escapeAttr(entry.id)}" title="Delete this brain dump entry">Delete</button>
+          ${entry.raisedBy ? '' : `<button class="secondary" data-edit="${escapeAttr(entry.id)}" title="Edit this entry's raw text">Edit</button>`}
+          <button class="secondary" data-delete="${escapeAttr(entry.id)}" title="Delete this ${entry.raisedBy ? 'filed finding' : 'brain dump entry'}">Delete</button>
+          ${suppressBtn}
           ${reopenBtn}
         </span>
       </div>
@@ -967,4 +974,139 @@ async function enterBrainDumpTab() {
 
 function leaveBrainDumpTab() {
   if (brainDumpEntriesInterval) { clearInterval(brainDumpEntriesInterval); brainDumpEntriesInterval = null; }
+}
+
+// Filed Findings tab (2026-09-14, Grimmethy: "Brain dump needs to go back to human input
+// only. All automatically generated tasks need to go into a separate filing tab") --
+// everything /api/brain-dump used to mix in whenever entry.raisedBy was set (764 of 999
+// live entries at the time of the split). Deliberately a plain renderMain()-dispatched
+// tab, not its own enter/leave lifecycle like Brain Dump -- there's no free-text editing
+// here to lose to a poll-driven rebuild, just buttons, so it's simpler to let it opt out
+// of the 5s auto-refresh (branches-joblist-hardware-tabs.js's refresh()) and re-fetch
+// once whenever the user switches into it or changes the status filter.
+let filedFindingsStatusFilter = '';
+let filedFindingsEntryById = new Map();
+
+async function renderFiledFindingsTab() {
+  const main = document.getElementById('main');
+  main.innerHTML = `
+    <div class="field-label" style="display:flex; justify-content:space-between; align-items:center;">
+      <span>Filed Findings -- everything a pipeline sweep raised on its own, not typed by a human</span>
+      <select id="filed-status-filter" style="text-transform:none; letter-spacing:normal; font-size:12px;">
+        <option value="" ${filedFindingsStatusFilter === '' ? 'selected' : ''}>Unprocessed</option>
+        <option value="actioned" ${filedFindingsStatusFilter === 'actioned' ? 'selected' : ''}>Processed</option>
+        <option value="all" ${filedFindingsStatusFilter === 'all' ? 'selected' : ''}>All</option>
+      </select>
+    </div>
+    <div id="filed-entries"><div class="empty">Loading...</div></div>
+  `;
+  document.getElementById('filed-status-filter').onchange = (e) => {
+    filedFindingsStatusFilter = e.target.value;
+    refreshFiledFindingsEntries();
+  };
+  await refreshFiledFindingsEntries();
+}
+
+async function refreshFiledFindingsEntries() {
+  const el = document.getElementById('filed-entries');
+  if (!el) return;
+  let entries;
+  try {
+    const qs = filedFindingsStatusFilter ? `?status=${encodeURIComponent(filedFindingsStatusFilter)}` : '';
+    entries = await fetchJson('/api/filed-findings' + qs);
+    entries.forEach((entry) => filedFindingsEntryById.set(entry.id, entry));
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Could not load: ${e.message}</div>`;
+    return;
+  }
+
+  if (entries.length === 0) {
+    const msg = filedFindingsStatusFilter === 'actioned' ? 'No processed findings yet.'
+      : filedFindingsStatusFilter === 'all' ? 'Nothing filed yet.'
+      : 'Nothing unprocessed -- everything filed so far has been actioned.';
+    el.innerHTML = `<div class="empty">${msg}</div>`;
+    return;
+  }
+
+  // renderBrainDumpCard already renders the raisedBy badge + Suppress button correctly
+  // for a machine-raised entry, and hides the human-note-only Edit/Send-to-Chat buttons
+  // -- every entry here has raisedBy set by construction (/api/filed-findings only ever
+  // returns those), so it just works with no Filed-Findings-specific card template.
+  el.innerHTML = entries.map((entry) => renderBrainDumpCard(entry)).join('');
+  wireFiledFindingsHandlers(el);
+}
+
+function wireFiledFindingsHandlers(el) {
+  el.querySelectorAll('[data-prioritize]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = 'Queuing...';
+      try {
+        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.prioritize) + '/prioritize', { method: 'POST' });
+        await refreshFiledFindingsEntries();
+      } catch (e) {
+        alert('Could not queue: ' + e.message);
+        btn.disabled = false;
+        btn.textContent = 'Process now';
+      }
+    };
+  });
+
+  el.querySelectorAll('[data-copy]').forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(btn.dataset.copyText || '');
+        const original = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => { btn.textContent = original; }, 1200);
+      } catch (e) {
+        alert('Could not copy: ' + e.message);
+      }
+    };
+  });
+
+  el.querySelectorAll('[data-delete]').forEach((btn) => {
+    btn.onclick = async () => {
+      if (!confirm('Delete this filed finding?')) return;
+      try {
+        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.delete), { method: 'DELETE' });
+        await refreshFiledFindingsEntries();
+      } catch (e) {
+        alert('Could not delete: ' + e.message);
+      }
+    };
+  });
+
+  el.querySelectorAll('[data-suppress]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = 'Suppressing...';
+      try {
+        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.suppress) + '/suppress', { method: 'POST' });
+        await refreshFiledFindingsEntries();
+      } catch (e) {
+        alert('Could not suppress: ' + e.message);
+        btn.disabled = false;
+        btn.textContent = 'Suppress';
+      }
+    };
+  });
+
+  el.querySelectorAll('[data-reopen]').forEach((btn) => {
+    btn.onclick = async () => {
+      if (!confirm(`Reopen '${btn.dataset.reopen}' for a fresh draft? This resets its retry history.`)) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/task/archived/${encodeURIComponent(btn.dataset.reopen)}/requeue`, { method: 'POST' });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.description || `${res.status}`);
+        }
+        await refreshFiledFindingsEntries();
+      } catch (e) {
+        alert('Could not reopen: ' + e.message);
+        btn.disabled = false;
+      }
+    };
+  });
 }
