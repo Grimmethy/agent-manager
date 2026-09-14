@@ -170,6 +170,16 @@ test('sweep: a file with a recent commit (hot file) still files -- this fixture 
   execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: dir });
   execFileSync('git', ['config', 'user.name', 'x'], { cwd: dir });
   writeFixtureSource(dir, 'src/big.js', SYMS);
+  // A leading side-effect require() -- 2026-09-14: validatePlan now only routes a .js
+  // source through the CommonJS one-pass builder when it actually looks like a Node
+  // module (require()/module.exports somewhere); this fixture needs to genuinely look
+  // like one to stay Tier-1-eligible. A bare `require('fs')` (not bound to a name, and
+  // referencing none of the symbol names) satisfies that without creating a spurious
+  // cross-reference the fan-out filter would then have to treat as real -- a trailing
+  // `module.exports = { every symbol }` line was tried first and rejected the whole
+  // fixture instead, since IT genuinely references every symbol from outside each one's
+  // own section.
+  fs.writeFileSync(path.join(dir, 'src/big.js'), `require('fs');\n\n${fs.readFileSync(path.join(dir, 'src/big.js'), 'utf8')}`);
   execFileSync('git', ['add', 'src/big.js'], { cwd: dir });
   execFileSync('git', ['commit', '-q', '-m', 'recent'], { cwd: dir });
 

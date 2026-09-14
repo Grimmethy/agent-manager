@@ -86,6 +86,17 @@ function readRequests(requestsDir) {
 
 // --- Preflight -------------------------------------------------------------------------
 
+// True if `text` actually uses the CommonJS module system somewhere -- at least one
+// require() call, or a module.exports assignment. A file loaded via a plain browser
+// `<script src>` tag (no bundler) never has either: `require`/`module` aren't defined
+// globals in that environment. Real Node modules in this repo always have at least one
+// (confirmed live 2026-09-14: 0 occurrences across every python/dashboard/static/js/*.js
+// file, 20+ each across a src/*.js sample) -- cheap, reliable, and doesn't depend on a
+// directory-naming convention that could drift.
+function looksLikeNodeCommonJsModule(text) {
+  return /\brequire\s*\(/.test(text || '') || /\bmodule\.exports\b/.test(text || '');
+}
+
 // Runs scripts/decompose-plan-check.py for one .py move. Returns null when the check can't
 // run (no python, non-.py source, script missing) -- the caller then proceeds advisory-only
 // rather than blocking a decomposition on a missing dev tool.
@@ -157,10 +168,28 @@ function validatePlan(repoRoot, request) {
   // nodeModuleApplyOk (the .js analogue of deterministicApplyOk); not-ok -> one hard
   // problem with the exact reason. The move `kind` (script-extract vs module-extract) is
   // irrelevant here -- .js wiring is require()/module.exports either way.
+  //
+  // 2026-09-14, screaminggoatclubmt: "Harden [this]" -- caught live: this branch used to
+  // match ANY .js source by extension alone, with zero regard for whether it's actually a
+  // Node CommonJS module. python/dashboard/static/js/*.js files are loaded via a plain
+  // browser `<script src>` tag (see index.html) -- no bundler, no Node runtime, `require`
+  // is not a defined identifier there at all. The produced split used real
+  // require()/module.exports wiring anyway, which would have thrown "require is not
+  // defined" the instant the browser loaded it, breaking the Models/Deep-Dive/Discovery/
+  // Tokenfold tabs -- caught before merge only because this session verifies every branch
+  // for real before recommending one. looksLikeNodeCommonJsModule (require()/module.exports
+  // ANYWHERE in the source) gates this branch now; every real Node module in this repo has
+  // at least one of those (confirmed: 0 occurrences across every static/js/*.js file,
+  // 20+ each across a sample of real src/*.js modules). A file that fails this gate falls
+  // through to the generic per-move loop below, which already handles `script-extract`
+  // moves in a browser-safe way (staticCheckScriptExtractMove, verbatim extraction, no
+  // require()/module.exports wiring at all) -- built and proven for plain .js sources
+  // back on 2026-09-08 (review-task.js), just never reachable for THIS class of file
+  // because this earlier, broader check always intercepted it first.
   if (/\.(js|mjs|cjs)$/.test(request.sourceFile || '')) {
     let sourceText = null;
     try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
-    if (sourceText != null) {
+    if (sourceText != null && looksLikeNodeCommonJsModule(sourceText)) {
       const built = buildNodeModuleOnePassChanges(sourceText, request.sourceFile, request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })), repoRoot);
       if (built.ok) {
         for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], nodeModuleApplyOk: true });
@@ -168,10 +197,10 @@ function validatePlan(repoRoot, request) {
         hardProblems.push(`${request.sourceFile}: ${built.reason}`);
         for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
       }
-    } else {
-      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      return { ok: hardProblems.length === 0, hardProblems, moveMeta };
     }
-    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+    // Unreadable, OR readable but not a CommonJS module -- fall through to the generic
+    // per-move loop below rather than returning here.
   }
 
   // A .py source whose plan is ALL flask-blueprint moves: run the whole plan through
@@ -622,7 +651,9 @@ function sweep({ pipelineDir, repoRoot, force = false, now = Date.now() } = {}) 
   return summary;
 }
 
-module.exports = { sweep, moveRawText, wiringRawText, validatePlan, staticCheckMove, staticCheckScriptExtractMove };
+module.exports = {
+  sweep, moveRawText, wiringRawText, validatePlan, staticCheckMove, staticCheckScriptExtractMove, looksLikeNodeCommonJsModule,
+};
 
 if (require.main === module) {
   const force = process.argv.includes('--force');
