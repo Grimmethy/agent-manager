@@ -244,6 +244,80 @@ test('a real Group B JSON change is never misclassified just because it mentions
   assert.equal(fs.readFileSync(path.join(REPO_ROOT, 'foo.js'), 'utf8'), 'b');
 });
 
+// --- assertStageableFiles guard (src/lib/apply-core.js): a registered source whose
+// artifact carries neither `file` nor `files` used to reach `git add [undefined]` here,
+// producing "fatal: pathspec 'undefined' did not match any files" -- a real, live failure
+// (2026-09-01, first real pipeline_forensics report) that recurred 3 times on task 12
+// before a manual re-approve unblocked it. `filesToAdd = artifact.files || [artifact.file]`
+// with neither present yields `[undefined]`; assertStageableFiles now throws a clear
+// "no target file path" error at that exact point instead. Note: this throw happens AFTER
+// writeArtifact()'s own try/catch (which is the only block that runs checkoutMain/
+// deleteBranch cleanup), so unlike the "artifact write failure rolls back" test above, the
+// throwaway branch is left created (empty, no commit) rather than torn back down here --
+// the next apply attempt's defensive pre-createBranch deleteBranch (see the "pre-existing
+// stale branch" test) sweeps it up. The one guarantee that matters -- never reaching git add
+// with the bad [undefined] pathspec -- still holds.
+test('a registered source whose artifact has neither file nor files throws "no target file path" instead of reaching git add [undefined]', () => {
+  const name = 'guard_no_file_probe';
+  if (!getRegisteredSource(name)) {
+    registerTaskSource(name, {
+      priority: 80,
+      next: () => null,
+      apply: () => ({}), // no `file`, no `files` -- the exact shape that used to crash git
+    });
+  }
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ source: name, id: 'guard-no-file-1' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.match(result.reason, /no target file path/);
+  assert.match(result.reason, /guard-no-file-1/);
+  const names = gitRunner.calls.map((c) => c.name);
+  // Branch created, then the guard throws before writeArtifact ever gets to filesToAdd/add
+  // -- crucially never reaches add/commit/push with the bad [undefined] pathspec.
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch']);
+  assert.ok(!names.includes('add'), 'must never call git add with an undefined pathspec');
+});
+
+test('a registered source whose artifact has files: [] (empty array) also throws "no target file path"', () => {
+  const name = 'guard_empty_files_probe';
+  if (!getRegisteredSource(name)) {
+    registerTaskSource(name, {
+      priority: 80,
+      next: () => null,
+      apply: () => ({ files: [] }),
+    });
+  }
+  const gitRunner = createFakeGitRunner();
+  const task = baseTask({ source: name, id: 'guard-empty-files-1' });
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(result.succeeded, false);
+  assert.match(result.reason, /no target file path/);
+  assert.ok(!gitRunner.calls.some((c) => c.name === 'add'));
+});
+
+test('applyDirectToMainBatch: a directToMain source whose artifact has no file/files fails that one task with "no target file path" instead of crashing the whole batch', () => {
+  const name = 'guard_no_file_batch_probe';
+  if (!getRegisteredSource(name)) {
+    registerTaskSource(name, {
+      priority: 80,
+      next: () => null,
+      directToMain: true,
+      apply: () => ({}), // same undefined-pathspec shape, exercised through the batch path
+    });
+  }
+  const gitRunner = createFakeGitRunner();
+  const bad = baseTask({ source: name, id: 'guard-batch-bad-1' });
+  const good = batchTriageTask('guard-batch-good-1');
+  const out = applyDirectToMainBatch([bad, good], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(out.results['guard-batch-bad-1'].succeeded, false);
+  assert.match(out.results['guard-batch-bad-1'].reason, /no target file path/);
+  assert.equal(out.results['guard-batch-good-1'].succeeded, true, 'a sibling task in the same batch still applies cleanly');
+});
+
 // --- arch_discovery/arch_import/observability_review/performance_review: direct-to-main
 // path (no throwaway branch) --------------------------------------------------------
 // Confirmed live 2026-08-16: the old branch-per-task flow left ~301 of ~311 real applied
