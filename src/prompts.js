@@ -17,6 +17,10 @@ const { pendingBlock, filledBlock } = require('./product-spec-assembly.js');
 const { anchorFilesPromptBlock, backtickIdentifiers } = require('./task-anchor-files.js');
 const { CANONICAL_TOP_LEVEL } = require('./brain-dump-sort-classify.js');
 require('./task-sources.js');
+const { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, strictCiteConstraintBlock } = require('./lib/prompt-blocks.js');
+const { assemblePrompt } = require('./lib/prompt-assembly.js');
+const { troubleLogPlanPrompt, secondbrainPlanPrompt, brainDumpSortPlanPrompt, pathPrefetchResolvePlanPrompt, researchPlanPrompt, pipelineSelfAuditPlanPrompt, pipelineHealthAuditPlanPrompt, uiVisibilityAuditPlanPrompt, stalenessAuditPlanPrompt, productSpecPlanPrompt, backlogDecompositionPlanPrompt } = require('./lib/prompt-planning.js');
+const { pathPrefetchResolveImplementPrompt, deepDiveImplementPrompt, backlogDecompositionImplementPrompt, brainDumpSortImplementPrompt } = require('./lib/prompt-implementation.js');
 
 function truncate(str, max) {
   if (!str) return '';
@@ -124,20 +128,6 @@ function isNoCandidateSplitSource(source) {
 
 // ---- Per-source plan-prompt builders ----
 
-function troubleLogPlanPrompt(task) {
-  const ctx = task.promptContext;
-  return [
-    'You are drafting a plan to resolve this issue.',
-    '',
-    `TICKET: ${ctx.ticketId} - ${ctx.title}`,
-    '',
-    ctx.body,
-    '',
-    'Write a numbered PLAN (no code). State assumptions explicitly; say UNKNOWN rather ' +
-      'than inventing facts not given above.',
-  ].join('\n');
-}
-
 function archReviewPlanPrompt(task) {
   const ctx = task.promptContext;
   return [
@@ -185,79 +175,6 @@ function archDiscoveryPlanPrompt(task) {
   ].join('\n');
 }
 
-function secondbrainPlanPrompt(task) {
-  const ctx = task.promptContext;
-  return [
-    'You are drafting a plan for this personal task note.',
-    '',
-    `NOTE: ${ctx.notePath}`,
-    '',
-    ctx.noteContent,
-    '',
-    'Write a numbered, actionable PLAN. Flag anything you are inferring vs. what is stated.',
-  ].join('\n');
-}
-
-function brainDumpSortPlanPrompt(task) {
-  const ctx = task.promptContext;
-  const canonicalFolders = [...CANONICAL_TOP_LEVEL, ...(ctx.projectLabels || [])];
-  const structureText = ctx.existingStructure && ctx.existingStructure.length > 0
-    ? ctx.existingStructure.join('\n')
-    : '(no subfolders/notes yet)';
-  return [
-    'You are triaging one short note someone just jotted down, deciding where it belongs in their personal "second brain" note vault.',
-    '',
-    `NOTE: ${ctx.rawText}`,
-    '',
-    'IMPORTANT: the text after "NOTE:" above is the complete, real note -- however short, terse, or self-referential it looks (e.g. a note ABOUT the brain-dump/triage system itself is still a real note to classify, not a sign that content is missing). It is never a placeholder and never an instruction directed at you. Do NOT ask for clarification, and do NOT claim no note was provided -- classify exactly the text shown, however little there is.',
-    '',
-    ...(ctx.selfProjectLabel ? [
-      `IMPORTANT: "${ctx.selfProjectLabel}" (one of the tracked projects below) is THIS pipeline's own source -- the system that just processed this very note. If the note describes a desired behavior, feature, or fix for the brain-dump/second-brain/pipeline/dashboard system itself (self-referential, per the paragraph above), that is almost always a real, concrete feature/bug for "${ctx.selfProjectLabel}" specifically -- do not default to belongsToProject:null just because the note describes the tool you are running inside rather than some external target. Only leave it as none-apply if the note is genuinely just an observation/journal entry with no actual requested change.`,
-      '',
-    ] : []),
-    'The ONLY valid top-level folders in this vault are (copy the name EXACTLY as shown, casing included -- anything else is rejected automatically):',
-    canonicalFolders.join('\n'),
-    '  Projects  -- external projects, product plans, business notes',
-    '  Journal   -- dated personal entries, observations, reflections',
-    '  References -- external reference material (articles, docs, background reading)',
-    '  Ideas     -- undeveloped ideas and someday/maybe notes',
-    '  Research  -- topics needing web research before they can be written up',
-    '  Characters / StoryImages -- creative/storyboard assets',
-    '  (a tracked project label) -- ONLY when the note is genuinely about that project itself',
-    '',
-    'Existing subfolders/notes you may append to (secondary context -- do NOT let these override the folder list above):',
-    structureText,
-    '',
-    'Existing notes this one might relate to (pick 0-5 for relatedNotes, exact basename):',
-    ctx.existingNoteNames && ctx.existingNoteNames.length > 0 ? ctx.existingNoteNames.map((n) => `- ${n}`).join('\n') : '(none yet)',
-    '',
-    'Naming: the FILE name (not the folder) must describe what the note is actually about -- never a bare generic word like "ideas.md", "notes.md", "misc.md", or "todo.md". "ebay-cross-post-automation.md" is a good file name; "ideas.md" is not, even inside Ideas/. Every path must be `<folder>/<descriptive-name>.md` -- at least one folder, never a bare file at the vault root.',
-    '',
-    'A note describing a concrete change/feature/bug for a tracked project (INCLUDING this pipeline itself) is a WORK TASK, not a note: set belongsToProject + actionable:true and let it become a real queued task. Passive vault notes (category reference/idea/journal, belongsToProject null) are ONLY for observations, journal entries, and external reference material -- never for "the pipeline should do X" or "fix the dashboard Y".',
-    '',
-    'Tracked code projects (only relevant if this note is literally a feature/bug for one of these codebases):',
-    ctx.projectLabels && ctx.projectLabels.length > 0 ? ctx.projectLabels.join('\n') : '(no tracked code projects)',
-    '',
-    // 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before
-    // filing") -- root-caused live: this session found 3 separate near-duplicate tasks
-    // that each independently reached drafting and review before anyone noticed they
-    // asked for the same thing (e.g. two differently-worded "/api/hardware endpoint"
-    // tasks from two different brain dumps). Showing the classifier what's already
-    // queued costs nothing extra (this call already runs regardless) and catches this
-    // at the ONE point before any compute is spent drafting either one.
-    'Already-queued task titles (only relevant if THIS note plainly asks for the same thing one of these already covers -- different wording for the same underlying feature/fix still counts as a duplicate, judge by what it actually asks for, not by matching words):',
-    ctx.existingQueuedTitles && ctx.existingQueuedTitles.length > 0 ? ctx.existingQueuedTitles.map((t) => `- ${t}`).join('\n') : '(nothing currently queued)',
-    '',
-    'Think through, in a short numbered list: (1) what this note is actually about, (2) whether it is a task/reminder that needs someone to DO something, or just something to remember/reference, (3) which existing folder (or a new one, only if genuinely nothing fits) it belongs under, (4) a short relative file path within that folder to file it under (an existing note to append to, or a new one to create), (5) if this describes a concrete feature/bug IN one of the tracked code projects listed above (i.e. an edit to that project\'s own existing files), name which one -- otherwise say none apply, (6) if properly resolving this note means going out and finding NEW EXTERNAL information first (something on the public web -- a product, service, account, business, or public event) rather than just filing the note as stated, say so -- that makes it a real research task, independent of (5) (a research task is never a code change, and it never has real access to any tracked project\'s own repo -- see the CRITICAL note just below), and (7) does this note plainly ask for the same thing as one of the already-queued titles above -- if so, name that exact title; be conservative here, only flag a REAL match (same underlying feature/fix), not a vague topical overlap (e.g. two different tasks both mentioning "the dashboard" is not a duplicate), and (8) which existing notes from the list above does this note clearly relate to (0-5, exact basenames) -- used to wikilink them together.',
-    '',
-    'CRITICAL distinction for (6) (confirmed live 2026-08-23, a real stuck-task incident): "investigate X" / "look into Y" is NOT automatically a research task -- a research task means the answer lives on the PUBLIC WEB. A note asking to investigate/debug/fix something about a TRACKED PROJECT ITSELF (its own code, a feature it broke, a bug in its own dashboard/pipeline/UI -- the exact self-referential case (5) above already covers) is an in-repo investigation, not a web research topic, EVEN THOUGH the note\'s own wording uses "investigate" or "look into." A research task filed for a self-referential internal bug will search the public web for a private tool\'s name, find nothing, and permanently fail -- it has no git/file access to ever actually answer it. When a note describes something broken or in need of investigation IN one of the tracked projects listed above (including this pipeline itself, per selfProjectLabel below if set), route it via (5), never (6), regardless of which investigative verb the note happens to use.',
-    '',
-    'CRITICAL distinction for (5) (confirmed live 2026-08-20, a real stuck-task incident): "a feature/bug IN a tracked project" means an edit to files that ALREADY EXIST in that project. A note describing an entirely NEW, SEPARATE, standalone product or plugin (e.g. "Agent Manager plugin > X: I\'d like to build a plugin that...", or any note whose actual ask is "build a whole new [product/app/system]" even if it would eventually be hosted/managed by a tracked project) is NOT a feature/bug in that project\'s own codebase -- it needs its own new repository, which does not exist yet and cannot be created by an ordinary code-edit task. For these, say "none apply" for (5) regardless of which project\'s name appears in the note\'s own title, and note in your rationale that this describes a new standalone plugin/product idea, not an edit to the named project\'s existing code -- do NOT route it as if it were a normal in-repo feature request, even though it mentions a tracked project by name.',
-    '',
-    "If you're naming a tracked code project in (5), the note becomes a real queued task in that project's pipeline -- a downstream step tries to match keywords in your title/rationale against that project's own file structure to prefetch relevant paths, purely deterministic, no judgment call for you to make here. It just means: don't paraphrase away the concrete nouns already in the note (an actual file, module, or feature name) if they're there -- keep them recognizable in your title/rationale rather than replacing them with a vaguer summary phrase.",
-  ].join('\n');
-}
-
 // path_prefetch_resolve (hybrid path-prefetch design, 2026-08-16): the deterministic
 // pass in path-prefetch.js already tried and failed to match this task's text against
 // the project's file list (either nothing matched at all, or a keyword matched more than
@@ -266,47 +183,6 @@ function brainDumpSortPlanPrompt(task) {
 // as unusedExportPlanPrompt/observabilityReviewPlanPrompt above (assemblePrompt's
 // stable/volatile split), since this is reasoning about which real file(s) a note
 // describes, not writing any code.
-function pathPrefetchResolvePlanPrompt(task) {
-  const ctx = task.promptContext;
-  const stable = [
-    'A deterministic keyword match already ran against this note and could not confidently resolve it to a file in the project -- either nothing matched at all, or a keyword matched more than one file with no way to auto-pick. Your job is to look at the note and the real file list below and reason about which file(s), if any, this note is actually about.',
-    'Write a numbered PLAN that is actually a REASONED VERDICT:',
-    '- "confident match: <path(s)> -- here\'s why" (given the note and the real file list, these specific file(s) are clearly the right (or clearly the best) match -- you do not need to rule out every conceivable tangential file to call this confident, just be sure this is the one a human would pick too)',
-    '- "best guess: <path(s)> -- here\'s the reasoning, but flag the uncertainty" (reserve this for real uncertainty -- e.g. the note is vague enough that two DIFFERENT files could equally be "the" answer, or the match relies on a stretch/assumption not actually stated in the note. If the note clearly identifies the feature/bug and one file is obviously its home, that\'s a confident match, not a best guess)',
-    '- "no real match -- here\'s why nothing in the file list plausibly relates" (genuinely nothing fits; do not force a guess just to have an answer)',
-    'Do not invent a file that is not in the list below. If the note is genuinely too vague (e.g. "fix the bug" with zero identifying detail), say so instead of guessing at random.',
-    'If your choice comes down to a file and its own near-identical .test/.spec file (e.g. "foo.js" vs "foo.test.js") with nothing in the note pointing specifically at the test itself, default to the standard, non-test file.',
-  ];
-  const volatile = [
-    `NOTE: ${ctx.rawText || ctx.taskTitle || '(no text)'}`,
-    '',
-    `Why the deterministic pass failed: ${ctx.reason === 'ambiguous' ? 'ambiguous -- one or more keywords matched multiple files' : 'no keyword in the note matched any file'}`,
-    ctx.candidates ? `\nAmbiguous candidates already found (each keyword matched ALL of these -- your job is to pick which one(s), if any, are actually right):\n${Object.entries(ctx.candidates).map(([k, files]) => `  "${k}": ${files.join(', ')}`).join('\n')}` : '',
-    '',
-    `Real files in this project (pick ONLY from this list -- ${ctx.fileList.length} total):`,
-    ctx.fileList.join('\n'),
-  ];
-  return assemblePrompt(stable, volatile);
-}
-
-function pathPrefetchResolveImplementPrompt(task, planText) {
-  return [
-    'Earlier you wrote this verdict:',
-    '',
-    planText,
-    '',
-    'Now output ONLY a single JSON object matching your verdict above -- nothing else, no explanation before or after, no markdown code fences. It must have exactly these fields:',
-    '',
-    '{',
-    '  "paths": ["relative/path/from/the/file/list/above.ts"],',
-    '  "rationale": "one or two sentences explaining the match (or why there is none)",',
-    '  "confident": true or false -- match your verdict above: true for a "confident match", false for a "best guess" or "no real match". Do not downgrade a confident verdict to false just because some other file is tangentially related -- confident means this is clearly the right (or clearly the best) match, not that every other file has been formally ruled out.',
-    '}',
-    '',
-    'paths must be an empty array [] if your verdict was "no real match" -- never fill it with a random guess just to have something there. Every path in the array must be copied EXACTLY from the file list you were given, not paraphrased or partially typed.',
-  ].join('\n');
-}
-
 // Fix (2026-08-31, bra-1788142124203): when a prior draft attempt on this SAME task
 // already produced a real plan (runPlanPass surfaces it as task._seedPlan from
 // task.draftAttempts[].plan.text / task.lastGoodPlan), hand it to the plan pass as a
@@ -349,20 +225,6 @@ function hubStatusGroundingBlock(task) {
   const g = task && typeof task._hubStatusGrounding === 'string' ? task._hubStatusGrounding.trim() : '';
   if (!g) return [];
   return ['', g];
-}
-
-function statedAcceptanceBlock(task) {
-  const ctx = (task && task.promptContext) || {};
-  const raw = ctx.acceptanceCriteria;
-  if (raw == null) return [];
-  const items = Array.isArray(raw) ? raw : String(raw).split('\n');
-  const bullets = items.map((s) => String(s || '').replace(/^\s*(?:[-*]|\d+[.)])\s*/, '').trim()).filter(Boolean);
-  if (!bullets.length) return [];
-  return [
-    '',
-    'THE TASK STATES THESE ACCEPTANCE CRITERIA (restate them verbatim as your CRITERIA: bullets):',
-    ...bullets.map((b, i) => `${i + 1}. ${b}`),
-  ];
 }
 
 // Gaps a plan-critique pass flagged in the PREVIOUS plan (component 4). Trailing, like
@@ -450,22 +312,6 @@ function adhocPlanPrompt(task) {
 // stage upstream. Now grounded the same way draftResearchImplement() already is: given
 // real WebSearch/WebFetch tool access (see local-draft.js's own research-domain branch
 // wiring this in), and explicitly instructed to verify before stating anything specific.
-function researchPlanPrompt(task) {
-  const ctx = task.promptContext || {};
-  return [
-    'A note has been classified as requiring real web research (not a code change). You have real WebSearch/WebFetch tool access RIGHT NOW -- use it. Your job here is NOT to write the final report (a separate, more thorough research pass does that next) -- it is to scope the investigation and pin down anything specific enough to verify.',
-    '',
-    'Write a short PLAN (2-5 numbered points) for what the follow-up research pass should investigate and what a good write-up should cover.',
-    '',
-    'CRITICAL: do not state a specific identifier, registry number, date, name, or URL as a known fact unless you actually found it via a real search/fetch in this pass just now. If you looked and could not confirm something specific (an exact registry ID, an exact site, an exact date), say so explicitly ("the research pass should look for X; I could not confirm it") rather than guessing a plausible-looking value -- a guessed-but-wrong specific here becomes a false requirement the next pass gets graded against, not a helpful lead.',
-    '',
-    `Title: ${task.title || ''}`,
-    '',
-    `NOTE: ${ctx.rawText || '(no text)'}`,
-    ctx.tags && ctx.tags.length ? `\nTags: ${ctx.tags.join(', ')}` : '',
-  ].join('\n');
-}
-
 // Prompt assembly: stable (identity/rules) block first, volatile (per-task) block last --
 // agent-engine's prompt-assembler.ts pattern (project idea shortlist, 2026-07-26),
 // adapted here. Putting ALL static instructional text in one contiguous leading block,
@@ -479,10 +325,6 @@ function researchPlanPrompt(task) {
 // could ever match a prior call's tokens exactly, no matter how similar the instructions
 // were. Not yet applied to every prompt builder in this file -- rolled out first to the
 // two "judgment call" plan prompts below as the initial adoption of the pattern.
-function assemblePrompt(stableLines, volatileLines) {
-  return [...stableLines, '', ...volatileLines].join('\n');
-}
-
 function unusedExportPlanPrompt(task) {
   const ctx = task.promptContext;
   const stable = [
@@ -505,7 +347,6 @@ function unusedExportPlanPrompt(task) {
   ];
   return assemblePrompt(stable, volatile);
 }
-
 
 // unused_export's implement pass has the identical gap observability_review's just had
 // fixed (2026-07-26) -- registered only a buildPlanPrompt, so it silently fell through to
@@ -661,27 +502,6 @@ function deepDivePlanPrompt(task) {
   ].join('\n');
 }
 
-function deepDiveImplementPrompt(task, planText) {
-  const ctx = task.promptContext;
-  return [
-    'Earlier you wrote this PLAN for one community of an external project:',
-    '',
-    planText,
-    '',
-    'Now write ONLY the final item write-up(s) your plan identified -- 0 to 5 of them (same cap as the plan). If your plan found nothing worth flagging, output the empty string and nothing else; do not invent an item to have something to show. Keep each Rationale to 2-3 sentences -- a revision pass rewriting all items at once has a fixed token budget, and a long response here can get cut off mid-item, silently losing content that was actually fine.',
-    '',
-    'Each item MUST use exactly this format (must match this parser exactly or it cannot be consumed downstream):',
-    '',
-    '### ITEM: short title',
-    `Community: ${ctx.communityName}`,
-    'Files: the specific file path(s) this references -- copy each path EXACTLY as shown in the "Files in this community" list from your plan input (full path, e.g. "python/packages/autogen-ext/src/foo/_bar.py"), never shortened or paraphrased',
-    'Rating: Use / Adapt / Ignore',
-    'Rationale: what this is, and specifically how it applies (or does not) to agent-manager',
-    '',
-    'Rating means: Use = take it close to as-is; Adapt = the idea is good but agent-manager\'s own context differs enough that it needs real rework; Ignore = considered and does not apply -- state the concrete reason, do not just omit it. An Ignore item with a real reason is exactly as valid an outcome as a Use/Adapt item -- never skip writing one just because the verdict is negative.',
-  ].join('\n');
-}
-
 // arch_import (ADR-0020, docs/arch-import-pipeline.md): closes the loop project_search
 // and deep_dive started. deep_dive already rated this item Use/Adapt against a real
 // external project's files; arch_import's job is narrower -- find out where in
@@ -762,23 +582,6 @@ function archImportImplementPrompt(task, planText) {
 // directly (groupBJsonInstructions, same as archReviewImplementPrompt) rather than a
 // candidate for a separate fulfillment stage, since the goal here is closing the loop
 // end-to-end on the local model with no second stage and no Claude dependency at all.
-function pipelineSelfAuditPlanPrompt(task) {
-  const ctx = task.promptContext;
-  return [
-    'A deterministic scan of THIS PIPELINE\'S OWN queue/blocked/ found a cluster of tasks all failing the SAME way -- likely a bug in this pipeline\'s own code (a harness/fetch bug, a prompt gap, a broken tool), not each task independently being a bad idea. See the evidence below.',
-    '',
-    `Failure signature: ${ctx.signature} (${ctx.taskCount} tasks failing this exact way)`,
-    '',
-    ctx.evidenceText,
-    '',
-    'Propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the pipeline code responsible for this failure pattern -- think about which source file generates or processes tasks of the affected type, or which harness/tool the failure signature points at.',
-    '',
-    'Output EXACTLY this format, one query per line, nothing else:',
-    'QUERY: <search terms>',
-    'QUERY: <search terms>',
-  ].join('\n');
-}
-
 // pipeline_health_audit (2026-08-24, Grimmethy: "that going looking needs to be an
 // automated process. A task that happens just like any other hygiene task") -- same
 // two-call harness-search shape as pipeline_self_audit right above (arguably worth
@@ -789,21 +592,6 @@ function pipelineSelfAuditPlanPrompt(task) {
 // orphaned processes holding a lock, a masked bash error) rather than a code-only bug a
 // blocked-task pattern could point at, so the plan explicitly asks for BOTH: real code
 // investigation AND an assessment of whether the anomaly is still ongoing right now.
-function pipelineHealthAuditPlanPrompt(task) {
-  const ctx = task.promptContext;
-  return [
-    'A deterministic health check of THIS PIPELINE\'S OWN live daemons, queue throughput, and recent logs found something that looks anomalous -- see the evidence below. This may be a real bug in this pipeline\'s own code, a transient operational hiccup already resolved, or evidence a human already fixed by hand since this check ran.',
-    '',
-    ctx.evidenceText,
-    '',
-    'Propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the pipeline code responsible for whatever the evidence points at -- think about which daemon script, lock, or model-call path the anomaly implicates.',
-    '',
-    'Output EXACTLY this format, one query per line, nothing else:',
-    'QUERY: <search terms>',
-    'QUERY: <search terms>',
-  ].join('\n');
-}
-
 function pipelineHealthAuditImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const hits = ctx.harnessHits || [];
@@ -843,21 +631,6 @@ function pipelineHealthAuditImplementPrompt(task, planText) {
 // from "deliberately not a dashboard concern" (confirmed live on this exact codebase:
 // /api/ping and /api/alerts's own docstrings say they're the companion Android app's
 // endpoints, not this dashboard's) before treating it as a real gap.
-function uiVisibilityAuditPlanPrompt(task) {
-  const ctx = task.promptContext;
-  return [
-    'A deterministic text-level scan cross-referenced every Flask route this dashboard defines against every frontend source file that could call it, and found route(s) with no reference anywhere -- see the evidence below. This is a CANDIDATE, not a confirmed gap: some backend endpoints are deliberately not meant to have a dashboard UI (e.g. a route documented as serving a different client entirely).',
-    '',
-    ctx.evidenceText,
-    '',
-    'Propose 1 to 3 SHORT search terms (function/variable/file names, or a few-word phrase) likely to find the route\'s own definition and docstring in app.py, plus whatever dashboard tab/panel would be the natural place to surface it if it genuinely needs one.',
-    '',
-    'Output EXACTLY this format, one query per line, nothing else:',
-    'QUERY: <search terms>',
-    'QUERY: <search terms>',
-  ].join('\n');
-}
-
 function uiVisibilityAuditImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const hits = ctx.harnessHits || [];
@@ -930,23 +703,6 @@ function pipelineSelfAuditImplementPrompt(task, planText) {
 // groupBJsonInstructions -- there is no diff to produce, and apply-task.js's own
 // applyVerdictOnly (same as unused_export/observability_review) is what actually "applies"
 // this: it never writes anything, just records the verdict text and marks the task done.
-function stalenessAuditPlanPrompt(task) {
-  const ctx = task.promptContext;
-  return [
-    `A deterministic scan flagged an OLDER blocked/needs-clarification task (${ctx.originalTaskId}) as possibly stale -- either it has sat untouched for a long time, or it was rejected repeatedly for fabricating claims. See the evidence below.`,
-    '',
-    `Flagged because: ${(ctx.reasons || []).join(', ')}`,
-    '',
-    ctx.evidenceText,
-    '',
-    'Propose 1 to 3 SHORT search terms (function/file/config names, or a few-word phrase) likely to confirm whether the CONCERN described above still holds against the CURRENT state of this repo -- e.g. does the file/function it worried about still look the way it described, or has other work since changed that.',
-    '',
-    'Output EXACTLY this format, one query per line, nothing else:',
-    'QUERY: <search terms>',
-    'QUERY: <search terms>',
-  ].join('\n');
-}
-
 function stalenessAuditImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const hits = ctx.harnessHits || [];
@@ -1356,27 +1112,6 @@ function adhocHarnessSearchImplementPrompt(task, planText) {
 // task gets grounded against -- a silently-resolved contradiction here is far more
 // expensive than the same mistake in one throwaway code diff, since it propagates into
 // everything built on top of it before anyone notices.
-function productSpecPlanPrompt(task) {
-  const ctx = task.promptContext;
-  return [
-    'You are maintaining the product specification document for a software project this pipeline is building.',
-    '',
-    ctx.specExists
-      ? 'CURRENT SPEC (the only decisions already made -- treat everything in it as settled unless the new request explicitly changes it):'
-      : 'CURRENT SPEC: (none yet -- this is the first request filed for this project. You are creating the document, not editing one.)',
-    '',
-    ctx.specExists ? `\`\`\`\n${ctx.currentSpec}\n\`\`\`` : '(empty)',
-    '',
-    `NEW REQUEST: ${ctx.requestText}`,
-    '',
-    'Write a numbered PLAN (no doc text yet) for how the spec should change to incorporate this request. ' +
-      'If the request contradicts something already in the current spec, say so explicitly and propose how ' +
-      'to resolve it -- do not silently pick one side. If the request is genuinely ambiguous (multiple ' +
-      'reasonable interpretations that would produce different specs), say UNKNOWN and list the ' +
-      'interpretations rather than guessing one.',
-  ].join('\n');
-}
-
 function productSpecImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   return [
@@ -1558,53 +1293,6 @@ function productSpecSectionImplementPrompt(task, planText) {
 // ORDER matters here in a way it doesn't for arch_discovery's independent friction points --
 // candidates must come out schema/data-model first, then core operations, then anything
 // that depends on those, because the consumer drains them strictly top-to-bottom.
-function backlogDecompositionPlanPrompt(task) {
-  const ctx = task.promptContext;
-  return [
-    'You are breaking a confirmed product specification down into an ORDERED backlog of real, buildable implementation steps.',
-    '',
-    'PRODUCT SPEC:',
-    '',
-    ctx.specText,
-    '',
-    'Write a numbered PLAN (no code, no candidate write-ups yet) listing the concrete implementation steps this spec calls for, IN BUILD ORDER: ' +
-      'data model / schema first (the entities and their relationships), then core operations on that data (create/read/update, key business rules), ' +
-      'then anything that depends on those (higher-level features, integrations, UI). Each step should be small enough to implement as one focused change, ' +
-      'not "build the whole system." Do not invent requirements the spec does not state; if the spec leaves something as an explicit open question or ' +
-      'deferred decision, do not plan a step for it -- note that it is blocked on a decision instead. Aim for the minimum ordered sequence that actually ' +
-      'gets from nothing to the spec being real, not an exhaustive wish list.',
-  ].join('\n');
-}
-
-function backlogDecompositionImplementPrompt(task, planText) {
-  return [
-    'Earlier you wrote this ordered PLAN for building out the product spec:',
-    '',
-    planText,
-    '',
-    'Now write ONLY the final candidate write-up(s) for each step in your plan, IN THE SAME ORDER -- this order is not cosmetic, ' +
-      'whatever comes first in your output gets built first. Do not reorder, skip, or merge steps from your plan without a reason stated in the write-up itself.',
-    '',
-    'Each candidate MUST use exactly this format (this must match the project\'s backlog-candidates doc convention exactly, or it cannot be consumed downstream):',
-    '',
-    '### AC-NNN · Title',
-    'Strength: Strong',
-    'Files: comma, separated, file, paths (leave blank if this creates brand-new files with no existing path to name)',
-    '',
-    'Problem:',
-    'What part of the spec this step implements, and why it belongs at this point in the build order (what it depends on, if anything).',
-    '',
-    'Solution:',
-    'A paragraph describing the concrete change -- specific enough that a later drafting pass can implement it without re-reading the whole spec.',
-    '',
-    'Benefits:',
-    'What becomes possible once this step lands.',
-    '',
-    '(Strength may instead be "Worth exploring" or "Speculative" if you are less confident a step is correctly scoped or ordered.) ' +
-      'Use AC-001, AC-002, ... in your own draft -- the real numbering is assigned when this is written to the doc, so collisions do not matter here.',
-  ].join('\n');
-}
-
 function projectSearchImplementPrompt(task, planText) {
   const ctx = task.promptContext;
   const resultsText = ctx.searchResults && ctx.searchResults.length > 0
@@ -1681,25 +1369,6 @@ function troubleLogImplementPrompt(task, planText) {
 // deterministic post-implement grep gate in review-runner.ps1 that verifies compliance
 // before spending a local-model review call, and gives a specific expected-vs-found diff back
 // to the next redraft attempt instead of vague prose criticism.
-function fixedLiteralsBlock(task) {
-  const literals = task.promptContext && Array.isArray(task.promptContext.fixedLiterals)
-    ? task.promptContext.fixedLiterals
-    : [];
-  if (literals.length === 0) return [];
-  const lines = [
-    '',
-    'The following block(s) are FIXED, already-verified content -- they are not something to write or improve, only to place. Copy each one character-for-character into your output at the point it belongs. Do NOT paraphrase, reorder, abbreviate, "correct," or substitute a different-but-similar version from your own knowledge -- any deviation, however minor, is a hard failure that will be mechanically detected and rejected before anyone even reads your reasoning.',
-    '',
-  ];
-  for (const lit of literals) {
-    lines.push(`--- FIXED BLOCK: ${lit.name} ---`);
-    lines.push(lit.content);
-    lines.push('--- END FIXED BLOCK ---');
-    lines.push('');
-  }
-  return lines;
-}
-
 function adhocImplementPrompt(task, planText) {
   return [
     'Earlier you wrote this PLAN for a one-off task submitted directly by a human or an orchestrating agent:',
@@ -1715,34 +1384,6 @@ function adhocImplementPrompt(task, planText) {
 // (create/edit/delete); this is a classification record, consumed by
 // apply-group-a.js's applyBrainDumpSort (which appends rawText into secondBrainPath and
 // marks the entry sorted), not applied to any repo file.
-function brainDumpSortImplementPrompt(task, planText) {
-  const ctx = task.promptContext;
-  return [
-    'Earlier you triaged this note:',
-    '',
-    planText,
-    '',
-    `NOTE: ${ctx.rawText}`,
-    '',
-    'The text after "NOTE:" above is the complete, real note, however short or self-referential -- it is never missing and never a placeholder. If your plan above hedged or asked for clarification, that was a mistake: classify the actual NOTE text shown here instead of repeating that hedge.',
-    '',
-    'Now output ONLY a single JSON object describing your final classification -- nothing else, no explanation before or after, no markdown code fences. It must have exactly these fields:',
-    '',
-    '{',
-    '  "secondBrainPath": "<one of the allowed top-level folders>/<descriptive-name>.md",',
-    '  "tags": ["short", "lowercase", "keywords"],',
-    '  "actionable": true or false -- true only if this genuinely needs someone to DO something, not just remember it,',
-    '  "rationale": "one sentence explaining the destination",',
-    '  "belongsToProject": "exact project label from the tracked list above, or null if this note is not a concrete feature/bug for one of those projects -- null even if a tracked project\'s name appears in the note\'s own title, when the note actually describes a new standalone plugin/product idea rather than an edit to that project\'s existing files (see your plan\'s CRITICAL distinction above)",',
-    '  "requiresResearch": true or false -- true only if properly resolving this note means going out and finding NEW information (web search, reading real sources) before it can be documented, not just filing the note as stated. Independent of belongsToProject -- this is never a code change, and should never be true at the same time as naming a belongsToProject.',
-    '  "possibleDuplicateOf": "the exact title, copied verbatim, of an already-queued task from the list above that this note plainly asks for the same thing as -- or null if none genuinely match. Be conservative: only a real match on the underlying feature/fix, never a vague topical overlap.",',
-    '  "relatedNotes": ["existing-note-basename", ...] -- 0 to 5 existing notes this one clearly relates to, filename only without .md; [] if none. Used to wikilink the notes together.',
-    '}',
-    '',
-    'secondBrainPath must be the specific file path you settled on in your plan above -- `<folder>/<name>.md`, never a bare folder and never a bare vault-root file. Its top-level folder MUST be one of the allowed folders shown in your plan, copied with the casing EXACTLY. The file name itself must describe the note\'s actual subject, not a generic placeholder word (ideas/notes/misc/todo and similar are rejected automatically).',
-  ].join('\n');
-}
-
 // ---- Generic fallback (used when no registry entry matches, or a matched entry has no
 // buildPlanPrompt/buildImplementPrompt of its own) ----
 
@@ -1825,19 +1466,6 @@ updateTaskSource('pipeline_forensics_fix', { buildPlanPrompt: archReviewPlanProm
 // saw that feedback -- each redraft was a blind fresh roll, not an informed retry.
 // Domain-agnostic (lives in the two thin lookup functions below, not per-source
 // builders) so every task source benefits, not just adhoc.
-function priorRejectionBlock(task) {
-  const feedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
-  if (feedback.length === 0) return '';
-  const lines = [
-    '',
-    `HARD CONSTRAINT: This task has been attempted ${feedback.length} time(s) before and rejected each time. You MUST NOT repeat any of the specific mistakes listed below. If a rejection reason states that a particular line, field, or piece of content already exists, you MUST NOT re-derive or restate that line -- do not produce it again. Read each entry below and ensure your new attempt genuinely avoids the stated mistake:`,
-    '',
-  ];
-  feedback.forEach((reason, i) => lines.push(`${i + 1}. ${reason}`));
-  lines.push('');
-  return lines.join('\n');
-}
-
 function buildPlanPrompt(task) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
@@ -1846,24 +1474,6 @@ function buildPlanPrompt(task) {
     ? source.buildPlanPrompt(task)
     : genericFallbackPlanPrompt(task);
   return prior ? prior + base : base;
-}
-
-function strictCiteConstraintBlock(task) {
-  const files = Array.isArray(task.verifiedFiles) ? task.verifiedFiles : [];
-  const lines = [
-    '',
-    'STRICT-CITE CONSTRAINT:',
-    files.length === 0
-      ? 'The verified-files list is empty. cite only the files explicitly provided in the plan text above -- cite no files beyond what is shown there.'
-      : 'cite only the files listed in the verified-files list below. Do NOT cite, reference, or assume the contents of any file not in this list, even if you think you know what it contains.',
-    '',
-  ];
-  if (files.length > 0) {
-    lines.push('VERIFIED-FILES LIST:');
-    files.forEach(f => lines.push(`  - ${f}`));
-  }
-  lines.push('');
-  return lines.join('\n');
 }
 
 function buildImplementPrompt(task, planText, options) {
