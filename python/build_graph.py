@@ -440,7 +440,21 @@ def build_import_graph(repo_root: Path, grep_dirs: list[str], file_cache: dict =
 # Directory names common enough across unrelated repos (and, per this repo's own
 # frontend/src + backend/src layout, common enough WITHIN one repo) that landing on one
 # alone as a community name is ambiguous rather than descriptive.
-_GENERIC_DIR_NAMES = {"src", "source", "lib", "app", "core", "common", "utils", "internal", "pkg", "."}
+_GENERIC_DIR_NAMES = {
+    "src", "source", "lib", "app", "core", "common", "utils", "internal", "pkg", ".",
+    "scripts", "bin", "tools", "helpers", "test", "tests", "config",
+}
+
+
+def _distinguishing_basenames(files: list[str], limit: int = 3) -> list[str]:
+    """Most common file stems (basename minus extension) across a community -- the
+    fallback disambiguator for a generic directory whose files sit directly in it with
+    no shared subdirectory to descend into (e.g. everything flat under "scripts/"), where
+    next_segments in name_community_heuristic comes back empty. Directory structure has
+    nothing left to say at that point, so the file names themselves are the only
+    remaining signal distinguishing this community from another "scripts" community."""
+    stems = [Path(f).stem for f in files if Path(f).stem]
+    return [stem for stem, _ in Counter(stems).most_common(limit)]
 
 
 def name_community_heuristic(files: list[str]) -> str:
@@ -467,11 +481,17 @@ def name_community_heuristic(files: list[str]) -> str:
 
     depth = len(common)
     next_segments = [parts[depth] for parts in parts_lists if len(parts) > depth]
-    if not next_segments:
-        return "/".join(common)
+    if next_segments:
+        top_segments = [seg for seg, _ in Counter(next_segments).most_common(3)]
+        return "/".join(common) + "/{" + ",".join(top_segments) + "}"
 
-    top_segments = [seg for seg, _ in Counter(next_segments).most_common(3)]
-    return "/".join(common) + "/{" + ",".join(top_segments) + "}"
+    # Flat generic directory (e.g. files sitting directly in "scripts/" with no
+    # subfolder) -- no subdirectory left to disambiguate with, so name it after the
+    # files themselves instead of leaving the bare, duplicate-prone directory name.
+    basenames = _distinguishing_basenames(files)
+    if not basenames:
+        return "/".join(common)
+    return "/".join(common) + "/(" + ",".join(basenames) + ")"
 
 
 def name_community_ornith(files: list[str], ollama_url: str, ornith_model: str) -> str | None:
