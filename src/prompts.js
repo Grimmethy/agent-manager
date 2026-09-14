@@ -1622,6 +1622,12 @@ function projectSearchImplementPrompt(task, planText) {
     '',
     resultsText,
     '',
+    'If the search tools were unavailable, or a query above shows only failure lines (ENOTFOUND, ' +
+      'timeout, "search failed", or "(no results -- the searches returned nothing usable)"), do NOT ' +
+      'narrate the failure, apologize, or refuse. Instead, output a structured zero-findings record: ' +
+      'an empty findings array plus one note line stating that the searches could not be completed. ' +
+      'That is a complete, approvable output -- not a refusal.',
+    '',
     'Now write 0 to N findings from the REAL results above -- do not invent a project that is not ' +
       'listed. It is fine and expected to write nothing if none of the results are genuinely useful. ' +
       'For each finding you keep, rate it Strong or Weak: Strong means specifically, concretely useful ' +
