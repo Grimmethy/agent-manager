@@ -461,6 +461,31 @@ test('firstRuntimeError: null for a self-contained split that require()s + calls
   assert.ok(err && /GONE|not defined|ReferenceError/.test(err), String(err));
 });
 
+// 2026-09-14, screaminggoatclubmt: "fix the runtime probe bug too" -- found live against
+// task-sources.js's REAL exports: nextDeepDiveTask spawns real python3 subprocesses
+// against real external repo clones as a side effect of being called with zero args
+// (this pipeline's own dominant `next<X>Task()` task-source shape, which the risky-name
+// denylist never anticipated) -- the probe hit its timeout mid-spawn and the generic
+// fallback mislabeled that as "module failed to load". `next` is now in the denylist, so
+// this never gets called at all; the export just goes unverified by this pass, same as
+// any other risky-named export already does (verified some other way, or trusted).
+test('firstRuntimeError: never calls a `next*` export (task-source poller shape) -- would misreport a slow/side-effecting call as a runtime error otherwise', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'rte-next-test-'));
+  fs.mkdirSync(path.join(repo, 'src'));
+  const changes = [
+    {
+      mode: 'edit',
+      file: 'src/m.js',
+      find: 'x',
+      // Would hang for 30s (past any sane probe timeout) if actually called -- proves the
+      // risky-name skip, not merely a fast synchronous throw, is what prevents the false
+      // positive here.
+      replace: "'use strict';\nfunction nextDeepDiveTask() { const start = Date.now(); while (Date.now() - start < 30000) {} return null; }\nmodule.exports = { nextDeepDiveTask };\n",
+    },
+  ];
+  assert.equal(firstRuntimeError(changes, 'src/m.js', repo), null);
+});
+
 // 2026-09-13 regression: a move whose newFile sits in a SUBDIRECTORY of sourceFile's own
 // directory (e.g. sdk/candidate-fulfillment.js -> sdk/lib/candidate-lifecycle.js) used to
 // carry every require() path -- both top-level and lazily called inside a moved function
