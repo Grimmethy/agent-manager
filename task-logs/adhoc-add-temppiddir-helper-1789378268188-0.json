@@ -1,0 +1,335 @@
+{
+  "id": "adhoc-add-temppiddir-helper-1789378268188-0",
+  "title": "Add tempPidDir helper",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-14T10:06:58.360Z",
+  "history": [
+    {
+      "stage": "advisory",
+      "at": "2026-09-14T10:06:20.709293+00:00",
+      "detail": "premium priority set by operator override"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-14T10:06:59.191Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-14T10:17:47.985Z",
+      "detail": "6 turn(s)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-14T10:20:12.812Z",
+      "detail": "2 attempt(s), 2470 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-14T10:21:21.258Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-14T10:23:58.737Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- diff touches src/dead-process-check.test.js (matches forbidden \"src/dead-process-check.test.js\") -- the task explicitly says not to"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-14T10:23:58.737Z",
+      "detail": "attempt 1: blocked, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-14T10:24:43.850Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- diff touches src/dead-process-check.test.js (matches forbidden \"src/dead-process-check.test.js\") -- the task explicitly says not to"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-14T10:44:27.223Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-14T10:49:33.444Z",
+      "detail": "4 turn(s)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-14T10:54:07.206Z",
+      "detail": "3 attempt(s), 2450 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-14T10:54:07.207Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-14T10:55:51.290Z",
+      "detail": "agentic, 1835 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-14T10:55:51.291Z",
+      "detail": "resolution=implemented, retry 1, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-14T10:55:51.291Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-14T10:55:51.291Z",
+      "detail": "attempt 2: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-14T10:56:02.433Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-14T10:59:38.799Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "In src/dead-process-check.test.js, insert a tempPidDir() helper immediately after the existing tempInstancesDir() helper. It should return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-')), mirroring the existing tempInstancesDir pattern exactly. This gives each test an isolated empty pid directory so the pidfile gate finds no live pid and falls through to normal restart/flag logic.",
+    "decomposedFrom": "adhoc-add-pidfile-gate-acceptance-test-and-run-test-suite-1789350728623-1"
+  },
+  "blockedReason": "Agentic implement pass produced a diff that is not a real implementation -- diff touches src/dead-process-check.test.js (matches forbidden \"src/dead-process-check.test.js\") -- the task explicitly says not to",
+  "priorRejectionFeedback": [
+    "Your diff modified src/dead-process-check.test.js, which the task EXPLICITLY forbids (\"src/dead-process-check.test.js\", \"src/\"). Discard those changes entirely. Implement the actual change in the file(s) the plan/task names, and nowhere else."
+  ],
+  "draftAttempts": [
+    {
+      "at": "2026-09-14T10:06:59.188Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": true,
+          "reason": "Agentic implement pass produced a diff that is not a real implementation -- diff touches src/dead-process-check.test.js (matches forbidden \"src/dead-process-check.test.js\") -- the task explicitly says not to",
+          "responseChars": 1828,
+          "response": "The commit failed only because the sandbox's git index directory is read-only — the working-tree change itself is present on disk (verified by `git diff --stat` showing 4 insertions in the one target file before the failed `git add`). The pipeline will commit from the working tree. All acceptance checks pass against the real files.\n\nI added the `tempPidDir()` helper to `src/dead-process-check.test.js` immediately after `tempInstancesDir()`, exactly mirroring its pattern: a two-line function returning `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))`. No new imports were needed (`fs`, `os`, `path` were already required), and the file passes `node --check`. This gives each test an isolated empty pid directory so the pidfile gate finds no live pid and falls through to normal restart/flag logic.\n\nAcceptance:\n1. `tempPidDir` line between `tempInstancesDir` and `writeHeartbeat` -- `grep -n \"function tempPidDir\\|function tempInstancesDir\\|function writeHeartbeat\"` -- PASS: `11:function tempInstancesDir()`, `15:function tempPidDir()`, `19:function writeHeartbeat(`\n2. Body contains literal `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))` -- `grep -n \"dc-pids\" src/dead-process-check.test.js` -- PASS: `16:  return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));`\n3. No syntax error -- `node --check src/dead-process-check.test.js` -- PASS: exit 0, \"syntax OK\"\n4. Exactly one `tempPidDir` reference in src/ -- `grep -rn \"tempPidDir\" src/` -- PASS: single hit `src/dead-process-check.test.js:15:function tempPidDir() {`\n5. Diff touches only the target file and adds (not modifies) the helper -- `git diff --stat` -- PASS: `src/dead-process-check.test.js | 4 ++++  1 file changed, 4 insertions(+)` (commit attempt failed on read-only git index in sandbox; working-tree change is intact)\n\nRESOLUTION: implemented",
+          "rawDiffChars": 619,
+          "rawDiff": "diff --git a/src/dead-process-check.test.js b/src/dead-process-check.test.js\nindex 113c2c4801a329c8f5cb8ae51733155831c91cd5..d263539a5e0406a5fe5be27cc723a7658748f78f 100644\n--- a/src/dead-process-check.test.js\n+++ b/src/dead-process-check.test.js\n@@ -12,6 +12,10 @@ function tempInstancesDir() {\n   return fs.mkdtempSync(path.join(os.tmpdir(), 'dead-process-check-test-'));\n }\n \n+function tempPidDir() {\n+  return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));\n+}\n+\n function writeHeartbeat(dir, instanceId, overrides = {}) {\n   const hb = {\n     instanceId, pid: process.pid, model: 'ornith:35b', status: 'idle',\n",
+          "turnsUsed": 5,
+          "toolCalls": {
+            "total": 4,
+            "byTool": {
+              "read_file": 1,
+              "edit_file": 1,
+              "run_bash": 2
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "limit"
+                ],
+                "bytes": 1441
+              },
+              {
+                "n": 2,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 55
+              },
+              {
+                "n": 3,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 751
+              },
+              {
+                "n": 4,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 665
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": false,
+        "turnsUsed": 6
+      },
+      "plan": {
+        "chars": 2470,
+        "text": "## PLAN\n\n1. **Open `src/dead-process-check.test.js` and locate the insertion point.**\n   The existing helper `tempInstancesDir()` occupies lines 11–13 (confirmed by the read-only pass). Line 15 begins `function writeHeartbeat(...)`. The new helper goes in the blank line(s) between line 13 and line 15.\n\n2. **Insert the `tempPidDir()` helper immediately after line 13.**\n   Add exactly these two lines (mirroring the `tempInstancesDir` shape — a named function whose body is a single `return`):\n\n   ```js\n   function tempPidDir() {\n     return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));\n   }\n   ```\n\n   No new `require`/`import` statements are needed: `fs`, `os`, and `path` are already required at lines 5–7 of the same file (verified by the orientation pass).\n\n3. **Verify the edit is syntactically valid and in the right place.**\n   Run:\n   ```bash\n   node -e \"require('./src/dead-process-check.test.js')\" 2>&1 | head -5\n   ```\n   (or simply `node --check src/dead-process-check.test.js`) to confirm no syntax error was introduced.\n   Then confirm placement:\n   ```bash\n   grep -n \"tempPidDir\\|tempInstancesDir\\|writeHeartbeat\" src/dead-process-check.test.js\n   ```\n   Expected output order: `tempInstancesDir` (line 11), `tempPidDir` (line ~15), `writeHeartbeat` (line ~18). The new helper must appear **between** the other two.\n\n4. **Confirm no pre-existing reference conflicts.**\n   The orientation pass already verified that `tempPidDir` and `dc-pids` appear nowhere else in the repo. Re-check quickly:\n   ```bash\n   grep -rn \"tempPidDir\\|dc-pids\" src/\n   ```\n   Expected: only the one new definition in `src/dead-process-check.test.js`.\n\n5. **Commit (or leave staged) the single-file change.**\n   The diff should show exactly one added block (2 lines + 1 blank separator line) in `src/dead-process-check.test.js`, with no other file touched.\n\nCRITERIA:\n- `grep -n \"function tempPidDir\" src/dead-process-check.test.js` returns exactly one match, and its line number is greater than the `tempInstancesDir` line and less than the `writeHeartbeat` line.\n- The body of `tempPidDir` contains the literal string `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))`.\n- `node --check src/dead-process-check.test.js` exits 0 (no syntax error).\n- `grep -rn \"tempPidDir\" src/` yields exactly one hit (the new definition); no other file references the symbol.\n- The diff for this task touches only `src/dead-process-check.test.js` and adds (not modifies) the helper.",
+        "attempts": 2,
+        "grounded": true,
+        "groundingChars": 5649,
+        "anchorPaths": [
+          "src/dead-process-check.test.js"
+        ]
+      },
+      "outcome": "blocked",
+      "blockedReason": "Agentic implement pass produced a diff that is not a real implementation -- diff touches src/dead-process-check.test.js (matches forbidden \"src/dead-process-check.test.js\") -- the task explicitly says not to",
+      "acceptance": {
+        "criteriaCount": 5,
+        "resultCount": 0,
+        "passCount": 0,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-14T10:23:58.737Z"
+    },
+    {
+      "at": "2026-09-14T10:44:27.221Z",
+      "attemptNo": 2,
+      "source": "manual",
+      "localRejectCount": 1,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 1201,
+          "response": "All acceptance criteria pass. The diff is purely additive (4 insertions, 0 deletions), touching exactly one file.\n\nRESOLUTION: implemented\n\nI added the `tempPidDir()` helper to `src/dead-process-check.test.js` immediately after `tempInstancesDir()`, exactly mirroring its pattern: a named function whose body is a single `return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))`. No new imports were needed (`fs`, `os`, `path` were already required at the top of the file). The file passes `node --check` and the diff is purely additive to the single target file.\n\nAcceptance:\n- `tempPidDir` line between `tempInstancesDir` and `writeHeartbeat` -- `grep -n \"function tempInstancesDir\\|function tempPidDir\\|function writeHeartbeat\"` -- PASS: `11:function tempInstancesDir()`, `15:function tempPidDir()`, `19:function writeHeartbeat(`\n- Body contains literal `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))` -- `grep -n \"dc-pids\"` -- PASS: `16:  return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));`\n- `node --check src/dead-process-check.test.js` exits 0 -- PASS: \"syntax OK\"\n- `git diff --name-only` lists only the target file -- PASS: `src/dead-process-check.test.js` (single line output)",
+          "rawDiffChars": 619,
+          "rawDiff": "diff --git a/src/dead-process-check.test.js b/src/dead-process-check.test.js\nindex 113c2c4801a329c8f5cb8ae51733155831c91cd5..d263539a5e0406a5fe5be27cc723a7658748f78f 100644\n--- a/src/dead-process-check.test.js\n+++ b/src/dead-process-check.test.js\n@@ -12,6 +12,10 @@ function tempInstancesDir() {\n   return fs.mkdtempSync(path.join(os.tmpdir(), 'dead-process-check-test-'));\n }\n \n+function tempPidDir() {\n+  return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));\n+}\n+\n function writeHeartbeat(dir, instanceId, overrides = {}) {\n   const hb = {\n     instanceId, pid: process.pid, model: 'ornith:35b', status: 'idle',\n",
+          "turnsUsed": 5,
+          "toolCalls": {
+            "total": 8,
+            "byTool": {
+              "read_file": 1,
+              "run_bash": 6,
+              "edit_file": 1
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 1122
+              },
+              {
+                "n": 2,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 75
+              },
+              {
+                "n": 3,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 55
+              },
+              {
+                "n": 4,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 298
+              },
+              {
+                "n": 5,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 172
+              },
+              {
+                "n": 6,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 133
+              },
+              {
+                "n": 7,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 109
+              },
+              {
+                "n": 8,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 635
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": false,
+        "turnsUsed": 4
+      },
+      "plan": {
+        "chars": 2450,
+        "text": "## PLAN\n\n1. **Open `src/dead-process-check.test.js` and confirm the insertion point.**\n   Per the orientation pass: `tempInstancesDir()` is defined at line 11 (body: `return fs.mkdtempSync(path.join(os.tmpdir(), 'dead-process-check-test-'))`). The next function, `writeHeartbeat(dir, instanceId, overrides)`, begins at line 13. The new helper is inserted in the gap between the end of `tempInstancesDir` and the start of `writeHeartbeat` (i.e., after line 12, before line 13).\n\n2. **Insert the `tempPidDir()` helper.**\n   Add exactly these three lines (function + body + closing brace), mirroring the `tempInstancesDir` shape (a named `function` whose body is a single `return`):\n\n   ```js\n   function tempPidDir() {\n     return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));\n   }\n   ```\n\n   No new `require`/`import` statements are needed: `fs`, `os`, and `path` are already required at lines 3–7 of the same file (confirmed by the orientation pass).\n\n3. **Verify syntax and placement.**\n   ```bash\n   node --check src/dead-process-check.test.js\n   ```\n   Must exit 0. Then confirm ordering:\n   ```bash\n   grep -n \"tempInstancesDir\\|tempPidDir\\|writeHeartbeat\" src/dead-process-check.test.js\n   ```\n   Expected: `tempInstancesDir` (line 11) → `tempPidDir` (line ~13) → `writeHeartbeat` (line ~16). The new helper must sit **between** the other two.\n\n4. **Confirm no pre-existing references conflict.**\n   ```bash\n   grep -rn \"tempPidDir\\|dc-pids\" src/\n   ```\n   Expected: exactly one hit — the new definition in `src/dead-process-check.test.js`. (The orientation pass already confirmed zero prior hits for either symbol.)\n\n5. **Verify the diff touches exactly one file.**\n   ```bash\n   git diff --name-only\n   ```\n   Must list **only** `src/dead-process-check.test.js`. No other file in the repo is created, modified, or deleted. The diff content is purely additive (one new 3-line function block plus one blank separator line); no existing line is altered or removed.\n\nCRITERIA:\n- `grep -n \"function tempPidDir\" src/dead-process-check.test.js` returns exactly one match whose line number is greater than the `tempInstancesDir` line and less than the `writeHeartbeat` line.\n- The body of `tempPidDir` contains the literal string `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))`.\n- `node --check src/dead-process-check.test.js` exits 0.\n- `git diff --name-only` lists only `src/dead-process-check.test.js`; no other file appears in the diff.",
+        "attempts": 3,
+        "seededFromPrior": true,
+        "grounded": true,
+        "groundingChars": 1913
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 4,
+        "passCount": 4,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-14T10:55:51.291Z"
+    }
+  ],
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff adds `tempPidDir()` at line 15 (between `tempInstancesDir` at line 11 and `writeHeartbeat` at line 19) with the exact required body `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))`, `node --check` passes, and `git diff --name-only` lists only `src/dead-process-check.test.js` — all four acceptance criteria are satisfied with concrete command output.",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds `tempPidDir()` at line 15 (between `tempInstancesDir` at line 11 and `writeHeartbeat` at line 19) with the exact required body `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))`, `node --check` passes, and `git diff --name-only` lists only `src/dead-process-check.test.js` — all four acceptance criteria are satisfied with concrete command output."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds `tempPidDir()` at line 15 (between `tempInstancesDir` at line 11 and `writeHeartbeat` at line 19), contains the literal `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))` at line 16, passes `node --check`, and `git diff --name-only` lists only `src/dead-process-check.test.js` — all four acceptance criteria are met with concrete command output."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`grep -n \"function tempPidDir\" src/dead-process-check.test.js` returns exactly one match whose line number is greater than the `tempInstancesDir` line and less than the `writeHeartbeat` line.",
+    "The body of `tempPidDir` contains the literal string `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))`.",
+    "`node --check src/dead-process-check.test.js` exits 0.",
+    "`git diff --name-only` lists only `src/dead-process-check.test.js`; no other file appears in the diff."
+  ],
+  "draftModel": "qwen3.8:27b-q4_K_M",
+  "implementResponse": "All acceptance criteria pass. The diff is purely additive (4 insertions, 0 deletions), touching exactly one file.\n\nRESOLUTION: implemented\n\nI added the `tempPidDir()` helper to `src/dead-process-check.test.js` immediately after `tempInstancesDir()`, exactly mirroring its pattern: a named function whose body is a single `return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))`. No new imports were needed (`fs`, `os`, `path` were already required at the top of the file). The file passes `node --check` and the diff is purely additive to the single target file.\n\nAcceptance:\n- `tempPidDir` line between `tempInstancesDir` and `writeHeartbeat` -- `grep -n \"function tempInstancesDir\\|function tempPidDir\\|function writeHeartbeat\"` -- PASS: `11:function tempInstancesDir()`, `15:function tempPidDir()`, `19:function writeHeartbeat(`\n- Body contains literal `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))` -- `grep -n \"dc-pids\"` -- PASS: `16:  return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));`\n- `node --check src/dead-process-check.test.js` exits 0 -- PASS: \"syntax OK\"\n- `git diff --name-only` lists only the target file -- PASS: `src/dead-process-check.test.js` (single line output)\n\n=== DIFF ===\ndiff --git a/src/dead-process-check.test.js b/src/dead-process-check.test.js\nindex 113c2c4801a329c8f5cb8ae51733155831c91cd5..d263539a5e0406a5fe5be27cc723a7658748f78f 100644\n--- a/src/dead-process-check.test.js\n+++ b/src/dead-process-check.test.js\n@@ -12,6 +12,10 @@ function tempInstancesDir() {\n   return fs.mkdtempSync(path.join(os.tmpdir(), 'dead-process-check-test-'));\n }\n \n+function tempPidDir() {\n+  return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));\n+}\n+\n function writeHeartbeat(dir, instanceId, overrides = {}) {\n   const hb = {\n     instanceId, pid: process.pid, model: 'ornith:35b', status: 'idle',\n",
+  "planResponse": "## PLAN\n\n1. **Open `src/dead-process-check.test.js` and confirm the insertion point.**\n   Per the orientation pass: `tempInstancesDir()` is defined at line 11 (body: `return fs.mkdtempSync(path.join(os.tmpdir(), 'dead-process-check-test-'))`). The next function, `writeHeartbeat(dir, instanceId, overrides)`, begins at line 13. The new helper is inserted in the gap between the end of `tempInstancesDir` and the start of `writeHeartbeat` (i.e., after line 12, before line 13).\n\n2. **Insert the `tempPidDir()` helper.**\n   Add exactly these three lines (function + body + closing brace), mirroring the `tempInstancesDir` shape (a named `function` whose body is a single `return`):\n\n   ```js\n   function tempPidDir() {\n     return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));\n   }\n   ```\n\n   No new `require`/`import` statements are needed: `fs`, `os`, and `path` are already required at lines 3–7 of the same file (confirmed by the orientation pass).\n\n3. **Verify syntax and placement.**\n   ```bash\n   node --check src/dead-process-check.test.js\n   ```\n   Must exit 0. Then confirm ordering:\n   ```bash\n   grep -n \"tempInstancesDir\\|tempPidDir\\|writeHeartbeat\" src/dead-process-check.test.js\n   ```\n   Expected: `tempInstancesDir` (line 11) → `tempPidDir` (line ~13) → `writeHeartbeat` (line ~16). The new helper must sit **between** the other two.\n\n4. **Confirm no pre-existing references conflict.**\n   ```bash\n   grep -rn \"tempPidDir\\|dc-pids\" src/\n   ```\n   Expected: exactly one hit — the new definition in `src/dead-process-check.test.js`. (The orientation pass already confirmed zero prior hits for either symbol.)\n\n5. **Verify the diff touches exactly one file.**\n   ```bash\n   git diff --name-only\n   ```\n   Must list **only** `src/dead-process-check.test.js`. No other file in the repo is created, modified, or deleted. The diff content is purely additive (one new 3-line function block plus one blank separator line); no existing line is altered or removed.\n\nCRITERIA:\n- `grep -n \"function tempPidDir\" src/dead-process-check.test.js` returns exactly one match whose line number is greater than the `tempInstancesDir` line and less than the `writeHeartbeat` line.\n- The body of `tempPidDir` contains the literal string `fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'))`.\n- `node --check src/dead-process-check.test.js` exits 0.\n- `git diff --name-only` lists only `src/dead-process-check.test.js`; no other file appears in the diff.",
+  "reviewedAt": "2026-09-14T10:59:38.799Z",
+  "claimedAt": "2026-09-14T10:06:58.683Z"
+}
