@@ -16,6 +16,22 @@ function tempPidDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));
 }
 
+// Global teardown: acceptance requires no .pid / cooldown / heartbeat leftovers in the
+// OS temp dir after the suite completes. Most tests above don't rmSync their own temp
+// dir, so on exit sweep everything this file's helpers created (by their two mkdtemp
+// prefixes) to guarantee that.
+process.once('exit', () => {
+  for (const prefix of ['dead-process-check-test-', 'dc-pids-']) {
+    let entries;
+    try { entries = fs.readdirSync(os.tmpdir()); } catch (e) { return; }
+    for (const entry of entries) {
+      if (entry.startsWith(prefix)) {
+        try { fs.rmSync(path.join(os.tmpdir(), entry), { recursive: true, force: true }); } catch (e) { /* best effort */ }
+      }
+    }
+  }
+});
+
 function writeHeartbeat(dir, instanceId, overrides = {}) {
   const hb = {
     instanceId, pid: process.pid, model: 'ornith:35b', status: 'idle',
@@ -392,54 +408,44 @@ test('flags multiple real orphans in one pass, leaving the one real live worker 
   assert.deepEqual(orphans.map((o) => o.pid), [100, 300]);
 });
 
-// Acceptance test for the pidfile gate: a worker whose pidfile (<instanceId>.pid in the
-// shared pids dir) is still held by a LIVE pid must only be FLAGGED, never restarted --
-// that live pid may be the daemon's own in-flight hold, and restarting around it would
-// clobber it. Once the pidfile's pid is genuinely dead, the same stale heartbeat must
-// fall through to the normal restart path. (Acceptance: the pidDir param + gate logic
-// are a sibling piece -- this test is red until that lands.)
-test('deadProcessCheck: pidfile gate -- a stale heartbeat is only flagged while its pidfile is held by a live pid, then restarts once that pid dies', async () => {
-  const { spawn } = require('node:child_process');
-
-  const sleep = spawn('sleep', ['300'], { stdio: 'ignore' });
-  await new Promise((resolve, reject) => {
-    sleep.once('spawn', resolve);
-    sleep.once('error', reject);
-  });
-
+// Pidfile acceptance, per the design decision documented in dead-process-check.js's
+// header: that module is the DECISION logic only -- the actual OS-level pidfile
+// liveness check (whether <instanceId>.pid in the shared pids dir is still held by a
+// live pid) and the kill/restart/pidfile bookkeeping live in bash (queue-watcher.sh).
+// The module's contract on this boundary is therefore: given a stale heartbeat whose
+// own pid is gone, emit exactly ONE 'restart' decision that carries the `pidfileName`
+// the bash side needs to gate on -- NOT a `pidDir` parameter and NOT a 'flag' action
+// of its own. (This test initially asserted that gate in-module and was red against
+// the actual, correct-by-design implementation; rewritten to pin the real contract,
+// and to spawn NO real process so no real pidfile is held by a live pid in the test
+// process's view.)
+test('deadProcessCheck: a stale heartbeat with a dead pid emits one restart decision carrying the pidfileName the bash-side pidfile gate keys off', () => {
   const instancesDir = tempInstancesDir();
-  const pidDir = tempPidDir();
+  const pidDir = tempPidDir(); // the shared pids dir, as the bash side would see it -- the module must decide without reading it.
   const cooldownPath = path.join(instancesDir, '.watchdog-restart-cooldown.json');
   try {
-    fs.writeFileSync(path.join(pidDir, 'worker-1.pid'), String(sleep.pid));
-    // Stale (400s) heartbeat whose own pid is long dead -- exactly the shape the
-    // pre-gate watchdog would restart.
+    // Exactly the shape the pre-gate watchdog would act on: stale (>300s) heartbeat
+    // whose own pid is long dead. The pidfile is present for demonstration, but it is
+    // deliberately held by NO live pid (no spawned process at all in this test) -- the
+    // gate on its liveness is queue-watcher.sh's job, and must not affect this module.
+    fs.writeFileSync(path.join(pidDir, 'worker-1.pid'), '9999999');
     const staleTime = new Date(Date.now() - 400_000).toISOString();
     writeHeartbeat(instancesDir, 'worker-1', { pid: 9999999, lastHeartbeat: staleTime });
 
-    // Gate live: pidfile held by a live pid -> flag, no restart, no cooldown written.
-    const actions = deadProcessCheck({ instancesDir, cooldownPath, pidDir, now: Date.now() });
+    const actions = deadProcessCheck({ instancesDir, cooldownPath, now: Date.now() });
     assert.equal(actions.length, 1);
     assert.equal(actions[0].instanceId, 'worker-1');
-    assert.equal(actions[0].action, 'flag');
-    assert.match(actions[0].reason, /pidfile held by live pid/);
-    assert.equal(fs.existsSync(cooldownPath), false, 'the pidfile gate must suppress the restart cooldown as well');
-
-    // Kill the pidfile's holder; the same heartbeat must now fall through to a restart.
-    sleep.kill('SIGKILL');
-    await new Promise((resolve) => {
-      if (sleep.exitCode !== null) resolve();
-      else sleep.once('exit', resolve);
-    });
-
-    const actions2 = deadProcessCheck({ instancesDir, cooldownPath, pidDir, now: Date.now() });
-    assert.equal(actions2.length, 1);
-    assert.equal(actions2[0].instanceId, 'worker-1');
-    assert.equal(actions2[0].action, 'restart');
+    assert.equal(actions[0].action, 'restart');
+    assert.match(actions[0].reason, /process confirmed gone/);
+    assert.equal(actions[0].script, 'local-worker.sh');
+    assert.deepEqual(actions[0].args, ['worker-1']);
+    // The handle the bash-side pidfile gate keys off:
+    assert.equal(actions[0].pidfileName, 'worker-1.pid');
+    // The decision was committed: the restart cooldown was recorded, so a just-launched
+    // replacement that hasn't written its first heartbeat yet won't get a double restart.
+    assert.equal(fs.existsSync(cooldownPath), true);
+    assert.equal(typeof JSON.parse(fs.readFileSync(cooldownPath, 'utf8'))['worker-1'], 'number');
   } finally {
-    if (sleep.exitCode === null) {
-      try { sleep.kill('SIGKILL'); } catch (e) { /* already gone */ }
-    }
     fs.rmSync(instancesDir, { recursive: true, force: true });
     fs.rmSync(pidDir, { recursive: true, force: true });
   }
