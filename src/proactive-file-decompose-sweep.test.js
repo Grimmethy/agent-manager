@@ -8,11 +8,12 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const {
   sweep, isDue, markChecked, hasExistingRequestFor, isRequestResolved,
+  countOutstandingDecomposeBranches, CHECK_INTERVAL_MS, TIER1_CAP, TIER2_CAP,
 } = require('./proactive-file-decompose-sweep.js');
 
 function tmpPipeline(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'proactive-decompose-'));
-  for (const s of ['file-decompose-requests', 'coordinating', 'adhoc', 'done', 'done/_archived_no_action', 'instances']) {
+  for (const s of ['file-decompose-requests', 'coordinating', 'adhoc', 'pending', 'done', 'done/_archived_no_action', 'instances']) {
     fs.mkdirSync(path.join(dir, 'queue', s), { recursive: true });
   }
   fs.writeFileSync(path.join(dir, 'queue', 'file-length-flags.json'), JSON.stringify({
@@ -37,14 +38,18 @@ const MOVES = [
   { newFile: 'src/lib/b.js', kind: 'script-extract', symbols: ['renderC', 'renderD'] },
 ];
 
+// 2026-09-14: CHECK_INTERVAL_MS is now a short floor (minutes, not a day -- see the
+// module header's THROTTLE note) so the sweep can respond to a freshly-merged branch
+// within about a minute rather than waiting up to 24h. Read the real exported constant
+// rather than hardcoding a duration, so this test tracks whatever it's actually set to.
 test('isDue: true on a fresh instancesDir (never checked), false right after markChecked, true again after CHECK_INTERVAL_MS', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'proactive-instances-'));
   assert.equal(isDue(dir), true);
   const now = new Date('2026-01-01T00:00:00Z');
   markChecked(dir, now);
   assert.equal(isDue(dir, now), false);
-  assert.equal(isDue(dir, new Date(now.getTime() + 23 * 60 * 60 * 1000)), false);
-  assert.equal(isDue(dir, new Date(now.getTime() + 24 * 60 * 60 * 1000 + 1)), true);
+  assert.equal(isDue(dir, new Date(now.getTime() + CHECK_INTERVAL_MS - 1)), false);
+  assert.equal(isDue(dir, new Date(now.getTime() + CHECK_INTERVAL_MS + 1)), true);
 });
 
 test('sweep: not due and not forced -> no-op, nothing filed', async () => {
@@ -226,4 +231,65 @@ test('sweep: no oversized files at all -> due but nothing to do, still marks che
   assert.equal(summary.due, true);
   assert.equal(summary.filed, 0);
   assert.equal(isDue(path.join(dir, 'instances')), false, 'still marks checked on a clean run');
+});
+
+// --- outstanding-branches cap (2026-09-14) -------------------------------------------
+
+function writeDecomposeTask(dir, subdir, id, { decomposedFrom, deterministicApply, applied = true, merged = false }) {
+  const promptContext = { decomposedFrom };
+  if (deterministicApply) promptContext.deterministicApply = deterministicApply;
+  const history = [];
+  if (applied) history.push({ stage: 'applied', at: new Date().toISOString() });
+  if (merged) history.push({ stage: 'merged', at: new Date().toISOString() });
+  fs.writeFileSync(path.join(dir, 'queue', subdir, `${id}.json`), JSON.stringify({ id, promptContext, history }, null, 2));
+}
+
+test('countOutstandingDecomposeBranches: counts applied-not-merged decompose tasks, split Tier1/Tier2; ignores merged, un-applied, and non-decompose tasks', () => {
+  const dir = tmpPipeline([]);
+  // Tier1: one-pass, applied, not merged -- counts
+  writeDecomposeTask(dir, 'done', 'onepass-1', { decomposedFrom: 'file-decompose-a', deterministicApply: 'one-pass-decompose' });
+  // Tier2: a hub move child, applied, not merged -- counts
+  writeDecomposeTask(dir, 'done', 'move-1', { decomposedFrom: 'file-decompose-hub-b' });
+  // Already merged -- does not count
+  writeDecomposeTask(dir, 'done', 'onepass-2', { decomposedFrom: 'file-decompose-c', deterministicApply: 'one-pass-decompose', merged: true });
+  // Not yet applied -- does not count
+  writeDecomposeTask(dir, 'adhoc', 'onepass-3', { decomposedFrom: 'file-decompose-d', deterministicApply: 'one-pass-decompose', applied: false });
+  // Not decompose-derived at all -- does not count even though applied
+  writeDecomposeTask(dir, 'done', 'unrelated-1', { decomposedFrom: 'adhoc-brain-dump-bd-123' });
+  // The coordinator hub record itself (self-referential decomposedFrom, no `applied` stage) -- must not double-count
+  fs.writeFileSync(path.join(dir, 'queue', 'coordinating', 'file-decompose-hub-b.json'),
+    JSON.stringify({ id: 'file-decompose-hub-b', promptContext: { decomposedFrom: 'file-decompose-hub-b' }, history: [] }));
+
+  const counts = countOutstandingDecomposeBranches(dir);
+  assert.equal(counts.tier1, 1);
+  assert.equal(counts.tier2, 1);
+});
+
+test('sweep: both tier caps full -> capped, nothing filed, schedule still marked', async () => {
+  const dir = tmpPipeline(['src/big.js']);
+  writeFixtureSource(dir, 'src/big.js', SYMS);
+  for (let i = 0; i < TIER1_CAP; i += 1) {
+    writeDecomposeTask(dir, 'done', `onepass-${i}`, { decomposedFrom: `file-decompose-t1-${i}`, deterministicApply: 'one-pass-decompose' });
+  }
+  for (let i = 0; i < TIER2_CAP; i += 1) {
+    writeDecomposeTask(dir, 'done', `move-${i}`, { decomposedFrom: `file-decompose-hub-t2-${i}` });
+  }
+
+  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call: fakeCall(MOVES), force: true });
+  assert.equal(summary.capped, true);
+  assert.equal(summary.filed, 0);
+  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests')).length, 0);
+  assert.equal(isDue(path.join(dir, 'instances')), false, 'schedule still marked so the floor interval still applies');
+});
+
+test('sweep: Tier1 at cap but Tier2 has room -> still proceeds (only ONE tier needs headroom)', async () => {
+  const dir = tmpPipeline(['src/big.js']);
+  writeFixtureSource(dir, 'src/big.js', SYMS);
+  for (let i = 0; i < TIER1_CAP; i += 1) {
+    writeDecomposeTask(dir, 'done', `onepass-${i}`, { decomposedFrom: `file-decompose-t1-${i}`, deterministicApply: 'one-pass-decompose' });
+  }
+
+  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call: fakeCall(MOVES), force: true });
+  assert.equal(summary.capped, false);
+  assert.equal(summary.filed, 1);
 });
