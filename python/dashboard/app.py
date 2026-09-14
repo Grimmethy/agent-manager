@@ -1201,52 +1201,6 @@ def task_summary(data: dict, filename: str) -> dict:
     }
 
 
-@app.route("/api/tokenfold/stats")
-def api_tokenfold_stats():
-    # Thin same-origin proxy to the TokenFold proxy's own stats endpoint (launch.sh starts
-    # TokenFold on TOKENFOLD_PORT, default 9339) -- the dashboard page can't fetch the
-    # 9339 origin directly without CORS. "available": False (never an HTTP error) when the
-    # proxy isn't running, so the tab can render a quiet "not running" state instead of
-    # tripping the generic error path.
-    import urllib.request
-
-    port = os.environ.get("TOKENFOLD_PORT", "9339")
-    try:
-        with urllib.request.urlopen(
-                f"http://localhost:{port}/tokenfold/stats", timeout=3) as r:
-            data = json.loads(r.read().decode())
-        return jsonify({"available": True, "port": port, "stats": data})
-    except Exception as exc:
-        logger.warning(
-            "TokenFold stats fetch failed (localhost:%s /tokenfold/stats): %s: %s",
-            port, type(exc).__name__, exc,
-        )
-        return jsonify({"available": False, "port": port})
-
-
-@app.route("/api/promptforge/config")
-def api_promptforge_config():
-    # PromptForge is a separate local app (its own Flask server). The dashboard just
-    # tells the browser where to point the embedded iframe -- PROMPTFORGE_URL, else the
-    # convention :7430. No proxy: the iframe loads that origin directly.
-    return jsonify({"url": os.environ.get("PROMPTFORGE_URL", "http://localhost:7430")})
-
-
-@app.route("/api/adforge/config")
-def api_adforge_config():
-    # AdForge is a separate local app (its own Flask server), same as PromptForge above.
-    # Just tells the browser where to point the embedded iframe -- ADFORGE_URL, else the
-    # convention :7431. No proxy.
-    return jsonify({"url": os.environ.get("ADFORGE_URL", "http://localhost:7431")})
-
-
-@app.route("/api/scriptforge/config")
-def api_scriptforge_config():
-    # ScriptForge is a separate local app (phase 1 of the AdForge pipeline), same shape
-    # as the two above -- SCRIPTFORGE_URL, else the convention :7432.
-    return jsonify({"url": os.environ.get("SCRIPTFORGE_URL", "http://localhost:7432")})
-
-
 @app.route("/")
 def index():
     return render_template("index.html")
@@ -7877,12 +7831,14 @@ from routes.concepts import concepts_bp  # noqa: E402
 from routes.second_brain import second_brain_bp  # noqa: E402
 from routes.brain_dump import brain_dump_bp  # noqa: E402
 from routes.benchmark import benchmark_bp  # noqa: E402
+from routes.embedded_tools import embedded_tools_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
 app.register_blueprint(concepts_bp)
 app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
 app.register_blueprint(benchmark_bp)
+app.register_blueprint(embedded_tools_bp)
 
 
 def _active_hardware_plugin():
