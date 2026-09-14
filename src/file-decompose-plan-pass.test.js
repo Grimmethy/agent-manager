@@ -6,7 +6,11 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const M = require('./file-decompose-plan-pass.js');
-const { extractTopLevelSymbols, assignSections, groupBySection, planFromSections, planFromSectionMerge, parseMovesJson, bannerLabel, routeFamily, runFileDecomposePlanPass } = M;
+const {
+  extractTopLevelSymbols, assignSections, groupBySection, planFromSections, planFromSectionMerge,
+  parseMovesJson, bannerLabel, routeFamily, runFileDecomposePlanPass, computeFanOutSymbols,
+  computeRoutelessSections, packSections,
+} = M;
 
 test('extractTopLevelSymbols: python + html <script> functions, nested excluded', () => {
   const py = 'def a(x):\n    return x\n@app.route("/x")\ndef b():\n    pass\nclass C:\n    def m(self):\n        pass\n';
@@ -162,7 +166,11 @@ test('runFileDecomposePlanPass: Path A (deterministic) when the file has clean d
   assert.match(plan.planPassNote, /deterministic/);
 });
 
-test('runFileDecomposePlanPass: Path B (model merges sections) for a many-section file', async () => {
+// 2026-09-14: this used to be the "too many sections" trigger for Path B (12 sections,
+// none oversized) -- Path A's packer now handles that shape deterministically (see the
+// FAN-OUT FILTER / packSections header note), so a >8-section file with clean, small,
+// self-contained sections no longer reaches the model at all.
+test('runFileDecomposePlanPass: Path A now deterministically packs a many-section file (used to require Path B)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-'));
   const parts = ['<script>'];
   for (let s = 0; s < 12; s += 1) {
@@ -171,18 +179,47 @@ test('runFileDecomposePlanPass: Path B (model merges sections) for a many-sectio
   }
   parts.push('</script>');
   fs.writeFileSync(path.join(dir, 'index.html'), parts.join('\n'));
+  let called = false;
+  const call = async () => { called = true; return { response: '[]' }; };
+  const plan = await runFileDecomposePlanPass('index.html', { repoRoot: dir, call });
+  assert.ok(plan);
+  assert.equal(called, false, 'deterministic packer took no model call');
+  assert.ok(plan.moves.length <= 8, 'packed down to the module ceiling');
+  assert.match(plan.planPassNote, /deterministic/);
+  const total = plan.moves.reduce((n, m) => n + m.symbols.length, 0);
+  assert.equal(total, 36, 'every symbol still lands in exactly one module');
+});
+
+// Path B's remaining real trigger: Path A's OWN size-sanity checks reject the section
+// structure (too much unsectioned code here), not merely "too many sections" -- that
+// case is now handled deterministically, see above.
+test('runFileDecomposePlanPass: Path B (model merges sections) when too much of the file is unsectioned for Path A to trust', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-'));
+  // assignSections assigns each symbol the NEAREST PRECEDING banner, inherited forward
+  // until the next one -- so "no section" only actually happens BEFORE the first banner
+  // in the file. These loose functions must come first to land in the '' bucket.
+  const parts = ['<script>'];
+  for (let i = 0; i < 20; i += 1) parts.push(`function loose${i}() {}`); // no banner yet -> unsectioned
+  for (let s = 0; s < 3; s += 1) {
+    parts.push(`// --- Section ${s} ---`);
+    for (let i = 0; i < 2; i += 1) parts.push(`function s${s}f${i}() {}`);
+  }
+  parts.push('</script>');
+  fs.writeFileSync(path.join(dir, 'index.html'), parts.join('\n'));
   const call = async ({ prompt }) => {
     const secs = [...prompt.matchAll(/^  "(.+?)" -- /gm)].map((m) => m[1]);
-    const mods = [[], [], []];
-    secs.forEach((x, i) => mods[i % 3].push(x));
-    return { response: JSON.stringify(mods.map((sc, i) => ({ module: `m${i}`, sections: sc }))) };
+    return {
+      response: JSON.stringify([
+        { module: 'm0', sections: secs.slice(0, 2), includeUnsectioned: true },
+        { module: 'm1', sections: secs.slice(2) },
+      ]),
+    };
   };
   const plan = await runFileDecomposePlanPass('index.html', { repoRoot: dir, call });
   assert.ok(plan);
-  assert.equal(plan.moves.length, 3);
   assert.match(plan.planPassNote, /merged sections/);
   const total = plan.moves.reduce((n, m) => n + m.symbols.length, 0);
-  assert.equal(total, 36);
+  assert.equal(total, 26);
 });
 
 test('runFileDecomposePlanPass: null when nothing produces >=2 groups', async () => {
@@ -190,4 +227,149 @@ test('runFileDecomposePlanPass: null when nothing produces >=2 groups', async ()
   fs.writeFileSync(path.join(dir, 'flat.js'), Array.from({ length: 10 }, (_, i) => `function f${i}(){}`).join('\n'));
   const plan = await runFileDecomposePlanPass('flat.js', { repoRoot: dir, call: async () => ({ response: JSON.stringify([{ newFile: 'lib/all.js', symbols: Array.from({ length: 10 }, (_, i) => `f${i}`) }]) }) });
   assert.equal(plan, null);
+});
+
+// --- fan-out filter (2026-09-14) -----------------------------------------------------
+
+function writePy(dir, name, content) {
+  fs.writeFileSync(path.join(dir, name), content);
+  return path.join(dir, name);
+}
+
+test('computeFanOutSymbols: a symbol referenced from another section is flagged; a section-local symbol is not', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fanout-'));
+  const src = [
+    '# --- Section A ---',
+    'def route_a():',
+    '    return shared_helper() + local_helper_a()',
+    '',
+    'def local_helper_a():',
+    '    return 1',
+    '',
+    '# --- Section B ---',
+    'def route_b():',
+    '    return shared_helper() + 2',
+    '',
+    '# --- Shared ---',
+    'def shared_helper():',
+    '    return 42',
+    '',
+  ].join('\n');
+  writePy(dir, 'app.py', src);
+
+  const symbols = assignSections(src, '.py', extractTopLevelSymbols(src, '.py'));
+  const groups = groupBySection(symbols);
+  const fanOut = computeFanOutSymbols(dir, 'app.py', groups);
+  assert.equal(fanOut.has('shared_helper'), true, 'called from both Section A and B -- cross-cutting');
+  assert.equal(fanOut.has('route_a'), false, 'never called from outside its own section');
+  assert.equal(fanOut.has('local_helper_a'), false, 'only used within its own section (by route_a)');
+  assert.equal(fanOut.has('route_b'), false);
+});
+
+test('computeFanOutSymbols: a no-op (empty set) for a non-.py source', () => {
+  const groups = new Map([['A', [{ name: 'x' }]]]);
+  assert.deepEqual(computeFanOutSymbols('/nonexistent', 'app.js', groups), new Set());
+});
+
+test('runFileDecomposePlanPass: a file-wide Python helper is excluded from every move and left in the source', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fanout-plan-'));
+  const sections = [];
+  for (let s = 0; s < 4; s += 1) {
+    sections.push(`# --- Section ${s} ---`);
+    // A real @app.route decorator is required -- routeFamily has priority over the banner
+    // for section assignment, but more importantly each section must clear the
+    // computeRoutelessSections filter (a section with zero routes is excluded entirely).
+    sections.push(`@app.route("/${s}/a")`);
+    sections.push(`def route_${s}_a():`);
+    sections.push(`    return shared_helper() + 1`);
+    sections.push(`@app.route("/${s}/b")`);
+    sections.push(`def route_${s}_b():`);
+    sections.push(`    return 2`);
+  }
+  sections.push('# --- Shared ---');
+  sections.push('def shared_helper():');
+  sections.push('    return 42');
+  writePy(dir, 'app.py', sections.join('\n'));
+
+  const plan = await runFileDecomposePlanPass('app.py', { repoRoot: dir, call: async () => ({ response: '[]' }) });
+  assert.ok(plan);
+  assert.match(plan.planPassNote, /shared\/cross-cutting/);
+  for (const mv of plan.moves) assert.ok(!mv.symbols.includes('shared_helper'), 'shared_helper must never be claimed by a move');
+});
+
+test('packSections: merges the two smallest sections repeatedly down to the cap, never splitting a section', () => {
+  const kept = [
+    ['a', [{ name: 'a1' }]],
+    ['b', [{ name: 'b1' }, { name: 'b2' }]],
+    ['c', [{ name: 'c1' }]],
+    ['d', [{ name: 'd1' }, { name: 'd2' }, { name: 'd3' }]],
+    ['e', [{ name: 'e1' }]],
+  ];
+  const packed = packSections(kept, 3);
+  assert.equal(packed.length, 3);
+  const allSyms = packed.flatMap(([, syms]) => syms.map((s) => s.name)).sort();
+  assert.deepEqual(allSyms, ['a1', 'b1', 'b2', 'c1', 'd1', 'd2', 'd3', 'e1'].sort(), 'every original symbol still present exactly once');
+});
+
+test('packSections: a no-op when already at or under the cap', () => {
+  const kept = [['a', [{ name: 'a1' }]], ['b', [{ name: 'b1' }]]];
+  const packed = packSections(kept, 8);
+  assert.equal(packed.length, 2);
+});
+
+// --- routeless-section filter (2026-09-14) -------------------------------------------
+
+test('computeRoutelessSections: every symbol in a section with zero @app.route views is flagged; a section with at least one route is not', () => {
+  const src = [
+    '# --- Helpers only ---',
+    'def _helper_a():',
+    '    return 1',
+    'def _helper_b():',
+    '    return 2',
+    '',
+    '# --- Has a route ---',
+    '@app.route("/x")',
+    'def view_x():',
+    '    return _shared()',
+    'def _shared():',
+    '    return 3',
+  ].join('\n');
+  const symbols = assignSections(src, '.py', extractTopLevelSymbols(src, '.py'));
+  const groups = groupBySection(symbols);
+  const routeless = computeRoutelessSections('app.py', groups);
+  assert.equal(routeless.has('_helper_a'), true);
+  assert.equal(routeless.has('_helper_b'), true);
+  // view_x's own section is route-family-labeled (routeFamily wins over the banner), not
+  // grouped with _shared under "Has a route" -- so _shared (no route in ITS OWN section)
+  // is itself routeless, same real-world shape as the app.py incident.
+  assert.equal(routeless.has('_shared'), true);
+});
+
+test('computeRoutelessSections: a no-op (empty set) for a non-.py source', () => {
+  const groups = new Map([['A', [{ name: 'x', isRoute: false }]]]);
+  assert.deepEqual(computeRoutelessSections('app.js', groups), new Set());
+});
+
+test("moveTemplateFor (via runFileDecomposePlanPass): a multi-word packed .py module name has no hyphen in its import path -- 'from routes.worker-models-1-more import ...' is invalid Python syntax", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hyphen-plan-'));
+  const sections = [];
+  // 9 tiny, oddly-cased, multi-word-labeled sections -- forces packSections' "X + N more"
+  // combo-label path, which is what produced the hyphenated module name live.
+  for (let s = 0; s < 9; s += 1) {
+    sections.push(`# --- Worker Models ${s} ---`);
+    sections.push(`@app.route("/w${s}/a")`);
+    sections.push(`def w${s}_view_a():`);
+    sections.push(`    return 1`);
+    sections.push(`@app.route("/w${s}/b")`);
+    sections.push(`def w${s}_view_b():`);
+    sections.push(`    return 2`);
+  }
+  writePy(dir, 'app.py', sections.join('\n'));
+
+  const plan = await runFileDecomposePlanPass('app.py', { repoRoot: dir, call: async () => ({ response: '[]' }) });
+  assert.ok(plan);
+  for (const mv of plan.moves) {
+    const base = mv.newFile.split('/').pop().replace(/\.py$/, '');
+    assert.doesNotMatch(base, /-/, `${mv.newFile}: a Python module name cannot contain a hyphen`);
+  }
 });
