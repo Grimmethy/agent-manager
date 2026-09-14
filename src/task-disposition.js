@@ -61,12 +61,31 @@ function lastAppliedEvent(history) {
 }
 
 // A default git probe -- swappable in tests. Returns stdout (trimmed) or '' on any failure.
+//
+// maxBuffer (2026-09-14, root-caused live): with no override, execFileSync defaults to
+// Node's stock 1MB stdout cap. buildShipContext's own `git log origin/<main>
+// --format=%H%x00%B%x00%x00` (full commit BODIES, unbounded history, used to populate
+// onMainIds -- the primary "is this task's commit reachable from main" check) had grown
+// past that 1MB cap on this repo's real history, throwing ENOBUFS on every single call.
+// The bare catch below swallowed it into an indistinguishable '', so onMainIds silently
+// stayed EMPTY on every reconcile run -- every task fell through to the branchAhead
+// fallback (works only while its throwaway branch still exists) and, once that branch
+// was cleaned up post-merge as normal, all the way through to a false `abandoned: branch
+// gone, work lost` verdict. Confirmed live: b213c3c3 (a real commit on origin/master,
+// correct Task: trailer) was invisible to onMainIds.has() purely because of this.
+// 64MB is generous headroom against the repo continuing to grow; the ENOBUFS check below
+// keeps a *future* recurrence of the same overflow loud in logs instead of silently
+// wrong again, without changing this function's existing "return '' on any failure"
+// contract that other call sites (a genuinely missing ref, offline) already depend on.
 function realGit(repoRoot, args) {
   try {
     return execFileSync('git', ['-C', repoRoot, ...args], {
-      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000,
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000, maxBuffer: 64 * 1024 * 1024,
     }).trim();
-  } catch {
+  } catch (e) {
+    if (e && e.code === 'ENOBUFS') {
+      console.error(`[task-disposition] git output exceeded maxBuffer (64MB) for "git ${args.join(' ')}" -- disposition resolution is now working from incomplete data. Repo history has likely outgrown this limit; raise it further.`);
+    }
     return '';
   }
 }
@@ -283,4 +302,4 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   return { stage: classified.stage, detail: classified.detail };
 }
 
-module.exports = { resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain, isNoopApplyDetail };
+module.exports = { resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain, isNoopApplyDetail, realGit };
