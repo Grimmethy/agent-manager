@@ -14,22 +14,46 @@
 //
 //   A. SECTION GROUPING (no model). Big source files are already organised behind comment
 //      banners -- `// --- Discovery tab ---`, `// Plugins tab -- ...`, a `@app.route`
-//      URL-prefix family. Assign each symbol its nearest preceding banner, and if that
-//      yields 3-8 balanced groups, emit them directly. Zero model risk.
+//      URL-prefix family. Assign each symbol its nearest preceding banner; a section-count
+//      overflow no longer bails to the model (see the packing note below) -- it bin-packs
+//      instead. Zero model risk.
 //
-//   B. MODEL GROUPS SECTIONS. If A is lopsided (one giant group, or 20 tiny ones), hand
-//      the model the SECTIONS as the unit -- "merge these 18 sections into 3-8 modules" --
-//      a far smaller labelling task than 147 raw names (the job-list case, where flat-name
-//      grouping produced no usable split, live 2026-09-03).
+//   B. MODEL GROUPS SECTIONS. Only reached now when fewer than 3 usable sections survive
+//      the fan-out filter below (too sparse for the deterministic packer to work with) --
+//      hand the model the SECTIONS as the unit, a far smaller labelling task than 147 raw
+//      names (the job-list case, where flat-name grouping produced no usable split, live
+//      2026-09-03).
 //
 //   C. MODEL GROUPS NAMES. No banner structure at all -> the original flat-name approach,
 //      only for a file small enough (<= FLAT_NAME_CEILING) that one pass can hold it.
 //
 // Every grouped symbol is validated against the deterministically extracted set before the
 // plan is written. Injectable `call` for tests; A + the parsers need no model.
+//
+// FAN-OUT FILTER (2026-09-14, screaminggoatclubmt: "we analyze the plan itself... why
+// isn't it producing quality results"). Root-caused live: app.py's comment-banner
+// sectioning put 77 symbols under one "LAN access" label, but most of them were actually
+// file-wide utilities (queue_dir, read_env_file, get_active_repo_root) that just happened
+// to sit under that banner physically -- referenced from routes in a dozen OTHER sections.
+// Tier B's model call was only ever shown a label + a count + 8 example names, with no
+// cross-reference information, so it had no way to know that and bundled the whole section
+// into one 83-symbol module -- rejected by validatePlan's AST preflight only AFTER the
+// full plan was built, with no feedback into a better attempt.
+//
+// Fix: BEFORE any grouping (deterministic or model), reuse the SAME AST reference scan
+// validatePlan's own staticCheckMove already runs (file-decompose-to-hub.js), one section
+// at a time, to find every symbol referenced from OUTSIDE its own section. Those are
+// cross-cutting shared utilities, not movable features -- exclude them from every tier's
+// candidate pool entirely (left behind in the source file) rather than discovering the
+// same problem only after a full plan fails preflight. This also means Tier A's packer can
+// now trust that every remaining section is genuinely self-contained, which is what lets
+// it safely bin-pack an arbitrary number of sections instead of bailing past 8.
 
 const fs = require('fs');
 const path = require('path');
+// file-decompose-to-hub.js does not require this module (only decompose-loop-autoroute.js
+// does, separately) -- safe, no cycle.
+const { staticCheckMove } = require('./file-decompose-to-hub.js');
 
 const FLAT_NAME_CEILING = 45; // above this, a flat "group 147 names" pass just truncates
 
@@ -146,7 +170,9 @@ function assignSections(text, ext, symbols) {
   for (const s of symbols) {
     // .py: the @app.route family is the strongest signal (route families = modules); a
     // file-level `# --- X ---` divider in a 6,900-line file is far too coarse.
-    let section = ext === '.py' ? routeFamily(lines, s.line - 1) : null;
+    const family = ext === '.py' ? routeFamily(lines, s.line - 1) : null;
+    s.isRoute = family !== null; // exposed for computeRoutelessSections below
+    let section = family;
     if (!section) section = bannerByLine[s.line - 1] || null;
     if (!section) section = anchorByLine[s.line - 1] || null;
     s.section = section;
@@ -163,6 +189,74 @@ function groupBySection(symbols) {
     groups.get(k).push(s);
   }
   return groups;
+}
+
+// Returns a Set of symbol names referenced from OUTSIDE their own section -- see the
+// FAN-OUT FILTER header note above. Only wired for .py sources so far (staticCheckMove's
+// AST scan is Python-only); HTML/JS sections already get an equivalent self-containment
+// check per-move, post-hoc, via decompose-node-module.js/script-extract.js's deterministic
+// apply oracle, and haven't shown this failure mode in practice. Unsectioned ('') symbols
+// have no "own section" to be external to, so they're left for the normal dropped/misc
+// handling futher down rather than run through this check.
+function computeFanOutSymbols(repoRoot, sourceFile, groups) {
+  const fanOut = new Set();
+  if (!/\.py$/.test(sourceFile)) return fanOut;
+  for (const [label, syms] of groups) {
+    if (!label) continue;
+    const names = syms.map((s) => s.name);
+    if (names.length === 0) continue;
+    let check;
+    try { check = staticCheckMove(repoRoot, sourceFile, names); } catch { check = null; }
+    if (!check) continue; // can't check (no python3, file unreadable) -- no filter this run
+    for (const s of Object.keys(check.externalRefs || {})) fanOut.add(s);
+  }
+  return fanOut;
+}
+
+// A flask-blueprint move needs at least one real @app.route view to attach the blueprint
+// to (helpers may ride along, but a blueprint made of zero routes is nonsense -- the exact
+// rejection decompose-blueprint-extract.py's own AST check (decorator_is_app_route) already
+// enforces after the fact, error string "none of ... is an @app.route view -- not a
+// blueprint move"). .py section labeling gives ROUTE-FAMILY priority over the comment
+// banner (see assignSections above), so a banner's actual @app.route views can get
+// siphoned into a DIFFERENT, url-family-named section, leaving the banner's own section as
+// pure helpers with nothing to attach a blueprint to. Caught live 2026-09-14: app.py's
+// "Chat 'make GPU space' preemption" banner's two real routes (api_chat_message,
+// api_chat_reserve) landed in the separate "chat" URL-family section, leaving its
+// remaining 18 symbols (all private `_`-prefixed helpers) offered as their own move --
+// rejected by the AST preflight after a full plan was already built, same shape as the
+// fan-out incident above. Reuses `s.isRoute` (stamped by assignSections) rather than
+// re-scanning decorators here.
+function computeRoutelessSections(sourceFile, groups) {
+  const routeless = new Set();
+  if (!/\.py$/.test(sourceFile)) return routeless;
+  for (const [label, syms] of groups) {
+    if (!label) continue;
+    if (!syms.some((s) => s.isRoute)) {
+      for (const s of syms) routeless.add(s.name);
+    }
+  }
+  return routeless;
+}
+
+// First-fit-decreasing-ish bin merge: repeatedly combines the two SMALLEST bins until at
+// most maxBins remain, keeping every section atomic (never splits one across modules, so
+// the human-authored banner semantics survive). Safe to do blindly because every section
+// entering here has already been through computeFanOutSymbols -- nothing in it is called
+// from outside its own section, so merging two sections together can't introduce a stray
+// cross-module reference that wasn't already excluded.
+function packSections(kept, maxBins) {
+  let bins = kept.map(([label, syms]) => ({ labels: [label], syms: [...syms] }));
+  bins.sort((a, b) => a.syms.length - b.syms.length);
+  while (bins.length > maxBins) {
+    const a = bins.shift();
+    const b = bins.shift();
+    const merged = { labels: [...a.labels, ...b.labels], syms: [...a.syms, ...b.syms] };
+    let i = 0;
+    while (i < bins.length && bins[i].syms.length < merged.syms.length) i += 1;
+    bins.splice(i, 0, merged);
+  }
+  return bins.map((bin) => [bin.labels.length > 1 ? `${bin.labels[0]} + ${bin.labels.length - 1} more` : bin.labels[0], bin.syms]);
 }
 
 // --- move construction --------------------------------------------------------------
@@ -187,7 +281,14 @@ function moveTemplateFor(sourceFile) {
     return { kind: 'script-extract', newFile: (slug) => `${appRoot}/static/js/${slug}.js` };
   }
   if (ext === '.py') {
-    return { kind: 'flask-blueprint', newFile: (slug) => `${dir}/routes/${slug}.py`, blueprint: (slug) => `${slug.replace(/-/g, '_')}_bp` };
+    // 2026-09-14: a Python module name cannot contain a hyphen -- `from routes.worker-
+    // models-1-more import ...` is invalid syntax (parsed as subtraction), not just an
+    // ugly name. slugify() happily produces hyphens (fine for a bare filename on most
+    // filesystems), so the file's BASENAME needs the same hyphen->underscore conversion
+    // the blueprint name already gets -- caught live via py_compile on a real
+    // packSections combo label ("worker-models + 1 more"), not something an isolated
+    // single-word label (this session's own hand-picked names) ever exercised.
+    return { kind: 'flask-blueprint', newFile: (slug) => `${dir}/routes/${slug.replace(/-/g, '_')}.py`, blueprint: (slug) => `${slug.replace(/-/g, '_')}_bp` };
   }
   // 2026-09-08, Grimmethy: "Yes, please build it" -- a plain .js/.mjs/.cjs source now also
   // gets kind:'script-extract' (was 'module-extract', the one category with no
@@ -231,8 +332,14 @@ function planFromSections(sourceFile, symbols) {
     if (syms.length === 1) misc.push(...syms);
     else kept.push([label, syms]);
   }
-  if (kept.length < 3 || kept.length > 8) return null; // too few / too many -> let the model merge (Path B)
-  const moves = kept.map(([label, syms]) => buildMove(sourceFile, label, syms, `section: ${label}`));
+  if (kept.length < 3) return null; // too sparse -- let the model merge (Path B)
+  // 2026-09-14: used to return null past 8 kept sections and fall through to the model
+  // (Path B) -- that's exactly the app.py shape (18 kept sections) that produced the
+  // broken "LAN access" plan. Every section here has already survived the fan-out filter
+  // in runFileDecomposePlanPass (nothing in it is called from outside its own section), so
+  // merging sections together deterministically is safe -- no model judgment needed.
+  const packed = kept.length > 8 ? packSections(kept, 8) : kept;
+  const moves = packed.map(([label, syms]) => buildMove(sourceFile, label, syms, `section: ${label}`));
   const miscAll = [...misc, ...(groups.get('') || [])];
   if (miscAll.length >= 2 && miscAll.length < symbols.length * 0.4) {
     moves.push(buildMove(sourceFile, 'shared-misc', miscAll, 'symbols with no clear section -- grouped together, split later if needed'));
@@ -350,18 +457,30 @@ async function runFileDecomposePlanPass(sourceFile, {
   const symbols = assignSections(text, ext, extractTopLevelSymbols(text, ext));
   if (symbols.length < minSymbols) return null;
 
+  // Fan-out + routeless-section filters (see the header notes on computeFanOutSymbols and
+  // computeRoutelessSections) -- run BEFORE any tier sees the symbol list, so a
+  // cross-cutting shared utility or a helper-only section with no route to attach a
+  // blueprint to is never offered to the deterministic packer or the model as something
+  // safe to move.
+  const rawGroups = groupBySection(symbols);
+  const fanOut = computeFanOutSymbols(repoRoot, sourceFile, rawGroups);
+  const routeless = computeRoutelessSections(sourceFile, rawGroups);
+  const candidates = symbols.filter((s) => !fanOut.has(s.name) && !routeless.has(s.name));
+  if (candidates.length < minSymbols) return null; // nothing safe enough left to split
+
   const headText = text.split('\n').slice(0, 80).join('\n');
   const doCall = (prompt) => call({ prompt, think: false, temperature: 0.2, source: 'file_decompose_plan' });
   let moves = null;
   let strategy = null;
 
   // A. deterministic section grouping
-  moves = planFromSections(sourceFile, symbols);
+  moves = planFromSections(sourceFile, candidates);
   if (moves) strategy = 'sections (deterministic)';
 
-  // B. model merges the sections
+  // B. model merges the sections (now only reached when fewer than 3 sections survive the
+  // fan-out filter -- too sparse for the deterministic packer, not too NUMEROUS -- see A)
   if (!moves) {
-    const groups = groupBySection(symbols);
+    const groups = groupBySection(candidates);
     const named = [...groups.keys()].filter((k) => k !== '');
     if (named.length >= 3) {
       try {
@@ -373,11 +492,11 @@ async function runFileDecomposePlanPass(sourceFile, {
   }
 
   // C. model groups raw names -- only for a small enough structureless file
-  if (!moves && symbols.length <= FLAT_NAME_CEILING) {
+  if (!moves && candidates.length <= FLAT_NAME_CEILING) {
     try {
-      const r = await doCall(flatNamePrompt(sourceFile, symbols, headText));
-      const parsed = parseMovesJson(r && r.response, { validSymbols: symbols });
-      if (parsed.moves.length >= 2 && parsed.dropped.length <= symbols.length * 0.4) {
+      const r = await doCall(flatNamePrompt(sourceFile, candidates, headText));
+      const parsed = parseMovesJson(r && r.response, { validSymbols: candidates });
+      if (parsed.moves.length >= 2 && parsed.dropped.length <= candidates.length * 0.4) {
         moves = parsed.moves;
         strategy = 'model grouped names';
       }
@@ -386,9 +505,10 @@ async function runFileDecomposePlanPass(sourceFile, {
 
   if (!moves || moves.length < 2) return null;
 
-  // Final validation: every symbol referenced by a move must be a real extracted one, and
-  // no symbol claimed twice.
-  const valid = new Set(symbols.map((s) => s.name));
+  // Final validation: every symbol referenced by a move must be a real extracted CANDIDATE
+  // (a fan-out symbol must never end up claimed by a move, even if a tier somehow proposed
+  // it), and no symbol claimed twice.
+  const valid = new Set(candidates.map((s) => s.name));
   const claimed = new Set();
   const clean = [];
   for (const mv of moves) {
@@ -398,14 +518,16 @@ async function runFileDecomposePlanPass(sourceFile, {
   }
   if (clean.length < 2) return null;
   const dropped = [...valid].filter((s) => !claimed.has(s));
-  if (dropped.length > symbols.length * 0.4) return null;
+  if (dropped.length > candidates.length * 0.4) return null;
 
   return {
     id: requestId || `autodecomp-${slugify(sourceFile)}`,
     sourceFile,
     moves: clean,
     autoAuthored: true,
-    planPassNote: `${clean.length} module(s) via ${strategy} from ${symbols.length} symbols`
+    planPassNote: `${clean.length} module(s) via ${strategy} from ${candidates.length} symbols`
+      + (fanOut.size ? ` (${fanOut.size} shared/cross-cutting symbol(s) excluded -- kept in ${sourceFile}: ${[...fanOut].slice(0, 8).join(', ')})` : '')
+      + (routeless.size ? ` (${routeless.size} helper-only/routeless symbol(s) excluded -- no @app.route view in their section, kept in ${sourceFile})` : '')
       + (dropped.length ? ` (${dropped.length} left in place: ${dropped.slice(0, 8).join(', ')})` : ''),
   };
 }
@@ -413,4 +535,5 @@ async function runFileDecomposePlanPass(sourceFile, {
 module.exports = {
   runFileDecomposePlanPass, extractTopLevelSymbols, assignSections, groupBySection,
   planFromSections, planFromSectionMerge, parseMovesJson, bannerLabel, routeFamily,
+  computeFanOutSymbols, computeRoutelessSections, packSections,
 };
