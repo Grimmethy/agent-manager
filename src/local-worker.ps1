@@ -731,6 +731,17 @@ while ($true) {
 
     if ($critiqueResult.degenerate) {
         # Critic failed -- inconclusive, don't block the task over this.
+        #
+        # 2026-09 (degenerate-as-skip, Windows-parity note): local-draft.js's own
+        # runCritiqueAndRevision had a bug where this same outcome fell through to the
+        # SAME recordCritique()/'critique-done' history-stage event a real no-issues pass
+        # uses, so a degenerate critique was indistinguishable downstream from a completed
+        # one (see [[hub-task-integration]], "stop treating critique-degenerate as a pass
+        # signal"). This script does NOT have that failure mode: there is no per-outcome
+        # history-stage event here at all -- 'critique-degenerate' is written to
+        # Invoke-TaskDb 'draft-done' below as a plain critiqueOutcome field value,
+        # uniformly with every other outcome, so a consumer reading that field can already
+        # tell a degenerate critique apart from a real pass. No behavior change needed.
         $task | Add-Member -NotePropertyName 'critiqueOutcome' -NotePropertyValue 'critique-degenerate' -Force
     } elseif (((($critiqueResult.response).Trim()).ToLower() -eq 'no issues found') -or (($critiqueResult.response).StartsWith('NO ISSUES FOUND'))) {
         # No real feedback -- skip revision.
