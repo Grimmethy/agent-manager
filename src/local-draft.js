@@ -74,6 +74,11 @@ const { checkOllamaReachable } = require('./ollama-health.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
 const { getModelProfile } = require('./model-profile-registry.js');
+const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./lib/draft-lifecycle.js');
+const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./lib/harness-search.js');
+const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch } = require('./lib/draft-context.js');
+const { computePlanNumPredict, tryDeterministicScriptExtractEdit, tryDeterministicOnePassDecompose, tryDeterministicNodeModuleDecompose, tryDeterministicBlueprintDecompose, tryDeterministicLiteralEdit } = require('./lib/deterministic-extract.js');
+const { runCritiqueAndRevision, ensureHeadroomForExtendedContext, computeImplementBudget, callImplementModel } = require('./lib/implement-critique.js');
 
 // 2026-09-08, Grimmethy: "fix worker-1" -- see gpu-arbiter.js's own header for the
 // incident (worker-1's qwen2.5:3b starved into repeated hard OLLAMA_TIMEOUTs by
@@ -81,16 +86,6 @@ const { getModelProfile } = require('./model-profile-registry.js');
 // GPU). Same OLLAMA_URL default local-client.js/local-tool-client.js already use for the
 // real call itself -- this process's own env IS the real endpoint it's about to hit, so
 // reading it here (rather than threading a new param through) is exact by construction.
-function localOllamaLockKey() {
-  const url = process.env.OLLAMA_URL || 'http://localhost:11434';
-  try {
-    const u = new URL(url);
-    return `ollama-${u.hostname}-${u.port || (u.protocol === 'https:' ? '443' : '80')}`;
-  } catch {
-    return `ollama-${url}`;
-  }
-}
-
 // 2026-09-08, Second Brain [[dspy-refine]] research: dspy.Refine deliberately samples
 // EVERY retry at temperature=1.0 (a distinct rollout_id per attempt) specifically to
 // avoid attempts collapsing into near-identical repeats -- confirmed against the real
@@ -114,58 +109,20 @@ const RETRY_TEMPERATURE = 1.0;
 // everything eagerly; it no longer covers plugin sources.)
 ensureRegistered();
 
-function writeTaskJson(taskPath, task) {
-  // Atomic write: the history persist hook (see main()) rewrites this file on every
-  // checkpoint while a draft is in flight, and the dashboard polls it concurrently -- a
-  // half-written file must never be observable. Same-dir tmp keeps the rename on one fs.
-  const tmp = `${taskPath}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(task, null, 2));
-  fs.renameSync(tmp, taskPath);
-}
-
 // research_task drafting is the one path with no local equivalent -- WebSearch/WebFetch
 // exist only in the Claude Code CLI (2026-09-01: everything else in the reasoning path
 // now runs on the local model). So research runs ONLY when a deployment has explicitly
 // opted it onto Claude (AGENT_MANAGER_CLAUDE_SOURCES) AND a token is set AND Claude isn't
 // paused; otherwise the task blocks cleanly with a legible reason instead of wedging.
 // Returns { ok: true } or { ok: false, reason }.
-function researchClaudeStatus(task, isClaudePausedFn) {
-  const src = resolveSourceName(task) || task.source || 'research_task';
-  const optedIn = (process.env.AGENT_MANAGER_CLAUDE_SOURCES || '')
-    .split(',').map((s) => s.trim()).filter(Boolean);
-  if (!optedIn.includes(src)) {
-    return { ok: false, reason: `research_task drafting needs the Claude Code CLI (WebSearch/WebFetch) -- there is no local web-research capability. Add "${src}" to AGENT_MANAGER_CLAUDE_SOURCES (and set CLAUDE_CODE_OAUTH_TOKEN) to enable it.` };
-  }
-  if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-    return { ok: false, reason: 'research_task drafting needs Claude (WebSearch/WebFetch) but CLAUDE_CODE_OAUTH_TOKEN is not set.' };
-  }
-  if (isClaudePausedFn()) {
-    return { ok: false, reason: 'research_task drafting needs Claude (WebSearch/WebFetch) but Claude is manually paused from the Workers tab.' };
-  }
-  return { ok: true };
-}
-
 // 2026-09: routing into the research branch was keyed only on task.domain === 'research',
 // so a task titled "Research: ..." that arrived through a different domain (e.g. an
 // adhoc-sourced brain-dump spawn) fell straight into the adhoc tier ladder / plan-stage
 // model call instead of draftResearchBranch. Same pre-model-call string-gate style as
 // detectExternalDependency in local-agentic-write-draft.js: cheap, O(title), deterministic.
-function isResearchDomainTask(task) {
-  return /^Research:/i.test((task && task.title || '').trim());
-}
-
 // A one-line summary for the 'draft-done' checkpoint, assembled from whatever the draft
 // branch already stamped on the task (adhoc resolution, retry count, model). Returns
 // undefined when there's nothing worth showing -- appendHistoryEvent then omits `detail`.
-function draftDoneDetail(task) {
-  const parts = [];
-  if (task.adhocResolution) parts.push(`resolution=${task.adhocResolution}`);
-  if (task.localRejectCount) parts.push(`retry ${task.localRejectCount}`);
-  const model = task.draftModelDisplay || task.draftModel;
-  if (model) parts.push(model);
-  return parts.join(', ') || undefined;
-}
-
 // The draft phase is complete and the task is heading to review. Emit an explicit
 // 'draft-done' checkpoint -- bookend to the 'draft-started' event above, and the same
 // -started/-done pairing plan/implement/critique/review already have -- BEFORE the
@@ -174,12 +131,6 @@ function draftDoneDetail(task) {
 // Invoke-TaskDb 'draft-done'; the bash port never substituted a history event for it.)
 // Every draft-success return in draftTask/draftAdhocBranch/research/product_spec funnels
 // through here. Idempotent w.r.t. task.status.
-function concludeDraft(task) {
-  task.status = 'needs-review';
-  appendHistoryEvent(task, 'draft-done', draftDoneDetail(task));
-  appendHistoryEvent(task, 'needs-review');
-}
-
 // task-sources.js's nextCandidateFulfillmentTask() -- the shared candidate-consumer every
 // candidateFulfillment: true source uses, each fetching real file content (fetchedFiles)
 // for the exact files their own candidate names, so their implement pass always has real
@@ -188,11 +139,6 @@ function concludeDraft(task) {
 // EMPTY_APPROVAL_SOURCES) -- now reads the flag straight off each source's own
 // registerTaskSource() entry instead, so a plugin's own registration is the only place
 // that needs to say so. See function-length-review.js's registration for the pattern.
-function isCandidateFulfillmentSource(source) {
-  const entry = getRegisteredSource(source);
-  return !!(entry && entry.candidateFulfillment);
-}
-
 // promptContext.fetchedFiles is a snapshot taken ONCE at candidate-creation
 // (nextCandidateFulfillmentTask, task-sources.js) and, until now, never refreshed before
 // the DRAFT prompt was built -- only before review (get-grounding-source.js's
@@ -203,42 +149,10 @@ function isCandidateFulfillmentSource(source) {
 // each fetched path from disk here, re-windowed the same way, so plan + implement +
 // findUnverifiedEdit all see current reality. Best-effort: a deleted/moved/unreadable path
 // keeps its frozen copy (stale grounding beats none), same fallback as the review path.
-function refreshCandidateFetchedFiles(task) {
-  const pc = task && task.promptContext;
-  if (!pc || !Array.isArray(pc.fetchedFiles) || pc.fetchedFiles.length === 0) return;
-  let repoRoot;
-  try { ({ repoRoot } = getConfig()); } catch (err) { console.warn('[local-draft] getConfig failed:', err.message); return; }
-  if (!repoRoot) return;
-  let windowFetchedFileContent;
-  try { ({ windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js')); } catch (err) { console.warn('[local-draft] candidate-fulfillment require failed:', err.message); return; }
-  const resolvedRoot = path.resolve(repoRoot);
-  const section = pc.body || '';
-  pc.fetchedFiles = pc.fetchedFiles.map((f) => {
-    if (!f || !f.path) return f;
-    try {
-      const full = path.resolve(resolvedRoot, f.path);
-      if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
-      const windowed = windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section);
-      return { ...f, content: windowed.text, anchorConfidence: windowed.confidence };
-    } catch (err) {
-      console.warn('[local-draft] file enrich failed:', f.path, err.message);
-      return f;
-    }
-  });
-}
-function isEmptyApprovalSource(source) {
-  const entry = getRegisteredSource(source);
-  return !!(entry && entry.emptyApproval);
-}
 // Same shape as isEmptyApprovalSource/isCandidateFulfillmentSource above -- reads the
 // advisoryProse flag straight off each source's own registerTaskSource() entry (same
 // flag review-task.js's own isAdvisoryProseSource() already reads, not exported from
 // there so re-declared here rather than reached into a sibling module's internals).
-function isAdvisoryProseSource(source) {
-  const entry = getRegisteredSource(source);
-  return !!(entry && entry.advisoryProse);
-}
-
 // Between plan and implement, several task sources need the QUERY: lines their plan pass
 // proposed actually run against a real search harness, with the hits handed to the
 // implement pass as grounding (rather than leaving the local model to invent file paths or
@@ -247,50 +161,6 @@ function isAdvisoryProseSource(source) {
 // promptContext.harnessHits/harnessFiles); 'projectSearch' hits the GitHub/HF search APIs
 // (-> promptContext.searchResults). ADR-0022 Stage A4 -- one generic step here replaces six
 // near-identical `if (task.source === ...)` branches.
-function parseHarnessQueries(planResponse) {
-  return [...(planResponse || '').matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
-}
-
-async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetch, roots }) {
-  const queries = parseHarnessQueries(task.planResponse);
-  if (kind === 'projectSearch') {
-    let searchResults = [];
-    if (queries.length > 0) {
-      try {
-        searchResults = await projectSearchFetch(queries);
-      } catch (e) {
-        console.warn(`[local-draft] projectSearchFetch failed, proceeding with no results:`, e?.message ?? e);
-        // Non-fatal -- implement proceeds with no results (its own prompt handles an empty
-        // list: "(no results -- the searches returned nothing usable)").
-      }
-    }
-    task.promptContext.searchResults = searchResults;
-    appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${searchResults.length} result(s)`);
-    return;
-  }
-  // 'archImport' -- also pipeline_self_audit / pipeline_health_audit / ui_visibility_audit /
-  // staleness_audit / pipeline_forensics(_fix) / product_spec_outline/section: literally
-  // the same archImportFetch of agent-manager's own repo (PLUS any loaded plugin repo,
-  // 2026-09-04 -- see accessible-roots.js's own header for the incident this closes), the
-  // only difference being what promptContext text the implement prompt renders around the
-  // hits (which lives in the prompt, not this step).
-  let harnessHits = [];
-  let harnessFiles = [];
-  if (queries.length > 0) {
-    try {
-      const result = archImportFetch(queries, { roots });
-      harnessHits = result.hits || [];
-      harnessFiles = result.files || [];
-    } catch (e) {
-      console.warn(`archImportFetch failed, continuing with empty harness data: ${e && e.message ? e.message : e}`);
-    }
-  }
-  task.promptContext.harnessHits = harnessHits;
-  task.promptContext.harnessFiles = harnessFiles;
-  appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${harnessHits.length} hit(s), ${harnessFiles.length} file(s)`);
-}
-
-
 // 2026-08-23, Grimmethy: "build it" -- caught live: even with real fetchedFiles content
 // given (task-sources.js's own 2026-08-21 grounding fix), the model still routinely wrote
 // a plausible-but-fabricated `find` string that matched nothing in the real file --
@@ -307,11 +177,6 @@ async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetc
 // A candidate-fulfillment task's promptContext.body carries the flagged code as a
 // `Snippet:` fenced block (observability_* / performance_* / function_length_* candidates).
 // Pull it out so the implement-verify step can check the model edited THAT block.
-function extractCandidateSnippet(body) {
-  const m = /(?:^|\n)\s*Snippet:\s*```[\w-]*\n([\s\S]*?)```/i.exec(String(body || ''));
-  return m ? m[1].replace(/\s+$/, '') : '';
-}
-
 // An import/logger line an `_fix` edit routinely re-adds even when the file already has it
 // (observed live: 5 blocked observability_fix tasks -- "duplicate import logging").
 const REDUNDANT_LINE_RE = /^\s*(?:import logging|from logging import|(?:logger|log|_log|LOG|LOGGER)\s*=\s*logging\.getLogger\([^)]*\))\s*$/;
@@ -319,27 +184,10 @@ const REDUNDANT_LINE_RE = /^\s*(?:import logging|from logging import|(?:logger|l
 // The most distinctive single line of a snippet (longest non-trivial, non-comment line) --
 // used to locate the flagged block inside the real file even when leading/trailing lines
 // of the snippet were paraphrased or reindented.
-function distinctiveLine(snippet) {
-  return (snippet || '').split('\n')
-    .map((l) => l.trim())
-    .filter((l) => l.length >= 12 && !/^(#|\/\/|\*|"""|''')/.test(l))
-    .sort((a, b) => b.length - a.length)[0] || '';
-}
-
 // 2026-09-02: a candidate-fulfillment edit whose `find` string is a real substring of the
 // file but sits far from the block the candidate actually flagged (observed live: 8 blocked
 // observability_fix tasks -- the model targeted `except OSError:` when the flag was
 // `except Exception:`, an `except` that returns a 504, a catch that already had logging).
-function findEditFarFromAnchor(find, content, anchorSnippet) {
-  const anchor = distinctiveLine(anchorSnippet);
-  if (anchor.length < 12) return false;                 // no usable anchor
-  if (anchorSnippet.replace(/\s+/g, ' ').includes(find.replace(/\s+/g, ' ').trim())) return false; // find IS in the snippet -- correct block
-  const anchorIdx = content.indexOf(anchor);
-  if (anchorIdx === -1) return false;                   // snippet stale/paraphrased -- can't judge, don't false-positive
-  const findIdx = content.indexOf(find);
-  return findIdx !== -1 && Math.abs(findIdx - anchorIdx) > 600; // ~15 lines away = a different block
-}
-
 // A `function NAME(` / `const NAME = (…) =>` / `const NAME = function` / `NAME = async` --
 // the declaration forms a candidate-fulfillment diff introduces a new helper as.
 const HELPER_DECL_RE = /(?:^|\n)\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(|(?:^|\n)\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/g;
@@ -525,145 +373,6 @@ function parseCandidateSplit(implementResponse) {
 // draftTask() run -- all of it depends on the task object (reasoning tier, model profile,
 // resolved label), none of it mutates the task. Returns the four things every real
 // model-call site below shares.
-function resolveDraftContext(task, { localCall, withLockFn }) {
-  // Resolved here rather than as a static default param: the right backend depends on the
-  // task's reasoning tier (model-provider.js's reasoningTierFor()), which isn't known
-  // until the task object itself is in hand -- passing the whole task (not just
-  // task.source) lets a per-instance task.reasoningTier override take effect, e.g. Brain
-  // Dump #77's automatic high-reasoning retry for a needs-clarification task. Explicit
-  // test/caller overrides (localCall passed in) always win -- this only fills the gap
-  // production code leaves (local-draft.js's own main() calls draftTask(task) with no
-  // second argument at all).
-  // 2026-08-24 (model-profile-registry.js): when the task's own source declares a
-  // modelProfile, its model/numCtx/numPredict become defaults for every real call below --
-  // spread BEFORE each call site's own opts so a pass's own tuned numPredict (plan=1400,
-  // critique=900, ...) still wins over the profile's generic default, while model/numCtx
-  // (never set by any call site's own opts today) reliably take effect. Skipped entirely
-  // for an injected localCall (test/caller override) -- that already wins outright, same
-  // as it always has; wrapping it here would silently change what a test believes it's
-  // calling.
-  const modelProfile = resolveModelProfile(task);
-  const profileOverrides = modelProfile
-    ? { model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict }
-    : null;
-  const baseLocalCall = localCall || providerFor(task).call;
-  const profileWrappedCall = profileOverrides && !localCall
-    ? (opts) => baseLocalCall({ ...profileOverrides, ...opts })
-    : baseLocalCall;
-  // Side-finding capture (2026-09-05, side-finding.js) defaults to on for every call --
-  // opt a source out via `strictOutputOnly: true` on its registerTaskSource() entry when
-  // its implement pass MUST come back clean/parseable-only (brain_dump_sort's classify
-  // JSON, a digest-verdict pass, decompose's JSON array, path-prefetch-resolve) and
-  // couldn't tolerate an interleaved SIDE-FINDING: block. Read off the registry (not a
-  // hardcoded source-name list) same as candidateFulfillment/emptyApproval/etc. already
-  // are -- see isCandidateFulfillmentSource's own comment for why a hardcoded array was
-  // rejected here before.
-  const sourceEntry = getRegisteredSource(resolveSourceName(task));
-  const allowSideFindings = !(sourceEntry && sourceEntry.strictOutputOnly);
-  const resolvedLocalCall = allowSideFindings
-    ? profileWrappedCall
-    : (opts) => profileWrappedCall({ ...opts, allowSideFindings: false });
-  // 2026-08-24 (root-caused live: every brain_dump_sort draft failed outright with
-  // "does not support thinking" for as long as the brain-dump-cheap-local profile
-  // existed) -- unlike model/numCtx/numPredict above, `think` can't just join
-  // profileOverrides: every call site below passes its OWN explicit think value as part
-  // of `opts` (plan/critique/revise: true; implement: !hasFixedLiterals), and opts is
-  // spread AFTER profileOverrides in resolvedLocalCall above, so a profile-level think
-  // override would never actually take effect no matter what value it held. Each call
-  // site below now ANDs its own reasoning-needed value with this, instead.
-  const profileSupportsThink = !modelProfile || modelProfile.think !== false;
-
-  // Real plan/implement lock split (2026-08-22, Grimmethy: "build it now" -- see
-  // single-flight-lock.js's own header for the full incident this fixes). Every real
-  // resolvedLocalCall() invocation below -- plan, the non-A/B implement branch, critique,
-  // revision -- shares the SAME resolved backend for one draftTask() call (it's computed
-  // once, above), so this is computed once too rather than re-checked at each call site.
-  // Deliberately based on labelFor(task) ALONE, not on whether localCall was injected --
-  // an earlier version of this gated on `!localCall` too (skip locking whenever a test
-  // supplies a mock call), but that conflated "is this call actually local" with "are we
-  // in a test," which meant a test asserting real locking behavior for a normal task
-  // would have to leave localCall unset and make a real Ollama/Claude call to exercise
-  // it. A real flock acquire/release is single-digit milliseconds (confirmed live) --
-  // cheap enough that tests just inject withLockFn as a lightweight in-memory spy instead
-  // (see local-draft.test.js), and production behavior stays exactly what labelFor(task)
-  // says regardless of how a test wires the rest of this function. For adhoc, the IMPLEMENT
-  // path is a single write-agentic pass (draftAdhocBranch) which manages its own lock; for
-  // research (when opted into Claude), the implement call is a Claude call that never
-  // touches the local GPU. For every other task, plan and implement resolve to the SAME
-  // backend, so locking around each call individually (rather than one lock spanning the
-  // whole function) costs a few extra flock round-trips in exchange for never holding the
-  // lock across an off-GPU call by construction.
-  // labelFor(task) can genuinely return undefined now (LOCAL_MODEL has no hardcoded
-  // fallback string as of the earlier fix today -- see local-client.js's own comment) --
-  // treat that the same safe-default way as everywhere else in this codebase treats an
-  // unresolved label ("assume local, lock" rather than risk skipping a real local call's
-  // protection): `(label || '')` so `.startsWith` never throws on undefined, and an empty
-  // string correctly fails the 'claude:' prefix check.
-  const resolvedLabel = labelFor(task) || '';
-  const resolvedCallIsLocal = !resolvedLabel.startsWith('claude:');
-  const instancesDir = path.join(getConfig().pipelineDir, 'instances');
-  // Locked per-model, not globally (2026-08-25 -- see single-flight-lock.js's own header
-  // for the full "worker-1 and reasoning taking turns" incident this fixes): resolvedLabel
-  // IS the resolved local model name whenever resolvedCallIsLocal is true (labelFor()
-  // returns the bare model string for local, "claude:<model>" otherwise), so it's reused
-  // directly as the lock key -- no separate resolution needed.
-  // Restores the 2026-08-19 "queued" (waiting on the lock) vs "working" (actually
-  // computing) heartbeat distinction that the 2026-08-22 plan/implement lock split
-  // (see the header comment on local-worker.sh's own draft_display_model block) made
-  // bash unable to report any more -- the real wait now happens right here, inside this
-  // node process, so this is the one place that can still see it. `pass` labels which
-  // sub-call is queued/working (plan/implement/critique/revise/...), same convention
-  // local-worker.sh's own write_heartbeat_file calls already use for currentPass.
-  // AGENT_MANAGER_INSTANCE_ID is exported by local-worker.sh specifically so a node
-  // child can identify itself this way (see review-runner.sh's own identical export and
-  // comment) -- best-effort no-op when absent (e.g. a direct CLI/test invocation with no
-  // real daemon wrapper) rather than a hard requirement.
-  const instanceId = process.env.AGENT_MANAGER_INSTANCE_ID;
-  // Route the real GPU wait through the arbiter (priority class 'draft' -- below an
-  // interactive chat/Discuss turn and below a reviewer vote), unless a test injected its
-  // own withLockFn spy. gpu-arbiter.js wraps single-flight-lock.js's flock and adds the
-  // cross-lane priority ordering + cancellation this used to lack.
-  const usingInjectedLock = withLockFn !== defaultWithLock;
-  // lockKey (2026-09-08, Grimmethy: "fix worker-1" -- see gpu-arbiter.js's own header for
-  // the incident): the per-model default lets two DIFFERENT models generate concurrently
-  // on the SAME physical GPU, which starved worker-1's light qwen2.5:3b into dozens of
-  // hard OLLAMA_TIMEOUTs while worker-reasoning's heavy qwen3.8:27b-q4_K_M ran alongside
-  // it. localOllamaLockKey() resolves to the actual Ollama ENDPOINT this call is going
-  // to (this process's own OLLAMA_URL), so both draft-class calls below now serialize
-  // against any other local model hitting that SAME endpoint, while a call to a genuinely
-  // different endpoint (e.g. the P40 VM's AGENT_MANAGER_P40_OLLAMA_URL, which sets its own
-  // OLLAMA_URL for that lane) still runs fully independently, exactly as before.
-  const maybeLocked = (isLocal, fn, pass) => {
-    if (!isLocal) return fn();
-    if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'queued', resolvedLabel, task.id, pass);
-    const run = () => {
-      if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'working', resolvedLabel, task.id, pass);
-      return fn();
-    };
-    if (usingInjectedLock) return withLockFn(instancesDir, run, resolvedLabel);
-    return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: resolvedLabel, lockKey: localOllamaLockKey(), taskId: task.id, phase: pass }, run);
-  };
-
-  // Same as maybeLocked but keyed on an EXPLICIT model tag for heartbeat/display purposes
-  // -- the real serialization key is still localOllamaLockKey() (the shared endpoint), not
-  // this model tag, so a sub-call on a different model (e.g. the plan-critique's
-  // qwen2.5:3b) no longer runs in parallel with a main-model draft on the SAME physical
-  // GPU (that was the exact class of concurrency this fix closes); it still runs in
-  // parallel with a draft on a genuinely SEPARATE endpoint.
-  const maybeLockedOn = (model, fn, pass) => {
-    const key = model || resolvedLabel;
-    if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'queued', key, task.id, pass);
-    const run = () => {
-      if (instanceId) writeHeartbeatFile(instancesDir, instanceId, 'working', key, task.id, pass);
-      return fn();
-    };
-    if (usingInjectedLock) return withLockFn(instancesDir, run, key);
-    return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: key, lockKey: localOllamaLockKey(), taskId: task.id, phase: pass }, run);
-  };
-
-  return { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked, maybeLockedOn };
-}
-
 // Deterministic staleness-recheck short-circuit (2026-08-23, Grimmethy: "How do we
 // systematically solve this issue in the future. We need to harden the system so that we
 // don't have to keep manually following up on these" -- see staleness-fastpath.js's own
@@ -688,26 +397,6 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
 // critique-skip all constructed directly, task left at needs-review); returns null when
 // the original finding isn't from a deterministically re-runnable rule, so the caller
 // falls through to the normal harness-grounded local-model path unchanged.
-function runStalenessFastpath(task, attempt) {
-  const { deterministicRecheck } = require('./staleness-fastpath.js');
-  const verdict = deterministicRecheck(task, getConfig().repoRoot);
-  if (!verdict) return null;
-  task.planResponse = 'Deterministic recheck: the original finding came from a scanner rule this pipeline can re-run directly against the file\'s current content -- no search terms or model judgment needed.';
-  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
-  appendHistoryEvent(task, 'plan-done', 'deterministic recheck, no model call');
-  task.promptContext.harnessHits = verdict.hits;
-  task.promptContext.harnessFiles = [];
-  appendHistoryEvent(task, 'harness-search', `deterministic re-scan, ${verdict.hits.length} hit(s)`);
-  task.implementResponse = verdict.reportText;
-  recordImplement(attempt, { text: task.implementResponse, note: `deterministic recheck: ${verdict.recommendation}` });
-  appendHistoryEvent(task, 'implement-done', `deterministic recheck: ${verdict.recommendation}`);
-  task.critiqueOutcome = 'no-issues';
-  recordCritique(attempt, { outcome: 'no-issues' });
-  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic report, nothing for a critique pass to add)');
-  concludeDraft(task);
-  return { succeeded: true, blocked: false };
-}
-
 // adhoc-shaped tasks ("Process now" queues one of these -- see task-source-registry.js's
 // resolveSourceName() for why this checks the SAME resolved name apply-task.js's own
 // writeArtifact() dispatch uses, not a raw task.domain === 'adhoc' check: this project's
@@ -722,170 +411,6 @@ function runStalenessFastpath(task, attempt) {
 // "revision" of an already-real unified diff would almost certainly corrupt it (diffs are
 // strict, line-based format; a freeform rewrite is not a safe way to edit one) -- every
 // path here returns a final draftTask result directly instead.
-async function draftAdhocBranch(task, {
-  maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
-  draftAdhocViaLocalAgenticWriteFn,
-}) {
-  // Single LOCAL pass: local-agentic-write, multi-turn with real edit/write/run_bash in
-  // an isolated worktree (this is what the deleted Claude adhoc-agentic-draft.js used to
-  // do). Returns a terminal draftTask-shaped verdict (implemented / blocked /
-  // needs-clarification) -- if it can't do the task it BLOCKS for a human. No Claude
-  // fallback. Unconditionally lock-wrapped (always local).
-  //
-  // 2026-09-06, Grimmethy: this used to be a 3-tier escalation (cheap harness-search ->
-  // read-only local-agentic -> this write-capable pass), added 2026-09-01 on the theory
-  // that trying cheap tiers first would save time and that a read-only tier ahead of
-  // write access was a meaningful safety gate. Real production history disproved both:
-  // across 81 real adhoc tasks with a determinable winner, tier1 won 6% of the time and
-  // tier2 won 5% -- the write tier won 89% regardless. Measured tier durations (tier1
-  // avg 138.6s, tier2 avg 198.3s, tier3 avg 247.2s) meant the ~94% of tasks that declined
-  // tier 1 paid its full cost for nothing, and expected-value math across the sample
-  // showed starting every task at this tier directly saves ~55% of total drafting time
-  // vs. the 3-tier cascade. A safety audit before removing tier 2's read-only gate found
-  // zero real incidents of this tier's write access producing a bad edit that a cheaper
-  // read-only pass would have caught (28 live tier-3 tasks' history checked for revert/
-  // bad-edit signals -- zero hits, every decline was the model correctly refusing rather
-  // than writing something wrong; only 2 revert commits exist in this repo's entire git
-  // history and neither involves the adhoc ladder at all).
-  //
-  // Bracketed with an 'implement-started' checkpoint: this is a multi-turn agentic pass
-  // that routinely runs for many minutes, so without it a task killed mid-draft shows
-  // only '... -> plan-done' and the Pipeline History looks cut short. With main()'s
-  // persist hook this lands on disk the moment it fires, so the log shows exactly how
-  // far the draft got. (2026-08-31, Grimmethy: "the task log gets cut short" -- observed
-  // on a stubborn brain-dump adhoc looping in this pass.)
-
-  // PRELIMINARY DECOMPOSE CHECK (2026-09-02): one cheap model call, no tool loop, run
-  // BEFORE the write-agentic pass. A task that is genuinely 5 endpoints + a UI + tests
-  // wastes a full 35-turn agentic pass (and 2 retries) discovering that; catch it here
-  // instead. Only on a FRESH task -- a retry / re-scoped / already-decomposed task has
-  // specific feedback to act on and skips this. The decompose verdict flows straight to
-  // review -> coordinator exactly like a RESOLUTION: decompose from the agentic pass.
-  const preliminaryDecomposeEnabled = process.env.AGENT_MANAGER_PRELIMINARY_DECOMPOSE !== 'false';
-  const isFreshAdhoc = !task.localRejectCount
-    && !(Array.isArray(task.priorRejectionFeedback) && task.priorRejectionFeedback.length)
-    && !task.rescopedFromDecompose
-    && !task.autoDecomposeCount
-    && !task.atomic // a file-decompose child IS the output of a decomposition -- re-splitting it loops
-    && task.adhocResolution !== 'decompose';
-  if (preliminaryDecomposeEnabled && isFreshAdhoc) {
-    const split = await maybeLocked(resolvedCallIsLocal !== false, () => runDecomposePass(task, { mode: 'preliminary', call: resolvedLocalCall }), 'decompose-check');
-    delete task._decomposeHint; // transient -- consumed by preliminaryPrompt above; never persist
-    if (split && split.subTasks.length >= 2) {
-      appendHistoryEvent(task, 'implement-started', `adhoc: preliminary size check -> decompose (${split.subTasks.length} pieces)`);
-      task.adhocResolution = 'decompose';
-      task.subTaskProposals = split.subTasks;
-      task.rawDiff = '';
-      task.implementResponse = `Preliminary size check: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.`;
-      concludeDraft(task);
-      return { succeeded: true, blocked: false };
-    }
-  }
-
-  // Local write-agentic. Returns the same verdict shape the Claude tier did
-  // (succeeded/blocked/blockedReason/needsClarification); a non-succeeded result is a
-  // genuine infra error (retry), everything else is terminal.
-  appendHistoryEvent(task, 'implement-started', 'adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)');
-  // Transient -- buildWriteAgenticPrompt reads it synchronously at the top of
-  // draftAdhocViaLocalAgenticWrite; delete it right after so it is never persisted on the
-  // task (same pattern as runPlanPass's task._seedPlan).
-  if (typeof task.orientNotes === 'string' && task.orientNotes.trim()) {
-    // The pre-plan orient pass (component 3) already mapped this task -- feed its report
-    // in so this pass starts from confirmed findings instead of a blind re-grep.
-    task._priorInvestigation = `Pre-plan orientation report (read-only pass, before the plan):\n\n${task.orientNotes.trim()}`;
-  } else if (task.planWasGrounded && process.env.AGENT_MANAGER_ADHOC_PLAN_GROUNDING !== 'false') {
-    // No agentic exploration ran, but the plan pass built deterministic grounding. Rebuild
-    // it (cheap, no LLM) so this pass starts from verified file content instead of a blind re-grep.
-    try {
-      const g = buildPlanGrounding(task);
-      if (g) task._priorInvestigation = `Deterministic grep grounding (no agentic exploration was run -- verify anything not shown):\n\n${g.text}`;
-    } catch { /* non-fatal */ }
-  }
-  // PRE-FILTER FACT-CHECK: run the same deterministic fact-checker review-task.js uses
-  // (checkDraft) against the text this pass is about to act on -- task.title +
-  // promptContext.rawText + the blind plan (exactly the "ask" text
-  // buildWriteAgenticPrompt assembles -- see local-agentic-write-draft.js) -- and stash
-  // the resulting flags on task.preFilterFlags as an array of { type, detail } entries,
-  // so the write-agentic prompt can warn the drafter up front about, e.g., files the
-  // task claims that do not exist (missing-file / fabricated-commit-reference) instead
-  // of only discovering it mid-loop. Best-effort: any failure (no repoRoot, fact-checker
-  // throwing on an odd shape) leaves task.preFilterFlags untouched and this pass proceeds
-  // exactly as before -- same non-fatal posture as the plan-grounding rebuild above.
-  try {
-    const fcText = [task && task.title,
-      (task && task.promptContext && task.promptContext.rawText) || '',
-      (task && (task.planResponse || task.lastGoodPlan))]
-      .filter((s) => typeof s === 'string' && s.trim()).join('\n\n');
-    if (fcText.trim()) {
-      let fcRepoRoot;
-      let fcExtraRoots = [];
-      try {
-        const cfg = getConfig();
-        fcRepoRoot = cfg.repoRoot;
-        fcExtraRoots = Array.isArray(cfg.grepAllowedDirs) ? cfg.grepAllowedDirs : [];
-      } catch { /* fall through with whatever we have -- checkDraft tolerates it */ }
-      const factCheck = checkDraft(fcText, fcRepoRoot, undefined, fcExtraRoots);
-      // checkDraft returns { flags: [{ type, detail }, ...], ... } -- attach exactly the
-      // flags array (guaranteed to be an array even when empty) per the pre-filter contract.
-      task.preFilterFlags = Array.isArray(factCheck && factCheck.flags) ? factCheck.flags : [];
-    }
-  } catch (err) {
-    console.warn('[local-draft] pre-filter fact-check failed (non-fatal):', err?.message ?? err);
-  }
-  const agenticResult = await maybeLocked(true, () => draftAdhocViaLocalAgenticWriteFn(task, { recordModelCall }), 'local-agentic-write');
-  delete task._priorInvestigation;
-  recordTier(attempt, {
-    tier: 'local-agentic-write',
-    resolution: agenticResult.resolution || task.adhocResolution,
-    blocked: agenticResult.blocked,
-    reason: agenticResult.reason || agenticResult.blockedReason,
-    response: agenticResult.response,
-    rawDiff: agenticResult.capturedDiff || (agenticResult.blocked ? undefined : task.rawDiff),
-    turnsUsed: agenticResult.turnsUsed,
-    toolCallLog: agenticResult.toolCallLog,
-  });
-  appendTierWorkLog(task, { tier: 'local-agentic-write', turnsUsed: agenticResult.turnsUsed, toolCallLog: agenticResult.toolCallLog, finalMessage: agenticResult.response });
-  if (!agenticResult.succeeded) {
-    return { succeeded: false, reason: agenticResult.reason };
-  }
-  if (agenticResult.blocked) {
-    appendHistoryEvent(task, 'blocked', agenticResult.blockedReason);
-    return { succeeded: true, blocked: true, blockedReason: agenticResult.blockedReason };
-  }
-  // 2026-08-24 (RESOLUTION: needs-human-decision, adhoc-agentic-draft.js): a real
-  // open product/design question, not a diff or a sub-task list -- nothing here for
-  // an automatic reviewer to verify against real repo state, so this skips review-
-  // task.js/apply-task.js entirely and goes straight to queue/needs-clarification/
-  // (local-worker.sh's own move-destination branch) for a human to actually answer.
-  // Reuses `needsClarification`'s FIELD NAME (not path_prefetch_resolve's specific
-  // shape) so the dashboard's existing "does this task have needsClarification"
-  // check and Discuss button pick it up; `reason: 'design-decision'` is what
-  // distinguishes this from path_prefetch's own ambiguous/no-match held tasks (see
-  // python/dashboard/app.py's api_discuss_end, which branches on this exact field).
-  // NB by the time execution reaches here, `BLOCKER-TYPE: budget-exhausted` and
-  // `BLOCKER-TYPE: infra-error` have already been intercepted as retryable blocks in
-  // resolveAgenticDraft (agentic-draft-common.js) -- the only thing that still arrives as
-  // needsClarification is a genuine `BLOCKER-TYPE: design-question` (or an untagged real
-  // open question), so the hardcoded reason:'design-decision' is now accurate.
-  if (agenticResult.needsClarification) {
-    // 2026-08-24 (Grimmethy: multiple-choice shortcut) -- options is undefined
-    // (never a key at all, not even null) when the model didn't offer a clean
-    // 2+ option OPTIONS block, so the dashboard's existing `nc.options` check
-    // stays a plain truthy test either way.
-    const options = parseClarificationOptions(task.implementResponse);
-    task.needsClarification = {
-      reason: 'design-decision', openQuestions: task.implementResponse,
-      ...(options ? { options } : {}),
-    };
-    appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
-    appendHistoryEvent(task, 'needs-clarification');
-    return { succeeded: true, blocked: false, needsClarification: true };
-  }
-  appendHistoryEvent(task, 'implement-done', `agentic, ${(task.implementResponse || '').length} chars, resolution=${task.adhocResolution}`);
-  concludeDraft(task);
-  return { succeeded: true, blocked: false };
-}
-
 // research_task (Brain Dump #1 follow-up, 2026-08-17): same reasoning as the adhoc branch
 // -- a real agentic Claude call (WebSearch/WebFetch this time, not
 // Read/Grep/Glob/Edit/Write/Bash against a code repo) already did its own investigation
@@ -893,32 +418,6 @@ async function draftAdhocBranch(task, {
 // would add nothing (there's no repo state to reason about, and "revision" of a research
 // write-up the model already finished is redundant with the normal review-task.js pass
 // this still flows into afterward).
-async function draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn = isClaudePaused, attempt }) {
-  // research_task has no local implementation -- WebSearch/WebFetch are Claude-only. It
-  // runs only when explicitly opted onto Claude AND a token is set AND Claude isn't
-  // paused; otherwise it blocks cleanly for a human (draftTask hoists the same check
-  // ahead of the plan pass, this is defence-in-depth).
-  const claudeStatus = researchClaudeStatus(task, isClaudePausedFn);
-  if (!claudeStatus.ok) {
-    appendHistoryEvent(task, 'blocked', claudeStatus.reason);
-    return { succeeded: true, blocked: true, blockedReason: claudeStatus.reason };
-  }
-  appendHistoryEvent(task, 'implement-started', 'agentic research (WebSearch/WebFetch, multi-turn -- can take minutes)');
-  const researchResult = await draftResearchImplementFn(task, { recordModelCall });
-  if (!researchResult.succeeded) {
-    return { succeeded: false, reason: researchResult.reason };
-  }
-  if (researchResult.blocked) {
-    recordTier(attempt, { tier: 'agentic-research', blocked: true, reason: researchResult.blockedReason });
-    appendHistoryEvent(task, 'blocked', researchResult.blockedReason);
-    return { succeeded: true, blocked: true, blockedReason: researchResult.blockedReason };
-  }
-  recordTier(attempt, { tier: 'agentic-research', resolution: 'implemented', response: task.implementResponse });
-  appendHistoryEvent(task, 'implement-done', `agentic research, ${(task.implementResponse || '').length} chars`);
-  concludeDraft(task);
-  return { succeeded: true, blocked: false };
-}
-
 // Fix (2026-08-31, bra-1788142124203): a plan can clear detectDegenerate (non-empty, no
 // repeat/gibberish loop) while still being useless -- e.g. a lone "1. Inspect the current
 // code" bullet. That stub then reaches implement with no map, and for adhoc the
@@ -999,13 +498,6 @@ function bestPriorPlan(task) {
 // 7170-21381 chars; the smallest observed failure was 7170, so 6000 leaves real margin
 // without needing to hardcode these source names (a future large-context source gets
 // this for free, same discipline as the evidenceText check already established here).
-function computePlanNumPredict(task) {
-  const ctx = task.promptContext;
-  const hasLargeEvidenceBundle = !!(ctx && ctx.evidenceText && ctx.evidenceText.length > 10000);
-  const hasLargePromptContext = !!(ctx && JSON.stringify(ctx).length > 6000);
-  return (ctx && ctx.brainDumpEntryId) || hasLargeEvidenceBundle || hasLargePromptContext ? 2800 : 1400;
-}
-
 // The plan pass plus its harness-search grounding step. Mutates task.planResponse (and,
 // for a harnessSearch source, task.promptContext.harnessHits/searchResults) and emits the
 // plan-done / harness-search history events. Returns { blocked: true, blockedReason } --
@@ -1220,110 +712,6 @@ async function runPlanPass(task, {
 // tryDeterministicLiteralEdit below, which still lets a plan pass run) since there is no
 // judgment call left at all for this move kind -- skipping the plan/orient passes too,
 // not just implement.
-function tryDeterministicScriptExtractEdit(task, attempt) {
-  const ctx = task.promptContext;
-  if (!(ctx && ctx.deterministicApply === 'script-extract' && ctx.sourceFile && ctx.newFile && Array.isArray(ctx.symbols) && ctx.symbols.length)) {
-    return null;
-  }
-  let repoRoot;
-  try { ({ repoRoot } = getConfig()); } catch { return null; }
-  if (!repoRoot) return null;
-
-  // 2026-09-09, root-caused live (file-decompose-hub-autodecomp-adhoc-add-job-stage-
-  // groups-...): this used to always read the plain repoRoot working tree, which for a
-  // stacked file-decompose sub-task is main's content, not the shared stacked branch's --
-  // already missing earlier sibling moves already extracted from it. The `find`/`replace`
-  // pair below got built from the wrong base, so it verified fine in isolation (against
-  // itself) but failed a real `git apply` once actually applied to the real stacked
-  // branch. Same missing concept already fixed at 5 other call sites via
-  // stacked-grounding.js's resolveGroundingRef -- groundingRef is null for any non-stacked
-  // task, so every non-stacked caller reads exactly as before.
-  const groundingRef = resolveGroundingRef(task, repoRoot);
-  let html;
-  if (groundingRef) {
-    html = readFileAtRef(repoRoot, groundingRef, ctx.sourceFile);
-    if (html === null) return null;
-  } else {
-    const absSource = path.join(repoRoot, ctx.sourceFile);
-    try { html = fs.readFileSync(absSource, 'utf8'); } catch { return null; }
-  }
-
-  // isHtml (2026-09-08, Grimmethy: "Yes, please build it" -- see script-extract.js's own
-  // header for the review-task.js incident this closes): a plain .js/.mjs/.cjs source now
-  // ALSO gets this deterministic short-circuit, not just .html -- buildExtraction returns
-  // `newSource` (the whole rewritten file) instead of `newHtml` for that case, since there
-  // is no <script> tag/insertion-point rewriting to do.
-  const isHtml = /\.html?$/.test(ctx.sourceFile);
-  const { buildExtraction } = require('./script-extract.js');
-  const extraction = buildExtraction(html, ctx.symbols, { isHtml });
-  if (!extraction.ok) {
-    // Drifted since plan-validation time (e.g. an earlier stacked move on this same
-    // branch already touched the file) -- fall through to the normal path rather than
-    // trust a check that's no longer true. Advisory only, never a block: the model-
-    // driven path below is exactly what would have run if this short-circuit didn't
-    // exist at all.
-    appendHistoryEvent(task, 'advisory', `deterministic script-extract check no longer holds (${extraction.problems.map((p) => `${p.name}: ${p.status}`).join('; ')}) -- falling through to the normal drafting path`);
-    return null;
-  }
-
-  const groupBChanges = [
-    { mode: 'create', file: ctx.newFile, content: extraction.newFileContent },
-    { mode: 'edit', file: ctx.sourceFile, find: html, replace: isHtml ? extraction.newHtml : extraction.newSource },
-  ];
-
-  // adhoc-domain tasks apply via applyAdhocDiff (apply-task.js's writeArtifact ->
-  // source.apply), which reads task.rawDiff -- a REAL unified diff -- and has never
-  // looked at task.implementResponse at all. Real incident, 2026-09-07: this short-
-  // circuit originally only ever set task.implementResponse to the Group-B JSON above,
-  // so review correctly verified and approved it, then apply silently did nothing at
-  // all ("adhoc agentic draft produced no diff") because task.rawDiff was never set --
-  // the task landed in queue/done/ marked succeeded despite zero real changes reaching
-  // the repo. group-b-worktree-diff.js already exists for exactly this conversion (the
-  // adhoc write-tier's own real diffs are produced the identical way) -- reused here
-  // rather than hand-rolling unified-diff text, so the SAME proven git-apply-verified
-  // path produces it. It also re-confirms the Group-B change still applies cleanly
-  // against real origin/<main> content (not just the repoRoot snapshot read above),
-  // throwing (caught below, falls through to the normal path) if that has ALSO drifted.
-  // `task` passed through (2026-09-09) so a stacked sub-task's diff is captured against
-  // its own shared branch, not main -- see captureGroupBDiffInWorktree's own header for
-  // the real incident this closes.
-  const { pipelineDir } = getConfig();
-  let rawDiff;
-  try {
-    const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
-    rawDiff = captureGroupBDiffInWorktree({
-      repoRoot, pipelineDir, implementResponse: JSON.stringify(groupBChanges), worktreeSuffix: task.id, task,
-    });
-  } catch (e) {
-    appendHistoryEvent(task, 'advisory', `deterministic script-extract diff capture failed (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
-    return null;
-  }
-  if (!rawDiff) {
-    appendHistoryEvent(task, 'advisory', 'deterministic script-extract move produced an empty diff against real origin content -- falling through to the normal drafting path');
-    return null;
-  }
-
-  task.planResponse = 'Deterministic script-extract move: every named symbol resolves to a real, unambiguous top-level function declaration via script-extract.js\'s V8-parser oracle -- no search terms or model judgment needed.';
-  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
-  appendHistoryEvent(task, 'plan-done', 'deterministic script-extract, no model call');
-
-  // implementResponse (the Group-B JSON) stays -- this is what review's own
-  // verifyDeterministicScriptExtractDraft gate inspects. rawDiff (the real unified diff,
-  // just captured above) is the separate field apply actually consumes for an adhoc task.
-  task.implementResponse = JSON.stringify(groupBChanges);
-  task.rawDiff = rawDiff;
-  task.adhocResolution = 'implemented';
-  recordImplement(attempt, { text: task.implementResponse, note: `deterministic script-extract move (${ctx.symbols.length} symbol(s), V8-parser-verified)` });
-  appendHistoryEvent(task, 'implement-done', `deterministic script-extract move: ${ctx.symbols.length} symbol(s) moved to ${ctx.newFile}, no model call`);
-
-  task.critiqueOutcome = 'no-issues';
-  recordCritique(attempt, { outcome: 'no-issues' });
-  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic move, nothing for a critique pass to add)');
-
-  concludeDraft(task);
-  return { succeeded: true, blocked: false };
-}
-
 // Deterministic ONE-PASS decompose ([[hub-task-integration]], spec Docs/hub-task-independent-
 // merge.md Tier 1, 2026-09-09). Same idea as tryDeterministicScriptExtractEdit above but for
 // a WHOLE fully-mechanical HTML file-decompose: file-decompose-to-hub.js files one task with
@@ -1333,62 +721,6 @@ function tryDeterministicScriptExtractEdit(task, attempt) {
 // captures the real diff against fresh origin/<main> -- so the split lands as ONE verified
 // commit that can't go days-stale. Falls through (returns null) if any symbol no longer
 // resolves cleanly against the current file.
-function tryDeterministicOnePassDecompose(task, attempt) {
-  const ctx = task.promptContext;
-  if (!(ctx && ctx.deterministicApply === 'one-pass-decompose' && ctx.sourceFile
-        && Array.isArray(ctx.moves) && ctx.moves.length >= 2)) {
-    return null;
-  }
-  let repoRoot; let pipelineDir;
-  try { ({ repoRoot, pipelineDir } = getConfig()); } catch { return null; }
-  if (!repoRoot) return null;
-
-  // Never stacked -- read the plain working tree (the worktree diff capture below
-  // re-verifies against real origin/<main>).
-  let sourceText;
-  try { sourceText = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch { return null; }
-
-  const { buildOnePassGroupBChanges } = require('./decompose-one-pass.js');
-  const built = buildOnePassGroupBChanges(sourceText, ctx.sourceFile, ctx.moves);
-  if (!built.ok) {
-    appendHistoryEvent(task, 'advisory', `deterministic one-pass decompose not applicable (${built.reason}) -- falling through to the normal drafting path`);
-    return null;
-  }
-
-  let rawDiff;
-  try {
-    const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
-    rawDiff = captureGroupBDiffInWorktree({
-      repoRoot, pipelineDir, implementResponse: JSON.stringify(built.changes), worktreeSuffix: task.id, task,
-    });
-  } catch (e) {
-    appendHistoryEvent(task, 'advisory', `deterministic one-pass decompose diff capture failed (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
-    return null;
-  }
-  if (!rawDiff) {
-    appendHistoryEvent(task, 'advisory', 'deterministic one-pass decompose produced an empty diff against real origin content -- falling through to the normal drafting path');
-    return null;
-  }
-
-  const symCount = ctx.moves.reduce((n, m) => n + (m.symbols || []).length, 0);
-  task.planResponse = `Deterministic one-pass decomposition: ${ctx.moves.length} module(s), ${symCount} symbol(s), every one a V8-parser-verified top-level declaration -- no model judgment needed.`;
-  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
-  appendHistoryEvent(task, 'plan-done', 'deterministic one-pass decompose, no model call');
-
-  task.implementResponse = JSON.stringify(built.changes);
-  task.rawDiff = rawDiff;
-  task.adhocResolution = 'implemented';
-  recordImplement(attempt, { text: task.implementResponse, note: `deterministic one-pass decompose (${ctx.moves.length} module(s), ${symCount} symbol(s), V8-parser-verified)` });
-  appendHistoryEvent(task, 'implement-done', `deterministic one-pass decompose: ${symCount} symbol(s) into ${ctx.moves.length} module(s) + <script> wiring, no model call`);
-
-  task.critiqueOutcome = 'no-issues';
-  recordCritique(attempt, { outcome: 'no-issues' });
-  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic move, nothing for a critique pass to add)');
-
-  concludeDraft(task);
-  return { succeeded: true, blocked: false };
-}
-
 // Deterministic ONE-PASS CommonJS decompose ([[hub-task-integration]], 2026-09-09). The
 // src/*.js analogue of tryDeterministicOnePassDecompose above: file-decompose-to-hub.js
 // files one task with promptContext.deterministicApply='node-module-decompose' when every
@@ -1398,75 +730,6 @@ function tryDeterministicOnePassDecompose(task, attempt) {
 // module.exports untouched) as one Group-B change set, no model call. Falls through
 // (returns null) if a symbol no longer resolves or a move stopped being self-contained
 // against the current file, or if any produced file fails `node --check`.
-function tryDeterministicNodeModuleDecompose(task, attempt) {
-  const ctx = task.promptContext;
-  if (!(ctx && ctx.deterministicApply === 'node-module-decompose' && ctx.sourceFile
-        && Array.isArray(ctx.moves) && ctx.moves.length >= 1)) {
-    return null;
-  }
-  let repoRoot; let pipelineDir;
-  try { ({ repoRoot, pipelineDir } = getConfig()); } catch { return null; }
-  if (!repoRoot) return null;
-
-  let sourceText;
-  try { sourceText = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch { return null; }
-
-  const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
-  const built = buildNodeModuleOnePassChanges(sourceText, ctx.sourceFile, ctx.moves, repoRoot);
-  if (!built.ok) {
-    appendHistoryEvent(task, 'advisory', `deterministic node-module decompose not applicable (${built.reason}) -- falling through to the normal drafting path`);
-    return null;
-  }
-
-  // 2026-09-14 removed: a redundant, ADDITIONAL parse-check here (`new vm.Script(text)`
-  // on every produced file) that was strictly WEAKER than buildNodeModuleOnePassChanges's
-  // own firstNodeCheckError just above (real `node --check`, added later -- 2026-09-09
-  // incident, see decompose-node-module.js's own header) -- and actively WRONG for a
-  // common, valid pattern: `new vm.Script(text)` compiles `text` as a bare top-level
-  // script with NO CommonJS module wrapper, so a perfectly legal top-level `return`
-  // inside `if (require.main === module) { ... return; }` (this codebase's own standard
-  // CLI-entry-point guard, e.g. task-sources.js's own --priority-map/--pending-readiness
-  // handlers) throws "Illegal return statement" here even though real `node --check` (and
-  // real `require()`) both correctly treat it as legal, since Node's actual module
-  // wrapper IS a function. Caught live 2026-09-14: task-sources.js's own deterministic
-  // decompose fell through to the full agentic drafting path on every single attempt,
-  // purely because of this false positive -- `built.ok` above already proves the file
-  // parses and requires cleanly; this check added nothing but a stricter, buggier retest.
-
-  let rawDiff;
-  try {
-    const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
-    rawDiff = captureGroupBDiffInWorktree({
-      repoRoot, pipelineDir, implementResponse: JSON.stringify(built.changes), worktreeSuffix: task.id, task,
-    });
-  } catch (e) {
-    appendHistoryEvent(task, 'advisory', `deterministic node-module decompose diff capture failed (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
-    return null;
-  }
-  if (!rawDiff) {
-    appendHistoryEvent(task, 'advisory', 'deterministic node-module decompose produced an empty diff against real origin content -- falling through to the normal drafting path');
-    return null;
-  }
-
-  const symCount = ctx.moves.reduce((n, m) => n + (m.symbols || []).length, 0);
-  task.planResponse = `Deterministic one-pass CommonJS decomposition: ${ctx.moves.length} module(s), ${symCount} function(s), every one a V8-parser-verified self-contained top-level declaration -- no model judgment needed.`;
-  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
-  appendHistoryEvent(task, 'plan-done', 'deterministic node-module decompose, no model call');
-
-  task.implementResponse = JSON.stringify(built.changes);
-  task.rawDiff = rawDiff;
-  task.adhocResolution = 'implemented';
-  recordImplement(attempt, { text: task.implementResponse, note: `deterministic node-module decompose (${ctx.moves.length} module(s), ${symCount} function(s), V8-parser-verified)` });
-  appendHistoryEvent(task, 'implement-done', `deterministic node-module decompose: ${symCount} function(s) into ${ctx.moves.length} module(s) + require() wiring, no model call`);
-
-  task.critiqueOutcome = 'no-issues';
-  recordCritique(attempt, { outcome: 'no-issues' });
-  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic move, nothing for a critique pass to add)');
-
-  concludeDraft(task);
-  return { succeeded: true, blocked: false };
-}
-
 // Deterministic ONE-PASS Flask-Blueprint decompose ([[hub-task-integration]], 2026-09-09).
 // The .py analogue of the two functions above: file-decompose-to-hub.js files one task
 // with promptContext.deterministicApply='blueprint-decompose' when every move is a
@@ -1477,62 +740,6 @@ function tryDeterministicNodeModuleDecompose(task, attempt) {
 // budget orienting on a large app.py and runs out before the edits (the 2026-09-09
 // blueprint hub: ~4 attempts per child, brain-dump failed all 6). Falls through (returns
 // null) on any drift / compile failure / empty diff.
-function tryDeterministicBlueprintDecompose(task, attempt) {
-  const ctx = task.promptContext;
-  if (!(ctx && ctx.deterministicApply === 'blueprint-decompose' && ctx.sourceFile
-        && Array.isArray(ctx.moves) && ctx.moves.length >= 1)) {
-    return null;
-  }
-  let repoRoot; let pipelineDir;
-  try { ({ repoRoot, pipelineDir } = getConfig()); } catch { return null; }
-  if (!repoRoot) return null;
-
-  let sourceText;
-  try { sourceText = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch { return null; }
-
-  const { buildBlueprintOnePassChanges } = require('./decompose-flask-blueprint.js');
-  const built = buildBlueprintOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
-  if (!built.ok) {
-    appendHistoryEvent(task, 'advisory', `deterministic blueprint decompose not applicable (${built.reason}) -- falling through to the normal drafting path`);
-    return null;
-  }
-  // buildBlueprintOnePassChanges already runs `python3 -m py_compile` on every produced
-  // file before returning ok -- no separate parse check needed here.
-
-  let rawDiff;
-  try {
-    const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
-    rawDiff = captureGroupBDiffInWorktree({
-      repoRoot, pipelineDir, implementResponse: JSON.stringify(built.changes), worktreeSuffix: task.id, task,
-    });
-  } catch (e) {
-    appendHistoryEvent(task, 'advisory', `deterministic blueprint decompose diff capture failed (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
-    return null;
-  }
-  if (!rawDiff) {
-    appendHistoryEvent(task, 'advisory', 'deterministic blueprint decompose produced an empty diff against real origin content -- falling through to the normal drafting path');
-    return null;
-  }
-
-  const routeCount = ctx.moves.reduce((n, m) => n + (m.symbols || []).length, 0);
-  task.planResponse = `Deterministic one-pass Flask-Blueprint decomposition: ${ctx.moves.length} blueprint(s), ${routeCount} route(s), AST-extracted + py_compile-verified -- no model judgment needed.`;
-  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
-  appendHistoryEvent(task, 'plan-done', 'deterministic blueprint decompose, no model call');
-
-  task.implementResponse = JSON.stringify(built.changes);
-  task.rawDiff = rawDiff;
-  task.adhocResolution = 'implemented';
-  recordImplement(attempt, { text: task.implementResponse, note: `deterministic blueprint decompose (${ctx.moves.length} blueprint(s), ${routeCount} route(s), AST + py_compile)` });
-  appendHistoryEvent(task, 'implement-done', `deterministic blueprint decompose: ${routeCount} route(s) into ${ctx.moves.length} blueprint(s) + register_blueprint wiring, no model call`);
-
-  task.critiqueOutcome = 'no-issues';
-  recordCritique(attempt, { outcome: 'no-issues' });
-  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic move, nothing for a critique pass to add)');
-
-  concludeDraft(task);
-  return { succeeded: true, blocked: false };
-}
-
 // Deterministic find/replace short-circuit (2026-08-23, Grimmethy: "build it" -- caught
 // live via a Grill-skills adhoc task exhausting both retries because the model couldn't
 // reliably reproduce a 4362-char fixedLiterals block character-for-character in a JSON
@@ -1546,27 +753,6 @@ function tryDeterministicBlueprintDecompose(task, attempt) {
 // adhoc-shaped task authored this way never even reaches the expensive Claude agentic
 // tiers for something that needed zero real reasoning. Returns the finished draftTask
 // result when it constructed the edit directly, else null.
-function tryDeterministicLiteralEdit(task, attempt) {
-  const literalEditLiterals = (task.promptContext && Array.isArray(task.promptContext.fixedLiterals))
-    ? task.promptContext.fixedLiterals
-    : [];
-  if (!(task.promptContext && typeof task.promptContext.file === 'string' && task.promptContext.file
-    && typeof task.promptContext.find === 'string' && task.promptContext.find
-    && literalEditLiterals.length === 1 && typeof literalEditLiterals[0].content === 'string' && literalEditLiterals[0].content)) {
-    return null;
-  }
-  task.implementResponse = JSON.stringify({
-    mode: 'edit',
-    file: task.promptContext.file,
-    find: task.promptContext.find,
-    replace: literalEditLiterals[0].content,
-  });
-  recordImplement(attempt, { text: task.implementResponse, note: 'deterministic find/replace (fully specified in the task)' });
-  appendHistoryEvent(task, 'implement-done', 'deterministic find/replace (file, find, and the single fixedLiterals block were all fully specified in the task -- constructed directly instead of asking the model to reproduce content it was already handed verbatim)');
-  concludeDraft(task);
-  return { succeeded: true, blocked: false };
-}
-
 // Critique + revision: a second, independent model call reviews the drafter's own
 // implement output before it ever reaches the review queue. Mutates task.critiqueOutcome
 // (and, when issues were flagged, task.critiqueText / task.implementResponse /
@@ -1591,121 +777,6 @@ function tryDeterministicLiteralEdit(task, attempt) {
 // model does the judgment and measurably made it worse), this changes nothing about
 // model choice or the judgment itself -- it only removes a self-review layer already
 // shown, on real data, to almost never do anything.
-async function runCritiqueAndRevision(task, {
-  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
-}) {
-  if (isAdvisoryProseSource(resolveSourceName(task))) {
-    return;
-  }
-
-  // Advisory pre-critique fact-check on the IMPLEMENT RESPONSE (brain-dump
-  // bd-1788725054994): missingFileCheck (src/draft-file-guard.js -- a pure checkDraft
-  // wrapper) flags file paths the draft names that do not exist in the repo and are not
-  // its own create targets. Merged into task.preFilterFlags so buildCritiquePrompt
-  // surfaces them to the critic as leads. Deliberately NOT a hard block: checkFilePaths
-  // over-matches prose/example paths, which is exactly why review-task.js has always
-  // treated missing-file as a reviewer hint, never an auto-reject. Best-effort -- any
-  // failure leaves task.preFilterFlags untouched and critique proceeds unchanged.
-  try {
-    const cfg = getConfig();
-    const { missing } = require('./draft-file-guard.js').missingFileCheck(
-      task.implementResponse || '',
-      cfg.repoRoot,
-      Array.isArray(cfg.grepAllowedDirs) ? cfg.grepAllowedDirs : [],
-    );
-    if (Array.isArray(missing) && missing.length) {
-      const existing = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
-      const seen = new Set(existing.map((f) => `${f.type} ${f.detail}`));
-      const added = missing
-        .map((p) => ({ type: 'missing-file', detail: p }))
-        .filter((f) => !seen.has(`${f.type} ${f.detail}`));
-      if (added.length) task.preFilterFlags = [...existing, ...added];
-    }
-  } catch (err) {
-    console.warn('[local-draft] pre-critique missing-file check failed (advisory):', (err && err.message) || err);
-  }
-
-  const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
-  let startedAt = new Date().toISOString();
-  let startMs = Date.now();
-  const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source, taskId: task.id, stage: 'critique' }), 'critique');
-  // Records the critique (and, when triggered, revise) call into model-stats.db -- see
-  // runPlanPass's own identical comment for the full incident this closes (2026-09-06,
-  // Grimmethy: "We need to fix cost tracking before we can even begin to properly work
-  // on this problem").
-  if (recordModelCall) {
-    recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: critiqueResult, source: task.source, stage: 'critique' });
-  }
-
-  // Gate critique-done on a grounding check: for sources whose drafts cite REAL code
-  // (deep_dive, or any registered source with its own postImplementCheck), an ungrounded
-  // draft must not reach the review queue -- block it right here, before any revise call
-  // or degenerate/no-issues assignment. Advisory: a throwing check never blocks a real
-  // draft (same contract as the postImplementCheck disposition in runImplementPass).
-  {
-    const src = resolveSourceName(task);
-    const regEntry = getRegisteredSource(src);
-    const realFiles = (task.promptContext && Array.isArray(task.promptContext.files))
-      ? task.promptContext.files.filter((f) => f && typeof f.content === 'string')
-      : [];
-    if (realFiles.length > 0 && (src === 'deep_dive' || (regEntry && typeof regEntry.postImplementCheck === 'function'))) {
-      let groundingVerdict = null;
-      try {
-        groundingVerdict = await require('./deep-dive-grounding-check.js').runGroundingCheck(task, task.implementResponse, { call: resolvedLocalCall });
-      } catch (e) {
-        console.warn('[local-draft] grounding check failed (advisory):', (e && e.message) || e);
-      }
-      if (groundingVerdict && groundingVerdict.verdict === 'ungrounded') {
-        const blockedReason = `Ungrounded draft: ${String(groundingVerdict.reason || '(no detail)')}`.slice(0, 500);
-        task.critiqueOutcome = 'grounding-failed';
-        task.blockedStage = 'review';
-        task.blockedReason = blockedReason;
-        task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
-        task.priorRejectionFeedback.push(blockedReason);
-        recordCritique(attempt, { outcome: 'grounding-failed' });
-        appendHistoryEvent(task, 'critique-done', blockedReason);
-        return;
-      }
-    }
-  }
-
-  // task.critiqueOutcome is a STRING enum, NOT an object: it has no `.facts` property.
-  // The only values it ever holds are the four outcome literals assigned just below
-  // ('no-issues' | 'grounding-failed' | 'critique-degenerate' | 'issues-flagged').
-  // Structured findings live in a SEPARATE field -- task.preFilterFlags (an
-  // Array<{ type: string, detail: string }>, populated by the pre-filter fact-check
-  // and the missingFileCheck advisory above) -- NOT on critiqueOutcome itself.
-  /** @type {'no-issues'|'grounding-failed'|'critique-degenerate'|'issues-flagged'} */
-  if (critiqueResult.degenerate) {
-    task.critiqueOutcome = 'critique-degenerate';
-  } else if (critiqueResult.response.trim() === 'NO ISSUES FOUND') {
-    task.critiqueOutcome = 'no-issues';
-  } else {
-    task.critiqueOutcome = 'issues-flagged';
-    // 2026-08-24 (pipeline hardening): only the OUTCOME enum used to survive past this
-    // function -- the actual critique text was discarded the moment the revision call
-    // finished, so review-task.js's buildVerdictPrompt had no way to show a reviewer
-    // what the critique actually found, even when a revision WAS applied and the
-    // reviewer might want to verify it really addressed those specific points.
-    task.critiqueText = critiqueResult.response;
-    const revisePrompt = buildRevisionPrompt(task, task.planResponse, task.implementResponse, critiqueResult.response);
-    startedAt = new Date().toISOString();
-    startMs = Date.now();
-    const reviseResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: revisePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 1400, source: task.source, taskId: task.id, stage: 'revise' }), 'revise');
-    if (recordModelCall) {
-      recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reviseResult, source: task.source, stage: 'revise' });
-    }
-    if (!reviseResult.degenerate) {
-      task.implementResponse = reviseResult.response;
-      task.revisionApplied = true;
-    }
-    // Revision came back degenerate: bounded to one attempt, leave original draft
-    // intact rather than lose a working draft to a bad revision call.
-  }
-  recordCritique(attempt, { outcome: task.critiqueOutcome, revised: !!task.revisionApplied });
-  appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
-}
-
 // 2026-09-07, Grimmethy: "If we need to go higher the task can request the 3b model be
 // dropped until the end of that task." A call using EXTENDED_NUM_CTX (see gpu-capacity.js's
 // own comment on it) doesn't fit on this box alongside the resident qwen2.5:3b utility
@@ -1734,184 +805,11 @@ async function runCritiqueAndRevision(task, {
 //      below, which adds a generous timeout bump specifically for that one call instead
 //      of leaving it to race the same 150-240s ceiling a fresh multi-minute tensor load
 //      from disk has no chance of finishing inside.
-async function ensureHeadroomForExtendedContext(implNumCtx, task) {
-  if (!(implNumCtx > PINNED_NUM_CTX)) return { evicted: false };
-  const smallModel = getModelProfile('brain-dump-cheap-local')?.model;
-  if (!smallModel) return { evicted: false };
-  const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
-  let succeeded = false;
-  let errorMessage = null;
-  try {
-    await postJson(`${ollamaUrl}/api/generate`, { model: smallModel, keep_alive: 0 }, 10_000);
-    succeeded = true;
-  } catch (err) {
-    // best-effort -- see comment above -- but still logged below either way.
-    errorMessage = String((err && err.message) || err).slice(0, 300);
-  }
-  try {
-    const { pipelineDir } = getConfig();
-    logPipelineEvent(pipelineDir, 'model-eviction', {
-      taskId: task && task.id, source: task && task.source, implNumCtx,
-      evictedModel: smallModel, succeeded, errorMessage,
-      instanceId: process.env.AGENT_MANAGER_INSTANCE_ID || null,
-    });
-  } catch { /* best-effort -- see logPipelineEvent's own header */ }
-  return { evicted: succeeded };
-}
-
 // Token budget for the implement pass: how many tokens it may generate (implNumPredict),
 // the context window that has to hold prompt + thinking trace + that output (implNumCtx),
 // whether the task carries fixedLiterals to transcribe verbatim (hasFixedLiterals), and
 // whether an empty implement response is a valid answer for this source
 // (allowEmptyImplement). Pure -- derived from the task and the built implement prompt.
-function computeImplementBudget(task, implPrompt) {
-  // A fixedLiterals task must reproduce that content verbatim, character for
-  // character, inside a JSON string value -- JSON-string-escaping alone (every
-  // newline becomes a literal \n) inflates the character count well above the raw
-  // source, and generation is token-bounded, not character-bounded. The flat 1400
-  // cap silently truncated mid-file on a real 190-line fixedLiterals task (confirmed
-  // live 2026-08-14: a 6135-char literal, escaping to ~6900 JSON chars, cut off at
-  // 5024 chars of output -- caught downstream as "Unterminated string in JSON", not
-  // as the token-budget problem it actually was). ~3 chars/token is a conservative
-  // (i.e. UNDER-estimating true token count, so this errs toward too much budget
-  // rather than too little) ratio for English/code mixed text; the 2x multiplier
-  // covers JSON-escaping overhead plus the surrounding {"mode":...,"content":...}
-  // envelope. Floor keeps the original 1400 for every task that never had this
-  // problem; ceiling bounds worst-case latency/cost for a pathologically large task.
-  const fixedLiteralsChars = (task.promptContext && Array.isArray(task.promptContext.fixedLiterals))
-    ? task.promptContext.fixedLiterals.reduce((sum, lit) => sum + (lit.content ? lit.content.length : 0), 0)
-    : 0;
-  const hasFixedLiterals = fixedLiteralsChars > 0;
-  // Non-fixedLiterals tasks still run think:true below, so the same starvation this
-  // comment block documents for fixedLiterals (reasoning trace consuming the budget
-  // before real output is produced) applies to them too -- 1400 was too tight even
-  // before accounting for a thinking trace. A flat 2800 floor (tried live 2026-08-16)
-  // cleared small/medium tasks but still truncated large multi-file ones -- a
-  // 4912-char plan (8 files: chat-server.js, tool-registry.js, priority-scheduler.js,
-  // agent-manager.js, ChatPopup.tsx, ToolTogglePanel.tsx, useChatSocket.ts, plus
-  // message-protocol.js) cut off after only 1 of 8 files at 4061 output chars, and a
-  // 2155-char plan cut off mid-function at 3088 chars. Scaling by plan size (same
-  // principle as the fixedLiterals content-derived floor above, just keyed off the
-  // plan instead of literal content since there's no literal to measure) tracks task
-  // complexity better than either flat number: a plan enumerating many files/steps is
-  // the leading signal for how much output the implement pass will need. ~2 chars of
-  // plan per token of implement output is calibrated to comfortably clear both
-  // real-world cutoffs above; floor keeps the 2800 that already worked for
-  // small/medium tasks, ceiling bounds worst-case latency/cost.
-  const planChars = (task.planResponse || '').length;
-  // product_spec (confirmed live 2026-08-20, romance-plugin's first bootstrap run):
-  // this source's implement pass produces a whole standalone document (entities,
-  // relationships, a state machine, an API table, decisions) rather than a bounded
-  // code diff -- the SAME planChars*2 scaling that comfortably covers "8 files changed"
-  // for a code task genuinely undershoots "write the full spec," and got caught mid-
-  // document by review's truncation check (correctly -- the alternative is a silently
-  // incomplete spec landing as though it were complete). Every OTHER Group B source's
-  // output is bounded by how much of an existing file it's allowed to touch; a spec
-  // doc has no such natural ceiling, so it gets a higher one instead of the shared
-  // 8000-token cap "bounds worst-case latency/cost" default.
-  // backlog_decomposition (2026-08-20): same "whole document, no natural ceiling"
-  // class as product_spec right above -- its implement pass writes MULTIPLE full
-  // AC-NNN candidate write-ups (Problem/Solution/Benefits each) in one call, easily
-  // exceeding what a single code diff needs. product_spec_outline (2026-08-30) is the
-  // brownfield analogue of backlog_decomposition -- it writes the same multi-candidate
-  // AC-NNN block list -- so it belongs in the same higher-ceiling class.
-  // pipeline_forensics (2026-09-01): the same "whole document, no natural ceiling" class
-  // as product_spec -- its implement pass writes a full ranked root-cause report (RANKING /
-  // CONTRAST / RECOMMENDED FIX). But its PLAN is deliberately tiny (2-3 `QUERY:` lines), so
-  // the planChars*2 floor lands on 2800 -- and think:true then spends that entire budget on
-  // the reasoning trace, emitting zero final content (confirmed live on the first real run:
-  // eval_count 2800, implementResponse empty). Its "how much output" signal is the evidence
-  // blob, not the plan, so it gets its own higher floor plus the 16000 ceiling.
-  // pipeline_debrief (2026-09-06): the identical shape -- a full What/So-What/Now-What
-  // report over an evidence blob (debrief-bundle.js), tiny plan. Confirmed live: 2 real
-  // debrief tasks blocked "Plan pass degenerate: truncated"/"Implement pass degenerate:
-  // truncated" back to back, one of them AFTER its plan pass succeeded -- the implement
-  // pass alone still exhausted the un-widened 2800 floor. Belongs in this class for the
-  // exact reason pipeline_forensics does.
-  const isWholeDocReport = task.source === 'pipeline_forensics' || task.source === 'pipeline_debrief';
-  const implNumPredictCeiling = (task.source === 'product_spec' || task.source === 'backlog_decomposition' || task.source === 'product_spec_outline' || isWholeDocReport) ? 16000 : 8000;
-  const forensicsFloor = isWholeDocReport
-    ? Math.max(6000, Math.ceil(((task.promptContext && task.promptContext.evidenceText) || '').length / 8))
-    : 2800;
-  const implNumPredict = hasFixedLiterals
-    ? Math.min(implNumPredictCeiling, Math.max(1400, fixedLiteralsChars))
-    : Math.min(implNumPredictCeiling, Math.max(forensicsFloor, planChars * 2));
-  // think:false when fixedLiterals are present -- num_predict is a cap on TOTAL
-  // generated tokens, thinking trace included, so a "think" pass spent reasoning
-  // about a plain transcription task eats directly into the same budget the actual
-  // output needs. Confirmed live 2026-08-14: raising numPredict from 1400 to 2908
-  // for a 4362-char fixedLiterals task STILL truncated at exactly the same char
-  // count as the too-small budget before it -- the extra room was being consumed by
-  // reasoning, not reaching the output at all. There is nothing to reason about when
-  // the task is "copy this exact block character-for-character" -- skip thinking
-  // entirely and hand the full budget to the transcription itself.
-  //
-  // num_ctx must cover prompt + thinking trace + output together, not just output --
-  // the 8192 callOnce default was sized for the old flat 1400 numPredict, so scaling
-  // numPredict up to 8000 without also raising this would let the context window
-  // itself truncate (silently dropping the oldest prompt tokens, e.g. the task
-  // instructions) before generation even gets to use the larger output budget. Model
-  // supports up to 262144 (`ollama show ornith:35b`), so there's ample headroom;
-  // ~3 chars/token for the prompt (same conservative ratio used above) plus the full
-  // output budget plus a fixed margin for the thinking trace.
-  //
-  // FLOOR at PINNED_NUM_CTX (2026-08-31): Ollama fully reloads the model on ANY num_ctx
-  // change (~55-100s for the 27B). This value used to vary per-prompt and usually landed
-  // on the 8192 floor -- so every draft flipped num_ctx away from the plan pass's and the
-  // Chat tool-loop's PINNED_NUM_CTX and paid a reload, WHILE HOLDING the single-flight GPU
-  // lock. Confirmed live as the cause of `flock -w 600` lock-acquisition timeouts under
-  // 3-way lane contention (worker-1 + worker-reasoning + reviewer), which requeued adhoc
-  // drafts indefinitely. Raising the floor to PINNED_NUM_CTX makes the normal case a
-  // single stable value shared with every other local-model call -> no reload. The
-  // computed need is almost always below the floor anyway; only the whole-document
-  // sources (product_spec family, implNumPredict up to 16000) still grow past it, and a
-  // one-time reload there beats a truncated spec.
-  const implNumCtx = Math.min(EXTENDED_NUM_CTX, Math.max(PINNED_NUM_CTX, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
-  // Several sources' implement prompts explicitly tell the local model to output the empty
-  // string when nothing genuinely applies (see prompts.js) -- an empty response from
-  // them is a valid, intended answer, not a failed call, so the degenerate-output
-  // detector's 'empty' check must not fire for them (see local-client.js's call()
-  // comment for the live-confirmed backlog this caused). The candidateFulfillment
-  // ones (arch_review/arch_import_review/observability_fix/performance_fix/
-  // backlog_fulfillment/...) are grounded in real fetched file content and explicitly
-  // told to output empty rather than fabricate a find/replace when the named file(s)
-  // couldn't be read -- a legitimate, expected outcome, same reasoning as arch_import's
-  // own empty-on-no-match case. isEmptyApprovalSource() reads this straight off each
-  // source's own registerTaskSource() entry now (see its own comment above) instead of
-  // a hardcoded array.
-  const allowEmptyImplement = isEmptyApprovalSource(task.source);
-  // pipeline_forensics: the implement prompt's METHOD section already forces explicit
-  // step-by-step reasoning INTO the report itself (a counterfactual line per ranked cause,
-  // the contrast paragraph). qwen3 think:true then runs a SECOND full reasoning pass
-  // first and, on a task this analytically heavy against ~26KB of evidence, spends the
-  // entire num_predict budget inside <think> -- emitting an empty final answer. Confirmed
-  // live 2026-09-01: 3 consecutive attempts, ~166s eval each, implementResponse empty
-  // every time (this is the same "reasoning trace eats the budget" starvation the
-  // fixedLiterals branch above already fixes by disabling think). Hand the whole budget
-  // to the report.
-  // pipeline_debrief (2026-09-06): same shape -- its METHOD section forces the same kind
-  // of explicit reasoning into the report (per-item counterfactual-style Why:, the
-  // survivorship-bias check), same evidence-blob size class. Confirmed live: 2 real
-  // debrief tasks hit "degenerate: truncated" (doneReason 'length') back to back,
-  // including one whose PLAN pass had already succeeded -- the implement pass alone still
-  // burned its entire budget on a redundant think trace.
-  const implNoThink = hasFixedLiterals || task.source === 'pipeline_forensics' || task.source === 'pipeline_debrief';
-  return {
-    hasFixedLiterals,
-    implNoThink,
-    implNumPredict,
-    implNumCtx,
-    allowEmptyImplement,
-    // evalTokCap / latencyMsCap (2026-09-08): hard ceilings on the implement pass's
-    // token generation and wall-clock latency, exposed alongside the token/context
-    // budgets above. Inert for the local-call path (callImplementModel destructures only
-    // the five fields it consumes), but present on the budget object so downstream
-    // consumers (retry routing, attempt recording) can read a single cap source.
-    evalTokCap: 1000,
-    latencyMsCap: 20000,
-  };
-}
-
 // Post-processing for the five candidate-fulfillment sources only, which are the only
 // ones with a `{"mode":"split"}` path and with fetchedFiles to verify a find against.
 // Mutates task (candidateSplitProposals / implementResponse) and emits the implement-done
@@ -2011,102 +909,6 @@ async function finalizeCandidateFulfillment(task, {
 // LOCAL_AB_MODELS overrides that -- runs it under the lock when it's local, records the
 // call into model-stats.db, and stamps task.abCallId / task.draftModel. Returns the raw
 // call result (which may carry `degenerate`); the caller owns what to do with it.
-async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected = false }) {
-  const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
-  const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
-  const implStartedAt = new Date().toISOString();
-  const implStartMs = Date.now();
-  // coldLoadExpected (2026-09-08, see ensureHeadroomForExtendedContext's own header for
-  // the incident): ensureHeadroomForExtendedContext just evicted the small model to make
-  // room for THIS call, so a cold multi-minute tensor reload from disk is now likely --
-  // give this one call extra headroom on top of the normal throughput-based ceiling
-  // rather than let it race the same 150-240s window a fresh load has no chance of
-  // finishing inside. COLD_LOAD_TIMEOUT_BUMP_MS (3 min) is a real observed load time for
-  // the 18GB q4_K_M model this eviction path exists for.
-  const COLD_LOAD_TIMEOUT_BUMP_MS = 180_000;
-  const coldLoadTimeoutMs = coldLoadExpected ? PER_CALL_TIMEOUT_CEILING_MS + COLD_LOAD_TIMEOUT_BUMP_MS : undefined;
-
-  // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
-  // local-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why
-  // this had zero real callers on Linux until now). LOCAL_AB_MODELS is a
-  // comma-separated list, each entry either a bare Ollama model tag, a
-  // model-strategies.js registry name, or a "claude:<model>" entry (new: this is the
-  // extension that lets an A/B run directly compare a local model against Claude,
-  // not just two local models). Empty/single-entry list -> selectAbModel returns null
-  // -> abModel stays null -> falls through to resolvedLocalCall exactly as before,
-  // the same backward-compatibility guarantee model-strategies.js's own resolveStrategy()
-  // already promises. When abModel IS set, it deliberately overrides providerFor(task)'s
-  // normal tier-based routing rather than deferring to it -- the whole point of a
-  // cross-provider A/B entry is to run BOTH sides against the same real tasks
-  // regardless of which tier/provider that task would have used by default.
-  const abCandidates = (process.env.LOCAL_AB_MODELS || '').split(',').map((s) => s.trim()).filter(Boolean);
-  const abCandidateName = selectAbModel(task.id, abCandidates);
-  const abStrategy = abCandidateName ? resolveStrategy(abCandidateName) : null;
-  const abModel = abStrategy ? abStrategy.model : null;
-
-  let implResult;
-  if (abModel && abModel.startsWith('claude:')) {
-    const { call: abClaudeCall } = require('./claude-client.js');
-    // Never local -- a claude: A/B candidate never touches the local GPU, so no lock.
-    implResult = await abClaudeCall({ prompt: implPrompt, model: abModel.slice('claude:'.length), maxTurns: 1, permissionMode: 'dontAsk' });
-  } else if (abModel) {
-    const { call: abLocalCall } = require('./local-client.js');
-    // Always local -- this branch only exists because abModel resolved to a bare
-    // Ollama tag, not a "claude:" one, so it always needs the real lock (unlike
-    // resolvedCallIsLocal above, this doesn't depend on whether localCall was
-    // test-injected, since this branch never calls resolvedLocalCall at all).
-    implResult = await maybeLocked(true, () => abLocalCall({
-      prompt: implPrompt,
-      think: abStrategy.think != null ? abStrategy.think : !hasFixedLiterals,
-      temperature: abStrategy.temperature != null ? abStrategy.temperature : 0.4,
-      numPredict: abStrategy.numPredict != null ? abStrategy.numPredict : implNumPredict,
-      numCtx: implNumCtx,
-      allowEmpty: allowEmptyImplement,
-      model: abModel,
-    }), 'implement');
-  } else {
-    implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement', timeoutMs: coldLoadTimeoutMs }), 'implement');
-  }
-
-  // Records this implement-pass call into model-stats.db (powers the dashboard's
-  // Models tab) and stamps task.abCallId so a later outcome (review verdict, watchdog
-  // requeue) can be joined back to this same row -- port of local-worker.ps1's own
-  // record-call-after-implement placement. Confirmed live 2026-08-14: model-stats.db
-  // was never created at all (better-sqlite3, the dependency model-stats-db.js needs,
-  // wasn't installed -- `npm install` had simply never been run on this Linux install),
-  // AND this instrumentation itself had never been ported here regardless.
-  task.abCallId = recordModelCall({
-    taskId: task.id,
-    // Reflects whichever backend actually served this call -- was hardcoded
-    // 'ornith' from before model-provider.js's per-task-source routing existed,
-    // which would have silently mislabeled every Claude-served call as the local model in
-    // model-stats.db (the Models tab's own data source) the moment that routing
-    // was used for anything. abModel (when an A/B candidate was actually selected)
-    // takes precedence over labelFor(task) the same way it took precedence over
-    // resolvedLocalCall above -- labelFor(task) only knows about providerFor(task)'s
-    // normal tier routing, not this call's deliberate override of it.
-    model: abModel || labelFor(task),
-    candidates: abCandidates.length > 1 ? abCandidates.join(',') : null,
-    startedAt: implStartedAt,
-    latencyMs: Date.now() - implStartMs,
-    result: implResult,
-    // source (2026-09-06, Grimmethy: "We need to fix cost tracking before we can even
-    // begin to properly work on this problem" -- an efficiency analysis found every
-    // per-source cost/degenerate-rate breakdown was blind, because this call never
-    // passed it: 705 of 797 real model_calls rows in a 48h sample had source=NULL,
-    // forcing every prior analysis to guess a source from the task_id string instead of
-    // reading the real field this row already had access to).
-    source: task.source,
-    stage: 'implement',
-  });
-  // Stamped onto the task itself (not just recorded into model-stats.db, which
-  // apply-task.js has no access path back to via just task.abCallId) so its commit
-  // message can attribute Co-Authored-By to whichever backend actually drafted the
-  // change instead of always crediting the local model -- see apply-task.js's own comment.
-  task.draftModel = abModel || labelFor(task.source);
-  return implResult;
-}
-
 // The implement pass: the deterministic zero-hit skip, the token-budgeted implement call
 // (with optional A/B model override), model-stats recording, degenerate-output blocking,
 // and candidate-fulfillment post-processing. Mutates task (implementResponse, abCallId,
