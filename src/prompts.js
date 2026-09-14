@@ -1954,6 +1954,7 @@ module.exports = {
   unusedExportPlanPrompt, unusedExportImplementPrompt,
   productSpecOutlinePlanPrompt, productSpecOutlineImplementPrompt,
   productSpecSectionPlanPrompt, productSpecSectionImplementPrompt,
+  projectSearchPlanPrompt, projectSearchImplementPrompt,
 };
 
 if (require.main === module) {
