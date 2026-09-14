@@ -1,0 +1,233 @@
+{
+  "id": "adhoc-append-the-pidfile-gate-acceptance-test-1789378268188-2",
+  "title": "Append the pidfile-gate acceptance test",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-14T11:21:09.072Z",
+  "history": [
+    {
+      "stage": "advisory",
+      "at": "2026-09-14T10:06:20.757125+00:00",
+      "detail": "premium priority set by operator override"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-14T11:21:09.906Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-14T11:26:26.266Z",
+      "detail": "7 turn(s)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-14T11:30:30.898Z",
+      "detail": "3 attempt(s), 8736 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-14T11:30:49.508Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-14T11:34:36.283Z",
+      "detail": "agentic, 4860 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-14T11:34:36.284Z",
+      "detail": "resolution=implemented, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-14T11:34:36.284Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-14T11:34:36.285Z",
+      "detail": "attempt 1: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-14T11:34:44.850Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-14T11:35:16.900Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "In src/dead-process-check.test.js, append a new test() block titled to match /pidfile gate/ at the end of the file. It spawns sleep 300, awaits its 'spawn' event, mkdtmpts a pids dir and writes worker-1.pid with the sleep pid, uses the existing writeHeartbeat helper to write a stale worker-1 heartbeat (dead pid 9999999, lastHeartbeat ~400s ago), calls deadProcessCheck({instancesDir, cooldownPath, pidDir, now: Date.now()}) and asserts action is 'flag', reason matches /pidfile held by live pid/, and the cooldown file does NOT exist. Then SIGKILL the sleep, await exit, re-run and assert action is 'restart'. In finally, kill if needed and rmSync both temp dirs.",
+    "decomposedFrom": "adhoc-add-pidfile-gate-acceptance-test-and-run-test-suite-1789350728623-1"
+  },
+  "draftAttempts": [
+    {
+      "at": "2026-09-14T11:21:09.903Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 1632,
+          "response": "Done. Appended the pidfile-gate acceptance test as the final test block (53 lines added, purely additive) to `src/dead-process-check.test.js`. The `tempPidDir` helper from the sibling task already existed; the `pidDir` gate implementation does not yet exist in `src/dead-process-check.js`, so the test is red on a clean assertion (`'restart' !== 'flag'`) — the expected acceptance state. I asserted `actions[0].action` (array form) to match the module's established API and the convention of every other test in the file.\n\nAcceptance:\n- Test title matches /pidfile gate/ and is last in file -- `grep -n \"^test(\" | tail -3` shows it at line 401, the final `test(` in a 446-line file -- PASS\n- Runs without crash/syntax/ReferenceError -- `node --test --test-name-pattern='pidfile gate' src/dead-process-check.test.js` executes and fails only on assertion `'restart' !== 'flag'` (red acceptance) -- PASS\n- Body spawns `sleep 300`, writes `worker-1.pid` with the sleep pid into a `tempPidDir()`, calls with `pidDir` key, asserts `action==='flag'` + `/pidfile held by live pid/` + no cooldown, SIGKILLs, awaits exit, re-calls asserting `restart`, finally kills+rmSyncs both dirs -- all present in the appended block (lines 401-445) -- PASS\n- Pre-existing tests unchanged -- `node --test src/dead-process-check.test.js`: 25 tests, 24 pass, 1 fail, and the only `not ok` is the new pidfile-gate test -- PASS\n\nRESOLUTION: implemented\nAcceptance test appended to `src/dead-process-check.test.js`; it is red (`'restart' !== 'flag'`) because the `pidDir` gate in `deadProcessCheck` is a sibling's job, and all 24 pre-existing tests still pass.",
+          "rawDiffChars": 3213,
+          "rawDiff": "diff --git a/src/dead-process-check.test.js b/src/dead-process-check.test.js\nindex d263539a5e0406a5fe5be27cc723a7658748f78f..d10496af0ea1ca7a0c30338ca4048a3f9110ee27 100644\n--- a/src/dead-process-check.test.js\n+++ b/src/dead-process-check.test.js\n@@ -391,3 +391,56 @@ test('flags multiple real orphans in one pass, leaving the one real live worker\n   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });\n   assert.deepEqual(orphans.map((o) => o.pid), [100, 300]);\n });\n+\n+// Acceptance test for the pidfile gate: a worker whose pidfile (<instanceId>.pid in the\n+// shared pids dir) is still held by a LIVE pid must only be FLAGGED, never restarted --\n+// that live pid may be the daemon's own in-flight hold, and restarting around it would\n+// clobber it. Once the pidfile's pid is genuinely dead, the same stale heartbeat must\n+// fall through to the normal restart path. (Acceptance: the pidDir param + gate logic\n+// are a sibling piece -- this test is red until that lands.)\n+test('deadProcessCheck: pidfile gate -- a stale heartbeat is only flagged while its pidfile is held by a live pid, then restarts once that pid dies', async () => {\n+  const { spawn } = require('node:child_process');\n+\n+  const sleep = spawn('sleep', ['300'], { stdio: 'ignore' });\n+  await new Promise((resolve, reject) => {\n+    sleep.once('spawn', resolve);\n+    sleep.once('error', reject);\n+  });\n+\n+  const instancesDir = tempInstancesDir();\n+  const pidDir = tempPidDir();\n+  const cooldownPath = path.join(instancesDir, '.watchdog-restart-cooldown.json');\n+  try {\n+    fs.writeFileSync(path.join(pidDir, 'worker-1.pid'), String(sleep.pid));\n+    // Stale (400s) heartbeat whose own pid is long dead -- exactly the shape the\n+    // pre-gate watchdog would restart.\n+    const staleTime = new Date(Date.now() - 400_000).toISOString();\n+    writeHeartbeat(instancesDir, 'worker-1', { pid: 9999999, lastHeartbeat: staleTime });\n+\n+    // Gate live: pidfile held by a live pid -> flag, no restart, no cooldown written.\n+    const actions = deadProcessCheck({ instancesDir, cooldownPath, pidDir, now: Date.now() });\n+    assert.equal(actions.length, 1);\n+    assert.equal(actions[0].instanceId, 'worker-1');\n+    assert.equal(actions[0].action, 'flag');\n+    assert.match(actions[0].reason, /pidfile held by live pid/);\n+    assert.equal(fs.existsSync(cooldownPath), false, 'the pidfile gate must suppress the restart cooldown as well');\n+\n+    // Kill the pidfile's holder; the same heartbeat must now fall through to a restart.\n+    sleep.kill('SIGKILL');\n+    await new Promise((resolve) => {\n+      if (sleep.exitCode !== null) resolve();\n+      else sleep.once('exit', resolve);\n+    });\n+\n+    const actions2 = deadProcessCheck({ instancesDir, cooldownPath, pidDir, now: Date.now() });\n+    assert.equal(actions2.length, 1);\n+    assert.equal(actions2[0].instanceId, 'worker-1');\n+    assert.equal(actions2[0].action, 'restart');\n+  } finally {\n+    if (sleep.exitCode === null) {\n+      try { sleep.kill('SIGKILL'); } catch (e) { /* already gone */ }\n+    }\n+    fs.rmSync(instancesDir, { recursive: true, force: true });\n+    fs.rmSync(pidDir, { recursive: true, force: true });\n+  }\n+});\n",
+          "turnsUsed": 9,
+          "toolCalls": {
+            "total": 10,
+            "byTool": {
+              "read_file": 3,
+              "grep_codebase": 2,
+              "run_bash": 4,
+              "edit_file": 1
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 4171
+              },
+              {
+                "n": 2,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 2
+              },
+              {
+                "n": 3,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 2
+              },
+              {
+                "n": 4,
+                "tool": "read_file",
+                "argKeys": [
+                  "offset",
+                  "limit",
+                  "path"
+                ],
+                "bytes": 5824
+              },
+              {
+                "n": 5,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 708
+              },
+              {
+                "n": 6,
+                "tool": "read_file",
+                "argKeys": [
+                  "limit",
+                  "offset",
+                  "path"
+                ],
+                "bytes": 966
+              },
+              {
+                "n": 7,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 55
+              },
+              {
+                "n": 8,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 965
+              },
+              {
+                "n": 9,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 417
+              },
+              {
+                "n": 10,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 705
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": false,
+        "turnsUsed": 7
+      },
+      "plan": {
+        "chars": 8736,
+        "text": "# PLAN: Append the pidfile-gate acceptance test\n\n## Context check (from orientation report)\n\n- `src/dead-process-check.js:151` — `deadProcessCheck({ instancesDir, cooldownPath, now })` currently has **no** `pidDir` parameter. The strings `\"pidfile held by live pid\"` and `pidDir` have **zero** grep hits in the repo.\n- `src/dead-process-check.js:126` — `isProcessAlive(pid)` helper (uses `kill(pid, 0)`).\n- `src/dead-process-check.js:112` — `restartTargetFor` already returns `pidfileName: \\`${instanceId}.pid\\``.\n- `scripts/queue-watcher.sh:31` — real pid dir is `PID_DIR=\"${HOME}/.local/state/agent-manager/pids\"`.\n- Hub sibling \"Add tempPidDir helper\" is marked **done**, yet the orientation grep found no `pidDir` in the repo. **This is a conflict.** Before writing the test, verify whether the implementation actually landed (see step 1). If it did not, the test will be a red acceptance test — that is acceptable for this task (we are writing the test, not the feature), but the plan must note it.\n\n---\n\n## Numbered steps\n\n1. **Verify the `pidDir` implementation actually exists.**\n   - `grep -rn 'pidDir' src/` and `grep -rn 'pidfile held by live pid' src/` on the current working tree.\n   - If both return zero hits, the sibling \"Add tempPidDir helper\" has **not** landed. Record this. The test we write will be a failing acceptance test (expected). Do **not** implement the feature here — that is a sibling's job.\n   - If they do exist, note the exact signature of `deadProcessCheck` (does it accept `pidDir` as a third/fourth param?) so the test call matches.\n\n2. **Read the tail of `src/dead-process-check.test.js`** to confirm:\n   - The test framework in use (`node:test` `test()`/`describe()`, or a custom runner).\n   - The exact signature and behaviour of the existing `writeHeartbeat` helper (what args it takes: instance id, pid, lastHeartbeat timestamp, target dir?).\n   - The last line number so we know exactly where to append.\n   - Whether `child_process`, `fs` (`mkdtempSync`, `rmSync`, `writeFileSync`, `existsSync`), and `path` are already imported at the top of the file, or whether we need to add imports.\n\n3. **Append the new `test()` block at the end of `src/dead-process-check.test.js`.**\n   The block must satisfy every requirement in the task description. Concrete structure:\n\n   ```js\n   test('pidfile gate', async (t) => {\n     // --- setup ---\n     const { spawn } = require('node:child_process');   // or import at top\n     const fs = require('node:fs');\n     const path = require('node:path');\n\n     const sleep = spawn('sleep', ['300']);\n     await new Promise((res, rej) => {\n       sleep.once('spawn', res);\n       sleep.once('error', rej);\n     });\n\n     const instancesDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'dpc-instances-'));\n     const pidDir       = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'dpc-pids-'));\n     const cooldownPath = path.join(instancesDir, 'worker-1.cooldown');\n\n     try {\n       // Write the pidfile: worker-1.pid → sleep's pid\n       fs.writeFileSync(path.join(pidDir, 'worker-1.pid'), String(sleep.pid));\n\n       // Write a stale heartbeat via the existing helper\n       // (verify exact signature in step 2; assumed shape below)\n       writeHeartbeat(instancesDir, 'worker-1', {\n         pid: 9999999,\n         lastHeartbeat: Date.now() - 400_000,   // ~400 s ago\n       });\n\n       // --- first call: pidfile held by a LIVE pid → flag, no cooldown ---\n       const result1 = deadProcessCheck({\n         instancesDir,\n         cooldownPath,\n         pidDir,\n         now: Date.now(),\n       });\n\n       t.assert.equal(result1.action, 'flag');\n       t.assert.match(result1.reason, /pidfile held by live pid/);\n       t.assert.equal(fs.existsSync(cooldownPath), false,\n         'cooldown file must NOT be written when pidfile gate fires');\n\n       // --- kill the sleep, wait for exit ---\n       sleep.kill('SIGKILL');\n       await new Promise((res) => sleep.once('exit', res));\n\n       // --- second call: pidfile still present but pid is now dead → restart ---\n       const result2 = deadProcessCheck({\n         instancesDir,\n         cooldownPath,\n         pidDir,\n         now: Date.now(),\n       });\n\n       t.assert.equal(result2.action, 'restart');\n\n     } finally {\n       // Cleanup: kill if still alive, remove both temp dirs\n       if (sleep.exitCode === null) {\n         try { sleep.kill('SIGKILL'); } catch {}\n       }\n       fs.rmSync(instancesDir, { recursive: true, force: true });\n       fs.rmSync(pidDir, { recursive: true, force: true });\n     }\n   });\n   ```\n\n   **Adjustments to make after step 2:**\n   - If the test file uses `import` syntax, convert the `require` calls to top-level imports (or add them to the existing import block).\n   - Match the `writeHeartbeat` helper's real argument order/shape (it may take `(dir, instanceId, heartbeatObj)` or `(dir, instanceId, pid, lastHeartbeat)` — verify).\n   - Match the assertion API: if the file uses `node:test`'s `assert` module (`assert.strictEqual`, `assert.match`), use that instead of `t.assert.*`.\n   - If `deadProcessCheck`'s current signature does **not** accept `pidDir` (step 1 found nothing), the call will throw or ignore the param. That is the expected red state; add a brief comment `// acceptance: pidDir param added by sibling task`.\n\n4. **Run just this test to confirm it parses and executes (expected to fail on assertions if the feature is not yet implemented, or to pass if it is).**\n   ```bash\n   node --test --test-name-pattern='pidfile gate' src/dead-process-check.test.js\n   ```\n   - If it fails with a `TypeError: deadProcessCheck is not a function` or a missing-param error, that confirms the implementation is absent — acceptable.\n   - If it fails on an assertion (e.g. `action` is `'restart'` instead of `'flag'`), that confirms the gate logic is missing — acceptable.\n   - If it **passes**, the feature is already in place and the acceptance test is green.\n   - If it fails with a **syntax error** or\n... [truncated 2736 more chars]",
+        "attempts": 3,
+        "grounded": true,
+        "groundingChars": 6885,
+        "anchorPaths": [
+          "src/dead-process-check.test.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 4,
+        "passCount": 4,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-14T11:34:36.285Z"
+    }
+  ],
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff appends a `test()` block titled \"deadProcessCheck: pidfile gate -- ...\" as the final test (line 401 of 446), the live grounding confirms `tempPidDir()` and `writeHeartbeat()` exist in the file, and the real test run shows 24 pass / 1 fail with the only failure being the new test failing on the expected `'restart' !== 'flag'` assertion (not a syntax/ReferenceError), satisfying all four acceptance criteria.",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff appends a `test()` block titled \"deadProcessCheck: pidfile gate -- ...\" as the final test (line 401 of 446), the live grounding confirms `tempPidDir()` and `writeHeartbeat()` exist in the file, and the real test run shows 24 pass / 1 fail with the only failure being the new test failing on the expected `'restart' !== 'flag'` assertion (not a syntax/ReferenceError), satisfying all four acceptance criteria."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff appends a `test()` block titled \"deadProcessCheck: pidfile gate -- ...\" as the final test (line 401 of 446), and the grounding confirms `node --test --test-name-pattern='pidfile gate'` executes and fails only on the assertion `'restart' !== 'flag'` (no syntax/ReferenceError), while the full run shows 25 tests / 24 pass / 1 fail with the sole `not ok` being the new test, and the body spawns `sleep 300`, writes `worker-1.pid` into `tempPidDir()`, calls `deadProcessCheck` with a `pidDir` key, asserts `action==='flag'` + `/pidfile held by live pid/` + no cooldown, SIGKILLs, re-calls asserting `restart`, and cleans up in `finally`."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`src/dead-process-check.test.js` contains a `test()` block whose title matches the regex `/pidfile gate/` and is the **last** test in the file (appended, not inserted mid-file).",
+    "Running `node --test --test-name-pattern='pidfile gate' src/dead-process-check.test.js` executes the test (it either passes or fails on an assertion — it must **not** crash with a syntax error, missing import, or `ReferenceError`).",
+    "The test body (a) spawns `sleep 300`, (b) writes `worker-1.pid` containing the sleep's PID into a `pidDir` temp dir, (c) calls `deadProcessCheck` with a `pidDir` key, (d) asserts `action === 'flag'` and `reason` matches `/pidfile held by li",
+    "No pre-existing test in `src/dead-process-check.test.js` changes its pass/fail status as a result of the append (verified by `node --test src/dead-process-check.test.js` showing the same set of passing tests as before, plus the new test)."
+  ],
+  "draftModel": "qwen3.8:27b-q4_K_M",
+  "implementResponse": "Done. Appended the pidfile-gate acceptance test as the final test block (53 lines added, purely additive) to `src/dead-process-check.test.js`. The `tempPidDir` helper from the sibling task already existed; the `pidDir` gate implementation does not yet exist in `src/dead-process-check.js`, so the test is red on a clean assertion (`'restart' !== 'flag'`) — the expected acceptance state. I asserted `actions[0].action` (array form) to match the module's established API and the convention of every other test in the file.\n\nAcceptance:\n- Test title matches /pidfile gate/ and is last in file -- `grep -n \"^test(\" | tail -3` shows it at line 401, the final `test(` in a 446-line file -- PASS\n- Runs without crash/syntax/ReferenceError -- `node --test --test-name-pattern='pidfile gate' src/dead-process-check.test.js` executes and fails only on assertion `'restart' !== 'flag'` (red acceptance) -- PASS\n- Body spawns `sleep 300`, writes `worker-1.pid` with the sleep pid into a `tempPidDir()`, calls with `pidDir` key, asserts `action==='flag'` + `/pidfile held by live pid/` + no cooldown, SIGKILLs, awaits exit, re-calls asserting `restart`, finally kills+rmSyncs both dirs -- all present in the appended block (lines 401-445) -- PASS\n- Pre-existing tests unchanged -- `node --test src/dead-process-check.test.js`: 25 tests, 24 pass, 1 fail, and the only `not ok` is the new pidfile-gate test -- PASS\n\nRESOLUTION: implemented\nAcceptance test appended to `src/dead-process-check.test.js`; it is red (`'restart' !== 'flag'`) because the `pidDir` gate in `deadProcessCheck` is a sibling's job, and all 24 pre-existing tests still pass.\n\n=== DIFF ===\ndiff --git a/src/dead-process-check.test.js b/src/dead-process-check.test.js\nindex d263539a5e0406a5fe5be27cc723a7658748f78f..d10496af0ea1ca7a0c30338ca4048a3f9110ee27 100644\n--- a/src/dead-process-check.test.js\n+++ b/src/dead-process-check.test.js\n@@ -391,3 +391,56 @@ test('flags multiple real orphans in one pass, leaving the one real live worker\n   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });\n   assert.deepEqual(orphans.map((o) => o.pid), [100, 300]);\n });\n+\n+// Acceptance test for the pidfile gate: a worker whose pidfile (<instanceId>.pid in the\n+// shared pids dir) is still held by a LIVE pid must only be FLAGGED, never restarted --\n+// that live pid may be the daemon's own in-flight hold, and restarting around it would\n+// clobber it. Once the pidfile's pid is genuinely dead, the same stale heartbeat must\n+// fall through to the normal restart path. (Acceptance: the pidDir param + gate logic\n+// are a sibling piece -- this test is red until that lands.)\n+test('deadProcessCheck: pidfile gate -- a stale heartbeat is only flagged while its pidfile is held by a live pid, then restarts once that pid dies', async () => {\n+  const { spawn } = require('node:child_process');\n+\n+  const sleep = spawn('sleep', ['300'], { stdio: 'ignore' });\n+  await new Promise((resolve, reject) => {\n+    sleep.once('spawn', resolve);\n+    sleep.once('error', reject);\n+  });\n+\n+  const instancesDir = tempInstancesDir();\n+  const pidDir = tempPidDir();\n+  const cooldownPath = path.join(instancesDir, '.watchdog-restart-cooldown.json');\n+  try {\n+    fs.writeFileSync(path.join(pidDir, 'worker-1.pid'), String(sleep.pid));\n+    // Stale (400s) heartbeat whose own pid is long dead -- exactly the shape the\n+    // pre-gate watchdog would restart.\n+    const staleTime = new Date(Date.now() - 400_000).toISOString();\n+    writeHeartbeat(instancesDir, 'worker-1', { pid: 9999999, lastHeartbeat: staleTime });\n+\n+    // Gate live: pidfile held by a live pid -> flag, no restart, no cooldown written.\n+    const actions = deadProcessCheck({ instancesDir, cooldownPath, pidDir, now: Date.now() });\n+    assert.equal(actions.length, 1);\n+    assert.equal(actions[0].instanceId, 'worker-1');\n+    assert.equal(actions[0].action, 'flag');\n+    assert.match(actions[0].reason, /pidfile held by live pid/);\n+    assert.equal(fs.existsSync(cooldownPath), false, 'the pidfile gate must suppress the restart cooldown as well');\n+\n+    // Kill the pidfile's holder; the same heartbeat must now fall through to a restart.\n+    sleep.kill('SIGKILL');\n+    await new Promise((resolve) => {\n+      if (sleep.exitCode !== null) resolve();\n+      else sleep.once('exit', resolve);\n+    });\n+\n+    const actions2 = deadProcessCheck({ instancesDir, cooldownPath, pidDir, now: Date.now() });\n+    assert.equal(actions2.length, 1);\n+    assert.equal(actions2[0].instanceId, 'worker-1');\n+    assert.equal(actions2[0].action, 'restart');\n+  } finally {\n+    if (sleep.exitCode === null) {\n+      try { sleep.kill('SIGKILL'); } catch (e) { /* already gone */ }\n+    }\n+    fs.rmSync(instancesDir, { recursive: true, force: true });\n+    fs.rmSync(pidDir, { recursive: true, force: true });\n+  }\n+});\n",
+  "planResponse": "# PLAN: Append the pidfile-gate acceptance test\n\n## Context check (from orientation report)\n\n- `src/dead-process-check.js:151` — `deadProcessCheck({ instancesDir, cooldownPath, now })` currently has **no** `pidDir` parameter. The strings `\"pidfile held by live pid\"` and `pidDir` have **zero** grep hits in the repo.\n- `src/dead-process-check.js:126` — `isProcessAlive(pid)` helper (uses `kill(pid, 0)`).\n- `src/dead-process-check.js:112` — `restartTargetFor` already returns `pidfileName: \\`${instanceId}.pid\\``.\n- `scripts/queue-watcher.sh:31` — real pid dir is `PID_DIR=\"${HOME}/.local/state/agent-manager/pids\"`.\n- Hub sibling \"Add tempPidDir helper\" is marked **done**, yet the orientation grep found no `pidDir` in the repo. **This is a conflict.** Before writing the test, verify whether the implementation actually landed (see step 1). If it did not, the test will be a red acceptance test — that is acceptable for this task (we are writing the test, not the feature), but the plan must note it.\n\n---\n\n## Numbered steps\n\n1. **Verify the `pidDir` implementation actually exists.**\n   - `grep -rn 'pidDir' src/` and `grep -rn 'pidfile held by live pid' src/` on the current working tree.\n   - If both return zero hits, the sibling \"Add tempPidDir helper\" has **not** landed. Record this. The test we write will be a failing acceptance test (expected). Do **not** implement the feature here — that is a sibling's job.\n   - If they do exist, note the exact signature of `deadProcessCheck` (does it accept `pidDir` as a third/fourth param?) so the test call matches.\n\n2. **Read the tail of `src/dead-process-check.test.js`** to confirm:\n   - The test framework in use (`node:test` `test()`/`describe()`, or a custom runner).\n   - The exact signature and behaviour of the existing `writeHeartbeat` helper (what args it takes: instance id, pid, lastHeartbeat timestamp, target dir?).\n   - The last line number so we know exactly where to append.\n   - Whether `child_process`, `fs` (`mkdtempSync`, `rmSync`, `writeFileSync`, `existsSync`), and `path` are already imported at the top of the file, or whether we need to add imports.\n\n3. **Append the new `test()` block at the end of `src/dead-process-check.test.js`.**\n   The block must satisfy every requirement in the task description. Concrete structure:\n\n   ```js\n   test('pidfile gate', async (t) => {\n     // --- setup ---\n     const { spawn } = require('node:child_process');   // or import at top\n     const fs = require('node:fs');\n     const path = require('node:path');\n\n     const sleep = spawn('sleep', ['300']);\n     await new Promise((res, rej) => {\n       sleep.once('spawn', res);\n       sleep.once('error', rej);\n     });\n\n     const instancesDir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'dpc-instances-'));\n     const pidDir       = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'dpc-pids-'));\n     const cooldownPath = path.join(instancesDir, 'worker-1.cooldown');\n\n     try {\n       // Write the pidfile: worker-1.pid → sleep's pid\n       fs.writeFileSync(path.join(pidDir, 'worker-1.pid'), String(sleep.pid));\n\n       // Write a stale heartbeat via the existing helper\n       // (verify exact signature in step 2; assumed shape below)\n       writeHeartbeat(instancesDir, 'worker-1', {\n         pid: 9999999,\n         lastHeartbeat: Date.now() - 400_000,   // ~400 s ago\n       });\n\n       // --- first call: pidfile held by a LIVE pid → flag, no cooldown ---\n       const result1 = deadProcessCheck({\n         instancesDir,\n         cooldownPath,\n         pidDir,\n         now: Date.now(),\n       });\n\n       t.assert.equal(result1.action, 'flag');\n       t.assert.match(result1.reason, /pidfile held by live pid/);\n       t.assert.equal(fs.existsSync(cooldownPath), false,\n         'cooldown file must NOT be written when pidfile gate fires');\n\n       // --- kill the sleep, wait for exit ---\n       sleep.kill('SIGKILL');\n       await new Promise((res) => sleep.once('exit', res));\n\n       // --- second call: pidfile still present but pid is now dead → restart ---\n       const result2 = deadProcessCheck({\n         instancesDir,\n         cooldownPath,\n         pidDir,\n         now: Date.now(),\n       });\n\n       t.assert.equal(result2.action, 'restart');\n\n     } finally {\n       // Cleanup: kill if still alive, remove both temp dirs\n       if (sleep.exitCode === null) {\n         try { sleep.kill('SIGKILL'); } catch {}\n       }\n       fs.rmSync(instancesDir, { recursive: true, force: true });\n       fs.rmSync(pidDir, { recursive: true, force: true });\n     }\n   });\n   ```\n\n   **Adjustments to make after step 2:**\n   - If the test file uses `import` syntax, convert the `require` calls to top-level imports (or add them to the existing import block).\n   - Match the `writeHeartbeat` helper's real argument order/shape (it may take `(dir, instanceId, heartbeatObj)` or `(dir, instanceId, pid, lastHeartbeat)` — verify).\n   - Match the assertion API: if the file uses `node:test`'s `assert` module (`assert.strictEqual`, `assert.match`), use that instead of `t.assert.*`.\n   - If `deadProcessCheck`'s current signature does **not** accept `pidDir` (step 1 found nothing), the call will throw or ignore the param. That is the expected red state; add a brief comment `// acceptance: pidDir param added by sibling task`.\n\n4. **Run just this test to confirm it parses and executes (expected to fail on assertions if the feature is not yet implemented, or to pass if it is).**\n   ```bash\n   node --test --test-name-pattern='pidfile gate' src/dead-process-check.test.js\n   ```\n   - If it fails with a `TypeError: deadProcessCheck is not a function` or a missing-param error, that confirms the implementation is absent — acceptable.\n   - If it fails on an assertion (e.g. `action` is `'restart'` instead of `'flag'`), that confirms the gate logic is missing — acceptable.\n   - If it **passes**, the feature is already in place and the acceptance test is green.\n   - If it fails with a **syntax error** or **import error**, fix the test code (wrong import, wrong helper signature) and re-run.\n\n5. **Run the full test file to make sure the new test does not break existing tests.**\n   ```bash\n   node --test src/dead-process-check.test.js\n   ```\n   - All pre-existing tests should still pass (or fail for the same pre-existing reasons).\n   - The new test may fail (red acceptance) — that is fine.\n\n6. **Commit / stage the change** (if the workflow requires it):\n   ```bash\n   git add src/dead-process-check.test.js\n   git diff --cached   # review the appended block\n   ```\n\n---\n\n## Things to watch for\n\n- **`writeHeartbeat` signature** is the single biggest unknown. The orientation report confirms it exists in the test file but the content was truncated. Step 2 must resolve this before writing the test body.\n- **`cooldownPath` location**: the task says \"the cooldown file does NOT exist\" after the first call. The test must use a `cooldownPath` that `deadProcessCheck` would write to if it chose to. Based on `src/dead-process-check.js:151` the param is `cooldownPath` (a file path, not a dir). Place it inside `instancesDir` so `rmSync(instancesDir)` cleans it up.\n- **`sleep 300` on macOS vs Linux**: `sleep` accepts an integer number of seconds on both. `300` is fine. If the CI environment lacks `sleep` (unlikely), fall back to `node -e \"setTimeout(()=>{},300000)\"` — but prefer `sleep` per the task spec.\n- **`pidDir` param name**: the orientation report and the task both use `pidDir`. If the implementation (sibling) used a different name (e.g. `pidsDir`), the test must match. Step 1's grep will reveal this.\n\n---\n\nCRITERIA:\n- `src/dead-process-check.test.js` contains a `test()` block whose title matches the regex `/pidfile gate/` and is the **last** test in the file (appended, not inserted mid-file).\n- Running `node --test --test-name-pattern='pidfile gate' src/dead-process-check.test.js` executes the test (it either passes or fails on an assertion — it must **not** crash with a syntax error, missing import, or `ReferenceError`).\n- The test body (a) spawns `sleep 300`, (b) writes `worker-1.pid` containing the sleep's PID into a `pidDir` temp dir, (c) calls `deadProcessCheck` with a `pidDir` key, (d) asserts `action === 'flag'` and `reason` matches `/pidfile held by live pid/` and `cooldownPath` does not exist, (e) SIGKILLs the sleep, (f) re-calls and asserts `action === 'restart'`, and (g) has a `finally` block that kills the child if needed and `rmSync`s both temp dirs.\n- No pre-existing test in `src/dead-process-check.test.js` changes its pass/fail status as a result of the append (verified by `node --test src/dead-process-check.test.js` showing the same set of passing tests as before, plus the new test).",
+  "reviewedAt": "2026-09-14T11:35:16.900Z",
+  "claimedAt": "2026-09-14T11:21:09.312Z"
+}

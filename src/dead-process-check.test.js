@@ -391,3 +391,56 @@ test('flags multiple real orphans in one pass, leaving the one real live worker 
   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.deepEqual(orphans.map((o) => o.pid), [100, 300]);
 });
+
+// Acceptance test for the pidfile gate: a worker whose pidfile (<instanceId>.pid in the
+// shared pids dir) is still held by a LIVE pid must only be FLAGGED, never restarted --
+// that live pid may be the daemon's own in-flight hold, and restarting around it would
+// clobber it. Once the pidfile's pid is genuinely dead, the same stale heartbeat must
+// fall through to the normal restart path. (Acceptance: the pidDir param + gate logic
+// are a sibling piece -- this test is red until that lands.)
+test('deadProcessCheck: pidfile gate -- a stale heartbeat is only flagged while its pidfile is held by a live pid, then restarts once that pid dies', async () => {
+  const { spawn } = require('node:child_process');
+
+  const sleep = spawn('sleep', ['300'], { stdio: 'ignore' });
+  await new Promise((resolve, reject) => {
+    sleep.once('spawn', resolve);
+    sleep.once('error', reject);
+  });
+
+  const instancesDir = tempInstancesDir();
+  const pidDir = tempPidDir();
+  const cooldownPath = path.join(instancesDir, '.watchdog-restart-cooldown.json');
+  try {
+    fs.writeFileSync(path.join(pidDir, 'worker-1.pid'), String(sleep.pid));
+    // Stale (400s) heartbeat whose own pid is long dead -- exactly the shape the
+    // pre-gate watchdog would restart.
+    const staleTime = new Date(Date.now() - 400_000).toISOString();
+    writeHeartbeat(instancesDir, 'worker-1', { pid: 9999999, lastHeartbeat: staleTime });
+
+    // Gate live: pidfile held by a live pid -> flag, no restart, no cooldown written.
+    const actions = deadProcessCheck({ instancesDir, cooldownPath, pidDir, now: Date.now() });
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].instanceId, 'worker-1');
+    assert.equal(actions[0].action, 'flag');
+    assert.match(actions[0].reason, /pidfile held by live pid/);
+    assert.equal(fs.existsSync(cooldownPath), false, 'the pidfile gate must suppress the restart cooldown as well');
+
+    // Kill the pidfile's holder; the same heartbeat must now fall through to a restart.
+    sleep.kill('SIGKILL');
+    await new Promise((resolve) => {
+      if (sleep.exitCode !== null) resolve();
+      else sleep.once('exit', resolve);
+    });
+
+    const actions2 = deadProcessCheck({ instancesDir, cooldownPath, pidDir, now: Date.now() });
+    assert.equal(actions2.length, 1);
+    assert.equal(actions2[0].instanceId, 'worker-1');
+    assert.equal(actions2[0].action, 'restart');
+  } finally {
+    if (sleep.exitCode === null) {
+      try { sleep.kill('SIGKILL'); } catch (e) { /* already gone */ }
+    }
+    fs.rmSync(instancesDir, { recursive: true, force: true });
+    fs.rmSync(pidDir, { recursive: true, force: true });
+  }
+});
