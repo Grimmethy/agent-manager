@@ -505,6 +505,24 @@ async function call(opts, maxRetries = 2) {
         TRUNCATION_RETRY_NUM_PREDICT_CEILING,
       );
       if (escalated > callOpts.numPredict) callOpts = { ...callOpts, numPredict: escalated };
+      // 2026-09-14, root-caused against a real blocked backlog (21 tasks, every one
+      // truncated with ZERO visible characters -- confirmed via model_calls: eval_count
+      // present, response empty): doneReason:'length' with no real content at all means
+      // <think> reasoning ate the WHOLE budget before any visible answer, not that a
+      // real answer got cut short partway. Escalating numPredict alone doesn't
+      // reliably fix this -- observability-fix-ac-37's own history shows numPredict
+      // already escalated 1400 -> 2800 -> 5600 across 3 attempts and STILL came back
+      // truncated at 0 chars, because a runaway reasoning chain just keeps consuming
+      // whatever budget it's given rather than converging. Mirrors the ALREADY-PROVEN
+      // implNoThink pattern (local-draft.js's computeImplementBudget: think disabled
+      // outright for pipeline_forensics/pipeline_debrief, sources where reasoning was
+      // found not to help) -- but scoped precisely to the confirmed failure signature
+      // (truncated + zero real content) rather than a blanket per-source list, so it
+      // only touches the exact case that needs it and never a partial-but-real
+      // truncation that might still be benefiting from the reasoning already spent.
+      if (callOpts.think && !(result.response || '').trim()) {
+        callOpts = { ...callOpts, think: false };
+      }
     }
   }
   // Only propagate the hard error if NO attempt ever got a real response, degenerate or
