@@ -223,3 +223,40 @@ Replace the per-entry synchronous calls with their `fs.promises` equivalents (`f
 
 Benefits:
 The event loop is no longer held hostage for the full duration of N sequential syscalls; concurrent requests, timers, and other I/O callbacks can interleave during the await windows. The TTL memo removes redundant stat/readdir work for callers that poll the staleness flag in a tight loop, cutting syscall count by the repetition factor. Because the change is confined to the I/O calls inside the existing function, the public API and return shape are unchanged, so no caller needs modification.
+
+### AC-12 · AC-7a: Make deadProcessCheck async and parallelize heartbeat file reads with Promise.all
+Strength: Strong
+Split-Depth: 1
+Files: src/dead-process-check.js
+
+Problem:
+deadProcessCheck currently reads each heartbeat file sequentially via fs.readFileSync inside a for-loop over names. With many instances this is a serial I/O bottleneck: each readFileSync blocks the event loop until the OS returns the file, so total sweep time is O(n × disk-latency) rather than O(max-disk-latency). The function is synchronous and returns a plain array.
+
+Solution:
+Two edits in src/dead-process-check.js, applied in order:
+
+1. Change the function declaration from `function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {` to `async function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {`. This makes the return type Promise<Array>.
+
+2. Replace the entire `for (const name of names) { try { const hb = JSON.parse(fs.readFileSync(...)) ... } catch (e) { ... } }` block (from `for (const name of names) {` through the closing `}` of the for-loop, inclusive) with:
+   - A `const heartbeats = await Promise.all(names.map((name) => fs.promises.readFile(path.join(instancesDir, name), 'utf8').then((raw) => JSON.parse(raw)).catch((e) => { console.warn(...); return null; }));` block that reads all files in parallel, resolving each to a parsed object or null (with a console.warn on failure).
+   - A `for (let i = 0; i < names.length; i++)` loop that uses `heartbeats[i]` as `hb`, skips null entries, and runs the exact same per-instance logic (queue-watchdog guard, age check, PID liveness, zombie detection, cooldown check, restartTargetFor, actions.push) inside a try/catch that references `names[i]` in its warn message.
+
+No new imports needed: fs.promises is part of the already-imported fs module; Promise.all is a global. No package.json change.
+
+Benefits:
+All heartbeat file reads issue concurrently instead of serially, reducing sweep wall-time from sum-of-latencies to max-latency. Per-file failure isolation is preserved (one bad file still just warns and is treated as stale). No semantic change to cooldown bookkeeping, kill decisions, or action output.
+
+### AC-13 · AC-7b: Await the now-async deadProcessCheck at its call site in main()
+Strength: Strong
+Split-Depth: 1
+Files: src/dead-process-check.js
+Depends-On: AC-12
+
+Problem:
+After AC-7a lands, deadProcessCheck returns a Promise<Array> instead of a plain Array. The call site in main() (or the equivalent top-level entry point in this file) currently does `const actions = deadProcessCheck(...)` and then iterates with `for (const action of actions)`. Without `await`, `actions` is a Promise object, and the for-of loop will either throw (Promise is not iterable) or silently produce no output, breaking the CLI's restart/flag reporting. This is the exact failure mode that caused the prior rejection.
+
+Solution:
+In src/dead-process-check.js, locate the call site where deadProcessCheck is invoked (it will be in the main/entry-point section of the file, likely near the bottom). Ensure the enclosing function is `async` (add `async` to its declaration if it is not already). Change the assignment line from `const actions = deadProcessCheck(` to `const actions = await deadProcessCheck(`. If there are any other call sites of deadProcessCheck in the file (search for the identifier), add `await` at each. Do not change the arguments passed or the subsequent iteration logic.
+
+Benefits:
+The CLI correctly awaits the parallel read batch before iterating the resolved actions array, preserving the existing output format and exit-code semantics. Prevents the 'iterating over a Promise' bug that would silently produce no restart/flag output.
