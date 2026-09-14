@@ -32,6 +32,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { runFileDecomposePlanPass } = require('./file-decompose-plan-pass.js');
 const { sweep: fileDecomposeToHubSweep } = require('./file-decompose-to-hub.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
+const { fileHasRecentCommits, HOT_FILE_DAYS } = require('./hot-file-guard.js');
 
 const SCAN_DIRS = ['blocked', 'needs-clarification'];
 const MIN_RETRY_MS = 6 * 60 * 60 * 1000; // don't re-attempt the plan pass more often than this
@@ -90,35 +91,14 @@ function attemptGate(task, now) {
   return !Number.isFinite(last) || now - last >= MIN_RETRY_MS;
 }
 
-// Hot-file exclusion ([[hub-task-integration]], concept-hub-task-integration-549f09): a
-// file with commits in the last N days is not a safe UNATTENDED auto-decompose target.
-// A file-decompose is a whole-file rewrite -- maximal conflict surface -- and the hub
-// takes days; concurrent edits to that file in the window are the norm, and the stacked
-// branch rots (lost a finished split twice: app.py 2026-09-06, index.html 2026-09-09).
-// The file-length-flags advisory entry stays -- a HUMAN can still decompose it
-// deliberately, and Tier-1 fast one-pass decomposes (see the spec) are exempt; this only
-// gates the reactive auto-authoring here. AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS=0 disables.
-const HOT_FILE_DAYS = (() => {
-  const v = process.env.AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS;
-  return v === undefined ? 7 : Number(v);
-})();
-
-function fileHasRecentCommits(repoRoot, filePath, days = HOT_FILE_DAYS) {
-  if (!repoRoot || !days || days <= 0) return false;
-  try {
-    const out = execFileSync(
-      'git',
-      ['log', `--since=${days} days ago`, '--oneline', '-1', '--', filePath],
-      { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15_000 },
-    );
-    return out.trim().length > 0;
-  } catch {
-    // A git failure must not silently DISABLE the gate (that would re-open the exact hole
-    // this closes) nor block a legit request forever -- treat "can't tell" as "not hot"
-    // for THIS tick; the request is idempotent so a later tick with a working git re-checks.
-    return false;
-  }
-}
+// Hot-file exclusion ([[hub-task-integration]], concept-hub-task-integration-549f09) --
+// fileHasRecentCommits/HOT_FILE_DAYS now live in hot-file-guard.js (2026-09-14: moved out
+// so file-decompose-to-hub.js can apply the SAME check to just the Tier-2 hub path,
+// instead of every sweep hand-rolling its own upfront skip that also caught Tier-1-
+// eligible files it was never meant to). This reactive sweep still applies it here, before
+// authoring at all -- a stuck TASK reacting to an oversized file is a rarer, more
+// deliberate path than the proactive sweep's routine tick, and the extra plan-authoring
+// cost of deferring to file-decompose-to-hub.js instead isn't worth the churn here.
 
 function bumpAttempt(task, now, note) {
   const a = task.autorouteAttempts || { count: 0 };

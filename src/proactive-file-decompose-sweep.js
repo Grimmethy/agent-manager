@@ -15,11 +15,20 @@
 //
 // This is the proactive counterpart: for any still-oversized file with no existing
 // file-decompose-request/hub and no active task stuck on it, author + file a fresh plan
-// the SAME way (same runFileDecomposePlanPass, same hot-file exclusion, same
-// file-decompose-to-hub.js materialisation) with no waiting task required at all. Reuses
-// everything decompose-loop-autoroute.js already built rather than reimplementing any of
-// it -- the two sweeps differ only in what they iterate over and what happens to the
-// (nonexistent, here) stuck task afterward.
+// the SAME way (same runFileDecomposePlanPass, same file-decompose-to-hub.js
+// materialisation) with no waiting task required at all. Reuses everything
+// decompose-loop-autoroute.js already built rather than reimplementing any of it -- the
+// two sweeps differ only in what they iterate over and what happens to the (nonexistent,
+// here) stuck task afterward.
+//
+// NO upfront hot-file skip here (2026-09-14 fix -- screaminggoatclubmt: "we need these
+// things broken down into manageable chunks as we build them... why is that timer set to
+// a week" -- found live: app.py's flask-blueprint plan is Tier-1-eligible, a single
+// deterministic one-pass commit that can't go stale, but the old upfront check ran BEFORE
+// a plan even existed, so it had no way to know that and blocked it for a full week
+// anyway). file-decompose-to-hub.js's fileHub() now applies the hot-file check itself,
+// AFTER every Tier-1 short-circuit has had its chance, so it only ever defers the
+// multi-day Tier-2 hub case this guard actually exists for.
 //
 // Bounded to ONE new plan per run (MAX_FILES_PER_RUN) -- same "small, scoped, don't dump
 // the whole backlog on the pipeline at once" discipline as this session's manual slicing.
@@ -35,9 +44,7 @@ const path = require('path');
 const { getConfig } = require('./config.js');
 const { runFileDecomposePlanPass } = require('./file-decompose-plan-pass.js');
 const { sweep: fileDecomposeToHubSweep } = require('./file-decompose-to-hub.js');
-const {
-  oversizedFiles, fileHasRecentCommits, HOT_FILE_DAYS,
-} = require('./decompose-loop-autoroute.js');
+const { oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -117,7 +124,7 @@ function hasExistingRequestFor(pipelineDir, targetFile) {
 }
 
 async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.now() } = {}) {
-  const summary = { checked: 0, filed: 0, planFailed: 0, skipped: 0, errors: 0, due: false };
+  const summary = { checked: 0, filed: 0, deferred: 0, planFailed: 0, skipped: 0, errors: 0, due: false };
   if (process.env.AGENT_MANAGER_PROACTIVE_FILE_DECOMPOSE === 'false') return summary;
 
   let resolvedPipelineDir = pipelineDir;
@@ -145,7 +152,6 @@ async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.no
     summary.checked += 1;
 
     if (hasExistingRequestFor(resolvedPipelineDir, targetFile)) { summary.skipped += 1; continue; }
-    if (fileHasRecentCommits(resolvedRepoRoot, targetFile, HOT_FILE_DAYS)) { summary.skipped += 1; continue; }
 
     const requestId = `proactive-${slugify(targetFile)}-${new Date(now).toISOString().slice(0, 10)}`;
     try {
@@ -160,12 +166,23 @@ async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.no
         note: `Auto-authored by proactive-file-decompose-sweep (no waiting task -- ${targetFile} is still flagged oversized with nothing currently blocked on it). ${plan.planPassNote || ''}`,
       }, null, 2)}\n`);
       // Materialise the hub/one-pass task in this same run, matching decompose-loop-
-      // autoroute.js's own reasoning (a request with no hub yet is invisible work).
+      // autoroute.js's own reasoning (a request with no hub yet is invisible work). This
+      // may DEFER rather than file (file-decompose-to-hub.js's own hot-file check on the
+      // Tier-2 hub path -- see hot-file-guard.js) -- re-read the request to tell which.
       try { fileDecomposeToHubSweep({ pipelineDir: resolvedPipelineDir, repoRoot: resolvedRepoRoot, now }); } catch (e) {
         console.error(`[proactive-file-decompose-sweep] inline hub materialise failed for ${requestId}: ${e && e.message}`);
       }
-      summary.filed += 1;
-      filedThisRun += 1;
+      const written = readJson(path.join(reqDir, `${requestId}.json`)) || {};
+      if (written.hubId || written.onePassTaskId) {
+        summary.filed += 1;
+        filedThisRun += 1;
+      } else {
+        summary.deferred += 1;
+        // A deferred request still counts against MAX_FILES_PER_RUN -- don't spend the
+        // rest of this tick's budget re-authoring plans for other files just because the
+        // one we picked turned out to need the Tier-2 hub's own hot-file wait.
+        filedThisRun += 1;
+      }
     } catch (e) {
       console.error(`[proactive-file-decompose-sweep] ${targetFile}: ${e && e.message}`);
       summary.errors += 1;

@@ -342,6 +342,81 @@ test('sweep is idempotent -- a stamped request is skipped', () => {
   assert.equal(fs.readdirSync(path.join(dir, 'queue', 'adhoc')).length, 2);
 });
 
+// --- hot-file exclusion (2026-09-14, screaminggoatclubmt: "these things [need to be]
+// broken down into manageable chunks as we build them ... why is that timer set to a
+// week") -- moved from the sweeps (before a plan even existed) to here, the actual Tier-2
+// hub path, so a Tier-1-eligible plan is never blocked by it (see hot-file-guard.js and
+// decompose-one-pass.js/decompose-node-module.js/decompose-flask-blueprint.js's own
+// Tier-1 short-circuits above, which run BEFORE this and are unaffected by hotness). -----
+
+test('a recent commit on the source file defers the Tier-2 hub -- no hubId stamped, request stays retryable', () => {
+  const dir = tmpRepo();
+  const { execFileSync } = require('child_process');
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'x'], { cwd: dir });
+  fs.mkdirSync(path.join(dir, 'python', 'dashboard'), { recursive: true });
+  fs.writeFileSync(path.join(dir, PLAN.sourceFile), '# placeholder\n');
+  execFileSync('git', ['add', PLAN.sourceFile], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'recent edit'], { cwd: dir });
+  // Delete it from the working tree (git log --since still finds the commit) so
+  // validatePlan's fs.readFileSync fails and the plan validates vacuously -- same
+  // "source file unreadable -> advisory only, no hard block" shape the other tests in
+  // this file rely on. A placeholder with real content but the wrong symbols would fail
+  // buildBlueprintOnePassChanges for real and block the hub before the hot-file check
+  // (which sits past that point) ever runs -- not what this test is isolating.
+  fs.unlinkSync(path.join(dir, PLAN.sourceFile));
+
+  const reqPath = path.join(dir, 'queue', 'file-decompose-requests', 'p.json');
+  fs.writeFileSync(reqPath, JSON.stringify(PLAN));
+  withEnv(dir, { AGENT_MANAGER_DECOMPOSE_STACKED: 'legacy' }, ({ sweep }) => {
+    const s = sweep({ pipelineDir: dir });
+    assert.equal(s.filedHubs, 0);
+    assert.equal(s.deferredHubs, 1);
+    assert.equal(s[PLAN.id].deferred, true);
+  });
+
+  const coordDir = path.join(dir, 'queue', 'coordinating');
+  assert.equal(fs.existsSync(coordDir) ? fs.readdirSync(coordDir).length : 0, 0, 'no hub materialised while hot');
+  const req = JSON.parse(fs.readFileSync(reqPath, 'utf8'));
+  assert.equal(req.hubFiledAt, undefined, 'not stamped -- a later, non-hot sweep tick must re-attempt this same request');
+  assert.equal(req.hubId, undefined);
+});
+
+test('a recent commit does NOT defer a Tier-1-eligible plan (all-flask-blueprint, source readable and self-contained)', () => {
+  const dir = tmpRepo();
+  const { execFileSync } = require('child_process');
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'x'], { cwd: dir });
+  fs.mkdirSync(path.join(dir, 'python', 'dashboard', 'routes'), { recursive: true });
+  const source = [
+    "from flask import Flask, jsonify",
+    "app = Flask(__name__)",
+    "",
+    "@app.route('/api/hardware')",
+    "def api_hardware():",
+    "    return jsonify({})",
+    "",
+  ].join('\n');
+  fs.writeFileSync(path.join(dir, 'python/dashboard/app.py'), source);
+  execFileSync('git', ['add', 'python/dashboard/app.py'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'recent edit'], { cwd: dir });
+
+  const onePassPlan = {
+    id: 'decompose-app-py-onepass-hot',
+    sourceFile: 'python/dashboard/app.py',
+    moves: [{ newFile: 'python/dashboard/routes/hardware.py', kind: 'flask-blueprint', blueprint: 'hardware_bp', symbols: ['api_hardware'] }],
+  };
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'p.json'), JSON.stringify(onePassPlan));
+  withEnv(dir, {}, ({ sweep }) => {
+    const s = sweep({ pipelineDir: dir });
+    assert.equal(s.deferredHubs, 0, 'Tier-1 short-circuit runs before the hot-file check even applies');
+    assert.equal(s.filedHubs, 1);
+    assert.equal(s[onePassPlan.id].onePass, true);
+  });
+});
+
 test('kill switch + a malformed request are both no-ops', () => {
   const dir = tmpRepo();
   fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'bad.json'), JSON.stringify({ id: 'x', sourceFile: 'a.js' }));
