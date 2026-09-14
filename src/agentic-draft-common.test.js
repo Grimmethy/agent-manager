@@ -13,7 +13,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 const {
-  parseSubTaskProposals, parseClarificationOptions, priorRejectionBlock,
+  parseSubTaskProposals, formatSubTaskProposalsForReview, parseClarificationOptions, priorRejectionBlock,
   RESOLUTION_RE, resolveAgenticDraft, prepareAdhocWorktree, agenticWorktreePaths,
   runAgenticDraftInWorktree, SELF_DECLARED_PARTIAL_SCOPE_RE,
 } = require('./agentic-draft-common.js');
@@ -71,6 +71,31 @@ test('parseSubTaskProposals correctly handles a literal bracket character INSIDE
   assert.deepEqual(parseSubTaskProposals(text), [
     { title: 'a', rawText: 'update the config[env] block' }, { title: 'b', rawText: 'do b' },
   ]);
+});
+
+// Root-caused live 2026-09-14: every decompose call site used to stamp
+// task.implementResponse to a content-free templated sentence with no trace of the actual
+// proposals, so review-task.js's buildVerdictPrompt (which never reads subTaskProposals
+// directly) showed the reviewer nothing to check coverage against -- even though
+// ADHOC_DECOMPOSE_GUIDANCE has always told it to judge "the actual DECOMPOSITION in the
+// IMPLEMENT draft below." This is the shared formatter all three call sites now use to
+// actually put that content there.
+test('formatSubTaskProposalsForReview renders a numbered title+rawText listing, with an after-dependency note', () => {
+  const out = formatSubTaskProposalsForReview([
+    { title: 'Add schema module', rawText: 'Create a new self-contained schema module.' },
+    { title: 'Add endpoint', rawText: 'Add a GET endpoint reading the schema.', after: 0 },
+  ]);
+  assert.equal(
+    out,
+    '1. Add schema module\n   Create a new self-contained schema module.\n'
+    + '2. Add endpoint (after piece 1)\n   Add a GET endpoint reading the schema.',
+  );
+});
+
+test('formatSubTaskProposalsForReview returns an empty string for null/empty input, never throws', () => {
+  assert.equal(formatSubTaskProposalsForReview(null), '');
+  assert.equal(formatSubTaskProposalsForReview([]), '');
+  assert.equal(formatSubTaskProposalsForReview(undefined), '');
 });
 
 test('parseClarificationOptions needs an OPTIONS: header + 2 well-formed lines', () => {

@@ -13,7 +13,7 @@ const { providerFor, labelFor, resolveModelProfile } = require('../model-provide
 const { getConfig, ensureRegistered } = require('../config.js');
 const { withLock: defaultWithLock } = require('../single-flight-lock.js');
 const gpuArbiter = require('../gpu-arbiter.js');
-const { parseClarificationOptions } = require('../agentic-draft-common.js');
+const { parseClarificationOptions, formatSubTaskProposalsForReview } = require('../agentic-draft-common.js');
 const { runDecomposePass } = require('../decompose-pass.js');
 const { checkDraft } = require('../fact-checker.js');
 const { resolveSourceName, getRegisteredSource } = require('../task-source-registry.js');
@@ -234,7 +234,7 @@ async function draftAdhocBranch(task, {
       task.adhocResolution = 'decompose';
       task.subTaskProposals = split.subTasks;
       task.rawDiff = '';
-      task.implementResponse = `Preliminary size check: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.`;
+      task.implementResponse = `Preliminary size check: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
       concludeDraft(task);
       return { succeeded: true, blocked: false };
     }

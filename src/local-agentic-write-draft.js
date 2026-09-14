@@ -27,7 +27,7 @@ const fs = require('fs');
 const { getConfig } = require('./config.js');
 const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
-const { runAgenticDraftInWorktree, priorRejectionBlock } = require('./agentic-draft-common.js');
+const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { runDecomposePass } = require('./decompose-pass.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
@@ -447,6 +447,7 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       if (split && split.subTasks && split.subTasks.length >= 2) {
         task.adhocResolution = 'decompose';
         task.subTaskProposals = split.subTasks;
+        task.implementResponse = `Scope-complexity gate: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
         return { succeeded: true, blocked: false, resolution: 'decompose' };
       }
     }
@@ -522,7 +523,7 @@ async function draftAdhocViaLocalAgenticWrite(task, {
         const why = task.turnBudgetExhausted
           ? 'a turn-budget-exhausted implement pass'
           : 'two implement passes that both chose RESOLUTION: decompose without usable pieces';
-        task.implementResponse = `Auto-decomposed after ${why} (${split.subTasks.length} pieces).\n\n${verdict.blockedReason || ''}`;
+        task.implementResponse = `Auto-decomposed after ${why} (${split.subTasks.length} pieces).\n\n${verdict.blockedReason || ''}\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
         delete task.turnBudgetExhausted;
         delete task.retryableDraftBlock;
         delete task.rescopedRawText;
