@@ -64,6 +64,13 @@ function requeueBlockedTasksForSignature(pipelineDir, signature, { dirs = ['bloc
       }
       if (!taskMatchesSignature(data, signature)) continue;
 
+      // reviewInconclusive (local-draft.js / implement-critique.js's stochastic harness
+      // gates -- see reject-retry-check.js's isReviewRejection for the full reasoning)
+      // marks a re-roll-worthy gate flake, not a fixable rejection cluster -- signature
+      // matching would pull it back in as if some landed code fix addressed it, when what
+      // it actually needs is a fresh grounding re-check, a different mechanism entirely.
+      if (data.reviewInconclusive) continue;
+
       // reason:'design-decision' covers two very different holds:
       //  (a) a GENUINE human question -- the agentic pass emitted RESOLUTION:
       //      needs-human-decision (local-draft.js), or a duplicate / staleness escalation.

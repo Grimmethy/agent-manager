@@ -57,6 +57,29 @@ test('requeueBlockedTasksForSignature moves every task matching the signature to
   assert.equal(pending.history[0].note, undefined);
 });
 
+// 2026-09-14 (hub bd-1788969231749): reviewInconclusive marks a stochastic harness-gate
+// re-roll, not a fixable rejection cluster -- signature matching must not pull it back in
+// as if a landed code fix addressed it (it needs a fresh grounding re-check instead).
+test('requeueBlockedTasksForSignature skips a reviewInconclusive task even when it matches the signature', () => {
+  const dir = tempPipelineDir();
+  writeBlocked(dir, 'arch-import-x-1', {
+    source: 'arch_import', domain: 'default', title: 'X-1',
+    promptContext: { itemId: '1' },
+    history: [{ stage: 'harness-search', detail: '3 quer(y/ies), 0 hit(s), 0 file(s)' }],
+    reviewInconclusive: true,
+  });
+  writeBlocked(dir, 'arch-import-x-2', {
+    source: 'arch_import', domain: 'default', title: 'X-2',
+    promptContext: { itemId: '2' },
+    history: [{ stage: 'harness-search', detail: '2 quer(y/ies), 0 hit(s), 0 file(s)' }],
+  });
+
+  const { requeuedIds } = requeueBlockedTasksForSignature(dir, 'arch_import::harness-search-zero-results');
+
+  assert.deepEqual(requeuedIds, ['arch-import-x-2'], 'the reviewInconclusive sibling is skipped, not requeued');
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'blocked', 'arch-import-x-1.json')), true, 'left alone in blocked/');
+});
+
 test('requeueBlockedTasksForSignature does not touch a task that already has a pending entry', () => {
   const dir = tempPipelineDir();
   writeBlocked(dir, 'arch-import-x-1', {

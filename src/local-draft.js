@@ -999,6 +999,14 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
       appendHistoryEvent(task, 'blocked', blockedReason);
       task.blockedStage = 'review';
       task.blockedReason = blockedReason;
+      // Stochastic harness gate, not a genuine reviewer rejection -- reject-retry-check.js's
+      // isReviewRejection() currently keys only on blockedStage:'review', which silently
+      // conflates a re-roll-worthy gate flake with a real REJECT verdict. This structured
+      // flag lets downstream consumers (retry, drain, self-audit) tell them apart without
+      // depending on blockedStage alone. Never set at a genuine review-time rejection site
+      // (see src/review-task.js's own blockedStage:'review' assignments, which do not set
+      // this) -- only here and postImplementCheck's sibling gate in implement-critique.js.
+      task.reviewInconclusive = true;
       task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
       task.priorRejectionFeedback.push(blockedReason);
       return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
