@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { checkFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix } = require('./fact-checker.js');
+const { checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
 // against a hash that genuinely exists, not just one that doesn't.
@@ -89,6 +89,32 @@ test('checkFilePaths tries multiple extraRoots in order, not just the first', ()
   fs.writeFileSync(path.join(repoRoot, 'backend', 'src', 'only-in-backend.js'), '// x');
 
   const [check] = checkFilePaths('`only-in-backend.js`', repoRoot, ['frontend/src', 'backend/src']);
+  assert.equal(check.exists, true);
+});
+
+// --- Regression: a file:line token (e.g. "src/foo.js:310") must not be silently truncated
+// to its bare path by PATH_EXT_RE -- that would leak a false exists:true (or exists:false)
+// signal downstream. PATH_EXT_RE's (?!\s*:\s*\d) lookahead rejects the :NNN suffix at
+// extraction time (commit #239); these tests pin that behaviour so a future regex edit
+// cannot reintroduce the truncation. ---
+
+test('extractFilePaths does not truncate a file:line token to its bare path', () => {
+  assert.deepEqual(extractFilePaths('see src/agentic-draft-common.js:310 for detail'), []);
+});
+
+test('extractFilePaths still extracts a bare path with no line suffix', () => {
+  assert.deepEqual(extractFilePaths('see src/real-file.js for detail'), ['src/real-file.js']);
+});
+
+test('checkFilePaths does not leak a :NNN-suffixed token as an existing file', () => {
+  const repoRoot = makeRepo();
+  assert.deepEqual(checkFilePaths('see src/real-file.js:310 for detail', repoRoot, ['src']), []);
+});
+
+test('checkFilePaths still resolves a bare path to an existing file', () => {
+  const repoRoot = makeRepo();
+  const [check] = checkFilePaths('see src/real-file.js for detail', repoRoot, ['src']);
+  assert.equal(check.claimedPath, 'src/real-file.js');
   assert.equal(check.exists, true);
 });
 
