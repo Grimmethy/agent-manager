@@ -2524,6 +2524,40 @@ test('draftTask still runs the critique+revision pass for a non-advisoryProse so
   });
 });
 
+// 2026-09 (degenerate-as-skip, twin of the local-worker.ps1 fix): a degenerate critique
+// call is a FAILURE of the critic, not a completed pass -- runCritiqueAndRevision (now in
+// src/lib/implement-critique.js) must skip (critique-skipped + return) rather than fall
+// through to recordCritique() / 'critique-done', which downstream read as a pass signal.
+test('draftTask skips (not passes) the critique pass when the critique call is degenerate', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'obs-fix-critique-degenerate', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-3', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 };
+      return { response: '', degenerate: 'truncated', attempts: 1 }; // 3rd call = degenerate critique
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(callCount, 3, 'plan + implement + critique; no revise call after a degenerate critique');
+    assert.equal(task.critiqueOutcome, 'critique-degenerate', 'degenerate critique must be marked as a skip, not a pass');
+    assert.ok((task.history || []).some((h) => h.stage === 'critique-skipped'), 'a critique-skipped history entry must be recorded');
+    assert.ok(!(task.history || []).some((h) => h.stage === 'critique-done'), 'no critique-done entry for a degenerate critique');
+    const last = (task.draftAttempts || [])[ (task.draftAttempts || []).length - 1 ];
+    assert.equal(last && last.critique, undefined, 'recordCritique must not run for a degenerate critique');
+  });
+});
+
 // Plan-grounding fix, 2026-08-25: research_task's plan pass now gets real WebSearch/
 // WebFetch tool access (see prompts.js's researchPlanPrompt for the incident this
 // fixes -- an ungrounded plan pass fabricated a fake clinical trial registry ID/site,
