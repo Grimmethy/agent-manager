@@ -36,7 +36,9 @@ function isRejectedAtCreationMislabel(task) {
 }
 
 function backfillRejectedHubDisposition({ pipelineDir }) {
-  const result = { checked: 0, fixed: 0, errors: [] };
+  const result = {
+    checked: 0, fixed: 0, relabeledInPlace: 0, errors: [],
+  };
   if (process.env.AGENT_MANAGER_REJECTED_HUB_BACKFILL === 'false') return result;
 
   const doneDir = path.join(pipelineDir, 'queue', 'done');
@@ -66,7 +68,7 @@ function backfillRejectedHubDisposition({ pipelineDir }) {
     if (!isRejectedAtCreationMislabel(task)) continue;
 
     // Re-labels the false 'merged' event in place (never inserts a duplicate) so the
-    // history reads honestly as "created -> noop -> done -> archived", matching exactly
+    // history reads honestly as "created -> noop -> done[ -> archived]", matching exactly
     // what coordinator-sweep.js's own fixed path now produces for a fresh hub.
     const mergedEvent = Array.isArray(task.history) ? task.history.find((h) => h.stage === 'merged') : null;
     if (mergedEvent) {
@@ -74,12 +76,37 @@ function backfillRejectedHubDisposition({ pipelineDir }) {
       mergedEvent.detail = 'coordinator hub: plan rejected at creation, no sub-tasks were ever filed (relabeled by one-time backfill, was incorrectly stamped merged)';
     }
     task.terminalDisposition = 'noop';
-    appendHistoryEvent(task, 'archived', 'Auto-archived by one-time backfill: coordinator hub rejected at creation, no sub-tasks were ever filed -- nothing to review or wait on');
 
+    // 2026-09-14, screaminggoatclubmt: confirmed live -- the proactive decompose sweep can
+    // generate more than one hub record for the same source file over time, sharing the
+    // same deterministic id/filename. When an EARLIER attempt's hub already occupies the
+    // archive destination (already correctly labeled by this same backfill or by
+    // coordinator-sweep.js itself), never clobber it -- but still fix the honesty of the
+    // label on the stuck duplicate in place, rather than leave it lying about 'merged'
+    // forever just because it lost the race for the shared filename. It stays in done/'s
+    // top level (not archived) since there's nowhere safe to move it without a naming
+    // scheme change this backfill isn't the place to make.
+    const dest = path.join(destDir, entry.name);
+    let destTaken = false;
+    try {
+      destTaken = fs.existsSync(dest);
+    } catch (e) {
+      result.errors.push(`stat(${dest}): ${e.message}`);
+    }
+
+    if (destTaken) {
+      try {
+        fs.writeFileSync(src, JSON.stringify(task, null, 2));
+        result.relabeledInPlace += 1;
+      } catch (e) {
+        result.errors.push(`relabel-in-place(${src}): ${e.message}`);
+      }
+      continue;
+    }
+
+    appendHistoryEvent(task, 'archived', 'Auto-archived by one-time backfill: coordinator hub rejected at creation, no sub-tasks were ever filed -- nothing to review or wait on');
     try {
       fs.mkdirSync(destDir, { recursive: true });
-      const dest = path.join(destDir, entry.name);
-      if (fs.existsSync(dest)) continue; // already archived by a prior/racing run -- don't clobber
       fs.writeFileSync(dest, JSON.stringify(task, null, 2));
       fs.unlinkSync(src);
       result.fixed += 1;
