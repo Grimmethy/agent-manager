@@ -624,13 +624,37 @@ function firstRuntimeError(changes, sourceFile, repoRoot) {
       // then blew the timeout mid-spawn -- misreported by the generic fallback below as
       // "module failed to load" instead of what actually happened (a timeout while it was
       // doing real work it should never have been allowed to start).
+      // 2026-09-14, screaminggoatclubmt: "dig into the new bug too" -- found live against
+      // local-draft.js's own real exports: callImplementModel is an `async function`.
+      // Calling `v()` on it NEVER throws synchronously, even when its own parameter
+      // destructuring (`{ recordModelCall, implPrompt, ... }` with no argument supplied)
+      // would throw -- an async function always returns a Promise, so that failure
+      // becomes a REJECTED promise instead, which the `try{v()}catch` here can never see.
+      // The rejection then surfaces later as an unhandled promise rejection, which
+      // crashes the WHOLE probe process by default in modern Node -- not name-pattern-
+      // specific like the next*/onboard/clone fix above, since ANY async export with a
+      // required parameter hits this, regardless of its name. Extending the denylist
+      // forever is whack-a-mole; a global safety net fixes the whole class at once.
+      'let sawRTE=null;',
+      'process.on("unhandledRejection",(e)=>{ if(e && e.name==="ReferenceError" && !sawRTE) sawRTE=e; });',
+      'process.on("uncaughtException",()=>{});', // same belt-and-suspenders spirit as the risky-name denylist: never let a call we made crash this probe outright
       'const risky=/^(write|apply|save|generate|run|queue|file|commit|push|delete|sync|remove|move|reset|migrate|send|post|exec|spawn|kill|install|build|next|onboard|clone)/i;',
       'for(const [k,v] of Object.entries(m||{})){',
       '  if(typeof v!=="function"||risky.test(k)||v.length>4) continue;',
-      '  try{ v(); }catch(e){',
+      '  try{',
+      '    const r=v();',
+      '    if(r && typeof r.then==="function") r.catch((e)=>{ if(e && e.name==="ReferenceError" && !sawRTE) sawRTE=e; });',
+      '  }catch(e){',
       '    if(e && e.name==="ReferenceError"){ process.stderr.write("RTE "+k+": "+e.message); process.exit(3); }',
       '  }',
       '}',
+      // Give any pending promise rejection a chance to settle before deciding the
+      // verdict -- without this, a same-tick unhandledRejection listener can still fire
+      // AFTER the process would otherwise exit 0, silently losing a genuine async RTE.
+      'setTimeout(()=>{',
+      '  if(sawRTE){ process.stderr.write("RTE (async): "+sawRTE.message); process.exit(3); }',
+      '  process.exit(0);',
+      '},50);',
     ].join('\n');
     try {
       // Timeout dropped 20s -> 8s: belt-and-suspenders alongside the risky-name fix above
