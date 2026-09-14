@@ -400,12 +400,22 @@ def api_summary():
     counts = {s: 0 for s in QUEUE_STATES}
     counts["drafting"] = 0
     bd_entries = _brain_dump_entries_with_task_status()
+    # Split human notes from machine-raised findings (2026-09-14: Brain Dump tab went
+    # human-only, everything with a `raisedBy` moved to Filed Findings -- see
+    # routes/brain_dump.py's _filtered_brain_dump_view for the full reasoning) so each
+    # nav badge counts only its own half.
+    human_bd_entries = [e for e in bd_entries if not e.get("raisedBy")]
+    filed_entries = [e for e in bd_entries if e.get("raisedBy")]
     # Unprocessed (captured/sorted) PLUS actioned-but-stuck -- see
     # BRAIN_DUMP_NEEDS_ATTENTION_STATES's own header for why the latter half exists: a
     # stuck-actioned entry previously gave zero nav-level signal at all.
     counts["brain-dump"] = (
-        sum(1 for e in bd_entries if e.get("status") != "actioned")
-        + _brain_dump_needs_attention_count(bd_entries)
+        sum(1 for e in human_bd_entries if e.get("status") != "actioned")
+        + _brain_dump_needs_attention_count(human_bd_entries)
+    )
+    counts["filed"] = (
+        sum(1 for e in filed_entries if e.get("status") != "actioned")
+        + _brain_dump_needs_attention_count(filed_entries)
     )
     # Cached (list_unmerged_branches(force=False)) -- this route is polled every 5s by
     # the nav badge cycle, and a live `git fetch` on every single poll would be both slow

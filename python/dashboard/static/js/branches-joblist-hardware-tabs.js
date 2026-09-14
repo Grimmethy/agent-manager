@@ -899,6 +899,7 @@ async function renderMain() {
     else if (activeTab === 'scriptforge') await renderScriptForgeTab();
     else if (activeTab === 'adhoc') await renderAdhocTasksTab();
     else if (activeTab === 'concepts') await renderConceptsTab();
+    else if (activeTab === 'filed') await renderFiledFindingsTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
@@ -923,7 +924,10 @@ async function refresh() {
   // race against this same 5s cycle rebuilding the tab's DOM via innerHTML mid-click,
   // silently discarding the interaction with no error. Same class of bug Brain Dump's
   // own opt-out already exists to prevent; re-entering the tab still re-fetches once.
-  if (!['project', 'brain-dump', 'promptforge', 'adforge', 'scriptforge', 'concepts'].includes(activeTab)) renderMain();
+  // filed (2026-09-14): same reasoning as brain-dump's own opt-out just above -- a
+  // suppress/prioritize/delete click mid-flight (button disabled, awaiting its fetch)
+  // shouldn't get its DOM silently rebuilt out from under it by this 5s cycle.
+  if (!['project', 'brain-dump', 'filed', 'promptforge', 'adforge', 'scriptforge', 'concepts'].includes(activeTab)) renderMain();
 }
 
 function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }

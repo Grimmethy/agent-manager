@@ -90,6 +90,9 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         self.assertIn("T", entry["editedAt"])
 
     def test_suppress_sets_flag_and_hides_from_default_view_but_not_status_all(self):
+        # 2026-09-14: Brain Dump went human-only, everything with a `raisedBy` (like both
+        # fixtures below -- suppress only ever applies to a machine-raised finding) moved
+        # to /api/filed-findings -- see routes/brain_dump.py's _filtered_brain_dump_view.
         self._seed([
             {"id": "bd-keep", "serial": 1, "rawText": "live finding", "status": "sorted",
              "raisedBy": {"source": "pipeline_debrief"}},
@@ -103,12 +106,17 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         self.assertEqual(entry["suppressedReason"], "config removed")
         self.assertIn("T", entry["suppressedAt"])
 
-        default_ids = [e["id"] for e in self.client.get("/api/brain-dump").get_json()]
+        default_ids = [e["id"] for e in self.client.get("/api/filed-findings").get_json()]
         self.assertIn("bd-keep", default_ids)
         self.assertNotIn("bd-stale", default_ids)
 
-        all_ids = [e["id"] for e in self.client.get("/api/brain-dump?status=all").get_json()]
+        all_ids = [e["id"] for e in self.client.get("/api/filed-findings?status=all").get_json()]
         self.assertIn("bd-stale", all_ids)
+
+        # And confirm the human-only endpoint never shows either machine-raised fixture.
+        human_ids = [e["id"] for e in self.client.get("/api/brain-dump?status=all").get_json()]
+        self.assertNotIn("bd-keep", human_ids)
+        self.assertNotIn("bd-stale", human_ids)
 
     def test_suppress_is_reversible(self):
         self._seed([{"id": "bd-x", "serial": 1, "rawText": "x", "status": "sorted",
@@ -119,6 +127,35 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         self.assertNotIn("suppressed", entry)
         self.assertNotIn("suppressedReason", entry)
         self.assertIn("bd-x", [e["id"] for e in self.client.get("/api/brain-dump").get_json()])
+
+    def test_brain_dump_and_filed_findings_are_disjoint_and_status_filtering_still_works_on_both(self):
+        # 2026-09-14 (Grimmethy: "Brain dump needs to go back to human input only. All
+        # automatically generated tasks need to go into a separate filing tab"): the
+        # split itself, and that /api/filed-findings honors the exact same
+        # unprocessed/actioned/all semantics as /api/brain-dump always has.
+        self._seed([
+            {"id": "bd-human", "serial": 1, "rawText": "a note I typed", "status": "captured"},
+            {"id": "bd-human-done", "serial": 2, "rawText": "an old note", "status": "actioned"},
+            {"id": "bd-machine", "serial": 3, "rawText": "a sweep found this", "status": "captured",
+             "raisedBy": {"source": "side-finding-sweep"}},
+            {"id": "bd-machine-done", "serial": 4, "rawText": "an old finding", "status": "actioned",
+             "raisedBy": {"source": "side-finding-sweep"}},
+        ])
+
+        human_default = [e["id"] for e in self.client.get("/api/brain-dump").get_json()]
+        self.assertEqual(human_default, ["bd-human"])
+        machine_default = [e["id"] for e in self.client.get("/api/filed-findings").get_json()]
+        self.assertEqual(machine_default, ["bd-machine"])
+
+        human_actioned = [e["id"] for e in self.client.get("/api/brain-dump?status=actioned").get_json()]
+        self.assertEqual(human_actioned, ["bd-human-done"])
+        machine_actioned = [e["id"] for e in self.client.get("/api/filed-findings?status=actioned").get_json()]
+        self.assertEqual(machine_actioned, ["bd-machine-done"])
+
+        human_all = sorted(e["id"] for e in self.client.get("/api/brain-dump?status=all").get_json())
+        self.assertEqual(human_all, ["bd-human", "bd-human-done"])
+        machine_all = sorted(e["id"] for e in self.client.get("/api/filed-findings?status=all").get_json())
+        self.assertEqual(machine_all, ["bd-machine", "bd-machine-done"])
 
     def test_suppress_unknown_entry_404s(self):
         self._seed([])
