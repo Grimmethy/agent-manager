@@ -58,6 +58,7 @@ const { getConfig } = require('./config.js');
 const { planIsFullyMechanicalHtml } = require('./decompose-one-pass.js');
 const { planIsFullyMechanicalNodeModule, buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
 const { planIsFullyMechanicalBlueprint, buildBlueprintOnePassChanges } = require('./decompose-flask-blueprint.js');
+const { fileHasRecentCommits, HOT_FILE_DAYS } = require('./hot-file-guard.js');
 
 function slugify(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'x';
@@ -446,6 +447,18 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
     return fileOnePassTask({ pipelineDir, requestFile, request, now, kind: 'flask-blueprint' });
   }
 
+  // Hot-file exclusion applies ONLY here, past every Tier-1 short-circuit above (2026-09-14
+  // fix -- screaminggoatclubmt: "we need these things broken down into manageable chunks
+  // as we build them", found live when the proactive sweep held app.py's flask-blueprint
+  // decomposes for a full week even though every one of them landed as a single Tier-1
+  // one-pass commit, never the multi-day Tier-2 hub this guard exists to protect). Do NOT
+  // stamp hubFiledAt/hubId -- leaving the request unresolved means sweep() above just
+  // retries this same cheap (no model call) check on its next tick, and materialises the
+  // real hub the moment the file cools down.
+  if (fileHasRecentCommits(repoRoot, request.sourceFile)) {
+    return { deferred: true, reason: `${request.sourceFile} has commits in the last ${HOT_FILE_DAYS} days -- Tier-2 hub deferred until it cools down` };
+  }
+
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
   fs.mkdirSync(adhocDir, { recursive: true });
@@ -583,7 +596,7 @@ function fileHub({ pipelineDir, repoRoot, requestFile, request, now }) {
 }
 
 function sweep({ pipelineDir, repoRoot, force = false, now = Date.now() } = {}) {
-  const summary = { checked: 0, filedHubs: 0, blockedHubs: 0, errors: 0, skipped: [] };
+  const summary = { checked: 0, filedHubs: 0, blockedHubs: 0, deferredHubs: 0, errors: 0, skipped: [] };
   if (process.env.AGENT_MANAGER_FILE_DECOMPOSE_TO_HUB === 'false') return summary;
   const requestsDir = path.join(pipelineDir, 'queue', 'file-decompose-requests');
   let resolvedRepoRoot = repoRoot;
@@ -598,7 +611,8 @@ function sweep({ pipelineDir, repoRoot, force = false, now = Date.now() } = {}) 
     try {
       const res = fileHub({ pipelineDir, repoRoot: resolvedRepoRoot, requestFile: full, request, now });
       summary[request.id] = res;
-      if (res.blocked) summary.blockedHubs += 1;
+      if (res.deferred) summary.deferredHubs += 1;
+      else if (res.blocked) summary.blockedHubs += 1;
       else summary.filedHubs += 1;
     } catch (e) {
       console.error(`[file-decompose-to-hub] ${request.id}: ${e && e.message}`);
@@ -614,7 +628,7 @@ if (require.main === module) {
   const force = process.argv.includes('--force');
   const { pipelineDir, repoRoot } = getConfig();
   const s = sweep({ pipelineDir, repoRoot, force });
-  const parts = [`checked=${s.checked}`, `filedHubs=${s.filedHubs}`, `blockedHubs=${s.blockedHubs}`, `errors=${s.errors}`];
+  const parts = [`checked=${s.checked}`, `filedHubs=${s.filedHubs}`, `blockedHubs=${s.blockedHubs}`, `deferredHubs=${s.deferredHubs}`, `errors=${s.errors}`];
   if (s.skipped.length) parts.push(`skipped=[${s.skipped.join('; ')}]`);
   console.log(`file-decompose-to-hub: ${parts.join(' ')}`);
   process.exit(0);
