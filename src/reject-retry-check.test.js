@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { rejectRetryCheck } = require('./reject-retry-check.js');
+const { rejectRetryCheck, isReviewRejection } = require('./reject-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
@@ -669,4 +669,20 @@ test('a non-retryable classification with no pre-existing needsClarification sta
   const out = JSON.parse(fs.readFileSync(path.join(d.needsClarificationDir, 'pff-ac8.json'), 'utf8'));
   const ncEvent = out.history.find((h) => h.stage === 'needs-clarification');
   assert.match(ncEvent.detail, /unreliable-grounding \(harness-side\)/);
+});
+
+// --- isReviewRejection: reviewInconclusive carve-out (2026-09-14, hub bd-1788969231749) --
+// Inconclusive vs real REJECT are conflated across the whole pipeline: this function used
+// to key only on blockedStage:'review', so local-draft.js's two stochastic harness gates
+// (postImplementCheck, implement-critique.js's grounding-failed gate) -- which also set
+// blockedStage:'review' -- silently inherited the blind-redraft behavior meant for a
+// genuine reviewer REJECT. task.reviewInconclusive, stamped only at those two real gate
+// sites, is the structured signal that lets this function (and any other downstream
+// consumer) tell them apart.
+test('isReviewRejection returns false when reviewInconclusive is set, even with blockedStage:"review"', () => {
+  assert.equal(isReviewRejection({ blockedStage: 'review', reviewInconclusive: true }), false);
+});
+
+test('isReviewRejection returns true for a genuine review rejection (blockedStage:"review", no reviewInconclusive flag)', () => {
+  assert.equal(isReviewRejection({ blockedStage: 'review' }), true);
 });

@@ -94,7 +94,11 @@ function invalidPremiseBeforeCheckExisted(task) {
 }
 
 function isReviewRejection(task) {
-  return task.blockedStage === 'review';
+  // reviewInconclusive (local-draft.js / implement-critique.js's two stochastic harness
+  // gates) marks a re-roll-worthy gate flake, not a genuine reviewer rejection -- both set
+  // blockedStage:'review' too (the field this function used to key on alone), which
+  // silently inherited the blind-redraft behavior meant for a real REJECT verdict.
+  return task.blockedStage === 'review' && !task.reviewInconclusive;
 }
 
 // Same reasoning as queue-watchdog.ps1's arch_discovery/arch_import stamping (not ported
@@ -483,7 +487,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection };
 
 if (require.main === module) {
   main();
