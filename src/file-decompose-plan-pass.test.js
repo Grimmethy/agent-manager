@@ -610,3 +610,62 @@ function writeJsFile(dir, relPath, content) {
   fs.mkdirSync(path.dirname(abs), { recursive: true });
   fs.writeFileSync(abs, content);
 }
+
+// --- Tier C hardening (2026-09-14, screaminggoatclubmt: "Harden Tier C") -------------
+
+// The exact live incident, condensed: Tier C (structureless, model groups flat names) has
+// no section boundaries to respect at all -- two symbols that would be section-mates
+// under Tier A/B can still get split across different Tier C modules by the model's own
+// grouping, and the upfront fan-out filter (a "referenced from outside its SECTION"
+// check) has no way to know that, since there IS no section here. prompts.js's
+// assemblePrompt and its own caller got split this way live; validatePlan correctly
+// rejected the whole plan rather than ship it. This test reproduces that shape directly.
+test('runFileDecomposePlanPass: Tier C hardening removes a symbol whose caller landed in a DIFFERENT model-grouped module, instead of producing an invalid plan', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'tierc-harden-'));
+  const parts = [
+    'function assemblePrompt() {',
+    '  return "core";',
+    '}',
+    'function callerNeedsAssemble() {',
+    // The exact live shape: a caller in a DIFFERENT eventual module than its own callee.
+    '  return assemblePrompt() + "!";',
+    '}',
+    'function standaloneA() { return 1; }',
+    'function standaloneB() { return 2; }',
+    'function standaloneC() { return 3; }',
+    'function standaloneD() { return 4; }',
+  ];
+  writeJsFile(dir, 'src/prompts-fixture.js', parts.join('\n'));
+
+  // Simulates the model's own imperfect flat-name grouping: assemblePrompt and its own
+  // caller (callerNeedsAssemble) end up in TWO DIFFERENT modules.
+  const call = async () => ({
+    response: JSON.stringify([
+      { newFile: 'src/lib/core-tasks.js', symbols: ['assemblePrompt', 'standaloneA'] },
+      { newFile: 'src/lib/path-prefetch.js', symbols: ['callerNeedsAssemble', 'standaloneB'] },
+      { newFile: 'src/lib/misc.js', symbols: ['standaloneC', 'standaloneD'] },
+    ]),
+  });
+
+  const plan = await runFileDecomposePlanPass('src/prompts-fixture.js', { repoRoot: dir, call, minSymbols: 6 });
+  assert.ok(plan, 'hardening trims the bad move rather than nulling out the whole plan');
+  const allMoved = plan.moves.flatMap((m) => m.symbols);
+  // Both ends of the cross-module reference get excluded, not just the caller:
+  // decompose-node-module.js has no mechanism for one NEW module to require() from
+  // ANOTHER new module (only a back-import to the ORIGINAL source), so a callee moved to
+  // a different module than its caller is unsafe from EITHER symbol's perspective.
+  // Merging them into the same move would also fix this, but that's a bigger change than
+  // this hardening pass -- excluding both is the safe, conservative outcome.
+  assert.ok(!allMoved.includes('callerNeedsAssemble'), 'its own callee (assemblePrompt) landed in a different module');
+  assert.ok(!allMoved.includes('assemblePrompt'), 'called by a symbol left in a different module -- symmetric exclusion');
+  assert.ok(allMoved.includes('standaloneA'));
+  assert.ok(allMoved.includes('standaloneC'));
+  assert.ok(allMoved.includes('standaloneD'));
+
+  // The hardened plan must ACTUALLY pass the real self-containment check, not just look
+  // plausible -- prove it against the real deterministic builder, same as validatePlan does.
+  const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
+  const sourceText = fs.readFileSync(path.join(dir, 'src/prompts-fixture.js'), 'utf8');
+  const built = buildNodeModuleOnePassChanges(sourceText, 'src/prompts-fixture.js', plan.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols })), dir);
+  assert.ok(built.ok, built.ok ? '' : built.reason);
+});

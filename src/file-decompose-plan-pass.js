@@ -653,13 +653,44 @@ async function runFileDecomposePlanPass(sourceFile, {
   // it), and no symbol claimed twice.
   const valid = new Set(candidates.map((s) => s.name));
   const claimed = new Set();
-  const clean = [];
+  let clean = [];
   for (const mv of moves) {
     const syms = (mv.symbols || []).filter((s) => valid.has(s) && !claimed.has(s));
     for (const s of syms) claimed.add(s);
     if (syms.length) clean.push({ ...mv, symbols: syms });
   }
   if (clean.length < 2) return null;
+
+  // Tier C (and, less commonly, Tier B's model-merged sections) hardening (2026-09-14,
+  // screaminggoatclubmt: "Harden Tier C"). computeFanOutSymbols/computeJsFanOutSymbols
+  // above only ever checked "referenced from outside its own SECTION" -- a meaningful
+  // proxy ONLY because Tier A/packSections guarantee a section always lands in exactly
+  // one module together. Tier C has no such guarantee: it lets the model freely group
+  // FLAT symbol names with zero regard for section boundaries, so two symbols in the
+  // SAME section (one safe assumption the upfront filter relied on) can still end up in
+  // DIFFERENT produced modules. Caught live: prompts.js's assemblePrompt and its own
+  // caller (pathPrefetchResolvePlanPrompt) shared a section but Tier C split them across
+  // two different modules -- validatePlan correctly rejected the result (the safety net
+  // worked), but that's a whole plan thrown away instead of a smaller, still-useful one.
+  //
+  // Reuses computeJsFanOutSymbols itself here, unchanged -- just handed the ACTUAL final
+  // move groupings as its "groups" instead of comment-banner sections. A no-op for a
+  // .py source (computeFanOutSymbols's dispatcher only does this for .js/.mjs/.cjs) and
+  // effectively a no-op for a genuinely self-contained Tier A plan too (nothing new to
+  // flag when sections already package correctly).
+  if (/\.(js|mjs|cjs)$/.test(sourceFile)) {
+    const symbolByName = new Map(symbols.map((s) => [s.name, s]));
+    const moveGroups = new Map(clean.map((mv) => [mv.newFile, mv.symbols.map((n) => symbolByName.get(n)).filter(Boolean)]));
+    const postMoveFanOut = computeJsFanOutSymbols(sourceFile, text, symbols, moveGroups);
+    if (postMoveFanOut.size) {
+      clean = clean
+        .map((mv) => ({ ...mv, symbols: mv.symbols.filter((n) => !postMoveFanOut.has(n)) }))
+        .filter((mv) => mv.symbols.length > 0);
+      for (const n of postMoveFanOut) claimed.delete(n);
+      if (clean.length < 2) return null;
+    }
+  }
+
   const dropped = [...valid].filter((s) => !claimed.has(s));
   if (dropped.length > candidates.length * 0.4) return null;
 
