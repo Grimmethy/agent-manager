@@ -51,6 +51,19 @@ function runGit(args, cwd) {
 // see this file's own docstring) still returns `''` unchanged.
 function normalizeDiffOutput(rawDiff) {
   if (!rawDiff || !rawDiff.trim()) return '';
+  // 2026-09-14, screaminggoatclubmt: "please dig into it" -- root-caused live, second
+  // layer of the same NUL-byte-triggers-a-binary-patch incident (see runGit's own
+  // --full-index --binary note above): a `GIT binary patch` section's reverse-patch
+  // block ("literal 0\nHcmV?d00001\n") MUST be followed by a blank line to terminate it
+  // -- confirmed directly, `git apply` failed with "corrupt binary patch at line N"
+  // whenever that trailing blank line was missing. The blanket `.replace(/\s+$/, '')`
+  // below collapses ALL trailing whitespace (both of the diff's two trailing newlines)
+  // down to the single one this function then re-adds -- correct for an ordinary text
+  // diff (that's exactly what the 2026-09-08 fix above this one restores), but it
+  // silently eats a STRUCTURALLY REQUIRED blank line for a binary patch. Only strip
+  // leading whitespace for that case; git's own trailing structure is already correct
+  // and must be left untouched.
+  if (/^GIT binary patch$/m.test(rawDiff)) return rawDiff.replace(/^\s+/, '');
   return `${rawDiff.replace(/^\s+/, '').replace(/\s+$/, '')}\n`;
 }
 
@@ -95,7 +108,20 @@ function captureGroupBDiffInWorktree({ repoRoot, pipelineDir, implementResponse,
   try {
     applyGroupB({ implementResponse, repoRoot: worktreeDir, pipelineDir });
     runGit(['add', '-A'], worktreeDir);
-    const rawDiff = runGit(['diff', '--cached'], worktreeDir);
+    // --full-index --binary (2026-09-14, screaminggoatclubmt: "please dig into it" --
+    // root-caused live): git diff --cached abbreviates blob SHAs in the index line by
+    // default, AND omits the actual binary delta payload (just "Binary files ... differ")
+    // unless --binary is passed. If git decides a produced file is "binary" -- genuinely
+    // happened for a plain JS source extracted from local-draft.js, whose
+    // runCritiqueAndRevision deliberately embeds a literal NUL byte as a guaranteed-
+    // unique string-key separator (`${a}\0${b}`, valid, working code) -- `git apply`
+    // LATER refuses an abbreviated-SHA/payload-less binary patch outright: "cannot apply
+    // binary patch ... without full index line" (a binary patch, unlike a text one, needs
+    // both the full SHA and the actual base85 delta to safely apply at all). Reproduced
+    // and confirmed fixed end-to-end (byte-for-byte, including the NUL) with both flags
+    // together -- --full-index alone still failed with "missing binary patch data".
+    // Costs nothing for the overwhelmingly common text-patch case.
+    const rawDiff = runGit(['diff', '--cached', '--full-index', '--binary'], worktreeDir);
     return normalizeDiffOutput(rawDiff);
   } finally {
     // Best-effort cleanup regardless of outcome -- same reasoning adhoc-agentic-draft.js's
