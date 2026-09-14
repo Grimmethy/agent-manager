@@ -260,11 +260,46 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
     if (!Array.isArray(parent.subTasks) || parent.subTasks.length === 0) {
       // A coordinating parent with no checklist is a bug upstream -- complete it out so it
       // does not sit here forever.
+      //
+      // 2026-09-14, screaminggoatclubmt: "fix the mislabeling" -- a hub that carries
+      // `coordinatorBlocked` from the moment it was filed (file-decompose-to-hub.js's
+      // fileBlockedHub(): validatePlan() found a hard problem, subTasks was `[]` from
+      // creation, ZERO children were ever attempted) was being routed through
+      // stampHubMerged() exactly like a hub whose children ALL genuinely shipped, so its
+      // history read "created -> merged -> done" and the dashboard reported it as a
+      // successful merge. Confirmed live: 33 `Decompose <file> -- plan needs revision`
+      // records in queue/done/ carry this exact false "merged" disposition. Route the
+      // rejected-at-creation case through `noop` instead (task-disposition.js's own
+      // definition: "the apply produced no change... no code change") -- still stamps
+      // mergedAt so any (unlikely, since no children ever existed) dependsOn sibling isn't
+      // blocked forever, per stampHubMerged's own reasoning, just without the false
+      // "merged" label.
+      const rejectedAtCreation = !!parent.coordinatorBlocked;
       parent.status = 'done';
-      parent.doneMarker = 'coordinator had no sub-tasks -- completed';
-      stampHubMerged(parent);
+      parent.doneMarker = rejectedAtCreation
+        ? 'coordinator hub rejected at creation -- no sub-tasks were ever filed'
+        : 'coordinator had no sub-tasks -- completed';
+      stampHubMerged(parent, rejectedAtCreation ? {
+        disposition: 'noop',
+        detail: 'coordinator hub: plan rejected at creation, no sub-tasks were ever filed',
+      } : undefined);
       appendHistoryEvent(parent, 'done', parent.doneMarker);
-      moveToDone(file, doneDir, name, parent);
+      // 2026-09-14, screaminggoatclubmt: "fold it into the watchdog sweep" -- file
+      // straight into done/_archived_no_action/ instead of done/'s top level for the
+      // rejected-at-creation case: it produced zero real work, so there is nothing for a
+      // human to review or a dependent to wait on, the exact "no action" meaning this
+      // folder already carries elsewhere (staleness-auto-archive.js's own DENY-vote and
+      // archive-recommendation paths file directly here the same way, with no human
+      // click in between -- established precedent for an automated sweep to use this
+      // folder, not only the dashboard's own Archive button). Otherwise these hubs would
+      // just sit in done/'s top level for up to done-archive.js's 30-day retention window
+      // before its generic time-based pass finally moved them. The genuine
+      // all-children-succeeded case is unaffected -- it still lands in done/ normally.
+      const destDir = rejectedAtCreation ? path.join(doneDir, '_archived_no_action') : doneDir;
+      if (rejectedAtCreation) {
+        appendHistoryEvent(parent, 'archived', 'Auto-archived: coordinator hub rejected at creation, no sub-tasks were ever filed -- nothing to review or wait on');
+      }
+      moveToDone(file, destDir, name, parent);
       summary.checked += 1;
       summary.completed += 1;
       continue;
@@ -434,15 +469,22 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
 // reached a terminal-good state" IS the ship signal for a hub -- stamp it here so the
 // dependency gate can clear. Confirmed live 2026-09-02: the plugins-marketplace
 // coordinator chain, every downstream child frozen behind an unmergeable hub id.
-function stampHubMerged(parent) {
+// 2026-09-14: `opts.disposition`/`opts.detail` let the zero-sub-tasks-ever-filed case above
+// stamp an honest `noop` instead of `merged` while still reusing the mergedAt-for-
+// isDependencySatisfied() plumbing this function exists for -- see that call site's own
+// comment. Every other caller (the real all-children-succeeded path) is unaffected: with
+// opts omitted this behaves exactly as before.
+function stampHubMerged(parent, opts) {
+  const disposition = (opts && opts.disposition) || 'merged';
+  const detail = (opts && opts.detail) || 'coordinator hub: every decomposed sub-task reached a terminal-good state';
   if (!parent.mergedAt) {
     parent.mergedAt = new Date().toISOString();
     parent.mergedAtSource = 'coordinator-hub-all-subtasks-done';
     // Close the hub's task log with a terminal event (task-disposition.js) -- a hub has no
     // branch of its own, so "every sub-task shipped" IS its merge.
-    if (parent.terminalDisposition !== 'merged') {
-      appendHistoryEvent(parent, 'merged', 'coordinator hub: every decomposed sub-task reached a terminal-good state');
-      parent.terminalDisposition = 'merged';
+    if (parent.terminalDisposition !== disposition) {
+      appendHistoryEvent(parent, disposition, detail);
+      parent.terminalDisposition = disposition;
     }
   }
 }
