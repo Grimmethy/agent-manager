@@ -623,6 +623,65 @@ test('validatePlan + fileHub: a plain .js (CommonJS) source files ONE determinis
   assert.equal(req.onePassTaskId, task.id);
 });
 
+// 2026-09-14, screaminggoatclubmt: "Harden [Tier C]" / "go build it" -- caught live:
+// python/dashboard/static/js/analytics-and-discovery.js is loaded via a plain browser
+// `<script src>` tag (index.html), not require()d by anything -- no bundler, no Node
+// runtime, `require` is not a defined identifier there. validatePlan used to route ANY
+// .js source through the CommonJS one-pass builder by extension alone, so the produced
+// split used real require()/module.exports wiring, which would have thrown "require is
+// not defined" the instant the browser loaded it -- caught before merge only because
+// every branch gets verified for real first. A source with NEITHER require() NOR
+// module.exports anywhere (the real, confirmed shape of every static/js/*.js file in
+// this repo) must fall through to the browser-safe per-move script-extract path
+// instead, exactly like an .html source's inline <script> block already does.
+test('validatePlan: a .js source with NO require()/module.exports anywhere (a browser <script>-loaded file, not a Node module) is NOT routed through the CommonJS builder', () => {
+  const dir = tmpRepo();
+  writeJs(dir, 'python/dashboard/static/js/analytics-fixture.js',
+    'async function renderModelsTab() {\n  return fetchJson("/api/models");\n}\n\n'
+    + 'function renderDiscoveryTab() {\n  return 1;\n}\n\n'
+    + 'function unrelatedHelper() {\n  return 2;\n}\n');
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'browser-js.json'), JSON.stringify({
+    id: 'decompose-browser-js',
+    sourceFile: 'python/dashboard/static/js/analytics-fixture.js',
+    moves: [
+      { newFile: 'python/dashboard/static/js/lib/models.js', kind: 'script-extract', symbols: ['renderModelsTab'] },
+      { newFile: 'python/dashboard/static/js/lib/discovery.js', kind: 'script-extract', symbols: ['renderDiscoveryTab'] },
+    ],
+  }));
+  withEnv(dir, {}, ({ validatePlan: vp, sweep }) => {
+    const request = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'browser-js.json'), 'utf8'));
+    const v = vp(dir, request);
+    assert.equal(v.ok, true);
+    // The REAL tell: nodeModuleApplyOk must never be set for this source -- if it were,
+    // planIsFullyMechanicalNodeModule would wrongly make this Tier-1-eligible again and
+    // materialize the exact broken require()/module.exports split this test exists to
+    // prevent.
+    for (const meta of v.moveMeta) assert.equal(meta.nodeModuleApplyOk, undefined);
+    // deterministicApplyOk (the script-extract, browser-safe signal) should be set
+    // instead -- proves it actually fell through to the per-move path, not just that
+    // the CommonJS path silently no-op'd.
+    for (const meta of v.moveMeta) assert.equal(meta.deterministicApplyOk, true);
+
+    sweep({ pipelineDir: dir });
+  });
+  // No Tier-1 one-pass task -- falls through to the (safe) per-move hub instead.
+  const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+  assert.equal(adhoc.some((n) => /-onepass\.json$/.test(n)), false, 'must not materialize as a one-pass CommonJS task');
+  for (const name of adhoc) {
+    const t = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', name), 'utf8'));
+    assert.doesNotMatch(JSON.stringify(t), /require\(|module\.exports/, `${name}: must not reference require()/module.exports anywhere in a browser-script child task`);
+  }
+});
+
+test('looksLikeNodeCommonJsModule: true for a real require()/module.exports source, false for a plain browser <script>-shaped one', () => {
+  const { looksLikeNodeCommonJsModule } = require('./file-decompose-to-hub.js');
+  assert.equal(looksLikeNodeCommonJsModule("const fs = require('fs');\nfunction f() {}\n"), true);
+  assert.equal(looksLikeNodeCommonJsModule('function f() {}\nmodule.exports = { f };\n'), true);
+  assert.equal(looksLikeNodeCommonJsModule('async function renderTab() {\n  return fetchJson("/x");\n}\n'), false);
+  assert.equal(looksLikeNodeCommonJsModule(''), false);
+  assert.equal(looksLikeNodeCommonJsModule(undefined), false);
+});
+
 test('validatePlan + fileHub: a .js plan whose move is NOT self-contained is filed BLOCKED with the exact external name', () => {
   const dir = tmpRepo();
   writeJs(dir, 'src/m.js',
