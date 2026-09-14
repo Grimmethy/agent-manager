@@ -613,7 +613,18 @@ function firstRuntimeError(changes, sourceFile, repoRoot) {
     const probe = [
       'const path=require("path");',
       `const m=require(${JSON.stringify(path.join(dir, path.relative(ancestorRel, sourceFile)))});`,
-      'const risky=/^(write|apply|save|generate|run|queue|file|commit|push|delete|sync|remove|move|reset|migrate|send|post|exec|spawn|kill|install|build)/i;',
+      // 2026-09-14, screaminggoatclubmt: "fix the runtime probe bug too" -- found live
+      // against task-sources.js's own real exports: nextDeepDiveTask/nextProjectSearchTask
+      // (task-source POLLERS, not simple helpers) spawn REAL python3 subprocesses against
+      // REAL external repo clones as a side effect of merely being called with no args --
+      // this isn't a naming-convention edge case, it's this pipeline's own dominant
+      // `next<X>Task()` shape across every task-source module. The risky-name denylist
+      // never anticipated it (none of write/apply/save/... match "next"), so the probe ran
+      // real external I/O during what's supposed to be a side-effect-free dry-run check,
+      // then blew the timeout mid-spawn -- misreported by the generic fallback below as
+      // "module failed to load" instead of what actually happened (a timeout while it was
+      // doing real work it should never have been allowed to start).
+      'const risky=/^(write|apply|save|generate|run|queue|file|commit|push|delete|sync|remove|move|reset|migrate|send|post|exec|spawn|kill|install|build|next|onboard|clone)/i;',
       'for(const [k,v] of Object.entries(m||{})){',
       '  if(typeof v!=="function"||risky.test(k)||v.length>4) continue;',
       '  try{ v(); }catch(e){',
@@ -622,15 +633,24 @@ function firstRuntimeError(changes, sourceFile, repoRoot) {
       '}',
     ].join('\n');
     try {
+      // Timeout dropped 20s -> 8s: belt-and-suspenders alongside the risky-name fix above
+      // -- bounds the worst case for any FUTURE side-effecting export shape this denylist
+      // still doesn't anticipate, so a stray real subprocess fails fast instead of running
+      // wild for 20s.
       execFileSync('node', ['-e', probe], {
-        cwd: dir, timeout: 20_000, stdio: ['ignore', 'ignore', 'pipe'],
+        cwd: dir, timeout: 8_000, stdio: ['ignore', 'ignore', 'pipe'],
         env: { ...process.env, AGENT_MANAGER_REPO_ROOT: repoRoot },
       });
       return null;
     } catch (e) {
       const err = String((e && e.stderr) || (e && e.message) || e);
       if (e && e.status === 3) return err.replace(/^RTE\s*/, '').split('\n')[0].slice(0, 200);
-      // any other non-zero exit == the reduced module could not even be require()d
+      // A SIGTERM (e.signal) with no output is the timeout firing mid-call -- distinct
+      // from "the module could not even be require()d" (the ONLY case this branch used to
+      // describe), and worth saying so plainly rather than the misleading generic message.
+      if (e && e.signal && !err.trim()) {
+        return `${sourceFile}: an exported function ran long enough to hit the ${8_000}ms probe timeout (likely real side effects the risky-name filter didn't anticipate) -- rather than a missing dependency`;
+      }
       const line = err.split('\n').find((l) => /Error:|ReferenceError|is not defined/.test(l)) || 'module failed to load';
       return `${sourceFile}: ${line.trim().slice(0, 200)}`;
     }
