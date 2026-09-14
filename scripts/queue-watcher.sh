@@ -95,6 +95,19 @@ while :; do
       mapfile -t action_env_pairs < <(echo "$action_line" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));Object.entries(o.env||{}).forEach(([k,v])=>console.log(`${k}=${v}`))}catch(e){}')
 
       if [[ "$action_kind" == "restart-after-kill" && -n "$action_pid" ]]; then
+        # Last-moment recheck: dead-process-check.js decided this instance was dead,
+        # but a manual restart (launch.sh / stop.sh / agent-manager) may have raced in
+        # between that decision and this spawn. If the pidfile now holds a live pid,
+        # someone already restarted it -- skip to avoid a duplicate.
+        if [[ -n "$action_pidfile_name" && -f "$PID_DIR/$action_pidfile_name" ]]; then
+          _recheck_pid="$(cat "$PID_DIR/$action_pidfile_name" 2>/dev/null)"
+          if [[ -n "$_recheck_pid" ]] && kill -0 "$_recheck_pid" 2>/dev/null; then
+            printf '[watchdog] %s pidfile held by live pid %s -- skipping restart (manual restart raced in)\n' \
+              "$action_instance" "$_recheck_pid" >&2
+            continue
+          fi
+        fi
+
         kill -9 "$action_pid" 2>/dev/null    # zombie: the pid is still real and running (that's the whole problem) -- force-kill before restarting, or it keeps squatting the drafting claim/heartbeat file identity alongside the fresh replacement.
 
         # Verify the kill actually took before spawning a replacement -- confirmed live
