@@ -7078,6 +7078,29 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     except OSError as exc:
         logger.debug("ComfyUI lease unlink failed: %s", exc, exc_info=True)
 
+    # Proactive file-decompose sweep (2026-09-14): "when the project is selected as the
+    # target of agent manager" is exactly this event -- a project becoming the active
+    # pipeline target, whether via a fresh Start Pipeline or a restart. Fire-and-forget,
+    # never blocks this response: the sweep can make a real local-model call (Tier B/C of
+    # runFileDecomposePlanPass) if the file has no comment-banner structure to group
+    # deterministically, and this route's own caller (the Project tab) should not wait on
+    # that. --force bypasses the sweep's own 24h internal gate for this one on-demand
+    # trigger; the periodic queue-watchdog tick still runs it every 24h regardless of
+    # whether a project switch happens to trigger it in between.
+    try:
+        _decompose_log_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
+        _decompose_log_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(
+            ["node", str(SRC_DIR / "proactive-file-decompose-sweep.js"), "--force"],
+            env=child_env,
+            cwd=str(SRC_DIR),
+            stdout=(_decompose_log_dir / "proactive-file-decompose-sweep.log").open("a"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        logger.warning("Could not spawn proactive-file-decompose-sweep on project select: %s", exc)
+
     if os.name != "nt":
         import platform, subprocess as sp, shlex
         LOG_DIR = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
