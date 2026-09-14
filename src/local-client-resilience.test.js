@@ -242,6 +242,64 @@ test('call() caps the escalated numPredict at the ceiling rather than growing un
   );
 });
 
+// 2026-09-14, root-caused against a real blocked backlog (21 tasks, every one truncated
+// with ZERO visible characters): escalating numPredict alone doesn't reliably recover a
+// truncated response when <think> reasoning ate the WHOLE budget before any visible
+// answer -- observability-fix-ac-37's own real history shows numPredict already escalated
+// 1400 -> 2800 -> 5600 across 3 attempts and STILL came back truncated at 0 chars, because
+// a runaway reasoning chain just keeps consuming whatever budget it's given. Mirrors the
+// already-proven implNoThink pattern (computeImplementBudget: think disabled outright for
+// sources where reasoning was found not to help), scoped to the confirmed failure
+// signature (truncated AND zero real content) instead of a blanket per-source list.
+test('call() also drops think on a retry after a "truncated" attempt with ZERO real content (reasoning ate the whole budget)', async () => {
+  const capturedThinks = [];
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        const body = JSON.parse(raw);
+        capturedThinks.push(body.think);
+        if (capturedThinks.length < 2) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ response: '', done: true, done_reason: 'length', eval_count: body.options.num_predict }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(generateResponse('a real, complete response, landed once think was off.'));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: true, numPredict: 1400 }, 2);
+      assert.equal(result.degenerate, null);
+      assert.deepEqual(capturedThinks, [true, false], 'think must flip false on the retry after a zero-content truncation, not stay true forever');
+    }
+  );
+});
+
+test('call() does NOT drop think on a "truncated" retry that had SOME real content -- only the zero-content signature triggers it', async () => {
+  const capturedThinks = [];
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        const body = JSON.parse(raw);
+        capturedThinks.push(body.think);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ response: 'a real partial answer that got cut off mid', done: true, done_reason: 'length', eval_count: body.options.num_predict }));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: true, numPredict: 1400 }, 2);
+      assert.equal(result.degenerate, 'truncated');
+      assert.deepEqual(capturedThinks, [true, true, true], 'a genuine partial-content truncation must never force think off');
+    }
+  );
+});
+
 test('call() does NOT escalate numPredict on a non-truncation degenerate (e.g. empty) -- only "truncated" gets the ceiling bump', async () => {
   const capturedNumPredicts = [];
   await withServer(
