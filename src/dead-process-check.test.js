@@ -12,6 +12,10 @@ function tempInstancesDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'dead-process-check-test-'));
 }
 
+function tempPidDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'dc-pids-'));
+}
+
 function writeHeartbeat(dir, instanceId, overrides = {}) {
   const hb = {
     instanceId, pid: process.pid, model: 'ornith:35b', status: 'idle',
