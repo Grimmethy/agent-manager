@@ -38,6 +38,10 @@ const { incrementJobTypeCounter } = require('./job-type-counters.js');
 const { runGroundingCheck: runDeepDiveGroundingCheck } = require('./deep-dive-grounding-check.js');
 const { runSoWhatCitationCheck: runPipelineDebriefSoWhatCheck } = require('./pipeline-debrief-so-what-check.js');
 const { runPremiseCheckAsPostImplement } = require('./candidate-premise-check.js');
+const { listHeldTasksFifo, deriveResolveIdentity, selfHealResolveDeadlock, buildResolveTask } = require('./lib/task-resolve.js');
+const { taskPriority } = require('./lib/task-priority.js');
+const { markPipelineHealthAuditChecked, markUiVisibilityAuditChecked, coverageEntryActiveLocal, markPipelineDebriefReported } = require('./lib/task-audit.js');
+const { nextProductSpecSectionTask, getNextTask } = require('./lib/task-selection.js');
 
 function slugifyForId(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
@@ -1171,18 +1175,6 @@ const PERIODIC_REATTEMPT_INTERVAL_MS = 14 * 24 * 60 * 60 * 1000;
 // treatment as everything else this pipeline processes, not whatever arbitrary order the
 // filesystem happens to return. Returns null (not []) when the directory itself is
 // unreadable/absent -- the caller reads that as "no held tasks at all, nothing to do".
-function listHeldTasksFifo(heldDir) {
-  try {
-    return fs.readdirSync(heldDir)
-      .filter((f) => f.endsWith('.json'))
-      .map((f) => ({ f, mtime: fs.statSync(path.join(heldDir, f)).mtimeMs }))
-      .sort((a, b) => a.mtime - b.mtime)
-      .map((entry) => entry.f);
-  } catch {
-    return null;
-  }
-}
-
 // Which automatic retry tier (if any) a held task is currently eligible for. Returns null
 // to mean "skip this held task this tick"; otherwise { isHighReasoningRetry,
 // isPeriodicReattempt } -- both false being an ordinary first / low-reasoning attempt.
@@ -1245,18 +1237,6 @@ function classifyReattemptTier(needsClarification, createdAt) {
 // the three ever collides with either other's id in queue/done/. The periodic round
 // number comes from the held task itself (bumped by applyPathPrefetchResolve on each
 // periodic run), so every cycle gets a fresh id.
-function deriveResolveIdentity(held, fileName, { isHighReasoningRetry, isPeriodicReattempt }) {
-  const heldId = held.id || fileName.replace(/\.json$/, '');
-  const attempt = held.needsClarification.attempt || 1;
-  const periodicRound = (held.needsClarification.periodicReattemptCount || 0) + 1;
-  const resolveId = isPeriodicReattempt
-    ? `path-prefetch-resolve-${heldId}-periodic${periodicRound}`
-    : isHighReasoningRetry
-      ? `path-prefetch-resolve-${heldId}-attempt${attempt}-highreasoning`
-      : (attempt > 1 ? `path-prefetch-resolve-${heldId}-attempt${attempt}` : `path-prefetch-resolve-${heldId}`);
-  return { heldId, periodicRound, resolveId };
-}
-
 // Self-heal a deadlock confirmed live 2026-08-17: a resolve task that gets rejected by
 // REVIEW never reaches applyPathPrefetchResolve() at all, so the held task's own
 // suggestionAttempted/highReasoningAttempted flag never gets stamped -- but if
@@ -1270,44 +1250,6 @@ function deriveResolveIdentity(held, fileName, { isHighReasoningRetry, isPeriodi
 // stamp the flag here instead of leaving it to that function alone, so this held task
 // stops being offered (matches the "spent" outcome review-rejection-exhaustion already
 // represents) and a human can pick it up via Discuss like any other exhausted case.
-function selfHealResolveDeadlock({
-  pipelineDir, heldDir, fileName, held, resolveId,
-  isHighReasoningRetry, isPeriodicReattempt, periodicRound,
-}) {
-  const resolveTerminalPath = ['blocked', 'done']
-    .map((state) => path.join(pipelineDir, 'queue', state, `${resolveId}.json`))
-    .find((p) => fs.existsSync(p));
-  if (!resolveTerminalPath) return;
-
-  const heldPath = path.join(heldDir, fileName);
-  // Same deadlock class, applied to the periodic tier: a rejected periodic resolve task
-  // must still advance lastPeriodicReattemptAt/periodicReattemptCount, or this exact
-  // resolveId (round N) "exists" in queue/blocked/ forever and the interval check in
-  // classifyReattemptTier() never gets a fresh anchor to count forward from -- an
-  // indefinite stall identical to the pre-existing high-reasoning deadlock this block
-  // already self-heals, just for a different tier.
-  if (isPeriodicReattempt) {
-    held.needsClarification.lastPeriodicReattemptAt = new Date().toISOString();
-    held.needsClarification.periodicReattemptCount = periodicRound;
-    try {
-      fs.writeFileSync(heldPath, JSON.stringify(held, null, 2));
-    } catch {
-      // Non-fatal -- worst case this self-heal is retried next tick.
-    }
-    return;
-  }
-
-  const flagKey = isHighReasoningRetry ? 'highReasoningAttempted' : 'suggestionAttempted';
-  if (!held.needsClarification[flagKey]) {
-    held.needsClarification[flagKey] = true;
-    try {
-      fs.writeFileSync(heldPath, JSON.stringify(held, null, 2));
-    } catch {
-      // Non-fatal -- worst case this self-heal is retried next tick.
-    }
-  }
-}
-
 // The candidate file universe the LLM fallback reasons over -- the exact same real files
 // path-prefetch.js's own deterministic pass already searched, not a separate signal that
 // could disagree with what "matched" would even mean. Uses getConfig().graphPath
@@ -1323,40 +1265,6 @@ function loadGraphFileList(graphPath) {
   } catch {
     return [];
   }
-}
-
-function buildResolveTask({
-  resolveId, held, heldId,
-  isHighReasoningRetry, isPeriodicReattempt, periodicRound, fileList,
-}) {
-  return {
-    id: resolveId,
-    domain: 'path_prefetch_resolve',
-    source: 'path_prefetch_resolve',
-    // Per-instance override (see model-provider.js's reasoningTierFor()) -- only the
-    // retry attempt sets this; the first attempt stays on path_prefetch_resolve's
-    // ordinary low-reasoning default (no static reasoningTier registered for that source).
-    ...(isHighReasoningRetry ? { reasoningTier: 'high' } : {}),
-    title: isPeriodicReattempt
-      ? `Periodic re-check (round ${periodicRound}): suggest file path(s) for held task: ${(held.title || heldId).slice(0, 60)}`
-      : `Suggest file path(s) for held task: ${(held.title || heldId).slice(0, 80)}`,
-    promptContext: {
-      heldTaskId: heldId,
-      rawText: (held.promptContext && held.promptContext.rawText) || held.title || '',
-      taskTitle: held.title || '',
-      reason: held.needsClarification.reason,
-      candidates: held.needsClarification.candidates || null,
-      // Budget cap matching path-prefetch.js's own MAX_PREFETCHED_PATHS reasoning --
-      // this is meant to give the model a real candidate list, not the whole repo's
-      // worth of paths crammed into one prompt.
-      fileList: fileList.slice(0, 400),
-      // Read by applyPathPrefetchResolve() to know which flag/counter to advance on
-      // completion -- see its own comment for why this can't just reuse
-      // suggestionAttempted/highReasoningAttempted (both are already true by the time
-      // this tier fires).
-      periodicReattempt: isPeriodicReattempt,
-    },
-  };
 }
 
 // Hybrid path-prefetch fallback: offers the oldest still-unresolved held task in
@@ -1415,14 +1323,6 @@ function nextPathPrefetchResolveTask() {
 // that only ever wanted the module's exports, not a live pipeline). Falling back to `def`
 // on that throw keeps this a nice-to-have override, not a new hard requirement to even
 // import this file.
-function taskPriority(name, def) {
-  try {
-    return getConfig().taskPriorityOverrides[name] ?? def;
-  } catch {
-    return def;
-  }
-}
-
 // apply: applyAdhocDiff -- registered HERE, not via prompts.js's later updateTaskSource
 // call, same reasoning unused_export's own apply:applyVerdictOnly already established:
 // apply-task.js requires task-sources.js directly but never requires prompts.js at all,
@@ -1703,12 +1603,6 @@ function nextPipelineHealthAuditTask() {
 // pipeline_health_audit task to pending/ -- same reasoning as
 // markPipelineSelfAuditReported below (avoid marking the hourly clock forward before
 // the finding is confirmed to have actually reached the queue).
-function markPipelineHealthAuditChecked() {
-  const { pipelineDir } = getConfig();
-  const instancesDir = path.join(pipelineDir, 'instances');
-  require('./pipeline-health-audit.js').markChecked(instancesDir);
-}
-
 // ui_visibility_audit (2026-08-24, Grimmethy: "How do we look for functions and code
 // that should have a display in the ui?" -> "build 1 now" for the endpoint-audit half;
 // see ui-visibility-audit.js's own header for the full detection design and its
@@ -1757,12 +1651,6 @@ function nextUiVisibilityAuditTask() {
 // Called once from the CLI, only after writeTask() has actually persisted a
 // ui_visibility_audit task to pending/ -- same reasoning as markPipelineHealthAuditChecked
 // above.
-function markUiVisibilityAuditChecked() {
-  const { pipelineDir } = getConfig();
-  const instancesDir = path.join(pipelineDir, 'instances');
-  require('./ui-visibility-audit.js').markChecked(instancesDir);
-}
-
 // Called once from the CLI, only after writeTask() has actually persisted a
 // pipeline_self_audit task to pending/ -- see nextPipelineSelfAuditTask()'s own comment
 // for why the write moved here instead of living inside the generator.
@@ -1909,10 +1797,6 @@ function nextPipelineForensicsTask() {
 // Local copy of pipeline-forensics.js's coverageEntryActive (avoids a second import line
 // for a 3-line predicate; kept identical -- an entry with a future eligibleAgainAt is
 // still active, one whose eligibleAgainAt has passed is not).
-function coverageEntryActiveLocal(entry, now) {
-  return pipelineForensics.coverageEntryActive(entry, now);
-}
-
 // Called once from the CLI, only after writeTask() persists a pipeline_forensics task.
 function markPipelineForensicsReported(task) {
   const { forensicsCoveragePath } = getConfig();
@@ -1984,14 +1868,6 @@ function nextPipelineDebriefTask() {
 // advances the cursor PAST this window (windowEnd) so the next call never re-selects any of
 // these same done/ tasks, same "record coverage only after the write actually landed" lesson
 // nextPipelineForensicsTask()'s own comment names.
-function markPipelineDebriefReported(task) {
-  const { debriefCoveragePath } = getConfig();
-  const windowEnd = task.promptContext && task.promptContext.windowEnd;
-  if (!windowEnd) return;
-  fs.mkdirSync(path.dirname(debriefCoveragePath), { recursive: true });
-  fs.writeFileSync(debriefCoveragePath, JSON.stringify({ lastDebriefedAt: windowEnd, taskId: task.id, reportedAt: new Date().toISOString() }, null, 2));
-}
-
 // doc_drift_fix (2026-09-06, "Project Documentation" concept -- see drift-fix.js's own
 // header for the full incident). drift-scan.js already runs every watchdog tick and
 // writes queue/drift-flags.json, but nothing ever consumed it into a real fix -- this
@@ -2148,7 +2024,6 @@ function markStalenessAuditReported(task) {
   fs.mkdirSync(path.dirname(stalenessAuditCoveragePath), { recursive: true });
   fs.writeFileSync(stalenessAuditCoveragePath, JSON.stringify(coverage, null, 2));
 }
-
 
 // postImplementCheck (2026-09-05): 8 of 8 blocked deep_dive tasks investigated shared one
 // shape -- a write-up fabricating a specific class/function/architecture detail
@@ -2442,14 +2317,6 @@ registerTaskSource('product_spec_outline', {
 // NO emptyApproval -- a section it cannot draft should retry/escalate, not auto-close (the
 // same reason arch_review drops emptyApproval on its fulfillment half). It ALSO gets its
 // own harness grep pass on top of the files the outline already named (fetchedFiles).
-function nextProductSpecSectionTask() {
-  const { productSpecOutlineCandidatesPath, productSpecPath, repoRoot } = getConfig();
-  const task = nextCandidateFulfillmentTask(productSpecOutlineCandidatesPath, 'product_spec_section');
-  // nextCandidateFulfillmentTask is generic and doesn't know the spec doc path the edit
-  // must target -- add it here so productSpecSectionImplementPrompt can name `file`.
-  if (task) task.promptContext.specRelPath = path.relative(repoRoot, productSpecPath);
-  return task;
-}
 registerTaskSource('product_spec_section', {
   priority: taskPriority('product_spec_section', 13),   // consumer outranks its generator
   next: nextProductSpecSectionTask,
@@ -2595,28 +2462,6 @@ registerTaskSource('pipeline_forensics_fix', {
 // here is a pure "what would I offer" read with no queue-write side effect (writeTask()
 // is the only thing that actually persists a task), so skipping a candidate wastes at
 // most one extra read, never loses or duplicates work.
-function getNextTask({ tierFilter } = {}) {
-  const { taskSourceAllowlist } = getConfig();
-  const restricted = taskSourceAllowlist && taskSourceAllowlist.length > 0;
-  for (const source of getRegisteredSources()) {
-    // 'adhoc' is a fixed contract (README: "preempts every deterministic source") --
-    // an allowlist restricting this run to e.g. just project_search should still let an
-    // explicitly human-queued adhoc task through, not silently swallow it. 'brain_dump_sort'
-    // is documented (see app.py's _ALWAYS_ENSURE_DOMAINS) as an always-on background source,
-    // independent of whichever project's pipeline mode is active -- a mode-scoped allowlist
-    // like Project Search's [project_search, deep_dive] should never be able to silently
-    // pause it, since Brain Dump is meant to sit above any single active project.
-    const alwaysAllowed = source.name === 'adhoc' || source.name === 'brain_dump_sort';
-    if (restricted && !alwaysAllowed && !taskSourceAllowlist.includes(source.name)) continue;
-    if (typeof source.next !== 'function') continue;
-    const task = source.next();
-    if (!task) continue;
-    if (tierFilter && reasoningTierFor(task) !== tierFilter) continue;
-    return task;
-  }
-  return null;
-}
-
 // generatedForRepoRoot stamps which repo's config was live when this task was generated.
 // Several sources (project_search, deep_dive, arch_import, and anything reading a path
 // derived from path.dirname(repoRoot) rather than repoRoot itself) resolve to the SAME
