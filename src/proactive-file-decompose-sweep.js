@@ -38,6 +38,7 @@ const { sweep: fileDecomposeToHubSweep } = require('./file-decompose-to-hub.js')
 const {
   oversizedFiles, fileHasRecentCommits, HOT_FILE_DAYS,
 } = require('./decompose-loop-autoroute.js');
+const { listArchivedMonthDirs } = require('./done-archive.js');
 
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const MAX_FILES_PER_RUN = 1;
@@ -92,6 +93,14 @@ function isRequestResolved(pipelineDir, req) {
   const candidates = [
     path.join(pipelineDir, 'queue', 'done', `${linkedId}.json`),
     path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${linkedId}.json`),
+    // done-archive.js's routine sweep relocates old done/ tasks into dated done/_archived/
+    // <YYYY-MM>/ buckets on its own retention schedule -- caught live 2026-09-14: two of
+    // app.py's own resolved hubs (decompose-app-py-01, blueprints-2026-09-09) had already
+    // aged into that bucket by the time this sweep's first forced run checked them, so they
+    // still read as unresolved and kept blocking a fresh request. listArchivedMonthDirs is
+    // the same helper task-anywhere.js/system-report.js already use to look past this
+    // rolling cutoff, reused here instead of hand-duplicating the month-dir glob.
+    ...listArchivedMonthDirs(pipelineDir).map((dir) => path.join(dir, `${linkedId}.json`)),
   ];
   return candidates.some((p) => fs.existsSync(p));
 }

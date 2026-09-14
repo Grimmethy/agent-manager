@@ -119,6 +119,19 @@ test('isRequestResolved: also true for a hub that reached done/, or a task an op
   assert.equal(isRequestResolved(dir, { sourceFile: 'x.py', onePassTaskId: 'op-2' }), true, 'a discarded/dismissed task still counts as resolved -- it no longer blocks a fresh slice');
 });
 
+// 2026-09-14, caught live on the deployed fix's first forced run: done-archive.js's own
+// routine retention sweep had already relocated 2 of app.py's resolved hubs from
+// queue/done/ into a dated queue/done/_archived/<YYYY-MM>/ bucket by the time this ran --
+// isRequestResolved's first version didn't know about that bucket, so those requests
+// still read as unresolved and kept blocking app.py exactly like the original bug.
+test('isRequestResolved: also true once done-archive.js has relocated the linked task into a dated done/_archived/<YYYY-MM>/ bucket', () => {
+  const dir = tmpPipeline([]);
+  const monthDir = path.join(dir, 'queue', 'done', '_archived', '2026-09');
+  fs.mkdirSync(monthDir, { recursive: true });
+  fs.writeFileSync(path.join(monthDir, 'hub-old.json'), JSON.stringify({ id: 'hub-old' }));
+  assert.equal(isRequestResolved(dir, { sourceFile: 'x.py', hubId: 'hub-old' }), true);
+});
+
 test('hasExistingRequestFor: a file whose only requests are all RESOLVED is treated as free for a new one', () => {
   const dir = tmpPipeline([]);
   fs.writeFileSync(path.join(dir, 'queue', 'done', 'op-done.json'), JSON.stringify({ id: 'op-done' }));
