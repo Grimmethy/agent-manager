@@ -424,3 +424,6 @@ test('write tier: turn cap default is 35, env override still wins', async () => 
   });
 });
 
+// scopeComplexityGate's own generalized-anchor contract is covered in the dedicated
+// scope-complexity-gate.test.js, not duplicated here.
+

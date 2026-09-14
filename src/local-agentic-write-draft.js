@@ -29,6 +29,7 @@ const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js'
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { runDecomposePass } = require('./decompose-pass.js');
+const { oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
 
@@ -129,22 +130,42 @@ function detectExternalDependency(task) {
   return null;
 }
 
-// A task whose anchor-file list (promptContext.prefetchedPaths -- the source
-// taskAnchorFiles consumes first) includes python/dashboard/app.py AND whose text names
-// >=3 distinct endpoint paths (/api/... or /plugins/...) OR hits >=3 distinct subsystem
-// keywords (catalog/install/update/uninstall/ui/frontend) is a scope that has historically
-// blown a full tier-3 turn budget in one pass (a single app.py edit touching 3+ routes or
-// subsystems is a decompose candidate, not an atomic leaf). Pure, O(text) string work,
-// runs BEFORE the first model call.
+// A task whose target is a file the file-length-scan watchdog already flagged as
+// oversized (queue/file-length-flags.json -- ANY flagged file, not hardcoded to one path)
+// AND whose text names >=3 distinct endpoint paths (/api/... or /plugins/...) OR hits
+// >=3 distinct subsystem keywords (catalog/install/update/uninstall/ui/frontend) is a
+// scope that has historically blown a full tier-3 turn budget in one pass (a single big-
+// file edit touching 3+ routes or subsystems is a decompose candidate, not an atomic
+// leaf). Pure, O(text) string work, runs BEFORE the first model call -- on EVERY pass,
+// retry included, since it's the only Layer-A check still active once the generic
+// preliminary check (draft-context.js) starts skipping itself on `localRejectCount`.
+//
+// 2026-09-14 (generalized off a hardcoded python/dashboard/app.py anchor -- research
+// finding: that file was ~8,000 lines when this gate was written, and file-decompose
+// work the same day took it to 4,457; a gate pinned to one shrinking file provides zero
+// protection to every OTHER large file a retried task might target). The anchor must
+// still come from prefetchedPaths, not just be NAMED in the task text -- prefetchedPaths
+// is the orient/grep pass's own confirmation that this file is actually relevant, and
+// scope-complexity-gate.test.js locks down that a file merely mentioned in prose (never
+// prefetched) must NOT trip the gate, same as before this change. What generalizes is
+// only WHICH prefetched file counts: any file file-length-scan currently has flagged
+// (queue/file-length-flags.json), via decompose-loop-autoroute.js's own oversizedFiles()
+// -- the same "is this file currently oversized" source the reactive file-decompose
+// sweep already trusts, so there is one definition of that, not two.
 const SCOPING_SUBSYSTEM_KEYWORDS = ['catalog', 'install', 'update', 'uninstall', 'ui', 'frontend'];
 
 function scopeComplexityGate(task) {
   const ctx = (task && task.promptContext) || {};
   const text = [task && task.title, ctx.rawText, task && (task.planResponse || task.lastGoodPlan)]
     .filter(Boolean).join(' ');
-  const prefetched = ctx.prefetchedPaths;
-  const hasAnchor = Array.isArray(prefetched) && prefetched.includes('python/dashboard/app.py');
-  if (!hasAnchor) return { shouldDecompose: false };
+  const prefetched = Array.isArray(ctx.prefetchedPaths) ? ctx.prefetchedPaths : [];
+  let anchor = null;
+  try {
+    const { pipelineDir } = getConfig();
+    const oversized = oversizedFiles(pipelineDir);
+    anchor = prefetched.find((p) => oversized.has(p)) || null;
+  } catch { /* no pipeline dir / no flags file yet -- treat as no anchor, not an error */ }
+  if (!anchor) return { shouldDecompose: false };
   const endpointRe = /\/(?:api|plugins)\/[A-Za-z0-9_\-/]+/g;
   const endpoints = new Set(text.match(endpointRe) || []);
   const lower = text.toLowerCase();
@@ -152,7 +173,7 @@ function scopeComplexityGate(task) {
   if (endpoints.size >= 3 || keywords.size >= 3) {
     return {
       shouldDecompose: true,
-      reason: `scope-complexity-gate: anchor python/dashboard/app.py present with ${endpoints.size} endpoint path(s) and ${keywords.size} subsystem keyword(s)`,
+      reason: `scope-complexity-gate: anchor ${anchor} (flagged oversized) present with ${endpoints.size} endpoint path(s) and ${keywords.size} subsystem keyword(s)`,
     };
   }
   return { shouldDecompose: false };
@@ -386,6 +407,66 @@ function buildWriteAgenticPrompt(task) {
   ].join('\n');
 }
 
+// Backstop: instead of requeueing for ANOTHER doomed 35-turn pass, run a single-call
+// decompose pass. Two triggers, both meaning "this model cannot land this in one pass":
+//   - turnBudgetExhausted: a pass burned its whole budget without a single edit.
+//   - decomposeBlockCount >= 2: the model answered RESOLUTION: decompose on two separate
+//     passes but never produced usable sub-task JSON (agentic-draft-common.js counts it).
+// Named and extracted 2026-09-14 (consolidation research: these were the two Layer-B
+// "give up and split" triggers, already sharing one runDecomposePass call underneath a
+// mode ternary -- pulling them into one function makes that a single thing to read,
+// not two near-duplicate blocks 20 lines apart) -- no behavior change from the prior
+// inline version.
+//
+// Fires on ANY give-up verdict, not just verdict.blocked: confirmed live 2026-09-02
+// (second-brain note-graph, gpu-single-flight-lock, job-list) -- after two decompose
+// blocks the model punts the 3rd pass to needs-human-decision (a no-RESOLUTION forced
+// summary, or a real needs-human-decision), which is `blocked:false, needsClarification:
+// true`, so this gate was skipped and the deterministic split never ran -- all three
+// landed in needs-clarification/ with a placeholder non-question instead of a coordinator.
+//
+// Returns a verdict-shaped object to return from the caller on a successful split, or
+// null if no split happened (caller should return the original verdict as-is).
+async function runGiveUpSplit(task, verdict) {
+  const autoN = Number(task.autoDecomposeCount) || 0;
+  const repeatedDecompose = (Number(task.decomposeBlockCount) || 0) >= 2;
+  const gaveUp = verdict.blocked || verdict.needsClarification;
+  // A file-decompose child is already a single verbatim move -- splitting it again just
+  // produces a hub of one sub-task and loops. If it can't land, it needs a human, not
+  // another decompose pass.
+  if (task.atomic || !gaveUp || !(task.turnBudgetExhausted || repeatedDecompose) || autoN >= MAX_AUTO_DECOMPOSE) {
+    return null;
+  }
+  const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
+  const split = await runDecomposePass(task, {
+    mode,
+    priorAttemptBlock: priorAttemptAnalysisBlock(task),
+  });
+  if (!split || split.subTasks.length < 2) return null;
+
+  task.autoDecomposeCount = autoN + 1;
+  task.adhocResolution = 'decompose';
+  task.subTaskProposals = split.subTasks;
+  task.rawDiff = '';
+  const why = task.turnBudgetExhausted
+    ? 'a turn-budget-exhausted implement pass'
+    : 'two implement passes that both chose RESOLUTION: decompose without usable pieces';
+  task.implementResponse = `Auto-decomposed after ${why} (${split.subTasks.length} pieces).\n\n${verdict.blockedReason || ''}\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
+  delete task.turnBudgetExhausted;
+  delete task.retryableDraftBlock;
+  delete task.rescopedRawText;
+  // The give-up verdict may have stamped a needs-clarification routing on the task
+  // (needs-human-decision / no-RESOLUTION forced summary) -- clear it so recordApplyOutcome
+  // routes this to the decompose/coordinator path, not queue/needs-clarification/.
+  delete task.needsClarification;
+  delete task.priorPartialDiff;
+  delete task.isAgenticContinuation;
+  return {
+    succeeded: true, blocked: false, resolution: 'decompose',
+    response: verdict.response, toolCallLog: verdict.toolCallLog, turnsUsed: verdict.turnsUsed,
+  };
+}
+
 /**
  * Adhoc tier-3, local. Same return contract as the (deleted) Claude draftAdhocImplement:
  * { succeeded, blocked?, blockedReason?, needsClarification? } plus a `reason` on a
@@ -491,54 +572,8 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       runInWorktree: doRun,
       modelLabel: localDraftModelLabel(),
     });
-
-    // Backstop: instead of requeueing for ANOTHER doomed 35-turn pass, run a single-call
-    // decompose pass. Two triggers, both meaning "this model cannot land this in one pass":
-    //   - turnBudgetExhausted: a pass burned its whole budget without a single edit.
-    //   - decomposeBlockCount >= 2: the model answered RESOLUTION: decompose on two separate
-    //     passes but never produced usable sub-task JSON (agentic-draft-common.js counts it).
-    // Fires on ANY give-up verdict, not just verdict.blocked: confirmed live 2026-09-02
-    // (second-brain note-graph, gpu-single-flight-lock, job-list) -- after two decompose
-    // blocks the model punts the 3rd pass to needs-human-decision (a no-RESOLUTION forced
-    // summary, or a real needs-human-decision), which is `blocked:false, needsClarification:
-    // true`, so this gate was skipped and the deterministic split never ran -- all three
-    // landed in needs-clarification/ with a placeholder non-question instead of a coordinator.
-    const autoN = Number(task.autoDecomposeCount) || 0;
-    const repeatedDecompose = (Number(task.decomposeBlockCount) || 0) >= 2;
-    const gaveUp = verdict.blocked || verdict.needsClarification;
-    // A file-decompose child is already a single verbatim move -- splitting it again just
-    // produces a hub of one sub-task and loops. If it can't land, it needs a human, not
-    // another decompose pass.
-    if (!task.atomic && gaveUp && (task.turnBudgetExhausted || repeatedDecompose) && autoN < MAX_AUTO_DECOMPOSE) {
-      const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
-      const split = await runDecomposePass(task, {
-        mode,
-        priorAttemptBlock: priorAttemptAnalysisBlock(task),
-      });
-      if (split && split.subTasks.length >= 2) {
-        task.autoDecomposeCount = autoN + 1;
-        task.adhocResolution = 'decompose';
-        task.subTaskProposals = split.subTasks;
-        task.rawDiff = '';
-        const why = task.turnBudgetExhausted
-          ? 'a turn-budget-exhausted implement pass'
-          : 'two implement passes that both chose RESOLUTION: decompose without usable pieces';
-        task.implementResponse = `Auto-decomposed after ${why} (${split.subTasks.length} pieces).\n\n${verdict.blockedReason || ''}\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
-        delete task.turnBudgetExhausted;
-        delete task.retryableDraftBlock;
-        delete task.rescopedRawText;
-        // The give-up verdict may have stamped a needs-clarification routing on the task
-        // (needs-human-decision / no-RESOLUTION forced summary) -- clear it so recordApplyOutcome
-        // routes this to the decompose/coordinator path, not queue/needs-clarification/.
-        delete task.needsClarification;
-        delete task.priorPartialDiff;
-        delete task.isAgenticContinuation;
-        return {
-          succeeded: true, blocked: false, resolution: 'decompose',
-          response: verdict.response, toolCallLog: verdict.toolCallLog, turnsUsed: verdict.turnsUsed,
-        };
-      }
-    }
+    const giveUp = await runGiveUpSplit(task, verdict);
+    if (giveUp) return giveUp;
     return verdict;
   } catch (e) {
     return { succeeded: false, reason: `local write-agentic draft failed: ${e.message}` };
