@@ -54,6 +54,9 @@ const path = require('path');
 // file-decompose-to-hub.js does not require this module (only decompose-loop-autoroute.js
 // does, separately) -- safe, no cycle.
 const { staticCheckMove } = require('./file-decompose-to-hub.js');
+const {
+  topLevelBindingNames, locallyBoundNames, referencedIdentifiers, allTopLevelRequireStatements, JS_GLOBALS,
+} = require('./decompose-node-module.js');
 
 const FLAT_NAME_CEILING = 45; // above this, a flat "group 147 names" pass just truncates
 
@@ -220,7 +223,114 @@ function groupBySection(symbols) {
 // apply oracle, and haven't shown this failure mode in practice. Unsectioned ('') symbols
 // have no "own section" to be external to, so they're left for the normal dropped/misc
 // handling futher down rather than run through this check.
-function computeFanOutSymbols(repoRoot, sourceFile, groups) {
+// JS counterpart of the .py path below (2026-09-14, screaminggoatclubmt: "Build the JS
+// fan-out filter now" -- found live: task-sources.js and local-draft.js both hit the
+// EXACT same class of bug the .py fan-out filter fixed, just with no protection at all
+// for non-Python files, since staticCheckMove is a Python AST scanner and always returns
+// null for anything but .py). No AST available here -- reuses the same text-based
+// self-containment primitives decompose-node-module.js's OWN "is this move self-
+// contained" check already trusts (topLevelBindingNames/locallyBoundNames/
+// referencedIdentifiers/JS_GLOBALS), just run in the OPPOSITE direction: instead of
+// asking "does the moved code read a name it doesn't carry with it", this asks "does the
+// REST of the file still read a name this section is about to take away". For each
+// section, "the rest of the file" is built by finding which symbol owns each line
+// (nearest PRECEDING declared symbol, same technique assignSections already uses for
+// banner/anchor labels) and blanking out every line owned by a symbol in this section --
+// then checking whether any of the section's own symbol names still get read there.
+function computeJsFanOutSymbols(sourceFile, text, symbols, groups) {
+  const fanOut = new Set();
+  if (!/\.(js|mjs|cjs)$/.test(sourceFile)) return fanOut;
+  const lines = String(text || '').split('\n');
+
+  // A THIRD gap on top of the two above, also caught live: extractTopLevelSymbols only
+  // recognizes const/let/var bound to a FUNCTION VALUE (its own regex requires `function`
+  // or `=>` on the RHS) -- a plain data constant like `const PERIODIC_REATTEMPT_INTERVAL_MS
+  // = 60000` or `const _depOnMainBranchMemo = new Map()` is invisible to it, so it never
+  // becomes a candidate `symbol` and can never be flagged by the checks above either. But
+  // a moved function can still reference one, hitting the identical "not a self-contained
+  // move" rejection. topLevelBindingNames (decompose-node-module.js) recognizes EVERY
+  // top-level binding, not just function-valued ones -- names it finds that aren't in our
+  // own `symbols` list are the ones extractTopLevelSymbols missed; those are inherently
+  // unmovable (we have no move-construction logic for a bare data constant at all), so
+  // seed the closure pass below with them directly rather than requiring a section-level
+  // "referenced from outside" check first (there's no section to check -- they were never
+  // sectioned in the first place).
+  const requireBound = topLevelBindingNames(allTopLevelRequireStatements(text).join('\n'));
+  const knownSymbolNames = new Set(symbols.map((s) => s.name));
+  const unseenBindings = [...topLevelBindingNames(text)].filter((n) => !knownSymbolNames.has(n) && !requireBound.has(n));
+  const sorted = [...symbols].sort((a, b) => a.line - b.line);
+  const ownerByLine = [];
+  let cur = null;
+  let si = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    while (si < sorted.length && sorted[si].line - 1 === i) { cur = sorted[si]; si += 1; }
+    ownerByLine[i] = cur;
+  }
+  // NOTE: unlike the .py path's per-named-section loop, this does NOT skip the ''
+  // (unsectioned) bucket -- found live: isDependencySatisfied/isSoftDependencySatisfied/
+  // taskIdExistsInQueue in task-sources.js are all unsectioned, which just means they
+  // don't get offered as their OWN dedicated move; they still get swept into whichever
+  // module absorbs the misc/`includeUnsectioned` bucket, and are exactly as vulnerable to
+  // being needed elsewhere as a named section's symbols. Checking '' the same way asks
+  // "does anything outside the WHOLE unsectioned set still read this name" -- a reference
+  // from a named section's own code (a different eventual module) still gets caught;
+  // a reference from ANOTHER unsectioned symbol destined for the SAME misc bucket does
+  // not, which is correct (that's a same-module, not cross-module, reference).
+  for (const [, syms] of groups) {
+    const sectionNames = new Set(syms.map((s) => s.name));
+    const outsideLines = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      const owner = ownerByLine[i];
+      if (owner && sectionNames.has(owner.name)) continue; // this line belongs to the section
+      outsideLines.push(lines[i]);
+    }
+    const outsideText = outsideLines.join('\n');
+    const refs = referencedIdentifiers(outsideText);
+    const locals = locallyBoundNames(outsideText);
+    for (const name of sectionNames) {
+      if (refs.has(name) && !locals.has(name) && !JS_GLOBALS.has(name)) fanOut.add(name);
+    }
+  }
+
+  // Transitive closure: unlike the .py flask-blueprint model (which can add a lazy
+  // `from app import X` back-import for a cross-reference), decompose-node-module.js's
+  // deterministic .js extractor has NO mechanism for a moved function to reference back
+  // to a name left behind in the source -- ANY such reference is a hard rejection
+  // (buildNodeModuleExtraction's own "not a self-contained move" check). So a symbol that
+  // itself CALLS an excluded fan-out symbol is exactly as unmovable as the fan-out symbol
+  // itself -- caught live: task-sources.js's nextAdhocLikeTask calls
+  // isDependencySatisfied (correctly excluded above), so nextAdhocLikeTask must be
+  // excluded too, or its own move fails the identical check one layer down. Repeat to a
+  // fixed point -- excluding a caller can make an even-outer caller newly unmovable.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const s of symbols) {
+      if (fanOut.has(s.name)) continue;
+      const ownLines = [];
+      for (let i = 0; i < lines.length; i += 1) {
+        if (ownerByLine[i] && ownerByLine[i].name === s.name) ownLines.push(lines[i]);
+      }
+      const ownText = ownLines.join('\n');
+      const refs = referencedIdentifiers(ownText);
+      const locals = locallyBoundNames(ownText);
+      for (const r of refs) {
+        if ((fanOut.has(r) || unseenBindings.includes(r)) && !locals.has(r)) {
+          fanOut.add(s.name);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+  return fanOut;
+}
+
+function computeFanOutSymbols(repoRoot, sourceFile, groups, text) {
+  if (/\.(js|mjs|cjs)$/.test(sourceFile)) {
+    const symbols = [...groups.values()].flat();
+    return computeJsFanOutSymbols(sourceFile, text, symbols, groups);
+  }
   const fanOut = new Set();
   if (!/\.py$/.test(sourceFile)) return fanOut;
   for (const [label, syms] of groups) {
@@ -495,7 +605,7 @@ async function runFileDecomposePlanPass(sourceFile, {
   // blueprint to is never offered to the deterministic packer or the model as something
   // safe to move.
   const rawGroups = groupBySection(symbols);
-  const fanOut = computeFanOutSymbols(repoRoot, sourceFile, rawGroups);
+  const fanOut = computeFanOutSymbols(repoRoot, sourceFile, rawGroups, text);
   const routeless = computeRoutelessSections(sourceFile, rawGroups);
   const appHooks = computeAppHookSymbols(symbols);
   const candidates = symbols.filter((s) => !fanOut.has(s.name) && !routeless.has(s.name) && !appHooks.has(s.name));
@@ -569,5 +679,5 @@ async function runFileDecomposePlanPass(sourceFile, {
 module.exports = {
   runFileDecomposePlanPass, extractTopLevelSymbols, assignSections, groupBySection,
   planFromSections, planFromSectionMerge, parseMovesJson, bannerLabel, routeFamily,
-  computeFanOutSymbols, computeRoutelessSections, computeAppHookSymbols, hasNonRouteAppHook, packSections,
+  computeFanOutSymbols, computeJsFanOutSymbols, computeRoutelessSections, computeAppHookSymbols, hasNonRouteAppHook, packSections,
 };
