@@ -295,5 +295,41 @@ class MergeCoverageTest(unittest.TestCase):
         self.assertEqual(merged["communities"], [{"id": 0, "name": "new-area", "lastReviewedAt": None, "lastCandidateCount": -1}])
 
 
+class NameCommunityHeuristicTest(unittest.TestCase):
+    """Two unrelated communities both flat under a generic directory (no shared
+    subfolder to descend into) used to both come back named literally "src" or
+    "scripts" -- indistinguishable in the dashboard. See build_graph.py's own comment
+    on _GENERIC_DIR_NAMES / _distinguishing_basenames for why directory structure alone
+    can't disambiguate these and file stems are the fallback signal."""
+
+    def test_scripts_is_now_treated_as_generic_like_src_already_was(self):
+        name = build_graph.name_community_heuristic(["scripts/deploy.sh", "scripts/backup.sh"])
+        self.assertNotEqual(name, "scripts")
+        self.assertIn("deploy", name)
+        self.assertIn("backup", name)
+
+    def test_two_unrelated_flat_scripts_communities_get_distinct_names(self):
+        deploy_name = build_graph.name_community_heuristic(["scripts/deploy.sh", "scripts/rollback.sh"])
+        db_name = build_graph.name_community_heuristic(["scripts/migrate.py", "scripts/seed.py"])
+        self.assertNotEqual(deploy_name, db_name)
+
+    def test_flat_src_with_no_subfolder_no_longer_collapses_to_bare_src(self):
+        name = build_graph.name_community_heuristic(["src/auth.js", "src/session.js"])
+        self.assertNotEqual(name, "src")
+        self.assertIn("auth", name)
+
+    def test_generic_dir_with_a_real_subfolder_still_prefers_the_subfolder_grouping(self):
+        # Existing behavior for the non-flat case must be unchanged: when there IS a
+        # shared subdirectory to descend into, that's still preferred over basenames.
+        name = build_graph.name_community_heuristic([
+            "src/payments/charge.js", "src/payments/refund.js", "src/payments/invoice.js",
+        ])
+        self.assertIn("payments", name)
+
+    def test_non_generic_directory_is_unaffected(self):
+        name = build_graph.name_community_heuristic(["payments/charge.js", "payments/refund.js"])
+        self.assertEqual(name, "payments")
+
+
 if __name__ == "__main__":
     unittest.main()
