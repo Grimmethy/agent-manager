@@ -305,7 +305,10 @@ async function sweep({ pipelineDir, repoRoot, call, now = Date.now() } = {}) {
   return summary;
 }
 
-module.exports = { sweep, targetOversizedFile, oversizedFiles, rewireCoordinatorParent };
+module.exports = {
+  sweep, targetOversizedFile, oversizedFiles, rewireCoordinatorParent,
+  fileHasRecentCommits, HOT_FILE_DAYS,
+};
 
 if (require.main === module) {
   const { pipelineDir, repoRoot } = getConfig();

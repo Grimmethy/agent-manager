@@ -300,6 +300,15 @@ while :; do
       fi
     fi
 
+    # proactive-file-decompose-sweep (2026-09-14): decompose-loop-autoroute above only
+    # reacts to an ALREADY-stuck task -- a file file-length-scan just re-flagged, with
+    # nothing currently blocked on it, gets no auto-authored plan at all otherwise. Time-
+    # gated to once per 24h internally (isDue/markChecked); runs the file-length-scan
+    # result from THIS same tick, so it always sees fresh flags. Disable with
+    # AGENT_MANAGER_PROACTIVE_FILE_DECOMPOSE=false.
+    proactive_decompose_result="$(node "${PACKAGE_SRC_DIR}/proactive-file-decompose-sweep.js" 2>>"${HOME_LOGS}/proactive-file-decompose-sweep.log")"
+    printf '[watchdog] proactive-file-decompose-sweep: %s\n' "$proactive_decompose_result" >&2
+
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
     # already existed to catch exactly this class of bug (a static list, e.g. the
