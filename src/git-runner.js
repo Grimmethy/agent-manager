@@ -78,6 +78,27 @@ function createRealGitRunner(repoRoot) {
       throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
     }
     run(['reset', '--hard', remote]);
+    // Pop the stash created above right back onto the now-reset tree (2026-09-14, fixing
+    // the "never popped" hazard this function used to carry -- see the header comment on
+    // the returned object below for the full incident history). Confirmed live: the
+    // dedicated AGENT_MANAGER_APPLY_REPO_ROOT worktree this runs against is never
+    // interactively edited, so there is no live human WIP this could clobber -- unlike
+    // the pre-2026-09-07 shape where resetToMain() ran directly against the same checkout
+    // a human sometimes edits live, popping immediately was NOT safe (a stray edit could
+    // ride back onto the tree right before an automated commit). "No stash entries found"
+    // (the overwhelmingly common case -- nothing was stashed) is swallowed as a no-op;
+    // any other pop failure (e.g. a real conflict) is logged and swallowed rather than
+    // thrown -- the reset itself already succeeded, and git leaves the stash entry intact
+    // on a failed pop for manual recovery, so this can never make things worse than the
+    // old never-popped behavior, only better.
+    try {
+      run(['stash', 'pop']);
+    } catch (e) {
+      const msg = e.stderr ? e.stderr.toString() : e.message;
+      if (!/no stash entries found/i.test(msg)) {
+        console.error(`[git-runner] stash pop after resetToMain failed (stash entry left in place for manual recovery): ${msg}`);
+      }
+    }
   }
   return {
     mainBranch,
@@ -92,15 +113,16 @@ function createRealGitRunner(repoRoot) {
     // through to the destructive reset below, so it's re-thrown with context rather than
     // swallowed.
     //
-    // HAZARD (2026-09-03): this stash is never popped -- it is a graveyard, not a
-    // round-trip. That is fine for the "human left debris in the tree" case it exists
-    // for, but it means ANY untracked, NON-git-ignored file inside repoRoot is swept
-    // here and silently lost (the writer just recreates an empty one). When
+    // FIXED (2026-09-14, was a HAZARD since 2026-09-03): the stash created above is now
+    // popped right after the hard reset (see doResetToMain()) instead of being left as a
+    // graveyard -- so any untracked/tracked content swept up here round-trips back onto
+    // the tree instead of silently vanishing. This used to matter enormously: when
     // pipelineDir === repoRoot, every pipeline runtime-state file lands inside repoRoot,
-    // so every one of them MUST be in .gitignore -- `git stash -u` skips ignored files.
-    // 90 scanner false-positive suppressions were lost this way over 3 days before the
-    // ledgers were ignored. src/pipeline-state-gitignored.test.js enforces the invariant
-    // against every getConfig() path.
+    // and 90 scanner false-positive suppressions were lost this way over 3 days before
+    // the ledgers were ignored. src/pipeline-state-gitignored.test.js still enforces the
+    // getConfig()-path .gitignore invariant as defense-in-depth (a state file that's
+    // git-ignored is never even stashed in the first place, `git stash -u` skips it
+    // outright), independent of this pop fix.
     resetToMain: doResetToMain,
     createBranch: (name) => run(['checkout', '-b', name]),
     checkoutMain: () => run(['checkout', mainBranch]),

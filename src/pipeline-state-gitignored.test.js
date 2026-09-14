@@ -1,19 +1,25 @@
 'use strict';
 
-// Guard against the 2026-09-03 class of bug: git-runner.js's resetToMain() runs
-// `git stash push -u` before every `git reset --hard`, and NEVER pops it. When
-// pipelineDir === repoRoot (the self-hosting pipeline), any runtime-state file the
-// pipeline writes inside repoRoot that is NOT git-ignored gets swept into an abandoned
-// stash within the hour -- silently, since the code just recreates an empty one on the
-// next write. That is exactly how 90 correctly-recorded scanner false-positive
+// Guard against the 2026-09-03 class of bug, now fixed at the source (2026-09-14):
+// git-runner.js's resetToMain() runs `git stash push -u` before every `git reset --hard`
+// and now pops it right back after the reset instead of leaving it as a graveyard. Before
+// the fix, when pipelineDir === repoRoot (the self-hosting pipeline), any runtime-state
+// file the pipeline writes inside repoRoot that is NOT git-ignored got swept into an
+// abandoned stash within the hour -- silently, since the code just recreated an empty one
+// on the next write. That is exactly how 90 correctly-recorded scanner false-positive
 // suppressions were lost over 3 days, leaving observability_review re-flagging the same
 // constructs forever.
 //
-// Invariant enforced here: every path getConfig() hands out that lives inside this repo
-// must be EITHER git-tracked (committed source -- the Docs/*.md candidate files) OR
-// git-ignored (runtime state). "Neither" is the bug. A new task source that adds a
-// pipelineDir-relative state file and forgets the .gitignore line fails this test
-// instead of silently losing data in production.
+// Invariant enforced here (defense-in-depth, independent of the pop fix above): every
+// path getConfig() hands out that lives inside this repo must be EITHER git-tracked
+// (committed source -- the Docs/*.md candidate files) OR git-ignored (runtime state).
+// "Neither" is the bug -- a git-ignored file is never even stashed in the first place
+// (`git stash -u` skips it outright), so this test still matters even with the pop fix:
+// a state file that's neither tracked nor ignored would ride through a stash/pop cycle
+// on every single reset, which is unnecessary churn and a real conflict risk (the stash
+// pop can fail on a genuine merge conflict) that a plain .gitignore line avoids entirely.
+// A new task source that adds a pipelineDir-relative state file and forgets the
+// .gitignore line fails this test instead of silently losing data in production.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
@@ -98,4 +104,37 @@ test('.gitignore also covers SQLite side-car files (*.db-journal / -wal / -shm)'
 test('REPO_ROOT resolves to this git repo', () => {
   assert.ok(fs.existsSync(path.join(REPO_ROOT, '.git')));
   assert.ok(fs.existsSync(path.join(REPO_ROOT, 'src', 'config.js')));
+});
+
+// Real-repo regression test for the pop fix itself (git-runner.js's own test file exercises
+// this more thoroughly against createRealGitRunner directly -- this one exists so the
+// invariant is visible from the same file that documents the historical incident).
+test('resetToMain on a real repo round-trips an untracked file through the stash instead of abandoning it', () => {
+  const os = require('os');
+  const { createRealGitRunner } = require('./git-runner.js');
+
+  const bareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pipeline-state-gitignored-origin-'));
+  const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pipeline-state-gitignored-repo-'));
+  try {
+    execFileSync('git', ['init', '-b', 'main', bareDir], { cwd: bareDir, stdio: 'pipe' });
+    execFileSync('git', ['config', '--local', 'receive.denyCurrentBranch', 'ignore'], { cwd: bareDir, stdio: 'pipe' });
+    execFileSync('git', ['clone', bareDir, repoDir], { stdio: 'pipe' });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoDir, stdio: 'pipe' });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoDir, stdio: 'pipe' });
+    fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v1\n');
+    execFileSync('git', ['add', 'tracked.txt'], { cwd: repoDir, stdio: 'pipe' });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repoDir, stdio: 'pipe' });
+    execFileSync('git', ['push', 'origin', 'main'], { cwd: repoDir, stdio: 'pipe' });
+
+    const untrackedPath = path.join(repoDir, 'runtime-state.json');
+    fs.writeFileSync(untrackedPath, '{"suppressions": 90}\n');
+
+    createRealGitRunner(repoDir).resetToMain();
+
+    assert.equal(fs.readFileSync(untrackedPath, 'utf8'), '{"suppressions": 90}\n', 'the untracked file survived the reset -- round-tripped, not lost');
+    assert.equal(execFileSync('git', ['stash', 'list'], { cwd: repoDir, encoding: 'utf8' }).trim(), '', 'no abandoned stash entry left behind');
+  } finally {
+    fs.rmSync(bareDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
 });

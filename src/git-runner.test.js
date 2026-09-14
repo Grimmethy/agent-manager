@@ -60,7 +60,15 @@ test('resetToMain resets a clean working tree onto origin with no stash created'
   assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n');
 });
 
-test('resetToMain auto-stashes an uncommitted tracked-file edit instead of destroying it', () => {
+// 2026-09-14: resetToMain() now pops the auto-stash right back onto the tree after the
+// hard reset (see git-runner.js's own header on doResetToMain for why this is safe --
+// the dedicated apply worktree it runs against in production is never interactively
+// edited, so there's no live human WIP an auto-pop could clobber). These two tests used
+// to assert the OLD "stash and never restore" behavior (manually popping themselves at
+// the end just to prove the content wasn't destroyed); they now assert the real
+// round-trip the fix provides, and the stash list is empty immediately after
+// resetToMain() returns -- no manual pop needed, nothing left behind.
+test('resetToMain auto-stashes an uncommitted tracked-file edit, then pops it back (round-trip, not a graveyard)', () => {
   const { repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);
 
@@ -68,18 +76,16 @@ test('resetToMain auto-stashes an uncommitted tracked-file edit instead of destr
 
   runner.resetToMain();
 
-  // The destructive reset happened -- working tree matches origin, not the edit.
-  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n');
-
-  // But the edit was NOT destroyed -- it's sitting in the stash, recoverable.
-  const stashList = git(['stash', 'list'], repoDir);
-  assert.match(stashList, /agent-manager auto-stash before reset/);
-
-  git(['stash', 'pop'], repoDir);
+  // The destructive reset happened (tree briefly matched origin) AND the edit round-tripped
+  // straight back on top of it -- resetToMain() itself is the one place responsible for
+  // both halves now, not "reset here, manually pop somewhere else, someday."
   assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1 + uncommitted local edit\n');
+
+  // Nothing left behind -- no abandoned stash entry for a human to ever discover or lose.
+  assert.equal(git(['stash', 'list'], repoDir).trim(), '');
 });
 
-test('resetToMain auto-stashes an untracked file too (stash -u), not just tracked edits', () => {
+test('resetToMain auto-stashes an untracked file too (stash -u), then pops it back', () => {
   const { repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);
 
@@ -87,10 +93,8 @@ test('resetToMain auto-stashes an untracked file too (stash -u), not just tracke
 
   runner.resetToMain();
 
-  assert.equal(fs.existsSync(path.join(repoDir, 'untracked.txt')), false);
-
-  git(['stash', 'pop'], repoDir);
   assert.equal(fs.readFileSync(path.join(repoDir, 'untracked.txt'), 'utf8'), 'new work in progress\n');
+  assert.equal(git(['stash', 'list'], repoDir).trim(), '');
 });
 
 // resetToMain: local-only COMMITS on mainBranch -----------------------------------------
@@ -173,11 +177,15 @@ test('resetToMain fast-forwards when local is simply behind origin (an out-of-ba
   assert.equal(git(['stash', 'list'], repoDir).trim(), '');
 });
 
-test('resetToMain still lands on a real, clean checkout of the default branch', () => {
+// 2026-09-14: with a genuinely clean starting tree (nothing to stash, nothing to pop
+// back), resetToMain() still lands cleanly on the default branch with an empty status --
+// the dirty-starting-tree case is covered separately above and, since the auto-pop fix,
+// deliberately does NOT end with an empty status (the popped edit is a real modification
+// again, not silently discarded).
+test('resetToMain lands on a real, clean checkout of the default branch when the tree started clean', () => {
   const { repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);
 
-  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'dirty\n');
   runner.resetToMain();
 
   const branch = git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim();
