@@ -1450,6 +1450,62 @@ test('a task without the deterministicApply marker never triggers the script-ext
   });
 });
 
+// 2026-09-14, screaminggoatclubmt: "Dig into it now" -- root-caused live: task-sources.js's
+// own deterministic node-module decompose fell through to the FULL agentic drafting path
+// on every single attempt with advisory "produced a file that does not parse (Illegal
+// return statement)", even though buildNodeModuleOnePassChanges's own real `node --check`
+// (built.ok) had already passed it. The (now-removed) extra `new vm.Script(text)` parse-
+// check compiled the reduced source as a bare top-level script with NO CommonJS module
+// wrapper -- so a top-level `return` inside `if (require.main === module) { ... return; }`
+// (this codebase's own standard CLI-entry-point guard) was flagged as a syntax error,
+// even though it's perfectly legal once Node's real module wrapper is in play.
+test('a node-module-decompose task on a source with a require.main CLI guard (top-level return) is applied deterministically, not falsely rejected', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    writeJsWithFunctions(dir, 'src/cli-guard-fixture.js', [
+      "'use strict';",
+      '',
+      'function movable() {',
+      '  return 1;',
+      '}',
+      '',
+      'function keepMe() {',
+      '  return 2;',
+      '}',
+      '',
+      'module.exports = { movable, keepMe };',
+      '',
+      'if (require.main === module) {',
+      '  if (process.argv.includes("--flag")) {',
+      '    console.log("flag");',
+      '    return;', // the exact live shape: a top-level return, only nested inside plain if-blocks
+      '  }',
+      '  console.log(JSON.stringify(keepMe()));',
+      '}',
+      '',
+    ].join('\n'));
+    makeGitOriginFor(dir);
+    const task = {
+      id: 'node-module-decompose-cli-guard-1', domain: 'adhoc', source: 'manual', title: 'test',
+      promptContext: {
+        deterministicApply: 'node-module-decompose',
+        sourceFile: 'src/cli-guard-fixture.js',
+        moves: [{ newFile: 'src/lib/movable.js', symbols: ['movable'] }],
+      },
+    };
+    let callCount = 0;
+    const localCall = async () => { callCount += 1; return { response: PLAN_STUB, degenerate: null, attempts: 1 }; };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+    assert.equal(callCount, 0, 'no model call -- fully deterministic');
+    assert.equal((task.history || []).some((h) => h.stage === 'advisory' && /does not parse/.test(h.detail || '')), false, 'must not fall through on the CLI guard\'s legal top-level return');
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    const parsed = JSON.parse(task.implementResponse);
+    assert.ok(parsed.some((c) => c.mode === 'create' && c.file === 'src/lib/movable.js' && /function movable/.test(c.content)));
+  });
+});
+
 // Regression, 2026-08-23: caught live -- a staleness_audit task auditing a scanner-
 // originated finding burned all 3 infra-requeue rounds on real local-model timeouts and
 // permanently blocked, needing a human to manually re-derive an answer a regex could give
