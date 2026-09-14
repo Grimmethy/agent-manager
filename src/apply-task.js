@@ -28,6 +28,9 @@ const { requeueBlockedTasksForSignature } = require('./blocked-drain.js');
 // some of these built-ins (e.g. attaching a custom `apply` to arch_discovery), which
 // throws if the base entry isn't registered yet. Order matters.
 require('./task-sources.js');
+const { coAuthorTrailer, usesGroupB, applyCandidateSplit, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles } = require('./lib/apply-core.js');
+const { applyDirectToMainBatch, mainPartition } = require('./lib/apply-main-batch.js');
+
 ensureRegistered();
 
 // A source whose apply is a low-risk, additive-only append to a candidates-tracking doc
@@ -61,27 +64,6 @@ ensureRegistered();
 // the Claude branch right above it was always specific ("Claude (sonnet)"). Confirmed
 // live: dashboard-settings.json currently pins all three lanes to
 // qwen3.8:27b-q4_K_M -- none of them are literally named "ornith" at all.
-function coAuthorTrailer(task) {
-  const draftModel = task.draftModel || '';
-  if (draftModel.startsWith('claude:')) {
-    return `Co-Authored-By: Claude (${draftModel.slice('claude:'.length)}) <noreply@anthropic.com>`;
-  }
-  // 2026-08-24 (Grimmethy: "Ornith is no longer the default model... reference local
-  // instead") -- this used to hardcode "Ornith" as the local drafting model's identity,
-  // which was already stale per this function's own comment above (dashboard-settings.json
-  // pins qwen3.8:27b-q4_K_M, not literally "ornith"). Names whichever local model actually
-  // drafted it instead of assuming a fixed brand.
-  if (draftModel && draftModel !== 'ornith' && draftModel !== 'local') {
-    return `Co-Authored-By: Local Model (${draftModel}) <noreply@agent-manager.local>`;
-  }
-  return 'Co-Authored-By: Local Model <noreply@agent-manager.local>';
-}
-
-function usesGroupB(task) {
-  const source = getRegisteredSource(resolveSourceName(task));
-  return !(source && typeof source.apply === 'function');
-}
-
 // 2026-08-26, root-caused live via arch-review-ac-4 -- see prompts.js's
 // candidateSplitInstructions and local-draft.js's parseCandidateSplit for the full
 // incident/design. A resolved `{"mode": "split"}` task has no diff to apply -- its
@@ -101,97 +83,6 @@ function usesGroupB(task) {
 // a bare {succeeded:false} here instead would fall through to the untouched
 // `filesToAdd = artifact.files || [artifact.file]` line with neither present, a worse
 // and less diagnosable failure than the one this function is trying to report clearly.
-function applyCandidateSplit(task, source) {
-  if (!source || typeof source.candidatesPath !== 'function') {
-    throw new Error(`task ${task.id} has candidateSplitProposals but its source ("${resolveSourceName(task)}") has no registered candidatesPath to write them back to`);
-  }
-  // AC-1, AC-2, ... placeholder numbering -- parseArchDiscoveryCandidates (apply-group-a.js)
-  // requires a real digit after "AC-" just to recognize a block boundary at all
-  // (`/(?=^#{1,6}\s*AC-\d+)/m`); applyArchDiscoveryCandidates re-derives the REAL id from
-  // whatever already exists in the target doc regardless of what's written here (same
-  // "the real numbering is assigned when this is written to the doc" convention
-  // backlogDecompositionImplementPrompt already tells the model directly), so these only
-  // need to be valid enough to parse, never actually correct.
-  const markdown = task.candidateSplitProposals.map((c, i) => [
-    `### AC-${i + 1} · ${c.title}`,
-    'Strength: Strong',
-    // Split-Depth: N -- nextCandidateFulfillmentTask refuses to pre-split a candidate at
-    // depth >= 1, the hard one-level recursion stop for the deterministic pre-split gate.
-    c.splitDepth ? `Split-Depth: ${c.splitDepth}` : '',
-    c.files ? `Files: ${c.files}` : '',
-    // Placeholder, index-space local to THIS split batch -- candidate-docs.js's
-    // applyArchDiscoveryCandidates resolves it to the sibling's REAL AC-NNN id (known
-    // only once ids are actually assigned, in the same pass) and rewrites this into a
-    // real `Depends-On: AC-NNN` line before the doc is ever saved. See
-    // prompts.js's candidateSplitInstructions for the incident this fixes.
-    Number.isInteger(c.dependsOn) ? `Depends-On-Index: ${c.dependsOn}` : '',
-    '',
-    'Problem:', c.problem,
-    '',
-    'Solution:', c.solution,
-    '',
-    'Benefits:', c.benefits || '(not specified)',
-  ].join('\n')).join('\n\n');
-  const result = applyArchDiscoveryCandidates({
-    implementResponse: markdown,
-    candidatesPath: source.candidatesPath(),
-    ...(source.candidateDocTitle ? { docTitle: source.candidateDocTitle } : {}),
-  });
-  if (result.skipped) {
-    // parseArchDiscoveryCandidates found nothing parseable -- parseCandidateSplit already
-    // validated title/problem/solution are non-empty strings, so this would mean a
-    // markdown-escaping edge case, not a legitimately-empty split.
-    throw new Error(`candidate split approved but produced no parseable sub-candidate(s): ${result.reason}`);
-  }
-  // Same shape applyArchDiscoveryCandidates always returns ({file, candidateCount,
-  // candidateIds}) -- identical to what arch_discovery's own registered `apply` hands
-  // back for the exact same appender, so the generic "Group A returns {file: '...'}"
-  // handling a few lines below this function's own caller already has picks it up with
-  // no special-casing needed.
-  return result;
-}
-
-function writeArtifact(task, repoRoot, pipelineDir) {
-  if (Array.isArray(task.candidateSplitProposals) && task.candidateSplitProposals.length > 0) {
-    return applyCandidateSplit(task, getRegisteredSource(resolveSourceName(task)));
-  }
-  if (!usesGroupB(task)) {
-    const source = getRegisteredSource(resolveSourceName(task));
-    return source.apply({ implementResponse: task.implementResponse, repoRoot, pipelineDir, task });
-  }
-  // Confirmed live 2026-08-22: several Group B sources (arch_review, observability_fix,
-  // performance_fix, pipeline_self_audit, ...) are explicitly told to output the empty
-  // string when there's genuinely nothing to change (see prompts.js's own instructions,
-  // and review-task.js's EMPTY_APPROVAL_SOURCES, which already treats this exact case as
-  // a legitimate approved outcome at REVIEW time) -- but this apply stage had no matching
-  // check of its own, so an approved-empty task reached applyGroupB's JSON.parse
-  // unconditionally and threw "Invalid JSON in Group B implementResponse: Unexpected end
-  // of JSON input", landing the task in blocked/ instead of a clean, correct skip. Found
-  // as a real 6-task cluster in queue/blocked/ this same session -- invisible to
-  // pipeline_self_audit's own detector besides, since that error text matches none of its
-  // REASON_CATEGORIES keywords. Same {skipped, reason} shape apply-group-a.js's own
-  // applyVerdictOnly already uses for "nothing to write, that's a legitimate outcome."
-  if (isEffectivelyEmptyResponse(task.implementResponse)) {
-    return { skipped: true, reason: 'no code change needed (empty implement response, already approved at review)' };
-  }
-  // Same failure shape as the empty-response gap above, one layer further out: a Group B
-  // source can legitimately answer with a plain-text refusal ("FALSE POSITIVE -- the real
-  // file already contains the fix the candidate described") instead of a change. Review
-  // can and does approve this prose as a genuinely correct answer -- unlike the
-  // empty-string case, nothing marks it specially at review time, so it reaches here as
-  // ordinary approved implementResponse text. Found live as a real 2-task cluster
-  // (observability-fix-ac-45/ac-59) in queue/blocked/: both correctly explained the flagged
-  // issue no longer exists, and both got "Invalid JSON in Group B implementResponse:
-  // Unexpected token 'F', \"FALSE POSI\"..." instead of the clean skip they deserved.
-  // Anchored to the START of the (trimmed) response -- real Group B JSON always begins
-  // with `[` or `{`, so this can never misfire on a legitimate change whose diff content
-  // happens to mention "false positive" somewhere inside a string value.
-  if (/^false[\s-]?positive\b/i.test(String(task.implementResponse || '').trim())) {
-    return { skipped: true, reason: `false positive (already fixed / no code change needed): ${String(task.implementResponse).trim().slice(0, 300)}` };
-  }
-  return applyGroupB({ implementResponse: task.implementResponse, repoRoot, pipelineDir });
-}
-
 /**
  * The actual apply logic, independent of the CLI/stdout wrapper below -- exported so tests
  * can call it directly with a fake git runner and a throwaway repoRoot/pipelineDir,
@@ -222,32 +113,10 @@ function writeArtifact(task, repoRoot, pipelineDir) {
 // a raw queue-adhoc-task.js CLI task submitted with no brain-dump origin has none, and
 // correctly has nothing to close here). Best-effort -- see closeBrainDumpEntryResolved's
 // own header for why a missing/already-mutated entry is not an apply failure.
-function closeOriginatingBrainDumpEntry(task, brainDumpPath, note) {
-  // research (Brain Dump #1 follow-up, 2026-08-17): same shape as adhoc -- a
-  // brainDumpEntryId only ever appears on a task queued by applyBrainDumpSort's own
-  // requiresResearch branch, so this is unambiguous the same way adhoc's own check is.
-  if (task.domain !== 'adhoc' && task.domain !== 'research') return;
-  const brainDumpEntryId = task.promptContext && task.promptContext.brainDumpEntryId;
-  if (!brainDumpEntryId) return;
-  try {
-    closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note });
-  } catch (e) {
-    // Never let bookkeeping failure turn a real, already-applied fix into a reported
-    // apply failure -- same "recording shouldn't break the real feature" contract
-    // model_stats_client.py's own header states for its own best-effort writes.
-  }
-}
-
 // Guards both staging sites below against the "git add [undefined]"
 // pathspec failure: artifact.files absent AND artifact.file undefined yields
 // [undefined] from `artifact.files || [artifact.file]`. Fails fast with the task
 // id in the message instead of a cryptic git pathspec error.
-function assertStageableFiles(task, files) {
-  if (!Array.isArray(files) || files.length === 0 || !files.every((f) => typeof f === 'string' && f.length > 0)) {
-    throw new Error(`task ${task.id}: no target file path`);
-  }
-}
-
 function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, gitRunner = createRealGitRunner(repoRoot), skipPush = false }) {
   try {
     if (task.domain === 'secondbrain') {
@@ -683,107 +552,10 @@ function recordApplyOutcome(task, result) {
 // Returns { results: { <taskId>: { succeeded, doneMarker?, reason? } }, committed, pushed?, branch? }.
 // A task whose source is NOT directToMain is refused here (results[id].succeeded=false) --
 // the caller must send those through the per-task applyTask path.
-function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, brainDumpPath, gitRunner = createRealGitRunner(repoRoot) } = {}) {
-  const results = {};
-  const eligible = [];
-  for (const task of tasks) {
-    const reg = getRegisteredSource(resolveSourceName(task));
-    if (reg && reg.directToMain === true) {
-      eligible.push(task);
-    } else {
-      results[task.id] = { succeeded: false, reason: 'source is not directToMain -- must be applied individually, not in the triage batch' };
-    }
-  }
-  if (eligible.length === 0) return { results, committed: false };
-
-  gitRunner.fetchMain();
-  gitRunner.resetToMain();
-
-  const staged = [];
-  for (const task of eligible) {
-    try {
-      const artifact = writeArtifact(task, repoRoot, pipelineDir);
-      if (artifact && artifact.skipped) {
-        results[task.id] = { succeeded: true, doneMarker: artifact.reason };
-        closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
-        continue;
-      }
-      if (artifact && artifact.needsConfirmation) {
-        results[task.id] = artifact; // -> awaiting-confirm/, nothing staged for this one
-        continue;
-      }
-      const files = artifact.files || [artifact.file];
-      assertStageableFiles(task, files);
-      const taskLogRel = writeTaskLogFile(repoRoot, task);
-      gitRunner.add([...files, taskLogRel]);
-      staged.push({ task, files, taskLogRel });
-    } catch (e) {
-      // This task's append threw. Its file may carry a partial trailing line -- cosmetic
-      // in an append-only markdown candidate doc and visible in review; not worth a
-      // resetToMain here (that would discard every sibling's already-good append too).
-      results[task.id] = { succeeded: false, reason: `writeArtifact failed: ${e.message}` };
-    }
-  }
-
-  if (staged.length === 0) return { results, committed: false };
-
-  const msgPath = path.join(require('os').tmpdir(), `apply-batch-msg-${process.pid}.txt`);
-  const commitMessage = [
-    `Triage batch: ${staged.length} candidate-doc update(s)`,
-    '',
-    ...staged.map((s) => `- ${s.task.title} (task ${s.task.id})`),
-    '',
-    ...staged.map((s) => `Task-Log: ${s.taskLogRel}`),
-    '',
-    coAuthorTrailer(staged[0].task),
-  ].join('\n');
-  fs.writeFileSync(msgPath, commitMessage);
-  try {
-    gitRunner.commit(msgPath);
-  } finally {
-    fs.unlinkSync(msgPath);
-  }
-
-  try {
-    gitRunner.pushMain();
-  } catch (pushErr) {
-    // Same rationale as applyTask's commitsDirectlyToMain push-failure handling: the
-    // commit is real, already-reviewed work; discarding it here recreates the data-loss
-    // this whole path exists to prevent. It stays local and rides out with the next push.
-    for (const s of staged) {
-      results[s.task.id] = { succeeded: false, reason: `triage batch push to main failed after commit (kept local, not rolled back): ${pushErr.message}` };
-    }
-    return { results, committed: true, pushed: false };
-  }
-
-  for (const s of staged) {
-    results[s.task.id] = { succeeded: true, doneMarker: `committed to ${gitRunner.mainBranch} in a ${staged.length}-task triage batch` };
-    closeOriginatingBrainDumpEntry(s.task, brainDumpPath, `Applied in a triage batch -- Task: ${s.task.id}`);
-  }
-  return { results, committed: true, pushed: true, branch: gitRunner.mainBranch };
-}
-
 // node apply-task.js --partition <file...>  -> { direct: [...], other: [...] }
 // Splits approved task files into the directToMain set (batchable by --batch) and the rest
 // (per-task applyTask). A file that can't be read/classified goes to `other` so the normal
 // path reports its failure properly.
-function mainPartition() {
-  const { repoRoot } = getConfig();
-  void repoRoot;
-  const direct = [];
-  const other = [];
-  for (const p of process.argv.slice(3)) {
-    try {
-      const t = JSON.parse(fs.readFileSync(p, 'utf8'));
-      const reg = getRegisteredSource(resolveSourceName(t));
-      if (reg && reg.directToMain === true) direct.push(p); else other.push(p);
-    } catch {
-      other.push(p);
-    }
-  }
-  process.stdout.write(JSON.stringify({ direct, other }));
-}
-
 // node apply-task.js --batch <file...>  -> { batch: true, results: [{ taskId, path, succeeded, needsConfirmation, doneMarker?, reason? }] }
 // Writes each task file back in place (recordApplyOutcome -> status/history) before the
 // caller moves it, exactly like the single-task path.
