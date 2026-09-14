@@ -236,6 +236,33 @@ test('adhoc: the preliminary check splits a fresh task straight to decompose, no
   });
 });
 
+// Root-caused live 2026-09-14 (pidfile-gate acceptance test task, 4 straight review
+// rejections before a human manually re-specified the task): task.implementResponse used
+// to be a content-free templated sentence with no trace of the actual subTaskProposals, so
+// review-task.js's buildVerdictPrompt -- which never reads subTaskProposals directly --
+// showed the reviewer nothing to check coverage against, even though task-sources.js's own
+// ADHOC_DECOMPOSE_GUIDANCE explicitly instructs it to "judge ONLY the actual DECOMPOSITION
+// in the IMPLEMENT draft below." A genuinely good split and a genuinely empty one looked
+// identical from the review prompt's point of view. This locks down that implementResponse
+// now actually carries every piece's title + rawText, so the guidance's coverage-check
+// instructions have real content to judge.
+test('adhoc: the preliminary check writes the real sub-task titles/rawText into implementResponse, not just a content-free sentence', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-predecomp-review-content', domain: 'adhoc', source: 'manual', title: 'big thing', promptContext: { rawText: 'build the plugin catalog, endpoints and UI' } };
+    await draftTask(task, {
+      localCall: splittingLocalCall(),
+      withLockFn: async (d, fn) => fn(),
+      draftAdhocViaLocalAgenticWriteFn: async () => ({ applied: false, succeeded: true, reason: 'should not be reached' }),
+    });
+
+    assert.equal(task.adhocResolution, 'decompose');
+    for (const st of task.subTaskProposals) {
+      assert.ok(task.implementResponse.includes(st.title), `implementResponse must include sub-task title "${st.title}"`);
+      assert.ok(task.implementResponse.includes(st.rawText), `implementResponse must include sub-task rawText for "${st.title}"`);
+    }
+  });
+});
+
 test('adhoc: the preliminary check is skipped on a retry (localRejectCount set)', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = { id: 'adhoc-predecomp-retry', domain: 'adhoc', source: 'manual', title: 'big thing', localRejectCount: 1, promptContext: { rawText: 'build the plugin catalog, endpoints and UI' } };

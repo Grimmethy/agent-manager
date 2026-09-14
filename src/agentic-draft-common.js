@@ -214,6 +214,30 @@ function parseSubTaskProposals(text) {
   return cleaned.length ? cleaned : null;
 }
 
+// Root-caused live 2026-09-14 (pidfile-gate acceptance test task, 4 straight rejections
+// before a human manually re-specified the task): every adhocResolution==='decompose' call
+// site (the preliminary check in draft-context.js, and the post-exhaustion/repeated-
+// decompose backstops in local-agentic-write-draft.js) stamped task.implementResponse to a
+// content-free templated sentence ("Preliminary size check: this task spans N independent
+// pieces..." / "Auto-decomposed after ... (N pieces)."), NEVER the actual subTaskProposals
+// content -- while task-sources.js's own ADHOC_DECOMPOSE_GUIDANCE prompt text has *always*
+// told the reviewer to "judge ONLY the actual DECOMPOSITION in the IMPLEMENT draft below"
+// and check per-deliverable coverage against it. The reviewer was asked to judge coverage
+// against sub-tasks it was structurally never shown -- so a genuinely good decomposition
+// and a genuinely empty one looked identical from the review prompt's point of view, and
+// review correctly (from what it could see) rejected both. This renders the real proposals
+// into implementResponse so the review pass -- and the guidance's coverage-check
+// instructions -- actually has something to judge.
+function formatSubTaskProposalsForReview(subTasks) {
+  if (!Array.isArray(subTasks) || subTasks.length === 0) return '';
+  return subTasks
+    .map((t, i) => {
+      const dep = Number.isInteger(t.after) ? ` (after piece ${t.after + 1})` : '';
+      return `${i + 1}. ${t.title}${dep}\n   ${t.rawText}`;
+    })
+    .join('\n');
+}
+
 // Optional multiple-choice shortcut for a needs-human-decision resolution: an `OPTIONS:`
 // header followed by `N. label :: description` lines. Best-effort -- requires 2+
 // well-formed lines, otherwise the plain-English open question is the only surface.
@@ -779,7 +803,7 @@ function summariseInvestigation(responseText, toolCallLog) {
 
 module.exports = {
   GIT_ENV, GIT_TIMEOUT_MS, runGit, priorRejectionBlock,
-  RESOLUTION_RE, parseSubTaskProposals, parseClarificationOptions, extractFirstJsonArray,
+  RESOLUTION_RE, parseSubTaskProposals, formatSubTaskProposalsForReview, parseClarificationOptions, extractFirstJsonArray,
   agenticWorktreePaths, prepareAdhocWorktree, cleanupAdhocWorktree,
   runAgenticDraftInWorktree, resolveAgenticDraft,
   summariseInvestigation,
