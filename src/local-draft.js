@@ -1418,19 +1418,20 @@ function tryDeterministicNodeModuleDecompose(task, attempt) {
     return null;
   }
 
-  // Parse-check every produced file before trusting the change set (the vm oracle inside
-  // buildExtraction already proved each moved fn is a complete unit; this catches a
-  // prelude/back-require splice that somehow did not).
-  try {
-    const vm = require('vm');
-    for (const ch of built.changes) {
-      const text = ch.mode === 'create' ? ch.content : ch.replace;
-      new vm.Script(text, { filename: ch.file }); // throws on a syntax error
-    }
-  } catch (e) {
-    appendHistoryEvent(task, 'advisory', `deterministic node-module decompose produced a file that does not parse (${String(e && e.message || e).slice(0, 200)}) -- falling through to the normal drafting path`);
-    return null;
-  }
+  // 2026-09-14 removed: a redundant, ADDITIONAL parse-check here (`new vm.Script(text)`
+  // on every produced file) that was strictly WEAKER than buildNodeModuleOnePassChanges's
+  // own firstNodeCheckError just above (real `node --check`, added later -- 2026-09-09
+  // incident, see decompose-node-module.js's own header) -- and actively WRONG for a
+  // common, valid pattern: `new vm.Script(text)` compiles `text` as a bare top-level
+  // script with NO CommonJS module wrapper, so a perfectly legal top-level `return`
+  // inside `if (require.main === module) { ... return; }` (this codebase's own standard
+  // CLI-entry-point guard, e.g. task-sources.js's own --priority-map/--pending-readiness
+  // handlers) throws "Illegal return statement" here even though real `node --check` (and
+  // real `require()`) both correctly treat it as legal, since Node's actual module
+  // wrapper IS a function. Caught live 2026-09-14: task-sources.js's own deterministic
+  // decompose fell through to the full agentic drafting path on every single attempt,
+  // purely because of this false positive -- `built.ok` above already proves the file
+  // parses and requires cleanly; this check added nothing but a stricter, buggier retest.
 
   let rawDiff;
   try {
