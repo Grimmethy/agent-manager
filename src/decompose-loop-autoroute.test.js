@@ -316,12 +316,17 @@ test('sweep: AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS=0 disables the hot-file gate 
 
   process.env.AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS = '0';
   try {
+    // HOT_FILE_DAYS is now read once at require-time by hot-file-guard.js (2026-09-14:
+    // extracted so file-decompose-to-hub.js can share it without a circular require) --
+    // clear ITS cache entry too, not just decompose-loop-autoroute.js's own.
+    delete require.cache[require.resolve('./hot-file-guard.js')];
     delete require.cache[require.resolve('./decompose-loop-autoroute.js')];
     const { sweep: freshSweep } = require('./decompose-loop-autoroute.js');
     await freshSweep({ pipelineDir: dir, repoRoot: dir, call });
     assert.equal(planPassRan, true, 'gate disabled -> sweep got past the hot-file skip and ran the plan pass');
   } finally {
     delete process.env.AGENT_MANAGER_DECOMPOSE_HOT_FILE_DAYS;
+    delete require.cache[require.resolve('./hot-file-guard.js')];
     delete require.cache[require.resolve('./decompose-loop-autoroute.js')];
   }
 });

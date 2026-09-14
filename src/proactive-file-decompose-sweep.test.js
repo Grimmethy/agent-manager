@@ -153,7 +153,13 @@ test('sweep: a big file with only RESOLVED prior requests (this session\'s own a
   assert.equal(fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests')).length, 2);
 });
 
-test('sweep: a file with a recent commit (hot file) is skipped', async () => {
+// 2026-09-14 fix (screaminggoatclubmt: "why is that timer set to a week" -- the hot-file
+// check used to run HERE, before a plan even existed, and blocked this exact fixture's
+// Tier-1-eligible plan (self-contained JS functions -> planIsFullyMechanicalNodeModule)
+// for a full week even though a Tier-1 one-pass is a single commit that can't go stale.
+// It now only applies inside file-decompose-to-hub.js's Tier-2 hub path (hot-file-guard.js)
+// -- this fixture is Tier-1-eligible, so a recent commit no longer blocks it at all.
+test('sweep: a file with a recent commit (hot file) still files -- this fixture is Tier-1-eligible (self-contained JS), which is exempt from the hot-file guard', async () => {
   const dir = tmpPipeline(['src/big.js']);
   execFileSync('git', ['init', '-q'], { cwd: dir });
   execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: dir });
@@ -163,8 +169,31 @@ test('sweep: a file with a recent commit (hot file) is skipped', async () => {
   execFileSync('git', ['commit', '-q', '-m', 'recent'], { cwd: dir });
 
   const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call: fakeCall(MOVES), force: true });
-  assert.equal(summary.filed, 0);
-  assert.equal(summary.skipped, 1);
+  assert.equal(summary.filed, 1);
+  assert.equal(summary.deferred, 0);
+});
+
+// The hot-file guard's actual remaining target: a plan that is NOT Tier-1-eligible (forced
+// here via AGENT_MANAGER_DECOMPOSE_NODE_MODULE=false, same fixture) falls through to the
+// multi-day Tier-2 hub path in file-decompose-to-hub.js, which IS still hot-file-gated.
+test('sweep: a file with a recent commit whose plan is NOT Tier-1-eligible is deferred, not filed', async () => {
+  const dir = tmpPipeline(['src/big.js']);
+  execFileSync('git', ['init', '-q'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'a@b.c'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'x'], { cwd: dir });
+  writeFixtureSource(dir, 'src/big.js', SYMS);
+  execFileSync('git', ['add', 'src/big.js'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'recent'], { cwd: dir });
+
+  const prev = process.env.AGENT_MANAGER_DECOMPOSE_NODE_MODULE;
+  process.env.AGENT_MANAGER_DECOMPOSE_NODE_MODULE = 'false';
+  try {
+    const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call: fakeCall(MOVES), force: true });
+    assert.equal(summary.filed, 0);
+    assert.equal(summary.deferred, 1);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_NODE_MODULE; else process.env.AGENT_MANAGER_DECOMPOSE_NODE_MODULE = prev;
+  }
 });
 
 test('sweep: bounded to MAX_FILES_PER_RUN (1) even with 2 eligible oversized files', async () => {
