@@ -67,6 +67,43 @@ function resolveGraphPath(repoRoot) {
   return fallback;
 }
 
+const coveragePathCache = new Map();
+
+function resolveCommunityCoveragePath(repoRoot, pipelineDir) {
+  const fs = require('fs');
+  const path = require('path');
+
+  const key = path.resolve(repoRoot);
+  if (coveragePathCache.has(key)) return coveragePathCache.get(key);
+
+  const cacheDir = path.join(repoRoot, '.agent-manager-cache');
+
+  const defaultCacheCoverage = path.join(cacheDir, 'default', 'coverage.json');
+  if (fs.existsSync(defaultCacheCoverage)) {
+    coveragePathCache.set(key, defaultCacheCoverage);
+    return defaultCacheCoverage;
+  }
+
+  try {
+    const candidates = fs.readdirSync(cacheDir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => path.join(cacheDir, e.name, 'coverage.json'))
+      .filter((p) => fs.existsSync(p))
+      .map((p) => ({ p, mtime: fs.statSync(p).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    if (candidates.length > 0) {
+      coveragePathCache.set(key, candidates[0].p);
+      return candidates[0].p;
+    }
+  } catch {
+    // cacheDir itself doesn't exist -- fall through to the legacy default below.
+  }
+
+  const fallback = path.join(pipelineDir, 'community-coverage.json');
+  coveragePathCache.set(key, fallback);
+  return fallback;
+}
+
 function getConfig() {
   const path = require('path');
   const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
@@ -126,7 +163,7 @@ function getConfig() {
   const troubleLogPath = process.env.AGENT_MANAGER_TROUBLE_LOG_PATH || path.join(applyRepoRoot, 'Docs', 'TROUBLE_LOG.md');
   const archReviewCandidatesPath = process.env.AGENT_MANAGER_ARCH_CANDIDATES_PATH || path.join(applyRepoRoot, 'Docs', 'ARCH_REVIEW_CANDIDATES.md');
   const archImportCandidatesPath = process.env.AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH || path.join(applyRepoRoot, 'Docs', 'ARCH_IMPORT_CANDIDATES.md');
-  const communityCoveragePath = process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH || path.join(pipelineDir, 'community-coverage.json');
+  const communityCoveragePath = process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH || resolveCommunityCoveragePath(repoRoot, pipelineDir);
   const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || resolveGraphPath(repoRoot);
   const domainsPath = process.env.AGENT_MANAGER_DOMAINS_PATH || path.join(pipelineDir, 'task-domains.json');
   // project_search's apply target lives OUTSIDE any single project's repo root by design
@@ -403,4 +440,4 @@ function ensureRegistered() {
   }
 }
 
-module.exports = { getConfig, ensureRegistered, resolveGraphPath };
+module.exports = { getConfig, ensureRegistered, resolveGraphPath, resolveCommunityCoveragePath };
