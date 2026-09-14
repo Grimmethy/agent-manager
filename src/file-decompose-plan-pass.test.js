@@ -9,7 +9,7 @@ const M = require('./file-decompose-plan-pass.js');
 const {
   extractTopLevelSymbols, assignSections, groupBySection, planFromSections, planFromSectionMerge,
   parseMovesJson, bannerLabel, routeFamily, runFileDecomposePlanPass, computeFanOutSymbols,
-  computeRoutelessSections, packSections,
+  computeRoutelessSections, computeAppHookSymbols, hasNonRouteAppHook, packSections,
 } = M;
 
 test('extractTopLevelSymbols: python + html <script> functions, nested excluded', () => {
@@ -372,4 +372,56 @@ test("moveTemplateFor (via runFileDecomposePlanPass): a multi-word packed .py mo
     const base = mv.newFile.split('/').pop().replace(/\.py$/, '');
     assert.doesNotMatch(base, /-/, `${mv.newFile}: a Python module name cannot contain a hyphen`);
   }
+});
+
+// --- app-hook filter (2026-09-14, real Flask import failure) ------------------------
+
+test('hasNonRouteAppHook: true for @app.errorhandler/@app.before_request, false for @app.route or a plain function', () => {
+  const lines = ['@app.errorhandler(HTTPException)', 'def handle_http_exception(e):', '    pass'];
+  assert.equal(hasNonRouteAppHook(lines, 1), true);
+  const lines2 = ['@app.before_request', 'def check_auth():', '    pass'];
+  assert.equal(hasNonRouteAppHook(lines2, 1), true);
+  const lines3 = ['@app.route("/x")', 'def view_x():', '    pass'];
+  assert.equal(hasNonRouteAppHook(lines3, 1), false);
+  const lines4 = ['def plain():', '    pass'];
+  assert.equal(hasNonRouteAppHook(lines4, 0), false);
+});
+
+test('hasNonRouteAppHook: true even when @app.route is ALSO stacked above the same def (multiple decorators)', () => {
+  const lines = ['@app.errorhandler(404)', '@app.route("/not-a-real-combo")', 'def h(e):', '    pass'];
+  assert.equal(hasNonRouteAppHook(lines, 2), true);
+});
+
+test('computeAppHookSymbols: flags only the hook-decorated symbols', () => {
+  const symbols = [{ name: 'a', isAppHook: true }, { name: 'b', isAppHook: false }, { name: 'c', isAppHook: true }];
+  assert.deepEqual(computeAppHookSymbols(symbols), new Set(['a', 'c']));
+});
+
+// The exact live incident: a section WITH a real route also contains an unrelated global
+// @app.errorhandler as a sibling -- computeRoutelessSections alone would not catch this
+// (the section has a route), so the app-hook filter must be a separate, per-symbol check.
+test('runFileDecomposePlanPass: a global @app.errorhandler sharing a section with a real route is excluded, the route itself is not', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apphook-plan-'));
+  const sections = [];
+  for (let s = 0; s < 5; s += 1) {
+    sections.push(`# --- Section ${s} ---`);
+    sections.push(`@app.route("/sec${s}/a")`);
+    sections.push(`def sec${s}_view_a():`);
+    sections.push(`    return 1`);
+    sections.push(`@app.route("/sec${s}/b")`);
+    sections.push(`def sec${s}_view_b():`);
+    sections.push(`    return 2`);
+  }
+  sections.push('# --- Errors ---');
+  sections.push('@app.errorhandler(HTTPException)');
+  sections.push('def handle_http_exception(e):');
+  sections.push('    return "err"');
+  writePy(dir, 'app.py', sections.join('\n'));
+
+  const plan = await runFileDecomposePlanPass('app.py', { repoRoot: dir, call: async () => ({ response: '[]' }) });
+  assert.ok(plan);
+  assert.match(plan.planPassNote, /global @app\.\* hook/);
+  for (const mv of plan.moves) assert.ok(!mv.symbols.includes('handle_http_exception'), 'the global error handler must never be claimed by a move');
+  const allMoved = plan.moves.flatMap((m) => m.symbols);
+  assert.ok(allMoved.includes('sec0_view_a'), 'the real routes are still movable');
 });

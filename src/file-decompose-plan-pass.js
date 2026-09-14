@@ -139,6 +139,27 @@ function routeFamily(lines, lineIdx) {
   return null;
 }
 
+// Any `@app.<hook>` OTHER than `@app.route` is a GLOBAL, whole-app Flask hook --
+// errorhandler, before_request, after_request, teardown_appcontext, context_processor,
+// template_filter, url_value_preprocessor, and the like. Moving one into a blueprint file
+// either breaks outright (the blueprint file has no `app` object to reference) or, worse,
+// silently changes its SCOPE: a Blueprint's own .errorhandler()/.before_request() only
+// fires for that blueprint's own routes, not the whole app -- fixing the missing import
+// would not make this safe. Caught live 2026-09-14: handle_http_exception
+// (@app.errorhandler(HTTPException)) got swept into shared_misc.py as an ordinary helper
+// (computeRoutelessSections only checks for the PRESENCE of a route in a section, not
+// whether a SIBLING symbol in that same section is itself unmovable) -- NameError on a
+// real Flask import, caught only because this session verifies with a real import, not
+// just py_compile. Same lookback-and-break style as routeFamily above.
+function hasNonRouteAppHook(lines, lineIdx) {
+  for (let j = lineIdx - 1; j >= 0 && j >= lineIdx - 6; j -= 1) {
+    const m = /^\s*@(\w+)\.(\w+)/.exec(lines[j]);
+    if (m && m[1] === 'app' && m[2].toLowerCase() !== 'route') return true;
+    if (!/^\s*@/.test(lines[j]) && lines[j].trim() !== '') break;
+  }
+  return false;
+}
+
 // Assigns each symbol a `section`, cheapest-signal-first:
 //   1. an explicit `// --- X ---` divider it sits under
 //   2. (.py) the @app.route("/api/<family>/") family of the def
@@ -172,6 +193,7 @@ function assignSections(text, ext, symbols) {
     // file-level `# --- X ---` divider in a 6,900-line file is far too coarse.
     const family = ext === '.py' ? routeFamily(lines, s.line - 1) : null;
     s.isRoute = family !== null; // exposed for computeRoutelessSections below
+    s.isAppHook = ext === '.py' && hasNonRouteAppHook(lines, s.line - 1); // for computeAppHookSymbols below
     let section = family;
     if (!section) section = bannerByLine[s.line - 1] || null;
     if (!section) section = anchorByLine[s.line - 1] || null;
@@ -237,6 +259,16 @@ function computeRoutelessSections(sourceFile, groups) {
     }
   }
   return routeless;
+}
+
+// A symbol decorated with a non-route @app.* hook is unmovable, full stop -- independent
+// of which section it landed in (unlike fan-out/routeless, which are section-level
+// properties, this is a per-symbol one: a section can have a real route AND also contain
+// an unrelated global hook as a sibling). See hasNonRouteAppHook's header note.
+function computeAppHookSymbols(symbols) {
+  const hooks = new Set();
+  for (const s of symbols) if (s.isAppHook) hooks.add(s.name);
+  return hooks;
 }
 
 // First-fit-decreasing-ish bin merge: repeatedly combines the two SMALLEST bins until at
@@ -465,7 +497,8 @@ async function runFileDecomposePlanPass(sourceFile, {
   const rawGroups = groupBySection(symbols);
   const fanOut = computeFanOutSymbols(repoRoot, sourceFile, rawGroups);
   const routeless = computeRoutelessSections(sourceFile, rawGroups);
-  const candidates = symbols.filter((s) => !fanOut.has(s.name) && !routeless.has(s.name));
+  const appHooks = computeAppHookSymbols(symbols);
+  const candidates = symbols.filter((s) => !fanOut.has(s.name) && !routeless.has(s.name) && !appHooks.has(s.name));
   if (candidates.length < minSymbols) return null; // nothing safe enough left to split
 
   const headText = text.split('\n').slice(0, 80).join('\n');
@@ -528,6 +561,7 @@ async function runFileDecomposePlanPass(sourceFile, {
     planPassNote: `${clean.length} module(s) via ${strategy} from ${candidates.length} symbols`
       + (fanOut.size ? ` (${fanOut.size} shared/cross-cutting symbol(s) excluded -- kept in ${sourceFile}: ${[...fanOut].slice(0, 8).join(', ')})` : '')
       + (routeless.size ? ` (${routeless.size} helper-only/routeless symbol(s) excluded -- no @app.route view in their section, kept in ${sourceFile})` : '')
+      + (appHooks.size ? ` (${appHooks.size} global @app.* hook(s) excluded -- errorhandler/before_request/etc. cannot move into a blueprint, kept in ${sourceFile}: ${[...appHooks].slice(0, 8).join(', ')})` : '')
       + (dropped.length ? ` (${dropped.length} left in place: ${dropped.slice(0, 8).join(', ')})` : ''),
   };
 }
@@ -535,5 +569,5 @@ async function runFileDecomposePlanPass(sourceFile, {
 module.exports = {
   runFileDecomposePlanPass, extractTopLevelSymbols, assignSections, groupBySection,
   planFromSections, planFromSectionMerge, parseMovesJson, bannerLabel, routeFamily,
-  computeFanOutSymbols, computeRoutelessSections, packSections,
+  computeFanOutSymbols, computeRoutelessSections, computeAppHookSymbols, hasNonRouteAppHook, packSections,
 };
