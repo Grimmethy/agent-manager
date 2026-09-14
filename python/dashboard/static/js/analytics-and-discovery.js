@@ -446,11 +446,52 @@ function wireBenchmarkPanel(models, cases) {
   });
 }
 
+const DEEP_DIVE_ADD_BAR = `
+  <div class="capture-row">
+    <input id="dd-add-url-input" placeholder="Paste a github.com/org/repo URL to scout it" autocomplete="off">
+    <button class="action" id="dd-add-url-btn" title="Add this repo -- it clones/grabs communities on the next worker tick, same as any auto-discovered lead">Add repo</button>
+  </div>
+`;
+
+function wireDeepDiveAddBar() {
+  const input = document.getElementById('dd-add-url-input');
+  const btn = document.getElementById('dd-add-url-btn');
+  const submit = async () => {
+    const url = input.value.trim();
+    if (!url) return;
+    btn.disabled = true;
+    try {
+      const res = await fetch('/api/project-search/manual-lead', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.description || res.statusText);
+      }
+      const result = await res.json();
+      input.value = '';
+      if (result.alreadyPresent) {
+        alert(`${result.name} is already scouted -- it'll clone on its next worker tick if it hasn't already.`);
+      }
+    } catch (e) {
+      alert('Could not add repo: ' + e.message);
+    } finally {
+      btn.disabled = false;
+    }
+    if (activeTab === 'deepdive') await renderDeepDiveTab();
+  };
+  btn.onclick = submit;
+  input.onkeydown = (e) => { if (e.key === 'Enter') submit(); };
+}
+
 async function renderDeepDiveTab() {
   const projects = await fetchJson('/api/deep-dive/projects');
   const main = document.getElementById('main');
   if (projects.length === 0) {
-    main.innerHTML = '<div class="empty">No repos scouted yet -- project_search hasn\'t landed a Strong lead for deep_dive to pick up.</div>';
+    main.innerHTML = DEEP_DIVE_ADD_BAR + '<div class="empty">No repos scouted yet -- project_search hasn\'t landed a Strong lead for deep_dive to pick up, or add one above.</div>';
+    wireDeepDiveAddBar();
     return;
   }
   const rows = projects.map(p => `
@@ -463,7 +504,8 @@ async function renderDeepDiveTab() {
       <td>${p.clonedAt ? new Date(p.clonedAt).toLocaleString() : ''}</td>
     </tr>
   `).join('');
-  main.innerHTML = `<table><thead><tr><th>Hot</th><th>Project</th><th>Source</th><th>Communities Reviewed</th><th>Action Items</th><th>Cloned</th></tr></thead><tbody>${rows}</tbody></table>`;
+  main.innerHTML = DEEP_DIVE_ADD_BAR + `<table><thead><tr><th>Hot</th><th>Project</th><th>Source</th><th>Communities Reviewed</th><th>Action Items</th><th>Cloned</th></tr></thead><tbody>${rows}</tbody></table>`;
+  wireDeepDiveAddBar();
   main.querySelectorAll('tr.clickable').forEach(row => {
     row.onclick = () => openDeepDiveDetail(row.dataset.slug);
   });
