@@ -76,13 +76,33 @@ function slugify(s) {
 // not it's been processed into a hub/one-pass task yet. One outstanding request per file
 // at a time; a file with real content changes gets picked up again on a later run once
 // its earlier split has actually merged and file-length-scan re-flags it (or doesn't).
+//
+// Real bug, caught live on this feature's own first production run (2026-09-14): app.py
+// had EIGHT resolved requests already sitting in queue/file-decompose-requests/ (this
+// session's own manual slices, each stamped hubId/onePassTaskId once processed) -- the
+// original version of this check counted every one of them as still "outstanding" and
+// would have skipped app.py FOREVER, since a file this large legitimately needs many
+// successive requests over time, not just one. A request only actually blocks a NEW one
+// for the same file while its linked hub/one-pass task hasn't reached a terminal state
+// yet (queue/done/, whether that's a real completion or an operator dismiss/discard) --
+// once it has, that slice is done and the file is free to be sliced again.
+function isRequestResolved(pipelineDir, req) {
+  const linkedId = req.onePassTaskId || req.hubId;
+  if (!linkedId) return false; // never even processed by file-decompose-to-hub yet
+  const candidates = [
+    path.join(pipelineDir, 'queue', 'done', `${linkedId}.json`),
+    path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${linkedId}.json`),
+  ];
+  return candidates.some((p) => fs.existsSync(p));
+}
+
 function hasExistingRequestFor(pipelineDir, targetFile) {
   const reqDir = path.join(pipelineDir, 'queue', 'file-decompose-requests');
   let names;
   try { names = fs.readdirSync(reqDir).filter((n) => n.endsWith('.json')); } catch { return false; }
   for (const name of names) {
     const req = readJson(path.join(reqDir, name));
-    if (req && req.sourceFile === targetFile) return true;
+    if (req && req.sourceFile === targetFile && !isRequestResolved(pipelineDir, req)) return true;
   }
   return false;
 }
@@ -147,7 +167,7 @@ async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.no
   return summary;
 }
 
-module.exports = { sweep, isDue, markChecked, hasExistingRequestFor, CHECK_INTERVAL_MS };
+module.exports = { sweep, isDue, markChecked, hasExistingRequestFor, isRequestResolved, CHECK_INTERVAL_MS };
 
 if (require.main === module) {
   const { pipelineDir, repoRoot } = getConfig();

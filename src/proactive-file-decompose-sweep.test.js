@@ -7,12 +7,12 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const {
-  sweep, isDue, markChecked,
+  sweep, isDue, markChecked, hasExistingRequestFor, isRequestResolved,
 } = require('./proactive-file-decompose-sweep.js');
 
 function tmpPipeline(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'proactive-decompose-'));
-  for (const s of ['file-decompose-requests', 'coordinating', 'adhoc', 'instances']) {
+  for (const s of ['file-decompose-requests', 'coordinating', 'adhoc', 'done', 'done/_archived_no_action', 'instances']) {
     fs.mkdirSync(path.join(dir, 'queue', s), { recursive: true });
   }
   fs.writeFileSync(path.join(dir, 'queue', 'file-length-flags.json'), JSON.stringify({
@@ -94,6 +94,50 @@ test('sweep: a file that already has ANY existing file-decompose-request is skip
   assert.equal(summary.filed, 0);
   assert.equal(summary.skipped, 1);
   assert.equal(fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests')).length, 1, 'still just the one pre-existing request');
+});
+
+// 2026-09-14 regression, caught live on this feature's own first production run: app.py
+// had 8 RESOLVED requests already on file (this session's own manual slices, each
+// stamped hubId/onePassTaskId once processed) -- the original check counted every one as
+// still "outstanding" and would have skipped app.py forever, since a file this large
+// legitimately needs many successive requests over time.
+test('isRequestResolved: false with no linked hub/onePassTaskId yet; true once the linked task reached queue/done/', () => {
+  const dir = tmpPipeline([]);
+  assert.equal(isRequestResolved(dir, { sourceFile: 'x.py', moves: [] }), false, 'never processed yet -- not resolved');
+  assert.equal(isRequestResolved(dir, { sourceFile: 'x.py', onePassTaskId: 'op-1' }), false, 'linked but the task has not landed in done/ yet');
+
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'op-1.json'), JSON.stringify({ id: 'op-1' }));
+  assert.equal(isRequestResolved(dir, { sourceFile: 'x.py', onePassTaskId: 'op-1' }), true);
+});
+
+test('isRequestResolved: also true for a hub that reached done/, or a task an operator discarded to done/_archived_no_action/', () => {
+  const dir = tmpPipeline([]);
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'hub-1.json'), JSON.stringify({ id: 'hub-1' }));
+  assert.equal(isRequestResolved(dir, { sourceFile: 'x.py', hubId: 'hub-1' }), true);
+
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'op-2.json'), JSON.stringify({ id: 'op-2' }));
+  assert.equal(isRequestResolved(dir, { sourceFile: 'x.py', onePassTaskId: 'op-2' }), true, 'a discarded/dismissed task still counts as resolved -- it no longer blocks a fresh slice');
+});
+
+test('hasExistingRequestFor: a file whose only requests are all RESOLVED is treated as free for a new one', () => {
+  const dir = tmpPipeline([]);
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'op-done.json'), JSON.stringify({ id: 'op-done' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'old-resolved.json'),
+    JSON.stringify({ id: 'old-resolved', sourceFile: 'python/dashboard/app.py', onePassTaskId: 'op-done' }));
+
+  assert.equal(hasExistingRequestFor(dir, 'python/dashboard/app.py'), false, 'the one existing request for this file is fully resolved -- not blocking');
+});
+
+test('sweep: a big file with only RESOLVED prior requests (this session\'s own app.py shape) is picked up again, not skipped forever', async () => {
+  const dir = tmpPipeline(['src/big.js']);
+  writeFixtureSource(dir, 'src/big.js', SYMS);
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'op-done.json'), JSON.stringify({ id: 'op-done' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'old-resolved.json'),
+    JSON.stringify({ id: 'old-resolved', sourceFile: 'src/big.js', onePassTaskId: 'op-done' }));
+
+  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call: fakeCall(MOVES), force: true });
+  assert.equal(summary.filed, 1, 'the file gets a fresh request even with 8 (here: 1) resolved ones already on file');
+  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests')).length, 2);
 });
 
 test('sweep: a file with a recent commit (hot file) is skipped', async () => {
