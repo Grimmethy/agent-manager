@@ -486,6 +486,43 @@ test('firstRuntimeError: never calls a `next*` export (task-source poller shape)
   assert.equal(firstRuntimeError(changes, 'src/m.js', repo), null);
 });
 
+// 2026-09-14, screaminggoatclubmt: "dig into the new bug too" -- found live against
+// local-draft.js's own real exports: callImplementModel is `async function`. Calling
+// `v()` on it never throws synchronously (an async function always returns a Promise),
+// so the destructuring failure from a missing options argument became a REJECTED
+// promise instead -- invisible to the `try{v()}catch` here, and the resulting unhandled
+// rejection crashed the WHOLE probe process (exit code 1, no RTE/output), which the
+// generic fallback then misreported as "module failed to load". Not name-pattern-
+// specific like next*/onboard/clone: ANY async export with a required parameter hits
+// this, no denylist entry can cover it -- needs the global unhandledRejection net.
+test('firstRuntimeError: an async export whose destructured parameter throws does not crash the whole probe (the ORIGINAL false positive), and a genuine async ReferenceError is still caught', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'rte-async-test-'));
+  fs.mkdirSync(path.join(repo, 'src'));
+
+  const benignChanges = [
+    {
+      mode: 'edit',
+      file: 'src/m.js',
+      find: 'x',
+      replace: "'use strict';\nasync function callImplementModel(task, ctx, { recordModelCall, implPrompt }) {\n  return recordModelCall(implPrompt);\n}\nmodule.exports = { callImplementModel };\n",
+    },
+  ];
+  assert.equal(firstRuntimeError(benignChanges, 'src/m.js', repo), null, 'calling with no args throws inside the async fn -- a rejected promise, not a real dropped dependency -- must not fail the probe');
+
+  // A GENUINE dropped dependency inside an async export must still be caught, just via
+  // the rejection path instead of a synchronous throw.
+  const badChanges = [
+    {
+      mode: 'edit',
+      file: 'src/m.js',
+      find: 'x',
+      replace: "'use strict';\nasync function callImplementModel() {\n  return GONE_ASYNC_DEPENDENCY;\n}\nmodule.exports = { callImplementModel };\n",
+    },
+  ];
+  const err = firstRuntimeError(badChanges, 'src/m.js', repo);
+  assert.ok(err && /GONE_ASYNC_DEPENDENCY|not defined|ReferenceError/.test(err), String(err));
+});
+
 // 2026-09-13 regression: a move whose newFile sits in a SUBDIRECTORY of sourceFile's own
 // directory (e.g. sdk/candidate-fulfillment.js -> sdk/lib/candidate-lifecycle.js) used to
 // carry every require() path -- both top-level and lazily called inside a moved function
