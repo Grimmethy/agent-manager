@@ -32,10 +32,25 @@
 //
 // Bounded to ONE new plan per run (MAX_FILES_PER_RUN) -- same "small, scoped, don't dump
 // the whole backlog on the pipeline at once" discipline as this session's manual slicing.
-// Time-gated to once per CHECK_INTERVAL_MS (default 24h, same isDue/markChecked idiom as
-// pipeline-health-audit.js/ui-visibility-audit.js) PLUS an on-demand --force flag for the
-// "project just became the active target" trigger (see app.py's _start_pipeline, which
-// spawns this in the background on every project switch/start).
+//
+// THROTTLE (2026-09-14, screaminggoatclubmt: "why not remove the max files per run
+// altogether? ... make sure the process continues by spawning the next task after the
+// task is finished, otherwise if the next task is only queued by the 24 hour scan").
+// A flat daily quota was never tied to anything that actually mattered -- not worker
+// capacity, not review throughput, not the risk of filing many attempts against a
+// still-young mechanism at once. Replaced with a self-regulating cap on how many
+// decompose-derived branches are currently APPLIED BUT NOT YET MERGED
+// (countOutstandingDecomposeBranches), split Tier1 (fast, single atomic commit, safe --
+// looser cap) vs Tier2 (multi-day per-move hub, worker-hungry -- stricter cap). Merging
+// one frees a slot immediately: task-log-reconcile.js already stamps a task's `merged`
+// history stage on EVERY watchdog tick (scripts/queue-watcher.sh's main loop runs every
+// ORC_TICK_SECS, default 60s), so the very next tick after a merge sees the freed
+// capacity -- no separate "on merge" event hook needed, just a short time floor
+// (CHECK_INTERVAL_MS, now minutes not a day) so a full oversized-file scan + plan-pass
+// attempt doesn't re-run on literally every 60s tick when there's nothing new to do.
+// PLUS an on-demand --force flag for the "project just became the active target" trigger
+// (see app.py's _start_pipeline, which spawns this in the background on every project
+// switch/start) -- force bypasses the time floor but NOT the outstanding-branches cap.
 //
 // Kill switch: AGENT_MANAGER_PROACTIVE_FILE_DECOMPOSE=false.
 
@@ -47,8 +62,28 @@ const { sweep: fileDecomposeToHubSweep } = require('./file-decompose-to-hub.js')
 const { oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 
-const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+// Was 24h -- now just a floor against re-scanning every single ~60s watchdog tick, not
+// the thing standing between a merge and the next slice being filed (see THROTTLE above).
+const CHECK_INTERVAL_MS = (() => {
+  const v = process.env.AGENT_MANAGER_PROACTIVE_FILE_DECOMPOSE_INTERVAL_MS;
+  return v === undefined ? 5 * 60 * 1000 : Number(v);
+})();
 const MAX_FILES_PER_RUN = 1;
+
+// Outstanding-branches cap (see THROTTLE above). Tier1 = a single deterministic one-pass
+// commit (script-extract/node-module/flask-blueprint short-circuit) -- fast, atomic,
+// twice real-import-verified this session. Tier2 = the multi-day per-move hub -- each
+// move is its own model-drafted, individually-reviewed task, competing with the rest of
+// the pipeline for the same local-model worker lanes. Looser cap for the cheap tier,
+// stricter for the expensive one.
+const TIER1_CAP = (() => {
+  const v = process.env.AGENT_MANAGER_DECOMPOSE_TIER1_CAP;
+  return v === undefined ? 3 : Number(v);
+})();
+const TIER2_CAP = (() => {
+  const v = process.env.AGENT_MANAGER_DECOMPOSE_TIER2_CAP;
+  return v === undefined ? 1 : Number(v);
+})();
 
 function schedulePath(instancesDir) {
   return path.join(instancesDir, '.proactive-file-decompose-schedule.json');
@@ -123,8 +158,50 @@ function hasExistingRequestFor(pipelineDir, targetFile) {
   return false;
 }
 
+// Counts decompose-derived tasks that are APPLIED (a real `agent/...` branch exists) but
+// NOT YET MERGED, split Tier1/Tier2 -- see the THROTTLE header note. Works entirely off
+// queue task records (the same `applied`/`merged` history stages task-log-reconcile.js
+// already maintains every watchdog tick), not git branch-name parsing -- no branch-naming
+// convention to keep in sync as file-decompose-to-hub.js's own conventions evolve.
+//
+// A task is decompose-derived if `promptContext.decomposedFrom` names either a plain
+// file-decompose request (file-decompose-<slug>, the Tier1 one-pass shape) or a hub
+// (file-decompose-hub-<slug>, the Tier2 per-move shape). A coordinator HUB record itself
+// never has an `applied` history stage (it coordinates, it doesn't apply a diff), so it's
+// naturally excluded without a separate check. Tier1 is identified by
+// `promptContext.deterministicApply`, a field only fileOnePassTask ever sets.
+//
+// Caveat: the legacy STACKED Tier2 model (AGENT_MANAGER_DECOMPOSE_STACKED=legacy, opt-in
+// only, not the live default) puts every move on ONE shared branch -- this would count
+// each move task as its own outstanding branch, over-counting for that mode. Not fixed
+// here since stacked mode isn't the active path; worth revisiting if that ever changes.
+function countOutstandingDecomposeBranches(pipelineDir) {
+  const counts = { tier1: 0, tier2: 0 };
+  const dirs = ['pending', 'adhoc', 'drafting', 'review', 'approved', 'coordinating', 'done']
+    .map((d) => path.join(pipelineDir, 'queue', d));
+  for (const dir of dirs) {
+    let names;
+    try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { continue; }
+    for (const name of names) {
+      const rec = readJson(path.join(dir, name));
+      if (!rec) continue;
+      const decomposedFrom = rec.promptContext && rec.promptContext.decomposedFrom;
+      if (!decomposedFrom || !/^file-decompose/.test(decomposedFrom)) continue;
+      const history = rec.history || [];
+      const applied = history.some((h) => h.stage === 'applied');
+      const merged = !!rec.mergedAt || history.some((h) => h.stage === 'merged');
+      if (!applied || merged) continue;
+      const isTier1 = !!(rec.promptContext && rec.promptContext.deterministicApply);
+      if (isTier1) counts.tier1 += 1; else counts.tier2 += 1;
+    }
+  }
+  return counts;
+}
+
 async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.now() } = {}) {
-  const summary = { checked: 0, filed: 0, deferred: 0, planFailed: 0, skipped: 0, errors: 0, due: false };
+  const summary = {
+    checked: 0, filed: 0, deferred: 0, planFailed: 0, skipped: 0, errors: 0, due: false, capped: false,
+  };
   if (process.env.AGENT_MANAGER_PROACTIVE_FILE_DECOMPOSE === 'false') return summary;
 
   let resolvedPipelineDir = pipelineDir;
@@ -137,6 +214,17 @@ async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.no
   const instancesDir = path.join(resolvedPipelineDir, 'instances');
   if (!force && !isDue(instancesDir, new Date(now))) return summary;
   summary.due = true;
+
+  // Outstanding-branches cap (see THROTTLE above) -- force bypasses the time floor but
+  // never this: filing more work while you already have unreviewed branches waiting
+  // doesn't get anything merged faster, it just grows the backlog.
+  const outstanding = countOutstandingDecomposeBranches(resolvedPipelineDir);
+  summary.outstanding = outstanding;
+  if (outstanding.tier1 >= TIER1_CAP && outstanding.tier2 >= TIER2_CAP) {
+    summary.capped = true;
+    markChecked(instancesDir, new Date(now));
+    return summary;
+  }
 
   const oversized = [...oversizedFiles(resolvedPipelineDir)];
   if (oversized.length === 0) {
@@ -193,7 +281,10 @@ async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.no
   return summary;
 }
 
-module.exports = { sweep, isDue, markChecked, hasExistingRequestFor, isRequestResolved, CHECK_INTERVAL_MS };
+module.exports = {
+  sweep, isDue, markChecked, hasExistingRequestFor, isRequestResolved, countOutstandingDecomposeBranches,
+  CHECK_INTERVAL_MS, TIER1_CAP, TIER2_CAP,
+};
 
 if (require.main === module) {
   const { pipelineDir, repoRoot } = getConfig();
