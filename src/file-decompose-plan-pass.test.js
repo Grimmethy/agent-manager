@@ -9,7 +9,7 @@ const M = require('./file-decompose-plan-pass.js');
 const {
   extractTopLevelSymbols, assignSections, groupBySection, planFromSections, planFromSectionMerge,
   parseMovesJson, bannerLabel, routeFamily, runFileDecomposePlanPass, computeFanOutSymbols,
-  computeRoutelessSections, computeAppHookSymbols, hasNonRouteAppHook, packSections,
+  computeJsFanOutSymbols, computeRoutelessSections, computeAppHookSymbols, hasNonRouteAppHook, packSections,
 } = M;
 
 test('extractTopLevelSymbols: python + html <script> functions, nested excluded', () => {
@@ -266,9 +266,12 @@ test('computeFanOutSymbols: a symbol referenced from another section is flagged;
   assert.equal(fanOut.has('route_b'), false);
 });
 
-test('computeFanOutSymbols: a no-op (empty set) for a non-.py source', () => {
+// 2026-09-14: computeFanOutSymbols now dispatches .js/.mjs/.cjs to computeJsFanOutSymbols
+// (a REAL check, not a no-op) -- see the dedicated JS fan-out tests further down. Only a
+// genuinely unsupported extension (no template, no check at all) is still a no-op.
+test('computeFanOutSymbols: a no-op (empty set) for an extension with no fan-out check at all (e.g. .md)', () => {
   const groups = new Map([['A', [{ name: 'x' }]]]);
-  assert.deepEqual(computeFanOutSymbols('/nonexistent', 'app.js', groups), new Set());
+  assert.deepEqual(computeFanOutSymbols('/nonexistent', 'README.md', groups), new Set());
 });
 
 test('runFileDecomposePlanPass: a file-wide Python helper is excluded from every move and left in the source', async () => {
@@ -425,3 +428,185 @@ test('runFileDecomposePlanPass: a global @app.errorhandler sharing a section wit
   const allMoved = plan.moves.flatMap((m) => m.symbols);
   assert.ok(allMoved.includes('sec0_view_a'), 'the real routes are still movable');
 });
+
+// --- JS fan-out filter (2026-09-14, screaminggoatclubmt: "Build the JS fan-out filter
+// now" -- found live: task-sources.js and local-draft.js hit the exact same class of bug
+// the .py fan-out filter fixed, with zero protection for non-Python files). ------------
+
+test('computeJsFanOutSymbols: a symbol referenced from another section is flagged; a section-local symbol is not', () => {
+  const src = [
+    '// --- Section A ---',
+    'function routeA() {',
+    '  return sharedHelper() + localHelperA();',
+    '}',
+    'function localHelperA() {',
+    '  return 1;',
+    '}',
+    '',
+    '// --- Section B ---',
+    'function routeB() {',
+    '  return sharedHelper() + 2;',
+    '}',
+    '',
+    '// --- Shared ---',
+    'function sharedHelper() {',
+    '  return 42;',
+    '}',
+  ].join('\n');
+  const symbols = assignSections(src, '.js', extractTopLevelSymbols(src, '.js'));
+  const groups = groupBySection(symbols);
+  const fanOut = computeJsFanOutSymbols('x.js', src, symbols, groups);
+  assert.equal(fanOut.has('sharedHelper'), true, 'called from both Section A and B -- cross-cutting');
+  // routeA/routeB both directly CALL sharedHelper, so the transitive-closure pass (tested
+  // in detail below) correctly excludes them too -- decompose-node-module.js has no way
+  // to move a function that reads a name staying behind. localHelperA calls nothing
+  // outside its own section, so it alone stays movable.
+  assert.equal(fanOut.has('routeA'), true, 'calls sharedHelper directly');
+  assert.equal(fanOut.has('localHelperA'), false, 'only used within its own section, calls nothing external');
+  assert.equal(fanOut.has('routeB'), true, 'calls sharedHelper directly');
+});
+
+// The exact live bug: isDependencySatisfied et al. are UNSECTIONED (no preceding banner),
+// which used to make the check skip them entirely (mirroring the .py path's `if (!label)
+// continue`) -- unsectioned symbols still get swept into a misc/includeUnsectioned move,
+// so they need the same cross-reference check as a named section.
+test('computeJsFanOutSymbols: an UNSECTIONED symbol referenced from a named section is still flagged', () => {
+  const src = [
+    'function isDependencySatisfied() {',
+    '  return true;',
+    '}',
+    '',
+    '// --- Section A ---',
+    'function nextTask() {',
+    '  return isDependencySatisfied();',
+    '}',
+  ].join('\n');
+  const symbols = assignSections(src, '.js', extractTopLevelSymbols(src, '.js'));
+  const groups = groupBySection(symbols);
+  const fanOut = computeJsFanOutSymbols('x.js', src, symbols, groups);
+  assert.equal(fanOut.has('isDependencySatisfied'), true);
+});
+
+// The transitive-closure bug: decompose-node-module.js's deterministic extractor has NO
+// back-import mechanism (unlike the .py flask-blueprint model's lazy `from app import X`),
+// so a symbol that itself CALLS an excluded fan-out symbol is exactly as unmovable.
+test('computeJsFanOutSymbols: a caller of an excluded fan-out symbol is transitively excluded too', () => {
+  const src = [
+    'function isDependencySatisfied() {',
+    '  return true;',
+    '}',
+    '',
+    '// --- Section A ---',
+    'function nextAdhocLikeTask() {',
+    '  return isDependencySatisfied();',
+    '}',
+    'function unrelatedHelperA() {',
+    '  return 1;',
+    '}',
+    '',
+    '// --- Section B ---',
+    'function otherRoute() {',
+    '  return isDependencySatisfied();',
+    '}',
+  ].join('\n');
+  const symbols = assignSections(src, '.js', extractTopLevelSymbols(src, '.js'));
+  const groups = groupBySection(symbols);
+  const fanOut = computeJsFanOutSymbols('x.js', src, symbols, groups);
+  assert.equal(fanOut.has('isDependencySatisfied'), true, 'referenced from two different sections');
+  assert.equal(fanOut.has('nextAdhocLikeTask'), true, 'calls the excluded symbol -- can\'t be moved without a back-import decompose-node-module.js does not support');
+  assert.equal(fanOut.has('otherRoute'), true, 'same reason, other section');
+  assert.equal(fanOut.has('unrelatedHelperA'), false, 'does not call anything excluded -- still safely movable');
+});
+
+// The THIRD live gap: extractTopLevelSymbols only recognizes const/let/var bound to a
+// FUNCTION value -- a plain data constant is invisible to it and never becomes a
+// candidate `symbol`, so it can't be flagged by the section-level check at all. A symbol
+// that references one must still be excluded (topLevelBindingNames sees it; the closure
+// pass is seeded with names it finds that extractTopLevelSymbols missed).
+test('computeJsFanOutSymbols: a symbol referencing a plain (non-function) top-level constant extractTopLevelSymbols never even saw is excluded', () => {
+  const src = [
+    'const PERIODIC_REATTEMPT_INTERVAL_MS = 60000;',
+    '',
+    '// --- Section A ---',
+    'function checkReattempt() {',
+    '  return Date.now() > PERIODIC_REATTEMPT_INTERVAL_MS;',
+    '}',
+    'function unrelatedHelperB() {',
+    '  return 2;',
+    '}',
+  ].join('\n');
+  const symbols = assignSections(src, '.js', extractTopLevelSymbols(src, '.js'));
+  assert.ok(!symbols.some((s) => s.name === 'PERIODIC_REATTEMPT_INTERVAL_MS'), 'sanity: the plain constant really is invisible to extractTopLevelSymbols');
+  const groups = groupBySection(symbols);
+  const fanOut = computeJsFanOutSymbols('x.js', src, symbols, groups);
+  assert.equal(fanOut.has('checkReattempt'), true);
+  assert.equal(fanOut.has('unrelatedHelperB'), false);
+});
+
+// A require()-bound name is carried over automatically by decompose-node-module.js --
+// referencing one must NOT trigger exclusion (it's not "left behind", it's imported).
+test('computeJsFanOutSymbols: a symbol referencing a require()-bound top-level name is NOT excluded', () => {
+  const src = [
+    "const { readJsonSafe } = require('./util.js');",
+    '',
+    '// --- Section A ---',
+    'function loadThing() {',
+    '  return readJsonSafe("x.json");',
+    '}',
+  ].join('\n');
+  const symbols = assignSections(src, '.js', extractTopLevelSymbols(src, '.js'));
+  const groups = groupBySection(symbols);
+  const fanOut = computeJsFanOutSymbols('x.js', src, symbols, groups);
+  assert.equal(fanOut.has('loadThing'), false, 'require()-bound names are carried over, not a fan-out problem');
+});
+
+test('computeJsFanOutSymbols: a no-op for a non-.js/.mjs/.cjs source', () => {
+  assert.deepEqual(computeJsFanOutSymbols('app.py', 'x', [], new Map()), new Set());
+});
+
+// End-to-end: the actual live incident, condensed -- runFileDecomposePlanPass must
+// produce a plan that never claims isDependencySatisfied or its caller.
+test('runFileDecomposePlanPass: a shared JS helper AND its caller are both excluded, still leaving other symbols movable', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'js-fanout-plan-'));
+  const parts = [
+    'function isDependencySatisfied() {',
+    '  return true;',
+    '}',
+    '',
+  ];
+  for (let s = 0; s < 4; s += 1) {
+    parts.push(`// --- Section ${s} ---`);
+    parts.push(`function nextTaskFor${s}() {`);
+    parts.push(`  return isDependencySatisfied();`);
+    parts.push('}');
+    // Two independent helpers per section (not one) -- Path A's planFromSections merges
+    // any section left with only a single surviving symbol into the misc bucket, and a
+    // >=3-non-singleton-section requirement then fails with only 1 real symbol/section
+    // left after exclusion, forcing a fallback to the model tiers this test's fake `call`
+    // deliberately can't satisfy (that fallback path is exercised by other tests already).
+    parts.push(`function plainHelper${s}a() {`);
+    parts.push('  return 1;');
+    parts.push('}');
+    parts.push(`function plainHelper${s}b() {`);
+    parts.push('  return 2;');
+    parts.push('}');
+  }
+  writeJsFile(dir, 'src/task-sources.js', parts.join('\n'));
+
+  const plan = await runFileDecomposePlanPass('src/task-sources.js', { repoRoot: dir, call: async () => ({ response: '[]' }) });
+  assert.ok(plan);
+  assert.match(plan.planPassNote, /deterministic/, 'enough non-singleton sections survive exclusion for Path A -- no model call needed');
+  const allMoved = plan.moves.flatMap((m) => m.symbols);
+  assert.ok(!allMoved.includes('isDependencySatisfied'));
+  for (let s = 0; s < 4; s += 1) assert.ok(!allMoved.includes(`nextTaskFor${s}`), `nextTaskFor${s} calls the excluded helper`);
+  for (let s = 0; s < 4; s += 1) {
+    assert.ok(allMoved.includes(`plainHelper${s}a`), `plainHelper${s}a is independently movable`);
+    assert.ok(allMoved.includes(`plainHelper${s}b`), `plainHelper${s}b is independently movable`);
+  }
+});
+
+function writeJsFile(dir, relPath, content) {
+  const abs = path.join(dir, relPath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, content);
+}
