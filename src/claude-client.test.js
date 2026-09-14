@@ -595,17 +595,25 @@ test('call() extracts a CONCEPT-BUILD report and records the tally on concepts.j
 // must surface a distinct, catchable error (code 'DRAFT_TURN_LIMIT_EXCEEDED') and
 // must NOT burn its retry budget on it.
 //
-// test.skip, not test: the DRAFT_MAX_TURNS ceiling / DRAFT_TURN_LIMIT_EXCEEDED
-// error was being added to claude-client.js by a sibling task in the same
-// decomposition ("Add DRAFT_MAX_TURNS ceiling + turn-limit error to
-// claude-client.js") and is NOT yet on this worktree (grep src/ for
-// DRAFT_TURN_LIMIT_EXCEEDED -> 0 hits at the time this was written). The test is
-// written against the agreed error-code contract so it flips to active by
-// deleting the skip option once that sibling lands -- then verify the stub's
-// stop_reason/numTurns values actually trigger the real code path and adjust if
-// the sibling's sentinel differs.
-// TODO: un-skip once "Add DRAFT_MAX_TURNS ceiling + turn-limit error to claude-client.js" merges.
-test('call() throws DRAFT_TURN_LIMIT_EXCEEDED (code) and does not retry a turn-limit stop_reason', { skip: true }, async () => {
+// 2026-09-14: un-skipped now that the sibling task ("Add DRAFT_MAX_TURNS ceiling +
+// turn-limit error to claude-client.js") has landed. Per this test's own original
+// TODO, the stub needed adjusting to match the real trigger condition
+// (callOnce's `parsed.stop_reason === 'tool_use' && parsed.num_turns >=
+// effectiveMaxTurns`, not the placeholder `stop_reason: 'end_turn'` / `numTurns`
+// (camelCase) this was originally written with, which would never have matched).
+// call({prompt:'hi'}, 2) passes no maxTurns, so effectiveMaxTurns defaults to
+// min(1, DRAFT_MAX_TURNS) = 1 -- num_turns: 5 clears that easily.
+//
+// "must NOT burn its retry budget on it" (the second half of this test's name) holds
+// structurally, not via an explicit catch-and-rethrow: call()'s retry loop has no
+// try/catch around callOnce() at all, so ANY thrown error -- this one included --
+// already propagates straight out on the first attempt, consuming none of maxRetries.
+// Confirmed the same holds for every real caller of call()/claude-client.js
+// (research-agentic-draft.js, decompose-pass.js): none wraps it in a retry loop of
+// their own either. The sibling sub-task asking to "catch the DRAFT_TURN_LIMIT_EXCEEDED
+// error... and rethrow immediately without consuming retry attempts" needed no source
+// change as a result -- only this test, proving the already-correct behavior.
+test('call() throws DRAFT_TURN_LIMIT_EXCEEDED (code) and does not retry a turn-limit stop_reason', async () => {
   let calls = 0;
   await withEnv({ CLAUDE_CODE_OAUTH_TOKEN: 'fake-token' }, async () => {
     await withMockedClient(
@@ -613,8 +621,8 @@ test('call() throws DRAFT_TURN_LIMIT_EXCEEDED (code) and does not retry a turn-l
         calls++;
         return JSON.stringify({
           result: 'Reached maximum number of turns (5) for this conversation.',
-          stop_reason: 'end_turn',
-          numTurns: 5,
+          stop_reason: 'tool_use',
+          num_turns: 5,
           session_id: 's1',
         });
       },
