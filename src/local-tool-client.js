@@ -1362,8 +1362,21 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const runForcedSummaryTurn = async (reason = 'turns') => {
     turnStartLengths.push(messages.length);
     turnStartLogLengths.push(toolCallLog.length);
+    // Three genuinely distinct causes land here, each needing its own model-facing
+    // framing -- 'turns' is the only one where "you are out of turns and can no longer
+    // call tools" is actually true. 'voluntary-stop' (2026-09-15, Grimmethy: "different
+    // stop reasons should absolutely be distinguishable -- it keeps the system
+    // understandable") used to share 'turns'' default reason and its wrong leadIn even
+    // though the model stopped ON ITS OWN, often on turn 2 of a 100-turn budget --
+    // telling it "you are out of turns" then was simply false, and the caller-facing
+    // explainer built from this same reason string (chat_sessions.py's _stream_local)
+    // told a human the same false thing ("ran out of its 100-turn tool budget") on
+    // ordinary short conversational replies that never called a tool. See this file's
+    // own voluntary-stop call site for what actually triggers it.
     const leadIn = reason === 'context'
       ? 'This conversation has grown too large to safely continue -- you are nearly out of context room and can no longer call tools.'
+      : reason === 'voluntary-stop'
+      ? 'Your last message ended without a RESOLUTION: line.'
       : 'You are out of turns and can no longer call tools.';
     // budgetWarning (2026-09-08, root-caused live): a real forced-summary turn with
     // reason:'context' answered RESOLUTION: decompose and got cut off mid-string writing
@@ -1540,7 +1553,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       // sentinel -- gated on the caller opting in and the line genuinely being absent (a
       // clean finish still returns immediately, as before).
       if (forceSummaryOnCap && !HAS_RESOLUTION_RE.test(content)) {
-        return runForcedSummaryTurn();
+        return runForcedSummaryTurn('voluntary-stop');
       }
       return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
     }
@@ -1560,7 +1573,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // the voluntary-stop path above). Off by default so the Chat panel CLI path (which has
   // its own "ran out of budget" explainer keyed on turnsUsed) is unaffected.
   if (forceSummaryOnCap) {
-    return runForcedSummaryTurn();
+    return runForcedSummaryTurn('turns');
   }
 
   return withUsage({ response: (lastMessage && lastMessage.content) || '', toolCallLog, turnsUsed, toolsDisabled: false });
