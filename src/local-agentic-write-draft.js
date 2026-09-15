@@ -28,6 +28,7 @@ const { getConfig } = require('./config.js');
 const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
+const { detectContradictoryLiteralAcceptance } = require('./acceptance-criteria.js');
 const { runDecomposePass } = require('./decompose-pass.js');
 const { oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
@@ -505,6 +506,26 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       needsClarification: {
         reason: 'external-dependency',
         openQuestions: [`This task references an external resource (${extDep}). Please confirm: (a) the resource already exists and its URL/credentials, or (b) you want it created, in which case this must be handled outside the local sandbox.`],
+      },
+    };
+  }
+
+  // Contradictory-literal-acceptance gate (2026-09-15, brain-dump bd-1789433484492,
+  // "pipeline hardening 5/5"): a task can mandate an exact multi-line literal to write
+  // AND separately demand an exact-phrase grep check that the literal, as specified,
+  // structurally cannot satisfy (the phrase spans a line boundary the mandated text
+  // itself introduces) -- no draft attempt could ever pass. Root-caused live: burned 3
+  // real automated attempts on system-report.js's LESSONS-LEARNED comment task before a
+  // human caught it. See detectContradictoryLiteralAcceptance's own header.
+  const contradiction = detectContradictoryLiteralAcceptance(task);
+  if (contradiction) {
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `task's own literal instructions are self-contradictory: ${contradiction.reason}`,
+      needsClarification: {
+        reason: 'contradictory-literal-acceptance',
+        openQuestions: [`${contradiction.reason} Please either drop the exact-phrase check, or rewrite the mandated literal text so "${contradiction.requiredPhrase}" appears unbroken on one line.`],
       },
     };
   }
