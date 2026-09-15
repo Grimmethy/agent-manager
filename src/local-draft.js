@@ -76,6 +76,7 @@ const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
 const { getModelProfile } = require('./model-profile-registry.js');
 const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./lib/draft-lifecycle.js');
 const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./lib/harness-search.js');
+const { usesGroupB } = require('./lib/apply-core.js');
 const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch } = require('./lib/draft-context.js');
 const { computePlanNumPredict, tryDeterministicScriptExtractEdit, tryDeterministicOnePassDecompose, tryDeterministicNodeModuleDecompose, tryDeterministicBlueprintDecompose, tryDeterministicLiteralEdit } = require('./lib/deterministic-extract.js');
 const { runCritiqueAndRevision, ensureHeadroomForExtendedContext, computeImplementBudget, callImplementModel } = require('./lib/implement-critique.js');
@@ -198,6 +199,36 @@ function helpersDeclaredIn(text) {
   HELPER_DECL_RE.lastIndex = 0;
   while ((m = HELPER_DECL_RE.exec(String(text || '')))) names.add(m[1] || m[2]);
   return [...names];
+}
+
+// AC-20 (pipeline_forensics_fix): a compliant implement output is EITHER real JSON (a
+// Group B diff or a candidate split array -- parseJsonMaybeFenced succeeds) OR the
+// literal FALSE POSITIVE escape line groupBJsonInstructions instructs the model to use
+// when there's nothing to change. Anything else -- prose, hedging, a description of the
+// code instead of a diff -- is neither, and would otherwise flow straight into critique
+// and a full review-vote cycle before finally being rejected there for the exact same
+// reason. Checked right before the implement->critique hand-off, in both implement
+// paths (finalizeCandidateFulfillment and runImplementPass's own tail) -- harmless for a
+// normal Group-B diff response, which is already valid JSON and passes immediately.
+function isImplementOutputCompliant(task, implementResponse) {
+  // Scoped to sources that actually use groupBJsonInstructions (prompts.js) -- the
+  // instruction block this FALSE POSITIVE escape line lives in, and the only shape this
+  // gate knows how to validate. A source with its own custom apply() (usesGroupB false --
+  // advisoryProse candidate write-ups, product_spec's outline/markdown, etc.) was never
+  // asked to produce JSON or a FALSE POSITIVE line in the first place; its own compliant
+  // output is prose by design, so there is nothing for this gate to check. Confirmed live:
+  // without this scoping, an advisoryProse source's normal "### AC-NNN" candidate
+  // write-up and a product_spec_outline's markdown both got misread as non-compliant,
+  // triggering a spurious extra implement call.
+  if (!usesGroupB(task)) return true;
+  const trimmed = (implementResponse || '').trim();
+  if (trimmed.includes('FALSE POSITIVE')) return true;
+  try {
+    const parsed = parseJsonMaybeFenced(trimmed);
+    return parsed !== null && parsed !== undefined;
+  } catch {
+    return false;
+  }
 }
 
 // implementResponse + the candidate's fetched files (+ optionally the flagged code snippet,
@@ -915,6 +946,15 @@ async function finalizeCandidateFulfillment(task, {
     recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts });
     appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
   }
+  if (!task.nonCompliantImplementRetried && !isImplementOutputCompliant(task, task.implementResponse)) {
+    task.nonCompliantImplementRetried = true;
+    console.warn(`[local-draft] non-compliant implement output (missing JSON and missing FALSE POSITIVE token) -- retrying once, task=${task.id}, source=${task.source}`);
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry' }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+    }
+    appendHistoryEvent(task, 'implement-retry', 'non-compliant output (missing JSON and missing FALSE POSITIVE token) -- retried once before critique');
+  }
   return { done: false };
 }
 
@@ -1077,6 +1117,15 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     ...(task.oversizedImplementRetried ? { promptVariant: 'oversized-strict-cite' } : {}),
   });
   appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
+  if (!task.nonCompliantImplementRetried && !isImplementOutputCompliant(task, task.implementResponse)) {
+    task.nonCompliantImplementRetried = true;
+    console.warn(`[local-draft] non-compliant implement output (missing JSON and missing FALSE POSITIVE token) -- retrying once, task=${task.id}, source=${task.source}`);
+    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected: false });
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+    }
+    appendHistoryEvent(task, 'implement-retry', 'non-compliant output (missing JSON and missing FALSE POSITIVE token) -- retried once before critique');
+  }
   return { done: false };
 }
 
