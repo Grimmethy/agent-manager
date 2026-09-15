@@ -92,6 +92,14 @@ test('the agent-manager-hygiene scanner ledgers are git-ignored (written at repo
   }
 });
 
+// 2026-09-15, found live during a GitHub-vs-local sync check: reclaim-orphaned-drafts.js
+// appends to this exact path (pipelineDir root) via a hardcoded literal, not through
+// getConfig() -- same blind spot as the hygiene ledgers above, so the walk-getConfig()
+// check just above can never see it either.
+test('reclaim-log.jsonl (reclaim-orphaned-drafts.js) is git-ignored', () => {
+  assert.ok(gitIgnored('reclaim-log.jsonl'), 'reclaim-log.jsonl must be git-ignored -- resetToMain stash -u eviction otherwise, and it is a hardcoded literal in reclaim-orphaned-drafts.js, invisible to the getConfig()-path walk above');
+});
+
 test('.gitignore also covers SQLite side-car files (*.db-journal / -wal / -shm)', () => {
   // hardware-stats.db / model-stats.db are ignored, but their transient WAL/journal
   // side-cars were being swept too (found in 11 abandoned stashes 2026-09-03).
