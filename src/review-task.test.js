@@ -727,6 +727,42 @@ test('reviewTask deterministically rejects a draft citing a URL not present anyw
   assert.equal(captured.length, 0, 'no review call should be spent voting on a draft with a known hallucinated URL');
 });
 
+// preValidateCitedPaths gate (2026-09-08 brain-dump request): project_search/arch_import
+// drafts cite specific files/line-numbers as prose evidence, not a Group B diff -- this
+// runs BEFORE the rest of the fact-checker, scoped to exactly those two sources.
+test('reviewTask deterministically rejects a project_search draft citing a fabricated file path -- no review call spent', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'pre-validate-test', domain: 'default', source: 'project_search',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'The relevant logic lives in src/totally-made-up-file.js:12.',
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-pre-validation');
+  assert.match(result.blockedReason, /^ungrounded draft: fabricated file path/);
+  assert.match(result.blockedReason, /src\/totally-made-up-file\.js:12/);
+  assert.equal(captured.length, 0, 'no review call should be spent voting on a draft with a known fabricated citation');
+});
+
+test('reviewTask does NOT apply the preValidateCitedPaths gate outside project_search/arch_import', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'pre-validate-scope-test', domain: 'default', source: 'observability_fix',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Added a console.warn to log the previously-swallowed error. The relevant logic lives in src/totally-made-up-file.js:12, which now surfaces the failure instead of silently discarding it.',
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-pre-validation');
+  assert.equal(result.verdict, 'approved', 'same fabricated citation must not be auto-blocked for a source outside this gate\'s scope');
+});
+
 // reverts-a-prior-fix (2026-09-08, root-caused live via change-review-fix-ac-1 -- see
 // fact-checker.js's checkRevertsAPriorFix header for the full incident) ------------------
 
