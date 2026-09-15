@@ -69,14 +69,14 @@ function renderHistoryPanel() {
   });
 }
 
-async function fetchJson(url) {
+async function fetchJson(url, { timeoutMs = 8000 } = {}) {
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   let r;
   try {
     r = await fetch(url, { signal: controller.signal });
   } catch (e) {
-    if (e.name === 'AbortError') throw new Error(url + ' -> timed out after 8s');
+    if (e.name === 'AbortError') throw new Error(url + ' -> timed out after ' + (timeoutMs / 1000) + 's');
     throw e;
   } finally {
     clearTimeout(timeoutId);
