@@ -81,6 +81,25 @@ test('a genuinely dead worker (pid gone, stale heartbeat) still produces a resta
   assert.match(actions[0].reason, /process confirmed gone/);
 });
 
+// Regression, 2026-09-15: root-caused live from a real duplicate worker-1 (pids 205693
+// and 1198141 both running). heartbeat.js's writeHeartbeatFile overwrites plain `pid`
+// with the in-flight local-draft.js child's OWN pid during a real call -- if that child
+// has since exited (call finished, crashed) while the heartbeat is stale, `pid` alone
+// looks dead even though the real daemon (daemonPid) is still alive and about to write
+// a fresh heartbeat. Liveness must be judged against daemonPid when present, or this
+// fires a needless 'restart' that queue-watcher.sh spawns with no recheck, producing a
+// second live daemon under the same instanceId.
+test('a stale heartbeat whose pid (a since-exited call child) looks dead is NOT restarted when daemonPid is still alive', () => {
+  const dir = tempInstancesDir();
+  const longDeadChildPid = 999999; // the exited local-draft.js child -- astronomically unlikely to be live.
+  const staleTime = new Date(Date.now() - 400_000).toISOString(); // > 300s STALE_HEARTBEAT_SECONDS
+  writeHeartbeat(dir, 'worker-1', { pid: longDeadChildPid, daemonPid: process.pid, lastHeartbeat: staleTime });
+  const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
+
+  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  assert.deepEqual(actions, []);
+});
+
 // restartTargetFor's P40 env (2026-09-07, Grimmethy: "the p40 has 2 tasks running on it
 // and the gtx is idle" -- root-caused live: a watchdog-restarted worker-p40 process was
 // found actually running with LOCAL_MODEL=qwen3.8:27b-q4_K_M, the HOST's model, because
