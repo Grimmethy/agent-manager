@@ -4007,6 +4007,7 @@ from routes.job_types import job_types_bp  # noqa: E402
 from routes.worker_models_1_more import worker_models_1_more_bp  # noqa: E402
 from routes.instances import instances_bp  # noqa: E402
 from routes.chat import chat_bp  # noqa: E402
+from routes.internal_chat import internal_chat_bp  # noqa: E402
 from routes.project import project_bp  # noqa: E402
 from routes.task_anywhere_1_more import task_anywhere_1_more_bp  # noqa: E402
 from routes.pipeline_1_more import pipeline_1_more_bp  # noqa: E402
@@ -4028,6 +4029,7 @@ app.register_blueprint(job_types_bp)
 app.register_blueprint(worker_models_1_more_bp)
 app.register_blueprint(instances_bp)
 app.register_blueprint(chat_bp)
+app.register_blueprint(internal_chat_bp)
 app.register_blueprint(project_bp)
 app.register_blueprint(task_anywhere_1_more_bp)
 app.register_blueprint(pipeline_1_more_bp)
