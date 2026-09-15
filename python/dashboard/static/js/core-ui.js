@@ -113,6 +113,7 @@ function renderTabButton(tab, indent) {
     btn.onclick = () => {
       if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
       if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
+      if (activeTab === 'branches' && tab.key !== 'branches') leaveBranchesTab();
       activeTab = tab.key;
       renderNav();
       renderMain();
@@ -126,10 +127,12 @@ function renderTabButton(tab, indent) {
   btn.onclick = () => {
     if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
     if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
+    if (activeTab === 'branches' && tab.key !== 'branches') leaveBranchesTab();
     activeTab = tab.key;
     renderNav();
     if (tab.key === 'project') enterProjectTab();
     else if (tab.key === 'brain-dump') enterBrainDumpTab();
+    else if (tab.key === 'branches') enterBranchesTab();
     else renderMain();
   };
   return btn;

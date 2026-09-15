@@ -1,58 +1,43 @@
-async function renderBranchesTab() {
-  const main = document.getElementById('main');
-  let branches;
-  try {
-    // list_unmerged_branches(force=True) shells out to git per branch (fetch, 2x
-    // rev-list, a merge-tree conflict preview, label/hub lookups) -- cost scales with
-    // how many agent/* branches are currently unmerged. The default 8s client timeout
-    // (sized for ordinary single-request routes) was already being blown past with as
-    // few as 17 branches (measured 9.27s live), so this tab reliably rendered "timed
-    // out after 8s" instead of the list. 30s matches the server's own per-subprocess
-    // timeout (_run_git/_check_merge_conflict both use 30s) as the floor for how long a
-    // single one of those git calls is allowed to legitimately take.
-    branches = await fetchJson('/api/git/unmerged-branches', { timeoutMs: 30000 });
-  } catch (e) {
-    main.innerHTML = `<div class="empty">Error loading branches: ${escapeHtml(e.message)}</div>`;
-    return;
-  }
-  if (branches.length === 0) {
-    main.innerHTML = '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
-    return;
-  }
-  main.innerHTML = branches.map((b) => {
-    // willConflict is a git merge-tree preview (app.py's _check_merge_conflict) -- a
-    // real 3-way merge computed entirely against the object database, no working tree
-    // touched -- run fresh every time this tab loads, not just at merge time. Added
-    // after a real near-miss (2026-08-18): two branches that independently created the
-    // same new file only revealed that conflict as an opaque error AFTER a merge was
-    // already attempted. null means the check itself failed (not "no conflict") --
-    // shown as unknown, never silently treated as safe.
-    const conflictBadge = b.willConflict === true
-      ? `<span class="badge bad" title="Conflicts on: ${escapeAttr((b.conflictFiles || []).join(', '))}">⚠ will conflict</span>`
-      : b.willConflict === null
-        ? `<span class="badge warn" title="Could not preview this merge -- outcome unknown until attempted.">? conflict unknown</span>`
-        : '';
-    const behindBadge = typeof b.behind === 'number' && b.behind > 0
-      ? `<span class="badge" style="background:var(--panel);color:var(--muted)" title="master has moved ${b.behind} commit${b.behind === 1 ? '' : 's'} since this branch was forked -- git's 3-way merge still only applies this branch's OWN changes, so being behind alone is not itself dangerous.">${b.behind} behind</span>`
+// Last-fetched branch list, keyed implicitly by array order -- shared between the full
+// render and the background poll below so click handlers always resolve against
+// whatever's actually on screen, not a stale closure from whichever fetch built it.
+let currentBranches = [];
+let branchesPollTimer = null;
+
+function branchCardHtml(b) {
+  // willConflict is a git merge-tree preview (app.py's _check_merge_conflict) -- a
+  // real 3-way merge computed entirely against the object database, no working tree
+  // touched -- run fresh every time this tab loads, not just at merge time. Added
+  // after a real near-miss (2026-08-18): two branches that independently created the
+  // same new file only revealed that conflict as an opaque error AFTER a merge was
+  // already attempted. null means the check itself failed (not "no conflict") --
+  // shown as unknown, never silently treated as safe.
+  const conflictBadge = b.willConflict === true
+    ? `<span class="badge bad" title="Conflicts on: ${escapeAttr((b.conflictFiles || []).join(', '))}">⚠ will conflict</span>`
+    : b.willConflict === null
+      ? `<span class="badge warn" title="Could not preview this merge -- outcome unknown until attempted.">? conflict unknown</span>`
       : '';
-    // A branch owned by an unfinished coordinator hub (a stacked file-decompose branch
-    // still missing its wiring commit + gate pass) -- merging it now ships an incomplete
-    // decomposition. The merge endpoint 409s it without {force:true}.
-    const hubMidFlight = b.hub && !b.hub.readyToMerge;
-    // Clickable straight from the list row (2026-09-12, screaminggoatclubmt: "I need
-    // links in the unmerged branches task log to the hub task associated with unmerged
-    // branches that are waiting on hubs to finish") -- before this, the ONLY way to see
-    // which hub a mid-flight branch was waiting on was the tooltip's plain text (hub id,
-    // no way to jump to it) or opening this row's own detail modal first. data-open-hub
-    // reuses task-detail-modal.js's existing openTaskAnywhere(), the same generic
-    // "look this task id up wherever it currently lives" opener every other tab already
-    // uses -- no new endpoint needed.
-    const hubBadge = b.hub
-      ? (hubMidFlight
-        ? `<span class="badge bad" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Hub ${escapeAttr(b.hub.id)}: ${b.hub.progress.done}/${b.hub.progress.total} done${b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : ''} -- click to open the hub">⚠ hub mid-flight</span>`
-        : `<span class="badge ok" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Coordinator hub complete -- click to open the hub">✓ hub complete</span>`)
-      : '';
-    return `
+  const behindBadge = typeof b.behind === 'number' && b.behind > 0
+    ? `<span class="badge" style="background:var(--panel);color:var(--muted)" title="master has moved ${b.behind} commit${b.behind === 1 ? '' : 's'} since this branch was forked -- git's 3-way merge still only applies this branch's OWN changes, so being behind alone is not itself dangerous.">${b.behind} behind</span>`
+    : '';
+  // A branch owned by an unfinished coordinator hub (a stacked file-decompose branch
+  // still missing its wiring commit + gate pass) -- merging it now ships an incomplete
+  // decomposition. The merge endpoint 409s it without {force:true}.
+  const hubMidFlight = b.hub && !b.hub.readyToMerge;
+  // Clickable straight from the list row (2026-09-12, screaminggoatclubmt: "I need
+  // links in the unmerged branches task log to the hub task associated with unmerged
+  // branches that are waiting on hubs to finish") -- before this, the ONLY way to see
+  // which hub a mid-flight branch was waiting on was the tooltip's plain text (hub id,
+  // no way to jump to it) or opening this row's own detail modal first. data-open-hub
+  // reuses task-detail-modal.js's existing openTaskAnywhere(), the same generic
+  // "look this task id up wherever it currently lives" opener every other tab already
+  // uses -- no new endpoint needed.
+  const hubBadge = b.hub
+    ? (hubMidFlight
+      ? `<span class="badge bad" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Hub ${escapeAttr(b.hub.id)}: ${b.hub.progress.done}/${b.hub.progress.total} done${b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : ''} -- click to open the hub">⚠ hub mid-flight</span>`
+      : `<span class="badge ok" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Coordinator hub complete -- click to open the hub">✓ hub complete</span>`)
+    : '';
+  return `
     <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}" data-open-branch="${escapeAttr(b.branch)}" style="cursor:pointer">
       <div class="row">
         <span class="id">${escapeHtmlBright(b.title)}</span>
@@ -77,41 +62,45 @@ async function renderBranchesTab() {
       </div>
     </div>
   `;
-  }).join('');
+}
 
-  main.querySelectorAll('[data-open-branch]').forEach((card) => {
-    card.onclick = (e) => {
-      // Don't hijack the Merge/Discard buttons' own clicks -- each has its own handler
-      // and confirm() flow below, opening the history modal underneath it would be
-      // surprising. Same reasoning for the hub badge (data-open-hub, below): it opens a
-      // DIFFERENT task's detail (the hub, not this branch), so it must win over the
-      // row's own "open this branch's detail" click.
-      if (e.target.closest('[data-merge-branch]') || e.target.closest('[data-discard-branch]') || e.target.closest('[data-open-hub]')) return;
-      const b = branches.find((x) => x.branch === card.dataset.openBranch);
-      if (b) renderBranchDetailModal(b);
-    };
-  });
+// Wires one card's own click handlers -- called both after a full rebuild (every card)
+// and after appending a single new card during a background poll (just that one), so a
+// poll never has to re-wire cards that were already working.
+function wireBranchCard(card) {
+  card.onclick = (e) => {
+    // Don't hijack the Merge/Discard buttons' own clicks -- each has its own handler
+    // and confirm() flow below, opening the history modal underneath it would be
+    // surprising. Same reasoning for the hub badge (data-open-hub, below): it opens a
+    // DIFFERENT task's detail (the hub, not this branch), so it must win over the
+    // row's own "open this branch's detail" click.
+    if (e.target.closest('[data-merge-branch]') || e.target.closest('[data-discard-branch]') || e.target.closest('[data-open-hub]')) return;
+    const b = currentBranches.find((x) => x.branch === card.dataset.openBranch);
+    if (b) renderBranchDetailModal(b);
+  };
 
-  main.querySelectorAll('[data-open-hub]').forEach((badge) => {
-    badge.onclick = (e) => {
+  const hubBadge = card.querySelector('[data-open-hub]');
+  if (hubBadge) {
+    hubBadge.onclick = (e) => {
       e.stopPropagation();
-      openTaskAnywhere(badge.dataset.openHub);
+      openTaskAnywhere(hubBadge.dataset.openHub);
     };
-  });
+  }
 
-  main.querySelectorAll('[data-merge-branch]').forEach((btn) => {
-    btn.onclick = async (e) => {
+  const mergeBtn = card.querySelector('[data-merge-branch]');
+  if (mergeBtn) {
+    mergeBtn.onclick = async (e) => {
       e.stopPropagation();
-      const branch = btn.dataset.mergeBranch;
-      const midFlight = btn.dataset.hubMidflight === 'true';
-      const confirmMsg = btn.dataset.willConflict === 'true'
-        ? `"${branch}" is flagged as WILL CONFLICT with master on: ${btn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
+      const branch = mergeBtn.dataset.mergeBranch;
+      const midFlight = mergeBtn.dataset.hubMidflight === 'true';
+      const confirmMsg = mergeBtn.dataset.willConflict === 'true'
+        ? `"${branch}" is flagged as WILL CONFLICT with master on: ${mergeBtn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
         : midFlight
-          ? `"${branch}" belongs to a coordinator hub that is NOT finished (${btn.dataset.hubStatus}).\n\nMerging now ships an incomplete decomposition -- the moved routes will 404 until the wiring task lands. Force the merge anyway?`
+          ? `"${branch}" belongs to a coordinator hub that is NOT finished (${mergeBtn.dataset.hubStatus}).\n\nMerging now ships an incomplete decomposition -- the moved routes will 404 until the wiring task lands. Force the merge anyway?`
           : `Merge "${branch}" into master and sync the live dashboard?`;
       if (!confirm(confirmMsg)) return;
-      btn.disabled = true;
-      btn.textContent = 'Merging...';
+      mergeBtn.disabled = true;
+      mergeBtn.textContent = 'Merging...';
       try {
         const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/merge`, {
           method: 'POST',
@@ -121,11 +110,11 @@ async function renderBranchesTab() {
         const result = await resp.json();
         if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
         if (result.liveSync && result.liveSync.restartTriggered) {
-          btn.textContent = 'Merged -- dashboard reloading...';
+          mergeBtn.textContent = 'Merged -- dashboard reloading...';
           // Werkzeug's reloader restart is near-instant but not synchronous with this
           // response -- give it a moment, then just re-render; if it's still mid-restart
           // renderMain()'s own try/catch shows a normal "disconnected" state until the
-          // next 5s poll succeeds, same as any other brief connection drop.
+          // next poll succeeds, same as any other brief connection drop.
           setTimeout(() => renderMain(), 1500);
         } else {
           await renderBranchesTab();
@@ -135,19 +124,20 @@ async function renderBranchesTab() {
         await renderBranchesTab();
       }
     };
-  });
+  }
 
   // Discard (2026-09-08, see api_git_discard_branch's own header for the incident this
   // closes) -- for a branch you've decided NOT to merge: permanently deletes the remote
   // ref and archives its task, so it actually stops showing here instead of just being
   // hidden or forgotten about.
-  main.querySelectorAll('[data-discard-branch]').forEach((btn) => {
-    btn.onclick = async (e) => {
+  const discardBtn = card.querySelector('[data-discard-branch]');
+  if (discardBtn) {
+    discardBtn.onclick = async (e) => {
       e.stopPropagation();
-      const branch = btn.dataset.discardBranch;
+      const branch = discardBtn.dataset.discardBranch;
       if (!confirm(`Discard "${branch}"?\n\nThis PERMANENTLY DELETES the remote branch (not just merging it later) and archives its task as dismissed. This cannot be undone from here.`)) return;
-      btn.disabled = true;
-      btn.textContent = 'Discarding...';
+      discardBtn.disabled = true;
+      discardBtn.textContent = 'Discarding...';
       try {
         const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/discard`, { method: 'POST' });
         const result = await resp.json();
@@ -158,7 +148,108 @@ async function renderBranchesTab() {
         await renderBranchesTab();
       }
     };
+  }
+}
+
+// Full (re)build from scratch -- used on first opening the tab, and after a deliberate
+// user action (merge/discard) where showing the definitive fresh state matters more than
+// preserving exactly what was on screen. NOT used for the passive background poll below
+// (see refreshBranchesTab) -- that's what used to tear the whole list out from under a
+// viewer every 5s just because one poll was slow (or timed out).
+async function renderBranchesTab() {
+  const main = document.getElementById('main');
+  let branches;
+  try {
+    // list_unmerged_branches(force=True) shells out to git per branch (fetch, 2x
+    // rev-list, a merge-tree conflict preview, label/hub lookups) -- cost scales with
+    // how many agent/* branches are currently unmerged. The default 8s client timeout
+    // (sized for ordinary single-request routes) was already being blown past with as
+    // few as 17 branches (measured 9.27s live), so this tab reliably rendered "timed
+    // out after 8s" instead of the list. 30s matches the server's own per-subprocess
+    // timeout (_run_git/_check_merge_conflict both use 30s) as the floor for how long a
+    // single one of those git calls is allowed to legitimately take.
+    branches = await fetchJson('/api/git/unmerged-branches', { timeoutMs: 30000 });
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Error loading branches: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  currentBranches = branches;
+  if (branches.length === 0) {
+    main.innerHTML = '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
+    return;
+  }
+  main.innerHTML = branches.map(branchCardHtml).join('');
+  main.querySelectorAll('[data-branch-row]').forEach(wireBranchCard);
+}
+
+// Entered from the nav click handler (core-ui.js), same "own render lifecycle, not the
+// generic full-teardown 5s cycle" pattern the Project/Brain Dump tabs already use --
+// started here instead of picked up by refresh()'s renderMain() dispatch.
+async function enterBranchesTab() {
+  await renderBranchesTab();
+  if (branchesPollTimer) clearInterval(branchesPollTimer);
+  // 15s, not 5s: this route is already the expensive one (server-side git work scales
+  // with branch count, confirmed 9s+ with a modest 17 branches) -- polling it as often
+  // as the old blind 5s cycle did was a real part of why fetches piled up and the tab
+  // kept showing "timed out" instead of settling.
+  branchesPollTimer = setInterval(refreshBranchesTab, 15000);
+}
+
+function leaveBranchesTab() {
+  if (branchesPollTimer) { clearInterval(branchesPollTimer); branchesPollTimer = null; }
+}
+
+// The actual fix for "the reset needs to stop happening": a background poll now only
+// diffs the fetched list against what's already on screen -- appending cards for
+// branches that are newly there, and removing cards for branches that dropped out
+// (merged/discarded from elsewhere) -- instead of wiping and rebuilding everything, and
+// a failed/timed-out poll leaves the existing list exactly as it was rather than
+// replacing it with an error banner. The full renderBranchesTab() (tab entry, and after
+// a deliberate merge/discard) is untouched and still shows a real error if IT fails --
+// there's nothing yet on screen worth preserving at that point.
+async function refreshBranchesTab() {
+  if (activeTab !== 'branches') return;
+  let branches;
+  try {
+    branches = await fetchJson('/api/git/unmerged-branches', { timeoutMs: 30000 });
+  } catch (e) {
+    console.warn('[branches] background refresh failed (non-fatal, keeping current list):', e.message);
+    return;
+  }
+  if (activeTab !== 'branches') return; // tab may have changed while the fetch was in flight
+
+  const main = document.getElementById('main');
+  // Nothing rendered yet to diff against (e.g. the tab was showing the empty-state or
+  // error placeholder) -- do a normal full build instead of trying to patch a list that
+  // isn't there.
+  if (!main.querySelector('[data-branch-row]')) {
+    currentBranches = branches;
+    main.innerHTML = branches.length
+      ? branches.map(branchCardHtml).join('')
+      : '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
+    main.querySelectorAll('[data-branch-row]').forEach(wireBranchCard);
+    return;
+  }
+  if (branches.length === 0) {
+    currentBranches = [];
+    main.innerHTML = '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
+    return;
+  }
+
+  const seen = new Set();
+  for (const b of branches) {
+    seen.add(b.branch);
+    if (main.querySelector(`[data-branch-row="${CSS.escape(b.branch)}"]`)) continue; // already on screen -- leave it, see header comment
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = branchCardHtml(b);
+    const card = wrapper.firstElementChild;
+    main.appendChild(card);
+    wireBranchCard(card);
+  }
+  main.querySelectorAll('[data-branch-row]').forEach((card) => {
+    if (!seen.has(card.dataset.branchRow)) card.remove();
   });
+  currentBranches = branches;
 }
 
 async function renderBranchDetailModal(b) {
@@ -938,7 +1029,13 @@ async function refresh() {
   // filed (2026-09-14): same reasoning as brain-dump's own opt-out just above -- a
   // suppress/prioritize/delete click mid-flight (button disabled, awaiting its fetch)
   // shouldn't get its DOM silently rebuilt out from under it by this 5s cycle.
-  if (!['project', 'brain-dump', 'filed', 'promptforge', 'adforge', 'scriptforge', 'concepts'].includes(activeTab)) renderMain();
+  // branches (2026-09-15): same class of bug again, plus its own wrinkle -- the route
+  // behind this tab is the slow one (server-side git work scales with branch count,
+  // 9s+ measured with just 17), so this blind 5s full-teardown cycle was firing a fresh
+  // request before the last one had even resolved, and replacing the whole list with a
+  // "timed out" error on every miss. enterBranchesTab()/leaveBranchesTab() now run
+  // their own 15s poll that diffs in new/removed branches instead of rebuilding.
+  if (!['project', 'brain-dump', 'filed', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'].includes(activeTab)) renderMain();
 }
 
 function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
