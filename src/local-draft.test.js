@@ -2521,6 +2521,90 @@ test('draftTask does not retry a candidate-fulfillment source whose find string 
   });
 });
 
+// AC-20 (pipeline_forensics_fix): a candidate-fulfillment implement response that is
+// neither a real JSON diff nor a FALSE POSITIVE line is prose/hedging that would
+// otherwise sail into critique and a full review-vote cycle before finally being
+// rejected there for the same reason. One bounded retry, same shape as the other
+// implement-stage retries in this file.
+test('draftTask retries once when a candidate-fulfillment implement response is neither JSON nor a FALSE POSITIVE line', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'obs-fix-noncompliant-1', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-1', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 }; // plan
+      if (callCount === 2) return { response: 'I think this line might be a problem but I am not fully sure how to fix it.', degenerate: null, attempts: 1 }; // implement, non-compliant prose
+      if (callCount === 3) return { response: 'FALSE POSITIVE -- the code is already correct.', degenerate: null, attempts: 1 }; // retry, compliant
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }; // critique
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(callCount, 4, 'plan, non-compliant implement, retried implement, critique -- no infinite loop');
+    assert.equal(task.implementResponse, 'FALSE POSITIVE -- the code is already correct.', 'the compliant retry response must win');
+    assert.match(task.history.find((h) => h.stage === 'implement-retry').detail, /non-compliant output/);
+  });
+});
+
+test('draftTask does NOT retry when a candidate-fulfillment implement response is non-compliant twice in a row (bounded to one retry)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'obs-fix-noncompliant-2', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-1', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: 'still just prose, no JSON here', degenerate: null, attempts: 1 };
+      if (callCount === 3) return { response: 'still prose on the retry too', degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(callCount, 4, 'plan, implement, one retry, critique -- never a second retry');
+    assert.equal(task.implementResponse, 'still prose on the retry too');
+  });
+});
+
+test('draftTask does NOT retry an advisoryProse source\'s normal candidate write-up (not a JSON/FALSE-POSITIVE shape by design)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { updateTaskSource } = require('./task-source-registry.js');
+    updateTaskSource('observability_review', { advisoryProse: true });
+    const task = {
+      id: 'obs-review-prose-1', domain: 'default', source: 'observability_review', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/x.js'], body: 'Files: src/x.js' },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      // A normal advisoryProse candidate write-up -- neither JSON nor 'FALSE POSITIVE'.
+      return { response: '### AC-1\nProblem: x\nSolution: y', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(callCount, 2, 'plan + implement only -- no spurious retry, and no critique call for an advisoryProse source');
+    assert.equal(task.implementResponse, '### AC-1\nProblem: x\nSolution: y');
+  });
+});
+
 test('labelFor(task) returning undefined (LOCAL_MODEL unset) is treated as local, not a crash', async () => {
   await withFixtureRepo(async (draftTask) => {
     delete process.env.LOCAL_MODEL; // the exact edge case local-client.js's own fallback-removal fix made newly possible
