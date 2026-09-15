@@ -44,7 +44,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
-const { checkDraft } = require('./fact-checker.js');
+const { checkDraft, preValidateCitedPaths } = require('./fact-checker.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
 const { resolveModelProfile } = require('./model-provider.js');
 const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
@@ -647,6 +647,31 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // task (the overwhelming majority) or when the deep_dive external-clone repoRootForCheck
   // swap already happened above, so this only diverges for the exact stacked case.
   const groundingRef = (repoRootForCheck === workDir) ? resolveGroundingRef(task, repoRootForCheck) : null;
+
+  // Pre-fact-check gate for project_search/arch_import (2026-09-08 brain-dump request):
+  // those two sources' drafts are plain prose citing specific files and line numbers as
+  // evidence for a claim, not a Group B diff -- checkDraft's own fabricated-path handling
+  // is tuned for a diff's claimed file targets, not "does this cited EVIDENCE actually
+  // exist." Cheaper and runs first: a draft that fails this never reaches the rest of the
+  // fact-checker or a review call at all. blockedReason is prefixed 'ungrounded draft:
+  // fabricated file path' so blocked-task-classifiers.js's hasFabricatedFilePath treats
+  // it as the same retryable:false category a real diff-side fabrication already is.
+  const preValidateSource = resolveSourceName(task);
+  if (preValidateSource === 'project_search' || preValidateSource === 'arch_import') {
+    const preValidation = preValidateCitedPaths(task.implementResponse || '', repoRootForCheck, factCheckExtraRoots);
+    if (!preValidation.valid) {
+      const reason = `ungrounded draft: fabricated file path -- pre-validation: ${preValidation.failures.join('; ')}`;
+      task.reviewProvider = 'deterministic-pre-validation';
+      logFactCheckAudit(pipelineDir, {
+        taskId: task.id, source: preValidateSource, reason,
+        flags: preValidation.failures.map((f) => ({ type: 'pre-validation', detail: f })),
+      });
+      recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+      appendHistoryEvent(task, 'blocked', reason);
+      return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict: 'skipped' };
+    }
+  }
+
   const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined, factCheckExtraRoots, groundingRef);
   // `imprecise-file-path` is informational (a real file cited with a sloppy prefix) --
   // it must not by itself flip the verdict label to "flagged".
