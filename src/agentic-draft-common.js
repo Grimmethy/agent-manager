@@ -714,10 +714,18 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     if (claim) {
       task.retryableDraftBlock = true;
       task.adhocNoChangesClaimFeedback = claim.retryFeedback;
+      // First refusal is a signal the task may be too broad for one pass -- mark the
+      // re-issue as a decompose directive (mirroring the negation of isLeafTask in
+      // local-agentic-write-draft.js) UNLESS this is already a confirmed-atomic leaf
+      // (decomposed from a parent or rescoped from a decompose), which must implement.
+      if (!(task.promptContext && (task.promptContext.decomposedFrom || task.rescopedFromDecompose))) {
+        task.decomposeDirective = true;
+      }
       return {
         succeeded: true,
         blocked: true,
         blockedReason: `Agentic implement pass resolved no-changes-needed but ${claim.reason}`,
+        decomposeDirective: true,
         ...meta,
         capturedDiff: trimmedDiff || undefined,
       };
