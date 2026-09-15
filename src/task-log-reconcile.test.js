@@ -269,3 +269,67 @@ test('reconcile triggers a real amplification sweep when a pipeline_self_audit/p
     else process.env.AGENT_MANAGER_GREP_DIRS = prevGrepDirs;
   }
 });
+
+// --- shipContextLooksBroken: sanity guard against a silent buildShipContext failure ---
+// (2026-09-14, filed as brain-dump bd-1789433484408 -- "pipeline hardening 4/5" -- after
+// root-causing task-disposition.js's own maxBuffer bug: onMainIds stayed silently EMPTY
+// on every reconcile run for an unknown span of time, and it only ever surfaced as "lots
+// of individually abandoned tasks," never as an infra error. This guard would have made
+// that failure loud on the very first tick instead of silently cascading into wrong
+// terminal dispositions.)
+const { shipContextLooksBroken } = require('./task-log-reconcile.js');
+
+test('shipContextLooksBroken: null ctx is never broken (repoRoot-less callers)', () => {
+  assert.equal(shipContextLooksBroken(null, { repoRoot: '/x' }), false);
+});
+
+test('shipContextLooksBroken: a populated onMainIds is never broken, regardless of commit count', () => {
+  const ctx = { mainBranch: 'master', onMainIds: new Map([['t1', 'abc123']]) };
+  assert.equal(shipContextLooksBroken(ctx, { repoRoot: '/x', commitCountFn: () => 99999 }), false);
+});
+
+test('shipContextLooksBroken: empty onMainIds on a brand-new repo (few real commits) is NOT flagged -- must not block the pipeline\'s first-ever pass', () => {
+  const ctx = { mainBranch: 'master', onMainIds: new Map() };
+  assert.equal(shipContextLooksBroken(ctx, { repoRoot: '/x', commitCountFn: () => 3 }), false);
+});
+
+test('shipContextLooksBroken: empty onMainIds on a repo with real merge history IS flagged', () => {
+  const ctx = { mainBranch: 'master', onMainIds: new Map() };
+  let calledWith = null;
+  const commitCountFn = (repoRoot, mainBranch) => { calledWith = { repoRoot, mainBranch }; return 500; };
+  assert.equal(shipContextLooksBroken(ctx, { repoRoot: '/real/repo', commitCountFn }), true);
+  assert.deepEqual(calledWith, { repoRoot: '/real/repo', mainBranch: 'master' }, 'commitCountFn is called with the ctx-resolved mainBranch, not a hardcoded one');
+});
+
+test('reconcile skips the whole pass (resolves nothing, writes nothing) when shipContextLooksBroken fires, instead of risking a false verdict', () => {
+  const dir = tmpPipeline();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tlr-broken-ctx-root-'));
+  writeRec(dir, '', 'would-be-merged', [{ stage: 'applied', detail: 'agent/would-be-merged' }]);
+
+  delete require.cache[require.resolve('./task-disposition.js')];
+  const realDisposition = require('./task-disposition.js');
+  require.cache[require.resolve('./task-disposition.js')].exports = {
+    ...realDisposition,
+    // Reproduces the real maxBuffer failure shape: buildShipContext "succeeds" (no throw)
+    // but hands back a completely empty onMainIds despite the caller believing real merge
+    // history exists.
+    buildShipContext: () => ({ mainBranch: 'master', onMainIds: new Map(), branchAhead: new Map() }),
+  };
+  delete require.cache[require.resolve('./task-log-reconcile.js')];
+  const mod = require('./task-log-reconcile.js');
+
+  try {
+    const summary = mod.reconcile({
+      pipelineDir: dir, repoRoot: root, argv: ['--no-fetch'],
+      commitCountFn: () => 500, // "real merge history exists" -- the empty onMainIds must be treated as broken, not as a legitimately-empty repo
+    });
+
+    assert.equal(summary.skippedReason, 'onMainIds-empty');
+    assert.equal(summary.scanned, 0, 'nothing was even read, let alone resolved');
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'would-be-merged.json'), 'utf8'));
+    assert.equal(rec.history.length, 1, 'the record is untouched -- no terminal event appended off a broken context');
+  } finally {
+    require.cache[require.resolve('./task-disposition.js')].exports = realDisposition;
+    delete require.cache[require.resolve('./task-log-reconcile.js')];
+  }
+});
