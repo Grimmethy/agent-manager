@@ -25,6 +25,9 @@ const { injectAmplificationInstruction, extractAmplificationRequests } = require
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
+const {
+  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask,
+} = require('./chat-task-requeue.js');
 const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
 
 // Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
@@ -695,6 +698,75 @@ const CHAT_TOOLS = [
       },
     },
   },
+  // Four task-unstick tools (2026-09-15, Grimmethy: "The chat's job is to interact with
+  // the user to help get these blocked tasks unstuck. If it can't do that it won't be
+  // able to properly do its job.") -- see src/chat-task-requeue.js's own header. Every
+  // one of these mutates TASK STATE only (which queue/ directory a JSON file sits in),
+  // never source code -- the same guarantee queue_reviewed_task already gives, just
+  // acting on an EXISTING stuck task instead of filing a brand-new one. Four narrow,
+  // distinctly-named tools rather than one with a mode enum -- matches the existing
+  // run_bash/queue_reviewed_task precedent, and each action has a genuinely different
+  // required-argument shape a JSON-schema `required` array can't conditionally express.
+  {
+    type: 'function',
+    function: {
+      name: 'answer_task_clarification',
+      description: 'Answer a held needs-clarification task\'s open design question directly, resolving it and requeuing it to adhoc/ for a fresh implementation pass -- the same effect as a human using the dashboard\'s Needs Clarification picker. Use ONLY after you have discussed the open question with the human in this conversation and they have given you a real decision to relay -- never invent an answer yourself. Summarize the decision back to the human in your reply after calling this.',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          answer: { type: 'string', description: 'The human\'s decision/free text, to be folded into the task as the resolving answer.' },
+        },
+        required: ['taskId', 'answer'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'resolve_task_clarification',
+      description: 'Resolve a held needs-clarification task that was blocked on picking a file/path (an "ambiguous" or "no-match" case), NOT a design decision, and requeue it to adhoc/. Use after the human has told you which path(s) apply; omit paths if they said to proceed without a prefetched path.',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          paths: { type: 'array', items: { type: 'string' }, description: 'The file path(s) the human picked. Omit or leave empty to proceed with no prefetched path.' },
+        },
+        required: ['taskId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'mark_task_clarification_done',
+      description: 'Mark a held needs-clarification task as already resolved/complete with no further pipeline action needed -- terminal, does NOT requeue. Use only when the human explicitly says the underlying work is already done, not merely that they have answered the question.',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'The stuck task\'s id.' },
+        },
+        required: ['taskId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'requeue_blocked_task',
+      description: 'Send a blocked (or done/archived) task back to pending/ for a fresh attempt, stripped of its stale draft/review state -- the same effect as a human clicking Requeue in Job Status. Use after discussing the blocker with the human and confirming a fresh attempt makes sense. If this reports the same rejection reason recurring (a repeatedBlocker match), tell the human plainly and ask before retrying with force:true -- do not silently force it yourself.',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          state: { type: 'string', enum: ['blocked', 'done', 'archived'], description: 'The task\'s current location -- where it is stuck today.' },
+          force: { type: 'boolean', description: 'Set true only after telling the human about a repeatedBlocker match and they want to retry anyway.' },
+        },
+        required: ['taskId', 'state'],
+      },
+    },
+  },
 ];
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -921,10 +993,14 @@ function buildWriteToolHandlers(allowedRoots, pipelineDir) {
 // write_file/edit_file handlers exist here at all (not just hidden from the tool list --
 // even a malformed/hallucinated tool_calls entry naming them would find no handler and
 // fall through to executeToolCalls' "unknown tool" error, same as any other typo).
-function buildChatToolHandlers(allowedRoots, pipelineDir) {
+function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
   return {
     run_bash: (args) => runBashTool(allowedRoots, { command: args.command, readOnly: true }),
     queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description }),
+    answer_task_clarification: (args) => answerNeedsClarification(pipelineDir, args.taskId, args.answer),
+    resolve_task_clarification: (args) => resolveNeedsClarification(pipelineDir, args.taskId, args.paths),
+    mark_task_clarification_done: (args) => markNeedsClarificationDone(pipelineDir, args.taskId),
+    requeue_blocked_task: (args) => requeueBlockedTask(pipelineDir, repoRoot, args.taskId, { state: args.state, force: !!args.force }),
   };
 }
 
@@ -1252,7 +1328,12 @@ function flakeDegradeResult(lastMessage, toolCallLog, turnsUsed, onChunk) {
 // tool call degrades to an error STRING result the model can see and correct on its next
 // turn -- never a thrown exception that would kill the whole loop (see this file's header:
 // one bad tool call should never crash the entire draft attempt).
-function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, toolCallLog) {
+// async (2026-09-15): the four new chat-task-requeue.js-backed handlers
+// (answer_task_clarification and friends) are genuinely async (classifyRequeue awaits a
+// possible model call). `await`ing a plain non-Promise return value resolves it
+// immediately, so every existing SYNCHRONOUS handler here is unaffected -- this widened
+// signature, not a behavior change for anything already calling this function.
+async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, toolCallLog) {
   messages.push(assistantMessage);
   for (const toolCall of toolCalls) {
     const name = toolCall.function && toolCall.function.name;
@@ -1263,7 +1344,7 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
       result = { error: `unknown tool: ${name}` };
     } else {
       try {
-        result = handler(args);
+        result = await handler(args);
       } catch (e) {
         result = { error: `tool ${name} failed: ${e.message}` };
       }
@@ -1316,7 +1397,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const toolHandlers = allowWrite
     ? {
       ...buildToolHandlers(allowedRoots, pipelineDir),
-      ...(isChatCaller ? buildChatToolHandlers(allowedRoots, pipelineDir) : buildWriteToolHandlers(allowedRoots, pipelineDir)),
+      ...(isChatCaller ? buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) : buildWriteToolHandlers(allowedRoots, pipelineDir)),
     }
     : buildToolHandlers(allowedRoots, pipelineDir);
   // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
@@ -1635,7 +1716,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       }
       return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
     }
-    executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
+    await executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
   }
 
   // maxTurns reached without a final (no-tool-calls) response -- deliberate forced stop,

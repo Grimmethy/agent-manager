@@ -505,20 +505,27 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly run_bash and queue_reviewed_task -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the six chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
-    assert.deepEqual(names, ['queue_reviewed_task', 'run_bash']);
+    assert.deepEqual(names, [
+      'answer_task_clarification', 'mark_task_clarification_done', 'queue_reviewed_task',
+      'requeue_blocked_task', 'resolve_task_clarification', 'run_bash',
+    ]);
   });
 });
 
-test('buildChatToolHandlers has no write_file/edit_file handler even if called directly', () => {
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all six chat tools', () => {
   withFixtureRepo((mod, dir) => {
-    const handlers = mod.buildChatToolHandlers([dir], dir);
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
     assert.equal(handlers.write_file, undefined);
     assert.equal(handlers.edit_file, undefined);
-    assert.equal(typeof handlers.run_bash, 'function');
-    assert.equal(typeof handlers.queue_reviewed_task, 'function');
+    for (const name of [
+      'run_bash', 'queue_reviewed_task', 'answer_task_clarification',
+      'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task',
+    ]) {
+      assert.equal(typeof handlers[name], 'function', `expected a handler for ${name}`);
+    }
   });
 });
 
@@ -529,6 +536,10 @@ test('runPlanWithTools with source:"chat" sends CHAT_TOOLS, not WRITE_TOOLS, to 
     const sentToolNames = sentBodies[0].tools.map((t) => t.function.name).sort();
     assert.ok(sentToolNames.includes('run_bash'));
     assert.ok(sentToolNames.includes('queue_reviewed_task'));
+    assert.ok(sentToolNames.includes('answer_task_clarification'));
+    assert.ok(sentToolNames.includes('resolve_task_clarification'));
+    assert.ok(sentToolNames.includes('mark_task_clarification_done'));
+    assert.ok(sentToolNames.includes('requeue_blocked_task'));
     assert.ok(!sentToolNames.includes('write_file'), 'Chat must never be offered write_file');
     assert.ok(!sentToolNames.includes('edit_file'), 'Chat must never be offered edit_file');
   });
@@ -541,6 +552,89 @@ test('runPlanWithTools with a non-chat source still sends the full WRITE_TOOLS s
     const sentToolNames = sentBodies[0].tools.map((t) => t.function.name).sort();
     assert.ok(sentToolNames.includes('write_file'));
     assert.ok(sentToolNames.includes('edit_file'));
+  });
+});
+
+// --- Chat's task-unstick tools, wired end to end (2026-09-15) --------------------------
+// Integration-style: real fixture task files, real handler calls through
+// buildChatToolHandlers -- proves the wiring, not just chat-task-requeue.js's own unit
+// tests (src/chat-task-requeue.test.js) which cover the edge cases exhaustively.
+
+function writeQueueTask(dir, state, id, data) {
+  const qdir = path.join(dir, 'queue', state);
+  fs.mkdirSync(qdir, { recursive: true });
+  fs.writeFileSync(path.join(qdir, `${id}.json`), JSON.stringify({ id, ...data }));
+}
+
+test('answer_task_clarification handler moves a real needs-clarification task to adhoc/ with the answer folded in', async () => {
+  await withFixtureRepo(async (mod, dir) => {
+    writeQueueTask(dir, 'needs-clarification', 't-1', { needsClarification: { reason: 'design-decision' }, promptContext: { rawText: 'original ask' } });
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = await handlers.answer_task_clarification({ taskId: 't-1', answer: 'use option B' });
+    assert.equal(result.ok, true);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'needs-clarification', 't-1.json')), false);
+    const moved = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', 't-1.json'), 'utf8'));
+    assert.match(moved.promptContext.rawText, /use option B/);
+    assert.equal(moved.needsClarification, undefined);
+  });
+});
+
+test('answer_task_clarification handler returns a clean error, not a throw, for a missing task', async () => {
+  await withFixtureRepo(async (mod, dir) => {
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = await handlers.answer_task_clarification({ taskId: 'nope', answer: 'x' });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /read_task/);
+  });
+});
+
+test('resolve_task_clarification handler moves a real task to adhoc/ with prefetchedPaths set', async () => {
+  await withFixtureRepo(async (mod, dir) => {
+    writeQueueTask(dir, 'needs-clarification', 't-2', { needsClarification: { reason: 'ambiguous' } });
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = await handlers.resolve_task_clarification({ taskId: 't-2', paths: ['src/foo.js'] });
+    assert.equal(result.ok, true);
+    const moved = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', 't-2.json'), 'utf8'));
+    assert.deepEqual(moved.promptContext.prefetchedPaths, ['src/foo.js']);
+  });
+});
+
+test('mark_task_clarification_done handler moves a real task to done/, terminal', async () => {
+  await withFixtureRepo(async (mod, dir) => {
+    writeQueueTask(dir, 'needs-clarification', 't-3', {});
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = await handlers.mark_task_clarification_done({ taskId: 't-3' });
+    assert.equal(result.ok, true);
+    const moved = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 't-3.json'), 'utf8'));
+    assert.match(moved.doneMarker, /Chat/);
+  });
+});
+
+test('requeue_blocked_task handler moves a real blocked task to pending/, stripped to the fresh-record shape', async () => {
+  await withFixtureRepo(async (mod, dir) => {
+    writeQueueTask(dir, 'blocked', 't-4', { domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', blockedReason: 'nope', ornithVotes: [1, 2] });
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = await handlers.requeue_blocked_task({ taskId: 't-4', state: 'blocked' });
+    assert.equal(result.ok, true);
+    const moved = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'pending', 't-4.json'), 'utf8'));
+    assert.equal(moved.status, 'pending');
+    assert.equal(moved.ornithVotes, undefined, 'stale review state must not survive a requeue');
+  });
+});
+
+test('requeue_blocked_task handler surfaces a repeatedBlocker match as a clean error instead of blocking silently', async () => {
+  await withFixtureRepo(async (mod, dir) => {
+    writeQueueTask(dir, 'blocked', 't-5', {
+      domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x',
+      blockedReason: 'missing `computeThing` symbol',
+      priorRejectionFeedback: ['earlier rejection also cited `computeThing` as missing'],
+    });
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = await handlers.requeue_blocked_task({ taskId: 't-5', state: 'blocked' });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /computeThing/);
+    assert.ok(result.repeatedBlocker);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'blocked', 't-5.json')), true, 'must not have moved without force');
   });
 });
 
