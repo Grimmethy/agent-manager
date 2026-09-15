@@ -148,7 +148,41 @@ function candidateRecords(doneDir, { backfill, state }) {
   return out;
 }
 
-function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn } = {}) {
+// Below this many real commits on origin/<main>, an empty onMainIds is plausibly just a
+// brand-new repo with no merge history yet -- the sanity check below must never block
+// the pipeline's very first pass. Comfortably past that on any repo that has been running
+// this pipeline for more than a few days.
+const MIN_COMMITS_FOR_SHIP_CONTEXT_SANITY_CHECK = 20;
+
+// Injectable for tests -- default is a real, single, cheap git call (once per whole
+// sweep, not per record -- same discipline buildShipContext itself already follows).
+function realCommitCount(repoRoot, mainBranch) {
+  try {
+    const out = execFileSync('git', ['-C', repoRoot, 'rev-list', '--count', `origin/${mainBranch}`], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 15000,
+    });
+    return Number(out.trim()) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Sanity check (2026-09-14, root-caused live -- see task-disposition.js's own maxBuffer
+// fix): buildShipContext's onMainIds should never be empty on a repo with real merge
+// history sitting on origin/<main> -- an empty map is far more likely a silent git-log
+// failure (execFileSync's maxBuffer exceeded and swallowed, confirmed live in this exact
+// codebase) than genuinely zero `Task: <id> (` trailers ever merged. Trusting a broken-
+// but-empty onMainIds silently misclassifies real merged/pending-merge work as
+// `abandoned: branch gone, work lost` -- the STABLE_TERMINAL_STAGE that never self-heals.
+// One cheap `rev-list --count` call distinguishes "repo legitimately has no merge history
+// yet" (a brand-new deployment, must not be blocked) from "onMainIds is broken" (must be
+// blocked) -- see MIN_COMMITS_FOR_SHIP_CONTEXT_SANITY_CHECK's own comment.
+function shipContextLooksBroken(ctx, { repoRoot, commitCountFn = realCommitCount } = {}) {
+  if (!ctx || ctx.onMainIds.size > 0) return false;
+  return commitCountFn(repoRoot, ctx.mainBranch) >= MIN_COMMITS_FOR_SHIP_CONTEXT_SANITY_CHECK;
+}
+
+function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } = {}) {
   const report = argv.includes('--report');
   const reclassify = argv.includes('--reclassify');
   const backfill = argv.includes('--backfill') || reclassify;
@@ -183,6 +217,11 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn } = {}) {
 
   const state = loadState(pipelineDir);
   const ctx = repoRoot ? buildShipContext(repoRoot) : null;
+
+  if (shipContextLooksBroken(ctx, { repoRoot, commitCountFn })) {
+    console.error(`[task-log-reconcile] onMainIds is empty despite origin/${ctx.mainBranch} having real merge history -- buildShipContext likely failed silently (see task-disposition.js's own maxBuffer fix). Skipping this reconcile pass entirely rather than risk a false merged/abandoned verdict; will retry next tick.`);
+    return { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0, skippedReason: 'onMainIds-empty' };
+  }
 
   const summary = { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0 };
   const pendingList = [];
@@ -274,7 +313,7 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn } = {}) {
   return summary;
 }
 
-module.exports = { reconcile, candidateRecords, loadState, deriveAmplificationRequestFromFix };
+module.exports = { reconcile, candidateRecords, loadState, deriveAmplificationRequestFromFix, shipContextLooksBroken };
 
 if (require.main === module) {
   let cfg;
