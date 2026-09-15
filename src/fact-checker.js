@@ -620,6 +620,59 @@ function checkFileLineCitations(draftText, sourceText) {
   return { unconfirmedCitations };
 }
 
+// Pre-fact-check gate for project_search / arch_import (2026-09-08 brain-dump request):
+// those two sources' implement drafts are plain prose citing specific files and line
+// numbers as evidence for a claim, not a Group B diff -- checkDraft's own fabricated-path
+// handling (checkFilePaths/extractCreateModeTargets) is tuned for a diff's claimed file
+// targets, not for "does this cited evidence actually exist". This is a cheaper, narrower
+// check meant to run BEFORE the rest of the fact-checker: does every path token the draft
+// cites actually resolve in the repo, and does every "path:NN" line-number citation point
+// at a line that exists in that file. Extracts BOTH shapes citeFileLineCitations already
+// distinguishes -- FILE_LINE_CITATION_RE ("path.ext:NN") and bare PATH_EXT_RE tokens (no
+// line number) -- since a plain-prose citation uses both forms interchangeably. Fabricated
+// CREATE targets are deliberately excluded (extractCreateModeTargets) for the same reason
+// checkDraft excludes them: a path that doesn't exist YET is the normal, correct shape for
+// a create claim, not fabrication.
+function preValidateCitedPaths(draftText, repoRoot, extraRoots = []) {
+  const failures = [];
+  const createModeTargets = extractCreateModeTargets(draftText);
+
+  const lineCitations = [...new Set((draftText.match(FILE_LINE_CITATION_RE) || []).filter((t) => !t.includes('://')))];
+  const barePaths = extractFilePaths(draftText);
+  const seenPaths = new Set();
+
+  for (const token of lineCitations) {
+    const lastColon = token.lastIndexOf(':');
+    const claimedPath = token.slice(0, lastColon);
+    const claimedLine = parseInt(token.slice(lastColon + 1), 10);
+    seenPaths.add(claimedPath);
+    if (createModeTargets.has(claimedPath)) continue;
+    const { resolvedPath } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
+    if (!resolvedPath) {
+      failures.push(`fabricated path: ${token}`);
+      continue;
+    }
+    let lineCount;
+    try {
+      lineCount = fs.readFileSync(resolvedPath, 'utf8').split('\n').length;
+    } catch {
+      failures.push(`fabricated path: ${token}`);
+      continue;
+    }
+    if (!Number.isInteger(claimedLine) || claimedLine < 1 || claimedLine > lineCount) {
+      failures.push(`line number out of range: ${token} (file has ${lineCount} lines)`);
+    }
+  }
+
+  for (const claimedPath of barePaths) {
+    if (seenPaths.has(claimedPath) || createModeTargets.has(claimedPath)) continue;
+    const { resolvedPath } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
+    if (!resolvedPath) failures.push(`fabricated path: ${claimedPath}`);
+  }
+
+  return { valid: failures.length === 0, failures };
+}
+
 // Returns a flat list of flags Claude's review pass should look at first. An empty
 // list means "nothing suspicious found by this cheap pass" -- it does NOT mean the
 // draft is correct. `sourceText` (optional) is the material the local model was actually given for
@@ -702,6 +755,7 @@ module.exports = {
   checkBlastRadiusBias,
   checkGroundedValues,
   checkFileLineCitations,
+  preValidateCitedPaths,
   checkCommitClaims,
   checkRevertsAPriorFix,
   extractFilePaths,
