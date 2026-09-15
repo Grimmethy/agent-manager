@@ -54,10 +54,15 @@ function applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome = defaultR
 
   for (const name of names) {
     const filePath = path.join(blockedDir, name);
-    let step = 'write';
+    // Tracks the operation actually in flight when the catch below fires, so
+    // errorDetails' step reflects reality instead of always reading "write" for a
+    // failure that happened during read/parse/record -- see this variable's own
+    // reassignments just ahead of each real operation it names.
+    let step = 'read';
     try {
       const raw = fs.readFileSync(filePath, 'utf8');
       if (!raw) continue;
+      step = 'parse';
       const task = JSON.parse(raw);
       summary.checked++;
 
@@ -73,7 +78,9 @@ function applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome = defaultR
         // watchdog tick for as long as the task sits here, unbounded.
         const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
         if (alreadyStamped) { summary.exhausted++; continue; }
+        step = 'record';
         appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_APPLY_RETRIES} apply retries used`);
+        step = 'write';
         fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
         summary.exhausted++;
         continue;
@@ -81,9 +88,11 @@ function applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome = defaultR
 
       task.applyRetryCount = retryCount + 1;
 
+      step = 'record';
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'apply-watchdog', outcomeReason: task.blockedReason || null });
       appendHistoryEvent(task, 'requeued', task.blockedReason || undefined);
 
+      step = 'write';
       const newPath = path.join(pendingDir, name);
       fs.mkdirSync(pendingDir, { recursive: true });
       fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
