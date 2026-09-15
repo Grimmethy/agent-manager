@@ -29,6 +29,7 @@ const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js'
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { detectContradictoryLiteralAcceptance } = require('./acceptance-criteria.js');
+const { detectStaleDecomposePremise } = require('./decompose-premise-check.js');
 const { runDecomposePass } = require('./decompose-pass.js');
 const { oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
@@ -526,6 +527,26 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       needsClarification: {
         reason: 'contradictory-literal-acceptance',
         openQuestions: [`${contradiction.reason} Please either drop the exact-phrase check, or rewrite the mandated literal text so "${contradiction.requiredPhrase}" appears unbroken on one line.`],
+      },
+    };
+  }
+
+  // Stale-decompose-premise gate (2026-09-15, brain-dump bd-1789433484305, "pipeline
+  // hardening 3/5"): a sub-task filed by an internal decompose can cite a specific line
+  // in a file that's since been restructured by a LATER, independent decompose -- the
+  // cited site cannot possibly still be there. Root-caused live: burned a real draft
+  // attempt on a local-draft.js sub-task citing line 2178 against a file decompose #226
+  // had already shrunk to 1327 lines. See detectStaleDecomposePremise's own header for
+  // what this does and (importantly) does not catch.
+  const staleDecompose = detectStaleDecomposePremise(task, { repoRoot: getConfig().repoRoot });
+  if (staleDecompose) {
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `sub-task premise may be stale: ${staleDecompose.reason}`,
+      needsClarification: {
+        reason: 'stale-decompose-premise',
+        openQuestions: [`${staleDecompose.reason} Please confirm the real current location of what this sub-task is meant to change, or re-scope it.`],
       },
     };
   }
