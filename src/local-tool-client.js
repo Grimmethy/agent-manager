@@ -1205,7 +1205,15 @@ function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, t
   }
 }
 
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null }) {
+// orientTurnLimit (2026-09-15, brain-dump bd-1789433484128, "pipeline hardening 1/5"):
+// defaults to the module-level ORIENT_TURN_LIMIT, but a caller with a substantive
+// priorAttemptAnalysisBlock already in `prompt` (a retry that already has verified
+// file/line findings from its own prior attempt) can pass a smaller value -- the model
+// keeps re-deriving those facts from scratch instead of trusting them despite being told
+// to (a compliance gap no amount of prompt wording reliably closes), so shrinking the
+// window before the "stop exploring, edit now" nudge fires structurally bounds how much
+// re-verification a retry can do, rather than trying to argue the model out of doing it.
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, orientTurnLimit = ORIENT_TURN_LIMIT }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -1449,8 +1457,8 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
     // If this run is meant to produce a diff and has spent its orientation budget without
     // a single edit, one firm push before the next turn: stop exploring, act now. The
-    // model still has (maxTurns - ORIENT_TURN_LIMIT) turns left to implement or conclude.
-    if (nudgeToEditEarly && !editNudgeFired && turn >= ORIENT_TURN_LIMIT
+    // model still has (maxTurns - orientTurnLimit) turns left to implement or conclude.
+    if (nudgeToEditEarly && !editNudgeFired && turn >= orientTurnLimit
         && turn < maxTurns - 1 && editToolCallCount() === 0) {
       editNudgeFired = true;
       messages.push({
@@ -1464,7 +1472,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
     // Firmer second push for a confirmed-atomic leaf that STILL has not edited a few turns
     // after the soft nudge.
-    if (leafMustEdit && !hardNudgeFired && turn >= ORIENT_TURN_LIMIT + 3
+    if (leafMustEdit && !hardNudgeFired && turn >= orientTurnLimit + 3
         && turn < maxTurns - 2 && editToolCallCount() === 0) {
       hardNudgeFired = true;
       messages.push({

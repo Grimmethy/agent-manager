@@ -186,6 +186,73 @@ test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks 
   });
 });
 
+// 2026-09-15 (brain-dump bd-1789433484128, "pipeline hardening 1/5"): orientTurnLimit is
+// now an explicit override, threaded through to BOTH sentences that cite it in the
+// prompt -- the model's own instructions must always match whatever limit is actually
+// enforced this pass (a cold-start default, or a retry's smaller window).
+test('write tier: buildWriteAgenticPrompt reflects the default ORIENT_TURN_LIMIT when no override is passed', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const { ORIENT_TURN_LIMIT } = require('./local-tool-client.js');
+    const p = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'the ask' } });
+    assert.match(p, new RegExp(`~${ORIENT_TURN_LIMIT} on orientation`));
+  });
+});
+
+test('write tier: buildWriteAgenticPrompt reflects a custom orientTurnLimit, everywhere it is cited', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const p = buildWriteAgenticPrompt({ title: 'T', promptContext: { rawText: 'the ask' } }, { orientTurnLimit: 3 });
+    assert.match(p, /~3 on orientation/);
+    assert.match(p, /still lost about where to make the change after 3 turns/);
+    assert.doesNotMatch(p, /after 10 turns/, 'the cold-start default must not leak through when an override is passed');
+  });
+});
+
+test('write tier: buildWriteAgenticPrompt reflects a custom orientTurnLimit for a confirmed-atomic leaf too', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const leafTask = { title: 'T', promptContext: { rawText: 'the ask', decomposedFrom: 'parent-1' } };
+    const p = buildWriteAgenticPrompt(leafTask, { orientTurnLimit: 3 });
+    assert.match(p, /still lost about where to make the change after 3 turns, answer RESOLUTION: needs-human-decision/);
+  });
+});
+
+// priorAttemptAnalysisBlock (previously untested despite gating the new orientTurnLimit
+// decision in draftAdhocViaLocalAgenticWrite -- see RETRY_ORIENT_TURN_LIMIT's header).
+test('write tier: priorAttemptAnalysisBlock returns \'\' when there are no prior local-agentic-write attempts', async () => {
+  await withRepo(async () => {
+    const { priorAttemptAnalysisBlock } = freshModule();
+    assert.equal(priorAttemptAnalysisBlock({ id: 't', draftAttempts: [] }), '');
+    assert.equal(priorAttemptAnalysisBlock({ id: 't' }), '');
+  });
+});
+
+test('write tier: priorAttemptAnalysisBlock feeds forward the most recent local-agentic-write tier\'s real response text', async () => {
+  await withRepo(async () => {
+    const { priorAttemptAnalysisBlock } = freshModule();
+    const task = {
+      id: 't',
+      draftAttempts: [
+        { tiers: [{ tier: 'local-agentic-write', response: 'first attempt findings' }] },
+        { tiers: [{ tier: 'local-agentic-write', response: 'SECOND attempt, most recent findings' }] },
+      ],
+    };
+    const block = priorAttemptAnalysisBlock(task);
+    assert.match(block, /SECOND attempt, most recent findings/);
+    assert.doesNotMatch(block, /first attempt findings/, 'only the most recent attempt is fed forward, not every prior one');
+    assert.match(block, /do not re-run the whole investigation/i);
+  });
+});
+
+test('write tier: priorAttemptAnalysisBlock ignores tiers other than local-agentic-write', async () => {
+  await withRepo(async () => {
+    const { priorAttemptAnalysisBlock } = freshModule();
+    const task = { id: 't', draftAttempts: [{ tiers: [{ tier: 'local-agentic-draft', response: 'wrong tier' }] }] };
+    assert.equal(priorAttemptAnalysisBlock(task), '');
+  });
+});
+
 test('write tier: buildWriteAgenticPrompt lists non-empty pre-filter flags verbatim', async () => {
   await withRepo(async () => {
     const { buildWriteAgenticPrompt } = freshModule();
