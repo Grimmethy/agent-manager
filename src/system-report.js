@@ -28,6 +28,12 @@
 // CLI:
 //   node system-report.js --check-due               (queue-watcher.sh's own per-tick call)
 //   node system-report.js --period hourly|daily|weekly --start <iso> --end <iso> [--dry-run]
+//
+// LESSONS-LEARNED CONSTRAINT (2026-09-07, brain-dump bd-1788686010195): All lessons-
+// learned / debrief Now-What findings file into the SAME Second Brain vault
+// (secondBrainDir), under Lessons/. Do NOT create a parallel store, sidecar DB, or
+// separate index. Retrieval is the AI-navigation concept's job over this one vault;
+// storage is not our differentiator. See concept-ai-navigation-of-existing-knowledge-a34a32.
 
 const fs = require('fs');
 const path = require('path');
