@@ -77,4 +77,73 @@ function parseAcceptanceBlock(summary) {
   return out;
 }
 
-module.exports = { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, normalizeList, MAX_CRITERIA };
+// detectContradictoryLiteralAcceptance (2026-09-15, filed as brain-dump bd-1789433484492,
+// "pipeline hardening 5/5") -- a task's own rawText can be unsatisfiable BY CONSTRUCTION:
+// it mandates inserting an exact multi-line literal block of quoted text AND separately
+// demands that some exact phrase appear as a single contiguous string (a grep/"Verify the
+// string X appears" check), but that phrase's own characters straddle a line boundary
+// inside the mandated literal as specified -- no implementation can satisfy both at once.
+// Root-caused live: system-report.js's LESSONS-LEARNED comment task specified the six-line
+// comment text as a sequence of separately-quoted lines wrapping "...Do NOT create a" /
+// "parallel store..." across two of them, while also requiring
+// `grep -c 'Do NOT create a parallel store'` to return >= 1 -- burned 3 real automated
+// attempts before a human caught it. This runs BEFORE any draft attempt (mirrors
+// detectExternalDependency's own "bail before spending a single turn" contract in
+// local-agentic-write-draft.js) rather than letting the pipeline discover the
+// contradiction the expensive way.
+//
+// Heuristic, not a general contradiction solver: only catches this one recurring shape
+// (a cluster of >= 3 consecutive single-quoted literal segments, read as the lines of a
+// file to write verbatim, plus a "verify/grep ... 'PHRASE'" clause elsewhere in the same
+// text) -- deliberately narrow so it can never false-positive on a task that merely
+// mentions a quoted string once or twice.
+const LITERAL_LINE_CLUSTER_MIN = 3;
+const REQUIRED_PHRASE_RE = /(?:verify|grep(?:\s+-\w+)*)\b[^.]*?['"]([^'"]{8,})['"]/i;
+
+function detectContradictoryLiteralAcceptance(task) {
+  const rawText = String((task && task.promptContext && task.promptContext.rawText) || '');
+  if (!rawText) return null;
+
+  // A run of >= LITERAL_LINE_CLUSTER_MIN single-quoted segments, each separated by only
+  // whitespace/nothing (the "'line one' 'line two' 'line three' ..." shape a mandated
+  // multi-line literal block gets flattened into as prose) -- collected as the ordered
+  // lines of the literal text the task wants written verbatim.
+  const clusterRe = /(?:'[^']*'\s*){3,}/;
+  const clusterMatch = rawText.match(clusterRe);
+  if (!clusterMatch) return null;
+  const lines = [...clusterMatch[0].matchAll(/'([^']*)'/g)].map((m) => m[1]);
+  if (lines.length < LITERAL_LINE_CLUSTER_MIN) return null;
+
+  const requiredMatch = rawText.match(REQUIRED_PHRASE_RE);
+  if (!requiredMatch) return null;
+  const requiredPhrase = requiredMatch[1];
+
+  // The phrase the task actually wants written literally, one line per array entry.
+  const asWritten = lines.join('\n');
+  if (asWritten.includes(requiredPhrase)) return null; // already satisfiable, nothing wrong
+
+  // Collapsing line breaks to spaces -- stripping each line's own leading comment
+  // marker/indentation first (// , #, *, etc.), since those decorate each WRITTEN line
+  // individually and are never part of the prose content a human pictures reading
+  // continuously -- is what the task AUTHOR was almost certainly picturing when they
+  // wrote the requirement. If the phrase appears there but not in the real, as-written
+  // (newline-preserving, marker-preserving) text, that's the exact contradiction: the
+  // literal instructions wrap the required phrase across a line boundary a plain-text
+  // grep can never cross.
+  // \s+ collapsed to a single space throughout -- both the per-line indentation after a
+  // stripped marker (e.g. the 3 spaces in '//   text') and the required phrase itself are
+  // normalized the same way, so neither side's incidental whitespace produces a false
+  // negative.
+  const norm = (s) => s.replace(/\s+/g, ' ').trim();
+  const collapsed = norm(lines.map((l) => l.replace(/^\s*(?:\/\/|#|\*|--)\s*/, '')).join(' '));
+  if (!collapsed.includes(norm(requiredPhrase))) return null; // not this specific shape -- some other mismatch, not ours to diagnose
+
+  return {
+    contradictory: true,
+    requiredPhrase,
+    lines,
+    reason: `The task's own literal text (read line-by-line, as it would actually be written) never contains "${requiredPhrase}" as one contiguous string -- it is split across a line boundary in the mandated text. No implementation can satisfy both "write these exact lines" and "grep for this exact unwrapped phrase" at once.`,
+  };
+}
+
+module.exports = { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, normalizeList, MAX_CRITERIA, detectContradictoryLiteralAcceptance };
