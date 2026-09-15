@@ -709,14 +709,83 @@ function providerPayload(idAttr) {
   return { provider: (btn && btn.dataset.provider) || 'local' };
 }
 
-function chatSetCollapsed(collapsed) {
-  const panel = document.getElementById('chat-panel');
-  if (panel) panel.classList.toggle('chat-collapsed', collapsed);
-  localStorage.setItem('agentManagerChatPanel', collapsed ? 'collapsed' : 'expanded');
+// 2026-09-15: Chat moved out of this repo entirely into its own plugin
+// (agent-manager-chat-plugin, slotKind:"persistent-sidebar" in plugins.json) -- see
+// /home/wok/.claude/plans/immutable-noodling-axolotl.md. chatSetCollapsed/chatPanelInit/
+// chatStartNew/chatSend/chatToggleReserve/chatWireProviderToggle/chatRender (and the
+// module-level `chatSession`) are gone; the plugin's own iframe'd page owns all of that
+// now, in its own document/JS context this page can't reach into directly. What's left
+// here is generic (works for ANY future slotKind:"persistent-sidebar" plugin, not just
+// Chat) plus the one cross-iframe bridge "Send to chat" still needs.
+
+// Cache of the currently-active persistent-sidebar plugins, refreshed by
+// mountPersistentSidebarPlugins() -- sendTextToChat() below needs a plugin's proxy base
+// path without re-fetching /api/plugins on every single click.
+let _persistentSidebarPlugins = [];
+
+async function mountPersistentSidebarPlugins() {
+  const layout = document.getElementById('layout');
+  if (!layout) return;
+  let data;
+  try {
+    data = await fetchJson('/api/plugins');
+  } catch (e) {
+    return; // best-effort -- a dashboard with no plugins configured yet has nothing to mount
+  }
+  const plugins = (data.plugins || []).filter((p) => p.slotKind === 'persistent-sidebar' && p.active && p.url);
+  _persistentSidebarPlugins = plugins;
+  // Remove any previously-mounted sidebars/toggles before remounting (refresh() can
+  // call this again later if the plugin list ever changes at runtime).
+  layout.querySelectorAll('.plugin-sidebar').forEach((el) => el.remove());
+  document.querySelectorAll('.plugin-sidebar-toggle').forEach((el) => el.remove());
+  for (const plugin of plugins) {
+    const storageKey = `agentManagerPluginSidebar:${plugin.name}`;
+    const collapsed = localStorage.getItem(storageKey) === 'collapsed';
+    const proxyBase = `/api/plugins/${encodeURIComponent(plugin.name)}/proxy`;
+    // Every plugin route this dashboard proxies to is expected to serve its own real
+    // page at "<proxyBase>/<something>" (see agent-manager-chat-plugin's own GET /chat
+    // for why a bare trailing-slash root won't match the generic proxy route at all --
+    // Werkzeug's <path:subpath> converter never matches an empty segment). "chat" is
+    // Chat's own choice, not a generic convention -- a future second persistent-sidebar
+    // plugin can name its own page path however it likes, this just has to match.
+    const pagePath = plugin.homePath || 'chat';
+
+    const aside = document.createElement('aside');
+    aside.className = 'plugin-sidebar' + (collapsed ? ' sidebar-collapsed' : '');
+    aside.dataset.plugin = plugin.name;
+    const iframe = document.createElement('iframe');
+    iframe.src = `${proxyBase}/${pagePath}`;
+    iframe.title = plugin.description || plugin.name;
+    aside.appendChild(iframe);
+    layout.appendChild(aside);
+
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'plugin-sidebar-toggle';
+    toggle.dataset.plugin = plugin.name;
+    toggle.title = `Show/hide ${plugin.description || plugin.name}`;
+    toggle.textContent = plugin.sidebarLabel || 'Chat';
+    toggle.onclick = () => {
+      const isCollapsed = aside.classList.toggle('sidebar-collapsed');
+      localStorage.setItem(storageKey, isCollapsed ? 'collapsed' : 'expanded');
+    };
+    document.body.appendChild(toggle);
+  }
 }
 
+// "Send to chat" (task detail modal, Brain Dump entries): posts through the same
+// same-origin proxy path the sidebar iframe itself uses, then tells that iframe to
+// refresh via postMessage -- this page cannot call into the iframe's own JS/DOM
+// directly (different document, and same-origin-policy-isolated regardless once served
+// from a different real port behind the proxy). The plugin's own chat.js listens for
+// {type: "agent-manager-chat-refresh"} and re-fetches+re-renders its active session
+// when it arrives. Un-collapses the sidebar so the sent text is actually visible.
 async function sendTextToChat(text) {
-  const r = await fetch('/api/chat/inject', {
+  if (!_persistentSidebarPlugins.length) await mountPersistentSidebarPlugins();
+  const plugin = _persistentSidebarPlugins.find((p) => p.name === 'agent-manager-chat-plugin') || _persistentSidebarPlugins[0];
+  if (!plugin) throw new Error('no active Chat sidebar plugin to send to');
+  const proxyBase = `/api/plugins/${encodeURIComponent(plugin.name)}/proxy`;
+  const r = await fetch(`${proxyBase}/api/chat/inject`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text }),
@@ -726,225 +795,12 @@ async function sendTextToChat(text) {
     throw new Error(body.detail || body.description || `HTTP ${r.status}`);
   }
   await r.json().catch(() => null);
-  chatSetCollapsed(false);
-  chatRender();
-}
-
-async function chatPanelInit() {
-  chatSetCollapsed(localStorage.getItem('agentManagerChatPanel') === 'collapsed');
-  const tab = document.getElementById('chat-toggle-tab');
-  if (tab) {
-    tab.onclick = () => {
-      const panel = document.getElementById('chat-panel');
-      chatSetCollapsed(!panel.classList.contains('chat-collapsed'));
-    };
-  }
-  const newBtn = document.getElementById('chat-new-btn');
-  if (newBtn) newBtn.onclick = chatStartNew;
-  const sendBtn = document.getElementById('chat-send-btn');
-  if (sendBtn) sendBtn.onclick = chatSend;
-  const input = document.getElementById('chat-input');
-  if (input) {
-    input.onkeydown = (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); chatSend(); }
-    };
-  }
-  try {
-    chatSession = await fetchJson('/api/chat/active');
-  } catch (e) {
-    chatSession = null;
-  }
-  chatRender();
-}
-
-async function chatStartNew() {
-  const newBtn = document.getElementById('chat-new-btn');
-  if (newBtn) { newBtn.disabled = true; newBtn.textContent = 'Starting...'; }
-  try {
-    const resp = await fetch('/api/chat/new', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(providerPayload('chat-provider')),
-    });
-    const body = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
-    chatSession = body;
-  } catch (e) {
-    showToast('Could not start a new conversation: ' + e.message);
-  } finally {
-    if (newBtn) { newBtn.disabled = false; newBtn.textContent = 'New'; }
-  }
-  chatRender();
-}
-
-async function chatSend() {
-  const input = document.getElementById('chat-input');
-  const sendBtn = document.getElementById('chat-send-btn');
-  const message = input && input.value.trim();
-  if (!message || !chatSession) return;
-  input.value = '';
-  sendBtn.disabled = true;
-  sendBtn.textContent = 'Thinking...';
-  // Optimistic append so the user's own message shows immediately -- a real reply
-  // (local provider especially, under real worker-lane contention) can take a while.
-  chatSession.transcript.push({ role: 'user', text: message });
-  // 2026-08-26 (Open WebUI investigation: "vastly improve the chat system... streaming")
-  // -- a live in-progress assistant entry that fills in as SSE chunks arrive, instead of
-  // one blocking fetch()+json() that left the user staring at nothing until the whole
-  // reply (or the turn budget) was done.
-  const assistantEntry = { role: 'assistant', text: '' };
-  chatSession.transcript.push(assistantEntry);
-  chatRender();
-  try {
-    const resp = await fetch(`/api/chat/${encodeURIComponent(chatSession.id)}/message`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message }),
-    });
-    if (!resp.ok || !resp.body) {
-      const body = await resp.json().catch(() => ({}));
-      throw new Error(body.description || `HTTP ${resp.status}`);
-    }
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    let finalSession = null;
-    let streamErr = null;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const frames = buf.split('\n\n');
-      buf = frames.pop(); // keep the last, possibly-incomplete frame for next read
-      for (const frame of frames) {
-        const line = frame.split('\n').find((l) => l.startsWith('data: '));
-        if (!line) continue;
-        const evt = JSON.parse(line.slice(6));
-        if (evt.type === 'preempt') {
-          // "make GPU space" summary (brain dump #5) -- a muted line prepended to this
-          // turn's reply so the user can see what the pipeline gave up for it.
-          const lanes = evt.lanes || [];
-          const killed = lanes.filter((l) => l.action === 'killed').map((l) => l.lane);
-          const spared = lanes.filter((l) => l.action === 'spared')
-            .map((l) => `${l.lane} (${Math.round((l.ageSeconds || 0) / 60)}m in)`);
-          const bits = [];
-          if (killed.length) bits.push('freed ' + killed.join(', '));
-          if (spared.length) bits.push('spared ' + spared.join(', '));
-          if (bits.length) { assistantEntry.text = `_⚡ ${bits.join(' · ')}_\n\n`; chatRender(); }
-        } else if (evt.type === 'chunk') {
-          assistantEntry.text += evt.text;
-          chatRender();
-        } else if (evt.type === 'final') {
-          finalSession = evt.session;
-        } else if (evt.type === 'error') {
-          streamErr = evt.error;
-        }
-      }
-    }
-    if (streamErr) throw new Error(streamErr);
-    if (finalSession) chatSession = finalSession;
-  } catch (e) {
-    showToast('Chat message failed: ' + e.message);
-    // Roll back the optimistic append -- the real transcript (without this failed turn)
-    // is whatever's still on disk; simplest correct fix is just re-fetching it.
-    try { chatSession = await fetchJson('/api/chat/active'); } catch (e2) { /* leave as-is */ }
-  } finally {
-    sendBtn.disabled = false;
-    sendBtn.textContent = 'Send';
-  }
-  chatRender();
-}
-
-async function chatToggleReserve() {
-  if (!chatSession) return;
-  const btn = document.getElementById('chat-reserve-btn');
-  const wantOn = !chatSession.reserved;
-  btn.disabled = true;
-  // Plain fetch, no client-side timeout -- turning reservation ON can genuinely block
-  // server-side for a while (single_flight_lock.acquire() waiting for a busy worker
-  // lane's current call to finish), same as any other real acquire-the-lock wait
-  // discussed at length tonight; an artificial abort here would misreport a legitimately
-  // slow-but-successful reservation as a failure.
-  btn.textContent = wantOn ? 'Reserving...' : 'Releasing...';
-  try {
-    const resp = await fetch(`/api/chat/${encodeURIComponent(chatSession.id)}/reserve`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ on: wantOn }),
-    });
-    const body = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(body.description || `HTTP ${resp.status}`);
-    chatSession = body;
-  } catch (e) {
-    showToast('Could not toggle reservation: ' + e.message);
-  } finally {
-    btn.disabled = false;
-  }
-  chatRender();
-}
-
-function chatWireProviderToggle() {
-  const btn = document.getElementById('chat-provider');
-  if (!btn) return;
-  btn.onclick = async (e) => {
-    e.stopPropagation();
-    const next = btn.dataset.provider === 'local' ? 'claude' : 'local';
-    btn.dataset.provider = next;
-    providerChoices['chat-provider'] = next;
-    btn.textContent = next === 'claude' ? 'Claude' : 'Local';
-    btn.classList.toggle('provider-toggle-claude', next === 'claude');
-    await chatStartNew();
-  };
-}
-
-function chatRender() {
-  const titleEl = document.getElementById('chat-title');
-  if (titleEl && chatSession && Array.isArray(chatSession.roots) && chatSession.roots.length) {
-    titleEl.title = 'Accessible repos (roots[0] is primary):\n' + chatSession.roots.join('\n');
-  }
-  const container = document.getElementById('chat-provider-container');
-  if (container && !document.getElementById('chat-provider')) {
-    container.innerHTML = renderProviderToggle('chat-provider');
-    chatWireProviderToggle();
-  }
-  if (chatSession && document.getElementById('chat-provider')) {
-    // Provider is fixed once a session exists (same "no mid-conversation switch"
-    // reasoning as Discuss) -- the header toggle reflects/controls only what the NEXT
-    // "New" conversation will use, so pin it to match the ACTIVE session's own provider
-    // rather than letting it silently drift out of sync with what's actually running.
-    const btn = document.getElementById('chat-provider');
-    if (btn.dataset.provider !== chatSession.provider) {
-      btn.dataset.provider = chatSession.provider;
-      providerChoices['chat-provider'] = chatSession.provider;
-      btn.textContent = chatSession.provider === 'claude' ? 'Claude' : 'Local';
-      btn.classList.toggle('provider-toggle-claude', chatSession.provider === 'claude');
-    }
-  }
-
-  const reserveBtn = document.getElementById('chat-reserve-btn');
-  if (reserveBtn) {
-    const showReserve = !!chatSession && chatSession.provider === 'local';
-    reserveBtn.style.display = showReserve ? '' : 'none';
-    if (showReserve) {
-      reserveBtn.onclick = chatToggleReserve;
-      reserveBtn.classList.toggle('active', !!chatSession.reserved);
-      reserveBtn.textContent = chatSession.reserved ? 'Reserved' : 'Reserve';
-      reserveBtn.title = chatSession.reserved
-        ? 'Holding the local model exclusively -- click to release it back to the worker lanes'
-        : 'Hold the local model exclusively for this conversation until you turn it back off';
-    }
-  }
-
-  const transcriptEl = document.getElementById('chat-transcript');
-  if (transcriptEl) {
-    transcriptEl.innerHTML = chatSession && chatSession.transcript.length
-      ? grillRenderTranscript(chatSession.transcript, chatSession)
-      : '<div class="empty">Say something to the chat.</div>';
-    // 2026-08-26: the ACTUAL scrollable box is the .grill-transcript div
-    // grillRenderTranscript() just created one level inside #chat-transcript, not
-    // #chat-transcript itself -- see the CSS comment above #chat-transcript's own rule
-    // for the full incident. Setting scrollTop on the wrong (outer) element was a
-    // silent no-op every single render, which is why every new message left the inner
-    // box sitting at its default post-render scrollTop of 0 (top) instead of the bottom.
-    const scrollBox = transcriptEl.querySelector('.grill-transcript');
-    if (scrollBox) scrollBox.scrollTop = scrollBox.scrollHeight;
+  const aside = document.querySelector(`.plugin-sidebar[data-plugin="${plugin.name}"]`);
+  if (aside) {
+    aside.classList.remove('sidebar-collapsed');
+    localStorage.setItem(`agentManagerPluginSidebar:${plugin.name}`, 'expanded');
+    const iframe = aside.querySelector('iframe');
+    if (iframe && iframe.contentWindow) iframe.contentWindow.postMessage({ type: 'agent-manager-chat-refresh' }, '*');
   }
 }
 
