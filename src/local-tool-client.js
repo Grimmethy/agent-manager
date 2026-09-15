@@ -22,6 +22,7 @@ const gpuArbiter = require('./gpu-arbiter.js');
 const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
 const { injectAmplificationInstruction, extractAmplificationRequests } = require('./incident-amplification-marker.js');
+const { injectContextLogInstruction, extractContextLog, writeContextLogInbox } = require('./context-log-marker.js');
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
@@ -1362,7 +1363,7 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
 // to (a compliance gap no amount of prompt wording reliably closes), so shrinking the
 // window before the "stop exploring, edit now" nudge fires structurally bounds how much
 // re-verification a retry can do, rather than trying to argue the model out of doing it.
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, orientTurnLimit = ORIENT_TURN_LIMIT }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, contextLogSessionId = null, orientTurnLimit = ORIENT_TURN_LIMIT }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -1447,6 +1448,14 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   if (conceptId && messages.length) {
     messages[0] = { ...messages[0], content: injectConceptBuildInstruction(messages[0].content) };
   }
+  // Per-session context log (2026-09-15, see context-log-marker.js's own header) --
+  // truthy-gated on contextLogSessionId the same way conceptId gates the block above,
+  // not a separate boolean flag: this needs the session id to route the write
+  // regardless, so there is no meaningful "enabled but no id" state. Chat is currently
+  // the only caller that ever sets this.
+  if (contextLogSessionId && messages.length) {
+    messages[0] = { ...messages[0], content: injectContextLogInstruction(messages[0].content) };
+  }
   const toolCallLog = [];
   let turnsUsed = 0;
   let lastMessage = null;
@@ -1497,6 +1506,11 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       const { cleanText, report } = extractConceptBuildReport(merged.response);
       merged.response = cleanText;
       if (report) recordConceptBuildTally(pipelineDir, conceptId, report.kind);
+    }
+    if (contextLogSessionId && merged.response && merged.response.includes('CONTEXT-LOG:')) {
+      const { cleanText, entry } = extractContextLog(merged.response);
+      merged.response = cleanText;
+      if (entry) writeContextLogInbox(entry, { sessionId: contextLogSessionId, pipelineDir });
     }
     return merged;
   };
