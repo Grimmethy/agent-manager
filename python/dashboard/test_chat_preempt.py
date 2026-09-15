@@ -18,6 +18,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 import app  # noqa: E402
+import chat_preempt  # noqa: E402
 
 
 class PreemptDecisionTest(unittest.TestCase):
@@ -132,9 +133,15 @@ class PreemptPipelineTest(unittest.TestCase):
     # Worker draft lanes moved onto the GPU arbiter (2026-09-02): _preempt_pipeline_for_chat
     # cancels them via _arbiter_cancel_below (mocked here); only the reviewer stays on this
     # legacy heartbeat path. The arbiter cancel path is covered by test_gpu_arbiter_cli.py.
+    #
+    # 2026-09-15: patched on the chat_preempt module, not app -- _preempt_pipeline_for_chat
+    # now lives in chat_preempt.py (extracted so it can be vendored into a standalone Chat
+    # plugin repo) and its bare `_arbiter_cancel_below(...)` call resolves in that module's
+    # own namespace; app.py's `from chat_preempt import _arbiter_cancel_below` is a separate
+    # binding in app's namespace that patching there would not affect.
 
     def test_calls_the_arbiter_for_worker_lanes_and_folds_its_summary_in(self):
-        with mock.patch.object(app, "_arbiter_cancel_below",
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below",
                                return_value=[{"lane": "draft", "action": "killed", "taskId": "t-w1", "ageSeconds": None}]) as m:
             self._hb("reviewer", status="idle", pass_="idle", pid=self._spawn().pid, task_id=None)
             summary = app._preempt_pipeline_for_chat()
@@ -142,7 +149,7 @@ class PreemptPipelineTest(unittest.TestCase):
             self.assertIn({"lane": "draft", "action": "killed", "taskId": "t-w1", "ageSeconds": None}, summary)
 
     def test_reviewer_still_uses_the_legacy_age_gated_kill(self):
-        with mock.patch.object(app, "_arbiter_cancel_below", return_value=[]):
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[]):
             rv = self._spawn()
             self._hb("reviewer", status="working", pass_="vote", pid=rv.pid, task_id="t-rv")
             self._task("reviewer", "t-rv", claimed_epoch=time.time() - 5)  # young -> killed
@@ -151,7 +158,7 @@ class PreemptPipelineTest(unittest.TestCase):
             self.assertEqual({s["lane"]: s["action"] for s in summary}.get("reviewer"), "killed")
 
     def test_reviewer_old_call_is_spared(self):
-        with mock.patch.object(app, "_arbiter_cancel_below", return_value=[]):
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[]):
             rv = self._spawn()
             self._hb("reviewer", status="working", pass_="vote", pid=rv.pid, task_id="t-rv")
             self._task("reviewer", "t-rv", claimed_epoch=time.time() - 600)  # >180s -> spared
