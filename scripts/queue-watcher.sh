@@ -197,6 +197,22 @@ while :; do
     blocked_cluster_result="$(node "${PACKAGE_SRC_DIR}/blocked-cluster-sweep.js" 2>>"${HOME_LOGS}/blocked-cluster-sweep.log")"
     printf '[watchdog] blocked-cluster-sweep: %s\n' "$blocked_cluster_result" >&2
 
+    # Pipeline-health-audit sweep (2026-09-15, root-caused live: a 22+ hour Ollama hang --
+    # every worker draft call timing out, throughput fully stopped, 80+ tasks piled up in
+    # pending/). pipeline-health-audit.js's own LOG_ERROR_SIGNATURES already recognizes
+    # this exact shape ('ollama-request-timeout') and would have filed an actionable
+    # finding -- but nextPipelineHealthAuditTask() was ONLY ever reachable as a registered
+    # task source (priority 90, "an operational incident can be actively costing
+    # throughput"), so it never got a turn in getNextTask()'s priority ladder while a real
+    # backlog -- exactly what an unnoticed incident causes -- kept outranking it.
+    # instances/.health-audit-schedule.json's lastCheckedAt hadn't moved in 38+ hours.
+    # No priority number fixes "must run even when everything is busy" -- it has to run
+    # independent of the ladder, like every sweep on this list already does. Harmless
+    # alongside the still-registered task-source path: both share the same hourly
+    # isDue()/markChecked() gate, so whichever runs first in the window satisfies it.
+    pipeline_health_audit_result="$(node "${PACKAGE_SRC_DIR}/pipeline-health-audit-sweep.js" 2>>"${HOME_LOGS}/pipeline-health-audit-sweep.log")"
+    printf '[watchdog] pipeline-health-audit-sweep: %s\n' "$pipeline_health_audit_result" >&2
+
     # Task-log reconcile: `applied` used to be the last event in a done task's history, so
     # an update audit could not tell from the log whether a task's code actually reached
     # origin/<main>, is still on an unmerged agent/<id> branch, or was applied to a branch
