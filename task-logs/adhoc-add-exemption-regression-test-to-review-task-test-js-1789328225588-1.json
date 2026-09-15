@@ -1,0 +1,644 @@
+{
+  "id": "adhoc-add-exemption-regression-test-to-review-task-test-js-1789328225588-1",
+  "title": "Add exemption regression test to review-task.test.js",
+  "domain": "adhoc",
+  "source": "manual",
+  "createdAt": "2026-09-13T19:38:19.385Z",
+  "history": [
+    {
+      "stage": "created",
+      "at": "2026-09-13T19:38:19.386Z",
+      "detail": "manual"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T19:46:36.985Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T19:46:39.399Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T19:57:15.934Z",
+      "detail": "3 attempt(s), 7436 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T19:59:48.480Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T20:06:11.042Z",
+      "detail": "agentic, 202 chars, resolution=decompose"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T20:06:11.042Z",
+      "detail": "resolution=decompose, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T20:06:11.044Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T20:06:11.044Z",
+      "detail": "attempt 1: succeeded, tiers: local-agentic-write=decompose"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T20:06:27.253Z"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-13T20:07:31.522Z",
+      "detail": "The IMPLEMENT draft contains no actual sub-tasks or code—only meta-commentary about a budget-exhausted pass (\"Auto-decomposed after a turn-budget-exhausted implement pass... requeued for a clean retry\")—leaving every named deliverable (the two new test cases for `staleness_audit` exemption and `trouble_log` flagging, and the test run verification) completely uncovered."
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-13T20:07:54.731Z",
+      "detail": "The IMPLEMENT draft contains no actual sub-tasks or code—only meta-commentary about a budget-exhausted pass (\"Auto-decomposed after a turn-budget-exhausted implement pass... requeued for a clean retry\")—leaving every named deliverable (the two new test cases for `staleness_audit` exemption and `trouble_log` flagging, and the test run verification) completely uncovered."
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T20:27:47.463Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T20:27:49.644Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T20:34:19.874Z",
+      "detail": "3 attempt(s), 7319 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T20:34:19.875Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-13T20:38:38.575Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 74 tests but the diff only adds 2 test definition(s)"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T20:38:38.576Z",
+      "detail": "attempt 2: blocked, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-13T20:38:53.743Z",
+      "detail": "Agentic implement pass produced a diff that is not a real implementation -- summary claims 74 tests but the diff only adds 2 test definition(s)"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T20:40:11.727Z",
+      "detail": "retry 2"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T20:40:14.706Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T20:54:30.591Z",
+      "detail": "3 attempt(s), 7111 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T20:54:30.592Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T20:54:48.315Z",
+      "detail": "attempt 3: error, tiers: local-agentic-write=decompose"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T20:54:53.093Z",
+      "detail": "retry 2"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T20:54:56.836Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-13T21:11:20.913Z",
+      "detail": "3 attempt(s), 8257 chars, seeded from a prior plan"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-13T21:11:20.915Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-13T21:22:50.644Z",
+      "detail": "agentic, 202 chars, resolution=decompose"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-13T21:22:50.646Z",
+      "detail": "resolution=decompose, retry 2, qwen3.8-p40:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-13T21:22:50.647Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T21:22:50.648Z",
+      "detail": "attempt 4: succeeded, tiers: local-agentic-write=decompose"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-13T21:23:52.998Z"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-13T21:25:44.595Z",
+      "detail": "The IMPLEMENT draft is a meta-commentary (\"Auto-decomposed after a turn-budget-exhausted implement pass... requeued for a clean retry\") that contains no actual sub-tasks, JSON array, or code, failing to deliver the two required test cases for `staleness_audit` and `trouble_log` in `src/review-task.test.js`."
+    },
+    {
+      "stage": "exhausted",
+      "at": "2026-09-13T21:26:29.866Z",
+      "detail": "2/2 retries used"
+    },
+    {
+      "stage": "needs-clarification",
+      "at": "2026-09-13T21:26:29.867Z",
+      "detail": "escalated to a human after exhausting redraft retries"
+    },
+    {
+      "stage": "advisory",
+      "at": "2026-09-13T21:26:54.069Z",
+      "detail": "staleness flag: decompose-loop (medium, re-scope) -- every draft attempt chose to decompose and never produced usable pieces -- re-file as a product_spec or split into smaller adhoc tasks by hand"
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-13T21:26:54.575Z",
+      "detail": "needs-clarification-triage: decompose-loop flag but target is not an oversized file (autoroute declines) -- clean-state retry 1/1"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-13T22:22:46.279Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-13T22:22:48.780Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-13T22:28:18.483Z",
+      "detail": "Plan pass degenerate: truncated"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-13T22:28:18.485Z",
+      "detail": "attempt 5: blocked"
+    },
+    {
+      "stage": "advisory",
+      "at": "2026-09-13T22:29:30.673Z",
+      "detail": "staleness flag: retries-exhausted (medium, capability-ceiling) -- the pipeline exhausted its automatic retries and will never touch this again on its own -- needs a human decision or a Claude-opt-in run"
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-14T19:36:50.029140+00:00",
+      "note": "manually requeued from blocked/",
+      "blockedReasonAtRequeue": "Plan pass degenerate: truncated",
+      "priorRejectionFeedbackAtRequeue": null
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-14T20:47:25.968Z"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-14T20:47:30.916Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-14T20:52:10.359Z",
+      "detail": "2 attempt(s), 4431 chars"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-14T20:54:08.982Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-14T21:01:42.650Z",
+      "detail": "agentic, 192 chars, resolution=decompose"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-14T21:01:42.651Z",
+      "detail": "resolution=decompose, qwen3.8:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-14T21:01:42.655Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-14T21:01:42.656Z",
+      "detail": "attempt 1: succeeded, tiers: local-agentic-write=decompose"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-14T21:01:51.295Z"
+    },
+    {
+      "stage": "blocked",
+      "at": "2026-09-14T21:05:21.671Z",
+      "detail": "The IMPLEMENT draft contains no actual code, diff, or sub-task decomposition—only meta-commentary stating the implement pass \"exhausted its turn budget without making any edits\"—so none of the required deliverables (the two new test cases in `src/review-task.test.js` and the passing test run) are delivered."
+    },
+    {
+      "stage": "requeued",
+      "at": "2026-09-14T21:08:05.540Z",
+      "detail": "The IMPLEMENT draft contains no actual code, diff, or sub-task decomposition—only meta-commentary stating the implement pass \"exhausted its turn budget without making any edits\"—so none of the required deliverables (the two new test cases in `src/review-task.test.js` and the passing test run) are delivered."
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-14T23:21:16.430Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-14T23:21:16.456Z",
+      "detail": "attempt 2: error"
+    },
+    {
+      "stage": "draft-started",
+      "at": "2026-09-15T00:02:08.954Z",
+      "detail": "retry 1"
+    },
+    {
+      "stage": "orient-done",
+      "at": "2026-09-15T00:02:11.323Z",
+      "detail": "skipped (grep-covered)"
+    },
+    {
+      "stage": "plan-done",
+      "at": "2026-09-15T00:20:23.522Z",
+      "detail": "5 attempt(s), 5791 chars, seeded from a prior plan, re-rolled once"
+    },
+    {
+      "stage": "implement-started",
+      "at": "2026-09-15T00:20:23.532Z",
+      "detail": "adhoc: local-agentic-write (multi-turn edit/write/run_bash in a worktree -- can take many minutes)"
+    },
+    {
+      "stage": "implement-done",
+      "at": "2026-09-15T00:30:56.045Z",
+      "detail": "agentic, 4484 chars, resolution=implemented"
+    },
+    {
+      "stage": "draft-done",
+      "at": "2026-09-15T00:30:56.046Z",
+      "detail": "resolution=implemented, retry 1, qwen3.8-p40:27b-q4_K_M"
+    },
+    {
+      "stage": "needs-review",
+      "at": "2026-09-15T00:30:56.046Z"
+    },
+    {
+      "stage": "draft-attempt",
+      "at": "2026-09-15T00:30:56.047Z",
+      "detail": "attempt 3: succeeded, tiers: local-agentic-write=implemented"
+    },
+    {
+      "stage": "review-started",
+      "at": "2026-09-15T00:32:13.459Z"
+    },
+    {
+      "stage": "approved",
+      "at": "2026-09-15T00:33:20.027Z",
+      "detail": "votes: 2/3 real"
+    }
+  ],
+  "promptContext": {
+    "rawText": "In src/review-task.test.js, add (or extend near line 1293, the existing NON_IMPL_PATTERNS prose test) two cases around the isNonImplementation gate: one where task.source is 'staleness_audit' with a <80-char no-code-fence prose draft asserting it is NOT flagged as refusal (source exempt via advisoryProse), and one with the same draft from a non-exempt source asserting it IS flagged. Then run `node --test src/review-task.test.js` and confirm zero new failures.",
+    "decomposedFrom": "adhoc-brain-dump-bd-1788979749381-isemptyapprovalsource-gate-risk-1788981857847"
+  },
+  "blockedReason": "The IMPLEMENT draft contains no actual code, diff, or sub-task decomposition—only meta-commentary stating the implement pass \"exhausted its turn budget without making any edits\"—so none of the required deliverables (the two new test cases in `src/review-task.test.js` and the passing test run) are delivered.",
+  "priorRejectionFeedback": [
+    "The IMPLEMENT draft contains no actual code, diff, or sub-task decomposition—only meta-commentary stating the implement pass \"exhausted its turn budget without making any edits\"—so none of the required deliverables (the two new test cases in `src/review-task.test.js` and the passing test run) are delivered."
+  ],
+  "draftAttempts": [
+    {
+      "at": "2026-09-14T20:47:25.967Z",
+      "attemptNo": 1,
+      "source": "manual",
+      "localRejectCount": 0,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "decompose",
+          "blocked": false,
+          "responseChars": 1338,
+          "response": "I got far enough to verify the state of the file but could not write the edit before running out of context.\n\n**What I confirmed:**\n- Case A (exempt source NOT flagged) **already exists** at `src/review-task.test.js:~345` — test `'a short staleness_audit report is NOT auto-rejected by the deterministic non-implementation gate -- reaches the real (mocked) vote instead'`, uses `source:'staleness_audit'`, `implementResponse:'RECOMMENDATION: archive.'` (19 chars, no fence), asserts `task.reviewProvider !== 'deterministic-non-implementation'` and `verdict==='approved'`. (Plus the same shape for `observability_review`/`performance_review` at ~362–379.)\n- `staleness_audit` is registered with `advisoryProse: true` at `src/task-sources.js:2142`.\n- The gate impl is `src/review-task.js:770–782`; on fire it sets `task.reviewProvider='deterministic-non-implementation'` (line 777), `verdict:'blocked'`, `blockedStage:'review'`, `blockedReason` = `\"...bare tool-call request or meta-commentary, not a real implementation attempt...\"`.\n- Case B (non-exempt source **IS** flagged) does **not** exist: a grep for the literal `deterministic-non-implementation` returned only 2 test-file hits, both `assert.notEqual` (the \"NOT flagged\" direction). No test asserts the gate fires.\n\nSo the missing delta is exactly Case B, added adjacent to line ~",
+          "turnsUsed": 4,
+          "toolCalls": {
+            "total": 8,
+            "byTool": {
+              "read_file": 5,
+              "grep_codebase": 3
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 5908
+              },
+              {
+                "n": 2,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 3901
+              },
+              {
+                "n": 3,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 3669
+              },
+              {
+                "n": 4,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 6899
+              },
+              {
+                "n": 5,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir",
+                  "contextLines"
+                ],
+                "bytes": 738
+              },
+              {
+                "n": 6,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir",
+                  "contextLines"
+                ],
+                "bytes": 2490
+              },
+              {
+                "n": 7,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir",
+                  "contextLines"
+                ],
+                "bytes": 8289
+              },
+              {
+                "n": 8,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 5485
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 4431,
+        "text": "PLAN:\n\n1. **Locate the existing `NON_IMPL_PATTERNS` prose test.** Open `src/review-task.test.js` and find the existing test block near line 1293 that exercises the `NON_IMPL_PATTERNS` gate (the `<80-char no-code-fence` prose case). This is the anchor point where the two new cases will be added or the existing test extended. (The task explicitly names \"line 1293, the existing NON_IMPL_PATTERNS prose test\"; the file's own header comment at the top of the shown window confirms `NON_IMPL_PATTERNS` is exported from `review-task.js` and is the gate under test.)\n\n2. **Verify `staleness_audit` is registered with `advisoryProse: true`.** The test file's own comment (shown in the window) states that `review-task.js`'s `isAdvisoryProseSource()` reads each source's `advisoryProse` flag off the shared registry, and that `task-sources.js` must be required first. The stub-registration block in the test file only covers `observability_review` and `performance_review`. Grep `src/task-sources.js` (or wherever `staleness_audit` is registered) to confirm it carries `advisoryProse: true`. If it does not, the \"exempt\" case will not pass — in that case, either add the flag to the registration or add a stub registration in the test file's existing stub block (mirroring the pattern for `observability_review`/`performance_review`). *Assuming `staleness_audit` is registered in-tree with `advisoryProse: true` — verify by reading `src/task-sources.js` or grepping for `registerTaskSource.*staleness_audit`.*\n\n3. **Add Case A (exempt source — NOT flagged).** Inside or adjacent to the existing `NON_IMPL_PATTERNS` test (near line 1293), add a test case that:\n   - Constructs a task object via the existing `baseTask()` helper (or an inline object) with:\n     - `source: 'staleness_audit'`\n     - `implementResponse`: a prose string that is **< 80 characters** and contains **no code fence** (e.g., `\"This is a false positive; no action needed.\"` — 42 chars, no backticks).\n   - Calls `reviewTask(task)` (or the relevant exported function that invokes the `isNonImplementation` gate at `src/review-task.js:770`).\n   - Asserts the verdict is **NOT** a refusal/auto-reject (i.e., the `isNonImplementation` gate does not fire because `isAdvisoryProseSource('staleness_audit')` returns `true`).\n   - Label the test clearly, e.g., `'NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged'`.\n\n4. **Add Case B (non-exempt source — IS flagged).** In the same test block, add a second case that:\n   - Uses the **same** short prose `implementResponse` (< 80 chars, no code fence).\n   - Sets `source` to a value that is **not** registered with `advisoryProse: true` (e.g., `'trouble_log'`, which is the default in `baseTask()` and is not in the advisoryProse list).\n   - Calls `reviewTask(task)`.\n   - Asserts the verdict **IS** a refusal/auto-reject (the `isNonImplementation` gate fires because the source is not exempt).\n   - Label: `'NON_IMPL gate: non-exempt source short prose IS flagged'`.\n\n5. **Run the test suite.** Execute:\n   ```\n   node --test src/review-task.test.js\n   ```\n   Confirm **zero new failures**. Pre-existing failures (if any) are noted but not introduced by this change. The two new test cases must both pass.\n\n6. **Verify no side effects.** Ensure the new test cases do not mutate shared state (the `baseTask` helper creates a fresh object per call; the registry stubs are idempotent via the `if (!getRegisteredSource(name))` guard). Confirm the test file still passes when run in isolation (no dependency on test ordering).\n\nCRITERIA:\n- `node --test src/review-task.test.js` exits with code 0 (zero failures), and the output includes two new passing test lines matching the labels in steps 3 and 4.\n- `src/review-task.test.js` contains a test case where `task.source === 'staleness_audit'`, `implementResponse.length < 80`, `implementResponse` contains no ` ``` `, and the assertion expects the task to **not** be flagged as non-implementation.\n- `src/review-task.test.js` contains a test case where `task.source` is a non-advisoryProse value (e.g., `'trouble_log'`), `implementResponse` is the same short prose string, and the assertion expects the task to **be** flagged as non-implementation.\n- The two new test cases are located within or immediately adjacent to the existing `NON_IMPL_PATTERNS` test block (within ~20 lines of the original test at ~line 1293), not scattered elsewhere in the file.",
+        "attempts": 2,
+        "grounded": true,
+        "groundingChars": 7611,
+        "anchorPaths": [
+          "src/review-task.test.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "decompose",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 0,
+        "passCount": 0,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-14T21:01:42.656Z"
+    },
+    {
+      "at": "2026-09-14T23:21:16.428Z",
+      "attemptNo": 2,
+      "source": "manual",
+      "localRejectCount": 1,
+      "tiers": [],
+      "outcome": "error",
+      "reason": "Ollama endpoint http://192.168.122.29:11434 is not reachable (ECONNREFUSED: connect ECONNREFUSED 192.168.122.29:11434)",
+      "adhocResolution": "decompose",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 0,
+        "passCount": 0,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-14T23:21:16.456Z"
+    },
+    {
+      "at": "2026-09-15T00:02:08.948Z",
+      "attemptNo": 3,
+      "source": "manual",
+      "localRejectCount": 1,
+      "tiers": [
+        {
+          "tier": "local-agentic-write",
+          "resolution": "implemented",
+          "blocked": false,
+          "responseChars": 1604,
+          "response": "I added the two regression tests immediately after the existing NON_IMPL gate test (anchor at `src/review-task.test.js:339`; new tests at lines 356 and 372): one asserting a `staleness_audit` (advisoryProse-exempt) 44-char no-fence prose draft reaches the mocked vote and is approved (not `deterministic-non-implementation`), and one asserting the same draft from non-exempt source `trouble_log` is flagged — `reviewProvider === 'deterministic-non-implementation'`, verdict `blocked`, stage `review`, matching deterministic-gate reason, zero votes spent. The full suite passes: 74/74, exit 0.\n\nAcceptance:\n1. Suite exits 0 with both named tests passing -- `node --test src/review-task.test.js` -- PASS (`# pass 74 / # fail 0`, `ok 19 - NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged`, `ok 20 - NON_IMPL gate: non-exempt source short prose IS flagged`)\n2. Exempt-source test: `source:'staleness_audit'`, 44-char no-backtick implementResponse, expects not flagged -- `grep -n` shows test at src/review-task.test.js:356 asserting `assert.notEqual(task.reviewProvider, 'deterministic-non-implementation')` -- PASS\n3. Non-exempt test: `source:'trouble_log'`, same prose, expects flagged -- test at src/review-task.test.js:372 asserting `assert.equal(task.reviewProvider, 'deterministic-non-implementation')` + `verdict 'blocked'` -- PASS\n4. Both blocks within 30 lines of the existing NON_IMPL prose test (line 339) -- new tests at lines 356 and 372 (17 and 33 lines below anchor; both tests begin within 30 lines of the anchor test's closing brace) -- PASS\n\nRESOLUTION: implemented",
+          "rawDiffChars": 2865,
+          "rawDiff": "diff --git a/src/review-task.test.js b/src/review-task.test.js\nindex f2b50325e02b9f5aae9bbd1ddc03218e145845b0..707b7f445986717d08e8a62dfa7d29ad3b7cba08 100644\n--- a/src/review-task.test.js\n+++ b/src/review-task.test.js\n@@ -353,6 +353,40 @@ test('a short staleness_audit report is NOT auto-rejected by the deterministic n\n   assert.equal(captured.length, 1, 'a short-but-legitimate advisory report must reach the real reviewer vote, not get auto-rejected before it');\n });\n \n+test('NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged', async () => {\n+  const { repoRoot, domainsPath } = makeFixture();\n+  const task = baseTask({\n+    source: 'staleness_audit',\n+    planResponse: 'QUERY: is this still valid?',\n+    implementResponse: 'This is a false positive; no action needed.', // 44 chars, no code fence -- would trip the <80-char heuristic for a non-exempt source\n+  });\n+  const captured = [];\n+  const result = await reviewTask(task, {\n+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},\n+  });\n+  assert.notEqual(task.reviewProvider, 'deterministic-non-implementation', 'advisoryProse source must be exempt from the deterministic non-implementation gate');\n+  assert.equal(result.verdict, 'approved', 'advisoryProse source must not be auto-rejected for short prose');\n+  assert.equal(captured.length, 1, 'the short advisory prose must reach the real reviewer vote');\n+});\n+\n+test('NON_IMPL gate: non-exempt source short prose IS flagged', async () => {\n+  const { repoRoot, domainsPath } = makeFixture();\n+  const task = baseTask({\n+    source: 'trouble_log', // NOT advisoryProse/emptyApproval -- the gate must fire\n+    planResponse: '1. Add a guard in foo.js.',\n+    implementResponse: 'This is a false positive; no action needed.', // same 44-char, no-code-fence prose as the exempt case above\n+  });\n+  const captured = [];\n+  const result = await reviewTask(task, {\n+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},\n+  });\n+  assert.equal(task.reviewProvider, 'deterministic-non-implementation', 'non-exempt source with <80-char no-code-fence prose must be flagged as non-implementation');\n+  assert.equal(result.verdict, 'blocked', 'non-exempt source SHOULD be auto-blocked for short prose');\n+  assert.equal(result.blockedStage, 'review');\n+  assert.match(result.blockedReason, /Deterministic gate: implementResponse is a bare tool-call request or meta-commentary/);\n+  assert.equal(captured.length, 0, 'no reviewer vote spent on a mechanically-decidable rejection');\n+});\n+\n // Regression, 2026-08-23: caught live -- observabilityReviewImplementPrompt/\n // performanceReviewImplementPrompt (prompts.js) explicitly ask for a short 2-4 sentence\n // prose paragraph on a FALSE POSITIVE/UNCERTAIN verdict, but neither source was in\n",
+          "turnsUsed": 7,
+          "toolCalls": {
+            "total": 8,
+            "byTool": {
+              "grep_codebase": 2,
+              "read_file": 3,
+              "edit_file": 1,
+              "run_bash": 2
+            },
+            "errors": 0,
+            "calls": [
+              {
+                "n": 1,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 259
+              },
+              {
+                "n": 2,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 6899
+              },
+              {
+                "n": 3,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 7511
+              },
+              {
+                "n": 4,
+                "tool": "grep_codebase",
+                "argKeys": [
+                  "query",
+                  "dir"
+                ],
+                "bytes": 848
+              },
+              {
+                "n": 5,
+                "tool": "read_file",
+                "argKeys": [
+                  "path",
+                  "offset",
+                  "limit"
+                ],
+                "bytes": 6225
+              },
+              {
+                "n": 6,
+                "tool": "edit_file",
+                "argKeys": [
+                  "path",
+                  "find",
+                  "replace"
+                ],
+                "bytes": 48
+              },
+              {
+                "n": 7,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 547
+              },
+              {
+                "n": 8,
+                "tool": "run_bash",
+                "argKeys": [
+                  "command"
+                ],
+                "bytes": 1720
+              }
+            ]
+          }
+        }
+      ],
+      "orient": {
+        "skipped": true,
+        "turnsUsed": 0
+      },
+      "plan": {
+        "chars": 5791,
+        "text": "PLAN:\n\n1. **Verify `staleness_audit` carries `advisoryProse: true` in the registry.**\n   Run:\n   ```bash\n   grep -n 'staleness_audit' src/task-sources.js\n   ```\n   Confirm the `registerTaskSource('staleness_audit', { …, advisoryProse: true, … })` call exists (the hub's sibling \"Verify/complete source registration flags\" is marked done, so it should). If it does **not** appear, add a stub registration in the existing stub block in `src/review-task.test.js` (the block at the top that registers `observability_review`/`performance_review` with `advisoryProse: true`), mirroring that pattern:\n   ```js\n   if (!getRegisteredSource('staleness_audit')) {\n     registerTaskSource('staleness_audit', { priority: 80, next: () => null, apply: () => ({ skipped: true }), advisoryProse: true });\n   }\n   ```\n   This is the only fallback; in the expected case the in-tree `task-sources.js` already has it.\n\n2. **Locate the anchor test block.**\n   Open `src/review-task.test.js` and scroll to the test near line 1293 that exercises `NON_IMPL_PATTERNS` (the `<80-char no-code-fence` prose gate). The gate itself is at `src/review-task.js:770`:\n   ```js\n   isNonImplementation = NON_IMPL_PATTERNS.some((pat) => pat.test(trimmedImplResponse));\n   ```\n   and the `<80-char` / no-``` ``` `` heuristic sits just below it (referenced in the comment at `src/review-task.js:115`). The existing test already constructs a task via `baseTask(overrides)` and calls `reviewTask(task)`. The two new cases go **immediately after** that existing test (same `test(` block or a new `test(` block on the next line).\n\n3. **Write the two new test cases (exact code to insert).**\n   Insert the following immediately after the existing `NON_IMPL_PATTERNS` prose test (still within the same `describe`/section, near line 1293+). Use the already-imported `reviewTask` and `baseTask`:\n\n   ```js\n   test('NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged', () => {\n     const task = baseTask({\n       source: 'staleness_audit',\n       implementResponse: 'This is a false positive; no action needed.',\n     });\n     const result = reviewTask(task);\n     assert.equal(result.verdict, 'approved', 'advisoryProse source must not be auto-rejected for short prose');\n   });\n\n   test('NON_IMPL gate: non-exempt source short prose IS flagged', () => {\n     const task = baseTask({\n       source: 'trouble_log',\n       implementResponse: 'This is a false positive; no action needed.',\n     });\n     const result = reviewTask(task);\n     assert.equal(result.verdict, 'rejected', 'non-exempt source SHOULD be auto-rejected for short prose');\n   });\n   ```\n\n   Notes on the code above (verify against the repo before finalising):\n   - `baseTask` (defined in the test file, shown in the window) defaults `source` to `'trouble_log'` and `implementResponse` to a JSON edit-mode string; the overrides here replace both.\n   - The prose string `'This is a false positive; no action needed.'` is 44 characters (< 80) and contains no ` ``` ` fence, satisfying the `<80-char-no-code-fence` heuristic at `src/review-task.js:770`+.\n   - `'trouble_log'` is the `baseTask` default source and is **not** in the advisoryProse registry (it appears nowhere in the stub block or in any grep hit with `advisoryProse`), so it is the correct non-exempt source.\n   - **Assuming** `reviewTask` returns an object with a `.verdict` property of `'approved'` / `'rejected'` — verify by reading `src/review-task.js` around line 770–800 to confirm the exact shape (it may be `result.autoRejected === true` or `result.isNonImplementation === true` instead). Adjust the assertion to match the actual return shape. If the gate sets a boolean flag rather than a verdict string, use e.g. `assert.equal(result.isNonImplementation, false)` / `assert.equal(result.isNonImplementation, true)`.\n\n4. **Run the test suite and confirm zero new failures.**\n   ```bash\n   node --test src/review-task.test.js\n   ```\n   Expected: the two new test names appear in the output with a passing checkmark. Total failures must not exceed the pre-existing failure count (capture the baseline by running the command once **before** inserting the new tests, then again after). If a pre-existing failure exists, note it but do not fix it here.\n\n5. **Confirm no shared-state leakage.**\n   - `baseTask()` creates a fresh object per call (confirmed in the file window: it builds a literal and spreads `overrides`), so the two cases do not mutate each other.\n   - The stub-registration block uses `if (!getRegisteredSource(name))` guards, so re-running the file is idempotent.\n   - Run the file in isolation (no other test files loaded) to confirm no ordering dependency:\n     ```bash\n     node --test src/review-task.test.js 2>&1 | tail -5\n   ```\n\nCRITERIA:\n- `node --test src/review-task.test.js` exits 0 and the output contains two lines matching the test names \"NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged\" and \"NON_IMPL gate: non-exempt source short prose IS flagged\", both marked passing.\n- `src/review-task.test.js` (searchable via `grep -n 'staleness_audit' src/review-task.test.js`) contains a test where `source` is set to `'staleness_audit'`, `implementResponse` is a string of length < 80 with no triple-backtick, and the assertion expects the task to **not** be flagged as non-implementation.\n- `src/review-task.test.js` contains a test where `source` is `'trouble_log'` (or another non-advisoryProse source), `implementResponse` is the same short prose string, and the assertion expects the task **to be** flagged as non-implementation.\n- The two new test blocks are within 30 lines of the existing `NON_IMPL_PATTERNS` prose test (anchor at ~line 1293 in the pre-edit file), not appended to the end of the file or scattered elsewhere.",
+        "attempts": 5,
+        "reRolled": true,
+        "seededFromPrior": true,
+        "grounded": true,
+        "groundingChars": 7611,
+        "anchorPaths": [
+          "src/review-task.test.js"
+        ]
+      },
+      "outcome": "succeeded",
+      "adhocResolution": "implemented",
+      "acceptance": {
+        "criteriaCount": 4,
+        "resultCount": 4,
+        "passCount": 3,
+        "source": "plan-derived"
+      },
+      "finishedAt": "2026-09-15T00:30:56.047Z"
+    }
+  ],
+  "draftFailureCount": 1,
+  "localVerdict": "Confident majority APPROVE (votes: 2/3 real)\n\nAPPROVE: The diff adds both required tests with the exact names, correct sources (`staleness_audit` with `advisoryProse: true` confirmed in registry, `trouble_log` without it), the 44-char no-backtick prose string, and assertions matching the actual `reviewTask` return shape (`verdict: 'blocked'`/`'approved'`, `reviewProvider: 'deterministic-non-implementation'`), and the grounding source confirms the test suite passes 74/74 with exit 0.",
+  "localVotes": [
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds both required tests with the exact names, correct sources (`staleness_audit` with `advisoryProse: true` confirmed in registry, `trouble_log` without it), the 44-char no-backtick prose string, and assertions matching the actual `reviewTask` return shape (`verdict: 'blocked'`/`'approved'`, `reviewProvider: 'deterministic-non-implementation'`), and the grounding source confirms the test suite passes 74/74 with exit 0."
+    },
+    {
+      "verdict": "APPROVE",
+      "response": "APPROVE: The diff adds both required tests with the exact names, correct sources (`staleness_audit` with `advisoryProse: true` confirmed in registry, `trouble_log` without it), the 44-char no-backtick prose string, and assertions matching the actual `reviewTask` return shape (`verdict: 'blocked'`/`'approved'`, `reviewProvider: 'deterministic-non-implementation'`), and the grounding source confirms the test suite passes 74/74 with exit 0."
+    }
+  ],
+  "voteErrors": [],
+  "acceptanceCriteria": [
+    "`node --test src/review-task.test.js` exits 0 and the output contains two lines matching the test names \"NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged\" and \"NON_IMPL gate: non-exempt source short prose IS flagged",
+    "`src/review-task.test.js` (searchable via `grep -n 'staleness_audit' src/review-task.test.js`) contains a test where `source` is set to `'staleness_audit'`, `implementResponse` is a string of length < 80 with no triple-backtick, and the ass",
+    "`src/review-task.test.js` contains a test where `source` is `'trouble_log'` (or another non-advisoryProse source), `implementResponse` is the same short prose string, and the assertion expects the task **to be** flagged as non-implementatio",
+    "The two new test blocks are within 30 lines of the existing `NON_IMPL_PATTERNS` prose test (anchor at ~line 1293 in the pre-edit file), not appended to the end of the file or scattered elsewhere."
+  ],
+  "draftModel": "qwen3.8-p40:27b-q4_K_M",
+  "implementResponse": "I added the two regression tests immediately after the existing NON_IMPL gate test (anchor at `src/review-task.test.js:339`; new tests at lines 356 and 372): one asserting a `staleness_audit` (advisoryProse-exempt) 44-char no-fence prose draft reaches the mocked vote and is approved (not `deterministic-non-implementation`), and one asserting the same draft from non-exempt source `trouble_log` is flagged — `reviewProvider === 'deterministic-non-implementation'`, verdict `blocked`, stage `review`, matching deterministic-gate reason, zero votes spent. The full suite passes: 74/74, exit 0.\n\nAcceptance:\n1. Suite exits 0 with both named tests passing -- `node --test src/review-task.test.js` -- PASS (`# pass 74 / # fail 0`, `ok 19 - NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged`, `ok 20 - NON_IMPL gate: non-exempt source short prose IS flagged`)\n2. Exempt-source test: `source:'staleness_audit'`, 44-char no-backtick implementResponse, expects not flagged -- `grep -n` shows test at src/review-task.test.js:356 asserting `assert.notEqual(task.reviewProvider, 'deterministic-non-implementation')` -- PASS\n3. Non-exempt test: `source:'trouble_log'`, same prose, expects flagged -- test at src/review-task.test.js:372 asserting `assert.equal(task.reviewProvider, 'deterministic-non-implementation')` + `verdict 'blocked'` -- PASS\n4. Both blocks within 30 lines of the existing NON_IMPL prose test (line 339) -- new tests at lines 356 and 372 (17 and 33 lines below anchor; both tests begin within 30 lines of the anchor test's closing brace) -- PASS\n\nRESOLUTION: implemented\n\n=== DIFF ===\ndiff --git a/src/review-task.test.js b/src/review-task.test.js\nindex f2b50325e02b9f5aae9bbd1ddc03218e145845b0..707b7f445986717d08e8a62dfa7d29ad3b7cba08 100644\n--- a/src/review-task.test.js\n+++ b/src/review-task.test.js\n@@ -353,6 +353,40 @@ test('a short staleness_audit report is NOT auto-rejected by the deterministic n\n   assert.equal(captured.length, 1, 'a short-but-legitimate advisory report must reach the real reviewer vote, not get auto-rejected before it');\n });\n \n+test('NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged', async () => {\n+  const { repoRoot, domainsPath } = makeFixture();\n+  const task = baseTask({\n+    source: 'staleness_audit',\n+    planResponse: 'QUERY: is this still valid?',\n+    implementResponse: 'This is a false positive; no action needed.', // 44 chars, no code fence -- would trip the <80-char heuristic for a non-exempt source\n+  });\n+  const captured = [];\n+  const result = await reviewTask(task, {\n+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},\n+  });\n+  assert.notEqual(task.reviewProvider, 'deterministic-non-implementation', 'advisoryProse source must be exempt from the deterministic non-implementation gate');\n+  assert.equal(result.verdict, 'approved', 'advisoryProse source must not be auto-rejected for short prose');\n+  assert.equal(captured.length, 1, 'the short advisory prose must reach the real reviewer vote');\n+});\n+\n+test('NON_IMPL gate: non-exempt source short prose IS flagged', async () => {\n+  const { repoRoot, domainsPath } = makeFixture();\n+  const task = baseTask({\n+    source: 'trouble_log', // NOT advisoryProse/emptyApproval -- the gate must fire\n+    planResponse: '1. Add a guard in foo.js.',\n+    implementResponse: 'This is a false positive; no action needed.', // same 44-char, no-code-fence prose as the exempt case above\n+  });\n+  const captured = [];\n+  const result = await reviewTask(task, {\n+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},\n+  });\n+  assert.equal(task.reviewProvider, 'deterministic-non-implementation', 'non-exempt source with <80-char no-code-fence prose must be flagged as non-implementation');\n+  assert.equal(result.verdict, 'blocked', 'non-exempt source SHOULD be auto-blocked for short prose');\n+  assert.equal(result.blockedStage, 'review');\n+  assert.match(result.blockedReason, /Deterministic gate: implementResponse is a bare tool-call request or meta-commentary/);\n+  assert.equal(captured.length, 0, 'no reviewer vote spent on a mechanically-decidable rejection');\n+});\n+\n // Regression, 2026-08-23: caught live -- observabilityReviewImplementPrompt/\n // performanceReviewImplementPrompt (prompts.js) explicitly ask for a short 2-4 sentence\n // prose paragraph on a FALSE POSITIVE/UNCERTAIN verdict, but neither source was in\n",
+  "planResponse": "PLAN:\n\n1. **Verify `staleness_audit` carries `advisoryProse: true` in the registry.**\n   Run:\n   ```bash\n   grep -n 'staleness_audit' src/task-sources.js\n   ```\n   Confirm the `registerTaskSource('staleness_audit', { …, advisoryProse: true, … })` call exists (the hub's sibling \"Verify/complete source registration flags\" is marked done, so it should). If it does **not** appear, add a stub registration in the existing stub block in `src/review-task.test.js` (the block at the top that registers `observability_review`/`performance_review` with `advisoryProse: true`), mirroring that pattern:\n   ```js\n   if (!getRegisteredSource('staleness_audit')) {\n     registerTaskSource('staleness_audit', { priority: 80, next: () => null, apply: () => ({ skipped: true }), advisoryProse: true });\n   }\n   ```\n   This is the only fallback; in the expected case the in-tree `task-sources.js` already has it.\n\n2. **Locate the anchor test block.**\n   Open `src/review-task.test.js` and scroll to the test near line 1293 that exercises `NON_IMPL_PATTERNS` (the `<80-char no-code-fence` prose gate). The gate itself is at `src/review-task.js:770`:\n   ```js\n   isNonImplementation = NON_IMPL_PATTERNS.some((pat) => pat.test(trimmedImplResponse));\n   ```\n   and the `<80-char` / no-``` ``` `` heuristic sits just below it (referenced in the comment at `src/review-task.js:115`). The existing test already constructs a task via `baseTask(overrides)` and calls `reviewTask(task)`. The two new cases go **immediately after** that existing test (same `test(` block or a new `test(` block on the next line).\n\n3. **Write the two new test cases (exact code to insert).**\n   Insert the following immediately after the existing `NON_IMPL_PATTERNS` prose test (still within the same `describe`/section, near line 1293+). Use the already-imported `reviewTask` and `baseTask`:\n\n   ```js\n   test('NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged', () => {\n     const task = baseTask({\n       source: 'staleness_audit',\n       implementResponse: 'This is a false positive; no action needed.',\n     });\n     const result = reviewTask(task);\n     assert.equal(result.verdict, 'approved', 'advisoryProse source must not be auto-rejected for short prose');\n   });\n\n   test('NON_IMPL gate: non-exempt source short prose IS flagged', () => {\n     const task = baseTask({\n       source: 'trouble_log',\n       implementResponse: 'This is a false positive; no action needed.',\n     });\n     const result = reviewTask(task);\n     assert.equal(result.verdict, 'rejected', 'non-exempt source SHOULD be auto-rejected for short prose');\n   });\n   ```\n\n   Notes on the code above (verify against the repo before finalising):\n   - `baseTask` (defined in the test file, shown in the window) defaults `source` to `'trouble_log'` and `implementResponse` to a JSON edit-mode string; the overrides here replace both.\n   - The prose string `'This is a false positive; no action needed.'` is 44 characters (< 80) and contains no ` ``` ` fence, satisfying the `<80-char-no-code-fence` heuristic at `src/review-task.js:770`+.\n   - `'trouble_log'` is the `baseTask` default source and is **not** in the advisoryProse registry (it appears nowhere in the stub block or in any grep hit with `advisoryProse`), so it is the correct non-exempt source.\n   - **Assuming** `reviewTask` returns an object with a `.verdict` property of `'approved'` / `'rejected'` — verify by reading `src/review-task.js` around line 770–800 to confirm the exact shape (it may be `result.autoRejected === true` or `result.isNonImplementation === true` instead). Adjust the assertion to match the actual return shape. If the gate sets a boolean flag rather than a verdict string, use e.g. `assert.equal(result.isNonImplementation, false)` / `assert.equal(result.isNonImplementation, true)`.\n\n4. **Run the test suite and confirm zero new failures.**\n   ```bash\n   node --test src/review-task.test.js\n   ```\n   Expected: the two new test names appear in the output with a passing checkmark. Total failures must not exceed the pre-existing failure count (capture the baseline by running the command once **before** inserting the new tests, then again after). If a pre-existing failure exists, note it but do not fix it here.\n\n5. **Confirm no shared-state leakage.**\n   - `baseTask()` creates a fresh object per call (confirmed in the file window: it builds a literal and spreads `overrides`), so the two cases do not mutate each other.\n   - The stub-registration block uses `if (!getRegisteredSource(name))` guards, so re-running the file is idempotent.\n   - Run the file in isolation (no other test files loaded) to confirm no ordering dependency:\n     ```bash\n     node --test src/review-task.test.js 2>&1 | tail -5\n   ```\n\nCRITERIA:\n- `node --test src/review-task.test.js` exits 0 and the output contains two lines matching the test names \"NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged\" and \"NON_IMPL gate: non-exempt source short prose IS flagged\", both marked passing.\n- `src/review-task.test.js` (searchable via `grep -n 'staleness_audit' src/review-task.test.js`) contains a test where `source` is set to `'staleness_audit'`, `implementResponse` is a string of length < 80 with no triple-backtick, and the assertion expects the task to **not** be flagged as non-implementation.\n- `src/review-task.test.js` contains a test where `source` is `'trouble_log'` (or another non-advisoryProse source), `implementResponse` is the same short prose string, and the assertion expects the task **to be** flagged as non-implementation.\n- The two new test blocks are within 30 lines of the existing `NON_IMPL_PATTERNS` prose test (anchor at ~line 1293 in the pre-edit file), not appended to the end of the file or scattered elsewhere.",
+  "reviewedAt": "2026-09-15T00:33:20.027Z",
+  "claimedAt": "2026-09-14T20:47:24.944Z"
+}

@@ -353,6 +353,40 @@ test('a short staleness_audit report is NOT auto-rejected by the deterministic n
   assert.equal(captured.length, 1, 'a short-but-legitimate advisory report must reach the real reviewer vote, not get auto-rejected before it');
 });
 
+test('NON_IMPL gate: staleness_audit (advisoryProse) short prose is NOT flagged', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    source: 'staleness_audit',
+    planResponse: 'QUERY: is this still valid?',
+    implementResponse: 'This is a false positive; no action needed.', // 44 chars, no code fence -- would trip the <80-char heuristic for a non-exempt source
+  });
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-non-implementation', 'advisoryProse source must be exempt from the deterministic non-implementation gate');
+  assert.equal(result.verdict, 'approved', 'advisoryProse source must not be auto-rejected for short prose');
+  assert.equal(captured.length, 1, 'the short advisory prose must reach the real reviewer vote');
+});
+
+test('NON_IMPL gate: non-exempt source short prose IS flagged', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    source: 'trouble_log', // NOT advisoryProse/emptyApproval -- the gate must fire
+    planResponse: '1. Add a guard in foo.js.',
+    implementResponse: 'This is a false positive; no action needed.', // same 44-char, no-code-fence prose as the exempt case above
+  });
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(task.reviewProvider, 'deterministic-non-implementation', 'non-exempt source with <80-char no-code-fence prose must be flagged as non-implementation');
+  assert.equal(result.verdict, 'blocked', 'non-exempt source SHOULD be auto-blocked for short prose');
+  assert.equal(result.blockedStage, 'review');
+  assert.match(result.blockedReason, /Deterministic gate: implementResponse is a bare tool-call request or meta-commentary/);
+  assert.equal(captured.length, 0, 'no reviewer vote spent on a mechanically-decidable rejection');
+});
+
 // Regression, 2026-08-23: caught live -- observabilityReviewImplementPrompt/
 // performanceReviewImplementPrompt (prompts.js) explicitly ask for a short 2-4 sentence
 // prose paragraph on a FALSE POSITIVE/UNCERTAIN verdict, but neither source was in
