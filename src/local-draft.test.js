@@ -2429,6 +2429,40 @@ test('draftTask retries the implement call once when a candidate-fulfillment sou
   });
 });
 
+// 2026-09-10, brain-dump bd-1788748625403 ("before spending a second implement attempt
+// on an observability_fix requeue, feed the prior rejection reason"): the correction text
+// built for the inline find-string retry above used to be discarded once that retry
+// succeeded -- if THIS candidate is later rejected by critique/review and
+// reject-retry-check.js redrafts it from scratch, the fresh attempt had no memory of the
+// mistake it already made once. It must survive onto task.priorRejectionFeedback so
+// prompts.js's priorRejectionBlock() folds it into the next attempt as a hard constraint.
+test('draftTask pushes the find-string correction onto task.priorRejectionFeedback so it survives a later full redraft', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'obs-fix-test-feedback', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-1', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'fabricated text not in file', replace: 'x' }), degenerate: null, attempts: 1 };
+      if (callCount === 3) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(task.priorRejectionFeedback.length, 1, 'exactly one correction pushed, for the one inline retry');
+    assert.match(task.priorRejectionFeedback[0], /ALREADY EXISTS in the file's real content|does not appear verbatim/, 'the pushed text is the real find-string correction message');
+  });
+});
+
 // Second Brain [[dspy-refine]] research, 2026-09-08: same diversify-on-retry principle as
 // the plan re-roll above, applied to the implement-retry call site (local-draft.js's own
 // explicitly-named retry path).

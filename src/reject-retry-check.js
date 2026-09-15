@@ -9,11 +9,11 @@
 // 'review' is a permanent dead end on Linux -- confirmed live 2026-08-14: 17 real blocked
 // tasks, zero retries, because nothing was ever wired to look at localRejectCount at all.
 //
-// KNOWN LIMITATION (same as the reference): this is a BLIND retry -- the redraft doesn't
-// see WHY it was rejected beyond priorRejectionFeedback's accumulated reasons (which
-// prompts.js's priorRejectionBlock() DOES already read and fold into the next plan/
-// implement prompt -- no changes needed there, local-draft.js already imports
-// buildPlanPrompt/buildImplementPrompt directly).
+// Not a blind retry: specific rejection reasons (including find-string mismatches, see
+// local-draft.js's finalizeCandidateFulfillment) are carried in
+// task.priorRejectionFeedback and injected into the next plan/implement prompt as a hard
+// constraint via prompts.js's priorRejectionBlock() -- the redraft is told exactly which
+// prior mistakes it must not repeat, not left to guess why it failed.
 //
 // Trimmed to what's actually reachable via task-domains.json on this deployment: the
 // exhaustion-stamping side effect is ported for deep_dive (wired, real coverage file)
