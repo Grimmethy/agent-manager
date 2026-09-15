@@ -656,6 +656,18 @@ specifically needs 35B's larger capability and the much slower generation is acc
   (`ollama stop ornith:9b` / `ollama stop ornith:35b`) before loading the other —
   `OLLAMA_MAX_LOADED_MODELS:0` means the server only keeps one resident, so calls to the two
   tiers interleaved will cause repeated swap-load thrashing, not a crash, but very slow.
+- **Two separate concurrency knobs, easy to conflate** (brain-dump bd-1788737232941):
+  `OLLAMA_MAX_LOADED_MODELS` caps how many *distinct* models can be resident in VRAM at
+  once (default: 3x GPU count) — the knob above. `OLLAMA_NUM_PARALLEL` is a different
+  lever entirely: it caps how many concurrent *requests* a single already-loaded model
+  will batch-process together (default auto-selects 4 or 1 based on available memory).
+  For running several agents against ONE cheap model (e.g. `qwen2.5-coder:3b`), raising
+  `OLLAMA_NUM_PARALLEL` is likely the higher-leverage knob — a small model's VRAM
+  footprint is small enough that several parallel requests to it can fit comfortably
+  where even two 27B-class models could not coexist at all via `OLLAMA_MAX_LOADED_MODELS`
+  alone. Neither knob is currently set in `scripts/agent-manager-common.sh`, and there is
+  no automated check yet confirming a given `OLLAMA_NUM_PARALLEL` value is actually in
+  effect — this is a real lever worth validating, not something already wired in.
 - **9B tier via Vulkan fits entirely in VRAM** (33/33 layers offloaded, confirmed live in
   `server.log`) — this is why it's standard again: full GPU offload beats a mostly-CPU 35B on
   this hardware for most tasks. Only reach for 35B when a task's reasoning/context needs
