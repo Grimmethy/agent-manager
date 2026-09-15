@@ -348,12 +348,24 @@ function preFilterFlagsBlock(task) {
 function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } = {}) {
   const ctx = task.promptContext || {};
   const leaf = leafDecomposeLocked(task);
-  const stillLostAdvice = leaf
-    ? `If you are still lost about where to make the change after ${orientTurnLimit} turns, answer RESOLUTION: needs-human-decision AND name the one concrete fact you are missing -- do not keep grepping, and do NOT answer RESOLUTION: decompose.`
-    : `If you are still lost about where to make the change after ${orientTurnLimit} turns, that is a signal to answer RESOLUTION: decompose or RESOLUTION: needs-human-decision, not to keep grepping.`;
-  const tooLargeClause = leaf
-    ? 'This task has already been scoped by a prior decompose pass to be implementable in ONE pass. If you genuinely cannot, answer RESOLUTION: needs-human-decision with the specific blocker -- do not answer RESOLUTION: decompose and do not leave a partial edit.'
-    : 'If the task is simply TOO LARGE to implement confidently in one pass (many files/subsystems, or you can tell you would run out of turns partway through), do NOT attempt a partial implementation and do NOT make any code changes. Instead split it into 2-6 smaller, independently-implementable pieces that together cover the original task. Each piece should touch ONE file; strongly prefer a NEW self-contained file/module over pieces that need edits scattered through a large existing file.';
+  // decomposeDirective (2026-09-10, agentic-draft-common.js's resolveAgenticDraft): the
+  // PRIOR pass on this same task was a bare no-changes-needed refusal with no real "already
+  // covered" evidence -- a signal the ask is too broad for one implement pass (a "build a
+  // whole feature" request), not that it is genuinely already done. Re-issuing the same
+  // free-form prompt just produces the same refusal again (the original decompose-loop
+  // incident this hub exists to fix). Force RESOLUTION: decompose on this re-issue instead
+  // of repeating the standard advice -- takes priority over the leaf/non-leaf split above
+  // since a leaf that hit this branch was wrongly scoped as atomic in the first place.
+  const stillLostAdvice = task.decomposeDirective
+    ? 'Answer RESOLUTION: decompose with a JSON array of 2-6 {title, rawText} sub-tasks that together cover the feature.'
+    : leaf
+      ? `If you are still lost about where to make the change after ${orientTurnLimit} turns, answer RESOLUTION: needs-human-decision AND name the one concrete fact you are missing -- do not keep grepping, and do NOT answer RESOLUTION: decompose.`
+      : `If you are still lost about where to make the change after ${orientTurnLimit} turns, that is a signal to answer RESOLUTION: decompose or RESOLUTION: needs-human-decision, not to keep grepping.`;
+  const tooLargeClause = task.decomposeDirective
+    ? 'The prior pass on this task was a rejected refusal / no-changes-needed claim: the ask is too broad for one implement pass. Do NOT attempt a full implementation in this pass and do NOT make any code changes. This pass MUST answer RESOLUTION: decompose with a JSON array of 2-6 {title, rawText} sub-tasks covering the feature.'
+    : leaf
+      ? 'This task has already been scoped by a prior decompose pass to be implementable in ONE pass. If you genuinely cannot, answer RESOLUTION: needs-human-decision with the specific blocker -- do not answer RESOLUTION: decompose and do not leave a partial edit.'
+      : 'If the task is simply TOO LARGE to implement confidently in one pass (many files/subsystems, or you can tell you would run out of turns partway through), do NOT attempt a partial implementation and do NOT make any code changes. Instead split it into 2-6 smaller, independently-implementable pieces that together cover the original task. Each piece should touch ONE file; strongly prefer a NEW self-contained file/module over pieces that need edits scattered through a large existing file.';
   return [
     'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
     'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Prefer read_file with offset/limit to page a large file and grep_codebase to locate code; a quick `run_bash` `sed -n \'3600,3700p\' path` slice is fine for a fast look, just do not burn turns re-listing the tree. Reserve run_bash otherwise for the final targeted check on files you actually changed.',
