@@ -40,15 +40,54 @@ function parseCriteriaBlock(planText) {
   return normalizeList(out);
 }
 
+// File-path-shaped tokens found anywhere in a task's own edit-instruction prose (not
+// just a structured "Files:" line, which most adhoc tasks don't have) -- deliberately
+// broader-recall than adhoc-diff-sanity.js's extractDeclaredTargets, which only scans
+// the TITLE for this purpose. Sentence-scoped and restriction-aware for the same reason:
+// a file named only inside a "do not touch X" clause is not a declared edit target.
+const FILE_TOKEN_RE = /\b(?:src|python|scripts|lib|tests?|docs)\/[\w./@-]*[\w]|\b[\w-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b/gi;
+const RESTRICTION_SENTENCE_RE = /\b(?:do ?n(?:'?o?)?t|don['’]t|never|must not|no other|nothing (?:else |but )?(?:in|under)|not (?:touch|modif|chang|edit))\b.*?\b(?:touch\w*|modif\w+|chang\w+|edit\w+|alter\w+|updat\w+|delet\w+|writ\w+ (?:to|into))\b|\b(?:never|does ?n(?:'?o)?t) (?:touch\w*|modif\w+)\b/i;
+
+function declaredEditFiles(rawText) {
+  const out = new Set();
+  for (const sentence of String(rawText || '').split(/(?<=[.!?:;])\s+|\n+/)) {
+    if (RESTRICTION_SENTENCE_RE.test(sentence)) continue;
+    for (const m of sentence.matchAll(FILE_TOKEN_RE)) out.add(m[0].replace(/^\.\//, ''));
+  }
+  return [...out];
+}
+
+// dropSingleFileScopeContradictions (2026-09-15) -- the plan pass writes its own
+// CRITERIA: bullets (prompts.js's "definition of done" instruction) with no visibility
+// into whether the SAME task also names a second file elsewhere in its own prose. Root-
+// caused live on adhoc-add-getsecondbraindir-and-requiresecondbraindir-helpers-to-
+// config-js-with-tests: the task's rawText explicitly says "In src/config.test.js ...
+// add tests", but the plan model still wrote a criterion asserting the diff touches only
+// src/config.js -- burning 6 draft attempts across 3 needs-clarification-triage retries
+// before a human caught the contradiction, because every fresh plan re-derived the same
+// self-defeating criterion. A criterion cannot legitimately restrict the diff to fewer
+// files than the task's OWN prose already commits it to touching -- so when the task
+// names >= 2 distinct edit-target files, any criterion that reads as a single-file-only
+// scope restriction is dropped before implement/review ever see it, rather than letting
+// the contradiction get rediscovered the expensive way on every retry.
+const SINGLE_FILE_SCOPE_RE = /\bonly\b[^.]*\b(?:file|modif|touch|chang)|\bno other files?\b|\bexclusively\b[^.]*\b(?:file|modif|touch|chang)|\bmust not (?:be modified|appear|change)\b/i;
+
+function dropSingleFileScopeContradictions(task, criteria) {
+  const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
+  const files = declaredEditFiles(rawText);
+  if (files.length < 2) return criteria; // no multi-file scope to contradict
+  return criteria.filter((c) => !SINGLE_FILE_SCOPE_RE.test(c));
+}
+
 // task -> { criteria: string[], source: 'promptContext' | 'plan-derived' | null }
 function resolveAcceptanceCriteria(task) {
   const pc = (task && task.promptContext) || {};
   if (pc.acceptanceCriteria != null) {
     const criteria = normalizeList(pc.acceptanceCriteria);
-    if (criteria.length) return { criteria, source: 'promptContext' };
+    if (criteria.length) return { criteria: dropSingleFileScopeContradictions(task, criteria), source: 'promptContext' };
   }
   const fromPlan = parseCriteriaBlock(task && (task.planResponse || task.lastGoodPlan));
-  if (fromPlan.length) return { criteria: fromPlan, source: 'plan-derived' };
+  if (fromPlan.length) return { criteria: dropSingleFileScopeContradictions(task, fromPlan), source: 'plan-derived' };
   return { criteria: [], source: null };
 }
 
@@ -146,4 +185,4 @@ function detectContradictoryLiteralAcceptance(task) {
   };
 }
 
-module.exports = { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, normalizeList, MAX_CRITERIA, detectContradictoryLiteralAcceptance };
+module.exports = { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, normalizeList, MAX_CRITERIA, detectContradictoryLiteralAcceptance, declaredEditFiles, dropSingleFileScopeContradictions };

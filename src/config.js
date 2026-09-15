@@ -129,7 +129,7 @@ function getConfig() {
   // before -- unset, this defaults to `repoRoot` so nothing changes for a deployment
   // that hasn't set up a dedicated apply worktree.
   const applyRepoRoot = process.env.AGENT_MANAGER_APPLY_REPO_ROOT || repoRoot;
-  const secondBrainDir = process.env.SECOND_BRAIN_DIR || null;
+  const secondBrainDir = getSecondBrainDir();
   const grepAllowedDirs = (process.env.AGENT_MANAGER_GREP_DIRS || 'frontend/src,backend/src')
     .split(',')
     .map((s) => s.trim())
@@ -440,4 +440,11 @@ function ensureRegistered() {
   }
 }
 
-module.exports = { getConfig, ensureRegistered, resolveGraphPath, resolveCommunityCoveragePath };
+function getSecondBrainDir() { return process.env.SECOND_BRAIN_DIR || null; }
+function requireSecondBrainDir() {
+  const d = getSecondBrainDir();
+  if (!d) throw new Error('SECOND_BRAIN_DIR is not set. Export SECOND_BRAIN_DIR=<path> before running this command.');
+  return d;
+}
+
+module.exports = { getConfig, ensureRegistered, resolveGraphPath, resolveCommunityCoveragePath, getSecondBrainDir, requireSecondBrainDir };
