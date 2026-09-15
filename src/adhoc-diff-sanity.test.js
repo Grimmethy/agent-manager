@@ -117,6 +117,22 @@ test('forbidden-path: extractForbiddenPaths pulls src/ and a named file from rea
   assert.ok(f.some((x) => x.startsWith('src/apply-adhoc-diff')));
 });
 
+test('forbidden-path: a "do NOT touch X" clause naming a specific src/ file does not forbid all of src/ (live regression)', () => {
+  // Root-caused live 2026-09-15: adhoc-add-missing-code-diff-deterministic-gate-to-src-
+  // review-task-js-1788851012066-0's own task text -- "Do NOT touch the two existing
+  // 'skipped-advisory-prose' occurrences in src/local-draft.js:1292 and
+  // src/local-draft.test.js:2143" -- was misread as forbidding the ENTIRE src/ directory
+  // (the sentence's own "in src/local-draft.js" matched the same regex meant for "anything
+  // under the src directory"), rejecting the task's own primary edit target
+  // (src/review-task.js) 3 times running.
+  const txt = 'In src/review-task.js, add a gate. Do NOT touch the two existing occurrences in '
+    + 'src/local-draft.js:1292 and src/local-draft.test.js:2143.';
+  const f = extractForbiddenPaths(txt);
+  assert.ok(!f.includes('src/'), `expected src/ NOT to be forbidden, got ${JSON.stringify(f)}`);
+  assert.ok(f.some((x) => x.startsWith('src/local-draft.js')));
+  assert.ok(f.some((x) => x.startsWith('src/local-draft.test.js')));
+});
+
 test('forbidden-path: a diff touching an explicitly off-limits dir is flagged', () => {
   const t = adhoc('Reorganize the Job List tab in python/dashboard/templates/index.html. Do NOT modify anything under src/.');
   const p = adhocDiffSubstanceProblem(t, editDiff('src/adhoc-harness-draft.js'));

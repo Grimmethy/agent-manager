@@ -115,9 +115,23 @@ function extractForbiddenPaths(text) {
     if (!RESTRICTION_SENTENCE_RE.test(sen)) continue;
     for (const p of sen.matchAll(/\b(?:src|python|scripts|lib|tests?|docs|node_modules)\/[\w./@-]*[\w]/gi)) add(p[0]);
     for (const p of sen.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b/gi)) add(p[0]);
-    for (const p of sen.matchAll(/(?:anything|everything|any(?: of the)? files?)?\s*(?:under|inside|within|in)\s+(?:the\s+)?["'`]?(src|python|scripts|lib|tests?|docs)["'`]?(?:\s+(?:dir\w*|folder|tree|directory))?/gi)) add(p[1]);
+    // (?!\/[A-Za-z0-9_-]) after the capture group (2026-09-15, root-caused live): without
+    // it, "...the occurrences in src/local-draft.js..." matches "in " + "src" here just as
+    // readily as an actual directory-scope restriction like "anything under the src
+    // directory" -- both look identical to this regex up through the bare keyword. The
+    // lookahead blocks exactly the case where what follows is a real path segment
+    // ("src/whatever", which this line's OWN sibling regex above already extracts
+    // correctly as its own specific forbidden path), while still matching a bare trailing
+    // reference like "anything under src/" or "this task never touches src/" (nothing
+    // path-like immediately after the slash, or no slash at all).
+    for (const p of sen.matchAll(/(?:anything|everything|any(?: of the)? files?)?\s*(?:under|inside|within|in)\s+(?:the\s+)?["'`]?(src|python|scripts|lib|tests?|docs)(?!\/[A-Za-z0-9_-])["'`]?(?:\s+(?:dir\w*|folder|tree|directory))?/gi)) add(p[1]);
     if (/\b(?:under|anything|everything|whole|entire|any (?:file|change) (?:in|under))\b/i.test(sen)) {
-      for (const p of sen.matchAll(/\b(src|python|scripts|lib)\b/gi)) add(p[1]);
+      // Same reasoning as the loop above -- a restriction sentence can trip this
+      // trigger-word check (e.g. its own "anything under...") while ALSO citing an
+      // unrelated specific path elsewhere in the same sentence; without the lookahead,
+      // "src/some-file.js" mentioned anywhere in such a sentence would wrongly add bare
+      // "src" as forbidden too.
+      for (const p of sen.matchAll(/\b(src|python|scripts|lib)(?!\/[A-Za-z0-9_-])\b/gi)) add(p[1]);
     }
   }
   return [...out];
