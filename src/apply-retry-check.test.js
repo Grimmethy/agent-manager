@@ -78,6 +78,26 @@ test('applyRetryCheck leaves a non-JSON/unreadable file alone and counts it as a
 
   assert.equal(summary.errors, 1);
   assert.ok(fs.existsSync(path.join(blockedDir, 'broken.json')));
+  // A JSON.parse failure is a 'parse' error, not a 'write' one -- see the fix's own
+  // header comment on `step` for why this distinction was wrong before.
+  assert.equal(summary.errorDetails[0].step, 'parse');
+});
+
+test('applyRetryCheck reports step "record" (not "write") when recordModelOutcome itself throws', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', { applyRetryCount: 0 });
+
+  const summary = applyRetryCheck({
+    blockedDir, pendingDir,
+    recordModelOutcome: () => { throw new Error('model-stats db is locked'); },
+  });
+
+  assert.equal(summary.errors, 1);
+  assert.equal(summary.errorDetails[0].step, 'record');
+  assert.match(summary.errorDetails[0].message, /model-stats db is locked/);
+  // Nothing should have moved -- the requeue write never happened.
+  assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')));
+  assert.ok(!fs.existsSync(path.join(pendingDir, 'task-1.json')));
 });
 
 test('applyRetryCheck returns an all-zero summary when queue/blocked/ does not exist at all', () => {
