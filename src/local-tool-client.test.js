@@ -669,6 +669,7 @@ test('runPlanWithTools with forceSummaryOnCap spends one extra no-tools turn for
   await withMockedChat([toolTurn, toolTurn, summaryTurn], async (mod, _dir, { sentBodies }) => {
     const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 2, forceSummaryOnCap: true });
     assert.equal(result.forcedSummary, true);
+    assert.equal(result.forcedSummaryReason, 'turns', 'a real cap-hit-while-still-calling-tools case, distinct from a voluntary stop');
     assert.equal(result.turnsUsed, 3, 'the forced summary turn counts');
     assert.match(result.response, /RESOLUTION: needs-human-decision/);
     // the extra turn asked the model to stop and offered no tools
@@ -698,10 +699,14 @@ test('runPlanWithTools with forceSummaryOnCap adds a turn when the model STOPS E
     // cap is 10 but the model quits after turn 2 -- the forced turn still fires
     const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 10, forceSummaryOnCap: true });
     assert.equal(result.forcedSummary, true);
+    assert.equal(result.forcedSummaryReason, 'voluntary-stop', 'the model stopped on its own with turns to spare -- NOT a turns-cap hit');
     assert.equal(result.turnsUsed, 3, 'the early stop (2) plus the forced summary turn');
     assert.match(result.response, /RESOLUTION: needs-human-decision/);
     const last = sentBodies[sentBodies.length - 1];
     assert.deepEqual(last.tools, []);
+    // must NOT claim the model was out of turns -- it wasn't, it just omitted the sentinel
+    assert.doesNotMatch(last.messages[last.messages.length - 1].content, /out of turns/i);
+    assert.match(last.messages[last.messages.length - 1].content, /RESOLUTION/);
   });
 });
 
