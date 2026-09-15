@@ -60,3 +60,9 @@ runs/
 .agent-manager-chat-sessions.json
 dashboard-settings.json
 vendor/tokenfold/core/build/
+# Runtime log reclaim-orphaned-drafts.js appends to at pipelineDir root (2026-09-15,
+# found live during a GitHub-vs-local sync check) -- same class of leak
+# pipeline-state-gitignored.test.js's invariant exists to catch generally, missed here
+# since this path is a hardcoded literal in reclaim-orphaned-drafts.js, not exposed via
+# getConfig() the way that test's own coverage walks.
+reclaim-log.jsonl
