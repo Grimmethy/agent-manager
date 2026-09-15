@@ -2,7 +2,15 @@ async function renderBranchesTab() {
   const main = document.getElementById('main');
   let branches;
   try {
-    branches = await fetchJson('/api/git/unmerged-branches');
+    // list_unmerged_branches(force=True) shells out to git per branch (fetch, 2x
+    // rev-list, a merge-tree conflict preview, label/hub lookups) -- cost scales with
+    // how many agent/* branches are currently unmerged. The default 8s client timeout
+    // (sized for ordinary single-request routes) was already being blown past with as
+    // few as 17 branches (measured 9.27s live), so this tab reliably rendered "timed
+    // out after 8s" instead of the list. 30s matches the server's own per-subprocess
+    // timeout (_run_git/_check_merge_conflict both use 30s) as the floor for how long a
+    // single one of those git calls is allowed to legitimately take.
+    branches = await fetchJson('/api/git/unmerged-branches', { timeoutMs: 30000 });
   } catch (e) {
     main.innerHTML = `<div class="empty">Error loading branches: ${escapeHtml(e.message)}</div>`;
     return;
@@ -160,7 +168,10 @@ async function renderBranchDetailModal(b) {
   backdrop.classList.add('open');
   let data;
   try {
-    data = await fetchJson(`/api/git/branches/${encodeURIComponent(b.branch)}/commits`);
+    // Same reasoning as renderBranchesTab's own fetchJson call above -- this hits
+    // list_unmerged_branches(force=False) too (to resolve the hub), so it can be slow
+    // for the same reason on a cold cache.
+    data = await fetchJson(`/api/git/branches/${encodeURIComponent(b.branch)}/commits`, { timeoutMs: 30000 });
   } catch (e) {
     content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2><div class="meta" style="color:var(--bad)">Error loading history: ${escapeHtml(e.message)}</div>`;
     return;
