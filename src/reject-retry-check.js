@@ -450,6 +450,20 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // blind-redraft budget on it (its own MAX_AGENTIC_CONTINUATIONS cap bounds it).
       if (!isContinuation) task.localRejectCount = retryCount + 1;
 
+      // AC-131 (2026-09-15): a genuine review-stage rejection requeues with its prior
+      // planResponse/implementResponse still intact -- the NEXT draftTask() run can then
+      // treat the task as already-planned and skip or no-op the plan pass, producing the
+      // "Plan pass degenerate: empty" failure seen in AC-128. Unlike the
+      // retryableDraftBlock branches above (continuation, decompose-rescope, etc., which
+      // deliberately need the prior state to build on), a real review rejection means the
+      // draft itself was judged wrong -- the next pass should plan and implement fresh,
+      // informed by priorRejectionFeedback (kept), not carry the rejected draft forward.
+      if (isReviewRejection(task)) {
+        delete task.planResponse;
+        delete task.implementResponse;
+        appendHistoryEvent(task, 'requeued', 'review rejection -- cleared stale plan/implement state for fresh redraft');
+      }
+
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
       appendHistoryEvent(task, 'requeued', task.blockedReason || undefined);
 
