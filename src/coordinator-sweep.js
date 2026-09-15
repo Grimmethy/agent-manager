@@ -119,20 +119,24 @@ function classifyChildStatus(rec) {
   const state = rec.state;
   const task = rec.task || {};
   const merged = task.mergedAt;
-  if (state === 'done') return merged ? 'merged' : 'done';
-  if (state === 'archived') {
-    // done-archive.js's monthly housekeeping moves EVERY done/ task into a dated bucket
-    // once it ages out, regardless of how it actually closed -- merged, abandoned,
-    // dismissed, noop, filed. "archived == shipped" was only ever true for the common
-    // case; a task whose terminalDisposition says otherwise must report that real
-    // status, not a manufactured 'merged' (caught live: a sub-task record aged into
-    // done/_archived/<month>/ with terminalDisposition:'abandoned' -- its branch was
-    // deleted before merge -- kept reporting 'merged' forever, so the hub sat at
-    // "2/3 done" while one of those two was actually dead work needing a redo).
-    if (merged) return 'merged';
+  if (state === 'done' || state === 'archived') {
+    // terminalDisposition wins whenever it is explicitly set to something other than
+    // 'merged' -- it is the later, authoritative correction (a human or the reconcile
+    // sweep discovering the branch was actually deleted before merge, dismissed, etc.),
+    // while mergedAt is just a timestamp stamped once and easy to leave stale behind it.
+    // 2026-09-14, hand-corrected live 3 separate times this session: a manual disposition
+    // correction away from 'merged' did not always also clear mergedAt/mergeCommit on the
+    // SAME record, and checking mergedAt truthiness first (the previous behavior here)
+    // kept reporting 'merged' on the parent's checklist forever regardless of what
+    // terminalDisposition said. One shared rule now covers both 'done' and 'archived':
+    // a done-archive.js month-bucket move is unconditional housekeeping ("archived ==
+    // shipped" was only ever true for the common case) and a plain 'done' record can
+    // carry the exact same stale-mergedAt shape, so there is no reason for the two
+    // states to disagree on precedence.
     const disp = task.terminalDisposition;
     if (disp && disp !== 'merged') return disp;
-    return 'merged'; // no disposition recorded (pre-terminalDisposition-tracking record) -- fall back to the old default
+    if (merged) return 'merged';
+    return state === 'done' ? 'done' : 'merged'; // 'archived' + no disposition (pre-terminalDisposition-tracking record) falls back to the old default
   }
   if (state === 'archived_no_action') return 'abandoned';
   if (state === 'blocked' || state === 'needs-clarification' || state === 'awaiting-confirm') return state;
