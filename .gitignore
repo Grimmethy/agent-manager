@@ -66,3 +66,15 @@ vendor/tokenfold/core/build/
 # since this path is a hardcoded literal in reclaim-orphaned-drafts.js, not exposed via
 # getConfig() the way that test's own coverage walks.
 reclaim-log.jsonl
+# task-logs/<id>.json (src/task-log-store.js) was previously deliberately git-tracked and
+# committed alongside every applied task's real change, as a durable snapshot surviving
+# queue/ archival -- see that module's own header. RE-EVALUATED 2026-09-15, Grimmethy:
+# this repo is PUBLIC on GitHub, and task-logs/ retains a task's full promptContext.rawText
+# / implementResponse / planResponse verbatim -- for a brain_dump-derived task that is the
+# user's own free-typed personal/business note text (confirmed live: 13 of 48 already-
+# committed task-logs/ entries originate from brain-dump entries, the same free-text
+# source a captured note with a private Google Sheets link was sitting in). No amount of
+# redacting individual fields is as safe as simply not tracking this directory at all --
+# still written locally (apply-task.js/task-log-store.js unchanged otherwise) for the
+# user's own reference, just never staged/committed/pushed.
+task-logs/

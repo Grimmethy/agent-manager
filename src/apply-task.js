@@ -20,7 +20,7 @@ const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { isNoopApplyDetail } = require('./task-disposition.js');
-const { writeTaskLogFile, taskLogRelPath } = require('./task-log-store.js');
+const { writeTaskLogFile } = require('./task-log-store.js');
 const { requeueBlockedTasksForSignature } = require('./blocked-drain.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
@@ -362,19 +362,22 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     const filesToAdd = artifact.files || [artifact.file];
     assertStageableFiles(task, filesToAdd);
 
-    // The durable task log: a git-tracked snapshot of task.history (+ a few terminal
-    // fields) staged and committed in the SAME commit as the real change, named in the
-    // trailer below. See task-log-store.js's header for why this can't just be the
-    // queue/ file the rest of apply-task.js already works with.
-    const taskLogRel = writeTaskLogFile(repoRoot, task);
-    gitRunner.add([...filesToAdd, taskLogRel]);
+    // The durable task log: a curated snapshot of task.history (+ a few terminal fields),
+    // written to task-logs/<id>.json for the user's own local reference -- see
+    // task-log-store.js's header for why this can't just be the queue/ file the rest of
+    // apply-task.js already works with. RE-EVALUATED 2026-09-15 (see .gitignore's own
+    // comment on task-logs/): this repo is public, and the log retains a task's full
+    // rawText/implementResponse/planResponse verbatim, which for a brain_dump-derived
+    // task is the user's own free-typed personal/business note content -- no longer
+    // staged/committed/pushed, written to disk only.
+    writeTaskLogFile(repoRoot, task);
+    gitRunner.add(filesToAdd);
 
     const msgPath = path.join(require('os').tmpdir(), `apply-commit-msg-${task.id}.txt`);
     const commitMessage = [
       task.title,
       '',
       `Task: ${task.id} (${task.domain}/${task.source})`,
-      `Task-Log: ${taskLogRel}`,
       '',
       coAuthorTrailer(task),
     ].join('\n');

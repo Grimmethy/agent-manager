@@ -1,12 +1,19 @@
-"""Tests that /api/git/branches/<branch>/merge closes out the GIT-TRACKED task log
+"""Tests that /api/git/branches/<branch>/merge closes out the LOCAL task log
 (task-logs/<id>.json, see src/task-log-store.js) with a `merged` history event and
 terminalDisposition, not just the queue/ working-copy JSON it already updated -- see
-api_git_merge_branch's own comment. This is the other half of the durable-task-log
-mechanism (2026-09-12, Grimmethy: "the final unmerged branches version should just be the
-whole task log, completed... it should arguably have more information than an in-process
-task"): task-logs/<id>.json is committed by apply-task.js when the task ships, so it
+api_git_merge_branch's own comment. task-logs/<id>.json is a durable local snapshot that
 survives archival of queue/done/*.json, and this endpoint is the one place it can record
 that the branch actually landed.
+
+RE-EVALUATED 2026-09-15 (Grimmethy, task-log-store.js's own header): task-logs/ used to be
+git-tracked and pushed; it is now gitignored, since it retains a task's full rawText/
+implementResponse/planResponse verbatim, and for a brain_dump-derived task that is the
+user's own free-typed personal/business note content on a PUBLIC repo. This endpoint's
+merge-disposition update is now local-only -- it no longer commits or pushes
+task-logs/<id>.json. The second test below covers a branch whose task-logs file was
+already committed to history before this change (a realistic pre-existing-repo shape):
+the LOCAL file still gets the merged disposition, but that update is confirmed to never
+reach the remote.
 
 Uses the same real bare-origin + clone fixture as test_git_discard_branch.py, since
 list_unmerged_branches/merge both do real subprocess git calls, not mocked output.
@@ -84,7 +91,7 @@ class TestMergeClosesTaskLog(unittest.TestCase):
             mock.patch.object(app, "queue_dir", return_value=repo_root / "queue"),
         ]
 
-    def test_merge_appends_a_merged_event_to_the_tracked_task_log_and_pushes_it(self):
+    def test_merge_appends_a_merged_event_to_the_local_task_log_but_never_pushes_it(self):
         task_id = "observability-fix-ac-merge-test-1"
         repo, bare = make_repo_with_task_log_branch(f"agent/{task_id}", task_id)
         patches = self._patches(repo)
@@ -104,12 +111,19 @@ class TestMergeClosesTaskLog(unittest.TestCase):
             self.assertEqual(log_data["history"][0]["stage"], "created")
             self.assertEqual(log_data["history"][1]["stage"], "applied")
 
-            # The finalized log must actually be pushed to origin -- "available at a
-            # click, ever" means reachable from a fresh clone, not just this checkout.
+            # task-logs/ is gitignored now -- the merge-disposition update above must stay
+            # purely local, never committed or pushed. The real `git merge` step (this
+            # endpoint's core job, unaffected by the gitignore change) still carries the
+            # branch's OWN pre-existing task-logs/<id>.json commit into main (this
+            # fixture's own setup, simulating a pre-gitignore repo's history) -- so a fresh
+            # clone DOES have a file there, but with the ORIGINAL, pre-merge content: no
+            # 'merged' disposition, proving the follow-up local-only update never reached
+            # the remote.
             clone2 = repo.parent / "clone2"
             _git(["clone", str(bare), str(clone2)], cwd=repo.parent)
             remote_log = json.loads((clone2 / "task-logs" / f"{task_id}.json").read_text())
-            self.assertEqual(remote_log["terminalDisposition"], "merged")
+            self.assertNotEqual(remote_log.get("terminalDisposition"), "merged")
+            self.assertEqual(remote_log["history"][-1]["stage"], "applied")
         finally:
             for p in patches:
                 p.stop()
