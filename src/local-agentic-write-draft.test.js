@@ -337,6 +337,40 @@ test('write tier: a confirmed-atomic leaf (decomposedFrom) is told NOT to decomp
   });
 });
 
+// 2026-09-10, brain-dump bd-1788725105579 ("route broad 'build a whole feature' asks to
+// decompose on the FIRST implement pass"): resolveAgenticDraft (agentic-draft-common.js)
+// stamps task.decomposeDirective=true when a re-issued task's PRIOR pass was a bare
+// no-changes-needed refusal with no real "already covered" evidence -- a broad ask that
+// looks done on the surface but isn't, not something to keep re-litigating with the same
+// free-form prompt. This pass must be forced straight to RESOLUTION: decompose instead of
+// repeating the standard leaf/non-leaf advice (which, before this fix, just produced the
+// same refusal again -- the original decompose-loop incident this hub exists to close).
+test('write tier: decomposeDirective forces RESOLUTION: decompose and suppresses the normal leaf/non-leaf advice', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const directed = buildWriteAgenticPrompt({
+      title: 'Build a mobile app with a radar chart and note-graph',
+      promptContext: { rawText: 'build the whole feature' },
+      decomposeDirective: true,
+    });
+    assert.match(directed, /RESOLUTION: decompose with a JSON array of 2-6 \{title, rawText\} sub-tasks/);
+    assert.match(directed, /Do NOT attempt a full implementation in this pass/);
+    assert.doesNotMatch(directed, /still lost about where to make the change/);
+    assert.doesNotMatch(directed, /TOO LARGE to implement confidently/);
+
+    // decomposeDirective only ever coexists with a non-leaf task (resolveAgenticDraft only
+    // stamps it when NOT decomposedFrom/rescopedFromDecompose) -- but assert the directive
+    // wins even if a caller somehow set both, since a stale refusal signal must never be
+    // silently dropped.
+    const both = buildWriteAgenticPrompt({
+      title: 'T',
+      promptContext: { rawText: 'add one route', decomposedFrom: 'parent-123' },
+      decomposeDirective: true,
+    });
+    assert.match(both, /RESOLUTION: decompose with a JSON array of 2-6 \{title, rawText\} sub-tasks/);
+  });
+});
+
 // 2026-09-02: a leaf is only decompose-LOCKED while it is fresh. Once it has demonstrably
 // blown a whole turn budget (turnBudgetExhaustedBefore) or already been auto-split once
 // (autoDecomposeCount), it may choose RESOLUTION: decompose again -- the MAX_AUTO_DECOMPOSE
