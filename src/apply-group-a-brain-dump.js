@@ -136,6 +136,35 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
 
   const trackedLabels = readProjectRegistry().map((p) => p.label).filter(Boolean);
   result.secondBrainPath = normalizeSecondBrainPathCase(result.secondBrainPath, trackedLabels);
+  result.secondBrainPath = path.normalize(result.secondBrainPath);
+  // normalizeSecondBrainPathCase above only corrects against the CANONICAL_TOP_LEVEL
+  // constant + the project registry's own label spelling -- it trusts the registry, not
+  // the disk. If a tracked project's real on-disk folder casing has ever drifted from
+  // its registry label (a manual rename, or the label recorded before the folder existed),
+  // that correction can hand validateSecondBrainPath's OWN on-disk conflict check a
+  // spelling that doesn't match what's actually there, tripping its "different-case
+  // duplicate" rejection for a folder that in fact already exists -- the silent no-op
+  // this whole task is about. Resolve the first segment against disk directly, but only
+  // when exactly one entry matches case-insensitively (0 or 2+ matches is ambiguous or
+  // missing -- leave the path as-is and let validateSecondBrainPath's own rejection,
+  // "different-case duplicate" included, be the fallback).
+  if (secondBrainDir) {
+    const segments = result.secondBrainPath.split(/[\\/]/).filter(Boolean);
+    if (segments.length > 0) {
+      let entries;
+      try {
+        entries = fs.readdirSync(secondBrainDir, { withFileTypes: true })
+          .filter((e) => e.isDirectory() && !e.name.startsWith('.'));
+      } catch {
+        entries = [];
+      }
+      const matches = entries.filter((e) => e.name.toLowerCase() === segments[0].toLowerCase());
+      if (matches.length === 1 && matches[0].name !== segments[0]) {
+        segments[0] = matches[0].name;
+        result.secondBrainPath = segments.join('/');
+      }
+    }
+  }
   const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir, trackedLabels);
   if (namingError) {
     return recoverableSortSkip(data, entry, brainDumpPath,
