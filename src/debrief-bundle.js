@@ -87,10 +87,16 @@ function collectDoneWindow(pipelineDir, sinceIso, maxWindow = MAX_WINDOW_TASKS) 
   return withTs.slice(0, maxWindow).map((r) => r.task);
 }
 
-// Contrast set: tasks from the SAME sources as the window that are still stuck (blocked /
-// needs-clarification) as of `now` -- the shared-inefficiency check (is a wasteful stage
-// ALSO where the stuck siblings burn out?). Newest first (the most
-// recently-stuck sibling is the sharpest "did this pattern actually help, or just this
+// Contrast set: tasks from the SAME sources as the window that are in a terminal FAILED
+// state as of `now` -- the shared-inefficiency check (is a wasteful stage ALSO where the
+// stuck siblings burn out?). The failure-status set is EXACTLY ['blocked',
+// 'needs-clarification']: per QUEUE_STATES (src/task-anywhere.js) those are the only
+// terminal failure states, and they mirror the forensic side's own subject pool
+// (collectSubjectTasks in src/forensic-bundle.js) -- same two state dirs, same `t.source`
+// filter, same terminalTs() sort key, same { task, state } record shape; `sinceIso` here
+// is a debrief-only window cursor the forensic side has no equivalent of. readStateDir
+// already returns [] on a missing dir, so no extra guard is needed here. Newest first (the
+// most recently-stuck sibling is the sharpest "did this pattern actually help, or just this
 // batch" contrast).
 function collectContrastTasks(pipelineDir, windowTasks, maxContrast = MAX_CONTRAST_TASKS) {
   if (!windowTasks.length) return [];
