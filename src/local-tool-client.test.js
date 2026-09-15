@@ -498,6 +498,90 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
   });
 });
 
+// --- Chat's restricted tool set (2026-09-15) -------------------------------------------
+// Grimmethy: "I'd like to see the local chat stick to the task system when making these
+// fixes... build it in such a way that it honors the task log system and pushes the fix
+// to unmerged branches for review" -- the hard-gate choice (no write_file/edit_file at
+// all for Chat, queue_reviewed_task is the only way to make a real change), not a
+// prompt-level "please prefer queuing" ask.
+
+test('CHAT_TOOLS declares exactly run_bash and queue_reviewed_task -- no write_file/edit_file', () => {
+  withFixtureRepo((mod) => {
+    const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
+    assert.deepEqual(names, ['queue_reviewed_task', 'run_bash']);
+  });
+});
+
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly', () => {
+  withFixtureRepo((mod, dir) => {
+    const handlers = mod.buildChatToolHandlers([dir], dir);
+    assert.equal(handlers.write_file, undefined);
+    assert.equal(handlers.edit_file, undefined);
+    assert.equal(typeof handlers.run_bash, 'function');
+    assert.equal(typeof handlers.queue_reviewed_task, 'function');
+  });
+});
+
+test('runPlanWithTools with source:"chat" sends CHAT_TOOLS, not WRITE_TOOLS, to the model', () => {
+  const turn = { role: 'assistant', content: 'no tools needed, just answering' };
+  withMockedChat([turn], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'hi', source: 'chat', allowWrite: true });
+    const sentToolNames = sentBodies[0].tools.map((t) => t.function.name).sort();
+    assert.ok(sentToolNames.includes('run_bash'));
+    assert.ok(sentToolNames.includes('queue_reviewed_task'));
+    assert.ok(!sentToolNames.includes('write_file'), 'Chat must never be offered write_file');
+    assert.ok(!sentToolNames.includes('edit_file'), 'Chat must never be offered edit_file');
+  });
+});
+
+test('runPlanWithTools with a non-chat source still sends the full WRITE_TOOLS set (the real agentic-draft implement pass is unaffected)', () => {
+  const turn = { role: 'assistant', content: 'no tools needed, just answering' };
+  withMockedChat([turn], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'hi', source: 'manual', allowWrite: true });
+    const sentToolNames = sentBodies[0].tools.map((t) => t.function.name).sort();
+    assert.ok(sentToolNames.includes('write_file'));
+    assert.ok(sentToolNames.includes('edit_file'));
+  });
+});
+
+test('runBashTool with readOnly:true cannot write a file, even though the same roots are writable without it', () => {
+  withFixtureRepo((mod, dir) => {
+    const write = mod.runBashTool({ command: 'echo hello > new-file.txt', readOnly: true });
+    if (write.error) {
+      // bwrap missing on the test host -- fails closed, also an acceptable proof this
+      // never silently wrote the file unsandboxed.
+      assert.match(write.error, /sandbox \(bwrap\) is not available/);
+      assert.equal(fs.existsSync(path.join(dir, 'new-file.txt')), false);
+      return;
+    }
+    // A real bwrap run: the write must have failed at the filesystem level (read-only
+    // bind), and the file must genuinely not exist on the host afterward.
+    assert.notEqual(write.exitCode, 0, 'writing into a read-only bind must fail');
+    assert.equal(fs.existsSync(path.join(dir, 'new-file.txt')), false);
+
+    // The exact same root, same command, WITHOUT readOnly, succeeds -- proves the
+    // restriction is readOnly itself, not something incidental about the command/host.
+    const writable = mod.runBashTool({ command: 'echo hello > new-file.txt' });
+    if (!writable.error) {
+      assert.equal(writable.exitCode, 0);
+      assert.equal(fs.existsSync(path.join(dir, 'new-file.txt')), true);
+    }
+  });
+});
+
+test('runBashTool with readOnly:true still runs real read-only investigation commands', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'marker.txt'), 'present\n');
+    const result = mod.runBashTool({ command: 'cat marker.txt', readOnly: true });
+    if (result.error) {
+      assert.match(result.error, /sandbox \(bwrap\) is not available/);
+    } else {
+      assert.match(result.stdout, /present/);
+      assert.equal(result.exitCode, 0);
+    }
+  });
+});
+
 // Regression, 2026-08-24: caught live within minutes of the Chat panel shipping -- app.py
 // used to wrap chat_sessions.send_message()'s ENTIRE call in apply-task.sh's own
 // git-safety mutex, held for however long the whole turn took (a local-provider turn can

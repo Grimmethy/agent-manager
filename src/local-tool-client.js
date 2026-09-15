@@ -529,7 +529,7 @@ const RISKY_GIT_COMMAND_RE = /\bgit\s+(merge\b|push\b)/;
 
 function runBashTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
-  const { command } = args;
+  const { command, readOnly } = args;
   if (typeof command !== 'string' || !command.trim()) {
     return { error: 'run_bash requires a non-empty "command" argument' };
   }
@@ -544,12 +544,23 @@ function runBashTool(a, b) {
   const realRoots = allowedRoots.map((r) => fs.realpathSync(r));
   const wrapped = wrapWithSandbox('bash', ['-c', command], {
     workDir: realRoots[0],
-    readOnlyBinds: ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl'],
-    // Every accessible repo, writable -- unlike adhoc-agentic-draft.js's throwaway
-    // worktree, Chat edits are meant to land directly on the real working trees (see
-    // this feature's own plan: "the same trust model as this session itself"). For a
-    // non-chat caller allowedRoots is just [repoRoot], identical to before.
-    writableBinds: realRoots,
+    // Every accessible repo is still BOUND (must be, or --chdir into it fails and every
+    // command errors, read or write) -- just read-only instead of writable when this is
+    // Chat's own restricted handler (readOnly:true, see buildChatToolHandlers). 2026-09-15
+    // (Grimmethy: "I'd like to see the local chat stick to the task system when making
+    // these fixes... build it in such a way that it honors the task log system and
+    // pushes the fix to unmerged branches for review"): Chat no longer gets write_file/
+    // edit_file at all (see CHAT_TOOLS below) and this read-only mount is the same
+    // guarantee applied to its remaining run_bash access -- a real filesystem-level
+    // block, not a string-matched command-shape guess the way RISKY_GIT_COMMAND_RE above
+    // necessarily is (that check stays too, for a clear error message instead of an
+    // opaque permission-denied one). Every accessible repo stays writable for every
+    // OTHER allowWrite caller (the real agentic-draft implement pass,
+    // local-agentic-write-draft.js) -- unaffected, readOnly is never set there.
+    readOnlyBinds: readOnly
+      ? ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl', ...realRoots]
+      : ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl'],
+    writableBinds: readOnly ? [] : realRoots,
   });
   if (!wrapped.available) {
     // Fails CLOSED here, not open -- unlike the Claude adhoc path (a hardening layer on
@@ -633,6 +644,52 @@ const WRITE_TOOLS = [
         properties: {
           title: { type: 'string', description: 'Short title for the queued task, e.g. "Merge agent/observability-fix-ac-57 into master".' },
           description: { type: 'string', description: 'What should be done and why -- include enough detail (branch names, the specific change, any known risks like a merge conflict) for the pipeline to act on without further back-and-forth.' },
+        },
+        required: ['title', 'description'],
+      },
+    },
+  },
+];
+
+// Chat's OWN restricted tool set (2026-09-15, Grimmethy: "I'd like to see the local chat
+// stick to the task system when making these fixes... build it in such a way that it
+// honors the task log system and pushes the fix to unmerged branches for review" -- the
+// explicit hard-gate option, chosen over a prompt-level "please prefer queuing" ask after
+// this same assistant was asked, unsupervised, to "go build and wire up" a whole new
+// mechanism directly on the live tree via WRITE_TOOLS' write_file/edit_file, which the
+// auto-mode classifier itself correctly flagged as creating an unsafe unsupervised
+// agent). Chat gets NO write_file/edit_file at all now -- every real change, however
+// small, goes through queue_reviewed_task, landing on the same implement/critique/
+// review/majority-vote pipeline (a real unmerged branch for a human to review) every
+// other pipeline change goes through. run_bash stays for read-only investigation
+// (grep/tests/git log-diff-show-status), but mounted genuinely read-only (readOnly:true,
+// see runBashTool) -- a filesystem-level guarantee, not a request the model can choose
+// to ignore the way "please use queue_reviewed_task" alone would have been.
+const CHAT_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'run_bash',
+      description: 'Run a shell command inside a READ-ONLY filesystem sandbox -- every accessible repo is mounted read-only (use `git -C <abs path>` or `cd` for another repo). Use for investigation only: git log/diff/show/status, grep, running tests, reading generated output. Any command that tries to write (redirection, sed -i, git commit, touch, mkdir, ...) will fail at the filesystem level, not just be refused by a string check. To make a real change, call queue_reviewed_task instead -- you cannot write files directly.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'The shell command to run.' },
+        },
+        required: ['command'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'queue_reviewed_task',
+      description: 'File a real task for the pipeline to implement -- the ONLY way to make a real code change from Chat (you have no direct write access). Use this for anything from a one-line fix to a whole new mechanism: investigate and design the change as normal, then call this tool with enough detail for the pipeline to implement it without further back-and-forth. The task goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as a real unmerged branch for a human to review -- never applied directly.',
+      parameters: {
+        type: 'object',
+        properties: {
+          title: { type: 'string', description: 'Short title for the queued task, e.g. "Add re-admission path for symbol-still-referenced decompose rejections".' },
+          description: { type: 'string', description: 'What should be built/changed and why -- include enough detail (files, the specific behavior, acceptance criteria) for the pipeline to act on without further back-and-forth.' },
         },
         required: ['title', 'description'],
       },
@@ -856,6 +913,17 @@ function buildWriteToolHandlers(allowedRoots, pipelineDir) {
     write_file: (args) => writeFileTool(allowedRoots, { path: args.path, content: args.content }),
     edit_file: (args) => editFileTool(allowedRoots, { path: args.path, find: args.find, replace: args.replace }),
     run_bash: (args) => runBashTool(allowedRoots, { command: args.command }),
+    queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description }),
+  };
+}
+
+// Chat's own restricted handler set -- see CHAT_TOOLS' own header for why. No
+// write_file/edit_file handlers exist here at all (not just hidden from the tool list --
+// even a malformed/hallucinated tool_calls entry naming them would find no handler and
+// fall through to executeToolCalls' "unknown tool" error, same as any other typo).
+function buildChatToolHandlers(allowedRoots, pipelineDir) {
+  return {
+    run_bash: (args) => runBashTool(allowedRoots, { command: args.command, readOnly: true }),
     queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description }),
   };
 }
@@ -1237,9 +1305,19 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   }
   if (allowedRoots.length === 0) allowedRoots.push(path.resolve(repoRoot));
 
-  const tools = withGrepDirsHint(allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS);
+  // Chat (source:'chat') gets CHAT_TOOLS instead of the full WRITE_TOOLS even when it
+  // opts into allowWrite -- see CHAT_TOOLS' own header. Every OTHER allowWrite caller
+  // (local-agentic-write-draft.js's real implement pass) is completely unaffected: this
+  // only narrows the 'chat' source, nothing else.
+  const isChatCaller = source === 'chat';
+  const tools = withGrepDirsHint(
+    allowWrite ? [...TOOLS, ...(isChatCaller ? CHAT_TOOLS : WRITE_TOOLS)] : TOOLS,
+  );
   const toolHandlers = allowWrite
-    ? { ...buildToolHandlers(allowedRoots, pipelineDir), ...buildWriteToolHandlers(allowedRoots, pipelineDir) }
+    ? {
+      ...buildToolHandlers(allowedRoots, pipelineDir),
+      ...(isChatCaller ? buildChatToolHandlers(allowedRoots, pipelineDir) : buildWriteToolHandlers(allowedRoots, pipelineDir)),
+    }
     : buildToolHandlers(allowedRoots, pipelineDir);
   // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
   // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
@@ -1582,8 +1660,8 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 module.exports = {
   runPlanWithTools, readFileTool, listDirectoryTool, listRootsTool,
   resolveInsideRepo, resolveInsideRoots, TOOLS,
-  writeFileTool, editFileTool, runBashTool, WRITE_TOOLS,
-  buildToolHandlers, buildWriteToolHandlers,
+  writeFileTool, editFileTool, runBashTool, WRITE_TOOLS, CHAT_TOOLS,
+  buildToolHandlers, buildWriteToolHandlers, buildChatToolHandlers,
   readTaskTool, searchTasksTool, taskSummary,
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
