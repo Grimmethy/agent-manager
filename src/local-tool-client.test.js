@@ -1576,6 +1576,53 @@ test('runPlanWithTools with allowSideFindings:false never extracts even if the r
   });
 });
 
+// --- per-session context log (2026-09-15) -----------------------------------------------
+
+function contextLogInboxFiles(dir) {
+  const inbox = path.join(dir, 'queue', 'context-log-inbox');
+  if (!fs.existsSync(inbox)) return [];
+  return fs.readdirSync(inbox).map((f) => JSON.parse(fs.readFileSync(path.join(inbox, f), 'utf8')));
+}
+
+test('runPlanWithTools injects the CONTEXT-LOG instruction only when contextLogSessionId is set', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'ok' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'do the task', contextLogSessionId: 'chat-1-abc' });
+    assert.match(sentBodies[0].messages[0].content, /CONTEXT-LOG:/);
+  });
+});
+
+test('runPlanWithTools does not inject CONTEXT-LOG when contextLogSessionId is absent (every non-chat caller)', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'ok' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'do the task' });
+    assert.doesNotMatch(sentBodies[0].messages[0].content, /CONTEXT-LOG/);
+  });
+});
+
+test('runPlanWithTools extracts a CONTEXT-LOG block from the final response, returns cleaned text, and files it to the inbox keyed by session', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'Real answer here.\n\nCONTEXT-LOG: Distilled summary of this exchange.\nTASK-REF: adhoc-xyz-1' },
+  ], async (mod, dir) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', contextLogSessionId: 'chat-1-abc' });
+    assert.equal(result.response.includes('CONTEXT-LOG'), false);
+    assert.match(result.response, /Real answer here\./);
+    const files = contextLogInboxFiles(dir);
+    assert.equal(files.length, 1);
+    assert.equal(files[0].sessionId, 'chat-1-abc');
+    assert.equal(files[0].summary, 'Distilled summary of this exchange.');
+    assert.equal(files[0].taskRef, 'adhoc-xyz-1');
+  });
+});
+
+test('runPlanWithTools with no contextLogSessionId never extracts even if the response happens to contain the marker text', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'CONTEXT-LOG: should not be extracted' },
+  ], async (mod, dir) => {
+    const result = await mod.runPlanWithTools({ prompt: 'classify this' });
+    assert.match(result.response, /CONTEXT-LOG: should not be extracted/);
+    assert.equal(contextLogInboxFiles(dir).length, 0);
+  });
+});
+
 // --- incident amplification (2026-09-08) -----------------------------------------------
 
 test('runPlanWithTools does not inject AMPLIFY by default (allowAmplification defaults false)', async () => {

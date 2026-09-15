@@ -178,8 +178,9 @@ def api_internal_chat_local_turn():
     holds the GPU lock via /reserve doesn't pay for a redundant preempt call on every turn.
 
     Body: {messages?, prompt?, maxTurns, source?, allowWrite?, primaryRoot?, extraRoots?,
-    forceSummaryOnCap?, allowAmplification?} -- same fields local_tool_client.py's own
-    stream_plan_with_tools() already takes, passed straight through.
+    forceSummaryOnCap?, allowAmplification?, contextLogSessionId?} -- same fields
+    local_tool_client.py's own stream_plan_with_tools() already takes, passed straight
+    through.
 
     2026-09-15 fix (caught before this route had any real caller yet -- see the plan's
     Phase 3 progress log): the in-tree feature this route replaces held
@@ -213,6 +214,7 @@ def api_internal_chat_local_turn():
                     extra_roots=body.get("extraRoots"),
                     force_summary_on_cap=bool(body.get("forceSummaryOnCap")),
                     allow_amplification=bool(body.get("allowAmplification")),
+                    context_log_session_id=body.get("contextLogSessionId"),
                 ):
                     yield f"data: {json.dumps(event)}\n\n"
             except LocalToolClientError as e:

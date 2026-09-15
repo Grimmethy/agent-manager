@@ -100,7 +100,8 @@ def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
 def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns: int = 5,
                             source: str = None, allow_write: bool = False,
                             primary_root: str = None, extra_roots: list = None,
-                            force_summary_on_cap: bool = False, allow_amplification: bool = False):
+                            force_summary_on_cap: bool = False, allow_amplification: bool = False,
+                            context_log_session_id: str = None):
     """Generator sibling of run_plan_with_tools for the Chat panel's live-streamed replies
     (2026-08-26, Grimmethy: "vastly improve the chat system... Open WebUI" investigation --
     Open WebUI streams tokens over Socket.IO/SSE as they generate instead of blocking for
@@ -128,6 +129,8 @@ def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns:
         request["forceSummaryOnCap"] = True
     if allow_amplification:
         request["allowAmplification"] = True
+    if context_log_session_id:
+        request["contextLogSessionId"] = context_log_session_id
 
     tmp_path = Path(tempfile.gettempdir()) / f"local-tool-client-req-{uuid.uuid4().hex}.json"
     tmp_path.write_text(json.dumps(request), encoding="utf-8")

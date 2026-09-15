@@ -282,6 +282,17 @@ while :; do
     side_finding_result="$(node "${PACKAGE_SRC_DIR}/side-finding-sweep.js" 2>>"${HOME_LOGS}/side-finding-sweep.log")"
     printf '[watchdog] side-finding-sweep: %s\n' "$side_finding_result" >&2
 
+    # Context-log sweep: drains queue/context-log-inbox/ (Chat's own CONTEXT-LOG: block,
+    # emitted at the end of every response -- see src/context-log-marker.js) into one
+    # Second Brain note per chat session under Agent Manager Reports/Chat Context Logs/ --
+    # a durable, cross-referenced backstop for Chat's own message-window trimming. Never
+    # routed through brain_dump_sort/brain-dump.json (would flood the human-facing Brain
+    # Dump tab); a TASK-REF: the model names is only ever linked ([[project]]) once
+    # verified to still exist, never guessed. Cheap when the inbox is empty. Disable with
+    # AGENT_MANAGER_CONTEXT_LOG_SWEEP=false.
+    context_log_result="$(node "${PACKAGE_SRC_DIR}/context-log-sweep.js" 2>>"${HOME_LOGS}/context-log-sweep.log")"
+    printf '[watchdog] context-log-sweep: %s\n' "$context_log_result" >&2
+
     # needs-clarification triage: churns stuck reason:'design-decision' tasks -- clean-state
     # requeues a degenerate "no prior context" draft (local-model forced-summary flake, not
     # a real question), archives an invalid-premise / already-done task behind a resolution-
