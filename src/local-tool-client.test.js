@@ -1089,6 +1089,23 @@ test('nudgeToEditEarly: after ORIENT_TURN_LIMIT turns with zero edits, one "stop
   }
 });
 
+// 2026-09-15 (brain-dump bd-1789433484128, "pipeline hardening 1/5"): orientTurnLimit is
+// now a per-call override, independent of the env-var-driven module default -- proves the
+// caller-supplied value is what actually gates the nudge, not just the env var.
+test('nudgeToEditEarly: a per-call orientTurnLimit overrides the module default, independent of the env var', async () => {
+  const explore = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const finish = { role: 'assistant', content: 'RESOLUTION: needs-human-decision\nwhich approach?' };
+  // Only 2 explore turns before concluding -- well under the module default (10), but
+  // over a caller-supplied orientTurnLimit of 1, so the nudge must still fire.
+  await withMockedChat([explore, explore, finish], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 10, nudgeToEditEarly: true, orientTurnLimit: 1 });
+    assert.match(result.response, /needs-human-decision/);
+    const msgs = sentBodies[sentBodies.length - 1].messages;
+    const nudgeIdx = msgs.findIndex((m) => m.role === 'user' && /Stop exploring now/.test(m.content || ''));
+    assert.ok(nudgeIdx > 0, 'a nudge message was injected despite only 2 explore turns, well under the module default of 10');
+  });
+});
+
 test('nudgeToEditEarly: NO nudge when the model edits within the orientation budget', async () => {
   const prev = process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS;
   process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS = '3';
