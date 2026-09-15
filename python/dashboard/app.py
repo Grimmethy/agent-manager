@@ -4126,5 +4126,7 @@ if __name__ == "__main__":
     # shape as _run_build's own background thread; see _chat_reservation_watchdog's own
     # docstring for why this has to be built here rather than reused from elsewhere.
     threading.Thread(target=_chat_reservation_watchdog, daemon=True).start()
+    from routes.internal_chat import start_internal_chat_reservation_watchdog
+    start_internal_chat_reservation_watchdog()
 
     app.run(host=host, port=port, debug=False, use_reloader=True, threaded=True, ssl_context=ssl_context)

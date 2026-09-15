@@ -23,10 +23,56 @@ plugin tab (PromptForge etc.) could reach.
 import hmac
 import json
 import os
+import threading
+import time
 
 from flask import Blueprint, Response, abort, jsonify, request, stream_with_context
 
 internal_chat_bp = Blueprint("internal-chat-bp", __name__)
+
+# Own registry, deliberately SEPARATE from app.py's own _chat_reservations (the in-tree
+# Chat feature's dict, still live and still swept by app.py's _chat_reservation_watchdog
+# thread today). Reusing that dict was the first draft of this route -- caught before
+# any real caller existed: that watchdog directly indexes r["lastActivity"] and
+# record["storageDir"] on every entry it sweeps, and calls chat_sessions.set_reserved()
+# against storageDir on timeout, both of which this route's own entries never had
+# (session storage now lives in the plugin repo's own process, not reachable by path
+# from here) -- the very next sweep after this route created its first real entry would
+# have KeyError'd that background thread. Keyed by the plugin's own opaque
+# reservationId -> {"fh", "lastActivity"}.
+_internal_chat_reservations = {}
+_internal_chat_reservations_lock = threading.Lock()
+INTERNAL_CHAT_RESERVATION_IDLE_TIMEOUT_S = 600  # same 10-minute window app.py's own uses
+
+
+def _internal_chat_reservation_watchdog():
+    """Own sweep loop, independent of app.py's _chat_reservation_watchdog -- releases
+    the OS-level single-flight lock on a reservation nobody has refreshed in 10 minutes
+    (a crashed/forgotten toggle). Does NOT reach into the plugin's own session storage
+    to clear its `reserved` flag the way the in-tree watchdog does for its own dict --
+    that storage is a different process's, not this one's, to write into. The plugin
+    repo's own chat_sessions.py must poll or otherwise notice the lock is gone on its
+    next call if it wants to keep that flag honest; a stale `reserved: true` badge in
+    the UI after an idle timeout is a cosmetic gap, not a functional one (the underlying
+    lock IS actually released, which is the part that matters for GPU contention)."""
+    import single_flight_lock
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with _internal_chat_reservations_lock:
+            stale_ids = [rid for rid, r in _internal_chat_reservations.items()
+                         if now - r["lastActivity"] > INTERNAL_CHAT_RESERVATION_IDLE_TIMEOUT_S]
+            stale_records = [_internal_chat_reservations.pop(rid) for rid in stale_ids]
+        for record in stale_records:
+            single_flight_lock.release(record["fh"])
+
+
+def start_internal_chat_reservation_watchdog():
+    """NOT started at module import time -- app.py's own _chat_reservation_watchdog is
+    only started inside main(), right before app.run(), specifically so a plain `import
+    app` (every test file's own setup) never spins up a real background thread. This
+    mirrors that: app.py's main() must call this alongside its own watchdog start."""
+    threading.Thread(target=_internal_chat_reservation_watchdog, name="internal-chat-reservation-watchdog", daemon=True).start()
 
 
 def _require_internal_token():
@@ -71,13 +117,16 @@ def api_internal_chat_reserve():
     """Wraps single_flight_lock's reservation toggle -- holding the local model's own
     per-model lock across turns, not just for the span of one call (Brain Dump #153).
     Body: {reservationId: string, model: string, on: bool}. reservationId is the
-    plugin's own session id, opaque to this route -- just a key into the SAME
-    process-local _chat_reservations registry the in-tree feature always used, now
-    living here instead of in the plugin repo's own process (the lock's fh is a real
-    OS file handle, meaningless across a process boundary, so it has to live wherever
-    the acquire/release actually happens)."""
+    plugin's own session id, opaque to this route -- just a key into
+    _internal_chat_reservations (see this module's own header for why that is a
+    SEPARATE registry from app.py's in-tree _chat_reservations, not a shared one).
+
+    Calling again with on:true while already on is a valid, expected refresh -- not a
+    no-op -- it re-touches lastActivity so this module's own idle-timeout watchdog
+    doesn't release the lock out from under an active conversation; routes/chat.py's own
+    in-tree equivalent does this same refresh on every real message."""
     _require_internal_token()
-    from app import _chat_reservations, _chat_reservations_lock, instances_dir
+    from app import instances_dir
     import single_flight_lock
 
     body = request.get_json(silent=True) or {}
@@ -89,30 +138,32 @@ def api_internal_chat_reserve():
 
     # Same two-short-critical-sections shape as the in-tree route's own comment: acquire()
     # BLOCKS (the real GPU/model mutex), so it must never run while holding
-    # _chat_reservations_lock, or every other Chat request would stall for the same
-    # duration.
-    with _chat_reservations_lock:
-        already_on = reservation_id in _chat_reservations
+    # _internal_chat_reservations_lock, or every other Chat request would stall for the
+    # same duration.
+    with _internal_chat_reservations_lock:
+        already_on = reservation_id in _internal_chat_reservations
         claiming = want_on and not already_on
-        releasing_record = _chat_reservations.pop(reservation_id) if (not want_on and already_on) else None
+        releasing_record = _internal_chat_reservations.pop(reservation_id) if (not want_on and already_on) else None
+        if already_on and want_on:
+            _internal_chat_reservations[reservation_id]["lastActivity"] = time.time()
         if claiming:
-            _chat_reservations[reservation_id] = {"fh": None}
+            _internal_chat_reservations[reservation_id] = {"fh": None, "lastActivity": time.time()}
 
     if releasing_record is not None:
         single_flight_lock.release(releasing_record["fh"])
     if claiming:
         if not model:
-            with _chat_reservations_lock:
-                _chat_reservations.pop(reservation_id, None)
+            with _internal_chat_reservations_lock:
+                _internal_chat_reservations.pop(reservation_id, None)
             abort(400, description="model is required when reserving")
         inst_dir = instances_dir()
         if not inst_dir:
-            with _chat_reservations_lock:
-                _chat_reservations.pop(reservation_id, None)
+            with _internal_chat_reservations_lock:
+                _internal_chat_reservations.pop(reservation_id, None)
             abort(500, description="no active project's instances dir resolvable")
         fh = single_flight_lock.acquire(inst_dir, model)  # blocking
-        with _chat_reservations_lock:
-            _chat_reservations[reservation_id] = {"fh": fh}
+        with _internal_chat_reservations_lock:
+            _internal_chat_reservations[reservation_id] = {"fh": fh, "lastActivity": time.time()}
 
     return jsonify({"reservationId": reservation_id, "reserved": want_on})
 

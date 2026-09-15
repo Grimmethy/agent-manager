@@ -13,6 +13,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 import app  # noqa: E402
+import routes.internal_chat as internal_chat  # noqa: E402
 
 TOKEN = "test-token-abc123"
 
@@ -97,23 +98,32 @@ class InternalChatApiTest(unittest.TestCase):
             res = self._post("/api/internal/chat/reserve", {"reservationId": "s1", "model": "m", "on": True})
             self.assertEqual(res.get_json(), {"reservationId": "s1", "reserved": True})
             m_acquire.assert_called_once_with(Path("/inst"), "m")
-            self.assertIn("s1", app._chat_reservations)
+            self.assertIn("s1", internal_chat._internal_chat_reservations)
         # cleanup so this test doesn't leak state into others
-        app._chat_reservations.pop("s1", None)
+        internal_chat._internal_chat_reservations.pop("s1", None)
 
     def test_reserve_release_releases_the_lock_and_forgets_it(self):
-        app._chat_reservations["s2"] = {"fh": "fake-fh"}
+        internal_chat._internal_chat_reservations["s2"] = {"fh": "fake-fh", "lastActivity": 0}
         with mock.patch("single_flight_lock.release") as m_release:
             res = self._post("/api/internal/chat/reserve", {"reservationId": "s2", "on": False})
             self.assertEqual(res.get_json(), {"reservationId": "s2", "reserved": False})
             m_release.assert_called_once_with("fake-fh")
-            self.assertNotIn("s2", app._chat_reservations)
+            self.assertNotIn("s2", internal_chat._internal_chat_reservations)
 
     def test_reserve_no_instances_dir_aborts_and_does_not_leave_a_stuck_claim(self):
         with mock.patch.object(app, "instances_dir", return_value=None):
             res = self._post("/api/internal/chat/reserve", {"reservationId": "s3", "model": "m", "on": True})
             self.assertEqual(res.status_code, 500)
-            self.assertNotIn("s3", app._chat_reservations)
+            self.assertNotIn("s3", internal_chat._internal_chat_reservations)
+
+    def test_reserve_claim_again_while_already_on_refreshes_lastActivity_without_reacquiring(self):
+        internal_chat._internal_chat_reservations["s4"] = {"fh": "fake-fh", "lastActivity": 0}
+        with mock.patch("single_flight_lock.acquire") as m_acquire:
+            res = self._post("/api/internal/chat/reserve", {"reservationId": "s4", "model": "m", "on": True})
+            self.assertEqual(res.get_json(), {"reservationId": "s4", "reserved": True})
+            m_acquire.assert_not_called()
+            self.assertGreater(internal_chat._internal_chat_reservations["s4"]["lastActivity"], 0)
+        internal_chat._internal_chat_reservations.pop("s4", None)
 
     # --- local-turn -----------------------------------------------------------------------
 
