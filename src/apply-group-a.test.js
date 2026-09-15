@@ -577,9 +577,48 @@ test('applyBrainDumpSort injects prefetchedPaths and queues to adhoc/ on an unam
 // queued at filing time). A flagged possibleDuplicateOf overrides even a confident
 // anchor match -- routed to needs-clarification for a human via the same multiple-
 // choice/free-text picker "needs a human decision" adhoc tasks already use.
-test('applyBrainDumpSort routes to needs-clarification, not adhoc, when the classifier flags a possible duplicate', () => {
+//
+// 2026-09-15, brain-dump bd-1788900769368 ("All three 'failing' tasks share identical
+// death signature... with zero model_calls"): a first-time flag no longer goes straight
+// to needs-clarification -- see the bounded duplicateGateAttempts gate's own header in
+// apply-group-a-brain-dump.js. Case A below covers the first-hit retry; this test now
+// covers the SECOND hit (duplicateGateAttempts already 1), where the original
+// kill/archive-via-human-review behavior is preserved.
+test('applyBrainDumpSort routes to needs-clarification, not adhoc, when the classifier flags a possible duplicate for a second time', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-dup-test-'));
   const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'src', 'budget_guard.ts'), '// stub\n');
+  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
+
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard', duplicateGateAttempts: 1 })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard' } };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
+    possibleDuplicateOf: 'Fix the budget guard rounding bug',
+  });
+
+  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')) && fs.readdirSync(path.join(pipelineDir, 'queue', 'adhoc')).length > 0, false, 'must not queue into adhoc/ when a duplicate is flagged again');
+  const heldFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'needs-clarification'));
+  assert.equal(heldFiles.length, 1);
+  const held = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'needs-clarification', heldFiles[0]), 'utf8'));
+  assert.equal(held.needsClarification.reason, 'design-decision');
+  assert.match(held.needsClarification.openQuestions, /Fix the budget guard rounding bug/);
+  // Even though the anchor match above was confident, prefetchedPaths still isn't
+  // silently discarded -- it stays on the record for if/when a human proceeds anyway.
+  assert.deepEqual(held.promptContext.prefetchedPaths, ['src/budget_guard.ts']);
+});
+
+// Case A (this hub's sub-task 1): a FIRST duplicate flag (duplicateGateAttempts unset) is
+// not killed/archived -- it gets one clean fresh classification pass instead. Nothing is
+// queued to adhoc/ or needs-clarification/ this call; the entry stays 'captured' with
+// duplicateGateAttempts stamped so nextBrainDumpSortTask() drafts it again, and a repeat
+// flag on that second pass falls through to the original behavior (test above).
+test('applyBrainDumpSort gives a FIRST possible-duplicate flag one retry instead of killing it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-dup-retry-test-'));
+  const { repoRoot, label } = setupMatchedProjectFixture(dir);
   fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
   fs.writeFileSync(path.join(repoRoot, 'src', 'budget_guard.ts'), '// stub\n');
   writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
@@ -591,17 +630,15 @@ test('applyBrainDumpSort routes to needs-clarification, not adhoc, when the clas
     possibleDuplicateOf: 'Fix the budget guard rounding bug',
   });
 
-  applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
 
-  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')) && fs.readdirSync(path.join(pipelineDir, 'queue', 'adhoc')).length > 0, false, 'must not queue into adhoc/ when a duplicate is flagged');
-  const heldFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'needs-clarification'));
-  assert.equal(heldFiles.length, 1);
-  const held = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'needs-clarification', heldFiles[0]), 'utf8'));
-  assert.equal(held.needsClarification.reason, 'design-decision');
-  assert.match(held.needsClarification.openQuestions, /Fix the budget guard rounding bug/);
-  // Even though the anchor match above was confident, prefetchedPaths still isn't
-  // silently discarded -- it stays on the record for if/when a human proceeds anyway.
-  assert.deepEqual(held.promptContext.prefetchedPaths, ['src/budget_guard.ts']);
+  assert.equal(result.skipped, true);
+  assert.equal(result.recoverable, true);
+  assert.match(result.reason, /possible duplicate/);
+  const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+  const entry = data.entries.find((e) => e.id === 'bd-1');
+  assert.equal(entry.duplicateGateAttempts, 1);
+  assert.equal(entry.status, 'captured', 'entry stays captured so a fresh classification pass picks it up again');
 });
 
 // 2026-08-24 (Grimmethy: "The brain dump sort would have to know that repo specific tasks

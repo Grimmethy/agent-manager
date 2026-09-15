@@ -289,6 +289,31 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
       // "yes, duplicate") plus the free-text Other box (for "no, here's why not") already
       // fully cover.
       if (result.possibleDuplicateOf) {
+        // Bounded one-retry gate (2026-09-15, brain-dump bd-1788900769368: "All three
+        // 'failing' tasks share identical death signature... with zero model_calls" --
+        // root-caused live: a fuzzy title-match false positive here used to route
+        // straight to needs-clarification every time, with no way back -- this decision
+        // happens at APPLY time for the brain_dump_sort CLASSIFICATION task, before the
+        // downstream adhoc task this block builds ever exists, so reject-retry-check.js's
+        // retry machinery (which only ever sees adhoc/research tasks, not this one) can
+        // never reach it. Mirrors needs-clarification-triage.js's own ncTriageAttempts/
+        // MAX_REQUEUES pattern -- and reuses recoverableSortSkip, the SAME mechanism this
+        // file already relies on for every other "give it one more classification pass"
+        // case just above -- by leaving entry.status as 'captured' (not writing the
+        // downstream adhoc task, not marking the entry actioned), nextBrainDumpSortTask()
+        // naturally re-drafts a fresh classification of this same note later, which may
+        // well not repeat the same fuzzy match on a differently-worded pass. The counter
+        // lives on the brain-dump ENTRY (not the classification task or the not-yet-built
+        // adhocTask) since the entry is the one object that genuinely persists across
+        // repeated classification attempts of the same logical note.
+        const duplicateGateAttempts = Number(entry.duplicateGateAttempts) || 0;
+        if (duplicateGateAttempts < 1) {
+          entry.duplicateGateAttempts = duplicateGateAttempts + 1;
+          console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" (duplicateGateAttempts=${entry.duplicateGateAttempts}) -- retrying with a fresh classification pass instead of routing to needs-clarification`);
+          return recoverableSortSkip(data, entry, brainDumpPath,
+            `possible duplicate of "${result.possibleDuplicateOf}" on the first flag -- retrying with a fresh classification pass`);
+        }
+        console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" again (duplicateGateAttempts=${duplicateGateAttempts}) -- routing to needs-clarification`);
         adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
         adhocTask.needsClarification = {
           reason: 'design-decision',
