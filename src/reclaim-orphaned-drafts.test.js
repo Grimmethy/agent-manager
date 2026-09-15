@@ -140,6 +140,37 @@ test('skips an unreadable/malformed file rather than throwing, and still reclaim
   assert.ok(fs.existsSync(path.join(draftingDir, 'broken.json')));
 });
 
+test('a non-Error throw (null) from readFileSync does not abort the loop -- skips that file and reclaims the rest', (t) => {
+  const dir = tempPipelineDir();
+  const draftingDir = path.join(dir, 'queue', 'drafting', 'worker-1');
+  fs.mkdirSync(draftingDir, { recursive: true });
+  writeDraftingTask(dir, 'worker-1', { id: 'bad-task', domain: 'default', title: 'x', history: [] });
+  writeDraftingTask(dir, 'worker-1', { id: 'good-task', domain: 'default', title: 'x', history: [] });
+
+  const realReadFileSync = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (filePath, ...rest) => {
+    if (String(filePath).includes('bad-task')) throw null; // eslint-disable-line no-throw-literal
+    return realReadFileSync(filePath, ...rest);
+  });
+
+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });
+
+  assert.equal(result.reclaimed, 1);
+  assert.deepEqual(result.ids, ['good-task']);
+});
+
+test('a non-Error throw (null) from readdirSync returns empty instead of crashing', (t) => {
+  const dir = tempPipelineDir();
+  const draftingDir = path.join(dir, 'queue', 'drafting', 'worker-1');
+  fs.mkdirSync(draftingDir, { recursive: true });
+
+  t.mock.method(fs, 'readdirSync', () => { throw null; }); // eslint-disable-line no-throw-literal
+
+  const result = reclaimOrphanedDrafts({ pipelineDir: dir, instanceId: 'worker-1' });
+
+  assert.deepEqual(result, { reclaimed: 0, ids: [] });
+});
+
 test('reclaims multiple orphaned tasks in one pass', () => {
   const dir = tempPipelineDir();
   writeDraftingTask(dir, 'worker-1', { id: 'multi-1', domain: 'adhoc', title: 'x', history: [] });

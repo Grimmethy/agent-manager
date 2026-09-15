@@ -45,10 +45,14 @@ function reclaimOrphanedDrafts({ pipelineDir, instanceId }) {
   try {
     names = fs.readdirSync(draftingDir).filter((f) => f.endsWith('.json'));
   } catch (err) {
-    if (err.code === 'ENOENT') {
+    if (err?.code === 'ENOENT') {
       return { reclaimed: 0, ids: [] };
     }
-    console.warn(`reclaimOrphanedDrafts: failed to read ${draftingDir} -- code=${err.code}, message=${err.message}`);
+    // err?.message ?? String(err) / err?.code (2026-09-15): a non-Error throw (null,
+    // undefined, or a bare string from an unusual filesystem layer) would otherwise throw
+    // a TypeError reading .message/.code off it INSIDE this catch, escaping the function
+    // entirely instead of the best-effort "log and return empty" this block exists for.
+    console.warn(`reclaimOrphanedDrafts: failed to read ${draftingDir} -- code=${err?.code}, message=${err?.message ?? String(err)}`);
     return { reclaimed: 0, ids: [] };
   }
 
@@ -59,7 +63,10 @@ function reclaimOrphanedDrafts({ pipelineDir, instanceId }) {
     try {
       task = JSON.parse(fs.readFileSync(filePath, 'utf8'));
     } catch (err) {
-      console.warn(`reclaimOrphanedDrafts: skipping unreadable draft file ${filePath} -- message=${err.message}${err.code ? ` (code=${err.code})` : ''}`);
+      // Same err?.message ?? String(err) / err?.code guard as above -- a non-Error throw
+      // here would otherwise abort the whole reclaim loop (escaping this file's own
+      // try/catch) instead of just skipping this one file and continuing to the rest.
+      console.warn(`reclaimOrphanedDrafts: skipping unreadable draft file ${filePath} -- message=${err?.message ?? String(err)}${err?.code ? ` (code=${err.code})` : ''}`);
       continue; // unreadable/mid-write -- leave it, next startup can try again
     }
 
