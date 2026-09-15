@@ -895,6 +895,25 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
+  // Enforce code-diff presence for function_length_review (2026-09-08 brain-dump
+  // request): its deliverable is an `### AC-NNN` candidate whose Solution shows the
+  // proposed change, not just prose describing what should change -- a prose-only draft
+  // routinely got voted through, then rejected downstream (fulfillment) for having
+  // nothing concrete to implement. Block before spending a review call, same discipline
+  // as the neighboring deterministic gates above. Kept permissive enough to still pass a
+  // legitimate candidate whose Solution includes an inline fenced snippet or diff hunk --
+  // this only rejects PURE prose with no code shape at all.
+  if (resolveSourceName(task) === 'function_length_review' && trimmedImplResponse
+      && !/```/.test(trimmedImplResponse)
+      && !/^(?:---|\+\+\+|@@)/m.test(trimmedImplResponse)
+      && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)) {
+    const reason = 'Deterministic gate: missing-code-diff -- function_length_review drafts must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all.';
+    task.reviewProvider = 'deterministic-missing-code-diff';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
+
   await waitForLocalAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);

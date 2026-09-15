@@ -645,6 +645,43 @@ test('reviewTask reaches the vote when the acceptance criteria draft DID report 
   assert.equal(captured.length, 1);
 });
 
+test('reviewTask deterministically rejects a function_length_review draft with no code block or diff -- no vote spent', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'function_length_review',
+    implementResponse: '### AC-9\nProblem: this function is too long and does three unrelated things.\nSolution: split it into three smaller helper functions, one per responsibility, and call each in turn.',
+  });
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-missing-code-diff');
+  assert.match(result.blockedReason, /missing-code-diff/);
+  assert.equal(captured.length, 0, 'no review call should be spent voting on a function_length_review draft with no code shape at all');
+});
+
+test('reviewTask reaches the vote for a function_length_review draft whose Solution includes a diff hunk', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  // A diff hunk with no braces/brackets/backticks -- avoids an unrelated, separately-known
+  // issue (pipeline-self-audit-function_length_review-truncated-draft-1788034686181,
+  // 2026-08-29, never fixed): detectTruncatedImplementResponse's CODE_MARKERS check (any
+  // of {}[]`) misfires on legitimate code-bearing prose for a non-JSON advisoryProse
+  // source -- ANY real code snippet with a brace (near-universal in JS) reads as
+  // "unparseable JSON with code markers" -> "truncated." Out of scope for this gate;
+  // filed separately rather than fixed here.
+  const task = baseTask({
+    domain: 'default', source: 'function_length_review',
+    implementResponse: '### AC-9\nProblem: this function is too long.\nSolution:\n@@ -10,3 +10,5 @@\n+const result = computeHelper(x);\n+return result;',
+  });
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-missing-code-diff');
+  assert.equal(captured.length, 1);
+});
+
 test('the acceptance pre-vote gate is skipped when AGENT_MANAGER_ADHOC_ACCEPTANCE_GATE=false', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE_GATE = 'false';
