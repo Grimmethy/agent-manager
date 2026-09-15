@@ -16,6 +16,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const { lineRangeOf, extractChangedSpan, normalizeCode } = require('./lib/fact-checker-text-utils.js');
+const { extractDomainRoot } = require('./lib/fact-checker-url-utils.js');
 
 // (?!\s*:\s*\d) rejects a match where a ":NNN" line-number suffix follows, so
 // "foo.js:310" is not silently truncated to the bare path "foo.js".
@@ -258,14 +260,6 @@ const AC_MARKER_RE = /\bAC-\d+\b/;
 const MIN_CHANGED_SPAN_CHARS = 4;
 
 // Byte offset -> 1-indexed [startLine, endLine] the substring spans in `fileText`.
-function lineRangeOf(fileText, substring) {
-  const idx = fileText.indexOf(substring);
-  if (idx === -1) return null;
-  const startLine = fileText.slice(0, idx).split('\n').length;
-  const endLine = startLine + substring.split('\n').length - 1;
-  return { startLine, endLine };
-}
-
 // Strips the longest common prefix and suffix shared by `oldText`/`newText`, leaving just
 // the substantive middle each side changed -- e.g. find "...); throw err; }" / replace
 // "...); continue; }" isolates to { oldMiddle: "throw err", newMiddle: "continue" },
@@ -273,24 +267,6 @@ function lineRangeOf(fileText, substring) {
 // "what did this edit change" signal -- comparing find/replace's FULL text against a
 // prior commit's full removed text dilutes on shared boilerplate (see
 // MIN_CHANGED_SPAN_CHARS's own comment for the real case this fixes).
-function extractChangedSpan(oldText, newText) {
-  let i = 0;
-  while (i < oldText.length && i < newText.length && oldText[i] === newText[i]) i += 1;
-  let j = 0;
-  while (
-    j < oldText.length - i && j < newText.length - i
-    && oldText[oldText.length - 1 - j] === newText[newText.length - 1 - j]
-  ) j += 1;
-  return {
-    oldMiddle: oldText.slice(i, oldText.length - j).trim(),
-    newMiddle: newText.slice(i, newText.length - j).trim(),
-  };
-}
-
-function normalizeCode(text) {
-  return String(text || '').replace(/\s+/g, ' ').trim();
-}
-
 const GIT_LOG_LINE_RANGE_TIMEOUT_MS = 15_000;
 
 // Best-effort: any git/env failure (no repo, git missing, timeout, file not found) skips
@@ -509,18 +485,6 @@ function extractEchoMarkers(text) {
 // source material the drafter was given (a fabricated domain the human never mentioned still
 // gets flagged, same as before). Root length>=3 guard avoids a short/common label (e.g. a "co"
 // or "io" TLD-adjacent segment) incidentally matching unrelated prose.
-function extractDomainRoot(url) {
-  let hostname;
-  try {
-    ({ hostname } = new URL(url));
-  } catch (e) {
-    return null;
-  }
-  const labels = hostname.split('.').filter(Boolean);
-  if (labels.length < 2) return labels[0] || null;
-  return labels[labels.length - 2];
-}
-
 function isNamedServiceUrl(url, sourceText) {
   const root = extractDomainRoot(url);
   if (!root || root.length < 3) return false;
