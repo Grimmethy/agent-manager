@@ -1057,6 +1057,56 @@ test('a non-adhoc/research task locks around EVERY real call (plan, implement, c
   });
 });
 
+// 2026-09-08, brain-dump bd-1788725054994 ("cap the implement-pass token/latency budget
+// per draft and route oversized drafts to strict-cite retry"): computeImplementBudget's
+// evalTokCap (1000) sat inert since 2026-09-10 -- nothing ever read it. An implement call
+// that reports eval_count over that cap must trigger exactly one retry with the
+// strict-cite prompt variant (prompts.js's strictCiteConstraintBlock), and the retried
+// response must be what the task actually keeps.
+test('an oversized implement response (eval_count over the cap) gets exactly one strict-cite retry, and the retry result wins', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'oversized-test-1', domain: 'default', source: 'brain_dump_sort', title: 'test', promptContext: { rawText: 'a note to classify', tags: [] } };
+
+    const prompts = [];
+    let callCount = 0;
+    const localCall = async (opts) => {
+      callCount++;
+      prompts.push(opts && opts.prompt);
+      if (callCount === 1) return { response: 'confident match: none', degenerate: null, attempts: 1 }; // plan
+      if (callCount === 2) return { response: 'x'.repeat(50), degenerate: null, attempts: 1, eval_count: 1500 }; // implement, oversized
+      if (callCount === 3) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1, eval_count: 300 }; // implement retry, under cap
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }; // critique
+    };
+
+    await draftTask(task, { localCall });
+
+    assert.equal(callCount, 4, 'exactly one extra call for the retry -- plan, implement, implement-retry, critique');
+    assert.equal(task.oversizedImplementRetried, true);
+    assert.match(task.implementResponse, /"secondBrainPath":"x\.md"/, 'the task keeps the RETRY response, not the original oversized one');
+    assert.match(prompts[2], /STRICT-CITE CONSTRAINT/, 'the retry prompt (3rd real call) must carry the strict-cite constraint block');
+    assert.doesNotMatch(prompts[1], /STRICT-CITE CONSTRAINT/, 'the original (2nd) call must NOT already have it');
+  });
+});
+
+test('a normal-sized implement response (eval_count under the cap) never triggers a retry', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'oversized-test-2', domain: 'default', source: 'brain_dump_sort', title: 'test', promptContext: { rawText: 'a note to classify', tags: [] } };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount++;
+      if (callCount === 1) return { response: 'confident match: none', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ category: 'idea', secondBrainPath: 'x.md', tags: [], actionable: false, rationale: 'r' }), degenerate: null, attempts: 1, eval_count: 300 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+
+    await draftTask(task, { localCall });
+
+    assert.equal(callCount, 3, 'no retry call made -- plan, implement, critique only');
+    assert.ok(!task.oversizedImplementRetried);
+  });
+});
+
 // 2026-09-06, Grimmethy: "We need to fix cost tracking before we can even begin to
 // properly work on this problem" -- an efficiency analysis found recordModelCall was
 // ONLY ever invoked from the implement stage: model-stats.db (every cost/degenerate-
