@@ -78,8 +78,17 @@ function countRecentCompletions(pipelineDir, now, windowMs) {
   let names;
   try {
     names = fs.readdirSync(doneDir).filter((f) => f.endsWith('.json'));
-  } catch {
-    return 0;
+  } catch (err) {
+    // Same ENOENT-vs-everything-else split as the sibling countPending just below
+    // (AC-57): a missing queue/done/ (fresh pipeline, nothing shipped yet) is genuinely
+    // 0 completions, but any OTHER error -- permission denied, a bad mount, disk I/O --
+    // silently read as the same "0" and looked exactly like a healthy, quiet pipeline to
+    // checkPipelineHealth's own THROUGHPUT_STALL check, which only fires on
+    // recentCompletions === 0. That's the one signal this whole audit exists to catch;
+    // masking the read failure behind the same 0 a real stall produces defeats it.
+    if (err.code === 'ENOENT') return 0;
+    console.error(`countRecentCompletions: failed to read ${doneDir}: ${err.message}`);
+    throw err;
   }
   const cutoff = now.getTime() - windowMs;
   let count = 0;

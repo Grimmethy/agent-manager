@@ -68,6 +68,21 @@ test('countRecentCompletions returns 0, not a throw, when queue/done/ does not e
   assert.equal(countRecentCompletions(dir, new Date(), 60 * 60 * 1000), 0);
 });
 
+test('countRecentCompletions throws (and logs), not a silent 0, on a real read error other than ENOENT', (t) => {
+  // AC-57's sibling gap (2026-09-15): a bare `catch { return 0; }` made an unreadable
+  // queue/done/ (permission denied, bad mount, disk I/O) look identical to "0 tasks
+  // completed" -- exactly the THROUGHPUT_STALL signal checkPipelineHealth exists to
+  // catch, silently masking a real problem instead of flagging it. Only ENOENT (a
+  // pipeline that genuinely hasn't shipped anything yet) still returns 0.
+  const dir = tempDir('health-audit-count-test-');
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  const err = new Error('permission denied');
+  err.code = 'EACCES';
+  t.mock.method(fs, 'readdirSync', () => { throw err; });
+
+  assert.throws(() => countRecentCompletions(dir, new Date(), 60 * 60 * 1000), /permission denied/);
+});
+
 test('countPending counts real pending/ files, 0 when the dir is absent', () => {
   const dir = tempDir('health-audit-count-test-');
   assert.equal(countPending(dir), 0);
