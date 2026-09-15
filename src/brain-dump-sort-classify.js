@@ -257,6 +257,20 @@ function reviewBrainDumpSort(task, { secondBrainDir, trackedProjectLabels = [] }
     parsed.belongsToProject = derived.belongsToProject;
     parsed.actionable = derived.actionable;
   }
+  // Auto-correct a CANONICAL_TOP_LEVEL folder name mistakenly used as a belongsToProject
+  // value (2026-09-11, brain-dump bd-1788967398266): secondBrainPath's folder vocabulary
+  // and belongsToProject's tracked-label vocabulary are DIFFERENT taxonomies, but the
+  // prompt lists them in the same neighborhood ("Projects" is both a valid top-level
+  // folder AND, confusingly, adjacent to "(a tracked project label)" in that same list --
+  // see prompt-planning.js's own folder enumeration). qwen2.5:3b conflated them 3 retries
+  // in a row with zero progress -- "use one exactly, or null" below never told it WHICH
+  // taxonomy was wrong, so it just re-output the same folder name every time. Coerce
+  // before the tracked-label check rather than reject-and-retry a mistake this cheap to
+  // fix deterministically -- the model already answered "no specific tracked project", it
+  // just used the wrong vocabulary to say so.
+  if (parsed.belongsToProject && CANONICAL_TOP_LEVEL.some((f) => f.toLowerCase() === String(parsed.belongsToProject).toLowerCase())) {
+    parsed.belongsToProject = null;
+  }
   if (parsed.belongsToProject && !trackedProjectLabels.includes(parsed.belongsToProject)) {
     return {
       ok: false,

@@ -262,6 +262,25 @@ test('reviewBrainDumpSort passes a belongsToProject that IS a tracked label', ()
   assert.deepEqual(reviewBrainDumpSort(task, { trackedProjectLabels: ['real-proj'] }), { ok: true });
 });
 
+// 2026-09-11, brain-dump bd-1788967398266 ("qwen2.5:3b cannot distinguish 'Projects' (a
+// second-brain folder) from a project label despite identical rejection feedback across
+// 3 retries"): 'Projects' is a valid CANONICAL_TOP_LEVEL secondBrainPath folder AND sits
+// right next to "(a tracked project label)" in the prompt's own folder enumeration --
+// coerce it (and any other canonical folder name) to null before the tracked-label
+// rejection, instead of burning a retry round on a mistake this cheap to fix
+// deterministically.
+test('reviewBrainDumpSort auto-corrects a CANONICAL_TOP_LEVEL folder name used as belongsToProject to null', () => {
+  const task = { implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: 'Projects' }) };
+  assert.deepEqual(reviewBrainDumpSort(task, { trackedProjectLabels: ['real-proj'] }), { ok: true });
+});
+
+test('reviewBrainDumpSort auto-correct is case-insensitive and covers every canonical folder name', () => {
+  for (const folder of ['projects', 'JOURNAL', 'References', 'ideas', 'Research', 'characters', 'storyimages']) {
+    const task = { implementResponse: JSON.stringify({ secondBrainPath: 'Ideas/x.md', belongsToProject: folder }) };
+    assert.deepEqual(reviewBrainDumpSort(task, { trackedProjectLabels: ['real-proj'] }), { ok: true }, `should coerce "${folder}" to null`);
+  }
+});
+
 test('reviewBrainDumpSort accepts a lowercase canonical folder instead of rejecting it (the real 6-of-7 blocked-backlog shape)', () => {
   const task = { implementResponse: JSON.stringify({ secondBrainPath: 'journal/go-on-a-date.md' }) };
   assert.deepEqual(reviewBrainDumpSort(task, { trackedProjectLabels: [] }), { ok: true });
