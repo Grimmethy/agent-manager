@@ -953,7 +953,9 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   // persist hook this makes a draft killed mid-call show 'implement-started' rather than
   // ending at 'plan-done'.
   appendHistoryEvent(task, 'implement-started', hasFixedLiterals ? 'fixed-literals implement pass' : 'implement pass');
-  const implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected });
+  const implCallStartMs = Date.now();
+  let implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected });
+  let implLatencyMs = Date.now() - implCallStartMs;
 
   if (implResult.degenerate) {
     const blockedReason = `Implement pass degenerate: ${implResult.degenerate}`;
@@ -962,6 +964,38 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
   }
   task.implementResponse = implResult.response;
+
+  // evalTok/latency cap routing (2026-09-08, brain-dump bd-1788725054994 "cap the
+  // implement-pass token/latency budget per draft and route oversized drafts to
+  // strict-cite retry"): computeImplementBudget's evalTokCap/latencyMsCap (added
+  // 2026-09-10) sat inert until now -- nothing ever read them, and prompts.js's
+  // strictCiteConstraintBlock (added alongside them) was never invoked either. A draft
+  // that blows well past the normal generation length or latency for an implement pass
+  // is usually not a legitimately large but correct change -- it is the model
+  // re-deriving or hedging on context it was already given. One bounded retry with the
+  // strict-cite prompt variant reins it back in without burning a second full free-form
+  // pass. Capped at exactly one retry -- oversizedImplementRetried guards against
+  // retrying the retry, so a second oversized result is left as-is and flows through the
+  // normal postImplementCheck/candidate-fulfillment/review path below unchanged.
+  const isOversized = (Number(implResult.eval_count) || 0) > budget.evalTokCap
+    || implLatencyMs > budget.latencyMsCap;
+  if (isOversized && !task.oversizedImplementRetried) {
+    task.oversizedImplementRetried = true;
+    const strictPrompt = buildImplementPrompt(task, task.planResponse, { strictCite: true });
+    const retryStartMs = Date.now();
+    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt: strictPrompt, budget, coldLoadExpected: false });
+    const retryLatencyMs = Date.now() - retryStartMs;
+    appendHistoryEvent(
+      task,
+      'implement-oversized',
+      `evalTok=${implResult.eval_count || 0} latencyMs=${implLatencyMs} (caps ${budget.evalTokCap}/${budget.latencyMsCap}ms) -- retried once with strict-cite, ${retryResult.degenerate ? `retry degenerate (${retryResult.degenerate}), keeping original` : `retry evalTok=${retryResult.eval_count || 0} latencyMs=${retryLatencyMs}`}`,
+    );
+    if (!retryResult.degenerate) {
+      implResult = retryResult;
+      implLatencyMs = retryLatencyMs;
+      task.implementResponse = retryResult.response;
+    }
+  }
 
   // A source can register a `postImplementCheck(task, implementResponse, {call,
   // maybeLockedOn})` -- generic, source-agnostic hook, same convention as premiseCheck
@@ -1026,7 +1060,11 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
       implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt,
     });
   }
-  recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts });
+  recordImplement(attempt, {
+    text: task.implementResponse,
+    attempts: implResult.attempts,
+    ...(task.oversizedImplementRetried ? { promptVariant: 'oversized-strict-cite' } : {}),
+  });
   appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
   return { done: false };
 }
