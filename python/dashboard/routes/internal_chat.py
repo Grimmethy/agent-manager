@@ -128,29 +128,45 @@ def api_internal_chat_local_turn():
 
     Body: {messages?, prompt?, maxTurns, source?, allowWrite?, primaryRoot?, extraRoots?,
     forceSummaryOnCap?, allowAmplification?} -- same fields local_tool_client.py's own
-    stream_plan_with_tools() already takes, passed straight through."""
+    stream_plan_with_tools() already takes, passed straight through.
+
+    2026-09-15 fix (caught before this route had any real caller yet -- see the plan's
+    Phase 3 progress log): the in-tree feature this route replaces held
+    single_flight_lock.priority_marker() for the WHOLE turn (refreshed by a daemon
+    thread), not just the initial preempt call -- see that context manager's own header.
+    Without it, a worker/reviewer daemon respawns and reclaims the GPU BETWEEN this
+    tool-loop's own turns, and the call starves with no output (confirmed live
+    2026-09-02, the original incident this mechanism exists for). This route's first
+    draft omitted it entirely."""
     _require_internal_token()
+    import contextlib
+
+    import single_flight_lock
+    from app import instances_dir
     from local_tool_client import LocalToolClientError, stream_plan_with_tools
 
     body = request.get_json(silent=True) or {}
+    inst_dir = instances_dir()
 
     def generate():
-        try:
-            for event in stream_plan_with_tools(
-                messages=body.get("messages"),
-                prompt=body.get("prompt"),
-                max_turns=body.get("maxTurns", 5),
-                source=body.get("source"),
-                allow_write=bool(body.get("allowWrite")),
-                primary_root=body.get("primaryRoot"),
-                extra_roots=body.get("extraRoots"),
-                force_summary_on_cap=bool(body.get("forceSummaryOnCap")),
-                allow_amplification=bool(body.get("allowAmplification")),
-            ):
-                yield f"data: {json.dumps(event)}\n\n"
-        except LocalToolClientError as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-        except (TimeoutError, ConnectionError, OSError) as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': f'local model call failed ({e})'})}\n\n"
+        marker_cm = single_flight_lock.priority_marker(inst_dir) if inst_dir else contextlib.nullcontext()
+        with marker_cm:
+            try:
+                for event in stream_plan_with_tools(
+                    messages=body.get("messages"),
+                    prompt=body.get("prompt"),
+                    max_turns=body.get("maxTurns", 5),
+                    source=body.get("source"),
+                    allow_write=bool(body.get("allowWrite")),
+                    primary_root=body.get("primaryRoot"),
+                    extra_roots=body.get("extraRoots"),
+                    force_summary_on_cap=bool(body.get("forceSummaryOnCap")),
+                    allow_amplification=bool(body.get("allowAmplification")),
+                ):
+                    yield f"data: {json.dumps(event)}\n\n"
+            except LocalToolClientError as e:
+                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+            except (TimeoutError, ConnectionError, OSError) as e:
+                yield f"data: {json.dumps({'type': 'error', 'error': f'local model call failed ({e})'})}\n\n"
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream")

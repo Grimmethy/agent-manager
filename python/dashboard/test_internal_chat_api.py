@@ -147,6 +147,45 @@ class InternalChatApiTest(unittest.TestCase):
             self.assertIn('"type": "error"', body)
             self.assertIn("node blew up", body)
 
+    def test_local_turn_holds_the_priority_marker_for_the_whole_call(self):
+        # 2026-09-15 regression: this route's first draft never held
+        # single_flight_lock.priority_marker() at all -- without it, a worker/reviewer
+        # daemon can respawn and reclaim the GPU BETWEEN this tool-loop's own turns
+        # (confirmed live 2026-09-02, the original incident priority_marker exists for).
+        marker_active_during_call = []
+
+        class FakeMarkerCm:
+            def __enter__(self_inner):
+                marker_active_during_call.append(True)
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                marker_active_during_call.append(False)
+
+        def fake_stream(**kwargs):
+            # The marker must already be held by the time the tool loop actually runs.
+            self.assertEqual(marker_active_during_call, [True])
+            yield {"type": "final", "response": "ok"}
+
+        with mock.patch.object(app, "instances_dir", return_value=Path("/inst")), \
+             mock.patch("single_flight_lock.priority_marker", return_value=FakeMarkerCm()) as m_marker, \
+             mock.patch("local_tool_client.stream_plan_with_tools", side_effect=fake_stream):
+            res = self._post("/api/internal/chat/local-turn", {"prompt": "hi"})
+            res.get_data()  # force the streaming generator to actually run
+            m_marker.assert_called_once_with(Path("/inst"))
+            self.assertEqual(marker_active_during_call, [True, False], "marker must be released after the call finishes")
+
+    def test_local_turn_with_no_instances_dir_still_streams_without_a_marker(self):
+        def fake_stream(**kwargs):
+            yield {"type": "final", "response": "ok"}
+
+        with mock.patch.object(app, "instances_dir", return_value=None), \
+             mock.patch("single_flight_lock.priority_marker") as m_marker, \
+             mock.patch("local_tool_client.stream_plan_with_tools", side_effect=fake_stream):
+            res = self._post("/api/internal/chat/local-turn", {"prompt": "hi"})
+            self.assertIn('"type": "final"', res.get_data(as_text=True))
+            m_marker.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
