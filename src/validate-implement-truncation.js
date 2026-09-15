@@ -7,9 +7,15 @@
 
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 
-// Characters/markers that indicate the text contains code or JSON structure.
+// Characters that indicate the text contains real code or JSON structure. Deliberately
+// NOT also matching bare keywords like return/function/const/let/class -- those are
+// common English words too ("let me read...", "this class of bug", "please return to...")
+// and a keyword-only heuristic produced real false positives (found live 2026-09-15,
+// wiring this into review-task.js: a plain brain_dump_sort refusal, "let me read the
+// vault first", was misclassified as truncated code purely because of the word "let"). A
+// genuine code/JSON fragment reliably contains at least one brace/bracket/backtick;
+// prose essentially never does.
 const CODE_MARKERS = /[{}\[\]`]/;
-const CODE_KEYWORDS = /\b(return|function|const|let|var|import|export|class)\b/;
 
 /**
  * Detect whether `rawText` looks like a truncated model output.
@@ -43,7 +49,7 @@ function detectTruncatedImplementResponse(rawText) {
       return { truncated: true, reason: 'truncated output' };
     }
     // 4. No code/JSON markers at all -- treat as a clean refusal.
-    if (!CODE_MARKERS.test(trimmed) && !CODE_KEYWORDS.test(trimmed)) {
+    if (!CODE_MARKERS.test(trimmed)) {
       return { truncated: false, reason: null };
     }
     // 5. Code markers present but unparseable -- truncated.
