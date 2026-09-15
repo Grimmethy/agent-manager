@@ -87,5 +87,5 @@ test('applyRetryCheck returns an all-zero summary when queue/blocked/ does not e
     pendingDir: path.join(root, 'queue', 'pending'),
     recordModelOutcome: () => {},
   });
-  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0 });
+  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0, errorDetails: [] });
 });
