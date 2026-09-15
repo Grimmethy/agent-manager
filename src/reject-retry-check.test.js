@@ -43,6 +43,45 @@ test('rejectRetryCheck requeues a review-rejected task under the retry cap', () 
   assert.equal(requeued.localRejectCount, 1);
 });
 
+test('rejectRetryCheck clears stale planResponse/implementResponse on a genuine review-rejection requeue (AC-131)', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    localRejectCount: 0,
+    planResponse: '# Plan\n1. Do the thing.',
+    implementResponse: '{"mode":"edit","file":"x.js","find":"a","replace":"b"}',
+  });
+
+  rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-1.json'), 'utf8'));
+  assert.equal(requeued.planResponse, undefined, 'stale plan must not survive a review-rejection requeue');
+  assert.equal(requeued.implementResponse, undefined, 'stale implement response must not survive a review-rejection requeue');
+  // priorRejectionFeedback is the rejection SIGNAL the next plan pass should read -- must
+  // survive the same clearing that wipes the stale draft itself.
+  assert.ok(Array.isArray(requeued.priorRejectionFeedback) && requeued.priorRejectionFeedback.length > 0);
+  assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /cleared stale plan\/implement state/.test(h.detail || '')));
+});
+
+test('rejectRetryCheck does NOT clear planResponse/implementResponse for a retryable draft-block continuation (not a review rejection)', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  const task = {
+    id: 'task-1', domain: 'adhoc', source: 'manual',
+    blockedStage: 'draft', blockedReason: 'agentic continuation', retryableDraftBlock: true,
+    isAgenticContinuation: true, agenticContinuationCount: 1, agenticContinuationNote: 'ran out of turns partway through',
+    planResponse: '# Plan\n1. Do the thing.',
+    implementResponse: 'partial progress notes',
+    history: [], localRejectCount: 0,
+  };
+  fs.writeFileSync(path.join(blockedDir, 'task-1.json'), JSON.stringify(task, null, 2));
+
+  rejectRetryCheck({ blockedDir, pendingDir, adhocDir: path.join(blockedDir, '..', 'adhoc'), recordModelOutcome: () => {} });
+
+  const adhocDir = path.join(blockedDir, '..', 'adhoc');
+  const requeued = JSON.parse(fs.readFileSync(path.join(adhocDir, 'task-1.json'), 'utf8'));
+  // A continuation must build ON the prior plan, not restart from nothing.
+  assert.equal(requeued.planResponse, '# Plan\n1. Do the thing.');
+});
+
 test('rejectRetryCheck stamps exhausted exactly once when the retry cap is hit, not on every call', () => {
   const { blockedDir, pendingDir } = setupDirs();
   writeBlockedTask(blockedDir, 'task-1', { localRejectCount: 2 });
