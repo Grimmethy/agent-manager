@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock } = require('./acceptance-criteria.js');
+const { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, detectContradictoryLiteralAcceptance } = require('./acceptance-criteria.js');
 const { runAcceptanceCommand } = require('./acceptance-command-gate.js');
 
 test('resolveAcceptanceCriteria: promptContext array', () => {
@@ -64,4 +64,43 @@ test('runAcceptanceCommand: failure via injected exec that throws', () => {
   assert.equal(r.ok, false);
   assert.equal(r.checks[0].status, 'fail');
   assert.match(r.checks[0].detail, /AssertionError/);
+});
+
+// --- detectContradictoryLiteralAcceptance (2026-09-15, brain-dump bd-1789433484492,
+// "pipeline hardening 5/5") -- root-caused live against system-report.js's
+// LESSONS-LEARNED comment task, which burned 3 real automated attempts before a human
+// caught that its own acceptance check was unsatisfiable by construction. -------------
+
+test('detectContradictoryLiteralAcceptance: the real incident text (required phrase spans a line boundary in the mandated literal)', () => {
+  const rawText = "Insert exactly this text (as // comments): '// LESSONS-LEARNED CONSTRAINT:' '//   All findings file into the SAME' '//   vault, under Lessons/. Do NOT create a' '//   parallel store, sidecar DB, or separate index.' Verify the string 'Do NOT create a parallel store' appears in the header block.";
+  const result = detectContradictoryLiteralAcceptance({ promptContext: { rawText } });
+  assert.ok(result, 'must detect the contradiction');
+  assert.equal(result.contradictory, true);
+  assert.equal(result.requiredPhrase, 'Do NOT create a parallel store');
+  assert.match(result.reason, /line boundary/);
+});
+
+test('detectContradictoryLiteralAcceptance: null when the required phrase fits on one line of the mandated literal', () => {
+  const rawText = "Insert exactly this text: '// LESSONS-LEARNED CONSTRAINT:' '// All findings go to the SAME vault.' '// Do NOT create a parallel store.' '// See the concept note.' Verify the string 'Do NOT create a parallel store' appears in the header.";
+  assert.equal(detectContradictoryLiteralAcceptance({ promptContext: { rawText } }), null);
+});
+
+test('detectContradictoryLiteralAcceptance: null when there is no literal-line cluster at all (an ordinary task)', () => {
+  const rawText = "In src/foo.js, add a guard that returns early when 'input' is empty. Verify with node --test src/foo.test.js.";
+  assert.equal(detectContradictoryLiteralAcceptance({ promptContext: { rawText } }), null);
+});
+
+test('detectContradictoryLiteralAcceptance: null when there is a literal-line cluster but no verify/grep clause', () => {
+  const rawText = "Insert exactly this text: '// line one' '// line two' '// line three' at the top of the file.";
+  assert.equal(detectContradictoryLiteralAcceptance({ promptContext: { rawText } }), null);
+});
+
+test('detectContradictoryLiteralAcceptance: null on a task with no promptContext/rawText at all', () => {
+  assert.equal(detectContradictoryLiteralAcceptance({}), null);
+  assert.equal(detectContradictoryLiteralAcceptance(null), null);
+});
+
+test('detectContradictoryLiteralAcceptance: only 2 quoted segments (below the cluster minimum) is not flagged even if it would otherwise match', () => {
+  const rawText = "Insert: '// Do NOT create a' '// parallel store here.' Verify the string 'Do NOT create a parallel store' appears.";
+  assert.equal(detectContradictoryLiteralAcceptance({ promptContext: { rawText } }), null);
 });
