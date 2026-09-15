@@ -127,6 +127,41 @@ test('brain_dump_sort deterministic review BLOCKS a malformed classification wit
   assert.match(result.blockedReason, /Deterministic review:/);
 });
 
+// 2026-09-08, brain-dump bd-1788787323412 ("investigate the COMPLETED 20 (line 2714)
+// failure mode"): the real incident shape -- a refusal sentence followed by a code
+// fragment that cuts off mid-string at an unterminated trailing quote -- must be rejected
+// before any fact-check/vote call, on a real (non-brain_dump_sort) task that would
+// otherwise reach the full review machinery.
+test('a truncated implementResponse (refusal + unterminated code fragment) is blocked before any fact-check or vote call', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const task = baseTask({
+    implementResponse: 'I could not find the exact pattern, but here is my best attempt:\nfunction example() {\n  return "Topology',
+  });
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath,
+    localMajorityVote: async () => { throw new Error('vote must not be called for a truncated draft'); },
+    recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.equal(result.blockedReason, 'truncated output');
+  assert.equal(result.factCheckVerdict, 'skipped');
+  assert.equal(task.reviewProvider, 'deterministic-truncation-guard');
+});
+
+test('a normal, well-formed implementResponse is NOT caught by the truncation guard', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const capturedPrompts = [];
+  const task = baseTask();
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath,
+    localMajorityVote: fakeApprove(capturedPrompts),
+    recordModelOutcome: () => {},
+  });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(capturedPrompts.length, 1, 'the real vote path was reached, not short-circuited');
+});
+
 test('brain_dump_sort deterministic review BLOCKS an off-taxonomy secondBrainPath', async () => {
   const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
   const task = brainDumpSortTask({

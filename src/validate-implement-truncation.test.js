@@ -29,3 +29,20 @@ test('flags a sub-40-char JSON fragment as truncated', () => {
   const result = detectTruncatedImplementResponse('{"content": "he');
   assert.deepEqual(result, { truncated: true, reason: 'truncated output' });
 });
+
+// 2026-09-15, found live wiring this into review-task.js: a bare code KEYWORD (as
+// opposed to a real brace/bracket/backtick marker) is not a reliable code signal --
+// ordinary English sentences use these words constantly. A real brain_dump_sort refusal
+// hit exactly this before the fix.
+test('does not flag ordinary English refusal sentences that happen to contain code keywords', () => {
+  const cases = [
+    'let me read the vault first',
+    'this class of bug keeps coming back',
+    'please return to the previous step',
+    'I cannot import that dependency here',
+    'the constraints of the request make this infeasible',
+  ];
+  for (const text of cases) {
+    assert.deepEqual(detectTruncatedImplementResponse(text), { truncated: false, reason: null }, `should not flag: "${text}"`);
+  }
+});

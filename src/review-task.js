@@ -53,6 +53,7 @@ const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { decideEmptyApprovalOutcome } = require('./empty-approval-decision.js');
+const { detectTruncatedImplementResponse } = require('./validate-implement-truncation.js');
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene: observability/performance/function-length/arch/
@@ -544,6 +545,37 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     ? (opts) => baseMajorityVote({ ...profileOverrides, ...opts })
     : baseMajorityVote;
   appendHistoryEvent(task, 'review-started');
+
+  // 2026-09-08, brain-dump bd-1788787323412 ("investigate the COMPLETED 20 (line 2714)
+  // failure mode"): a draft whose implementResponse is a refusal sentence followed by a
+  // code fragment that cuts off mid-string (an unterminated trailing quote -- the
+  // incident's own literal "...Topology signature) used to reach the full fact-check +
+  // majority-vote machinery below, burning a real review round on content that was never
+  // going to apply. Checked here, first, before any real work -- cheap and applies to
+  // every source, not just the one this incident happened on. (The task that first
+  // described this fix named review-runner.ps1/decode-group-b-content.js as the
+  // insertion point -- that pair is the Windows reference implementation's own
+  // fixedLiterals compliance gate and is never invoked from the real Linux path;
+  // review-runner.sh calls this module, review-task.js, directly, with no
+  // decode-group-b-content.js step at all. Wired here instead: the actual live entry
+  // point every draft's review goes through.)
+  // A genuinely empty/whitespace-only implementResponse is NOT this guard's concern --
+  // decideEmptyApprovalOutcome below already handles that case deliberately (approve when
+  // harness search found zero real hits, block otherwise), a more informed decision than
+  // this guard's blanket "empty = truncated" rule 1 would make. Only run the guard on
+  // NON-empty text, where its real job (a refusal sentence followed by a code fragment
+  // that cuts off mid-string) applies.
+  const rawImplementResponse = task.implementResponse || '';
+  const truncationCheck = rawImplementResponse.trim()
+    ? detectTruncatedImplementResponse(rawImplementResponse)
+    : { truncated: false, reason: null };
+  if (truncationCheck.truncated) {
+    const rawText = rawImplementResponse;
+    task.reviewProvider = 'deterministic-truncation-guard';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: truncationCheck.reason });
+    appendHistoryEvent(task, 'blocked', `${truncationCheck.reason} (raw text length ${rawText.length}, starts "${rawText.slice(0, 80)}", ends "${rawText.slice(-80)}")`);
+    return { succeeded: true, verdict: 'blocked', blockedReason: truncationCheck.reason, blockedStage: 'review', factCheckVerdict: 'skipped' };
+  }
 
   // Deterministic review (brain_dump_sort, 2026-09-03): a mechanical validate replaces the
   // LLM majority vote entirely -- no grounding subprocess, no fact-check, no vote. The vote
