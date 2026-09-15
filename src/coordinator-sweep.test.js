@@ -529,3 +529,47 @@ test('wiring hub: not all children done -> wiring does not fire', () => {
   coordinatorSweep({ pipelineDir: dir, repoRoot: '/repo', runWiring: () => { wiringCalls += 1; return { ok: true }; } });
   assert.equal(wiringCalls, 0);
 });
+
+// --- TERMINAL_GOOD (2026-09-15, root-caused live) ---------------------------------------
+// classifyChildStatus() (fixed by PR #253) can now report a child's REAL
+// terminalDisposition -- noop, dismissed, filed, superseded -- instead of collapsing
+// almost everything to 'merged'/'done'. TERMINAL_GOOD used to be a hand-picked 4-item
+// list that predated that fix and never recognized any of those as complete, so a hub
+// with e.g. a legitimately noop-resolved child ("already satisfied, no code change
+// needed" -- a real, common, correct outcome) could never auto-complete again. Caught
+// live on a real hub whose two stuck sub-tasks both correctly resolved to noop.
+test('a plain (non-decomposeHub) coordinating hub completes once every child reaches ANY real terminalDisposition, not just merged/done/abandoned', () => {
+  const dir = makePipeline();
+  write(dir, 'coordinating', {
+    id: 'ordinary-hub', status: 'coordinating', history: [{ stage: 'coordinating', at: 'x' }],
+    subTasks: [
+      { id: 'c-noop', title: 'A', status: 'in-progress' },
+      { id: 'c-dismissed', title: 'B', status: 'in-progress' },
+      { id: 'c-filed', title: 'C', status: 'in-progress' },
+      { id: 'c-merged', title: 'D', status: 'in-progress' },
+    ],
+  });
+  write(dir, 'done', { id: 'c-noop', terminalDisposition: 'noop' });
+  write(dir, 'done', { id: 'c-dismissed', terminalDisposition: 'dismissed' });
+  write(dir, 'done', { id: 'c-filed', terminalDisposition: 'filed' });
+  write(dir, 'done', { id: 'c-merged', mergedAt: 'x' });
+
+  const summary = coordinatorSweep({ pipelineDir: dir });
+  assert.equal(summary.completed, 1, 'every child reached a real terminal disposition -- the hub must complete');
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'ordinary-hub.json')), false);
+  const parent = readParent(dir, 'done', 'ordinary-hub');
+  assert.deepEqual(parent.progress, { done: 4, total: 4 });
+});
+
+test('a plain coordinating hub does NOT complete while a child is still pending-merge (excluded from TERMINAL_GOOD on purpose)', () => {
+  const dir = makePipeline();
+  write(dir, 'coordinating', {
+    id: 'pm-hub', status: 'coordinating', history: [{ stage: 'coordinating', at: 'x' }],
+    subTasks: [{ id: 'c-pm', title: 'A', status: 'in-progress' }],
+  });
+  write(dir, 'done', { id: 'c-pm', terminalDisposition: 'pending-merge' });
+
+  const summary = coordinatorSweep({ pipelineDir: dir });
+  assert.equal(summary.completed, 0, 'pending-merge must never count as done -- the child has not actually landed yet');
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'pm-hub.json')), true);
+});
