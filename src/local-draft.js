@@ -892,6 +892,17 @@ async function finalizeCandidateFulfillment(task, {
     } else {
       correction = `Your previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
     }
+    // 2026-09-10, brain-dump bd-1788748625403 ("before spending a second implement
+    // attempt on an observability_fix requeue, feed the prior rejection reason"): this
+    // correction text was built for ONE inline retry here and then discarded -- if this
+    // candidate still gets rejected later (critique/review) and reject-retry-check.js
+    // redrafts it from scratch, the fresh attempt had no memory of this exact mistake and
+    // could easily reproduce it. Pushing it onto task.priorRejectionFeedback lets
+    // priorRejectionBlock() (prompts.js/lib/prompt-blocks.js) fold it into the next
+    // attempt's prompt as a hard constraint, same as every other rejection reason already
+    // does -- no signature changes, just one more caller of the existing mechanism.
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(correction);
     const retryPrompt = `${implPrompt}\n\n${correction}`;
     const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry' }), 'implement-retry');
     if (!retryResult.degenerate) {
