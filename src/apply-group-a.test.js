@@ -348,6 +348,39 @@ test('applyBrainDumpSort files the entry, appends a dated line, and marks it sor
   assert.ok(entries[0].sortedAt);
 });
 
+test('applyBrainDumpSort resolves the top-level segment to its real on-disk casing before validation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(path.join(secondBrainDir, 'Projects'), { recursive: true });
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'projects/plan.md' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(result.skipped, undefined);
+  assert.equal(result.file, path.join(secondBrainDir, 'Projects', 'plan.md'));
+});
+
+test('applyBrainDumpSort still rejects an ambiguous top-level segment when BOTH case variants exist on disk', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(path.join(secondBrainDir, 'Projects'), { recursive: true });
+  fs.mkdirSync(path.join(secondBrainDir, 'projects'), { recursive: true });
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  // normalizeSecondBrainPathCase rewrites this to the canonical 'Projects' first; the
+  // on-disk resolver then sees TWO case-insensitive matches ('Projects' and 'projects')
+  // and must leave it unresolved, so validateSecondBrainPath's own different-case-duplicate
+  // check is what actually rejects it.
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'projects/plan.md' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /different-case duplicate/);
+});
+
 test('applyBrainDumpSort appends to an EXISTING note instead of overwriting it', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
   const secondBrainDir = path.join(dir, 'secondbrain');
