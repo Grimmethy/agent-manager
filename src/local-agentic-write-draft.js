@@ -48,6 +48,19 @@ const MAX_AUTO_DECOMPOSE = Number(process.env.AGENT_MANAGER_MAX_AUTO_DECOMPOSE) 
 // override still wins.
 const LOCAL_AGENTIC_WRITE_MAX_TURNS = Number(process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS) || 35;
 
+// RETRY_ORIENT_TURN_LIMIT (2026-09-15, brain-dump bd-1789433484128, "pipeline hardening
+// 1/5"): a retry whose prompt already carries a substantive priorAttemptAnalysisBlock (a
+// prior attempt's own verified file/line findings, fed forward specifically so this pass
+// does not need to re-investigate) gets a much smaller orientation window than a
+// cold-start attempt -- see runPlanWithTools' own header on orientTurnLimit for why. Root-
+// caused live: repeated real incidents (apply-task.test.js's guard tests took 6 attempts,
+// each re-deriving the same already-known facts) where the model kept re-verifying
+// despite the prior findings sitting right there in its context -- a compliance gap the
+// prompt wording alone did not close. Small but non-zero: still enough turns for a quick
+// sanity-confirm of the carried-forward facts before the nudge fires, per the prompt's own
+// instruction ("confirm them quickly, then GO EDIT").
+const RETRY_ORIENT_TURN_LIMIT = Number(process.env.AGENT_MANAGER_AGENTIC_RETRY_ORIENT_TURNS) || 3;
+
 function isEnabled() {
   return process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE !== 'false';
 }
@@ -326,12 +339,18 @@ function preFilterFlagsBlock(task) {
   return lines.join('\n');
 }
 
-function buildWriteAgenticPrompt(task) {
+// orientTurnLimit override (2026-09-15): defaults to ORIENT_TURN_LIMIT, but a retry
+// carrying a substantive priorAttemptAnalysisBlock passes RETRY_ORIENT_TURN_LIMIT instead
+// -- see RETRY_ORIENT_TURN_LIMIT's own header. The prompt text must state whichever
+// number is ACTUALLY enforced this pass (runPlanWithTools' nudge timing uses the same
+// value, passed by the caller below), not always the cold-start default, or the model's
+// own instructions would contradict when the nudge really fires.
+function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } = {}) {
   const ctx = task.promptContext || {};
   const leaf = leafDecomposeLocked(task);
   const stillLostAdvice = leaf
-    ? `If you are still lost about where to make the change after ${ORIENT_TURN_LIMIT} turns, answer RESOLUTION: needs-human-decision AND name the one concrete fact you are missing -- do not keep grepping, and do NOT answer RESOLUTION: decompose.`
-    : `If you are still lost about where to make the change after ${ORIENT_TURN_LIMIT} turns, that is a signal to answer RESOLUTION: decompose or RESOLUTION: needs-human-decision, not to keep grepping.`;
+    ? `If you are still lost about where to make the change after ${orientTurnLimit} turns, answer RESOLUTION: needs-human-decision AND name the one concrete fact you are missing -- do not keep grepping, and do NOT answer RESOLUTION: decompose.`
+    : `If you are still lost about where to make the change after ${orientTurnLimit} turns, that is a signal to answer RESOLUTION: decompose or RESOLUTION: needs-human-decision, not to keep grepping.`;
   const tooLargeClause = leaf
     ? 'This task has already been scoped by a prior decompose pass to be implementable in ONE pass. If you genuinely cannot, answer RESOLUTION: needs-human-decision with the specific blocker -- do not answer RESOLUTION: decompose and do not leave a partial edit.'
     : 'If the task is simply TOO LARGE to implement confidently in one pass (many files/subsystems, or you can tell you would run out of turns partway through), do NOT attempt a partial implementation and do NOT make any code changes. Instead split it into 2-6 smaller, independently-implementable pieces that together cover the original task. Each piece should touch ONE file; strongly prefer a NEW self-contained file/module over pieces that need edits scattered through a large existing file.';
@@ -339,7 +358,7 @@ function buildWriteAgenticPrompt(task) {
     'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
     'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Prefer read_file with offset/limit to page a large file and grep_codebase to locate code; a quick `run_bash` `sed -n \'3600,3700p\' path` slice is fine for a fast look, just do not burn turns re-listing the tree. Reserve run_bash otherwise for the final targeted check on files you actually changed.',
     'Files here can be thousands of lines. read_file returns a WINDOW of lines: check `totalLines` and `nextOffset` in the result and re-call with a higher `offset` to page -- never assume the first window is the whole file. grep_codebase searches this repo\'s configured dirs (or a subpath, or "." for all); it is a literal substring / all-words match, not a regex, and returns matching lines only -- read_file around a hit for context.',
-    `TURN BUDGET: you have about ${LOCAL_AGENTIC_WRITE_MAX_TURNS} turns total. Spend at most the first ~${ORIENT_TURN_LIMIT} on orientation (grep/read/list). By then you MUST have either started editing with edit_file/write_file, or concluded with a RESOLUTION: line. Do not keep exploring past that -- a rough first edit you then fix is far better than running out of turns having changed nothing. ${stillLostAdvice}`,
+    `TURN BUDGET: you have about ${LOCAL_AGENTIC_WRITE_MAX_TURNS} turns total. Spend at most the first ~${orientTurnLimit} on orientation (grep/read/list). By then you MUST have either started editing with edit_file/write_file, or concluded with a RESOLUTION: line. Do not keep exploring past that -- a rough first edit you then fix is far better than running out of turns having changed nothing. ${stillLostAdvice}`,
     '',
     `Title: ${task.title || ''}`,
     leaf ? 'This task is a CONFIRMED-ATOMIC LEAF: a prior decompose pass already split the larger feature and this is one indivisible piece. It MUST be implemented in this pass with edit_file / write_file. Do NOT answer RESOLUTION: decompose.' : '',
@@ -576,7 +595,11 @@ async function draftAdhocViaLocalAgenticWrite(task, {
     }
   }
 
-  const prompt = buildWriteAgenticPrompt(task);
+  // A retry that already has its own prior attempt's verified findings fed forward (see
+  // priorAttemptAnalysisBlock) gets a much shorter orientation window -- see
+  // RETRY_ORIENT_TURN_LIMIT's own header for why.
+  const orientTurnLimit = priorAttemptAnalysisBlock(task) ? RETRY_ORIENT_TURN_LIMIT : ORIENT_TURN_LIMIT;
+  const prompt = buildWriteAgenticPrompt(task, { orientTurnLimit });
   const started = Date.now();
 
   const doRun = runInWorktree || (async (worktreeDir) => {
@@ -593,9 +616,10 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       forceSummaryOnCap: true,
       // Edit-by-turn-N forcing function: this tier's whole job is to produce a diff, and
       // it has repeatedly burned its entire budget on read-only orientation. If it hasn't
-      // edited anything by ORIENT_TURN_LIMIT turns, runPlanWithTools pushes one firm
+      // edited anything by orientTurnLimit turns, runPlanWithTools pushes one firm
       // "stop exploring, act now" message.
       nudgeToEditEarly: true,
+      orientTurnLimit,
       // A confirmed-atomic leaf (decomposedFrom / rescopedFromDecompose) that still hasn't
       // edited a few turns after the soft nudge gets one firmer push: edit now or conclude
       // needs-human-decision -- decompose is off the table for a leaf.
