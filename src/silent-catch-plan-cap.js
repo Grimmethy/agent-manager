@@ -6,7 +6,8 @@
 // 'dismiss'), the plan text is truncated to SILENT_CATCH_PLAN_MAX_CHARS to
 // keep the queue payload bounded; every other (ruleId, disposition)
 // combination passes through untouched. Pure, no I/O, no external requires
-// (same constraint as cluster-dedup.js, a core file on a hot path).
+// (same constraint deterministic-recheck-registry.js holds, another core file
+// on a hot path).
 
 /**
  * @module silent-catch-plan-cap
