@@ -1581,6 +1581,17 @@ function nextPipelineHealthAuditTask() {
 
   const id = `pipeline-health-audit-${Date.now()}`;
   if (taskIdExistsInQueue(id)) return null;
+  // 2026-09-15: markChecked() used to run ONLY on the clean (no-anomaly) branch above --
+  // harmless while this was only ever reached through getNextTask()'s priority ladder
+  // (rarely, if ever, in practice), but pipeline-health-audit-sweep.js now guarantees
+  // this runs every watchdog tick regardless of backlog. Without marking checked here
+  // too, a persisting anomaly (a still-hung Ollama backend, a still-duplicated worker
+  // daemon) would re-file a fresh Date.now()-keyed task on EVERY tick until the
+  // underlying problem is actually fixed -- confirmed live within minutes of wiring the
+  // always-run sweep in (2 near-duplicate tasks filed 6 minutes apart for the same
+  // still-live duplicate-worker-1 anomaly). One filed task per hour is still a real,
+  // timely alert; a new one every ~30s-2min is queue spam, not observability.
+  pipelineHealthAudit.markChecked(instancesDir);
 
   const evidenceText = [
     `${anomalies.length} anomal${anomalies.length === 1 ? 'y' : 'ies'} found by a deterministic live-system check:`,

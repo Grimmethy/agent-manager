@@ -2546,6 +2546,31 @@ test('nextPipelineHealthAuditTask returns null (does nothing) when the hourly ch
   assert.equal(nextPipelineHealthAuditTask(), null);
 });
 
+// Regression (2026-09-15): pipeline-health-audit-sweep.js now calls this every watchdog
+// tick regardless of backlog (see that file's own header for the incident this closes).
+// markChecked() used to run ONLY on the clean branch, so a PERSISTING anomaly re-filed a
+// fresh Date.now()-keyed task on every single tick -- confirmed live within minutes of
+// wiring the sweep in. This proves the fix: a real anomaly is still filed once, but the
+// very next call (same hour) is a no-op, not a second near-duplicate task.
+test('nextPipelineHealthAuditTask marks checked on the anomaly branch too, so a persisting anomaly is not re-filed every call', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'health-audit-refire-test-'));
+  fs.mkdirSync(path.join(dir, 'queue', 'pending'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  // recentCompletions === 0 (empty done/) && pending > 5 -> a real THROUGHPUT_STALL
+  // anomaly, with no dependency on this machine's real log files.
+  for (let i = 0; i < 6; i++) {
+    fs.writeFileSync(path.join(dir, 'queue', 'pending', `t${i}.json`), JSON.stringify({ id: `t${i}` }));
+  }
+  const { nextPipelineHealthAuditTask } = freshTaskSources(dir);
+
+  const first = nextPipelineHealthAuditTask();
+  assert.notEqual(first, null, 'the stall anomaly must actually fire on the first call');
+  assert.match(first.title, /throughput has stalled|Pipeline health audit/i);
+
+  const second = nextPipelineHealthAuditTask();
+  assert.equal(second, null, 'the SAME still-persisting anomaly must not re-file on the very next call');
+});
+
 // nextUiVisibilityAuditTask (2026-08-24, Grimmethy: "How do we look for functions and
 // code that should have a display in the ui?") -- ui-visibility-audit.js's own test file
 // covers the actual detection logic in isolation; this just proves the due-gating wiring
