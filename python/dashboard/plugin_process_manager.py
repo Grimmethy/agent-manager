@@ -18,9 +18,11 @@ called it.
 import logging
 import os
 import signal
+import socket
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 log = logging.getLogger(__name__)
 
@@ -56,10 +58,45 @@ def is_running(name: str) -> bool:
         return False
 
 
+def _port_from_url(url: str) -> int | None:
+    try:
+        parsed = urlsplit(url)
+        return parsed.port
+    except (ValueError, AttributeError):
+        return None
+
+
+def _port_in_use(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
+    """True if something is already accepting connections on host:port -- regardless
+    of whether it's a process this module's own pidfile knows about."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def start(entry: dict) -> bool:
     """Idempotent: already running -> log + return True, matching start_bg()'s
     "already running (pid N) -- skipping" behavior. Returns False (never raises) if
-    the process fails to launch at all (bad command, missing cwd, etc.)."""
+    the process fails to launch at all (bad command, missing cwd, etc.).
+
+    2026-09-15, real incident (confirmed live, twice in one session): is_running()
+    only ever checks the PID in OUR OWN pidfile. A plugin process started some other
+    way (manually, or by an earlier start() call whose pidfile write raced/drifted)
+    keeps serving its configured port with no pidfile entry at all -- is_running()
+    then reports False, so a later stop()+start() cycle SIGTERMs nothing (the tracked
+    pid is already dead or doesn't exist) and spawns a brand-new child that fails to
+    bind the port (already held by the untracked orphan) -- yet
+    _wait_for_plugin_health()'s plain GET /healthz still succeeds, because the OLD,
+    untracked process answers it. The dashboard then reports the plugin "started" and
+    "healthy" while it's silently still serving pre-restart code, with no error
+    anywhere. This masked a real code fix from taking effect twice in the same
+    session before a human noticed by hand (killed the orphan pid found via `ss
+    -ltnp`, removed the stale pidfile, restarted). Fixed here at the one point that
+    actually catches it: refuse to spawn a duplicate at all when the configured port
+    is already answering and our own pidfile doesn't know why -- a clear, loud
+    failure instead of a silent double-bind."""
     name = entry.get("name")
     if is_running(name):
         log.info("plugin '%s' already running -- skipping start", name)
@@ -69,6 +106,18 @@ def start(entry: dict) -> bool:
     cwd = process.get("cwd")
     if not command:
         log.warning("plugin '%s' has no process.command -- cannot start", name)
+        return False
+    port = _port_from_url(entry.get("url") or "")
+    if port is not None and _port_in_use(port):
+        log.warning(
+            "plugin '%s': refusing to start -- port %s is already answering but our "
+            "own pidfile (%s) has no live pid for it. This is an untracked process "
+            "(started outside plugin_process_manager, or a prior start() that lost "
+            "its pidfile) -- find and stop it by hand (e.g. `ss -ltnp | grep :%s`) "
+            "before starting this plugin again, or the new child will silently fail "
+            "to bind while the old one keeps answering health checks.",
+            name, port, _pidfile(name), port,
+        )
         return False
     try:
         PID_DIR.mkdir(parents=True, exist_ok=True)
