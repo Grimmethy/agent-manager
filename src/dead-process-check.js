@@ -185,7 +185,26 @@ function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {
       const ageSeconds = (now - new Date(hb.lastHeartbeat).getTime()) / 1000;
       if (ageSeconds < STALE_HEARTBEAT_SECONDS) continue; // recently updated, fine.
 
-      const pidAlive = isProcessAlive(hb.pid);
+      // Liveness must be judged against daemonPid, not plain pid (2026-09-15,
+      // root-caused live from a real duplicate worker-1: pids 205693 and 1198141 both
+      // running simultaneously). heartbeat.js's writeHeartbeatFile -- called from INSIDE
+      // local-draft.js during plan/implement passes -- intentionally overwrites `pid`
+      // with the in-flight child's OWN pid for most of a real call's lifetime (see this
+      // file's own findOrphanedModelCallProcesses comment, and heartbeat.js's header).
+      // If that child exits (call finishes, crashes, gets OOM-killed) before the daemon's
+      // bash loop gets back around to writing a fresh heartbeat with its own pid, a
+      // heartbeat that goes stale in that exact window still shows `pid` pointing at a
+      // now-dead child -- `isProcessAlive(hb.pid)` reports false even though the real
+      // daemon (bash loop, `daemonPid`) is very much alive, so this fired a plain
+      // 'restart' action with no recheck, and queue-watcher.sh's restart path spawns
+      // unconditionally, producing a second live daemon under the same instanceId. The
+      // exact same bug class was already fixed on 2026-09-07 for the bash-side startup
+      // gate (agent-manager-common.sh's check_instance_liveness, which falls back to
+      // daemonPid) but never ported to this decision path. `hb.pid` is still the right
+      // target to SIGKILL for a genuine zombie below (it's the actual stuck call), only
+      // the overall alive/dead verdict needs the stable daemon identity.
+      const ownerPid = hb.daemonPid != null ? hb.daemonPid : hb.pid;
+      const pidAlive = isProcessAlive(ownerPid);
       const isWorker = hb.instanceId.startsWith('worker-');
       const zombieThreshold = P40_INSTANCE_IDS.has(hb.instanceId) ? WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 : WORKER_ZOMBIE_THRESHOLD_SECONDS;
       const isZombie = pidAlive && isWorker && ageSeconds >= zombieThreshold;
