@@ -19,7 +19,7 @@ const { findTaskRecordById } = require('./forensic-bundle.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { runIntegrationGate, realExec } = require('./decompose-integration-gate.js');
 const { wireDecomposedBlueprints } = require('./wire-decomposed-blueprints.js');
-const { taskCommitOnMain } = require('./task-disposition.js');
+const { taskCommitOnMain, STABLE_TERMINAL_STAGES } = require('./task-disposition.js');
 const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
 
 // On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
@@ -146,7 +146,19 @@ function classifyChildStatus(rec) {
 // A child in one of these is finished as far as the parent is concerned. `abandoned` is
 // deliberately terminal-good too: a human archived that sub-task on purpose, so it should
 // not hold the parent open forever.
-const TERMINAL_GOOD = new Set(['done', 'merged', 'gone', 'abandoned']);
+//
+// 2026-09-15, root-caused live: this used to be a hand-picked list of only 4 statuses,
+// which classifyChildStatus() could rarely even produce before PR #253 fixed it to report
+// a child's REAL terminalDisposition (noop, dismissed, filed, superseded, applied-direct)
+// instead of collapsing almost everything to 'merged' or 'done'. Once that fix landed, a
+// hub with e.g. a 'noop'-resolved child (a sub-task correctly closed as "already
+// satisfied, no code change needed" -- a real, common, legitimate outcome, not a failure)
+// could never auto-complete again: TERMINAL_GOOD didn't recognize 'noop' as done, so the
+// hub sat open forever even with every child in a genuinely finished state. Reuses task-
+// disposition.js's own STABLE_TERMINAL_STAGES (its authoritative closed vocabulary, minus
+// 'pending-merge' -- a child still awaiting merge is NOT done) instead of a second,
+// independently-hand-maintained list that can drift out of sync with it again.
+const TERMINAL_GOOD = new Set(['done', 'gone', ...STABLE_TERMINAL_STAGES]);
 
 // A child in one of these cannot progress on its own -- the pipeline has given up on it and
 // is waiting for a human. If a sibling `dependsOn` one of these, that sibling is frozen
