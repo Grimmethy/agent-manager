@@ -386,8 +386,7 @@ function renderTaskDetailModal(task) {
       try {
         const parts = [`# ${task.id}`];
         if (task.title) parts.push('title: ' + task.title);
-        await sendTextToChat(parts.join('\n\n')); // POSTs, expands the panel, re-renders; throws on !ok
-        try { chatSession = await fetchJson('/api/chat/active'); chatRender(); } catch (e) { /* leave the panel as-is */ }
+        await sendTextToChat(parts.join('\n\n')); // POSTs, expands the sidebar, tells the plugin iframe to refresh; throws on !ok
         showToast('Sent to chat', 'info');
       } catch (e) {
         showToast('Could not send to chat: ' + e.message);

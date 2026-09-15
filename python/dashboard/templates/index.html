@@ -41,42 +41,18 @@
      the fold and forcing a full-page scroll just to reach it (Grimmethy, confirmed live:
      "I have to scroll to the bottom of the page to use the chat box"). overflow:hidden on
      the panel itself pushes all scrolling down into .grill-transcript, where it belongs. */
-  #chat-panel { width: 380px; border-left: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
-  #chat-panel.chat-collapsed { width: 0; overflow: hidden; border-left: none; }
-  .chat-header { padding: 12px 16px; border-bottom: 2px solid var(--border); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .chat-header h2 { font-size: 13px; margin: 0; font-weight: 600; flex: 1; }
-  /* min-height: 0 on BOTH nested flex:1 levels -- the classic flexbox trap (Grimmethy,
-     confirmed live: "When I send a message... the chat scrolls all the way up to the
-     beginning"): a flex item's min-height defaults to auto, which means it won't shrink
-     below its OWN CONTENT's natural height even with flex:1 set. Without this, .chat-body
-     and #chat-transcript both just grow to fit the whole transcript instead of staying
-     fixed-height with internal scroll -- the newest messages get pushed past #chat-panel's
-     own fixed, clipped (overflow:hidden) box and are invisibly cut off, while the oldest
-     messages stay visible at the top. */
-  .chat-body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 12px 16px; overflow: hidden; }
-  /* 2026-08-26, Grimmethy: "Whenever I press enter... it resets to the top of the scroll
-     instead of the bottom" -- root-caused live: #chat-transcript's own static markup
-     ALREADY carries class="grill-transcript" (for exactly this flex-sizing rule), but
-     grillRenderTranscript() (shared with Discuss/Grill, called by chatRender() below)
-     unconditionally wraps its rows in ANOTHER "grill-transcript"-classed div -- fine for
-     every OTHER caller (their container element doesn't already carry that class, so
-     grillRenderTranscript's own div is the only one), but Chat alone ends up with the
-     class on both #chat-transcript AND the freshly-rendered div nested one level inside
-     it. Both then match the base .grill-transcript rule's own `overflow-y: auto`, so BOTH
-     become independently scrollable -- the flex:1/min-height:0 sizing here means the OUTER
-     one (#chat-transcript) never actually has anything to scroll (its single child fills
-     it exactly), so the REAL scrolling happens on the INNER, freshly-created div instead,
-     whose scrollTop chatRender() never touched (it only ever set scrollTop on the outer
-     #chat-transcript) -- so every fresh render (i.e. every message, whichever way it was
-     sent) left that inner div sitting at its default post-render scrollTop of 0. Targeting
-     #chat-transcript by ID instead of the shared class here (rather than .grill-transcript)
-     keeps this sizing rule from ALSO matching that inner div a second time; overflow:hidden
-     on the outer makes it explicit that only the inner div should ever show a scrollbar.
-     See chatRender()'s own comment for the matching JS-side fix. */
-  .chat-body #chat-transcript { flex: 1; min-height: 0; overflow: hidden; }
-  .chat-reserve-btn.active { background: var(--warn); color: #1a1300; border-color: var(--warn); }
-  #chat-toggle-tab { position: fixed; right: 0; top: 70px; writing-mode: vertical-rl; background: var(--panel); border: 2px solid var(--border); border-right: none; border-radius: 6px 0 0 6px; color: var(--muted); padding: 10px 6px; cursor: pointer; font-size: 12px; z-index: 5; }
-  #chat-toggle-tab:hover { color: var(--text); }
+  /* Generic persistent-sidebar plugin container (2026-09-15, replacing the old
+     hardcoded #chat-panel/.chat-header/.chat-body/#chat-toggle-tab rules -- Chat is now
+     a plugin, its own internal layout/scrolling lives in its own iframe'd page's CSS,
+     not here). One .plugin-sidebar per active slotKind:"persistent-sidebar" plugin,
+     mounted by mountPersistentSidebarPlugins() in core-ui.js. Named by data-plugin so a
+     second future persistent-sidebar plugin can't collide with this one's collapsed
+     state in localStorage. */
+  .plugin-sidebar { width: 380px; border-left: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; display: flex; flex-direction: column; flex-shrink: 0; overflow: hidden; }
+  .plugin-sidebar.sidebar-collapsed { width: 0; overflow: hidden; border-left: none; }
+  .plugin-sidebar iframe { width: 100%; height: 100%; border: none; display: block; }
+  .plugin-sidebar-toggle { position: fixed; right: 0; top: 70px; writing-mode: vertical-rl; background: var(--panel); border: 2px solid var(--border); border-right: none; border-radius: 6px 0 0 6px; color: var(--muted); padding: 10px 6px; cursor: pointer; font-size: 12px; z-index: 5; }
+  .plugin-sidebar-toggle:hover { color: var(--text); }
   nav button { display: flex; justify-content: space-between; width: 100%; padding: 10px 20px; background: none; border: none; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
   nav button:hover { background: var(--panel); }
   nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
@@ -245,13 +221,14 @@
   .priority-input:focus { outline: 1px solid var(--accent); }
 
   /* Mobile layout: below this width there isn't room for the fixed 200px nav rail plus a
-     380px chat panel alongside main content, so the three-column .layout collapses to a
+     380px sidebar alongside main content, so the three-column .layout collapses to a
      single column -- nav becomes a horizontally-scrollable top strip (same buttons, just
-     laid out in a row instead of stacked), and the chat panel becomes a bottom sheet that
-     overlays main instead of sitting beside it (it already toggles via .chat-collapsed on
-     #chat-panel, so this only changes ITS geometry, not the JS that drives it). Tables are
-     left as real <table> markup (JS renders them as raw HTML strings with no wrapper div to
-     hang overflow on) and instead scroll horizontally inside #main itself. */
+     laid out in a row instead of stacked), and each persistent-sidebar plugin becomes a
+     bottom sheet that overlays main instead of sitting beside it (it already toggles via
+     .sidebar-collapsed on .plugin-sidebar, so this only changes ITS geometry, not the JS
+     that drives it). Tables are left as real <table> markup (JS renders them as raw HTML
+     strings with no wrapper div to hang overflow on) and instead scroll horizontally
+     inside #main itself. */
   @media (max-width: 860px) {
     header { flex-wrap: wrap; padding: 10px 14px; gap: 8px 12px; }
     header .pipeline-dir { flex-basis: 100%; }
@@ -261,9 +238,9 @@
     nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
     main { padding: 12px; overflow-x: auto; }
     table { min-width: 560px; }
-    #chat-panel { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: 65vh; border-left: none; border-top: 2px solid var(--border); z-index: 15; }
-    #chat-panel.chat-collapsed { height: 0; width: 100%; border-top: none; }
-    #chat-toggle-tab { writing-mode: horizontal-tb; right: 12px; top: auto; bottom: 12px; border: 2px solid var(--border); border-radius: 20px; padding: 8px 14px; }
+    .plugin-sidebar { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: 65vh; border-left: none; border-top: 2px solid var(--border); z-index: 15; }
+    .plugin-sidebar.sidebar-collapsed { height: 0; width: 100%; border-top: none; }
+    .plugin-sidebar-toggle { writing-mode: horizontal-tb; right: 12px; top: auto; bottom: 12px; border: 2px solid var(--border); border-radius: 20px; padding: 8px 14px; }
     .worker-card .row { flex-wrap: wrap; row-gap: 6px; }
     .worker-model-select { margin-left: 0; margin-right: 0; max-width: none; width: 100%; }
     .stat-row { flex-wrap: wrap; row-gap: 10px; }
@@ -281,26 +258,16 @@
   <span class="pipeline-dir" id="pipeline-status">loading...</span>
   <button class="action" id="global-brain-dump-btn" style="margin-left:auto" title="Capture a quick note to Brain Dump from any tab">+ Brain Dump</button>
 </header>
-<div class="layout">
+<div class="layout" id="layout">
   <nav id="nav"></nav>
   <main id="main"><div class="empty">Loading...</div></main>
-  <aside id="chat-panel">
-    <div class="chat-header">
-      <h2 id="chat-title" title="Rooted at the agent-manager repo, with read/write access to every registered plugin and project repo.">System Chat</h2>
-      <span id="chat-provider-container"></span>
-      <button type="button" class="secondary" id="chat-reserve-btn" style="display:none" title="Hold the local model exclusively for this conversation until you turn it back off">Reserve</button>
-      <button type="button" class="secondary" id="chat-new-btn" title="Start a fresh conversation">New</button>
-    </div>
-    <div class="chat-body">
-      <div id="chat-transcript"></div>
-      <textarea class="grill-answer" id="chat-input" rows="3" placeholder="Talk to the chat... (Enter to send, Shift+Enter for a new line)"></textarea>
-      <div class="row" style="margin-top:8px;gap:8px">
-        <button type="button" class="action" id="chat-send-btn">Send</button>
-      </div>
-    </div>
-  </aside>
+  <!-- persistent-sidebar plugins (e.g. agent-manager-chat-plugin's Chat) are mounted
+       dynamically here by mountPersistentSidebarPlugins() in core-ui.js, one
+       <aside class="plugin-sidebar">+<button class="plugin-sidebar-toggle"> pair per
+       active slotKind:"persistent-sidebar" plugin -- see that function's own header for
+       why (2026-09-15, replacing the old hardcoded #chat-panel/#chat-toggle-tab: Chat is
+       no longer in-tree, see /home/wok/.claude/plans/immutable-noodling-axolotl.md). -->
 </div>
-<button type="button" id="chat-toggle-tab" title="Show/hide the System Chat panel">Chat</button>
 
 <div class="modal-backdrop" id="modal-backdrop">
   <div class="modal" id="modal-content"></div>
@@ -616,37 +583,8 @@ const providerChoices = {};
 // model-profile-registry.js) -- "Ornith" is no longer necessarily what's actually running
 // locally, so hardcoding that name here would be actively wrong depending on
 // configuration. "Local" is accurate regardless of which model is currently loaded.
-// Chat panel (2026-08-24, Brain Dump #153: "a hideable panel on the right side of the
-// app for a conversational AI... make edits to the system... the ghost in the machine" --
-// renamed to "Chat Panel" per Grimmethy's later request; the original brain-dump text
-// itself is quoted verbatim above, unchanged). Global and persistent -- unlike
-// Discuss/Grill, not scoped to any task/note/entry, so its own state lives at this top
-// level rather than inside a per-row render function.
-// See app.py's /api/chat/* routes and chat_sessions.py for the backend.
-let chatSession = null;
-
-// 2026-09-01 (Brain Dump "Send to Chat" fix): injects a block of plain text as a user
-// turn into the System Chat panel via POST /api/chat/inject -- which deliberately
-// RECORDS the message without calling the model, so it works even while the local
-// model is busy serving a worker lane (the old per-entry Discuss start 404'd on
-// exactly that). Raw fetch here because fetchJson above is GET-only. Throws on
-// !ok with the server's error detail so the caller's catch can toast it; on
-// success the response carries the chat session id and the panel is expanded +
-// re-rendered so the injected turn is immediately visible.
-// 2026-08-24 -- caught live: clicking the header's provider toggle while a session was
-// already active (the common case -- get_active_session() always has one) only changed
-// this button's own DOM state. chatSend() never reads it at all (only chatStartNew()
-// does), so the very next message silently went to whichever provider the ALREADY-ACTIVE
-// session was on, not the one the toggle now visually showed -- then chatRender()'s own
-// "keep the toggle in sync with the active session" logic snapped it back afterward,
-// which is what looked like the click just "reverting" for no reason. A toggle that
-// visually responds to a click but doesn't actually do what it shows is worse than no
-// toggle at all -- wired here to immediately start a fresh conversation on the newly
-// picked provider, so the click has real, guaranteed effect instead of a cosmetic one
-// the next message could silently ignore. Deliberately NOT reusing the generic
-// wireProviderToggle() (shared with Discuss, where a toggle really is just a pre-start
-// choice with no persistent existing session to worry about) -- Chat needs this
-// different, session-aware behavior.
+// Chat is now a persistent-sidebar plugin (mountPersistentSidebarPlugins() in
+// core-ui.js) -- see /home/wok/.claude/plans/immutable-noodling-axolotl.md's Phase 4.
 // budget-monitor.js's own signal, unchanged here -- see /api/claude-usage's docstring
 // for exactly what this is (a real rate-limit hit/reset history plus a rolling volume
 // trend) and isn't (a live "% of quota used" gauge -- Claude Code doesn't expose one).
@@ -1115,7 +1053,7 @@ document.getElementById('main').addEventListener('click', (e) => {
 refresh();  // always -- populates counts + renders nav regardless of which tab is active
 if (activeTab === 'project') enterProjectTab();
 setInterval(refresh, 5000);
-chatPanelInit();
+mountPersistentSidebarPlugins();
 
 // The graph iframe's CSS box resizes correctly on window resize (flex:1 fills whatever
 // space main's own flex-column layout gives it), but a box change caused by the OUTER
