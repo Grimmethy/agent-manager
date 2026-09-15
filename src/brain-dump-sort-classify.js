@@ -141,7 +141,19 @@ function validateSecondBrainPath(relPath, secondBrainDir, trackedProjectLabels =
 
   const topLevel = segments[0];
   const allowed = new Set([...CANONICAL_TOP_LEVEL, ...(Array.isArray(trackedProjectLabels) ? trackedProjectLabels : [])]);
-  if (!allowed.has(topLevel)) {
+  // Case-insensitive membership check (2026-09-15): a caller upstream (apply-group-a-
+  // brain-dump.js's applyBrainDumpSort) resolves topLevel's case against the REAL on-disk
+  // folder name when a tracked project's registry label has drifted from it -- e.g.
+  // registry says "TaxHarvest", the real folder is "Taxharvest". Before this, an
+  // exact-case Set.has() then rejected that already-correct, disk-verified spelling as
+  // "not one of the allowed second-brain folders" (since it matches no entry byte-for-
+  // byte), even though it unambiguously refers to the same tracked project -- the exact
+  // silent-no-op this whole on-disk-resolution feature was built to close, just moved to
+  // a different rejection message instead of actually fixed. The OTHER check just below
+  // (different-case duplicate) already does the real, still-exact-case-sensitive job of
+  // catching a genuinely ambiguous or wrongly-cased folder that ISN'T the resolved match.
+  const allowedLower = new Set([...allowed].map((a) => a.toLowerCase()));
+  if (!allowedLower.has(topLevel.toLowerCase())) {
     return `top-level folder "${topLevel}" is not one of the allowed second-brain folders (${[...allowed].join(', ')}) -- file this under the closest existing one`;
   }
 

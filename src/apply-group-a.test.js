@@ -362,6 +362,31 @@ test('applyBrainDumpSort resolves the top-level segment to its real on-disk casi
   assert.equal(result.file, path.join(secondBrainDir, 'Projects', 'plan.md'));
 });
 
+test('applyBrainDumpSort resolves a tracked project label whose real on-disk folder has drifted in case from the registry', () => {
+  // Root-caused live 2026-09-15: the on-disk resolver above correctly rewrites the first
+  // segment to match disk ("Taxharvest"), but validateSecondBrainPath's OWN "is this an
+  // allowed folder" check was still an exact-case Set.has() against the registry's own
+  // spelling ("TaxHarvest") -- rejecting the already-correct, disk-verified path as "not
+  // one of the allowed second-brain folders" instead of the different-case-duplicate
+  // rejection this whole feature exists to avoid. Just a different rejection, same
+  // silent no-op.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(path.join(secondBrainDir, 'Taxharvest'), { recursive: true });
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry()]);
+
+  const registryPath = path.join(dir, 'projects.json');
+  fs.writeFileSync(registryPath, JSON.stringify([{ label: 'TaxHarvest' }]));
+  process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = registryPath;
+
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Buy milk' } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'taxharvest/plan.md' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(result.skipped, undefined, `expected no skip, got: ${JSON.stringify(result)}`);
+  assert.equal(result.file, path.join(secondBrainDir, 'Taxharvest', 'plan.md'));
+});
+
 test('applyBrainDumpSort still rejects an ambiguous top-level segment when BOTH case variants exist on disk', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
   const secondBrainDir = path.join(dir, 'secondbrain');
