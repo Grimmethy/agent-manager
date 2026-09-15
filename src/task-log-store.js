@@ -10,16 +10,21 @@
 // its queue/ file is gone, and none of it survives a resetToMain() or a lost pipeline
 // host.
 //
-// This module writes a curated snapshot of the task's full history into a file this repo
-// actually TRACKS -- task-logs/<taskId>.json -- as part of the same commit that applies
-// the task's real change. apply-task.js stages it alongside the artifact's own files and
-// stamps a `Task-Log: <relPath>` trailer on the (still short) commit message, so anyone
-// looking at the landed commit later has a stable name to go find the complete log by --
-// no live pipeline state, no queue/ archive-hunting, no requeue-attribution.db query.
-// api_git_merge_branch (app.py) appends one more event here at merge time (mergedAt /
-// terminalDisposition), so the log a MERGED branch carries is strictly more complete
-// than what any in-process task has -- exactly the "arguably more information than an
-// in-process task" the mechanism is for (2026-09-12, Grimmethy).
+// This module writes a curated snapshot of the task's full history to
+// task-logs/<taskId>.json, alongside the same commit that applies the task's real change
+// -- durable across queue/ archival, no live pipeline state, no queue/ archive-hunting, no
+// requeue-attribution.db query needed to find it later.
+//
+// RE-EVALUATED 2026-09-15 (Grimmethy: a captured brain-dump note with a private Google
+// Sheets link, and this repo being PUBLIC on GitHub): task-logs/ used to be git-tracked
+// and pushed. buildTaskLogRecord below deliberately retains implementResponse/
+// planResponse/promptContext.rawText verbatim -- for a task derived from a brain-dump
+// entry, that rawText IS the user's own free-typed personal/business note content, not
+// grounded task text. Confirmed live: 13 of 48 already-committed task-logs/ entries
+// originated from brain-dump entries. task-logs/ is now in .gitignore -- this module still
+// writes the file (apply-task.js's writeTaskLogFile call, and the dashboard's
+// api_git_merge_branch merge-disposition update in pipeline_1_more.py) for the user's own
+// local reference, but neither caller stages/commits/pushes it any more.
 
 const fs = require('fs');
 const path = require('path');

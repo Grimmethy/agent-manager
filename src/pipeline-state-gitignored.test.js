@@ -100,6 +100,19 @@ test('reclaim-log.jsonl (reclaim-orphaned-drafts.js) is git-ignored', () => {
   assert.ok(gitIgnored('reclaim-log.jsonl'), 'reclaim-log.jsonl must be git-ignored -- resetToMain stash -u eviction otherwise, and it is a hardcoded literal in reclaim-orphaned-drafts.js, invisible to the getConfig()-path walk above');
 });
 
+// 2026-09-15, Grimmethy (a captured brain-dump note with a private Google Sheets link,
+// and this repo being PUBLIC on GitHub): task-logs/<id>.json (task-log-store.js) used to
+// be deliberately git-tracked and pushed by apply-task.js -- it was never wired through
+// getConfig() (a hardcoded 'task-logs' literal, same blind spot as reclaim-log.jsonl
+// above), so the walk-getConfig() check at the top of this file could never catch it, and
+// nothing else asserted the directory stays out of git. It retains promptContext.rawText/
+// implementResponse/planResponse verbatim, which for a brain_dump-derived task IS the
+// user's own free-typed personal/business note content -- confirmed live, 13 of 48
+// already-committed entries originated from brain-dump entries.
+test('task-logs/ (task-log-store.js) is git-ignored -- it can retain a brain-dump note verbatim, and this repo is public', () => {
+  assert.ok(gitIgnored('task-logs'), 'task-logs/ must be git-ignored -- it retains promptContext.rawText/implementResponse/planResponse verbatim, which for a brain_dump-derived task is free-typed personal/business content, on a repo that is public on GitHub');
+});
+
 test('.gitignore also covers SQLite side-car files (*.db-journal / -wal / -shm)', () => {
   // hardware-stats.db / model-stats.db are ignored, but their transient WAL/journal
   // side-cars were being swept too (found in 11 abandoned stashes 2026-09-03).

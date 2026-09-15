@@ -272,18 +272,17 @@ def api_git_merge_branch(branch):
                         raise
                 break
 
-        # Close out the GIT-TRACKED task log too (src/task-log-store.js), not just the
-        # queue/ working copy above -- that file is gitignored and gets archived/pruned,
-        # while task-logs/<id>.json is committed and this is the one moment (the task's
-        # branch just landed on main) its own log can record that fact durably. Without
-        # this, "the final unmerged-branches version should just be the whole task log,
-        # completed" (2026-09-12, Grimmethy) would be true right up until merge and then
-        # regress back to whatever the log said before -- the mergedAt/terminalDisposition
-        # a MERGED task's log needs to actually be more complete than an in-process one's.
-        # Best-effort and non-fatal by the same reasoning as the block above: the merge
-        # itself already fully succeeded, and a task not authored through apply-task.js
-        # (so it never got a task-logs/ entry in the first place) is a normal, expected
-        # case, not an error.
+        # Close out the LOCAL task log too (src/task-log-store.js), not just the queue/
+        # working copy above -- that file is gitignored and gets archived/pruned, while
+        # task-logs/<id>.json is a durable local snapshot that survives it, and this is the
+        # one moment (the task's branch just landed on main) its own log can record that
+        # fact. RE-EVALUATED 2026-09-15 (Grimmethy, .gitignore's own comment on
+        # task-logs/): this repo is public and the log retains a task's rawText/
+        # implementResponse/planResponse verbatim -- for a brain_dump-derived task that is
+        # the user's own free-typed personal/business note content, so this file is no
+        # longer committed/pushed, updated on disk only. Best-effort: a task not authored
+        # through apply-task.js (so it never got a task-logs/ entry in the first place) is
+        # a normal, expected case, not an error.
         task_log_path = repo_root / "task-logs" / f"{task_id}.json"
         if task_log_path.is_file():
             log_data = read_json_safe(task_log_path)
@@ -300,10 +299,7 @@ def api_git_merge_branch(branch):
                 log_data["terminalDisposition"] = "merged"
                 try:
                     task_log_path.write_text(json.dumps(log_data, indent=2) + "\n", encoding="utf-8")
-                    _run_git(["add", str(task_log_path.relative_to(repo_root))], repo_root)
-                    _run_git(["commit", "-m", f"Record merge disposition in task log for {task_id}"], repo_root)
-                    _run_git(["push", "origin", main_branch], repo_root)
-                except (RuntimeError, OSError) as exc:
+                except OSError as exc:
                     logger.warning("Non-fatal: could not record merge disposition in task-logs/%s.json: %s", task_id, exc)
 
     return jsonify({"succeeded": True, "branch": branch, "mainBranch": main_branch, "liveSync": live_sync})
