@@ -29,7 +29,16 @@ test('classifyChildStatus maps queue state + mergedAt to a checklist status', ()
   assert.equal(classifyChildStatus({ state: 'archived', task: { terminalDisposition: 'abandoned' } }), 'abandoned');
   assert.equal(classifyChildStatus({ state: 'archived', task: { terminalDisposition: 'dismissed' } }), 'dismissed');
   assert.equal(classifyChildStatus({ state: 'archived', task: { terminalDisposition: 'merged' } }), 'merged');
-  assert.equal(classifyChildStatus({ state: 'archived', task: { terminalDisposition: 'abandoned', mergedAt: 'x' } }), 'merged');
+  // 2026-09-14: a stale mergedAt left behind by a manual disposition correction must NOT
+  // override the real, later terminalDisposition -- hand-corrected live 3 separate times
+  // this session (a task moved to 'abandoned' after discovering its branch never actually
+  // landed, but mergedAt/mergeCommit from the earlier premature stamp were still present
+  // on the same record). terminalDisposition wins over a merely-truthy mergedAt whenever
+  // it explicitly says something other than 'merged' -- this used to assert 'merged' here,
+  // which was the bug, not the intended contract.
+  assert.equal(classifyChildStatus({ state: 'archived', task: { terminalDisposition: 'abandoned', mergedAt: 'x' } }), 'abandoned');
+  assert.equal(classifyChildStatus({ state: 'done', task: { terminalDisposition: 'abandoned', mergedAt: 'x' } }), 'abandoned', 'the same stale-mergedAt shape on a plain done/ record (not yet archived) must not disagree with archived/');
+  assert.equal(classifyChildStatus({ state: 'done', task: { terminalDisposition: 'noop', mergedAt: 'x' } }), 'noop');
   assert.equal(classifyChildStatus({ state: 'archived_no_action', task: {} }), 'abandoned');
   assert.equal(classifyChildStatus({ state: 'blocked', task: {} }), 'blocked');
   assert.equal(classifyChildStatus({ state: 'needs-clarification', task: {} }), 'needs-clarification');
