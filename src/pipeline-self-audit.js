@@ -38,6 +38,7 @@
 const CLUSTER_THRESHOLD = 5; // below this, "a pattern" is indistinguishable from a handful of independently bad drafts
 const MAX_EXAMPLES = 5;
 const MAX_REASON_CHARS = 220;
+const MAX_DEBRIEF_ACTIONS = 3; // 2026-09-07: Easy Agile / Coveros retrospective research — teams that limit themselves to 1-3 well-defined, time-bound action items complete them at a much higher rate than long lists. Mirrors this file's own CLUSTER_THRESHOLD-gated, one-signature-at-a-time discipline.
 
 // 2026-09-06: classification itself moved to src/blocked-task-classifiers.js -- the
 // unified fault-side registry that ALSO backs reject-retry-check.js's retry-safety
@@ -74,7 +75,7 @@ function findAuditClusters(blockedTasks, coverage = {}) {
   // shape every other next*Task() follows), so if only one audit task gets filed this
   // tick, it should be the most-evidenced pattern.
   clusters.sort((a, b) => b.tasks.length - a.tasks.length);
-  return clusters;
+  return clusters.slice(0, MAX_DEBRIEF_ACTIONS);
 }
 
 // Neither the plan pass nor the harness-fetch step below has any access to the live
@@ -154,6 +155,7 @@ function buildAuditTask(cluster, domain) {
 
 module.exports = {
   CLUSTER_THRESHOLD,
+  MAX_DEBRIEF_ACTIONS,
   REASON_CATEGORIES,
   hasZeroHitHarnessSearch,
   categorizeBlockedReason,
