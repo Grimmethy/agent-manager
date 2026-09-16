@@ -744,6 +744,45 @@ function stalenessAuditImplementPrompt(task, planText) {
   ].join('\n');
 }
 
+// second_brain_opportunities (2026-09-02, Second Brain note "second-brain-recurring-
+// sweep.md") -- unlike stalenessAudit*/pipelineForensics* above, this source needs no
+// harness-search grounding: nextSecondBrainOpportunitiesTask() (task-sources.js) already
+// hands the implement pass the full, real content of every candidate note directly in
+// promptContext.candidates, so there is nothing to grep for and no plan-stage search
+// round-trip. The plan pass is a light sanity pass only; the implement pass is a plain
+// scoring call with a closed JSON-array output contract (no diff, no prose).
+function secondBrainOpportunitiesPlanPrompt(task) {
+  const ctx = task.promptContext || {};
+  const candidates = ctx.candidates || [];
+  return [
+    'A batch of Second Brain notes (under Research/ or Ideas/) have never been promoted into a project or a queued task. Your job in the next step is to SCORE each one and suggest ONE concrete next step -- no code change, no diff, this is pure judgment over text.',
+    '',
+    `Notes in this batch: ${candidates.map((c) => c.relPath).join(', ') || '(none)'}`,
+    '',
+    'Write a short plan (2-4 sentences): for each note, say what it looks like it is about at a glance and which kind of next step (draft a spec, needs more research first, merge into an existing project, or drop) seems most likely -- you will confirm this against the full note content in the next step.',
+  ].join('\n');
+}
+
+function secondBrainOpportunitiesImplementPrompt(task, planText) {
+  const ctx = task.promptContext || {};
+  const candidates = ctx.candidates || [];
+  const notesBlock = candidates.map((c) => `--- ${c.relPath} ---\n${truncate(c.content, 4000)}`).join('\n\n');
+  return [
+    'Earlier plan:',
+    planText,
+    '',
+    'Score each of the following Second Brain notes for whether it represents a real opportunity worth turning into work. For EACH note decide:',
+    '- score: an integer 0 (not actionable / already stale) to 3 (clearly worth acting on now)',
+    '- nextStep: exactly ONE of "draft a product_spec_outline", "needs web research first", "merge into <existing project>" (name the real project if you choose this), or "drop"',
+    '- rationale: one sentence',
+    '',
+    notesBlock || '(no note content provided)',
+    '',
+    'Output ONLY a JSON array, one object per note, in this exact shape and nothing else -- no markdown fence, no prose before or after:',
+    '[{"note": "<relPath, copied exactly from above>", "score": 0, "nextStep": "...", "rationale": "..."}]',
+  ].join('\n');
+}
+
 // pipeline_forensics (2026-09-01) -- deep root-cause study of why a class of pipeline
 // tasks keeps failing. Two-call harness shape like stalenessAudit*: the plan pass proposes
 // greps to locate the implicated pipeline code, the harness runs them against this repo's
@@ -1441,6 +1480,7 @@ updateTaskSource('pipeline_self_audit', { buildPlanPrompt: pipelineSelfAuditPlan
 updateTaskSource('pipeline_health_audit', { buildPlanPrompt: pipelineHealthAuditPlanPrompt, buildImplementPrompt: pipelineHealthAuditImplementPrompt });
 updateTaskSource('ui_visibility_audit', { buildPlanPrompt: uiVisibilityAuditPlanPrompt, buildImplementPrompt: uiVisibilityAuditImplementPrompt });
 updateTaskSource('staleness_audit', { buildPlanPrompt: stalenessAuditPlanPrompt, buildImplementPrompt: stalenessAuditImplementPrompt });
+updateTaskSource('second_brain_opportunities', { buildPlanPrompt: secondBrainOpportunitiesPlanPrompt, buildImplementPrompt: secondBrainOpportunitiesImplementPrompt });
 updateTaskSource('pipeline_forensics', { buildPlanPrompt: pipelineForensicsPlanPrompt, buildImplementPrompt: pipelineForensicsImplementPrompt });
 updateTaskSource('pipeline_debrief', { buildPlanPrompt: pipelineDebriefPlanPrompt, buildImplementPrompt: pipelineDebriefImplementPrompt });
 updateTaskSource('doc_drift_fix', { buildPlanPrompt: driftFixPlanPrompt, buildImplementPrompt: driftFixImplementPrompt });
@@ -1552,6 +1592,7 @@ module.exports = {
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents, priorRejectionBlock,
   adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock, planGroundingBlock, hubStatusGroundingBlock, planCritiqueFeedbackBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
+  secondBrainOpportunitiesPlanPrompt, secondBrainOpportunitiesImplementPrompt,
   pipelineDebriefPlanPrompt, pipelineDebriefImplementPrompt,
   driftFixPlanPrompt, driftFixImplementPrompt,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene), which owns the
