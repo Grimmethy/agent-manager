@@ -298,3 +298,13 @@ Also add a focused unit test (in the existing test file for src/local-draft.js, 
 
 Benefits:
 Eliminates the "Plan pass degenerate: truncated" failure for research-keyword tasks by routing them to the tier that actually has WebSearch/WebFetch. Zero changes to src/research-agentic-draft.js (non-goal preserved). The guard clause is a single early-return -- no existing adhoc logic is touched, so non-research tasks are unaffected. The keyword list is imported from src/prompts.js (sub-candidate 0), keeping prompt-domain constants in the prompt module. Testable in isolation via the pure isResearchTask helper.
+
+### AC-131 · "change_review" — $9.53 est. API cost, 0% benefit, 0 shipped over 7d
+Strength: Strong
+Files: src/local-draft.js, src/prompts.js
+
+Problem: The `implement` stage prompt does not enforce a consistency check between the `plan` stage's hunk-level findings and the final verdict, allowing the model to output "NO CORRECTNESS ISSUES" while the plan explicitly flags hunks as "UNKNOWN" or "SUSPECT."
+Solution: Modify the `implement` stage prompt in `src/prompts.js` to explicitly require the model to either resolve all "UNKNOWN" or "SUSPECT" hunks from the plan stage or downgrade the final verdict to "INCONCLUSIVE" if they cannot be resolved. Add a validation step in `src/local-draft.js` that checks if the plan stage contains any "UNKNOWN" or "SUSPECT" markers and, if so, rejects the implement stage's output if it claims "NO CORRECTNESS ISSUES."
+Benefits: This fix will prevent the class of tasks where the implement stage's verdict contradicts the plan stage's findings, which is the primary reason for the rejections in Subjects 1, 2, and 4.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-change-review-9-53-est-api-cost-0-benefit-0-shipped-over-7d-1789390500827
