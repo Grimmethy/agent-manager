@@ -54,6 +54,7 @@ const {
 const { appendTierWorkLog, pruneWorkLogs } = require('./work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
 const { getConfig, ensureRegistered } = require('./config.js');
+const { missingFileCheck } = require('./draft-file-guard.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
@@ -1319,6 +1320,38 @@ async function runDraftPasses(task, attempt, {
         maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
       }, { recordModelCall, attempt });
       if (implementOutcome.done) return implementOutcome.result;
+    }
+
+    // Hard pre-critique guard (2026-09-16, recovering a real approved-but-lost fix --
+    // see draft-file-guard.js's own header): if the implement response names file(s)
+    // that do not exist in the repo (and are not a legitimate create-mode target), block
+    // BEFORE critique/revision spends a turn revising phantom code. This is the single
+    // rejection cause shared by the costliest fulfillment candidate reworks (observability_
+    // fix et al) -- catching it here, before review, removes an entire review+redraft
+    // cycle per occurrence. missingFileCheck's signature is (draftText, repoRoot,
+    // extraRoots) -- positional, not an options object.
+    //
+    // Scoped to candidateFulfillment sources only: a fulfillment candidate's Files: line
+    // is always THIS repo's own real path (see e.g. pipeline_forensics_fix's own
+    // registration comment: "the candidate's Files: line is always this pipeline's OWN
+    // src/..."), so a citation that resolves nowhere really is a fabrication. A
+    // generator/recommendation-stage source (deep_dive, arch_discovery, product_spec_
+    // outline, ...) legitimately cites paths that don't resolve against THIS repoRoot --
+    // an external project's own file (deep_dive) or a not-yet-real target the outline is
+    // merely proposing -- so the guard must not run for those at all.
+    if (isCandidateFulfillmentSource(resolveSourceName(task))
+      && typeof task.implementResponse === 'string' && task.implementResponse.length > 0) {
+      const { repoRoot, grepAllowedDirs } = getConfig();
+      const guardResult = missingFileCheck(task.implementResponse, repoRoot, grepAllowedDirs);
+      if (guardResult.blocked) {
+        appendHistoryEvent(task, 'blocked', guardResult.reason);
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: guardResult.reason,
+          blockedStage: 'pre-critique',
+        };
+      }
     }
 
     await runCritiqueAndRevision(task, {

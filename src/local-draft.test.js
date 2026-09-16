@@ -2401,7 +2401,9 @@ test('draftTask blocks a candidate-fulfillment source that says mode "split" but
 });
 
 test('draftTask retries the implement call once when a candidate-fulfillment source writes an unverifiable find, and accepts the corrected retry', async () => {
-  await withFixtureRepo(async (draftTask) => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'function real() {\n  return 1;\n}\n');
     const task = {
       id: 'obs-fix-test-1', domain: 'default', source: 'observability_fix', title: 'test',
       promptContext: {
@@ -2497,7 +2499,9 @@ test('draftTask samples the implement-retry call at RETRY_TEMPERATURE, not the f
 });
 
 test('draftTask does not retry a candidate-fulfillment source whose find string verifies correctly the first time', async () => {
-  await withFixtureRepo(async (draftTask) => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'function real() {\n  return 1;\n}\n');
     const task = {
       id: 'obs-fix-test-2', domain: 'default', source: 'observability_fix', title: 'test',
       promptContext: {
@@ -2518,6 +2522,66 @@ test('draftTask does not retry a candidate-fulfillment source whose find string 
     await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
 
     assert.equal(callCount, 3, 'plan, implement, critique -- correct on the first try, no retry burned');
+  });
+});
+
+// 2026-09-16: recovering a real approved-but-lost fix -- see draft-file-guard.js's own
+// header and local-draft.js's own inline comment on this guard for the incident (a
+// prior approved branch wiring this exact guard was applied but never merged, and the
+// branch was later lost -- the standalone src/draft-file-guard.js module survived, this
+// wiring did not).
+test('draftTask blocks BEFORE critique when a candidate-fulfillment implement response names a file that does not exist in the repo', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'function real() {\n  return 1;\n}\n');
+    const task = {
+      id: 'obs-fix-guard-phantom-file', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-9', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      // implement cites a phantom file, not src/x.js -- must never reach critique
+      return { response: JSON.stringify({ mode: 'edit', file: 'src/phantom-does-not-exist.js', find: 'x', replace: 'y' }), degenerate: null, attempts: 1 };
+    };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+
+    assert.equal(callCount, 2, 'plan + implement only -- the guard must block before a third (critique) call');
+    assert.equal(result.blocked, true);
+    assert.match(result.blockedReason, /missing-file: src\/phantom-does-not-exist\.js/);
+  });
+});
+
+test('draftTask does NOT run the phantom-file guard for a non-candidateFulfillment source (deep_dive) even when its Files: line cites an external path', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'deep-dive-guard-scope-test', domain: 'default', source: 'deep_dive', title: 'test',
+      promptContext: {
+        projectName: 'external/project', communityId: 'c1', communityName: 'stuff',
+        files: [{ path: 'lib/real.py', degree: 1, content: 'def real():\n    pass\n' }],
+      },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: '1. Use `real`.', degenerate: null, attempts: 1 };
+      // cites an external-project path that will never exist under agent-manager's own
+      // repoRoot -- must not be treated as a fabrication for a recommendation-stage source
+      return {
+        response: '### ITEM: reuse it\nCommunity: stuff\nFiles: lib/real.py\nRating: Use\nRationale: it works.',
+        degenerate: null, attempts: 1,
+      };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.blockedStage, undefined, 'deep_dive is not a candidateFulfillment source -- the guard must not apply to it at all');
+    assert.equal(task.status, 'needs-review');
   });
 });
 
@@ -2695,7 +2759,9 @@ test('draftTask skips the critique+revision pass entirely for an advisoryProse s
 });
 
 test('draftTask still runs the critique+revision pass for a non-advisoryProse source (observability_fix, unaffected)', async () => {
-  await withFixtureRepo(async (draftTask) => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'function real() {\n  return 1;\n}\n');
     const task = {
       id: 'obs-fix-critique-still-runs', domain: 'default', source: 'observability_fix', title: 'test',
       promptContext: {
@@ -2724,7 +2790,9 @@ test('draftTask still runs the critique+revision pass for a non-advisoryProse so
 // src/lib/implement-critique.js) must skip (critique-skipped + return) rather than fall
 // through to recordCritique() / 'critique-done', which downstream read as a pass signal.
 test('draftTask skips (not passes) the critique pass when the critique call is degenerate', async () => {
-  await withFixtureRepo(async (draftTask) => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'function real() {\n  return 1;\n}\n');
     const task = {
       id: 'obs-fix-critique-degenerate', domain: 'default', source: 'observability_fix', title: 'test',
       promptContext: {
