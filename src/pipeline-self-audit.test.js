@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   hasZeroHitHarnessSearch, categorizeBlockedReason, signatureForTask,
-  findAuditClusters, buildAuditRawText, buildAuditTask, CLUSTER_THRESHOLD,
+  findAuditClusters, buildAuditRawText, buildAuditTask, CLUSTER_THRESHOLD, MAX_DEBRIEF_ACTIONS,
 } = require('./pipeline-self-audit.js');
 
 function makeBlocked(id, source, blockedReason, history = []) {
@@ -110,4 +110,44 @@ test('buildAuditRawText keeps the original fault-side wording when no task has r
   const text = buildAuditRawText({ signature: 'arch_import::inconclusive-review', tasks });
   assert.doesNotMatch(text, /gate-inconclusive/);
   assert.match(text, /Classified as:/);
+});
+
+// --- MAX_DEBRIEF_ACTIONS cap (2026-09-07, Easy Agile/Coveros retrospective research:
+// teams limited to 1-3 well-defined, time-bound action items complete them at a much
+// higher rate than long lists) ------------------------------------------------------
+
+const CAP_CATEGORIES = [
+  'This draft contains a fabricated claim that cannot be verified against the codebase',
+  'Model refused: no-changes-needed, the code is already correct',
+  'empty response: no code was produced at all',
+  'truncated draft output, the response was cut off mid-edit',
+  'Invalid JSON in Group B implementResponse: unexpected token',
+];
+
+function makeCappedCluster(categoryReason, index) {
+  return Array.from({ length: CLUSTER_THRESHOLD }, (_, i) =>
+    makeBlocked(`synthetic-t${index}-${i}`, 'synthetic_audit_source', categoryReason));
+}
+
+test('findAuditClusters caps qualifying clusters at MAX_DEBRIEF_ACTIONS', () => {
+  // 5 distinct qualifying clusters -- more than the cap of 3.
+  const tasks = CAP_CATEGORIES.flatMap((reason, i) => makeCappedCluster(reason, i));
+  const clusters = findAuditClusters(tasks);
+  assert.ok(clusters.length <= MAX_DEBRIEF_ACTIONS, `expected <= ${MAX_DEBRIEF_ACTIONS} clusters, got ${clusters.length}`);
+  for (const cluster of clusters) {
+    assert.ok(cluster.signature.startsWith('synthetic_audit_source::'), `unexpected signature: ${cluster.signature}`);
+    assert.ok(cluster.tasks.length >= CLUSTER_THRESHOLD);
+  }
+});
+
+test('findAuditClusters does not over-truncate below the cap', () => {
+  // Only 2 distinct qualifying clusters -- both must survive, untruncated.
+  const tasks = CAP_CATEGORIES.slice(0, 2).flatMap((reason, i) => makeCappedCluster(reason, i));
+  const clusters = findAuditClusters(tasks);
+  assert.equal(clusters.length, 2);
+  const signatures = clusters.map((c) => c.signature).sort();
+  assert.deepEqual(signatures, [
+    'synthetic_audit_source::fabricated-ungrounded-claim',
+    'synthetic_audit_source::refusal-no-changes-needed',
+  ].sort());
 });
