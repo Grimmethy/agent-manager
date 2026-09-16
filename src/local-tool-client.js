@@ -1264,7 +1264,7 @@ async function runWithoutToolsFallback(prompt, pipelineDir) {
 // the model regenerates that turn from a fresh sample. Mutates messages / toolCallLog /
 // turnStartLengths / turnStartLogLengths in place on each rollback. Returns
 // { message } once a call succeeds, or { flakeErr } when both recovery layers are spent.
-async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths }) {
+async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths, useExtendedContext = false }) {
   let rollbackAttempts = 0;
   for (;;) {
     let message;
@@ -1273,7 +1273,7 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
     let attemptErr = null;
     for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
       try {
-        const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }));
+        const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk, useExtendedContext }));
         if (isEmptyCompletion(turnRes.message)) {
           attemptErr = new Error('local model returned an empty completion (no content, no tool calls)');
           continue;
