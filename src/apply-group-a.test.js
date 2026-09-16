@@ -1376,7 +1376,7 @@ test('parseDebriefNowWhatItems: empty/missing text yields zero items, never thro
   assert.deepEqual(parseDebriefNowWhatItems(null), []);
 });
 
-test('applyDebriefReport: confirmed pass files each NOW WHAT item into queue/side-findings-inbox/ (the brain-dump route)', () => {
+test('applyDebriefReport: confirmed pass routes a real fix-candidate NOW WHAT item into queue/adhoc/ via now-what-route.js', () => {
   const dir = makeDebriefPipeline();
   fs.writeFileSync(path.join(dir, 'queue', 'done', 'd1.json'), JSON.stringify({ id: 'd1' }));
   const prev = process.env.AGENT_MANAGER_PIPELINE_DIR;
@@ -1387,16 +1387,20 @@ test('applyDebriefReport: confirmed pass files each NOW WHAT item into queue/sid
   try {
     const task = { id: 't', title: 'Pipeline debrief: x', debriefReportConfirmedAt: 'now', promptContext: { taskIds: ['d1'] } };
     const r = applyDebriefReport({ implementResponse: DEBRIEF_REPORT, task });
-    assert.match(r.reason, /filed 1 Now-What finding\(s\)/);
+    // DEBRIEF_REPORT's one NOW WHAT item names a real file ("Files:
+    // src/maintenance/observability-review.js"), so now-what-route.js's isFixCandidate
+    // gate routes it into queue/adhoc/ rather than the brain-dump inbox.
+    assert.match(r.reason, /routed 1 Now-What item\(s\) to queue\/adhoc\/, filed 0 to the brain-dump inbox/);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'side-findings-inbox')), false);
 
-    const inboxDir = path.join(dir, 'queue', 'side-findings-inbox');
-    const names = fs.readdirSync(inboxDir).filter((f) => f.endsWith('.json'));
+    const adhocDir = path.join(dir, 'queue', 'adhoc');
+    const names = fs.readdirSync(adhocDir).filter((f) => f.endsWith('.json'));
     assert.equal(names.length, 1);
-    const filed = JSON.parse(fs.readFileSync(path.join(inboxDir, names[0]), 'utf8'));
-    assert.equal(filed.title, 'Cap the enclosing-function window fed to the model.');
-    assert.equal(filed.source, 'pipeline_debrief');
-    assert.equal(filed.taskId, 't');
-    assert.equal(filed.stage, 'now-what');
+    const routed = JSON.parse(fs.readFileSync(path.join(adhocDir, names[0]), 'utf8'));
+    assert.equal(routed.title, 'Cap the enclosing-function window fed to the model.');
+    assert.equal(routed.domain, 'adhoc');
+    assert.equal(routed.source, 'now_what');
+    assert.equal(routed.raisedBy.taskId, 't');
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev;
     if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
@@ -1404,7 +1408,34 @@ test('applyDebriefReport: confirmed pass files each NOW WHAT item into queue/sid
   }
 });
 
-test('applyDebriefReport: a report with no NOW WHAT section (NO CONFIDENT PATTERN) archives but files nothing', () => {
+test('applyDebriefReport: a vague NOW WHAT item (no file/identifier+verb) still files to the brain-dump inbox', () => {
+  const dir = makeDebriefPipeline();
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'd1.json'), JSON.stringify({ id: 'd1' }));
+  const prev = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  try {
+    const vagueReport = [
+      'WHAT', 'x', '', 'NOW WHAT',
+      '1. Keep thinking about this. -- Why: no strong pattern yet, just a hunch.',
+    ].join('\n');
+    const task = { id: 't3', title: 'Pipeline debrief: z', debriefReportConfirmedAt: 'now', promptContext: { taskIds: ['d1'] } };
+    const r = applyDebriefReport({ implementResponse: vagueReport, task });
+    assert.match(r.reason, /routed 0 Now-What item\(s\) to queue\/adhoc\/, filed 1 to the brain-dump inbox/);
+
+    const inboxDir = path.join(dir, 'queue', 'side-findings-inbox');
+    const names = fs.readdirSync(inboxDir).filter((f) => f.endsWith('.json'));
+    assert.equal(names.length, 1);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev;
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  }
+});
+
+test('applyDebriefReport: a report with no NOW WHAT section (NO CONFIDENT PATTERN) archives but routes/files nothing', () => {
   const dir = makeDebriefPipeline();
   fs.writeFileSync(path.join(dir, 'queue', 'done', 'd1.json'), JSON.stringify({ id: 'd1' }));
   const prev = process.env.AGENT_MANAGER_PIPELINE_DIR;
@@ -1415,7 +1446,7 @@ test('applyDebriefReport: a report with no NOW WHAT section (NO CONFIDENT PATTER
   try {
     const task = { id: 't2', title: 'Pipeline debrief: y', debriefReportConfirmedAt: 'now', promptContext: { taskIds: ['d1'] } };
     const r = applyDebriefReport({ implementResponse: 'NO CONFIDENT PATTERN -- needs a bigger window', task });
-    assert.match(r.reason, /filed 0 Now-What finding\(s\)/);
+    assert.match(r.reason, /routed 0 Now-What item\(s\) to queue\/adhoc\/, filed 0 to the brain-dump inbox/);
     assert.equal(fs.existsSync(path.join(dir, 'queue', 'side-findings-inbox')), false);
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev;

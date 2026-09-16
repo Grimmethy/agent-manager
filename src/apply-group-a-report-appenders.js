@@ -255,6 +255,7 @@ function parseDebriefNowWhatItems(text) {
 function applyDebriefReport({ implementResponse, task }) {
   const { archiveSpecificDoneTasks } = require('./done-archive.js');
   const { writeSideFindingInbox } = require('./side-finding.js');
+  const { routeNowWhatItem } = require('./now-what-route.js');
   const { getConfig } = require('./config.js');
   const text = (implementResponse || '').trim();
 
@@ -277,10 +278,18 @@ function applyDebriefReport({ implementResponse, task }) {
   const result = archiveSpecificDoneTasks({ pipelineDir, taskIds });
 
   const nowWhatItems = parseDebriefNowWhatItems(text);
+  let routedCount = 0;
+  let filedCount = 0;
   for (const item of nowWhatItems) {
-    writeSideFindingInbox(item, {
-      source: 'pipeline_debrief', taskId: task.id, stage: 'now-what', pipelineDir,
-    });
+    const routedPath = routeNowWhatItem({ title: item.title, body: item.body, taskId: task.id, pipelineDir });
+    if (routedPath) {
+      routedCount += 1;
+    } else {
+      writeSideFindingInbox(item, {
+        source: 'pipeline_debrief', taskId: task.id, stage: 'now-what', pipelineDir,
+      });
+      filedCount += 1;
+    }
   }
 
   // {skipped: true} (never {succeeded: true} with no `file`) -- this apply never touches
@@ -291,7 +300,7 @@ function applyDebriefReport({ implementResponse, task }) {
   // would instead reach `gitRunner.add([artifact.file])` as `git add [undefined]` and throw.
   return {
     skipped: true,
-    reason: `debriefed ${taskIds.length} task(s); archived ${result.moved}, already-moved ${result.missing}${result.errors.length ? `, ${result.errors.length} error(s): ${result.errors.join('; ')}` : ''}; filed ${nowWhatItems.length} Now-What finding(s) to the brain-dump inbox`,
+    reason: `debriefed ${taskIds.length} task(s); archived ${result.moved}, already-moved ${result.missing}${result.errors.length ? `, ${result.errors.length} error(s): ${result.errors.join('; ')}` : ''}; routed ${routedCount} Now-What item(s) to queue/adhoc/, filed ${filedCount} to the brain-dump inbox`,
   };
 }
 
