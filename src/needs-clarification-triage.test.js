@@ -668,6 +668,89 @@ test('bucket J: already at MAX_REQUEUES -> falls through to leave-for-human, not
   assert.ok(exists(at(dir, 'needs-clarification', 'tj5.json')));
 });
 
+// --- Bucket K: decompose-review-blind signature (2026-09-16) ---------------------------
+
+const REAL_SUB_TASKS = [
+  { title: 'Add the allowlist constant', rawText: 'In src/foo.js, add ALLOWLIST = [...].' },
+  { title: 'Wire the allowlist into the check', rawText: 'In src/bar.js, reference ALLOWLIST.' },
+];
+
+test('bucket K: decompose-review-blind signature -> implementResponse regenerated, sent to queue/review/', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, baseTask('tk1', {
+    adhocResolution: 'decompose',
+    subTaskProposals: REAL_SUB_TASKS,
+    implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).\n\nAgentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it',
+    needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
+    blockedReason: 'The IMPLEMENT draft is a degenerate meta-commentary...',
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tk1.json')));
+  const moved = read(at(dir, 'review', 'tk1.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.equal(moved.needsClarification, undefined);
+  assert.equal(moved.blockedReason, undefined);
+  assert.equal(moved.ncTriageAttempts, 1);
+  // The real sub-tasks are now genuinely present in implementResponse.
+  assert.match(moved.implementResponse, /Add the allowlist constant/);
+  assert.match(moved.implementResponse, /Wire the allowlist into the check/);
+  // The real, valid decomposition itself is untouched -- this bucket repairs, never redrafts.
+  assert.deepEqual(moved.subTaskProposals, REAL_SUB_TASKS);
+  assert.equal(moved.adhocResolution, 'decompose');
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && /decompose-review-blind signature/.test(h.detail)));
+});
+
+test('bucket K: a decompose task whose implementResponse ALREADY shows the real sub-tasks is left alone', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tk2', {
+    adhocResolution: 'decompose',
+    subTaskProposals: REAL_SUB_TASKS,
+    implementResponse: `Decomposed into 2 sub-task(s).\n\n1. ${REAL_SUB_TASKS[0].title}\n   ${REAL_SUB_TASKS[0].rawText}\n2. ${REAL_SUB_TASKS[1].title}\n   ${REAL_SUB_TASKS[1].rawText}`,
+    needsClarification: { reason: 'design-decision', openQuestions: 'Should the widget default to on or off? I need you to decide the product behaviour.' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tk2.json')));
+});
+
+test('bucket K: a task with fewer than 2 sub-tasks is left alone (not a real decomposition)', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tk3', {
+    adhocResolution: 'decompose',
+    subTaskProposals: [REAL_SUB_TASKS[0]],
+    implementResponse: 'Auto-decomposed after a turn-budget-exhausted implement pass (1 pieces).',
+    needsClarification: { reason: 'design-decision', openQuestions: 'Should the widget default to on or off? I need you to decide the product behaviour.' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tk3.json')));
+});
+
+test('bucket K: a genuinely non-decompose task is left alone', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tk4', {
+    needsClarification: { reason: 'design-decision', openQuestions: 'Should the widget default to on or off? I need you to decide the product behaviour.' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tk4.json')));
+});
+
+test('bucket K: already at MAX_REQUEUES -> falls through to leave-for-human, not re-repaired', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tk5', {
+    adhocResolution: 'decompose',
+    subTaskProposals: REAL_SUB_TASKS,
+    implementResponse: 'Auto-decomposed after two implement passes (2 pieces).',
+    ncTriageAttempts: 1,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tk5.json')));
+});
+
 // --- Ghost-in-the-Machine: bucket C retry-exhausted -> ghost debt (2026-09-09) ---------
 
 const sfInbox = (dir) => {
