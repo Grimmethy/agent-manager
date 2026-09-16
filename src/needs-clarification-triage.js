@@ -147,6 +147,29 @@
 //      masking an earlier attempt's still-valid decomposition), which that allowlist
 //      excludes since it only lets 'design-decision'/'invalid-premise'/'unreliable-
 //      grounding' through. See its own inline comment for both incidents.
+//
+//   L. FABRICATED-FILE-PATH NEAR-MISS AUTO-REPAIR (2026-09-16) -- candidate-path-
+//      grounding.js's Check 0 escalates an arch_discovery candidate straight to
+//      needs-clarification (reason:'fabricated-file-path', non-retryable by design --
+//      see blocked-task-classifiers.js's own comment: 3 qwen passes all re-invented the
+//      same wrong path, so a blind redraft never differs) whenever the write-up's
+//      `Files:` line names a path that resolves nowhere in the repo. Root-caused live
+//      (arch-discovery-community-15, "scripts" community): the model was handed exactly
+//      3 real files verbatim in its own promptContext.files (candidates-doc-merge.js,
+//      candidates-doc-merge-driver.js, candidates-doc-merge.test.js -- all sharing the
+//      same 3-4 word stem) and cited `merge-candidates.js`, a token-shuffle of the first
+//      real path, not a wholesale invention. The gate correctly refuses to guess, but
+//      "correctly refuses to guess" and "a human must now read this" are different bars:
+//      when the claimed path's basename tokens are a STRICT subset of exactly one real
+//      grounded path's tokens (and every other candidate has a worse -- larger -- extra-
+//      token count), that's not a judgment call either; it is close enough as a matter
+//      of set arithmetic. This bucket substitutes the real path for the fabricated one
+//      everywhere it appears in implementResponse and sends the repaired write-up
+//      straight to review, instead of leaving a mechanically-recoverable near-miss for a
+//      human. Scoped to source:'arch_discovery' only -- the one shape with a verified,
+//      trustworthy promptContext.files list of real grounded paths; a genuinely
+//      unrecoverable fabrication (no real path is a confident match) still falls through
+//      to bucket C, unchanged.
 const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
@@ -233,6 +256,47 @@ const REQUEUE_STRIP_FIELDS = [
   'priorRejectionFeedback', 'rawDiff', 'implementResponse', 'blockedReason', 'blockedStage',
   'claimedAt',
 ];
+
+// Bucket L helpers. Parses candidate-path-grounding.js's own formatFabricatedReason()
+// shape ("fabricated file path(s): a, b -- not present anywhere in the target repo. ...")
+// -- deliberately matching that exact producer rather than a looser pattern, so this
+// never fires on a differently-worded blockedReason from some other gate.
+const FABRICATED_PATHS_RE = /fabricated file path\(s\):\s*(.+?)\s*--\s*not present anywhere in the target repo/i;
+function extractFabricatedPaths(blockedReason) {
+  const m = FABRICATED_PATHS_RE.exec(String(blockedReason || ''));
+  if (!m) return [];
+  return m[1].split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+// basename, extension stripped, split on any run of non-alphanumeric characters --
+// "candidates-doc-merge.test.js" -> ['candidates','doc','merge','test'].
+function basenameTokens(filePath) {
+  const base = String(filePath || '').split('/').pop() || '';
+  const noExt = base.replace(/\.[a-z0-9]+$/i, '');
+  return noExt.split(/[^a-z0-9]+/i).map((t) => t.toLowerCase()).filter(Boolean);
+}
+
+// A claimed (fabricated) path is a confident near-miss of a real grounded path when its
+// token set is a non-empty STRICT subset of the real path's token set, and no other real
+// path ties for the fewest leftover (extra) tokens -- a unique closest superset, not just
+// "some overlap." Returns the matching real path, or null if there is no unique winner.
+function findNearMissRealPath(claimedPath, realPaths) {
+  const claimedTokens = new Set(basenameTokens(claimedPath));
+  if (claimedTokens.size === 0) return null;
+  let best = null; // { realPath, extra }
+  let tie = false;
+  for (const realPath of realPaths) {
+    const realTokens = new Set(basenameTokens(realPath));
+    if (realTokens.size <= claimedTokens.size) continue; // not a strict superset by size
+    let isSubset = true;
+    for (const t of claimedTokens) { if (!realTokens.has(t)) { isSubset = false; break; } }
+    if (!isSubset) continue;
+    const extra = realTokens.size - claimedTokens.size;
+    if (!best || extra < best.extra) { best = { realPath, extra }; tie = false; }
+    else if (extra === best.extra && realPath !== best.realPath) { tie = true; }
+  }
+  return best && !tie ? best.realPath : null;
+}
 
 function log(line) {
   process.stderr.write(`[nc-triage] ${line}\n`);
@@ -398,6 +462,72 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             }
           }
           continue;
+        }
+      }
+    }
+
+    // --- Bucket L: fabricated-file-path near-miss auto-repair (arch_discovery only) ---
+    // Checked BEFORE the `nc.reason` allowlist below, same reasoning as bucket K:
+    // reason:'fabricated-file-path' is not in that allowlist, so this would otherwise be
+    // silently skipped every tick. See the top-of-file header for the full incident.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const nc0 = task.needsClarification || {};
+      if (nc0.reason === 'fabricated-file-path' && task.source === 'arch_discovery'
+        && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const realPaths = Array.isArray(task.promptContext && task.promptContext.files)
+          ? task.promptContext.files.map((f) => f && f.path).filter(Boolean)
+          : [];
+        const claimed = extractFabricatedPaths(task.blockedReason);
+        const repairs = claimed.length > 0
+          ? claimed.map((c) => ({ claimed: c, real: findNearMissRealPath(c, realPaths) }))
+          : [];
+        const allResolved = repairs.length > 0 && repairs.every((r) => r.real);
+        if (allResolved) {
+          const reviewDir = path.join(pipelineDir, 'queue', 'review');
+          const reviewPath = path.join(reviewDir, `${id0}.json`);
+          if (fs.existsSync(reviewPath)) {
+            log(`${id0}: bucket L but ${id0}.json already in review/ -- already handled, skipping`);
+          } else {
+            summary.checked += 1;
+            const attempt = (task.ncTriageAttempts || 0) + 1;
+            log(`${id0}: bucket L (fabricated-file-path near-miss) -> repaired ${repairs.length} path(s), sent to review ${attempt}/${MAX_REQUEUES}`);
+            summary.requeued += 1;
+            if (!DRY_RUN) {
+              let text = String(task.implementResponse || '');
+              for (const r of repairs) {
+                text = text.split(r.claimed).join(r.real);
+              }
+              task.implementResponse = text;
+              delete task.needsClarification;
+              delete task.localRejectCount;
+              delete task.retryableDraftBlock;
+              delete task.preDrafted;
+              delete task.priorRejectionFeedback;
+              delete task.blockedReason;
+              delete task.blockedStage;
+              delete task.claimedAt;
+              delete task.ncTriageDecision;
+              delete task.ncTriageReviewedAt;
+              task.ncTriageAttempts = attempt;
+              task.status = 'needs-review';
+              appendHistoryEvent(task, 'requeued',
+                `needs-clarification-triage: fabricated-file-path near-miss signature -- substituted the real grounded path for ${repairs.map((r) => `"${r.claimed}" -> "${r.real}"`).join(', ')}, sent straight to review ${attempt}/${MAX_REQUEUES}`);
+              try {
+                await classifyRequeue(task, { reasonHint: 'bucket-L: fabricated-file-path near-miss', requeueWriter: 'needs-clarification-triage', repoRoot });
+              } catch { /* classification must never block the real requeue */ }
+              try {
+                fs.mkdirSync(reviewDir, { recursive: true });
+                fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+                fs.unlinkSync(file);
+              } catch (e) {
+                log(`${id0}: repair-and-review move failed: ${e.message}`);
+                summary.requeued -= 1;
+                summary.errors += 1;
+              }
+            }
+            continue;
+          }
         }
       }
     }
