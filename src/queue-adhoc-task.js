@@ -28,7 +28,7 @@ function defaultTaskDomain(validDomains) {
 // instead of executing it directly -- can queue a real adhoc task without shelling out
 // to this script. Throws on an invalid domain rather than the CLI's own
 // print-and-exit(1), since a library call has no business calling process.exit.
-function queueAdhocTask({ title, promptContext, domain, dependsOn }, { pipelineDir, domainsPath }) {
+function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority }, { pipelineDir, domainsPath }) {
   if (!title) throw new Error('queueAdhocTask: title is required');
   if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
 
@@ -54,6 +54,16 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn }, { pipelineD
     // `source` alone (task-sources.js's own loader force-overrides source:'manual' on
     // every queue/adhoc/ file it reads, human- or bot-written).
     humanQueued: true,
+    // premiumPriority (2026-09-16, Grimmethy: "any tasks that chat is working on
+    // directly should be labelled premium priority") -- opt-in, not a blanket default
+    // for every queueAdhocTask() caller (the plain CLI has no reason to assume this):
+    // Chat's own queue_reviewed_task tool passes it explicitly. Same field
+    // /api/task-anywhere/<id>/premium-priority sets by hand -- see that route's own
+    // header for what it actually does (next-claimable-task.js's effectivePriority()
+    // sorts it ahead of every other pending item, survives every retry/requeue cycle).
+    // This was previously a manual step an operator had to remember to do after every
+    // Chat-queued task; automating it here closes that gap.
+    ...(premiumPriority ? { premiumPriority: true } : {}),
     ...(cleanDependsOn && cleanDependsOn.length ? { dependsOn: cleanDependsOn } : {}),
   };
   const filePath = path.join(adhocDir, `${id}.json`);

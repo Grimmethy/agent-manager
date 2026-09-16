@@ -429,6 +429,8 @@ test('buildWriteToolHandlers.queue_reviewed_task writes a real adhoc task and re
     assert.equal(record.source, 'manual');
     assert.equal(record.promptContext.rawText, 'AC-57 is clean, no conflicts -- merge into master.');
     assert.equal(record.promptContext.raisedFrom, 'chat');
+    assert.equal(record.premiumPriority, true, 'every task Chat queues is something a human is actively watching it work on right now');
+    assert.match(result.message, /premium priority/);
   });
 });
 
