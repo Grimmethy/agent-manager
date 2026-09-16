@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, detectContradictoryLiteralAcceptance } = require('./acceptance-criteria.js');
+const { resolveAcceptanceCriteria, parseAcceptanceBlock, parseCriteriaBlock, detectContradictoryLiteralAcceptance, declaredEditFiles, dropSingleFileScopeContradictions } = require('./acceptance-criteria.js');
 const { runAcceptanceCommand } = require('./acceptance-command-gate.js');
 
 test('resolveAcceptanceCriteria: promptContext array', () => {
@@ -103,4 +103,52 @@ test('detectContradictoryLiteralAcceptance: null on a task with no promptContext
 test('detectContradictoryLiteralAcceptance: only 2 quoted segments (below the cluster minimum) is not flagged even if it would otherwise match', () => {
   const rawText = "Insert: '// Do NOT create a' '// parallel store here.' Verify the string 'Do NOT create a parallel store' appears.";
   assert.equal(detectContradictoryLiteralAcceptance({ promptContext: { rawText } }), null);
+});
+
+// --- dropSingleFileScopeContradictions (2026-09-15) -- root-caused live on
+// adhoc-add-getsecondbraindir-and-requiresecondbraindir-helpers-to-config-js-with-tests:
+// the task's own rawText names two edit-target files (src/config.js and
+// src/config.test.js), but the plan pass's own CRITERIA: block asserted a single-file-
+// only scope, contradicting the very same task -- burned 6 draft attempts before a
+// human caught it. -----------------------------------------------------------------
+
+test('declaredEditFiles: picks up files named anywhere in the prose, not just the title', () => {
+  const rawText = 'In src/config.js, add a helper. Also, in src/config.test.js, add tests for it.';
+  assert.deepEqual(declaredEditFiles(rawText), ['src/config.js', 'src/config.test.js']);
+});
+
+test('declaredEditFiles: a file named only inside a "do not touch" clause is excluded', () => {
+  const rawText = 'Edit src/foo.js to add the helper. Do not touch src/bar.js.';
+  assert.deepEqual(declaredEditFiles(rawText), ['src/foo.js']);
+});
+
+test('dropSingleFileScopeContradictions: drops a single-file-scope criterion when the task itself declares 2+ edit targets', () => {
+  const task = { promptContext: { rawText: 'In src/config.js, add a helper. Also, in src/config.test.js, add tests for it.' } };
+  const criteria = ['requireSecondBrainDir throws when unset', 'Only src/config.js is modified -- src/config.test.js must not appear'];
+  assert.deepEqual(dropSingleFileScopeContradictions(task, criteria), ['requireSecondBrainDir throws when unset']);
+});
+
+test('dropSingleFileScopeContradictions: the real incident phrasing ("no other paths" / "does not appear", not "only"/"must not")', () => {
+  const task = { promptContext: { rawText: 'In src/config.js, add getSecondBrainDir. Also, in src/config.test.js, add tests for it.' } };
+  const criteria = [
+    '`git diff --name-only` outputs exactly `src/config.js` (one line, no other paths). `src/config.test.js` does not appear.',
+    '`src/config.js` contains top-level `function getSecondBrainDir()`.',
+  ];
+  assert.deepEqual(dropSingleFileScopeContradictions(task, criteria), ['`src/config.js` contains top-level `function getSecondBrainDir()`.']);
+});
+
+test('dropSingleFileScopeContradictions: keeps the criterion when the task only names one file', () => {
+  const task = { promptContext: { rawText: 'In src/config.js, add a helper function.' } };
+  const criteria = ['Only src/config.js is modified'];
+  assert.deepEqual(dropSingleFileScopeContradictions(task, criteria), criteria);
+});
+
+test('resolveAcceptanceCriteria: strips a plan-derived criterion that contradicts the task\'s own multi-file scope', () => {
+  const task = {
+    promptContext: { rawText: 'In src/config.js, add getSecondBrainDir. Also, in src/config.test.js, add tests for it.' },
+    planResponse: 'plan text\n\nCRITERIA:\n- getSecondBrainDir returns null when unset\n- Only src/config.js is modified, src/config.test.js must not appear',
+  };
+  const r = resolveAcceptanceCriteria(task);
+  assert.deepEqual(r.criteria, ['getSecondBrainDir returns null when unset']);
+  assert.equal(r.source, 'plan-derived');
 });
