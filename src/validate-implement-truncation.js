@@ -5,17 +5,40 @@
 // pipeline to reject broken drafts before the decode/apply step.
 // Run: node --test src/validate-implement-truncation.test.js
 
-const { parseJsonMaybeFenced } = require('./json-fence.js');
+// 2026-09-15 (day-of regression, PR #265 wired this into review-task.js unconditionally
+// for every task, then this same needs-clarification sweep root-caused it hours later):
+// this used to also fall back to json-fence.js's parseJsonMaybeFenced(), whose
+// extractBalancedJson() recovery scans the ENTIRE text for the first '{'/'[' and tries to
+// JSON.parse whatever balanced-bracket substring starts there -- built for the APPLY path,
+// where recovering a real JSON payload buried in prose is the point. Reused here for
+// TRUNCATION DETECTION, it means any normal, COMPLETE adhoc implementResponse (a plain
+// "RESOLUTION: implemented" summary followed by `=== DIFF ===` + a real unified diff) gets
+// its first '{' or '[' extracted from deep inside actual code (e.g. `function foo() {`),
+// fails to parse as JSON, and then failed the old CODE_MARKERS fallback below too (a real
+// diff always contains braces/brackets/backticks) -- flagging essentially every correct,
+// complete Group-A draft as "truncated". Confirmed live: ~half of all real adhoc/brain-dump
+// reviews in the hours after this landed were false-blocked and auto-requeued for a
+// from-scratch redraft, burning real retry budget on drafts that were already correct
+// (adhoc-add-7-coverage-path-tests-to-src-config-test-js-1789403753654-1's own captured
+// blockedReason shows a 7457-char response ending in a complete, ordinary sentence).
+//
+// Fix: this function now only ever recognizes a LITERAL (optionally fenced) JSON envelope
+// -- a whole-string JSON.parse, no "find JSON anywhere in the text" recovery -- and drops
+// the CODE_MARKERS-implies-truncated rule entirely; a complete diff or code snippet is
+// never itself evidence of truncation. The only real truncation signal this file ever had
+// solid evidence for (the 2026-09-08 "Topology" incident: a response that cuts off
+// mid-string) is the trailing-unterminated-quote heuristic below, which needs no JSON
+// parsing at all and catches that shape whether or not the surrounding text also happens
+// to contain code.
+const FENCED_JSON_RE = /```(?:json)?\s*\n([\s\S]*?)\n?```/i;
 
-// Characters that indicate the text contains real code or JSON structure. Deliberately
-// NOT also matching bare keywords like return/function/const/let/class -- those are
-// common English words too ("let me read...", "this class of bug", "please return to...")
-// and a keyword-only heuristic produced real false positives (found live 2026-09-15,
-// wiring this into review-task.js: a plain brain_dump_sort refusal, "let me read the
-// vault first", was misclassified as truncated code purely because of the word "let"). A
-// genuine code/JSON fragment reliably contains at least one brace/bracket/backtick;
-// prose essentially never does.
-const CODE_MARKERS = /[{}\[\]`]/;
+// A RESOLUTION: decompose response is a documented, FIXED-format exception: a
+// "RESOLUTION: decompose" line followed by a real JSON array of sub-task proposals (see
+// agentic-draft-common.js's own RESOLUTION_RE / decompose handling). Stripping exactly
+// this known prefix (never an arbitrary search for '{'/'[' anywhere in the text -- that's
+// the extractBalancedJson trap the header above describes) lets a legitimate decompose
+// response's trailing JSON parse cleanly even though the line above it isn't JSON itself.
+const RESOLUTION_PREFIX_RE = /^RESOLUTION:\s*\S+\s*\n+/i;
 
 /**
  * Detect whether `rawText` looks like a truncated model output.
@@ -33,28 +56,31 @@ function detectTruncatedImplementResponse(rawText) {
 
   const trimmed = rawText.trim();
 
-  // 2. Attempt JSON parse via the shared helper (try first so valid envelopes
-  //    are accepted regardless of internal whitespace).
-  try {
-    parseJsonMaybeFenced(trimmed);
-    // Successfully parsed -- valid JSON envelope (possibly fenced).
-    return { truncated: false, reason: null };
-  } catch {
-    // 3. Unparseable. Apply the trailing-unterminated-string heuristic:
-    //    the last whitespace-delimited token has an odd number of unescaped
-    //    double-quotes (e.g. ...return "Topology).
-    const trailingToken = trimmed.split(/\s+/).pop();
-    const unescapedQuotes = (trailingToken.match(/(?<!\\)"/g) || []).length;
-    if (unescapedQuotes % 2 !== 0) {
-      return { truncated: true, reason: 'truncated output' };
-    }
-    // 4. No code/JSON markers at all -- treat as a clean refusal.
-    if (!CODE_MARKERS.test(trimmed)) {
+  // 2. A literal JSON envelope, whole-string only (optionally fenced) -- a complete Group
+  //    B response. NOT extractBalancedJson's "find JSON anywhere" recovery (see header).
+  const fenced = trimmed.match(FENCED_JSON_RE);
+  const afterResolutionPrefix = trimmed.replace(RESOLUTION_PREFIX_RE, '');
+  for (const candidate of [fenced ? fenced[1] : trimmed, afterResolutionPrefix]) {
+    try {
+      JSON.parse(candidate);
       return { truncated: false, reason: null };
+    } catch {
+      // Try the next candidate / fall through to the prose/diff heuristic below. Not
+      // parsing as JSON is expected and NORMAL for the vast majority of real drafts (a
+      // Group A implementResponse is never JSON at all), not itself a sign of trouble.
     }
-    // 5. Code markers present but unparseable -- truncated.
+  }
+
+  // 3. Trailing-unterminated-string heuristic: the last whitespace-delimited token has an
+  //    odd number of unescaped double-quotes (e.g. ...return "Topology). The one shape
+  //    this file has real incident evidence for -- see header.
+  const trailingToken = trimmed.split(/\s+/).pop();
+  const unescapedQuotes = (trailingToken.match(/(?<!\\)"/g) || []).length;
+  if (unescapedQuotes % 2 !== 0) {
     return { truncated: true, reason: 'truncated output' };
   }
+
+  return { truncated: false, reason: null };
 }
 
 module.exports = { detectTruncatedImplementResponse };
