@@ -35,11 +35,11 @@ from pathlib import Path
 from flask import Flask, jsonify, render_template, abort, request, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
 
-# build_graph.py / visualize_graph.py live one directory up (python/), not inside
+# graph_build.py / visualize_graph.py live one directory up (python/), not inside
 # dashboard/ -- added explicitly rather than relying on an installed package, matching
 # this whole project's no-build-step, run-from-source philosophy.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import build_graph  # noqa: E402
+import graph_build  # noqa: E402
 import visualize_graph  # noqa: E402
 
 import plugin_process_manager
@@ -477,8 +477,8 @@ def _cache_paths_for_dir(cache_dir: Path) -> dict:
         "positions": cache_dir / "positions.json",
         # 2026-08-24 (Brain Dump #155: "Every time I build a project graph it starts from
         # scratch... build on diff's") -- per-file mtime/size -> resolved-edges cache, see
-        # build_graph.py's build_import_graph. Build-process bookkeeping, not graph data
-        # any consumer reads, same reasoning as build_graph.py's own .graph-file-cache.json
+        # graph_build.py's build_import_graph. Build-process bookkeeping, not graph data
+        # any consumer reads, same reasoning as graph_build.py's own .graph-file-cache.json
         # living under instances/ rather than next to graph.json.
         "file_cache": cache_dir / "file-cache.json",
     }
@@ -2472,20 +2472,20 @@ def _run_build(path_str: str, grep_dirs: list[str]):
         cache = resolve_writable_cache(path_str, grep_dirs)
         # 2026-08-24 (Grimmethy, Brain Dump #155: "Every time I build a project graph it
         # starts from scratch. Can we instead build on diff's...") -- this call site never
-        # loaded the previous build's graph/coverage at all (unlike build_graph.py's own
+        # loaded the previous build's graph/coverage at all (unlike graph_build.py's own
         # main()/check_due(), which already did), so it never even carried forward
         # lastReviewedAt review state on a rebuild, let alone skipped re-parsing unchanged
         # files or re-naming unchanged communities. Now does all three, via the SAME
-        # file_cache/old_coverage/old_graph_nodes params build_graph.py's own callers use.
+        # file_cache/old_coverage/old_graph_nodes params graph_build.py's own callers use.
         old_graph = read_json_safe(cache["graph"]) or {"nodes": [], "links": []}
         old_coverage = read_json_safe(cache["coverage"]) or {"communities": []}
         file_cache = read_json_safe(cache["file_cache"]) or {}
 
-        result = build_graph.build_graph_data(
+        result = graph_build.build_graph_data(
             Path(path_str), grep_dirs, ollama_url, local_model, progress=progress,
             file_cache=file_cache, old_coverage=old_coverage, old_graph_nodes=old_graph.get("nodes", []),
         )
-        merged_coverage = build_graph.merge_coverage(old_coverage, old_graph.get("nodes", []), result["coverage"], result["graph"]["nodes"])
+        merged_coverage = graph_build.merge_coverage(old_coverage, old_graph.get("nodes", []), result["coverage"], result["graph"]["nodes"])
 
         cache["graph"].write_text(json.dumps(result["graph"], indent=2), encoding="utf-8")
         cache["coverage"].write_text(json.dumps(merged_coverage, indent=2), encoding="utf-8")
