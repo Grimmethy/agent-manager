@@ -18,6 +18,20 @@
 // queue-watcher.sh to iterate than a single JSON array would be):
 //   { instanceId, pid, action: 'restart'|'restart-after-kill'|'flag', reason, script, args, pidfileName }
 // 'flag' means "looks dead but no restart rule matches this instanceId" -- log only.
+// ── Design context: Celery analogy (2026-09-07, brain-dump research finding) ──
+// Celery separates two liveness signals that this file conflates into one
+// "is the process alive?" question:
+//   (a) Broker-level heartbeat (AMQP/RabbitMQ TCP keepalive) → detects a dead
+//       WORKER; the broker redelivers that worker's unacked tasks.
+//       ≈ this file's stale-heartbeat / zombie-threshold checks.
+//   (b) Visibility timeout (SQS 30 min, Redis 1 hr) → blindly redelivers a task
+//       if it goes unacked for that long, with NO liveness probe of whether the
+//       task is still being worked.
+//       ≈ agent-manager has NO equivalent. A live worker that hangs mid-task is
+//       never re-claimed; the task is stuck until the worker process itself dies.
+// The Celery visibility timeout is a blunt instrument for exactly this per-claim
+// gap, not a solved pattern. Do not "fix" the per-claim gap by copying it without
+// first solving the false-redelivery problem it introduces.
 
 const fs = require('fs');
 const path = require('path');
