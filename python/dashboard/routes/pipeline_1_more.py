@@ -168,6 +168,34 @@ def api_git_merge_branch(branch):
     if not match:
         abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 
+    # A sibling branch still unmerged in the SAME coordinator hub that this branch would
+    # conflict with (2026-09-16: root-caused live -- 4 sub-tasks of one hub all edited the
+    # same file, each independently branched off main, so each showed willConflict:False
+    # against main alone; merging them one at a time hit a real conflict on the 2nd). The
+    # real merge attempt below would fail the same way (or worse, silently ship whichever
+    # side happened to be merged first without the other's change) -- block and name the
+    # sibling(s) so the caller merges in dependency order (or combines them by hand) rather
+    # than discovering this from an opaque git error. Checked BEFORE the hub-not-finished
+    # gate below: a hub mid-decomposition is ALSO very often the exact shape with an
+    # unmerged sibling still pending, and that gate's own `force` would otherwise mask
+    # this one from ever being seen at all (only one gate's reason is ever returned per
+    # request) -- surfacing the sibling-conflict warning first means a caller who force-
+    # bypasses the hub gate still sees it, instead of being silently exposed to the same
+    # conflict this whole check exists to catch.
+    sibling_conflicts = [s for s in (match.get("hubSiblingConflicts") or [])
+                          if any(b["branch"] == s for b in branches)]
+    if sibling_conflicts and not (request.get_json(silent=True) or {}).get("force"):
+        return jsonify({
+            "succeeded": False,
+            "reason": (
+                f"'{branch}' would conflict with still-unmerged sibling branch(es) in the same "
+                f"coordinator hub: {', '.join(sibling_conflicts)}. Merge the sibling(s) first (in "
+                "dependency order), or resolve the overlap by hand, rather than merging this one "
+                'independently. Re-send with {"force": true} only if you have already verified '
+                "the resolution."
+            ),
+        }), 409
+
     # A branch owned by a coordinator hub that hasn't finished (a stacked file-decompose
     # branch still missing its wiring commit + integration-gate pass) is not safe to merge
     # -- doing so 404s the moved routes. Block it unless the caller explicitly forces.

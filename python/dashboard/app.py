@@ -2683,6 +2683,86 @@ def _check_merge_conflict(repo_root, main_branch, branch):
     return {"willConflict": None, "conflictFiles": [], "checked": False}
 
 
+def _check_sibling_conflict(repo_root, branch_a, branch_b):
+    """Same idea as _check_merge_conflict, but between two SIBLING unmerged branches
+    instead of one branch against main (2026-09-16, root-caused live: a coordinator hub
+    decomposed one feature into 4 sub-tasks that all edit the same file -- local-
+    tool-client.js -- but the model never declared `after` links between them, so each
+    was independently branched straight off the same main commit. Every branch's own
+    willConflict (checked only against main) correctly said False; the real collision
+    was invisible until a human/agent merged them one at a time and hit a real conflict
+    on the 2nd branch. willConflict has never checked a branch against a SIBLING still
+    sitting unmerged in the same hub -- this closes that blind spot).
+
+    Uses the two branches' own merge-base as the 3-way base (not main_branch): they
+    usually branch directly off main, in which case this is equivalent, but it stays
+    correct even when one is stacked on top of the other.
+    """
+    base = subprocess.run(
+        ["git", "merge-base", f"origin/{branch_a}", f"origin/{branch_b}"],
+        cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+    )
+    if base.returncode != 0:
+        return {"willConflict": None, "conflictFiles": [], "checked": False}
+    base_sha = base.stdout.strip()
+    if not base_sha:
+        return {"willConflict": None, "conflictFiles": [], "checked": False}
+    # --write-tree's own 2-branch form always computes the merge-base itself; overriding
+    # it takes the separate --merge-base=<commit> OPTION, not a 3rd positional argument
+    # (that positional form only exists for the older, write-tree-less --trivial-merge
+    # mode) -- confirmed live the hard way: the naive 3-positional-arg form used here
+    # first always errored with git's own usage text (exit 129), which this function's
+    # broad "non-conflict, non-zero code" branch silently swallowed as checked:False,
+    # meaning the sibling-conflict check would have silently never fired for ANY pair.
+    result = subprocess.run(
+        ["git", "merge-tree", "--write-tree", f"--merge-base={base_sha}", f"origin/{branch_a}", f"origin/{branch_b}"],
+        cwd=str(repo_root), capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode == 0:
+        return {"willConflict": False, "conflictFiles": [], "checked": True}
+    if result.returncode == 1:
+        files = _CONFLICT_LINE_RE.findall(result.stdout)
+        return {"willConflict": True, "conflictFiles": files, "checked": True}
+    return {"willConflict": None, "conflictFiles": [], "checked": False}
+
+
+def _annotate_hub_sibling_conflicts(repo_root, branches):
+    """Mutates `branches` in place, adding `hubSiblingConflicts: [branch, ...]` to any
+    branch whose coordinator hub has another still-unmerged sibling it would conflict
+    with. O(members^2) merge-tree calls per hub -- hubs are small (2-4 real sub-tasks in
+    every one seen so far), so this stays cheap. Best-effort: a git failure on any one
+    pairwise check leaves that pair unflagged rather than raising (matches _check_merge_
+    conflict's own "unknown, not a false 'safe'" doctrine for a checked=False result, but
+    an unflagged pair here just means a human sees one fewer warning, not a false
+    all-clear on the branch's own primary willConflict field).
+    """
+    by_hub = {}
+    for b in branches:
+        hub = b.get("hub")
+        hub_id = hub.get("id") if hub else None
+        if hub_id:
+            by_hub.setdefault(hub_id, []).append(b)
+            # Always present (never a missing key) for any branch with a hub, even when
+            # it's the only one of that hub still unmerged -- a consumer should never
+            # need to distinguish "no conflicts" from "field not computed yet".
+            b["hubSiblingConflicts"] = []
+    for siblings in by_hub.values():
+        if len(siblings) < 2:
+            continue
+        for i, b in enumerate(siblings):
+            conflicts_with = []
+            for j, other in enumerate(siblings):
+                if i == j:
+                    continue
+                try:
+                    sib = _check_sibling_conflict(repo_root, b["branch"], other["branch"])
+                except (subprocess.SubprocessError, OSError):
+                    continue
+                if sib["willConflict"]:
+                    conflicts_with.append(other["branch"])
+            b["hubSiblingConflicts"] = conflicts_with
+
+
 _RESOLUTION_LINE_RE = re.compile(r"RESOLUTION:\s*(?:implemented|no-changes-needed|decompose)\b", re.IGNORECASE)
 _CANDIDATE_METADATA_LINE_RE = re.compile(r"^(?:###.*|Strength:.*|Files?:.*|Source:.*)$", re.MULTILINE)
 _DESCRIPTION_MAX_CHARS = 600
@@ -3068,6 +3148,7 @@ def _list_unmerged_branches_uncached():
             "hub": hub,
         })
 
+    _annotate_hub_sibling_conflicts(repo_root, branches)
     branches.sort(key=lambda b: b["pushedAt"])
     return branches
 
