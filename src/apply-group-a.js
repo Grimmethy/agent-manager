@@ -333,6 +333,94 @@ function applyPathPrefetchResolve({ implementResponse, task, pipelineDir }) {
 // existing adhoc-diff confirm gate). Registered as research_task's `apply` in
 // task-sources.js -- reached only after the confirm gate has already passed, same
 // ordering as applyAdhocDiff's own git-apply step.
+// Strips a leaked <think>...</think> block (closed or ran-out-of-budget-mid-block) the
+// same way decompose-pass.js's stripReasoningBlock does -- reimplemented here rather than
+// exported from that file since it's a tiny, dependency-free 3-line transform and
+// decompose-pass.js's own module boundary is about sub-task extraction, not this.
+function stripLeakedThinkBlock(text) {
+  let out = (text || '').replace(/<think>[\s\S]*?<\/think>/gi, '');
+  const openIdx = out.search(/<think>/i);
+  if (openIdx !== -1) out = out.slice(0, openIdx);
+  return out.trim();
+}
+
+// second_brain_opportunities (2026-09-02) -- parses the implement pass's scored JSON
+// array (one {note, score, nextStep, rationale} per candidate in the batch --
+// secondBrainOpportunitiesImplementPrompt in prompts.js) and upserts each result into
+// <pipelineDir>/second-brain-opportunities.json, the file the dashboard's Opportunities
+// panel (Piece 2, not yet built) will read. Also stamps the coverage cursor's
+// lastSweptAt for every candidate in the batch -- including one the model failed to
+// score, so a candidate the model dropped isn't offered again every single tick.
+function applySecondBrainOpportunities({ implementResponse, pipelineDir, task }) {
+  const { getConfig } = require('./config.js');
+  const { secondBrainOpportunitiesCoveragePath } = getConfig();
+  const candidates = (task.promptContext && task.promptContext.candidates) || [];
+  if (!candidates.length) {
+    return { skipped: true, reason: 'task has no promptContext.candidates -- nothing to score' };
+  }
+
+  const cleaned = stripLeakedThinkBlock(implementResponse);
+  let parsed;
+  try {
+    parsed = parseJsonMaybeFenced(cleaned);
+  } catch (e) {
+    return { skipped: true, reason: `could not parse a JSON array from the implement response: ${e.message}` };
+  }
+  if (!Array.isArray(parsed)) {
+    return { skipped: true, reason: 'implement response parsed but is not a JSON array' };
+  }
+
+  const byNote = new Map();
+  for (const entry of parsed) {
+    if (!entry || typeof entry !== 'object' || !entry.note) continue;
+    byNote.set(String(entry.note), entry);
+  }
+
+  const now = new Date().toISOString();
+  const outputPath = path.join(pipelineDir, 'second-brain-opportunities.json');
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
+  } catch {
+    doc = { generatedAt: now, items: [] };
+  }
+  if (!Array.isArray(doc.items)) doc.items = [];
+
+  const items = new Map(doc.items.map((it) => [it.note, it]));
+  let scoredCount = 0;
+  for (const c of candidates) {
+    const result = byNote.get(c.relPath);
+    if (result) {
+      items.set(c.relPath, {
+        note: c.relPath,
+        score: Number(result.score) || 0,
+        nextStep: String(result.nextStep || '').slice(0, 300),
+        rationale: String(result.rationale || '').slice(0, 500),
+        sweptAt: now,
+      });
+      scoredCount += 1;
+    }
+  }
+
+  doc = { generatedAt: now, items: [...items.values()] };
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  writeJsonAtomicSync(outputPath, doc);
+
+  let coverage;
+  try {
+    coverage = JSON.parse(fs.readFileSync(secondBrainOpportunitiesCoveragePath, 'utf8'));
+  } catch {
+    coverage = {};
+  }
+  for (const c of candidates) {
+    coverage[c.relPath] = { ...(coverage[c.relPath] || {}), lastSweptAt: now };
+  }
+  fs.mkdirSync(path.dirname(secondBrainOpportunitiesCoveragePath), { recursive: true });
+  writeJsonAtomicSync(secondBrainOpportunitiesCoveragePath, coverage);
+
+  return { file: outputPath, count: scoredCount };
+}
+
 function applyResearchTask({ task, secondBrainDir }) {
   const researchDoc = (task && task.researchDoc) || '';
   if (!researchDoc.trim()) {
@@ -394,4 +482,5 @@ module.exports = {
   closeBrainDumpEntryResolved,
   applyResearchTask,
   loadBrainDump,
+  applySecondBrainOpportunities,
 };

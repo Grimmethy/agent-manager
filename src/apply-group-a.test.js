@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport, applyDebriefReport, parseDebriefNowWhatItems } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport, applyDebriefReport, parseDebriefNowWhatItems, applySecondBrainOpportunities } = require('./apply-group-a.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -539,6 +539,96 @@ test('applyBrainDumpSort does NOT queue a research task when requiresResearch is
   applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
 
   assert.ok(!fs.existsSync(path.join(pipelineDir, 'queue', 'research')), 'must not create queue/research/ when requiresResearch is false');
+});
+
+// --- applySecondBrainOpportunities (2026-09-02) -----------------------------------------
+
+function withPipelineDirEnv(dir, fn) {
+  const prev = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev;
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  }
+}
+
+test('applySecondBrainOpportunities parses the scored JSON array, writes second-brain-opportunities.json, and stamps coverage', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-sbo-test-'));
+  withPipelineDirEnv(dir, () => {
+    const task = {
+      id: 't',
+      promptContext: {
+        candidates: [
+          { relPath: 'Ideas/a.md', content: 'about a' },
+          { relPath: 'Ideas/b.md', content: 'about b' },
+        ],
+      },
+    };
+    const implementResponse = JSON.stringify([
+      { note: 'Ideas/a.md', score: 3, nextStep: 'draft a product_spec_outline', rationale: 'clearly actionable' },
+      { note: 'Ideas/b.md', score: 0, nextStep: 'drop', rationale: 'stale' },
+    ]);
+    const result = applySecondBrainOpportunities({ implementResponse, pipelineDir: dir, task });
+    assert.equal(result.count, 2);
+    assert.equal(result.file, path.join(dir, 'second-brain-opportunities.json'));
+
+    const doc = JSON.parse(fs.readFileSync(result.file, 'utf8'));
+    assert.equal(doc.items.length, 2);
+    const a = doc.items.find((i) => i.note === 'Ideas/a.md');
+    assert.equal(a.score, 3);
+    assert.equal(a.nextStep, 'draft a product_spec_outline');
+
+    const coverage = JSON.parse(fs.readFileSync(path.join(dir, 'second-brain-opportunities-coverage.json'), 'utf8'));
+    assert.ok(coverage['Ideas/a.md'].lastSweptAt);
+    assert.ok(coverage['Ideas/b.md'].lastSweptAt);
+  });
+});
+
+test('applySecondBrainOpportunities tolerates a leaked <think> block before the JSON array', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-sbo-test-'));
+  withPipelineDirEnv(dir, () => {
+    const task = { id: 't', promptContext: { candidates: [{ relPath: 'Ideas/a.md', content: 'x' }] } };
+    const implementResponse = '<think>let me consider this...</think>[{"note": "Ideas/a.md", "score": 2, "nextStep": "needs web research first", "rationale": "unsure"}]';
+    const result = applySecondBrainOpportunities({ implementResponse, pipelineDir: dir, task });
+    assert.equal(result.count, 1);
+  });
+});
+
+test('applySecondBrainOpportunities newest scoring wins per note across separate applies', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-sbo-test-'));
+  withPipelineDirEnv(dir, () => {
+    const task = { id: 't', promptContext: { candidates: [{ relPath: 'Ideas/a.md', content: 'x' }] } };
+    applySecondBrainOpportunities({ implementResponse: JSON.stringify([{ note: 'Ideas/a.md', score: 1, nextStep: 'drop', rationale: 'first pass' }]), pipelineDir: dir, task });
+    applySecondBrainOpportunities({ implementResponse: JSON.stringify([{ note: 'Ideas/a.md', score: 3, nextStep: 'draft a product_spec_outline', rationale: 'second pass' }]), pipelineDir: dir, task });
+
+    const doc = JSON.parse(fs.readFileSync(path.join(dir, 'second-brain-opportunities.json'), 'utf8'));
+    assert.equal(doc.items.length, 1);
+    assert.equal(doc.items[0].score, 3);
+    assert.equal(doc.items[0].rationale, 'second pass');
+  });
+});
+
+test('applySecondBrainOpportunities skips cleanly when the task has no candidates', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-sbo-test-'));
+  withPipelineDirEnv(dir, () => {
+    const result = applySecondBrainOpportunities({ implementResponse: '[]', pipelineDir: dir, task: { id: 't', promptContext: {} } });
+    assert.equal(result.skipped, true);
+  });
+});
+
+test('applySecondBrainOpportunities skips cleanly on unparseable implementResponse', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-sbo-test-'));
+  withPipelineDirEnv(dir, () => {
+    const task = { id: 't', promptContext: { candidates: [{ relPath: 'Ideas/a.md', content: 'x' }] } };
+    const result = applySecondBrainOpportunities({ implementResponse: 'not json at all', pipelineDir: dir, task });
+    assert.equal(result.skipped, true);
+  });
 });
 
 // --- applyResearchTask (Brain Dump #1 follow-up, 2026-08-17) ----------------------------
