@@ -1058,10 +1058,10 @@ function pickUsage(o) {
   };
 }
 
-async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
+async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk, useExtendedContext = false }) {
   if (!onChunk) {
     const res = await postJson(`${OLLAMA_URL}/api/chat`, {
-      model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
+      model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: { num_ctx: useExtendedContext ? EXTENDED_NUM_CTX : PINNED_NUM_CTX },
     }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
     return { message: res.message || {}, usage: pickUsage(res) };
   }
@@ -1071,7 +1071,7 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   let usage = pickUsage(null);
   let doneReason = null;
   await postJsonStream(`${OLLAMA_URL}/api/chat`, {
-    model: MODEL, messages, tools, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
+    model: MODEL, messages, tools, keep_alive: KEEP_ALIVE, options: { num_ctx: useExtendedContext ? EXTENDED_NUM_CTX : PINNED_NUM_CTX },
   }, REQUEST_TIMEOUT_MS, tokenFoldHeaders, (obj) => {
     if (obj.error || obj.done_reason === 'error') {
       streamError = obj.error || obj.done_reason || 'unknown stream error';
