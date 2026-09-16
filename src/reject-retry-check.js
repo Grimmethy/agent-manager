@@ -26,13 +26,27 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getConfig } = require('./config.js');
+const { getConfig, ensureRegistered } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { classifyBlockedTask, findClassifier } = require('./blocked-task-classifiers.js');
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
+// 2026-09-16: registers this package's built-in sources (side effect of the require) --
+// deterministicReviewRecoveryCheck below looks a task's source up in this SAME registry
+// (getRegisteredSource), but this file itself never required task-sources.js, so a
+// standalone `node reject-retry-check.js` process (this CLI's own real, documented entry
+// point -- see scripts/queue-watcher.sh) started with a completely EMPTY registry: every
+// lookup silently returned undefined, and the whole recovery feature was inert in
+// production despite passing its own unit tests (which register a fake source directly,
+// bypassing this exact gap). ensureRegistered() covers a consumer's own plugin-registered
+// sources too (get-grounding-source.js's own header explains why both calls are needed
+// together) -- deterministicReview is source-agnostic by design, so a future plugin-
+// registered source should be covered by this recovery path too, not just today's one
+// built-in user (brain_dump_sort).
+require('./task-sources.js');
+try { ensureRegistered(); } catch { /* no live config (e.g. a unit test) -- fine, nothing to register */ }
 
 const MAX_LOCAL_REJECT_RETRIES = 2;
 

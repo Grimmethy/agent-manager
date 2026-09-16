@@ -801,3 +801,33 @@ test('deterministic-review-recovery: a source with no deterministicReviewValidat
   assert.equal(summary.requeued, 1);
   clearRegistry();
 });
+
+// 2026-09-16, real regression: the deterministic-review-recovery tests above all register
+// a FAKE source directly via registerTaskSource(), which exercises the RECOVERY LOGIC
+// correctly but never proves the real, built-in brain_dump_sort source is actually
+// reachable from reject-retry-check.js's own standalone CLI entry point (`node reject-
+// retry-check.js`, a fresh process with no other module having required task-sources.js
+// first) -- confirmed live: the feature shipped, unit tests green, and was completely
+// inert in production because nothing in this file required task-sources.js, so
+// getRegisteredSource('brain_dump_sort') returned undefined every time. This test does
+// NOT register anything itself -- it only requires this module (as the real CLI does) and
+// checks the registry brain_dump_sort actually landed in, catching a reintroduction of
+// the exact same wiring gap.
+test('the real, built-in brain_dump_sort source is actually registered after requiring this module, in a genuinely FRESH process (regression: task-sources.js must be required as a side effect)', () => {
+  // A real child process, not a require-cache trick: this is the exact real-world shape
+  // of the bug -- `node reject-retry-check.js` (scripts/queue-watcher.sh's own real
+  // invocation) starts a FRESH process with an empty task-source registry. Forcing a
+  // re-require inside THIS process risks colliding with other registries (model-profile,
+  // etc.) that clearRegistry() doesn't reset -- a real, separate process sidesteps that
+  // entirely and proves the actual thing that matters: the registry is populated by the
+  // time reject-retry-check.js's own code can look a source up, with no other module
+  // having required task-sources.js first.
+  const out = require('child_process').execFileSync(
+    process.execPath,
+    ['-e', "require('./reject-retry-check.js'); const { getRegisteredSource } = require('./task-source-registry.js'); const e = getRegisteredSource('brain_dump_sort'); console.log(JSON.stringify({ found: !!e, hasValidate: !!(e && typeof e.deterministicReviewValidate === 'function') }));"],
+    { cwd: __dirname, encoding: 'utf8' },
+  );
+  const result = JSON.parse(out.trim());
+  assert.equal(result.found, true, 'brain_dump_sort must be registered once reject-retry-check.js has been required, in a real fresh process');
+  assert.equal(result.hasValidate, true);
+});
