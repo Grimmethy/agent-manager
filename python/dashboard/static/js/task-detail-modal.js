@@ -379,6 +379,11 @@ function renderTaskDetailModal(task) {
   // actually needs it -- instead of paying for the whole blob on every single click. See
   // concept-send-to-chat-307f1b's research for the two gaps this closes (no lookup tool
   // existed, no search existed) and the plan behind this change.
+  // VERIFIED 2026-09-08 (this file): button created at line 221; this handler reads ONLY
+  // task.id (line 387) and task.title (line 388) -- none of blockedReason/request/plan/
+  // implement -- and hard-caps the payload at <=200 chars before sendTextToChat
+  // (core-ui.js:783), which POSTs the { text } verbatim to /api/chat/inject with no
+  // further expansion. That is the full, complete scope of what gets injected.
   const taskSendToChatBtn = document.getElementById('task-send-to-chat');
   if (taskSendToChatBtn) {
     taskSendToChatBtn.onclick = async () => {
@@ -386,7 +391,9 @@ function renderTaskDetailModal(task) {
       try {
         const parts = [`# ${task.id}`];
         if (task.title) parts.push('title: ' + task.title);
-        await sendTextToChat(parts.join('\n\n')); // POSTs, expands the sidebar, tells the plugin iframe to refresh; throws on !ok
+        let text = parts.join('\n\n');
+        if (text.length > 200) text = text.slice(0, 199) + '…'; // hard cap: sendTextToChat must never receive >200 chars
+        await sendTextToChat(text); // POSTs, expands the sidebar, tells the plugin iframe to refresh; throws on !ok
         showToast('Sent to chat', 'info');
       } catch (e) {
         showToast('Could not send to chat: ' + e.message);
