@@ -732,6 +732,28 @@ test('bucket K: still fires even when the task is ALSO decompose-loop-flagged wi
   assert.match(moved.implementResponse, /Add the allowlist constant/);
 });
 
+// 2026-09-16, positioning fix 2 (same day as fix 1): root-caused live running the sweep
+// for real -- 2 remaining un-recovered targets carry needsClarification.reason ===
+// 'infra-error' (a later, unrelated retry's failure masking an earlier attempt's still-
+// valid decomposition), which the reason allowlist below excludes before this bucket
+// ever runs, unless this bucket is checked ahead of it too.
+test('bucket K: still fires when needsClarification.reason is NOT design-decision (e.g. a later infra-error masks an earlier valid decompose)', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, baseTask('tk7', {
+    adhocResolution: 'decompose',
+    subTaskProposals: REAL_SUB_TASKS,
+    implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).',
+    needsClarification: { reason: 'infra-error', openQuestions: 'Agentic implement pass tagged BLOCKER-TYPE: infra-error -- requeued for a clean retry' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tk7.json')));
+  const moved = read(at(dir, 'review', 'tk7.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.match(moved.implementResponse, /Add the allowlist constant/);
+});
+
 test('bucket K: a decompose task whose implementResponse ALREADY shows the real sub-tasks is left alone', async () => {
   const dir = makePipeline();
   held(dir, baseTask('tk2', {
