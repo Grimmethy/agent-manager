@@ -225,6 +225,14 @@ function getConfig() {
   // rather than suppressed forever.
   const stalenessAuditCoveragePath = process.env.AGENT_MANAGER_STALENESS_AUDIT_COVERAGE_PATH
     || path.join(pipelineDir, 'staleness-audit-coverage.json');
+  // second_brain_opportunities (2026-09-02, Second Brain note "second-brain-recurring-
+  // sweep.md": "we need a set of recurring tasks that sort through second brain, turning
+  // knowledge into opportunities") -- per-note cursor tracking which Research/Ideas notes
+  // have already been scored and when, so the sweep doesn't re-score the same note every
+  // tick. Keyed by relPath from the vault root, mirroring stalenessAuditCoveragePath's own
+  // per-item (not per-signature) shape and cooldown-based re-eligibility.
+  const secondBrainOpportunitiesCoveragePath = process.env.AGENT_MANAGER_SECOND_BRAIN_OPPORTUNITIES_COVERAGE_PATH
+    || path.join(pipelineDir, 'second-brain-opportunities-coverage.json');
   // pipeline_forensics (2026-09-01, Grimmethy: "break [the forensic study we've done by
   // hand 3 times] into a formal task agent-manager can reproduce") -- see
   // pipeline-forensics.js / forensic-bundle.js. Deep sibling of pipeline_self_audit:
@@ -400,6 +408,7 @@ function getConfig() {
     observabilityFixCandidatesPath, performanceFixCandidatesPath,
     selfAuditCoveragePath,
     stalenessAuditCoveragePath,
+    secondBrainOpportunitiesCoveragePath,
     forensicsCoveragePath,
     pipelineFixCandidatesPath,
     debriefCoveragePath,
