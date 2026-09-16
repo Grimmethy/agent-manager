@@ -27,7 +27,7 @@ from pathlib import Path
 import networkx as nx
 from networkx.algorithms.community import greedy_modularity_communities
 
-from build_graph import (
+from graph_communities import (
     _community_member_signature,
     merge_coverage,
     name_community_heuristic,
