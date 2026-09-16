@@ -1718,6 +1718,126 @@ test('nextStalenessAuditTask returns null when nothing in queue/blocked or queue
   assert.equal(nextStalenessAuditTask(), null);
 });
 
+// --- nextSecondBrainOpportunitiesTask ----------------------------------------------------
+
+function makeSecondBrainOpportunitiesFixtureRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-sbo-test-'));
+  process.env.SECOND_BRAIN_DIR = path.join(dir, 'secondbrain');
+  return dir;
+}
+
+test('nextSecondBrainOpportunitiesTask returns null when SECOND_BRAIN_DIR is unset', () => {
+  const dir = makeSecondBrainOpportunitiesFixtureRepo();
+  delete process.env.SECOND_BRAIN_DIR;
+  const { nextSecondBrainOpportunitiesTask } = freshTaskSources(dir);
+  assert.equal(nextSecondBrainOpportunitiesTask(), null);
+});
+
+test('nextSecondBrainOpportunitiesTask returns null when Research/ and Ideas/ are both empty/absent', () => {
+  const dir = makeSecondBrainOpportunitiesFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'secondbrain'), { recursive: true });
+  const { nextSecondBrainOpportunitiesTask } = freshTaskSources(dir);
+  assert.equal(nextSecondBrainOpportunitiesTask(), null);
+});
+
+test('nextSecondBrainOpportunitiesTask returns a task with a non-empty candidates batch for an un-promoted note', () => {
+  const dir = makeSecondBrainOpportunitiesFixtureRepo();
+  const researchDir = path.join(dir, 'secondbrain', 'Research');
+  fs.mkdirSync(researchDir, { recursive: true });
+  fs.writeFileSync(path.join(researchDir, 'my-idea.md'), '# My Idea\n\nSome content.');
+
+  const { nextSecondBrainOpportunitiesTask } = freshTaskSources(dir);
+  const task = nextSecondBrainOpportunitiesTask();
+  assert.ok(task);
+  assert.equal(task.source, 'second_brain_opportunities');
+  assert.equal(task.promptContext.candidates.length, 1);
+  assert.equal(task.promptContext.candidates[0].relPath, path.join('Research', 'my-idea.md'));
+  assert.match(task.promptContext.candidates[0].content, /My Idea/);
+});
+
+test('nextSecondBrainOpportunitiesTask skips a note already promoted via a matching Projects/<basename>.md', () => {
+  const dir = makeSecondBrainOpportunitiesFixtureRepo();
+  const ideasDir = path.join(dir, 'secondbrain', 'Ideas');
+  fs.mkdirSync(ideasDir, { recursive: true });
+  fs.writeFileSync(path.join(ideasDir, 'promoted-idea.md'), '# Promoted');
+  fs.mkdirSync(path.join(dir, 'secondbrain', 'Projects'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'secondbrain', 'Projects', 'promoted-idea.md'), '# Project');
+
+  const { nextSecondBrainOpportunitiesTask } = freshTaskSources(dir);
+  assert.equal(nextSecondBrainOpportunitiesTask(), null);
+});
+
+test('nextSecondBrainOpportunitiesTask skips a note already promoted via a [[wikilink]] from a Projects/ note', () => {
+  const dir = makeSecondBrainOpportunitiesFixtureRepo();
+  const ideasDir = path.join(dir, 'secondbrain', 'Ideas');
+  fs.mkdirSync(ideasDir, { recursive: true });
+  fs.writeFileSync(path.join(ideasDir, 'linked-idea.md'), '# Linked');
+  fs.mkdirSync(path.join(dir, 'secondbrain', 'Projects'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'secondbrain', 'Projects', 'real-project.md'), 'See [[linked-idea]] for background.');
+
+  const { nextSecondBrainOpportunitiesTask } = freshTaskSources(dir);
+  assert.equal(nextSecondBrainOpportunitiesTask(), null);
+});
+
+test('nextSecondBrainOpportunitiesTask skips a note marked dismissed in the coverage cursor', () => {
+  const dir = makeSecondBrainOpportunitiesFixtureRepo();
+  const ideasDir = path.join(dir, 'secondbrain', 'Ideas');
+  fs.mkdirSync(ideasDir, { recursive: true });
+  fs.writeFileSync(path.join(ideasDir, 'dismissed-idea.md'), '# Dismissed');
+  fs.writeFileSync(path.join(dir, 'second-brain-opportunities-coverage.json'), JSON.stringify({
+    [path.join('Ideas', 'dismissed-idea.md')]: { dismissed: true },
+  }));
+
+  const { nextSecondBrainOpportunitiesTask } = freshTaskSources(dir);
+  assert.equal(nextSecondBrainOpportunitiesTask(), null);
+});
+
+test('nextSecondBrainOpportunitiesTask skips a note swept within the cooldown window', () => {
+  const dir = makeSecondBrainOpportunitiesFixtureRepo();
+  const ideasDir = path.join(dir, 'secondbrain', 'Ideas');
+  fs.mkdirSync(ideasDir, { recursive: true });
+  fs.writeFileSync(path.join(ideasDir, 'recent-idea.md'), '# Recent');
+  fs.writeFileSync(path.join(dir, 'second-brain-opportunities-coverage.json'), JSON.stringify({
+    [path.join('Ideas', 'recent-idea.md')]: { lastSweptAt: new Date().toISOString() },
+  }));
+
+  const { nextSecondBrainOpportunitiesTask } = freshTaskSources(dir);
+  assert.equal(nextSecondBrainOpportunitiesTask(), null);
+});
+
+test('nextSecondBrainOpportunitiesTask re-offers a note once its cooldown has expired', () => {
+  const dir = makeSecondBrainOpportunitiesFixtureRepo();
+  const ideasDir = path.join(dir, 'secondbrain', 'Ideas');
+  fs.mkdirSync(ideasDir, { recursive: true });
+  fs.writeFileSync(path.join(ideasDir, 'old-sweep-idea.md'), '# Old sweep');
+  const longAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  fs.writeFileSync(path.join(dir, 'second-brain-opportunities-coverage.json'), JSON.stringify({
+    [path.join('Ideas', 'old-sweep-idea.md')]: { lastSweptAt: longAgo },
+  }));
+
+  const { nextSecondBrainOpportunitiesTask } = freshTaskSources(dir);
+  const task = nextSecondBrainOpportunitiesTask();
+  assert.ok(task);
+  assert.equal(task.promptContext.candidates.length, 1);
+});
+
+test('nextSecondBrainOpportunitiesTask caps the batch at AGENT_MANAGER_SECOND_BRAIN_OPPORTUNITIES_BATCH', () => {
+  const dir = makeSecondBrainOpportunitiesFixtureRepo();
+  const ideasDir = path.join(dir, 'secondbrain', 'Ideas');
+  fs.mkdirSync(ideasDir, { recursive: true });
+  for (let i = 0; i < 6; i += 1) {
+    fs.writeFileSync(path.join(ideasDir, `idea-${i}.md`), `# Idea ${i}`);
+  }
+  process.env.AGENT_MANAGER_SECOND_BRAIN_OPPORTUNITIES_BATCH = '2';
+  try {
+    const { nextSecondBrainOpportunitiesTask } = freshTaskSources(dir);
+    const task = nextSecondBrainOpportunitiesTask();
+    assert.equal(task.promptContext.candidates.length, 2);
+  } finally {
+    delete process.env.AGENT_MANAGER_SECOND_BRAIN_OPPORTUNITIES_BATCH;
+  }
+});
+
 // backlog_decomposition (2026-08-20, see task-sources.js's nextBacklogDecompositionTask
 // header): turns a confirmed product spec into an ordered backlog. Idempotency is via a
 // spec-content hash baked into the task id (not a separate coverage file), checked

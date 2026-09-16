@@ -21,7 +21,7 @@ const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
-const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport } = require('./apply-group-a.js');
+const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport, applySecondBrainOpportunities } = require('./apply-group-a.js');
 const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-assembly.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
@@ -31,7 +31,7 @@ const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js'
 const pipelineForensics = require('./pipeline-forensics.js');
 const debriefBundle = require('./debrief-bundle.js');
 const driftFix = require('./drift-fix.js');
-const { buildForensicBundle } = require('./forensic-bundle.js');
+const { buildForensicBundle, findTaskRecordById } = require('./forensic-bundle.js');
 const { findStalenessCandidates, buildStalenessAuditTask, pickFairCandidate } = require('./staleness-audit.js');
 const { applyStalenessAuditVerdict } = require('./staleness-auto-archive.js');
 const { incrementJobTypeCounter } = require('./job-type-counters.js');
@@ -2036,6 +2036,112 @@ function markStalenessAuditReported(task) {
   fs.writeFileSync(stalenessAuditCoveragePath, JSON.stringify(coverage, null, 2));
 }
 
+// second_brain_opportunities (2026-09-02, Second Brain note "second-brain-recurring-
+// sweep.md"): recurring sweep over Research/ and Ideas/ notes that turns "knowledge
+// already filed" into "a scored, ranked opportunity a human can act on" -- see the note
+// for the full resolved design. Coverage stamping (lastSweptAt/dismissed) happens
+// entirely inside applySecondBrainOpportunities (apply-group-a.js), NOT here -- unlike
+// staleness_audit's separate markXReported hook, there's no queue-write side effect to
+// wait for; the coverage cursor only needs to reflect notes that actually got scored.
+function walkMarkdownFiles(dir, depth = 0) {
+  const out = [];
+  if (depth > 5) return out;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const abs = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...walkMarkdownFiles(abs, depth + 1));
+    else if (e.name.endsWith('.md')) out.push(abs);
+  }
+  return out;
+}
+
+// A note is PROMOTED (skip it) if it already has a downstream artifact: a "Queued as ...
+// task `<id>`" line whose task reached done+merged, a matching Projects/<basename>.md, or
+// a [[wikilink]] to it from any note under Projects/.
+function isSecondBrainNotePromoted({ content, basename, pipelineDir, secondBrainDir, projectFiles }) {
+  const queuedMatch = content.match(/Queued as .*task `([^`]+)`/);
+  if (queuedMatch) {
+    const rec = findTaskRecordById(pipelineDir, queuedMatch[1]);
+    if (rec && rec.state === 'done' && rec.task && rec.task.mergedAt) return true;
+  }
+  const kebab = basename.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  for (const candidate of new Set([basename, kebab])) {
+    if (fs.existsSync(path.join(secondBrainDir, 'Projects', `${candidate}.md`))) return true;
+  }
+  const wikilinkRe = new RegExp(`\\[\\[${basename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]\\]`);
+  for (const projectContent of projectFiles) {
+    if (wikilinkRe.test(projectContent)) return true;
+  }
+  return false;
+}
+
+function nextSecondBrainOpportunitiesTask() {
+  const { pipelineDir, secondBrainDir, secondBrainOpportunitiesCoveragePath, defaultDomain } = getConfig();
+  if (!secondBrainDir) return null;
+
+  const notePaths = [
+    ...walkMarkdownFiles(path.join(secondBrainDir, 'Research')),
+    ...walkMarkdownFiles(path.join(secondBrainDir, 'Ideas')),
+  ];
+  if (notePaths.length === 0) return null;
+
+  let coverage;
+  try {
+    coverage = JSON.parse(readIfExists(secondBrainOpportunitiesCoveragePath) || '{}');
+  } catch {
+    coverage = {};
+  }
+  const cooldownDays = Number(process.env.AGENT_MANAGER_SECOND_BRAIN_OPPORTUNITIES_COOLDOWN_DAYS) || 21;
+  const cooldownMs = cooldownDays * 24 * 60 * 60 * 1000;
+  const batchSize = Number(process.env.AGENT_MANAGER_SECOND_BRAIN_OPPORTUNITIES_BATCH) || 4;
+  const now = Date.now();
+
+  const projectFiles = walkMarkdownFiles(path.join(secondBrainDir, 'Projects'))
+    .map((p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return ''; } });
+
+  const candidates = [];
+  for (const abs of notePaths) {
+    const relPath = path.relative(secondBrainDir, abs);
+    const entry = coverage[relPath];
+    if (entry && entry.dismissed) continue;
+    if (entry && entry.lastSweptAt && (now - new Date(entry.lastSweptAt).getTime()) < cooldownMs) continue;
+
+    let content;
+    let mtimeMs;
+    try {
+      content = fs.readFileSync(abs, 'utf8');
+      mtimeMs = fs.statSync(abs).mtimeMs;
+    } catch {
+      continue;
+    }
+    const basename = path.basename(abs, '.md');
+    if (isSecondBrainNotePromoted({ content, basename, pipelineDir, secondBrainDir, projectFiles })) continue;
+    candidates.push({ relPath, content, mtimeMs });
+  }
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  const batch = candidates.slice(0, batchSize).map(({ relPath, content }) => ({ relPath, content }));
+
+  const id = `second-brain-opportunities-${Date.now()}`;
+  return {
+    id,
+    domain: defaultDomain,
+    source: 'second_brain_opportunities',
+    title: `Score ${batch.length} Second Brain opportunit${batch.length === 1 ? 'y' : 'ies'} (${batch.map((c) => c.relPath).join(', ')})`,
+    promptContext: {
+      candidates: batch,
+      secondBrainOpportunitiesCoveragePath,
+    },
+  };
+}
+
 // postImplementCheck (2026-09-05): 8 of 8 blocked deep_dive tasks investigated shared one
 // shape -- a write-up fabricating a specific class/function/architecture detail
 // contradicting the real community file content it was given. See
@@ -2151,6 +2257,11 @@ registerTaskSource('ui_visibility_audit', { priority: taskPriority('ui_visibilit
 // done/_archived_no_action/ automatically once the report has cleared review. See
 // staleness-auto-archive.js's own header for the full reasoning and safety scoping.
 registerTaskSource('staleness_audit', { priority: taskPriority('staleness_audit', 91), next: nextStalenessAuditTask, apply: applyStalenessAuditVerdict, advisoryProse: true, reviewGuidance: STALENESS_AUDIT_REVIEW_GUIDANCE, reviewCompletenessQuestion: STALENESS_AUDIT_COMPLETENESS_QUESTION, harnessSearch: 'archImport' });
+// second_brain_opportunities (2026-09-02, see nextSecondBrainOpportunitiesTask above and
+// apply-group-a.js's applySecondBrainOpportunities) -- housekeeping band, between
+// staleness_audit and pipeline_debrief. advisoryProse: true, same as every other source
+// here whose deliverable is a judgment call written as JSON/prose, not a diff.
+registerTaskSource('second_brain_opportunities', { priority: taskPriority('second_brain_opportunities', 93), next: nextSecondBrainOpportunitiesTask, apply: applySecondBrainOpportunities, advisoryProse: true, reportClass: 'housekeeping' });
 
 // --- Source: product_spec (Grimmethy, 2026-08-20: "The goal of the Agent Manager project
 // is to create an automated systems development suite. It should build its own plugins...
@@ -2537,6 +2648,7 @@ module.exports = {
   nextPipelineHealthAuditTask, markPipelineHealthAuditChecked,
   nextUiVisibilityAuditTask, markUiVisibilityAuditChecked,
   nextStalenessAuditTask, markStalenessAuditReported,
+  nextSecondBrainOpportunitiesTask,
   nextProductSpecTask,
   nextProductSpecOutlineTask,
   nextProductSpecSectionTask,
