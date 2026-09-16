@@ -118,10 +118,26 @@
 //      that lands here via the identical mechanism (a deterministic gate later found
 //      buggy), not just this one incident.
 
+//   K. DECOMPOSE-REVIEW-BLIND SIGNATURE (2026-09-16) -- PR #230 ("decompose review was
+//      structurally blind to the actual sub-tasks", merged 2026-09-14) fixed
+//      local-agentic-write-draft.js's give-up backstop to render the real sub-task list
+//      into task.implementResponse via formatSubTaskProposalsForReview -- before that
+//      fix, a task whose decompose was accepted (task.adhocResolution === 'decompose',
+//      a genuine >= 2-item task.subTaskProposals) still carried an implementResponse
+//      that never mentioned any of those sub-tasks by name, so review correctly-per-its-
+//      own-instructions rejected it as "no actual decomposition, just meta-commentary" --
+//      not a real design question, a rendering bug in a task that ALREADY has a valid,
+//      complete decomposition sitting right there in subTaskProposals. Confirmed live:
+//      21 of 31 needs-clarification tasks with a real >= 2-item subTaskProposals show
+//      this exact gap. No redraft needed -- unlike every other bucket here, this one
+//      REPAIRS the existing artifact (regenerates implementResponse from the already-
+//      valid subTaskProposals) and sends it straight to queue/review/ for a real vote,
+//      not queue/adhoc/ for a fresh draft.
 const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { classifyVote, clip } = require('./auto-confirm-review.js');
 const { hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { targetOversizedFile, oversizedFiles } = require('./decompose-loop-autoroute.js');
@@ -598,6 +614,62 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
               fs.unlinkSync(file);
             } catch (e) {
               log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket K: decompose-review-blind signature -> repair in place, send to review --
+    // Unlike every other bucket here, this does NOT redraft: the task already has a
+    // valid, complete decomposition (task.subTaskProposals), just an implementResponse
+    // that (pre-PR-#230) never mentioned it. Regenerate implementResponse from the real
+    // sub-tasks and file straight to queue/review/ for a real vote -- see the header
+    // comment above for the full incident.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
+      const isDecompose = task.adhocResolution === 'decompose' && subTasks.length >= 2;
+      const hasEvidence = isDecompose && subTasks.some((s) => s && s.title
+        && String(task.implementResponse || '').includes(String(s.title).slice(0, 30)));
+      if (isDecompose && !hasEvidence && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket K but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = (task.ncTriageAttempts || 0) + 1;
+          log(`${id0}: bucket K (decompose-review-blind signature) -> repaired in place, sent to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            delete task.needsClarification;
+            delete task.localRejectCount;
+            delete task.retryableDraftBlock;
+            delete task.preDrafted;
+            delete task.priorRejectionFeedback;
+            delete task.blockedReason;
+            delete task.blockedStage;
+            delete task.claimedAt;
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            task.ncTriageAttempts = attempt;
+            task.status = 'needs-review';
+            task.implementResponse = `Decomposed into ${subTasks.length} sub-task(s).\n\n${formatSubTaskProposalsForReview(subTasks)}`;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: decompose-review-blind signature (a since-fixed rendering gap, PR #230, hid a genuinely valid decomposition from review) -- implementResponse regenerated from the existing subTaskProposals, sent straight to review ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-K: decompose-review-blind signature', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: repair-and-review move failed: ${e.message}`);
               summary.requeued -= 1;
               summary.errors += 1;
             }
