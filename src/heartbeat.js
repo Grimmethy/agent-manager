@@ -13,6 +13,9 @@
 // extra status differentiation back?" -- the 2026-08-19 queued/working distinction and
 // the 2026-08-22 per-sub-call lock scoping were never actually in tension; the
 // distinction just needed to move to wherever the real wait now happens.
+// NOTE: this file covers process-liveness only (heartbeat file freshness).
+// The per-claim liveness gap (a live worker hanging mid-task) is documented
+// in dead-process-check.js's "Design context: Celery analogy" block.
 
 const fs = require('fs');
 const path = require('path');
