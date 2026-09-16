@@ -31,7 +31,7 @@ const task = (over = {}) => ({
 test('checkFabricatedSymbols flags a class-shaped symbol absent from every real file', () => {
   const r = checkFabricatedSymbols(task(), 'The draft references `TextFileConverter`.');
   assert.equal(r.length, 1);
-  assert.equal(r[0].kind, 'fabricated-symbol');
+  assert.equal(r[0].kind, 'class');
   assert.match(r[0].detail, /`TextFileConverter`/);
 });
 
@@ -62,6 +62,59 @@ test('checkFabricatedSymbols reports only the first occurrence of a repeated fab
   assert.equal(r.length, 1);
 });
 
+// --- checkFabricatedSymbols: dotted module paths / slash file paths (kind: 'import') -----
+
+test('checkFabricatedSymbols flags a dotted module path whose final segment is absent from every real file', () => {
+  const r = checkFabricatedSymbols(task(), 'Imported via `haystack.converters.TextFileConverter`.');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].kind, 'import');
+  assert.match(r[0].detail, /haystack\.converters\.TextFileConverter/);
+});
+
+test('checkFabricatedSymbols flags a slash-separated file path absent from every real file', () => {
+  const r = checkFabricatedSymbols(task(), 'Defined in `src/utils/helper`.');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].kind, 'import');
+});
+
+test('checkFabricatedSymbols does not flag a dotted path whose final segment genuinely appears in the file content', () => {
+  const r = checkFabricatedSymbols(task(), 'Imported via `haystack.converters.TextFileToDocument`.');
+  assert.deepEqual(r, []);
+});
+
+test('checkFabricatedSymbols does not flag a path whose WHOLE string appears verbatim even if the final segment alone would not resolve', () => {
+  const t = task({ promptContext: { files: [{ path: 'x.py', content: 'see converters/txt.py for details' }] } });
+  const r = checkFabricatedSymbols(t, 'Defined in `converters/txt.py`.');
+  assert.deepEqual(r, []);
+});
+
+test('checkFabricatedSymbols does not run the path-shaped check on a bare class-shaped symbol (no separator)', () => {
+  // CLASS_SHAPED_SYMBOL_RE already covers this shape -- PATH_SHAPED_SYMBOL_RE must not
+  // double-flag the same fabricated symbol under a second kind.
+  const r = checkFabricatedSymbols(task(), 'The draft references `TextFileConverter`.');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].kind, 'class');
+});
+
+// --- checkFabricatedSymbols: __all__ = [...] list (kind: 'all') --------------------------
+
+test('checkFabricatedSymbols flags an identifier inside a literal __all__ list absent from every real file', () => {
+  const r = checkFabricatedSymbols(task(), '```python\n__all__ = ["TextFileToDocument", "TextFileConverter"]\n```');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].kind, 'all');
+  assert.match(r[0].detail, /TextFileConverter/);
+});
+
+test('checkFabricatedSymbols does not flag an __all__ entry that genuinely appears in the file content', () => {
+  const r = checkFabricatedSymbols(task(), '__all__ = ["TextFileToDocument"]');
+  assert.deepEqual(r, []);
+});
+
+test('checkFabricatedSymbols with no __all__ list at all reports nothing from that check', () => {
+  const r = checkFabricatedSymbols(task(), 'No exports list mentioned here.');
+  assert.deepEqual(r, []);
+});
+
 // --- parseGroundingVerdict ----------------------------------------------------------------
 
 test('parseGroundingVerdict parses GROUNDED and NOT_GROUNDED, treats noise as ok', () => {
@@ -79,6 +132,27 @@ test('runGroundingCheck catches a fabricated class name deterministically, no mo
   const r = await runGroundingCheck(task(), 'The draft references `TextFileConverter` and `ConversionError`.', { call });
   assert.equal(r.verdict, 'ungrounded');
   assert.equal(calls, 0, 'the deterministic check must short-circuit before any model call');
+});
+
+test('runGroundingCheck ungrounded verdict includes the full ungrounded[] findings array', async () => {
+  const r = await runGroundingCheck(task(), 'The draft references `TextFileConverter` and `ConversionError`.', { call: async () => ({ response: 'GROUNDED' }) });
+  assert.equal(r.verdict, 'ungrounded');
+  assert.equal(r.ungrounded.length, 2);
+  assert.deepEqual(r.ungrounded.map((f) => f.kind), ['class', 'class']);
+});
+
+test('runGroundingCheck is callable with just (task) -- defaults implementResponse to task.implementResponse', async () => {
+  // Fabricated-symbol short-circuit means this never reaches the real localCall default
+  // even though none is injected here -- a genuine single-argument call.
+  const t = task({ implementResponse: 'The draft references `TextFileConverter`.' });
+  const r = await runGroundingCheck(t);
+  assert.equal(r.verdict, 'ungrounded');
+});
+
+test('runGroundingCheck is callable with just (task) -- falls back to task.draft when implementResponse is absent', async () => {
+  const t = task({ draft: 'The draft references `TextFileConverter`.' });
+  const r = await runGroundingCheck(t);
+  assert.equal(r.verdict, 'ungrounded');
 });
 
 test('runGroundingCheck falls back to the cheap model for a contradiction the deterministic check cannot catch', async () => {

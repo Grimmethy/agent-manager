@@ -57,25 +57,65 @@ function realFilesOf(task) {
 // cited symbol.
 const CLASS_SHAPED_SYMBOL_RE = /`([A-Z][A-Za-z0-9]{3,})`/g;
 
+// A backtick-quoted dotted module path (`foo.bar.Baz`) or slash-separated file path
+// (`src/utils/helper`) -- at least two segments joined by '.' or '/', so a bare
+// CLASS_SHAPED_SYMBOL_RE match (no separator) never double-matches here. Grounded if
+// EITHER the whole string or just its final segment (the part that actually identifies
+// the thing being cited -- a real symbol imported under a slightly different path prefix
+// than the draft guessed is still real) appears in the real file content; only flagged
+// when neither does.
+const PATH_SHAPED_SYMBOL_RE = /`([A-Za-z_][\w-]*(?:[./][A-Za-z_][\w-]*)+)`/g;
+
+// A literal `__all__ = [...]` list in the draft (Python export list convention) -- each
+// quoted identifier inside it is a claim that name is really exported, checkable the same
+// deterministic way as a cited class name.
+const ALL_LIST_RE = /__all__\s*=\s*\[([\s\S]*?)\]/g;
+const ALL_LIST_ITEM_RE = /['"]([\w.]+)['"]/g;
+
 function checkFabricatedSymbols(task, implementResponse) {
   const files = realFilesOf(task);
   if (!files.length) return [];
   const combined = files.map((f) => f.content).join('\n');
   const seen = new Set();
   const contradictions = [];
+  const flag = (kind, symbol, detail) => {
+    const key = `${kind}:${symbol}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    contradictions.push({ kind, detail });
+  };
+
   let m;
   CLASS_SHAPED_SYMBOL_RE.lastIndex = 0;
   while ((m = CLASS_SHAPED_SYMBOL_RE.exec(implementResponse))) {
     const symbol = m[1];
-    if (seen.has(symbol)) continue;
-    seen.add(symbol);
     if (!combined.includes(symbol)) {
-      contradictions.push({
-        kind: 'fabricated-symbol',
-        detail: `the draft cites \`${symbol}\`, but that name does not appear anywhere in the real fetched content of any file in this community`,
-      });
+      flag('class', symbol, `the draft cites \`${symbol}\`, but that name does not appear anywhere in the real fetched content of any file in this community`);
     }
   }
+
+  PATH_SHAPED_SYMBOL_RE.lastIndex = 0;
+  while ((m = PATH_SHAPED_SYMBOL_RE.exec(implementResponse))) {
+    const symbol = m[1];
+    const finalSegment = symbol.split(/[./]/).pop();
+    if (!combined.includes(symbol) && !combined.includes(finalSegment)) {
+      flag('import', symbol, `the draft cites \`${symbol}\`, but neither that path nor its final segment (\`${finalSegment}\`) appears anywhere in the real fetched content of any file in this community`);
+    }
+  }
+
+  ALL_LIST_RE.lastIndex = 0;
+  let allMatch;
+  while ((allMatch = ALL_LIST_RE.exec(implementResponse))) {
+    ALL_LIST_ITEM_RE.lastIndex = 0;
+    let item;
+    while ((item = ALL_LIST_ITEM_RE.exec(allMatch[1]))) {
+      const symbol = item[1];
+      if (!combined.includes(symbol)) {
+        flag('all', symbol, `the draft's __all__ list claims to export \`${symbol}\`, but that name does not appear anywhere in the real fetched content of any file in this community`);
+      }
+    }
+  }
+
   return contradictions;
 }
 
@@ -108,14 +148,17 @@ function parseGroundingVerdict(text) {
   return { verdict: 'ok' }; // non-conforming 3b output -- same "0 survivors -> ok" rule as plan-critique.js/premiseCheck
 }
 
-// task, implementResponse, { call?, maybeLockedOn } -> { verdict: 'ok'|'ungrounded', reason? }
-async function runGroundingCheck(task, implementResponse, { call = localCall, maybeLockedOn } = {}) {
+// task, implementResponse?, { call?, maybeLockedOn } -> { verdict: 'ok'|'ungrounded', reason?, ungrounded? }
+// implementResponse defaults to task.implementResponse || task.draft so this is callable
+// as just runGroundingCheck(task) -- the two callers that already have the text handy
+// still pass it explicitly and get identical behavior.
+async function runGroundingCheck(task, implementResponse = (task && (task.implementResponse || task.draft)), { call = localCall, maybeLockedOn } = {}) {
   if (!isEnabled()) return { verdict: 'ok' };
   const text = String(implementResponse || '');
   if (!text.trim()) return { verdict: 'ok' }; // a legitimate "found nothing" empty draft -- nothing to check
 
   const fabricated = checkFabricatedSymbols(task, text);
-  if (fabricated.length) return { verdict: 'ungrounded', reason: fabricated[0].detail };
+  if (fabricated.length) return { verdict: 'ungrounded', reason: fabricated[0].detail, ungrounded: fabricated };
 
   if (!realFilesOf(task).length) return { verdict: 'ok' }; // nothing real to ground a model check against either
 
@@ -131,7 +174,8 @@ async function runGroundingCheck(task, implementResponse, { call = localCall, ma
     return { verdict: 'ok', error: String((e && e.message) || e).slice(0, 160) }; // advisory -- never blocks on a model-call failure
   }
   if (result && result.degenerate) return { verdict: 'ok' };
-  return parseGroundingVerdict(result && result.response);
+  const verdict = parseGroundingVerdict(result && result.response);
+  return verdict.verdict === 'ungrounded' ? { ...verdict, ungrounded: [] } : verdict;
 }
 
 module.exports = {
