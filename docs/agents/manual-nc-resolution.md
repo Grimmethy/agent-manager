@@ -43,6 +43,20 @@ applies, test output that really ran) rather than fabricated.
    pipeline-hardening fix (the kind of thing normally filed as a brain-dump follow-up),
    split them into separate worktrees/diffs/task files — matches how the pipeline scopes
    every other task and keeps each review vote meaningful.
+
+   **Even one logically-coherent unit has a real size ceiling.** Confirmed live
+   2026-09-16: a 607-line/7-file diff (~45,600 chars / ~11,400 tokens, comfortably inside
+   the reviewer's 24,576-token `numCtx` with zero truncation, verified by hand) was
+   rejected twice by two independent review votes, both times falsely claiming specific,
+   genuinely-present functions were missing — a "lost in the middle" reading-comprehension
+   failure in the local review model, not a bug in `review-task.js`'s prompt assembly.
+   Every other diff filed this same session (all well under ~20KB / 4 files) reviewed
+   correctly on the first vote. If a hand-authored fix naturally spans many files or a few
+   hundred lines, split it along its real dependency order (e.g. the file a second file's
+   code imports from lands first) into multiple sequential `queue/review/` submissions,
+   even though it's one coherent feature — don't wait for a false rejection to discover
+   this the expensive way. Filed as brain-dump `bd-1789534616336` for a possible future
+   deterministic pre-review size gate.
 3. **Capture the diff exactly as the pipeline would**: `git add -A <files>; git diff
    --cached --full-index --binary` inside the worktree. Never hand-type a diff.
 4. **Build the task JSON** (see `src/local-draft.js`/`agentic-draft-common.js` for the
