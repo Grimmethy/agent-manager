@@ -980,3 +980,83 @@ test('ambiguous reason is still skipped (out of scope for this fix)', async () =
   assert.deepEqual([s.checked, s.archived, s.leftForHuman], [0, 0, 0]);
   assert.ok(exists(at(dir, 'needs-clarification', 'amb1.json')), 'left completely untouched, same as before');
 });
+
+// --- Bucket L: fabricated-file-path near-miss auto-repair (2026-09-16) -----------------
+// Real incident shape: arch-discovery-community-15 ("scripts" community). The model was
+// handed 3 real files verbatim (all sharing the "candidates-doc-merge" stem) and cited
+// `merge-candidates.js` -- a token-shuffle of the first, not a wholesale invention.
+
+const ARCH_DISCOVERY_REAL_FILES = [
+  { path: 'src/candidates-doc-merge.js', degree: 2, content: '// real file' },
+  { path: 'scripts/candidates-doc-merge-driver.js', degree: 1, content: '// real file' },
+  { path: 'src/candidates-doc-merge.test.js', degree: 1, content: '// real file' },
+];
+
+function archDiscoveryTask(id, over = {}) {
+  return baseTask(id, {
+    source: 'arch_discovery',
+    promptContext: { communityId: 15, communityName: 'scripts', files: ARCH_DISCOVERY_REAL_FILES },
+    blockedReason: 'Ungrounded draft: fabricated file path(s): merge-candidates.js -- not present anywhere in the target repo. A redraft cannot make an invented path real; re-file with an accurate citation, or archive if nothing applies.',
+    needsClarification: { reason: 'fabricated-file-path', openQuestions: 'This candidate cited a destination file path that does not exist.' },
+    implementResponse: 'Problem: candidate merge logic duplicated.\n\nFiles: merge-candidates.js\n\nSolution: consolidate in merge-candidates.js.',
+    ...over,
+  });
+}
+
+test('bucket L: fabricated path with a unique near-miss real match -> repaired in place, sent to review', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, archDiscoveryTask('l1'));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'l1.json')));
+  const moved = read(at(dir, 'review', 'l1.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.equal(moved.needsClarification, undefined);
+  assert.equal(moved.blockedReason, undefined);
+  assert.equal(moved.ncTriageAttempts, 1);
+  assert.match(moved.implementResponse, /Files: src\/candidates-doc-merge\.js/);
+  assert.doesNotMatch(moved.implementResponse, /merge-candidates\.js/);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && /fabricated-file-path near-miss/.test(h.detail)));
+});
+
+test('bucket L: only source:arch_discovery is eligible -- a non-arch_discovery task with the same signature is left for a human', async () => {
+  const dir = makePipeline();
+  held(dir, archDiscoveryTask('l2', { source: 'manual' }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'l2.json')));
+});
+
+test('bucket L: an ambiguous fabricated path (matches 2 real paths with the same extra-token count) is left alone, not guessed', async () => {
+  const dir = makePipeline();
+  held(dir, archDiscoveryTask('l3', {
+    promptContext: {
+      communityId: 15, communityName: 'scripts', files: [
+        { path: 'src/candidates-doc-merge-a.js', degree: 1, content: 'x' },
+        { path: 'src/candidates-doc-merge-b.js', degree: 1, content: 'x' },
+      ],
+    },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'l3.json')), 'left in place -- no unique winner to repair to');
+});
+
+test('bucket L: a genuinely unrecoverable fabrication (no real path is even a superset) is left for a human', async () => {
+  const dir = makePipeline();
+  held(dir, archDiscoveryTask('l4', {
+    blockedReason: 'Ungrounded draft: fabricated file path(s): src/totally-invented-module.js -- not present anywhere in the target repo. A redraft cannot make an invented path real; re-file with an accurate citation, or archive if nothing applies.',
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'l4.json')));
+});
+
+test('bucket L: MAX_REQUEUES cap is respected', async () => {
+  const dir = makePipeline();
+  held(dir, archDiscoveryTask('l5', { ncTriageAttempts: 1 }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'l5.json')));
+});
