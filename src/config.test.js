@@ -139,3 +139,27 @@ test('getSecondBrainDir returns the string when SECOND_BRAIN_DIR is set', () => 
     assert.equal(getSecondBrainDir(), '/tmp/second-brain');
   });
 });
+
+// 2026-09-16, root-caused via docs/arch-import-pipeline.md's own pre-flight checklist:
+// the old 'frontend/src,backend/src' default only ever matched a literal frontend+backend
+// split repo, silently 0-hit-grounding any consumer without that exact layout (including
+// this package's own repo before AGENT_MANAGER_GREP_DIRS was added to its own
+// agent-manager.env). '.' is already a first-class value grep-codebase-tool.js's own
+// resolvePrimaryDirs treats as "search the whole repo root" (node_modules/.git/queue
+// excluded by the walker itself), so it's a safe default that never silently 0-hits.
+test('getConfig().grepAllowedDirs defaults to ["."] (whole repo) when AGENT_MANAGER_GREP_DIRS is unset', () => {
+  const repoRoot = makeRepo();
+  withEnv({ AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_GREP_DIRS: undefined }, () => {
+    delete process.env.AGENT_MANAGER_GREP_DIRS;
+    const cfg = getConfig();
+    assert.deepEqual(cfg.grepAllowedDirs, ['.']);
+  });
+});
+
+test('getConfig().grepAllowedDirs still honors an explicit AGENT_MANAGER_GREP_DIRS override', () => {
+  const repoRoot = makeRepo();
+  withEnv({ AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_GREP_DIRS: 'src,python,scripts,docs' }, () => {
+    const cfg = getConfig();
+    assert.deepEqual(cfg.grepAllowedDirs, ['src', 'python', 'scripts', 'docs']);
+  });
+});
