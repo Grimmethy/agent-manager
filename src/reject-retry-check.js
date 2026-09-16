@@ -26,12 +26,27 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getConfig } = require('./config.js');
+const { getConfig, ensureRegistered } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { classifyBlockedTask, findClassifier } = require('./blocked-task-classifiers.js');
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
+const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
+// 2026-09-16: registers this package's built-in sources (side effect of the require) --
+// deterministicReviewRecoveryCheck below looks a task's source up in this SAME registry
+// (getRegisteredSource), but this file itself never required task-sources.js, so a
+// standalone `node reject-retry-check.js` process (this CLI's own real, documented entry
+// point -- see scripts/queue-watcher.sh) started with a completely EMPTY registry: every
+// lookup silently returned undefined, and the whole recovery feature was inert in
+// production despite passing its own unit tests (which register a fake source directly,
+// bypassing this exact gap). ensureRegistered() covers a consumer's own plugin-registered
+// sources too (get-grounding-source.js's own header explains why both calls are needed
+// together) -- deterministicReview is source-agnostic by design, so a future plugin-
+// registered source should be covered by this recovery path too, not just today's one
+// built-in user (brain_dump_sort).
+require('./task-sources.js');
+try { ensureRegistered(); } catch { /* no live config (e.g. a unit test) -- fine, nothing to register */ }
 
 const MAX_LOCAL_REJECT_RETRIES = 2;
 
@@ -47,6 +62,39 @@ const READMIT_CLEAN_SLATE_FIELDS = [
   'isAgenticContinuation', 'agenticContinuationCount', 'agenticContinuationNote', 'priorPartialDiff',
   'adhocDiffSubstanceFeedback', 'adhocNoChangesClaimFeedback', 'premiseReadmitCount',
 ];
+
+// 2026-09-16: a source registered with deterministicReview (brain_dump_sort today) that was
+// blocked at review time by that MECHANICAL validator -- not a model judgment call, a pure
+// function of task.implementResponse plus live config (tracked project labels, second-brain
+// taxonomy). When that validator's own rule is fixed after the fact (real incident:
+// belongsToProject "Projects" -- a Second-Brain vault folder name, not a tracked project
+// label -- got auto-corrected to null by a 2026-09-11 fix, but 2 tasks blocked on the OLD
+// unfixed rule back on 2026-09-07 were non-adhoc, so reject-retry-check's own "non-adhoc
+// stays in blocked/ forever" branch stamped them exhausted-once and left them stranded --
+// found live 2026-09-16, 5 and 9 days stale, both already re-validated by hand to confirm
+// they pass under the CURRENT rule with zero redraft needed) a blind retry is pointless (the
+// content that will be redrafted is unchanged, and deterministicReview never involves model
+// judgment that could vary between attempts) -- but so is leaving it stranded forever once
+// the actual gate bug is fixed. Re-running the SAME pure validator against the EXISTING
+// implementResponse is cheap (no model call, no redraft) and, if it now passes, this is
+// exactly the outcome review-task.js's own deterministic-review ok:true branch would have
+// produced -- replicate it here (reviewedAt/reviewProvider/localVerdict/history) and move
+// straight to queue/approved/, skipping the wasted redraft entirely. Bounded implicitly: a
+// recovered task leaves blocked/ for good, so this can never loop on the same task twice.
+function deterministicReviewRecoveryCheck(task, { secondBrainDir, repoRoot } = {}) {
+  if (task.blockedStage !== 'review') return null;
+  const entry = getRegisteredSource(resolveSourceName(task));
+  const validate = entry && typeof entry.deterministicReviewValidate === 'function'
+    ? entry.deterministicReviewValidate : null;
+  if (!validate) return null;
+  let outcome;
+  try {
+    outcome = validate(task, { secondBrainDir, repoRoot });
+  } catch {
+    return null; // validator itself errored -- leave the task exactly as-is, never guess
+  }
+  return outcome && outcome.ok ? true : null;
+}
 
 // A prior forbidden-path block whose named path is actually one of the task's OWN declared
 // edit targets -- adhoc-diff-sanity.js's forbidden-path gate false-positived on the task's
@@ -179,13 +227,21 @@ function buildExhaustedAdhocQuestion(task) {
   ].join('\n');
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, recordModelOutcome = defaultRecordModelOutcome }) {
-  const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0 };
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
+  const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
   // Derive it from needsClarificationDir (<pipelineDir>/queue/needs-clarification) when a
   // caller (older tests) didn't pass it explicitly.
   const ghostRoot = pipelineDir
     || (needsClarificationDir ? path.dirname(path.dirname(needsClarificationDir)) : null);
+  // Lazy, best-effort (deterministicReviewRecoveryCheck below tolerates undefined) -- same
+  // "read env inside the sweep, never at module load, never let a missing config block a
+  // sweep tick" discipline every other watchdog sweep in this codebase already follows.
+  // Callers that pass approvedDir explicitly (tests) skip this derivation entirely.
+  const approvedDirResolved = approvedDir
+    || (ghostRoot ? path.join(ghostRoot, 'queue', 'approved') : null);
+  let recoveryConfig = {};
+  try { recoveryConfig = getConfig(); } catch { /* no live config (e.g. a unit test) -- recovery check just no-ops */ }
   const entries = [];
   try {
     for (const n of fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'))) {
@@ -258,6 +314,35 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // (2026-09-06): once ANY prior mechanism flags a needed human decision, nothing
       // here should ever re-decide it, regardless of which reason string it used.
       if (task.needsClarification) continue;
+
+      // A source with deterministicReview (mechanical validate, no model judgment) that was
+      // blocked by that SAME validator -- re-run it against the existing implementResponse;
+      // if the underlying rule has since been fixed and it now passes, this is exactly the
+      // outcome a normal review pass would produce, so skip the wasted redraft and land it
+      // straight in queue/approved/ instead. See deterministicReviewRecoveryCheck's own
+      // header for the real incident this recovers. Checked before the forbidden-path
+      // readmit below since it's a distinct, unrelated signal, not a fallback to it.
+      if (deterministicReviewRecoveryCheck(task, { secondBrainDir: recoveryConfig.secondBrainDir, repoRoot: recoveryConfig.repoRoot })) {
+        task.reviewedAt = new Date().toISOString();
+        task.reviewProvider = 'deterministic-review-recovery';
+        task.localVerdict = 'Auto-approved on re-check: the deterministic rule that originally blocked this has since been fixed, and the existing (unchanged) classification now passes it -- no redraft needed.';
+        delete task.blockedReason;
+        delete task.blockedStage;
+        appendHistoryEvent(task, 'approved', 'reject-retry-check: deterministic-review-recovery -- re-validated against the existing implementResponse, now passes');
+        recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'watchdog', outcomeReason: 'deterministic-review-recovery' });
+        summary.recovered += 1;
+        if (approvedDirResolved) {
+          try {
+            fs.mkdirSync(approvedDirResolved, { recursive: true });
+            fs.writeFileSync(path.join(approvedDirResolved, name), JSON.stringify(task, null, 2));
+            fs.unlinkSync(filePath);
+          } catch (e) {
+            console.warn(`[reject-retry-check] deterministic-review-recovery move to approved/ failed for ${task.id || name}:`, e.message);
+            summary.errors += 1;
+          }
+        }
+        continue;
+      }
 
       // Re-admit a task the (now-fixed) forbidden-path gate bug wrongly ran to exhaustion:
       // its block named one of its OWN declared edit targets, so no blind retry could ever

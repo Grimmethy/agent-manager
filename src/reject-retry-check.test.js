@@ -115,7 +115,7 @@ test('rejectRetryCheck ignores an apply-stage failure (not a review rejection)',
 test('rejectRetryCheck returns an all-zero summary when blockedDir does not exist', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
   const summary = rejectRetryCheck({ blockedDir: path.join(root, 'nope'), pendingDir: path.join(root, 'pending') });
-  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0 });
+  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 });
 });
 
 // --- adhoc-specific routing (2026-08-30) ---------------------------------------------
@@ -183,7 +183,7 @@ test('a non-blocked adhoc task in queue/adhoc/ is left completely alone', () => 
   const task = { id: 'adhoc-fresh', domain: 'adhoc', source: 'manual', history: [] };
   fs.writeFileSync(path.join(d.adhocDir, 'adhoc-fresh.json'), JSON.stringify(task));
   const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
-  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0 });
+  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 });
   assert.ok(fs.existsSync(path.join(d.adhocDir, 'adhoc-fresh.json')));
 });
 
@@ -724,6 +724,112 @@ test('isReviewRejection returns false when reviewInconclusive is set, even with 
 
 test('isReviewRejection returns true for a genuine review rejection (blockedStage:"review", no reviewInconclusive flag)', () => {
   assert.equal(isReviewRejection({ blockedStage: 'review' }), true);
+});
+
+// --- deterministic-review-recovery (2026-09-16) -----------------------------------------
+// Real incident: 2 brain_dump_sort tasks blocked 2026-09-07 by belongsToProject:"Projects"
+// (a Second-Brain vault folder name mistaken for a tracked project label); a 2026-09-11 fix
+// auto-corrects exactly this to null, but both tasks were non-adhoc, so the OLD "non-adhoc
+// stays in blocked/ forever" exhaustion path stranded them -- found stale 5+ days later,
+// confirmed to pass the CURRENT validator with zero redraft needed.
+
+const { registerTaskSource, clearRegistry } = require('./task-source-registry.js');
+
+function setupDirsWithApproved() {
+  const d = setupDirs();
+  const approvedDir = path.join(d.root, 'queue', 'approved');
+  fs.mkdirSync(approvedDir, { recursive: true });
+  return { ...d, approvedDir };
+}
+
+test('deterministic-review-recovery: a blocked task whose source rule now passes is auto-approved, no redraft', () => {
+  clearRegistry();
+  registerTaskSource('fake_det_review', {
+    priority: 1,
+    next: () => null,
+    deterministicReview: true,
+    deterministicReviewValidate: (task) => (task.implementResponse === 'good' ? { ok: true } : { ok: false, reason: 'bad' }),
+  });
+  const { blockedDir, pendingDir, approvedDir } = setupDirsWithApproved();
+  writeBlockedTask(blockedDir, 'dr-1', {
+    source: 'fake_det_review', localRejectCount: 2, implementResponse: 'good',
+    blockedReason: 'Deterministic review: the old, now-fixed rule',
+  });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.recovered, 1);
+  assert.equal(summary.requeued, 0);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'dr-1.json')), 'moved out of blocked/');
+  assert.ok(fs.existsSync(path.join(approvedDir, 'dr-1.json')), 'landed in approved/');
+  const moved = JSON.parse(fs.readFileSync(path.join(approvedDir, 'dr-1.json'), 'utf8'));
+  assert.equal(moved.blockedReason, undefined);
+  assert.equal(moved.blockedStage, undefined);
+  assert.equal(moved.reviewProvider, 'deterministic-review-recovery');
+  assert.ok(moved.history.some((h) => h.stage === 'approved' && /deterministic-review-recovery/.test(h.detail)));
+  clearRegistry();
+});
+
+test('deterministic-review-recovery: a blocked task whose source rule STILL fails falls through to the normal retry/exhaust path, untouched by recovery', () => {
+  clearRegistry();
+  registerTaskSource('fake_det_review', {
+    priority: 1,
+    next: () => null,
+    deterministicReview: true,
+    deterministicReviewValidate: () => ({ ok: false, reason: 'still bad' }),
+  });
+  const { blockedDir, pendingDir, approvedDir } = setupDirsWithApproved();
+  writeBlockedTask(blockedDir, 'dr-2', { source: 'fake_det_review', localRejectCount: 0, implementResponse: 'still-bad' });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.recovered, 0);
+  assert.equal(summary.requeued, 1, 'still under the retry cap -- normal requeue path handles it');
+  assert.ok(!fs.existsSync(path.join(approvedDir, 'dr-2.json')));
+  clearRegistry();
+});
+
+test('deterministic-review-recovery: a source with no deterministicReviewValidate registered is unaffected (ordinary requeue)', () => {
+  clearRegistry();
+  const { blockedDir, pendingDir, approvedDir } = setupDirsWithApproved();
+  writeBlockedTask(blockedDir, 'dr-3', { source: 'manual', localRejectCount: 0 });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.recovered, 0);
+  assert.equal(summary.requeued, 1);
+  clearRegistry();
+});
+
+// 2026-09-16, real regression: the deterministic-review-recovery tests above all register
+// a FAKE source directly via registerTaskSource(), which exercises the RECOVERY LOGIC
+// correctly but never proves the real, built-in brain_dump_sort source is actually
+// reachable from reject-retry-check.js's own standalone CLI entry point (`node reject-
+// retry-check.js`, a fresh process with no other module having required task-sources.js
+// first) -- confirmed live: the feature shipped, unit tests green, and was completely
+// inert in production because nothing in this file required task-sources.js, so
+// getRegisteredSource('brain_dump_sort') returned undefined every time. This test does
+// NOT register anything itself -- it only requires this module (as the real CLI does) and
+// checks the registry brain_dump_sort actually landed in, catching a reintroduction of
+// the exact same wiring gap.
+test('the real, built-in brain_dump_sort source is actually registered after requiring this module, in a genuinely FRESH process (regression: task-sources.js must be required as a side effect)', () => {
+  // A real child process, not a require-cache trick: this is the exact real-world shape
+  // of the bug -- `node reject-retry-check.js` (scripts/queue-watcher.sh's own real
+  // invocation) starts a FRESH process with an empty task-source registry. Forcing a
+  // re-require inside THIS process risks colliding with other registries (model-profile,
+  // etc.) that clearRegistry() doesn't reset -- a real, separate process sidesteps that
+  // entirely and proves the actual thing that matters: the registry is populated by the
+  // time reject-retry-check.js's own code can look a source up, with no other module
+  // having required task-sources.js first.
+  const out = require('child_process').execFileSync(
+    process.execPath,
+    ['-e', "require('./reject-retry-check.js'); const { getRegisteredSource } = require('./task-source-registry.js'); const e = getRegisteredSource('brain_dump_sort'); console.log(JSON.stringify({ found: !!e, hasValidate: !!(e && typeof e.deterministicReviewValidate === 'function') }));"],
+    { cwd: __dirname, encoding: 'utf8' },
+  );
+  const result = JSON.parse(out.trim());
+  assert.equal(result.found, true, 'brain_dump_sort must be registered once reject-retry-check.js has been required, in a real fresh process');
+  assert.equal(result.hasValidate, true);
 });
 
 test('requeue clears adhocNoChangesClaimFeedback but preserves coordination flags', () => {
