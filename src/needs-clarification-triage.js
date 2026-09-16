@@ -133,6 +133,14 @@
 //      REPAIRS the existing artifact (regenerates implementResponse from the already-
 //      valid subTaskProposals) and sends it straight to queue/review/ for a real vote,
 //      not queue/adhoc/ for a fresh draft.
+//
+//      POSITIONING FIX (2026-09-16, same day): first shipped positioned after every
+//      other bucket, which meant it never actually ran -- every real target also has
+//      stalenessFlag.reason === 'decompose-loop' and, often, an oversized target file,
+//      so the decompose-loop/oversized-file deferral ("autoroute owns it") a few lines
+//      below silently `continue`d the task away before this bucket, or even bucket D,
+//      ever got a look. Moved to run BEFORE that deferral -- see its own inline comment
+//      for the full incident.
 const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
@@ -392,6 +400,81 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       continue;
     }
 
+    // --- Bucket K: decompose-review-blind signature -> repair in place, send to review --
+    // Checked BEFORE the decompose-loop/oversized-file deferral immediately below --
+    // root-caused live 2026-09-16, hours after this bucket first shipped: EVERY one of
+    // its intended targets also carries stalenessFlag.reason === 'decompose-loop' (the
+    // same repeated-decompose history that triggered the give-up backstop this bucket
+    // exists to repair), and a large fraction of those target an oversized file (the
+    // very files -- local-draft.js, agentic-draft-common.js -- this pipeline's own
+    // decompose-related fixes live in). The line below silently `continue`s any
+    // decompose-loop task whose target is oversized ("autoroute owns it") with NO log
+    // line and NO bucket ever getting a chance to run -- including this one, and
+    // including Bucket D above it, though D's own signature rarely overlaps in
+    // practice. decompose-loop-autoroute.js's OWN precondition then declines anyway
+    // when that same file is "actively developed" (a real, separate safety guard), so
+    // the net effect was a permanent dead zone: deferred here, declined there, visible
+    // nowhere. This bucket's own concern (a decomposition that ALREADY happened and
+    // just needs its rendering repaired) has nothing to do with whether the target file
+    // is oversized -- there is nothing left for autoroute to do -- so it must run
+    // before that deferral, not after it, unlike every requeue bucket below which
+    // genuinely does need to yield to autoroute's oversized-file ownership.
+    //
+    // Unlike every other bucket here, this does NOT redraft: the task already has a
+    // valid, complete decomposition (task.subTaskProposals), just an implementResponse
+    // that (pre-PR-#230) never mentioned it. Regenerate implementResponse from the real
+    // sub-tasks and file straight to queue/review/ for a real vote -- see the top-of-file
+    // header comment for the full incident.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
+      const isDecompose = task.adhocResolution === 'decompose' && subTasks.length >= 2;
+      const hasEvidence = isDecompose && subTasks.some((s) => s && s.title
+        && String(task.implementResponse || '').includes(String(s.title).slice(0, 30)));
+      if (isDecompose && !hasEvidence && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket K but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = (task.ncTriageAttempts || 0) + 1;
+          log(`${id0}: bucket K (decompose-review-blind signature) -> repaired in place, sent to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            delete task.needsClarification;
+            delete task.localRejectCount;
+            delete task.retryableDraftBlock;
+            delete task.preDrafted;
+            delete task.priorRejectionFeedback;
+            delete task.blockedReason;
+            delete task.blockedStage;
+            delete task.claimedAt;
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            task.ncTriageAttempts = attempt;
+            task.status = 'needs-review';
+            task.implementResponse = `Decomposed into ${subTasks.length} sub-task(s).\n\n${formatSubTaskProposalsForReview(subTasks)}`;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: decompose-review-blind signature (a since-fixed rendering gap, PR #230, hid a genuinely valid decomposition from review) -- implementResponse regenerated from the existing subTaskProposals, sent straight to review ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-K: decompose-review-blind signature', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
     const decompLoop = !!(task.stalenessFlag && task.stalenessFlag.reason === 'decompose-loop');
     if (decompLoop && targetOversizedFile(task, oversizedFiles(pipelineDir))) continue; // autoroute owns it
     if (task.stalenessKeep && task.stalenessKeep.until && task.stalenessKeep.until > now) continue; // human said Keep
@@ -623,61 +706,6 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       }
     }
 
-    // --- Bucket K: decompose-review-blind signature -> repair in place, send to review --
-    // Unlike every other bucket here, this does NOT redraft: the task already has a
-    // valid, complete decomposition (task.subTaskProposals), just an implementResponse
-    // that (pre-PR-#230) never mentioned it. Regenerate implementResponse from the real
-    // sub-tasks and file straight to queue/review/ for a real vote -- see the header
-    // comment above for the full incident.
-    {
-      const id0 = task.id || name.replace(/\.json$/, '');
-      const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
-      const isDecompose = task.adhocResolution === 'decompose' && subTasks.length >= 2;
-      const hasEvidence = isDecompose && subTasks.some((s) => s && s.title
-        && String(task.implementResponse || '').includes(String(s.title).slice(0, 30)));
-      if (isDecompose && !hasEvidence && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
-        const reviewDir = path.join(pipelineDir, 'queue', 'review');
-        const reviewPath = path.join(reviewDir, `${id0}.json`);
-        if (fs.existsSync(reviewPath)) {
-          log(`${id0}: bucket K but ${id0}.json already in review/ -- already handled, skipping`);
-        } else {
-          summary.checked += 1;
-          const attempt = (task.ncTriageAttempts || 0) + 1;
-          log(`${id0}: bucket K (decompose-review-blind signature) -> repaired in place, sent to review ${attempt}/${MAX_REQUEUES}`);
-          summary.requeued += 1;
-          if (!DRY_RUN) {
-            delete task.needsClarification;
-            delete task.localRejectCount;
-            delete task.retryableDraftBlock;
-            delete task.preDrafted;
-            delete task.priorRejectionFeedback;
-            delete task.blockedReason;
-            delete task.blockedStage;
-            delete task.claimedAt;
-            delete task.ncTriageDecision;
-            delete task.ncTriageReviewedAt;
-            task.ncTriageAttempts = attempt;
-            task.status = 'needs-review';
-            task.implementResponse = `Decomposed into ${subTasks.length} sub-task(s).\n\n${formatSubTaskProposalsForReview(subTasks)}`;
-            appendHistoryEvent(task, 'requeued',
-              `needs-clarification-triage: decompose-review-blind signature (a since-fixed rendering gap, PR #230, hid a genuinely valid decomposition from review) -- implementResponse regenerated from the existing subTaskProposals, sent straight to review ${attempt}/${MAX_REQUEUES}`);
-            try {
-              await classifyRequeue(task, { reasonHint: 'bucket-K: decompose-review-blind signature', requeueWriter: 'needs-clarification-triage', repoRoot });
-            } catch { /* classification must never block the real requeue */ }
-            try {
-              fs.mkdirSync(reviewDir, { recursive: true });
-              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
-              fs.unlinkSync(file);
-            } catch (e) {
-              log(`${id0}: repair-and-review move failed: ${e.message}`);
-              summary.requeued -= 1;
-              summary.errors += 1;
-            }
-          }
-          continue;
-        }
-      }
-    }
 
     if (task.ncTriageDecision === 'leave-for-human') continue;           // already reviewed
 
