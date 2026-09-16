@@ -15,7 +15,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { resolveGraphPath, getConfig } = require('./config.js');
+const { resolveGraphPath, getConfig, getSecondBrainDir, requireSecondBrainDir } = require('./config.js');
 
 function makeRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'config-resolve-graph-test-'));
@@ -111,5 +111,31 @@ test('directToMain candidate-doc paths are rooted at applyRepoRoot, not repoRoot
       assert.ok(cfg[key].startsWith(applyRoot + '/Docs/'), `${key} must live under applyRepoRoot/Docs (got ${cfg[key]})`);
       assert.ok(!cfg[key].startsWith(repoRoot + '/Docs/'), `${key} must NOT be rooted at repoRoot/Docs`);
     }
+  });
+});
+
+test('requireSecondBrainDir throws when SECOND_BRAIN_DIR is unset', () => {
+  withEnv({ SECOND_BRAIN_DIR: undefined }, () => {
+    delete process.env.SECOND_BRAIN_DIR;
+    assert.throws(() => requireSecondBrainDir(), /SECOND_BRAIN_DIR is not set/);
+  });
+});
+
+test('requireSecondBrainDir returns the string when SECOND_BRAIN_DIR is set', () => {
+  withEnv({ SECOND_BRAIN_DIR: '/tmp/second-brain' }, () => {
+    assert.equal(requireSecondBrainDir(), '/tmp/second-brain');
+  });
+});
+
+test('getSecondBrainDir returns null when SECOND_BRAIN_DIR is unset', () => {
+  withEnv({ SECOND_BRAIN_DIR: undefined }, () => {
+    delete process.env.SECOND_BRAIN_DIR;
+    assert.equal(getSecondBrainDir(), null);
+  });
+});
+
+test('getSecondBrainDir returns the string when SECOND_BRAIN_DIR is set', () => {
+  withEnv({ SECOND_BRAIN_DIR: '/tmp/second-brain' }, () => {
+    assert.equal(getSecondBrainDir(), '/tmp/second-brain');
   });
 });
