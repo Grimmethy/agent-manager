@@ -174,6 +174,8 @@ def api_task_confirm_delete(task_id):
     # src/apply-group-a.js).
     if data.get("source") == "pipeline_debrief":
         data["debriefReportConfirmedAt"] = now_iso
+    if data.get("source") == "decompose_design_question":
+        data["decomposeQuestionConfirmedAt"] = now_iso
 
     approved_dir = qdir / "approved"
     approved_dir.mkdir(parents=True, exist_ok=True)
