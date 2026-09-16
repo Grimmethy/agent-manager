@@ -582,6 +582,30 @@ test('applyDirectToMainBatch: three triage tasks share ONE fetch/reset/commit/pu
   assert.equal(names.filter((n) => n === 'pushMain').length, 1, 'exactly one push for the whole batch');
 });
 
+// 2026-09-16, root-caused live via a real stuck task (arch-discovery-community-15): the
+// 2026-09-15 privacy fix (task-logs/ is gitignored -- see task-log-store.js's own header
+// -- so it must be written to disk only, never staged/committed/pushed) was applied to
+// apply-task.js's single-task path but missed this batch path, which is what
+// apply-task.sh's --batch mode actually uses for the common case (arch_discovery,
+// arch_review, observability_review, ...). Every batched apply started failing `git add`
+// with "The following paths are ignored by one of your .gitignore files: task-logs" the
+// moment it reached here, and looped on requeue forever since the failure is
+// deterministic.
+test('applyDirectToMainBatch: never stages task-logs/ (gitignored, disk-only) -- regression for the batch path missing the 2026-09-15 fix', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = batchTriageTask('tl1');
+  const out = applyDirectToMainBatch([task], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+
+  assert.equal(out.results.tl1.succeeded, true);
+  const addCall = gitRunner.calls.find((c) => c.name === 'add');
+  assert.ok(addCall, 'add was called');
+  const staged = addCall.args[0];
+  assert.ok(!staged.some((f) => f.startsWith('task-logs/')), `task-logs/ must never be staged, got: ${JSON.stringify(staged)}`);
+  // the log is still written to disk for the user's own local reference
+  assert.ok(fs.existsSync(path.join(REPO_ROOT, 'task-logs', 'tl1.json')), 'task-logs/tl1.json should still exist on disk');
+  assert.ok(gitRunner.calls.some((c) => c.name === 'commit'), 'the batch still commits');
+});
+
 test('applyDirectToMainBatch: refuses a non-directToMain source instead of batching it', () => {
   const gitRunner = createFakeGitRunner();
   const good = batchTriageTask('ok1');

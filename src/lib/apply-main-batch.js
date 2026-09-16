@@ -42,8 +42,22 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
       }
       const files = artifact.files || [artifact.file];
       assertStageableFiles(task, files);
+      // 2026-09-16: task-logs/ is gitignored (see task-log-store.js's own 2026-09-15
+      // RE-EVALUATED header -- it can retain a task's full rawText/implementResponse
+      // verbatim, which for a brain_dump-derived task is the user's own free-typed
+      // personal/business note content, and this repo is public). apply-task.js's
+      // single-task path was updated to only write it to disk, never stage it -- this
+      // batch path was missed, so EVERY batched directToMain apply (arch_discovery,
+      // arch_review, observability_review, ...) started failing `git add` with "The
+      // following paths are ignored by one of your .gitignore files: task-logs" the
+      // moment a task whose artifact needed staging reached here, root-caused live via
+      // a real stuck task (arch-discovery-community-15) that got approved at review and
+      // then failed at apply with exactly this error, looping on requeue forever since
+      // the failure is deterministic. writeTaskLogFile still writes the file to disk
+      // (for the user's own local reference, and so the commit message's `Task-Log:`
+      // line below still points somewhere real); it just never joins `files` here.
       const taskLogRel = writeTaskLogFile(repoRoot, task);
-      gitRunner.add([...files, taskLogRel]);
+      gitRunner.add(files);
       staged.push({ task, files, taskLogRel });
     } catch (e) {
       // This task's append threw. Its file may carry a partial trailing line -- cosmetic
