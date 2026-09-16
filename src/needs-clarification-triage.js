@@ -106,6 +106,17 @@
 //      file ghost debt (no automated recovery exists), stamp it reviewed, leave it
 //      visible for a human to fix the grounding source or archive -- instead of the old
 //      silent, permanent drop.
+//
+//   J. DETERMINISTIC-TRUNCATION-GUARD FALSE-BLOCK SIGNATURE (2026-09-16) -- same shape as
+//      bucket D: `task.reviewProvider === 'deterministic-truncation-guard'` means a
+//      deterministic review gate (src/validate-implement-truncation.js), not a real
+//      judgment call, was the terminal rejection before escalation. That gate false-
+//      flagged essentially any complete Group A implementResponse as "truncated" for
+//      about a day (PR #265, 2026-09-14) before being root-caused and fixed -- a task
+//      stuck on exactly this signature was never a design question. Not date-scoped: the
+//      `reviewProvider` marker itself is the signature, so this recovers any future task
+//      that lands here via the identical mechanism (a deterministic gate later found
+//      buggy), not just this one incident.
 
 const fs = require('fs');
 const path = require('path');
@@ -527,6 +538,59 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
               `needs-clarification-triage: drafter tagged BLOCKER-TYPE: infra-error (tool/environment failure, not a design question) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
             try {
               await classifyRequeue(task, { reasonHint: 'bucket-G: infra-error, not a design question', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket J: deterministic-truncation-guard false-block signature -> requeue ---
+    // 2026-09-16, same shape as Bucket D (a since-fixed deterministic gate false-positive,
+    // not a real design question): src/validate-implement-truncation.js's
+    // detectTruncatedImplementResponse(), wired unconditionally into review-task.js by PR
+    // #265 (2026-09-14), false-flagged essentially any COMPLETE, correct Group A
+    // implementResponse as "truncated output" -- root-caused live 2026-09-16 (~half of
+    // real adhoc/brain-dump reviews false-blocked in the hours after it landed), fixed,
+    // and merged. A task whose terminal review verdict before escalation was THIS exact
+    // deterministic gate (`reviewProvider === 'deterministic-truncation-guard'`) was never
+    // actually a design question -- it's a real, already-drafted, already-implemented
+    // response that a bug rejected. Checked BEFORE the "already reviewed" skip, same
+    // reasoning as D/E/F/G: a stale leave-for-human stamp from before this fix landed must
+    // not shield an already-triaged task from it. Not date-scoped -- the signature
+    // (`reviewProvider`) is itself the deterministic marker, so this recovers any future
+    // task landing here via the identical mechanism (a deterministic review gate later
+    // found to be buggy), not just this one incident.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (task.reviewProvider === 'deterministic-truncation-guard' && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket J but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = (task.ncTriageAttempts || 0) + 1;
+          log(`${id0}: bucket J (deterministic-truncation-guard false-block signature) -> requeue ${attempt}/${MAX_REQUEUES}, now fixed in validate-implement-truncation.js`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            delete task.reviewProvider;
+            task.ncTriageAttempts = attempt;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: deterministic-truncation-guard false-block signature (a since-fixed review gate rejected an already-correct implementResponse) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-J: deterministic-truncation-guard false-block signature', requeueWriter: 'needs-clarification-triage', repoRoot });
             } catch { /* classification must never block the real requeue */ }
             try {
               fs.mkdirSync(adhocDir, { recursive: true });

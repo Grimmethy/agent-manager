@@ -605,6 +605,69 @@ test('bucket G skipped: an exhausted history event -> not requeued', async () =>
   assert.ok(exists(at(dir, 'needs-clarification', 'tg2.json')));
 });
 
+// --- Bucket J: deterministic-truncation-guard false-block signature (2026-09-16) -------
+
+test('bucket J: reviewProvider === deterministic-truncation-guard -> clean requeue to adhoc/', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj1', {
+    reviewProvider: 'deterministic-truncation-guard',
+    blockedReason: 'truncated output',
+    needsClarification: { reason: 'design-decision', openQuestions: 'could not get this past review after 2 attempts' },
+    history: [{ stage: 'exhausted', at: '2026-09-16T00:00:00Z' }],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tj1.json')));
+  const moved = read(at(dir, 'adhoc', 'tj1.json'));
+  assert.equal(moved.needsClarification, undefined);
+  assert.equal(moved.blockedReason, undefined);
+  assert.equal(moved.reviewProvider, undefined);
+  assert.equal(moved.ncTriageAttempts, 1);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && /deterministic-truncation-guard false-block signature/.test(h.detail)));
+});
+
+test('bucket J: previously stamped leave-for-human is NOT frozen against the signature', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj2', {
+    reviewProvider: 'deterministic-truncation-guard',
+    blockedReason: 'truncated output',
+    ncTriageDecision: 'leave-for-human',
+    ncTriageReviewedAt: '2026-09-15T00:00:00Z',
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 1);
+  const moved = read(at(dir, 'adhoc', 'tj2.json'));
+  assert.equal(moved.ncTriageDecision, undefined, 'stale leave-for-human stamp cleared on requeue');
+});
+
+test('bucket J: a task with no matching reviewProvider stays skipped (checked stays 0)', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj3', { ncTriageDecision: 'leave-for-human' }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.checked, 0);
+  assert.equal(s.requeued, 0);
+});
+
+test('bucket J: a genuinely blocked task (real content rejection, not the truncation gate) is untouched', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj4', {
+    reviewProvider: 'majority-vote',
+    blockedReason: 'the draft never implements the requested helper',
+    needsClarification: { reason: 'design-decision', openQuestions: 'Should the widget default to on or off? I need you to decide the product behaviour.' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tj4.json')));
+});
+
+test('bucket J: already at MAX_REQUEUES -> falls through to leave-for-human, not re-requeued', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj5', { reviewProvider: 'deterministic-truncation-guard', ncTriageAttempts: 1 }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tj5.json')));
+});
+
 // --- Ghost-in-the-Machine: bucket C retry-exhausted -> ghost debt (2026-09-09) ---------
 
 const sfInbox = (dir) => {
