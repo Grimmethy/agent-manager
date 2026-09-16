@@ -16,7 +16,7 @@ from pathlib import Path
 from networkx.algorithms.community import greedy_modularity_communities
 
 from graph_constants import GRAPH_BUILD_INTERVAL_SECONDS
-from graph_edge_resolution import build_import_graph
+from graph_edge_resolution import build_import_graph, resolve_zig_import
 from graph_communities import _community_member_signature, merge_coverage, name_community_heuristic, name_community_ornith
 
 def get_config():

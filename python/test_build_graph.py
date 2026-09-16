@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import build_graph  # noqa: E402
+import graph_build  # noqa: E402
 
 
 class BuildImportGraphSymlinkTest(unittest.TestCase):
@@ -34,7 +34,7 @@ class BuildImportGraphSymlinkTest(unittest.TestCase):
             symlink_dir.symlink_to(real_dir)
 
             # Before the fix, this line raised ValueError.
-            graph = build_graph.build_import_graph(symlink_dir, ["src"])
+            graph = graph_build.build_import_graph(symlink_dir, ["src"])
             self.assertEqual(graph.number_of_nodes(), 2)
             self.assertEqual(graph.number_of_edges(), 1)
 
@@ -52,7 +52,7 @@ class BuildImportGraphFileCacheTest(unittest.TestCase):
             (repo / "src" / "b.js").write_text("module.exports = {};\n")
 
             file_cache = {}
-            graph = build_graph.build_import_graph(repo, ["src"], file_cache=file_cache)
+            graph = graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
             self.assertEqual(graph.number_of_edges(), 1)
             self.assertIn("src/a.js", file_cache["files"])
             self.assertEqual(file_cache["files"]["src/a.js"]["edges"], ["src/b.js"])
@@ -66,14 +66,14 @@ class BuildImportGraphFileCacheTest(unittest.TestCase):
             (repo / "src" / "c.js").write_text("module.exports = {};\n")
 
             file_cache = {}
-            build_graph.build_import_graph(repo, ["src"], file_cache=file_cache)
+            graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
 
             # Deliberately wrong: a.js does NOT really import c.js. If the cache is
             # genuinely trusted (mtime/size unchanged), this wrong edge survives into the
             # next build's graph -- proof the file's real text was never re-scanned.
             file_cache["files"]["src/a.js"]["edges"] = ["src/c.js"]
 
-            graph = build_graph.build_import_graph(repo, ["src"], file_cache=file_cache)
+            graph = graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
             self.assertTrue(graph.has_edge("src/a.js", "src/c.js"), "cached (even if stale) edges must be trusted when mtime/size are unchanged")
             self.assertFalse(graph.has_edge("src/a.js", "src/b.js"), "the real edge should NOT reappear -- that would mean the cache was ignored and the file was re-parsed")
 
@@ -86,12 +86,12 @@ class BuildImportGraphFileCacheTest(unittest.TestCase):
             (repo / "src" / "c.js").write_text("module.exports = {};\n")
 
             file_cache = {}
-            build_graph.build_import_graph(repo, ["src"], file_cache=file_cache)
+            graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
 
             # Real change: a.js now imports c.js instead of b.js. write_text changes both
             # mtime and (here) size, so this must be detected as a cache miss.
             (repo / "src" / "a.js").write_text("require('./c.js');\n")
-            graph = build_graph.build_import_graph(repo, ["src"], file_cache=file_cache)
+            graph = graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
             self.assertTrue(graph.has_edge("src/a.js", "src/c.js"))
             self.assertFalse(graph.has_edge("src/a.js", "src/b.js"))
 
@@ -103,12 +103,12 @@ class BuildImportGraphFileCacheTest(unittest.TestCase):
             (repo / "src" / "b.js").write_text("module.exports = {};\n")
 
             file_cache = {}
-            build_graph.build_import_graph(repo, ["src"], file_cache=file_cache)
+            graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
             self.assertIn("src/b.js", file_cache["files"])
 
             (repo / "src" / "b.js").unlink()
             (repo / "src" / "a.js").write_text("// no import now\n")
-            build_graph.build_import_graph(repo, ["src"], file_cache=file_cache)
+            graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
             self.assertNotIn("src/b.js", file_cache["files"], "a deleted file's stale cache entry must not linger forever")
 
 
@@ -124,7 +124,7 @@ class ResolveZigImportTest(unittest.TestCase):
             repo = Path(tmp)
             (repo / "src").mkdir()
             (repo / "src" / "compat.zig").write_text("pub const X = 1;\n")
-            target = build_graph.resolve_zig_import(repo / "src" / "api.zig", "compat.zig")
+            target = graph_build.resolve_zig_import(repo / "src" / "api.zig", "compat.zig")
             self.assertEqual(target, (repo / "src" / "compat.zig").resolve())
 
     def test_a_zig_suffixed_spec_with_no_leading_dot_still_resolves_unlike_js(self):
@@ -135,7 +135,7 @@ class ResolveZigImportTest(unittest.TestCase):
             repo = Path(tmp)
             (repo / "src" / "compat").mkdir(parents=True)
             (repo / "src" / "compat" / "shared.zig").write_text("pub const Y = 2;\n")
-            target = build_graph.resolve_zig_import(repo / "src" / "compat.zig", "compat/shared.zig")
+            target = graph_build.resolve_zig_import(repo / "src" / "compat.zig", "compat/shared.zig")
             self.assertEqual(target, (repo / "src" / "compat" / "shared.zig").resolve())
 
     def test_a_spec_with_no_zig_suffix_is_a_module_reference_and_is_ignored(self):
@@ -144,7 +144,7 @@ class ResolveZigImportTest(unittest.TestCase):
             (repo / "src").mkdir()
             # No file named "std" or "builtin" exists -- these are compiler-builtin /
             # build.zig-declared modules, never a real file in the repo.
-            target = build_graph.resolve_zig_import(repo / "src" / "api.zig", "std")
+            target = graph_build.resolve_zig_import(repo / "src" / "api.zig", "std")
             self.assertIsNone(target)
 
     def test_build_import_graph_links_two_real_zig_files_via_import(self):
@@ -153,7 +153,7 @@ class ResolveZigImportTest(unittest.TestCase):
             (repo / "src").mkdir()
             (repo / "src" / "main.zig").write_text('const std = @import("std");\nconst config = @import("config.zig");\n')
             (repo / "src" / "config.zig").write_text("pub const Config = struct {};\n")
-            graph = build_graph.build_import_graph(repo, ["src"])
+            graph = graph_build.build_import_graph(repo, ["src"])
             self.assertEqual(graph.number_of_nodes(), 2)
             self.assertEqual(graph.number_of_edges(), 1)
             self.assertTrue(graph.has_edge("src/main.zig", "src/config.zig"))
@@ -166,7 +166,7 @@ class ResolveZigImportTest(unittest.TestCase):
             (repo / "src").mkdir()
             (repo / "src" / "api.zig").write_text('const Store = @import("store.zig").Store;\n')
             (repo / "src" / "store.zig").write_text("pub const Store = struct {};\n")
-            graph = build_graph.build_import_graph(repo, ["src"])
+            graph = graph_build.build_import_graph(repo, ["src"])
             self.assertTrue(graph.has_edge("src/api.zig", "src/store.zig"))
 
 
@@ -191,8 +191,8 @@ class BuildGraphDataCommunityNameReuseTest(unittest.TestCase):
             ]}
 
             calls = {"ornith": 0, "heuristic": 0}
-            original_ornith = build_graph.name_community_ornith
-            original_heuristic = build_graph.name_community_heuristic
+            original_ornith = graph_build.name_community_ornith
+            original_heuristic = graph_build.name_community_heuristic
 
             def spy_ornith(*a, **kw):
                 calls["ornith"] += 1
@@ -202,17 +202,17 @@ class BuildGraphDataCommunityNameReuseTest(unittest.TestCase):
                 calls["heuristic"] += 1
                 return original_heuristic(*a, **kw)
 
-            build_graph.name_community_ornith = spy_ornith
-            build_graph.name_community_heuristic = spy_heuristic
+            graph_build.name_community_ornith = spy_ornith
+            graph_build.name_community_heuristic = spy_heuristic
             try:
-                result = build_graph.build_graph_data(
+                result = graph_build.build_graph_data(
                     repo, ["src"], "http://localhost:11434", "fake-model",
                     progress=lambda *a: None, use_model_naming=True,
                     old_coverage=old_coverage, old_graph_nodes=old_graph_nodes,
                 )
             finally:
-                build_graph.name_community_ornith = original_ornith
-                build_graph.name_community_heuristic = original_heuristic
+                graph_build.name_community_ornith = original_ornith
+                graph_build.name_community_heuristic = original_heuristic
 
             self.assertEqual(calls["ornith"], 0, "naming functions must not be called at all for an unchanged community")
             self.assertEqual(calls["heuristic"], 0)
@@ -235,7 +235,7 @@ class BuildGraphDataCommunityNameReuseTest(unittest.TestCase):
                 {"id": 0, "name": "Stale Name", "lastReviewedAt": None, "lastCandidateCount": -1},
             ]}
 
-            result = build_graph.build_graph_data(
+            result = graph_build.build_graph_data(
                 repo, ["src"], "http://localhost:11434", "fake-model",
                 progress=lambda *a: None, use_model_naming=False,  # heuristic only -- no real network call
                 old_coverage=old_coverage, old_graph_nodes=old_graph_nodes,
@@ -262,7 +262,7 @@ class MergeCoverageTest(unittest.TestCase):
             {"id": 5, "name": "src", "lastReviewedAt": None, "lastCandidateCount": -1},
         ]}
 
-        merged = build_graph.merge_coverage(old_coverage, old_graph_nodes, new_coverage, new_graph_nodes)
+        merged = graph_build.merge_coverage(old_coverage, old_graph_nodes, new_coverage, new_graph_nodes)
         self.assertEqual(merged["communities"][0]["lastReviewedAt"], "2026-08-01T00:00:00Z")
         self.assertEqual(merged["communities"][0]["lastCandidateCount"], 3)
         self.assertEqual(merged["communities"][0]["id"], 5)  # keeps the NEW id, only borrows review state
@@ -282,12 +282,12 @@ class MergeCoverageTest(unittest.TestCase):
             {"id": 0, "name": "src", "lastReviewedAt": None, "lastCandidateCount": -1},
         ]}
 
-        merged = build_graph.merge_coverage(old_coverage, old_graph_nodes, new_coverage, new_graph_nodes)
+        merged = graph_build.merge_coverage(old_coverage, old_graph_nodes, new_coverage, new_graph_nodes)
         self.assertIsNone(merged["communities"][0]["lastReviewedAt"])
         self.assertEqual(merged["communities"][0]["lastCandidateCount"], -1)
 
     def test_brand_new_community_with_no_old_history_is_untouched(self):
-        merged = build_graph.merge_coverage(
+        merged = graph_build.merge_coverage(
             {"communities": []}, [],
             {"communities": [{"id": 0, "name": "new-area", "lastReviewedAt": None, "lastCandidateCount": -1}]},
             [{"id": "src/new.js", "community": 0}],
@@ -303,31 +303,31 @@ class NameCommunityHeuristicTest(unittest.TestCase):
     can't disambiguate these and file stems are the fallback signal."""
 
     def test_scripts_is_now_treated_as_generic_like_src_already_was(self):
-        name = build_graph.name_community_heuristic(["scripts/deploy.sh", "scripts/backup.sh"])
+        name = graph_build.name_community_heuristic(["scripts/deploy.sh", "scripts/backup.sh"])
         self.assertNotEqual(name, "scripts")
         self.assertIn("deploy", name)
         self.assertIn("backup", name)
 
     def test_two_unrelated_flat_scripts_communities_get_distinct_names(self):
-        deploy_name = build_graph.name_community_heuristic(["scripts/deploy.sh", "scripts/rollback.sh"])
-        db_name = build_graph.name_community_heuristic(["scripts/migrate.py", "scripts/seed.py"])
+        deploy_name = graph_build.name_community_heuristic(["scripts/deploy.sh", "scripts/rollback.sh"])
+        db_name = graph_build.name_community_heuristic(["scripts/migrate.py", "scripts/seed.py"])
         self.assertNotEqual(deploy_name, db_name)
 
     def test_flat_src_with_no_subfolder_no_longer_collapses_to_bare_src(self):
-        name = build_graph.name_community_heuristic(["src/auth.js", "src/session.js"])
+        name = graph_build.name_community_heuristic(["src/auth.js", "src/session.js"])
         self.assertNotEqual(name, "src")
         self.assertIn("auth", name)
 
     def test_generic_dir_with_a_real_subfolder_still_prefers_the_subfolder_grouping(self):
         # Existing behavior for the non-flat case must be unchanged: when there IS a
         # shared subdirectory to descend into, that's still preferred over basenames.
-        name = build_graph.name_community_heuristic([
+        name = graph_build.name_community_heuristic([
             "src/payments/charge.js", "src/payments/refund.js", "src/payments/invoice.js",
         ])
         self.assertIn("payments", name)
 
     def test_non_generic_directory_is_unaffected(self):
-        name = build_graph.name_community_heuristic(["payments/charge.js", "payments/refund.js"])
+        name = graph_build.name_community_heuristic(["payments/charge.js", "payments/refund.js"])
         self.assertEqual(name, "payments")
 
 
