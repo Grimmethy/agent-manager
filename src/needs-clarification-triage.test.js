@@ -702,6 +702,36 @@ test('bucket K: decompose-review-blind signature -> implementResponse regenerate
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /decompose-review-blind signature/.test(h.detail)));
 });
 
+// 2026-09-16, same-day positioning fix: root-caused live via this exact task shape --
+// EVERY real bucket K target also carries stalenessFlag.reason === 'decompose-loop', and
+// often targets a real oversized file (the give-up backstop's own repeated-decompose
+// history is what stamps decompose-loop in the first place). Bucket K originally sat
+// AFTER the decompose-loop/oversized-file deferral a few lines below ("autoroute owns
+// it"), which silently `continue`s any such task away with no log line -- meaning this
+// bucket never actually fired for a single one of its intended targets until moved
+// ahead of that deferral. This test reproduces the real shape end-to-end: a
+// decompose-loop-flagged task whose rawText names a file file-length-flags.json also
+// flags as oversized.
+test('bucket K: still fires even when the task is ALSO decompose-loop-flagged with an oversized target file (the real incident shape)', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  fs.writeFileSync(at(dir, 'file-length-flags.json'), JSON.stringify({ findings: [{ file: 'src/local-draft.js' }] }));
+  held(dir, baseTask('tk6', {
+    promptContext: { rawText: 'In src/local-draft.js, add a short-circuit for critique-degenerate.' },
+    adhocResolution: 'decompose',
+    subTaskProposals: REAL_SUB_TASKS,
+    implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).',
+    stalenessFlag: { reason: 'decompose-loop', disposition: 're-scope', confidence: 'medium' },
+    needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tk6.json')));
+  const moved = read(at(dir, 'review', 'tk6.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.match(moved.implementResponse, /Add the allowlist constant/);
+});
+
 test('bucket K: a decompose task whose implementResponse ALREADY shows the real sub-tasks is left alone', async () => {
   const dir = makePipeline();
   held(dir, baseTask('tk2', {
