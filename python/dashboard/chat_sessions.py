@@ -321,7 +321,7 @@ def _stream_local(session: dict, message: str):
     for event in local_tool_client.stream_plan_with_tools(
         messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
         primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
-        allow_amplification=True,
+        allow_amplification=True, use_extended_context=True,
     ):
         if event.get("type") == "chunk":
             yield event["text"]
