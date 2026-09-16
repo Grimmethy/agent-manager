@@ -420,6 +420,13 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         // feedback names the exact gap. See adhoc-diff-sanity.js.
         priorFeedback.push(task.adhocNoChangesClaimFeedback);
         delete task.adhocNoChangesClaimFeedback;
+        // GUARD (coordination-field survival): do NOT add a blanket
+        // `delete task.<coordinationField>` in this requeue branch. Coordination flags
+        // -- e.g. task.decomposeDirective, set by the decompose/rescope path in
+        // agentic-draft-common.js (resolveAgenticDraft) -- must survive here and reach
+        // buildWriteAgenticPrompt (src/local-agentic-write-draft.js) intact. Only the
+        // fields explicitly listed in READMIT_CLEAN_SLATE_FIELDS (line 42 above) are
+        // safe to clear in this branch; decomposeDirective is deliberately not among them.
       } else if (retryableDraftBlock && typeof task.infraErrorNote === 'string' && task.infraErrorNote.trim()) {
         // resolveAgenticDraft (agentic-draft-common.js): the model tagged BLOCKER-TYPE:
         // infra-error -- a tool/command/file-op that should have worked failed, unrelated
