@@ -180,6 +180,7 @@ const { hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { targetOversizedFile, oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
+const { surfaceDecomposeDesignQuestion } = require('./decompose-question-surface.js');
 
 // Read env inside the sweep, not at module load -- keeps tests able to toggle it and
 // matches auto-confirm-review.js's discipline.
@@ -639,6 +640,25 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     // toward `checked`) when decompLoop is set; otherwise falls through unchanged.
     if (decompLoop) {
       const id0 = task.id || name.replace(/\.json$/, '');
+      // Surface the decompose design question to a human BEFORE the terminal action
+      // below (requeue, or the cap-spent leave-for-human fall-through), so the original
+      // triage still proceeds either way. Best-effort: the helper is idempotent (it
+      // scans queue/awaiting-confirm/ + queue/approved/ for the same originalTaskId
+      // and no-ops on a repeat), and any failure must never block the sweep.
+      if (!DRY_RUN) {
+        try {
+          const surfaced = surfaceDecomposeDesignQuestion({
+            title: clip(task.title || nc.openQuestions || task.blockedReason || `decompose-loop: ${id0}`, 200),
+            promptContext: task.promptContext
+              || { source: 'needs-clarification-triage', bucket: 'E-decompose-loop', openQuestions: nc.openQuestions || '', blockedReason: task.blockedReason || '' },
+            originalTaskId: id0,
+            decomposeBlockedAt: (task.stalenessFlag && task.stalenessFlag.at) || now,
+          });
+          if (surfaced) log(`${id0}: bucket E decompose question surfaced -> ${surfaced.filePath}`);
+        } catch (e) {
+          log(`${id0}: surfacing decompose question failed (non-fatal): ${e.message}`);
+        }
+      }
       if ((task.ncTriageAttempts || 0) < MAX_REQUEUES) {
         const adhocPath = path.join(adhocDir, `${id0}.json`);
         if (fs.existsSync(adhocPath)) {
