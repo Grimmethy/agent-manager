@@ -130,7 +130,19 @@ function getConfig() {
   // that hasn't set up a dedicated apply worktree.
   const applyRepoRoot = process.env.AGENT_MANAGER_APPLY_REPO_ROOT || repoRoot;
   const secondBrainDir = getSecondBrainDir();
-  const grepAllowedDirs = (process.env.AGENT_MANAGER_GREP_DIRS || 'frontend/src,backend/src')
+  // Default '.' (the whole repo), not a guessed 'frontend/src,backend/src' split --
+  // root-caused 2026-09-16 via docs/arch-import-pipeline.md's own pre-flight checklist
+  // ("Confirm AGENT_MANAGER_GREP_DIRS actually covers agent-manager's own repo layout...
+  // a silent empty-grep result would make every arch_import draft ungrounded without any
+  // obvious error"): the old default only ever matched a literal frontend+backend split
+  // repo layout, so ANY consumer without that exact structure -- including this package's
+  // own repo before AGENT_MANAGER_GREP_DIRS was added to agent-manager.env -- got a
+  // silent 0-hit grounding search with no error, just quietly ungrounded drafts. A guessed
+  // directory list can never fit every consumer; falling back to the repo root when unset
+  // means grounding at least searches something real instead of silently searching
+  // nothing, and a consumer that wants a narrower/faster scope still sets the env var
+  // exactly as before -- this only changes the UNSET fallback.
+  const grepAllowedDirs = (process.env.AGENT_MANAGER_GREP_DIRS || '.')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
