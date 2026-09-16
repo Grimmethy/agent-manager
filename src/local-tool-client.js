@@ -971,11 +971,16 @@ function queueReviewedTaskTool(pipelineDir, { title, description }) {
   if (typeof description !== 'string' || !description.trim()) return { error: 'queue_reviewed_task requires a non-empty "description" argument' };
   const { domainsPath } = getConfig();
   try {
+    // premiumPriority: true (2026-09-16, Grimmethy: "any tasks that chat is working on
+    // directly should be labelled premium priority") -- every task Chat itself queues
+    // is, by construction, something a human is actively watching Chat work on right
+    // now, not a background-priority idea to triage eventually. See
+    // queueAdhocTask()'s own header for what this field does.
     const { record } = queueAdhocTask(
-      { title, promptContext: { rawText: description, raisedFrom: 'chat' } },
+      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true },
       { pipelineDir, domainsPath },
     );
-    return { queuedTaskId: record.id, message: `Queued as ${record.id} -- it will go through the normal review pipeline (see the Adhoc Tasks tab).` };
+    return { queuedTaskId: record.id, message: `Queued as ${record.id} (premium priority) -- it will go through the normal review pipeline (see the Adhoc Tasks tab).` };
   } catch (e) {
     return { error: `failed to queue task: ${e.message}` };
   }

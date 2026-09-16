@@ -29,6 +29,24 @@ test('queueAdhocTask writes the expected record shape and defaults domain to "de
   assert.ok(fs.existsSync(filePath));
   const onDisk = JSON.parse(fs.readFileSync(filePath, 'utf8'));
   assert.deepEqual(onDisk, record);
+  assert.equal('premiumPriority' in record, false, 'not a blanket default for every caller -- opt-in only');
+});
+
+test('queueAdhocTask sets premiumPriority:true when explicitly requested, omits it otherwise', () => {
+  const dir = tmpPipeline();
+  const domainsPath = path.join(dir, 'task-domains.json');
+
+  const { record: premium } = queueAdhocTask(
+    { title: 'Chat-queued fix', promptContext: { rawText: 'x', raisedFrom: 'chat' }, premiumPriority: true },
+    { pipelineDir: dir, domainsPath },
+  );
+  assert.equal(premium.premiumPriority, true);
+
+  const { record: plain } = queueAdhocTask(
+    { title: 'Plain task', promptContext: { rawText: 'y' } },
+    { pipelineDir: dir, domainsPath },
+  );
+  assert.equal('premiumPriority' in plain, false);
 });
 
 // Port of app.py's default_task_domain() (2026-09-06): picking the first key with no
