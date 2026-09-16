@@ -115,7 +115,7 @@ test('rejectRetryCheck ignores an apply-stage failure (not a review rejection)',
 test('rejectRetryCheck returns an all-zero summary when blockedDir does not exist', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
   const summary = rejectRetryCheck({ blockedDir: path.join(root, 'nope'), pendingDir: path.join(root, 'pending') });
-  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0 });
+  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 });
 });
 
 // --- adhoc-specific routing (2026-08-30) ---------------------------------------------
@@ -183,7 +183,7 @@ test('a non-blocked adhoc task in queue/adhoc/ is left completely alone', () => 
   const task = { id: 'adhoc-fresh', domain: 'adhoc', source: 'manual', history: [] };
   fs.writeFileSync(path.join(d.adhocDir, 'adhoc-fresh.json'), JSON.stringify(task));
   const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
-  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0 });
+  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 });
   assert.ok(fs.existsSync(path.join(d.adhocDir, 'adhoc-fresh.json')));
 });
 
@@ -724,4 +724,80 @@ test('isReviewRejection returns false when reviewInconclusive is set, even with 
 
 test('isReviewRejection returns true for a genuine review rejection (blockedStage:"review", no reviewInconclusive flag)', () => {
   assert.equal(isReviewRejection({ blockedStage: 'review' }), true);
+});
+
+// --- deterministic-review-recovery (2026-09-16) -----------------------------------------
+// Real incident: 2 brain_dump_sort tasks blocked 2026-09-07 by belongsToProject:"Projects"
+// (a Second-Brain vault folder name mistaken for a tracked project label); a 2026-09-11 fix
+// auto-corrects exactly this to null, but both tasks were non-adhoc, so the OLD "non-adhoc
+// stays in blocked/ forever" exhaustion path stranded them -- found stale 5+ days later,
+// confirmed to pass the CURRENT validator with zero redraft needed.
+
+const { registerTaskSource, clearRegistry } = require('./task-source-registry.js');
+
+function setupDirsWithApproved() {
+  const d = setupDirs();
+  const approvedDir = path.join(d.root, 'queue', 'approved');
+  fs.mkdirSync(approvedDir, { recursive: true });
+  return { ...d, approvedDir };
+}
+
+test('deterministic-review-recovery: a blocked task whose source rule now passes is auto-approved, no redraft', () => {
+  clearRegistry();
+  registerTaskSource('fake_det_review', {
+    priority: 1,
+    next: () => null,
+    deterministicReview: true,
+    deterministicReviewValidate: (task) => (task.implementResponse === 'good' ? { ok: true } : { ok: false, reason: 'bad' }),
+  });
+  const { blockedDir, pendingDir, approvedDir } = setupDirsWithApproved();
+  writeBlockedTask(blockedDir, 'dr-1', {
+    source: 'fake_det_review', localRejectCount: 2, implementResponse: 'good',
+    blockedReason: 'Deterministic review: the old, now-fixed rule',
+  });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.recovered, 1);
+  assert.equal(summary.requeued, 0);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'dr-1.json')), 'moved out of blocked/');
+  assert.ok(fs.existsSync(path.join(approvedDir, 'dr-1.json')), 'landed in approved/');
+  const moved = JSON.parse(fs.readFileSync(path.join(approvedDir, 'dr-1.json'), 'utf8'));
+  assert.equal(moved.blockedReason, undefined);
+  assert.equal(moved.blockedStage, undefined);
+  assert.equal(moved.reviewProvider, 'deterministic-review-recovery');
+  assert.ok(moved.history.some((h) => h.stage === 'approved' && /deterministic-review-recovery/.test(h.detail)));
+  clearRegistry();
+});
+
+test('deterministic-review-recovery: a blocked task whose source rule STILL fails falls through to the normal retry/exhaust path, untouched by recovery', () => {
+  clearRegistry();
+  registerTaskSource('fake_det_review', {
+    priority: 1,
+    next: () => null,
+    deterministicReview: true,
+    deterministicReviewValidate: () => ({ ok: false, reason: 'still bad' }),
+  });
+  const { blockedDir, pendingDir, approvedDir } = setupDirsWithApproved();
+  writeBlockedTask(blockedDir, 'dr-2', { source: 'fake_det_review', localRejectCount: 0, implementResponse: 'still-bad' });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.recovered, 0);
+  assert.equal(summary.requeued, 1, 'still under the retry cap -- normal requeue path handles it');
+  assert.ok(!fs.existsSync(path.join(approvedDir, 'dr-2.json')));
+  clearRegistry();
+});
+
+test('deterministic-review-recovery: a source with no deterministicReviewValidate registered is unaffected (ordinary requeue)', () => {
+  clearRegistry();
+  const { blockedDir, pendingDir, approvedDir } = setupDirsWithApproved();
+  writeBlockedTask(blockedDir, 'dr-3', { source: 'manual', localRejectCount: 0 });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.recovered, 0);
+  assert.equal(summary.requeued, 1);
+  clearRegistry();
 });
