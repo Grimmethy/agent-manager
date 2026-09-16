@@ -725,3 +725,32 @@ test('isReviewRejection returns false when reviewInconclusive is set, even with 
 test('isReviewRejection returns true for a genuine review rejection (blockedStage:"review", no reviewInconclusive flag)', () => {
   assert.equal(isReviewRejection({ blockedStage: 'review' }), true);
 });
+
+test('requeue clears adhocNoChangesClaimFeedback but preserves coordination flags', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'adhoc-sentinel', domain: 'adhoc', source: 'manual', blockedStage: 'review',
+    localRejectCount: 0, history: [],
+    retryableDraftBlock: true,
+    adhocNoChangesClaimFeedback: 'should-be-cleared',
+    // Coordination flag set by the decompose/rescope path (resolveAgenticDraft) -- the
+    // GUARD at the requeue-delete site in reject-retry-check.js forbids a blanket
+    // delete here; this test pins that guard.
+    decomposeDirective: 'sentinel-must-survive',
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-sentinel.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.ok(!fs.existsSync(path.join(d.blockedDir, 'adhoc-sentinel.json')), 'moved out of queue/blocked/');
+  assert.ok(fs.existsSync(path.join(d.adhocDir, 'adhoc-sentinel.json')), 'lands in queue/adhoc/');
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-sentinel.json'), 'utf8'));
+  // The feedback value must be CLEARED from the requeued file...
+  assert.equal(out.adhocNoChangesClaimFeedback, undefined, 'adhocNoChangesClaimFeedback must not survive the requeue');
+  // ...and its value must be preserved in priorRejectionFeedback for the next pass.
+  assert.ok(Array.isArray(out.priorRejectionFeedback), 'priorRejectionFeedback must be an array');
+  assert.ok(out.priorRejectionFeedback.includes('should-be-cleared'), 'original feedback value must be present in priorRejectionFeedback');
+  // ...while the coordination sentinel must reach the next pass intact.
+  assert.equal(out.decomposeDirective, 'sentinel-must-survive', 'decomposeDirective must survive the requeue');
+});
