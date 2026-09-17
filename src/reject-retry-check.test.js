@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure } = require('./reject-retry-check.js');
+const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock } = require('./reject-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
@@ -983,6 +983,58 @@ test('rejectRetryCheck exhausts a non-adhoc generic draft-call failure at the re
   writeBlockedTask(blockedDir, 'task-1', {
     blockedStage: 'draft',
     blockedReason: 'draft call failed 5 times in a row -- giving up rather than retrying every tick forever',
+    localRejectCount: 2,
+  });
+  const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')), 'non-adhoc exhausted task stays in blocked/');
+  assert.ok(!fs.existsSync(path.join(needsClarificationDir, 'task-1.json')));
+});
+
+// 2026-09-17: blockedStage:'plan' -- local-draft.js's plan-pass degenerate check used
+// to set NO blockedStage at all (nor flip task.status off 'pending'), so it was
+// invisible to every check in this file. See isPlanDegenerateBlock's own header.
+
+test('isPlanDegenerateBlock recognizes blockedStage:plan', () => {
+  assert.equal(isPlanDegenerateBlock({ blockedStage: 'plan' }), true);
+  assert.equal(isPlanDegenerateBlock({ blockedStage: 'draft' }), false);
+  assert.equal(isPlanDegenerateBlock({}), false);
+});
+
+test('rejectRetryCheck requeues a plan-degenerate block under the retry cap, even though task.status was left at pending', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    status: 'pending', // local-draft.js's real behavior: never flipped to 'blocked'
+    blockedStage: 'plan',
+    blockedReason: 'Plan pass degenerate: truncated',
+    localRejectCount: 0,
+    planResponse: 'a truncated, unusable plan',
+  });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')));
+  const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-1.json'), 'utf8'));
+  assert.equal(requeued.localRejectCount, 1);
+  assert.equal(requeued.planResponse, undefined, 'stale degenerate plan must not survive the requeue');
+  assert.ok(requeued.priorRejectionFeedback.some((f) => /degenerate/.test(f)));
+  assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /plan-pass degenerate/.test(h.detail || '')));
+});
+
+test('rejectRetryCheck exhausts a non-adhoc plan-degenerate block at the retry cap without escalating', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    status: 'pending',
+    blockedStage: 'plan',
+    blockedReason: 'Plan pass degenerate: truncated',
     localRejectCount: 2,
   });
   const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');

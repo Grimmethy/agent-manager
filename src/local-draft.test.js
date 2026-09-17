@@ -2989,6 +2989,10 @@ test('arch_review (candidate-fulfillment): the plan call is NOT allowed to be em
     assert.notEqual(planOpts[0].allowEmpty, true, 'arch_review has a specific candidate to implement -- an empty plan there is a real model failure');
     assert.equal(result.blocked, true);
     assert.match(result.blockedReason, /Plan pass degenerate: empty/);
+    // 2026-09-17: this used to carry NO blockedStage at all -- invisible to reject-
+    // retry-check.js's entry gate, so a task landing here sat in queue/blocked/ forever
+    // with zero automated retry. See reject-retry-check.js's isPlanDegenerateBlock.
+    assert.equal(result.blockedStage, 'plan');
   });
 });
 

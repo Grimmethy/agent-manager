@@ -223,6 +223,23 @@ function isStructurallyOversizedDraftFailure(task) {
   return isDraftFailureBlock(task) && DRAFT_STRUCTURALLY_OVERSIZED_RE.test(String(task.blockedReason || ''));
 }
 
+// 2026-09-17: local-draft.js's plan-pass degenerate check (planResult.degenerate --
+// "truncated" or "empty", after its own internal reroll-at-higher-temperature already
+// failed to produce a usable plan) used to set NO blockedStage at all -- invisible to
+// every check in this file (isReviewRejection/retryableDraftBlock/isPreCritiqueBlock/
+// isDraftFailureBlock all miss it), and the task's own `status` field is often left at
+// 'pending' too (never flipped to 'blocked'), even though the FILE sits in queue/blocked/.
+// Confirmed live: 2 of 4 currently-stuck coordinator-hub children in Hub Tasks were
+// gated on exactly this shape, and the fix's own code comments elsewhere in this
+// codebase cite "21 of ~99 blocked tasks" hitting it historically -- likely the single
+// highest-volume unrecognized block shape found this session. A blind retry is exactly
+// as appropriate here as for a review rejection or a generic draft-call failure: this is
+// model variance (the SAME plan-pass reroll-and-still-degenerate shape reject-retry-
+// check.js already treats as retryable everywhere else), not a structural dead end.
+function isPlanDegenerateBlock(task) {
+  return task.blockedStage === 'plan';
+}
+
 // Same reasoning as queue-watchdog.ps1's arch_discovery/arch_import stamping (not ported
 // here, see header) -- deep_dive's own coverage tracker: without this, a community whose
 // task exhausts its retries stays eligible for nextDeepDiveTask() to re-select FOREVER
@@ -373,7 +390,8 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
       const preCritiqueBlock = isPreCritiqueBlock(task);
       const draftFailureBlock = isDraftFailureBlock(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !draftFailureBlock) continue;
+      const planDegenerateBlock = isPlanDegenerateBlock(task);
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !draftFailureBlock && !planDegenerateBlock) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -660,6 +678,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           '',
           'Try again from a clean pass.',
         ].join('\n'));
+      } else if (planDegenerateBlock) {
+        priorFeedback.push([
+          'A prior plan pass produced a degenerate (truncated or empty) plan even after an internal higher-temperature reroll:',
+          '',
+          String(task.blockedReason || ''),
+          '',
+          'Try a fresh plan pass. Keep the plan concrete and complete -- do not truncate mid-thought.',
+        ].join('\n'));
       } else {
         priorFeedback.push(String(task.blockedReason || ''));
       }
@@ -721,6 +747,13 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         delete task.planResponse;
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'draft-call failure -- cleared stale plan/implement state for fresh redraft');
+      } else if (planDegenerateBlock) {
+        // The plan itself is what was degenerate -- nothing usable to carry forward.
+        // implementResponse never even ran yet at this stage, but clear it too in case a
+        // PRIOR cycle's stale value is still sitting on the record.
+        delete task.planResponse;
+        delete task.implementResponse;
+        appendHistoryEvent(task, 'requeued', 'plan-pass degenerate -- cleared stale plan state for a fresh plan pass');
       }
 
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
@@ -760,7 +793,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, computeBlockSignature };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, computeBlockSignature };
 
 if (require.main === module) {
   main();

@@ -665,7 +665,14 @@ async function runPlanPass(task, {
     const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
     recordPlan(attempt, { degenerate: planResult.degenerate, attempts: totalAttempts });
     appendHistoryEvent(task, 'blocked', blockedReason);
-    return { blocked: true, blockedReason };
+    // 2026-09-17: this used to set no blockedStage at all -- invisible to reject-retry-
+    // check.js's entry gate (isReviewRejection/retryableDraftBlock/isPreCritiqueBlock/
+    // isDraftFailureBlock all miss it), so a task landing here via 'blocked' with
+    // status left at 'pending' (never even flipped to 'blocked') just sat in queue/
+    // blocked/ forever with zero automated retry -- confirmed live: 2 of 4 stuck-child
+    // hubs in Hub Tasks were gated on exactly this shape. 'plan' is deliberately not
+    // 'review'/'apply'/'pre-critique'/'draft' so none of those checks accidentally match it.
+    return { blocked: true, blockedReason, blockedStage: 'plan' };
   }
 
   const stillThin = substanceGated && planIsThin(planResult.response);
@@ -1265,7 +1272,10 @@ async function runDraftPasses(task, attempt, {
         maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn, recordModelCall,
       });
       if (planOutcome.blocked) {
-        return { succeeded: true, blocked: true, blockedReason: planOutcome.blockedReason };
+        // blockedStage must propagate here -- dropping it (the previous behavior) is
+        // exactly what made a plan-pass-degenerate block invisible to reject-retry-
+        // check.js's entry gate even after runPlanPass started setting blockedStage:'plan'.
+        return { succeeded: true, blocked: true, blockedReason: planOutcome.blockedReason, blockedStage: planOutcome.blockedStage };
       }
 
       const literalEditResult = tryDeterministicLiteralEdit(task, attempt);
@@ -1292,7 +1302,7 @@ async function runDraftPasses(task, attempt, {
               maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt, runOrientPassFn,
             });
             delete task._planCritiqueFeedback;
-            if (rePlan.blocked) return { succeeded: true, blocked: true, blockedReason: rePlan.blockedReason };
+            if (rePlan.blocked) return { succeeded: true, blocked: true, blockedReason: rePlan.blockedReason, blockedStage: rePlan.blockedStage };
           }
         } catch (e) {
           appendHistoryEvent(task, 'advisory', `plan-critique errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
