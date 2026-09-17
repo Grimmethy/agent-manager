@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock } = require('./reject-retry-check.js');
+const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission } = require('./reject-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
@@ -1046,4 +1046,65 @@ test('rejectRetryCheck exhausts a non-adhoc plan-degenerate block at the retry c
   assert.equal(summary.requeued, 0);
   assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')), 'non-adhoc exhausted task stays in blocked/');
   assert.ok(!fs.existsSync(path.join(needsClarificationDir, 'task-1.json')));
+});
+
+// 2026-09-17: every escalation site here used to check "has this task EVER, in its
+// whole lifetime, carried a needs-clarification stage" -- correct the first time, but
+// permanently wrong once a task is legitimately re-admitted and exhausts AGAIN. Root-
+// caused live against the real blocked/ backlog: dozens of tasks stuck in exactly this
+// shape. See alreadyEscalatedSinceLastReadmission's own header.
+
+test('alreadyEscalatedSinceLastReadmission: false when a task has never been escalated', () => {
+  assert.equal(alreadyEscalatedSinceLastReadmission({ history: [{ stage: 'created' }, { stage: 'draft-started' }] }), false);
+  assert.equal(alreadyEscalatedSinceLastReadmission({ history: [] }), false);
+  assert.equal(alreadyEscalatedSinceLastReadmission({}), false);
+});
+
+test('alreadyEscalatedSinceLastReadmission: true right after an escalation, with nothing since proving a fresh cycle began', () => {
+  const task = { history: [
+    { stage: 'created' }, { stage: 'exhausted' }, { stage: 'needs-clarification' },
+  ] };
+  assert.equal(alreadyEscalatedSinceLastReadmission(task), true);
+});
+
+test('alreadyEscalatedSinceLastReadmission: false once a fresh draft-started cycle began AFTER the escalation -- eligible to escalate again', () => {
+  const task = { history: [
+    { stage: 'created' }, { stage: 'exhausted' }, { stage: 'needs-clarification' },
+    { stage: 'requeued', detail: 'needs-clarification-triage: requeued for a fresh attempt' },
+    { stage: 'draft-started' }, { stage: 'plan-done' }, { stage: 'blocked' },
+  ] };
+  assert.equal(alreadyEscalatedSinceLastReadmission(task), false, 'a draft-started cycle after the escalation proves this is a NEW exhaustion, not the old one');
+});
+
+test('alreadyEscalatedSinceLastReadmission: only the MOST RECENT escalation matters, even with an older one further back', () => {
+  const task = { history: [
+    { stage: 'needs-clarification' }, // escalation #1, long ago
+    { stage: 'draft-started' }, { stage: 'blocked' }, // re-admitted, fresh cycle
+    { stage: 'needs-clarification' }, // escalation #2, current -- nothing after it
+  ] };
+  assert.equal(alreadyEscalatedSinceLastReadmission(task), true, 'the SECOND escalation has nothing after it -- correctly still "already escalated"');
+});
+
+test('rejectRetryCheck re-escalates an adhoc task that exhausted a SECOND time after being legitimately re-admitted from needs-clarification', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    domain: 'adhoc', source: 'manual',
+    localRejectCount: 2,
+    history: [
+      { stage: 'created' },
+      { stage: 'exhausted', detail: '2/2 retries used' },
+      { stage: 'needs-clarification', detail: 'escalated to a human after exhausting redraft retries' },
+      { stage: 'requeued', detail: 'needs-clarification-triage: requeued for a fresh attempt' },
+      { stage: 'draft-started' },
+      { stage: 'blocked' },
+    ],
+  });
+  const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')), 'must move OUT of blocked/ this time -- not silently stay forever');
+  assert.ok(fs.existsSync(path.join(needsClarificationDir, 'task-1.json')), 'the SECOND exhaustion must reach a human -- the bug was refusing to re-escalate here');
 });
