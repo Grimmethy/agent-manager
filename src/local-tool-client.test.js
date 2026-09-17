@@ -1217,6 +1217,52 @@ test('runPlanWithTools does not nudge normal, non-narrating final content (regre
   });
 });
 
+// --- CONTEXT-LOG compliance nudge (needs-clarification, adhoc-add-a-bounded-context-log-
+// compliance-nudge-to-runplanwithtools) -- mirrors the narration-nudge tests above --------
+
+test('runPlanWithTools nudges once when CONTEXT-LOG is missing from a contextLogSessionId run, then accepts the compliant follow-up', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'Here is my answer with no log block.' },
+    { role: 'assistant', content: 'Here is my answer.\nCONTEXT-LOG: did the thing' },
+  ], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5, contextLogSessionId: 'sess-1' });
+    // The non-compliant first reply must never be returned as final -- the SECOND
+    // (compliant) turn's content wins, but the CONTEXT-LOG: block is then stripped from
+    // the response by the existing extractContextLog() post-processing (see this file's
+    // own contextLogSessionId branch just above runForcedSummaryTurn) before it reaches
+    // the caller, so the final response is the clean text, not the tag itself.
+    assert.equal(result.response, 'Here is my answer.', 'must be the SECOND turn\'s (compliant) content, log-stripped -- not the first, non-compliant reply');
+    assert.equal(result.turnsUsed, 2, 'the nudge consumes one real turn from the budget');
+    const secondCallMessages = sentBodies[1].messages;
+    assert.match(secondCallMessages[secondCallMessages.length - 1].content, /forgot the mandatory CONTEXT-LOG/i);
+  });
+});
+
+test('runPlanWithTools does not fire the CONTEXT-LOG nudge when contextLogSessionId is unset', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'answer with no log block' }], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5 });
+    assert.equal(result.response, 'answer with no log block');
+    assert.equal(result.turnsUsed, 1, 'no nudge turn spent when the caller never opted in');
+  });
+});
+
+test('runPlanWithTools fires the CONTEXT-LOG nudge at most once per run, then accepts the still-missing block rather than nudging forever', async () => {
+  const noLog = { role: 'assistant', content: 'still no log block' };
+  await withMockedChat([noLog, noLog], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5, contextLogSessionId: 'sess-1' });
+    assert.equal(result.response, 'still no log block', 'after the one-shot nudge, a second miss is accepted rather than nudged again');
+    assert.equal(result.turnsUsed, 2, 'one nudged turn plus the one that was finally accepted');
+  });
+});
+
+test('runPlanWithTools does not nudge when CONTEXT-LOG is already present (regression guard)', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'answer\nCONTEXT-LOG: already compliant' }], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 5, contextLogSessionId: 'sess-1' });
+    assert.equal(result.turnsUsed, 1, 'no nudge turn spent when the block is already there');
+    assert.equal(sentBodies.length, 1);
+  });
+});
+
 // --- multi-root (2026-08-31, system-wide Chat panel) ---------------------------------
 
 test('resolveInsideRoots: a relative path resolves against the primary (first) root', () => {

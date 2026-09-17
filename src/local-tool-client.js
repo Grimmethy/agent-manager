@@ -1662,6 +1662,16 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const MAX_NARRATION_NUDGES = 2;
   const NARRATION_NUDGE_MESSAGE = 'You just described taking an action ("let me check/look at/read/..." or similar) without actually calling the corresponding tool in this same turn. Either make the real tool call right now, or -- if you already have everything you need -- give your complete final answer now with no further hedging. Do not describe an action again without also calling it.';
 
+  // CONTEXT-LOG compliance nudge (needs-clarification, adhoc-add-a-bounded-context-log-
+  // compliance-nudge-to-runplanwithtools): mirrors the narration-nudge shape above -- a
+  // bounded, one-shot corrective nudge, but for a caller-opted-in session
+  // (contextLogSessionId set) whose final no-tool-calls response is missing the mandatory
+  // CONTEXT-LOG: block. Fires at most once per run (contextLogNudgeFired), independent of
+  // narrationNudges' own budget -- the two correct unrelated omissions and neither should
+  // starve the other's one chance.
+  let contextLogNudgeFired = false;
+  const CONTEXT_LOG_NUDGE_MESSAGE = 'You forgot the mandatory CONTEXT-LOG: block. Add it now, at the end of your response.';
+
   // Extended-context opt-in (sibling tasks "Extend imports for extended context" /
   // "Thread parameter through chatTurnWithFlakeRecovery" provide ensureHeadroomForExtendedContext,
   // EXTENDED_NUM_CTX and the chatTurnWithFlakeRecovery parameter). Once per run, before
@@ -1770,6 +1780,16 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
           && NARRATION_WITHOUT_TOOL_CALL_RE.test(content)) {
         narrationNudges += 1;
         messages.push({ role: 'user', content: NARRATION_NUDGE_MESSAGE });
+        continue;
+      }
+      // CONTEXT-LOG compliance nudge -- checked after the narration nudge (a narrated,
+      // uncalled action is the more specific/correctable case) but still ahead of
+      // forceSummaryOnCap below, same reasoning: this is a more targeted correction than
+      // a generic "no RESOLUTION line" forced summary.
+      if (contextLogSessionId && !contextLogNudgeFired && turn < maxTurns - 1
+          && !content.includes('CONTEXT-LOG:')) {
+        contextLogNudgeFired = true;
+        messages.push({ role: 'user', content: CONTEXT_LOG_NUDGE_MESSAGE });
         continue;
       }
       // forceSummaryOnCap, voluntary-stop case (bra-1788142124203 follow-up): the model can
