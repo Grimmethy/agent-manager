@@ -202,6 +202,27 @@ function isPreCritiqueBlock(task) {
   return task.blockedStage === 'pre-critique';
 }
 
+// 2026-09-17: blockedStage:'draft' -- stamped by scripts/local-worker.sh (bash), NOT any
+// src/*.js file, which is why the pre-critique audit above (grep -r on src/*.js) missed
+// it entirely: same "invisible to this whole sweep" shape, from a different half of the
+// codebase. Two distinct failure shapes share this one stage:
+//   - "STRUCTURALLY OVERSIZED" (short-circuited to blocked/ on the FIRST draft attempt
+//     when adhoc-agentic-draft.js's own internal turn-budget retry already ran out of
+//     turns twice in a row) -- the mechanism's OWN comment says a bigger budget alone
+//     won't fix this, so a blind retry would just reproduce the identical timeout. This
+//     needs a human decompose/scope decision, never a redraft attempt.
+//   - the generic "draft call failed N times in a row ... giving up rather than
+//     retrying every tick forever" (DRAFT_FAILURE_RETRY_LIMIT exhausted, non-infra) --
+//     an ordinary content/model-variance failure that plausibly DOES differ on a fresh
+//     pass, so this gets the same bounded blind retry as every other retryable block.
+const DRAFT_STRUCTURALLY_OVERSIZED_RE = /STRUCTURALLY OVERSIZED/i;
+function isDraftFailureBlock(task) {
+  return task.blockedStage === 'draft';
+}
+function isStructurallyOversizedDraftFailure(task) {
+  return isDraftFailureBlock(task) && DRAFT_STRUCTURALLY_OVERSIZED_RE.test(String(task.blockedReason || ''));
+}
+
 // Same reasoning as queue-watchdog.ps1's arch_discovery/arch_import stamping (not ported
 // here, see header) -- deep_dive's own coverage tracker: without this, a community whose
 // task exhausts its retries stays eligible for nextDeepDiveTask() to re-select FOREVER
@@ -351,7 +372,8 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // adhoc -> needs-clarification escalation as a stuck review rejection.
       const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
       const preCritiqueBlock = isPreCritiqueBlock(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock) continue;
+      const draftFailureBlock = isDraftFailureBlock(task);
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !draftFailureBlock) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -442,6 +464,30 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         if (path.resolve(filePath) !== path.resolve(newPath)) fs.unlinkSync(filePath);
         summary.requeued++;
         continue;
+      }
+
+      // A structurally-oversized draft-call failure: the mechanism that stamped it
+      // (local-worker.sh) already knows a blind retry would just reproduce the identical
+      // turn-exhaustion timeout, so this always needs a human decompose/scope decision.
+      // Checked before classifyBlockedTask so its generic non-retryable escalation
+      // (built for a different set of categories, and keyed on blockedReason text this
+      // shape wouldn't reliably match anyway) cannot pre-empt this specific, better-
+      // targeted one -- same discipline as the invalidPremiseBeforeCheckExisted check above.
+      if (isStructurallyOversizedDraftFailure(task) && needsClarificationDir) {
+        const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+        if (!alreadyEscalated) {
+          task.needsClarification = {
+            reason: 'design-decision',
+            openQuestions: `A draft attempt ran out of turns twice in a row on the very first pass -- the task is likely too large for one pass:\n\n${String(task.blockedReason || '')}\n\nDecide whether to split this into smaller sub-tasks (and how), or narrow the scope.`,
+          };
+          appendHistoryEvent(task, 'needs-clarification', 'escalated immediately -- structurally-oversized draft-call failure, a blind retry cannot differ');
+          if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'reject-retry-check:structurally-oversized-draft-failure', pipelineDir: ghostRoot });
+          fs.mkdirSync(needsClarificationDir, { recursive: true });
+          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+          fs.unlinkSync(filePath);
+          summary.exhausted++;
+          continue;
+        }
       }
 
       // Unified fault-side escalation (src/blocked-task-classifiers.js), replacing what
@@ -603,6 +649,17 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           '',
           'Only reference files that are actually present in the repo (verify with a tool call before citing one). If this task genuinely requires a brand-new file, create it with write_file/edit_file in create mode -- do not just describe or reference it as if it already exists.',
         ].join('\n'));
+      } else if (draftFailureBlock) {
+        // Reaching here means NOT structurally-oversized (that shape escalated straight to
+        // needs-clarification above, before this point) -- an ordinary content/model-
+        // variance draft-CALL failure, which plausibly differs on a fresh attempt.
+        priorFeedback.push([
+          'A prior draft attempt failed outright (not a content rejection or a design question) after repeated tries:',
+          '',
+          String(task.blockedReason || ''),
+          '',
+          'Try again from a clean pass.',
+        ].join('\n'));
       } else {
         priorFeedback.push(String(task.blockedReason || ''));
       }
@@ -651,6 +708,19 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         // is kept: the plan itself wasn't what named the nonexistent file.
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'pre-critique missing-file block -- cleared stale implementResponse for fresh redraft');
+      } else if (draftFailureBlock && !retryableDraftBlock) {
+        // retryableDraftBlock excluded: an adhoc draft-stage block ALSO happens to use the
+        // literal blockedStage value 'draft' in places (unrelated to this bash-side stamp,
+        // just a coincidentally-shared label) -- that shape's own priorFeedback branch above
+        // already ran and deliberately keeps plan/implement state (e.g. a continuation's
+        // priorPartialDiff to build on), so it must not be clobbered here too.
+        //
+        // The draft CALL itself failed -- unlike a review/pre-critique rejection (a real
+        // response the model produced, just a bad one), there is no reliable partial state
+        // worth keeping here.
+        delete task.planResponse;
+        delete task.implementResponse;
+        appendHistoryEvent(task, 'requeued', 'draft-call failure -- cleared stale plan/implement state for fresh redraft');
       }
 
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
@@ -690,7 +760,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, computeBlockSignature };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, computeBlockSignature };
 
 if (require.main === module) {
   main();
