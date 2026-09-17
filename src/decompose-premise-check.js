@@ -40,6 +40,24 @@ const path = require('path');
 const PATH_RE = /`?((?:src|python|scripts|lib|docs)\/[\w./-]+\.\w{1,5})`?/g;
 const LINE_REF_RE = /(?:~?\s*line\s+|:)(\d{2,6})\b/gi;
 
+// ISO-8601 timestamps (as appended by the "HUMAN DESIGN DECISION (answered directly from
+// the Needs Clarification picker/Discuss/Chat, <timestamp>):" answer stamps -- see
+// task.py's api_task_answer_clarification/api_task_resolve_clarification and
+// api_discuss_end) look exactly like a real line citation to LINE_REF_RE's bare ":NN"
+// alternative: "2026-09-16T23:19:11.363748+00:00" contains ":19", ":11", ":00" -- each a
+// spurious "line 19"/"line 11"/"line 00" match. Root-caused live: a decompose sub-task
+// with no real line reference anywhere in its OWN task text ("Create scripts/check-doc-
+// link.sh...") was wrongly flagged stale-premise purely because its OWN answer stamp's
+// timestamp supplied the phantom line references, which then attributed (via
+// nearestPathFor) to the one real path mentioned in the text -- a file the task's whole
+// point was to CREATE, so of course it "does not exist in the repo" yet. Masked out
+// (same length, so match indices used by nearestPathFor stay aligned with the original
+// text) before line-ref matching.
+const ISO_TIMESTAMP_RE = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})/g;
+function maskTimestamps(text) {
+  return text.replace(ISO_TIMESTAMP_RE, (m) => 'x'.repeat(m.length));
+}
+
 // A cited line more than this many lines past the file's real, current length is treated
 // as impossible -- generous slack (a task citing "line 1651" against a 1600-line file is
 // plausibly just a rough/rounded estimate, not a stale premise) rather than flagging
@@ -76,7 +94,7 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
   }
   if (!paths.length) return null;
 
-  const lineRefs = [...rawText.matchAll(LINE_REF_RE)].map((m) => ({ line: Number(m[1]), index: m.index }));
+  const lineRefs = [...maskTimestamps(rawText).matchAll(LINE_REF_RE)].map((m) => ({ line: Number(m[1]), index: m.index }));
   if (!lineRefs.length) return null;
 
   // Rough association: a line reference belongs to the nearest file path mentioned at or
@@ -126,4 +144,4 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
   };
 }
 
-module.exports = { detectStaleDecomposePremise, PATH_RE, LINE_REF_RE, LINE_OVERSHOOT_SLACK };
+module.exports = { detectStaleDecomposePremise, PATH_RE, LINE_REF_RE, LINE_OVERSHOOT_SLACK, maskTimestamps };
