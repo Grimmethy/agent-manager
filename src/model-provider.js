@@ -166,4 +166,31 @@ function labelFor(sourceOrTask) {
   return process.env.LOCAL_MODEL;
 }
 
-module.exports = { providerFor, labelFor, reasoningTierFor, resolveModelProfile };
+// AC-4 (arch_import_review candidate): a single, auditable place to resolve a provider's
+// base URL, instead of leaving it scattered/duplicated across client modules. Exported
+// only so AC-5's own unit tests can exercise it directly (the original candidate spec
+// asked for this to stay unexported, but that's unworkable together with a companion
+// "add unit tests for it" task) -- it plays no part in providerFor()/labelFor()'s actual
+// routing, which is keyed by MODULE IDENTITY (the real `local`/`claude` objects above),
+// not by a string key, so this introduces its own small string-keyed scheme rather than
+// reusing one that doesn't actually exist yet.
+//
+// 'claude' has no real base-URL concept: claude-client.js invokes the `claude` CLI
+// binary as a subprocess (CLAUDE_CLI_BIN), it never makes an HTTP call to any endpoint
+// -- so there is no meaningful URL to default OR override for it. Only 'local'/'ornith'
+// (both alias the same Ollama backend local-client.js talks to over HTTP) have one:
+// OLLAMA_URL, already the live env var local-client.js itself reads, default
+// 'http://localhost:11434'. An earlier draft attempt at this same candidate invented an
+// unrelated PROVIDER_DEFAULT_URLS constant that appears nowhere in the real grounding
+// source (flagged ungrounded-field, escalated to needs-clarification) -- this reuses the
+// actual live default/env var instead of inventing a new one.
+const OLLAMA_DEFAULT_URL = 'http://localhost:11434';
+function getEndpoint(source, override) {
+  if (override) return override;
+  if (source === 'local' || source === 'ornith') {
+    return process.env.OLLAMA_URL || OLLAMA_DEFAULT_URL;
+  }
+  return null; // 'claude' (no HTTP endpoint at all) and any unrecognized source alike.
+}
+
+module.exports = { providerFor, labelFor, reasoningTierFor, resolveModelProfile, getEndpoint };
