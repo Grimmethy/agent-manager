@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock } = require('./reject-retry-check.js');
+const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure } = require('./reject-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
@@ -917,4 +917,81 @@ test('rejectRetryCheck exhausts a non-adhoc pre-critique block at the retry cap 
   assert.ok(!fs.existsSync(path.join(needsClarificationDir, 'task-1.json')));
   const stayed = JSON.parse(fs.readFileSync(path.join(blockedDir, 'task-1.json'), 'utf8'));
   assert.ok(stayed.history.some((h) => h.stage === 'exhausted'));
+});
+
+// 2026-09-17: blockedStage:'draft' -- stamped directly by scripts/local-worker.sh (bash),
+// not any src/*.js file, so it was missed by the earlier pre-critique audit too (which only
+// grepped src/*.js). Same "invisible to this whole sweep" shape as pre-critique, but from a
+// different half of the codebase. See isDraftFailureBlock's own header.
+
+test('isDraftFailureBlock / isStructurallyOversizedDraftFailure recognize blockedStage:draft and the oversized reason text', () => {
+  assert.equal(isDraftFailureBlock({ blockedStage: 'draft' }), true);
+  assert.equal(isDraftFailureBlock({ blockedStage: 'review' }), false);
+  assert.equal(isStructurallyOversizedDraftFailure({ blockedStage: 'draft', blockedReason: 'STRUCTURALLY OVERSIZED: ran out of turns twice' }), true);
+  assert.equal(isStructurallyOversizedDraftFailure({ blockedStage: 'draft', blockedReason: 'draft call failed 5 times in a row' }), false);
+  assert.equal(isStructurallyOversizedDraftFailure({ blockedStage: 'review', blockedReason: 'STRUCTURALLY OVERSIZED' }), false);
+});
+
+test('rejectRetryCheck escalates a structurally-oversized draft failure straight to needs-clarification, never blind-retrying it', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    blockedStage: 'draft',
+    blockedReason: 'STRUCTURALLY OVERSIZED: draft call ran out of turns twice in a row on the very first attempt',
+    localRejectCount: 0,
+  });
+  const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')));
+  assert.ok(fs.existsSync(path.join(needsClarificationDir, 'task-1.json')));
+  const escalated = JSON.parse(fs.readFileSync(path.join(needsClarificationDir, 'task-1.json'), 'utf8'));
+  assert.equal(escalated.needsClarification.reason, 'design-decision');
+  assert.match(escalated.needsClarification.openQuestions, /ran out of turns twice/);
+  assert.ok(escalated.history.some((h) => h.stage === 'needs-clarification' && /structurally-oversized/.test(h.detail || '')));
+});
+
+test('rejectRetryCheck blind-retries a generic (non-oversized) draft-call failure under the retry cap', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    blockedStage: 'draft',
+    blockedReason: 'draft call failed 5 times in a row (most recent: connection reset) -- giving up rather than retrying every tick forever',
+    localRejectCount: 0,
+    planResponse: '# Plan\n1. Do the thing.',
+    implementResponse: 'partial garbage from a crashed call',
+  });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')));
+  const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-1.json'), 'utf8'));
+  assert.equal(requeued.localRejectCount, 1);
+  assert.equal(requeued.planResponse, undefined, 'stale plan must not survive a draft-call-failure requeue');
+  assert.equal(requeued.implementResponse, undefined, 'stale implement response must not survive a draft-call-failure requeue');
+  assert.ok(requeued.priorRejectionFeedback.some((f) => /failed outright/.test(f)));
+  assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /draft-call failure/.test(h.detail || '')));
+});
+
+test('rejectRetryCheck exhausts a non-adhoc generic draft-call failure at the retry cap without escalating', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    blockedStage: 'draft',
+    blockedReason: 'draft call failed 5 times in a row -- giving up rather than retrying every tick forever',
+    localRejectCount: 2,
+  });
+  const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')), 'non-adhoc exhausted task stays in blocked/');
+  assert.ok(!fs.existsSync(path.join(needsClarificationDir, 'task-1.json')));
 });
