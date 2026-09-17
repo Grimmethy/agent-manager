@@ -196,6 +196,27 @@ function cfgEnv() {
 }
 const MIN_RAWTEXT_FOR_REQUEUE = 400;
 
+// Per-bucket requeue-attempt counters (2026-09-16, pipeline hardening): every bucket below
+// used to share ONE flat task.ncTriageAttempts counter gated by MAX_REQUEUES, so a task
+// that burned its one shot on an EARLIER, unrelated bucket (e.g. a generic redraft) was
+// then permanently locked out of every LATER, more targeted repair bucket added
+// afterward -- confirmed live: Bucket K (built specifically to rescue a stuck-but-solvable
+// subset by resubmitting an existing, already-valid decomposition -- no redraft, none of a
+// fresh attempt's risk or cost) could never fire on a task that had already been requeued
+// once by an older, unrelated bucket, since the shared counter was already at its cap.
+// Each bucket now tracks its OWN attempt count under task.ncTriageBucketAttempts, so
+// buckets are independent budgets instead of one shared one that the first bucket to touch
+// a task exhausts for every bucket after it.
+function bucketAttempts(task, bucket) {
+  return (task.ncTriageBucketAttempts && task.ncTriageBucketAttempts[bucket]) || 0;
+}
+function bumpBucketAttempts(task, bucket) {
+  if (!task.ncTriageBucketAttempts) task.ncTriageBucketAttempts = {};
+  const next = bucketAttempts(task, bucket) + 1;
+  task.ncTriageBucketAttempts[bucket] = next;
+  return next;
+}
+
 // The drafter said, in effect, "I was handed nothing to work on". When the task's own
 // rawText is substantial this is a local-model flake on the forced-summary turn, not a
 // real question -- see the header and src/local-tool-client.js:652 (flake rollback).
@@ -423,14 +444,14 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       const isDecompose = task.adhocResolution === 'decompose' && subTasks.length >= 2;
       const hasEvidence = isDecompose && subTasks.some((s) => s && s.title
         && String(task.implementResponse || '').includes(String(s.title).slice(0, 30)));
-      if (isDecompose && !hasEvidence && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+      if (isDecompose && !hasEvidence && bucketAttempts(task, 'K') < MAX_REQUEUES) {
         const reviewDir = path.join(pipelineDir, 'queue', 'review');
         const reviewPath = path.join(reviewDir, `${id0}.json`);
         if (fs.existsSync(reviewPath)) {
           log(`${id0}: bucket K but ${id0}.json already in review/ -- already handled, skipping`);
         } else {
           summary.checked += 1;
-          const attempt = (task.ncTriageAttempts || 0) + 1;
+          const attempt = bucketAttempts(task, 'K') + 1;
           log(`${id0}: bucket K (decompose-review-blind signature) -> repaired in place, sent to review ${attempt}/${MAX_REQUEUES}`);
           summary.requeued += 1;
           if (!DRY_RUN) {
@@ -444,7 +465,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             delete task.claimedAt;
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
-            task.ncTriageAttempts = attempt;
+            bumpBucketAttempts(task, 'K');
             task.status = 'needs-review';
             task.implementResponse = `Decomposed into ${subTasks.length} sub-task(s).\n\n${formatSubTaskProposalsForReview(subTasks)}`;
             appendHistoryEvent(task, 'requeued',
@@ -475,7 +496,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       const id0 = task.id || name.replace(/\.json$/, '');
       const nc0 = task.needsClarification || {};
       if (nc0.reason === 'fabricated-file-path' && task.source === 'arch_discovery'
-        && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        && bucketAttempts(task, 'L') < MAX_REQUEUES) {
         const realPaths = Array.isArray(task.promptContext && task.promptContext.files)
           ? task.promptContext.files.map((f) => f && f.path).filter(Boolean)
           : [];
@@ -491,7 +512,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             log(`${id0}: bucket L but ${id0}.json already in review/ -- already handled, skipping`);
           } else {
             summary.checked += 1;
-            const attempt = (task.ncTriageAttempts || 0) + 1;
+            const attempt = bucketAttempts(task, 'L') + 1;
             log(`${id0}: bucket L (fabricated-file-path near-miss) -> repaired ${repairs.length} path(s), sent to review ${attempt}/${MAX_REQUEUES}`);
             summary.requeued += 1;
             if (!DRY_RUN) {
@@ -510,7 +531,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
               delete task.claimedAt;
               delete task.ncTriageDecision;
               delete task.ncTriageReviewedAt;
-              task.ncTriageAttempts = attempt;
+              bumpBucketAttempts(task, 'L');
               task.status = 'needs-review';
               appendHistoryEvent(task, 'requeued',
                 `needs-clarification-triage: fabricated-file-path near-miss signature -- substituted the real grounded path for ${repairs.map((r) => `"${r.claimed}" -> "${r.real}"`).join(', ')}, sent straight to review ${attempt}/${MAX_REQUEUES}`);
@@ -659,13 +680,13 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
           log(`${id0}: surfacing decompose question failed (non-fatal): ${e.message}`);
         }
       }
-      if ((task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+      if (bucketAttempts(task, 'E') < MAX_REQUEUES) {
         const adhocPath = path.join(adhocDir, `${id0}.json`);
         if (fs.existsSync(adhocPath)) {
           log(`${id0}: bucket E but ${id0}.json already in adhoc/ -- already handled, skipping`);
         } else {
           summary.checked += 1;
-          const attempt = (task.ncTriageAttempts || 0) + 1;
+          const attempt = bucketAttempts(task, 'E') + 1;
           log(`${id0}: bucket E (decompose-loop, not an oversized-file target) -> requeue ${attempt}/${MAX_REQUEUES}`);
           summary.requeued += 1;
           if (!DRY_RUN) {
@@ -675,7 +696,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             delete task.autoDecomposeCount;
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
-            task.ncTriageAttempts = attempt;
+            bumpBucketAttempts(task, 'E');
             appendHistoryEvent(task, 'requeued',
               `needs-clarification-triage: decompose-loop flag but target is not an oversized file (autoroute declines) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
             try {
@@ -706,20 +727,20 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     {
       const id0 = task.id || name.replace(/\.json$/, '');
       const sig = FALSE_CLAIM_RE.test(String(task.blockedReason || '')) || FALSE_CLAIM_RE.test(String(nc.openQuestions || ''));
-      if (sig && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+      if (sig && bucketAttempts(task, 'D') < MAX_REQUEUES) {
         const adhocPath = path.join(adhocDir, `${id0}.json`);
         if (fs.existsSync(adhocPath)) {
           log(`${id0}: bucket D but ${id0}.json already in adhoc/ -- already handled, skipping`);
         } else {
           summary.checked += 1;
-          const attempt = (task.ncTriageAttempts || 0) + 1;
+          const attempt = bucketAttempts(task, 'D') + 1;
           log(`${id0}: bucket D (false completion-claim signature) -> requeue ${attempt}/${MAX_REQUEUES}, now caught earlier by the draft-time verification gate`);
           summary.requeued += 1;
           if (!DRY_RUN) {
             for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
-            task.ncTriageAttempts = attempt;
+            bumpBucketAttempts(task, 'D');
             appendHistoryEvent(task, 'requeued',
               `needs-clarification-triage: false completion-claim signature (draft asserted something the diff/repo contradicts) -- now caught at draft time by adhoc-diff-sanity.js, clean-state retry ${attempt}/${MAX_REQUEUES}`);
             try {
@@ -751,20 +772,20 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       const id0 = task.id || name.replace(/\.json$/, '');
       const isBudgetExhausted = BLOCKER_TYPE_BUDGET_EXHAUSTED_RE.test(oqF)
         || (BUDGET_EXHAUSTED_RE.test(oqF) && COMPLETABLE_NOT_DESIGN_RE.test(oqF));
-      if (isBudgetExhausted && !hasExhaustedF && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+      if (isBudgetExhausted && !hasExhaustedF && bucketAttempts(task, 'F') < MAX_REQUEUES) {
         const adhocPath = path.join(adhocDir, `${id0}.json`);
         if (fs.existsSync(adhocPath)) {
           log(`${id0}: bucket F but ${id0}.json already in adhoc/ -- already handled, skipping`);
         } else {
           summary.checked += 1;
-          const attempt = (task.ncTriageAttempts || 0) + 1;
+          const attempt = bucketAttempts(task, 'F') + 1;
           log(`${id0}: bucket F (turn/context budget exhausted, not a design question) -> requeue ${attempt}/${MAX_REQUEUES}`);
           summary.requeued += 1;
           if (!DRY_RUN) {
             for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
-            task.ncTriageAttempts = attempt;
+            bumpBucketAttempts(task, 'F');
             appendHistoryEvent(task, 'requeued',
               `needs-clarification-triage: drafter explicitly disclaimed any design uncertainty (ran out of turn/context budget mid-mechanical-step) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
             try {
@@ -794,20 +815,20 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       const historyG = Array.isArray(task.history) ? task.history : [];
       const hasExhaustedG = historyG.some((h) => h && h.stage === 'exhausted');
       const id0 = task.id || name.replace(/\.json$/, '');
-      if (BLOCKER_TYPE_INFRA_ERROR_RE.test(oqG) && !hasExhaustedG && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+      if (BLOCKER_TYPE_INFRA_ERROR_RE.test(oqG) && !hasExhaustedG && bucketAttempts(task, 'G') < MAX_REQUEUES) {
         const adhocPath = path.join(adhocDir, `${id0}.json`);
         if (fs.existsSync(adhocPath)) {
           log(`${id0}: bucket G but ${id0}.json already in adhoc/ -- already handled, skipping`);
         } else {
           summary.checked += 1;
-          const attempt = (task.ncTriageAttempts || 0) + 1;
+          const attempt = bucketAttempts(task, 'G') + 1;
           log(`${id0}: bucket G (BLOCKER-TYPE: infra-error, a tool/environment failure, not a design question) -> requeue ${attempt}/${MAX_REQUEUES}`);
           summary.requeued += 1;
           if (!DRY_RUN) {
             for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
-            task.ncTriageAttempts = attempt;
+            bumpBucketAttempts(task, 'G');
             appendHistoryEvent(task, 'requeued',
               `needs-clarification-triage: drafter tagged BLOCKER-TYPE: infra-error (tool/environment failure, not a design question) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
             try {
@@ -846,13 +867,13 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     // found to be buggy), not just this one incident.
     {
       const id0 = task.id || name.replace(/\.json$/, '');
-      if (task.reviewProvider === 'deterministic-truncation-guard' && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+      if (task.reviewProvider === 'deterministic-truncation-guard' && bucketAttempts(task, 'J') < MAX_REQUEUES) {
         const adhocPath = path.join(adhocDir, `${id0}.json`);
         if (fs.existsSync(adhocPath)) {
           log(`${id0}: bucket J but ${id0}.json already in adhoc/ -- already handled, skipping`);
         } else {
           summary.checked += 1;
-          const attempt = (task.ncTriageAttempts || 0) + 1;
+          const attempt = bucketAttempts(task, 'J') + 1;
           log(`${id0}: bucket J (deterministic-truncation-guard false-block signature) -> requeue ${attempt}/${MAX_REQUEUES}, now fixed in validate-implement-truncation.js`);
           summary.requeued += 1;
           if (!DRY_RUN) {
@@ -860,7 +881,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
             delete task.reviewProvider;
-            task.ncTriageAttempts = attempt;
+            bumpBucketAttempts(task, 'J');
             appendHistoryEvent(task, 'requeued',
               `needs-clarification-triage: deterministic-truncation-guard false-block signature (a since-fixed review gate rejected an already-correct implementResponse) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
             try {
@@ -893,18 +914,18 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
 
     // --- Bucket A: degenerate draft -> clean-state requeue -------------------------
     if (DEGENERATE_RE.test(oq) && rawText.length >= MIN_RAWTEXT_FOR_REQUEUE
-        && !hasExhausted && (task.ncTriageAttempts || 0) < MAX_REQUEUES) {
+        && !hasExhausted && bucketAttempts(task, 'A') < MAX_REQUEUES) {
       const adhocPath = path.join(adhocDir, `${id}.json`);
       if (fs.existsSync(adhocPath)) {
         log(`${id}: bucket A but ${id}.json already in adhoc/ -- already handled, skipping`);
         continue;
       }
-      const attempt = (task.ncTriageAttempts || 0) + 1;
+      const attempt = bucketAttempts(task, 'A') + 1;
       log(`${id}: bucket A (degenerate draft, rawText ${rawText.length}c) -> requeue ${attempt}/${MAX_REQUEUES}`);
       summary.requeued += 1;
       if (DRY_RUN) continue;
       for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
-      task.ncTriageAttempts = attempt;
+      bumpBucketAttempts(task, 'A');
       appendHistoryEvent(task, 'requeued',
         `needs-clarification-triage: degenerate "no prior context" draft (rawText intact) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
       try {
