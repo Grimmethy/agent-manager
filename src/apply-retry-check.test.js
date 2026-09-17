@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { applyRetryCheck } = require('./apply-retry-check.js');
+const { applyRetryCheck, isDivergedHistoryFailure } = require('./apply-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-retry-test-'));
@@ -108,4 +108,62 @@ test('applyRetryCheck returns an all-zero summary when queue/blocked/ does not e
     recordModelOutcome: () => {},
   });
   assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0, errorDetails: [] });
+});
+
+// 2026-09-17 (decompose_design_question AC-60/AC-61): git-runner.js's resetToMain()/
+// prepareStackedBranch() throw this exact shape when the working checkout and
+// origin/<main> have each moved ahead independently -- a git-state problem, never
+// fixable by redrafting the diff. See isDivergedHistoryFailure's own header.
+
+const DIVERGED_REASON = "resetToMain: local master and origin/master have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset";
+
+test('isDivergedHistoryFailure recognizes the exact resetToMain/prepareStackedBranch diverged-history wording', () => {
+  assert.equal(isDivergedHistoryFailure({ blockedStage: 'apply', blockedReason: DIVERGED_REASON }), true);
+  assert.equal(isDivergedHistoryFailure({ blockedStage: 'apply', blockedReason: 'git apply failed: patch does not apply' }), false);
+  assert.equal(isDivergedHistoryFailure({ blockedStage: 'review', blockedReason: DIVERGED_REASON }), false, 'must still be a real apply failure, not just matching text on any stage');
+});
+
+test('applyRetryCheck escalates a diverged-history apply failure straight to needs-clarification, never blind-retrying it', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', { blockedReason: DIVERGED_REASON, applyRetryCount: 0 });
+  const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')), 'must not sit in blocked/ burning retries');
+  assert.ok(fs.existsSync(path.join(needsClarificationDir, 'task-1.json')));
+  const escalated = JSON.parse(fs.readFileSync(path.join(needsClarificationDir, 'task-1.json'), 'utf8'));
+  assert.equal(escalated.needsClarification.reason, 'git-state-diverged');
+  assert.equal(escalated.applyRetryCount, 0, 'never spent a retry -- this was never eligible for a blind redraft in the first place');
+  assert.ok(escalated.history.some((h) => h.stage === 'needs-clarification' && /diverged git history/.test(h.detail || '')));
+});
+
+test('applyRetryCheck does NOT escalate a diverged-history failure a second time once already escalated', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    blockedReason: DIVERGED_REASON,
+    applyRetryCount: 0,
+    history: [{ stage: 'needs-clarification', detail: 'escalated immediately -- diverged git history, a blind retry cannot differ' }],
+  });
+  const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  // Falls through to the ordinary retry-cap path instead (still bounded, no infinite loop).
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
+});
+
+test('applyRetryCheck falls back to the ordinary bounded retry when no needsClarificationDir is given (back-compat)', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', { blockedReason: DIVERGED_REASON, applyRetryCount: 0 });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
 });
