@@ -1808,6 +1808,23 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   return withUsage({ response: (lastMessage && lastMessage.content) || '', toolCallLog, turnsUsed, toolsDisabled: false });
 }
 
+// 2026-09-17, pipeline hardening: see this function's call site (the CLI entry below) for
+// the full incident. Exported so it's independently testable without spawning a real
+// subprocess and simulating an OS-level broken pipe.
+function installStdoutEpipeGuard(label, stream = process.stdout) {
+  // `stream` is injectable so tests can drive this against a throwaway EventEmitter
+  // instead of the real process.stdout -- emitting a synthetic 'error' on the real stream
+  // leaves it internally marked errored/destroyed for the rest of the process, which broke
+  // the test runner's own stdout-based TAP reporting the first time this was tried.
+  stream.on('error', (err) => {
+    if (err && err.code === 'EPIPE') {
+      process.exitCode = 0;
+      return;
+    }
+    try { process.stderr.write(`[${label}] stdout write failed (non-fatal): ${err && err.message}\n`); } catch (_) { /* stderr may also be broken; nothing more to do */ }
+  });
+}
+
 module.exports = {
   runPlanWithTools, readFileTool, listDirectoryTool, listRootsTool,
   resolveInsideRepo, resolveInsideRoots, TOOLS,
@@ -1818,6 +1835,7 @@ module.exports = {
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
   IS_P40_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
+  installStdoutEpipeGuard,
 };
 
 // CLI: node local-tool-client.js <request.json>
@@ -1830,6 +1848,23 @@ module.exports = {
 //     which then operates on the single configured repoRoot exactly as before.
 // Writes the JSON result to stdout.
 if (require.main === module) {
+  // 2026-09-17, pipeline hardening: the req.stream:true path below (local_tool_client.py's
+  // stream_plan_with_tools) writes MANY chunks to stdout over the life of a long multi-turn
+  // run -- if the Python reader on the other end dies mid-stream for any reason, every
+  // write after that hits a broken pipe. process.stdout is an EventEmitter; a failed write
+  // surfaces as an async 'error' event, not a thrown exception, so no try/catch around the
+  // call site can catch it -- with no listener, Node's default behavior for an unhandled
+  // stream 'error' is to crash the entire process. Confirmed live: exactly this shape (a
+  // Python-side crash -- 'FakeProc' object has no attribute 'poll' -- closing its read end
+  // mid-stream) took down a worker lane outright, with the crash surfacing several frames
+  // away in the calling script rather than here. A broken pipe just means the reader is
+  // already gone; exit cleanly instead of taking the whole process down with it. Scoped
+  // INSIDE this CLI-entry block, not at module load -- this file's exports
+  // (runPlanWithTools et al.) are required as a library by other long-running processes
+  // (local-agentic-write-draft.js, tests, ...) that must keep Node's normal stdout error
+  // behavior, not silently inherit a blanket EPIPE swallow meant only for this standalone
+  // subprocess's own stdout.
+  installStdoutEpipeGuard('local-tool-client');
   const requestPath = process.argv[2];
   if (!requestPath) {
     console.error('usage: node local-tool-client.js <request.json>');

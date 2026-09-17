@@ -12,6 +12,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
+const { EventEmitter } = require('events');
 
 function execSyncGitInit(dir) {
   execFileSync('git', ['init', '-q'], { cwd: dir });
@@ -1759,4 +1760,52 @@ test('local-tool-client REQUEST_TIMEOUT_MS gets the same P40 exception as local-
   withEnv({ OLLAMA_URL: 'http://192.168.122.29:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434', LOCAL_TIMEOUT_MS: '30000', ORNITH_TIMEOUT_MS: undefined }, (mod) => {
     assert.equal(mod.REQUEST_TIMEOUT_MS, 30_000, 'an explicit LOCAL_TIMEOUT_MS override still wins over the P40 exception');
   });
+});
+
+// 2026-09-17, pipeline hardening: installStdoutEpipeGuard() -- see local-draft.js's own
+// copy of this test suite (and the shared incident it closes) for the full rationale.
+// This file's req.stream:true CLI path (local_tool_client.py's stream_plan_with_tools)
+// writes many chunks to stdout over a long multi-turn run, making it at least as exposed
+// to a downstream reader dying mid-stream as local-draft.js's single final write.
+test('installStdoutEpipeGuard: an EPIPE on stdout is swallowed -- exitCode set to 0, not crashed, nothing written to stderr', () => {
+  const { installStdoutEpipeGuard } = require('./local-tool-client.js');
+  const originalExitCode = process.exitCode;
+  const stderrWrites = [];
+  const originalStderrWrite = process.stderr.write;
+  process.stderr.write = (chunk) => { stderrWrites.push(chunk); return true; };
+  const fakeStream = new EventEmitter();
+  try {
+    process.exitCode = undefined;
+    installStdoutEpipeGuard('test-label', fakeStream);
+    const err = new Error('write EPIPE');
+    err.code = 'EPIPE';
+    fakeStream.emit('error', err);
+    assert.equal(process.exitCode, 0);
+    assert.deepEqual(stderrWrites, [], 'a clean EPIPE swallow should not print anything');
+  } finally {
+    process.stderr.write = originalStderrWrite;
+    process.exitCode = originalExitCode;
+  }
+});
+
+test('installStdoutEpipeGuard: a non-EPIPE stdout error is still surfaced to stderr, not silently dropped', () => {
+  const { installStdoutEpipeGuard } = require('./local-tool-client.js');
+  const originalExitCode = process.exitCode;
+  const stderrWrites = [];
+  const originalStderrWrite = process.stderr.write;
+  process.stderr.write = (chunk) => { stderrWrites.push(chunk); return true; };
+  const fakeStream = new EventEmitter();
+  try {
+    process.exitCode = undefined;
+    installStdoutEpipeGuard('test-label', fakeStream);
+    const err = new Error('something else entirely');
+    err.code = 'ENOSPC';
+    fakeStream.emit('error', err);
+    assert.equal(process.exitCode, undefined, 'a non-EPIPE error does not force a clean exit code');
+    assert.equal(stderrWrites.length, 1);
+    assert.match(stderrWrites[0], /\[test-label\] stdout write failed \(non-fatal\): something else entirely/);
+  } finally {
+    process.stderr.write = originalStderrWrite;
+    process.exitCode = originalExitCode;
+  }
 });
