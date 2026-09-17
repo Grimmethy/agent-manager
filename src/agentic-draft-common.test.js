@@ -810,6 +810,41 @@ test('resolveAgenticDraft: forcedSummary + an edit_file call keeps the needs-hum
   });
 });
 
+// 2026-09-16, pipeline hardening: runPlanWithTools' forcedSummaryNonCompliant means the
+// model ignored the forced-summary turn's own explicit, twice-repeated RESOLUTION:
+// demand -- a mechanical gate/model-compliance failure, not the same thing as a genuine
+// RESOLUTION: needs-human-decision the model actually chose. Must be threaded onto the
+// task so a future triage pass (or a human) can tell the two apart.
+test('resolveAgenticDraft: forcedSummaryNonCompliant on the result is stamped onto the task', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't4g' };
+    const out = resolveAgenticDraft(task, {
+      result: {
+        response: 'Let me verify the edited code in the file:', forcedSummary: true, forcedSummaryNonCompliant: true, turnsUsed: 14,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(out.needsClarification, true);
+    assert.equal(task.adhocResolution, 'needs-human-decision');
+    assert.equal(task.forcedSummaryNonCompliant, true);
+  });
+});
+
+test('resolveAgenticDraft: forcedSummaryNonCompliant is NOT stamped when the forced-summary turn eventually complied', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't4h' };
+    resolveAgenticDraft(task, {
+      result: {
+        response: 'I edited but then ran out of budget', forcedSummary: true, turnsUsed: 35,
+        toolCallLog: [{ tool: 'read_file' }, { tool: 'edit_file' }],
+      },
+      worktreeDir: wt,
+    });
+    assert.equal(task.forcedSummaryNonCompliant, undefined);
+  });
+});
+
 test('resolveAgenticDraft: turnBudgetExhausted is cleared on a normal implemented outcome', () => {
   withRealRepo((wt) => {
     fs.writeFileSync(path.join(wt, 'a.txt'), 'changed\n');

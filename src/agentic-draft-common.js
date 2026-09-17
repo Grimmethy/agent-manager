@@ -435,6 +435,17 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
       task.rawDiff = '';
       task.implementResponse = summary
         || '(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity for what it had investigated)';
+      // 2026-09-16, pipeline hardening: result.forcedSummaryNonCompliant means the model
+      // ignored runPlanWithTools' own explicit, bounded, twice-repeated demand for a
+      // RESOLUTION: line -- a mechanical gate/model-compliance failure, NOT the same kind
+      // of thing as a genuine RESOLUTION: needs-human-decision the model actually chose.
+      // Confirmed live: this exact shape stranded a task with a fully correct diff already
+      // sitting in its own history behind a human-only queue, twice in a row, because
+      // nothing distinguished "the model declined to decide" from "the model never even
+      // tried to answer the question this turn asked." Stamped here so a future triage
+      // pass (or a human reading the task) can tell the two apart without re-deriving it
+      // from the raw transcript.
+      if (result && result.forcedSummaryNonCompliant) task.forcedSummaryNonCompliant = true;
       return { succeeded: true, blocked: false, needsClarification: true, ...meta, capturedDiff };
     }
     const budgetNote = retriedForTurnBudget

@@ -1586,10 +1586,50 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         evalCount: summaryUsage && summaryUsage.eval_count, ceiling: PINNED_NUM_CTX,
       });
     }
-    const summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
+    let summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
+
+    // 2026-09-16, pipeline hardening: this turn explicitly demands a RESOLUTION: line, but
+    // nothing ever checked whether the model actually complied -- a non-compliant reply
+    // (narration, a truncated thought, anything without the sentinel) was returned as-is
+    // and silently misread downstream as a genuine "needs-human-decision" design question,
+    // permanently stranding a task whose real diff was often already sitting in this same
+    // run's history. Confirmed live, twice in a row on the identical task: the model
+    // replied with narration ("Let me verify the edited code in the file:") on the FIRST
+    // forced-summary turn, ignoring the RESOLUTION: instruction entirely. One bounded
+    // retry with a short, unambiguous instruction gives the model a real second chance
+    // before this gets flagged as non-compliant for whoever reads the result downstream.
+    if (!HAS_RESOLUTION_RE.test(summaryContent)) {
+      turnStartLengths.push(messages.length);
+      turnStartLogLengths.push(toolCallLog.length);
+      messages.push({
+        role: 'user',
+        content: 'Your last message still did not end with a RESOLUTION: line. Reply with '
+          + 'NOTHING but that line (plus its required follow-up) now -- '
+          + 'RESOLUTION: implemented / no-changes-needed / decompose / needs-human-decision.',
+      });
+      turnsUsed += 1;
+      const retryResult = await chatTurnWithFlakeRecovery({
+        messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+        toolCallLog, turnStartLengths, turnStartLogLengths,
+      });
+      addUsage(retryResult.usage);
+      const retryContent = (!retryResult.flakeErr && retryResult.message && retryResult.message.content) ? retryResult.message.content : '';
+      if (HAS_RESOLUTION_RE.test(retryContent)) {
+        summaryContent = retryContent;
+      } else if (retryContent) {
+        // Neither attempt produced the sentinel -- keep whichever reply carries more real
+        // content (a fuller non-compliant answer is more useful to a human than a shorter
+        // one), and mark the result so a downstream reader (needs-clarification-triage,
+        // resolveAgenticDraft) can tell "the model never complied even under a direct,
+        // repeated instruction" apart from a genuine RESOLUTION: needs-human-decision.
+        if (retryContent.length > summaryContent.length) summaryContent = retryContent;
+      }
+    }
+    const compliant = HAS_RESOLUTION_RE.test(summaryContent);
     return withUsage({
       response: summaryContent || (lastMessage && lastMessage.content) || '',
       toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true, forcedSummaryReason: reason,
+      ...(compliant ? {} : { forcedSummaryNonCompliant: true }),
     });
   };
 
