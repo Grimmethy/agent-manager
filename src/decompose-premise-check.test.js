@@ -83,6 +83,45 @@ test('null without a repoRoot (nothing to check against)', () => {
   assert.equal(detectStaleDecomposePremise(task, { lineCountFn: () => 100 }), null);
 });
 
+// 2026-09-17, root-caused live via a real stuck task (adhoc-create-scripts-check-doc-
+// link-sh-drift-guard): a decompose sub-task's promptContext.rawText carries a
+// "HUMAN DESIGN DECISION (answered directly from the Needs Clarification picker,
+// <ISO timestamp>):" stamp (task.py's api_task_answer_clarification/
+// api_task_resolve_clarification), and the bare ISO timestamp's colons
+// ("2026-09-16T23:19:11.363748+00:00") matched LINE_REF_RE's ":NN" alternative as if
+// they were real line citations -- wrongly flagging a task whose text names NO real
+// line reference at all, purely because of its own answer stamp.
+
+test('a task whose ONLY "line-shaped" text is an ISO-timestamp answer stamp is not flagged -- no real line reference exists', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: 'p',
+      rawText: 'Create scripts/check-doc-link.sh (executable) that does X.\n\n'
+        + 'HUMAN DESIGN DECISION (answered directly from the Needs Clarification picker, 2026-09-16T23:19:11.363748+00:00):\n'
+        + 'Create it fresh exactly as specified.',
+    },
+  };
+  // scripts/check-doc-link.sh genuinely doesn't exist yet (the task's whole point is to
+  // create it) -- lineCountFn correctly returns null, but that must never be reached
+  // because there is no real line reference to trigger the check at all.
+  assert.equal(detectStaleDecomposePremise(task, { repoRoot: '/repo', lineCountFn: () => null }), null);
+});
+
+test('a genuine line reference elsewhere in the text still fires normally, even with an ISO-timestamp answer stamp also present', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: 'p',
+      rawText: 'In src/gone-in-a-later-decompose.js line 10, fix it.\n\n'
+        + 'HUMAN DESIGN DECISION (answered directly from Chat, 2026-09-15T19:24:34.036Z):\n'
+        + 'Confirmed, proceed.',
+    },
+  };
+  const result = detectStaleDecomposePremise(task, { repoRoot: '/repo', lineCountFn: () => null });
+  assert.ok(result, 'the real "line 10" citation must still be caught -- the timestamp mask must not suppress genuine line refs');
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'src/gone-in-a-later-decompose.js');
+});
+
 test('kill switch: AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK=false disables the check entirely', () => {
   const prev = process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK;
   process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK = 'false';
