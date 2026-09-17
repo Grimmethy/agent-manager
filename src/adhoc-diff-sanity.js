@@ -102,6 +102,10 @@ const DELETE_INTENT_RE = /\b(delet\w+|remov\w+|drop\w*|deprecat\w+|rip out|tear 
 // Sentence-scoped so a path from an unrelated later sentence is never pulled in.
 const RESTRICTION_SENTENCE_RE = /\b(?:do ?n(?:'?o?)?t|don['’]t|never|must not|no other|nothing (?:else |but )?(?:in|under)|not (?:touch|modif|chang|edit))\b.*?\b(?:touch\w*|modif\w+|chang\w+|edit\w+|alter\w+|updat\w+|delet\w+|writ\w+ (?:to|into))\b|\b(?:never|does ?n(?:'?o)?t) (?:touch\w*|modif\w+)\b/i;
 
+// Imperative edit verbs -- gates extractDeclaredTargets' rawText-BODY scan (source 4,
+// below) so a path merely cited for context doesn't get mistaken for an edit target.
+const EDIT_VERB_RE = /\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix)\b/i;
+
 function extractForbiddenPaths(text) {
   const out = new Set();
   const add = (raw) => {
@@ -182,6 +186,25 @@ function extractDeclaredTargets(task, planText = '') {
   const plan = String(planText || '');
   for (const m of plan.matchAll(/\b(?:edit_file|write_file)\b[^\n]*?`([\w./@-]+\.\w+)`/gi)) add(m[1]);
   for (const m of plan.matchAll(/\b(?:EDIT\b|Wire up\b[^\n]*?\binto)\b[^\n]*?`([\w./@-]+\.\w+)`/gi)) add(m[1]);
+  // 4. A leading "In `<path>`, <verb> ..." clause in the rawText BODY, not just the TITLE
+  // (2026-09-16, pipeline hardening) -- a decompose child's title sometimes names a
+  // DIFFERENT file than the one its own rawText body actually instructs editing (the
+  // parent decompose pass chose the title; the per-symbol instruction lives in the body
+  // prose, e.g. "In `python/test_build_graph.py`, change the module docstring on line 2
+  // ..."), so that real, explicitly-named target was invisible to every source above and
+  // could get wrongly caught by a forbidden-path restriction meant for sibling sub-tasks.
+  // Deliberately narrow (the path must be the subject of a LEADING "In X," clause, not
+  // just co-located anywhere in a sentence that happens to also contain an edit verb) --
+  // a looser same-sentence scan reintroduces the exact false-positive shape this fixes: a
+  // sentence like "Prepend a note stating X is enforced by scripts/check-doc-link.sh" has
+  // an edit verb (Prepend) and a path (scripts/check-doc-link.sh) that are NOT the same
+  // thing; only the tight leading-clause anchor tells target from citation apart.
+  for (const frag of String(rawText || '').split(/(?<=[.!?:;])\s+|\n+/)) {
+    const sentence = frag.trim();
+    if (RESTRICTION_SENTENCE_RE.test(sentence)) continue;
+    const leading = /^(?:In|At)\s+[`'"]?([\w./@-]+\.\w+)[`'"]?\s*,/i.exec(sentence);
+    if (leading && EDIT_VERB_RE.test(sentence)) add(leading[1]);
+  }
   return [...out];
 }
 

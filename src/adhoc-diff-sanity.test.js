@@ -212,6 +212,55 @@ test('extractDeclaredTargets: pulls the title path, the Files: line, and edit_fi
   assert.ok(!extractDeclaredTargets(t2).includes('src/b.js'));
 });
 
+// 2026-09-16, pipeline hardening: a decompose child's TITLE sometimes names a different
+// file than the one its own rawText body actually instructs editing -- concrete incident:
+// a docstring re-point sub-task titled "Re-point module docstring to graph_build.py" whose
+// rawText actually said "In python/test_build_graph.py, change the module docstring...".
+// extractDeclaredTargets only ever scanned the Files: line, the title, and the plan body --
+// never the rawText body prose -- so the real, explicitly-named edit target was invisible,
+// and a forbidden-path restriction inherited from the parent decompose (meant for sibling
+// sub-tasks) wrongly caught the one child whose entire job was to edit that exact file.
+test('extractDeclaredTargets: an imperative "In `<path>`, <verb> ..." sentence in the rawText BODY is recognized even when the title names a different file', () => {
+  const t = {
+    title: 'Re-point module docstring to graph_build.py',
+    promptContext: {
+      rawText: "In python/test_build_graph.py, change the module docstring on line 2 from "
+        + "'Regression tests for build_graph.py's symlink-resolution fix' to 'Regression "
+        + "tests for graph_build.py's symlink-resolution fix'. This is a single-token "
+        + "substitution on one line; leave the 'Run:' instruction on line 7 (which "
+        + "references the test module's own name) and all other lines untouched.",
+    },
+  };
+  const targets = extractDeclaredTargets(t);
+  assert.ok(targets.includes('python/test_build_graph.py'),
+    'the real edit target named only in rawText prose must be recognized');
+});
+
+test('extractDeclaredTargets: a path merely cited for context in the rawText body (no adjacent edit verb) is NOT treated as a target', () => {
+  const t = {
+    title: 'Add an invariant note',
+    promptContext: {
+      rawText: 'Prepend an HTML-comment block stating that doc accuracy is enforced by '
+        + 'scripts/check-doc-link.sh and src/doc-accuracy-check.js.',
+    },
+  };
+  const targets = extractDeclaredTargets(t);
+  assert.ok(!targets.includes('scripts/check-doc-link.sh'), 'cited as an enforcement mechanism, not an edit target');
+  assert.ok(!targets.includes('src/doc-accuracy-check.js'), 'cited as an enforcement mechanism, not an edit target');
+});
+
+test('extractDeclaredTargets: a leading "In `<path>`," clause inside a restriction sentence is NOT added as a target', () => {
+  const t = {
+    title: 'Fix the guard',
+    promptContext: {
+      rawText: 'In src/reject-retry-check.js, fix the retry guard. In src/review-task.js, do not change anything.',
+    },
+  };
+  const targets = extractDeclaredTargets(t);
+  assert.ok(targets.includes('src/reject-retry-check.js'), 'a genuine leading-clause edit target is recognized');
+  assert.ok(!targets.includes('src/review-task.js'), 'the SAME leading-clause shape inside a restriction sentence is excluded, not a declared target');
+});
+
 test('non-adhoc tasks and empty diffs are never gated', () => {
   assert.equal(adhocDiffSubstanceProblem({ source: 'observability_fix', promptContext: { rawText: 'x' } }, createDiff('docs/x.md')), null);
   assert.equal(adhocDiffSubstanceProblem(adhoc('implement the thing in src/x.js'), ''), null);
