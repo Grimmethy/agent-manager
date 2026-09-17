@@ -901,6 +901,53 @@ test('runPlanWithTools with forceSummaryOnCap does NOT add a turn when an early 
   });
 });
 
+// --- Forced-summary-turn RESOLUTION compliance (2026-09-16) --------------------------
+// runForcedSummaryTurn explicitly demands a RESOLUTION: line, but nothing ever checked
+// whether the model actually complied -- confirmed live, a real task's forced-summary
+// turn twice replied with plain narration ("Let me verify the edited code in the file:"),
+// no RESOLUTION line either time, and got silently misread downstream as a genuine
+// needs-human-decision design question.
+
+test('runPlanWithTools retries once when the forced-summary turn itself omits the RESOLUTION line, and accepts a compliant retry', async () => {
+  const toolTurn = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const nonCompliantSummary = { role: 'assistant', content: 'Let me verify the edited code in the file:' };
+  const compliantRetry = { role: 'assistant', content: 'RESOLUTION: implemented\nAdded the console.warn line.' };
+  await withMockedChat([toolTurn, toolTurn, nonCompliantSummary, compliantRetry], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 2, forceSummaryOnCap: true });
+    assert.equal(result.forcedSummary, true);
+    assert.equal(result.forcedSummaryNonCompliant, undefined, 'the retry succeeded -- not flagged non-compliant');
+    assert.match(result.response, /RESOLUTION: implemented/);
+    assert.equal(result.turnsUsed, 4, 'cap turns (2) + the original forced-summary turn + the compliance retry');
+    const last = sentBodies[sentBodies.length - 1];
+    assert.match(last.messages[last.messages.length - 1].content, /still did not end with a RESOLUTION/i);
+  });
+});
+
+test('runPlanWithTools flags forcedSummaryNonCompliant when the model ignores the RESOLUTION instruction on both the forced-summary turn AND the retry', async () => {
+  const toolTurn = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const nonCompliantSummary = { role: 'assistant', content: 'Let me verify the edited code in the file:' };
+  const stillNonCompliantRetry = { role: 'assistant', content: 'My test expectations were wrong -- fixing both failing tests:' };
+  await withMockedChat([toolTurn, toolTurn, nonCompliantSummary, stillNonCompliantRetry], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 2, forceSummaryOnCap: true });
+    assert.equal(result.forcedSummary, true);
+    assert.equal(result.forcedSummaryNonCompliant, true, 'neither attempt produced a RESOLUTION line -- must be flagged, not silently accepted');
+    assert.equal(result.turnsUsed, 4);
+    // The longer of the two non-compliant replies is kept (more useful to a human/redraft).
+    assert.match(result.response, /fixing both failing tests/);
+  });
+});
+
+test('runPlanWithTools forced-summary retry is NOT triggered when the first attempt already complies', async () => {
+  const toolTurn = { role: 'assistant', content: '', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+  const compliantSummary = { role: 'assistant', content: 'Done.\n\nRESOLUTION: needs-human-decision\nwhich approach?' };
+  await withMockedChat([toolTurn, toolTurn, compliantSummary], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'go', maxTurns: 2, forceSummaryOnCap: true });
+    assert.equal(result.forcedSummary, true);
+    assert.equal(result.forcedSummaryNonCompliant, undefined);
+    assert.equal(result.turnsUsed, 3, 'no retry turn spent -- the first forced-summary reply already complied');
+  });
+});
+
 // --- Context-budget-aware forced wrap-up (2026-09-05) -------------------------------
 // Real Chat panel incident (chat-1788639495-31ed485b, confirmed via model-stats.db:
 // turns_used=16, latency_ms=744939): the message history grew unpruned until it
