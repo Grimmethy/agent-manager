@@ -188,6 +188,20 @@ function isReviewRejection(task) {
   return task.blockedStage === 'review' && !task.reviewInconclusive;
 }
 
+// 2026-09-17: blockedStage:'pre-critique' (local-draft.js's hard pre-critique guard,
+// added 2026-09-16 -- draft-file-guard.js's missingFileCheck) blocks a candidateFulfillment
+// task whose implementResponse cites a file that doesn't exist in the repo, BEFORE
+// critique/review ever runs. It shipped with no corresponding retry-check branch: the
+// entry gate below only ever recognized isReviewRejection/retryableDraftBlock, so every
+// task landing here was invisible to this whole sweep -- permanently stuck in blocked/,
+// exactly the "huge backlog instead of pushed-to-completion" shape (never even reached
+// review, let alone got a chance to redraft without the bad citation). Deterministic like
+// the review-rejection case (a real content problem in the prior implementResponse, not a
+// stochastic flake), so it gets the same bounded blind-retry treatment.
+function isPreCritiqueBlock(task) {
+  return task.blockedStage === 'pre-critique';
+}
+
 // Same reasoning as queue-watchdog.ps1's arch_discovery/arch_import stamping (not ported
 // here, see header) -- deep_dive's own coverage tracker: without this, a community whose
 // task exhausts its retries stays eligible for nextDeepDiveTask() to re-select FOREVER
@@ -336,7 +350,8 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // Bounded by the same MAX_LOCAL_REJECT_RETRIES cap; on exhaustion it takes the same
       // adhoc -> needs-clarification escalation as a stuck review rejection.
       const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
-      if (!isReviewRejection(task) && !retryableDraftBlock) continue;
+      const preCritiqueBlock = isPreCritiqueBlock(task);
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -580,6 +595,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         delete task.infraErrorNote;
       } else if (retryableDraftBlock) {
         priorFeedback.push('A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.');
+      } else if (preCritiqueBlock) {
+        priorFeedback.push([
+          'A prior implementation was blocked before review because it cited a file that does not actually exist in the repo:',
+          '',
+          String(task.blockedReason || ''),
+          '',
+          'Only reference files that are actually present in the repo (verify with a tool call before citing one). If this task genuinely requires a brand-new file, create it with write_file/edit_file in create mode -- do not just describe or reference it as if it already exists.',
+        ].join('\n'));
       } else {
         priorFeedback.push(String(task.blockedReason || ''));
       }
@@ -622,6 +645,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         delete task.planResponse;
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'review rejection -- cleared stale plan/implement state for fresh redraft');
+      } else if (preCritiqueBlock) {
+        // The bad citation lives IN implementResponse -- carrying it forward would just
+        // hand the next pass its own broken output as "prior work" to build on. planResponse
+        // is kept: the plan itself wasn't what named the nonexistent file.
+        delete task.implementResponse;
+        appendHistoryEvent(task, 'requeued', 'pre-critique missing-file block -- cleared stale implementResponse for fresh redraft');
       }
 
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
@@ -661,7 +690,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, computeBlockSignature };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, computeBlockSignature };
 
 if (require.main === module) {
   main();

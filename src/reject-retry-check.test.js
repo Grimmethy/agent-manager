@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { rejectRetryCheck, isReviewRejection } = require('./reject-retry-check.js');
+const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock } = require('./reject-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
@@ -859,4 +859,62 @@ test('requeue clears adhocNoChangesClaimFeedback but preserves coordination flag
   assert.ok(out.priorRejectionFeedback.includes('should-be-cleared'), 'original feedback value must be present in priorRejectionFeedback');
   // ...while the coordination sentinel must reach the next pass intact.
   assert.equal(out.decomposeDirective, 'sentinel-must-survive', 'decomposeDirective must survive the requeue');
+});
+
+// 2026-09-17: blockedStage:'pre-critique' (local-draft.js's hard pre-critique guard,
+// added 2026-09-16) shipped with no retry-check coverage -- these tasks were entirely
+// invisible to this sweep's entry gate (isReviewRejection/retryableDraftBlock only), so
+// they sat in queue/blocked/ forever with zero chance of ever redrafting past the bad
+// citation. See isPreCritiqueBlock's own header in reject-retry-check.js.
+
+test('isPreCritiqueBlock recognizes blockedStage:pre-critique', () => {
+  assert.equal(isPreCritiqueBlock({ blockedStage: 'pre-critique' }), true);
+  assert.equal(isPreCritiqueBlock({ blockedStage: 'review' }), false);
+  assert.equal(isPreCritiqueBlock({}), false);
+});
+
+test('rejectRetryCheck requeues a pre-critique missing-file block under the retry cap', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    blockedStage: 'pre-critique',
+    blockedReason: 'implementResponse cites src/does-not-exist.js, which is not a file in this repo',
+    localRejectCount: 0,
+    planResponse: '# Plan\n1. Fix the thing.',
+    implementResponse: '{"mode":"edit","file":"src/does-not-exist.js","find":"a","replace":"b"}',
+  });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')));
+  const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-1.json'), 'utf8'));
+  assert.equal(requeued.localRejectCount, 1);
+  // The bad implementResponse must not carry forward as "prior work" to build on...
+  assert.equal(requeued.implementResponse, undefined, 'stale implement response must not survive a pre-critique requeue');
+  // ...but the plan itself is kept -- it wasn't what cited the nonexistent file.
+  assert.equal(requeued.planResponse, '# Plan\n1. Fix the thing.', 'planResponse must survive a pre-critique requeue');
+  assert.ok(requeued.priorRejectionFeedback.some((f) => /does-not-exist\.js/.test(f)), 'feedback must name the offending citation');
+  assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /cleared stale implementResponse/.test(h.detail || '')));
+});
+
+test('rejectRetryCheck exhausts a non-adhoc pre-critique block at the retry cap without escalating to needs-clarification', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    blockedStage: 'pre-critique',
+    blockedReason: 'implementResponse cites src/does-not-exist.js, which is not a file in this repo',
+    localRejectCount: 2,
+  });
+  const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')), 'non-adhoc exhausted task stays in blocked/');
+  assert.ok(!fs.existsSync(path.join(needsClarificationDir, 'task-1.json')));
+  const stayed = JSON.parse(fs.readFileSync(path.join(blockedDir, 'task-1.json'), 'utf8'));
+  assert.ok(stayed.history.some((h) => h.stage === 'exhausted'));
 });
