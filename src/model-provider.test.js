@@ -203,3 +203,41 @@ test('labelFor reflects the profile\'s own model name, not LOCAL_MODEL, when a p
     );
   });
 });
+
+// AC-5: unit tests for AC-4's getEndpoint(source, override) -- see that function's own
+// header for why 'claude' has no real base-URL concept (a CLI subprocess, not an HTTP
+// call) and why this reuses OLLAMA_URL rather than a new invented constant.
+
+test('getEndpoint returns the override immediately when one is provided, regardless of source', () => {
+  const { getEndpoint } = freshModelProvider();
+  assert.equal(getEndpoint('local', 'http://override:1234'), 'http://override:1234');
+  assert.equal(getEndpoint('claude', 'http://override:1234'), 'http://override:1234');
+  assert.equal(getEndpoint('unrecognized-source', 'http://override:1234'), 'http://override:1234');
+});
+
+test('getEndpoint resolves local/ornith to OLLAMA_URL when set', () => {
+  withEnv({ OLLAMA_URL: 'http://p40-vm:11434' }, () => {
+    const { getEndpoint } = freshModelProvider();
+    assert.equal(getEndpoint('local'), 'http://p40-vm:11434');
+    assert.equal(getEndpoint('ornith'), 'http://p40-vm:11434');
+  });
+});
+
+test('getEndpoint falls back to the documented default URL for local/ornith when OLLAMA_URL is unset', () => {
+  withEnv({ OLLAMA_URL: undefined }, () => {
+    const { getEndpoint } = freshModelProvider();
+    assert.equal(getEndpoint('local'), 'http://localhost:11434');
+    assert.equal(getEndpoint('ornith'), 'http://localhost:11434');
+  });
+});
+
+test('getEndpoint returns null for claude -- it has no HTTP endpoint, it is a CLI subprocess', () => {
+  const { getEndpoint } = freshModelProvider();
+  assert.equal(getEndpoint('claude'), null);
+});
+
+test('getEndpoint returns null for an unrecognized source', () => {
+  const { getEndpoint } = freshModelProvider();
+  assert.equal(getEndpoint('some-future-provider'), null);
+  assert.equal(getEndpoint(undefined), null);
+});
