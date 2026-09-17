@@ -180,6 +180,32 @@ function invalidPremiseBeforeCheckExisted(task) {
   );
 }
 
+// 2026-09-17: every escalation site in this file used to check "has this task EVER, in
+// its whole lifetime, carried a needs-clarification history stage" -- correct the FIRST
+// time a task exhausts, but permanently wrong afterward: a task legitimately re-admitted
+// from needs-clarification (needs-clarification-triage.js's own requeue path, or a human
+// answering it via the dashboard) starts a genuinely fresh retry cycle, can burn through
+// MORE attempts, and exhaust AGAIN -- at which point this whole-lifetime check reads its
+// OWN FIRST escalation as still current and refuses to escalate a second time, silently
+// stranding the task in queue/blocked/ forever with no further human visibility.
+// Root-caused live: sampled the real blocked/ backlog and found dozens of tasks in
+// exactly this shape (escalated once, requeued, exhausted again, now permanently stuck).
+//
+// Fix: only treat a task as "already escalated" if its MOST RECENT needs-clarification
+// history entry has nothing AFTER it proving a fresh cycle began since (a 'draft-started'
+// event -- the one stage every requeue-back-into-drafting path, human or automated,
+// always produces). If a fresh cycle started since the last escalation, this is a NEW
+// exhaustion, not a repeat of the old one -- eligible to escalate again.
+function alreadyEscalatedSinceLastReadmission(task) {
+  const history = Array.isArray(task.history) ? task.history : [];
+  let lastNcIndex = -1;
+  for (let i = 0; i < history.length; i += 1) {
+    if (history[i] && history[i].stage === 'needs-clarification') lastNcIndex = i;
+  }
+  if (lastNcIndex === -1) return false; // never escalated at all
+  return !history.slice(lastNcIndex + 1).some((h) => h && h.stage === 'draft-started');
+}
+
 function isReviewRejection(task) {
   // reviewInconclusive (local-draft.js / implement-critique.js's two stochastic harness
   // gates) marks a re-roll-worthy gate flake, not a genuine reviewer rejection -- both set
@@ -492,7 +518,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // shape wouldn't reliably match anyway) cannot pre-empt this specific, better-
       // targeted one -- same discipline as the invalidPremiseBeforeCheckExisted check above.
       if (isStructurallyOversizedDraftFailure(task) && needsClarificationDir) {
-        const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+        const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
         if (!alreadyEscalated) {
           task.needsClarification = {
             reason: 'design-decision',
@@ -517,7 +543,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       const classification = classifyBlockedTask(task);
       if (!classification.retryable) {
         if (needsClarificationDir) {
-          const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+          const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
           if (!alreadyEscalated) {
             const classifier = findClassifier(classification.classifierName);
             const openQuestions = classifier && typeof classifier.buildQuestion === 'function'
@@ -559,7 +585,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         // blocked/ forever. (Non-adhoc keeps the original "stamp once, stay in blocked"
         // behaviour.)
         if (isAdhocTask(task) && needsClarificationDir) {
-          const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+          const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
           if (alreadyEscalated) { summary.exhausted++; continue; }
           // A task that exhausted its retries on a tagged tool/environment failure lands
           // with an honest reason:'infra-error' -- not design-decision -- so forensics and
@@ -793,7 +819,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, computeBlockSignature };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature };
 
 if (require.main === module) {
   main();
