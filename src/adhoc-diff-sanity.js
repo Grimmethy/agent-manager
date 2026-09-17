@@ -64,6 +64,30 @@ const isDocPath = (p) => DOC_PATH_RE.test(p);
 // extractDeclaredFiles below for why the task's own "Files:" line is checked FIRST.
 const CODE_SIGNAL_RE = /\b(src|python|scripts|lib|app|dashboard|templates)\/|\.(js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b|\b(implement|endpoint|route|task source|new (?:module|file|source|helper)|render\w*\(|def \w+\(|function \w+|wire (?:it|this|the|in)|add .{0,25}(?:to|in|into) \w[\w./-]*\.(?:py|js|html|sh)|api route|backend|cursor module|sweep logic)\b/i;
 
+// 2026-09-16, pipeline hardening: CODE_SIGNAL_RE.test(combined) is a blind whole-blob scan
+// -- it can't tell "this src/ path is the edit target" from "this src/ path is cited as
+// existing context" any more than the Files:-line-absent fallback it guards. Confirmed
+// live, 4+ instances: a genuinely doc-only task (e.g. "prepend an invariant note to
+// AGENTS.md stating that doc accuracy is enforced by scripts/check-doc-link.sh and
+// src/doc-accuracy-check.js") got hard-blocked 3/3 attempts insisting it "asks for a real
+// code change," because the citation sentence itself contains code-shaped tokens.
+// CITATION_CONTEXT_RE marks the common phrasings a path is cited THROUGH rather than
+// targeted BY ("enforced by", "already exists", "documented in", "see", ...) -- a sentence
+// containing one of these is excluded from the code-signal scan, same "citation vs.
+// target" distinction extractDeclaredFiles/extractDeclaredTargets already draw elsewhere
+// in this file, just applied to the blind-scan fallback path instead of a structured one.
+const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|handle|contain)s?|documented in|as (?:shown|described|documented|seen|specified) in|mentioned in|cited in|referenced in|defined in|lives? in|found in|per\b|see\b|(?:anchor|grounding) is real|confirmed (?:real|in)|the (?:real|grounding) (?:source|evidence))\b/i;
+
+function wantsCodeChange(combined) {
+  // Split on sentence-ending punctuation only -- NOT a bare colon, unlike this file's
+  // other sentence-scoped scans. A colon here routinely introduces elaboration that's
+  // still part of the SAME citation ("The code anchor is real: src/foo.js defines ..."),
+  // and splitting on it would separate the citation marker from the very code-signal
+  // token it's meant to cover.
+  const sentences = String(combined || '').split(/(?<=[.!?])\s+|\n+/);
+  return sentences.some((sen) => CODE_SIGNAL_RE.test(sen) && !CITATION_CONTEXT_RE.test(sen));
+}
+
 // 2026-09-08, Grimmethy: "fix the gate" -- root-caused live (a docs-only checklist-tick
 // task blocked as "the task asks for a code change" because its own PLAN cited a real
 // src/ file as justifying EVIDENCE for the tick, not as an edit target). CODE_SIGNAL_RE
@@ -316,7 +340,7 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   const nonDoc = files.filter((f) => !isDocPath(f.path));
   if (nonDoc.length === 0) {
     const declaredFiles = extractDeclaredFiles(rawText);
-    const wantsCode = declaredFiles ? declaredFiles.some((p) => !isDocPath(p)) : CODE_SIGNAL_RE.test(combined);
+    const wantsCode = declaredFiles ? declaredFiles.some((p) => !isDocPath(p)) : wantsCodeChange(combined);
     if (wantsCode) {
       return {
         code: 'docs-only',

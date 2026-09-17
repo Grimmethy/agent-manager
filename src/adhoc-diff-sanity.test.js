@@ -83,6 +83,39 @@ test('docs-only: with no Files: line at all, the old CODE_SIGNAL_RE fallback sti
   assert.equal(p.code, 'docs-only');
 });
 
+// 2026-09-16, pipeline hardening: the CODE_SIGNAL_RE.test(combined) fallback (no Files:
+// line present) can't distinguish a code file mentioned as an EDIT TARGET from one merely
+// cited as context/reference -- confirmed live, a genuinely doc-only task got hard-blocked
+// 3/3 attempts insisting it "asks for a real code change" because its own citation
+// sentence ("doc accuracy is enforced by scripts/check-doc-link.sh and
+// src/doc-accuracy-check.js") contains code-shaped tokens.
+test('docs-only: a code file cited as "enforced by" context (no Files: line) does NOT trip the fallback', () => {
+  const t = adhoc(
+    "Append CLAUDE.md's unique Agent skills section to AGENTS.md, and prepend an "
+    + 'HTML-comment block stating this file is the primary grounding doc, that CLAUDE.md '
+    + 'is a symlink to it and must not be edited directly, and that doc accuracy is '
+    + 'enforced by scripts/check-doc-link.sh and src/doc-accuracy-check.js.',
+  );
+  const p = adhocDiffSubstanceProblem(t, editDiff('AGENTS.md'));
+  assert.equal(p, null, 'scripts/check-doc-link.sh and src/doc-accuracy-check.js are cited as enforcement context, not edit targets');
+});
+
+test('docs-only: a code file cited as "the code anchor is real" grounding evidence (no Files: line) does NOT trip the fallback', () => {
+  const t = adhoc(
+    'Write the research note mapping Sidekiq super_fetch onto agent-manager with the '
+    + 'poison-pill guard clause. The code anchor is real: src/reclaim-orphaned-drafts.js '
+    + 'defines reclaimOrphanedDrafts, which reclaims unconditionally.',
+  );
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/research/super-fetch-poison-pill-precedent.md'));
+  assert.equal(p, null, 'src/reclaim-orphaned-drafts.js is cited as grounding evidence for the research note, not an edit target');
+});
+
+test('docs-only: with no citation phrasing, a bare code-file mention (no Files: line) still trips the fallback as before', () => {
+  const t = adhoc('Write a note about scripts/check-doc-link.sh and src/doc-accuracy-check.js.');
+  const p = adhocDiffSubstanceProblem(t, createDiff('docs/note.md'));
+  assert.equal(p.code, 'docs-only', 'no citation-context phrase present -- the old blind-scan behavior still applies');
+});
+
 test('docs-only: a "Files: none" declaration is treated as no code paths declared -- not blocked', () => {
   const t = adhoc('Write a short design note.\nFiles: none.', 'Considered src/foo.js but decided against touching it.');
   const p = adhocDiffSubstanceProblem(t, createDiff('docs/adr/0031-note.md'));
