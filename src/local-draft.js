@@ -1451,8 +1451,47 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard };
+
+// 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
+// broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on
+// something unrelated) fails asynchronously as an 'error' event, not a thrown exception,
+// so it is NOT caught by the try/catch already wrapping draftTask() above. With no
+// listener, Node's default behavior for an unhandled stream 'error' is to crash the WHOLE
+// process -- confirmed live: a task testing the Python<->Node plumbing chain hit a broken
+// streaming path on the Python side ('FakeProc' object has no attribute 'poll'), which
+// closed its read end while this process's own final process.stdout.write was still in
+// flight; the resulting EPIPE killed local-draft.js outright, and local-worker.sh's
+// wrapping bash loop -- which never crashes itself, so nothing restarted this lane's
+// underlying work -- was left running with no visible sign anything had gone wrong (the
+// worker's own log file, redirected from this same now-defunct process, simply went
+// silent for the rest of the incident). A broken pipe here means only that whoever was
+// going to read this run's result is already gone; the RIGHT behavior is to note that and
+// exit cleanly, not to take the whole worker down with it. Exported (rather than inlined
+// in the require.main block below) so it's independently testable without spawning a real
+// subprocess and simulating an OS-level broken pipe.
+function installStdoutEpipeGuard(label, stream = process.stdout) {
+  // `stream` is injectable so tests can drive this against a throwaway EventEmitter
+  // instead of the real process.stdout -- emitting a synthetic 'error' on the real stream
+  // leaves it internally marked errored/destroyed for the rest of the process, which broke
+  // the test runner's own stdout-based TAP reporting the first time this was tried.
+  stream.on('error', (err) => {
+    if (err && err.code === 'EPIPE') {
+      process.exitCode = 0;
+      return;
+    }
+    // Anything else on stdout is unexpected enough to want visible on stderr, but still
+    // not worth crashing over -- this process's real job (draftTask) already ran; only
+    // the final write of its result failed.
+    try { process.stderr.write(`[${label}] stdout write failed (non-fatal): ${err && err.message}\n`); } catch (_) { /* stderr may also be broken; nothing more to do */ }
+  });
+}
 
 if (require.main === module) {
+  // Scoped to the CLI entry, not module load -- this file's exports (draftTask et al.) are
+  // required as a library by other long-running processes and tests that must keep Node's
+  // normal stdout error behavior, not silently inherit a guard meant only for this
+  // standalone subprocess's own stdout.
+  installStdoutEpipeGuard('local-draft');
   main();
 }

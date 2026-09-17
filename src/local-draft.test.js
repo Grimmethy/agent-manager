@@ -15,6 +15,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { EventEmitter } = require('events');
 
 // The hygiene sources -- observability/performance/function-length _review + _fix
 // (2026-08-27) and arch_review/arch_import/arch_discovery/unused_export (2026-08-27,
@@ -3376,4 +3377,57 @@ test('every real call site threads task.id and its own stage name into opts, so 
     // Spot-check the exact stage names on the two calls this run actually reaches.
     assert.equal(capturedOpts[0].stage, 'plan');
   });
+});
+
+// 2026-09-17, pipeline hardening: installStdoutEpipeGuard() -- a broken pipe on
+// process.stdout is an async 'error' event, not a thrown exception, so nothing already
+// wrapping main()/draftTask() in a try/catch can ever catch it; with no listener, Node's
+// default behavior is to crash the whole process. Confirmed live: exactly this shape (a
+// downstream Python reader crashing mid-stream and closing its read end) killed a worker
+// lane outright with no self-recovery signal. Tests drive the listener directly by
+// emitting a real 'error' event on process.stdout in-process, rather than spawning a
+// subprocess and simulating an OS-level broken pipe -- the risky, novel part is the
+// listener's own logic (does it swallow EPIPE and exit clean, does it still surface a
+// genuinely different error), not the OS plumbing around it.
+test('installStdoutEpipeGuard: an EPIPE on stdout is swallowed -- exitCode set to 0, not crashed, nothing written to stderr', () => {
+  const { installStdoutEpipeGuard } = require('./local-draft.js');
+  const originalExitCode = process.exitCode;
+  const stderrWrites = [];
+  const originalStderrWrite = process.stderr.write;
+  process.stderr.write = (chunk) => { stderrWrites.push(chunk); return true; };
+  const fakeStream = new EventEmitter();
+  try {
+    process.exitCode = undefined;
+    installStdoutEpipeGuard('test-label', fakeStream);
+    const err = new Error('write EPIPE');
+    err.code = 'EPIPE';
+    fakeStream.emit('error', err);
+    assert.equal(process.exitCode, 0);
+    assert.deepEqual(stderrWrites, [], 'a clean EPIPE swallow should not print anything');
+  } finally {
+    process.stderr.write = originalStderrWrite;
+    process.exitCode = originalExitCode;
+  }
+});
+
+test('installStdoutEpipeGuard: a non-EPIPE stdout error is still surfaced to stderr, not silently dropped', () => {
+  const { installStdoutEpipeGuard } = require('./local-draft.js');
+  const originalExitCode = process.exitCode;
+  const stderrWrites = [];
+  const originalStderrWrite = process.stderr.write;
+  process.stderr.write = (chunk) => { stderrWrites.push(chunk); return true; };
+  const fakeStream = new EventEmitter();
+  try {
+    process.exitCode = undefined;
+    installStdoutEpipeGuard('test-label', fakeStream);
+    const err = new Error('something else entirely');
+    err.code = 'ENOSPC';
+    fakeStream.emit('error', err);
+    assert.equal(process.exitCode, undefined, 'a non-EPIPE error does not force a clean exit code');
+    assert.equal(stderrWrites.length, 1);
+    assert.match(stderrWrites[0], /\[test-label\] stdout write failed \(non-fatal\): something else entirely/);
+  } finally {
+    process.stderr.write = originalStderrWrite;
+    process.exitCode = originalExitCode;
+  }
 });
