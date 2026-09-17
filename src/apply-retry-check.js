@@ -36,6 +36,7 @@ const path = require('path');
 const { getConfig } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { fileGhostDebt } = require('./ghost-debt.js');
 
 const MAX_APPLY_RETRIES = 2;
 
@@ -43,7 +44,26 @@ function isApplyFailure(task) {
   return task.blockedStage === 'apply';
 }
 
-function applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome = defaultRecordModelOutcome }) {
+// 2026-09-17 (decompose_design_question AC-60/AC-61, "apply-failed on diverged master,
+// yet the pipeline auto-requeued and re-drafted the *same* fix 3-4 times before a human
+// fixed the branch"): git-runner.js's resetToMain()/prepareStackedBranch() both throw
+// this exact shape when local <mainBranch> and origin/<mainBranch> have each moved ahead
+// independently -- a git-STATE problem (something outside this task changed the branch
+// history), never a content/draft-quality one. The blind requeue-and-redraft loop below
+// treats every apply failure identically, so it burns MAX_APPLY_RETRIES full draft->
+// review cycles reproducing the IDENTICAL diverged-history failure every time (a fresh
+// diff drafted against the same still-diverged branch can never apply either) before
+// finally giving up -- pure waste, and worse, it silently eats the actual signal (a
+// human needs to reconcile the branch) inside two generic "requeued"/"exhausted" events
+// instead of surfacing it. Checked BEFORE the retry-count logic, same "a non-retryable
+// classification means retrying would reproduce the exact same failure" discipline
+// reject-retry-check.js's own classifyBlockedTask short-circuit already uses.
+const GIT_DIVERGED_RE = /have diverged \(each has commit\(s\) the other lacks\) -- needs a human to reconcile/i;
+function isDivergedHistoryFailure(task) {
+  return isApplyFailure(task) && GIT_DIVERGED_RE.test(String(task.blockedReason || ''));
+}
+
+function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, pipelineDir, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0, errorDetails: [] };
   let names = [];
   try {
@@ -70,6 +90,33 @@ function applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome = defaultR
       // happens to still carry stale fields, same "only act on the specific stage this
       // check owns" reasoning reject-retry-check.js's own isReviewRejection() guard uses.
       if (!isApplyFailure(task)) continue;
+
+      // Diverged-history short-circuit -- see isDivergedHistoryFailure's own header.
+      // Regardless of retryCount: retrying reproduces the identical git-state failure,
+      // structurally, not stochastically, so there is no reason to wait for the cap.
+      if (isDivergedHistoryFailure(task) && needsClarificationDir) {
+        const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+        if (!alreadyEscalated) {
+          task.needsClarification = {
+            reason: 'git-state-diverged',
+            openQuestions: [
+              `Apply failed because the pipeline's own working checkout and origin/<main> have diverged (each has commits the other lacks) -- a git-state problem, not a content/draft-quality one: ${String(task.blockedReason || '')}`,
+              'A fresh redraft cannot fix this -- the SAME diverged branch will reject any diff. Reconcile the branch by hand (confirm which side'
+                + ' has the real intended history, then either fast-forward, rebase, or reset the working checkout to match), then requeue this task.',
+            ],
+          };
+          step = 'record';
+          appendHistoryEvent(task, 'needs-clarification', 'escalated immediately -- diverged git history, a blind retry cannot differ');
+          if (pipelineDir) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'apply-retry-check:diverged-history', pipelineDir });
+          step = 'write';
+          fs.mkdirSync(needsClarificationDir, { recursive: true });
+          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+          step = 'unlink';
+          fs.unlinkSync(filePath);
+          summary.exhausted++;
+          continue;
+        }
+      }
 
       const retryCount = Number(task.applyRetryCount) || 0;
       if (retryCount >= MAX_APPLY_RETRIES) {
@@ -115,12 +162,13 @@ function main() {
   const queueDir = path.join(pipelineDir, 'queue');
   const blockedDir = path.join(queueDir, 'blocked');
   const pendingDir = path.join(queueDir, 'pending');
+  const needsClarificationDir = path.join(queueDir, 'needs-clarification');
 
-  const summary = applyRetryCheck({ blockedDir, pendingDir });
+  const summary = applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, pipelineDir });
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { applyRetryCheck };
+module.exports = { applyRetryCheck, isDivergedHistoryFailure };
 
 if (require.main === module) {
   main();
