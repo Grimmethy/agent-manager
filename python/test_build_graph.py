@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for build_graph.py's symlink-resolution fix and the coverage-merge
+"""Regression tests for graph_build.py's symlink-resolution fix and the coverage-merge
 logic backing the new --check-due daily rebuild (2026-08-19). No prior Python test
 infrastructure existed in this package before this file -- uses only the stdlib
 (unittest), matching this file's own zero-extra-dependency spirit.
