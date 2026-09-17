@@ -26,6 +26,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -61,6 +62,7 @@ const READMIT_CLEAN_SLATE_FIELDS = [
   'priorRejectionFeedback', 'rawDiff', 'implementResponse', 'blockedReason', 'blockedStage', 'claimedAt',
   'isAgenticContinuation', 'agenticContinuationCount', 'agenticContinuationNote', 'priorPartialDiff',
   'adhocDiffSubstanceFeedback', 'adhocNoChangesClaimFeedback', 'premiseReadmitCount',
+  '_prevBlockSignature',
 ];
 
 // 2026-09-16: a source registered with deterministicReview (brain_dump_sort today) that was
@@ -121,6 +123,39 @@ function forbiddenPathBlockNamesOwnTarget(task) {
   let targets = [];
   try { targets = extractDeclaredTargets(task, task.planResponse || task.lastGoodPlan || ''); } catch { return false; }
   return [...named].some((n) => targets.some((t) => pathsRefEqual(n, t)));
+}
+
+// Deterministic-block short-circuit (ADR-0022): when the block text carries a
+// deterministic-recheck marker (staleness-fastpath.js's own "deterministic recheck" /
+// "deterministic-rescan" tag) AND task.promptContext.originalFile names a readable
+// in-repo file, the outcome of retrying is a PURE function of that file's bytes plus
+// the rule it was checked against -- no model judgment involved, so a requeue
+// reproduces the identical block and merely burns retry budget. Fingerprint that
+// function (sha256 of the file + the rule name) so the caller can compare it against
+// task._prevBlockSignature: the same signature twice in a row means the block is
+// deterministic AND unchanged -- escalate instead of requeueing. Returns null (i.e.
+// "not a deterministic block I can fingerprint") on any miss: no marker, no readable
+// file, or the file path resolving outside repoRoot (the same path-safety guard
+// staleness-fastpath.js uses).
+function computeBlockSignature(task) {
+  const text = [
+    String(task.blockedReason || ''),
+    ...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback.map(String) : []),
+  ].join('\n');
+  if (!/deterministic recheck|deterministic-rescan/i.test(text)) return null;
+  const originalFile = task.promptContext && task.promptContext.originalFile;
+  if (!originalFile || typeof originalFile !== 'string') return null;
+  let repoRoot;
+  try { repoRoot = getConfig().repoRoot; } catch { return null; }
+  if (!repoRoot) return null;
+  let absPath;
+  try { absPath = path.resolve(repoRoot, originalFile); } catch { return null; }
+  const root = path.resolve(repoRoot);
+  if (!absPath.startsWith(root + path.sep)) return null;
+  let fileBytes;
+  try { fileBytes = fs.readFileSync(absPath); } catch { return null; }
+  return crypto.createHash('sha256').update(fileBytes).digest('hex')
+    + '|' + ((task.promptContext && task.promptContext.originalRule) || '');
 }
 
 // 2026-09-06: candidate-premise-check.js's premise gate (the "Invalid premise:" block
@@ -420,6 +455,20 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       }
 
       const retryCount = Number(task.localRejectCount) || 0;
+      // Deterministic-block short-circuit: this block fingerprints the EXACT same
+      // deterministic input as the previous sweep (same file bytes, same rule, marker
+      // still in the text) -- a redraft cannot change the outcome, so don't requeue
+      // again: stamp exhausted + escalated and leave the task where it is.
+      const blockSig = computeBlockSignature(task);
+      if (blockSig !== null && blockSig === task._prevBlockSignature) {
+        task.localRejectCount = MAX_LOCAL_REJECT_RETRIES;
+        task.escalated = true;
+        appendHistoryEvent(task, 'exhausted', 'deterministic block signature unchanged since previous sweep (_prevBlockSignature match) -- short-circuit: no requeue, escalated for human');
+        try { fs.writeFileSync(filePath, JSON.stringify(task, null, 2)); } catch { /* non-fatal: state stays in memory for this tick's summary */ }
+        summary.exhausted++;
+        continue;
+      }
+      if (blockSig !== null) task._prevBlockSignature = blockSig;
       if (retryCount >= MAX_LOCAL_REJECT_RETRIES && !isContinuation) {
         // An exhausted ADHOC rejection is very often a real disagreement about scope
         // ("is this already done, or a request to extend it?") that no amount of blind
@@ -540,7 +589,22 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       task.priorRejectionFeedback = priorFeedback;
       // A continuation is forward progress, not a spent redraft -- don't burn a slot of the
       // blind-redraft budget on it (its own MAX_AGENTIC_CONTINUATIONS cap bounds it).
-      if (!isContinuation) task.localRejectCount = retryCount + 1;
+      if (!isContinuation) {
+        // Second short-circuit site (mirrors the retryCount-branch guard above, for any
+        // path that reaches the increment without tripping the cap check first): a
+        // repeat of the identical deterministic block is not a spent redraft slot.
+        const incSig = computeBlockSignature(task);
+        if (incSig !== null && incSig === task._prevBlockSignature) {
+          task.localRejectCount = MAX_LOCAL_REJECT_RETRIES;
+          task.escalated = true;
+          appendHistoryEvent(task, 'exhausted', 'deterministic block signature unchanged since previous sweep (_prevBlockSignature match) -- short-circuit: no increment, escalated for human');
+          try { fs.writeFileSync(filePath, JSON.stringify(task, null, 2)); } catch { /* non-fatal */ }
+          summary.exhausted++;
+          continue;
+        }
+        if (incSig !== null) task._prevBlockSignature = incSig;
+        task.localRejectCount = retryCount + 1;
+      }
 
       // AC-131 (2026-09-15): a genuine review-stage rejection requeues with its prior
       // planResponse/implementResponse still intact -- the NEXT draftTask() run can then
@@ -593,7 +657,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, computeBlockSignature };
 
 if (require.main === module) {
   main();
