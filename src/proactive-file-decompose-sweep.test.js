@@ -8,7 +8,8 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const {
   sweep, isDue, markChecked, hasExistingRequestFor, isRequestResolved,
-  countOutstandingDecomposeBranches, CHECK_INTERVAL_MS, TIER1_CAP, TIER2_CAP,
+  countOutstandingDecomposeBranches, filePlanRepeatedlyFailedIdentically,
+  CHECK_INTERVAL_MS, TIER1_CAP, TIER2_CAP,
 } = require('./proactive-file-decompose-sweep.js');
 
 function tmpPipeline(files) {
@@ -144,6 +145,85 @@ test('hasExistingRequestFor: a file whose only requests are all RESOLVED is trea
     JSON.stringify({ id: 'old-resolved', sourceFile: 'python/dashboard/app.py', onePassTaskId: 'op-done' }));
 
   assert.equal(hasExistingRequestFor(dir, 'python/dashboard/app.py'), false, 'the one existing request for this file is fully resolved -- not blocking');
+});
+
+// 2026-09-17, root-caused live: python/build_graph.py filed an identically-doomed
+// coordinator hub (same unresolved cross-reference problems) on 4 consecutive days --
+// each one eventually auto-archived by coordinator-sweep.js's rejected-at-creation
+// handling, which is exactly what freed hasExistingRequestFor() to let each day's fresh,
+// equally-doomed attempt through. filePlanRepeatedlyFailedIdentically closes that loop.
+
+test('filePlanRepeatedlyFailedIdentically: false with fewer than 2 requests carrying a coordinatorBlocked signature for this file', () => {
+  const dir = tmpPipeline([]);
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'hub-1.json'),
+    JSON.stringify({ id: 'hub-1', coordinatorBlocked: { signature: 'plan-invalid:xyz' } }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'req-1.json'),
+    JSON.stringify({ id: 'req-1', sourceFile: 'python/build_graph.py', hubId: 'hub-1', hubFiledAt: '2026-09-14T00:00:00Z' }));
+
+  assert.equal(filePlanRepeatedlyFailedIdentically(dir, 'python/build_graph.py'), false, 'only one prior attempt on file -- nothing to compare yet');
+});
+
+test('filePlanRepeatedlyFailedIdentically: false when the two most recent attempts have DIFFERENT signatures (the plan genuinely changed)', () => {
+  const dir = tmpPipeline([]);
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'hub-1.json'),
+    JSON.stringify({ id: 'hub-1', coordinatorBlocked: { signature: 'plan-invalid:aaa' } }));
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'hub-2.json'),
+    JSON.stringify({ id: 'hub-2', coordinatorBlocked: { signature: 'plan-invalid:bbb' } }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'req-1.json'),
+    JSON.stringify({ id: 'req-1', sourceFile: 'python/build_graph.py', hubId: 'hub-1', hubFiledAt: '2026-09-14T00:00:00Z' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'req-2.json'),
+    JSON.stringify({ id: 'req-2', sourceFile: 'python/build_graph.py', hubId: 'hub-2', hubFiledAt: '2026-09-15T00:00:00Z' }));
+
+  assert.equal(filePlanRepeatedlyFailedIdentically(dir, 'python/build_graph.py'), false, 'a different signature means the split strategy actually changed -- worth trying again');
+});
+
+test('filePlanRepeatedlyFailedIdentically: true when the two most recent attempts share an IDENTICAL signature -- stops the daily re-file loop', () => {
+  const dir = tmpPipeline([]);
+  const SAME_SIG = 'plan-invalid:python/build_graph/config.py: get_config is still referenced elsewhere';
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'hub-1.json'),
+    JSON.stringify({ id: 'hub-1', coordinatorBlocked: { signature: SAME_SIG } }));
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'hub-2.json'),
+    JSON.stringify({ id: 'hub-2', coordinatorBlocked: { signature: SAME_SIG } }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'req-1.json'),
+    JSON.stringify({ id: 'req-1', sourceFile: 'python/build_graph.py', hubId: 'hub-1', hubFiledAt: '2026-09-16T00:00:00Z' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'req-2.json'),
+    JSON.stringify({ id: 'req-2', sourceFile: 'python/build_graph.py', hubId: 'hub-2', hubFiledAt: '2026-09-17T00:00:00Z' }));
+
+  assert.equal(filePlanRepeatedlyFailedIdentically(dir, 'python/build_graph.py'), true);
+});
+
+test('filePlanRepeatedlyFailedIdentically: an unrelated file with its own repeated failure does not block THIS file', () => {
+  const dir = tmpPipeline([]);
+  const SAME_SIG = 'plan-invalid:same signature, different file';
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'hub-a1.json'),
+    JSON.stringify({ id: 'hub-a1', coordinatorBlocked: { signature: SAME_SIG } }));
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'hub-a2.json'),
+    JSON.stringify({ id: 'hub-a2', coordinatorBlocked: { signature: SAME_SIG } }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'req-a1.json'),
+    JSON.stringify({ id: 'req-a1', sourceFile: 'python/other_file.py', hubId: 'hub-a1', hubFiledAt: '2026-09-16T00:00:00Z' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'req-a2.json'),
+    JSON.stringify({ id: 'req-a2', sourceFile: 'python/other_file.py', hubId: 'hub-a2', hubFiledAt: '2026-09-17T00:00:00Z' }));
+
+  assert.equal(filePlanRepeatedlyFailedIdentically(dir, 'python/build_graph.py'), false, 'python/build_graph.py has no prior attempts of its own -- unaffected by a different file\'s repeat failure');
+});
+
+test('sweep: a file whose last two attempts failed identically is skipped and counted as stuckRepeat, not re-filed a third time', async () => {
+  const dir = tmpPipeline(['python/build_graph.py']);
+  writeFixtureSource(dir, 'python/build_graph.py', SYMS);
+  const SAME_SIG = 'plan-invalid:same cross-reference problem every time';
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'hub-1.json'),
+    JSON.stringify({ id: 'hub-1', coordinatorBlocked: { signature: SAME_SIG } }));
+  fs.writeFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'hub-2.json'),
+    JSON.stringify({ id: 'hub-2', coordinatorBlocked: { signature: SAME_SIG } }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'req-1.json'),
+    JSON.stringify({ id: 'req-1', sourceFile: 'python/build_graph.py', hubId: 'hub-1', hubFiledAt: '2026-09-16T00:00:00Z' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'file-decompose-requests', 'req-2.json'),
+    JSON.stringify({ id: 'req-2', sourceFile: 'python/build_graph.py', hubId: 'hub-2', hubFiledAt: '2026-09-17T00:00:00Z' }));
+
+  const summary = await sweep({ pipelineDir: dir, repoRoot: dir, call: fakeCall(MOVES), force: true });
+  assert.equal(summary.filed, 0, 'must not file a third identically-doomed attempt');
+  assert.equal(summary.stuckRepeat, 1);
+  assert.equal(fs.readdirSync(path.join(dir, 'queue', 'file-decompose-requests')).length, 2, 'no new request file written');
 });
 
 test('sweep: a big file with only RESOLVED prior requests (this session\'s own app.py shape) is picked up again, not skipped forever', async () => {
