@@ -61,6 +61,7 @@ const { runFileDecomposePlanPass } = require('./file-decompose-plan-pass.js');
 const { sweep: fileDecomposeToHubSweep } = require('./file-decompose-to-hub.js');
 const { oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
+const { fileGhostDebt } = require('./ghost-debt.js');
 
 // Was 24h -- now just a floor against re-scanning every single ~60s watchdog tick, not
 // the thing standing between a merge and the next slice being filed (see THROTTLE above).
@@ -158,6 +159,72 @@ function hasExistingRequestFor(pipelineDir, targetFile) {
   return false;
 }
 
+// A hub id can live in queue/coordinating/ (still open), queue/done/ or its
+// _archived_no_action/ subfolder, or one of done-archive.js's dated month buckets --
+// same set of locations isRequestResolved() already checks, just returning the record
+// itself instead of a boolean.
+function findTaskRecordAnywhere(pipelineDir, id) {
+  const candidates = [
+    path.join(pipelineDir, 'queue', 'coordinating', `${id}.json`),
+    path.join(pipelineDir, 'queue', 'done', `${id}.json`),
+    path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${id}.json`),
+    ...listArchivedMonthDirs(pipelineDir).map((dir) => path.join(dir, `${id}.json`)),
+  ];
+  for (const p of candidates) {
+    const rec = readJson(p);
+    if (rec) return rec;
+  }
+  return null;
+}
+
+// Stop re-authoring a doomed plan forever. hasExistingRequestFor() alone only blocks a
+// SECOND attempt while the first is still unresolved -- the moment coordinator-sweep.js's
+// own rejected-at-creation handling archives a hub whose plan failed preflight (moving it
+// to done/_archived_no_action/, exactly as it's supposed to for a hub that produced zero
+// real work), isRequestResolved() correctly reports the OLD request resolved and the
+// dedup above opens right back up -- with nothing checking whether the fresh plan this
+// run is about to author would just be the SAME structurally-invalid split again.
+// Confirmed live 2026-09-17: python/build_graph.py filed an identically-doomed hub (same
+// unresolved get_config/walk_source_files/build_graph_data/... cross-references) on
+// 2026-09-14, 15, 16, and 17 in a row, each auto-archived a day later, each freeing the
+// dedup for the next day's identical retry -- a plan-quality problem (the split doesn't
+// account for cross-references between the proposed new files) with no learning or
+// backoff at all, burning a plan-pass model call daily for zero new information.
+//
+// Compares the two MOST RECENT proactive requests' linked hubs' coordinatorBlocked.
+// signature (already computed at hub-creation time by file-decompose-to-hub.js's own
+// preflight validator) -- identical non-null signatures twice in a row means the planner
+// reproduced the exact same failure, not a fluke or a file that's since changed shape.
+function filePlanRepeatedlyFailedIdentically(pipelineDir, targetFile) {
+  const reqDir = path.join(pipelineDir, 'queue', 'file-decompose-requests');
+  let names;
+  try { names = fs.readdirSync(reqDir).filter((n) => n.endsWith('.json')); } catch { return false; }
+  const attempts = [];
+  for (const name of names) {
+    const req = readJson(path.join(reqDir, name));
+    if (!req || req.sourceFile !== targetFile) continue;
+    const linkedId = req.onePassTaskId || req.hubId;
+    if (!linkedId) continue;
+    const rec = findTaskRecordAnywhere(pipelineDir, linkedId);
+    const sig = rec && rec.coordinatorBlocked && rec.coordinatorBlocked.signature;
+    if (sig) attempts.push({ filedAt: req.hubFiledAt || req.createdAt || '', sig, linkedId });
+  }
+  if (attempts.length < 2) return false;
+  attempts.sort((a, b) => a.filedAt.localeCompare(b.filedAt));
+  const lastTwo = attempts.slice(-2);
+  if (lastTwo[0].sig !== lastTwo[1].sig) return false;
+  // Escalate (deduped internally by fileGhostDebt's own signature+REFILE_DAYS check) --
+  // without this, the file just silently stops getting new attempts with no visible
+  // signal that anything is stuck, once coordinator-sweep.js archives the last hub away.
+  fileGhostDebt({
+    task: { id: lastTwo[1].linkedId, source: 'proactive_file_decompose' },
+    reasonText: `proactive-file-decompose-sweep: ${targetFile} failed the identical plan-validation check twice in a row (${lastTwo[1].sig.slice(0, 200)}) -- giving up on automatic re-attempts, needs a human to fix the split plan (or the file) directly`,
+    site: 'proactive-file-decompose-sweep:repeated-identical-failure',
+    pipelineDir,
+  });
+  return true;
+}
+
 // Counts decompose-derived tasks that are APPLIED (a real `agent/...` branch exists) but
 // NOT YET MERGED, split Tier1/Tier2 -- see the THROTTLE header note. Works entirely off
 // queue task records (the same `applied`/`merged` history stages task-log-reconcile.js
@@ -240,6 +307,11 @@ async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.no
     summary.checked += 1;
 
     if (hasExistingRequestFor(resolvedPipelineDir, targetFile)) { summary.skipped += 1; continue; }
+    if (filePlanRepeatedlyFailedIdentically(resolvedPipelineDir, targetFile)) {
+      summary.skipped += 1;
+      summary.stuckRepeat = (summary.stuckRepeat || 0) + 1;
+      continue;
+    }
 
     const requestId = `proactive-${slugify(targetFile)}-${new Date(now).toISOString().slice(0, 10)}`;
     try {
@@ -283,6 +355,7 @@ async function sweep({ pipelineDir, repoRoot, call, force = false, now = Date.no
 
 module.exports = {
   sweep, isDue, markChecked, hasExistingRequestFor, isRequestResolved, countOutstandingDecomposeBranches,
+  filePlanRepeatedlyFailedIdentically, findTaskRecordAnywhere,
   CHECK_INTERVAL_MS, TIER1_CAP, TIER2_CAP,
 };
 
