@@ -301,8 +301,8 @@ const TABS = [
   { key: 'branches', label: '🌿 Unmerged Branches', description: 'List branches the pipeline has created that have not yet been merged, so nothing gets lost or forgotten.' },
   { key: 'adhoc', label: '📌 Adhoc Tasks', description: 'Every adhoc task in one place, with which queue state it currently sits in -- cuts across the whole Job Status group instead of checking each state tab by hand.' },
   { group: 'Job Status', children: [
-    { key: 'drafting', label: '✍️ Drafting', description: 'Jobs where an agent is currently writing the initial implementation.' },
     { key: 'pending', label: '⏳ Pending', description: 'Jobs queued and waiting for an agent to pick them up.' },
+    { key: 'drafting', label: '✍️ Drafting', description: 'Jobs where an agent is currently writing the initial implementation.' },
     { key: 'review', label: '👀 Review', description: 'Jobs with a draft implementation waiting on review before they can proceed.' },
     { key: 'approved', label: '✅ Approved', description: 'Jobs that passed review and are approved to move forward.' },
     { key: 'blocked', label: '🚫 Blocked', description: 'Jobs that cannot proceed until something outside the pipeline is resolved.' },
@@ -671,7 +671,7 @@ document.getElementById('global-brain-dump-btn').onclick = openGlobalBrainDumpMo
 // refresh() poll and across tab switches (switching away and back keeps your scroll
 // depth) -- only a full page reload resets them to the first page.
 const QUEUE_PAGE_SIZE = 10;
-const QUEUE_STATE_TABS = ['drafting', 'pending', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'coordinating', 'done'];
+const QUEUE_STATE_TABS = ['pending', 'drafting', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'coordinating', 'done'];
 const queueLoadedCount = {};
 const queueHasMore = {};
 let queueLoadInFlight = false;
