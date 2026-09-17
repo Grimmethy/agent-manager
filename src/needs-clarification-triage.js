@@ -279,6 +279,24 @@ const REQUEUE_STRIP_FIELDS = [
   'claimedAt',
 ];
 
+// 2026-09-17, root-caused live: every bucket below strips REQUEUE_STRIP_FIELDS (which
+// already includes blockedReason/blockedStage) before writing a clean-slate retry back
+// into queue/adhoc/, but none of them ever reset task.status away from 'blocked' --
+// escalation to needs-clarification never clears the blocked-stage fields underneath
+// it, so a task requeued this way lands in adhoc/ still reading status:'blocked' with
+// no blockedReason/blockedStage to explain it. Confirmed live: 2 real tasks requeued by
+// bucket E sat with an inexplicable "blocked, no reason" status. Harmless for CLAIM
+// eligibility (task-sources.js's nextAdhocLikeTask() never checks task.status at all),
+// but it DOES make the task indistinguishable from an already-exhausted blocked task to
+// any OTHER sweep that keys off status:'blocked' (reject-retry-check.js's own in-place
+// adhoc/ scan is exactly this shape) -- and if the task is genuinely re-claimed and
+// fails again, a stale status:'blocked' left over from a stripped-but-not-reset prior
+// cycle is exactly the kind of inconsistent state this whole class of bug (see
+// routes/task.py's matching /answer and /resolve fix, same day) keeps producing.
+function resetStatusForFreshAdhocAttempt(task) {
+  if (task.status === 'blocked') task.status = 'pending';
+}
+
 // Bucket L helpers. Parses candidate-path-grounding.js's own formatFabricatedReason()
 // shape ("fabricated file path(s): a, b -- not present anywhere in the target repo. ...")
 // -- deliberately matching that exact producer rather than a looser pattern, so this
@@ -691,6 +709,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
           summary.requeued += 1;
           if (!DRY_RUN) {
             for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
             delete task.stalenessFlag;
             delete task.decomposeBlockCount;
             delete task.autoDecomposeCount;
@@ -738,6 +757,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
           summary.requeued += 1;
           if (!DRY_RUN) {
             for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
             bumpBucketAttempts(task, 'D');
@@ -783,6 +803,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
           summary.requeued += 1;
           if (!DRY_RUN) {
             for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
             bumpBucketAttempts(task, 'F');
@@ -826,6 +847,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
           summary.requeued += 1;
           if (!DRY_RUN) {
             for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
             bumpBucketAttempts(task, 'G');
@@ -878,6 +900,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
           summary.requeued += 1;
           if (!DRY_RUN) {
             for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
             delete task.reviewProvider;
@@ -925,6 +948,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       summary.requeued += 1;
       if (DRY_RUN) continue;
       for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+      resetStatusForFreshAdhocAttempt(task);
       bumpBucketAttempts(task, 'A');
       appendHistoryEvent(task, 'requeued',
         `needs-clarification-triage: degenerate "no prior context" draft (rawText intact) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);

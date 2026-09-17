@@ -78,6 +78,7 @@ test('bucket A: degenerate draft + big rawText + no exhausted -> clean requeue t
   assert.equal(moved.promptContext.rawText, bigRawText, 'rawText preserved');
   assert.equal(moved.ncTriageBucketAttempts.A, 1);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /clean-state retry 1\/1/.test(h.detail)));
+  assert.equal(moved.status, 'pending', 'must not still read as blocked after a clean-slate requeue');
 });
 
 test('bucket A skipped: rawText too short -> leave for human', async () => {
@@ -307,6 +308,7 @@ test('bucket D: false completion-claim signature in blockedReason -> clean reque
   assert.equal(moved.blockedReason, undefined);
   assert.equal(moved.ncTriageBucketAttempts.D, 1);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /false completion-claim signature/.test(h.detail)));
+  assert.equal(moved.status, 'pending', 'must not still read as blocked after a clean-slate requeue');
 });
 
 test('bucket D: previously stamped leave-for-human is NOT frozen against the new signature', async () => {
@@ -386,6 +388,10 @@ test('bucket E: decompose-loop + no oversized-file target -> clean requeue to ad
   assert.equal(moved.needsClarification, undefined);
   assert.equal(moved.ncTriageBucketAttempts.E, 1);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /not an oversized file/.test(h.detail)));
+  // 2026-09-17: root-caused live -- REQUEUE_STRIP_FIELDS clears blockedReason/
+  // blockedStage but never reset task.status, so a clean-slate requeue landed in
+  // adhoc/ still reading status:'blocked' with nothing left to explain it.
+  assert.equal(moved.status, 'pending', 'must not still read as blocked after a clean-slate requeue');
 });
 
 test('bucket E: a real oversized-file target still defers to autoroute, unaffected', async () => {
