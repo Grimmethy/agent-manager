@@ -17,6 +17,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport, applyDebriefReport, parseDebriefNowWhatItems, applySecondBrainOpportunities } = require('./apply-group-a.js');
+const { isValidDuplicateMatch } = require('./apply-group-a-brain-dump.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
   const lines = [`### ${id} · ${title}`, `Strength: ${strength}`];
@@ -740,7 +741,7 @@ test('applyBrainDumpSort routes to needs-clarification, not adhoc, when the clas
   writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
 
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard', duplicateGateAttempts: 1 })]);
-  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard' } };
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard', existingQueuedTitles: ['Fix the budget guard rounding bug'] } };
   const implementResponse = JSON.stringify({
     category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
     possibleDuplicateOf: 'Fix the budget guard rounding bug',
@@ -772,7 +773,7 @@ test('applyBrainDumpSort gives a FIRST possible-duplicate flag one retry instead
   writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
 
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard' })]);
-  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard' } };
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard', existingQueuedTitles: ['Fix the budget guard rounding bug'] } };
   const implementResponse = JSON.stringify({
     category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
     possibleDuplicateOf: 'Fix the budget guard rounding bug',
@@ -787,6 +788,68 @@ test('applyBrainDumpSort gives a FIRST possible-duplicate flag one retry instead
   const entry = data.entries.find((e) => e.id === 'bd-1');
   assert.equal(entry.duplicateGateAttempts, 1);
   assert.equal(entry.status, 'captured', 'entry stays captured so a fresh classification pass picks it up again');
+});
+
+test('isValidDuplicateMatch: exact match passes', () => {
+  assert.equal(isValidDuplicateMatch('Fix the budget guard rounding bug', ['Fix the budget guard rounding bug']), true);
+});
+
+test('isValidDuplicateMatch: a truncated real title still matches (substring either direction)', () => {
+  assert.equal(isValidDuplicateMatch('Fix the budget guard rounding bug in the nightly reconciliation job',
+    ['Fix the budget guard rounding bug in the nightly reconciliation']), true);
+});
+
+test('isValidDuplicateMatch: a close paraphrase of a real title matches via Jaccard overlap', () => {
+  assert.equal(isValidDuplicateMatch('Budget guard rounding bug needs a fix',
+    ['Fix the budget guard rounding bug']), true);
+});
+
+test('isValidDuplicateMatch: a phrase echoed from the note\'s own body (not a real title) is rejected', () => {
+  assert.equal(isValidDuplicateMatch('Design option: a shared constrained action-interface layer, replacing per-task-type ad hoc tool access',
+    ['Add authentication to the Agent Manager dashboard', 'Rebalance the worker-1 lane split']), false);
+});
+
+test('isValidDuplicateMatch: a hallucinated slug matching no real title is rejected', () => {
+  assert.equal(isValidDuplicateMatch('agent-manager-apply-target',
+    ['Add authentication to the Agent Manager dashboard', 'Rebalance the worker-1 lane split']), false);
+});
+
+test('isValidDuplicateMatch: an empty or missing candidate list never validates', () => {
+  assert.equal(isValidDuplicateMatch('Anything at all', []), false);
+  assert.equal(isValidDuplicateMatch('Anything at all', undefined), false);
+});
+
+// 2026-09-16, pipeline hardening: possibleDuplicateOf is only trustworthy when it matches
+// something the classifier was ACTUALLY shown (task.promptContext.existingQueuedTitles) --
+// see isValidDuplicateMatch's own header in apply-group-a-brain-dump.js for the two
+// confirmed hallucination shapes this closes. A flagged value matching NOTHING in the real
+// candidate list must be discarded, routing straight to adhoc/ as if no duplicate was ever
+// flagged -- not held for a human to discover it was never real.
+test('applyBrainDumpSort discards a possibleDuplicateOf that matches nothing in the real candidate list', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-dup-hallucination-test-'));
+  const { repoRoot, pipelineDir, label } = setupMatchedProjectFixture(dir);
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'src', 'budget_guard.ts'), '// stub\n');
+  writeGraphFixture(repoRoot, [{ id: 0, community: 0, source_file: 'src/budget_guard.ts' }]);
+
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'Fix a bug in budget_guard' })]);
+  const task = {
+    promptContext: {
+      brainDumpEntryId: 'bd-1', rawText: 'Fix a bug in budget_guard',
+      existingQueuedTitles: ['Add authentication to the Agent Manager dashboard', 'Rebalance the worker-1 lane split'],
+    },
+  };
+  const implementResponse = JSON.stringify({
+    category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: label,
+    possibleDuplicateOf: 'agent-manager-apply-target',
+  });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(dir, 'sb') });
+
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'needs-clarification')), false, 'must not hold for a human -- the flag was never real');
+  const adhocFiles = fs.readdirSync(path.join(pipelineDir, 'queue', 'adhoc'));
+  assert.equal(adhocFiles.length, 1, 'proceeds straight to adhoc/ as if no duplicate was flagged');
+  assert.equal(result.queuedProject, label);
 });
 
 // 2026-08-24 (Grimmethy: "The brain dump sort would have to know that repo specific tasks

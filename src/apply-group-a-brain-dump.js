@@ -7,6 +7,7 @@ const path = require('path');
 const { resolveAnchors, extractKeywords } = require('./path-prefetch.js');
 const { resolveGraphPath } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
+const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 const {
   CANONICAL_TOP_LEVEL,
   GENERIC_FILENAME_BLOCKLIST,
@@ -24,6 +25,38 @@ function readProjectRegistry() {
   } catch {
     return [];
   }
+}
+
+// Validates a classifier-reported possibleDuplicateOf against the REAL candidate list it
+// was actually shown (task.promptContext.existingQueuedTitles, built by task-sources.js's
+// existingQueuedTaskTitles()) -- 2026-09-16, pipeline hardening: root-caused live that the
+// classifier's possibleDuplicateOf field was never checked against that list at all, so the
+// local model could (and, confirmed across a live needs-clarification queue, routinely did)
+// return a string that matches NEITHER a real queued title NOR anything resembling one --
+// two confirmed shapes: (a) echoing a quoted/bracketed phrase from INSIDE the note's own
+// rawText as if it were an external match, (b) a plausible-sounding but entirely invented
+// slug (e.g. "agent-manager-apply-target") that isn't a real task title at all (real titles
+// are full sentences). Both false-positive shapes permanently routed the note to
+// needs-clarification for a human to manually discover it was never a real duplicate --
+// confirmed on ~43% of one live needs-clarification queue. Tolerant matching (exact,
+// substring either direction for a truncated title, or Jaccard >= 0.5 for a close
+// paraphrase) so a genuine match phrased slightly differently than the 140-char-truncated
+// title still passes; anything below that bar is almost certainly a hallucination, not a
+// real duplicate the classifier actually found.
+const DUPLICATE_MATCH_JACCARD_THRESHOLD = 0.5;
+function isValidDuplicateMatch(candidate, existingTitles) {
+  const c = String(candidate || '').trim();
+  if (!c || !Array.isArray(existingTitles) || existingTitles.length === 0) return false;
+  const cLower = c.toLowerCase();
+  const cTokens = normalizeTokens(c);
+  return existingTitles.some((title) => {
+    const t = String(title || '').trim();
+    if (!t) return false;
+    const tLower = t.toLowerCase();
+    if (cLower === tLower) return true;
+    if (cLower.includes(tLower) || tLower.includes(cLower)) return true;
+    return jaccardSimilarity(cTokens, normalizeTokens(t)) >= DUPLICATE_MATCH_JACCARD_THRESHOLD;
+  });
 }
 
 function allNoteBasenames(secondBrainDir) {
@@ -105,7 +138,7 @@ function recoverableSortSkip(data, entry, brainDumpPath, reason) {
 }
 
 function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
-  const { brainDumpEntryId, rawText } = task.promptContext;
+  const { brainDumpEntryId, rawText, existingQueuedTitles } = task.promptContext;
 
   const data = loadBrainDump(brainDumpPath);
 
@@ -317,6 +350,13 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
       // call the existing generic Archive button on every needs-clarification row (for
       // "yes, duplicate") plus the free-text Other box (for "no, here's why not") already
       // fully cover.
+      // Validate BEFORE trusting it -- see isValidDuplicateMatch's own header for the
+      // incident this closes. A classifier answer that matches nothing in the real
+      // candidate list it was shown is treated as no match at all, not a duplicate flag.
+      if (result.possibleDuplicateOf && !isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles)) {
+        console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier -- discarding as a hallucinated match, not routing to needs-clarification`);
+        result.possibleDuplicateOf = null;
+      }
       if (result.possibleDuplicateOf) {
         // Bounded one-retry gate (2026-09-15, brain-dump bd-1788900769368: "All three
         // 'failing' tasks share identical death signature... with zero model_calls" --
@@ -424,4 +464,4 @@ function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) 
   return { closed: true, entryId: brainDumpEntryId };
 }
 
-module.exports = { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort, closeBrainDumpEntryResolved, readProjectRegistry };
+module.exports = { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort, closeBrainDumpEntryResolved, readProjectRegistry, isValidDuplicateMatch };
