@@ -55,7 +55,11 @@ const MAX_LOCAL_REJECT_RETRIES = 2;
 // with needs-clarification-triage.js's REQUEUE_STRIP_FIELDS -- same intent: a fresh start
 // for a task whose accumulated failure state was an artifact of a bug, not a real signal.
 const READMIT_CLEAN_SLATE_FIELDS = [
-  'needsClarification', 'localRejectCount', 'ncTriageAttempts', 'ncTriageDecision', 'ncTriageReviewedAt',
+  // ncTriageAttempts is the pre-2026-09-16 flat counter, kept here so an older task record
+  // still carrying it gets cleaned up too; ncTriageBucketAttempts is its per-bucket
+  // replacement (see needs-clarification-triage.js's own header on why buckets no longer
+  // share one counter).
+  'needsClarification', 'localRejectCount', 'ncTriageAttempts', 'ncTriageBucketAttempts', 'ncTriageDecision', 'ncTriageReviewedAt',
   'retryableDraftBlock', 'turnBudgetExhausted', 'turnBudgetExhaustedBefore',
   'infraErrorRetry', 'infraErrorNote', 'adhocResolution', 'subTaskProposals',
   'priorRejectionFeedback', 'rawDiff', 'implementResponse', 'blockedReason', 'blockedStage', 'claimedAt',

@@ -76,7 +76,7 @@ test('bucket A: degenerate draft + big rawText + no exhausted -> clean requeue t
   assert.equal(moved.turnBudgetExhausted, undefined);
   assert.equal(moved.priorRejectionFeedback, undefined);
   assert.equal(moved.promptContext.rawText, bigRawText, 'rawText preserved');
-  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.ncTriageBucketAttempts.A, 1);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /clean-state retry 1\/1/.test(h.detail)));
 });
 
@@ -91,7 +91,7 @@ test('bucket A skipped: rawText too short -> leave for human', async () => {
 
 test('bucket A skipped: already at MAX_REQUEUES -> leave for human', async () => {
   const dir = makePipeline();
-  held(dir, baseTask('t3', { ncTriageAttempts: 1 }));
+  held(dir, baseTask('t3', { ncTriageBucketAttempts: { A: 1 } }));
   const s = await needsClarificationTriage(args(dir));
   assert.deepEqual([s.requeued, s.leftForHuman], [0, 1]);
 });
@@ -305,7 +305,7 @@ test('bucket D: false completion-claim signature in blockedReason -> clean reque
   const moved = read(at(dir, 'adhoc', 'td1.json'));
   assert.equal(moved.needsClarification, undefined);
   assert.equal(moved.blockedReason, undefined);
-  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.ncTriageBucketAttempts.D, 1);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /false completion-claim signature/.test(h.detail)));
 });
 
@@ -334,7 +334,14 @@ test('bucket D: a plain leave-for-human task with no matching signature stays sk
 
 test('bucket D: already at MAX_REQUEUES -> falls through to leave-for-human, not re-requeued', async () => {
   const dir = makePipeline();
-  held(dir, baseTask('td4', { blockedReason: REAL_TEST_COUNT_CLAIM, ncTriageAttempts: 1 }));
+  // needsClarification override so this fixture matches ONLY bucket D's signature (its
+  // default openQuestions is bucket A's own degenerate-draft signature -- with per-bucket
+  // counters, bucket D being capped no longer implicitly caps bucket A too).
+  held(dir, baseTask('td4', {
+    blockedReason: REAL_TEST_COUNT_CLAIM,
+    needsClarification: { reason: 'design-decision', openQuestions: REAL_TEST_COUNT_CLAIM },
+    ncTriageBucketAttempts: { D: 1 },
+  }));
   const s = await needsClarificationTriage(args(dir));
   assert.equal(s.requeued, 0);
   assert.ok(exists(at(dir, 'needs-clarification', 'td4.json')));
@@ -377,7 +384,7 @@ test('bucket E: decompose-loop + no oversized-file target -> clean requeue to ad
   assert.equal(moved.stalenessFlag, undefined);
   assert.equal(moved.decomposeBlockCount, undefined);
   assert.equal(moved.needsClarification, undefined);
-  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.ncTriageBucketAttempts.E, 1);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /not an oversized file/.test(h.detail)));
 });
 
@@ -397,7 +404,7 @@ test('bucket E: already at MAX_REQUEUES -> falls through to bucket C, gets a vis
   const dir = makePipeline();
   held(dir, baseTask('te3', {
     stalenessFlag: { reason: 'decompose-loop' },
-    ncTriageAttempts: 1,
+    ncTriageBucketAttempts: { E: 1 },
     history: [{ stage: 'exhausted' }, { stage: 'needs-clarification' }],
   }));
   const s = await needsClarificationTriage(args(dir));
@@ -459,7 +466,7 @@ test('bucket F: turn/context budget exhausted, not a design question -> clean re
   assert.ok(!exists(at(dir, 'needs-clarification', 'tf1.json')));
   const moved = read(at(dir, 'adhoc', 'tf1.json'));
   assert.equal(moved.needsClarification, undefined);
-  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.ncTriageBucketAttempts.F, 1);
   assert.equal(moved.promptContext.rawText, bigRawText, 'rawText preserved');
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /ran out of turn\/context budget mid-mechanical-step/.test(h.detail)));
 });
@@ -481,7 +488,7 @@ test('bucket F skipped: already at MAX_REQUEUES -> falls through to leave-for-hu
   const dir = makePipeline();
   held(dir, baseTask('tf3', {
     needsClarification: { reason: 'design-decision', openQuestions: REAL_BUDGET_EXHAUSTED_OQ },
-    ncTriageAttempts: 1,
+    ncTriageBucketAttempts: { F: 1 },
   }));
   const s = await needsClarificationTriage(args(dir));
   assert.equal(s.requeued, 0);
@@ -553,7 +560,7 @@ test('bucket F: BLOCKER-TYPE: budget-exhausted alone triggers the requeue, witho
   assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
   assert.ok(!exists(at(dir, 'needs-clarification', 'tf7.json')));
   const moved = read(at(dir, 'adhoc', 'tf7.json'));
-  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.ncTriageBucketAttempts.F, 1);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /ran out of turn\/context budget mid-mechanical-step/.test(h.detail)));
 });
 
@@ -590,7 +597,7 @@ test('bucket G: BLOCKER-TYPE: infra-error -> clean requeue to adhoc/', async () 
   assert.ok(!exists(at(dir, 'needs-clarification', 'tg1.json')));
   const moved = read(at(dir, 'adhoc', 'tg1.json'));
   assert.equal(moved.needsClarification, undefined);
-  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.ncTriageBucketAttempts.G, 1);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /BLOCKER-TYPE: infra-error/.test(h.detail)));
 });
 
@@ -622,7 +629,7 @@ test('bucket J: reviewProvider === deterministic-truncation-guard -> clean reque
   assert.equal(moved.needsClarification, undefined);
   assert.equal(moved.blockedReason, undefined);
   assert.equal(moved.reviewProvider, undefined);
-  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.ncTriageBucketAttempts.J, 1);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /deterministic-truncation-guard false-block signature/.test(h.detail)));
 });
 
@@ -662,7 +669,12 @@ test('bucket J: a genuinely blocked task (real content rejection, not the trunca
 
 test('bucket J: already at MAX_REQUEUES -> falls through to leave-for-human, not re-requeued', async () => {
   const dir = makePipeline();
-  held(dir, baseTask('tj5', { reviewProvider: 'deterministic-truncation-guard', ncTriageAttempts: 1 }));
+  // needsClarification override -- same reasoning as bucket D's own MAX_REQUEUES test above.
+  held(dir, baseTask('tj5', {
+    reviewProvider: 'deterministic-truncation-guard',
+    needsClarification: { reason: 'design-decision', openQuestions: 'This is unrelated to any known signature.' },
+    ncTriageBucketAttempts: { J: 1 },
+  }));
   const s = await needsClarificationTriage(args(dir));
   assert.equal(s.requeued, 0);
   assert.ok(exists(at(dir, 'needs-clarification', 'tj5.json')));
@@ -692,7 +704,7 @@ test('bucket K: decompose-review-blind signature -> implementResponse regenerate
   assert.equal(moved.status, 'needs-review');
   assert.equal(moved.needsClarification, undefined);
   assert.equal(moved.blockedReason, undefined);
-  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.ncTriageBucketAttempts.K, 1);
   // The real sub-tasks are now genuinely present in implementResponse.
   assert.match(moved.implementResponse, /Add the allowlist constant/);
   assert.match(moved.implementResponse, /Wire the allowlist into the check/);
@@ -792,15 +804,46 @@ test('bucket K: a genuinely non-decompose task is left alone', async () => {
 
 test('bucket K: already at MAX_REQUEUES -> falls through to leave-for-human, not re-repaired', async () => {
   const dir = makePipeline();
+  // needsClarification override -- same reasoning as bucket D's own MAX_REQUEUES test above.
   held(dir, baseTask('tk5', {
     adhocResolution: 'decompose',
     subTaskProposals: REAL_SUB_TASKS,
     implementResponse: 'Auto-decomposed after two implement passes (2 pieces).',
-    ncTriageAttempts: 1,
+    needsClarification: { reason: 'design-decision', openQuestions: 'This is unrelated to any known signature.' },
+    ncTriageBucketAttempts: { K: 1 },
   }));
   const s = await needsClarificationTriage(args(dir));
   assert.equal(s.requeued, 0);
   assert.ok(exists(at(dir, 'needs-clarification', 'tk5.json')));
+});
+
+// 2026-09-16, pipeline hardening (the actual bug this whole per-bucket refactor fixes):
+// a task that already burned its ONE shot on an EARLIER, unrelated bucket (D here, standing
+// in for whichever generic bucket got there first in production) must not be locked out of
+// a LATER bucket whose own, completely different signature it separately matches. Before
+// this fix, every bucket shared one flat task.ncTriageAttempts counter, so Bucket K --
+// built specifically to rescue tasks with a valid decomposition sitting unused -- could
+// never fire on a task some other bucket had already touched once.
+test('bucket D being exhausted does NOT block bucket K from firing on the same task (buckets are independent budgets)', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, baseTask('tdk1', {
+    adhocResolution: 'decompose',
+    subTaskProposals: REAL_SUB_TASKS,
+    implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).\n\nAgentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it',
+    needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
+    blockedReason: 'The IMPLEMENT draft is a degenerate meta-commentary...',
+    // Bucket D's own budget is already spent -- simulates a task an earlier, unrelated
+    // requeue bucket already touched once, exactly the production incident this closes.
+    ncTriageBucketAttempts: { D: 1 },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  const moved = read(at(dir, 'review', 'tdk1.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.equal(moved.ncTriageBucketAttempts.K, 1, 'bucket K got its OWN fresh attempt, unaffected by D already being at its cap');
+  assert.equal(moved.ncTriageBucketAttempts.D, 1, 'bucket D\'s own prior count is preserved, not reset by K firing');
+  assert.match(moved.implementResponse, /Add the allowlist constant/);
 });
 
 // --- Ghost-in-the-Machine: bucket C retry-exhausted -> ghost debt (2026-09-09) ---------
@@ -1014,7 +1057,7 @@ test('bucket L: fabricated path with a unique near-miss real match -> repaired i
   assert.equal(moved.status, 'needs-review');
   assert.equal(moved.needsClarification, undefined);
   assert.equal(moved.blockedReason, undefined);
-  assert.equal(moved.ncTriageAttempts, 1);
+  assert.equal(moved.ncTriageBucketAttempts.L, 1);
   assert.match(moved.implementResponse, /Files: src\/candidates-doc-merge\.js/);
   assert.doesNotMatch(moved.implementResponse, /merge-candidates\.js/);
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /fabricated-file-path near-miss/.test(h.detail)));
@@ -1055,7 +1098,7 @@ test('bucket L: a genuinely unrecoverable fabrication (no real path is even a su
 
 test('bucket L: MAX_REQUEUES cap is respected', async () => {
   const dir = makePipeline();
-  held(dir, archDiscoveryTask('l5', { ncTriageAttempts: 1 }));
+  held(dir, archDiscoveryTask('l5', { ncTriageBucketAttempts: { L: 1 } }));
   const s = await needsClarificationTriage(args(dir));
   assert.equal(s.requeued, 0);
   assert.ok(exists(at(dir, 'needs-clarification', 'l5.json')));
