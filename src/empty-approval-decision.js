@@ -28,6 +28,7 @@
 //                this decision does not apply; fall through to the normal review path.
 
 const { getRegisteredSource } = require('./task-source-registry.js');
+const { parseArchDiscoveryCandidates } = require('./candidate-docs.js');
 
 // Mirrors review-task.js's own isEffectivelyEmpty / apply-group-a.js's
 // isEffectivelyEmptyResponse -- Ornith sometimes emits the two-char JSON empty-string
@@ -40,6 +41,36 @@ function isEffectivelyEmpty(implementResponse) {
 function isEmptyApprovalSource(source) {
   const entry = getRegisteredSource(source);
   return !!(entry && entry.emptyApproval);
+}
+
+// 2026-09-17 (needs-clarification bd-1788787323412, "if the rule must remain active,
+// change the apply-stage contract so a no-candidates draft is short-circuited to
+// dismissal before the review vote is consumed"): isEffectivelyEmpty only ever catches a
+// LITERAL empty/near-empty string. A candidate-generating source that writes real,
+// non-empty prose explaining WHY it found nothing is not effectively empty, so it burns
+// a full real majority vote today -- even though src/candidate-docs.js's own
+// parseArchDiscoveryCandidates() can already tell, deterministically, that the response
+// contains zero parseable "### AC-NNN" candidate blocks, which is exactly what
+// src/apply-task.js's apply stage will independently conclude anyway ("no candidates in
+// implement response -- nothing to apply").
+//
+// Deliberately an EXPLICIT opt-in flag (candidateDocFormat: true on the source's own
+// registerTaskSource() call), not an inference from emptyApproval/candidateFulfillment --
+// tried that first and it was live-wrong: deep_dive and project_search are BOTH
+// emptyApproval:true and non-candidateFulfillment, yet neither one's implement response
+// uses the "### AC-NNN" candidate-doc format at all (deep_dive writes a free-form
+// write-up; project_search has no `apply` key and falls through to the generic Group-B
+// git-diff path) -- an inferred check would have wrongly short-circuited every ordinary
+// deep_dive/project_search response that doesn't happen to contain that literal heading.
+// Only arch_discovery and arch_import (src/arch.js, agent-manager-hygiene) genuinely call
+// applyArchDiscoveryCandidates()/applyArchImportCandidate() and set this flag.
+function isEffectivelyNoCandidates(source, implementResponse) {
+  const entry = getRegisteredSource(source);
+  if (!entry || !entry.candidateDocFormat) return false;
+  if (isEffectivelyEmpty(implementResponse)) return false; // already the narrower, existing case
+  const text = String(implementResponse || '').trim();
+  if (!text) return false;
+  return parseArchDiscoveryCandidates(text).length === 0;
 }
 
 // promptContext.harnessHits (a count, or an array to .length), falling back to
@@ -55,11 +86,19 @@ function harnessHitCount(task) {
 
 function decideEmptyApprovalOutcome(task) {
   if (!task || !isEmptyApprovalSource(task.source)) return null;
-  if (!isEffectivelyEmpty(task.implementResponse)) return null;
-  return harnessHitCount(task) > 0 ? 'approve' : 'block';
+  if (isEffectivelyEmpty(task.implementResponse)) {
+    return harnessHitCount(task) > 0 ? 'approve' : 'block';
+  }
+  // Non-empty text that still parses to zero real candidates -- same approve/block
+  // reasoning as the literal-empty case above, just triggered on the broader
+  // "nothing the apply stage could act on" condition instead of raw string emptiness.
+  if (isEffectivelyNoCandidates(task.source, task.implementResponse)) {
+    return harnessHitCount(task) > 0 ? 'approve' : 'block';
+  }
+  return null;
 }
 
-module.exports = { decideEmptyApprovalOutcome, isEffectivelyEmpty, isEmptyApprovalSource, harnessHitCount };
+module.exports = { decideEmptyApprovalOutcome, isEffectivelyEmpty, isEffectivelyNoCandidates, isEmptyApprovalSource, harnessHitCount };
 
 // CLI: node src/empty-approval-decision.js <task.json>  ->  'approve' | 'block' | 'none'
 if (require.main === module) {
