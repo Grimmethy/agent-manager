@@ -15,6 +15,50 @@ import subprocess
 
 task_bp = Blueprint("task-bp", __name__)
 
+# 2026-09-17, root-caused live: /resolve and /answer below both move a held task from
+# queue/needs-clarification/ into queue/adhoc/ for "a fresh draft pass", but neither ever
+# clears the STALE blockedReason/blockedStage/status/localRejectCount fields the task
+# already carried from BEFORE it was escalated (escalation only ever ADDS a
+# needsClarification field + a needs-clarification history event -- it never clears the
+# blocked-stage fields underneath). Landing back in adhoc/ still reading
+# status:'blocked', blockedStage:'review', localRejectCount:2 (already AT the retry cap)
+# makes the task indistinguishable from an already-exhausted blocked task: reject-retry-
+# check.js's own in-place adhoc/ scan only picks up status:'blocked' entries at all, and
+# once picked up, alreadyEscalatedSinceLastReadmission() (src/reject-retry-check.js)
+# correctly sees the OLD needs-clarification history event with nothing after it proving
+# a fresh cycle began, and refuses to touch it again -- so answering/resolving a task
+# this way silently produces a permanently inert file instead of the "fresh draft pass"
+# both routes' own docstrings/history text promise. Confirmed live: 3 real tasks
+# answered via /answer during a 2026-09-17 sweep sat completely untouched afterward,
+# each still showing its ORIGINAL pre-escalation blockedReason and a retry count already
+# at cap.
+#
+# Mirrors src/reject-retry-check.js's READMIT_CLEAN_SLATE_FIELDS -- kept in sync by
+# convention (no shared source of truth across the JS/Python boundary; see that
+# constant's own comment). `status` is handled separately since the JS list never
+# includes it (JS-side requeues always explicitly flip status themselves).
+_NC_READMIT_CLEAN_SLATE_FIELDS = (
+    "needsClarification", "localRejectCount", "ncTriageAttempts", "ncTriageBucketAttempts",
+    "ncTriageDecision", "ncTriageReviewedAt", "retryableDraftBlock", "turnBudgetExhausted",
+    "turnBudgetExhaustedBefore", "infraErrorRetry", "infraErrorNote", "adhocResolution",
+    "subTaskProposals", "priorRejectionFeedback", "rawDiff", "implementResponse",
+    "blockedReason", "blockedStage", "claimedAt", "isAgenticContinuation",
+    "agenticContinuationCount", "agenticContinuationNote", "priorPartialDiff",
+    "adhocDiffSubstanceFeedback", "adhocNoChangesClaimFeedback", "premiseReadmitCount",
+    "_prevBlockSignature",
+)
+
+
+def _clean_slate_for_fresh_adhoc_attempt(data):
+    """Mutates `data` in place: strips every stale blocked/rejected-attempt field so a
+    task moved into queue/adhoc/ for a fresh draft pass is actually eligible for one,
+    instead of reading as an already-exhausted blocked task. Called by both /resolve and
+    /answer below, right before writing into adhoc_dir."""
+    for field in _NC_READMIT_CLEAN_SLATE_FIELDS:
+        data.pop(field, None)
+    if data.get("status") == "blocked":
+        data["status"] = "pending"
+
 @task_bp.route("/api/task/<state>/<task_id>")
 def api_task_detail(state, task_id):
     from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, queue_dir, read_json_safe
@@ -392,7 +436,7 @@ def api_task_resolve_clarification(task_id):
     paths = body.get("paths")
     if paths and isinstance(paths, list):
         data.setdefault("promptContext", {})["prefetchedPaths"] = [str(p) for p in paths]
-    data.pop("needsClarification", None)
+    _clean_slate_for_fresh_adhoc_attempt(data)
 
     adhoc_dir = qdir / "adhoc"
     adhoc_dir.mkdir(parents=True, exist_ok=True)
@@ -439,7 +483,7 @@ def api_task_answer_clarification(task_id):
         f"This answer resolves the open question(s) above -- implement against it "
         f"directly rather than re-asking for clarification."
     )
-    data.pop("needsClarification", None)
+    _clean_slate_for_fresh_adhoc_attempt(data)
     data.setdefault("history", []).append({
         "stage": "needs-clarification-resolved", "at": datetime.now(timezone.utc).isoformat(),
         "detail": "Answered directly from the dashboard's multiple-choice/Other picker -- requeued to adhoc/ for a fresh draft pass.",
