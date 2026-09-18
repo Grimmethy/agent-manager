@@ -409,7 +409,15 @@ function main() {
   }
 }
 
-module.exports = { deadProcessCheck, restartTargetFor, isProcessAlive, findOrphanedModelCallProcesses };
+module.exports = {
+  deadProcessCheck, restartTargetFor, isProcessAlive, findOrphanedModelCallProcesses,
+  // Exported for pipeline-health-audit.js's checkDaemonCounts, which needs the exact same
+  // "walk the ancestor chain through bash's own subshell forks" logic -- see this
+  // function's own header for the full incident history. Generic in its target set (any
+  // Set of pids), despite the worker-specific name kept as-is to avoid drifting from its
+  // original, already-battle-tested implementation.
+  hasLiveWorkerAncestor, MAX_ANCESTOR_DEPTH,
+};
 
 if (require.main === module) {
   main();
