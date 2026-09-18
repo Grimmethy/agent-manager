@@ -1121,6 +1121,11 @@ async function renderQueueTab(state) {
   // Archive already means everywhere else in this table.
   const showConfirmDeny = state === 'awaiting-confirm';
   const showApply = state === 'approved';
+  // Retire Hub (2026-09-09, brain-dump: "no direct way to archive/dismiss a coord hub"):
+  // a coordinating hub that is stalled or no longer wanted can be dismissed wholesale
+  // from this list without drilling into its detail view -- POSTs the new 'retire-hub'
+  // action (sibling endpoint) instead of the ordinary 'archive' the other tabs use.
+  const showRetireHub = state === 'coordinating';
 
   // 'prompt'-tier tasks get an active badge here instead of a plain row -- the whole
   // point of that tier vs 'approve' is not sitting unnoticed (see /api/job-types'
@@ -1250,10 +1255,11 @@ async function renderQueueTab(state) {
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}" data-adhoc="${isAdhocConfirm}" data-research="${isResearchConfirm}" data-forensics="${isForensicsConfirm}">Deny</button>
       </td>` : ''}
       ${showApply ? `<td><button type="button" class="secondary task-apply-btn" data-id="${escapeAttr(t.id)}">Apply</button></td>` : ''}
+      ${showRetireHub ? `<td><button type="button" class="secondary archive-btn retire-hub-btn" data-id="${escapeAttr(t.id)}">Retire Hub</button></td>` : ''}
     </tr>
   `;
   }).join('');
-  const actionHeader = (showArchiveRequeue || showArchiveOnly || showConfirmDeny || showApply) ? '<th>Actions</th>' : '';
+  const actionHeader = (showArchiveRequeue || showArchiveOnly || showConfirmDeny || showApply || showRetireHub) ? '<th>Actions</th>' : '';
   const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} of ${total}${queueHasMore[state] ? ' -- scroll for more' : ''}</div>`
     + (state === 'needs-clarification' ? '<div class="meta" style="padding:0 4px">Click a row to pick a file path, answer an open design question, or Discuss -- then send it back to drafting.</div>' : '');
   main.innerHTML = filterHtml + `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
@@ -1267,6 +1273,17 @@ async function renderQueueTab(state) {
       e.stopPropagation();
       const cur = btn.dataset.priority === '' ? null : parseInt(btn.dataset.priority, 10);
       setHubPriority(btn.dataset.id, cur);
+    };
+  });
+  // Retire Hub (see showRetireHub above): confirm, then POST the coordinating task's
+  // 'retire-hub' action -- the sibling server endpoint that dismisses a coord hub
+  // wholesale, rather than the per-tab Archive that retires a single task's underlying
+  // item.
+  main.querySelectorAll('.retire-hub-btn').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      postTaskAction(state, btn.dataset.id, 'retire-hub',
+        `Retire hub '${btn.dataset.id}'? This dismisses the coordinating hub and stops its work.`);
     };
   });
   main.querySelectorAll('.task-archive-btn').forEach((btn) => {
