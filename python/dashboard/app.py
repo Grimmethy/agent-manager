@@ -889,6 +889,21 @@ def read_json_safe(path: Path):
         return None
 
 
+def _sanitize_disposition(task: dict) -> dict:
+    """Strip merge-metadata fields when the task is not in a 'merged' terminal state.
+
+    Pops mergedAt, mergedAtSource, mergeCommit, and autoMergeCommit if
+    terminalDisposition is present and its value is not 'merged'. Returns the
+    same dict (mutated in-place) so callers can use it directly."""
+    td = task.get("terminalDisposition")
+    if td is not None and td != "merged":
+        task.pop("mergedAt", None)
+        task.pop("mergedAtSource", None)
+        task.pop("mergeCommit", None)
+        task.pop("autoMergeCommit", None)
+    return task
+
+
 # Matches a `.` + at least 7 digits and captures the first 6 -- PowerShell's `Get-Date
 # -Format 'o'` (used for every heartbeat/stateSince timestamp the *.ps1 scripts write)
 # emits 7-digit fractional seconds (100ns ticks), e.g. "...33.6859854-06:00". Python's own
@@ -1232,6 +1247,7 @@ def _relocate_task_to_pending(qdir: Path, task_id: str, target_instance_id: str)
                     "stage": "operator-preempted", "at": datetime.now(timezone.utc).isoformat(),
                     "detail": f"removed from {lane}'s backlog by operator override -- reassigned to {target_instance_id}",
                 })
+                _sanitize_disposition(data)
                 src.write_text(json.dumps(data, indent=2), encoding="utf-8")
             except (OSError, ValueError):
                 pass  # best-effort -- still attempt the move even if the history stamp failed
