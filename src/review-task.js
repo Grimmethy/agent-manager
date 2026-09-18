@@ -1,10 +1,12 @@
 'use strict';
 
 // Review step: takes one task sitting in queue/review/ (status "needs-review", written by
-// local-draft.js) and decides approved vs. blocked. Port of review-runner.ps1's 'local'
-// review-provider path ONLY -- the 'claude' path (a single `claude -p` call that reviews
-// AND applies in one shot) is a different reviewProvider mode this deployment never uses
-// (REVIEW_PROVIDER env var is unset here, and review-runner.ps1's own default is 'local'),
+// local-draft.js) and decides approved vs. blocked. This file is the single source of truth
+// for all review-gate logic; review-runner.ps1 is only a thin shell that invokes
+// it and holds no review-gate logic of its own. It implements the 'local' review-provider
+// path -- the 'claude' path (a single `claude -p` call that reviews AND applies in one
+// shot) is a different reviewProvider mode this deployment never uses (REVIEW_PROVIDER
+// env var is unset here, and review-runner.ps1's own default is 'local'),
 // so it's out of scope. Under the 'local' path the local model has no tool access -- it produces a
 // verdict only -- so APPROVE moves the task to queue/approved/ for apply-task.sh to
 // actually execute; it never pushes/writes anything itself.
