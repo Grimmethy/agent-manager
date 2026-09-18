@@ -418,7 +418,8 @@ module.exports = {
 
 if (require.main === module) {
   const cfg = getConfig();
-  const { majorityVote } = require('./local-client.js');
+  let { majorityVote } = require('./local-client.js');
+  majorityVote = require('./lib/sweep-gpu-lock.js').lockedModelFn(majorityVote, { phase: 'auto-confirm-review' });
   const grepDirs = (process.env.AGENT_MANAGER_GREP_DIRS || 'src,python,scripts,docs')
     .split(',').map((s) => s.trim()).filter(Boolean);
   Promise.resolve(autoConfirmReview({

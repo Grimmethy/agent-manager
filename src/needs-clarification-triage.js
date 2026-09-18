@@ -1137,7 +1137,8 @@ module.exports = {
 
 if (require.main === module) {
   const cfg = getConfig();
-  const { majorityVote } = require('./local-client.js');
+  let { majorityVote } = require('./local-client.js');
+  majorityVote = require('./lib/sweep-gpu-lock.js').lockedModelFn(majorityVote, { phase: 'needs-clarification-triage' });
   needsClarificationTriage({ pipelineDir: cfg.pipelineDir, repoRoot: cfg.repoRoot, majorityVote })
     .then((s) => process.stdout.write(JSON.stringify(s)))
     .catch((e) => { process.stderr.write(`needs-clarification-triage failed: ${e && e.stack || e}\n`); process.exit(1); });

@@ -302,6 +302,7 @@ if (require.main === module) {
   let majorityVote = null;
   if (!dryRun) {
     try { ({ majorityVote } = require('./local-client.js')); } catch { /* votes just won't run */ }
+    if (majorityVote) majorityVote = require('./lib/sweep-gpu-lock.js').lockedModelFn(majorityVote, { phase: 'adhoc-staleness-flag' });
   }
   sweep({ pipelineDir, repoRoot, majorityVote, dryRun })
     .then((s) => {
