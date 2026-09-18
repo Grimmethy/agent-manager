@@ -523,11 +523,28 @@ function stampHubMerged(parent, opts) {
   }
 }
 
+// 2026-09-18 (pipeline hardening -- confirmed live): a hub id is date-slugged
+// (file-decompose-to-hub.js's fileBlockedHub(): `file-decompose-hub-${slugify(request.id)}`,
+// and request.id itself embeds the day), so it's possible -- confirmed via real evidence,
+// 6 real hubs hit this exact shape -- for a SECOND coordinating/ record to be written
+// under the SAME id later the same day (e.g. a request whose hubFiledAt got force-reset,
+// or a stale-caused re-open racing this same sweep). Before this fix, `dest` already
+// existing made this function return with NEITHER file touched: the archived copy stayed
+// (correct), but the newer duplicate sitting in coordinating/ was never cleaned up --
+// EVERY future sweep hit the identical short-circuit forever, since `dest` never stops
+// existing. Confirmed live: 6 hubs sat in coordinating/ for hours, re-checked on every
+// tick, silently skipped every single time. Since the archived copy already fully
+// describes this exact failure (same target file, same day, same preflight-rejection
+// signature -- there is no new information in a second identical rejection), the
+// duplicate is safe to discard outright rather than preserved under a uniquified name.
 function moveToDone(srcFile, doneDir, name, parent) {
   try {
     fs.mkdirSync(doneDir, { recursive: true });
     const dest = path.join(doneDir, name);
-    if (fs.existsSync(dest)) return; // don't clobber -- something already put it there
+    if (fs.existsSync(dest)) {
+      fs.unlinkSync(srcFile); // already archived under this id -- just clear the stray duplicate
+      return;
+    }
     fs.writeFileSync(dest, JSON.stringify(parent, null, 2));
     fs.unlinkSync(srcFile);
   } catch { /* best-effort -- next tick retries */ }
