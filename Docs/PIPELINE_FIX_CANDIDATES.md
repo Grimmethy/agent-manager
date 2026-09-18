@@ -308,3 +308,13 @@ Solution: Modify the `implement` stage prompt in `src/prompts.js` to explicitly 
 Benefits: This fix will prevent the class of tasks where the implement stage's verdict contradicts the plan stage's findings, which is the primary reason for the rejections in Subjects 1, 2, and 4.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-change-review-9-53-est-api-cost-0-benefit-0-shipped-over-7d-1789390500827
+
+### AC-132 · on-demand task "adhoc-brain-dump-bd-1789045832920-rebalance-the-worker-1-worker-reasoning-1789047394
+Strength: Strong
+Files: src/local-agentic-write-draft.js, src/local-tool-client.js
+
+Problem: The `local-agentic-write` tier is not correctly injecting the task's accumulated context (plan, orient results, rawText) into the model's prompt, resulting in a degenerate 157-token prompt that causes the model to refuse the task.
+Solution: Audit the prompt assembly logic in `src/local-agentic-write-draft.js` to ensure `task.promptContext.rawText` and prior plan/orient outputs are included in the system/user prompt passed to `src/local-tool-client.js`. Add a guard that logs a warning if the prompt token count is below a threshold (e.g., 1000 tokens) before sending to the model.
+Benefits: Prevents all adhoc tasks from failing with "no prior context" errors due to context assembly bugs, ensuring the agentic write tier receives the necessary task details to proceed.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-brain-dump-bd-1789045832920-rebalance-the-worker-1-worker-r-1789704701741
