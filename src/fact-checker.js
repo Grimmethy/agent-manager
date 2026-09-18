@@ -593,7 +593,10 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   const fields = [...new Set(scannableText.match(GIS_FIELD_RE) || [])];
   for (const field of fields) {
     if (PLACEHOLDER_RE.test(field)) continue;
-    if (newlyDeclared.has(field)) continue;
+    if (newlyDeclared.has(field)) {
+      flags.push({ type: 'ungrounded-field', detail: field, severity: 'warning', note: "newly declared in this draft's own diff; not auto-requeued, flagged for review" });
+      continue;
+    }
     if (echoMarkers.has(field)) continue;
     if (sourceText.includes(field)) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
