@@ -81,6 +81,38 @@ fi
 
 mkdir -p "$DONE_DIR" "$BLOCKED_DIR" "$AWAITING_CONFIRM_DIR" "$COORDINATING_DIR"
 
+# 2026-09-18 (brain-dump bd-1789602146764): defense-in-depth backstop, on top of the real
+# fix (src/apply-task.js now catches applyTask()/applyDirectToMainBatch() throwing and
+# still records a real blockedReason via recordApplyOutcome before this script ever gets
+# to move anything). This exists for the one class of failure no try/catch in apply-task.js
+# can ever survive -- the node process getting SIGKILL'd (OOM, a watchdog force-kill) mid-
+# apply, which leaves $result empty with no chance for apply-task.js to write anything at
+# all, JS-side fix included. Confirmed live before the JS-side fix landed: 3 real tasks
+# reached queue/blocked/ with status:'approved', no blockedReason, no blockedStage, and no
+# history event explaining why -- invisible to blocked-drain.js's signature matching, a
+# human triaging the dashboard, and task-log-reconcile.js's terminal-disposition sweep
+# alike. Called right before every mv into $BLOCKED_DIR below; a task that already has a
+# real blockedReason (the normal case) is left untouched.
+ensure_blocked_reason() {
+  local task_path="$1" fallback_note="$2"
+  node -e '
+    const fs = require("fs");
+    const [p, fallback] = process.argv.slice(1);
+    try {
+      const task = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (task.blockedReason) process.exit(0); // already has a real reason -- nothing to backstop
+      const reason = (fallback && fallback.trim())
+        ? `apply-task.sh backstop: no blockedReason was ever recorded for this failure (likely a SIGKILL mid-apply, since even a caught exception writes one) -- last known output: ${fallback.trim().slice(0, 500)}`
+        : "apply-task.sh backstop: no blockedReason was ever recorded for this failure (likely a SIGKILL mid-apply) and no output was captured either -- check apply-task.log around this task'\''s timestamp for the real cause.";
+      task.blockedReason = reason;
+      task.blockedStage = task.blockedStage || "apply";
+      task.history = Array.isArray(task.history) ? task.history : [];
+      task.history.push({ stage: "blocked", at: new Date().toISOString(), detail: reason });
+      fs.writeFileSync(p, JSON.stringify(task, null, 2));
+    } catch (e) { /* best-effort -- never block the real mv on this backstop */ }
+  ' "$task_path" "$fallback_note" 2>/dev/null || true
+}
+
 # Split approved tasks into directToMain triage tasks (candidate-doc appends -- batchable
 # into ONE commit+push) and everything else (per-task apply to an agent/<id> branch).
 # Without this, a backlog of N reviewed triage tasks becomes N tiny commits pushed to main
@@ -126,6 +158,7 @@ if [[ ${#direct_files[@]} -gt 0 ]]; then
         mv "$bpath" "${DONE_DIR}/${btid}.json"
         printf '[apply-task] %s: applied (triage batch) -- %s\n' "$btid" "$bnote"
       else
+        ensure_blocked_reason "$bpath" "$bnote"
         mv "$bpath" "${BLOCKED_DIR}/${btid}.json"
         printf '[apply-task] %s: FAILED (triage batch) -- %s\n' "$btid" "$bnote" >&2
       fi
@@ -158,6 +191,7 @@ for file in "${other_files[@]}"; do
     mv "$file" "${DONE_DIR}/${task_id}.json"
     printf '[apply-task] %s: applied -> %s\n' "$task_id" "$result"
   else
+    ensure_blocked_reason "$file" "$result"
     mv "$file" "${BLOCKED_DIR}/${task_id}.json"
     printf '[apply-task] %s: FAILED -> %s\n' "$task_id" "$result" >&2
   fi

@@ -562,6 +562,21 @@ function recordApplyOutcome(task, result) {
 // node apply-task.js --batch <file...>  -> { batch: true, results: [{ taskId, path, succeeded, needsConfirmation, doneMarker?, reason? }] }
 // Writes each task file back in place (recordApplyOutcome -> status/history) before the
 // caller moves it, exactly like the single-task path.
+
+// 2026-09-18 (brain-dump bd-1789602146764): the ONE place an uncaught exception from
+// applyTask/applyDirectToMainBatch is turned into a real, informative
+// {succeeded:false, reason} instead of crashing this process before recordApplyOutcome
+// ever runs -- see mainBatch()'s own comment below for the full incident this closes.
+// Exported so this exact behavior (does a throw become a real reason, not a silent
+// process death) is directly unit-testable without spawning the CLI.
+function safeApplyCall(fn, label) {
+  try {
+    return fn();
+  } catch (e) {
+    return { succeeded: false, reason: `${label} crashed before producing a result: ${e.message}${e.stack ? `\n${e.stack.split('\n').slice(1, 4).join('\n')}` : ''}` };
+  }
+}
+
 function mainBatch() {
   // applyRepoRoot (see config.js's own comment): the real git-mutating destination,
   // deliberately separate from repoRoot when AGENT_MANAGER_APPLY_REPO_ROOT is set --
@@ -580,7 +595,36 @@ function mainBatch() {
     }
   }
 
-  const { results } = applyDirectToMainBatch(loaded.map((l) => l.task), { repoRoot: applyRepoRoot, pipelineDir, secondBrainDir, brainDumpPath });
+  // 2026-09-18 (brain-dump bd-1789602146764): applyDirectToMainBatch used to be called
+  // with no surrounding try/catch -- an uncaught exception inside it (or applyTask, in
+  // main() below) crashed this whole process before ANY of the loaded tasks' results got
+  // written or even returned, so apply-task.sh's own $result capture came back empty, its
+  // own succeeded="false" fallback moved the file to queue/blocked/, and NOTHING ever
+  // called recordApplyOutcome to set blockedReason/blockedStage/a history event -- a task
+  // lands in blocked/ with zero diagnostic trail, its real crash message visible only in
+  // whatever caught the process's stderr (a daemon log, easy to miss, easy to rotate
+  // away). Confirmed live: 3 real tasks (observability_review + 2 brain_dump_sort) sat in
+  // exactly this state, `status:'approved'`, no blockedReason, no blockedStage, history
+  // ending cleanly at 'approved' with nothing after it. Every EXPLICIT
+  // `{succeeded:false, reason: ...}` return in this file already carries a reason --
+  // recordApplyOutcome (below) already turns that into the correct blockedReason/
+  // blockedStage/history write; the gap was only ever "does recordApplyOutcome get
+  // CALLED at all when something throws instead of returning." safeApplyCall (below,
+  // exported for direct unit testing of exactly this behavior) closes that gap.
+  const batchOutcome = safeApplyCall(
+    () => applyDirectToMainBatch(loaded.map((l) => l.task), { repoRoot: applyRepoRoot, pipelineDir, secondBrainDir, brainDumpPath }),
+    'applyDirectToMainBatch',
+  );
+  let results;
+  if (batchOutcome && batchOutcome.results) {
+    results = batchOutcome.results;
+  } else {
+    // batchOutcome IS the synthesized {succeeded:false, reason} crash object -- apply it
+    // to every task this batch was trying to process, since a crash inside
+    // applyDirectToMainBatch gives no way to know which specific task caused it.
+    results = {};
+    for (const { task } of loaded) results[task.id] = batchOutcome;
+  }
 
   for (const { task, path: p } of loaded) {
     const r = results[task.id] || { succeeded: false, reason: 'no batch result produced for this task' };
@@ -619,7 +663,15 @@ function main() {
   // commit locally without pushing -- see applyTask's skipPush param.
   const skipPush = process.env.AGENT_MANAGER_APPLY_SKIP_PUSH === 'true';
 
-  const result = applyTask(task, { repoRoot: applyRepoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, skipPush });
+  // 2026-09-18 (brain-dump bd-1789602146764): see mainBatch()'s identical comment above
+  // for the full incident -- an uncaught exception here used to crash this process before
+  // recordApplyOutcome ever ran, landing the task in blocked/ (via apply-task.sh's own
+  // succeeded="false" fallback on empty/unparseable stdout) with no blockedReason,
+  // blockedStage, or history event at all.
+  const result = safeApplyCall(
+    () => applyTask(task, { repoRoot: applyRepoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, skipPush }),
+    'applyTask',
+  );
 
   // Previously this module never wrote taskPath back at all -- a task landing in done/ or
   // blocked/ after this step carried no record it was ever applied: no timestamp, no
@@ -639,7 +691,7 @@ function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { applyTask, recordApplyOutcome, applyDirectToMainBatch };
+module.exports = { applyTask, recordApplyOutcome, applyDirectToMainBatch, safeApplyCall };
 
 if (require.main === module) {
   main();
