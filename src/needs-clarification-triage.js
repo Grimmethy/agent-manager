@@ -191,7 +191,11 @@ function cfgEnv() {
     DRY_RUN: process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN === '1',
     MAX_REQUEUES: Number(process.env.AGENT_MANAGER_NC_TRIAGE_MAX_REQUEUES) || 1,
     MAX_VOTES: Number(process.env.AGENT_MANAGER_NC_TRIAGE_MAX_VOTES) || 2,
-    VOTE_MODEL: process.env.AGENT_MANAGER_NC_TRIAGE_VOTE_MODEL || 'qwen2.5:3b',
+    // 2026-09-18: no hardcoded model default -- see candidate-premise-check.js's
+    // identical fix (same worker-1/worker-reasoning GPU-thrashing incident) for the full
+    // rationale. undefined falls through majorityVote's own call() to LOCAL_MODEL;
+    // AGENT_MANAGER_NC_TRIAGE_VOTE_MODEL still opts a genuinely separate model back in.
+    VOTE_MODEL: process.env.AGENT_MANAGER_NC_TRIAGE_VOTE_MODEL,
   };
 }
 const MIN_RAWTEXT_FOR_REQUEUE = 400;

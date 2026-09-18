@@ -24,7 +24,15 @@
 //
 // Kill switch: AGENT_MANAGER_CANDIDATE_PREMISE_CHECK=false.
 
-const PREMISE_CHECK_MODEL = process.env.AGENT_MANAGER_CANDIDATE_PREMISE_MODEL || 'qwen2.5:3b';
+// 2026-09-18 (Grimmethy: "just don't use the 3B model until we've atomized enough tasks
+// to warrant its use" -- see task-sources.js's brain-dump-cheap-local profile comment for
+// the full worker-1/worker-reasoning GPU-thrashing incident this is part of the same
+// fix). No hardcoded model default: undefined here falls through call()'s own
+// `opts.model || MODEL` (local-client.js) to LOCAL_MODEL, whatever the claiming worker's
+// ambient model already is -- one fewer model Ollama has to keep evicting/reloading on
+// this shared GPU. AGENT_MANAGER_CANDIDATE_PREMISE_MODEL still lets a deployment opt a
+// genuinely separate model back in explicitly.
+const PREMISE_CHECK_MODEL = process.env.AGENT_MANAGER_CANDIDATE_PREMISE_MODEL;
 const PREMISE_CHECK_NUM_CTX = 8192;
 
 function isEnabled() {

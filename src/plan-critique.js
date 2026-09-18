@@ -18,7 +18,15 @@ const { call: localCall } = require('./local-client.js');
 
 const GAP_TAGS = ['MISSING_REQUIREMENT', 'UNVERIFIED_PATH', 'SCOPE_TOO_BIG', 'NO_VERIFICATION'];
 const MAX_GAPS = 5;
-const CRITIQUE_MODEL = process.env.AGENT_MANAGER_PLAN_CRITIQUE_MODEL || 'qwen2.5:3b';
+// 2026-09-18: no hardcoded model default -- see candidate-premise-check.js's identical
+// fix (same worker-1/worker-reasoning GPU-thrashing incident) for the full rationale.
+// undefined falls through to LOCAL_MODEL; AGENT_MANAGER_PLAN_CRITIQUE_MODEL still opts a
+// genuinely separate model back in. (This file's own header comment above, "its OWN GPU
+// lock key," predates the 2026-09-08 endpoint-based serialization fix -- draft-context.js's
+// maybeLockedOn always keys the real lock on the shared Ollama endpoint now, not the
+// model name, so this call already correctly took turns with the main draft lane before
+// this change; this fix only removes the swap cost, not a locking gap.)
+const CRITIQUE_MODEL = process.env.AGENT_MANAGER_PLAN_CRITIQUE_MODEL;
 const CRITIQUE_NUM_CTX = 8192;
 
 function clip(s, n) {

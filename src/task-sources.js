@@ -1464,12 +1464,34 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // source's output as "JSON metadata, not code" -- low blast radius if the experiment
 // doesn't pan out (same reject-retry bounded budget every other source already has, not a
 // new risk this profile introduces).
-// think: false -- qwen2.5:3b does not support Ollama's `think` parameter at all
-// (confirmed live 2026-08-24: every single brain_dump_sort draft call failed outright
-// with "Ollama HTTP 400: \"qwen2.5:3b\" does not support thinking" for as long as this
-// profile existed, since local-draft.js's own call sites unconditionally requested
-// think:true and had no way to know this profile's model couldn't honor it).
-registerModelProfile('brain-dump-cheap-local', { backend: 'local', model: 'qwen2.5:3b', numCtx: 8192, think: false });
+// think: false -- kept even without a hardcoded model (see below): guarantees
+// brain_dump_sort's calls never break with "does not support thinking" regardless of
+// which model ends up being the ambient default, the same protection this line has
+// always given (originally against qwen2.5:3b specifically; confirmed live 2026-08-24:
+// every single brain_dump_sort draft call failed outright with "Ollama HTTP 400:
+// \"qwen2.5:3b\" does not support thinking" for as long as this profile forced that
+// model with no think override, since local-draft.js's own call sites unconditionally
+// requested think:true and had no way to know this profile's model couldn't honor it).
+//
+// 2026-09-18 (Grimmethy: "just don't use the 3B model until we've atomized enough tasks
+// to warrant its use" -- root-caused live: worker-1's dedicated qwen2.5:3b lane was the
+// dominant cause of a near-total pipeline throughput stall, hours of zero completions
+// despite 250+ pending. worker-1 and worker-reasoning share the SAME physical GPU;
+// brain_dump_sort's hardcoded model forced Ollama to evict+reload an ~18GB resident
+// model on every single lane alternation, and that reload routinely exceeded the 240s
+// HTTP timeout -- see gpu-arbiter.js's own header for why serializing the two lanes
+// alone (already in place since 2026-09-08) isn't sufficient when they also disagree on
+// which model must be resident): no `model` override at all -- model-provider.js's
+// resolveModelProfile()/draft-context.js's resolveDraftContext() already fall back to
+// `LOCAL_MODEL` (process.env.LOCAL_MODEL, i.e. whatever the claiming worker's own
+// ambient model is) the moment a profile omits `model`, so this now costs brain_dump_sort
+// nothing in correctness while eliminating its whole reason to fight worker-reasoning
+// over GPU residency. Deliberately no env override here (unlike the four standalone
+// small-model call sites this same fix touches below) -- this profile registration is
+// the one place a genuinely cheap dedicated model would be reintroduced later, once
+// there's enough real atomized (small, well-scoped) task volume to justify paying for a
+// second resident model again.
+registerModelProfile('brain-dump-cheap-local', { backend: 'local', numCtx: 8192, think: false });
 registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping', strictOutputOnly: true });
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
