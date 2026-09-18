@@ -266,23 +266,23 @@ test('IS_P40_ENDPOINT is true only when OLLAMA_URL matches AGENT_MANAGER_P40_OLL
   });
 });
 
-test('resolveRequestTimeoutMs gives the P40 endpoint its 900s exception, past the standard 240s ceiling, for a real large-plan-pass shaped call', () => {
+test('resolveRequestTimeoutMs gives the P40 endpoint its 900s exception, past the standard 300s ceiling, for a real large-plan-pass shaped call', () => {
   withEnv({ OLLAMA_URL: 'http://192.168.122.29:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434' }, (mod) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-p40-timeout-'));
     // Real observed P40 throughput (~9.3 tok/s) and the computePlanNumPredict 2800-token
     // budget large-context sources now get (local-draft.js).
     fs.writeFileSync(path.join(dir, '.local-throughput.http___192_168_122_29_11434.json'), JSON.stringify({ tokensPerSecond: 9.3 }));
     const ms = mod.resolveRequestTimeoutMs({ promptTokens: 4000, numPredict: 2800, instancesDir: dir });
-    assert.ok(ms > mod.PER_CALL_TIMEOUT_CEILING_MS, `a real P40 large-plan call must get more than the standard 240s ceiling, got ${ms}`);
+    assert.ok(ms > mod.PER_CALL_TIMEOUT_CEILING_MS, `a real P40 large-plan call must get more than the standard 300s ceiling, got ${ms}`);
     assert.ok(ms <= mod.P40_PER_CALL_TIMEOUT_CEILING_MS, `still bounded by the P40 exception itself, got ${ms}`);
   });
 });
 
-test('resolveRequestTimeoutMs keeps the standard 240s-derived ceiling for the local (non-P40) endpoint, even for the same large numPredict', () => {
+test('resolveRequestTimeoutMs keeps the standard 300s-derived ceiling for the local (non-P40) endpoint, even for the same large numPredict', () => {
   withEnv({ OLLAMA_URL: 'http://localhost:11434', AGENT_MANAGER_P40_OLLAMA_URL: 'http://192.168.122.29:11434' }, (mod) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-local-timeout-'));
     const ms = mod.resolveRequestTimeoutMs({ promptTokens: 4000, numPredict: 2800, instancesDir: dir });
-    assert.ok(ms <= mod.PER_CALL_TIMEOUT_CEILING_MS, `the local GPU lane must stay within the documented 240s ceiling, got ${ms}`);
+    assert.ok(ms <= mod.PER_CALL_TIMEOUT_CEILING_MS, `the local GPU lane must stay within the documented 300s ceiling, got ${ms}`);
   });
 });
 

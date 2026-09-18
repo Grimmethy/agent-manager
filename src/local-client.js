@@ -340,17 +340,31 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   }
 }
 
-// PER_CALL_TIMEOUT_CEILING_MS stays at the pipeline's pre-existing 4-minute ceiling, not
-// ollama-http.js's full 5-minute hard ceiling -- dead-process-check.js's
-// WORKER_ZOMBIE_THRESHOLD_SECONDS (20 min) was sized against "up to 4 sequential
-// localCall()s per task, each individually bounded by 240s -- worst case ~960s" with
-// deliberate slack to 1200s. Letting a single call float all the way to 300s would erase
-// that slack (4*300s = 1200s, exactly the zombie threshold, zero margin) without anyone
-// having revisited that math -- so a computed timeout here can come in BELOW 240s for cheap
-// calls (failing faster, freeing a stuck lane sooner) but never above it. An explicit
-// LOCAL_TIMEOUT_MS (or the older ORNITH_TIMEOUT_MS name) still overrides everything below,
-// same as before this module existed.
-const PER_CALL_TIMEOUT_CEILING_MS = 240_000;
+// 2026-09-18 (pipeline throughput investigation, following the qwen2.5:3b GPU-thrashing
+// fix and the resume-loop pacing fix earlier this session): PER_CALL_TIMEOUT_CEILING_MS
+// used to stay at 240s specifically (not ollama-http.js's full 300s
+// HARD_TIMEOUT_CEILING_MS) because dead-process-check.js's WORKER_ZOMBIE_THRESHOLD_SECONDS
+// was, at the time, 1200s (20 min) -- "4 sequential localCall()s per task, each bounded
+// by 240s -- worst case 960s, deliberate slack to 1200s," and letting a call float to the
+// full 300s would have erased that slack entirely (4*300s = 1200s, zero margin). That
+// threshold has since been raised to 1680s (28 min, sized against REVIEW's own worst-case
+// chain, the larger of the two -- see dead-process-check.js's own comment), which the
+// 240s-specific self-restriction here was never revisited against: 4*300s = 1200s still
+// leaves 480s of margin under the current 1680s threshold, the exact same "deliberate
+// slack, not zero" property the original 240s choice was protecting. Confirmed live this
+// session the 240s ceiling is now genuinely too low, not just theoretically: resolveTimeoutMs's
+// OWN formula, at the host's real measured ~36.6 tok/s (local-throughput.js) and a normal
+// ~2800-token implement-pass budget (computePlanNumPredict), computes ~261s BEFORE this
+// ceiling clamps it down to 240s -- a legitimate, correctly-sized call gets cut off by a
+// ceiling that is now the tighter constraint than the zombie-threshold math it was
+// standing in for. Raised to match ollama-http.js's own HARD_TIMEOUT_CEILING_MS (300s) --
+// i.e. simply stops adding a SECOND, tighter restriction on top of the pipeline's own
+// formally documented "nothing should exceed 5 minutes" rule (docs/pipeline-incident-
+// 2026-07-19.md), rather than exceeding that rule. A computed timeout can still come in
+// BELOW 300s for cheap calls (failing faster, freeing a stuck lane sooner), same as
+// before. An explicit LOCAL_TIMEOUT_MS (or the older ORNITH_TIMEOUT_MS name) still
+// overrides everything below, same as before this module existed.
+const PER_CALL_TIMEOUT_CEILING_MS = 300_000;
 
 // 2026-09-11 (screaminggoatclubmt, "p40 is entirely blocked by ollama timeouts"): the
 // 240s ceiling above was sized for the local RTX 3090's throughput. Confirmed live via
