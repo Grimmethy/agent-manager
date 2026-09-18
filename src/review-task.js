@@ -686,7 +686,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   const factCheck = checkDraft(task.implementResponse || '', repoRootForCheck, groundingText || undefined, factCheckExtraRoots, groundingRef);
   // `imprecise-file-path` is informational (a real file cited with a sloppy prefix) --
   // it must not by itself flip the verdict label to "flagged".
-  const factCheckVerdict = (factCheck.flags || []).some((f) => f.type !== 'imprecise-file-path') ? 'flagged' : 'pass';
+  const factCheckVerdict = (factCheck.flags || []).some((f) => f.type !== 'imprecise-file-path' && f.severity !== 'warning') ? 'flagged' : 'pass';
 
   // 2026-08-24 (pipeline hardening -- resurrects a real gap closed once already on
   // 2026-08-12 for the old Windows/PowerShell review-runner.ps1, never carried forward
@@ -740,7 +740,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   const isProposalNotClaim = isDecomposeProposal || isAdvisoryProseSource(resolveSourceName(task));
   const highPrecisionFlags = isProposalNotClaim
     ? []
-    : (factCheck.flags || []).filter((f) => f.type === 'ungrounded-url' || f.type === 'ungrounded-field');
+    : (factCheck.flags || []).filter((f) => (f.type === 'ungrounded-url' || f.type === 'ungrounded-field') && f.severity !== 'warning');
   if (highPrecisionFlags.length > 0) {
     const detail = highPrecisionFlags.map((f) => `${f.type}: ${f.detail}`).join('; ');
     const reason = `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ${detail}. This fact-check flag is high-precision (almost never a false positive) and treated as disqualifying, not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to contain a hallucinated value.`;
