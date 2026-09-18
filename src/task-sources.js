@@ -1601,6 +1601,30 @@ function nextPipelineHealthAuditTask() {
     return null;
   }
 
+  // 2026-09-18 (pipeline hardening, confirmed live: 66 near-identical tasks piled up in
+  // queue/pending/ over 3 days -- see pipeline-health-audit.js's own anomalySignature
+  // header for the full incident). isDue()/markChecked() only stop the CURRENT tick from
+  // re-filing within the same hour; the NEXT hourly check, if the underlying condition
+  // is still true, had no memory of the last report at all and filed a fresh one every
+  // time. Skip filing when a pending pipeline_health_audit task already covers this
+  // EXACT same set of anomaly types (sameAnomalySignatures strips the volatile pids/
+  // counts, so a still-true condition is recognized as a repeat, not a fresh incident) --
+  // still marks checked so this doesn't re-run every tick for the rest of the hour.
+  const pendingDir = path.join(pipelineDir, 'queue', 'pending');
+  let pendingFiles = [];
+  try { pendingFiles = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json')); } catch { /* pending/ missing -- nothing to dedup against */ }
+  for (const f of pendingFiles) {
+    let existing;
+    try { existing = JSON.parse(fs.readFileSync(path.join(pendingDir, f), 'utf8')); } catch { continue; }
+    if (existing.source !== 'pipeline_health_audit') continue;
+    const existingAnomalies = existing.promptContext && existing.promptContext.anomalies;
+    if (!Array.isArray(existingAnomalies)) continue;
+    if (pipelineHealthAudit.sameAnomalySignatures(anomalies, existingAnomalies)) {
+      pipelineHealthAudit.markChecked(instancesDir);
+      return null;
+    }
+  }
+
   const id = `pipeline-health-audit-${Date.now()}`;
   if (taskIdExistsInQueue(id)) return null;
   // 2026-09-15: markChecked() used to run ONLY on the clean (no-anomaly) branch above --
@@ -1628,7 +1652,9 @@ function nextPipelineHealthAuditTask() {
     domain: defaultDomain,
     source: 'pipeline_health_audit',
     title: `Pipeline health audit: ${anomalies[0].slice(0, 100)}${anomalies.length > 1 ? ` (+${anomalies.length - 1} more)` : ''}`,
-    promptContext: { evidenceText },
+    // `anomalies` (the raw list, alongside the human-readable evidenceText) is what the
+    // dedup check above compares future runs against -- see its own comment.
+    promptContext: { evidenceText, anomalies },
   };
 }
 

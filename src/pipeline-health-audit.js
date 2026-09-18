@@ -229,8 +229,43 @@ function checkPipelineHealth({ pipelineDir, instancesDir, logDir, now = new Date
   };
 }
 
+// 2026-09-18 (pipeline hardening -- confirmed live: 66 near-identical pipeline_health_audit
+// tasks piled up in queue/pending/ over 3 days because nothing ever checked whether a
+// still-true anomaly was already reported. isDue()/markChecked() above only stop the SAME
+// tick from re-filing within the hour -- the NEXT hourly check, if the underlying
+// condition is still true, files a brand-new Date.now()-keyed task with no memory of the
+// last one at all). The volatile parts of an anomaly string (specific pids, specific
+// pending/backlog counts) differ every single time even when the underlying anomaly TYPE
+// is identical, so a literal string comparison would never catch a repeat -- this strips
+// them to a stable signature instead.
+function anomalySignature(anomaly) {
+  return String(anomaly || '')
+    .replace(/\(pids [^)]*\)/g, '(pids ...)')
+    .replace(/\d+/g, '#');
+}
+
+function anomalySignatureSet(anomalies) {
+  return new Set((anomalies || []).map(anomalySignature));
+}
+
+// True when two anomaly lists reduce to the exact same set of signatures -- i.e. an
+// existing pending task already covers every anomaly type the new check just found (and
+// nothing else), so filing a fresh task would be a pure duplicate. Deliberately an exact
+// set match, not a fuzzy/partial one: a check that now ALSO finds a second, genuinely new
+// anomaly type alongside a still-persisting old one is worth a fresh, complete report
+// (the old pending task's evidence doesn't mention the new problem at all), not silently
+// swallowed into the stale one.
+function sameAnomalySignatures(anomalies, existingAnomalies) {
+  const a = anomalySignatureSet(anomalies);
+  const b = anomalySignatureSet(existingAnomalies);
+  if (a.size !== b.size) return false;
+  for (const sig of a) if (!b.has(sig)) return false;
+  return true;
+}
+
 module.exports = {
   checkPipelineHealth, isDue, markChecked,
   countRecentCompletions, countPending, checkDaemonCounts, daemonRoots, checkOrphanedModelCalls, tailLogErrorSignatures,
+  anomalySignature, sameAnomalySignatures,
   THROUGHPUT_WINDOW_MS, CHECK_INTERVAL_MS,
 };
