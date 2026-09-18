@@ -31,7 +31,25 @@ function autoMergeEnabled() {
   return process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES !== 'false';
 }
 
+// Enforce the terminalDisposition invariant on a task record before it is persisted:
+// when `terminalDisposition` has been set to something other than 'merged' (e.g. 'noop',
+// 'dismissed', 'filed' -- see apply-task.js / classifyChildStatus), any stale
+// mergedAt / mergedAtSource / autoMergeCommit fields on the SAME record must go,
+// otherwise downstream consumers (dashboards, human inspection) keep seeing a record
+// that claims both "merged" and "not-merged". terminalDisposition is the later,
+// authoritative correction (2026-09-14, hand-corrected live 3 times: a manual
+// disposition correction away from 'merged' did not always clear the merge fields too).
+function sanitizeTaskDisposition(task) {
+  if (task && task.terminalDisposition && task.terminalDisposition !== 'merged') {
+    delete task.mergedAt;
+    delete task.mergedAtSource;
+    delete task.autoMergeCommit;
+  }
+  return task;
+}
+
 const writeChildDone = (pipelineDir, task) => {
+  sanitizeTaskDisposition(task); // clear stale merge fields before any persistence
   try {
     const doneFile = path.join(pipelineDir, 'queue', 'done', `${task.id}.json`);
     if (fs.existsSync(doneFile)) fs.writeFileSync(doneFile, JSON.stringify(task, null, 2));
@@ -515,7 +533,7 @@ function moveToDone(srcFile, doneDir, name, parent) {
   } catch { /* best-effort -- next tick retries */ }
 }
 
-module.exports = { coordinatorSweep, classifyChildStatus, findStuckChildren, TERMINAL_GOOD };
+module.exports = { coordinatorSweep, classifyChildStatus, findStuckChildren, TERMINAL_GOOD, sanitizeTaskDisposition };
 
 if (require.main === module) {
   const { pipelineDir, repoRoot } = getConfig();
