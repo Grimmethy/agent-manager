@@ -363,6 +363,7 @@ if (require.main === module) {
   const { pipelineDir, repoRoot } = getConfig();
   let call;
   try { ({ call } = require('./local-client.js')); } catch { /* plan pass just won't run past Tier A */ }
+  if (call) call = require('./lib/sweep-gpu-lock.js').lockedModelFn(call, { phase: 'proactive-file-decompose-sweep' });
   const force = process.argv.includes('--force');
   sweep({ pipelineDir, repoRoot, call, force })
     .then((s) => { console.log(`proactive-file-decompose-sweep: ${JSON.stringify(s)}`); process.exit(0); })
