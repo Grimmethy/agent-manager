@@ -15,7 +15,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { resolveGraphPath, getConfig, getSecondBrainDir, requireSecondBrainDir } = require('./config.js');
+const { resolveGraphPath, resolveCommunityCoveragePath, getConfig, getSecondBrainDir, requireSecondBrainDir } = require('./config.js');
 
 function makeRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'config-resolve-graph-test-'));
@@ -55,6 +55,89 @@ test('resolveGraphPath does not throw when .agent-manager-cache/ exists but is e
   const repoRoot = makeRepo();
   fs.mkdirSync(path.join(repoRoot, '.agent-manager-cache'), { recursive: true });
   assert.equal(resolveGraphPath(repoRoot), path.join(repoRoot, 'graphify-out', 'graph.json'));
+});
+
+// --- resolveCommunityCoveragePath: mirrors the resolveGraphPath coverage above ------------
+// resolveCommunityCoveragePath(repoRoot, pipelineDir) is a near-verbatim clone of
+// resolveGraphPath but for community-coverage.json: prefers
+// <repoRoot>/.agent-manager-cache/default/coverage.json, then the freshest hashed-subdir
+// coverage.json, then falls back to <pipelineDir>/community-coverage.json. Each test uses a
+// fresh makeRepo() temp dir, which sidesteps resolveCommunityCoveragePath's internal
+// coveragePathCache (keyed by path.resolve(repoRoot)) -- no cross-test cache collisions.
+
+test('resolveCommunityCoveragePath prefers .agent-manager-cache/default/coverage.json', () => {
+  const repoRoot = makeRepo();
+  const target = path.join(repoRoot, '.agent-manager-cache', 'default', 'coverage.json');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, '{}');
+  assert.equal(resolveCommunityCoveragePath(repoRoot, repoRoot), target);
+});
+
+test('resolveCommunityCoveragePath picks the freshest hashed-subdir coverage.json when "default" is absent', () => {
+  const repoRoot = makeRepo();
+  const older = path.join(repoRoot, '.agent-manager-cache', 'aaa111', 'coverage.json');
+  const newer = path.join(repoRoot, '.agent-manager-cache', 'bbb222', 'coverage.json');
+  fs.mkdirSync(path.dirname(older), { recursive: true });
+  fs.mkdirSync(path.dirname(newer), { recursive: true });
+  fs.writeFileSync(older, '{}');
+  // Force a real, distinguishable mtime gap (mirror the resolveGraphPath idiom).
+  const past = new Date(Date.now() - 60000);
+  fs.utimesSync(older, past, past);
+  fs.writeFileSync(newer, '{}');
+  assert.equal(resolveCommunityCoveragePath(repoRoot, repoRoot), newer);
+});
+
+test('resolveCommunityCoveragePath falls back to community-coverage.json when no cache dir exists', () => {
+  const repoRoot = makeRepo();
+  assert.equal(resolveCommunityCoveragePath(repoRoot, repoRoot), path.join(repoRoot, 'community-coverage.json'));
+});
+
+test('resolveCommunityCoveragePath does not throw when .agent-manager-cache/ is empty', () => {
+  const repoRoot = makeRepo();
+  fs.mkdirSync(path.join(repoRoot, '.agent-manager-cache'), { recursive: true });
+  assert.equal(resolveCommunityCoveragePath(repoRoot, repoRoot), path.join(repoRoot, 'community-coverage.json'));
+});
+
+// getConfig() wiring: AGENT_MANAGER_COMMUNITY_COVERAGE_PATH || resolveCommunityCoveragePath.
+// CRITICAL: in each test the FIRST statement inside the withEnv callback is
+// `delete process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH;`. Passing the key as
+// `: undefined` in the env object is a documented hazard (Object.assign stringifies / a prior
+// ambient value survives) -- the delete is authoritative. withEnv's finally only restores
+// keys listed in the vars object, so an unlisted deleted key stays cleared for fn()'s run.
+
+test('getConfig().communityCoveragePath defaults to the cache path', () => {
+  const repoRoot = makeRepo();
+  const target = path.join(repoRoot, '.agent-manager-cache', 'default', 'coverage.json');
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, '{}');
+  withEnv({ AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot }, () => {
+    delete process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH;
+    assert.equal(getConfig().communityCoveragePath, target);
+  });
+});
+
+test('getConfig().communityCoveragePath picks the freshest hashed path', () => {
+  const repoRoot = makeRepo();
+  const older = path.join(repoRoot, '.agent-manager-cache', 'aaa111', 'coverage.json');
+  const newer = path.join(repoRoot, '.agent-manager-cache', 'bbb222', 'coverage.json');
+  fs.mkdirSync(path.dirname(older), { recursive: true });
+  fs.mkdirSync(path.dirname(newer), { recursive: true });
+  fs.writeFileSync(older, '{}');
+  const past = new Date(Date.now() - 60000);
+  fs.utimesSync(older, past, past);
+  fs.writeFileSync(newer, '{}');
+  withEnv({ AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot }, () => {
+    delete process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH;
+    assert.equal(getConfig().communityCoveragePath, newer);
+  });
+});
+
+test('getConfig().communityCoveragePath falls back to community-coverage.json', () => {
+  const repoRoot = makeRepo();
+  withEnv({ AGENT_MANAGER_REPO_ROOT: repoRoot, AGENT_MANAGER_PIPELINE_DIR: repoRoot }, () => {
+    delete process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH;
+    assert.equal(getConfig().communityCoveragePath, path.join(repoRoot, 'community-coverage.json'));
+  });
 });
 
 // --- getConfig().applyRepoRoot (2026-09-07) ----------------------------------------------
