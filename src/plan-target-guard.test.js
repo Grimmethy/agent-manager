@@ -59,6 +59,38 @@ test('isDeclaredCreateTarget: true only when a creation verb precedes the mentio
   assert.equal(isDeclaredCreateTarget('We created something earlier. Now edit `src/new.js`.', 'src/new.js'), false);
 });
 
+// Existence-acknowledgment signal (2026-09-18, pipeline hardening -- see
+// plan-target-guard.js's own header for the 16-real-attempt incident this closes).
+test('isDeclaredCreateTarget: true when the plan states the target does not exist yet, AFTER the mention (the real live phrasing)', () => {
+  assert.equal(
+    isDeclaredCreateTarget('`src/review-parity.test.js` does **not** exist yet (confirmed by the orientation report).', 'src/review-parity.test.js'),
+    true,
+  );
+});
+
+test('isDeclaredCreateTarget: true for "doesn\'t exist" contraction, and "not yet present/created" phrasing', () => {
+  assert.equal(isDeclaredCreateTarget('`src/new.js` doesn\'t exist in the repo.', 'src/new.js'), true);
+  assert.equal(isDeclaredCreateTarget('`src/new.js` is not yet present, so this task will add it.', 'src/new.js'), true);
+  assert.equal(isDeclaredCreateTarget('`src/new.js` is not yet created.', 'src/new.js'), true);
+});
+
+test('isDeclaredCreateTarget: true when the existence-acknowledgment phrase precedes the mention', () => {
+  assert.equal(isDeclaredCreateTarget('This file does not exist yet: `src/new.js`.', 'src/new.js'), true);
+});
+
+test('isDeclaredCreateTarget: an existence-acknowledgment phrase far away (outside the local window) does not blanket-exempt an unrelated mention', () => {
+  const planText = `We confirmed src/other.js does not exist yet. ${'padding '.repeat(20)} Now EDIT \`src/new.js\` carefully.`;
+  assert.equal(isDeclaredCreateTarget(planText, 'src/new.js'), false);
+});
+
+test('planTargetGuard end to end: the real "does not exist yet" phrasing is not blocked', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Create src/review-parity.test.js' };
+  const planText = '`src/review-parity.test.js` does **not** exist yet (confirmed by the orientation report). Write the parity tests there.';
+  const r = planTargetGuard(task, planText, repo, ['src']);
+  assert.equal(r.blocked, false);
+});
+
 test('does not import from the draft pipeline -- only adhoc-diff-sanity.js and fact-checker.js', () => {
   const src = fs.readFileSync(path.join(__dirname, 'plan-target-guard.js'), 'utf8');
   const requires = [...src.matchAll(/require\('([^']+)'\)/g)].map((m) => m[1]);
