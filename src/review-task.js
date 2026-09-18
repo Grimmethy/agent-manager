@@ -438,6 +438,16 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push('--- This draft was revised in response to an earlier critique pass ---');
     lines.push(`Before producing the draft above, an independent critique call flagged real problems, and a revision was attempted. The draft above is the REVISED version. Verify the issues below were actually addressed -- if the draft above still has any of these same problems, reject it; do not assume a revision attempt means the issues are fixed.`);
     lines.push(task.critiqueText.length > 4000 ? `${task.critiqueText.slice(0, 4000)}\n...[truncated]` : task.critiqueText);
+    // 2026-09-18 (brain-dump bd-1789602450613, "reviewer-hallucination pattern extends to
+    // a 3rd task family"): a real, correct fix (performance-fix-ac-6) was rejected TWICE,
+    // both votes quoting the CRITIQUE's description of the pre-revision draft ("the draft
+    // is a refusal") as if it described the current one -- the critique text above ends
+    // up being the LAST thing read before the draft, and the model conflated "what was
+    // wrong before" with "what's wrong now." The "draft above is the REVISED version"
+    // line before the critique text apparently isn't a strong enough anchor on its own;
+    // this closes the loop immediately AFTER the critique text, right where the
+    // confusion originates, instead of only stating it once before.
+    lines.push('--- End of prior critique complaint. It describes an EARLIER, ALREADY-SUPERSEDED version of the draft -- not the current one shown above under "IMPLEMENT draft." The revision already addressed it; do not reject the current draft for a problem the critique found in that earlier version. Judge only what the current draft actually contains. ---');
     lines.push('');
   }
   lines.push('--- Deterministic fact-check pre-filter (necessary, NOT sufficient) ---');

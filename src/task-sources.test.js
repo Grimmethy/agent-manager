@@ -2838,6 +2838,29 @@ test('pipeline_debrief reviewGuidance/reviewCompletenessQuestion do NOT require 
   assert.match(debrief.reviewGuidance, /invents a file\/symbol not in the evidence/);
 });
 
+// 2026-09-18 (brain-dump bd-1789602083513, "unifying pattern, 3rd confirmed instance"):
+// same shape as the pipeline_debrief fix just above -- pipeline_forensics' own drafting
+// instructions (prompts.js) explicitly tell the model to say "0 winners, cannot contrast"
+// when the evidence genuinely has no successful sibling tasks, but the review guidance's
+// reject list never carried a matching exception -- a draft that correctly reported "0
+// contrast winner task(s)" got rejected for "failing the mandatory requirement to
+// contrast," identical in shape to the debrief NOW-WHAT-citation false rejection.
+test('pipeline_forensics reviewGuidance does NOT require a real contrast when the evidence shows ZERO winner tasks', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pipeline-forensics-guidance-'));
+  freshTaskSources(dir);
+  const { getRegisteredSource } = require('./task-source-registry.js');
+  const forensics = getRegisteredSource('pipeline_forensics');
+
+  assert.match(forensics.reviewGuidance, /ZERO winner tasks available to contrast against/i);
+  assert.match(forensics.reviewGuidance, /CORRECT, REQUIRED behavior/i);
+  assert.match(forensics.reviewGuidance, /do NOT reject a draft for failing to contrast against winners that do not exist/i);
+
+  // The reject condition for a genuinely fabricated divergence, or a root cause asserted
+  // with winners actually available but not used, must still stand.
+  assert.match(forensics.reviewGuidance, /fabricates a divergence the evidence cannot support/i);
+  assert.match(forensics.reviewGuidance, /no counterfactual and no contrast when winner tasks WERE actually available/i);
+});
+
 test('product_spec_section: consumes the outline doc top-to-bottom, one Strong AC at a time, with the spec doc path and fetched code attached', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'product-spec-section-test-'));
   fs.mkdirSync(path.join(dir, 'server'), { recursive: true });
