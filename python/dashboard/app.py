@@ -892,13 +892,14 @@ def read_json_safe(path: Path):
 def _sanitize_disposition(task: dict) -> dict:
     """Strip merge-metadata fields when the task is not in a 'merged' terminal state.
 
-    Pops mergedAt, mergedAtSource, and autoMergeCommit if terminalDisposition
-    is present and its value is not 'merged'. Returns the same dict (mutated
-    in-place) so callers can use it directly."""
+    Pops mergedAt, mergedAtSource, mergeCommit, and autoMergeCommit if
+    terminalDisposition is present and its value is not 'merged'. Returns the
+    same dict (mutated in-place) so callers can use it directly."""
     td = task.get("terminalDisposition")
     if td is not None and td != "merged":
         task.pop("mergedAt", None)
         task.pop("mergedAtSource", None)
+        task.pop("mergeCommit", None)
         task.pop("autoMergeCommit", None)
     return task
 

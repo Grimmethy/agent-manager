@@ -191,5 +191,40 @@ class TestDescribeChange(unittest.TestCase):
         self.assertEqual(desc, "Plain prose verdict write-up.")
 
 
+class TestDispositionSanitization(unittest.TestCase):
+    def test_abandoned_strips_mergedAt_and_mergeCommit(self):
+        # An 'abandoned' task must not advertise merge bookkeeping it never
+        # earned -- mergedAt and mergeCommit are both stripped.
+        task = {
+            "id": "task-1",
+            "terminalDisposition": "abandoned",
+            "mergedAt": "2025-06-15T12:00:00Z",
+            "mergeCommit": "abc123def",
+            "mergedAtSource": "git log",
+            "autoMergeCommit": "fff000111",
+        }
+        result = app._sanitize_disposition(task)
+        self.assertNotIn("mergedAt", result)
+        self.assertNotIn("mergeCommit", result)
+        self.assertNotIn("mergedAtSource", result)
+        self.assertNotIn("autoMergeCommit", result)
+        # Non-merge fields survive.
+        self.assertEqual(result["id"], "task-1")
+        self.assertEqual(result["terminalDisposition"], "abandoned")
+
+    def test_merged_preserves_mergedAt_and_mergeCommit(self):
+        task = {
+            "id": "task-2",
+            "terminalDisposition": "merged",
+            "mergedAt": "2025-06-15T12:00:00Z",
+            "mergeCommit": "abc123def",
+        }
+        result = app._sanitize_disposition(task)
+        self.assertEqual(result["mergedAt"], "2025-06-15T12:00:00Z")
+        self.assertEqual(result["mergeCommit"], "abc123def")
+        self.assertEqual(result["terminalDisposition"], "merged")
+        self.assertEqual(result["id"], "task-2")
+
+
 if __name__ == "__main__":
     unittest.main()
