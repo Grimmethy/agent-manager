@@ -52,17 +52,27 @@ require('./task-sources.js');
 // 2026-09-18: on a machine where plugins.json (gitignored, machine-local) actually names a
 // real, loadable agent-manager-hygiene checkout, requiring './review-task.js' below calls
 // config.js's ensureRegistered() at module top-level, which genuinely registers the REAL
-// 'observability_review' etc. sources. That require happens AFTER this block, so if this
-// block's stub claims the name first (its guard only checks "not registered yet", true
-// since nothing has run yet), the real registration then throws "already registered" --
-// confirmed live: this crashed this whole file outright on a checkout with a real
-// plugins.json, while an isolated clone with no plugins.json (the normal CI/scratchpad
-// shape) never hit it. Calling ensureRegistered() here FIRST (idempotent -- config.js's
-// own `registered` flag makes a repeat call at line ~80 below a no-op) lets the real
-// registration win when it's actually loadable; the stub checks below then correctly
-// skip via their existing getRegisteredSource() guards instead of squatting a name the
-// real plugin was about to claim.
-require('./config.js').ensureRegistered();
+// 'observability_review' etc. sources. Two failure modes came from this, both confirmed
+// live on such a machine: (1) if this block's stub claims a name FIRST, the real
+// registerTaskSource() call throws "already registered" when review-task.js is required
+// below; (2) even letting the real registration win first avoids that crash, but the REAL
+// plugin's actual behavior (e.g. arch_import's real harnessSearch/
+// skipImplementWhenNoHarnessHits flags, observability_review's real deterministic-recheck
+// rules instead of this file's fixture-bug-marker rule) then diverges from what tests below
+// assert, since they were written against the stub shape. Neither reproduces in an
+// isolated clone with no plugins.json (the normal CI/scratchpad shape) -- ensureRegistered()
+// there is a safe no-op -- so this went unnoticed on any machine but one with a real,
+// loadable plugin manifest.
+//
+// The robust fix: make this suite's plugin-loading behavior the same on EVERY machine,
+// not conditional on what happens to be installed locally. Neutralize ensureRegistered()
+// itself so the real plugin never loads during these tests regardless of ambient
+// plugins.json/AGENT_MANAGER_REGISTER_PATH, and the fixture stubs below always win,
+// matching what this file's tests were actually written against.
+{
+  const configModule = require('./config.js');
+  configModule.ensureRegistered = () => {};
+}
 {
   const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
   for (const name of ['observability_review', 'performance_review']) {
