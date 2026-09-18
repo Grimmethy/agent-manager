@@ -17,6 +17,7 @@ const path = require('path');
 const {
   checkPipelineHealth, isDue, markChecked,
   countRecentCompletions, countPending, checkDaemonCounts, daemonRoots, checkOrphanedModelCalls, tailLogErrorSignatures,
+  anomalySignature, sameAnomalySignatures,
 } = require('./pipeline-health-audit.js');
 
 function tempDir(prefix) {
@@ -288,4 +289,57 @@ test('checkPipelineHealth never throws when listProcessesFn itself fails (ps una
   const dir = tempDir('health-audit-integration-test-');
   const listProcessesFn = () => { throw new Error('ps: command not found'); };
   assert.doesNotThrow(() => checkPipelineHealth({ pipelineDir: dir, instancesDir: dir, logDir: dir, now: new Date(), listProcessesFn }));
+});
+
+// anomalySignature / sameAnomalySignatures (2026-09-18, pipeline hardening -- see this
+// file's own header comment for the 66-near-duplicate-task incident this closes).
+test('anomalySignature strips pids and counts, keeping the structural skeleton identical', () => {
+  const a = 'worker-1: 2 processes running simultaneously (pids 205693, 1198141) -- should only ever be one';
+  const b = 'worker-1: 2 processes running simultaneously (pids 307219, 1198141) -- should only ever be one';
+  assert.equal(anomalySignature(a), anomalySignature(b));
+});
+
+test('anomalySignature treats a genuinely different anomaly as a different signature', () => {
+  const a = 'worker-1: 2 processes running simultaneously (pids 1, 2) -- should only ever be one';
+  const b = 'worker-reasoning: 2 processes running simultaneously (pids 3, 4) -- should only ever be one';
+  assert.notEqual(anomalySignature(a), anomalySignature(b));
+});
+
+test('anomalySignature normalizes a varying pending/backlog count in a throughput-stall message', () => {
+  const a = 'Zero tasks completed in the last hour despite 73 pending -- throughput has stalled.';
+  const b = 'Zero tasks completed in the last hour despite 391 pending -- throughput has stalled.';
+  assert.equal(anomalySignature(a), anomalySignature(b));
+});
+
+test('sameAnomalySignatures: true when both lists reduce to the identical signature set (order-independent)', () => {
+  const now = [
+    'worker-1: 2 processes running simultaneously (pids 9, 10) -- should only ever be one',
+    'Zero tasks completed in the last hour despite 391 pending -- throughput has stalled.',
+  ];
+  const existing = [
+    'Zero tasks completed in the last hour despite 73 pending -- throughput has stalled.',
+    'worker-1: 2 processes running simultaneously (pids 1, 2) -- should only ever be one',
+  ];
+  assert.equal(sameAnomalySignatures(now, existing), true);
+});
+
+test('sameAnomalySignatures: false when the new check found an additional, genuinely new anomaly type', () => {
+  const now = [
+    'worker-1: 2 processes running simultaneously (pids 9, 10) -- should only ever be one',
+    'worker-reasoning: no process found (dead-process-check.js should restart this on its own next tick, but it\'s absent right now)',
+  ];
+  const existing = [
+    'worker-1: 2 processes running simultaneously (pids 1, 2) -- should only ever be one',
+  ];
+  assert.equal(sameAnomalySignatures(now, existing), false);
+});
+
+test('sameAnomalySignatures: false when the existing task covered a DIFFERENT anomaly entirely', () => {
+  const now = ['worker-1: 2 processes running simultaneously (pids 9, 10) -- should only ever be one'];
+  const existing = ['Zero tasks completed in the last hour despite 391 pending -- throughput has stalled.'];
+  assert.equal(sameAnomalySignatures(now, existing), false);
+});
+
+test('sameAnomalySignatures: empty lists are trivially equal', () => {
+  assert.equal(sameAnomalySignatures([], []), true);
 });

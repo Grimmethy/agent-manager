@@ -2691,6 +2691,79 @@ test('nextPipelineHealthAuditTask marks checked on the anomaly branch too, so a 
   assert.equal(second, null, 'the SAME still-persisting anomaly must not re-file on the very next call');
 });
 
+// Cross-HOUR dedup (2026-09-18, pipeline hardening -- see pipeline-health-audit.js's own
+// anomalySignature header for the 66-near-duplicate incident this closes). The test right
+// above only proves the same-tick/same-hour no-op; this proves the gate that actually
+// matters: an HOUR later (isDue() genuinely true again), a still-persisting anomaly must
+// not file a second near-duplicate task just because the pid/count numbers differ.
+// nextPipelineHealthAuditTask hardcodes its logDir off os.homedir() (no injection point),
+// so tailLogErrorSignatures would otherwise read THIS MACHINE's own real
+// ~/.local/state/agent-manager/logs/ and mix real log-signature anomalies into the
+// result -- confirmed live: a real "ollama-request-timeout" line on the dev machine
+// running this suite added a genuinely second anomaly the fixtures below never
+// accounted for. Point HOME at an empty temp dir so os.homedir() resolves to a directory
+// with no real log files, matching how checkPipelineHealth's OWN tests inject an empty
+// logDir directly.
+function withIsolatedHome(fn) {
+  const prevHome = process.env.HOME;
+  process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'health-audit-fake-home-'));
+  // tailLogErrorSignatures treats a MISSING logDir as its own anomaly ("unreadable:
+  // ENOENT"), not a silent empty result -- create it (empty) so the isolated home looks
+  // like a real, readable, log-free machine instead of manufacturing a different anomaly.
+  fs.mkdirSync(path.join(process.env.HOME, '.local', 'state', 'agent-manager', 'logs'), { recursive: true });
+  try {
+    return fn();
+  } finally {
+    process.env.HOME = prevHome;
+  }
+}
+
+test('nextPipelineHealthAuditTask does not re-file across separate hourly checks when a pending task already covers the same anomaly type', () => withIsolatedHome(() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'health-audit-cross-hour-dedup-'));
+  fs.mkdirSync(path.join(dir, 'queue', 'pending'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  // A prior hour's real THROUGHPUT_STALL task, still sitting unresolved in pending/ --
+  // same anomaly TYPE, different (older) pending-count number.
+  fs.writeFileSync(path.join(dir, 'queue', 'pending', 'pipeline-health-audit-OLD.json'), JSON.stringify({
+    id: 'pipeline-health-audit-OLD',
+    source: 'pipeline_health_audit',
+    promptContext: { anomalies: ['Zero tasks completed in the last hour despite 73 pending -- throughput has stalled.'] },
+  }));
+  // 6 more pending items (the OLD audit task itself plus 5 filler) so pending > 5 and the
+  // SAME anomaly type genuinely still fires this check.
+  for (let i = 0; i < 6; i++) {
+    fs.writeFileSync(path.join(dir, 'queue', 'pending', `t${i}.json`), JSON.stringify({ id: `t${i}` }));
+  }
+  const { markChecked } = require('./pipeline-health-audit.js');
+  markChecked(path.join(dir, 'instances'), new Date(Date.now() - 2 * 60 * 60 * 1000)); // >1h ago -- isDue() is genuinely true
+  const { nextPipelineHealthAuditTask } = freshTaskSources(dir);
+
+  assert.equal(nextPipelineHealthAuditTask(), null, 'a still-persisting THROUGHPUT_STALL must not file a second task while the first is still pending');
+}));
+
+test('nextPipelineHealthAuditTask DOES file when the anomaly type is genuinely new, even with an unrelated pending audit task present', () => withIsolatedHome(() => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'health-audit-cross-hour-newtype-'));
+  fs.mkdirSync(path.join(dir, 'queue', 'pending'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  // An existing pending audit task about a COMPLETELY different anomaly (a daemon-count
+  // finding, not a throughput stall) -- must not suppress a genuinely new report.
+  fs.writeFileSync(path.join(dir, 'queue', 'pending', 'pipeline-health-audit-OLD.json'), JSON.stringify({
+    id: 'pipeline-health-audit-OLD',
+    source: 'pipeline_health_audit',
+    promptContext: { anomalies: ['worker-1: 2 processes running simultaneously (pids 1, 2) -- should only ever be one'] },
+  }));
+  for (let i = 0; i < 6; i++) {
+    fs.writeFileSync(path.join(dir, 'queue', 'pending', `t${i}.json`), JSON.stringify({ id: `t${i}` }));
+  }
+  const { markChecked } = require('./pipeline-health-audit.js');
+  markChecked(path.join(dir, 'instances'), new Date(Date.now() - 2 * 60 * 60 * 1000));
+  const { nextPipelineHealthAuditTask } = freshTaskSources(dir);
+
+  const result = nextPipelineHealthAuditTask();
+  assert.notEqual(result, null, 'a genuinely different anomaly type (throughput stall) must still be reported');
+  assert.match(result.title, /throughput has stalled/i);
+}));
+
 // nextUiVisibilityAuditTask (2026-08-24, Grimmethy: "How do we look for functions and
 // code that should have a display in the ui?") -- ui-visibility-audit.js's own test file
 // covers the actual detection logic in isolation; this just proves the due-gating wiring
