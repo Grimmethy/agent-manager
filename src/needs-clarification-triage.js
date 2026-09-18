@@ -280,7 +280,7 @@ const REQUEUE_STRIP_FIELDS = [
   'needsClarification', 'localRejectCount', 'retryableDraftBlock', 'turnBudgetExhausted',
   'turnBudgetExhaustedBefore', 'adhocResolution', 'subTaskProposals', 'preDrafted',
   'priorRejectionFeedback', 'rawDiff', 'implementResponse', 'blockedReason', 'blockedStage',
-  'claimedAt',
+  'claimedAt', 'forcedSummaryNonCompliant',
 ];
 
 // 2026-09-17, root-caused live: every bucket below strips REQUEUE_STRIP_FIELDS (which
@@ -859,6 +859,58 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
               `needs-clarification-triage: drafter tagged BLOCKER-TYPE: infra-error (tool/environment failure, not a design question) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
             try {
               await classifyRequeue(task, { reasonHint: 'bucket-G: infra-error, not a design question', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket M: forced-summary turn ignored the RESOLUTION: instruction -> requeue ---
+    // 2026-09-18 (brain-dump bd-1789598216981): agentic-draft-common.js/local-tool-
+    // client.js already retry the forced-summary turn once and stamp
+    // task.forcedSummaryNonCompliant when the model STILL ignores the explicit,
+    // twice-repeated RESOLUTION: demand -- a mechanical model-compliance failure, NOT the
+    // model genuinely declining to decide. That stamp existed with no consumer (see
+    // agentic-draft-common.js's own "stamped here so a future triage pass... can tell the
+    // two apart" comment) -- this IS that future pass. Confirmed live: a task with a
+    // fully correct diff already captured in its own draftAttempts history got stranded
+    // behind a human-only queue, twice in a row; a human even answered it once believing
+    // it was a real design question, and the very next attempt reproduced the identical
+    // failure mode, proving it's mechanical, not a one-off model sample. Same shape and
+    // reasoning as F/G: not a design question, so clean-state requeue, bounded retries.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const historyM = Array.isArray(task.history) ? task.history : [];
+      const hasExhaustedM = historyM.some((h) => h && h.stage === 'exhausted');
+      if (task.forcedSummaryNonCompliant === true && !hasExhaustedM && bucketAttempts(task, 'M') < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket M but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'M') + 1;
+          log(`${id0}: bucket M (forced-summary turn ignored RESOLUTION: instruction, not a design question) -> requeue ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            bumpBucketAttempts(task, 'M');
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: forced-summary turn ignored the RESOLUTION: instruction (mechanical model-compliance failure, not a design question) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-M: forced-summary turn non-compliant, not a design question', requeueWriter: 'needs-clarification-triage', repoRoot });
             } catch { /* classification must never block the real requeue */ }
             try {
               fs.mkdirSync(adhocDir, { recursive: true });
