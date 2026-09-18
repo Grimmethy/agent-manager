@@ -246,7 +246,7 @@ test('the needs-clarification escalation is idempotent across ticks', () => {
   assert.ok(fs.existsSync(path.join(d.blockedDir, 'adhoc-idem.json')));
 });
 
-test('a NON-adhoc exhausted rejection keeps the original "stamp and stay in blocked/" behaviour', () => {
+test('a NON-adhoc, non-candidateFulfillment exhausted rejection keeps the original "stamp and stay in blocked/" behaviour', () => {
   const d = setupAdhocDirs();
   const task = { id: 'arch-x', source: 'trouble_log', blockedStage: 'review', blockedReason: 'r', localRejectCount: 2, history: [] };
   fs.writeFileSync(path.join(d.blockedDir, 'arch-x.json'), JSON.stringify(task));
@@ -257,6 +257,55 @@ test('a NON-adhoc exhausted rejection keeps the original "stamp and stay in bloc
   const out = JSON.parse(fs.readFileSync(path.join(d.blockedDir, 'arch-x.json'), 'utf8'));
   assert.ok(out.history.some((h) => h.stage === 'exhausted'));
   assert.equal(out.needsClarification, undefined);
+});
+
+// 2026-09-18 (brain-dump bd-1789702787675): a candidate-fulfillment source (the whole
+// "_fix" family: observability_fix, performance_fix, pipeline_forensics_fix, ...) used to
+// fall into the exact same permanent "stamp and stay in blocked/" dead end as any other
+// non-adhoc source above -- confirmed live via 10 real blocked _fix tasks, 9 of which sat
+// re-flagged by context-trim-sweep's own contextTrimFlag (a disposition nothing ever
+// consumed) for up to 12 days with zero resolution. These now get the SAME real
+// escalation adhoc always had, just with fulfillment-shaped question text.
+
+test('a candidateFulfillment source (a "_fix" task) exhausted rejection NOW escalates to needs-clarification', () => {
+  clearRegistry();
+  registerTaskSource('fixture_observability_fix', { priority: 80, next: () => null, candidateFulfillment: true });
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'obs-fix-1', source: 'fixture_observability_fix', blockedStage: 'review',
+    blockedReason: "The draft's find string does not match the actual source code.",
+    localRejectCount: 2, priorRejectionFeedback: ['first rejection reason'], history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'obs-fix-1.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.ok(!fs.existsSync(path.join(d.blockedDir, 'obs-fix-1.json')), 'moved out of blocked/');
+  const p = path.join(d.needsClarificationDir, 'obs-fix-1.json');
+  assert.ok(fs.existsSync(p), 'landed in needs-clarification/, not stuck in blocked/');
+  const out = JSON.parse(fs.readFileSync(p, 'utf8'));
+  assert.equal(out.needsClarification.reason, 'design-decision');
+  assert.match(out.needsClarification.openQuestions, /first rejection reason/);
+  assert.match(out.needsClarification.openQuestions, /find string does not match/);
+  assert.match(out.needsClarification.openQuestions, /already fixed/);
+  assert.ok(out.history.some((h) => h.stage === 'needs-clarification'));
+  clearRegistry();
+});
+
+test('a candidateFulfillment source exhaustion escalation is idempotent across ticks, same as adhoc', () => {
+  clearRegistry();
+  registerTaskSource('fixture_observability_fix', { priority: 80, next: () => null, candidateFulfillment: true });
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'obs-fix-idem', source: 'fixture_observability_fix', blockedStage: 'review', blockedReason: 'r',
+    localRejectCount: 2, history: [{ stage: 'needs-clarification', at: 'x' }],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'obs-fix-idem.json'), JSON.stringify(task));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.exhausted, 1);
+  assert.ok(fs.existsSync(path.join(d.blockedDir, 'obs-fix-idem.json')), 'already escalated on a prior tick -- left where it is');
+  clearRegistry();
 });
 
 // --- 2026-09-01: an adhoc tier-3 draft-stage block a redraft could plausibly fix

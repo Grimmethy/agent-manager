@@ -34,6 +34,7 @@ const { classifyBlockedTask, findClassifier } = require('./blocked-task-classifi
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
+const { isCandidateFulfillmentSource } = require('./lib/harness-search.js');
 // 2026-09-16: registers this package's built-in sources (side effect of the require) --
 // deterministicReviewRecoveryCheck below looks a task's source up in this SAME registry
 // (getRegisteredSource), but this file itself never required task-sources.js, so a
@@ -358,6 +359,34 @@ function buildExhaustedAdhocQuestion(task) {
   ].join('\n');
 }
 
+// 2026-09-18 (brain-dump bd-1789702787675, "every candidate-fulfillment _fix task has no
+// exhaustion-to-human escalation path"): a candidate-fulfillment task's implement
+// response is an exact find/replace against real file content fetched at candidate-
+// creation time -- when the real file has since moved (someone else already fixed it,
+// or just touched nearby code), every retry re-anchors against the same stale citation
+// and reproduces the identical rejection forever. Investigated 10 real blocked _fix
+// tasks live: 9 of 10 were exactly this, permanently stuck because the ONLY other
+// mechanism watching them (context-trim-sweep.js's contextTrimFlag) writes a
+// disposition:'needs-human-regrounding' flag that nothing ever consumes -- a label with
+// no reader. This question steers the human at that specific failure shape first,
+// since it's the dominant one, without assuming it (a genuinely-wrong candidate premise
+// or a degenerate empty pass are also possible and named explicitly).
+function buildExhaustedFulfillmentQuestion(task) {
+  const reasons = (Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [])
+    .concat(task.blockedReason ? [String(task.blockedReason)] : [])
+    .filter(Boolean);
+  return [
+    `The automated handler could not get this candidate past review/apply after ${MAX_LOCAL_REJECT_RETRIES + 1} attempts:`,
+    ...reasons.map((r, i) => `  ${i + 1}. ${r}`),
+    '',
+    "Common cause: the candidate's citation (file/line/find-string) no longer matches the "
+      + 'real source -- something else may have already changed or fixed it; check the real '
+      + 'file before redrafting. If the underlying issue is already fixed, Archive this task. '
+      + 'If the citation is just stale, correct it and requeue. Otherwise, say what a fresh '
+      + 'draft needs to do differently.',
+  ].join('\n');
+}
+
 function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
@@ -597,9 +626,24 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         // An exhausted ADHOC rejection is very often a real disagreement about scope
         // ("is this already done, or a request to extend it?") that no amount of blind
         // redraft will resolve -- send it to a human instead of leaving it to rot in
-        // blocked/ forever. (Non-adhoc keeps the original "stamp once, stay in blocked"
-        // behaviour.)
-        if (isAdhocTask(task) && needsClarificationDir) {
+        // blocked/ forever.
+        //
+        // 2026-09-18 (brain-dump bd-1789702787675): candidate-fulfillment sources
+        // (observability_fix, performance_fix, pipeline_forensics_fix, function_length_fix,
+        // arch_review, arch_import_review, change_review_fix, backlog_fulfillment) used to
+        // fall through to the "non-adhoc keeps stamp once, stay in blocked" branch below
+        // instead -- permanently, since nothing else in the pipeline ever reads them back
+        // out. context-trim-sweep.js's own contextTrimFlag (disposition:
+        // 'needs-human-regrounding') LOOKS like an escalation but has no consumer anywhere;
+        // confirmed live via 10 real blocked _fix tasks, 9 of which sat re-flagged every 3
+        // days for up to 12 days with zero resolution. These sources get the exact same
+        // real escalation adhoc already had, just with fulfillment-shaped question text
+        // (buildExhaustedFulfillmentQuestion) since their own failure vocabulary --
+        // stale/fabricated find-string citations, not "extend vs already done" -- differs
+        // from adhoc's. Every OTHER non-adhoc source (deep_dive, brain_dump_sort, etc.,
+        // each with its own cursor-advance recovery below) keeps the original behaviour.
+        const isFulfillment = isCandidateFulfillmentSource(task.source);
+        if ((isAdhocTask(task) || isFulfillment) && needsClarificationDir) {
           const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
           if (alreadyEscalated) { summary.exhausted++; continue; }
           // A task that exhausted its retries on a tagged tool/environment failure lands
@@ -608,7 +652,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           // design-decision values elsewhere: external-dependency, unreliable-grounding.)
           task.needsClarification = {
             reason: task.infraErrorBefore ? 'infra-error' : 'design-decision',
-            openQuestions: buildExhaustedAdhocQuestion(task),
+            openQuestions: isFulfillment ? buildExhaustedFulfillmentQuestion(task) : buildExhaustedAdhocQuestion(task),
           };
           appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
           appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting redraft retries');
