@@ -732,7 +732,21 @@ while :; do                                                                     
   items=()                                                                      # no `local` here because we're at script scope (not function), so declare without keyword — PowerShell would use just `$items = @()` directly with no type keyword either.
   pdir="$QUEUE_DIR/pending"                                                    # compute pending dir once — matches task-sources.js's own writeTask() destination (queue/pending), not the old bare "pending/" this script used to read from (which task-sources.js never wrote to, so this claim loop always found nothing).
 
-  if [[ -r "$pdir" ]]; then                                                     # check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
+  # 2026-09-18 (pipeline throughput investigation, following the qwen2.5:3b GPU-thrashing
+  # fix): the resume-leftover loop above already stops touching Ollama the moment ONE
+  # leftover item hits an infra-shaped failure -- correct pacing during a genuine outage,
+  # but it never stopped THIS block from claiming a brand-new task the SAME tick. Under
+  # sustained (not outage-level) GPU contention -- now a structural fact once two lanes
+  # share one physical GPU on the same model -- nearly every tick's resume attempt fails
+  # and breaks early, so at most one stuck leftover gets a retry attempt per tick while
+  # new claims kept flowing in unthrottled: the orphaned-retry backlog grows faster than
+  # it can ever drain. Confirmed live: queue/drafting/worker-1/ held 17 items, one over
+  # 10 hours old with only 3 recorded attempts (retries landing hours apart, not ticks
+  # apart), while zero tasks reached queue/done/ in 30+ minutes despite individual model
+  # calls completing successfully. Skipping a new claim too, on the SAME tick an infra
+  # failure was already seen, means this tick backs off from Ollama entirely rather than
+  # only half-backing-off -- the backlog can no longer outgrow its own drain rate.
+  if [[ -r "$pdir" ]] && ! "$TICK_HAD_INFRA_FAILURE"; then                     # check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
     while IFS= read -r name; do
       [[ -n "$name" ]] && items+=("$name")
     done < <(node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" "$IS_REASONING_LANE" 2>/dev/null)
