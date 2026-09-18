@@ -31,7 +31,7 @@ const PIPELINE_DIR = REPO_ROOT;
 // these tests can never leak into whatever repo happens to be ambient in the env.
 process.env.AGENT_MANAGER_REPO_ROOT = REPO_ROOT;
 
-const { applyTask, recordApplyOutcome } = require('./apply-task.js');
+const { applyTask, recordApplyOutcome, safeApplyCall } = require('./apply-task.js');
 
 // observability_review/performance_review (2026-08-27) and arch_discovery/arch_import/
 // arch_review (2026-08-27, Phase 2) moved to the out-of-tree agent-manager-hygiene plugin,
@@ -996,6 +996,44 @@ test('recordApplyOutcome does not touch blockedStage/blockedReason on a successf
   assert.equal(task.blockedStage, undefined);
   assert.equal(task.blockedReason, undefined);
   assert.equal(task.status, 'done', 'status tracks the queue/done/ dir apply-task.sh moves it to');
+});
+
+// --- safeApplyCall (2026-09-18, bd-1789602146764) --------------------------------------
+// An uncaught exception inside applyTask/applyDirectToMainBatch used to crash the whole
+// apply-task.js process before recordApplyOutcome ever ran -- apply-task.sh's own
+// succeeded="false" fallback on empty/unparseable stdout still moved the task to
+// queue/blocked/, but with NO blockedReason/blockedStage/history event at all. Confirmed
+// live: 3 real tasks (observability_review + 2 brain_dump_sort) sat in exactly that state.
+
+test('safeApplyCall: a normal return passes through unchanged', () => {
+  const r = safeApplyCall(() => ({ succeeded: true, branch: 'agent/x' }), 'applyTask');
+  assert.deepEqual(r, { succeeded: true, branch: 'agent/x' });
+});
+
+test('safeApplyCall: a throw is turned into a real {succeeded:false, reason} instead of propagating', () => {
+  const r = safeApplyCall(() => { throw new Error('unexpected null dereference in applyGroupB'); }, 'applyTask');
+  assert.equal(r.succeeded, false);
+  assert.match(r.reason, /^applyTask crashed before producing a result: unexpected null dereference in applyGroupB/);
+});
+
+test('safeApplyCall composed with recordApplyOutcome: a crash still produces a real blockedReason/blockedStage/history event, exactly like an ordinary apply failure', () => {
+  const task = { id: 'crash-task', status: 'approved', history: [{ stage: 'approved', at: '2026-09-01T00:00:00Z' }] };
+  const result = safeApplyCall(() => { throw new Error('Cannot read properties of undefined (reading \'sha\')'); }, 'applyTask');
+
+  const stage = recordApplyOutcome(task, result);
+
+  assert.equal(stage, 'apply-failed');
+  assert.equal(task.status, 'blocked');
+  assert.equal(task.blockedStage, 'apply');
+  assert.ok(task.blockedReason, 'a crash must never leave blockedReason empty/undefined');
+  assert.match(task.blockedReason, /applyTask crashed before producing a result/);
+  assert.match(task.blockedReason, /Cannot read properties of undefined/);
+});
+
+test('safeApplyCall: the crash message is capped, not an unbounded full stack dump', () => {
+  const r = safeApplyCall(() => { throw new Error('boom'); }, 'applyDirectToMainBatch');
+  // message + up to 3 stack frames -- generous but bounded, never the whole raw stack.
+  assert.ok(r.reason.length < 2000, `crash reason should be bounded, got ${r.reason.length} chars`);
 });
 
 test('recordApplyOutcome stamps a terminal noop event + terminalDisposition for a no-op apply', () => {
