@@ -359,6 +359,17 @@ while :; do
     proactive_decompose_result="$(node "${PACKAGE_SRC_DIR}/proactive-file-decompose-sweep.js" 2>>"${HOME_LOGS}/proactive-file-decompose-sweep.log")"
     printf '[watchdog] proactive-file-decompose-sweep: %s\n' "$proactive_decompose_result" >&2
 
+    # merged-work-sweep (2026-09-18): wires verify-merged-work.js -- built 2026-09-16,
+    # never previously called from anywhere -- into a periodic pass. Cheaply pre-filters
+    # queue/done/ tasks claiming terminalDisposition:'merged' down to the ones whose
+    # commit SHA is NOT a merge-base ancestor of current master/main, then runs the real
+    # content-based check on just those and files a side-finding for a genuine 'missing'
+    # or low-ratio 'partial' verdict only. Self-throttled internally via isDue/markChecked
+    # (own 5-min floor, plus a persisted checked-id set so a done task is verified once
+    # ever, not every tick) -- cheap to run on every watchdog tick like the sweep above.
+    merged_work_result="$(node "${PACKAGE_SRC_DIR}/merged-work-sweep.js" 2>>"${HOME_LOGS}/merged-work-sweep.log")"
+    printf '[watchdog] merged-work-sweep: %s\n' "$merged_work_result" >&2
+
     # Drift-scan (Brain Dump #83: "Reasoning tasks aren't represented in the job list...
     # make sure task visibility is a consistent part of the pipeline"). drift-scan.js
     # already existed to catch exactly this class of bug (a static list, e.g. the
