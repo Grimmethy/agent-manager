@@ -6,7 +6,10 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { extractFilesLine, checkCitedPaths, formatFabricatedReason } = require('./candidate-path-grounding.js');
+const {
+  extractFilesLine, checkCitedPaths, formatFabricatedReason,
+  checkCitedSymbols, formatFabricatedSymbolsReason,
+} = require('./candidate-path-grounding.js');
 
 // --- extractFilesLine -----------------------------------------------------------------
 
@@ -86,4 +89,63 @@ test('formatFabricatedReason: names every fabricated path and starts with the cl
   // The full blockedReason becomes "Ungrounded draft: " + this; the classifier keys on
   // /^ungrounded draft:\s*fabricated file path/i.
   assert.match(`Ungrounded draft: ${reason}`, /^ungrounded draft:\s*fabricated file path/i);
+});
+
+// --- checkCitedSymbols ----------------------------------------------------------------
+
+function checkedFor(repo, relPath) {
+  const resolvedPath = path.join(repo, relPath);
+  return [{ claimedPath: relPath, exists: true, resolvedPath }];
+}
+
+test('checkCitedSymbols: flags a backtick-quoted symbol absent from the cited (real) file', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'real-one.js'), 'function realFn() {}\n');
+  const text = 'Problem: `realFn` never calls `fakeHelper` before returning.';
+  const { fabricated, checked } = checkCitedSymbols(text, checkedFor(repo, 'src/real-one.js'));
+  assert.deepEqual(checked.sort(), ['fakeHelper', 'realFn'].sort());
+  assert.equal(fabricated.length, 1);
+  assert.equal(fabricated[0].name, 'fakeHelper');
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('checkCitedSymbols: a create-mode mention ("add a `newHelper`") is not flagged', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'real-one.js'), 'function realFn() {}\n');
+  const text = 'Solution: add a `newHelper` function that realFn can call.';
+  const { fabricated } = checkCitedSymbols(text, checkedFor(repo, 'src/real-one.js'));
+  assert.equal(fabricated.length, 0);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('checkCitedSymbols: skips stopwords and short tokens', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'real-one.js'), '// real\n');
+  const text = 'Uses `this`, `return`, and `ab` inline.';
+  const { checked } = checkCitedSymbols(text, checkedFor(repo, 'src/real-one.js'));
+  assert.deepEqual(checked, []);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('checkCitedSymbols: no-op when no cited path actually exists (Check 0 already caught it)', () => {
+  const { fabricated, checked } = checkCitedSymbols('`missingFn` is broken.', [{ claimedPath: 'src/nope.js', exists: false, resolvedPath: null }]);
+  assert.deepEqual(fabricated, []);
+  assert.deepEqual(checked, []);
+});
+
+test('checkCitedSymbols: all-real symbols -> nothing fabricated', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'real-one.js'), 'function realFn() { return otherReal(); }\nfunction otherReal() {}\n');
+  const text = '`realFn` calls `otherReal`.';
+  const { fabricated } = checkCitedSymbols(text, checkedFor(repo, 'src/real-one.js'));
+  assert.equal(fabricated.length, 0);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+// --- formatFabricatedSymbolsReason -------------------------------------------------
+
+test('formatFabricatedSymbolsReason: names every fabricated symbol and starts with the classifier prefix', () => {
+  const reason = formatFabricatedSymbolsReason([{ name: 'fakeHelper' }, { name: 'ghostFn' }]);
+  assert.match(reason, /^fabricated symbol citation\(s\): `fakeHelper`, `ghostFn`/);
+  assert.match(`Ungrounded draft: ${reason}`, /^ungrounded draft:\s*fabricated symbol citation/i);
 });

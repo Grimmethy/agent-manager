@@ -125,6 +125,28 @@ function buildFabricatedFilePathQuestion(task) {
   ].join('\n');
 }
 
+// candidate-path-grounding.js's checkCitedSymbols -- the same deterministic-fabrication
+// reasoning as hasFabricatedFilePath above, one level down: the Files: line resolved to a
+// real file, but the write-up's prose cites a specific symbol that grep confirms is not
+// textually present in it. blockedReason shape: "Ungrounded draft: fabricated symbol
+// citation(s): ...".
+function hasFabricatedSymbolCitation(task) {
+  return /^ungrounded draft:\s*fabricated symbol citation/i.test(String(task.blockedReason || '').trim());
+}
+
+function buildFabricatedSymbolCitationQuestion(task) {
+  const detail = String(task.blockedReason || '').replace(/^ungrounded draft:\s*/i, '').trim();
+  return [
+    `This candidate's implement pass cited a symbol name that does not appear anywhere in `
+      + `the file(s) it named: ${detail}`,
+    '',
+    'A blind redraft cannot fix this -- the cited file is unchanged each attempt, so the '
+      + 'model keeps re-citing the same non-existent name. Either the finding is about a '
+      + 'differently-named real symbol (re-file the candidate with the accurate citation), or '
+      + 'there is genuinely no applicable site (Archive this task).',
+  ].join('\n');
+}
+
 // Keyword categories over blockedReason text, same ones used by hand triaging this
 // session's blocked queue, same priority order. faultSide:'model' -- a keyword match on
 // the draft's own text/behavior -- and retryable:true for all six: no real evidence yet
@@ -231,6 +253,19 @@ const CLASSIFIERS = [
     buildQuestion: buildFabricatedFilePathQuestion,
   },
   {
+    // Ordered BEFORE harness-search-zero-results and the REASON_CATEGORIES keyword spread
+    // for the same reason as fabricated-file-path just above: "fabricated symbol
+    // citation" also contains "ungrounded"/"fabricat".
+    name: 'fabricated-symbol-citation',
+    classify(task) {
+      if (hasFabricatedSymbolCitation(task)) {
+        return { category: 'fabricated-symbol-citation', faultSide: 'model', retryable: false };
+      }
+      return null;
+    },
+    buildQuestion: buildFabricatedSymbolCitationQuestion,
+  },
+  {
     name: 'harness-search-zero-results',
     classify(task) {
       if (hasZeroHitHarnessSearch(task)) {
@@ -293,6 +328,7 @@ module.exports = {
   hasUnreliableGrounding,
   hasInvalidPremise,
   hasFabricatedFilePath,
+  hasFabricatedSymbolCitation,
   signatureForTask,
   findClassifier,
 };
