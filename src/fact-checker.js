@@ -748,6 +748,107 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
   return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks, revertChecks, cleanedText, strippedFileLineCitations };
 }
 
+// "Already done" claim check (2026-09-08, decomposed from adhoc-brain-dump-bd-1789456618325):
+// drafts have claimed work was "already in place" / "already inserted" with no verification --
+// the exact fabrication shape checkCommitClaims already catches for commit hashes, but for
+// file/function/token claims inside a note. Same contract as the other checks here:
+// deterministic prose extraction (PATH_EXT_RE / CLAIM_FN_RE), verification against the LIVE
+// repo via resolveAgainstRepoDetailed (never a hand-rolled existsOnly guess), fail-open on
+// environment errors (read failure => found:false with an error note, never a throw), and a
+// per-claim object so a caller can render found:false entries as "unverified, needs check"
+// instead of trusting the prose.
+const COMPLETION_CLAIM_RE = /\balready\s+(?:in\s+place|inserted)/gi;
+const CLAIM_FN_RE = /\bfunction\s+([A-Za-z_$][A-Za-z0-9_$]*)/;
+const CLAIM_BACKTICK_RE = /`([^`\n]+)`/g;
+
+function checkCompletionClaimsInNote(noteText, repoRoot) {
+  const text = noteText || '';
+  const results = [];
+  for (const m of text.matchAll(COMPLETION_CLAIM_RE)) {
+    // Verify against the sentence(s) around the claim, not the whole note -- a stray path
+    // or function name far away is not part of this claim (same locality rule as the
+    // heavy-change/scope-adjacency heuristic).
+    const start = Math.max(0, m.index - 120);
+    const end = Math.min(text.length, m.index + m[0].length + 160);
+    const window = text.slice(start, end);
+
+    const fileMatch = window.match(PATH_EXT_RE);
+    const file = fileMatch ? fileMatch[0] : null;
+    const fnMatch = CLAIM_FN_RE.exec(window);
+    const functionName = fnMatch ? fnMatch[1] : null;
+    // Token = a backticked span in the claim that is not itself the claimed file or the
+    // claimed function name (e.g. "`retryCount` is already inserted in src/foo.js").
+    let claimedToken = null;
+    for (const bt of window.matchAll(CLAIM_BACKTICK_RE)) {
+      const cand = bt[1].trim();
+      if (!cand || cand === file || cand === functionName) continue;
+      if (file && (file === cand || file.indexOf(cand) !== -1 || cand.indexOf(file) !== -1)) continue;
+      if (!/\.[a-z]{2,4}$/i.test(cand)) claimedToken = cand;
+    }
+
+    const candidate = { file, functionName, claimedToken, found: false, evidence: '' };
+    if (!file && !functionName && !claimedToken) {
+      candidate.evidence = 'no file, function, or token extractable from the claim -- cannot verify';
+      results.push(candidate);
+      continue;
+    }
+    if (!file) {
+      candidate.evidence = `no file path in the claim, so ${functionName ? 'function' : 'token'} '${functionName || claimedToken}' cannot be verified`;
+      results.push(candidate);
+      continue;
+    }
+    const { resolvedPath } = resolveAgainstRepoDetailed(repoRoot, file);
+    if (!resolvedPath) {
+      candidate.evidence = `file not found: ${file}`;
+      results.push(candidate);
+      continue;
+    }
+    let content;
+    try {
+      content = fs.readFileSync(resolvedPath, 'utf8');
+    } catch (e) {
+      // Fail-open: an environment/read problem is not evidence the claim is false --
+      // same treatment as checkCommitClaims' "unknown" for a missing git repo.
+      candidate.evidence = `error reading ${resolvedPath}: ${e.message}`;
+      results.push(candidate);
+      continue;
+    }
+    const lineAt = (idx) => content.slice(0, idx).split('\n').length;
+    if (!functionName && !claimedToken) {
+      // File-existence alone is the claim -- and it resolved, so the claim holds.
+      candidate.found = true;
+      candidate.evidence = `file ${file} exists (resolved: ${path.relative(repoRoot, resolvedPath) || path.basename(resolvedPath)})`;
+      results.push(candidate);
+      continue;
+    }
+    const parts = [];
+    let ok = true;
+    if (functionName) {
+      const esc = functionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const idx = content.search(new RegExp(`(?:function\\s+${esc}\\s*\\(|${esc}\\s*=\\s*(?:async\\s+)?(?:\\(|function))`));
+      if (idx === -1) {
+        ok = false;
+        parts.push(`function '${functionName}' not found in ${file}`);
+      } else {
+        parts.push(`function '${functionName}' confirmed at ${file}:${lineAt(idx)}`);
+      }
+    }
+    if (claimedToken) {
+      const tidx = content.indexOf(claimedToken);
+      if (tidx === -1) {
+        ok = false;
+        parts.push(`token '${claimedToken}' not found in ${file}`);
+      } else {
+        parts.push(`token '${claimedToken}' confirmed at ${file}:${lineAt(tidx)}`);
+      }
+    }
+    candidate.found = ok;
+    candidate.evidence = parts.join('; ');
+    results.push(candidate);
+  }
+  return results;
+}
+
 module.exports = {
   checkDraft,
   checkFilePaths,
@@ -758,6 +859,7 @@ module.exports = {
   preValidateCitedPaths,
   checkCommitClaims,
   checkRevertsAPriorFix,
+  checkCompletionClaimsInNote,
   extractFilePaths,
   extractCreateModeTargets,
   extractClaimedRelationships,
