@@ -184,6 +184,31 @@ test('daemonRoots: zero matches returns an empty array', () => {
   assert.deepEqual(daemonRoots([{ pid: 1, ppid: 0, cmd: 'node something-else.js' }], /queue-watcher\.sh/), []);
 });
 
+// 2026-09-18: a hyphen is a non-word character, so a plain `\b` after "worker-reasoning"
+// is satisfied at the "-p40" boundary just as it would be at a space -- worker-reasoning's
+// pattern wrongly also matched a real, separate worker-reasoning-p40 daemon.
+
+test('checkDaemonCounts does not confuse worker-reasoning with worker-reasoning-p40 (hyphen-suffix overlap)', () => {
+  const findings = checkDaemonCounts([
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
+    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning-p40' },
+    { pid: 3, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
+    { pid: 4, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
+  ]);
+  const wrFinding = findings.find((f) => f.startsWith('worker-reasoning:'));
+  assert.ok(wrFinding && wrFinding.includes('no process found'), 'worker-reasoning-p40 process must not count as satisfying worker-reasoning');
+});
+
+test('checkDaemonCounts still correctly recognizes a bare worker-reasoning process', () => {
+  const findings = checkDaemonCounts([
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
+    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 3, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
+    { pid: 4, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
+  ]);
+  assert.deepEqual(findings, []);
+});
+
 // --- checkOrphanedModelCalls ---------------------------------------------------------------
 
 test('checkOrphanedModelCalls finds a local-draft.js process reparented to pid 1', () => {

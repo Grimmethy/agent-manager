@@ -37,9 +37,17 @@ const THROUGHPUT_WINDOW_MS = 60 * 60 * 1000;
 // Every long-running daemon this pipeline expects, and the pattern that identifies it in
 // a process list -- worker-reasoning is deliberately NOT matched by the worker-1 pattern
 // (anchored with a trailing word boundary) despite the substring overlap.
+//
+// 2026-09-18: `\b` alone is NOT enough to stop worker-reasoning's pattern also matching
+// `local-worker.sh worker-reasoning-p40` -- a hyphen is itself a non-word character, so
+// `\b` is satisfied at the "g"/"-" boundary same as it would be at a space or end-of-
+// string. Confirmed live: every real worker-reasoning-p40 daemon was double-counted as a
+// second "worker-reasoning" instance. `(?!-)` rules out anything immediately followed by
+// a hyphen (i.e. a `-p40` suffix), while still matching the bare `worker-reasoning`
+// process a space or end-of-string legitimately follows.
 const EXPECTED_DAEMONS = [
   { name: 'worker-1', pattern: /local-worker\.sh worker-1\b/ },
-  { name: 'worker-reasoning', pattern: /local-worker\.sh worker-reasoning\b/ },
+  { name: 'worker-reasoning', pattern: /local-worker\.sh worker-reasoning\b(?!-)/ },
   { name: 'queue-watchdog', pattern: /queue-watcher\.sh/ },
   { name: 'reviewer', pattern: /review-runner\.sh/ },
 ];
