@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE, FALSE_CLAIM_RE, BUDGET_EXHAUSTED_RE, COMPLETABLE_NOT_DESIGN_RE, BLOCKER_TYPE_BUDGET_EXHAUSTED_RE, BLOCKER_TYPE_INFRA_ERROR_RE } = require('./needs-clarification-triage.js');
+const { needsClarificationTriage, DEGENERATE_RE, INVALID_PREMISE_RE, FALSE_CLAIM_RE, BUDGET_EXHAUSTED_RE, COMPLETABLE_NOT_DESIGN_RE, BLOCKER_TYPE_BUDGET_EXHAUSTED_RE, BLOCKER_TYPE_INFRA_ERROR_RE, hasFreshEscalationSince, isStillLeaveForHuman } = require('./needs-clarification-triage.js');
 
 function makePipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-triage-test-'));
@@ -216,6 +216,105 @@ test('idempotency: already leave-for-human -> skipped', async () => {
   held(dir, baseTask('t11', { ncTriageDecision: 'leave-for-human' }));
   const s = await needsClarificationTriage(args(dir));
   assert.equal(s.checked, 0);
+});
+
+// hasFreshEscalationSince / isStillLeaveForHuman (2026-09-18, pipeline hardening --
+// confirmed live: two real tasks stayed permanently invisible to every triage sweep
+// after a human resolved the question, requeued, redrafted, and re-escalated for an
+// unrelated reason, because ncTriageDecision:'leave-for-human' from the FIRST escalation
+// was never cleared).
+test('hasFreshEscalationSince: false when ncTriageReviewedAt is missing (fail closed, preserves old behavior)', () => {
+  assert.equal(hasFreshEscalationSince({ history: [{ stage: 'needs-clarification', at: '2026-09-18T00:00:00Z' }] }), false);
+});
+
+test('hasFreshEscalationSince: false when ncTriageReviewedAt is unparseable', () => {
+  assert.equal(hasFreshEscalationSince({
+    ncTriageReviewedAt: 'not-a-date',
+    history: [{ stage: 'needs-clarification', at: '2026-09-18T00:00:00Z' }],
+  }), false);
+});
+
+test('hasFreshEscalationSince: false when no needs-clarification history event exists at all', () => {
+  assert.equal(hasFreshEscalationSince({
+    ncTriageReviewedAt: '2026-09-16T13:03:56.000Z',
+    history: [{ stage: 'exhausted', at: '2026-09-18T04:05:21.000Z' }],
+  }), false);
+});
+
+test('hasFreshEscalationSince: false when the only needs-clarification event is AT OR BEFORE ncTriageReviewedAt (the escalation that produced the decision itself)', () => {
+  assert.equal(hasFreshEscalationSince({
+    ncTriageReviewedAt: '2026-09-16T13:03:56.000Z',
+    history: [{ stage: 'needs-clarification', at: '2026-09-16T13:03:40.092Z' }],
+  }), false);
+});
+
+test('hasFreshEscalationSince: true when a needs-clarification event is STRICTLY AFTER ncTriageReviewedAt', () => {
+  assert.equal(hasFreshEscalationSince({
+    ncTriageReviewedAt: '2026-09-16T13:03:56.000Z',
+    history: [
+      { stage: 'needs-clarification', at: '2026-09-16T13:03:40.092Z' }, // the original escalation -- must not count
+      { stage: 'needs-clarification-resolved', at: '2026-09-16T23:19:49.232Z' },
+      { stage: 'needs-clarification', at: '2026-09-18T04:05:21.408Z' }, // the real re-escalation
+    ],
+  }), true);
+});
+
+test('isStillLeaveForHuman: true for a stamped decision with no fresh re-escalation', () => {
+  assert.equal(isStillLeaveForHuman({
+    ncTriageDecision: 'leave-for-human',
+    ncTriageReviewedAt: '2026-09-16T13:03:56.000Z',
+    history: [{ stage: 'needs-clarification', at: '2026-09-16T13:03:40.092Z' }],
+  }), true);
+});
+
+test('isStillLeaveForHuman: false once a fresh re-escalation has happened since the decision', () => {
+  assert.equal(isStillLeaveForHuman({
+    ncTriageDecision: 'leave-for-human',
+    ncTriageReviewedAt: '2026-09-16T13:03:56.000Z',
+    history: [
+      { stage: 'needs-clarification', at: '2026-09-16T13:03:40.092Z' },
+      { stage: 'needs-clarification', at: '2026-09-18T04:05:21.408Z' },
+    ],
+  }), false);
+});
+
+test('isStillLeaveForHuman: false when the decision was never actually stamped', () => {
+  assert.equal(isStillLeaveForHuman({ history: [] }), false);
+});
+
+test('a task re-escalated after its stale leave-for-human decision gets a fresh triage pass, not silently skipped', async () => {
+  const dir = makePipeline();
+  // Mirrors the real live incident: escalated, a human resolved it (stamping
+  // ncTriageDecision/ncTriageReviewedAt via bucket C on the FIRST escalation), then
+  // requeued/redrafted and re-escalated a SECOND time for a totally unrelated reason
+  // (here: the degenerate-draft signature, so it lands in bucket A once re-evaluated).
+  held(dir, baseTask('t-reescalated', {
+    ncTriageDecision: 'leave-for-human',
+    ncTriageReviewedAt: '2026-09-16T13:03:56.000Z',
+    needsClarification: { reason: 'design-decision', openQuestions: DEGEN_OQ },
+    history: [
+      { stage: 'needs-clarification', at: '2026-09-16T13:03:40.092Z' },
+      { stage: 'needs-clarification-resolved', at: '2026-09-16T23:19:49.232Z' },
+      { stage: 'needs-clarification', at: '2026-09-18T04:05:21.408Z' },
+    ],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.checked, 1, 'the re-escalated task must be evaluated, not silently skipped');
+  assert.equal(s.requeued, 1);
+  assert.ok(exists(at(dir, 'adhoc', 't-reescalated.json')), 'bucket A should have requeued it to adhoc/ once actually evaluated');
+});
+
+test('a task with NO fresh re-escalation since its leave-for-human decision stays skipped (checked stays 0)', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('t-still-stale', {
+    ncTriageDecision: 'leave-for-human',
+    ncTriageReviewedAt: '2026-09-16T13:03:56.000Z',
+    needsClarification: { reason: 'design-decision', openQuestions: DEGEN_OQ },
+    history: [{ stage: 'needs-clarification', at: '2026-09-16T13:03:40.092Z' }],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.checked, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 't-still-stale.json')), 'must stay in needs-clarification, untouched');
 });
 
 test('reason ambiguous -> not ours, skipped', async () => {

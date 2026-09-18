@@ -221,6 +221,45 @@ function bumpBucketAttempts(task, bucket) {
   return next;
 }
 
+// 2026-09-18 (pipeline hardening, confirmed live): `ncTriageDecision:'leave-for-human'` is
+// stamped once, then checked at the top of every future sweep to avoid re-logging a task
+// a human already needs to look at -- but it is only ever CLEARED by one of the specific
+// requeue buckets above happening to match the task's exact rejection signature. A task
+// whose signature never matches any of them stays permanently invisible to every future
+// sweep, even across a full escalation -> human answer -> requeue -> redraft -> a BRAND
+// NEW re-escalation for a completely unrelated reason. Confirmed live on two real tasks:
+// a human resolved the design question via the picker, the task was requeued and
+// redrafted, but every subsequent attempt hit an unrelated infra outage or a degenerate
+// empty plan and re-escalated to needs-clarification a second time -- the stale flag from
+// the FIRST escalation silently skipped both of them on every sweep since, including with
+// the human's already-recorded answer sitting there unconsumed.
+//
+// A fresh 'needs-clarification' history event timestamped AFTER ncTriageReviewedAt means
+// the situation has genuinely changed since that decision was made (a new draft attempt
+// happened, and failed for some current reason) -- the old decision no longer describes
+// what is actually stuck now, so it must not keep blocking a fresh look. Only escalations
+// STRICTLY AFTER the stamped review time count; the escalation event that PRODUCED the
+// leave-for-human decision itself is at or before that timestamp and must not immediately
+// invalidate the decision it just made.
+function hasFreshEscalationSince(task) {
+  const reviewedAt = task.ncTriageReviewedAt;
+  if (!reviewedAt) return false; // no timestamp to compare against -- Bucket C always stamps both fields together, so this only happens for legacy/hand-edited data; fail CLOSED (preserve the existing permanent-skip behavior) rather than guess
+  const reviewedMs = new Date(reviewedAt).getTime();
+  if (!Number.isFinite(reviewedMs)) return false; // unparseable timestamp -- same fail-closed reasoning
+  const history = Array.isArray(task.history) ? task.history : [];
+  return history.some((h) => {
+    if (!h || h.stage !== 'needs-clarification') return false;
+    const at = new Date(h.at).getTime();
+    return Number.isFinite(at) && at > reviewedMs;
+  });
+}
+
+// The actual skip check every "already reviewed" gate below uses: still-current only when
+// the flag is set AND nothing has re-escalated the task since it was set.
+function isStillLeaveForHuman(task) {
+  return task.ncTriageDecision === 'leave-for-human' && !hasFreshEscalationSince(task);
+}
+
 // The drafter said, in effect, "I was handed nothing to work on". When the task's own
 // rawText is substantial this is a local-model flake on the forced-summary turn, not a
 // real question -- see the header and src/local-tool-client.js:652 (flake rollback).
@@ -584,7 +623,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
 
     // --- Bucket H: deterministically-classified invalid-premise -------------------
     if (reason === 'invalid-premise') {
-      if (task.ncTriageDecision === 'leave-for-human') continue;         // already reviewed
+      if (isStillLeaveForHuman(task)) continue;                            // already reviewed, and nothing has re-escalated since
       summary.checked += 1;
       const id = task.id || name.replace(/\.json$/, '');
       const oq = nc.openQuestions || '';
@@ -657,7 +696,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
 
     // --- Bucket I: deterministically-classified unreliable-grounding --------------
     if (reason === 'unreliable-grounding') {
-      if (task.ncTriageDecision === 'leave-for-human') continue;         // already reviewed
+      if (isStillLeaveForHuman(task)) continue;                            // already reviewed, and nothing has re-escalated since
       summary.checked += 1;
       const id = task.id || name.replace(/\.json$/, '');
       const oq = nc.openQuestions || '';
@@ -982,7 +1021,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     }
 
 
-    if (task.ncTriageDecision === 'leave-for-human') continue;           // already reviewed
+    if (isStillLeaveForHuman(task)) continue;                              // already reviewed, and nothing has re-escalated since
 
     summary.checked += 1;
     const id = task.id || name.replace(/\.json$/, '');
@@ -1133,6 +1172,8 @@ module.exports = {
   COMPLETABLE_NOT_DESIGN_RE,
   BLOCKER_TYPE_BUDGET_EXHAUSTED_RE,
   BLOCKER_TYPE_INFRA_ERROR_RE,
+  hasFreshEscalationSince,
+  isStillLeaveForHuman,
 };
 
 if (require.main === module) {
