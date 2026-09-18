@@ -4,7 +4,7 @@
 // systematic way to identify that these tasks are no longer valid" -- deleting stays a
 // human decision, but a human needs a signal telling them WHICH tasks and WHY).
 //
-// Runs every watchdog tick over queue/blocked/ + queue/needs-clarification/. For each task
+// Runs every watchdog tick over queue/blocked/ + queue/needs-clarification/ + queue/coordinating/. For each task
 // that trips a deterministic staleness criterion (staleness-audit.js's findStaleness
 // Candidates, now with `already-implemented` / `invalid-premise` / `duplicate-of` /
 // `decompose-loop`) it stamps a `stalenessFlag` on the task IN PLACE -- it never moves,
@@ -28,7 +28,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { findStalenessCandidates } = require('./staleness-audit.js');
 const { classifyVote } = require('./auto-confirm-review.js');
 
-const SCAN_DIRS = ['blocked', 'needs-clarification'];
+const SCAN_DIRS = ['blocked', 'needs-clarification', 'coordinating'];
 const CORPUS_DIRS = ['pending', 'drafting', 'blocked', 'needs-clarification', 'coordinating', 'adhoc', 'approved', 'review'];
 const DONE_STATES = new Set(['done', 'merged', 'applied-direct', 'archived', 'filed']);
 const FLAG_TTL_MS = 3 * 24 * 60 * 60 * 1000;        // re-evaluate a stamped flag after this long
