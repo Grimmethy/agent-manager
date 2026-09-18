@@ -29,6 +29,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
+const { hasLiveWorkerAncestor } = require('./dead-process-check.js');
 
 const CHECK_INTERVAL_MS = 60 * 60 * 1000; // hourly -- matches system-report.js's own hourly period, a natural fit since "completions in the last hour" IS the window this checks.
 const THROUGHPUT_WINDOW_MS = 60 * 60 * 1000;
@@ -118,12 +119,38 @@ function listProcesses() {
   }).filter(Boolean);
 }
 
+// 2026-09-18 (brain-dump bd-1789702787675 follow-up, Grimmethy: "I can't tell you how
+// many times I've had you report this issue to me"): this used to count every `ps` line
+// matching a daemon's pattern, with no regard for WHOSE child each match was. Each daemon
+// script's own loop body forks plain bash subshells during a normal tick (command
+// substitution, a piped `while read`, etc.) -- bash never re-execs on a fork, so
+// /proc/<subshell-pid>/cmdline is byte-identical to its parent's, including the daemon's
+// own script name and args. Confirmed live: every "N processes running simultaneously"
+// finding this month traced back to exactly this -- the "extra" pid's PPid was always the
+// SAME daemon's own long-lived pid, never an independent second instance, confirmed
+// against instances/<id>.json's single, stable daemonPid the whole time. This is the exact
+// ancestor-chain gotcha dead-process-check.js's own orphan detector already had to solve
+// (findOrphanedModelCallProcesses / hasLiveWorkerAncestor, see that function's header for
+// the three-pass incident history) -- reusing it here instead of re-deriving it, since the
+// underlying process-tree quirk is identical.
+//
+// A match now counts as a genuine SEPARATE daemon instance only when no ancestor in its
+// ppid chain is ALSO a match for the same pattern -- a matched process nested under
+// another match is that daemon's own subshell fork, not a second instance.
+function daemonRoots(ps, pattern) {
+  const matches = ps.filter((p) => pattern.test(p.cmd));
+  if (matches.length <= 1) return matches;
+  const matchPids = new Set(matches.map((m) => m.pid));
+  const pidToPpid = new Map(ps.map((p) => [p.pid, p.ppid]));
+  return matches.filter((m) => !hasLiveWorkerAncestor(m.ppid, pidToPpid, matchPids));
+}
+
 function checkDaemonCounts(ps) {
   const findings = [];
   for (const daemon of EXPECTED_DAEMONS) {
-    const matches = ps.filter((p) => daemon.pattern.test(p.cmd));
-    if (matches.length === 0) findings.push(`${daemon.name}: no process found (dead-process-check.js should restart this on its own next tick, but it's absent right now)`);
-    else if (matches.length > 1) findings.push(`${daemon.name}: ${matches.length} processes running simultaneously (pids ${matches.map((m) => m.pid).join(', ')}) -- should only ever be one`);
+    const roots = daemonRoots(ps, daemon.pattern);
+    if (roots.length === 0) findings.push(`${daemon.name}: no process found (dead-process-check.js should restart this on its own next tick, but it's absent right now)`);
+    else if (roots.length > 1) findings.push(`${daemon.name}: ${roots.length} processes running simultaneously (pids ${roots.map((m) => m.pid).join(', ')}) -- should only ever be one`);
   }
   return findings;
 }
@@ -196,6 +223,6 @@ function checkPipelineHealth({ pipelineDir, instancesDir, logDir, now = new Date
 
 module.exports = {
   checkPipelineHealth, isDue, markChecked,
-  countRecentCompletions, countPending, checkDaemonCounts, checkOrphanedModelCalls, tailLogErrorSignatures,
+  countRecentCompletions, countPending, checkDaemonCounts, daemonRoots, checkOrphanedModelCalls, tailLogErrorSignatures,
   THROUGHPUT_WINDOW_MS, CHECK_INTERVAL_MS,
 };

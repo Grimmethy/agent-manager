@@ -16,7 +16,7 @@ const path = require('path');
 
 const {
   checkPipelineHealth, isDue, markChecked,
-  countRecentCompletions, countPending, checkDaemonCounts, checkOrphanedModelCalls, tailLogErrorSignatures,
+  countRecentCompletions, countPending, checkDaemonCounts, daemonRoots, checkOrphanedModelCalls, tailLogErrorSignatures,
 } = require('./pipeline-health-audit.js');
 
 function tempDir(prefix) {
@@ -128,6 +128,60 @@ test('checkDaemonCounts does not confuse worker-1 with worker-reasoning (substri
   ]);
   const worker1Finding = findings.find((f) => f.startsWith('worker-1:'));
   assert.ok(worker1Finding && worker1Finding.includes('no process found'), 'worker-reasoning process must not count as satisfying worker-1');
+});
+
+// 2026-09-18 (brain-dump bd-1789702787675 follow-up): bash forks a plain subshell during
+// a daemon's own normal loop body (command substitution, a piped `while read`, ...) with
+// no exec, so ps shows a SECOND process with the byte-identical cmdline, parented under
+// the daemon's own long-lived pid -- not a genuine second instance. Confirmed live: every
+// "N processes running simultaneously" finding this month was exactly this shape.
+
+test('checkDaemonCounts does NOT flag a daemon whose "extra" match is its own subshell fork (real live shape)', () => {
+  const findings = checkDaemonCounts([
+    { pid: 3597394, ppid: 1560, cmd: 'bash scripts/local-worker.sh worker-1' }, // the real long-lived daemon
+    { pid: 352957, ppid: 3597394, cmd: 'bash scripts/local-worker.sh worker-1' }, // its own subshell fork this tick
+    { pid: 3597395, ppid: 1560, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 3597399, ppid: 1560, cmd: 'bash scripts/queue-watcher.sh watchdog' },
+    { pid: 3597398, ppid: 1560, cmd: 'bash scripts/review-runner.sh reviewer' },
+  ]);
+  assert.deepEqual(findings, []);
+});
+
+test('checkDaemonCounts still flags a REAL duplicate even with an unrelated subshell fork also present', () => {
+  const findings = checkDaemonCounts([
+    { pid: 100, ppid: 1, cmd: 'bash scripts/local-worker.sh worker-1' }, // first independent daemon
+    { pid: 200, ppid: 1, cmd: 'bash scripts/local-worker.sh worker-1' }, // second independent daemon -- a genuine duplicate
+    { pid: 201, ppid: 200, cmd: 'bash scripts/local-worker.sh worker-1' }, // the SECOND daemon's own subshell fork -- must not inflate the count further
+    { pid: 3, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 4, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
+    { pid: 5, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
+  ]);
+  assert.equal(findings.length, 1);
+  assert.match(findings[0], /worker-1: 2 processes/);
+  assert.match(findings[0], /pids 100, 200/);
+});
+
+test('checkDaemonCounts collapses a chain of several nested subshell forks to one root', () => {
+  const findings = checkDaemonCounts([
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
+    { pid: 2, ppid: 1, cmd: 'bash scripts/local-worker.sh worker-1' },
+    { pid: 3, ppid: 2, cmd: 'bash scripts/local-worker.sh worker-1' }, // nested two levels deep
+    { pid: 4, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 5, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
+    { pid: 6, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
+  ]);
+  assert.deepEqual(findings, []);
+});
+
+// --- daemonRoots --------------------------------------------------------------------------
+
+test('daemonRoots: a single match is trivially its own root (no ancestor walk needed)', () => {
+  const ps = [{ pid: 1, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' }];
+  assert.deepEqual(daemonRoots(ps, /queue-watcher\.sh/), ps);
+});
+
+test('daemonRoots: zero matches returns an empty array', () => {
+  assert.deepEqual(daemonRoots([{ pid: 1, ppid: 0, cmd: 'node something-else.js' }], /queue-watcher\.sh/), []);
 });
 
 // --- checkOrphanedModelCalls ---------------------------------------------------------------
