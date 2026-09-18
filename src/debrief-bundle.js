@@ -72,6 +72,21 @@ const MIN_WINDOW_TASKS = 12;
 const MAX_WINDOW_TASKS = 25;
 const MAX_CONTRAST_TASKS = 4;
 
+// 2026-09: model-routing recommendations in a debrief report are not as well-grounded as
+// the determinism findings they sit next to -- a debrief has no visibility into benchmark
+// rationale for a model choice, no visibility into the ~107s large-model reload latency a
+// route change would pay, and its only "contrast" is an n=1 task from a different repo,
+// which is correlational at best. Codified as a caveat so every pipeline_debrief bundle
+// tells the reader to treat routing advice accordingly: same reportClass treatment as
+// correlational contrast findings, and never self-acting.
+const ROUTING_ADVICE_CAVEAT =
+  'MODEL-ROUTING ADVICE CAVEAT: model-routing recommendations in this debrief are LOW-TRUST. ' +
+  'There is no visibility into benchmark rationale or the ~107s large-model reload latency a ' +
+  'route change would pay, and the n=1 contrast with a different repo is correlational, not ' +
+  'causal. Any "pin/keep model X" advice must require human confirmation before acting, and ' +
+  'carries the same reportClass treatment as correlational contrast findings -- do not treat ' +
+  'it as a decided change.';
+
 // The done/ window: real, top-level queue/done/*.json tasks (readStateDir never descends
 // into _archived/_archived_no_action -- same non-recursive readdirSync guarantee
 // done-archive.js's own scan relies on) whose terminal timestamp is after `sinceIso`,
@@ -164,6 +179,8 @@ function renderFraming(shippedTasks, noopCount, contrastRecords, windowStart, wi
     'the window simply predates it, say so -- the finding is STALE, do NOT re-propose it. A',
     'recommendation that duplicates code already in the current src/ is worse than none.',
     contrastRecords.length ? 'The CONTRAST tasks are still-stuck siblings from the same sources -- use them to check whether a stage that looks wasteful on the shipped tasks is ALSO where the stuck ones burn out (a shared inefficiency), or whether the stuck ones failed for an unrelated reason.' : '(No contrast tasks were found from these sources.)',
+    '',
+    ROUTING_ADVICE_CAVEAT,
   ].filter((l) => l !== undefined).join('\n');
 }
 
@@ -243,6 +260,8 @@ module.exports = {
   MAX_WINDOW_TASKS,
   MAX_CONTRAST_TASKS,
   DEFAULT_BUDGET_CHARS,
+  ROUTING_ADVICE_CAVEAT,
+  renderFraming,
   collectDoneWindow,
   collectContrastTasks,
   buildDebriefBundle,

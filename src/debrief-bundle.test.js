@@ -182,6 +182,32 @@ test('buildDebriefBundle: framing counts shipped vs no-op, and only shipped task
   assert.ok(!bundle.evidenceText.includes('COMPLETED 9'), 'no evidence block for a no-op task');
 });
 
+// --- low-trust model-routing caveat (2026-09) -----------------------------------------
+const { ROUTING_ADVICE_CAVEAT, renderFraming } = require('./debrief-bundle.js');
+
+test('ROUTING_ADVICE_CAVEAT is exported, states LOW-TRUST, and requires human confirmation', () => {
+  assert.equal(typeof ROUTING_ADVICE_CAVEAT, 'string');
+  assert.ok(ROUTING_ADVICE_CAVEAT.includes('LOW-TRUST'), 'caveat must state LOW-TRUST');
+  assert.ok(ROUTING_ADVICE_CAVEAT.includes('require human confirmation'), 'caveat must require human confirmation');
+  assert.ok(ROUTING_ADVICE_CAVEAT.includes('~107s'), 'caveat must cite the ~107s reload latency');
+  assert.ok(ROUTING_ADVICE_CAVEAT.includes('reportClass'), 'caveat must mention reportClass treatment');
+});
+
+test('renderFraming output carries the LOW-TRUST model-routing caveat', () => {
+  const text = renderFraming([doneTask('s1', '2026-09-01T00:00:00Z')], 0, [], '2026-09-01T00:00:00Z', '2026-09-02T00:00:00Z');
+  assert.ok(text.includes('LOW-TRUST'), 'framing must include the LOW-TRUST caveat');
+  assert.ok(text.includes('require human confirmation'), 'framing must include the human-confirmation phrase');
+});
+
+test('buildDebriefBundle evidence text carries the LOW-TRUST model-routing caveat in every bundle', () => {
+  const dir = makePipeline();
+  fillWindow(dir, MIN_WINDOW_TASKS);
+  const bundle = buildDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'model-stats.db') });
+  assert.ok(bundle.evidenceText, 'expected a real evidence blob');
+  assert.ok(bundle.evidenceText.includes('LOW-TRUST'), 'bundle text must include LOW-TRUST');
+  assert.ok(bundle.evidenceText.includes('require human confirmation'), 'bundle text must include the human-confirmation phrase');
+});
+
 test('buildDebriefBundle: a no-op-dominant window still produces a bundle, framed around the no-op problem', () => {
   const dir = makePipeline();
   for (let i = 0; i < 2; i++) {
