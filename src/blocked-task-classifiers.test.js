@@ -4,7 +4,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   classifyBlockedTask, categorizeBlockedReason, hasZeroHitHarnessSearch, hasUnreliableGrounding,
-  hasInvalidPremise, hasFabricatedFilePath, signatureForTask, findClassifier, REASON_CATEGORIES,
+  hasInvalidPremise, hasFabricatedFilePath, hasFabricatedSymbolCitation, signatureForTask,
+  findClassifier, REASON_CATEGORIES,
 } = require('./blocked-task-classifiers.js');
 
 test('classifyBlockedTask recognizes a pre-stamped external-dependency task as environment-side, non-retryable', () => {
@@ -72,6 +73,34 @@ test('findClassifier("fabricated-file-path").buildQuestion names the paths and s
   assert.ok(c);
   const q = c.buildQuestion({ blockedReason: 'Ungrounded draft: fabricated file path(s): src/agent-manager/task-queue.js -- not present anywhere in the target repo.' });
   assert.match(q, /src\/agent-manager\/task-queue\.js/);
+  assert.match(q, /blind redraft cannot fix this/i);
+  assert.match(q, /Archive/);
+});
+
+test('classifyBlockedTask recognizes a "fabricated symbol citation(s)" grounding block as model-side, NON-retryable', () => {
+  const task = { blockedReason: 'Ungrounded draft: fabricated symbol citation(s): `fakeHelper` -- not found anywhere in the cited file(s). A redraft cannot make an invented symbol real; re-file with an accurate citation, or archive if nothing applies.' };
+  const result = classifyBlockedTask(task);
+  assert.deepEqual(result, { category: 'fabricated-symbol-citation', faultSide: 'model', retryable: false, classifierName: 'fabricated-symbol-citation' });
+});
+
+test('fabricated-symbol-citation wins over the retryable "fabricated-ungrounded-claim" keyword classifier (ordering)', () => {
+  const result = classifyBlockedTask({ blockedReason: 'Ungrounded draft: fabricated symbol citation(s): `ghostFn` -- not found anywhere in the cited file(s).' });
+  assert.equal(result.classifierName, 'fabricated-symbol-citation');
+  assert.equal(result.retryable, false);
+});
+
+test('hasFabricatedSymbolCitation matches the exact grounding-check prefix, case-insensitively, and nothing else', () => {
+  assert.equal(hasFabricatedSymbolCitation({ blockedReason: 'Ungrounded draft: fabricated symbol citation(s): `x` -- ...' }), true);
+  assert.equal(hasFabricatedSymbolCitation({ blockedReason: 'UNGROUNDED DRAFT: FABRICATED SYMBOL CITATION(S): `x`' }), true);
+  assert.equal(hasFabricatedSymbolCitation({ blockedReason: 'Ungrounded draft: fabricated file path(s): src/x.js' }), false);
+  assert.equal(hasFabricatedSymbolCitation({}), false);
+});
+
+test('findClassifier("fabricated-symbol-citation").buildQuestion names the symbol and says a redraft cannot fix it', () => {
+  const c = findClassifier('fabricated-symbol-citation');
+  assert.ok(c);
+  const q = c.buildQuestion({ blockedReason: 'Ungrounded draft: fabricated symbol citation(s): `fakeHelper` -- not found anywhere in the cited file(s).' });
+  assert.match(q, /`fakeHelper`/);
   assert.match(q, /blind redraft cannot fix this/i);
   assert.match(q, /Archive/);
 });
