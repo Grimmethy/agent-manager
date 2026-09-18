@@ -69,6 +69,7 @@ function brainDumpSortPlanPrompt(task) {
     'Naming: the FILE name (not the folder) must describe what the note is actually about -- never a bare generic word like "ideas.md", "notes.md", "misc.md", or "todo.md". "ebay-cross-post-automation.md" is a good file name; "ideas.md" is not, even inside Ideas/. Every path must be `<folder>/<descriptive-name>.md` -- at least one folder, never a bare file at the vault root.',
     '',
     'A note describing a concrete change/feature/bug for a tracked project (INCLUDING this pipeline itself) is a WORK TASK, not a note: set belongsToProject + actionable:true and let it become a real queued task. Passive vault notes (category reference/idea/journal, belongsToProject null) are ONLY for observations, journal entries, and external reference material -- never for "the pipeline should do X" or "fix the dashboard Y".',
+    'belongsToProject is a PROJECT LABEL, NOT a second-brain folder name -- do not output a vault folder like \'Projects\', \'Notes\', \'Inbox\', or \'Ideas\' here; those are secondBrainPath values, a completely different field.',
     '',
     'Tracked code projects (only relevant if this note is literally a feature/bug for one of these codebases):',
     ctx.projectLabels && ctx.projectLabels.length > 0 ? ctx.projectLabels.join('\n') : '(no tracked code projects)',
