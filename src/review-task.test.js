@@ -55,6 +55,26 @@ require('./task-sources.js');
       registerTaskSource(name, { priority: 80, next: () => null, apply: () => ({ skipped: true }), advisoryProse: true });
     }
   }
+  // 2026-09-18: a fixture candidateFulfillment sibling opted into premiseRecheckSource,
+  // plus the deterministic-recheck rule set it points at -- see premise-recheck-decision
+  // test coverage below and premise-recheck-decision.js's own unit tests for the module
+  // itself. Real observability_fix/performance_fix registrations (agent-manager-hygiene)
+  // carry the identical shape in production.
+  if (!getRegisteredSource('fixture_premise_recheck_fix')) {
+    registerTaskSource('fixture_premise_recheck_fix', {
+      priority: 80, next: () => null, candidateFulfillment: true, premiseRecheckSource: 'observability_review',
+    });
+  }
+  const { registerDeterministicRecheck, getDeterministicRecheck } = require('./deterministic-recheck-registry.js');
+  if (!getDeterministicRecheck('observability_review')) {
+    registerDeterministicRecheck('observability_review', {
+      perFileRules: {
+        'fixture-bug-marker': (text) => text.split('\n').flatMap((line, i) => (
+          /\bBUG\b/.test(line) ? [{ file: null, line: i + 1, detail: 'BUG marker present' }] : []
+        )),
+      },
+    });
+  }
 }
 
 const { reviewTask, buildVerdictPrompt, renderImplementResponseForReview } = require('./review-task.js');
@@ -1514,6 +1534,53 @@ test('empty draft for a NON-emptyApproval source is unaffected (falls through, n
   const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]) });
   assert.notEqual(task.reviewProvider, 'deterministic-empty-fail');
   assert.notEqual(task.reviewProvider, 'deterministic-empty-approve');
+});
+
+// --- FALSE POSITIVE premise re-check (2026-09-18, premise-recheck-decision.js) -----------
+// A candidate-fulfillment "_fix" task's FALSE POSITIVE refusal used to fall straight into
+// the isNonImplementation gate below (short, no code fence) and get rejected exactly like
+// a bad draft -- even when the refusal is correct. See premise-recheck-decision.js's own
+// header for the full incident (brain-dump bd-1789602379616).
+
+test('FALSE POSITIVE refusal + the original scanner rule finds nothing in the current file -> deterministic approve, no reviewer vote', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  fs.writeFileSync(path.join(repoRoot, 'a.js'), 'function f() { return 1; }\n'); // clean -- no BUG marker
+  const task = {
+    id: 'fp-resolved', domain: 'default', source: 'fixture_premise_recheck_fix',
+    title: 'x', planResponse: 'p',
+    implementResponse: 'FALSE POSITIVE -- the flagged issue no longer exists in the real file.',
+    promptContext: { files: ['a.js'] },
+  };
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured) });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(task.reviewProvider, 'deterministic-premise-recheck-approve');
+  assert.equal(captured.length, 0, 'no reviewer vote spent on a mechanically-verified false-positive refusal');
+});
+
+test('FALSE POSITIVE refusal + the original scanner rule still finds it in the current file -> falls through, not auto-approved', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  fs.writeFileSync(path.join(repoRoot, 'a.js'), '// BUG: still here\nfunction f() { return 1; }\n');
+  const task = {
+    id: 'fp-still-live', domain: 'default', source: 'fixture_premise_recheck_fix',
+    title: 'x', planResponse: 'p',
+    implementResponse: 'FALSE POSITIVE -- the flagged issue no longer exists in the real file.',
+    promptContext: { files: ['a.js'] },
+  };
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]) });
+  assert.notEqual(task.reviewProvider, 'deterministic-premise-recheck-approve');
+});
+
+test('FALSE POSITIVE refusal for a source with no premiseRecheckSource opt-in is unaffected', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'fp-no-optin', domain: 'default', source: 'trouble_log',
+    title: 'x', planResponse: 'p',
+    implementResponse: 'FALSE POSITIVE -- nothing to do here.',
+    promptContext: { files: ['a.js'] },
+  };
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]) });
+  assert.notEqual(task.reviewProvider, 'deterministic-premise-recheck-approve');
 });
 
 // renderImplementResponseForReview (2026-09-13, screaminggoatclubmt investigation,

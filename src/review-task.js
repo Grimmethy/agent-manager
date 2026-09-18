@@ -53,6 +53,7 @@ const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { decideEmptyApprovalOutcome } = require('./empty-approval-decision.js');
+const { decidePremiseRecheckOutcome } = require('./premise-recheck-decision.js');
 const { detectTruncatedImplementResponse } = require('./validate-implement-truncation.js');
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
@@ -819,6 +820,31 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     task.localVerdict = `Auto-approved: implementResponse is genuinely empty and the harness search that fed this task found real hits -- a documented valid "nothing actionable" outcome for ${task.source} (no local-model review call spent -- this is deterministic, not a judgment call)`;
     recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
     appendHistoryEvent(task, 'approved', 'deterministic-empty-approve');
+    return { succeeded: true, verdict: 'approved', factCheckVerdict };
+  }
+
+  // 2026-09-18 (brain-dump bd-1789602379616, following up on PR #322's exhaustion-
+  // escalation fix): a candidate-fulfillment "_fix" task's implementResponse can be the
+  // documented "FALSE POSITIVE -- <reason>" refusal line (prompts.js's own instructed
+  // format for "this finding no longer applies") -- but that response is short and has
+  // no code fence, so without this check it falls straight into the isNonImplementation
+  // gate just below and gets rejected exactly like a genuinely bad draft, even when the
+  // refusal is CORRECT. decidePremiseRecheckOutcome re-runs the ORIGINAL *_review
+  // source's own deterministic scanner rule against the cited file's CURRENT content --
+  // see that module's own header for why "the rule finds nothing anywhere in the file"
+  // is a safe, conservative confirmation (not a guess) that this exact candidate's
+  // complaint is gone. Ordered before isNonImplementation so a confirmed-correct refusal
+  // never reaches that gate at all -- no wasted retry, no wasted human escalation.
+  const premiseRecheckOutcome = decidePremiseRecheckOutcome(task, { repoRoot: repoRootForCheck, extraRoots: factCheckExtraRoots });
+  if (premiseRecheckOutcome === 'approve') {
+    task.reviewedAt = new Date().toISOString();
+    task.reviewProvider = 'deterministic-premise-recheck-approve';
+    task.localVerdict = 'Auto-approved: implementResponse is a FALSE POSITIVE refusal, and a deterministic re-scan of the '
+      + `original ${getRegisteredSource(task.source) && getRegisteredSource(task.source).premiseRecheckSource}'s own rule set `
+      + 'against the cited file\'s current content confirms nothing is flagged there anymore -- verified, not a judgment call '
+      + '(no local-model review call spent).';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+    appendHistoryEvent(task, 'approved', 'deterministic-premise-recheck-approve');
     return { succeeded: true, verdict: 'approved', factCheckVerdict };
   }
 
