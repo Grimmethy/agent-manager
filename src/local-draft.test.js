@@ -25,7 +25,22 @@ const { EventEmitter } = require('events');
 // tool-access gating, heartbeats, the arch_import zero-query skip) using those sources as
 // the concrete example -- re-register a matching-shape stub so the assertions still
 // exercise the real core path. Prompt builders are the real ones prompts.js still exports.
+// 2026-09-18: on a machine where plugins.json (gitignored, machine-local) actually names
+// a real, loadable agent-manager-hygiene checkout, config.js's ensureRegistered() -- called
+// unconditionally at local-draft.js's own module top-level -- genuinely registers the REAL
+// 'observability_review' etc. sources the first time local-draft.js loads in this process.
+// If this function's own stub claims that name FIRST (its guard only checks "not registered
+// yet", true before the real load has had a chance to run), the real registration then
+// throws "already registered" the moment local-draft.js is required below -- confirmed
+// live: this crashed 3 tests in this file on a checkout with a real plugins.json, while an
+// isolated clone with no plugins.json (the normal CI/scratchpad shape) never hit it, since
+// ensureRegistered() there loads zero plugins and is a safe no-op. Calling
+// ensureRegistered() here FIRST (idempotent -- config.js's own `registered` flag makes a
+// repeat call a no-op) lets the real registration win when it's actually loadable; the
+// stubs below then correctly skip via their existing getRegisteredSource() guard instead of
+// squatting a name the real plugin was about to claim.
 function registerHygieneStubs() {
+  require('./config.js').ensureRegistered();
   const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
   const p = require('./prompts.js');
   const stub = (name, cfg, plan = p.archReviewPlanPrompt, impl = p.archReviewImplementPrompt) => {

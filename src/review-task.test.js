@@ -48,6 +48,21 @@ require('./task-sources.js');
 // regression tests below assert that reviewTask does not auto-reject a short false-positive
 // prose verdict from an advisoryProse source -- register a stub carrying that one flag so
 // isAdvisoryProseSource() still resolves them the way production (plugin loaded) does.
+//
+// 2026-09-18: on a machine where plugins.json (gitignored, machine-local) actually names a
+// real, loadable agent-manager-hygiene checkout, requiring './review-task.js' below calls
+// config.js's ensureRegistered() at module top-level, which genuinely registers the REAL
+// 'observability_review' etc. sources. That require happens AFTER this block, so if this
+// block's stub claims the name first (its guard only checks "not registered yet", true
+// since nothing has run yet), the real registration then throws "already registered" --
+// confirmed live: this crashed this whole file outright on a checkout with a real
+// plugins.json, while an isolated clone with no plugins.json (the normal CI/scratchpad
+// shape) never hit it. Calling ensureRegistered() here FIRST (idempotent -- config.js's
+// own `registered` flag makes a repeat call at line ~80 below a no-op) lets the real
+// registration win when it's actually loadable; the stub checks below then correctly
+// skip via their existing getRegisteredSource() guards instead of squatting a name the
+// real plugin was about to claim.
+require('./config.js').ensureRegistered();
 {
   const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
   for (const name of ['observability_review', 'performance_review']) {
