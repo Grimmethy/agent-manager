@@ -618,6 +618,54 @@ test('bucket G skipped: an exhausted history event -> not requeued', async () =>
   assert.ok(exists(at(dir, 'needs-clarification', 'tg2.json')));
 });
 
+// --- Bucket M: forced-summary turn ignored RESOLUTION: (2026-09-18) -------------------
+
+test('bucket M: forcedSummaryNonCompliant -> clean requeue to adhoc/', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tm1', {
+    forcedSummaryNonCompliant: true,
+    needsClarification: { reason: 'design-decision', openQuestions: 'some prior narration, no RESOLUTION: line' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tm1.json')));
+  const moved = read(at(dir, 'adhoc', 'tm1.json'));
+  assert.equal(moved.needsClarification, undefined);
+  assert.equal(moved.forcedSummaryNonCompliant, undefined, 'the stale flag must not survive into the fresh attempt');
+  assert.equal(moved.ncTriageBucketAttempts.M, 1);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && /forced-summary turn ignored the RESOLUTION:/.test(h.detail)));
+});
+
+test('bucket M skipped: an exhausted history event -> not requeued', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tm2', {
+    forcedSummaryNonCompliant: true,
+    history: [{ stage: 'exhausted', at: '2026-09-03T00:00:00Z', detail: '2/2 retries used' }],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tm2.json')));
+});
+
+test('bucket M skipped: forcedSummaryNonCompliant not set -> leave for human as before', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tm3', {
+    needsClarification: { reason: 'design-decision', openQuestions: 'a genuine, real design question about scope' },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tm3.json')));
+});
+
+test('bucket M: adhoc/<id>.json already exists -> left in place, not double-requeued', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tm4', { forcedSummaryNonCompliant: true }));
+  fs.writeFileSync(at(dir, 'adhoc', 'tm4.json'), JSON.stringify({ id: 'tm4' }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tm4.json')));
+});
+
 // --- Bucket J: deterministic-truncation-guard false-block signature (2026-09-16) -------
 
 test('bucket J: reviewProvider === deterministic-truncation-guard -> clean requeue to adhoc/', async () => {
