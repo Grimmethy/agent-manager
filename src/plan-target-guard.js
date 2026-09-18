@@ -36,11 +36,28 @@ const { checkFilePaths } = require('./fact-checker.js');
 // sentence must not blanket-exempt every declared target in the plan.
 const CREATE_FILE_VERBS_RE = /\b(?:create|creates|creating|add(?:s|ing)?\s+a\s+new\s+file|new\s+file\s+(?:at|named)?)\b[^\n]{0,80}$/i;
 
+// Existence-acknowledgment signal (2026-09-18, pipeline hardening -- confirmed live: a
+// task literally titled "Create src/review-parity.test.js" burned 16 real drafting
+// attempts because its own plan said, verbatim, "`src/review-parity.test.js` does
+// **not** exist yet (confirmed by the orientation report)" -- a model that has just
+// verified a target doesn't exist and says so has, in effect, declared it a create
+// target, even without using one of CREATE_FILE_VERBS_RE's specific verbs anywhere
+// nearby. Unlike the creation-verb check above, this phrasing lands AFTER the path
+// mention far more often than before it ("`X` does not exist yet, so this plan will
+// create it"), so both directions are checked, not just backward.
+// `[\s*_]+` (not plain `\s+`) between words: a model routinely bolds "not" for emphasis
+// ("does **not** exist yet") -- confirmed live, this is the EXACT real phrasing that
+// caused the incident above, and a literal whitespace-only gap would miss it.
+const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+)?exist\b|\bdoesn'?t[\s*_]+(?:yet[\s*_]+)?exist\b|\bnot[\s*_]+yet[\s*_]+(?:present|created)\b/i;
+
 function isDeclaredCreateTarget(planText, targetPath) {
-  const idx = String(planText || '').indexOf(targetPath);
+  const text = String(planText || '');
+  const idx = text.indexOf(targetPath);
   if (idx === -1) return false;
-  const before = planText.slice(Math.max(0, idx - 80), idx);
-  return CREATE_FILE_VERBS_RE.test(before);
+  const before = text.slice(Math.max(0, idx - 80), idx);
+  if (CREATE_FILE_VERBS_RE.test(before)) return true;
+  const after = text.slice(idx + targetPath.length, idx + targetPath.length + 80);
+  return EXISTENCE_ACK_RE.test(before) || EXISTENCE_ACK_RE.test(after);
 }
 
 // (task, planText, repoRoot, extraRoots) -> { blocked, reason?, missing? }
