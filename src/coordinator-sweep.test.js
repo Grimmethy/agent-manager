@@ -379,6 +379,44 @@ test('a hub rejected at creation (coordinatorBlocked, zero sub-tasks ever filed)
   assert.ok(archivedEvent, 'an archived history event should record the auto-archive');
 });
 
+// 2026-09-18 (pipeline hardening -- confirmed live): a hub id is date-slugged, so it's
+// possible for a SECOND coordinating/ record to be written under the SAME id later the
+// same day, after the first was already archived. Before this fix, moveToDone()'s "don't
+// clobber, something already put it there" guard left the SECOND (duplicate) copy
+// stranded in coordinating/ forever -- `dest` already existing made every future sweep
+// hit the same silent short-circuit, re-checking and re-skipping it every single tick.
+// Confirmed live: 6 real hubs sat in coordinating/ for hours this way. The fix: unlink
+// the stray duplicate too (the already-archived copy already fully describes this exact
+// rejected-at-creation failure -- no information is lost).
+test('a duplicate rejected-at-creation hub under an ALREADY-archived id is cleaned up, not stranded in coordinating/ forever', () => {
+  const dir = makePipeline();
+  const archivedDir = path.join(dir, 'queue', 'done', '_archived_no_action');
+  fs.mkdirSync(archivedDir, { recursive: true });
+  // The first occurrence, already archived (as if an earlier sweep tick did exactly
+  // what the test above verifies).
+  fs.writeFileSync(path.join(archivedDir, 'hub-dup.json'), JSON.stringify({
+    id: 'hub-dup', status: 'done', terminalDisposition: 'noop', mergedAt: '2026-09-18T14:05:00Z', history: [],
+  }));
+  // A second, later write under the SAME id -- still sitting in coordinating/, same
+  // rejected-at-creation shape.
+  write(dir, 'coordinating', {
+    id: 'hub-dup', status: 'coordinating', history: [], subTasks: [],
+    coordinatorBlocked: { signature: 'plan-invalid:src/x.js: some hard problem', since: new Date().toISOString(), children: [], escalated: false },
+  });
+  const summary = coordinatorSweep({ pipelineDir: dir });
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'hub-dup.json')), false, 'the duplicate must not be left stranded in coordinating/');
+  // The original archived copy is untouched -- still the FIRST occurrence's content,
+  // never overwritten by the duplicate.
+  const archived = JSON.parse(fs.readFileSync(path.join(archivedDir, 'hub-dup.json'), 'utf8'));
+  assert.equal(archived.mergedAt, '2026-09-18T14:05:00Z');
+  assert.equal(summary.completed, 1);
+
+  // And the fix is durable across ticks: a THIRD sweep with nothing new to do must not
+  // re-discover a duplicate that no longer exists.
+  const second = coordinatorSweep({ pipelineDir: dir });
+  assert.equal(second.checked, 0);
+});
+
 test('sweep on a missing coordinating/ dir is a clean no-op', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coordinator-sweep-empty-'));
   assert.deepEqual(coordinatorSweep({ pipelineDir: dir }), { checked: 0, updated: 0, completed: 0, errors: 0 });
