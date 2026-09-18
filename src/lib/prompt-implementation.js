@@ -24,12 +24,13 @@ function pathPrefetchResolveImplementPrompt(task, planText) {
 
 function deepDiveImplementPrompt(task, planText) {
   const ctx = task.promptContext;
+  const fileCount = (ctx.files && ctx.files.length) || 0;
   return [
     'Earlier you wrote this PLAN for one community of an external project:',
     '',
     planText,
     '',
-    'Now write ONLY the final item write-up(s) your plan identified -- 0 to 5 of them (same cap as the plan). If your plan found nothing worth flagging, output the empty string and nothing else; do not invent an item to have something to show. Keep each Rationale to 2-3 sentences -- a revision pass rewriting all items at once has a fixed token budget, and a long response here can get cut off mid-item, silently losing content that was actually fine.',
+    `Now write ONLY the final item write-up(s) your plan identified -- 0 to ${fileCount} of them (same cap as the plan). If your plan found nothing worth flagging, output the empty string and nothing else; do not invent an item to have something to show. Keep each Rationale to 2-3 sentences -- a revision pass rewriting all items at once has a fixed token budget, and a long response here can get cut off mid-item, silently losing content that was actually fine.`,
     '',
     'Each item MUST use exactly this format (must match this parser exactly or it cannot be consumed downstream):',
     '',
