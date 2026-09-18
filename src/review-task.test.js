@@ -750,6 +750,30 @@ test('reviewTask folds the critique text into the review prompt when a revision 
   assert.match(captured[0], /nonexistent function name/);
 });
 
+// 2026-09-18 (brain-dump bd-1789602450613): a real, correct fix (performance-fix-ac-6)
+// was rejected twice, both votes quoting the CRITIQUE's description of the pre-revision
+// draft as if it described the current one. Closes the loop immediately after the
+// critique text with an explicit "this is the OLD version, not the current draft" line.
+test('reviewTask closes the critique block with an explicit disambiguation, positioned AFTER the critique text', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'manual',
+    critiqueOutcome: 'issues-flagged',
+    revisionApplied: true,
+    critiqueText: 'The original draft was a bare refusal with no real edit.',
+  });
+  const captured = [];
+  await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.match(captured[0], /EARLIER, ALREADY-SUPERSEDED version/);
+  assert.match(captured[0], /do not reject the current draft/i);
+  const critiqueIdx = captured[0].indexOf('The original draft was a bare refusal');
+  const disambigIdx = captured[0].indexOf('EARLIER, ALREADY-SUPERSEDED version');
+  assert.ok(critiqueIdx !== -1 && disambigIdx !== -1 && disambigIdx > critiqueIdx,
+    'the disambiguation must come AFTER the critique text, closest to where the confusion originates');
+});
+
 test('reviewTask does not touch the critique gate at all when no critique ever ran (critiqueOutcome unset)', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = baseTask({ domain: 'default', source: 'manual' });
