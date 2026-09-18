@@ -55,7 +55,11 @@ test('runPlanCritique: deterministic gap -> gaps, viaModel false, no model call'
   assert.equal(called, false);
 });
 
-test('runPlanCritique: clean plan -> model call on the critique model, own lock key', async () => {
+test('runPlanCritique: clean plan -> model call with no hardcoded model override, own lock key', async () => {
+  // 2026-09-18: CRITIQUE_MODEL no longer hardcodes qwen2.5:3b -- undefined here means the
+  // call falls through to LOCAL_MODEL (local-client.js's own opts.model || MODEL), and the
+  // lock key falls through to maybeLockedOn's own `model || resolvedLabel` -- see
+  // plan-critique.js's own header comment on CRITIQUE_MODEL for the full incident.
   const seen = {};
   const r = await runPlanCritique(task(), {
     call: async (opts) => { Object.assign(seen, opts); return { response: 'PLAN OK' }; },
@@ -63,8 +67,8 @@ test('runPlanCritique: clean plan -> model call on the critique model, own lock 
   });
   assert.equal(r.verdict, 'ok');
   assert.equal(r.viaModel, true);
-  assert.equal(seen.model, 'qwen2.5:3b');
-  assert.equal(seen.lockModel, 'qwen2.5:3b');
+  assert.equal(seen.model, undefined);
+  assert.equal(seen.lockModel, undefined);
   assert.equal(seen.lockPass, 'plan-critique');
 });
 

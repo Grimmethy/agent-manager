@@ -615,34 +615,89 @@ test('computeImplementBudget still grows implNumCtx past the floor for a whole-d
   assert.ok(big.implNumCtx <= EXTENDED_NUM_CTX, 'still capped at EXTENDED_NUM_CTX');
 });
 
-test('ensureHeadroomForExtendedContext unloads the small utility model only when implNumCtx exceeds PINNED_NUM_CTX', async () => {
+// 2026-09-18: brain-dump-cheap-local no longer pins a dedicated small model by default
+// (task-sources.js's own registerModelProfile call -- see that file's comment for the
+// worker-1/worker-reasoning GPU-thrashing incident this closes), so
+// ensureHeadroomForExtendedContext's `getModelProfile('brain-dump-cheap-local')?.model`
+// read is now undefined in the real, ambient registry and it correctly no-ops (nothing
+// dedicated left to evict). These two tests register a FIXTURE profile with an explicit
+// model to keep exercising the eviction code path itself -- still real, still load-
+// bearing whenever a deployment opts a dedicated small model back in later.
+function withFixtureSmallModelProfile(model, fn) {
+  // Same full reset the file's own withFixtureRepo() uses (task-sources.js registers
+  // BOTH task sources, via task-source-registry.js, AND model profiles, via model-
+  // profile-registry.js, at module-load time -- clearing only one leaves the other's
+  // stale registration and registerTaskSource('adhoc', ...) throws "already registered"
+  // the moment task-sources.js gets re-required for the restore below).
+  const { registerTaskSource, clearRegistry } = require('./task-source-registry.js');
+  const { registerModelProfile, clearModelProfileRegistry } = require('./model-profile-registry.js');
+  clearRegistry();
+  clearModelProfileRegistry();
+  registerModelProfile('brain-dump-cheap-local', { backend: 'local', model, numCtx: 8192, think: false });
+  registerTaskSource('brain_dump_sort', { priority: 42, next: () => null, modelProfile: 'brain-dump-cheap-local' });
+  return Promise.resolve(fn()).finally(() => {
+    clearRegistry();
+    clearModelProfileRegistry();
+    delete require.cache[require.resolve('./task-sources.js')];
+    delete require.cache[require.resolve('./prompts.js')];
+    require('./task-sources.js'); // restores the real, ambient task-source + profile registrations
+    require('./prompts.js'); // re-attaches builders -- see withFixtureRepo's own comment on this exact pair
+  });
+}
+
+test('ensureHeadroomForExtendedContext unloads a pinned small model only when implNumCtx exceeds PINNED_NUM_CTX', async () => {
+  await withFixtureSmallModelProfile('qwen2.5:3b', async () => {
+    const http = require('http');
+    const { ensureHeadroomForExtendedContext } = require('./local-draft.js');
+    const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+    const requests = [];
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        requests.push(JSON.parse(body));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    const prevUrl = process.env.OLLAMA_URL;
+    process.env.OLLAMA_URL = `http://127.0.0.1:${port}`;
+    try {
+      const notExtended = await ensureHeadroomForExtendedContext(PINNED_NUM_CTX); // not extended -- must not call out at all
+      assert.equal(requests.length, 0, 'a normal, PINNED_NUM_CTX-sized call must not touch the small model');
+      assert.equal(notExtended.evicted, false);
+
+      const extended = await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1); // genuinely extended -- must unload
+      assert.equal(requests.length, 1);
+      assert.equal(requests[0].model, 'qwen2.5:3b');
+      assert.equal(requests[0].keep_alive, 0);
+      assert.equal(extended.evicted, true, 'a successful eviction call must report evicted:true so the next real call can bump its timeout');
+    } finally {
+      process.env.OLLAMA_URL = prevUrl;
+      server.close();
+    }
+  });
+});
+
+test('ensureHeadroomForExtendedContext is a no-op when no profile pins a dedicated small model (the current default)', async () => {
   const http = require('http');
   const { ensureHeadroomForExtendedContext } = require('./local-draft.js');
   const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
   const requests = [];
   const server = http.createServer((req, res) => {
-    let body = '';
-    req.on('data', (c) => { body += c; });
-    req.on('end', () => {
-      requests.push(JSON.parse(body));
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('{}');
-    });
+    req.on('data', () => {});
+    req.on('end', () => { requests.push(true); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{}'); });
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const { port } = server.address();
   const prevUrl = process.env.OLLAMA_URL;
   process.env.OLLAMA_URL = `http://127.0.0.1:${port}`;
   try {
-    const notExtended = await ensureHeadroomForExtendedContext(PINNED_NUM_CTX); // not extended -- must not call out at all
-    assert.equal(requests.length, 0, 'a normal, PINNED_NUM_CTX-sized call must not touch the small model');
-    assert.equal(notExtended.evicted, false);
-
-    const extended = await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1); // genuinely extended -- must unload
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].model, 'qwen2.5:3b');
-    assert.equal(requests[0].keep_alive, 0);
-    assert.equal(extended.evicted, true, 'a successful eviction call must report evicted:true so the next real call can bump its timeout');
+    const extended = await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1);
+    assert.equal(requests.length, 0, 'no dedicated small model is pinned -- nothing to evict, no HTTP call at all');
+    assert.equal(extended.evicted, false);
   } finally {
     process.env.OLLAMA_URL = prevUrl;
     server.close();
@@ -670,46 +725,48 @@ test('ensureHeadroomForExtendedContext never throws even when the unload call it
 // 'model-eviction' event to the same unified pipeline-history.log every other audit
 // class uses.
 test('ensureHeadroomForExtendedContext logs a model-eviction event to pipeline-history.log on both success and failure', async () => {
-  const fs = require('fs');
-  const os = require('os');
-  const path = require('path');
-  const http = require('http');
-  const { ensureHeadroomForExtendedContext } = require('./local-draft.js');
-  const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
-  const { readPipelineHistory } = require('./pipeline-history.js');
+  await withFixtureSmallModelProfile('qwen2.5:3b', async () => {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const http = require('http');
+    const { ensureHeadroomForExtendedContext } = require('./local-draft.js');
+    const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+    const { readPipelineHistory } = require('./pipeline-history.js');
 
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensure-headroom-audit-'));
-  const prevRepoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
-  const prevPipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR;
-  process.env.AGENT_MANAGER_REPO_ROOT = dir;
-  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
-  delete require.cache[require.resolve('./config.js')];
-
-  const server = http.createServer((req, res) => {
-    req.on('data', () => {});
-    req.on('end', () => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{}'); });
-  });
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const { port } = server.address();
-  const prevUrl = process.env.OLLAMA_URL;
-  process.env.OLLAMA_URL = `http://127.0.0.1:${port}`;
-  try {
-    await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1, { id: 't-1', source: 'product_spec' });
-    const events = readPipelineHistory(dir, { type: 'model-eviction' });
-    assert.equal(events.length, 1);
-    assert.equal(events[0].taskId, 't-1');
-    assert.equal(events[0].source, 'product_spec');
-    assert.equal(events[0].evictedModel, 'qwen2.5:3b');
-    assert.equal(events[0].succeeded, true);
-    assert.equal(events[0].implNumCtx, PINNED_NUM_CTX + 1);
-  } finally {
-    process.env.OLLAMA_URL = prevUrl;
-    server.close();
-    if (prevRepoRoot !== undefined) process.env.AGENT_MANAGER_REPO_ROOT = prevRepoRoot; else delete process.env.AGENT_MANAGER_REPO_ROOT;
-    if (prevPipelineDir !== undefined) process.env.AGENT_MANAGER_PIPELINE_DIR = prevPipelineDir; else delete process.env.AGENT_MANAGER_PIPELINE_DIR;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ensure-headroom-audit-'));
+    const prevRepoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+    const prevPipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR;
+    process.env.AGENT_MANAGER_REPO_ROOT = dir;
+    process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
     delete require.cache[require.resolve('./config.js')];
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+
+    const server = http.createServer((req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{}'); });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    const prevUrl = process.env.OLLAMA_URL;
+    process.env.OLLAMA_URL = `http://127.0.0.1:${port}`;
+    try {
+      await ensureHeadroomForExtendedContext(PINNED_NUM_CTX + 1, { id: 't-1', source: 'product_spec' });
+      const events = readPipelineHistory(dir, { type: 'model-eviction' });
+      assert.equal(events.length, 1);
+      assert.equal(events[0].taskId, 't-1');
+      assert.equal(events[0].source, 'product_spec');
+      assert.equal(events[0].evictedModel, 'qwen2.5:3b');
+      assert.equal(events[0].succeeded, true);
+      assert.equal(events[0].implNumCtx, PINNED_NUM_CTX + 1);
+    } finally {
+      process.env.OLLAMA_URL = prevUrl;
+      server.close();
+      if (prevRepoRoot !== undefined) process.env.AGENT_MANAGER_REPO_ROOT = prevRepoRoot; else delete process.env.AGENT_MANAGER_REPO_ROOT;
+      if (prevPipelineDir !== undefined) process.env.AGENT_MANAGER_PIPELINE_DIR = prevPipelineDir; else delete process.env.AGENT_MANAGER_PIPELINE_DIR;
+      delete require.cache[require.resolve('./config.js')];
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 // 2026-09-08, same incident as ensureHeadroomForExtendedContext's own header -- confirms
