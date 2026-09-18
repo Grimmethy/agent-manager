@@ -143,6 +143,28 @@ test('with the vote enabled: DENY drops the flag + Keep cooldown; CONFIRM promot
   }
 });
 
+test('sweep() resolves when fs.readdirSync throws EACCES on the first SCAN_DIRS entry (blocked)', async () => {
+  const dir = tmpPipeline();
+  const blockedDir = path.join(dir, 'queue', 'blocked');
+  const original = fs.readdirSync;
+  const eacces = Object.assign(new Error(`EACCES: permission denied, scandir '${blockedDir}'`), { code: 'EACCES' });
+  fs.readdirSync = (p, opts) => {
+    if (path.resolve(String(p)) === path.resolve(blockedDir)) throw eacces;
+    return original.call(fs, p, opts);
+  };
+  try {
+    // A scannable task in the OTHER scan dir, so the sweep would have work to do had the
+    // EACCES on 'blocked' not been tolerated.
+    writeTask(dir, 'needs-clarification', exhaustedTask('eac-1'));
+    await assert.doesNotReject(
+      sweep({ pipelineDir: dir, repoRoot: null, majorityVote: async () => ({}), now: Date.now() }),
+      'sweep() must resolve even when readdirSync throws EACCES on the first SCAN_DIRS entry',
+    );
+  } finally {
+    fs.readdirSync = original;
+  }
+});
+
 test('kill switch disables the sweep entirely', async () => {
   const dir = tmpPipeline();
   writeTask(dir, 'blocked', exhaustedTask('off-1'));
