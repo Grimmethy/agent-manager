@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission } = require('./reject-retry-check.js');
+const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission } = require('./reject-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
@@ -915,6 +915,59 @@ test('rejectRetryCheck exhausts a non-adhoc pre-critique block at the retry cap 
   assert.equal(summary.requeued, 0);
   assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')), 'non-adhoc exhausted task stays in blocked/');
   assert.ok(!fs.existsSync(path.join(needsClarificationDir, 'task-1.json')));
+  const stayed = JSON.parse(fs.readFileSync(path.join(blockedDir, 'task-1.json'), 'utf8'));
+  assert.ok(stayed.history.some((h) => h.stage === 'exhausted'));
+});
+
+// 2026-09-17: blockedStage:'pre-implement' (local-draft.js's hard PRE-implementation
+// guard, plan-target-guard.js's planTargetGuard) blocks a plan citing a missing edit
+// target BEFORE the implement pass runs at all -- one stage earlier than pre-critique.
+// Wired into this entry gate in the SAME change that introduces the blockedStage. See
+// isPreImplementBlock's own header in reject-retry-check.js.
+
+test('isPreImplementBlock recognizes blockedStage:pre-implement', () => {
+  assert.equal(isPreImplementBlock({ blockedStage: 'pre-implement' }), true);
+  assert.equal(isPreImplementBlock({ blockedStage: 'pre-critique' }), false);
+  assert.equal(isPreImplementBlock({}), false);
+});
+
+test('rejectRetryCheck requeues a pre-implement missing-file block under the retry cap', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    blockedStage: 'pre-implement',
+    blockedReason: 'plan cites missing-file target(s): src/does-not-exist.js',
+    localRejectCount: 0,
+    planResponse: '# Plan\n1. Edit src/does-not-exist.js to fix the thing.',
+  });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.exhausted, 0);
+  const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-1.json'), 'utf8'));
+  assert.equal(requeued.localRejectCount, 1);
+  // The plan itself named the bad target -- nothing usable to carry forward.
+  assert.equal(requeued.planResponse, undefined, 'stale plan must not survive a pre-implement requeue');
+  assert.equal(requeued.implementResponse, undefined);
+  assert.ok(requeued.priorRejectionFeedback.some((f) => /does-not-exist\.js/.test(f)), 'feedback must name the offending citation');
+  assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /cleared stale plan\/implement state/.test(h.detail || '')));
+});
+
+test('rejectRetryCheck exhausts a non-adhoc pre-implement block at the retry cap without escalating to needs-clarification', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    blockedStage: 'pre-implement',
+    blockedReason: 'plan cites missing-file target(s): src/does-not-exist.js',
+    localRejectCount: 2,
+  });
+  const needsClarificationDir = path.join(pendingDir, '..', 'needs-clarification');
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')), 'non-adhoc exhausted task stays in blocked/');
   const stayed = JSON.parse(fs.readFileSync(path.join(blockedDir, 'task-1.json'), 'utf8'));
   assert.ok(stayed.history.some((h) => h.stage === 'exhausted'));
 });

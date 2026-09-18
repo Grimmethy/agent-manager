@@ -228,6 +228,20 @@ function isPreCritiqueBlock(task) {
   return task.blockedStage === 'pre-critique';
 }
 
+// 2026-09-17: blockedStage:'pre-implement' (local-draft.js's hard PRE-implementation
+// guard, plan-target-guard.js's planTargetGuard) blocks an adhoc task whose PLAN cites an
+// edit target that does not exist in the repo, BEFORE the implement pass is even called --
+// one stage earlier than the pre-critique guard above. Wired into this entry gate in the
+// SAME change that introduces the blockedStage, unlike pre-critique/draft/plan above,
+// each of which shipped invisible to this sweep and sat as a permanently-stuck blocked/
+// backlog until a LATER pass noticed and retrofitted it -- see this file's own reject-
+// retry-check.test.js and needs-clarification-triage.test.js coverage for that repeated
+// incident shape. Deterministic like pre-critique (a real content problem in the plan,
+// not a stochastic flake), same bounded blind-retry treatment.
+function isPreImplementBlock(task) {
+  return task.blockedStage === 'pre-implement';
+}
+
 // 2026-09-17: blockedStage:'draft' -- stamped by scripts/local-worker.sh (bash), NOT any
 // src/*.js file, which is why the pre-critique audit above (grep -r on src/*.js) missed
 // it entirely: same "invisible to this whole sweep" shape, from a different half of the
@@ -415,9 +429,10 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // adhoc -> needs-clarification escalation as a stuck review rejection.
       const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
       const preCritiqueBlock = isPreCritiqueBlock(task);
+      const preImplementBlock = isPreImplementBlock(task);
       const draftFailureBlock = isDraftFailureBlock(task);
       const planDegenerateBlock = isPlanDegenerateBlock(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !draftFailureBlock && !planDegenerateBlock) continue;
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -693,6 +708,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           '',
           'Only reference files that are actually present in the repo (verify with a tool call before citing one). If this task genuinely requires a brand-new file, create it with write_file/edit_file in create mode -- do not just describe or reference it as if it already exists.',
         ].join('\n'));
+      } else if (preImplementBlock) {
+        priorFeedback.push([
+          'A prior plan was blocked before implementation because it named an edit target that does not actually exist in the repo:',
+          '',
+          String(task.blockedReason || ''),
+          '',
+          'Only declare edit targets that are actually present in the repo (verify with a tool call before naming one). If this task genuinely requires a brand-new file, say so explicitly (e.g. "create `path`") so it is recognized as a create target, not a citation of an existing file.',
+        ].join('\n'));
       } else if (draftFailureBlock) {
         // Reaching here means NOT structurally-oversized (that shape escalated straight to
         // needs-clarification above, before this point) -- an ordinary content/model-
@@ -760,6 +783,13 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         // is kept: the plan itself wasn't what named the nonexistent file.
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'pre-critique missing-file block -- cleared stale implementResponse for fresh redraft');
+      } else if (preImplementBlock) {
+        // The bad citation lives IN the plan itself -- implementResponse never ran yet at
+        // this stage (that's the whole point of catching it earlier), but clear it too in
+        // case a prior cycle's stale value is still sitting on the record.
+        delete task.planResponse;
+        delete task.implementResponse;
+        appendHistoryEvent(task, 'requeued', 'pre-implementation missing-file block -- cleared stale plan/implement state for a fresh plan pass');
       } else if (draftFailureBlock && !retryableDraftBlock) {
         // retryableDraftBlock excluded: an adhoc draft-stage block ALSO happens to use the
         // literal blockedStage value 'draft' in places (unrelated to this bash-side stamp,
@@ -819,7 +849,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature };
 
 if (require.main === module) {
   main();

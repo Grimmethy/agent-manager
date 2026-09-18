@@ -55,6 +55,7 @@ const { appendTierWorkLog, pruneWorkLogs } = require('./work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { missingFileCheck } = require('./draft-file-guard.js');
+const { planTargetGuard } = require('./plan-target-guard.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
@@ -1276,6 +1277,32 @@ async function runDraftPasses(task, attempt, {
         // exactly what made a plan-pass-degenerate block invisible to reject-retry-
         // check.js's entry gate even after runPlanPass started setting blockedStage:'plan'.
         return { succeeded: true, blocked: true, blockedReason: planOutcome.blockedReason, blockedStage: planOutcome.blockedStage };
+      }
+
+      // Hard PRE-implementation guard (2026-09-17, needs-clarification bd-1788967312693,
+      // "pre-implementation timing ambiguity" -- user-selected resolution): the pre-
+      // critique guard further below only ever runs AFTER runImplementPass, so it saves
+      // the critique/revision turn but still spends the full implement pass on a plan
+      // that names a file that was never real. adhoc's own plan already declares its
+      // edit targets in prose (plan-target-guard.js's planTargetGuard, reusing the same
+      // extractDeclaredTargets primitive reject-retry-check.js's forbidden-path rescue
+      // already trusts) -- checking those here, right after the plan pass, catches the
+      // identical fabrication one stage earlier. Scoped to adhoc only: a generator-stage
+      // source's plan legitimately proposes a not-yet-real or external-repo target (see
+      // the pre-critique guard's own scoping comment further below for the full
+      // reasoning) -- adhoc always targets THIS repo's own files.
+      if (resolveSourceName(task) === 'adhoc' && typeof task.planResponse === 'string' && task.planResponse) {
+        const { repoRoot, grepAllowedDirs } = getConfig();
+        const preImplementGuard = planTargetGuard(task, task.planResponse, repoRoot, grepAllowedDirs);
+        if (preImplementGuard.blocked) {
+          appendHistoryEvent(task, 'blocked', preImplementGuard.reason);
+          return {
+            succeeded: true,
+            blocked: true,
+            blockedReason: preImplementGuard.reason,
+            blockedStage: 'pre-implement',
+          };
+        }
       }
 
       const literalEditResult = tryDeterministicLiteralEdit(task, attempt);
