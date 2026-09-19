@@ -154,6 +154,18 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     if (filesMatch) {
       filesArray = filesMatch[1].split(',').map((f) => f.trim());
     }
+    // Resolve each declared entry with the SAME resolver the discovery-time check uses, so a bare
+    // basename or an extension-less entry (`SearchView`, `SearchView.tsx`) fetches the real file
+    // instead of nothing (2026-09-19, PropertyForager arch-review-ac-1: the drafter saw no code).
+    // An entry that resolves to no real file is kept as written (a candidate proposing a new file).
+    {
+      const { resolveCitedFile } = require('../../candidate-path-grounding.js');
+      const { repoRoot: resolveRoot, grepAllowedDirs } = getConfig();
+      filesArray = filesArray.map((f) => {
+        const r = resolveCitedFile(resolveRoot, f, grepAllowedDirs || []);
+        return (r.exists && r.isFile && r.relPath) ? r.relPath : f;
+      });
+    }
 
     // 2026-09-02: the `Files:` line is frequently incomplete -- a candidate whose Solution
     // says "call `buildPlanPrompt` with a second arg" needs prompts.js in view to see that

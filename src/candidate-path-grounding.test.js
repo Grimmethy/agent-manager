@@ -9,7 +9,7 @@ const path = require('path');
 const {
   extractFilesLine, checkCitedPaths, formatFabricatedReason,
   checkCitedSymbols, checkCitedSymbolsPerEntry, splitCandidateEntries, formatFabricatedSymbolsReason,
-  symbolCheckBlocks, formatSymbolWarnings,
+  symbolCheckBlocks, formatSymbolWarnings, resolveCitedFile, normalizeFilesLine,
 } = require('./candidate-path-grounding.js');
 
 // --- extractFilesLine -----------------------------------------------------------------
@@ -246,4 +246,58 @@ test('formatSymbolWarnings: one advisory line naming every symbol; empty in, emp
   const [w] = formatSymbolWarnings([{ name: 'a' }, { name: 'b' }]);
   assert.match(w, /`a`, `b`/);
   assert.doesNotMatch(w, /fabricated/i);
+});
+
+// --- one shared Files: resolver (2026-09-19, PropertyForager arch-review-ac-1) -------------------------
+
+function tsxRepo() {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'cpg-tsx-'));
+  fs.mkdirSync(path.join(repo, 'src', 'components'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'src', 'components', 'SearchView.tsx'), 'export const SearchView = 1;\n');
+  return repo;
+}
+
+test('resolveCitedFile: exact, bare basename, and an EXTENSION-LESS name all resolve to the repo-relative file', () => {
+  const repo = tsxRepo();
+  for (const claimed of ['src/components/SearchView.tsx', 'SearchView.tsx', 'SearchView', '`SearchView`']) {
+    const r = resolveCitedFile(repo, claimed, ['src']);
+    assert.equal(r.exists, true, claimed);
+    assert.equal(r.relPath, 'src/components/SearchView.tsx', claimed);
+    assert.equal(r.isFile, true);
+  }
+  assert.equal(resolveCitedFile(repo, 'src/components', ['src']).isFile, false, 'a directory resolves but is not a file');
+  assert.equal(resolveCitedFile(repo, 'Nope', ['src']).exists, false);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('resolveCitedFile: an ambiguous bare name (two files, none under a code dir) does not resolve', () => {
+  const repo = tsxRepo();
+  fs.mkdirSync(path.join(repo, 'a'), { recursive: true });
+  fs.mkdirSync(path.join(repo, 'b'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'a', 'Dup.ts'), 'x');
+  fs.writeFileSync(path.join(repo, 'b', 'Dup.ts'), 'x');
+  assert.equal(resolveCitedFile(repo, 'Dup', []).exists, false);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('checkCitedPaths: an extension-less Files: entry naming a REAL file passes; an invented one is fabricated; prose/globs are ignored', () => {
+  const repo = tsxRepo();
+  assert.deepEqual(checkCitedPaths('SearchView', repo, ['src']).fabricated, []);
+  assert.deepEqual(checkCitedPaths('SearchView, the search component, src/*', repo, ['src']).fabricated, []);
+  const bad = checkCitedPaths('SearchView, SearchViwe', repo, ['src']).fabricated;
+  assert.deepEqual(bad.map((f) => f.claimedPath), ['SearchViwe']);
+  // Regression: this exact line used to yield NO checked paths at all (no extension for the regex).
+  assert.equal(checkCitedPaths('SearchView', repo, ['src']).checked.length, 1);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('normalizeFilesLine: rewrites bare/extension-less entries to the real path; leaves exact, unresolved and unrelated text alone', () => {
+  const repo = tsxRepo();
+  assert.equal(
+    normalizeFilesLine('SearchView, SearchView.tsx, src/components/SearchView.tsx, Ghost, src/*', repo, ['src']),
+    'src/components/SearchView.tsx, src/components/SearchView.tsx, src/components/SearchView.tsx, Ghost, src/*',
+  );
+  assert.equal(normalizeFilesLine('Ghost', repo, ['src']), 'Ghost');
+  assert.equal(normalizeFilesLine('', repo, ['src']), '');
+  fs.rmSync(repo, { recursive: true, force: true });
 });
