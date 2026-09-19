@@ -10,6 +10,7 @@ const {
 const { providerFor, labelFor, resolveModelProfile } = require('../model-provider.js');
 const { getConfig, ensureRegistered } = require('../config.js');
 const { resolveSourceName, getRegisteredSource } = require('../task-source-registry.js');
+const { symbolCheckBlocks } = require('../candidate-path-grounding.js');
 const { selectAbModel } = require('../ab-model-select.js');
 const { resolveStrategy } = require('../model-strategies.js');
 const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('../gpu-capacity.js');
@@ -83,7 +84,19 @@ async function runCritiqueAndRevision(task, {
       } catch (e) {
         console.warn('[local-draft] grounding check failed (advisory):', (e && e.message) || e);
       }
-      if (groundingVerdict && groundingVerdict.verdict === 'ungrounded') {
+      // The generic check below was written for deep_dive write-ups. On the arch candidate
+      // generators (candidateDocFormat: arch_discovery/arch_import) it hard-blocked real drafts:
+      // it greps backticked filenames (`legalContent.tsx` -- TS imports omit the extension, so
+      // ".tsx" never appears in any file's content) and proposed class-shaped names against the
+      // fetched content (2026-09-19, PF arch-discovery-community-1). Same decision as their own
+      // postImplementCheck symbol check: warn (task.groundingWarnings -> the review votes), don't
+      // block. AGENT_MANAGER_SYMBOL_CHECK_BLOCKING=true restores the block.
+      if (groundingVerdict && groundingVerdict.verdict === 'ungrounded'
+          && regEntry && regEntry.candidateDocFormat && !symbolCheckBlocks()) {
+        const warning = `critique-time grounding check could not verify: ${String(groundingVerdict.reason || '(no detail)').slice(0, 250)}`;
+        task.groundingWarnings = [...(Array.isArray(task.groundingWarnings) ? task.groundingWarnings : []), warning].slice(0, 10);
+        appendHistoryEvent(task, 'grounding-warning', warning.slice(0, 300));
+      } else if (groundingVerdict && groundingVerdict.verdict === 'ungrounded') {
         const blockedReason = `Ungrounded draft: ${String(groundingVerdict.reason || '(no detail)')}`.slice(0, 500);
         task.critiqueOutcome = 'grounding-failed';
         task.blockedStage = 'review';
