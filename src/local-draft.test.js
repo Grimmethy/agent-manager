@@ -2441,6 +2441,53 @@ test('draftTask keeps postImplementCheck warnings on the task (not blocked) and 
   });
 });
 
+// 2026-09-19: the critique-time generic grounding check (deep-dive-grounding-check.js) flags a
+// backticked filename (`legalContent.tsx`) whose extension never appears in any file's content.
+// For candidateDocFormat sources (arch_discovery/arch_import) that is now a WARNING, not a block.
+async function draftWithCitation(sourceName, extraReg, id) {
+  let out;
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource(sourceName)) {
+      registerTaskSource(sourceName, { priority: 80, next: () => null, postImplementCheck: async () => ({ verdict: 'ok' }), ...extraReg });
+      updateTaskSource(sourceName, { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id, domain: 'default', source: sourceName, title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: [{ path: 'src/legalContent.tsx', degree: 1, content: "import { a } from './other';\nexport const B = 1;\n" }], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response: 'Problem: `legalContent.tsx` duplicates the label list.', degenerate: null, attempts: 1 };
+    };
+    const saved = process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING;
+    delete process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING;
+    try { await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() }); } finally {
+      if (saved !== undefined) process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING = saved;
+    }
+    out = task;
+  });
+  return out;
+}
+
+test('critique-time grounding: an arch-style (candidateDocFormat) draft citing a filename is WARNED, not blocked', async () => {
+  const task = await draftWithCitation('critique_warn_arch_like', { candidateDocFormat: true }, 'critique-warn-1');
+  assert.equal(task.blockedStage, undefined);
+  assert.notEqual(task.critiqueOutcome, 'grounding-failed');
+  assert.ok((task.groundingWarnings || []).some((w) => /critique-time grounding check/.test(w) && /legalContent\.tsx/.test(w)), JSON.stringify(task.groundingWarnings));
+  assert.ok(task.history.some((e) => e.stage === 'grounding-warning'));
+});
+
+test('critique-time grounding: a NON-candidateDocFormat source with the same draft is still blocked (unchanged)', async () => {
+  const task = await draftWithCitation('critique_block_non_arch', {}, 'critique-block-1');
+  assert.equal(task.critiqueOutcome, 'grounding-failed');
+  assert.equal(task.blockedStage, 'review');
+  assert.match(task.blockedReason, /legalContent\.tsx/);
+});
+
 test('draftTask proceeds normally when the source has no postImplementCheck registered (regression guard)', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = {
