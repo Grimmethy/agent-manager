@@ -44,4 +44,22 @@ function generationThrottled(inFlightCount, instancesDir) {
   return inFlightCount >= liveLaneCount(instancesDir);
 }
 
-module.exports = { liveLaneCount, generationThrottled };
+// Priority-aware throttle (2026-09-19, PF-Client-Portal): generationThrottled() is one global count, so once
+// pending + drafting held `lanes` tasks NO source was asked to generate -- even a source that outranks all of
+// them. arch_discovery (priority 30) never got work in while two derived tasks (priority 41) were queued; claim
+// ranking is priority-ordered but only among tasks that already exist. A source is now blocked only by in-flight
+// work that is at least as important as ITSELF (priority number <=): lower-priority tasks already queued cannot
+// starve it. Still bounded: at most `laneCount` in-flight tasks per priority band.
+//
+// inFlightPriorities: rank priority of every task in pending/ + drafting/ (Infinity for an unresolvable one).
+// Returns (priority) => true when a source of that priority must NOT generate now.
+function makeSourceThrottle({ inFlightPriorities, laneCount }) {
+  return (priority) => {
+    const p = typeof priority === 'number' ? priority : Infinity;
+    let atOrAbove = 0;
+    for (const x of inFlightPriorities) if (x <= p) atOrAbove += 1;
+    return atOrAbove >= laneCount;
+  };
+}
+
+module.exports = { liveLaneCount, generationThrottled, makeSourceThrottle };

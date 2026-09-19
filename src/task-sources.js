@@ -11,7 +11,7 @@
 // renumbering anything.
 
 const fs = require('fs');
-const { generationThrottled } = require('./generation-throttle.js');
+const { generationThrottled, makeSourceThrottle, liveLaneCount } = require('./generation-throttle.js');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
@@ -2824,22 +2824,23 @@ if (require.main === module) {
   // not just the top level.
   // Count of tasks in flight (drafting/ across every instance + pending/). The throttle is
   // bounded by the number of live lanes -- see generation-throttle.js.
-  let inFlightCount = 0;
+  const inFlightFiles = [];
   if (fs.existsSync(draftingDir)) {
     for (const entry of fs.readdirSync(draftingDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const instanceDir = path.join(draftingDir, entry.name);
       try {
-        inFlightCount += fs.readdirSync(instanceDir).filter((f) => f.endsWith('.json')).length;
+        for (const f of fs.readdirSync(instanceDir)) if (f.endsWith('.json')) inFlightFiles.push(path.join(instanceDir, f));
       } catch {
         // unreadable instance dir -- not counted, same non-fatal-skip convention as above
       }
     }
   }
   if (fs.existsSync(pendingDir)) {
-    inFlightCount += fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json')).length;
+    for (const f of fs.readdirSync(pendingDir)) if (f.endsWith('.json')) inFlightFiles.push(path.join(pendingDir, f));
   }
-  const alreadyPending = generationThrottled(inFlightCount, path.join(pipelineDir, 'instances'));
+  const instancesDir = path.join(pipelineDir, 'instances');
+  const alreadyPending = generationThrottled(inFlightFiles.length, instancesDir);
 
   // An already-queued lower-priority task must never block a NEW adhoc task from
   // reaching pending/ -- adhoc is the "drop everything, do this now" lane. This exception
@@ -2950,11 +2951,24 @@ if (require.main === module) {
     });
   })();
 
-  if (alreadyPending && !hasAdhocWaiting && !hasResearchWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting) {
-    console.log('pending/ already has work queued, not adding another task');
-  } else {
-    const task = getNextTask();
-    if (!task) {
+  {
+    const throttled = alreadyPending && !hasAdhocWaiting && !hasResearchWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting;
+    // Throttled no longer means "ask nobody": a source is vetoed only by in-flight work at least as important as
+    // itself (generation-throttle.js makeSourceThrottle), so a higher-priority source (arch_discovery 30) can still
+    // generate while lower-priority tasks (derived_task 41) already fill the slots.
+    let blocked;
+    if (throttled) {
+      const { rankPriorityOfTask } = require('./next-claimable-task.js');
+      const inFlightPriorities = inFlightFiles.map((f) => {
+        try { return rankPriorityOfTask(JSON.parse(fs.readFileSync(f, 'utf8'))); } catch { return Infinity; }
+      });
+      const veto = makeSourceThrottle({ inFlightPriorities, laneCount: liveLaneCount(instancesDir) });
+      blocked = (source) => veto(source.priority);
+    }
+    const task = getNextTask({ blocked });
+    if (!task && throttled) {
+      console.log('pending/ already has work queued, not adding another task');
+    } else if (!task) {
       console.log('no eligible task found (all registered sources exhausted or malformed)');
     } else {
       const file = writeTask(task);
