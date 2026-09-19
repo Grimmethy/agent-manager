@@ -1,5 +1,7 @@
 'use strict';
 
+const { isGitWriteRequest, GIT_WRITE_REQUEST_REFUSAL } = require('./lib/git-ownership.js');
+
 // Multi-turn tool-calling loop for a plan pass, giving it a real, narrow, read-only
 // codebase-search capability via grep-codebase-tool.js. Unlike local-client.js (which only
 // ever calls Ollama's /api/generate -- a single prompt-in, text-out call with no structured
@@ -540,10 +542,10 @@ function runBashTool(a, b) {
   }
   if (RISKY_GIT_COMMAND_RE.test(command)) {
     return {
-      error: 'git merge/push is not available via run_bash -- call queue_reviewed_task with a '
-        + 'title and description of what should be merged/pushed and why. This lands the change '
-        + 'through the same reviewed pipeline (implement/critique/review/majority-vote) every '
-        + 'other change goes through, instead of executing directly from Chat.',
+      error: 'git merge/push is not available via run_bash. The pipeline does not perform git '
+        + 'operations either: it commits and pushes an unmerged branch itself after a draft passes '
+        + 'review, and a human merges it from the dashboard\'s Unmerged Branches tab (which checks '
+        + 'for conflicts first). Investigate and recommend; do not queue a task to merge, push or commit.',
     };
   }
   const realRoots = allowedRoots.map((r) => fs.realpathSync(r));
@@ -643,7 +645,7 @@ const WRITE_TOOLS = [
     type: 'function',
     function: {
       name: 'queue_reviewed_task',
-      description: 'Hand off a risky or history-mutating action (merging a branch, pushing a change) to the existing reviewed pipeline instead of attempting it directly. Use this whenever run_bash refuses a git merge/push, or whenever you are recommending an action you should not take yourself. The task goes through the same implement/critique/review/majority-vote path every other pipeline change goes through.',
+      description: 'File a task describing a code CHANGE (which files, what behavior) for the reviewed pipeline to implement. It goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as an unmerged branch for a human. Never queue a git operation (commit, merge, push, branch, PR): the pipeline cannot perform them, and this tool refuses them.',
       parameters: {
         type: 'object',
         properties: {
@@ -689,7 +691,7 @@ const CHAT_TOOLS = [
     type: 'function',
     function: {
       name: 'queue_reviewed_task',
-      description: 'File a real task for the pipeline to implement -- the ONLY way to make a real code change from Chat (you have no direct write access). Use this for anything from a one-line fix to a whole new mechanism: investigate and design the change as normal, then call this tool with enough detail for the pipeline to implement it without further back-and-forth. The task goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as a real unmerged branch for a human to review -- never applied directly.',
+      description: 'File a real task for the pipeline to implement -- the ONLY way to make a real code change from Chat (you have no direct write access). Use this for anything from a one-line fix to a whole new mechanism: investigate and design the change as normal, then call this tool with enough detail for the pipeline to implement it without further back-and-forth. The task goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as a real unmerged branch for a human to review -- never applied directly. Describe the CHANGE wanted (files, behavior), never a git operation: do not ask for a commit, merge, push, branch or PR -- the pipeline commits by itself and a human merges from the Unmerged Branches tab, and this tool refuses git-operation requests.',
       parameters: {
         type: 'object',
         properties: {
@@ -970,6 +972,7 @@ function withGrepDirsHint(tools) {
 function queueReviewedTaskTool(pipelineDir, { title, description }) {
   if (typeof title !== 'string' || !title.trim()) return { error: 'queue_reviewed_task requires a non-empty "title" argument' };
   if (typeof description !== 'string' || !description.trim()) return { error: 'queue_reviewed_task requires a non-empty "description" argument' };
+  if (isGitWriteRequest({ title, description })) return { error: GIT_WRITE_REQUEST_REFUSAL };
   const { domainsPath } = getConfig();
   try {
     // premiumPriority: true (2026-09-16, Grimmethy: "any tasks that chat is working on

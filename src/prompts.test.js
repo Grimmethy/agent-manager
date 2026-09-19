@@ -712,3 +712,13 @@ test('adhocHarnessSearchPlanPrompt is unchanged (no extra section) when the task
   const p = adhocHarnessSearchPlanPrompt(task);
   assert.doesNotMatch(p, /Prefer these as your search terms/);
 });
+
+test('adhoc plan prompt and the agentic write prompt both carry the git-ownership rule', () => {
+  const { GIT_OWNERSHIP_RULE } = require('./lib/git-ownership.js');
+  const p = require('./prompts.js');
+  const task = { title: 'Fix a comment', promptContext: { rawText: 'change one comment line' } };
+  require('./task-sources.js'); // registers the adhoc source so buildPlanPrompt can dispatch to adhocPlanPrompt
+  assert.ok(p.buildPlanPrompt({ ...task, id: 't', source: 'manual', domain: 'adhoc' }).includes(GIT_OWNERSHIP_RULE), 'plan prompt');
+  const { buildWriteAgenticPrompt } = require('./local-agentic-write-draft.js');
+  assert.ok(buildWriteAgenticPrompt({ ...task, id: 't' }).includes(GIT_OWNERSHIP_RULE), 'agentic implement prompt');
+});

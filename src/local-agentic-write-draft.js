@@ -1,5 +1,7 @@
 'use strict';
 
+const { GIT_OWNERSHIP_RULE } = require('./lib/git-ownership.js');
+
 // Adhoc draft tier 3, LOCAL (2026-09-01, Grimmethy: "Those reasoning workers are supposed
 // to go through qwen. Claude needs to be removed as a dependency from that system."). The
 // local-model replacement for the deleted Claude adhoc-agentic-draft.js: a real multi-turn
@@ -368,6 +370,7 @@ function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } =
       : 'If the task is simply TOO LARGE to implement confidently in one pass (many files/subsystems, or you can tell you would run out of turns partway through), do NOT attempt a partial implementation and do NOT make any code changes. Instead split it into 2-6 smaller, independently-implementable pieces that together cover the original task. Each piece should touch ONE file; strongly prefer a NEW self-contained file/module over pieces that need edits scattered through a large existing file.';
   return [
     'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
+    GIT_OWNERSHIP_RULE,
     'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Prefer read_file with offset/limit to page a large file and grep_codebase to locate code; a quick `run_bash` `sed -n \'3600,3700p\' path` slice is fine for a fast look, just do not burn turns re-listing the tree. Reserve run_bash otherwise for the final targeted check on files you actually changed.',
     'Files here can be thousands of lines. read_file returns a WINDOW of lines: check `totalLines` and `nextOffset` in the result and re-call with a higher `offset` to page -- never assume the first window is the whole file. grep_codebase searches this repo\'s configured dirs (or a subpath, or "." for all); it is a literal substring / all-words match, not a regex, and returns matching lines only -- read_file around a hit for context.',
     `TURN BUDGET: you have about ${LOCAL_AGENTIC_WRITE_MAX_TURNS} turns total. Spend at most the first ~${orientTurnLimit} on orientation (grep/read/list). By then you MUST have either started editing with edit_file/write_file, or concluded with a RESOLUTION: line. Do not keep exploring past that -- a rough first edit you then fix is far better than running out of turns having changed nothing. ${stillLostAdvice}`,
