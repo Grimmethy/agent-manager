@@ -80,7 +80,7 @@ test('CLI entry point still works normally for a real array of queries', () => {
 // subprocess above). Mirrors grep-codebase-tool.test.js's two-fixture-repo pattern for its
 // own `root` param tests.
 
-const { fetchForQueries } = require('./arch-import-fetch.js');
+const { fetchForQueries, MAX_CONTENT_CHARS: MAX_CONTENT_CHARS_TEST } = require('./arch-import-fetch.js');
 
 function makeRepo(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'arch-import-fetch-inproc-'));
@@ -149,6 +149,40 @@ test('fetchForQueries({ roots }): an extra root has no dirs allowlist -- searche
     const result = fetchForQueries(['plugin_only_term'], { roots: [primary, plugin] });
     assert.equal(result.hits.length, 1);
     assert.equal(result.hits[0].file, 'python/deep/nested.py');
+  });
+});
+
+// 2026-09-19, ghost-in-the-machine retroactive audit of the pipeline_debrief blocked/
+// bucket: fetchForQueries used to require a matched file's ENTIRE content to fit the shared
+// MAX_CONTENT_CHARS (12000) budget or be skipped outright -- fine for a small utility file,
+// but structurally unable to ever include agent-manager's own hot files (review-task.js,
+// local-draft.js, task-sources.js, app.py -- all 7-18x that budget on their own). Confirmed
+// live: 15 of 28 blocked pipeline_debrief tasks showed real grep hits but 0 files fetched.
+test('fetchForQueries windows an oversized matched file around its real hit line instead of skipping it entirely', () => {
+  const filler = Array.from({ length: 2000 }, (_, i) => `// filler line ${i}`).join('\n');
+  const content = `${filler}\n// uniqueneedle marker here\nconst afterNeedle = 1;\n${filler}\n`;
+  assert.ok(content.length > 20000, 'fixture file must clear the whole-budget threshold to exercise windowing');
+  const primary = makeRepo({ 'src/huge.js': content });
+  withRepoConfig(primary, 'src', () => {
+    const result = fetchForQueries(['uniqueneedle']);
+    assert.equal(result.hits.length, 1, 'the real grep hit must still be reported');
+    assert.equal(result.files.length, 1, 'the oversized file must no longer be skipped entirely');
+    assert.match(result.files[0].content, /uniqueneedle marker here/, 'the windowed content must include the actual hit');
+    assert.ok(result.files[0].content.length < content.length, 'windowed content must be smaller than the whole file');
+  });
+});
+
+test('fetchForQueries still windows correctly when the shared budget is split across multiple oversized files', () => {
+  const filler = Array.from({ length: 2000 }, (_, i) => `// filler line ${i}`).join('\n');
+  const contentA = `${filler}\n// sharedneedle in file A\n${filler}\n`;
+  const contentB = `${filler}\n// sharedneedle in file B\n${filler}\n`;
+  const primary = makeRepo({ 'src/a.js': contentA, 'src/b.js': contentB });
+  withRepoConfig(primary, 'src', () => {
+    const result = fetchForQueries(['sharedneedle']);
+    assert.equal(result.hits.length, 2);
+    assert.equal(result.files.length, 2, 'both oversized files should get a windowed slot, not just the first');
+    const totalChars = result.files.reduce((sum, f) => sum + f.content.length, 0);
+    assert.ok(totalChars <= MAX_CONTENT_CHARS_TEST, `combined windowed content must respect the shared budget, got ${totalChars}`);
   });
 });
 
