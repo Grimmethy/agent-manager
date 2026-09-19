@@ -19,17 +19,27 @@ const REQUEST_OBJECT_STOPWORDS = new Set([
   'hide', 'show', 'make', 'like', 'need', 'want', 'note', 'used', 'uses', 'able', 'must',
 ]);
 const MAX_REQUEST_OBJECT_TOKENS = 8;
+const QUEUE_STATE_ID_RE = /\d{12,}/;
 
 function extractRequestObjectTokens(rawText) {
   const text = String(rawText || '');
   const tokens = new Set();
-  for (const m of text.matchAll(/\/[A-Za-z][\w/-]{2,}/g)) tokens.add(m[0]);                 // /api/... paths
-  for (const m of text.matchAll(/["'`]([^"'`]{3,40})["'`]/g)) tokens.add(m[1].trim());       // "quoted phrases"
+  // /api/... paths: the slash must START a token. Without the lookbehind this matched the tail
+  // of a relative file path (`src/validate-x.js` -> "/validate-x") and word/word alternations
+  // (`JavaScript/Python` -> "/Python"), neither of which is an API route.
+  for (const m of text.matchAll(/(?<![\w./-])\/[A-Za-z][\w/-]{2,}/g)) tokens.add(m[0]);
+  // "quoted phrases": the closing quote must be the SAME character as the opening one, and
+  // neither may sit inside a word. Without both, a backtick in a regex literal paired with the
+  // apostrophe of "isn't" several words later ("]/ -- when the response isn"), and one
+  // contraction's apostrophe paired with the next ("... but that self-audit task itself no-op").
+  for (const m of text.matchAll(/(?<!\w)(["'`])((?:(?!\1)[^\n]){3,40}?)\1(?!\w)/g)) tokens.add(m[2].trim());
   for (const m of text.matchAll(/\b[A-Za-z_][A-Za-z0-9]*(?:[_][A-Za-z0-9]+|[A-Z][a-z0-9]+)+\b/g)) tokens.add(m[0]); // camelCase / snake_case
   for (const m of text.matchAll(/\b[A-Za-z]{4,}\b/g)) {                                      // plain content words
     if (!REQUEST_OBJECT_STOPWORDS.has(m[0].toLowerCase())) tokens.add(m[0]);
   }
-  return [...tokens].slice(0, MAX_REQUEST_OBJECT_TOKENS);
+  // A queue-state reference (a task id or archive path carrying a 12+ digit epoch-ms stamp)
+  // names pipeline runtime state, never repo source, so it can never be grepped for.
+  return [...tokens].filter((t) => !QUEUE_STATE_ID_RE.test(t)).slice(0, MAX_REQUEST_OBJECT_TOKENS);
 }
 
 module.exports = { extractRequestObjectTokens, REQUEST_OBJECT_STOPWORDS, MAX_REQUEST_OBJECT_TOKENS };
