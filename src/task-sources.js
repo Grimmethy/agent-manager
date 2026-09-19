@@ -26,7 +26,7 @@ const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-a
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { hubOrderKeyForTask, compareHubKeys } = require('./hub-priority.js');
+const { hubOrderKeyForTask, compareHubKeys, hubHasUnmergedEarlierSibling } = require('./hub-priority.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
 const debriefBundle = require('./debrief-bundle.js');
@@ -475,6 +475,14 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
     if (Array.isArray(parsed.softDependsOn) && parsed.softDependsOn.length > 0) {
       const unmet = parsed.softDependsOn.filter((depId) => !isSoftDependencySatisfied(pipelineDir, depId));
       if (unmet.length > 0) continue;
+    }
+    // Hub-aware draft sequencing (see hubHasUnmergedEarlierSibling's own header in
+    // hub-priority.js for the full incident): a coarser safety net alongside dependsOn,
+    // not a replacement for it -- catches the case a dependsOn edge either wasn't
+    // declared for, or was satisfied by the stacked-branch exemption without the
+    // sibling's code actually being visible where THIS candidate will draft/review.
+    if (hubHasUnmergedEarlierSibling(pipelineDir, parsed).blocked) {
+      continue;
     }
 
     // Spread the WHOLE file through, then force only the fields this source's contract

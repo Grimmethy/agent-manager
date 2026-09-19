@@ -91,6 +91,83 @@ function compareHubKeys(a, b) {
   return 0;
 }
 
+// Hub-aware draft sequencing (2026-09-18, pipeline hardening -- Grimmethy: "These hub
+// tasks are closely linked in reality, they should be closely linked in the code").
+//
+// Root-caused live: a 3-sub-task hub (add a gate carve-out -> guard the review path
+// against it -> add tests proving both) had sub-task 2 draft/redraft THREE times while
+// sub-tasks 0 and 1 sat at `pending-merge` -- approved and applied, but not yet actually
+// merged into master. Every attempt hit the same wall: sub-task 2's own review ran
+// against a checkout that didn't have sub-tasks 0/1's code yet, so the very behavior
+// sub-task 2 was written to test (and needs present to pass its own review) simply wasn't
+// there. dependsOn (see isDependencySatisfied's own header in task-sources.js) exists
+// for exactly this and was even declared on the stuck task -- but its `stacked`-branch
+// exemption reported the dependency satisfied the moment the prerequisite reached
+// queue/done/, without confirming the REVIEW environment could actually see that code.
+// A single dependsOn edge is also only as complete as whoever authored the decompose
+// remembered to declare -- sub-task 2 here named only ONE of its two real prerequisites.
+//
+// This is a coarser, more conservative safety net that doesn't depend on either of those
+// being right: a hub's own subTasks array is already an ordered checklist (decompose
+// naturally produces build -> wire -> test sequences), so a child should not be drafted
+// while an EARLIER-ordered sibling in the SAME hub hasn't actually landed on main yet --
+// regardless of whether a fine-grained dependsOn edge names it. It sits alongside
+// dependsOn, not in place of it; either one blocking is enough to hold a candidate.
+//
+// Resolved = no code from this sibling will EVER land on main, so there's nothing left
+// to wait for. This is the full TERMINAL_STAGES set from task-disposition.js minus
+// 'pending-merge' (the one terminal stage that means "real code exists and genuinely
+// hasn't landed yet" -- the whole reason this check exists), plus classifyChildStatus's
+// own 'gone' (record missing entirely). Confirmed live via a dry run against the real
+// queue before this shipped: 8 real tasks across 5 hubs would have been held FOREVER
+// without this -- each one's "earlier sibling" had already resolved as 'noop' (no code
+// change was needed) or similar, so waiting for it to reach 'merged' specifically would
+// never happen; that's a brand-new permanent deadlock, the exact failure class this
+// feature exists to close, not open.
+//   merged          -- landed on main, obviously resolved
+//   applied-direct  -- committed straight to main (directToMain sources), already there
+//   filed           -- apply wrote a doc/candidate-list entry, no branch was ever created
+//   dismissed       -- reviewed and dismissed as a false positive, no code was produced
+//   noop            -- apply concluded no change was needed
+//   abandoned       -- branch gone, work lost -- a human already accepted that outcome
+//   superseded      -- this task record's own identity is moot; whatever superseded it
+//                      is a SEPARATE record this check will see on its own merits
+//   gone            -- the task record can't be found at all (aged out, hand-removed)
+const SIBLING_RESOLVED_STATUSES = new Set([
+  'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'abandoned', 'superseded', 'gone',
+]);
+
+// { blocked, blockingSiblingId?, blockingSiblingStatus? } for a task that may be a hub
+// child. `blocked: false` when the task isn't a hub child, its hub record can't be read,
+// it isn't listed in the hub's own subTasks, or it's first in that list (nothing earlier
+// to wait on). Otherwise reports the first (lowest-indexed) earlier sibling whose status
+// isn't in SIBLING_RESOLVED_STATUSES yet.
+function hubHasUnmergedEarlierSibling(pipelineDir, task) {
+  const hubId = hubIdForTask(task);
+  if (!hubId) return { blocked: false };
+  const taskId = task && typeof task.id === 'string' ? task.id : null;
+  if (!taskId) return { blocked: false };
+
+  let hub;
+  try {
+    hub = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'coordinating', `${hubId}.json`), 'utf8'));
+  } catch {
+    return { blocked: false }; // no live hub record -- nothing to sequence against
+  }
+  const subTasks = Array.isArray(hub.subTasks) ? hub.subTasks : [];
+  const myIndex = subTasks.findIndex((s) => s && s.id === taskId);
+  if (myIndex <= 0) return { blocked: false }; // not listed, or first in order
+
+  for (let i = 0; i < myIndex; i += 1) {
+    const sib = subTasks[i];
+    if (!sib || !sib.status) continue;
+    if (!SIBLING_RESOLVED_STATUSES.has(sib.status)) {
+      return { blocked: true, blockingSiblingId: sib.id, blockingSiblingStatus: sib.status };
+    }
+  }
+  return { blocked: false };
+}
+
 module.exports = {
   UNRANKED_HUB_PRIORITY,
   normalizeHubPriority,
@@ -98,4 +175,5 @@ module.exports = {
   readHubOrderKey,
   hubOrderKeyForTask,
   compareHubKeys,
+  hubHasUnmergedEarlierSibling,
 };

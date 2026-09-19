@@ -1290,6 +1290,100 @@ test('nextAdhocTask requires EVERY dependency to be merged, not just one of seve
   assert.equal(nextAdhocTask(), null);
 });
 
+// Hub-aware draft sequencing (2026-09-18, pipeline hardening -- Grimmethy: "These hub
+// tasks are closely linked in reality, they should be closely linked in the code"). See
+// hub-priority.js's hubHasUnmergedEarlierSibling for the full incident: a 3-sub-task hub
+// where sub-task 2 declared dependsOn ONLY sub-task 0 -- sub-task 1 (equally a real
+// prerequisite) was never named, and sub-task 0's own dependency was satisfied via the
+// `stacked`-branch exemption without its code actually being visible to sub-task 2's own
+// review pass. This is a coarser safety net alongside dependsOn: it uses the hub's own
+// subTasks ORDER, so it catches an undeclared or wrongly-satisfied dependency the same
+// way, without requiring a human to get every dependsOn edge right by hand.
+test('nextAdhocTask skips a hub child while an EARLIER-ordered sibling in the same hub is not yet merged, even with no dependsOn declared', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeHubFile(dir, {
+    id: 'hub-fact-checker',
+    title: 'Add an explicit new-identifier allowlist',
+    status: 'coordinating',
+    createdAt: '2026-09-17T00:00:00Z',
+    subTasks: [
+      { id: 'adhoc-emit-warning-flag-0', status: 'pending-merge' },
+      { id: 'adhoc-guard-review-gate-1', status: 'pending-merge' },
+      { id: 'adhoc-update-fact-checker-tests-2', status: 'in-progress' },
+    ],
+  });
+  writeAdhocFile(dir, 'update-tests.json', {
+    id: 'adhoc-update-fact-checker-tests-2',
+    title: 'Update and add fact-checker tests',
+    parentHub: 'hub-fact-checker',
+    // No dependsOn at all -- the hub-order check must still hold this candidate.
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null);
+});
+
+test('nextAdhocTask claims a hub child once every EARLIER-ordered sibling has actually merged', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeHubFile(dir, {
+    id: 'hub-fact-checker',
+    title: 'Add an explicit new-identifier allowlist',
+    status: 'coordinating',
+    createdAt: '2026-09-17T00:00:00Z',
+    subTasks: [
+      { id: 'adhoc-emit-warning-flag-0', status: 'merged' },
+      { id: 'adhoc-guard-review-gate-1', status: 'merged' },
+      { id: 'adhoc-update-fact-checker-tests-2', status: 'in-progress' },
+    ],
+  });
+  writeAdhocFile(dir, 'update-tests.json', {
+    id: 'adhoc-update-fact-checker-tests-2',
+    title: 'Update and add fact-checker tests',
+    parentHub: 'hub-fact-checker',
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-update-fact-checker-tests-2');
+});
+
+test('nextAdhocTask claims the FIRST sub-task of a hub even while later siblings do not exist yet -- nothing earlier to wait on', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeHubFile(dir, {
+    id: 'hub-1', title: 'x', status: 'coordinating', createdAt: '2026-09-17T00:00:00Z',
+    subTasks: [
+      { id: 'adhoc-first-child', status: 'in-progress' },
+      { id: 'adhoc-second-child', status: 'in-progress' },
+    ],
+  });
+  writeAdhocFile(dir, 'first.json', { id: 'adhoc-first-child', title: 'first', parentHub: 'hub-1' });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-first-child');
+});
+
+test('nextAdhocTask skips past a hub-sequence-blocked candidate to claim a later, unrelated one instead of stalling the whole lane', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeHubFile(dir, {
+    id: 'hub-1', title: 'x', status: 'coordinating', createdAt: '2026-09-17T00:00:00Z',
+    subTasks: [
+      { id: 'adhoc-earlier-unmerged', status: 'pending-merge' },
+      { id: 'adhoc-sequence-blocked', status: 'in-progress' },
+    ],
+  });
+  // Older mtime -- would be picked first if not for the sequencing hold.
+  writeAdhocFile(dir, 'a-blocked.json', { id: 'adhoc-sequence-blocked', title: 'blocked by hub order', parentHub: 'hub-1' });
+  writeAdhocFile(dir, 'b-ready.json', { id: 'adhoc-unrelated-ready', title: 'no hub link, ready to go' });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-unrelated-ready');
+});
+
 // softDependsOn (2026-09-12, screaminggoatclubmt: a real stuck hub -- subtask 1
 // dependsOn subtask 0, subtask 0's branch was deliberately left unmerged pending the
 // hub's own readiness, but the hub couldn't become ready until subtask 1 ran; nothing
