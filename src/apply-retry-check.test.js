@@ -107,7 +107,7 @@ test('applyRetryCheck returns an all-zero summary when queue/blocked/ does not e
     pendingDir: path.join(root, 'queue', 'pending'),
     recordModelOutcome: () => {},
   });
-  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, errors: 0, errorDetails: [] });
+  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, resolved: 0, errors: 0, errorDetails: [] });
 });
 
 // 2026-09-17 (decompose_design_question AC-60/AC-61): git-runner.js's resetToMain()/
@@ -166,4 +166,103 @@ test('applyRetryCheck falls back to the ordinary bounded retry when no needsClar
 
   assert.equal(summary.requeued, 1);
   assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
+});
+
+// --- apply-stage "find string not found" on a candidate whose own site is already fixed -----
+// 2026-09-18 (observability-fix-ac-169): a scanner-derived candidate whose edit's `find`
+// string no longer matches because the flagged code was since fixed by unrelated work. Every
+// redraft re-anchors on the same stale candidate; after MAX_APPLY_RETRIES the task was
+// stamped 'exhausted' and left in blocked/ forever. When the source's own deterministic
+// scanner rules confirm the candidate's site is clean (premise-recheck-decision.js's
+// decideFindingResolved), it is landed as the documented FALSE POSITIVE dismissal instead.
+
+const FIND_MISS = 'find string not found in src/local-draft.js';
+
+function setupWithApproved() {
+  const d = setupDirs();
+  const approvedDir = path.join(d.root, 'queue', 'approved');
+  const needsClarificationDir = path.join(d.root, 'queue', 'needs-clarification');
+  return { ...d, approvedDir, needsClarificationDir };
+}
+
+test('applyRetryCheck lands a find-string-miss whose site is verifiably resolved as a FALSE POSITIVE approval', () => {
+  const { blockedDir, pendingDir, approvedDir } = setupWithApproved();
+  writeBlockedTask(blockedDir, 'ac-169', {
+    source: 'observability_fix', blockedReason: FIND_MISS, applyRetryCount: 0,
+    implementResponse: '{"mode":"edit","file":"src/local-draft.js","find":"old","replace":"new"}',
+  });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, decideResolved: () => true, recordModelOutcome: () => {} });
+
+  assert.equal(summary.resolved, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'ac-169.json')));
+  assert.ok(!fs.existsSync(path.join(pendingDir, 'ac-169.json')));
+  const t = JSON.parse(fs.readFileSync(path.join(approvedDir, 'ac-169.json'), 'utf8'));
+  assert.match(t.implementResponse, /^FALSE POSITIVE\b/, 'the stale edit must be replaced, or apply would just fail on it again');
+  assert.equal(t.blockedReason, undefined);
+  assert.equal(t.blockedStage, undefined);
+  assert.equal(t.reviewProvider, 'deterministic-apply-site-resolved');
+  assert.ok(t.history.some((h) => h.stage === 'approved'), 'audit trail: an approved history event');
+});
+
+test('applyRetryCheck still resolves a find-string-miss AFTER the retry cap was already reached (the AC-169 state)', () => {
+  const { blockedDir, pendingDir, approvedDir } = setupWithApproved();
+  writeBlockedTask(blockedDir, 'ac-169', {
+    source: 'observability_fix', blockedReason: FIND_MISS, applyRetryCount: 2,
+    history: [{ stage: 'exhausted', at: '2026-09-09T00:00:00Z' }],
+  });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, decideResolved: () => true, recordModelOutcome: () => {} });
+
+  assert.equal(summary.resolved, 1);
+  assert.ok(fs.existsSync(path.join(approvedDir, 'ac-169.json')));
+});
+
+test('applyRetryCheck falls back to the ordinary retry when the site is NOT verifiably resolved', () => {
+  const { blockedDir, pendingDir, approvedDir } = setupWithApproved();
+  writeBlockedTask(blockedDir, 'ac-169', { source: 'observability_fix', blockedReason: FIND_MISS, applyRetryCount: 0 });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, decideResolved: () => false, recordModelOutcome: () => {} });
+
+  assert.equal(summary.resolved, 0);
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(pendingDir, 'ac-169.json')));
+});
+
+test('applyRetryCheck only consults the resolver for a find-string miss, not any other apply failure', () => {
+  const { blockedDir, pendingDir, approvedDir } = setupWithApproved();
+  writeBlockedTask(blockedDir, 'conflict', { blockedReason: 'git apply failed: patch does not apply', applyRetryCount: 0 });
+  let consulted = 0;
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, decideResolved: () => { consulted += 1; return true; }, recordModelOutcome: () => {} });
+
+  assert.equal(consulted, 0);
+  assert.equal(summary.resolved, 0);
+  assert.equal(summary.requeued, 1);
+});
+
+test('applyRetryCheck escalates an apply failure that exhausted its retries to needs-clarification instead of parking it forever', () => {
+  const { blockedDir, pendingDir, approvedDir, needsClarificationDir } = setupWithApproved();
+  writeBlockedTask(blockedDir, 'stuck', { source: 'observability_fix', blockedReason: FIND_MISS, applyRetryCount: 2 });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, needsClarificationDir, decideResolved: () => false, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'stuck.json')), 'no longer parked in blocked/');
+  const t = JSON.parse(fs.readFileSync(path.join(needsClarificationDir, 'stuck.json'), 'utf8'));
+  assert.equal(t.needsClarification.reason, 'design-decision');
+  assert.match(String(t.needsClarification.openQuestions), /find string not found/);
+  assert.ok(t.history.some((h) => h.stage === 'exhausted'));
+  assert.ok(t.history.some((h) => h.stage === 'needs-clarification'));
+});
+
+test('applyRetryCheck without needsClarificationDir keeps the original stamp-once-and-stay behaviour on exhaustion', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'stuck', { applyRetryCount: 2 });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'stuck.json')));
 });

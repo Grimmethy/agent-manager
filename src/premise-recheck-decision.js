@@ -48,44 +48,101 @@ function isFalsePositiveResponse(implementResponse) {
   return FALSE_POSITIVE_RE.test(String(implementResponse || '').trim());
 }
 
-// task, { repoRoot, extraRoots } -> 'approve' | null
-// null means "no opinion" (not opted in, no cited files, can't read a file, or the
-// rule set still finds something) -- the caller falls through to its normal review path.
-function decidePremiseRecheckOutcome(task, { repoRoot, extraRoots = [] } = {}) {
-  if (!task || !isFalsePositiveResponse(task.implementResponse)) return null;
+const { extractCandidateSnippet, distinctiveLine } = require('./lib/harness-search.js');
 
+const SITE_MARGIN_LINES = 2;
+
+function normLine(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+// Where does the candidate's own Snippet sit in the file's CURRENT content?
+// -> { start, end } (1-based, inclusive) or null when it cannot be located unambiguously.
+// The snippet's most distinctive line (the same anchor task-anchor-files windowing uses) is
+// matched whitespace-insensitively; exactly ONE hit is required -- zero means the anchor is
+// gone, several means we cannot tell which is the candidate's. The span is the snippet's own
+// geometry laid over that hit, so an edit INSIDE the snippet (the very fix that resolved it)
+// does not stop the site from being found, as long as the anchor line itself survived.
+function locateSnippetSite(snippet, fileText) {
+  const anchor = distinctiveLine(snippet);
+  if (!anchor) return null;
+  const want = normLine(anchor);
+  const snippetLines = snippet.split('\n');
+  const anchorIdx = snippetLines.findIndex((l) => normLine(l) === want);
+  if (anchorIdx < 0) return null;
+  const hits = [];
+  fileText.split('\n').forEach((l, i) => { if (normLine(l) === want) hits.push(i); });
+  if (hits.length !== 1) return null;
+  return {
+    start: hits[0] - anchorIdx + 1,
+    end: hits[0] + (snippetLines.length - 1 - anchorIdx) + 1,
+  };
+}
+
+// A finding with no usable line span is treated as overlapping -- never guess it away.
+function findingOverlapsSite(finding, site) {
+  const start = Number(finding.blockStartLine != null ? finding.blockStartLine : finding.line);
+  const end = Number(finding.blockEndLine != null ? finding.blockEndLine : (finding.line != null ? finding.line : start));
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return true;
+  return start <= site.end + SITE_MARGIN_LINES && end >= site.start - SITE_MARGIN_LINES;
+}
+
+// task, { repoRoot, extraRoots } -> boolean
+// True only when the source's own deterministic scanner rules confirm the candidate's
+// complaint is gone from the cited file(s) -- with no model call:
+//   1. the rule set finds NOTHING anywhere in the file (the original, whole-file check), or
+//   2. it still finds things elsewhere, but the candidate's own Snippet is located in the
+//      current file and NO finding overlaps that site (added 2026-09-18, AC-169: a large
+//      file with unrelated findings could never satisfy 1, so a fixed candidate in it sat
+//      permanently unresolvable).
+// Any doubt -- opt-out source, unresolved/unreadable file, a rule that errors, an anchor
+// that is missing or ambiguous -- is false ("no verdict"), never a guess toward resolved.
+function decideFindingResolved(task, { repoRoot, extraRoots = [] } = {}) {
+  if (!task) return false;
   const entry = getRegisteredSource(task.source);
   const recheckSourceName = entry && entry.premiseRecheckSource;
-  if (!recheckSourceName) return null;
+  if (!recheckSourceName) return false;
 
   const recheck = getDeterministicRecheck(recheckSourceName);
   const perFileRules = recheck && recheck.perFileRules;
-  if (!perFileRules || Object.keys(perFileRules).length === 0) return null;
+  if (!perFileRules || Object.keys(perFileRules).length === 0) return false;
 
-  const files = (task.promptContext && Array.isArray(task.promptContext.files)) ? task.promptContext.files : [];
-  if (!files.length || !repoRoot) return null;
+  const pc = task.promptContext || {};
+  const files = Array.isArray(pc.files) ? pc.files : [];
+  if (!files.length || !repoRoot) return false;
+  const snippet = extractCandidateSnippet(pc.body);
 
   for (const claimedPath of files) {
     const { resolvedPath } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
-    if (!resolvedPath) return null; // can't verify a path that doesn't resolve -- don't guess
+    if (!resolvedPath) return false; // can't verify a path that doesn't resolve -- don't guess
     let text;
     try {
       text = fs.readFileSync(resolvedPath, 'utf8');
     } catch {
-      return null; // unreadable -- advisory, don't guess
+      return false; // unreadable -- advisory, don't guess
     }
+    const findings = [];
     for (const ruleName of Object.keys(perFileRules)) {
-      let findings;
       try {
-        findings = perFileRules[ruleName](text, claimedPath) || [];
+        findings.push(...(perFileRules[ruleName](text, claimedPath) || []));
       } catch {
-        return null; // a rule erroring on this file's current content isn't a "resolved" signal
+        return false; // a rule erroring on this file's current content isn't a "resolved" signal
       }
-      if (findings.length > 0) return null; // still a real finding somewhere in the file -- not resolved
     }
+    if (findings.length === 0) continue; // whole file clean
+    const site = snippet ? locateSnippetSite(snippet, text) : null;
+    if (!site) return false; // findings remain and we cannot show they are not this candidate's
+    if (findings.some((f) => findingOverlapsSite(f, site))) return false;
   }
-
-  return 'approve';
+  return true;
 }
 
-module.exports = { decidePremiseRecheckOutcome, isFalsePositiveResponse };
+// task, { repoRoot, extraRoots } -> 'approve' | null
+// null means "no opinion" (not a FALSE POSITIVE claim, or decideFindingResolved has no
+// verdict) -- the caller falls through to its normal review path.
+function decidePremiseRecheckOutcome(task, opts = {}) {
+  if (!task || !isFalsePositiveResponse(task.implementResponse)) return null;
+  return decideFindingResolved(task, opts) ? 'approve' : null;
+}
+
+module.exports = { decidePremiseRecheckOutcome, decideFindingResolved, isFalsePositiveResponse };
