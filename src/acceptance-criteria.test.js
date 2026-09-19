@@ -152,3 +152,23 @@ test('resolveAcceptanceCriteria: strips a plan-derived criterion that contradict
   assert.deepEqual(r.criteria, ['getSecondBrainDir returns null when unset']);
   assert.equal(r.source, 'plan-derived');
 });
+
+// 2026-09-19 (PF-Client-Portal): a plan-derived CRITERIA block asked for "git log --oneline master contains
+// a commit whose subject ...", "merged to master" and "the throwaway branch is deleted" -- history outcomes a
+// drafting sandbox (shared git dir mounted read-only) can never produce, so a correct draft failed acceptance.
+test('resolveAcceptanceCriteria drops criteria that depend on git history written by a commit/merge/branch', () => {
+  const { resolveAcceptanceCriteria } = require('./acceptance-criteria.js');
+  const plan = [
+    '## PLAN', '1. Edit the file.', '',
+    'CRITERIA:',
+    '- `.env.tower.example` contains a comment stating six Prices',
+    '- `git log --oneline master` contains a commit whose subject is exactly `fix(env.example): x`',
+    '- The change is merged to master',
+    '- `grep -c STRIPE_PRICE_ .env.tower.example` returns 6',
+  ].join('\n');
+  const { criteria, source } = resolveAcceptanceCriteria({ promptContext: {}, planResponse: plan });
+  assert.equal(source, 'plan-derived');
+  assert.deepEqual(criteria, ['`.env.tower.example` contains a comment stating six Prices', '`grep -c STRIPE_PRICE_ .env.tower.example` returns 6']);
+  const fromCtx = resolveAcceptanceCriteria({ promptContext: { acceptanceCriteria: ['File X updated', 'Merged into main'] } });
+  assert.deepEqual(fromCtx.criteria, ['File X updated']);
+});

@@ -1,5 +1,7 @@
 'use strict';
 
+const { dropGitWriteCriteria } = require('./lib/git-ownership.js');
+
 // Per-task acceptance criteria for adhoc tasks (2026-09-04) -- component 2 of the "plan
 // mode" port. A task can carry an explicit "definition of done"; when it doesn't, the plan
 // pass is asked to STATE one. Downstream: tier 3 must report a real check per criterion in
@@ -84,10 +86,10 @@ function resolveAcceptanceCriteria(task) {
   const pc = (task && task.promptContext) || {};
   if (pc.acceptanceCriteria != null) {
     const criteria = normalizeList(pc.acceptanceCriteria);
-    if (criteria.length) return { criteria: dropSingleFileScopeContradictions(task, criteria), source: 'promptContext' };
+    if (criteria.length) return { criteria: dropGitWriteCriteria(dropSingleFileScopeContradictions(task, criteria)), source: 'promptContext' };
   }
   const fromPlan = parseCriteriaBlock(task && (task.planResponse || task.lastGoodPlan));
-  if (fromPlan.length) return { criteria: dropSingleFileScopeContradictions(task, fromPlan), source: 'plan-derived' };
+  if (fromPlan.length) return { criteria: dropGitWriteCriteria(dropSingleFileScopeContradictions(task, fromPlan)), source: 'plan-derived' };
   return { criteria: [], source: null };
 }
 

@@ -1,5 +1,7 @@
 'use strict';
 
+const { GIT_OWNERSHIP_RULE } = require('./lib/git-ownership.js');
+
 const path = require('path');
 
 // Builds the actual prompt text handed to the local model for each task domain/source.
@@ -281,6 +283,7 @@ function adhocPlanPrompt(task) {
     ...brainDumpDirective,
     ...decomposeMoveDirective,
     'Write a numbered, actionable PLAN.',
+    GIT_OWNERSHIP_RULE,
     'IMPORTANT: This promptContext\'s shape is NOT standardized. Treat anything not explicitly stated in it as unknown — do not assume a field exists just because a similar-sounding one appeared in another kind of task.',
     ...statedAcceptanceBlock(task),
     '',

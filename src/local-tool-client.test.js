@@ -374,11 +374,12 @@ test('runBashTool runs a real command in the repo root and captures stdout', () 
 // queue_reviewed_task instead. Refusal happens before wrapWithSandbox, so no bwrap
 // dependency for these tests.
 
-test('runBashTool refuses a git merge command and points at queue_reviewed_task', () => {
+test('runBashTool refuses a git merge command and points at the Unmerged Branches tab, NOT at queue_reviewed_task', () => {
   withFixtureRepo((mod) => {
     const result = mod.runBashTool({ command: 'git merge agent/observability-fix-ac-57' });
     assert.match(result.error, /git merge\/push is not available via run_bash/);
-    assert.match(result.error, /queue_reviewed_task/);
+    assert.match(result.error, /Unmerged Branches tab/);
+    assert.match(result.error, /do not queue a task to merge, push or commit/);
     assert.equal(result.stdout, undefined, 'must never have actually executed the command');
   });
 });
@@ -418,17 +419,17 @@ test('buildWriteToolHandlers.queue_reviewed_task writes a real adhoc task and re
     fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {} }));
     const handlers = mod.buildWriteToolHandlers([dir], dir);
     const result = handlers.queue_reviewed_task({
-      title: 'Merge AC-57',
-      description: 'AC-57 is clean, no conflicts -- merge into master.',
+      title: 'Add a re-admission path for symbol-still-referenced rejections',
+      description: 'AC-57 is clean, no conflicts -- add the re-admission path in src/decompose.js.',
     });
-    assert.match(result.queuedTaskId, /^adhoc-merge-ac-57-\d+$/);
+    assert.match(result.queuedTaskId, /^adhoc-add-a-re-admission-path-for-symbol-still-referenced-rejections-\d+$/);
     assert.match(result.message, /Adhoc Tasks tab/);
     const files = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
     assert.equal(files.length, 1);
     const record = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', files[0]), 'utf8'));
-    assert.equal(record.title, 'Merge AC-57');
+    assert.equal(record.title, 'Add a re-admission path for symbol-still-referenced rejections');
     assert.equal(record.source, 'manual');
-    assert.equal(record.promptContext.rawText, 'AC-57 is clean, no conflicts -- merge into master.');
+    assert.equal(record.promptContext.rawText, 'AC-57 is clean, no conflicts -- add the re-admission path in src/decompose.js.');
     assert.equal(record.promptContext.raisedFrom, 'chat');
     assert.equal(record.premiumPriority, true, 'every task Chat queues is something a human is actively watching it work on right now');
     assert.match(result.message, /premium priority/);
@@ -1854,4 +1855,33 @@ test('installStdoutEpipeGuard: a non-EPIPE stdout error is still surfaced to std
     process.stderr.write = originalStderrWrite;
     process.exitCode = originalExitCode;
   }
+});
+
+test('queue_reviewed_task refuses a git-operation request and queues nothing (2026-09-19: Chat queued "commit it and merge to master")', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'task-domains.json'), JSON.stringify({ default: {} }));
+    const handlers = mod.buildWriteToolHandlers([dir], dir);
+    for (const args of [
+      { title: 'Commit stale-comment fix in .env.tower.example', description: 'The line is already fixed in the worktree.' },
+      { title: 'Merge agent/x into master', description: 'clean' },
+      { title: 'Tidy a comment', description: 'Commit it with message `fix: x`, then merge to master.' },
+    ]) {
+      const result = handlers.queue_reviewed_task(args);
+      assert.equal(result.queuedTaskId, undefined, JSON.stringify(args));
+      assert.match(result.error, /cannot queue a git operation/);
+      assert.match(result.error, /Unmerged Branches tab/);
+    }
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false, 'nothing may be written to the queue');
+  });
+});
+
+test('the queue_reviewed_task tool descriptions say describe a CHANGE, never a git operation', () => {
+  withFixtureRepo((mod) => {
+    for (const set of [mod.WRITE_TOOLS, mod.CHAT_TOOLS].filter(Boolean)) {
+      const t = set.find((x) => x.function.name === 'queue_reviewed_task');
+      assert.ok(t, 'tool present');
+      assert.match(t.function.description, /git operation|CHANGE/);
+      assert.doesNotMatch(t.function.description, /merging a branch, pushing a change/);
+    }
+  });
 });
