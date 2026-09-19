@@ -194,3 +194,18 @@ test('grepCodebase without `root` is byte-identical to before (no root field, al
     assert.ok(!Array.isArray(grepCodebase({ query: 'draftTask', dir: 'nope' })));
   });
 });
+
+test('grepCodebase on a whole-repo walk skips .venv / build output but finds repo-root files', () => {
+  const dir = makeFixtureRepo();
+  fs.writeFileSync(path.join(dir, 'docker-compose.yml'), 'volumes:\n  - backend-storage:/app/storage\n');
+  fs.writeFileSync(path.join(dir, 'Dockerfile'), 'VOLUME backend-storage\n');
+  fs.writeFileSync(path.join(dir, '.env.tower.example'), '# backend-storage\n');
+  for (const skipped of ['.venv/lib/site-packages', 'build/static', 'dist']) {
+    fs.mkdirSync(path.join(dir, skipped), { recursive: true });
+    fs.writeFileSync(path.join(dir, skipped, 'noise.txt'), 'backend-storage noise\n');
+  }
+  withConfig(dir, '.', () => {
+    const files = grepCodebase({ query: 'backend-storage' }).map((h) => h.file);
+    assert.deepEqual(files.sort(), ['.env.tower.example', 'Dockerfile', 'docker-compose.yml']);
+  });
+});

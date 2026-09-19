@@ -110,12 +110,15 @@ test('groundingCovers: false when a named identifier has no hit anywhere', () =>
 
 // --- multi-repo (2026-09-04): also grep a loaded plugin's own repo -----------------------
 
-function withPluginManifest(pluginRegisterPath, fn) {
+function withPluginManifest(pluginRegisterPath, fn, { coreRoot } = {}) {
   const manifestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-grounding-manifest-'));
   const manifestPath = path.join(manifestDir, 'plugins.json');
   fs.writeFileSync(manifestPath, JSON.stringify([{ name: 'plugin', registerPath: pluginRegisterPath, enabled: true }]));
   const prev = process.env.AGENT_MANAGER_PLUGINS_MANIFEST;
   process.env.AGENT_MANAGER_PLUGINS_MANIFEST = manifestPath;
+  // Plugin repos are only grounded when the primary repo IS the core repo (accessible-roots.js).
+  const prevCore = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  if (coreRoot) process.env.AGENT_MANAGER_CORE_REPO_ROOT = coreRoot;
   delete require.cache[require.resolve('./plugins-manifest.js')];
   delete require.cache[require.resolve('./accessible-roots.js')];
   delete require.cache[require.resolve('./plan-grounding.js')];
@@ -123,6 +126,7 @@ function withPluginManifest(pluginRegisterPath, fn) {
     return fn(require('./plan-grounding.js'));
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_PLUGINS_MANIFEST; else process.env.AGENT_MANAGER_PLUGINS_MANIFEST = prev;
+    if (prevCore === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = prevCore;
     delete require.cache[require.resolve('./plugins-manifest.js')];
     delete require.cache[require.resolve('./accessible-roots.js')];
     delete require.cache[require.resolve('./plan-grounding.js')];
@@ -141,7 +145,18 @@ test('buildPlanGrounding surfaces a hit from a loaded plugin repo, tagged with i
     const pluginTag = path.basename(fs.realpathSync(plugin));
     assert.match(g.text, new RegExp(`\\[${pluginTag}\\] src/function-length-review\\.js`));
     assert.ok(g.grepHits.some((h) => h.root && h.file === 'src/function-length-review.js'));
-  });
+  }, { coreRoot: primary });
+});
+
+test('buildPlanGrounding: a NON-core project never sees a plugin repo hit', () => {
+  const primary = makeRepo({ 'src/a.js': 'const unrelated = 1;\n' });
+  const plugin = fs.mkdtempSync(path.join(os.tmpdir(), 'plan-grounding-plugin-'));
+  fs.mkdirSync(path.join(plugin, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(plugin, 'src', 'function-length-review.js'), 'function registerFunctionLengthFix() {}\n');
+  withPluginManifest(path.join(plugin, 'register.js'), ({ buildPlanGrounding: bpg }) => {
+    const g = bpg(adhoc('fix registerFunctionLengthFix so it stops recursively splitting'), { repoRoot: primary });
+    assert.ok(!g || !/function-length-review\.js/.test(g.text), 'plugin repo must not ground a non-core project');
+  }, { coreRoot: fs.mkdtempSync(path.join(os.tmpdir(), 'some-other-core-')) });
 });
 
 test('buildPlanGrounding: zero plugins loaded is unaffected (no manifest -> primary repo only)', () => {

@@ -15,6 +15,7 @@ const {
   validateSecondBrainPath,
   normalizeSecondBrainPathCase,
   deriveBelongsToProject,
+  isInvestigationFinding,
 } = require('./brain-dump-sort-classify.js');
 
 function readProjectRegistry() {
@@ -248,6 +249,14 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
         result.secondBrainPath = segments.join('/');
       }
     }
+  }
+
+  // Investigation-shaped machine findings become notes, never code tasks (see
+  // isInvestigationFinding's header). Applied AFTER origin routing so the note still files
+  // under the raising project's vault folder.
+  if (entry.raisedBy && isInvestigationFinding(rawText)) {
+    result.belongsToProject = null;
+    result.actionable = false;
   }
 
   // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code

@@ -83,3 +83,47 @@ test('applyBrainDumpSort routes a machine finding to the project that raised it,
     if (saved === undefined) delete process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH; else process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = saved;
   }
 });
+
+test('isInvestigationFinding: hedged-verification phrasing is an investigation, concrete defects are not', () => {
+  const { isInvestigationFinding } = require('./brain-dump-sort-classify.js');
+  for (const t of [
+    'Worth a quick grep of `core.ts` to confirm the option is honoured.',
+    'Worth confirming the two processes use disjoint subdirectories.',
+    '`auth: false` option is not visible in the shown diff',
+    'Confirm whether the enricher is read-only on that path',
+    'Verify the migration is idempotent',
+  ]) assert.equal(isInvestigationFinding(t), true, t);
+  for (const t of [
+    'Stale comment in `.env.tower.example` still says five Prices; the file now lists six.',
+    'Silent `catch` in a 30 s poll hides a persistent API outage; add console.warn.',
+    'Overlapping async calls in `setInterval` can double-request; add an inFlight guard.',
+  ]) assert.equal(isInvestigationFinding(t), false, t);
+});
+
+test('applyBrainDumpSort files an investigation-shaped machine finding as a note, not a task', () => {
+  const dir = tmp();
+  const repoRoot = path.join(dir, 'pf'); const pipelineDir = path.join(dir, 'pf-pipeline');
+  fs.mkdirSync(repoRoot, { recursive: true }); fs.mkdirSync(pipelineDir, { recursive: true });
+  const domainsPath = path.join(pipelineDir, 'task-domains.json');
+  fs.writeFileSync(domainsPath, JSON.stringify({ adhoc: {}, default: {} }));
+  const registryPath = path.join(dir, 'projects.json');
+  fs.writeFileSync(registryPath, JSON.stringify([{ label: 'pf-client-portal', repoRoot, pipelineDir, domainsPath }]));
+  const saved = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH;
+  process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = registryPath;
+  try {
+    const rawText = 'Volume shared by two services\n\nWorth confirming the two processes use disjoint subdirectories.';
+    const bd = path.join(dir, 'brain-dump.json');
+    fs.writeFileSync(bd, JSON.stringify({ entries: [{ id: 'e1', status: 'captured', rawText, raisedBy: { taskId: 't', repoRoot } }] }));
+    const implementResponse = JSON.stringify({ category: 'note', secondBrainPath: 'Ideas/shared-volume.md', actionable: true, belongsToProject: 'pf-client-portal' });
+    const res = applyBrainDumpSort({
+      implementResponse, task: { promptContext: { brainDumpEntryId: 'e1', rawText, projectLabels: ['pf-client-portal'] } },
+      brainDumpPath: bd, secondBrainDir: path.join(dir, 'sb'), pipelineDir,
+    });
+    assert.equal(res.queuedTaskId, undefined, JSON.stringify(res));
+    assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'derived')), false);
+    assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'adhoc')), false);
+    assert.ok(res.file && fs.existsSync(res.file), 'a SecondBrain note is filed instead');
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH; else process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = saved;
+  }
+});

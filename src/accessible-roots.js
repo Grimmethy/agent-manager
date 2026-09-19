@@ -32,9 +32,25 @@ const { readPluginsManifest, enabledRegisterPaths } = require('./plugins-manifes
 // [repoRoot] alone when nothing else resolves (a fresh clone with no plugins.json, or one
 // where every entry is disabled/missing) -- byte-identical to every pre-existing
 // single-root caller.
+// The plugin repos are "one logical system split into repos for packaging" with agent-manager
+// itself -- relevant only when the pipeline is working ON agent-manager. When it's pointed at
+// another project (PF-Client-Portal, 2026-09-19) they are unrelated code: a plan's "grep hits"
+// came back from agent-manager-hygiene, promptforge and a .venv, and the model reasoned from
+// them. Core = the checkout this package runs from, or AGENT_MANAGER_CORE_REPO_ROOT.
+const PACKAGE_ROOT = path.join(__dirname, '..');
+function realOrResolved(p) {
+  try { return fs.realpathSync(p); } catch { return path.resolve(p); }
+}
+function isCoreRepo(root) {
+  const r = realOrResolved(root);
+  if (r === realOrResolved(PACKAGE_ROOT)) return true;
+  const core = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  return !!core && r === realOrResolved(core);
+}
+
 function resolveAccessibleRoots({ repoRoot } = {}) {
   const root = repoRoot || require('./config.js').getConfig().repoRoot;
-  const manifest = readPluginsManifest();
+  const manifest = isCoreRepo(root) ? readPluginsManifest() : null;
   const raw = [root, ...enabledRegisterPaths(manifest).map((rp) => path.dirname(rp))];
 
   const seen = new Set();
@@ -56,4 +72,4 @@ function resolveAccessibleRoots({ repoRoot } = {}) {
   return out.length ? out : [path.resolve(root)];
 }
 
-module.exports = { resolveAccessibleRoots };
+module.exports = { resolveAccessibleRoots, isCoreRepo };
