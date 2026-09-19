@@ -10,6 +10,7 @@
 // which one it was given.
 
 const { execFileSync } = require('child_process');
+const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 
 const GIT_ENV = {
   ...process.env,
@@ -69,10 +70,25 @@ function createRealGitRunner(repoRoot) {
     const originInLocal = isAncestor(remote, mainBranch);
     const localInOrigin = isAncestor(mainBranch, remote);
     if (originInLocal && !localInOrigin) {
-      try {
-        run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
-      } catch (e) {
-        throw new Error(`resetToMain: local ${mainBranch} is ahead of origin but fast-forwarding it to origin failed (push rejected -- e.g. a protected branch or a race): ${e.message}`);
+      if (ungatedMainPushAllowed()) {
+        try {
+          run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
+        } catch (e) {
+          throw new Error(`resetToMain: local ${mainBranch} is ahead of origin but fast-forwarding it to origin failed (push rejected -- e.g. a protected branch or a race): ${e.message}`);
+        }
+      } else {
+        // Local main holds commits origin lacks. The old behavior pushed them to origin/main
+        // unattended -- exactly what must never happen without a human gate (see
+        // lib/main-push-policy.js). Preserve them on a rescue BRANCH (pushed best-effort, so a
+        // reset never destroys work) and fall through to the reset. A human decides about them.
+        const rescue = `agent/rescued-${mainBranch}-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
+        try {
+          run(['branch', rescue, mainBranch]);
+        } catch (e) {
+          throw new Error(`resetToMain: local ${mainBranch} is ahead of origin and could not be rescued to ${rescue} before the reset: ${e.message}`);
+        }
+        try { run(['push', '-u', 'origin', rescue]); } catch { /* best-effort: the local rescue branch still exists */ }
+        console.error(`[git-runner] local ${mainBranch} had commit(s) origin lacks; NOT pushed to ${mainBranch} (no ungated main pushes) -- kept on ${rescue} for a human to review/merge`);
       }
     } else if (!originInLocal && !localInOrigin) {
       throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
@@ -221,7 +237,12 @@ function createRealGitRunner(repoRoot) {
     // per-task branch isolation, and resetToMain()'s hard reset to origin/<mainBranch>
     // would otherwise silently destroy an un-pushed local commit on the very next apply
     // -- confirmed live 2026-08-16, see apply-task.js's own comment on this path.
-    pushMain: () => run(['push', '-u', 'origin', mainBranch]),
+    pushMain: () => {
+      if (!ungatedMainPushAllowed()) {
+        throw new Error(`pushMain refused: pushing ${mainBranch} to origin without a human gate is disabled (set AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true to override). Push a branch and merge it via the dashboard/PR instead.`);
+      }
+      return run(['push', '-u', 'origin', mainBranch]);
+    },
   };
 }
 

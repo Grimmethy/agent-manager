@@ -60,6 +60,10 @@ A blocked task whose `blockedStage` is exactly `"review"` — a real reviewer lo
 **Priority ladder**:
 The ordered list of registered task sources — lower number wins. `getNextTask()` walks it in order, so a task source only fires once every higher-priority one has nothing to offer.
 
+**Gated main**:
+The pipeline never pushes to a remote's main branch on its own -- the only way onto main is a human merge (the dashboard's merge button, or a PR). A `directToMain` source's approved candidate-doc append is committed onto ONE rolling branch, `agent/triage-queue` (shared, not per-task, because every task appends to the same `Docs/*_CANDIDATES.md` and separate branches would conflict at the end of that file), pushed, and left `pending-merge`; the task's apply note says "queued on agent/triage-queue ... awaiting a human merge" and deliberately avoids the phrases "committed to main"/"triage batch", which `task-disposition.js` reads as already-shipped (`applied-direct`). Consequence: a candidate doc is not visible to its consumer (`arch_review` etc., which read main) until that branch is merged. Also gated: the coordinator's auto-merge of verified mechanical moves, `resetToMain`'s fast-forward of origin (it rescues local-ahead commits to `agent/rescued-<main>-<ts>` instead), and `pushMain` (refuses). Single switch: `AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true` restores the old behavior (`src/lib/main-push-policy.js`). Added 2026-09-19 after an `arch_discovery` doc append reached a third-party repo's `origin/main` unattended, ~30s after approval.
+_Avoid_: direct commit, auto-merge (both are the ungated behavior this replaced)
+
 **Adhoc**:
 The special task source (priority 10, always wins the priority ladder) for tasks injected directly into `queue/adhoc/`, bypassing normal generation. Tasks from it carry `source: 'manual'`.
 

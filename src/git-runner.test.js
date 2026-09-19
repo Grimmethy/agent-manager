@@ -107,8 +107,29 @@ test('resetToMain auto-stashes an untracked file too (stash -u), then pops it ba
 // (the common case: local was strictly ahead) or the operation fails loudly instead of
 // discarding either side (local and origin had genuinely diverged).
 
-test('resetToMain pushes a local-only commit to origin instead of discarding it', () => {
+test('resetToMain with the explicit ungated opt-in pushes a local-only commit to origin instead of discarding it', () => {
   const { bareDir, repoDir } = makeRepoWithOrigin();
+  const savedEnv = process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = 'true';
+  const runner = createRealGitRunner(repoDir);
+
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v2 -- a real local fix\n');
+  git(['add', 'tracked.txt'], repoDir);
+  git(['commit', '-m', 'a real local fix, not yet pushed'], repoDir);
+  const localCommit = git(['rev-parse', 'HEAD'], repoDir).trim();
+
+  try { runner.resetToMain(); } finally { if (savedEnv === undefined) delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH; else process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = savedEnv; }
+
+  // The commit is not just still present locally -- it actually reached origin, so a
+  // FUTURE resetToMain() elsewhere (or a fresh clone) also sees it.
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v2 -- a real local fix\n');
+  const originTip = git(['rev-parse', 'main'], bareDir).trim();
+  assert.equal(originTip, localCommit);
+});
+test('gated default: resetToMain does NOT push a local-only commit to origin main -- it rescues it to a branch and resets main', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const originBefore = git(['rev-parse', 'main'], bareDir).trim();
   const runner = createRealGitRunner(repoDir);
 
   fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v2 -- a real local fix\n');
@@ -118,12 +139,20 @@ test('resetToMain pushes a local-only commit to origin instead of discarding it'
 
   runner.resetToMain();
 
-  // The commit is not just still present locally -- it actually reached origin, so a
-  // FUTURE resetToMain() elsewhere (or a fresh clone) also sees it.
-  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v2 -- a real local fix\n');
-  const originTip = git(['rev-parse', 'main'], bareDir).trim();
-  assert.equal(originTip, localCommit);
+  assert.equal(git(['rev-parse', 'main'], bareDir).trim(), originBefore, 'origin main is untouched');
+  assert.equal(git(['rev-parse', 'HEAD'], repoDir).trim(), originBefore, 'local main was reset to origin');
+  const rescue = git(['branch', '--list', 'agent/rescued-main-*'], repoDir).trim().replace(/^[* ]+/, '');
+  assert.ok(rescue, 'a rescue branch exists');
+  assert.equal(git(['rev-parse', rescue], repoDir).trim(), localCommit, 'the local commit is preserved on it');
+  assert.equal(git(['rev-parse', rescue], bareDir).trim(), localCommit, 'and the rescue BRANCH (not main) was pushed');
 });
+
+test('gated default: pushMain refuses outright', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const { repoDir } = makeRepoWithOrigin();
+  assert.throws(() => createRealGitRunner(repoDir).pushMain(), /pushMain refused/);
+});
+
 
 test('resetToMain throws instead of discarding history when local and origin have genuinely diverged', () => {
   const { bareDir, repoDir } = makeRepoWithOrigin();

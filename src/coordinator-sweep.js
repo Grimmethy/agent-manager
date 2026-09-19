@@ -21,14 +21,18 @@ const { runIntegrationGate, realExec } = require('./decompose-integration-gate.j
 const { wireDecomposedBlueprints } = require('./wire-decomposed-blueprints.js');
 const { taskCommitOnMain, STABLE_TERMINAL_STAGES } = require('./task-disposition.js');
 const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
+const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 
 // On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
 // verified mechanical move child's branch to main itself, instead of a human clicking
 // merge once per move. Only ever a `script-extract` / `one-pass-decompose` child that
 // still merges clean AND passes the integration gate -- see decompose-auto-merge.js.
 // Kill switch: AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES=false.
+// 2026-09-19: also requires the ungated-main-push opt-in (lib/main-push-policy.js) -- an unattended
+// merge+push to main is exactly what must not happen without a human gate, so a verified move now
+// waits as `pending-merge` for a click like every other branch.
 function autoMergeEnabled() {
-  return process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES !== 'false';
+  return ungatedMainPushAllowed() && process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES !== 'false';
 }
 
 // Enforce the terminalDisposition invariant on a task record before it is persisted:

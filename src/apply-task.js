@@ -18,6 +18,7 @@ const { getRegisteredSource, resolveSourceName } = require('./task-source-regist
 const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask, isEffectivelyEmptyResponse, applyArchDiscoveryCandidates } = require('./apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('./apply-group-b.js');
 const { createRealGitRunner } = require('./git-runner.js');
+const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { isNoopApplyDetail } = require('./task-disposition.js');
 const { writeTaskLogFile } = require('./task-log-store.js');
@@ -249,7 +250,9 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // else keeps the normal throwaway agent/<id> branch. Declared per source on its
     // registration, so an out-of-tree plugin's source opts in without editing this file.
     const registered = getRegisteredSource(resolveSourceName(task));
-    const commitsDirectlyToMain = !!(registered && registered.directToMain === true);
+    // Ungated main pushes are off by default (lib/main-push-policy.js): a directToMain source then
+    // takes the normal agent/<id> branch path below and waits for a human merge.
+    const commitsDirectlyToMain = !!(registered && registered.directToMain === true) && ungatedMainPushAllowed();
 
     // Stacked file-decompose child (file-decompose-to-hub.js `mode: 'stacked'`): every
     // move + the wiring step commits onto ONE shared branch, in sequence. Step 1 creates

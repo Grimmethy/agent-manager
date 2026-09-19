@@ -9,6 +9,7 @@ const { getRegisteredSource, resolveSourceName } = require('../task-source-regis
 const { createRealGitRunner } = require('../git-runner.js');
 const { writeTaskLogFile, taskLogRelPath } = require('../task-log-store.js');
 require('../task-sources.js');
+const { TRIAGE_BRANCH, ungatedMainPushAllowed } = require('./main-push-policy.js');
 const { coAuthorTrailer, usesGroupB, applyCandidateSplit, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles } = require('./apply-core.js');
 
 function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, brainDumpPath, gitRunner = createRealGitRunner(repoRoot) } = {}) {
@@ -24,8 +25,12 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
   }
   if (eligible.length === 0) return { results, committed: false };
 
+  // Gated (default): append onto the rolling TRIAGE_BRANCH, never main -- see main-push-policy.js.
+  // prepareStackedBranch syncs it from origin if it exists (earlier unmerged batches stay on it),
+  // or starts it fresh off current main (also after a human merged + deleted it).
+  const gated = !ungatedMainPushAllowed();
   gitRunner.fetchMain();
-  gitRunner.resetToMain();
+  if (gated) gitRunner.prepareStackedBranch(TRIAGE_BRANCH); else gitRunner.resetToMain();
 
   const staged = [];
   for (const task of eligible) {
@@ -84,6 +89,27 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
     gitRunner.commit(msgPath);
   } finally {
     fs.unlinkSync(msgPath);
+  }
+
+  if (gated) {
+    try {
+      gitRunner.push(TRIAGE_BRANCH);
+    } catch (pushErr) {
+      // Same rationale as the ungated path: the commit is real, reviewed work -- kept on the local
+      // branch (prepareStackedBranch trusts a strictly-ahead local copy next tick), not rolled back.
+      for (const s of staged) {
+        results[s.task.id] = { succeeded: false, reason: `push of ${TRIAGE_BRANCH} failed after commit (kept local, not rolled back): ${pushErr.message}` };
+      }
+      return { results, committed: true, pushed: false, branch: TRIAGE_BRANCH };
+    }
+    try { gitRunner.checkoutMain(); } catch { /* the next apply resets anyway */ }
+    // NB: this wording must NOT match task-disposition.js's DIRECT_RE ("committed to main" /
+    // "triage batch") or unmerged work would be reported as already shipped (applied-direct).
+    for (const s of staged) {
+      results[s.task.id] = { succeeded: true, doneMarker: `queued on ${TRIAGE_BRANCH} (${staged.length} update(s)) -- awaiting a human merge; nothing pushed to ${gitRunner.mainBranch}` };
+      closeOriginatingBrainDumpEntry(s.task, brainDumpPath, `Queued on ${TRIAGE_BRANCH}, awaiting merge -- Task: ${s.task.id}`);
+    }
+    return { results, committed: true, pushed: true, branch: TRIAGE_BRANCH };
   }
 
   try {

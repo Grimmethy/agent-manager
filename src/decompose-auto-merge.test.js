@@ -4,6 +4,10 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
 
+// The merge mechanics below run under the explicit ungated opt-in (lib/main-push-policy.js); the
+// gated default (fails closed, never pushes) is tested at the bottom.
+process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = 'true';
+
 const MECH_CHILD = {
   id: 'adhoc-decompose-index-01-ab-js',
   title: 'Decompose index.html → ab.js',
@@ -120,4 +124,18 @@ test('push rejected (main moved) -> reason:push-race (transient)', () => {
   });
   assert.equal(r.merged, false);
   assert.equal(r.reason, 'push-race');
+});
+
+test('gated default: autoMergeVerifiedMoveChild fails closed -- reason:gated, no git call at all', () => {
+  const saved = process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  try {
+    const exec = fakeExec();
+    const r = autoMergeVerifiedMoveChild({ repoRoot: '/repo', childId: MECH_CHILD.id, childTask: MECH_CHILD, mainBranch: 'master', exec });
+    assert.equal(r.merged, false);
+    assert.equal(r.reason, 'gated');
+    assert.deepEqual(exec.calls, []);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH; else process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = saved;
+  }
 });
