@@ -1134,7 +1134,7 @@ function nextBrainDumpSortTask() {
   // nothing to act on, because generation itself had stopped dead. Same "skip an
   // in-queue one and keep looking" loop nextArchImportTask/nextUnusedExportTask already
   // use for their own oldest-first selection.
-  const chosen = entries.find((e) => e && e.status === 'captured'
+  const chosen = entries.find((e) => e && e.status === 'captured' && !e.suppressed
     && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
     && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
   if (!chosen) return null;
@@ -2951,7 +2951,7 @@ if (require.main === module) {
     if (!brainDumpPath) return false;
     try {
       const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
-      return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured'
+      return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured' && !e.suppressed
         && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
         && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
     } catch {
