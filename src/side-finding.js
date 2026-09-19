@@ -28,14 +28,30 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Instruction bar raised 2026-09-19 (Grimmethy: "this is creating work. Work should have
+// value" -- but "taking away the ability is the wrong move", reviewers do raise valid
+// filings). First PF-Client-Portal run: 9 filings, of which one was false (claimed code it
+// admitted it hadn't seen), several were speculative "future fragility"/"not a regression"
+// notes. The fix is a stated bar the model must clear, not a removed capability.
 const SIDE_FINDING_INSTRUCTION = (
-  'If, while working on this, you notice a genuine issue, risk, or improvement '
-  + "opportunity that is NOT part of this task, you may flag it (don't act on it) by "
-  + 'adding a block anywhere in your response:\n'
+  'If, while working on this, you notice a real defect or hazard that is NOT part of this '
+  + 'task, you may flag it (do not act on it) by adding a block anywhere in your response:\n'
   + 'SIDE-FINDING: <one-line title>\n'
   + '<1-3 sentences of detail>\n'
-  + "Do this rarely -- only for something concrete and worth a human's attention later, "
-  + 'never to pad your answer.'
+  + 'A finding must meet ALL of these:\n'
+  + '1. Concrete -- name the file and function or line, and the specific input or state '
+  + 'under which it goes wrong TODAY.\n'
+  + '2. Verified -- you have actually seen the code in question in this session. If the '
+  + 'evidence lives in code you were not shown ("not visible in this diff", "worth a quick '
+  + 'grep to confirm"), do not file it.\n'
+  + '3. Consequential -- a human would change something because of it: wrong output, data '
+  + 'loss, a security or correctness hazard, a crash, or a failure that is silently '
+  + 'swallowed or misreported so a real problem goes unseen.\n'
+  + 'Do NOT file: naming, style or wording preferences; "could be more robust"; speculative '
+  + 'future risks ("if this ever changes..."); anything you would call low-severity, minor, '
+  + '"not a regression" or "worth noting"; or a restatement of the task you are already '
+  + 'doing. If you are unsure a finding clears the bar, leave it out -- filing nothing is '
+  + 'the normal outcome, and a false or trivial filing costs a human real time.'
 );
 
 const MAX_SIDE_FINDINGS_PER_RESPONSE = Number(process.env.AGENT_MANAGER_MAX_SIDE_FINDINGS_PER_RESPONSE) || 3;
