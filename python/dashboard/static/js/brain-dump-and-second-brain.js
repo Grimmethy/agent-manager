@@ -995,6 +995,7 @@ async function renderFiledFindingsTab() {
       <select id="filed-status-filter" style="text-transform:none; letter-spacing:normal; font-size:12px;">
         <option value="" ${filedFindingsStatusFilter === '' ? 'selected' : ''}>Unprocessed</option>
         <option value="actioned" ${filedFindingsStatusFilter === 'actioned' ? 'selected' : ''}>Processed</option>
+        <option value="filed" ${filedFindingsStatusFilter === 'filed' ? 'selected' : ''}>Filed notes</option>
         <option value="all" ${filedFindingsStatusFilter === 'all' ? 'selected' : ''}>All</option>
       </select>
     </div>

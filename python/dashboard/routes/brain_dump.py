@@ -14,6 +14,21 @@ from flask import Blueprint, abort, jsonify, request
 brain_dump_bp = Blueprint("brain-dump-bp", __name__)
 
 
+def is_filed_note(entry) -> bool:
+    """A machine-raised entry the sorter already dispositioned as a SecondBrain note: status
+    `sorted`, a note path recorded, and no task queued. Nothing is left for a human to act
+    on, so it must not count as "unprocessed" (2026-09-19, Grimmethy: the non-actionable
+    artifacts "are wasting attention and screen space" -- 315 of agent-manager's 396
+    unprocessed findings were these; `actionable: true` with no tracked project also lands
+    here, since with no project there is nowhere to queue a task). Still reachable via
+    ?status=filed and ?status=all."""
+    return (
+        entry.get("status") == "sorted"
+        and not entry.get("queuedTaskId")
+        and bool((entry.get("sort") or {}).get("secondBrainPath"))
+    )
+
+
 def _filtered_brain_dump_view(*, machine):
     """Shared status-filter logic behind both /api/brain-dump and /api/filed-findings --
     identical unprocessed/processed/all semantics, the only difference is which half of
@@ -61,12 +76,15 @@ def _filtered_brain_dump_view(*, machine):
             e for e in entries
             if e.get("status") == "actioned" and e.get("taskStatus") not in BRAIN_DUMP_NEEDS_ATTENTION_STATES
         ]
+    elif status_filter == "filed":
+        entries = [e for e in entries if is_filed_note(e)]
     elif status_filter and status_filter != "all":
         entries = [e for e in entries if e.get("status") == status_filter]
     elif not status_filter:
         entries = [
             e for e in entries
-            if e.get("status") != "actioned" or e.get("taskStatus") in BRAIN_DUMP_NEEDS_ATTENTION_STATES
+            if (e.get("status") != "actioned" or e.get("taskStatus") in BRAIN_DUMP_NEEDS_ATTENTION_STATES)
+            and not (machine and is_filed_note(e))
         ]
     return sorted(entries, key=lambda e: e.get("capturedAt") or "", reverse=True)
 
