@@ -181,13 +181,9 @@ function statusBadgeClass(status, stale) {
   return 'warn';
 }
 
-function laneForInstance(inst) {
-  return inst.instanceId.startsWith('worker-reasoning') ? 'reasoning' : 'local';
-}
-
 function modelKindForInstance(inst) {
   if (inst.instanceId === 'watchdog') return null;
-  return laneForInstance(inst) === 'reasoning' ? 'mixed' : 'ollama';
+  return 'ollama'; // every lane runs a local model (lanes are one per GPU)
 }
 
 async function setWorkerModel(instanceId, model) {
@@ -456,18 +452,14 @@ async function renderWorkers(isPoll) {
   });
   const filterBar = `
     <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
-      <div>
-        ${[['all', 'All'], ['local', 'Local (grunt)'], ['reasoning', 'Claude (reasoning)']].map(([key, label]) => `
-          <button class="${workersTypeFilter === key ? 'active' : ''}" data-worker-filter="${key}">${label}</button>
-        `).join('')}
-      </div>
+      <div></div>
       <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
         <input type="checkbox" id="claude-pause-toggle" ${workerModels.claudePaused ? 'checked' : ''}>
         Pause Claude (preserve subscription tokens)
       </label>
     </div>
   `;
-  const shown = instances.filter(inst => workersTypeFilter === 'all' || laneForInstance(inst) === workersTypeFilter);
+  const shown = instances;
   if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
   // Preserve scroll position across the full innerHTML replace below -- same isPoll
   // "don't yank state out from under the operator" reasoning as the dropdown guard
@@ -588,9 +580,6 @@ async function renderWorkers(isPoll) {
   }
   main.querySelectorAll('.worker-card[data-instance-id]').forEach((card) => {
     card.onclick = () => toggleWorkerExpand(card.dataset.instanceId);
-  });
-  main.querySelectorAll('[data-worker-filter]').forEach((btn) => {
-    btn.onclick = () => { workersTypeFilter = btn.dataset.workerFilter; renderWorkers(); };
   });
   const claudePauseToggle = main.querySelector('#claude-pause-toggle');
   if (claudePauseToggle) {

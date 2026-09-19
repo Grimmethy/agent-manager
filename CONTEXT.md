@@ -28,7 +28,7 @@ A claim sitting inside a drafting folder whose owning process is alive, but the 
 _Avoid_: orphaned claim
 
 **Instance**:
-One running process identified by an `instanceId` (`worker-1`, `review-runner`, `apply-runner`, `queue-watchdog`), which owns exactly one heartbeat file.
+One running process identified by an `instanceId` (a worker lane named for its GPU such as `worker-3090` or `worker-p40`, `reviewer`, `queue-watchdog`), which owns exactly one heartbeat file.
 
 **Heartbeat**:
 The JSON file an instance writes on every status change (`pid`, `status`, `currentTaskId`, `currentPass`, `lastHeartbeat`) — the system's only source of truth for whether an instance is alive and what it's doing.

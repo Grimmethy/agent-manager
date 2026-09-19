@@ -44,10 +44,10 @@ class PreemptDecisionTest(unittest.TestCase):
     def test_age_gated_lane_unknown_age_is_spared_not_killed(self):
         self.assertEqual(app._preempt_decision("reviewer", 99, None, self.NOW, 180, always=False)[0], "spare")
 
-    def test_default_always_set_now_includes_worker_reasoning(self):
-        # `always` not passed -> derived from the static _PREEMPT_LANES_ALWAYS.
-        self.assertEqual(app._preempt_decision("worker-reasoning", 7, self.NOW - 9999, self.NOW, 180)[0], "kill")
-        self.assertEqual(app._preempt_decision("worker-1", 7, self.NOW - 9999, self.NOW, 180)[0], "kill")
+    def test_default_always_kills_any_gpu_lane_and_spares_the_reviewer(self):
+        # `always` not passed -> every lane except the age-gated reviewer is always-kill.
+        self.assertEqual(app._preempt_decision("worker-3090", 7, self.NOW - 9999, self.NOW, 180)[0], "kill")
+        self.assertEqual(app._preempt_decision("worker-p40", 7, self.NOW - 9999, self.NOW, 180)[0], "kill")
         self.assertEqual(app._preempt_decision("reviewer", 7, self.NOW - 9999, self.NOW, 180)[0], "spare")
 
     def test_is_preemptable_child_pass(self):
@@ -65,12 +65,9 @@ class PreemptDecisionTest(unittest.TestCase):
         for p in (None, "", "idle", "claim", "starting"):
             self.assertFalse(app._is_preemptable_child_pass(p), repr(p))
 
-    def test_lane_sets_flip_with_the_spare_long_reasoning_env(self):
-        with mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING": ""}, clear=False):
-            os.environ.pop("AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING", None)
-            self.assertEqual(app._preempt_lane_sets(), (("worker-1", "worker-reasoning"), ("reviewer",)))
-        with mock.patch.dict(os.environ, {"AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING": "true"}):
-            self.assertEqual(app._preempt_lane_sets(), (("worker-1",), ("worker-reasoning", "reviewer")))
+    def test_lane_sets_are_every_gpu_lane_plus_age_gated_reviewer(self):
+        with mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40"]):
+            self.assertEqual(app._preempt_lane_sets(), (("worker-3090", "worker-p40"), ("reviewer",)))
 
 
 class PreemptPipelineTest(unittest.TestCase):

@@ -12,7 +12,6 @@
 
 const fs = require('fs');
 const { generationThrottled } = require('./generation-throttle.js');
-const { laneTiersEnabled } = require('./lane-tiers.js');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
@@ -347,37 +346,6 @@ function pendingReadinessMap() {
     map[id] = isTaskReady(task, pipelineDir);
   }
   return map;
-}
-
-// CLI mode (`node task-sources.js --pending-tier-counts`, mirrors --pending-readiness):
-// counts how many tasks currently sitting in pending/ resolve to each reasoningTierFor()
-// tier ('low'/'high'). Added 2026-08-18 for the model-swap-thrashing guard (Grimmethy:
-// "make sure that all the tasks that the currently loaded model has available to them is
-// completed before switching to the next model") -- a worker about to swap Ollama's
-// resident model calls this first to check whether the model it would be EVICTING still
-// has claimable work waiting, so it can yield instead of forcing a swap mid-backlog. Same
-// "compute it once in JS, consume it from bash" split pendingReadinessMap() already uses.
-function pendingTierCounts() {
-  const { pipelineDir } = getConfig();
-  const pendingDir = path.join(pipelineDir, 'queue', 'pending');
-  const counts = { low: 0, high: 0 };
-  let files;
-  try {
-    files = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
-  } catch {
-    return counts;
-  }
-  for (const f of files) {
-    let task;
-    try {
-      task = JSON.parse(fs.readFileSync(path.join(pendingDir, f), 'utf8'));
-    } catch {
-      continue; // malformed file -- doesn't count as claimable work for either tier
-    }
-    const tier = reasoningTierFor(task);
-    counts[tier] = (counts[tier] || 0) + 1;
-  }
-  return counts;
 }
 
 // --- Source: queue/adhoc/, a manually-submitted one-off task (priority 10) --------------
@@ -2646,20 +2614,6 @@ registerTaskSource('pipeline_forensics_fix', {
 // (src/maintenance/*-scan.js), because staleness-fastpath.js re-runs their rules for the
 // deterministic staleness recheck. Wire the plugin in via AGENT_MANAGER_REGISTER_PATH.
 
-// tierFilter ('low'|'high'|undefined) -- Brain Dump #77 follow-up (2026-08-17): without
-// this, getNextTask() always returns the FIRST source in priority order with eligible
-// work and stops there, even when that source's task doesn't match the calling lane's own
-// reasoning tier. Confirmed live: with path_prefetch_resolve's automatic high-reasoning
-// retry (priority 69, beats arch_discovery/arch_import/observability_review at 79/80/79)
-// having a real 20+ item backlog, worker-1's generation calls kept returning a high-tier
-// retry task every single tick, which worker-1 then correctly declined to CLAIM (see
-// local-worker.sh's tier filter) -- but never got far enough down the ladder to generate
-// any LOW-tier work for itself either, so worker-1 sat idle while worker-reasoning did
-// everything. A mismatched-tier task is skipped (not returned) and the ladder keeps
-// walking to the next source instead of stopping -- safe because every next() function
-// here is a pure "what would I offer" read with no queue-write side effect (writeTask()
-// is the only thing that actually persists a task), so skipping a candidate wastes at
-// most one extra read, never loses or duplicates work.
 // generatedForRepoRoot stamps which repo's config was live when this task was generated.
 // Several sources (project_search, deep_dive, arch_import, and anything reading a path
 // derived from path.dirname(repoRoot) rather than repoRoot itself) resolve to the SAME
@@ -2771,13 +2725,6 @@ if (require.main === module) {
     return;
   }
 
-  // `node task-sources.js --pending-tier-counts` prints {low: N, high: N} -- see
-  // pendingTierCounts()'s own header comment.
-  if (process.argv.includes('--pending-tier-counts')) {
-    console.log(JSON.stringify(pendingTierCounts()));
-    return;
-  }
-
   // `node task-sources.js --approval-modes` prints {name: mode} for every registered
   // source -- the resolved three-tier approval mode (config.js's approvalModeOverrides,
   // falling back to defaultApprovalMode), consumed by apply-runner.ps1 so its automatic
@@ -2859,16 +2806,6 @@ if (require.main === module) {
     return;
   }
 
-  // `node task-sources.js --tier=low|high` -- restricts generation to that reasoning
-  // tier (see getNextTask()'s own comment). Omitted entirely = no filter, generates
-  // whichever source is highest priority regardless of tier, matching this CLI's
-  // long-standing default behavior for any caller that doesn't care about tiers.
-  const tierArg = process.argv.find((a) => a.startsWith('--tier='));
-  // With lane tiers off (lane-tiers.js) the --tier arg is ignored: generation is unfiltered and the
-  // in-flight throttle is bounded by ALL live lanes, since any lane can claim any task.
-  const tiersOn = laneTiersEnabled();
-  const tierFilter = tiersOn && tierArg ? tierArg.slice('--tier='.length) : undefined;
-
   const { pipelineDir, brainDumpPath } = getConfig();
   const pendingDir = path.join(pipelineDir, 'queue', 'pending');
   const draftingDir = path.join(pipelineDir, 'queue', 'drafting');
@@ -2883,38 +2820,24 @@ if (require.main === module) {
   // on every single ~30s tick, since it only ever saw an empty pending/. drafting/ is one
   // level deeper (per-instance subfolders), so this checks any *.json under any of those,
   // not just the top level.
-  // When tierFilter is set, a task file only counts toward "already pending" if it's
-  // actually THIS tier's own backlog -- otherwise a tier-scoped caller (e.g. worker-1
-  // calling --tier=low) would see worker-reasoning's high-tier drafting/pending backlog and
-  // throttle itself into never generating any low-tier work at all, the exact starvation
-  // this tier split exists to fix. Unreadable/mid-write files count as backlog either way
-  // (conservative default, matches every other non-fatal-skip convention in this file).
-  const taskFileMatchesTier = (filePath) => {
-    if (!tierFilter) return true;
-    try {
-      return reasoningTierFor(JSON.parse(fs.readFileSync(filePath, 'utf8'))) === tierFilter;
-    } catch {
-      return true;
-    }
-  };
-  // Count of same-tier tasks in flight (drafting/ across every instance + pending/). The
-  // throttle is per live lane, not one-per-tier -- see generation-throttle.js.
+  // Count of tasks in flight (drafting/ across every instance + pending/). The throttle is
+  // bounded by the number of live lanes -- see generation-throttle.js.
   let inFlightCount = 0;
   if (fs.existsSync(draftingDir)) {
     for (const entry of fs.readdirSync(draftingDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const instanceDir = path.join(draftingDir, entry.name);
       try {
-        inFlightCount += fs.readdirSync(instanceDir).filter((f) => f.endsWith('.json') && taskFileMatchesTier(path.join(instanceDir, f))).length;
+        inFlightCount += fs.readdirSync(instanceDir).filter((f) => f.endsWith('.json')).length;
       } catch {
         // unreadable instance dir -- not counted, same non-fatal-skip convention as above
       }
     }
   }
   if (fs.existsSync(pendingDir)) {
-    inFlightCount += fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json') && taskFileMatchesTier(path.join(pendingDir, f))).length;
+    inFlightCount += fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json')).length;
   }
-  const alreadyPending = generationThrottled(inFlightCount, path.join(pipelineDir, 'instances'), tiersOn ? tierFilter : 'all');
+  const alreadyPending = generationThrottled(inFlightCount, path.join(pipelineDir, 'instances'));
 
   // An already-queued lower-priority task must never block a NEW adhoc task from
   // reaching pending/ -- adhoc is the "drop everything, do this now" lane. This exception
@@ -3028,7 +2951,7 @@ if (require.main === module) {
   if (alreadyPending && !hasAdhocWaiting && !hasResearchWaiting && !hasBrainDumpWaiting && !hasHeldClarificationWaiting) {
     console.log('pending/ already has work queued, not adding another task');
   } else {
-    const task = getNextTask({ tierFilter });
+    const task = getNextTask();
     if (!task) {
       console.log('no eligible task found (all registered sources exhausted or malformed)');
     } else {

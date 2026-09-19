@@ -8,6 +8,10 @@
 //
 // Run: node --test src/pipeline-health-audit.test.js  (or `npm test`)
 
+// Lane ids come from the environment (src/lanes.js): worker-3090 + worker-p40.
+process.env.AGENT_MANAGER_LOCAL_GPU = '3090';
+process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://p40:11434';
+process.env.AGENT_MANAGER_P40_MODEL = 'm';
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -96,39 +100,31 @@ test('countPending counts real pending/ files, 0 when the dir is absent', () => 
 
 test('checkDaemonCounts flags a missing daemon', () => {
   const findings = checkDaemonCounts([
-    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-p40' },
   ]);
-  assert.ok(findings.some((f) => f.includes('worker-1') && f.includes('no process found')));
+  assert.ok(findings.some((f) => f.includes('worker-3090') && f.includes('no process found')));
 });
 
 test('checkDaemonCounts flags a duplicated daemon', () => {
   const findings = checkDaemonCounts([
-    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
-    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
-    { pid: 3, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-3090' },
+    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-3090' },
+    { pid: 3, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-p40' },
     { pid: 4, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
     { pid: 5, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
   ]);
   assert.equal(findings.length, 1);
-  assert.match(findings[0], /worker-1.*2 processes/);
+  assert.match(findings[0], /worker-3090.*2 processes/);
 });
 
 test('checkDaemonCounts finds nothing wrong when every daemon has exactly one process', () => {
   const findings = checkDaemonCounts([
-    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
-    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-3090' },
+    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-p40' },
     { pid: 3, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
     { pid: 4, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
   ]);
   assert.deepEqual(findings, []);
-});
-
-test('checkDaemonCounts does not confuse worker-1 with worker-reasoning (substring overlap)', () => {
-  const findings = checkDaemonCounts([
-    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
-  ]);
-  const worker1Finding = findings.find((f) => f.startsWith('worker-1:'));
-  assert.ok(worker1Finding && worker1Finding.includes('no process found'), 'worker-reasoning process must not count as satisfying worker-1');
 });
 
 // 2026-09-18 (brain-dump bd-1789702787675 follow-up): bash forks a plain subshell during
@@ -139,9 +135,9 @@ test('checkDaemonCounts does not confuse worker-1 with worker-reasoning (substri
 
 test('checkDaemonCounts does NOT flag a daemon whose "extra" match is its own subshell fork (real live shape)', () => {
   const findings = checkDaemonCounts([
-    { pid: 3597394, ppid: 1560, cmd: 'bash scripts/local-worker.sh worker-1' }, // the real long-lived daemon
-    { pid: 352957, ppid: 3597394, cmd: 'bash scripts/local-worker.sh worker-1' }, // its own subshell fork this tick
-    { pid: 3597395, ppid: 1560, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 3597394, ppid: 1560, cmd: 'bash scripts/local-worker.sh worker-3090' }, // the real long-lived daemon
+    { pid: 352957, ppid: 3597394, cmd: 'bash scripts/local-worker.sh worker-3090' }, // its own subshell fork this tick
+    { pid: 3597395, ppid: 1560, cmd: 'bash scripts/local-worker.sh worker-p40' },
     { pid: 3597399, ppid: 1560, cmd: 'bash scripts/queue-watcher.sh watchdog' },
     { pid: 3597398, ppid: 1560, cmd: 'bash scripts/review-runner.sh reviewer' },
   ]);
@@ -150,24 +146,24 @@ test('checkDaemonCounts does NOT flag a daemon whose "extra" match is its own su
 
 test('checkDaemonCounts still flags a REAL duplicate even with an unrelated subshell fork also present', () => {
   const findings = checkDaemonCounts([
-    { pid: 100, ppid: 1, cmd: 'bash scripts/local-worker.sh worker-1' }, // first independent daemon
-    { pid: 200, ppid: 1, cmd: 'bash scripts/local-worker.sh worker-1' }, // second independent daemon -- a genuine duplicate
-    { pid: 201, ppid: 200, cmd: 'bash scripts/local-worker.sh worker-1' }, // the SECOND daemon's own subshell fork -- must not inflate the count further
-    { pid: 3, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 100, ppid: 1, cmd: 'bash scripts/local-worker.sh worker-3090' }, // first independent daemon
+    { pid: 200, ppid: 1, cmd: 'bash scripts/local-worker.sh worker-3090' }, // second independent daemon -- a genuine duplicate
+    { pid: 201, ppid: 200, cmd: 'bash scripts/local-worker.sh worker-3090' }, // the SECOND daemon's own subshell fork -- must not inflate the count further
+    { pid: 3, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-p40' },
     { pid: 4, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
     { pid: 5, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
   ]);
   assert.equal(findings.length, 1);
-  assert.match(findings[0], /worker-1: 2 processes/);
+  assert.match(findings[0], /worker-3090: 2 processes/);
   assert.match(findings[0], /pids 100, 200/);
 });
 
 test('checkDaemonCounts collapses a chain of several nested subshell forks to one root', () => {
   const findings = checkDaemonCounts([
-    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
-    { pid: 2, ppid: 1, cmd: 'bash scripts/local-worker.sh worker-1' },
-    { pid: 3, ppid: 2, cmd: 'bash scripts/local-worker.sh worker-1' }, // nested two levels deep
-    { pid: 4, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-3090' },
+    { pid: 2, ppid: 1, cmd: 'bash scripts/local-worker.sh worker-3090' },
+    { pid: 3, ppid: 2, cmd: 'bash scripts/local-worker.sh worker-3090' }, // nested two levels deep
+    { pid: 4, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-p40' },
     { pid: 5, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
     { pid: 6, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
   ]);
@@ -185,25 +181,23 @@ test('daemonRoots: zero matches returns an empty array', () => {
   assert.deepEqual(daemonRoots([{ pid: 1, ppid: 0, cmd: 'node something-else.js' }], /queue-watcher\.sh/), []);
 });
 
-// 2026-09-18: a hyphen is a non-word character, so a plain `\b` after "worker-reasoning"
-// is satisfied at the "-p40" boundary just as it would be at a space -- worker-reasoning's
-// pattern wrongly also matched a real, separate worker-reasoning-p40 daemon.
-
-test('checkDaemonCounts does not confuse worker-reasoning with worker-reasoning-p40 (hyphen-suffix overlap)', () => {
+// A hyphen is a non-word character, so a plain `\b` after a lane id would also match a longer id that
+// merely starts with it. Lane ids are anchored with (?![\w-]).
+test('checkDaemonCounts does not let a longer id (worker-3090-b) satisfy the worker-3090 lane', () => {
   const findings = checkDaemonCounts([
-    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
-    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning-p40' },
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-3090-b' },
+    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-p40' },
     { pid: 3, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
     { pid: 4, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
   ]);
-  const wrFinding = findings.find((f) => f.startsWith('worker-reasoning:'));
-  assert.ok(wrFinding && wrFinding.includes('no process found'), 'worker-reasoning-p40 process must not count as satisfying worker-reasoning');
+  const f = findings.find((x) => x.startsWith('worker-3090:'));
+  assert.ok(f && f.includes('no process found'), 'worker-3090-b must not count as worker-3090');
 });
 
-test('checkDaemonCounts still correctly recognizes a bare worker-reasoning process', () => {
+test('checkDaemonCounts recognizes one process per GPU lane plus watchdog and reviewer', () => {
   const findings = checkDaemonCounts([
-    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
-    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-3090' },
+    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-p40' },
     { pid: 3, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
     { pid: 4, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
   ]);
@@ -214,8 +208,8 @@ test('checkDaemonCounts still correctly recognizes a bare worker-reasoning proce
 
 test('checkOrphanedModelCalls finds a local-draft.js process reparented to pid 1', () => {
   const orphans = checkOrphanedModelCalls([
-    { pid: 100, ppid: 1, cmd: 'node src/local-draft.js queue/drafting/worker-1/x.json' },
-    { pid: 200, ppid: 555, cmd: 'node src/local-draft.js queue/drafting/worker-reasoning/y.json' },
+    { pid: 100, ppid: 1, cmd: 'node src/local-draft.js queue/drafting/worker-3090/x.json' },
+    { pid: 200, ppid: 555, cmd: 'node src/local-draft.js queue/drafting/worker-p40/y.json' },
   ]);
   assert.deepEqual(orphans.map((o) => o.pid), [100]);
 });
@@ -224,14 +218,14 @@ test('checkOrphanedModelCalls finds a local-draft.js process reparented to pid 1
 
 test('tailLogErrorSignatures finds a known bad signature in a recent log line', () => {
   const dir = tempDir('health-audit-logs-test-');
-  fs.writeFileSync(path.join(dir, 'worker-1.log'), 'some normal line\n[[: operand expected\nanother normal line\n');
+  fs.writeFileSync(path.join(dir, 'worker-3090.log'), 'some normal line\n[[: operand expected\nanother normal line\n');
   const findings = tailLogErrorSignatures(dir);
-  assert.ok(findings.some((f) => f.includes('worker-1.log') && f.includes('ansi-color-broke-numeric-test')));
+  assert.ok(findings.some((f) => f.includes('worker-3090.log') && f.includes('ansi-color-broke-numeric-test')));
 });
 
 test('tailLogErrorSignatures finds nothing in a clean log', () => {
   const dir = tempDir('health-audit-logs-test-');
-  fs.writeFileSync(path.join(dir, 'worker-1.log'), 'tick at 2026-08-24\nclaiming some-task\nclaimed successfully\n');
+  fs.writeFileSync(path.join(dir, 'worker-3090.log'), 'tick at 2026-08-24\nclaiming some-task\nclaimed successfully\n');
   assert.deepEqual(tailLogErrorSignatures(dir), []);
 });
 
@@ -262,8 +256,8 @@ test('checkPipelineHealth reports the throughput-stall anomaly when real backlog
 test('checkPipelineHealth does NOT flag a quiet-but-empty pipeline (no pending work, daemons genuinely idle) as a throughput stall', () => {
   const dir = tempDir('health-audit-integration-test-');
   const ps = [
-    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
-    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-3090' },
+    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-p40' },
     { pid: 3, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
     { pid: 4, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
   ];
@@ -276,8 +270,8 @@ test('checkPipelineHealth returns zero anomalies for a fully healthy snapshot', 
   const now = new Date('2026-08-24T12:00:00.000Z');
   writeDoneTask(path.join(dir, 'queue', 'done'), 'recent', new Date('2026-08-24T11:45:00.000Z'));
   const ps = [
-    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-1' },
-    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-reasoning' },
+    { pid: 1, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-3090' },
+    { pid: 2, ppid: 0, cmd: 'bash scripts/local-worker.sh worker-p40' },
     { pid: 3, ppid: 0, cmd: 'bash scripts/queue-watcher.sh watchdog' },
     { pid: 4, ppid: 0, cmd: 'bash scripts/review-runner.sh reviewer' },
   ];
@@ -294,14 +288,14 @@ test('checkPipelineHealth never throws when listProcessesFn itself fails (ps una
 // anomalySignature / sameAnomalySignatures (2026-09-18, pipeline hardening -- see this
 // file's own header comment for the 66-near-duplicate-task incident this closes).
 test('anomalySignature strips pids and counts, keeping the structural skeleton identical', () => {
-  const a = 'worker-1: 2 processes running simultaneously (pids 205693, 1198141) -- should only ever be one';
-  const b = 'worker-1: 2 processes running simultaneously (pids 307219, 1198141) -- should only ever be one';
+  const a = 'worker-3090: 2 processes running simultaneously (pids 205693, 1198141) -- should only ever be one';
+  const b = 'worker-3090: 2 processes running simultaneously (pids 307219, 1198141) -- should only ever be one';
   assert.equal(anomalySignature(a), anomalySignature(b));
 });
 
 test('anomalySignature treats a genuinely different anomaly as a different signature', () => {
-  const a = 'worker-1: 2 processes running simultaneously (pids 1, 2) -- should only ever be one';
-  const b = 'worker-reasoning: 2 processes running simultaneously (pids 3, 4) -- should only ever be one';
+  const a = 'worker-3090: 2 processes running simultaneously (pids 1, 2) -- should only ever be one';
+  const b = 'worker-p40: 2 processes running simultaneously (pids 3, 4) -- should only ever be one';
   assert.notEqual(anomalySignature(a), anomalySignature(b));
 });
 
@@ -313,29 +307,29 @@ test('anomalySignature normalizes a varying pending/backlog count in a throughpu
 
 test('sameAnomalySignatures: true when both lists reduce to the identical signature set (order-independent)', () => {
   const now = [
-    'worker-1: 2 processes running simultaneously (pids 9, 10) -- should only ever be one',
+    'worker-3090: 2 processes running simultaneously (pids 9, 10) -- should only ever be one',
     'Zero tasks completed in the last hour despite 391 pending -- throughput has stalled.',
   ];
   const existing = [
     'Zero tasks completed in the last hour despite 73 pending -- throughput has stalled.',
-    'worker-1: 2 processes running simultaneously (pids 1, 2) -- should only ever be one',
+    'worker-3090: 2 processes running simultaneously (pids 1, 2) -- should only ever be one',
   ];
   assert.equal(sameAnomalySignatures(now, existing), true);
 });
 
 test('sameAnomalySignatures: false when the new check found an additional, genuinely new anomaly type', () => {
   const now = [
-    'worker-1: 2 processes running simultaneously (pids 9, 10) -- should only ever be one',
-    'worker-reasoning: no process found (dead-process-check.js should restart this on its own next tick, but it\'s absent right now)',
+    'worker-3090: 2 processes running simultaneously (pids 9, 10) -- should only ever be one',
+    'worker-p40: no process found (dead-process-check.js should restart this on its own next tick, but it\'s absent right now)',
   ];
   const existing = [
-    'worker-1: 2 processes running simultaneously (pids 1, 2) -- should only ever be one',
+    'worker-3090: 2 processes running simultaneously (pids 1, 2) -- should only ever be one',
   ];
   assert.equal(sameAnomalySignatures(now, existing), false);
 });
 
 test('sameAnomalySignatures: false when the existing task covered a DIFFERENT anomaly entirely', () => {
-  const now = ['worker-1: 2 processes running simultaneously (pids 9, 10) -- should only ever be one'];
+  const now = ['worker-3090: 2 processes running simultaneously (pids 9, 10) -- should only ever be one'];
   const existing = ['Zero tasks completed in the last hour despite 391 pending -- throughput has stalled.'];
   assert.equal(sameAnomalySignatures(now, existing), false);
 });

@@ -2,19 +2,17 @@
 
 const fs = require('fs');
 const path = require('path');
-const { laneTiersEnabled } = require('./lane-tiers.js');
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
-// priority+mtime fix) plus its separate per-item reasoningTierFor() filter -- both now
-// live in one tested module instead of two untested `node -e` blocks in the shell
-// script. See local-worker.sh's own comments for why priority+mtime ordering and the
-// tier split exist; this module adds the operator "assign this task to this worker"
+// priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
+// shell script. There is no lane/tier filter any more (2026-09-19: lanes are one per GPU and every
+// lane claims any task by priority); this module adds the operator "assign this task to this worker"
 // override on top (2026-09-06, Grimmethy: "I need to be able to select the task I want
 // each worker to run... this should override the automated system").
 //
 // `pinnedWorker` on a pending task's JSON, when present, is an explicit operator
 // assignment (stamped by the dashboard's POST /api/instances/<id>/assign-task route):
-// a task pinned to THIS instance always wins, skipping the tier filter and priority
+// a task pinned to THIS instance always wins, skipping the priority
 // sort entirely (that's the override); a task pinned to ANY OTHER instance is excluded
 // from this instance's candidate list so a faster-polling lane can't steal it first.
 //
@@ -24,7 +22,7 @@ const { laneTiersEnabled } = require('./lane-tiers.js');
 // whats available for that specific worker type") backs the Workers tab's assign-task
 // dropdown: pending/ alone is too narrow a candidate pool -- the task an operator wants
 // to reassign is usually already claimed by some other lane -- so this also surfaces
-// every OTHER lane's queue/drafting/ contents, tier-filtered the same way.
+// every OTHER lane's queue/drafting/ contents.
 
 // Bot-vs-human adhoc sub-prioritization + the persistent "premium priority" pin
 // (2026-09-07, Grimmethy: "Adhoc has bloomed immensely because of the brain dump entries
@@ -69,8 +67,7 @@ const { laneTiersEnabled } = require('./lane-tiers.js');
 // the queue no matter which lane gets to it next, for as long as it takes."
 //
 // Shared by pickClaimableTasks and listAssignableTasks so the two can never disagree --
-// same discipline this file's own resolvesToTier() header already documents for the tier
-// split, and the exact class of bug the "ghost in the machine" concept's own
+// same discipline as the rest of this file, and the exact class of bug the "ghost in the machine" concept's own
 // standing-mechanism-vs-one-time-check lesson (AGENTS.md) warns to watch for: a rule that
 // only ever gets applied in ONE of two places that are supposed to agree.
 const BOT_ADHOC_PRIORITY_PENALTY = 30; // 10 -> 40, landing alongside brain_dump_sort (42) / secondbrain (40) -- thematically apt, since most bot-adhoc IS brain_dump_sort's own continued output
@@ -103,33 +100,12 @@ function readTaskSafe(fullPath) {
   return { task, mtimeMs };
 }
 
-// Shared by pickClaimableTasks (claim ranking) and listAssignableTasks (the operator's
-// "what could I assign here" dropdown) so the two can never disagree about which tasks
-// belong on a given lane -- both must ask model-provider.js's reasoningTierFor(), never
-// re-derive tier some other way. Requires task-sources.js itself (not just
-// model-provider.js) -- registerTaskSource() calls populate task-source-registry.js's
-// registry as a load-time side effect that reasoningTierFor() depends on to resolve a
-// source's registered tier; skipping this require silently defaults every task to 'low'
-// (confirmed live 2026-09-07: listAssignableTasks originally omitted this and inverted
-// every tier filter as a result -- caught by testing against the real queue before
-// shipping, not by the unit tests, which mock the registry away).
-function resolvesToTier(task, isReasoningLane) {
-  if (!laneTiersEnabled()) return true; // tiers off: every lane may claim any task (lane-tiers.js)
-  loadSourceRegistry();
-  const { reasoningTierFor } = require('./model-provider.js');
-  let tier = 'low';
-  if (task) {
-    try { tier = reasoningTierFor(task); } catch (_) { /* default 'low' */ }
-  }
-  return isReasoningLane ? tier === 'high' : tier !== 'high';
-}
-
 // Returns every filename in pendingDir this instance may claim, in claim-attempt order:
 // tasks pinned to this instance first (oldest first), then everything else ranked by
 // resolved source priority ascending, then mtime ascending. The caller
 // (local-worker.sh) iterates this list attempting an atomic claim (mv -n) on each in
 // turn, same as it did with the old inline script's output.
-function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } = {}) {
+function pickClaimableTasks(pendingDir, instanceId) {
   let names;
   try {
     names = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
@@ -178,7 +154,6 @@ function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } 
         }
       } catch (_) { /* unresolvable -- Infinity priority, sorts last, still listed */ }
     }
-    if (!resolvesToTier(task, isReasoningLane)) continue;
     // Within one source-priority band, order a live hub's children by their owning hub's
     // key (explicit hubPriority asc, then hub createdAt asc) so this path can't contradict
     // nextAdhocTask()'s hub ordering -- same "the two must never disagree" discipline this
@@ -197,8 +172,8 @@ function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } 
 // Single-winner convenience form. local-worker.sh itself uses pickClaimableTasks()
 // directly (it claims as many pending items as fit in one tick, not just one); this
 // exists for callers/tests that only care about "what would this instance claim next."
-function pickNextPendingTask(pendingDir, instanceId, opts) {
-  const [first] = pickClaimableTasks(pendingDir, instanceId, opts);
+function pickNextPendingTask(pendingDir, instanceId) {
+  const [first] = pickClaimableTasks(pendingDir, instanceId);
   return first || null;
 }
 
@@ -215,7 +190,7 @@ function pickNextPendingTask(pendingDir, instanceId, opts) {
 // the assign route already short-circuits, no point cluttering the list with it), each
 // tagged with `location` so the dashboard can label a stolen in-flight task distinctly
 // from idle pending work.
-function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } = {}) {
+function listAssignableTasks(queueDir, instanceId) {
   const out = [];
 
   const pendingDir = path.join(queueDir, 'pending');
@@ -238,7 +213,6 @@ function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } =
     // route already supports (it just re-pins). List it for every tier-matching lane
     // either way; only tag it (pinnedTo) so the dashboard can show which lane currently
     // has first claim on it, same spirit as the drafting-elsewhere `location` tag below.
-    if (!resolvesToTier(task, isReasoningLane)) continue;
     out.push({
       id: task.id || name.replace(/\.json$/, ''),
       title: task.title || null,
@@ -265,7 +239,6 @@ function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } =
     for (const name of names) {
       const { task } = readTaskSafe(path.join(laneDir, name));
       if (!task) continue;
-      if (!resolvesToTier(task, isReasoningLane)) continue;
       out.push({
         id: task.id || name.replace(/\.json$/, ''),
         title: task.title || null,
@@ -295,7 +268,6 @@ function listAssignableTasks(queueDir, instanceId, { isReasoningLane = false } =
   for (const name of adhocNames) {
     const { task } = readTaskSafe(path.join(adhocDir, name));
     if (!task) continue;
-    if (!resolvesToTier(task, isReasoningLane)) continue;
     adhocRows.push({
       id: task.id || name.replace(/\.json$/, ''),
       title: task.title || null,
@@ -316,31 +288,31 @@ module.exports = { pickClaimableTasks, pickNextPendingTask, listAssignableTasks,
 // --- CLI --------------------------------------------------------------------------
 // Two modes:
 //
-//   node next-claimable-task.js <pendingDir> <instanceId> <isReasoningLane:true|false>
+//   node next-claimable-task.js <pendingDir> <instanceId>
 //     Prints one claimable filename per line, in claim-attempt order (same contract the
 //     removed inline `node -e` script had) -- local-worker.sh consumes this via
 //     `while IFS= read -r name; do items+=("$name"); done < <(node ...)`.
 //
-//   node next-claimable-task.js --list-assignable <queueDir> <instanceId> <isReasoningLane:true|false>
+//   node next-claimable-task.js --list-assignable <queueDir> <instanceId>
 //     Prints a single JSON array of {id, title, source, location} to stdout -- the
 //     dashboard (python/dashboard/app.py's GET /api/instances/<id>/assignable-tasks)
 //     shells out to this exactly the way it already shells out to
-//     scripts/gpu-arbiter-cli.js for gpu-arbiter.js logic, so tier resolution can never
+//     scripts/gpu-arbiter-cli.js for gpu-arbiter.js logic, so the ranking can never
 //     drift between the two languages.
 if (require.main === module) {
   if (process.argv[2] === '--list-assignable') {
-    const [queueDir, instanceId, isReasoningLaneArg] = process.argv.slice(3);
+    const [queueDir, instanceId] = process.argv.slice(3);
     try {
-      const items = listAssignableTasks(queueDir, instanceId, { isReasoningLane: isReasoningLaneArg === 'true' });
+      const items = listAssignableTasks(queueDir, instanceId);
       process.stdout.write(JSON.stringify(items));
     } catch (e) {
       process.stderr.write(`next-claimable-task --list-assignable: ${e.message}\n`);
       process.stdout.write('[]');
     }
   } else {
-    const [pendingDir, instanceId, isReasoningLaneArg] = process.argv.slice(2);
+    const [pendingDir, instanceId] = process.argv.slice(2);
     try {
-      const items = pickClaimableTasks(pendingDir, instanceId, { isReasoningLane: isReasoningLaneArg === 'true' });
+      const items = pickClaimableTasks(pendingDir, instanceId);
       for (const name of items) console.log(name);
     } catch (e) {
       // Best-effort, matching the removed inline script's own catch-and-fall-through --

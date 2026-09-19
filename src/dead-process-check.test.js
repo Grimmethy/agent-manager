@@ -1,5 +1,6 @@
 'use strict';
 
+process.env.AGENT_MANAGER_LOCAL_GPU = '3090'; // lane ids: worker-3090 (+ worker-p40 when the P40 vars are set) -- src/lanes.js
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('fs');
@@ -43,13 +44,13 @@ function writeHeartbeat(dir, instanceId, overrides = {}) {
 
 test('a dot-prefixed state file (.active-local-model.json shape) is never mistaken for a dead worker', () => {
   const dir = tempInstancesDir();
-  // Real, healthy heartbeat for worker-reasoning.
-  writeHeartbeat(dir, 'worker-reasoning');
+  // Real, healthy heartbeat for worker-p40.
+  writeHeartbeat(dir, 'worker-p40');
   // The model-swap-guard's own state file: has `instanceId` matching a real worker, but no
   // lastHeartbeat/pid -- exactly the shape that used to produce a NaN age and a false
   // "process confirmed gone" verdict.
   fs.writeFileSync(path.join(dir, '.active-local-model.json'), JSON.stringify({
-    instanceId: 'worker-reasoning', model: 'qwen3.8:27b-q4_K_M', tier: 'high', updatedAt: new Date().toISOString(),
+    instanceId: 'worker-p40', model: 'qwen3.8:27b-q4_K_M', tier: 'high', updatedAt: new Date().toISOString(),
   }));
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
@@ -59,8 +60,8 @@ test('a dot-prefixed state file (.active-local-model.json shape) is never mistak
 
 test('the watchdog cooldown file itself (keyed by instanceId, no top-level instanceId field) is silently skipped, not flagged', () => {
   const dir = tempInstancesDir();
-  writeHeartbeat(dir, 'worker-1');
-  fs.writeFileSync(path.join(dir, '.watchdog-restart-cooldown.json'), JSON.stringify({ 'worker-1': Date.now() }));
+  writeHeartbeat(dir, 'worker-3090');
+  fs.writeFileSync(path.join(dir, '.watchdog-restart-cooldown.json'), JSON.stringify({ 'worker-3090': Date.now() }));
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
   const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
@@ -71,17 +72,17 @@ test('a genuinely dead worker (pid gone, stale heartbeat) still produces a resta
   const dir = tempInstancesDir();
   const longDeadPid = 999999; // astronomically unlikely to be a real live pid in the test sandbox
   const staleTime = new Date(Date.now() - 400_000).toISOString(); // > 300s STALE_HEARTBEAT_SECONDS
-  writeHeartbeat(dir, 'worker-1', { pid: longDeadPid, lastHeartbeat: staleTime });
+  writeHeartbeat(dir, 'worker-3090', { pid: longDeadPid, lastHeartbeat: staleTime });
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
   const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.equal(actions.length, 1);
-  assert.equal(actions[0].instanceId, 'worker-1');
+  assert.equal(actions[0].instanceId, 'worker-3090');
   assert.equal(actions[0].action, 'restart');
   assert.match(actions[0].reason, /process confirmed gone/);
 });
 
-// Regression, 2026-09-15: root-caused live from a real duplicate worker-1 (pids 205693
+// Regression, 2026-09-15: root-caused live from a real duplicate worker-3090 (pids 205693
 // and 1198141 both running). heartbeat.js's writeHeartbeatFile overwrites plain `pid`
 // with the in-flight local-draft.js child's OWN pid during a real call -- if that child
 // has since exited (call finished, crashed) while the heartbeat is stale, `pid` alone
@@ -93,7 +94,7 @@ test('a stale heartbeat whose pid (a since-exited call child) looks dead is NOT 
   const dir = tempInstancesDir();
   const longDeadChildPid = 999999; // the exited local-draft.js child -- astronomically unlikely to be live.
   const staleTime = new Date(Date.now() - 400_000).toISOString(); // > 300s STALE_HEARTBEAT_SECONDS
-  writeHeartbeat(dir, 'worker-1', { pid: longDeadChildPid, daemonPid: process.pid, lastHeartbeat: staleTime });
+  writeHeartbeat(dir, 'worker-3090', { pid: longDeadChildPid, daemonPid: process.pid, lastHeartbeat: staleTime });
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
   const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
@@ -125,24 +126,10 @@ test('restartTargetFor: worker-p40 carries the P40 env when both AGENT_MANAGER_P
   }
 });
 
-test('restartTargetFor: worker-reasoning-p40 gets the same P40 env treatment as worker-p40', () => {
-  const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
-  const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
-  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
-  process.env.AGENT_MANAGER_P40_MODEL = 'qwen3.8-p40:27b-q4_K_M';
-  try {
-    const target = restartTargetFor('worker-reasoning-p40');
-    assert.equal(target.env.LOCAL_MODEL, 'qwen3.8-p40:27b-q4_K_M');
-  } finally {
-    if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
-    if (prevModel === undefined) delete process.env.AGENT_MANAGER_P40_MODEL; else process.env.AGENT_MANAGER_P40_MODEL = prevModel;
-  }
-});
-
 // 2026-09-07 follow-up (Grimmethy: "let's disable the p40 until I can get a fan on it"
 // -- the card was found thermally throttling, see agent-manager.env's own comment on the
 // incident): when the P40 env is not configured at all, restartTargetFor now refuses to
-// restart worker-p40/worker-reasoning-p40 entirely (returns null, same as an
+// restart worker-p40/worker-p40 entirely (returns null, same as an
 // unrecognized instanceId) rather than the earlier behavior of still restarting it
 // WITHOUT the P40 env -- that earlier behavior was itself the original bug this file's
 // other tests cover (silently falling back to the host GPU); simply omitting the env
@@ -155,7 +142,6 @@ test('restartTargetFor: refuses to restart worker-p40 at all when the P40 vars a
   delete process.env.AGENT_MANAGER_P40_MODEL;
   try {
     assert.equal(restartTargetFor('worker-p40'), null);
-    assert.equal(restartTargetFor('worker-reasoning-p40'), null);
   } finally {
     if (prevUrl !== undefined) process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
     if (prevModel !== undefined) process.env.AGENT_MANAGER_P40_MODEL = prevModel;
@@ -175,14 +161,13 @@ test('restartTargetFor: refuses to restart worker-p40 when only ONE of the two P
   }
 });
 
-test('restartTargetFor: an ordinary worker (worker-1, worker-reasoning) never carries a P40 env, even when the P40 vars happen to be set', () => {
+test('restartTargetFor: an ordinary worker (worker-3090, worker-p40) never carries a P40 env, even when the P40 vars happen to be set', () => {
   const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
   const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
   process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
   process.env.AGENT_MANAGER_P40_MODEL = 'qwen3.8-p40:27b-q4_K_M';
   try {
-    assert.equal('env' in restartTargetFor('worker-1'), false);
-    assert.equal('env' in restartTargetFor('worker-reasoning'), false);
+    assert.equal('env' in restartTargetFor('worker-3090'), false);
     assert.equal('env' in restartTargetFor('reviewer'), false);
   } finally {
     if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
@@ -249,7 +234,7 @@ test('a worker-p40 stuck "working" the SAME task for the P40 lane\'s real worst-
   assert.deepEqual(actions, [], 'still within the P40 lane\'s real worst-case chain -- must not be treated as a hung/zombie process');
 });
 
-test('a worker-reasoning-p40 past the P40 lane\'s scaled threshold (3840s) IS flagged as a zombie -- the exception is not unlimited', () => {
+test('a worker-p40 past the P40 lane\'s scaled threshold (3840s) IS flagged as a zombie -- the exception is not unlimited', () => {
   const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
   const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
   process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
@@ -257,12 +242,12 @@ test('a worker-reasoning-p40 past the P40 lane\'s scaled threshold (3840s) IS fl
   try {
     const dir = tempInstancesDir();
     const staleTime = new Date(Date.now() - 3900_000).toISOString(); // past 3840s
-    writeHeartbeat(dir, 'worker-reasoning-p40', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: staleTime, stateSince: staleTime, pid: process.pid });
+    writeHeartbeat(dir, 'worker-p40', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: staleTime, stateSince: staleTime, pid: process.pid });
     const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
     const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
     assert.equal(actions.length, 1);
-    assert.equal(actions[0].instanceId, 'worker-reasoning-p40');
+    assert.equal(actions[0].instanceId, 'worker-p40');
     assert.equal(actions[0].action, 'restart-after-kill');
   } finally {
     if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
@@ -273,15 +258,15 @@ test('a worker-reasoning-p40 past the P40 lane\'s scaled threshold (3840s) IS fl
 // A non-P40 worker at the SAME 3600s age it takes to clear the P40's own longer threshold
 // must still be flagged -- confirms the exception is scoped to the two P40 instanceIds,
 // not a global change to WORKER_ZOMBIE_THRESHOLD_SECONDS.
-test('a worker-1 stuck for the P40 lane\'s worst-case duration (3600s) IS still flagged as a zombie -- the exception does not leak to other lanes', () => {
+test('a worker-3090 stuck for the P40 lane\'s worst-case duration (3600s) IS still flagged as a zombie -- the exception does not leak to other lanes', () => {
   const dir = tempInstancesDir();
   const stuckTime = new Date(Date.now() - 3600_000).toISOString();
-  writeHeartbeat(dir, 'worker-1', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: stuckTime, stateSince: stuckTime, pid: process.pid });
+  writeHeartbeat(dir, 'worker-3090', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: stuckTime, stateSince: stuckTime, pid: process.pid });
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
   const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.equal(actions.length, 1);
-  assert.equal(actions[0].instanceId, 'worker-1');
+  assert.equal(actions[0].instanceId, 'worker-3090');
   assert.equal(actions[0].action, 'restart-after-kill');
 });
 
@@ -307,9 +292,9 @@ const { findOrphanedModelCallProcesses } = require('./dead-process-check.js');
 
 test('flags a local-draft.js process whose ppid matches no currently-live worker heartbeat (e.g. reparented to pid 1)', () => {
   const dir = tempInstancesDir();
-  writeHeartbeat(dir, 'worker-1', { pid: 555 }); // the REAL, current worker-1 -- a different pid than the orphan's ppid below.
+  writeHeartbeat(dir, 'worker-3090', { pid: 555 }); // the REAL, current worker-3090 -- a different pid than the orphan's ppid below.
   const listProcesses = () => [
-    { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+    { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-3090/some-task.json' },
   ];
   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.equal(orphans.length, 1);
@@ -321,9 +306,9 @@ test('flags a local-draft.js process whose ppid matches no currently-live worker
 // The old ppid===1 check would have missed this entirely.
 test('flags a local-draft.js process whose ppid is a non-1, non-worker pid (reparented to a now-dead session reaper, not init)', () => {
   const dir = tempInstancesDir();
-  writeHeartbeat(dir, 'worker-1', { pid: 555 });
+  writeHeartbeat(dir, 'worker-3090', { pid: 555 });
   const listProcesses = () => [
-    { pid: 100, ppid: 902699, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+    { pid: 100, ppid: 902699, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-3090/some-task.json' },
   ];
   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.equal(orphans.length, 1);
@@ -332,9 +317,9 @@ test('flags a local-draft.js process whose ppid is a non-1, non-worker pid (repa
 
 test('does not flag a local-draft.js process whose parent IS the currently-live worker recorded in its own heartbeat', () => {
   const dir = tempInstancesDir();
-  writeHeartbeat(dir, 'worker-1', { pid: 555 });
+  writeHeartbeat(dir, 'worker-3090', { pid: 555 });
   const listProcesses = () => [
-    { pid: 100, ppid: 555, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+    { pid: 100, ppid: 555, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-3090/some-task.json' },
   ];
   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.deepEqual(orphans, []);
@@ -349,11 +334,11 @@ test('does not flag a local-draft.js process whose parent IS the currently-live 
 // ancestor chain, not just the immediate parent.
 test('does not flag a local-draft.js process reached through an intermediate command-substitution subshell', () => {
   const dir = tempInstancesDir();
-  writeHeartbeat(dir, 'worker-1', { pid: 555 });
+  writeHeartbeat(dir, 'worker-3090', { pid: 555 });
   const listProcesses = () => [
-    { pid: 555, ppid: 1, cmd: 'bash local-worker.sh worker-1' },
+    { pid: 555, ppid: 1, cmd: 'bash local-worker.sh worker-3090' },
     { pid: 700, ppid: 555, cmd: 'bash -c node /repo/src/local-draft.js ...' }, // the subshell $(...) forks
-    { pid: 100, ppid: 700, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+    { pid: 100, ppid: 700, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-3090/some-task.json' },
   ];
   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.deepEqual(orphans, []);
@@ -368,11 +353,11 @@ test('does not flag a local-draft.js process reached through an intermediate com
 // exactly, sampled repeatedly while a draft call was actively in progress.
 test('does not flag a local-draft.js process whose OWN pid is the live worker heartbeat pid (heartbeat.js self-write during an active call)', () => {
   const dir = tempInstancesDir();
-  writeHeartbeat(dir, 'worker-reasoning', { pid: 100 }); // heartbeat.js overwrote this to the child's own pid mid-call.
+  writeHeartbeat(dir, 'worker-p40', { pid: 100 }); // heartbeat.js overwrote this to the child's own pid mid-call.
   const listProcesses = () => [
-    { pid: 555, ppid: 1, cmd: 'bash local-worker.sh worker-reasoning' },
-    { pid: 700, ppid: 555, cmd: 'bash local-worker.sh worker-reasoning' }, // command-substitution subshell, still showing the parent's own argv pre-exec.
-    { pid: 100, ppid: 700, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-reasoning/some-task.json' },
+    { pid: 555, ppid: 1, cmd: 'bash local-worker.sh worker-p40' },
+    { pid: 700, ppid: 555, cmd: 'bash local-worker.sh worker-p40' }, // command-substitution subshell, still showing the parent's own argv pre-exec.
+    { pid: 100, ppid: 700, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-p40/some-task.json' },
   ];
   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.deepEqual(orphans, []);
@@ -380,10 +365,10 @@ test('does not flag a local-draft.js process whose OWN pid is the live worker he
 
 test('still flags a genuine orphan reached through a dead intermediate process (chain never reaches a live worker)', () => {
   const dir = tempInstancesDir();
-  writeHeartbeat(dir, 'worker-1', { pid: 555 });
+  writeHeartbeat(dir, 'worker-3090', { pid: 555 });
   const listProcesses = () => [
     { pid: 902699, ppid: 1, cmd: 'session-scope-manager' }, // the now-dead reaper, still present this ps snapshot
-    { pid: 100, ppid: 902699, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+    { pid: 100, ppid: 902699, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-3090/some-task.json' },
   ];
   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.equal(orphans.length, 1);
@@ -409,19 +394,19 @@ test('returns an empty list (never throws) when `ps` itself fails', () => {
 
 test('returns an empty list (never throws) when instancesDir itself is unreadable', () => {
   const listProcesses = () => [
-    { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/some-task.json' },
+    { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-3090/some-task.json' },
   ];
   assert.doesNotThrow(() => findOrphanedModelCallProcesses({ listProcesses, instancesDir: '/no/such/dir' }));
 });
 
 test('flags multiple real orphans in one pass, leaving the one real live worker child alone', () => {
   const dir = tempInstancesDir();
-  writeHeartbeat(dir, 'worker-1', { pid: 555 });
-  writeHeartbeat(dir, 'worker-reasoning', { pid: 777 });
+  writeHeartbeat(dir, 'worker-3090', { pid: 555 });
+  writeHeartbeat(dir, 'worker-p40', { pid: 777 });
   const listProcesses = () => [
-    { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/a.json' },
-    { pid: 200, ppid: 777, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-reasoning/b.json' }, // legitimate -- ppid matches worker-reasoning's real, current pid.
-    { pid: 300, ppid: 999, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-1/c.json' },
+    { pid: 100, ppid: 1, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-3090/a.json' },
+    { pid: 200, ppid: 777, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-p40/b.json' }, // legitimate -- ppid matches worker-p40's real, current pid.
+    { pid: 300, ppid: 999, cmd: 'node /repo/src/local-draft.js /repo/queue/drafting/worker-3090/c.json' },
   ];
   const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir });
   assert.deepEqual(orphans.map((o) => o.pid), [100, 300]);
@@ -447,25 +432,39 @@ test('deadProcessCheck: a stale heartbeat with a dead pid emits one restart deci
     // whose own pid is long dead. The pidfile is present for demonstration, but it is
     // deliberately held by NO live pid (no spawned process at all in this test) -- the
     // gate on its liveness is queue-watcher.sh's job, and must not affect this module.
-    fs.writeFileSync(path.join(pidDir, 'worker-1.pid'), '9999999');
+    fs.writeFileSync(path.join(pidDir, 'worker-3090.pid'), '9999999');
     const staleTime = new Date(Date.now() - 400_000).toISOString();
-    writeHeartbeat(instancesDir, 'worker-1', { pid: 9999999, lastHeartbeat: staleTime });
+    writeHeartbeat(instancesDir, 'worker-3090', { pid: 9999999, lastHeartbeat: staleTime });
 
     const actions = deadProcessCheck({ instancesDir, cooldownPath, now: Date.now() });
     assert.equal(actions.length, 1);
-    assert.equal(actions[0].instanceId, 'worker-1');
+    assert.equal(actions[0].instanceId, 'worker-3090');
     assert.equal(actions[0].action, 'restart');
     assert.match(actions[0].reason, /process confirmed gone/);
     assert.equal(actions[0].script, 'local-worker.sh');
-    assert.deepEqual(actions[0].args, ['worker-1']);
+    assert.deepEqual(actions[0].args, ['worker-3090']);
     // The handle the bash-side pidfile gate keys off:
-    assert.equal(actions[0].pidfileName, 'worker-1.pid');
+    assert.equal(actions[0].pidfileName, 'worker-3090.pid');
     // The decision was committed: the restart cooldown was recorded, so a just-launched
     // replacement that hasn't written its first heartbeat yet won't get a double restart.
     assert.equal(fs.existsSync(cooldownPath), true);
-    assert.equal(typeof JSON.parse(fs.readFileSync(cooldownPath, 'utf8'))['worker-1'], 'number');
+    assert.equal(typeof JSON.parse(fs.readFileSync(cooldownPath, 'utf8'))['worker-3090'], 'number');
   } finally {
     fs.rmSync(instancesDir, { recursive: true, force: true });
     fs.rmSync(pidDir, { recursive: true, force: true });
   }
+});
+
+test('restartTargetFor: legacy lane names and undefined lanes get NO restart rule (a stale old-layout heartbeat is never resurrected)', () => {
+  for (const id of ['worker-1', 'worker-reasoning', 'worker-reasoning-p40', 'worker-unknown']) {
+    assert.equal(restartTargetFor(id), null, id);
+  }
+});
+
+test('restartTargetFor: the host GPU lane restarts with no env (it inherits the host Ollama)', () => {
+  const target = restartTargetFor('worker-3090');
+  assert.equal(target.script, 'local-worker.sh');
+  assert.deepEqual(target.args, ['worker-3090']);
+  assert.equal(target.pidfileName, 'worker-3090.pid');
+  assert.equal('env' in target, false);
 });

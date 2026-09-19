@@ -54,27 +54,31 @@ class PipelineRunningTest(unittest.TestCase):
         p2 = mock.patch.object(app, "_pipeline_daemon_pids", return_value=[])
         p2.start()
         self.addCleanup(p2.stop)
+        # Lane ids come from src/lanes.js; pin them so the test never shells out.
+        p3 = mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090"])
+        p3.start()
+        self.addCleanup(p3.stop)
         self.addCleanup(self._tmp.cleanup)
 
     def test_fresh_worker_heartbeat_means_running(self):
-        _hb(self.inst, "worker-1", status="working", age_seconds=5, pid=os.getpid())
+        _hb(self.inst, "worker-3090", status="working", age_seconds=5, pid=os.getpid())
         self.assertTrue(app._pipeline_running())
 
     def test_stale_queued_heartbeat_but_live_pid_still_counts_as_running(self):
         # The incident: queued > OTHER_STALE_SECONDS, but the worker process is alive.
-        _hb(self.inst, "worker-1", status="queued",
+        _hb(self.inst, "worker-3090", status="queued",
             age_seconds=app.OTHER_STALE_SECONDS + 300, pid=os.getpid())
         self.assertTrue(app._pipeline_running(), "a blocked-but-alive worker is a running pipeline")
         self.assertTrue(app._pipeline_stoppable())
 
     def test_stale_heartbeat_with_dead_pid_and_no_daemons_is_not_running(self):
-        _hb(self.inst, "worker-1", status="queued",
+        _hb(self.inst, "worker-3090", status="queued",
             age_seconds=app.OTHER_STALE_SECONDS + 300, pid=2_000_000_000)
         self.assertFalse(app._pipeline_running())
         self.assertFalse(app._pipeline_stoppable())
 
     def test_worker1_heartbeat_missing_but_a_sibling_pid_is_live(self):
-        _hb(self.inst, "review-runner", status="idle", age_seconds=9999, pid=os.getpid())
+        _hb(self.inst, "reviewer", status="idle", age_seconds=9999, pid=os.getpid())
         self.assertTrue(app._pipeline_running())
 
     def test_running_and_stoppable_fall_through_to_a_real_daemon_scan_with_no_heartbeats(self):
@@ -84,7 +88,7 @@ class PipelineRunningTest(unittest.TestCase):
             self.assertTrue(app._pipeline_stoppable())
 
     def test_status_endpoint_exposes_stoppable(self):
-        _hb(self.inst, "worker-1", status="queued",
+        _hb(self.inst, "worker-3090", status="queued",
             age_seconds=app.OTHER_STALE_SECONDS + 300, pid=os.getpid())
         client = app.app.test_client()
         body = client.get("/api/pipeline/status").get_json()

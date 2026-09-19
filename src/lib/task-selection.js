@@ -4,7 +4,6 @@
 
 const path = require('path');
 const { registerTaskSource, getRegisteredSources, resolveSourceName } = require('../task-source-registry.js');
-const { reasoningTierFor } = require('../model-provider.js');
 const { getConfig } = require('../config.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('../sdk/candidate-fulfillment.js');
 
@@ -17,7 +16,7 @@ function nextProductSpecSectionTask() {
   return task;
 }
 
-function getNextTask({ tierFilter } = {}) {
+function getNextTask() {
   const { taskSourceAllowlist } = getConfig();
   const restricted = taskSourceAllowlist && taskSourceAllowlist.length > 0;
   for (const source of getRegisteredSources()) {
@@ -33,7 +32,6 @@ function getNextTask({ tierFilter } = {}) {
     if (typeof source.next !== 'function') continue;
     const task = source.next();
     if (!task) continue;
-    if (tierFilter && reasoningTierFor(task) !== tierFilter) continue;
     return task;
   }
   return null;

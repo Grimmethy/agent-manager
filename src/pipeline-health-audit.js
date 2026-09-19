@@ -28,29 +28,25 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFileSync } = require('child_process');
+const childProcess = require('child_process'); // execFileSync looked up at call time so tests can stub `ps`
 const { hasLiveWorkerAncestor } = require('./dead-process-check.js');
+const { getLanes } = require('./lanes.js');
 
 const CHECK_INTERVAL_MS = 60 * 60 * 1000; // hourly -- matches system-report.js's own hourly period, a natural fit since "completions in the last hour" IS the window this checks.
 const THROUGHPUT_WINDOW_MS = 60 * 60 * 1000;
 
-// Every long-running daemon this pipeline expects, and the pattern that identifies it in
-// a process list -- worker-reasoning is deliberately NOT matched by the worker-1 pattern
-// (anchored with a trailing word boundary) despite the substring overlap.
-//
-// 2026-09-18: `\b` alone is NOT enough to stop worker-reasoning's pattern also matching
-// `local-worker.sh worker-reasoning-p40` -- a hyphen is itself a non-word character, so
-// `\b` is satisfied at the "g"/"-" boundary same as it would be at a space or end-of-
-// string. Confirmed live: every real worker-reasoning-p40 daemon was double-counted as a
-// second "worker-reasoning" instance. `(?!-)` rules out anything immediately followed by
-// a hyphen (i.e. a `-p40` suffix), while still matching the bare `worker-reasoning`
-// process a space or end-of-string legitimately follows.
-const EXPECTED_DAEMONS = [
-  { name: 'worker-1', pattern: /local-worker\.sh worker-1\b/ },
-  { name: 'worker-reasoning', pattern: /local-worker\.sh worker-reasoning\b(?!-)/ },
-  { name: 'queue-watchdog', pattern: /queue-watcher\.sh/ },
-  { name: 'reviewer', pattern: /review-runner\.sh/ },
-];
+// Every long-running daemon this pipeline expects, and the pattern that identifies it in a
+// process list. One worker daemon per lane (src/lanes.js -- worker-3090, worker-p40, ...), plus the
+// watchdog and reviewer. `(?![\w-])` anchors a lane id so one id never matches another that merely
+// starts with it (a hyphen is itself a non-word character, so `\b` alone would not do).
+function expectedDaemons() {
+  const escapeRe = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return [
+    ...getLanes().map((l) => ({ name: l.id, pattern: new RegExp(`local-worker\\.sh ${escapeRe(l.id)}(?![\\w-])`) })),
+    { name: 'queue-watchdog', pattern: /queue-watcher\.sh/ },
+    { name: 'reviewer', pattern: /review-runner\.sh/ },
+  ];
+}
 
 // Same known-bad-signature shape as pipeline-self-audit.js's REASON_CATEGORIES, but over
 // recent LOG lines instead of blockedReason text -- both real incidents caught live this
@@ -120,7 +116,7 @@ function countPending(pipelineDir) {
 }
 
 function listProcesses() {
-  const out = execFileSync('ps', ['-eo', 'pid,ppid,cmd', '--no-headers'], { encoding: 'utf8' });
+  const out = childProcess.execFileSync('ps', ['-eo', 'pid,ppid,cmd', '--no-headers'], { encoding: 'utf8' });
   return out.split('\n').map((line) => {
     const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
     return m ? { pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] } : null;
@@ -155,7 +151,7 @@ function daemonRoots(ps, pattern) {
 
 function checkDaemonCounts(ps) {
   const findings = [];
-  for (const daemon of EXPECTED_DAEMONS) {
+  for (const daemon of expectedDaemons()) {
     const roots = daemonRoots(ps, daemon.pattern);
     if (roots.length === 0) findings.push(`${daemon.name}: no process found (dead-process-check.js should restart this on its own next tick, but it's absent right now)`);
     else if (roots.length > 1) findings.push(`${daemon.name}: ${roots.length} processes running simultaneously (pids ${roots.map((m) => m.pid).join(', ')}) -- should only ever be one`);
