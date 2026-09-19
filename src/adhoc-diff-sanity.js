@@ -130,6 +130,21 @@ const RESTRICTION_SENTENCE_RE = /\b(?:do ?n(?:'?o?)?t|don['’]t|never|must not|
 // below) so a path merely cited for context doesn't get mistaken for an edit target.
 const EDIT_VERB_RE = /\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix)\b/i;
 
+// A sentence that REPORTS the result of a scope check ("No other `src/` file modified --
+// `git status --porcelain src/` -- PASS") is evidence about what was done, not a restriction on
+// what may be done -- but it trips RESTRICTION_SENTENCE_RE's "no other ... modified" branch and
+// the extractors below then forbid every path it names, including the task's own edit targets
+// (adhoc-brain-dump-bd-1788906657760, blocked twice on `forbidden "src/"`). Verification
+// evidence -- a git status/diff command, --porcelain/--stat, a PASS/FAIL verdict, a checked box,
+// or "verified"/"confirmed" -- marks a report. An imperative prohibition ("do not", "never",
+// "must not") in the same sentence wins: "Never modify src/x.js -- verify with git diff" is
+// still a restriction that merely mentions a check.
+const VERIFICATION_MARKER_RE = /\bgit (?:status|diff)\b|--porcelain\b|--stat\b|\b(?:PASS|FAIL)\b|\[x\]|[\u2713\u2714]|\b[Vv]erified\b|\b[Cc]onfirmed\b/;
+const IMPERATIVE_PROHIBITION_RE = /\b(?:do ?n(?:'?o?)?t|don['\u2019]t|never|must not|should not|shouldn['\u2019]t|may not)\b/i;
+function isVerificationReport(sentence) {
+  return VERIFICATION_MARKER_RE.test(sentence) && !IMPERATIVE_PROHIBITION_RE.test(sentence);
+}
+
 function extractForbiddenPaths(text) {
   const out = new Set();
   const add = (raw) => {
@@ -141,6 +156,7 @@ function extractForbiddenPaths(text) {
   const sentences = String(text || '').split(/(?<=[.!?:])\s+|\n+/);
   for (const sen of sentences) {
     if (!RESTRICTION_SENTENCE_RE.test(sen)) continue;
+    if (isVerificationReport(sen)) continue;
     for (const p of sen.matchAll(/\b(?:src|python|scripts|lib|tests?|docs|node_modules)\/[\w./@-]*[\w]/gi)) add(p[0]);
     for (const p of sen.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b/gi)) add(p[0]);
     // (?!\/[A-Za-z0-9_-]) after the capture group (2026-09-15, root-caused live): without
