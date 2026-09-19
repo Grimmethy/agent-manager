@@ -62,6 +62,31 @@ test('rejectRetryCheck clears stale planResponse/implementResponse on a genuine 
   assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /cleared stale plan\/implement state/.test(h.detail || '')));
 });
 
+// 2026-09-19, ghost-in-the-machine retroactive audit (pipeline_forensics blocked/ bucket):
+// blockedStage/blockedReason used to survive this exact requeue untouched -- local-draft.js's
+// draftTask() reads task.blockedStage as a LIVE gate right after critique on the NEXT
+// attempt, so a stale leftover value short-circuited every subsequent automatic attempt
+// straight back to 'blocked' using the FIRST rejection's wording, no matter what the fresh
+// redraft actually produced. Confirmed live: a real pipeline_forensics task's attempts 3 and
+// 4 produced genuinely different, well-structured 4600/5702-char reports, but both were
+// blocked with the byte-identical reason describing attempt 1's 339-char draft.
+test('rejectRetryCheck clears stale blockedStage/blockedReason on a genuine review-rejection requeue, not just planResponse/implementResponse', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    localRejectCount: 0,
+    blockedStage: 'review',
+    blockedReason: 'fabricated reference',
+  });
+
+  rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-1.json'), 'utf8'));
+  assert.equal(requeued.blockedStage, undefined, 'a stale blockedStage must not survive a review-rejection requeue -- it gates local-draft.js\'s next attempt as a live "already blocked" check');
+  assert.equal(requeued.blockedReason, undefined, 'a stale blockedReason must not survive a review-rejection requeue');
+  // The reason is still preserved for the next redraft's prompt -- just no longer live-gated.
+  assert.ok(Array.isArray(requeued.priorRejectionFeedback) && requeued.priorRejectionFeedback.includes('fabricated reference'));
+});
+
 test('rejectRetryCheck does NOT clear planResponse/implementResponse for a retryable draft-block continuation (not a review rejection)', () => {
   const { blockedDir, pendingDir } = setupDirs();
   const task = {
