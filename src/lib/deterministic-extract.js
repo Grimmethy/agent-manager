@@ -16,6 +16,18 @@ function computePlanNumPredict(task) {
   const ctx = task.promptContext;
   const hasLargeEvidenceBundle = !!(ctx && ctx.evidenceText && ctx.evidenceText.length > 10000);
   const hasLargePromptContext = !!(ctx && JSON.stringify(ctx).length > 6000);
+  // change_review (2026-09-19, same incident as implement-critique.js's computeImplementBudget
+  // comment): its PART 1 plan pass has to walk EVERY hunk of ctx.unitDiff, one line of
+  // classification each. The generic "large prompt context" branch below already gives a
+  // change_review task with a 9000-char diff the 2800 floor, and that was fine -- but a
+  // genuinely large diff (>10000 chars) exhausted that SAME 2800 purely to think:true's
+  // reasoning trace before a single plan line got written (confirmed live: change-review-
+  // 7eecbfa's 15057-char diff and change-review-b8a6f21's 12202-char diff, both a 0-char
+  // plan on every attempt). Only kicks in above the existing threshold's own proven-good
+  // range, so the flat 2800 stays exactly as before for every diff size already confirmed
+  // to work with it.
+  const unitDiffChars = (ctx && ctx.unitDiff) ? ctx.unitDiff.length : 0;
+  if (unitDiffChars > 10000) return Math.min(8000, Math.max(6000, Math.ceil(unitDiffChars / 3)));
   return (ctx && ctx.brainDumpEntryId) || hasLargeEvidenceBundle || hasLargePromptContext ? 2800 : 1400;
 }
 

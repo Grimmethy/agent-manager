@@ -236,10 +236,28 @@ function computeImplementBudget(task, implPrompt) {
   // pass alone still exhausted the un-widened 2800 floor. Belongs in this class for the
   // exact reason pipeline_forensics does.
   const isWholeDocReport = task.source === 'pipeline_forensics' || task.source === 'pipeline_debrief';
-  const implNumPredictCeiling = (task.source === 'product_spec' || task.source === 'backlog_decomposition' || task.source === 'product_spec_outline' || isWholeDocReport) ? 16000 : 8000;
+  // change_review (2026-09-19, ghost-in-the-machine retroactive audit of the blocked/
+  // bucket): the SAME "how much output" signal is the evidence blob, not the plan" shape
+  // pipeline_forensics/pipeline_debrief already document above -- its implement pass must
+  // walk every hunk of task.promptContext.unitDiff and write a full per-hunk verdict, but
+  // that diff is not reflected in planChars at all (change-review.js's own PART 1 plan
+  // pass is a short hunk-classification list, not sized to the diff). Confirmed live:
+  // change-review-7eecbfa (15057-char diff) and change-review-b8a6f21 (12202-char diff)
+  // both hit a 0-char PLAN (the same think:true-eats-the-budget starvation the forensics
+  // comment above describes) which collapsed their implement floor to the un-widened 2800,
+  // and both then got blocked/exhausted for a review "truncated mid-sentence" -- an
+  // unwinnable loop identical in shape to the forensics one, just never given the same fix.
+  const isChangeReview = task.source === 'change_review';
+  const implNumPredictCeiling = (task.source === 'product_spec' || task.source === 'backlog_decomposition' || task.source === 'product_spec_outline' || isWholeDocReport || isChangeReview) ? 16000 : 8000;
+  const unitDiffChars = isChangeReview ? ((task.promptContext && task.promptContext.unitDiff) || '').length : 0;
+  // Only above the same 10000-char threshold deterministic-extract.js's computePlanNumPredict
+  // uses for the identical reason -- a smaller change_review diff already clears the normal
+  // planChars*2 floor below just fine and doesn't need the wider budget.
   const forensicsFloor = isWholeDocReport
     ? Math.max(6000, Math.ceil(((task.promptContext && task.promptContext.evidenceText) || '').length / 8))
-    : 2800;
+    : (isChangeReview && unitDiffChars > 10000)
+      ? Math.max(6000, Math.ceil(unitDiffChars / 3))
+      : 2800;
   const implNumPredict = hasFixedLiterals
     ? Math.min(implNumPredictCeiling, Math.max(1400, fixedLiteralsChars))
     : Math.min(implNumPredictCeiling, Math.max(forensicsFloor, planChars * 2));
