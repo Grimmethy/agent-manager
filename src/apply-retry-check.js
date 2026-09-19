@@ -37,6 +37,8 @@ const { getConfig } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
+const { decideFindingResolved } = require('./premise-recheck-decision.js');
+const { alreadyEscalatedSinceLastReadmission } = require('./reject-retry-check.js');
 
 const MAX_APPLY_RETRIES = 2;
 
@@ -63,8 +65,51 @@ function isDivergedHistoryFailure(task) {
   return isApplyFailure(task) && GIT_DIVERGED_RE.test(String(task.blockedReason || ''));
 }
 
-function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, pipelineDir, recordModelOutcome = defaultRecordModelOutcome }) {
-  const summary = { checked: 0, requeued: 0, exhausted: 0, errors: 0, errorDetails: [] };
+// 2026-09-18 (observability-fix-ac-169): apply-group-b.js's own "find string not found in
+// <file>" -- the edit's find string no longer matches the file. For a scanner-derived
+// candidate that very often means the flagged code was since FIXED by unrelated work, and
+// every redraft just re-anchors on the same stale candidate. See decideFindingResolved.
+const FIND_NOT_FOUND_RE = /find string not found in /i;
+function isFindStringMiss(task) {
+  return isApplyFailure(task) && FIND_NOT_FOUND_RE.test(String(task.blockedReason || ''));
+}
+
+function buildExhaustedApplyQuestion(task) {
+  return [
+    `An apply failure survived ${MAX_APPLY_RETRIES} automatic redraft attempts: ${String(task.blockedReason || '(no reason recorded)')}`,
+    '',
+    isFindStringMiss(task)
+      ? 'The draft\'s edit could not be matched against the real file. Common cause: the '
+        + 'candidate\'s citation is stale -- something else may have already changed or fixed '
+        + 'that code, and a deterministic re-scan could not confirm it either way. Check the '
+        + 'real file: if the issue is already fixed, Archive this task; if the citation is '
+        + 'merely stale, correct it and requeue.'
+      : 'A fresh draft against current code kept failing to apply. Check whether another task '
+        + 'changed the same lines, and either requeue after reconciling or Archive it.',
+  ].join('\n');
+}
+
+// Lands a task whose site is verifiably resolved exactly the way review-task.js lands a
+// confirmed FALSE POSITIVE refusal (decidePremiseRecheckOutcome): the stale edit is replaced
+// by the documented "FALSE POSITIVE -- <why>" line (leaving it would just fail to apply
+// again) and the task moves to approved/, where apply records it as a normal dismissal.
+function landAsResolvedFalsePositive(task, name, filePath, approvedDir) {
+  const why = 'the candidate\'s own code site no longer matches, and the source\'s deterministic scanner rules find nothing flagged at it in the current file';
+  task.implementResponse = `FALSE POSITIVE -- ${why}`;
+  task.reviewedAt = new Date().toISOString();
+  task.reviewProvider = 'deterministic-apply-site-resolved';
+  task.localVerdict = `Auto-approved: apply failed with "${String(task.blockedReason || '').slice(0, 120)}", and a deterministic re-scan (${why}) confirms the finding is already resolved -- verified, not a judgment call (no model call spent).`;
+  delete task.blockedReason;
+  delete task.blockedStage;
+  appendHistoryEvent(task, 'approved', 'apply-retry-check: deterministic-apply-site-resolved -- find string not found, but the candidate site is clean in the current file');
+  fs.mkdirSync(approvedDir, { recursive: true });
+  fs.writeFileSync(path.join(approvedDir, name), JSON.stringify(task, null, 2));
+  fs.unlinkSync(filePath);
+}
+
+function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approvedDir, pipelineDir, repoRoot, extraRoots, decideResolved = decideFindingResolved, recordModelOutcome = defaultRecordModelOutcome }) {
+  const summary = { checked: 0, requeued: 0, exhausted: 0, resolved: 0, errors: 0, errorDetails: [] };
+  const approvedDirResolved = approvedDir || (pipelineDir ? path.join(pipelineDir, 'queue', 'approved') : null);
   let names = [];
   try {
     names = fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'));
@@ -118,12 +163,44 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, pipeli
         }
       }
 
+      // Checked before the retry-count logic, regardless of retryCount: a resolved finding
+      // needs no further redraft, and a task ALREADY at the cap (the AC-169 state) is
+      // exactly the one that would otherwise never be looked at again.
+      if (isFindStringMiss(task) && approvedDirResolved) {
+        step = 'resolve';
+        const resolved = decideResolved(task, { repoRoot, extraRoots });
+        if (resolved) {
+          landAsResolvedFalsePositive(task, name, filePath, approvedDirResolved);
+          summary.resolved++;
+          continue;
+        }
+      }
+
       const retryCount = Number(task.applyRetryCount) || 0;
       if (retryCount >= MAX_APPLY_RETRIES) {
+        const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
+        // Exhaustion used to be a permanent dead end -- stamp 'exhausted' and stay in
+        // blocked/ forever, nothing ever reading it back out (reject-retry-check.js closed
+        // the same gap for review rejections 2026-09-17/18). Escalate to a human instead.
+        // Deliberately NOT gated on alreadyStamped: tasks stamped on an earlier tick (before
+        // this existed) are exactly the ones stuck right now.
+        if (needsClarificationDir && !alreadyEscalatedSinceLastReadmission(task)) {
+          step = 'record';
+          task.needsClarification = { reason: 'design-decision', openQuestions: buildExhaustedApplyQuestion(task) };
+          if (!alreadyStamped) appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_APPLY_RETRIES} apply retries used`);
+          appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting apply retries');
+          if (pipelineDir) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'apply-retry-check:retry-cap-exhausted', pipelineDir });
+          step = 'write';
+          fs.mkdirSync(needsClarificationDir, { recursive: true });
+          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+          step = 'unlink';
+          fs.unlinkSync(filePath);
+          summary.exhausted++;
+          continue;
+        }
         // Same "stamp once, never re-fire" guard reject-retry-check.js uses -- without
         // it this branch would re-append an 'exhausted' history event on every single
         // watchdog tick for as long as the task sits here, unbounded.
-        const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
         if (alreadyStamped) { summary.exhausted++; continue; }
         step = 'record';
         appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_APPLY_RETRIES} apply retries used`);
@@ -158,13 +235,20 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, pipeli
 }
 
 function main() {
-  const { pipelineDir } = getConfig();
+  // Populate the source + deterministic-recheck registries (built-ins AND
+  // AGENT_MANAGER_REGISTER_PATH plugins). This runs as its own one-shot `node` process from
+  // queue-watcher.sh's watchdog with an EMPTY registry otherwise -- decideFindingResolved
+  // would silently return false for every source and the whole resolve path would be inert
+  // in production despite passing its unit tests (same gap reject-retry-check.js documents).
+  require('./task-sources.js');
+  try { require('./config.js').ensureRegistered(); } catch { /* best-effort */ }
+  const { pipelineDir, repoRoot, grepAllowedDirs } = getConfig();
   const queueDir = path.join(pipelineDir, 'queue');
   const blockedDir = path.join(queueDir, 'blocked');
   const pendingDir = path.join(queueDir, 'pending');
   const needsClarificationDir = path.join(queueDir, 'needs-clarification');
 
-  const summary = applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, pipelineDir });
+  const summary = applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, pipelineDir, repoRoot, extraRoots: grepAllowedDirs });
   process.stdout.write(JSON.stringify(summary));
 }
 
