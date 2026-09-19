@@ -27,6 +27,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { runIntegrationGate, realExec } = require('./decompose-integration-gate.js');
+const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 
 const BRANCH_REF = 'refs/decompose-automerge/branch';
 const MAIN_REF = 'refs/decompose-automerge/main';
@@ -51,6 +52,8 @@ function autoMergeVerifiedMoveChild({
 }) {
   if (!repoRoot || !childId) return { merged: false, reason: 'setup-failed', detail: 'no repoRoot/childId' };
   if (!isMechanicalMoveChild(childTask)) return { merged: false, reason: 'not-mechanical' };
+  // Fail closed: this function pushes to main. Off unless the ungated opt-in is set (lib/main-push-policy.js).
+  if (!ungatedMainPushAllowed()) return { merged: false, reason: 'gated', detail: 'ungated main pushes are disabled (AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH); waits for a human merge' };
 
   const branch = `agent/${childId}`;
   const sourceFile = (childTask.promptContext && childTask.promptContext.sourceFile) || '';

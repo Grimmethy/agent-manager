@@ -9,6 +9,19 @@
 // Run: node --test src/apply-task.test.js  (or `npm test`, see package.json)
 
 const test = require('node:test');
+
+// The pre-2026-09-19 direct-to-main behavior still exists behind an explicit opt-in
+// (AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH=true, see lib/main-push-policy.js). These tests keep it
+// covered; the gated default has its own tests at the bottom of this file.
+function ungatedTest(name, fn) {
+  test(name, async (t) => {
+    const saved = process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+    process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = 'true';
+    try { return await fn(t); } finally {
+      if (saved === undefined) delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH; else process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = saved;
+    }
+  });
+}
 const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
@@ -345,7 +358,7 @@ function archDiscoveryTask(overrides = {}) {
   });
 }
 
-test('arch_discovery: commits straight to main, no branch, pushes immediately even without skipPush set', () => {
+ungatedTest('arch_discovery: commits straight to main, no branch, pushes immediately even without skipPush set', () => {
   const gitRunner = createFakeGitRunner();
   const result = applyTask(archDiscoveryTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
@@ -357,7 +370,7 @@ test('arch_discovery: commits straight to main, no branch, pushes immediately ev
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
-test('a source with `directToMain: true` on its registration takes the direct-to-main path even without a DIRECT_TO_MAIN_SOURCES literal entry', () => {
+ungatedTest('a source with `directToMain: true` on its registration takes the direct-to-main path even without a DIRECT_TO_MAIN_SOURCES literal entry', () => {
   const name = 'sa1_direct_probe';
   if (!getRegisteredSource(name)) {
     registerTaskSource(name, {
@@ -379,7 +392,7 @@ test('a source with `directToMain: true` on its registration takes the direct-to
   assert.deepEqual(gitRunner.calls.map((c) => c.name), ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
-test('arch_discovery: still pushes even when skipPush is true -- an unpushed direct-to-main commit would be destroyed by the next resetToMain()', () => {
+ungatedTest('arch_discovery: still pushes even when skipPush is true -- an unpushed direct-to-main commit would be destroyed by the next resetToMain()', () => {
   const gitRunner = createFakeGitRunner();
   const result = applyTask(archDiscoveryTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner, skipPush: true });
 
@@ -389,7 +402,7 @@ test('arch_discovery: still pushes even when skipPush is true -- an unpushed dir
   assert.ok(names.includes('pushMain'));
 });
 
-test('arch_discovery: push failure keeps the commit local instead of rolling it back (there is no branch to roll back)', () => {
+ungatedTest('arch_discovery: push failure keeps the commit local instead of rolling it back (there is no branch to roll back)', () => {
   const gitRunner = createFakeGitRunner({ failOn: 'pushMain', failMessage: 'remote: connection reset' });
   const result = applyTask(archDiscoveryTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
@@ -401,7 +414,7 @@ test('arch_discovery: push failure keeps the commit local instead of rolling it 
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
-test('arch_discovery: artifact write failure resets main instead of trying to delete a branch that was never created', () => {
+ungatedTest('arch_discovery: artifact write failure resets main instead of trying to delete a branch that was never created', () => {
   const gitRunner = createFakeGitRunner();
   const task = archDiscoveryTask({ implementResponse: 'not valid arch-discovery markdown' });
   const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
@@ -414,7 +427,7 @@ test('arch_discovery: artifact write failure resets main instead of trying to de
   assert.deepEqual(names, ['fetchMain', 'resetToMain']);
 });
 
-test('arch_import: a genuinely thrown write error resets main again for cleanup (called twice: once up front, once in the catch)', () => {
+ungatedTest('arch_import: a genuinely thrown write error resets main again for cleanup (called twice: once up front, once in the catch)', () => {
   const gitRunner = createFakeGitRunner();
   // No promptContext at all -> applyArchImportCandidate's destructuring of
   // task.promptContext throws a real TypeError, distinct from the "no candidates,
@@ -475,7 +488,7 @@ test('candidateSplitProposals: throws (rolls back the branch) when the resolved 
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch']);
 });
 
-test('arch_import: same direct-to-main shape as arch_discovery (both sources share DIRECT_TO_MAIN_SOURCES)', () => {
+ungatedTest('arch_import: same direct-to-main shape as arch_discovery (both sources share DIRECT_TO_MAIN_SOURCES)', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({
     domain: 'default',
@@ -504,7 +517,7 @@ test('arch_import: same direct-to-main shape as arch_discovery (both sources sha
 // their real identity in task.source alone. Exercising that exact realistic shape (not
 // domain: 'observability_review', which no real task ever has) is what would have
 // caught the task.domain-vs-task.source bug that made the fast path dead code.
-test('observability_review: real task shape (domain: default, source: observability_review) takes the direct-to-main path', () => {
+ungatedTest('observability_review: real task shape (domain: default, source: observability_review) takes the direct-to-main path', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({
     domain: 'default',
@@ -526,7 +539,7 @@ test('observability_review: real task shape (domain: default, source: observabil
   assert.deepEqual(names, ['fetchMain', 'resetToMain', 'add', 'commit', 'pushMain']);
 });
 
-test('performance_review: same direct-to-main shape (domain: default, source: performance_review)', () => {
+ungatedTest('performance_review: same direct-to-main shape (domain: default, source: performance_review)', () => {
   const gitRunner = createFakeGitRunner();
   const task = baseTask({
     domain: 'default',
@@ -566,7 +579,7 @@ function batchTriageTask(id, extra) {
   });
 }
 
-test('applyDirectToMainBatch: three triage tasks share ONE fetch/reset/commit/push', () => {
+ungatedTest('applyDirectToMainBatch: three triage tasks share ONE fetch/reset/commit/push', () => {
   const gitRunner = createFakeGitRunner();
   const tasks = [batchTriageTask('b1'), batchTriageTask('b2'), batchTriageTask('b3')];
   const out = applyDirectToMainBatch(tasks, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
@@ -606,7 +619,7 @@ test('applyDirectToMainBatch: never stages task-logs/ (gitignored, disk-only) --
   assert.ok(gitRunner.calls.some((c) => c.name === 'commit'), 'the batch still commits');
 });
 
-test('applyDirectToMainBatch: refuses a non-directToMain source instead of batching it', () => {
+ungatedTest('applyDirectToMainBatch: refuses a non-directToMain source instead of batching it', () => {
   const gitRunner = createFakeGitRunner();
   const good = batchTriageTask('ok1');
   const bad = baseTask({ id: 'branchy-1', source: 'trouble_log' }); // real branch source, not directToMain
@@ -619,7 +632,7 @@ test('applyDirectToMainBatch: refuses a non-directToMain source instead of batch
   assert.ok(!gitRunner.calls.some((c) => c.name === 'createBranch'));
 });
 
-test('applyDirectToMainBatch: a push failure marks every batched task failed, commit kept local', () => {
+ungatedTest('applyDirectToMainBatch: a push failure marks every batched task failed, commit kept local', () => {
   const gitRunner = createFakeGitRunner({ failOn: 'pushMain', failMessage: 'remote: connection reset' });
   const out = applyDirectToMainBatch([batchTriageTask('p1'), batchTriageTask('p2')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
 
@@ -1277,4 +1290,52 @@ test('stacked child: a write failure steps off the branch but does NOT delete it
   const names = gitRunner.calls.map((c) => c.name);
   assert.ok(names.includes('checkoutMain'));
   assert.ok(!names.includes('deleteBranch'), 'the shared branch carries committed prior steps -- never delete on cleanup');
+});
+
+// --- Gated default (2026-09-19): nothing reaches main without a human merge ----------------------
+
+test('gated default: a directToMain source (arch_discovery) takes the agent/<id> BRANCH path, never pushMain', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const gitRunner = createFakeGitRunner();
+  const result = applyTask(archDiscoveryTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('createBranch'), 'a branch is created');
+  assert.ok(names.includes('push'), 'the BRANCH is pushed');
+  assert.ok(!names.includes('pushMain'), 'main is never pushed');
+  assert.notEqual(result.branch, gitRunner.mainBranch);
+});
+
+test('gated default: applyDirectToMainBatch appends onto the rolling agent/triage-queue branch and pushes THAT, not main', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const gitRunner = createFakeGitRunner();
+  const tasks = [batchTriageTask('g1'), batchTriageTask('g2')];
+  const out = applyDirectToMainBatch(tasks, { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(out.committed, true);
+  assert.equal(out.pushed, true);
+  assert.equal(out.branch, 'agent/triage-queue');
+  const calls = gitRunner.calls;
+  const names = calls.map((c) => c.name);
+  assert.ok(names.includes('prepareStackedBranch'));
+  assert.deepEqual(calls.find((c) => c.name === 'prepareStackedBranch').args, ['agent/triage-queue']);
+  assert.ok(!names.includes('pushMain'), 'main is never pushed');
+  assert.deepEqual(calls.find((c) => c.name === 'push').args, ['agent/triage-queue']);
+  assert.equal(names.filter((n) => n === 'commit').length, 1, 'one commit for the whole batch');
+  for (const id of ['g1', 'g2']) {
+    assert.equal(out.results[id].succeeded, true);
+    // Must not read as "already on main" to task-disposition.js's DIRECT_RE.
+    assert.doesNotMatch(out.results[id].doneMarker, /committed to (?:master|main)|triage batch/i);
+    assert.match(out.results[id].doneMarker, /agent\/triage-queue/);
+    assert.match(out.results[id].doneMarker, /awaiting a human merge/);
+  }
+});
+
+test('gated default: a triage-queue push failure marks every batched task failed and still never touches main', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const gitRunner = createFakeGitRunner({ failOn: 'push', failMessage: 'remote: connection reset' });
+  const out = applyDirectToMainBatch([batchTriageTask('h1')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(out.pushed, false);
+  assert.equal(out.results.h1.succeeded, false);
+  assert.match(out.results.h1.reason, /agent\/triage-queue failed after commit/);
+  assert.ok(!gitRunner.calls.some((c) => c.name === 'pushMain'));
 });

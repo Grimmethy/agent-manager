@@ -239,7 +239,10 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   //    the record carries one; fall back to agent/<taskId> for a normal (non-stacked)
   //    apply, unchanged from before.
   if (taskId) {
-    const realBranch = record.stacked && record.stacked.branch;
+    // A gated triage-batch task shares ONE rolling branch (agent/triage-queue), named in its apply
+    // note -- not agent/<own id>. Same shape as the stacked case above.
+    const detailBranch = (detail.match(/\bagent\/[A-Za-z0-9._\/-]+/) || [])[0];
+    const realBranch = (record.stacked && record.stacked.branch) || detailBranch;
     const branchKey = realBranch ? realBranch.replace(/^agent\//, '') : taskId;
     const branchLabel = realBranch || `agent/${taskId}`;
     let exists = false;

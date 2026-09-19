@@ -333,3 +333,20 @@ test('TERMINAL_STAGES is the closed vocabulary', () => {
     }
   });
 }
+
+// Gated triage batch (2026-09-19): every task in the batch shares ONE rolling branch,
+// agent/triage-queue, named in its apply note -- not agent/<own id>.
+const TRIAGE_NOTE = 'queued on agent/triage-queue (2 update(s)) -- awaiting a human merge; nothing pushed to main';
+
+test('resolveDisposition: a gated triage-batch task with its branch still open -> pending-merge, NOT abandoned and NOT applied-direct', () => {
+  const r = { id: 'arch-discovery-community-3', ...applied(TRIAGE_NOTE) };
+  const out = resolveDisposition(r, { ctx: ctx({ branches: { 'triage-queue': 2 } }) });
+  assert.equal(out.stage, 'pending-merge');
+  assert.match(out.detail, /agent\/triage-queue/);
+});
+
+test('resolveDisposition: a gated triage-batch task whose commit later reached main by a human merge -> merged (trailer wins)', () => {
+  const r = { id: 'arch-discovery-community-3', ...applied(TRIAGE_NOTE) };
+  const out = resolveDisposition(r, { ctx: ctx({ onMain: { 'arch-discovery-community-3': 'abc123def456' } }) });
+  assert.equal(out.stage, 'merged');
+});
