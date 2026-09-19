@@ -324,6 +324,43 @@ function renderTierMap() {
     ...TIER_SOURCE_MAP.map(([tier, file]) => `  ${tier}  →  ${file}`)].join('\n');
 }
 
+// [{ path, added, removed }] per touched file, parsed from a unified diff. Deterministic, no
+// model. Counts content lines only (the +++/--- file headers are not content).
+function summarizeDiffStat(rawDiff) {
+  const stats = [];
+  let cur = null;
+  for (const line of String(rawDiff || '').split('\n')) {
+    const header = /^diff --git a\/(\S+) b\/(\S+)/.exec(line);
+    if (header) { cur = { path: header[2], added: 0, removed: 0 }; stats.push(cur); continue; }
+    if (!cur || line.startsWith('+++') || line.startsWith('---')) continue;
+    if (line.startsWith('+')) cur.added += 1;
+    else if (line.startsWith('-')) cur.removed += 1;
+  }
+  return stats;
+}
+
+// A compact, never-dropped contrast: what each winner actually SHIPPED (files + line counts +
+// resolution). The bulky per-winner evidence sections are the first things the budget trims, and
+// once they are gone the bundle carried only stage NAMES for the winners -- while the ranked-
+// report contract (and its reviewer) demands a contrast against their content. A forensic
+// report that honestly says "the winners' diffs are not provided" was then REJECTed forever
+// (pipeline-forensics-3-needs-clarification-tasks-same-signature-manual-retryable-draft-block).
+// Small by construction (<= MAX_WINNERS one-to-few-line entries), so it is safe to always keep.
+const DIGEST_MAX_FILES = 8;
+function renderWinnerDigest(winnerRecords) {
+  if (!winnerRecords.length) return null;
+  const lines = ['WINNER DIGEST (always kept -- what each contrast "winner" actually shipped; contrast the failing tasks against THIS):'];
+  winnerRecords.forEach(({ task, state }, i) => {
+    const stat = summarizeDiffStat(task.rawDiff);
+    const shown = stat.slice(0, DIGEST_MAX_FILES).map((f) => `${f.path} (+${f.added}/-${f.removed})`);
+    const more = stat.length > DIGEST_MAX_FILES ? ` ... and ${stat.length - DIGEST_MAX_FILES} more file(s)` : '';
+    lines.push(`  winner ${i + 1}: ${task.id} [${state}] source=${task.source || 'unknown'} resolution=${task.adhocResolution || 'n/a'} merged=${task.mergedAt || 'no'}`);
+    if (task.title) lines.push(`    title: ${String(task.title).slice(0, 160)}`);
+    lines.push(`    touched: ${shown.length ? shown.join(', ') + more : '(no diff retained for this task)'}`);
+  });
+  return lines.join('\n');
+}
+
 function historyStageDiff(subjectRecords, winnerRecords) {
   const stagesOf = (t) => (Array.isArray(t.history) ? t.history.map((h) => h.stage) : []);
   const line = (label, t) => `  ${label}: ${stagesOf(t).join(' → ') || '(none)'}`;
@@ -390,6 +427,10 @@ function buildForensicBundle({ pipelineDir, dbPath, subject, now = new Date(), b
     { text: framing },
     { text: renderTierMap() },
   ];
+  // Placed BEFORE the bulky subject/winner sections and given no dropTag: it is never dropped
+  // for budget, and a tail hard-truncate (which cuts from the end) cannot reach it.
+  const winnerDigest = renderWinnerDigest(winnerRecords);
+  if (winnerDigest) sections.push({ text: winnerDigest });
   subjectRecords.forEach((rec, i) => {
     sections.push({
       text: gatherEvidenceForTask(rec, worklogById.get(rec.task.id), callsById.get(rec.task.id), { label: `SUBJECT ${i + 1} (FAILED)` }),
@@ -434,6 +475,8 @@ module.exports = {
   selectWinners,
   gatherEvidenceForTask,
   assembleText,
+  summarizeDiffStat,
+  renderWinnerDigest,
   terminalTs,
   TIER_SOURCE_MAP,
   DEFAULT_BUDGET_CHARS,

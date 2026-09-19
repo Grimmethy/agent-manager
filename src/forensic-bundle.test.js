@@ -8,7 +8,7 @@ const path = require('path');
 
 const {
   buildForensicBundle, findTaskRecordById, readModelCallsForTasks,
-  collectSubjectTasks, selectWinners, assembleText,
+  collectSubjectTasks, selectWinners, assembleText, summarizeDiffStat,
 } = require('./forensic-bundle.js');
 
 function makePipeline() {
@@ -171,4 +171,65 @@ test('buildForensicBundle: budgetChars is respected', () => {
   const b = buildForensicBundle({ pipelineDir: dir, dbPath: '/no/db', subject: { kind: 'source', key: 'adhoc' }, budgetChars: 6000 });
   assert.ok(b.evidenceText.length <= 6200, `got ${b.evidenceText.length}`);
   assert.ok(b.stats.droppedForBudget.length > 0);
+});
+
+
+// --- winner digest survives budget trimming (2026-09-18) ---------------------------------
+// Real incident: pipeline-forensics-3-needs-clarification-tasks-same-signature-manual-
+// retryable-draft-block. Four large failing subjects pushed the bundle over budget, and
+// assembleText dropped EVERY winner section (winnerCalls, then winnerAttempts) before it
+// touched subject 1's -- leaving only a stage-name trace. The ranked-report contract (and its
+// reviewer) still demands a contrast against the winners' actual content, so the model
+// honestly said "the winners' diff contents are not provided", was REJECTed for it, and the
+// task could never pass no matter how often it was redrafted.
+
+const WINNER_DIFF = [
+  'diff --git a/src/reject-retry-check.js b/src/reject-retry-check.js',
+  'index 111..222 100644',
+  '--- a/src/reject-retry-check.js',
+  '+++ b/src/reject-retry-check.js',
+  '@@ -1,2 +1,4 @@',
+  ' keep',
+  '+added one',
+  '+added two',
+  '-removed one',
+  'diff --git a/src/new-file.js b/src/new-file.js',
+  'new file mode 100644',
+  '--- /dev/null',
+  '+++ b/src/new-file.js',
+  '@@ -0,0 +1,2 @@',
+  '+a',
+  '+b',
+].join('\n');
+
+test('summarizeDiffStat lists each touched file with added/removed line counts', () => {
+  assert.deepEqual(summarizeDiffStat(WINNER_DIFF), [
+    { path: 'src/reject-retry-check.js', added: 2, removed: 1 },
+    { path: 'src/new-file.js', added: 2, removed: 0 },
+  ]);
+  assert.deepEqual(summarizeDiffStat(''), []);
+  assert.deepEqual(summarizeDiffStat(undefined), []);
+});
+
+test('buildForensicBundle: a winner digest with the winner\'s touched files is present even at a tiny budget', () => {
+  const dir = makePipeline();
+  for (let i = 0; i < 4; i++) writeTask(dir, 'needs-clarification', failingTask(`s${i}`, {
+    draftAttempts: [{ attemptNo: 1, outcome: 'blocked', tiers: [{ tier: 'local-agentic-write', blocked: true, response: 'x'.repeat(4000) }] }],
+  }));
+  writeTask(dir, 'done', winnerTask('w0', { rawDiff: WINNER_DIFF, title: 'Add the retry guard' }));
+
+  const b = buildForensicBundle({ pipelineDir: dir, dbPath: '/no/db', subject: { kind: 'source', key: 'adhoc' }, budgetChars: 5000 });
+
+  assert.match(b.evidenceText, /WINNER DIGEST/);
+  assert.match(b.evidenceText, /w0/);
+  assert.match(b.evidenceText, /src\/reject-retry-check\.js \(\+2\/-1\)/);
+  assert.match(b.evidenceText, /src\/new-file\.js \(\+2\/-0\)/);
+  assert.ok(b.stats.droppedForBudget.length > 0, 'the budget really did force drops');
+});
+
+test('buildForensicBundle: no winners -> no digest section', () => {
+  const dir = makePipeline();
+  writeTask(dir, 'needs-clarification', failingTask('subj-1'));
+  const b = buildForensicBundle({ pipelineDir: dir, dbPath: '/no/db', subject: { kind: 'task', key: 'subj-1' } });
+  assert.doesNotMatch(b.evidenceText, /WINNER DIGEST/);
 });
