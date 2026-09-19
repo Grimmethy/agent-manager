@@ -509,7 +509,26 @@ def api_task_mark_done_clarification(task_id):
     item is silently freed up for reconsideration), this writes queue/done/<id>.json directly
     -- the same path a real apply-pass completion uses -- so it shows up in the Done tab and
     taskIdExistsInQueue() correctly treats it as already handled, matching what the user is
-    telling us: the work is genuinely finished, not merely dismissed."""
+    telling us: the work is genuinely finished, not merely dismissed.
+
+    2026-09-19, [[ghost-in-the-machine]] incident (concept-ghost-in-the-machine-0dbeea):
+    this route used to move the file into done/ without ever stamping `status` or
+    `terminalDisposition`, and appended a malformed history entry (`{"status": ...}`
+    instead of every other event's `{"stage": ...}` shape). The record's own top-level
+    `status` field stayed whatever it was before (usually 'blocked'), directly
+    contradicting the folder it now lived in -- and with no `terminalDisposition` and no
+    `mergedAt`, task-sources.js's isDependencySatisfied() (which only recognizes those two
+    signals) could NEVER be satisfied by it. Confirmed live: two real tasks sat completely
+    untouched for 6-9 days, silently waiting on a `dependsOn` edge that named exactly this
+    kind of manually-"done"-but-unstamped task -- a merge that was never going to happen,
+    because the "prerequisite" never produced any code the pipeline could track in the
+    first place. A human correctly resolving a stuck task by hand still has to leave the
+    record in a state every OTHER deterministic consumer can actually read, or the manual
+    action just relocates the ghost instead of exorcising it. `terminalDisposition:
+    'noop'` is the closest existing, already-understood signal for "no code is coming
+    from this specific record, but the need is considered met" -- exactly what
+    isDependencySatisfied's own new no-code-coming check now looks for (see its comment).
+    """
     from app import queue_dir, read_json_safe
     qdir = queue_dir()
     if not qdir:
@@ -521,8 +540,11 @@ def api_task_mark_done_clarification(task_id):
 
     now_iso = datetime.now(timezone.utc).isoformat()
     data["doneMarker"] = "manually marked done from Needs Clarification"
+    data["status"] = "done"
+    data["terminalDisposition"] = "noop"
     data.setdefault("history", []).append({
-        "status": "done", "at": now_iso, "note": "manually marked done from needs-clarification/",
+        "stage": "noop", "at": now_iso,
+        "detail": "manually marked done from needs-clarification/ (operator override -- no code produced, need considered met)",
     })
 
     done_dir = qdir / "done"

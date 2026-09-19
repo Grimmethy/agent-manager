@@ -1290,6 +1290,62 @@ test('nextAdhocTask requires EVERY dependency to be merged, not just one of seve
   assert.equal(nextAdhocTask(), null);
 });
 
+// isDependencySatisfied: no-code-coming terminal dispositions (2026-09-19,
+// [[ghost-in-the-machine]] incident -- see the function's own header for the full
+// incident: two real tasks sat untouched for 6-9 days because their dependency was
+// resolved via a manual "mark done" action that never stamped mergedAt OR a recognized
+// terminalDisposition -- the ONLY two signals this check used to look at).
+test('nextAdhocTask treats a dependency resolved as "noop" (manually marked done, no code produced) as satisfied', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeDoneFile(dir, 'adhoc-prereq-1', {
+    id: 'adhoc-prereq-1', status: 'done', terminalDisposition: 'noop',
+    // The exact shape routes/task.py's fixed /done route now produces -- no mergedAt,
+    // because no code was ever produced.
+  });
+  writeAdhocFile(dir, 'dependent.json', {
+    id: 'adhoc-dependent-1',
+    title: 'Depends on a manually-resolved, code-free prerequisite',
+    dependsOn: ['adhoc-prereq-1'],
+  });
+
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task, 'must not wait forever for a merge that will never happen');
+  assert.equal(task.id, 'adhoc-dependent-1');
+});
+
+test('nextAdhocTask treats "dismissed"/"filed"/"abandoned"/"superseded" dependencies the same way -- no code is coming from any of them', () => {
+  for (const disposition of ['dismissed', 'filed', 'abandoned', 'superseded']) {
+    const dir = makeAdhocFixtureRepo();
+    writeDoneFile(dir, 'adhoc-prereq-1', { id: 'adhoc-prereq-1', terminalDisposition: disposition });
+    writeAdhocFile(dir, 'dependent.json', {
+      id: 'adhoc-dependent-1', title: 'x', dependsOn: ['adhoc-prereq-1'],
+    });
+    const { nextAdhocTask } = freshTaskSources(dir);
+    assert.ok(nextAdhocTask(), `terminalDisposition '${disposition}' must satisfy the dependency`);
+  }
+});
+
+test('nextAdhocTask treats "applied-direct" (committed straight to main) as satisfied even with no mergedAt stamp', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeDoneFile(dir, 'adhoc-prereq-1', { id: 'adhoc-prereq-1', terminalDisposition: 'applied-direct' });
+  writeAdhocFile(dir, 'dependent.json', {
+    id: 'adhoc-dependent-1', title: 'x', dependsOn: ['adhoc-prereq-1'],
+  });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.ok(nextAdhocTask(), 'code committed straight to main is on main -- must satisfy the dependency');
+});
+
+test('nextAdhocTask still correctly waits when the dependency is "pending-merge" -- real code exists and genuinely has not landed', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeDoneFile(dir, 'adhoc-prereq-1', { id: 'adhoc-prereq-1', terminalDisposition: 'pending-merge' });
+  writeAdhocFile(dir, 'dependent.json', {
+    id: 'adhoc-dependent-1', title: 'x', dependsOn: ['adhoc-prereq-1'],
+  });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'pending-merge must still block -- unlike the no-code dispositions, real code is waiting to land');
+});
+
 // Hub-aware draft sequencing (2026-09-18, pipeline hardening -- Grimmethy: "These hub
 // tasks are closely linked in reality, they should be closely linked in the code"). See
 // hub-priority.js's hubHasUnmergedEarlierSibling for the full incident: a 3-sub-task hub
