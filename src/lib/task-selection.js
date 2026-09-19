@@ -17,13 +17,16 @@ function nextProductSpecSectionTask() {
   return task;
 }
 
-function getNextTask() {
+function getNextTask({ blocked } = {}) {
   const { taskSourceAllowlist } = getConfig();
   const restricted = taskSourceAllowlist && taskSourceAllowlist.length > 0;
   const coreActive = activeRepoIsCore();
   for (const source of getRegisteredSources()) {
     // scope:'core' sources audit agent-manager itself -- skip them on any other project (source-scope.js).
     if (!sourceEligibleHere(source, coreActive)) continue;
+    // The generation throttle's per-source veto (generation-throttle.js makeSourceThrottle): a source is blocked only
+    // by in-flight work at least as important as itself, so lower-priority queued tasks can't starve it.
+    if (blocked && blocked(source)) continue;
     // 'adhoc' is a fixed contract (README: "preempts every deterministic source") --
     // an allowlist restricting this run to e.g. just project_search should still let an
     // explicitly human-queued adhoc task through, not silently swallow it. 'brain_dump_sort'

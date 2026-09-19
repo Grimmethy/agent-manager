@@ -100,6 +100,29 @@ function readTaskSafe(fullPath) {
   return { task, mtimeMs };
 }
 
+// The rank priority of one task (lower number = claimed sooner): its source's registered priority with the
+// bot-adhoc penalty / premium override applied. Infinity when unresolvable (sorts last, still listed). Shared by
+// pickClaimableTasks (claim ranking) and task-sources.js's generation throttle, so "how important is this
+// in-flight task" can never disagree between the two.
+function rankPriorityOfTask(task) {
+  if (!task) return Infinity;
+  loadSourceRegistry();
+  const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
+  try {
+    // A derived_task carries domain:'adhoc' (so every draft/apply path treats it exactly like adhoc --
+    // resolveSourceName() sends it there), but it must RANK at its own registered priority (48,
+    // self-maintenance band), never adhoc's base 10 + BOT_ADHOC_PRIORITY_PENALTY. Look it up by its
+    // literal source name.
+    if (task.source === 'derived_task') {
+      const dt = getRegisteredSource('derived_task');
+      return (dt && typeof dt.priority === 'number') ? dt.priority : Infinity;
+    }
+    const source = getRegisteredSource(resolveSourceName(task));
+    if (source && typeof source.priority === 'number') return effectivePriority(task, source.priority, resolveSourceName);
+  } catch (_) { /* unresolvable -- Infinity */ }
+  return Infinity;
+}
+
 // Returns every filename in pendingDir this instance may claim, in claim-attempt order:
 // tasks pinned to this instance first (oldest first), then everything else ranked by
 // resolved source priority ascending, then mtime ascending. The caller
@@ -147,22 +170,7 @@ function pickClaimableTasks(pendingDir, instanceId) {
       if (task && !sourceEligibleHere(getRegisteredSource(resolveSourceName(task)), coreActive)) continue;
     } catch (_) { /* unresolvable source -- not gated */ }
 
-    let priority = Infinity;
-    if (task) {
-      try {
-        // A derived_task carries domain:'adhoc' (so every draft/apply path treats it
-        // exactly like adhoc -- resolveSourceName() sends it there), but it must RANK at
-        // its own registered priority (48, self-maintenance band), never adhoc's base 10
-        // + BOT_ADHOC_PRIORITY_PENALTY. Look it up by its literal source name.
-        if (task.source === 'derived_task') {
-          const dt = getRegisteredSource('derived_task');
-          priority = (dt && typeof dt.priority === 'number') ? dt.priority : Infinity;
-        } else {
-          const source = getRegisteredSource(resolveSourceName(task));
-          if (source && typeof source.priority === 'number') priority = effectivePriority(task, source.priority, resolveSourceName);
-        }
-      } catch (_) { /* unresolvable -- Infinity priority, sorts last, still listed */ }
-    }
+    const priority = rankPriorityOfTask(task);
     // Within one source-priority band, order a live hub's children by their owning hub's
     // key (explicit hubPriority asc, then hub createdAt asc) so this path can't contradict
     // nextAdhocTask()'s hub ordering -- same "the two must never disagree" discipline this
@@ -292,7 +300,7 @@ function listAssignableTasks(queueDir, instanceId) {
   return out;
 }
 
-module.exports = { pickClaimableTasks, pickNextPendingTask, listAssignableTasks, effectivePriority, BOT_ADHOC_PRIORITY_PENALTY };
+module.exports = { pickClaimableTasks, pickNextPendingTask, listAssignableTasks, effectivePriority, rankPriorityOfTask, BOT_ADHOC_PRIORITY_PENALTY };
 
 // --- CLI --------------------------------------------------------------------------
 // Two modes:
