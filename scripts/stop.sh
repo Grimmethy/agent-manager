@@ -59,7 +59,38 @@ kill_tree() {
   kill -KILL "$pid" 2>/dev/null
 }
 
+# descendants_of: every transitive child pid of $1 (not $1 itself).
+descendants_of() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do
+    printf '%s\n' "$child"
+    descendants_of "$child"
+  done
+}
+child_snapshot=()
+# Overridable so tests can target a sandboxed fake without touching live drafts.
+ORPHAN_PATTERN="${AGENT_MANAGER_STOP_ORPHAN_PATTERN:-src/(local-draft|apply-task)\.js}"
+
+sweep_orphans() {
+  local child_pid orphan_pid
+  # First kill whatever we snapshotted as descendants of the daemons we just stopped...
+  for child_pid in ${child_snapshot[@]+"${child_snapshot[@]}"}; do
+    if kill -0 "$child_pid" 2>/dev/null; then
+      kill_tree "$child_pid"
+      printf '[stop] killed orphaned child (pid %s) of a stopped daemon\n' "$child_pid"
+    fi
+  done
+  # ...then sweep by command pattern for pre-existing orphans (from an earlier stop that
+  # predates this fix, or a daemon that died on its own), same idea as the stray sweep below.
+  for orphan_pid in $(pgrep -f "$ORPHAN_PATTERN" 2>/dev/null || true); do
+    kill_tree "$orphan_pid"
+    printf '[stop] killed orphaned draft/apply process (pid %s, no live daemon owns it)\n' "$orphan_pid"
+  done
+}
+
+
 if [[ ! -d "$PID_DIR" ]]; then
+  sweep_orphans
   printf '[stop] nothing to do: %s does not exist.\n' "$PID_DIR"
   exit 0
 fi
@@ -69,7 +100,8 @@ pidfiles=("$PID_DIR"/*.pid)
 shopt -u nullglob
 
 if [[ ${#pidfiles[@]} -eq 0 ]]; then
-  printf '[stop] nothing to do: no pidfiles in %s.\n' "$PID_DIR"
+  sweep_orphans
+  printf '[stop] nothing else to do: no pidfiles in %s.\n' "$PID_DIR"
   exit 0
 fi
 
@@ -82,6 +114,10 @@ for pidfile in "${pidfiles[@]}"; do
   fi
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    # Snapshot descendants BEFORE signalling: a daemon that exits cleanly on SIGTERM
+    # leaves its in-flight child (node local-draft.js, a claude -p call...) reparented
+    # to init, where pid-tree walking can no longer find it. Swept after the wait below.
+    child_snapshot+=( $(descendants_of "$pid") )
     if [[ "$FORCE" == true ]]; then
       kill_tree "$pid"
       printf '[stop] force-killed %s (pid %s) and its process tree\n' "$name" "$pid"
@@ -116,6 +152,13 @@ for i in "${!pids[@]}"; do
     printf '[stop] %s (pid %s) exited cleanly.\n' "$name" "$pid"
   fi
 done
+
+# Orphan sweep (2026-09-19): a daemon that exits cleanly on SIGTERM does not take its
+# in-flight child with it -- only --force's kill_tree did. The child (node local-draft.js)
+# was reparented to init, its pidfile-less daemon was gone, and nothing below matched it,
+# so the dashboard's daemon pgrep kept reporting the pipeline "running" (blocking Start
+# with a 409) while Stop -- which only acts on pidfiles -- had nothing left to kill.
+sweep_orphans
 
 # Stray sweep: worker-1/reviewer are the only two instanceIds queue-watchdog's own
 # dead-process-check.js will restart on its own initiative (see restartTargetFor there --
