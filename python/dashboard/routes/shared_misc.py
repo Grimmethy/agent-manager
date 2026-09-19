@@ -399,7 +399,10 @@ def api_summary():
     qdir = queue_dir()
     counts = {s: 0 for s in QUEUE_STATES}
     counts["drafting"] = 0
-    bd_entries = _brain_dump_entries_with_task_status()
+    # Suppressed entries are hidden from every list view (routes/brain_dump.py) and must not
+    # count toward the nav badges either -- the Filed Findings badge read 13 while the tab
+    # listed 5, the other 8 having been suppressed (2026-09-19).
+    bd_entries = [e for e in _brain_dump_entries_with_task_status() if not e.get("suppressed")]
     # Split human notes from machine-raised findings (2026-09-14: Brain Dump tab went
     # human-only, everything with a `raisedBy` moved to Filed Findings -- see
     # routes/brain_dump.py's _filtered_brain_dump_view for the full reasoning) so each
