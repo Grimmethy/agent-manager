@@ -983,6 +983,10 @@ def task_summary(data: dict, filename: str) -> dict:
         # adhoc-staleness-flag.js / staleness-auto-archive.js -- the row shows a chip +
         # Archive/Keep buttons so a human can retire a dead adhoc task without opening it.
         "stalenessFlag": data.get("stalenessFlag"),
+        # True when this task was blocked at the review stage with its draft intact -- the row then offers
+        # Re-review (send the SAME draft back to review, no redraft; src/rereview-task.js). Mirrors that
+        # module's isRereviewable().
+        "rereviewable": data.get("blockedStage") == "review" and bool((data.get("implementResponse") or "").strip()),
         # Same shape/purpose as stalenessFlag above but for context-trim-sweep.js: the
         # task's file-content anchoring went stale and re-anchoring never resolved it.
         "contextTrimFlag": data.get("contextTrimFlag"),

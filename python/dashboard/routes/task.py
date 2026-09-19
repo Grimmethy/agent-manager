@@ -114,6 +114,34 @@ def api_task_archive(state, task_id):
     return jsonify({"id": task_id, "archived": True})
 
 
+@task_bp.route("/api/task/<state>/<task_id>/rereview", methods=["POST"])
+def api_task_rereview(state, task_id):
+    """Re-review: send a review-stage-blocked task BACK TO REVIEW with its draft intact -- no redraft.
+    Every other requeue drops planResponse/implementResponse, so retrying a blocked task always meant a
+    full (expensive) redraft even when the draft was fine and the REVIEW side was wrong (e.g. a
+    deterministic gate that contradicted the prompt). Single implementation: src/rereview-task.js, run
+    here as a subprocess the same way the assignable-tasks route runs next-claimable-task.js, so the
+    dashboard, the CLI and any future caller can never diverge."""
+    from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
+    if state not in ("blocked", "needs-clarification"):
+        abort(400, description="only a blocked or needs-clarification task can be re-reviewed")
+    body = request.get_json(silent=True) or {}
+    reason = (body.get("reason") or "").strip() or "re-review requested from the dashboard"
+    script = PACKAGE_ROOT / "src" / "rereview-task.js"
+    try:
+        cp = subprocess.run(
+            ["node", str(script), task_id, "--state", state, "--reason", reason],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        result = json.loads((cp.stdout or "{}").strip().splitlines()[-1])
+    except Exception as e:  # noqa: BLE001 -- surface a clean error, never a stack trace
+        abort(500, description=f"re-review failed: {e}")
+    if not result.get("ok"):
+        return jsonify(result), 409
+    return jsonify(result)
+
+
 @task_bp.route("/api/task/<state>/<task_id>/staleness-keep", methods=["POST"])
 def api_task_staleness_keep(state, task_id):
     """Dismiss a stalenessFlag (adhoc-staleness-flag.js): the human looked and decided the

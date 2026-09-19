@@ -706,6 +706,20 @@ test('reviewTask deterministically rejects a function_length_review draft with n
   assert.equal(captured.length, 0, 'no review call should be spent voting on a function_length_review draft with no code shape at all');
 });
 
+test('reviewTask lets a prose-only FALSE POSITIVE verdict for function_length_review through to the vote (it is the prompt-mandated shape)', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'function_length_review',
+    implementResponse: 'The 110-line count is dominated by roughly 75 lines of flat, declarative JSX with no nested conditionals or loops. The remaining lines are standard React wiring that express one cohesive flow, so the line-count threshold is a blunt heuristic that does not reflect real maintainability risk here.',
+  });
+  const captured = [];
+  await reviewTask(task, {
+    repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.notEqual(task.reviewProvider, 'deterministic-missing-code-diff');
+  assert.equal(captured.length, 1, 'the verdict reaches a real vote');
+});
+
 test('reviewTask reaches the vote for a function_length_review draft whose Solution includes a diff hunk', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   // A diff hunk with no braces/brackets/backticks -- avoids an unrelated, separately-known
