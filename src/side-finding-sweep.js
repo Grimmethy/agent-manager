@@ -160,6 +160,7 @@ async function sweep({ pipelineDir, dryRun = false, now = Date.now() }) {
             taskId: record.taskId || null,
             stage: record.stage || null,
             conceptId: record.conceptId || null,
+            repoRoot: record.repoRoot || null,
           },
           count: 1,
           lastSeenAt: nowIso,

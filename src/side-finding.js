@@ -134,7 +134,7 @@ function inboxDir(pipelineDir) {
 // dashboard/CLI single writer is side-finding-sweep.js, later). Never throws past the
 // caller -- a disk/permissions problem here must never turn into a pipeline-wide outage
 // over what is, after all, an optional side channel.
-function writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir, conceptId }) {
+function writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir, conceptId, repoRoot }) {
   if (!pipelineDir) return;
   try {
     const dir = inboxDir(pipelineDir);
@@ -152,6 +152,11 @@ function writeSideFindingInbox(finding, { source, taskId, stage, pipelineDir, co
       // research batches (see that file's dedup-scoping comment for the incident this
       // closes).
       conceptId: conceptId || null,
+      // The project this finding was raised against (the pipeline's active repo at filing
+      // time). brain-dump.json is global, so without this the sorter has to GUESS a machine
+      // finding's project and defaulted to its own (agent-manager) -- a PF-Client-Portal
+      // finding became a task in agent-manager's queue (2026-09-19).
+      repoRoot: repoRoot || process.env.AGENT_MANAGER_REPO_ROOT || null,
       extractedAt: new Date().toISOString(),
     };
     fs.writeFileSync(path.join(dir, name), JSON.stringify(record, null, 2));

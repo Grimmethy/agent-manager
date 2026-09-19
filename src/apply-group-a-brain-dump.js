@@ -27,6 +27,21 @@ function readProjectRegistry() {
   }
 }
 
+function sameDir(a, b) {
+  const real = (x) => { try { return fs.realpathSync(x); } catch { return path.resolve(x); } };
+  return !!a && !!b && real(a) === real(b);
+}
+
+// A machine-raised finding (entry.raisedBy.repoRoot, stamped by side-finding.js) belongs to
+// the project whose pipeline raised it. brain-dump.json is global, so the classifier could
+// only guess -- and its own-project bias sent PF-Client-Portal findings to agent-manager
+// (2026-09-19). Returns the registered project entry for that repo, or null.
+function originProjectFor(entry, registry) {
+  const root = entry && entry.raisedBy && entry.raisedBy.repoRoot;
+  if (!root) return null;
+  return registry.find((p) => sameDir(p.repoRoot, root)) || null;
+}
+
 // Validates a classifier-reported possibleDuplicateOf against the REAL candidate list it
 // was actually shown (task.promptContext.existingQueuedTitles, built by task-sources.js's
 // existingQueuedTaskTitles()) -- 2026-09-16, pipeline hardening: root-caused live that the
@@ -151,6 +166,11 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   // a text change) or otherwise changed since this task was drafted -- classifying stale
   // text into the entry's CURRENT record would silently mislabel it under a rawText it no
   // longer has. Only apply if the entry is still exactly what this task was drafted against.
+  if (entry.suppressed) {
+    // A human retired this finding after its sort task was queued -- sorting it now would
+    // still file a note or queue a task for something they already dismissed.
+    return { skipped: true, reason: 'brain-dump entry was suppressed since this task was queued -- not sorting it' };
+  }
   if (entry.status !== 'captured' || entry.rawText !== rawText) {
     return recoverableSortSkip(data, entry, brainDumpPath,
       'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text');
@@ -211,6 +231,23 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     const derived = deriveBelongsToProject(result, task.promptContext);
     result.belongsToProject = derived.belongsToProject;
     result.actionable = derived.actionable;
+  }
+
+  // Origin routing: a finding raised by project X's pipeline is about project X, whatever
+  // the classifier guessed. Overrides the label; and a note filed under a DIFFERENT tracked
+  // project's vault folder moves to X's folder when that folder exists.
+  {
+    const origin = originProjectFor(entry, readProjectRegistry());
+    if (origin && origin.label) {
+      result.belongsToProject = origin.label;
+      const segments = result.secondBrainPath.split(/[\\/]/).filter(Boolean);
+      if (segments.length > 1 && segments[0] !== origin.label
+          && trackedLabels.includes(segments[0])
+          && fs.existsSync(path.join(secondBrainDir, origin.label))) {
+        segments[0] = origin.label;
+        result.secondBrainPath = segments.join('/');
+      }
+    }
   }
 
   // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
@@ -464,4 +501,4 @@ function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) 
   return { closed: true, entryId: brainDumpEntryId };
 }
 
-module.exports = { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort, closeBrainDumpEntryResolved, readProjectRegistry, isValidDuplicateMatch };
+module.exports = { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort, closeBrainDumpEntryResolved, readProjectRegistry, isValidDuplicateMatch, originProjectFor };
