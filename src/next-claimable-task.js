@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { laneTiersEnabled } = require('./lane-tiers.js');
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) plus its separate per-item reasoningTierFor() filter -- both now
@@ -113,6 +114,7 @@ function readTaskSafe(fullPath) {
 // every tier filter as a result -- caught by testing against the real queue before
 // shipping, not by the unit tests, which mock the registry away).
 function resolvesToTier(task, isReasoningLane) {
+  if (!laneTiersEnabled()) return true; // tiers off: every lane may claim any task (lane-tiers.js)
   loadSourceRegistry();
   const { reasoningTierFor } = require('./model-provider.js');
   let tier = 'low';

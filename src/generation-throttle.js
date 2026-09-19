@@ -24,7 +24,7 @@ function pidAlive(pid) {
   }
 }
 
-// Live worker lanes of `tier` ('low'|'high'), per heartbeat files whose pid is still alive.
+// Live worker lanes of `tier` ('low'|'high', or 'all' when lane tiers are off), per heartbeat files whose pid is still alive.
 // Never below 1: an unreadable/empty instances dir must fall back to the old
 // one-in-flight behavior rather than opening generation without bound.
 function liveLaneCount(instancesDir, tier) {
@@ -35,7 +35,7 @@ function liveLaneCount(instancesDir, tier) {
       try {
         const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, f), 'utf8'));
         const id = hb.instanceId || f.replace(/\.json$/, '');
-        if (laneTier(id) === tier && hb.pid && pidAlive(hb.pid)) count += 1;
+        if ((tier === 'all' || laneTier(id) === tier) && hb.pid && pidAlive(hb.pid)) count += 1;
       } catch {
         // unreadable heartbeat -- not counted
       }
@@ -46,7 +46,8 @@ function liveLaneCount(instancesDir, tier) {
   return Math.max(1, count);
 }
 
-// tierFilter undefined (no --tier) keeps the legacy single-slot behavior.
+// tierFilter undefined (no --tier) keeps the legacy single-slot behavior; 'all' bounds by every
+// live worker lane (lane tiers off -- see lane-tiers.js).
 function generationThrottled(inFlightCount, instancesDir, tierFilter) {
   if (!tierFilter) return inFlightCount >= 1;
   return inFlightCount >= liveLaneCount(instancesDir, tierFilter);

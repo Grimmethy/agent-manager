@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const { generationThrottled } = require('./generation-throttle.js');
+const { laneTiersEnabled } = require('./lane-tiers.js');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
@@ -2863,7 +2864,10 @@ if (require.main === module) {
   // whichever source is highest priority regardless of tier, matching this CLI's
   // long-standing default behavior for any caller that doesn't care about tiers.
   const tierArg = process.argv.find((a) => a.startsWith('--tier='));
-  const tierFilter = tierArg ? tierArg.slice('--tier='.length) : undefined;
+  // With lane tiers off (lane-tiers.js) the --tier arg is ignored: generation is unfiltered and the
+  // in-flight throttle is bounded by ALL live lanes, since any lane can claim any task.
+  const tiersOn = laneTiersEnabled();
+  const tierFilter = tiersOn && tierArg ? tierArg.slice('--tier='.length) : undefined;
 
   const { pipelineDir, brainDumpPath } = getConfig();
   const pendingDir = path.join(pipelineDir, 'queue', 'pending');
@@ -2910,7 +2914,7 @@ if (require.main === module) {
   if (fs.existsSync(pendingDir)) {
     inFlightCount += fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json') && taskFileMatchesTier(path.join(pendingDir, f))).length;
   }
-  const alreadyPending = generationThrottled(inFlightCount, path.join(pipelineDir, 'instances'), tierFilter);
+  const alreadyPending = generationThrottled(inFlightCount, path.join(pipelineDir, 'instances'), tiersOn ? tierFilter : 'all');
 
   // An already-queued lower-priority task must never block a NEW adhoc task from
   // reaching pending/ -- adhoc is the "drop everything, do this now" lane. This exception

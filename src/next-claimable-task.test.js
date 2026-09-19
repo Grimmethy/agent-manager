@@ -432,3 +432,30 @@ test('CLI claim order loads plugin-registered sources (plugin priority beats bra
   const order = res.stdout.split('\n').filter(Boolean);
   assert.deepEqual(order, ['z-plugin.json', 'a-sort.json'], res.stderr);
 });
+
+// AGENT_MANAGER_LANE_TIERS=off (lane-tiers.js): with the reasoning/worker split moot, every lane
+// claims any task purely by priority.
+test('lane tiers off: a low lane may claim a high-tier task and a reasoning lane a low-tier one', () => {
+  const { pendingDir, write } = (() => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-tiers-off-'));
+    const pendingDir = path.join(root, 'queue', 'pending');
+    fs.mkdirSync(pendingDir, { recursive: true });
+    return { pendingDir, write: (name, source) => fs.writeFileSync(path.join(pendingDir, name), JSON.stringify({ id: name, source, domain: source === 'adhoc' ? 'adhoc' : 'default', title: name, humanQueued: true })) };
+  })();
+  write('adhoc-task.json', 'adhoc');          // high tier
+  write('trouble-task.json', 'trouble_log');  // low tier
+  const saved = process.env.AGENT_MANAGER_LANE_TIERS;
+  try {
+    delete process.env.AGENT_MANAGER_LANE_TIERS;
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-1', { isReasoningLane: false }), ['trouble-task.json']);
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-reasoning', { isReasoningLane: true }), ['adhoc-task.json']);
+    process.env.AGENT_MANAGER_LANE_TIERS = 'off';
+    const low = pickClaimableTasks(pendingDir, 'worker-1', { isReasoningLane: false });
+    const high = pickClaimableTasks(pendingDir, 'worker-reasoning', { isReasoningLane: true });
+    assert.deepEqual([...low].sort(), ['adhoc-task.json', 'trouble-task.json']);
+    assert.deepEqual(low, high, 'every lane sees the same priority-ordered list');
+    assert.equal(low[0], 'adhoc-task.json', 'adhoc (priority 10) outranks trouble_log (20)');
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_LANE_TIERS; else process.env.AGENT_MANAGER_LANE_TIERS = saved;
+  }
+});
