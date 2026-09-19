@@ -318,3 +318,13 @@ Solution: Audit the prompt assembly logic in `src/local-agentic-write-draft.js` 
 Benefits: Prevents all adhoc tasks from failing with "no prior context" errors due to context assembly bugs, ensuring the agentic write tier receives the necessary task details to proceed.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-brain-dump-bd-1789045832920-rebalance-the-worker-1-worker-r-1789704701741
+
+### AC-133 · on-demand task "adhoc-brain-dump-bd-1788898017326-ac-1-fix-ships-without-the-test-the-task-178890018
+Strength: Strong
+Files: none
+
+Problem: The pipeline's review gate (src/review-task.js) rejects an already-correct implement response when its view of the diff is truncated or misread (attempt 8 "truncated output, raw text length 3812"; attempt 1 false "deletes test cases" claim), and the retry-exhaustion path (src/reject-retry-check.js) then spends the 2/2 redraft budget on a signature the pipeline itself labels "deterministic-truncation-guard false-block … since-fixed," escalating to needs-clarification and abandoning a task whose correct draft already exists. The implement tier (src/local-agentic-write-draft.js) is not the failure — it produced the correct draft twice (attempts 1 and 8).
+Solution: In src/review-task.js, before casting a rejection vote, add a **truncation-integrity pre-check**: if the raw implementResponse text is truncated (does not end on a clean token boundary, or its length matches a known truncation signature), the reviewer must **abstain** rather than vote "block," and the abstention must be recorded as a non-rejection. In src/reject-retry-check.js, add a **false-block signature carve-out**: when the block reason matches the "deterministic-truncation-guard false-block" / "since-fixed review gate" signature, do **not** decrement the redraft budget and do **not** escalate to needs-clarification; instead, re-queue the task to re-enter the review gate with the (now-fixed) truncation guard applied. Acceptance check: re-run the subject task; the correct draft from attempt 8 must reach `approved`/`merged` without consuming a redraft retry, and the review-vote log must show an abstention (not a block) on the truncated view.
+Benefits: The class of "small, correct, single-file implement that the review gate mis-rejects due to truncation or misread" stops failing — the pipeline stops spending its retry budget on its own diagnosed false blocks and stops abandoning tasks whose correct draft already exists.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-brain-dump-bd-1788898017326-ac-1-fix-ships-without-the-test-1789696105428
