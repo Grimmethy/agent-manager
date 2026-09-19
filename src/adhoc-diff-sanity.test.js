@@ -417,3 +417,51 @@ test('adhocNoChangesClaimProblem: non-adhoc tasks and empty summaries are never 
   assert.equal(adhocNoChangesClaimProblem({ source: 'observability_fix', promptContext: { rawText: 'x' } }, 'no citations here'), null);
   assert.equal(adhocNoChangesClaimProblem(adhoc('do the thing'), ''), null);
 });
+
+// --- a plan's own VERIFICATION REPORT is not a prohibition (2026-09-18) -------------------
+// Real incident: adhoc-brain-dump-bd-1788906657760 (task.localRejectCount null-guard) was
+// blocked twice with `matches forbidden "src/" -- the task explicitly says not to`. The task
+// never said that. The gate scans the request PLUS the plan text, and the model's own
+// verification line -- "No other `src/` file modified -- `git status --porcelain src/` -- PASS"
+// -- matched the "no other ... modified" restriction pattern, forbidding all of src/ and so
+// the task's own two edits. The exemption for declared edit targets only helps when the plan
+// names the target with an edit verb, which this one did not.
+
+const VERIFICATION_LINES = [
+  'No other `src/` file modified -- `git status --porcelain src/` -- PASS (exactly ` M src/local-draft.js` and ` M src/local-draft.test.js`, nothing else).',
+  'No other file in `src/` modified -- `git status --porcelain src/` → ` M src/local-draft.js` and ` M src/local-draft.test.js` only -- PASS',
+  'No other `src/` file modified -- `git status --porcelain src/` shows only those two files.',
+  '- [x] No other files under src/ were changed (verified with git diff --stat).',
+];
+
+test('forbidden-path: a verification report is never read as a restriction (the real worklog sentences)', () => {
+  for (const line of VERIFICATION_LINES) {
+    assert.deepEqual(extractForbiddenPaths(line), [], `wrongly forbade from: ${line}`);
+  }
+});
+
+test('forbidden-path: end to end -- a plan whose verification line says "no other src/ file modified" does not block its own diff', () => {
+  const task = {
+    source: 'manual', domain: 'adhoc',
+    promptContext: { rawText: '`task.localRejectCount` read inside the `try` without null-guard. A one-line guard before the `try` would prevent confusion.' },
+    // No edit verb naming the target, so extractDeclaredTargets returns [] and cannot rescue it.
+    planResponse: `## PLAN\nAdd a null guard before the try block in the draft entry point.\n\n## Verify\n${VERIFICATION_LINES[2]}`,
+  };
+  const diff = [
+    'diff --git a/src/local-draft.js b/src/local-draft.js', '--- a/src/local-draft.js', '+++ b/src/local-draft.js', '@@ -1,1 +1,2 @@', ' x', '+if (!task) { return; }',
+    'diff --git a/src/local-draft.test.js b/src/local-draft.test.js', '--- a/src/local-draft.test.js', '+++ b/src/local-draft.test.js', '@@ -1,1 +1,2 @@', ' y', '+test(1);',
+  ].join('\n');
+  const problem = adhocDiffSubstanceProblem(task, diff, '');
+  assert.equal(problem && problem.code, null, `unexpected block: ${problem && problem.reason}`);
+});
+
+test('forbidden-path: a real prohibition that happens to mention a check command is still a restriction', () => {
+  const f = extractForbiddenPaths('Do NOT touch src/apply-adhoc-diff.js -- confirm with git status when done.');
+  assert.ok(f.some((x) => x.startsWith('src/apply-adhoc-diff')), JSON.stringify(f));
+  const g = extractForbiddenPaths('Never modify anything under src/; verified by git diff at the end.');
+  assert.ok(g.includes('src/'), JSON.stringify(g));
+});
+
+test('forbidden-path: a terse restriction with no verification markers still forbids (unchanged behaviour)', () => {
+  assert.ok(extractForbiddenPaths('Fix the tab. No other files under src/ may be modified.').includes('src/'));
+});
