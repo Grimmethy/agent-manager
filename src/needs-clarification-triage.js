@@ -180,6 +180,7 @@ const { hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { targetOversizedFile, oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
+const { checkCompletionClaimsInNote } = require('./fact-checker.js');
 const { surfaceDecomposeDesignQuestion } = require('./decompose-question-surface.js');
 
 // Read env inside the sweep, not at module load -- keeps tests able to toggle it and
@@ -314,6 +315,12 @@ const BLOCKER_TYPE_INFRA_ERROR_RE = /BLOCKER-TYPE:\s*infra-error\b/i;
 // blockedReason wording ("resolved no-changes-needed but...", "no \"Already covered:\"
 // block", "summary claims N tests").
 const FALSE_CLAIM_RE = /\bclaims? (?:to have )?"?(?:implement|creat|verif)\w*\b|\bresolved no-changes-needed but\b|\bno "Already covered:" block\b|\bdeterministic fact-check (?:confirms|flags)\b|\bsummary claims\b/i;
+
+// Claim-verification pass flag: a task whose note/openQuestions assert something
+// "already in place / already done" that fact-checker.js could not verify against the
+// live repo is stamped with this (a self-documenting task field carrying the same name)
+// and left for a human to confirm rather than auto-acted-on.
+const ncClaimUnverified = 'ncClaimUnverified';
 
 const REQUEUE_STRIP_FIELDS = [
   'needsClarification', 'localRejectCount', 'retryableDraftBlock', 'turnBudgetExhausted',
@@ -1159,6 +1166,53 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     writeInPlace(file, task);
   }
 
+  // --- Claim-verification pass (advisory, ncClaimUnverified) ----------------------
+  // Re-walk the same files after the bucket sweep: a task whose note/openQuestions
+  // assert a completion ("already in place / already inserted / already fixed") that
+  // fact-checker.js cannot verify against the live repo is stamped ncClaimUnverified
+  // and left for a human to confirm rather than auto-acted-on. Advisory only -- never
+  // requeues, never archives, never votes; a task an earlier bucket already moved out
+  // of needs-clarification/ (or already left for a human) is simply skipped.
+  for (const name of names) {
+    const file = path.join(ncDir, name);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      continue; // file may have been moved/deleted by an earlier bucket
+    }
+    if (task.ncTriageDecision === 'leave-for-human') continue;
+
+    const noteText = [
+      task.note,
+      task.openQuestions,
+      task.needsClarification && task.needsClarification.openQuestions,
+    ].filter(Boolean).join('\n');
+    if (!noteText.trim()) continue;
+
+    let claims;
+    try {
+      claims = checkCompletionClaimsInNote(noteText, repoRoot);
+    } catch (err) {
+      log(`claim-check error ${name}: ${err.message}`);
+      continue; // advisory pass must never break the sweep
+    }
+
+    const hasUnverified = Array.isArray(claims) && claims.some((c) => c && c.found === false);
+    if (!hasUnverified) continue;
+
+    log(`${task.id || name.replace(/\.json$/, '')}: ${ncClaimUnverified} -- unverified completion claim, left for a human`);
+    summary.leftForHuman += 1;
+    if (DRY_RUN) continue;
+
+    task.ncClaimUnverified = true;
+    task.ncTriageDecision = 'leave-for-human';
+    task.ncTriageReviewedAt = now;
+    appendHistoryEvent(task, 'advisory',
+      `needs-clarification-triage: ${ncClaimUnverified} -- note/openQuestions assert a completion the fact-checker could not verify against the repo -- left for a human`);
+    writeInPlace(file, task);
+  }
+
   return summary;
 }
 
@@ -1174,6 +1228,7 @@ module.exports = {
   BLOCKER_TYPE_INFRA_ERROR_RE,
   hasFreshEscalationSince,
   isStillLeaveForHuman,
+  ncClaimUnverified,
 };
 
 if (require.main === module) {
