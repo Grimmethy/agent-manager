@@ -11,7 +11,7 @@ const path = require('node:path');
 // project_search carry emptyApproval; adhoc does not).
 require('./task-sources.js');
 const { registerTaskSource } = require('./task-source-registry.js');
-const { decideEmptyApprovalOutcome, isEffectivelyNoCandidates, harnessHitCount } = require('./empty-approval-decision.js');
+const { decideEmptyApprovalOutcome, isEffectivelyNoCandidates, harnessHitCount, contextFileCount } = require('./empty-approval-decision.js');
 
 // A fixture source carrying BOTH emptyApproval and candidateDocFormat -- mirrors
 // arch_discovery/arch_import's real registration shape (agent-manager-hygiene/src/
@@ -97,4 +97,38 @@ test('CLI: prints approve / block / none', () => {
   assert.equal(run({ source: 'deep_dive', implementResponse: '', promptContext: { harnessHits: [{}] } }), 'approve');
   assert.equal(run({ source: 'deep_dive', implementResponse: '', promptContext: { harnessHits: [] } }), 'block');
   assert.equal(run({ source: 'adhoc', implementResponse: '' }), 'none');
+});
+
+// --- 2026-09-19: arch_discovery has no harness search -- its "material" is promptContext.files ---
+
+test("candidateDocFormat source: an EMPTY draft WITH files in context is 'approve' (a clean community, reviewed -- nothing to do)", () => {
+  const task = { source: 'fixture_candidate_doc_source', implementResponse: '', promptContext: { files: [{ path: 'src/a.ts' }] } };
+  assert.equal(decideEmptyApprovalOutcome(task), 'approve');
+  assert.equal(decideEmptyApprovalOutcome({ ...task, implementResponse: 'No friction found -- the seam is clean.' }), 'approve');
+});
+
+test("candidateDocFormat source: ZERO files in context is 'block-no-context' for an empty draft AND for a non-empty one (fabricated by construction)", () => {
+  const empty = { source: 'fixture_candidate_doc_source', implementResponse: '', promptContext: { files: [] } };
+  assert.equal(decideEmptyApprovalOutcome(empty), 'block-no-context');
+  const invented = { ...empty, implementResponse: '### AC-001 · Something\nStrength: Strong\nFiles: src/x.js\n\nProblem: p\nSolution: s' };
+  assert.equal(decideEmptyApprovalOutcome(invented), 'block-no-context');
+});
+
+test('candidateDocFormat source with NO files array at all (arch_import shape) keeps the harness-hit behavior', () => {
+  assert.equal(decideEmptyApprovalOutcome({ source: 'fixture_candidate_doc_source', implementResponse: '', promptContext: { itemFiles: 'a.js' } }), 'block');
+  assert.equal(decideEmptyApprovalOutcome({ source: 'fixture_candidate_doc_source', implementResponse: '', promptContext: { harnessHits: [{}] } }), 'approve');
+});
+
+test('a non-candidateDocFormat emptyApproval source (deep_dive) is unaffected by promptContext.files', () => {
+  assert.equal(decideEmptyApprovalOutcome({ source: 'deep_dive', implementResponse: '', promptContext: { files: [{ path: 'x' }] } }), 'block');
+  assert.equal(decideEmptyApprovalOutcome({ source: 'deep_dive', implementResponse: '', promptContext: { files: [] } }), 'block');
+  assert.equal(contextFileCount({ source: 'deep_dive', promptContext: { files: [] } }), null);
+});
+
+test("CLI: the no-context block prints 'block' (review-runner.ps1 only knows approve|block|none)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ead-cli2-'));
+  const p = path.join(dir, 'task.json');
+  fs.writeFileSync(p, JSON.stringify({ source: 'deep_dive', implementResponse: '', promptContext: {} }));
+  const cli = path.join(__dirname, 'empty-approval-decision.js');
+  assert.equal(execFileSync('node', [cli, p], { encoding: 'utf8', env: { ...process.env, AGENT_MANAGER_REPO_ROOT: process.env.AGENT_MANAGER_REPO_ROOT || dir } }).trim(), 'block');
 });

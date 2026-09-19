@@ -134,6 +134,24 @@ function hasFabricatedSymbolCitation(task) {
   return /^ungrounded draft:\s*fabricated symbol citation/i.test(String(task.blockedReason || '').trim());
 }
 
+// 2026-09-19: review-task.js's 'block-no-context' gate (empty-approval-decision.js): a
+// candidate-doc source (arch_discovery) was given ZERO source files, so any draft is ungrounded.
+// HARNESS-side (the context assembly, not the model) and NOT retryable: a requeue keeps the same
+// stored promptContext.files, so every redraft sees the same empty context and re-blocks.
+function hasNoContextFiles(task) {
+  return /^deterministic gate: \S+ was given no source files/i.test(String(task.blockedReason || '').trim());
+}
+
+function buildNoContextFilesQuestion(task) {
+  return [
+    `This task was drafted with no source files in its context: ${String(task.blockedReason || '').replace(/^deterministic gate:\s*/i, '')}`,
+    '',
+    'A blind requeue cannot fix this -- it re-sends the same stored (empty) context. Check whether the '
+      + 'graph/community names files that no longer exist or cannot be read (rebuild the graph), or '
+      + 'regenerate the task so its context is rebuilt from the current generator, then requeue.',
+  ].join('\n');
+}
+
 function buildFabricatedSymbolCitationQuestion(task) {
   const detail = String(task.blockedReason || '').replace(/^ungrounded draft:\s*/i, '').trim();
   return [
@@ -266,6 +284,16 @@ const CLASSIFIERS = [
     buildQuestion: buildFabricatedSymbolCitationQuestion,
   },
   {
+    name: 'no-context-files',
+    classify(task) {
+      if (hasNoContextFiles(task)) {
+        return { category: 'no-context-files', faultSide: 'harness', retryable: false };
+      }
+      return null;
+    },
+    buildQuestion: buildNoContextFilesQuestion,
+  },
+  {
     name: 'harness-search-zero-results',
     classify(task) {
       if (hasZeroHitHarnessSearch(task)) {
@@ -329,6 +357,7 @@ module.exports = {
   hasInvalidPremise,
   hasFabricatedFilePath,
   hasFabricatedSymbolCitation,
+  hasNoContextFiles,
   signatureForTask,
   findClassifier,
 };

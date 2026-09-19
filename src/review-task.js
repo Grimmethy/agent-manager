@@ -825,6 +825,13 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // (nothing to review; the anchor search is deterministic against unchanged inputs so a
   // blind requeue only re-derives the same empty grounding). null -> fall through.
   const emptyOutcome = decideEmptyApprovalOutcome(task);
+  if (emptyOutcome === 'block-no-context') {
+    const reason = `Deterministic gate: ${task.source} was given no source files for this task (promptContext.files is empty -- the graph likely names files that are missing or unreadable, or a stale task carries context captured before a fix). Any draft would be ungrounded, so none is reviewed or approved; a blind requeue re-sends the same empty context. Rebuild the graph or regenerate the task.`;
+    task.reviewProvider = 'deterministic-no-context-fail';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+    appendHistoryEvent(task, 'blocked', reason);
+    return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
   if (emptyOutcome === 'block') {
     const reason = 'Deterministic gate: implementResponse is empty AND the harness search that fed this task found zero hits -- nothing to review, and a blind requeue only re-derives the same empty grounding (no local-model review call spent)';
     task.reviewProvider = 'deterministic-empty-fail';

@@ -15,7 +15,7 @@
 // env to revert" flip that had to exist because the old logic couldn't tell the two
 // empty cases apart).
 //
-// The decision:
+// The decision (plus 'block-no-context', below):
 //   'approve' -- effectively empty AND the harness search that fed this task found real
 //                hits (> 0). The model had material and chose to produce nothing, which
 //                for these sources IS the documented "reviewed it, nothing actionable"
@@ -84,21 +84,44 @@ function harnessHitCount(task) {
   return 0;
 }
 
+// A candidate-doc-format generator (arch_discovery) has no harness SEARCH: its "material" is the
+// source files pre-fetched into promptContext.files. Returns that file count for such a source,
+// or null when the notion doesn't apply (not a candidateDocFormat source, or no `files` array --
+// arch_import carries `itemFiles`, a string), so deep_dive / project_search keep using search hits.
+//
+// Why: the hit count was always 0 for arch_discovery, so a model that read real files and
+// correctly reported "0 friction points" was BLOCKED as if nothing had been searched (2026-09-19,
+// PropertyForager community 0), while one handed no files at all looked the same.
+function contextFileCount(task) {
+  const entry = getRegisteredSource(task && task.source);
+  if (!entry || !entry.candidateDocFormat) return null;
+  const files = task.promptContext && task.promptContext.files;
+  return Array.isArray(files) ? files.length : null;
+}
+
+// 'approve' | 'block' | 'block-no-context' | null. 'block-no-context': a candidate-doc source that
+// was given ZERO files. ANY draft it produced -- empty or not -- is ungrounded by construction
+// (the model saw no code), so it is blocked whatever it says; without this an empty one was a
+// silent no-op success and a non-empty one was a hallucinated candidate sent to review
+// (AM history: 6 of 20 arch_discovery tasks had zero files; some still produced candidate text).
 function decideEmptyApprovalOutcome(task) {
   if (!task || !isEmptyApprovalSource(task.source)) return null;
+  const ctxFiles = contextFileCount(task);
+  if (ctxFiles === 0) return 'block-no-context';
+  const hasMaterial = harnessHitCount(task) > 0 || (ctxFiles !== null && ctxFiles > 0);
   if (isEffectivelyEmpty(task.implementResponse)) {
-    return harnessHitCount(task) > 0 ? 'approve' : 'block';
+    return hasMaterial ? 'approve' : 'block';
   }
   // Non-empty text that still parses to zero real candidates -- same approve/block
   // reasoning as the literal-empty case above, just triggered on the broader
   // "nothing the apply stage could act on" condition instead of raw string emptiness.
   if (isEffectivelyNoCandidates(task.source, task.implementResponse)) {
-    return harnessHitCount(task) > 0 ? 'approve' : 'block';
+    return hasMaterial ? 'approve' : 'block';
   }
   return null;
 }
 
-module.exports = { decideEmptyApprovalOutcome, isEffectivelyEmpty, isEffectivelyNoCandidates, isEmptyApprovalSource, harnessHitCount };
+module.exports = { decideEmptyApprovalOutcome, isEffectivelyEmpty, isEffectivelyNoCandidates, isEmptyApprovalSource, harnessHitCount, contextFileCount };
 
 // CLI: node src/empty-approval-decision.js <task.json>  ->  'approve' | 'block' | 'none'
 if (require.main === module) {
@@ -110,5 +133,7 @@ if (require.main === module) {
   try {
     task = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
   } catch { /* unreadable -> {} -> 'none' */ }
-  process.stdout.write(decideEmptyApprovalOutcome(task) || 'none');
+  // review-runner.ps1 only knows approve|block|none: the no-context block is a block to it.
+  const outcome = decideEmptyApprovalOutcome(task);
+  process.stdout.write(outcome === 'block-no-context' ? 'block' : (outcome || 'none'));
 }
