@@ -119,6 +119,21 @@ function depWorkIsOnMainBranch(repoRoot, depId) {
   return onMain;
 }
 
+// Terminal dispositions meaning "no code is EVER coming from this specific task record,
+// but the underlying need is considered resolved" -- 2026-09-19, [[ghost-in-the-machine]]
+// incident (concept-ghost-in-the-machine-0dbeea): before this, the ONLY two signals
+// isDependencySatisfied recognized were `mergedAt` and `stacked.branch` -- so a
+// dependency resolved through ANY other real terminal path (a human manually marking a
+// stuck needs-clarification task done, a review dismissing a false positive, an apply
+// concluding no change was needed) left every dependent waiting for a merge that would
+// never happen. Confirmed live: two real tasks sat completely untouched for 6-9 days
+// this way -- the dashboard's "mark as done" action (routes/task.py) moved the file to
+// done/ without ever stamping a real terminalDisposition, so nothing downstream could
+// tell "genuinely resolved" apart from "still blocked". Same reasoning hub-priority.js's
+// SIBLING_RESOLVED_STATUSES already applies to hub sibling sequencing, applied here to
+// the identical class of deadlock on a dependsOn edge instead.
+const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'abandoned', 'superseded']);
+
 function isDependencySatisfied(pipelineDir, depId) {
   const trimmed = (depId || '').trim();
   if (!trimmed) return true; // a blank/malformed entry blocks nothing -- not this function's job to validate authoring mistakes
@@ -129,7 +144,10 @@ function isDependencySatisfied(pipelineDir, depId) {
   for (const candidate of candidates) {
     try {
       const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
-      if (data && data.mergedAt) return true;
+      // 'applied-direct' commits straight to main (directToMain sources) -- the code is
+      // already there just as surely as a 'merged' mergedAt stamp says it is.
+      if (data && (data.mergedAt || data.terminalDisposition === 'applied-direct')) return true;
+      if (data && NO_CODE_COMING_DISPOSITIONS.has(data.terminalDisposition)) return true;
       // Stacked file-decompose child (file-decompose-to-hub.js `mode: 'stacked'`): the
       // whole stack commits onto ONE shared branch and merges to main as a single unit
       // later, so a per-step merge to main is NEVER the release signal for the next step.
