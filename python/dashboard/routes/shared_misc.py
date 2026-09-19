@@ -416,8 +416,9 @@ def api_summary():
         sum(1 for e in human_bd_entries if e.get("status") != "actioned")
         + _brain_dump_needs_attention_count(human_bd_entries)
     )
+    from routes.brain_dump import is_filed_note
     counts["filed"] = (
-        sum(1 for e in filed_entries if e.get("status") != "actioned")
+        sum(1 for e in filed_entries if e.get("status") != "actioned" and not is_filed_note(e))
         + _brain_dump_needs_attention_count(filed_entries)
     )
     # Cached (list_unmerged_branches(force=False)) -- this route is polled every 5s by
