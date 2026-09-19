@@ -328,3 +328,24 @@ Solution: In src/review-task.js, before casting a rejection vote, add a **trunca
 Benefits: The class of "small, correct, single-file implement that the review gate mis-rejects due to truncation or misread" stops failing — the pipeline stops spending its retry budget on its own diagnosed false blocks and stops abandoning tasks whose correct draft already exists.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-brain-dump-bd-1788898017326-ac-1-fix-ships-without-the-test-1789696105428
+
+### AC-134 · 3 needs-clarification tasks, same signature (derived_task::empty-degenerate-draft)
+Strength: Strong
+Files: src/apply-group-a-brain-dump.js
+
+Model confidence: Worth exploring
+Problem: The duplicate-detection gate in `src/apply-group-a-brain-dump.js` (lines 356-388) is either not matching the canonical task "agent-manager-critique-stage-degenerate" for these three brain-dump entries, or the match is being discarded as a "hallucinated match" (line 357) because the classifier's `possibleDuplicateOf` field does not exactly match a real candidate title. The result is that these entries fall through to `needs-clarification` with `reason: 'design-decision'` instead of being merged with the existing task.
+Solution: Add a fallback fuzzy-match or substring-match check in the duplicate gate (around line 356) that compares the brain-dump entry's title and body against the existing queued task's title and body, not just the classifier's `possibleDuplicateOf` field. Acceptance check: a brain-dump entry whose title contains "critique-degenerate" or "degenerate critic" should be merged with the existing "agent-manager-critique-stage-degenerate" task rather than routed to `needs-clarification`.
+Benefits: Brain-dump entries that are duplicates of existing queued tasks will be correctly deduplicated instead of churning through `needs-clarification` and burning human attention on what is actually a deduplication problem.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-3-needs-clarification-tasks-same-signature-derived-task-empty-degenerate-draft-1789292278270
+
+### AC-135 · 3 needs-clarification tasks, same signature (derived_task::fabricated-ungrounded-claim)
+Strength: Strong
+Files: src/adhoc-staleness-flag.js
+
+Problem: The `needs-clarification-triage` advisory (referenced in Subject 1-3 history) overrides the `retire` disposition from `adhoc-staleness-flag.js` when it encounters an `invalid-premise` flag, incorrectly treating a deterministic factual error as a human-resolvable design question. This causes tasks that should be automatically retired to be stuck in `needs-clarification`, burning human attention on non-issues.
+Solution: In `src/adhoc-staleness-flag.js`, add a guard in the `sweep` function (or the advisory integration point) that prevents the `needs-clarification-triage` advisory from overriding a `high`-confidence `retire` disposition for `invalid-premise` reasons. Specifically, if `task.stalenessFlag.reason === 'invalid-premise'` and `task.stalenessFlag.confidence === 'high'`, the triage logic should skip the "genuine design question" classification and instead mark the task as `retired` or `archived` directly, bypassing the `needs-clarification` state. Acceptance check: A test case where a task with `invalid-premise` flag and `high` confidence is swept; assert that the task ends in `retired`/`archived` state, not `needs-clarification`, and that no `needs-clarification-triage` advisory is recorded in its history.
+Benefits: Tasks with factually impossible premises (naming non-existent files) are automatically retired without human intervention, reducing noise in the `needs-clarification` queue and freeing human attention for genuine design decisions.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-3-needs-clarification-tasks-same-signature-derived-task-fabricated-ungrounded-cl-1789389264707
