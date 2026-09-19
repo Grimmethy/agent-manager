@@ -46,8 +46,12 @@ test('pipelineHealthAuditSweep reports { filed: false, error } instead of throwi
 // "nextPipelineHealthAuditTask returns null ... when the hourly check is not due yet" --
 // proves the sweep's DEFAULT (uninjected) next/write actually resolve to the real
 // task-sources.js functions, not just that the injected-dependency plumbing works.
-test('pipelineHealthAuditSweep(), with no injected deps, defers to the real nextPipelineHealthAuditTask and is a no-op when not due', () => {
+test('pipelineHealthAuditSweep(), with no injected deps, defers to the real nextPipelineHealthAuditTask and is a no-op when not due', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'health-audit-sweep-wiring-test-'));
+  // pipeline_health_audit is a core-scope source (src/lib/source-scope.js): declare this temp repo as the core repo.
+  const savedCore = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  process.env.AGENT_MANAGER_CORE_REPO_ROOT = dir;
+  t.after(() => { if (savedCore === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = savedCore; });
   process.env.AGENT_MANAGER_REPO_ROOT = dir;
   process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
   const { clearRegistry } = require('./task-source-registry.js');

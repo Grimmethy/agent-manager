@@ -1825,6 +1825,12 @@ def task_source_default_priorities() -> dict:
     return {s["name"]: s.get("priority") for s in load_topology()}
 
 
+def task_source_scopes() -> dict:
+    """name -> 'core' | 'project'. 'core' sources audit agent-manager itself and are skipped when another
+    project is active (src/lib/source-scope.js)."""
+    return {s["name"]: s.get("scope", "project") for s in load_topology()}
+
+
 def task_source_default_worker_types() -> dict:
     return {s["name"]: s.get("workerType", "ornith") for s in load_topology()}
 

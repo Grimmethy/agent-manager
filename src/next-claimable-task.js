@@ -127,6 +127,8 @@ function pickClaimableTasks(pendingDir, instanceId) {
   const hubKeyCache = new Map();
   const noHubKey = { rank: Infinity, createdAt: null };
 
+  const { sourceEligibleHere, activeRepoIsCore } = require('./lib/source-scope.js');
+  const coreActive = activeRepoIsCore();
   const pinned = [];
   const rankable = [];
   for (const name of names) {
@@ -137,6 +139,13 @@ function pickClaimableTasks(pendingDir, instanceId) {
       pinned.push({ name, mtimeMs });
       continue;
     }
+
+    // A scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is
+    // not claimable, even if one is already sitting in pending/ (src/lib/source-scope.js). An explicit
+    // operator pin (handled above) still wins.
+    try {
+      if (task && !sourceEligibleHere(getRegisteredSource(resolveSourceName(task)), coreActive)) continue;
+    } catch (_) { /* unresolvable source -- not gated */ }
 
     let priority = Infinity;
     if (task) {

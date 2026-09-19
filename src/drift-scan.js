@@ -145,6 +145,13 @@ function scan(repoRoot) {
 }
 
 function main() {
+  // The drift pairs compare agent-manager's OWN README/docs against its live task-source registry, so they
+  // only mean something when agent-manager is the active project (on PF it wrote 'could not read README.md').
+  const { sourceEligibleHere } = require('./lib/source-scope.js');
+  if (!sourceEligibleHere({ scope: 'core' })) {
+    console.log('drift-scan: skipped -- active project is not agent-manager (core-scope check).');
+    process.exit(0);
+  }
   const { repoRoot, pipelineDir } = getConfig();
   const results = scan(repoRoot);
   const flagged = results.filter((r) => r.error || r.missingFromStatic.length || r.staleInStatic.length);

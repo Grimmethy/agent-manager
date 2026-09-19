@@ -5,6 +5,7 @@
 const path = require('path');
 const { registerTaskSource, getRegisteredSources, resolveSourceName } = require('../task-source-registry.js');
 const { getConfig } = require('../config.js');
+const { activeRepoIsCore, sourceEligibleHere } = require('./source-scope.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('../sdk/candidate-fulfillment.js');
 
 function nextProductSpecSectionTask() {
@@ -19,7 +20,10 @@ function nextProductSpecSectionTask() {
 function getNextTask() {
   const { taskSourceAllowlist } = getConfig();
   const restricted = taskSourceAllowlist && taskSourceAllowlist.length > 0;
+  const coreActive = activeRepoIsCore();
   for (const source of getRegisteredSources()) {
+    // scope:'core' sources audit agent-manager itself -- skip them on any other project (source-scope.js).
+    if (!sourceEligibleHere(source, coreActive)) continue;
     // 'adhoc' is a fixed contract (README: "preempts every deterministic source") --
     // an allowlist restricting this run to e.g. just project_search should still let an
     // explicitly human-queued adhoc task through, not silently swallow it. 'brain_dump_sort'
