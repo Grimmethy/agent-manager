@@ -2281,8 +2281,12 @@ test('nextCandidateFulfillmentTask fetches real, current content for a file that
   assert.equal(task.promptContext.fetchedFiles[0].content, 'try {\n  risky();\n} catch {}\n');
 });
 
-test('pipeline_forensics_fix: a candidate in Docs/PIPELINE_FIX_CANDIDATES.md mints a grounded fix task', () => {
+test('pipeline_forensics_fix: a candidate in Docs/PIPELINE_FIX_CANDIDATES.md mints a grounded fix task', (t) => {
   const dir = makeAdhocFixtureRepo();
+  // pipeline_forensics_fix is a core-scope source (src/lib/source-scope.js): declare this temp repo as the core repo.
+  const savedCore = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  process.env.AGENT_MANAGER_CORE_REPO_ROOT = dir;
+  t.after(() => { if (savedCore === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = savedCore; });
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'src', 'local-tool-client.js'), 'function readFileTool() { /* no line window */ }\n');
   const candidatesPath = writeCandidatesDocWithFiles(dir, path.join('Docs', 'PIPELINE_FIX_CANDIDATES.md'), 'src/local-tool-client.js');

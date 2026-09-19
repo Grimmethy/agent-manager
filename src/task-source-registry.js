@@ -22,6 +22,14 @@ function registerTaskSource(name, config) {
   if (registry[name] !== undefined) {
     throw new Error(`Task source "${name}" is already registered`);
   }
+  // scope:'core' sources audit agent-manager ITSELF (src/lib/source-scope.js). Wrap next() so that EVERY
+  // caller -- getNextTask, the always-run watchdog sweeps that call a source directly -- gets null on any
+  // other project, not just the priority ladder.
+  if (config && config.scope === 'core' && typeof config.next === 'function') {
+    const inner = config.next;
+    const { sourceEligibleHere } = require('./lib/source-scope.js');
+    config = { ...config, next: (...args) => (sourceEligibleHere({ scope: 'core' }) ? inner(...args) : null) };
+  }
   registry[name] = { name, ...config };
 }
 

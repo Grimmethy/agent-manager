@@ -8,6 +8,10 @@ A queue-based system that delegates scoped implementation tasks to a local Ornit
 A priority-ranked generator, registered via `registerTaskSource`, that produces tasks for the queue (e.g. `adhoc`, `deep_dive`, `backlog_fulfillment`). The priority ladder between task sources determines claim order. Sources come from this repo's `src/task-sources.js` **and** from any out-of-tree plugin loaded via `AGENT_MANAGER_REGISTER_PATH` — the programming-hygiene sources (`observability_*`, `performance_*`, `function_length_*`, `arch_*`, `unused_export`) live in the **agent-manager-hygiene** plugin, not here. See `docs/PLUGIN_API.md`.
 _Avoid_: source (ambiguous with the `source` field below — always say "task source" for the generator)
 
+**Core-scope source**:
+A task source registered with `scope: 'core'` whose subject is agent-manager ITSELF (its daemons, queue health, failure classes, README, dashboard UI): `pipeline_health_audit`, `pipeline_self_audit`, `pipeline_forensics`, `pipeline_forensics_fix`, `pipeline_debrief`, `doc_drift_fix`, `ui_visibility_audit`. It runs only when agent-manager is the active project (`src/lib/source-scope.js`, enforced at generation, at claim, and in the watchdog sweeps that call a source directly); on any other project it is skipped, so a self-audit can't outrank that project's hygiene work or file pipeline findings into its brain dump. `AGENT_MANAGER_CORE_SOURCES_ANYWHERE=true` disables the gate. The Job List marks these rows "agent-manager only".
+_Avoid_: pipeline source (ambiguous -- every source runs in the pipeline)
+
 **Source** (task field):
 Records which task source produced a given task. Usually matches the task source's registered name — except tasks from the `adhoc` task source, whose `source` field is `manual`, not `adhoc`.
 _Avoid_: domain (a different field, see below)

@@ -84,6 +84,15 @@ def api_job_types():
     counters = read_job_type_counters()
     available_counts = available_candidate_counts()
     family_of = task_source_family_of()
+    from app import task_source_scopes
+    scopes = task_source_scopes()
+
+    def _description(name):
+        desc = SOURCE_DESCRIPTIONS.get(name, "")
+        if scopes.get(name) == "core":
+            desc = (desc + " " if desc else "") + "[agent-manager only -- skipped when another project is active]"
+        return desc
+
     return jsonify([
         {
             "name": name,
@@ -103,7 +112,8 @@ def api_job_types():
             # blank cell rather than a misleading 0.
             "available": available_counts.get(name),
             "domain": SOURCE_DOMAIN_LABELS.get(_SOURCE_TO_DOMAIN_KEY.get(name, name), _SOURCE_TO_DOMAIN_KEY.get(name, name)),
-            "description": SOURCE_DESCRIPTIONS.get(name, ""),
+            "scope": scopes.get(name, "project"),
+            "description": _description(name),
         }
         for name in task_source_catalog()
     ])

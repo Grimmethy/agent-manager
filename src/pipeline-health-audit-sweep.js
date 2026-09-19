@@ -29,8 +29,12 @@
 // regardless of backlog size.
 
 const { nextPipelineHealthAuditTask, writeTask } = require('./task-sources.js');
+const { sourceEligibleHere } = require('./lib/source-scope.js');
 
 function pipelineHealthAuditSweep({ next = nextPipelineHealthAuditTask, write = writeTask } = {}) {
+  // Audits agent-manager's own daemons/queue health -- meaningless (and it outranked PF's hygiene reviews) on
+  // any other project. This sweep calls the source directly, so it needs its own core-scope check.
+  if (!sourceEligibleHere({ scope: 'core' })) return { filed: false, skipped: 'core-scope: active project is not agent-manager' };
   let task;
   try {
     task = next();
