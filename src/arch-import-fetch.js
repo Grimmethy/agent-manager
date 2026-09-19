@@ -32,6 +32,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { grepCodebase } = require('./grep-codebase-tool.js');
+const { windowedContent } = require('./task-anchor-files.js');
 
 const MAX_HITS_PER_QUERY = 8;
 // Smaller than deep_dive's DEEP_DIVE_CONTEXT_BUDGET_CHARS (24000) -- this content shares
@@ -84,6 +85,22 @@ function fetchForQueries(queries, { roots } = {}) {
   // insertion order already roughly reflects match density (files that matched more
   // queries/hits appear earlier via repeated hits) -- good enough for a budget cutoff,
   // no need for a second ranking pass.
+  //
+  // Line-anchored windowing (2026-09-19, ghost-in-the-machine retroactive audit of the
+  // pipeline_debrief blocked/ bucket): this used to require a matched file's ENTIRE content
+  // to fit the shared MAX_CONTENT_CHARS budget or be skipped outright -- fine for this
+  // module's original small-utility-file callers, but structurally unable to ever include
+  // agent-manager's own hot files (review-task.js 79KB, local-draft.js 106KB, task-
+  // sources.js 187KB, prompts.js 110KB, app.py 214KB -- every one 7-18x the whole budget),
+  // which is exactly what a determinism audit (pipeline_debrief/pipeline_forensics, the
+  // other real callers via kind:'archImport') keeps needing to cite. Confirmed live: 15 of
+  // 28 blocked pipeline_debrief tasks showed real grep hits (up to 40) but 0 files fetched --
+  // AVAILABLE FILES came back empty every time a hit landed in one of these files, leaving
+  // the model to either (correctly) say no file can be cited, or reach for a plausible-
+  // sounding filename from the codebase's own naming conventions -- flagged, rightly, as
+  // fabrication. Reusing task-anchor-files.js's own windowedContent() (built for the
+  // identical "oversized file, real hit lines available" shape on the adhoc-drafting side)
+  // windows each match to the lines actually hit instead of demanding the whole file.
   for (const { file: relPath, root } of matchedFiles.values()) {
     if (budgetUsed >= MAX_CONTENT_CHARS) break;
     let content;
@@ -92,9 +109,21 @@ function fetchForQueries(queries, { roots } = {}) {
     } catch {
       continue;
     }
-    if (budgetUsed + content.length > MAX_CONTENT_CHARS) continue;
-    files.push(root ? { path: relPath, root, content } : { path: relPath, content });
-    budgetUsed += content.length;
+    const hitLines = hits
+      .filter((h) => h.file === relPath && (h.root || null) === (root || null))
+      .map((h) => h.line)
+      .filter((n) => Number.isInteger(n));
+    let windowed = hitLines.length ? windowedContent(content, MAX_CONTENT_CHARS, { hitLines }) : content;
+    const remaining = MAX_CONTENT_CHARS - budgetUsed;
+    if (windowed.length > remaining) {
+      // windowedContent's own hit-line path has a larger internal cap than any single
+      // caller's remaining shared budget might allow (by design -- it doesn't know about
+      // this budget) -- a final defensive slice, not a silent full-file skip like before.
+      windowed = `${windowed.slice(0, Math.max(0, remaining))}\n...[window truncated to fit the shared budget]`;
+    }
+    if (!windowed.trim()) continue;
+    files.push(root ? { path: relPath, root, content: windowed } : { path: relPath, content: windowed });
+    budgetUsed += windowed.length;
   }
 
   return { hits, files };
@@ -117,4 +146,4 @@ if (require.main === module) {
   console.log(JSON.stringify(fetchForQueries(normalizedQueries)));
 }
 
-module.exports = { fetchForQueries };
+module.exports = { fetchForQueries, MAX_CONTENT_CHARS };

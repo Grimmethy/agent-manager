@@ -326,4 +326,4 @@ function anchorFilesPromptBlock(task) {
   ].join('\n');
 }
 
-module.exports = { taskAnchorFiles, anchorFilesPromptBlock, resolveBareFilename, taskIdentifiers, backtickIdentifiers };
+module.exports = { taskAnchorFiles, anchorFilesPromptBlock, resolveBareFilename, taskIdentifiers, backtickIdentifiers, windowedContent };
