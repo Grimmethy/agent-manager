@@ -177,3 +177,107 @@ test('runPremiseCheckAsPostImplement matches the (task, implementResponse, opts)
   });
   assert.equal(result.verdict, 'invalid-premise');
 });
+
+// --- full-file verification of a "not found" verdict (AC-13 incident, 2026-09-18) -----------
+// The deterministic checks above compare a cited symbol against promptContext.fetchedFiles,
+// which is a WINDOWED, truncated slice of each file. AC-13 cited `arch_discovery` in
+// python/dashboard/app.py (a 4,229-line file that really does contain it 7 times); the ~14KB
+// window simply didn't include it, so the check declared the citation fabricated, blocked the
+// task, and persisted that false verdict into promptContext.premiseEvidence to be replayed on
+// every retry. A "not found" verdict against a truncated snapshot must be re-verified against
+// the real file before it can block anything.
+
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+
+function withRepo(files, fn) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'premise-check-'));
+  try {
+    for (const [rel, content] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), content);
+    }
+    return fn(root);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const TRUNCATED = '...[truncated]...\nunrelated head of the file\n...[truncated]...\n';
+const citing = (over = {}) => task({
+  promptContext: {
+    body: 'Problem: `src/app.py` cites `arch_discovery` as an existing route but never wires it.',
+    fetchedFiles: [{ path: 'src/app.py', content: TRUNCATED }],
+    ...over,
+  },
+});
+
+test('checkCitations: a symbol missing from a TRUNCATED snapshot but present in the real file is NOT a contradiction', () => {
+  withRepo({ 'src/app.py': 'def arch_discovery():\n    pass\n' }, (root) => {
+    const t = citing();
+    assert.deepEqual(checkCitations(t, t.promptContext.body, { repoRoots: [root] }), []);
+  });
+});
+
+test('checkCitations: a symbol absent from both the snapshot and the real file IS still a contradiction', () => {
+  withRepo({ 'src/app.py': 'def something_else():\n    pass\n' }, (root) => {
+    const t = citing();
+    const c = checkCitations(t, t.promptContext.body, { repoRoots: [root] });
+    assert.equal(c.length, 1);
+    assert.equal(c[0].kind, 'missing-citation');
+  });
+});
+
+test('checkCitations: truncated snapshot + real file unreadable -> no verdict (cannot verify, do not guess)', () => {
+  withRepo({}, (root) => {
+    const t = citing();
+    assert.deepEqual(checkCitations(t, t.promptContext.body, { repoRoots: [root] }), []);
+  });
+});
+
+test('checkCitations: complete (untruncated) snapshot + real file unreadable keeps the original verdict', () => {
+  withRepo({}, (root) => {
+    const t = citing({ fetchedFiles: [{ path: 'src/app.py', content: 'def other():\n    pass\n' }] });
+    assert.equal(checkCitations(t, t.promptContext.body, { repoRoots: [root] }).length, 1);
+  });
+});
+
+test('checkPrerequisiteClaim: a prerequisite present in the real file but outside a truncated window is NOT a contradiction', () => {
+  withRepo({ 'src/app.py': 'def detectExternalDependency():\n    pass\n' }, (root) => {
+    const t = task({
+      promptContext: {
+        body: 'Problem: the existing `detectExternalDependency` gate is never consulted.',
+        files: ['src/app.py'],
+        fetchedFiles: [{ path: 'src/app.py', content: TRUNCATED }],
+      },
+    });
+    assert.deepEqual(checkPrerequisiteClaim(t, t.promptContext.body, { repoRoots: [root] }), []);
+  });
+});
+
+test('checkPrerequisiteClaim: truncated snapshot + nothing verifiable on disk -> no verdict', () => {
+  withRepo({}, (root) => {
+    const t = task({
+      promptContext: {
+        body: 'Problem: the existing `detectExternalDependency` gate is never consulted.',
+        fetchedFiles: [{ path: 'src/app.py', content: TRUNCATED }],
+      },
+    });
+    assert.deepEqual(checkPrerequisiteClaim(t, t.promptContext.body, { repoRoots: [root] }), []);
+  });
+});
+
+test('runPremiseCheck does not replay a stale persisted contradiction that the real file refutes', async () => {
+  await withRepo({ 'src/app.py': 'def arch_discovery():\n    pass\n' }, async (root) => {
+    const t = citing({
+      premiseEvidence: { contradictions: [{ kind: 'missing-citation', detail: 'candidate cites `arch_discovery` in src/app.py, but that name does not appear anywhere in the real fetched content of src/app.py' }] },
+    });
+    let modelCalls = 0;
+    const r = await runPremiseCheck(t, {
+      repoRoots: [root],
+      call: async () => { modelCalls += 1; return { response: 'PREMISE_VALID' }; },
+    });
+    assert.equal(r.verdict, 'ok');
+  });
+});

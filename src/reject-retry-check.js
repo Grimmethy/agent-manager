@@ -30,7 +30,7 @@ const crypto = require('crypto');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { classifyBlockedTask, findClassifier } = require('./blocked-task-classifiers.js');
+const { classifyBlockedTask, findClassifier, hasInvalidPremise } = require('./blocked-task-classifiers.js');
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
@@ -172,13 +172,22 @@ function computeBlockSignature(task) {
 // sets the count and READMIT_CLEAN_SLATE_FIELDS (which lists 'premiseReadmitCount')
 // strips the guard on any subsequent clean-slate pass, so the bound is one-shot per
 // task lifecycle and a task that somehow still fails this way is not re-admitted forever.
+//
+// 2026-09-18 (AC-13 / AC-133): not limited to blockedStage:'review'. local-draft.js's
+// premiseCheck hook stamps its "Invalid premise:" block with NO blockedStage, and a model-
+// fallback verdict can arrive with reviewInconclusive:true -- the entry gate's allow-list
+// of stages never saw either, so both sat in blocked/ forever, and the verdict itself was
+// wrong (the check compared against a truncated snapshot; see candidate-premise-check.js).
+// A review-stage task keeps the original test (verdict anywhere in the block text or prior
+// feedback); any OTHER stage only counts when its OWN blockedReason is the verdict, so an
+// old rejection note that merely mentions one can't trigger a readmit on an unrelated block.
 function invalidPremiseBeforeCheckExisted(task) {
-  const reason = (task.blockedReason || '') + ' ' + (task.priorRejectionFeedback || '');
-  return (
-    /Invalid premise:/i.test(reason) &&
-    task.blockedStage === 'review' &&
-    !task.premiseReadmitCount
-  );
+  if (task.premiseReadmitCount) return false;
+  if (task.blockedStage === 'review') {
+    const reason = (task.blockedReason || '') + ' ' + (task.priorRejectionFeedback || '');
+    return /Invalid premise:/i.test(reason);
+  }
+  return hasInvalidPremise(task);
 }
 
 // 2026-09-17: every escalation site in this file used to check "has this task EVER, in
@@ -461,7 +470,11 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       const preImplementBlock = isPreImplementBlock(task);
       const draftFailureBlock = isDraftFailureBlock(task);
       const planDegenerateBlock = isPlanDegenerateBlock(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock) continue;
+      // An "Invalid premise:" verdict is recognized whatever its blockedStage (or lack of
+      // one) -- see invalidPremiseBeforeCheckExisted / hasInvalidPremise: it is either
+      // re-admitted once or escalated by the classifier below, never left invisible.
+      const invalidPremiseBlock = hasInvalidPremise(task);
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !invalidPremiseBlock) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
