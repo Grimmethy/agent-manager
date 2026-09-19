@@ -132,3 +132,13 @@ test('writeSideFindingInbox writing two findings produces two distinct files, ne
   writeSideFindingInbox({ title: 'Two', body: 'B' }, { pipelineDir: dir });
   assert.equal(fs.readdirSync(inboxDir(dir)).length, 2);
 });
+
+test('instruction states the bar: concrete, verified, consequential, with explicit exclusions', () => {
+  const { SIDE_FINDING_INSTRUCTION } = require('./side-finding.js');
+  for (const clause of ['Concrete', 'Verified', 'Consequential', 'Do NOT file', 'not a regression', 'filing nothing is the normal outcome']) {
+    assert.ok(SIDE_FINDING_INSTRUCTION.includes(clause), `missing clause: ${clause}`);
+  }
+  // The marker and template tokens must survive: extraction and the placeholder-echo guard depend on them.
+  assert.ok(SIDE_FINDING_INSTRUCTION.includes('SIDE-FINDING: <one-line title>'));
+  assert.ok(SIDE_FINDING_INSTRUCTION.includes('<1-3 sentences of detail>'));
+});
