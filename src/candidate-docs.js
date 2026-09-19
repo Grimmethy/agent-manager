@@ -154,9 +154,15 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
 
   let text = fs.existsSync(candidatesPath) ? fs.readFileSync(candidatesPath, 'utf8') : `${docTitle}\n`;
 
+  // The working-tree copy is only ONE branch's view of the doc. Ids already used on the default branch or
+  // on any unmerged agent/* branch must be skipped too, or two branches each allocate "the next free id"
+  // and collide (2026-09-19: an arch_review split reused AC-2/AC-3 that the unmerged triage-queue branch
+  // -- since merged -- also used). See lib/candidate-doc-refs.js. 0 when git can't answer.
+  const idFloor = require('./lib/candidate-doc-refs.js').highestIdAcrossRefs(candidatesPath);
+
   const candidateIds = [];
   candidates.forEach((c) => {
-    const id = `AC-${nextAvailableCandidateId(text)}`;
+    const id = `AC-${Math.max(nextAvailableCandidateId(text), idFloor + 1)}`;
     const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
     // Split-Depth: N -- a one-level pre-split marker; nextCandidateFulfillmentTask (SDK)
     // refuses to pre-split a candidate at depth >= 1 (hard recursion stop).
