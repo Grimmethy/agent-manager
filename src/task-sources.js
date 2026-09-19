@@ -11,6 +11,7 @@
 // renumbering anything.
 
 const fs = require('fs');
+const { generationThrottled } = require('./generation-throttle.js');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
@@ -2892,18 +2893,24 @@ if (require.main === module) {
       return true;
     }
   };
-  const hasDraftingWork = fs.existsSync(draftingDir)
-    && fs.readdirSync(draftingDir, { withFileTypes: true }).some((entry) => {
-      if (!entry.isDirectory()) return false;
+  // Count of same-tier tasks in flight (drafting/ across every instance + pending/). The
+  // throttle is per live lane, not one-per-tier -- see generation-throttle.js.
+  let inFlightCount = 0;
+  if (fs.existsSync(draftingDir)) {
+    for (const entry of fs.readdirSync(draftingDir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
       const instanceDir = path.join(draftingDir, entry.name);
       try {
-        return fs.readdirSync(instanceDir).some((f) => f.endsWith('.json') && taskFileMatchesTier(path.join(instanceDir, f)));
+        inFlightCount += fs.readdirSync(instanceDir).filter((f) => f.endsWith('.json') && taskFileMatchesTier(path.join(instanceDir, f))).length;
       } catch {
-        return false;
+        // unreadable instance dir -- not counted, same non-fatal-skip convention as above
       }
-    });
-  const alreadyPending = hasDraftingWork
-    || (fs.existsSync(pendingDir) && fs.readdirSync(pendingDir).some((f) => f.endsWith('.json') && taskFileMatchesTier(path.join(pendingDir, f))));
+    }
+  }
+  if (fs.existsSync(pendingDir)) {
+    inFlightCount += fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json') && taskFileMatchesTier(path.join(pendingDir, f))).length;
+  }
+  const alreadyPending = generationThrottled(inFlightCount, path.join(pipelineDir, 'instances'), tierFilter);
 
   // An already-queued lower-priority task must never block a NEW adhoc task from
   // reaching pending/ -- adhoc is the "drop everything, do this now" lane. This exception
