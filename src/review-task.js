@@ -454,6 +454,14 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   lines.push('--- Deterministic fact-check pre-filter (necessary, NOT sufficient) ---');
   lines.push(JSON.stringify(factCheck));
   lines.push('');
+  // Advisory only (see local-draft.js's postImplementCheck handling): a literal-text check that
+  // could not verify something. NOT proof of a defect, so it informs the votes, never blocks.
+  if (Array.isArray(task.groundingWarnings) && task.groundingWarnings.length) {
+    lines.push('--- Grounding warnings (advisory) ---');
+    for (const w of task.groundingWarnings) lines.push(`- ${w}`);
+    lines.push('These come from a literal-text check, not proof of a defect: a name may live in a different real file, or be one this draft proposes to create. Verify each against the real grounding source; reject only if a claim about EXISTING code is actually false.');
+    lines.push('');
+  }
   if (groundingText) {
     lines.push('--- Real grounding source (the material the drafter was actually given -- use this to verify SPECIFIC claims, not just the fact-check above) ---');
     lines.push(groundingText.length > 40000 ? `${groundingText.slice(0, 40000)}\n...[truncated]` : groundingText);

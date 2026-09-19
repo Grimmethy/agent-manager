@@ -2410,6 +2410,37 @@ test('draftTask proceeds normally when the source\'s postImplementCheck returns 
   });
 });
 
+test('draftTask keeps postImplementCheck warnings on the task (not blocked) and clears them on the next pass', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    let warn = true;
+    if (!getRegisteredSource('post_implement_check_warn_source')) {
+      registerTaskSource('post_implement_check_warn_source', {
+        priority: 80, next: () => null,
+        postImplementCheck: async () => (warn ? { verdict: 'ok', warnings: ['symbol `resetResults` not found in the cited file(s)'] } : { verdict: 'ok' }),
+      });
+      updateTaskSource('post_implement_check_warn_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const mk = (id) => ({
+      id, domain: 'default', source: 'post_implement_check_warn_source', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+    });
+    const localCall = async () => ({ response: 'a candidate', degenerate: null, attempts: 1 });
+    const task = mk('post-implement-warn-1');
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.blockedStage, undefined);
+    assert.equal(task.status, 'needs-review');
+    assert.deepEqual(task.groundingWarnings, ['symbol `resetResults` not found in the cited file(s)']);
+    assert.ok(task.history.some((e) => e.stage === 'grounding-warning'));
+    warn = false;
+    const redraft = mk('post-implement-warn-2');
+    redraft.groundingWarnings = ['stale'];
+    await draftTask(redraft, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(redraft.groundingWarnings, undefined);
+  });
+});
+
 test('draftTask proceeds normally when the source has no postImplementCheck registered (regression guard)', async () => {
   await withFixtureRepo(async (draftTask) => {
     const task = {

@@ -1105,6 +1105,16 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
       task.priorRejectionFeedback.push(blockedReason);
       return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
     }
+    // An 'ok' verdict may still carry `warnings`: things the check could not verify but that
+    // are not proof of a defect (e.g. a symbol not found by literal grep in the cited files).
+    // Kept on the task for review-task.js's buildVerdictPrompt so the votes can weigh them,
+    // instead of blocking a draft on a heuristic. Reset every pass so a redraft never
+    // inherits a stale warning.
+    delete task.groundingWarnings;
+    if (grounding && grounding.verdict === 'ok' && Array.isArray(grounding.warnings) && grounding.warnings.length) {
+      task.groundingWarnings = grounding.warnings.slice(0, 10).map((w) => String(w).slice(0, 300));
+      appendHistoryEvent(task, 'grounding-warning', task.groundingWarnings.join('; ').slice(0, 300));
+    }
   }
 
   // Deterministic find-verification retry (see findUnverifiedEdit's own header) --

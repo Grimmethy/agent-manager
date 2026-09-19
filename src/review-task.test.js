@@ -138,6 +138,14 @@ function brainDumpSortTask(overrides = {}) {
 // June/August 2026 press coverage got rejected -- the reviewer's own blockedReason said
 // "given the current real-world date context (2024/2025)", i.e. it had no real anchor for
 // "today" at all. Fixed by stating the actual date unconditionally.
+test('buildVerdictPrompt shows advisory grounding warnings, and omits the section when there are none', () => {
+  const withWarn = buildVerdictPrompt({ ...baseTask(), groundingWarnings: ['symbol `resetResults` not found in the cited file(s)'] }, { flags: [] }, '');
+  assert.match(withWarn, /Grounding warnings \(advisory\)/);
+  assert.match(withWarn, /`resetResults` not found/);
+  assert.match(withWarn, /not proof of a defect/);
+  assert.doesNotMatch(buildVerdictPrompt(baseTask(), { flags: [] }, ''), /Grounding warnings/);
+});
+
 test('buildVerdictPrompt states the real current date so recency judgments have a real anchor', () => {
   const prompt = buildVerdictPrompt(baseTask(), { flags: [] }, '');
   const today = new Date().toISOString().slice(0, 10);
