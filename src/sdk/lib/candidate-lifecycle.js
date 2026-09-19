@@ -71,7 +71,11 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
   // next() poll calls this.
   const { taskIdExistsInQueue, isDependencySatisfied } = require('../../task-sources.js');
   const { defaultDomain, pipelineDir } = getConfig();
-  const text = readIfExists(candidatesPath);
+  // Read the doc as it is on the DEFAULT BRANCH, not from whichever branch the checkout is on: only a
+  // candidate a human has merged may become a task (2026-09-19: arch-review-ac-2 was drafting content that
+  // existed only on the unmerged agent/arch-review-ac-1). Falls back to the working-tree file when git
+  // can't answer. See lib/candidate-doc-refs.js.
+  const text = require('../../lib/candidate-doc-refs.js').readCandidatesText(candidatesPath);
   if (!text) return null;
 
   const sections = [];
