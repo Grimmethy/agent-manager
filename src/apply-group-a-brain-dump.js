@@ -152,8 +152,14 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   // text into the entry's CURRENT record would silently mislabel it under a rawText it no
   // longer has. Only apply if the entry is still exactly what this task was drafted against.
   if (entry.status !== 'captured' || entry.rawText !== rawText) {
-    return recoverableSortSkip(data, entry, brainDumpPath,
-      'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text');
+    console.warn(`[applyBrainDumpSort] stale brain-dump entry ${brainDumpEntryId}: status=${entry.status}, rawText mismatch — skipping sort`);
+    return {
+      skipped: true,
+      stale: true,
+      retryable: true,
+      recoverable: true,
+      reason: `brain-dump entry "${brainDumpEntryId}" changed since this task was drafted — a fresh sort will classify the current text`,
+    };
   }
 
   if (!secondBrainDir) {
