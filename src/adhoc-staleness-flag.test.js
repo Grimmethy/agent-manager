@@ -58,7 +58,7 @@ test('stale-age only, or possibly-resolved only -> null (staleness_audit source 
 
 function tmpPipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'adhoc-stale-'));
-  for (const d of ['blocked', 'needs-clarification', 'pending', 'done']) {
+  for (const d of ['blocked', 'needs-clarification', 'pending', 'done', 'coordinating']) {
     fs.mkdirSync(path.join(dir, 'queue', d), { recursive: true });
   }
   return dir;
@@ -173,4 +173,78 @@ test('kill switch disables the sweep entirely', async () => {
   delete process.env.AGENT_MANAGER_ADHOC_STALENESS_FLAG;
   assert.equal(s.scanned, 0);
   assert.equal(readTask(dir, 'blocked', 'off-1').stalenessFlag, undefined);
+});
+
+// --- coordinating-hub tests ----------------------------------------------------------
+// sweep() captured findStalenessCandidates at require time (destructured from
+// staleness-audit.js), so patching the exports object later is a no-op. Instead we
+// swap the module's cached exports, drop the already-loaded adhoc-staleness-flag
+// module from the cache, re-require a fresh sweep bound to our candidates, and
+// restore both in a finally.
+
+function withPatchedSweep(candidates) {
+  const auditPath = require.resolve('./staleness-audit.js');
+  const flagPath = require.resolve('./adhoc-staleness-flag.js');
+  const origAudit = require.cache[auditPath].exports;
+  require.cache[auditPath].exports = Object.assign({}, origAudit, {
+    findStalenessCandidates: () => candidates,
+  });
+  delete require.cache[flagPath];
+  return async (opts) => {
+    try {
+      return require('./adhoc-staleness-flag.js').sweep(opts);
+    } finally {
+      require.cache[auditPath].exports = origAudit;
+      delete require.cache[flagPath];
+    }
+  };
+}
+
+test('coordinating task with already-implemented-strong candidate gets retire/high flag', async () => {
+  const dir = tmpPipeline();
+  const task = {
+    id: 'coord-a', domain: 'adhoc', title: 'add function computeGreeting', status: 'blocked',
+    history: [{ stage: 'exhausted', at: new Date().toISOString() }],
+  };
+  writeTask(dir, 'coordinating', task);
+  const candidates = [
+    { task, reasons: ['already-implemented-strong'], evidence: ['asks to add `computeGreeting` -- already defined in src/x.js'] },
+  ];
+  await withPatchedSweep(candidates)({ pipelineDir: dir, repoRoot: null, majorityVote: async () => ({}), now: Date.now() });
+  const t = readTask(dir, 'coordinating', 'coord-a');
+  assert.equal(t.stalenessFlag.reason, 'already-implemented');
+  assert.equal(t.stalenessFlag.disposition, 'retire');
+  assert.equal(t.stalenessFlag.confidence, 'high');
+});
+
+test('coordinating task with no matching candidate is left untouched', async () => {
+  const dir = tmpPipeline();
+  writeTask(dir, 'coordinating', {
+    id: 'coord-b', domain: 'adhoc', title: 'brand new feature nobody else covers',
+    createdAt: new Date().toISOString(),
+  });
+  const before = readTask(dir, 'coordinating', 'coord-b');
+  await withPatchedSweep([])({ pipelineDir: dir, repoRoot: null, majorityVote: async () => ({}), now: Date.now() });
+  const t = readTask(dir, 'coordinating', 'coord-b');
+  assert.equal(t.stalenessFlag, undefined);
+  assert.deepEqual(t, before, 'task file unchanged');
+});
+
+test('coordinating task with a fresh flag within TTL is not re-stamped', async () => {
+  const dir = tmpPipeline();
+  const now = Date.now();
+  const flaggedAt = new Date(now - 60_000).toISOString();
+  const task = {
+    id: 'coord-c', domain: 'adhoc', title: 'add function computeGreeting', status: 'blocked',
+    stalenessFlag: { reason: 'already-implemented', disposition: 'retire', confidence: 'high', flaggedAt },
+  };
+  writeTask(dir, 'coordinating', task);
+  const histLen = (task.history || []).length;
+  const candidates = [
+    { task, reasons: ['already-implemented-strong'], evidence: ['asks to add `computeGreeting` -- already defined in src/x.js'] },
+  ];
+  await withPatchedSweep(candidates)({ pipelineDir: dir, repoRoot: null, majorityVote: async () => ({}), now: now + 120_000 });
+  const t = readTask(dir, 'coordinating', 'coord-c');
+  assert.equal(t.stalenessFlag.flaggedAt, flaggedAt, 'flaggedAt unchanged (fresh guard skipped re-stamp)');
+  assert.equal((t.history || []).length, histLen, 'history length unchanged');
 });
