@@ -46,3 +46,10 @@ test('missing instances dir and no --tier fall back to one slot', () => {
   assert.equal(generationThrottled(1, dir, undefined), true);
   assert.equal(generationThrottled(0, dir, undefined), false);
 });
+
+test("'all' scope counts every live worker lane (lane tiers off)", () => {
+  const dir = makeInstances([['worker-1', process.pid], ['worker-p40', process.pid], ['worker-reasoning', process.pid], ['worker-reasoning-p40', process.pid]]);
+  assert.equal(liveLaneCount(dir, 'all'), 4);
+  assert.equal(generationThrottled(3, dir, 'all'), false);
+  assert.equal(generationThrottled(4, dir, 'all'), true);
+});
