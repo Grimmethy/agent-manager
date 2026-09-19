@@ -137,29 +137,8 @@ function recoverableSortSkip(data, entry, brainDumpPath, reason) {
   return { skipped: true, recoverable: true, reason };
 }
 
-function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
+function runSortApply({ implementResponse, entry, data, brainDumpPath, secondBrainDir, pipelineDir, task }) {
   const { brainDumpEntryId, rawText, existingQueuedTitles } = task.promptContext;
-
-  const data = loadBrainDump(brainDumpPath);
-
-  const entry = findEntry(data, brainDumpEntryId);
-  if (!entry) {
-    // Terminal: the entry is gone, there is nothing to regenerate.
-    return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` };
-  }
-  // The entry may have been edited (the dashboard's PUT resets status back to 'captured' on
-  // a text change) or otherwise changed since this task was drafted -- classifying stale
-  // text into the entry's CURRENT record would silently mislabel it under a rawText it no
-  // longer has. Only apply if the entry is still exactly what this task was drafted against.
-  if (entry.status !== 'captured' || entry.rawText !== rawText) {
-    return recoverableSortSkip(data, entry, brainDumpPath,
-      'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text');
-  }
-
-  if (!secondBrainDir) {
-    // Terminal: no vault configured, no retry will help.
-    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
-  }
 
   const result = parseBrainDumpSortResult(implementResponse);
   if (!result) {
@@ -441,6 +420,33 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   writeJsonAtomicSync(brainDumpPath, data);
 
   return { file: fullPath };
+}
+
+function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
+  const { brainDumpEntryId, rawText } = task.promptContext;
+
+  const data = loadBrainDump(brainDumpPath);
+
+  const entry = findEntry(data, brainDumpEntryId);
+  if (!entry) {
+    // Terminal: the entry is gone, there is nothing to regenerate.
+    return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` };
+  }
+  // The entry may have been edited (the dashboard's PUT resets status back to 'captured' on
+  // a text change) or otherwise changed since this task was drafted -- classifying stale
+  // text into the entry's CURRENT record would silently mislabel it under a rawText it no
+  // longer has. Only apply if the entry is still exactly what this task was drafted against.
+  if (entry.status !== 'captured' || entry.rawText !== rawText) {
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text');
+  }
+
+  if (!secondBrainDir) {
+    // Terminal: no vault configured, no retry will help.
+    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
+  }
+
+  return runSortApply({ implementResponse, entry, data, brainDumpPath, secondBrainDir, pipelineDir, task });
 }
 
 function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) {
