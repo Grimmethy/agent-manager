@@ -6,7 +6,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { coordinatorSweep, classifyChildStatus } = require('./coordinator-sweep.js');
+const { coordinatorSweep, classifyChildStatus, sanitizeTaskDisposition } = require('./coordinator-sweep.js');
 
 function makePipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coordinator-sweep-test-'));
@@ -610,4 +610,54 @@ test('a plain coordinating hub does NOT complete while a child is still pending-
   const summary = coordinatorSweep({ pipelineDir: dir });
   assert.equal(summary.completed, 0, 'pending-merge must never count as done -- the child has not actually landed yet');
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'pm-hub.json')), true);
+});
+
+// --- sanitizeTaskDisposition (2026-09-14, root-caused live) ----------------------------
+// A record's terminalDisposition is the later, authoritative correction over any stale
+// mergedAt / mergedAtSource / autoMergeCommit fields on the SAME record -- hand-corrected
+// live 3 times this session (a task moved to 'abandoned' after discovering its branch
+// never actually landed, but the earlier premature merge stamp's fields were still
+// present on the same record). sanitizeTaskDisposition() is the single source of truth
+// that clears those stale merge fields whenever the real disposition is anything other
+// than 'merged'.
+
+test('sanitizeTaskDisposition removes stale merge fields for an abandoned task', () => {
+  const task = {
+    id: 't-abandoned',
+    status: 'done',
+    terminalDisposition: 'abandoned',
+    mergedAt: '2026-09-14T00:00:00Z',
+    mergedAtSource: 'auto-merge',
+    autoMergeCommit: 'deadbeef00',
+    history: [{ stage: 'done', at: 'x' }],
+  };
+
+  const result = sanitizeTaskDisposition(task);
+
+  assert.equal(result, task, 'mutates (and returns) the same object in place');
+  assert.equal(task.terminalDisposition, 'abandoned', 'terminalDisposition is untouched');
+  assert.equal(task.id, 't-abandoned', 'non-merge fields are untouched');
+  assert.equal(task.mergedAt, undefined, 'stale mergedAt must be cleared');
+  assert.equal(task.mergedAtSource, undefined, 'stale mergedAtSource must be cleared');
+  assert.equal(task.autoMergeCommit, undefined, 'stale autoMergeCommit must be cleared');
+});
+
+test('sanitizeTaskDisposition retains merge fields for a legitimately merged task', () => {
+  const task = {
+    id: 't-merged',
+    status: 'done',
+    terminalDisposition: 'merged',
+    mergedAt: '2026-09-14T00:00:00Z',
+    mergedAtSource: 'auto-merge',
+    autoMergeCommit: 'deadbeef00',
+    history: [{ stage: 'done', at: 'x' }],
+  };
+
+  const result = sanitizeTaskDisposition(task);
+
+  assert.equal(result, task, 'mutates (and returns) the same object in place');
+  assert.equal(task.terminalDisposition, 'merged', 'terminalDisposition is untouched');
+  assert.equal(task.mergedAt, '2026-09-14T00:00:00Z', 'a real merged task keeps its mergedAt');
+  assert.equal(task.mergedAtSource, 'auto-merge', 'a real merged task keeps its mergedAtSource');
+  assert.equal(task.autoMergeCommit, 'deadbeef00', 'a real merged task keeps its autoMergeCommit');
 });
