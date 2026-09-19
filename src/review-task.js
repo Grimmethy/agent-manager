@@ -51,6 +51,7 @@ const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
+const { unnamedChangedFiles } = require('./lib/draft-side-effects.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { decideEmptyApprovalOutcome } = require('./empty-approval-decision.js');
 const { decidePremiseRecheckOutcome } = require('./premise-recheck-decision.js');
@@ -478,6 +479,13 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   } else {
     const guidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task);
     if (guidance) lines.push(guidance);
+  }
+  // Deterministic scope note (2026-09-19, PF-Client-Portal): a draft's diff carried an 81-line package-lock.json
+  // rewrite that the task, the plan and the draft's own summary never mentioned, and two of three votes approved
+  // without noticing. List any changed file nothing mentions so the voters must account for it.
+  const unnamed = unnamedChangedFiles(task);
+  if (unnamed.length) {
+    lines.push(`SCOPE CHECK (deterministic): the diff also changes ${unnamed.length} file(s) that NEITHER the task, the plan NOR the draft's own summary mention: ${unnamed.slice(0, 8).join(', ')}. REJECT if any of them is unrelated to the task (for example a lockfile, config or generated file rewritten as a side effect); APPROVE only if you can say why each is needed.`);
   }
   const completenessQuestion = task.candidateSplitProposals
     // "real, complete code" directly contradicts the split carve-out above, whose whole
