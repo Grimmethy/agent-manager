@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission } = require('./reject-retry-check.js');
+const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission, isReviewVerdictAdvisoryProseSource } = require('./reject-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
@@ -330,6 +330,67 @@ test('a candidateFulfillment source exhaustion escalation is idempotent across t
   const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
   assert.equal(summary.exhausted, 1);
   assert.ok(fs.existsSync(path.join(d.blockedDir, 'obs-fix-idem.json')), 'already escalated on a prior tick -- left where it is');
+  clearRegistry();
+});
+
+// 2026-09-19 (ghost-in-the-machine retroactive audit, sibling finding to bd-1789702787675
+// above): the advisoryProse "_review" TRIAGE-stage siblings of the "_fix" family
+// (performance_review, function_length_review, observability_review(_digest),
+// change_review, staleness_audit, second_brain_opportunities) fall into the exact same
+// dead end -- confirmed live via 6 of the 10 tasks remaining in queue/blocked/ after the
+// fulfillment fix shipped. pipeline_forensics/pipeline_debrief are deliberately excluded
+// (cursor-based creation makes an exhausted window's own tasks usually already moot, not
+// something a human needs to individually triage).
+
+test('isReviewVerdictAdvisoryProseSource: true for a real advisoryProse review-verdict source, excludes the cursor-based ones', () => {
+  clearRegistry();
+  registerTaskSource('fixture_performance_review', { priority: 80, next: () => null, advisoryProse: true });
+  registerTaskSource('pipeline_forensics', { priority: 44, next: () => null, advisoryProse: true });
+  registerTaskSource('pipeline_debrief', { priority: 95, next: () => null, advisoryProse: true });
+  registerTaskSource('fixture_plain_adhoc_like', { priority: 50, next: () => null });
+  assert.equal(isReviewVerdictAdvisoryProseSource('fixture_performance_review'), true);
+  assert.equal(isReviewVerdictAdvisoryProseSource('pipeline_forensics'), false, 'cursor-based -- deliberately excluded');
+  assert.equal(isReviewVerdictAdvisoryProseSource('pipeline_debrief'), false, 'cursor-based -- deliberately excluded');
+  assert.equal(isReviewVerdictAdvisoryProseSource('fixture_plain_adhoc_like'), false, 'not advisoryProse at all');
+  clearRegistry();
+});
+
+test('an advisoryProse review-verdict source (e.g. performance_review) exhausted rejection escalates to needs-clarification', () => {
+  clearRegistry();
+  registerTaskSource('fixture_performance_review', { priority: 80, next: () => null, advisoryProse: true });
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'perf-review-1', source: 'fixture_performance_review', blockedStage: 'review',
+    blockedReason: 'The draft is a refusal to render a verdict, which violates the requirement to produce a decisive GENUINE or FALSE POSITIVE verdict.',
+    localRejectCount: 2, priorRejectionFeedback: ['earlier rejection: missing GENUINE label'], history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'perf-review-1.json'), JSON.stringify(task));
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.ok(!fs.existsSync(path.join(d.blockedDir, 'perf-review-1.json')), 'moved out of blocked/');
+  const p = path.join(d.needsClarificationDir, 'perf-review-1.json');
+  assert.ok(fs.existsSync(p), 'landed in needs-clarification/, not stuck in blocked/ forever');
+  const out = JSON.parse(fs.readFileSync(p, 'utf8'));
+  assert.equal(out.needsClarification.reason, 'design-decision');
+  assert.match(out.needsClarification.openQuestions, /earlier rejection: missing GENUINE label/);
+  assert.match(out.needsClarification.openQuestions, /refusal to render a verdict/);
+  assert.match(out.needsClarification.openQuestions, /GENUINE\/FALSE POSITIVE\/UNCERTAIN/);
+  assert.ok(out.history.some((h) => h.stage === 'needs-clarification'));
+  clearRegistry();
+});
+
+test('pipeline_forensics stays in the original "stamp and stay in blocked/" behaviour, not escalated, even though it is advisoryProse', () => {
+  clearRegistry();
+  registerTaskSource('pipeline_forensics', { priority: 44, next: () => null, advisoryProse: true });
+  const d = setupAdhocDirs();
+  const task = { id: 'forensics-x', source: 'pipeline_forensics', blockedStage: 'review', blockedReason: 'r', localRejectCount: 2, history: [] };
+  fs.writeFileSync(path.join(d.blockedDir, 'forensics-x.json'), JSON.stringify(task));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.exhausted, 1);
+  assert.ok(fs.existsSync(path.join(d.blockedDir, 'forensics-x.json')), 'cursor-based source stays in blocked/, not escalated');
+  assert.ok(!fs.existsSync(path.join(d.needsClarificationDir, 'forensics-x.json')));
   clearRegistry();
 });
 

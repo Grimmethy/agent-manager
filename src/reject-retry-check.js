@@ -34,7 +34,7 @@ const { classifyBlockedTask, findClassifier } = require('./blocked-task-classifi
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-const { isCandidateFulfillmentSource } = require('./lib/harness-search.js');
+const { isCandidateFulfillmentSource, isAdvisoryProseSource } = require('./lib/harness-search.js');
 // 2026-09-16: registers this package's built-in sources (side effect of the require) --
 // deterministicReviewRecoveryCheck below looks a task's source up in this SAME registry
 // (getRegisteredSource), but this file itself never required task-sources.js, so a
@@ -387,6 +387,47 @@ function buildExhaustedFulfillmentQuestion(task) {
   ].join('\n');
 }
 
+// 2026-09-18 (ghost-in-the-machine retroactive audit of the blocked/ bucket, sibling
+// finding to bd-1789702787675 above): the "_fix" candidate-fulfillment sources got a real
+// exhaustion-to-human escalation yesterday, but their TRIAGE-stage siblings -- the
+// advisoryProse "_review" scanner sources (performance_review, function_length_review,
+// observability_review(_digest), change_review, staleness_audit,
+// second_brain_opportunities) that render a GENUINE / FALSE POSITIVE / UNCERTAIN verdict,
+// not a code diff -- were never in scope for that fix (isCandidateFulfillmentSource is
+// false for all of them) and fall into the exact same dead end: stamped 'exhausted' and
+// left in blocked/ permanently, no recovery, no human-facing exit. Confirmed live on 6 of
+// the 10 tasks remaining in blocked/ after that fix. Their own failure vocabulary is
+// different from a fulfillment candidate's (a malformed/missing verdict label, a refusal
+// to render a decisive verdict, a claim contradicted by the grounding snippet) rather than
+// "citation went stale" -- this question steers the human at THAT shape instead.
+// pipeline_forensics/pipeline_debrief are deliberately excluded even though they are also
+// advisoryProse: their cursor-based creation means an exhausted window's own tasks are
+// usually already moot by the time they exhaust (a later window supersedes it), not
+// something a human needs to individually triage -- see this session's own manual
+// retirement of 24 exhausted pipeline_debrief tasks for exactly that reasoning.
+const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief']);
+
+function isReviewVerdictAdvisoryProseSource(source) {
+  return isAdvisoryProseSource(source) && !REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED.has(source);
+}
+
+function buildExhaustedReviewVerdictQuestion(task) {
+  const reasons = (Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [])
+    .concat(task.blockedReason ? [String(task.blockedReason)] : [])
+    .filter(Boolean);
+  return [
+    `The automated handler could not render a verdict that passed review after ${MAX_LOCAL_REJECT_RETRIES + 1} attempts:`,
+    ...reasons.map((r, i) => `  ${i + 1}. ${r}`),
+    '',
+    'Common causes: the flagged snippet genuinely needs more surrounding context to judge '
+      + '(the model kept refusing to commit to GENUINE/FALSE POSITIVE/UNCERTAIN, or omitted '
+      + 'the required verdict label), or a claimed finding is contradicted by the real '
+      + 'grounding source shown to the model. Read the flagged snippet/finding yourself: if '
+      + "it's a real issue, render the verdict directly and Approve; if it's a false positive, "
+      + 'Archive it. If more real context would let a fresh draft succeed, say what to fetch.',
+  ].join('\n');
+}
+
 function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
@@ -642,8 +683,15 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         // stale/fabricated find-string citations, not "extend vs already done" -- differs
         // from adhoc's. Every OTHER non-adhoc source (deep_dive, brain_dump_sort, etc.,
         // each with its own cursor-advance recovery below) keeps the original behaviour.
+        //
+        // 2026-09-18: the advisoryProse "_review" triage siblings (performance_review,
+        // function_length_review, observability_review(_digest), change_review,
+        // staleness_audit, second_brain_opportunities) get the same real escalation here
+        // too -- see isReviewVerdictAdvisoryProseSource's own header for the full
+        // incident this closes (the sibling gap to bd-1789702787675 above).
         const isFulfillment = isCandidateFulfillmentSource(task.source);
-        if ((isAdhocTask(task) || isFulfillment) && needsClarificationDir) {
+        const isReviewVerdict = isReviewVerdictAdvisoryProseSource(task.source);
+        if ((isAdhocTask(task) || isFulfillment || isReviewVerdict) && needsClarificationDir) {
           const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
           if (alreadyEscalated) { summary.exhausted++; continue; }
           // A task that exhausted its retries on a tagged tool/environment failure lands
@@ -652,7 +700,9 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           // design-decision values elsewhere: external-dependency, unreliable-grounding.)
           task.needsClarification = {
             reason: task.infraErrorBefore ? 'infra-error' : 'design-decision',
-            openQuestions: isFulfillment ? buildExhaustedFulfillmentQuestion(task) : buildExhaustedAdhocQuestion(task),
+            openQuestions: isFulfillment ? buildExhaustedFulfillmentQuestion(task)
+              : isReviewVerdict ? buildExhaustedReviewVerdictQuestion(task)
+                : buildExhaustedAdhocQuestion(task),
           };
           appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
           appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting redraft retries');
@@ -820,7 +870,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       if (isReviewRejection(task)) {
         delete task.planResponse;
         delete task.implementResponse;
-        // 2026-09-19, ghost-in-the-machine retroactive audit (pipeline_forensics blocked/
+        // 2026-09-18, ghost-in-the-machine retroactive audit (pipeline_forensics blocked/
         // bucket): blockedStage/blockedReason used to survive this requeue untouched --
         // deliberately, per this branch's own prior comment ("left for priorRejectionFeedback's
         // history"). But local-draft.js's draftTask() reads task.blockedStage as a LIVE gate
@@ -921,7 +971,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
 
 if (require.main === module) {
   main();
