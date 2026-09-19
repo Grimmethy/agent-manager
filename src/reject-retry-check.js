@@ -820,6 +820,34 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       if (isReviewRejection(task)) {
         delete task.planResponse;
         delete task.implementResponse;
+        // 2026-09-19, ghost-in-the-machine retroactive audit (pipeline_forensics blocked/
+        // bucket): blockedStage/blockedReason used to survive this requeue untouched --
+        // deliberately, per this branch's own prior comment ("left for priorRejectionFeedback's
+        // history"). But local-draft.js's draftTask() reads task.blockedStage as a LIVE gate
+        // right after critique (`if (task.blockedStage) return blocked:true, blockedReason:
+        // task.blockedReason`), meant to catch a grounding-gate rejection critique JUST found
+        // THIS attempt. Left stale, that gate fires on the very NEXT automatic attempt
+        // regardless of what the fresh redraft actually produced, reusing the FIRST
+        // rejection's wording verbatim. Confirmed live: pipeline-forensics-3-needs-
+        // clarification-tasks-same-signature-manual-retryable-draft-block-1789395453456's
+        // attempts 3 and 4 produced genuinely different, well-structured 4600/5702-char
+        // reports, but both were blocked with the byte-identical reason describing attempt
+        // 1's 339-char draft -- confirmed by comparing task.draftAttempts[2].implement.text
+        // (the real, distinct content) against task.draftAttempts[2].blockedReason (attempt
+        // 1's stale text) directly. Every domain:'default' source sharing this drafting path
+        // (pipeline_forensics, pipeline_debrief, change_review, ...) only ever got its FIRST
+        // automatic attempt really evaluated; every attempt after that up to the retry cap
+        // was a phantom re-block. adhoc-source tasks were never affected by the OLD bug --
+        // not because anything cleared this state for them, but because local-draft.js's
+        // draftTask() returns via the completely separate draftAdhocBranch()/local-agentic-
+        // write path for `resolveSourceName(task) === 'adhoc'`, BEFORE ever reaching
+        // runCritiqueAndRevision or this check at all (confirmed: local-draft.js:1342's early
+        // return). needs-clarification-triage.js already clears blockedStage/blockedReason
+        // the identical way when it re-admits a task, for the identical reason. blockedReason
+        // was already captured into priorRejectionFeedback above before this point, so
+        // nothing is lost by clearing it here.
+        delete task.blockedStage;
+        delete task.blockedReason;
         appendHistoryEvent(task, 'requeued', 'review rejection -- cleared stale plan/implement state for fresh redraft');
       } else if (preCritiqueBlock) {
         // The bad citation lives IN implementResponse -- carrying it forward would just
