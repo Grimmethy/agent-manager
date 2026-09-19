@@ -294,6 +294,49 @@ test('extractDeclaredTargets: a leading "In `<path>`," clause inside a restricti
   assert.ok(!targets.includes('src/review-task.js'), 'the SAME leading-clause shape inside a restriction sentence is excluded, not a declared target');
 });
 
+// 2026-09-19, ghost-in-the-machine retroactive audit: a real 9-attempt stuck task
+// (adhoc-brain-dump-bd-1788913849112-git-status-fails-in-the-worktree) whose rawText opens
+// with "In src/group-b-worktree-diff.test.js (append at end, after the stacked-branch
+// tests), add two tests:" -- the leading-clause regex demanded the comma immediately after
+// the path, so a totally ordinary parenthetical aside broke the match, the real declared
+// target went unrecognized, and a SEPARATE extraction ("no other changes to `<file>`" read
+// as forbidding that exact file) never got reconciled against it.
+test('extractDeclaredTargets: tolerates a parenthetical aside between the leading path and the comma', () => {
+  const t = {
+    title: 'git status fails in the worktree',
+    promptContext: {
+      rawText: 'In src/group-b-worktree-diff.test.js (append at end, after the stacked-branch '
+        + 'tests), add two tests: (1) a linkage test, (2) a cleanup test.',
+    },
+  };
+  const targets = extractDeclaredTargets(t);
+  assert.ok(targets.includes('src/group-b-worktree-diff.test.js'),
+    'the leading target must be recognized even with a parenthetical aside before the comma');
+});
+
+// Second half of the same incident class: the human task text never names a file at all
+// (it describes a symptom -- "task.localRejectCount read inside the try without null-
+// guard" -- and leaves the model's own grep-grounded plan to pin the real site), so the
+// declared target only ever appears in the PLAN body's own "In `<path>`, <verb> ..."
+// sentence. rule 4 (rawText-only) never saw it, and the SAME plan's self-scoping "No other
+// file in `src/` is modified" sentence broadly forbade all of src/ -- including the file
+// the plan had just named as its edit target two paragraphs earlier.
+test('extractDeclaredTargets: the SAME leading "In `<path>`," clause is also recognized in the PLAN body, not just rawText', () => {
+  const t = {
+    title: '`task.localRejectCount` read inside the `try` without null-guard',
+    promptContext: {
+      rawText: 'The snippet shows a null-guard gap before an appendHistoryEvent call. A one-line guard would prevent a misleading error.',
+    },
+  };
+  const planText = 'The grep evidence pins the exact site: `src/local-draft.js:1177`.\n\n'
+    + 'In `src/local-draft.js`, immediately before the `try {` that wraps line 1177, add exactly:\n'
+    + '```js\nif (!task) { return; }\n```\n\n'
+    + '- No other file in `src/` is modified.';
+  const targets = extractDeclaredTargets(t, planText);
+  assert.ok(targets.includes('src/local-draft.js'),
+    'a leading "In <path>," clause in the PLAN body must be recognized as a declared target, the same as one in rawText');
+});
+
 test('non-adhoc tasks and empty diffs are never gated', () => {
   assert.equal(adhocDiffSubstanceProblem({ source: 'observability_fix', promptContext: { rawText: 'x' } }, createDiff('docs/x.md')), null);
   assert.equal(adhocDiffSubstanceProblem(adhoc('implement the thing in src/x.js'), ''), null);
