@@ -6,121 +6,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
-# Parallel high-reasoning LOCAL lane (Brain Dump #67 follow-up, 2026-08-17; reasoning-tier
-# concept for Brain Dump #77; de-Claude'd 2026-09-01): any instance named worker-reasoning*
-# claims ONLY pending tasks whose reasoning tier (model-provider.js's reasoningTierFor())
-# resolves to 'high' -- adhoc (its tiered LOCAL agentic drafts), research_task, and the
-# Brain Dump #77 high-reasoning retry -- and every OTHER worker-* instance skips them,
-# leaving them for this lane. Motivation: a long multi-turn qwen draft would otherwise
-# block worker-1's much faster brain-dump-sort/etc. throughput behind it. Both lanes run
-# the local model and serialise on the GPU single-flight lock. This lane no longer routes
-# to Claude by default -- that only happens for a deployment with AGENT_MANAGER_CLAUDE_SOURCES
-# set (see refresh_active_model / model-provider.js). Pure naming convention; restartTargetFor()
-# (dead-process-check.js) already matches any instanceId.startsWith('worker-').
-case "$INSTANCE_ID" in
-  worker-reasoning*) IS_REASONING_LANE=true ;;
-  *) IS_REASONING_LANE=false ;;
-esac
-# Whether Claude is in play at all for this deployment (opt-in only). Gates the
-# budget/pause checks and the Claude-vs-local routing below -- with it unset, the
-# reasoning lane is just a second local lane.
-CLAUDE_OPT_IN=false
-[[ -n "${AGENT_MANAGER_CLAUDE_SOURCES:-}" ]] && CLAUDE_OPT_IN=true
+# Worker lanes are one per GPU, named for the GPU (src/lanes.js: worker-3090, worker-p40). Every
+# lane claims ANY pending task by priority -- there is no reasoning/worker split (2026-09-19).
+# restartTargetFor() (dead-process-check.js) restarts a lane using the same lane definition.
 
 source "${SCRIPT_DIR}/orc-common.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
 # Note: this source is idempotent-safe because orc-common sets only unset vars (so subsequent sources don't override caller's environment).
 
-# Every write_heartbeat_file call below used to hardcode "${LOCAL_MODEL:-}" as the
-# reported model regardless of which lane was actually running -- confirmed live
-# 2026-08-17: the dashboard's Workers tab showed worker-reasoning as running "ornith:35b"
-# even though it only ever claims adhoc tasks and never calls Ornith at all. Same
-# "claude:<model>" label format model-provider.js's own labelFor() already uses for the
-# Models tab, so the two stay consistent.
-#
-# Re-run once per tick (not just once at startup, 2026-08-18: Workers tab per-instance
-# model dropdown) -- exports LOCAL_MODEL/CLAUDE_MODEL for this tick from
-# dashboard-settings.json's workerModelOverrides when the dashboard has set one for THIS
-# instanceId, else leaves whatever agent-manager.env set at launch untouched. Every node
-# call downstream this tick (local-draft.js, claude-client.js via the reasoning lane)
-# inherits the exported value, so no other call site needs to change.
-#
-# The reasoning lane's override can name EITHER backend (2026-08-18 follow-up, Grimmethy:
-# "reasoning is set to only show subscription models -- I need to be able to select from
-# both subscription and local models") -- the dropdown prefixes its value with "claude:"
-# or "ollama:" precisely so this can tell which one was picked (worker-1/reviewer's plain
-# Ornith-only dropdown has no such ambiguity, so its override stays a bare model name).
-# AGENT_MANAGER_FORCE_PROVIDER is model-provider.js's own hook for this -- see its header
-# comment for why adhoc/research_task's agentic Claude calls are unaffected either way.
+# Re-run once per tick (Workers tab per-instance model dropdown): exports LOCAL_MODEL for this
+# tick from dashboard-settings.json's workerModelOverrides when the dashboard has set one for THIS
+# instanceId (a bare model name; a legacy "ollama:" prefix is tolerated), else leaves whatever
+# agent-manager.env / the lane's own env set at launch untouched. Every node call downstream this
+# tick (local-draft.js, ...) inherits the exported value.
 refresh_active_model() {
   local override
   override="$(get_model_override "$INSTANCE_ID")"
-  if "$IS_REASONING_LANE" && "$CLAUDE_OPT_IN"; then
-    # Budget-aware (2026-08-25, Grimmethy: "The override exists because when we don't
-    # have claude tokens available at the time, the worker and reasoning need to share a
-    # lane rather than working in parallel" -- confirmed live this was NOT what the code
-    # actually did: an "ollama:" override was a static on/off toggle with no regard for
-    # whether Claude tokens were actually unavailable, unconditionally routing every plan
-    # call to local Ollama and fighting worker-1 for the same GPU slot even while Claude
-    # budget was healthy). check_budget_healthy() now also covers a manual pause (Grimmethy,
-    # same day: "I need a way to pause the claude use... preserve the tokens" -- see
-    # get_claude_paused's own comment), so ONE call here correctly falls back to local for
-    # BOTH a real rate-limit hit AND a deliberate pause, applied uniformly across all three
-    # override shapes below (previously only the "ollama:" branch checked this at all --
-    # an explicit "claude:" override or no override at all ignored budget health entirely,
-    # which meant pausing Claude did nothing for an instance without an "ollama:" override
-    # already configured, the opposite of what a global pause switch should do).
-    local claude_ok=true
-    check_budget_healthy >/dev/null 2>&1 || claude_ok=false
-    case "$override" in
-      ollama:*)
-        if "$claude_ok"; then
-          unset AGENT_MANAGER_FORCE_PROVIDER
-          export CLAUDE_MODEL
-          HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
-        else
-          LOCAL_MODEL="${override#ollama:}"
-          export LOCAL_MODEL AGENT_MANAGER_FORCE_PROVIDER=local
-          HEARTBEAT_MODEL="$LOCAL_MODEL"
-        fi
-        ;;
-      claude:*)
-        if "$claude_ok"; then
-          CLAUDE_MODEL="${override#claude:}"
-          export CLAUDE_MODEL AGENT_MANAGER_FORCE_PROVIDER=claude
-          HEARTBEAT_MODEL="claude:${CLAUDE_MODEL}"
-        else
-          # An explicit per-instance "use Claude" choice still loses to a global pause or
-          # a real rate-limit hit -- neither is something one instance's dropdown should
-          # be able to override.
-          export AGENT_MANAGER_FORCE_PROVIDER=local
-          HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
-        fi
-        ;;
-      *)
-        if "$claude_ok"; then
-          unset AGENT_MANAGER_FORCE_PROVIDER
-          export CLAUDE_MODEL
-          HEARTBEAT_MODEL="claude:${CLAUDE_MODEL:-sonnet}"
-        else
-          export AGENT_MANAGER_FORCE_PROVIDER=local
-          HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
-        fi
-        ;;
-    esac
-  else
-    # Local-only lane (worker-1, or the reasoning lane when Claude isn't opted in). A
-    # per-instance dropdown override may be a bare model name or (reasoning lane) an
-    # "ollama:"/"claude:"-prefixed value; a "claude:" pick on a lane that no longer does
-    # Claude is ignored.
-    unset AGENT_MANAGER_FORCE_PROVIDER
-    case "$override" in
-      claude:*) : ;;
-      ollama:*) LOCAL_MODEL="${override#ollama:}" ;;
-      ?*) LOCAL_MODEL="$override" ;;
-    esac
-    export LOCAL_MODEL
-    HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
-  fi
+  case "$override" in
+    claude:*) : ;;
+    ollama:*) LOCAL_MODEL="${override#ollama:}" ;;
+    ?*) LOCAL_MODEL="$override" ;;
+  esac
+  export LOCAL_MODEL
+  HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
 }
 refresh_active_model
 
@@ -523,6 +430,10 @@ process_drafting_file() {
 # orphaned (a freshly-started process hasn't claimed anything yet). See
 # reclaim-orphaned-drafts.js's own header for why dead-process-check.js's restart
 # decision alone was never enough to prevent this.
+
+# Drafts stranded in a RETIRED lane folder (the old worker-1/worker-reasoning/worker-reasoning-p40 layout) have
+# no owner left; recover them too (never touches a folder whose heartbeat pid is alive).
+node "${PACKAGE_SRC_DIR}/reclaim-orphaned-drafts.js" --retired-lanes >>"$LOG_FILE" 2>&1 || true
 reclaim_result="$(node "${PACKAGE_SRC_DIR}/reclaim-orphaned-drafts.js" "$INSTANCE_ID" 2>>"$LOG_FILE")"
 # Plain grep on the raw JSON, not a second node subprocess -- confirmed live: a FORCE_COLOR
 # set in the parent environment (this daemon inherited it from an interactive launch shell)
@@ -552,69 +463,11 @@ while :; do                                                                     
   mkdir -p "$HOME_LOGS" 2>/dev/null                                              # ensure base home logs dir exists — PowerShell's New-Item creates the folder automatically when it doesn't exist (we mirror that behavior explicitly here because bash's redirection won't auto-create parent dirs the way PS does).
   [[ -r "$HOME_LOGS" ]]                                                          || mkdir -p "$HOME_LOGS"                  # ensure log dir exists (might not have been created yet between launch.sh running and this script actually reaching this step). Same pattern as PowerShell's `$logFolder = if (-not (Test-Path $dir)) { New-Item ... } else { $dir }` conditional creation block which is what we're replacing with simpler shell here.
 
-  # Claude rate-limit gate (agent-manager-common.sh's check_budget_healthy -- see its own
-  # comment) -- only the Claude lane needs this: worker-reasoning* instances are the only
-  # ones whose claimed/resumed tasks ever route to claude-client.js (the IS_REASONING_LANE
-  # claim filter above already restricts this lane to high-reasoning-tier tasks, and
-  # model-provider.js's providerFor() maps ONLY high-tier tasks to Claude). A low-tier
-  # Ornith worker checking this too would wrongly stall local Ornith work every time
-  # Claude's account-wide cap is hit, even though it never calls Claude at all -- that's
-  # not the bug being fixed here. Gated once per tick, before the resume-drafting pass AND
-  # the claim-from-pending loop, since both can reach a Claude call for this lane; skips
-  # straight to the budget-gate sleep tier (matching review-runner.ps1/apply-runner.ps1's
-  # own 10-minute 'budget' backoff) rather than the normal idle/busy tick interval, so a
-  # known rate-limit window doesn't get hammered with a fresh attempt every 30-60s.
-  #
-  # Skipped entirely when refresh_active_model already fell back to local this tick
-  # (2026-08-25, root-caused live while building the manual-pause feature): this gate
-  # used to run UNCONDITIONALLY for the Claude lane, even when the "ollama:" override's
-  # own budget-aware check just decided to fall back to local -- meaning an unhealthy
-  # budget (or now, a manual pause) made this lane go fully IDLE instead of doing the
-  # local work it was just configured to share, defeating the entire "share a lane rather
-  # than working in parallel" point of having a local fallback at all. If
-  # AGENT_MANAGER_FORCE_PROVIDER is already "local", there is real local work this tick
-  # CAN still do -- only skip the tick when Claude is unhealthy/paused AND there is no
-  # local fallback in play at all (no override configured for this instance).
-  # Only when this deployment actually opted a source onto Claude (AGENT_MANAGER_CLAUDE_SOURCES);
-  # with it unset the reasoning lane is pure-local and has no Claude budget to check.
-  if "$IS_REASONING_LANE" && "$CLAUDE_OPT_IN" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "local" ]]; then
-    budget_reason="$(check_budget_healthy)"
-    budget_rc=$?
-    if [[ $budget_rc -ne 0 ]]; then
-      printf '[worker-%s] Claude budget not healthy: %s -- skipping this tick.\n' "$INSTANCE_ID" "$budget_reason" >&2
-      write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "budget" "$STARTED_AT"
-      sleep "${ORC_BUDGET_GATE_SECS:-600}"
-      continue
-    fi
-  fi
-
-  # Model-swap-thrashing guard (agent-manager-common.sh's should_yield_for_model_swap) --
-  # only relevant when THIS tick's real work calls a LOCAL model. That's now every lane by
-  # default; the sole exception is a Claude-opted-in reasoning tick that's actually going
-  # to Claude (CLAUDE_OPT_IN, budget healthy so FORCE_PROVIDER isn't 'local').
-  active_locally="true"
-  if "$IS_REASONING_LANE" && "$CLAUDE_OPT_IN" && [[ "${AGENT_MANAGER_FORCE_PROVIDER:-}" != "local" ]]; then
-    active_locally="false"
-  fi
-  if [[ "$active_locally" == "true" ]]; then
-    # ComfyUI GPU lease (agent-manager-common.sh's comfyui_lease_held -- see its header):
-    # PromptForge is holding the GPU for an image generation that wouldn't otherwise fit
-    # alongside the resident local model. Yield the tick exactly like the model-swap guard
-    # below; a Claude-lane real-Claude tick never reaches here so it's unaffected.
-    if comfyui_lease_held; then
-      printf '[worker-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
-      sleep "${ORC_TICK_SECS:-30}"
-      continue
-    fi
-    target_tier="low"
-    "$IS_REASONING_LANE" && target_tier="high"
-    yield_verdict="$(should_yield_for_model_swap "$LOCAL_MODEL" "$target_tier")"
-    if [[ "$yield_verdict" == "yield" ]]; then
-      printf '[worker-%s] yielding this tick -- resident model still has pending work in the other tier (see should_yield_for_model_swap).\n' "$INSTANCE_ID" >&2
-      sleep "${ORC_TICK_SECS:-30}"
-      continue
-    fi
-    record_active_model "$INSTANCE_ID" "$LOCAL_MODEL" "$target_tier"
+  # Yield this tick while PromptForge holds the GPU (comfyui-lease).
+  if comfyui_lease_held; then
+    printf '[worker-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
   fi
 
   # GPU headroom check -- before spending any real model call this tick, see whether the
@@ -638,21 +491,9 @@ while :; do                                                                     
   # and the real `deep_dive: failed to onboard "...": ...` error task-sources.js logs via
   # console.error was silently discarded here, with no trace anywhere that onboarding had
   # ever been attempted or why Scouted Repos stayed empty despite tasks completing.
-  # Runs on BOTH lanes now, each scoped to its own reasoning tier via --tier (Brain Dump
-  # #77 follow-up, 2026-08-17) -- previously skipped entirely on the Claude lane, with the
-  # (at the time correct) reasoning that only one process should ever be generating new
-  # pending/ tasks. That stopped holding once task generation itself became
-  # priority-ordered across BOTH tiers in one shared list (path_prefetch_resolve's
-  # automatic high-reasoning retry, priority 69, beats arch_discovery/arch_import at
-  # 79/80): confirmed live -- worker-1's generation calls kept returning a high-tier retry
-  # candidate every single tick (that source's own backlog dominating the priority
-  # ladder), which worker-1 then correctly declined to CLAIM, but never got far enough
-  # down the ladder to generate any work for ITSELF either, leaving it idle while
-  # worker-reasoning did everything. --tier scopes getNextTask() (see its own comment) to
-  # skip past a mismatched-tier candidate instead of stopping there, so each lane's own
-  # generation call always reaches its own tier's real work if any exists, independent of
-  # what the other tier's backlog looks like.
-  node "${PACKAGE_SRC_DIR}/task-sources.js" --tier="$( "$IS_REASONING_LANE" && echo high || echo low )" >>"$LOG_FILE" 2>&1 || true
+  # Every lane runs generation, unfiltered: getNextTask() walks the ONE priority ladder and returns the
+  # best eligible task; the in-flight throttle is bounded by the number of live lanes (generation-throttle.js).
+  node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
 
   # Resume any task already sitting in THIS instance's own drafting/ folder before claiming
   # anything new -- a claim only ever gets processed by whichever worker process happened
@@ -749,7 +590,7 @@ while :; do                                                                     
   if [[ -r "$pdir" ]] && ! "$TICK_HAD_INFRA_FAILURE"; then                     # check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
     while IFS= read -r name; do
       [[ -n "$name" ]] && items+=("$name")
-    done < <(node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" "$IS_REASONING_LANE" 2>/dev/null)
+    done < <(node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" 2>/dev/null)
 
     # Iterate each pending draft, process if ready:
     for name in "${items[@]}"; do                                             # loop over collected filenames one at a time — bash array iteration via `${array[@]}` syntax (each element becomes separate word when quoted). Equivalent of PowerShell's `foreach ($item in $drafts)` which we're mirroring here since both languages use the same conceptual model for "do this to every X in collection".
@@ -772,15 +613,8 @@ while :; do                                                                     
         fi
       fi
 
-      # Parallel Claude worker lane filter (see IS_REASONING_LANE's own comment above) --
-      # reasoningTierFor() is the SAME function local-draft.js/review-task.js already call
-      # to pick a backend, so this lane split can never disagree with what actually happens
-      # once a task is claimed. The Claude lane claims ONLY high-reasoning-tier tasks;
-      # every other lane skips them, leaving them free for the Claude lane to pick up
-      # instead of racing for them. (2026-09-06: this filter -- along with the
-      # pinnedWorker operator-override check -- now happens inside
-      # src/next-claimable-task.js BEFORE `items` is even built, so `$items` above
-      # already only contains tasks this instance may claim; nothing further to check here.)
+      # (Lane/tier filtering no longer exists: src/next-claimable-task.js returns every task this
+      # instance may claim, in priority order; only the pinnedWorker operator override narrows it.)
 
       if "$claim_succeeded"; then                                               # actual claim action: rename pending/$name -> drafting/${INSTANCE_ID}/$name (use mv because we don't want to COPY — mv is atomic on same filesystem which prevents race where another loop picks up the same draft after we 'claimed' it). Bash's `mv` works for this; equivalent of PowerShell's `Move-Item -Force` which would do identical work under its file-system abstraction but bash doesn't need `-Force`.
         mkdir -p "${QUEUE_DIR}/drafting/${INSTANCE_ID}" >/dev/null 2>&1 # ensure destination exists before moving into it — bash's mv doesn't auto-create parent dirs; if we didn't mkdir we'd get 'No such file or directory' error on first claim attempt which would look like daemon failed but actually just meant the folder wasn't created yet (same issue PowerShell hits too and they handle with pre-creation pattern via -Force flag on New-Item).

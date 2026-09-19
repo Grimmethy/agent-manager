@@ -1011,30 +1011,41 @@ def index():
     return render_template("index.html")
 
 
+_LANE_IDS_CACHE: dict = {"at": 0.0, "ids": []}
+_LANE_IDS_TTL_S = 60.0
+
+
+def worker_lane_ids() -> list[str]:
+    """The pipeline's worker lane ids -- one per GPU, named for the GPU (worker-3090, worker-p40).
+    src/lanes.js is the single definition (launch.sh, the watchdog's restart rule and this list
+    all read it); shelled out to rather than re-derived here so the two languages can never drift,
+    and cached briefly because this is called from status polls. Falls back to the last good answer
+    (or a single 'worker-local') if node is unavailable."""
+    now = time.monotonic()
+    if _LANE_IDS_CACHE["ids"] and now - _LANE_IDS_CACHE["at"] < _LANE_IDS_TTL_S:
+        return list(_LANE_IDS_CACHE["ids"])
+    ids: list[str] = []
+    try:
+        cp = subprocess.run(
+            ["node", str(SRC_DIR / "lanes.js"), "--ids"],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        ids = [line.strip() for line in cp.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("could not read worker lanes from src/lanes.js: %s", exc)
+    if ids:
+        _LANE_IDS_CACHE.update(at=now, ids=ids)
+        return list(ids)
+    return list(_LANE_IDS_CACHE["ids"]) or ["worker-local"]
+
+
 def _expected_instance_ids() -> list[str]:
-    """The daemons scripts/launch.sh always starts (worker-1, reviewer, queue-watchdog),
-    plus worker-reasoning whenever it would actually be launched (gated on the same
-    CLAUDE_CODE_OAUTH_TOKEN check launch.sh itself uses), plus worker-p40/
-    worker-reasoning-p40 whenever the optional second-GPU lanes are configured (same
-    AGENT_MANAGER_P40_* gate launch.sh itself uses). apply-task-loop is deliberately
-    excluded -- it's a single-shot pass with no heartbeat file of its own (see
-    launch.sh's own comment), so it never has a slot to be "offline" in."""
-    # launch.sh always starts worker-reasoning now (de-Claude'd 2026-09-01: it no longer depends
-    # on a Claude token), so it is always an expected lane -- gating it on the token made it
-    # invisible in the expected list whenever no token was set.
-    ids = ["worker-1", "worker-reasoning", "reviewer", "watchdog"]
-    # Optional second-GPU lanes (2026-09-05) -- see agent-manager.env.example's
-    # AGENT_MANAGER_P40_OLLAMA_URL comment. Same gate scripts/launch.sh itself uses.
-    # worker-reasoning-p40 gives reasoning-tier work a second lane independent of the
-    # host's single worker-reasoning instance (Grimmethy, 2026-09-05: "we are still
-    # only doing one reasoning job at a time despite being fully capable of running 2
-    # simultaneously").
-    if os.environ.get("AGENT_MANAGER_P40_OLLAMA_URL") and os.environ.get("AGENT_MANAGER_P40_MODEL"):
-        ids.append("worker-p40")
-        # AGENT_MANAGER_P40_REASONING_LANE=off -- same switch launch.sh honors.
-        if (os.environ.get("AGENT_MANAGER_P40_REASONING_LANE") or "on").strip().lower() != "off":
-            ids.append("worker-reasoning-p40")
-    return ids
+    """Every daemon scripts/launch.sh starts: one worker lane per GPU (worker_lane_ids()), the
+    reviewer, and the queue-watchdog. apply-task-loop is deliberately excluded -- it's a single-shot
+    pass with no heartbeat file of its own (see launch.sh's own comment), so it never has a slot to
+    be "offline" in."""
+    return [*worker_lane_ids(), "reviewer", "watchdog"]
 
 
 def _is_live_worker_instance(instance_id: str) -> bool:
@@ -2446,7 +2457,7 @@ def _chat_roots() -> list:
 from chat_preempt import (  # noqa: E402
     _arbiter_cancel_below, _chat_preempt_enabled, _chat_preempt_max_age_s,
     _is_preemptable_child_pass, _kill_and_requeue_instance, _preempt_decision,
-    _preempt_lane_sets, _preempt_pipeline_for_chat, _preempt_spare_long_reasoning,
+    _preempt_lane_sets, _preempt_pipeline_for_chat,
     _read_fresh_model_locks,
 )
 
@@ -2597,7 +2608,7 @@ def _pipeline_stoppable() -> bool:
         return True
     inst_dir = instances_dir()
     if inst_dir and inst_dir.is_dir():
-        for name in ("worker-1", "worker-reasoning", "review-runner", "queue-watchdog"):
+        for name in (*worker_lane_ids(), "reviewer", "watchdog"):
             data = read_json_safe(inst_dir / f"{name}.json")
             if data and data.get("pid") and _pid_alive(data["pid"]):
                 return True
@@ -2605,9 +2616,9 @@ def _pipeline_stoppable() -> bool:
 
 
 def _pipeline_running() -> bool:
-    """A pipeline counts as running if worker-1's own heartbeat is fresh -- the other
-    loops matter too, but the worker is the one that actually produces work, and checking
-    just one avoids this being wrong the moment any ONE of the others is mid-restart.
+    """A pipeline counts as running if ANY worker lane's heartbeat is fresh -- the other
+    loops matter too, but the workers are what actually produce work, and not requiring
+    every lane avoids this being wrong the moment any ONE of the others is mid-restart.
 
     Fallbacks (2026-08-30, after a live incident where worker-1 sat status:'queued'
     blocked on the model lock for >OTHER_STALE_SECONDS behind a wedged local-agentic
@@ -2620,18 +2631,19 @@ def _pipeline_running() -> bool:
     if not inst_dir or not inst_dir.is_dir():
         return bool(_pipeline_daemon_pids())
 
-    worker_hb = inst_dir / "worker-1.json"
-    data = read_json_safe(worker_hb)
-    if data and data.get("lastHeartbeat"):
-        last_hb = parse_hb_timestamp(data["lastHeartbeat"])
-        if last_hb:
-            age = (datetime.now(timezone.utc) - last_hb).total_seconds()
-            threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
-            if age <= threshold:
-                return True
+    lane_ids = worker_lane_ids()
+    for lane in lane_ids:
+        data = read_json_safe(inst_dir / f"{lane}.json")
+        if data and data.get("lastHeartbeat"):
+            last_hb = parse_hb_timestamp(data["lastHeartbeat"])
+            if last_hb:
+                age = (datetime.now(timezone.utc) - last_hb).total_seconds()
+                threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
+                if age <= threshold:
+                    return True
 
     # Stale or unparseable heartbeat -- believe a live process over a stale timestamp.
-    for name in ("worker-1", "worker-reasoning", "review-runner"):
+    for name in (*lane_ids, "reviewer"):
         d = read_json_safe(inst_dir / f"{name}.json")
         if d and d.get("pid") and _pid_alive(d["pid"]):
             return True

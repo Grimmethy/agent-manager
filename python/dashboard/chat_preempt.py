@@ -8,12 +8,10 @@ with the pipeline's worker/reviewer lanes on the same single-flight lock. When t
 busy a chat turn can sit in `flock -w 600` for many minutes. Holding the lock (the
 Reserve feature) doesn't interrupt an in-flight call -- only killing the in-flight
 `local-draft.js` / `review-task.js` child frees the GPU now. On every local-provider
-chat message we kill BOTH worker lanes' in-flight draft outright -- chat takes priority
+chat message we kill EVERY worker lane's in-flight draft outright -- chat takes priority
 over the pipeline, full stop (2026-09-02, Grimmethy: "Chat should preclude workers").
 Only the `reviewer` stays age-gated (a review vote is short; and a chat turn that lands
-just as a vote completes gains little by killing it). Set
-AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING=true to go back to sparing a
-worker-reasoning agentic draft older than AGENT_MANAGER_CHAT_PREEMPT_REASONING_MAX_AGE_S.
+just as a vote completes gains little by killing it).
 A killed worker task is `mv`'d drafting/ -> pending/ first so no retry budget is burnt;
 the daemons treat the empty child result as a retryable failed call
 (scripts/local-worker.sh:239-434) and recover on their own next tick.
@@ -34,7 +32,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-_PREEMPT_LANES_ALWAYS = ("worker-1", "worker-reasoning")
+# Every worker lane (one per GPU -- app.worker_lane_ids()) is preempted unconditionally; only the
+# reviewer stays age-gated.
 _PREEMPT_LANES_AGE_GATED = ("reviewer",)
 # instances/<lane>.json currentPass values in which the heartbeat `pid` is the node
 # child (local-draft.js / review-task.js), NOT the bash daemon -- safe to signal. The
@@ -88,32 +87,21 @@ def _chat_preempt_max_age_s() -> int:
         return 180
 
 
-def _preempt_spare_long_reasoning() -> bool:
-    """Opt back in to the old behaviour: spare a worker-reasoning agentic draft that has
-    been running longer than the max-age. Off by default -- chat precludes workers."""
-    from app import ENV_FILE_PATH, read_env_file
-    v = (os.environ.get("AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING")
-         or read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING") or "false")
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
-
-
 def _preempt_lane_sets():
-    """(always_kill, age_gated) lane tuples for this chat turn. worker-reasoning is
-    always-kill unless AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING opts it back into
-    age-gating."""
-    if _preempt_spare_long_reasoning():
-        return ("worker-1",), ("worker-reasoning", "reviewer")
-    return _PREEMPT_LANES_ALWAYS, _PREEMPT_LANES_AGE_GATED
+    """(always_kill, age_gated) lane tuples for this chat turn: every GPU worker lane is
+    always-kill, the reviewer is age-gated."""
+    from app import worker_lane_ids
+    return tuple(worker_lane_ids()), _PREEMPT_LANES_AGE_GATED
 
 
 def _preempt_decision(lane, kill_pid, started_epoch, now, max_age_s, always=None):
     """Pure. -> (action, reason). action in {"kill", "spare", "skip"}.
     kill_pid: the resolved in-flight node child pid (or None). started_epoch: unix time
     the call/task started (or None = age unknown). `always`: whether this lane is
-    unconditionally preempted -- defaults to membership in _PREEMPT_LANES_ALWAYS (the
-    static default set) when not passed, so existing callers/tests keep working."""
+    unconditionally preempted -- defaults to "not an age-gated lane" when not passed, so
+    existing callers/tests keep working."""
     if always is None:
-        always = lane in _PREEMPT_LANES_ALWAYS
+        always = lane not in _PREEMPT_LANES_AGE_GATED
     if not kill_pid:
         return ("skip", "no in-flight model call")
     if always:

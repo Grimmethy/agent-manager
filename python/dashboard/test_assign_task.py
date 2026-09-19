@@ -302,14 +302,14 @@ class ApiAssignableTasksRouteTest(AssignTaskTestBase):
         self.assertEqual(by_id["elsewhere-one"]["location"], "drafting:worker-reasoning-p40")
         self.assertNotIn("already-mine", by_id)
 
-    def test_tier_filters_reasoning_only_tasks_out_of_a_non_reasoning_lanes_list(self):
+    def test_every_lane_lists_every_task_no_tier_filter(self):
         self._hb("worker-1", status="idle", pass_="idle", pid=None, task_id=None)
         self._pending_task("high-tier", {"source": "adhoc", "title": "High tier"})
         self._pending_task("low-tier", {"source": "trouble_log", "title": "Low tier"})
 
-        worker1_items = {i["id"] for i in self.client.get("/api/instances/worker-1/assignable-tasks").get_json()["items"]}
-        self.assertNotIn("high-tier", worker1_items)
-        self.assertIn("low-tier", worker1_items)
+        items = {i["id"] for i in self.client.get("/api/instances/worker-1/assignable-tasks").get_json()["items"]}
+        self.assertIn("high-tier", items)
+        self.assertIn("low-tier", items)
 
     def test_404_for_an_unknown_instance(self):
         resp = self.client.get("/api/instances/worker-does-not-exist/assignable-tasks")

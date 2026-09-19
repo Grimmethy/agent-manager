@@ -181,46 +181,9 @@ test('nextResearchTask skips a malformed/unreadable file and still finds a valid
   assert.equal(task.id, 'research-brain-dump-bd-1-1000');
 });
 
-// --- getNextTask tierFilter (Brain Dump #77 follow-up: keep both worker lanes busy in
-// parallel instead of the higher-priority tier's backlog starving the other) -----------
+// --- getNextTask: one priority ladder, no lane/tier filter (2026-09-19) -----------------------------
 
-test('getNextTask tierFilter: skips a higher-priority source whose task does not match the tier, falls through to the next one', () => {
-  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-tier-test-'));
-  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
-  process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
-  delete process.env.AGENT_MANAGER_TASK_SOURCES;
-
-  const { getNextTask } = freshTaskSources(repoRoot);
-  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
-  clearRegistry();
-  // High-priority (low number) source always has work but is high-reasoning-tier --
-  // mirrors path_prefetch_resolve's automatic retry outranking arch_discovery/arch_import.
-  registerTaskSource('high_priority_high_tier', { priority: 10, reasoningTier: 'high', next: () => ({ id: 'hp-1', source: 'high_priority_high_tier' }) });
-  registerTaskSource('low_priority_low_tier', { priority: 90, next: () => ({ id: 'lp-1', source: 'low_priority_low_tier' }) });
-
-  const lowTierTask = getNextTask({ tierFilter: 'low' });
-  assert.equal(lowTierTask.source, 'low_priority_low_tier', 'a low-tier caller must not get stuck behind the high-tier source and must fall through to its own work');
-
-  const highTierTask = getNextTask({ tierFilter: 'high' });
-  assert.equal(highTierTask.source, 'high_priority_high_tier', 'a high-tier caller still gets the high-priority source normally');
-});
-
-test('getNextTask tierFilter: returns null when nothing at that tier is eligible, even if lower-priority tiers have work', () => {
-  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-tier-test-'));
-  process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
-  process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
-  delete process.env.AGENT_MANAGER_TASK_SOURCES;
-
-  const { getNextTask } = freshTaskSources(repoRoot);
-  const { clearRegistry, registerTaskSource } = require('./task-source-registry.js');
-  clearRegistry();
-  registerTaskSource('only_low_tier_source', { priority: 10, next: () => ({ id: 'lt-1', source: 'only_low_tier_source' }) });
-
-  assert.equal(getNextTask({ tierFilter: 'high' }), null);
-  assert.ok(getNextTask({ tierFilter: 'low' }));
-});
-
-test('getNextTask tierFilter: omitted entirely behaves exactly like before (no filtering)', () => {
+test('getNextTask returns the best-priority source\'s task whatever its reasoningTier (no lane/tier filter)', () => {
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-tier-test-'));
   process.env.AGENT_MANAGER_REPO_ROOT = repoRoot;
   process.env.AGENT_MANAGER_PIPELINE_DIR = repoRoot;
@@ -2888,7 +2851,21 @@ test('nextPipelineHealthAuditTask does not re-file across separate hourly checks
   markChecked(path.join(dir, 'instances'), new Date(Date.now() - 2 * 60 * 60 * 1000)); // >1h ago -- isDue() is genuinely true
   const { nextPipelineHealthAuditTask } = freshTaskSources(dir);
 
-  assert.equal(nextPipelineHealthAuditTask(), null, 'a still-persisting THROUGHPUT_STALL must not file a second task while the first is still pending');
+  // The daemon-count check reads the REAL process list; stub `ps` with one healthy process per
+  // expected daemon so this test doesn't depend on what happens to be running on the machine.
+  const cp = require('child_process');
+  const realExec = cp.execFileSync;
+  const lines = [
+    ...require('./lanes.js').getLanes().map((l, i) => `${100 + i} 1 bash scripts/local-worker.sh ${l.id}`),
+    '200 1 bash scripts/queue-watcher.sh watchdog',
+    '201 1 bash scripts/review-runner.sh reviewer',
+  ];
+  cp.execFileSync = (cmd, args, opts) => (cmd === 'ps' ? lines.join('\n') : realExec(cmd, args, opts));
+  try {
+    assert.equal(nextPipelineHealthAuditTask(), null, 'a still-persisting THROUGHPUT_STALL must not file a second task while the first is still pending');
+  } finally {
+    cp.execFileSync = realExec;
+  }
 }));
 
 test('nextPipelineHealthAuditTask DOES file when the anomaly type is genuinely new, even with an unrelated pending audit task present', () => withIsolatedHome(() => {

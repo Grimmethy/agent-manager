@@ -215,9 +215,8 @@ def api_instance_assignable_tasks(instance_id):
 
     Shells out to src/next-claimable-task.js's listAssignableTasks (via its
     --list-assignable CLI mode), the same way _arbiter_cancel_below already shells out
-    to scripts/gpu-arbiter-cli.js: tier resolution (reasoningTierFor) depends on the
-    real registered task sources + config overrides and must never be re-derived in
-    Python, where it could silently drift from the Node source of truth that
+    to scripts/gpu-arbiter-cli.js: source resolution depends on the real registered
+    task sources + config overrides and must never be re-derived in Python, where it could silently drift from the Node source of truth that
     local-worker.sh's actual claim loop uses."""
     from app import ENV_FILE_PATH, PACKAGE_ROOT, _is_live_worker_instance, queue_dir, read_env_file
     if not _is_live_worker_instance(instance_id):
@@ -225,14 +224,12 @@ def api_instance_assignable_tasks(instance_id):
     qdir = queue_dir()
     if not qdir:
         return jsonify({"items": []})
-    is_reasoning_lane = instance_id.startswith("worker-reasoning")
     script = PACKAGE_ROOT / "src" / "next-claimable-task.js"
     if not script.is_file():
         return jsonify({"items": []})
     try:
         cp = subprocess.run(
-            ["node", str(script), "--list-assignable", str(qdir), instance_id,
-             "true" if is_reasoning_lane else "false"],
+            ["node", str(script), "--list-assignable", str(qdir), instance_id],
             capture_output=True, text=True, timeout=15,
             env={**os.environ, **read_env_file(ENV_FILE_PATH)},
         )

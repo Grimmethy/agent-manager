@@ -300,7 +300,7 @@ self-contained, tested unit of work as a race against the next `resetToMain()` -
 
 ## queue/ is live pipeline state, not a source tree -- never hand-edit it
 
-`queue/*/*.json` (gitignored) is mutated continuously by `worker-1`, `reviewer`, and
+`queue/*/*.json` (gitignored) is mutated continuously by the worker lanes (`worker-3090`, `worker-p40`), `reviewer`, and
 `watchdog` while the pipeline is live -- moving a task file between state directories,
 rewriting it in place, isn't a safe filesystem op the way it looks; go through the
 dashboard's `/api/task/...` endpoints (`python/dashboard/app.py`) instead, which encode

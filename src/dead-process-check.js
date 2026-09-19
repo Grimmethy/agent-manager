@@ -34,6 +34,7 @@
 // first solving the false-redelivery problem it introduces.
 
 const fs = require('fs');
+const { laneById } = require('./lanes.js');
 const path = require('path');
 const { getConfig } = require('./config.js');
 
@@ -70,62 +71,23 @@ const WORKER_ZOMBIE_THRESHOLD_SECONDS = 1680; // 28 min -- comfortably above rev
 // legitimately still-generating P40 worker mid-call. Same slack-margin discipline as the
 // general value (+240s), applied only to the two P40 instanceIds.
 const WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 = 3840; // 64 min -- 4*900s draft chain (3600s) + 240s slack, mirrors the general value's own margin.
-const P40_INSTANCE_IDS = new Set(['worker-p40', 'worker-reasoning-p40']);
+const P40_INSTANCE_IDS = new Set(['worker-p40']);
 const RESTART_COOLDOWN_SECONDS = 120; // don't re-restart the same instanceId again this soon -- a fresh replacement's own first heartbeat can take a moment to land.
 
-// instanceId -> { script, args, pidfileName } -- mirrors launch.sh's own hardcoded
-// start_bg() invocations exactly (the actual source of truth for how each instance is
-// named/launched on this Linux port), not a generic pattern-match table the way the
-// reference's $RESTART_MAP is -- this deployment only ever creates a small, fixed set of
-// instances, so there's no real "any worker-N" generality to preserve beyond the one
-// literal worker-1 already handles via the worker- prefix check below.
-// worker-p40 / worker-reasoning-p40 (2026-09-07, Grimmethy: "the p40 has 2 tasks running
-// on it and the gtx is idle" -- root-caused live): launch.sh's own start_bg() calls for
-// these two instances wrap them in `env OLLAMA_URL="$AGENT_MANAGER_P40_OLLAMA_URL"
-// LOCAL_MODEL="$AGENT_MANAGER_P40_MODEL" AGENT_MANAGER_GPU_YIELD_APPS=` (see its own
-// comment on why -- routes this ONE lane's Ollama traffic to the passthrough VM's own
-// Ollama instance instead of the host's), but this function -- the ONLY other place a
-// worker-p40*/worker-reasoning-p40 process ever gets spawned, via queue-watcher.sh's
-// dead-process-check restart path -- never carried that env at all. Confirmed live: two
-// real worker-p40 processes (pids 2830879, restarted by the watchdog per
-// queue-watchdog.log's own "restarted worker-p40 ... new pid 2830879" line, and a second
-// duplicate 3433178) were BOTH running with LOCAL_MODEL=qwen3.8:27b-q4_K_M (the HOST's
-// model, not the P40's qwen3.8-p40:27b-q4_K_M) -- silently fighting worker-1/reviewer for
-// the host GPU's single-flight lock instead of using the P40 at all, every time since
-// their last watchdog-triggered restart. Mirrors launch.sh's own gate exactly (both P40
-// env vars must be set, or this lane is skipped -- same condition launch.sh itself uses
-// to decide whether to start these lanes in the first place) so a restart can never
-// diverge from what a fresh `launch.sh` would have produced.
-function p40EnvFor(instanceId) {
-  if (instanceId !== 'worker-p40' && instanceId !== 'worker-reasoning-p40') return null;
-  const url = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
-  const model = process.env.AGENT_MANAGER_P40_MODEL;
-  if (!url || !model) return null;
-  return { OLLAMA_URL: url, LOCAL_MODEL: model, AGENT_MANAGER_GPU_YIELD_APPS: '' };
-}
-
+// instanceId -> { script, args, pidfileName, env? }. A worker lane restarts EXACTLY as launch.sh
+// would start it because both read the same lane definition (src/lanes.js: one lane per GPU,
+// each with its own Ollama env, e.g. worker-p40 -> the passthrough VM's OLLAMA_URL/LOCAL_MODEL).
+// This used to mirror launch.sh's hard-coded start_bg() calls by hand, which drifted twice: a
+// watchdog-restarted worker-p40 ran on the HOST's model and fought the host lanes for the wrong
+// GPU's lock (2026-09-07), and a deliberately disabled P40 lane was restarted as a local-GPU
+// worker. An id that is not a currently-defined lane -- a legacy name (worker-1, worker-reasoning,
+// worker-reasoning-p40) or a lane whose GPU isn't configured -- gets NO restart rule.
 function restartTargetFor(instanceId) {
   if (instanceId.startsWith('worker-')) {
-    // 2026-09-07 follow-up (Grimmethy: "let's disable the p40 until I can get a fan on
-    // it" -- the card was found thermally throttling, 89C/98% util with SW Thermal
-    // Slowdown active, SM clock at ~40-65% of rated speed): a worker-p40/worker-
-    // reasoning-p40 heartbeat can keep existing (and go stale) for a while after the
-    // lane is deliberately taken offline -- without this check, this function would
-    // still hand back an ordinary restart target for it (p40EnvFor above already
-    // returns null when the P40 vars aren't configured, but that only ever controlled
-    // whether the SPAWNED process got P40 env, not whether it should be spawned AT ALL).
-    // The watchdog would then silently restart a "disabled" P40 lane as an ordinary
-    // local-GPU worker, fighting worker-1/worker-reasoning/reviewer for the host GPU's
-    // own single-flight lock -- exactly the wrong-GPU-contention failure class this
-    // whole investigation started from, just reached a different way. Refuse instead:
-    // no restart rule at all for either P40 instance while its env isn't configured,
-    // matching launch.sh's own start_bg gate (same condition decides whether the lane
-    // starts in the first place).
-    if ((instanceId === 'worker-p40' || instanceId === 'worker-reasoning-p40') && !p40EnvFor(instanceId)) {
-      return null;
-    }
-    const env = p40EnvFor(instanceId);
-    return { script: 'local-worker.sh', args: [instanceId], pidfileName: `${instanceId}.pid`, ...(env ? { env } : {}) };
+    const lane = laneById(instanceId);
+    if (!lane) return null;
+    const hasEnv = Object.keys(lane.env).length > 0;
+    return { script: 'local-worker.sh', args: [instanceId], pidfileName: `${instanceId}.pid`, ...(hasEnv ? { env: lane.env } : {}) };
   }
   if (instanceId === 'reviewer') {
     return { script: 'review-runner.sh', args: ['reviewer'], pidfileName: 'review-runner.pid' };

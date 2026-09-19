@@ -217,3 +217,43 @@ test('no-op on empty pipelineDir: reclaimed 0, no reclaim-log.jsonl', () => {
   assert.ok(!fs.existsSync(path.join(dir, 'reclaim-log.jsonl')),
     'reclaim-log.jsonl must NOT exist when nothing was reclaimed');
 });
+
+// --- reclaimRetiredLaneDrafts: the old worker-1 / worker-reasoning / worker-reasoning-p40 layout ---
+const { reclaimRetiredLaneDrafts } = require('./reclaim-orphaned-drafts.js');
+
+function retiredFixture() {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'retired-lanes-'));
+  for (const lane of ['worker-1', 'worker-reasoning', 'worker-3090']) {
+    fs.mkdirSync(path.join(pipelineDir, 'queue', 'drafting', lane), { recursive: true });
+  }
+  fs.mkdirSync(path.join(pipelineDir, 'queue', 'pending'), { recursive: true });
+  fs.mkdirSync(path.join(pipelineDir, 'instances'), { recursive: true });
+  const put = (lane, id) => fs.writeFileSync(path.join(pipelineDir, 'queue', 'drafting', lane, `${id}.json`), JSON.stringify({ id, domain: 'default', history: [] }));
+  put('worker-1', 'old-a'); put('worker-reasoning', 'old-b'); put('worker-3090', 'current');
+  return { pipelineDir, put };
+}
+
+test('reclaimRetiredLaneDrafts: drafts in retired lane folders return to pending/, the folders and stale heartbeats go, current lanes are untouched', () => {
+  const { pipelineDir } = retiredFixture();
+  fs.writeFileSync(path.join(pipelineDir, 'instances', 'worker-1.json'), JSON.stringify({ instanceId: 'worker-1', pid: 2 ** 22 + 99 }));
+  const r = reclaimRetiredLaneDrafts({ pipelineDir, laneIds: ['worker-3090', 'worker-p40'], alive: () => false });
+  assert.deepEqual(r.retired.sort(), ['worker-1', 'worker-reasoning']);
+  assert.deepEqual(r.ids.sort(), ['old-a', 'old-b']);
+  assert.deepEqual(fs.readdirSync(path.join(pipelineDir, 'queue', 'pending')).sort(), ['old-a.json', 'old-b.json']);
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'drafting', 'worker-1')), false);
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'instances', 'worker-1.json')), false);
+  assert.deepEqual(fs.readdirSync(path.join(pipelineDir, 'queue', 'drafting', 'worker-3090')), ['current.json']);
+});
+
+test('reclaimRetiredLaneDrafts: a retired-named lane whose heartbeat pid is ALIVE is never touched', () => {
+  const { pipelineDir } = retiredFixture();
+  fs.writeFileSync(path.join(pipelineDir, 'instances', 'worker-1.json'), JSON.stringify({ instanceId: 'worker-1', pid: process.pid }));
+  const r = reclaimRetiredLaneDrafts({ pipelineDir, laneIds: ['worker-3090'], alive: (pid) => pid === process.pid });
+  assert.deepEqual(r.retired, ['worker-reasoning']);
+  assert.equal(fs.existsSync(path.join(pipelineDir, 'queue', 'drafting', 'worker-1', 'old-a.json')), true);
+});
+
+test('reclaimRetiredLaneDrafts: no drafting dir is a no-op, not a throw', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'retired-lanes-empty-'));
+  assert.deepEqual(reclaimRetiredLaneDrafts({ pipelineDir, laneIds: ['worker-3090'] }), { retired: [], reclaimed: 0, ids: [] });
+});

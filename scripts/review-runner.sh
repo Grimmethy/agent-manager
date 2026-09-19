@@ -56,26 +56,13 @@ while :; do                                                                     
 
   [[ -d "$review_dir" && -r "$review_dir" ]]                                    || { sleep "${ORC_TICK_SECS:-30}"; continue; }    # skip tick if review/ doesn't exist or isn't readable yet (e.g. no draft has ever reached review/) — same defensive early-exit as PowerShell's `if (-not (Test-Path $Drafts) ) { continue }` pattern. Sleep first so this path can't busy-spin.
 
-  # Model-swap-thrashing guard (agent-manager-common.sh's should_yield_for_model_swap) --
-  # same guard local-worker.sh's worker-1 lane uses, tier='low' for the same reason: this
-  # daemon's own Ornith calls only ever review low-tier items (a high-tier item's vote
-  # routes straight to Claude inside review-task.js's own providerFor(task) call,
-  # independent of LOCAL_MODEL). No-op when reviewer already shares worker-1's model, the
-  # default and common case.
-  yield_verdict="$(should_yield_for_model_swap "${LOCAL_MODEL:-}" "low")"
-  if [[ "$yield_verdict" == "yield" ]]; then
-    printf '[review-%s] yielding this tick -- resident model still has pending work in the other tier.\n' "$INSTANCE_ID" >&2
-    sleep "${ORC_TICK_SECS:-30}"
-    continue
-  fi
   # ComfyUI GPU lease (agent-manager-common.sh's comfyui_lease_held) -- PromptForge owns
-  # the GPU for an image generation this tick; yield exactly like the model-swap guard.
+  # the GPU for an image generation this tick.
   if comfyui_lease_held; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
     sleep "${ORC_TICK_SECS:-30}"
     continue
   fi
-  record_active_model "$INSTANCE_ID" "${LOCAL_MODEL:-}" "low"
 
   # GPU headroom check -- review's own majorityVote call spends real Ollama calls too
   # (n=3 votes per item), same starvation risk local-worker.sh's tick guards against;

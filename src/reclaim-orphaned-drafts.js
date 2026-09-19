@@ -93,18 +93,62 @@ function reclaimOrphanedDrafts({ pipelineDir, instanceId }) {
   return { reclaimed: ids.length, ids };
 }
 
+function pidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
+}
+
+// Recovers drafts stranded in the folder of a RETIRED lane. Worker lanes are now one per GPU
+// (src/lanes.js: worker-3090, worker-p40); the old layout's drafting/worker-1, worker-reasoning,
+// worker-reasoning-p40 folders have no process that will ever own them again, and
+// reclaimOrphanedDrafts() above only ever looks at a worker's OWN folder, so their tasks would sit
+// there forever (taskIdExistsInQueue() counts them as queued, so they can't even be regenerated).
+// A worker-* drafting folder that is not a currently defined lane and whose heartbeat pid is not
+// alive is retired: its drafts go back to pending/, then the empty folder and the stale heartbeat
+// file (which would otherwise show as an offline lane forever) are removed.
+function reclaimRetiredLaneDrafts({ pipelineDir, laneIds, alive = pidAlive }) {
+  const draftingRoot = path.join(pipelineDir, 'queue', 'drafting');
+  const instancesDir = path.join(pipelineDir, 'instances');
+  const out = { retired: [], reclaimed: 0, ids: [] };
+  let dirs = [];
+  try {
+    dirs = fs.readdirSync(draftingRoot, { withFileTypes: true }).filter((d) => d.isDirectory() && d.name.startsWith('worker-'));
+  } catch {
+    return out;
+  }
+  for (const d of dirs) {
+    if (laneIds.includes(d.name)) continue;
+    const hbPath = path.join(instancesDir, `${d.name}.json`);
+    let hb = null;
+    try { hb = JSON.parse(fs.readFileSync(hbPath, 'utf8')); } catch { /* no/unreadable heartbeat */ }
+    if (hb && alive(hb.pid)) continue; // a live process still owns it -- never touch
+    const r = reclaimOrphanedDrafts({ pipelineDir, instanceId: d.name });
+    out.reclaimed += r.reclaimed;
+    out.ids.push(...r.ids);
+    out.retired.push(d.name);
+    try { fs.rmdirSync(path.join(draftingRoot, d.name)); } catch { /* not empty (an unreadable file was left) -- leave the folder */ }
+    try { fs.unlinkSync(hbPath); } catch { /* no heartbeat file */ }
+  }
+  return out;
+}
+
 function main() {
   const instanceId = process.argv[2];
   if (!instanceId) {
-    console.error('Usage: node reclaim-orphaned-drafts.js <instanceId>');
+    console.error('Usage: node reclaim-orphaned-drafts.js <instanceId> | --retired-lanes');
     process.exit(1);
   }
   const { pipelineDir } = getConfig();
+  if (instanceId === '--retired-lanes') {
+    const { getLanes } = require('./lanes.js');
+    process.stdout.write(`${JSON.stringify(reclaimRetiredLaneDrafts({ pipelineDir, laneIds: getLanes().map((l) => l.id) }))}\n`);
+    return;
+  }
   const result = reclaimOrphanedDrafts({ pipelineDir, instanceId });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
-module.exports = { reclaimOrphanedDrafts, destinationDirFor };
+module.exports = { reclaimOrphanedDrafts, reclaimRetiredLaneDrafts, destinationDirFor };
 
 if (require.main === module) {
   main();
