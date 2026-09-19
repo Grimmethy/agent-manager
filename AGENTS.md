@@ -235,6 +235,15 @@ isolation can look broken (or look fine) when its sibling sub-task is actually t
 half of the same fix, and the hub may already carry a review verdict about the
 decomposition's completeness. See `docs/agents/unmerged-branch-review.md`.
 
+### Hand-resolving a needs-clarification task
+
+A fix for a stuck `queue/needs-clarification/` task must still flow through the real
+pipeline: `queue/review/` (real local-model review vote) → `queue/approved/` → the
+dashboard's Apply → Unmerged Branches → human merge. Never `git commit`/`push`/`gh pr
+create` directly for one of these, even from a throwaway worktree -- that bypasses the
+same review/fact-check gates every other task goes through. See
+`docs/agents/manual-nc-resolution.md` for the repeatable steps.
+
 ## Working directory: never edit this checkout directly
 
 This repo is self-hosting: `AGENT_MANAGER_REPO_ROOT` for the running pipeline points at
