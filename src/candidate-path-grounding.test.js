@@ -213,3 +213,15 @@ test('checkCitedSymbolsPerEntry: a symbol real only in ANOTHER entry\'s file is 
 test('splitCandidateEntries: text without ### headers is one entry', () => {
   assert.deepEqual(splitCandidateEntries('Files: a.js\nProblem: x'), ['Files: a.js\nProblem: x']);
 });
+
+test('checkCitedSymbols: names only in Benefits: are not checked (hypothetical/post-change prose)', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'real-one.js'), 'function realFn() {}\n');
+  const text = [
+    'Files: src/real-one.js', '', 'Problem:', '`realFn` is duplicated.', '',
+    'Solution:', 'Extract a helper.', '', 'Benefits:',
+    'Adding a new field (e.g. a `totalPages` counter) touches one place; `resetResults` handles it.',
+  ].join('\n');
+  assert.deepEqual(checkCitedSymbols(text, checkedFor(repo, 'src/real-one.js')).fabricated, []);
+  fs.rmSync(repo, { recursive: true, force: true });
+});

@@ -95,14 +95,16 @@ const SYMBOL_STOPWORDS = new Set([
 // PropertyForager's first arch_discovery drafts were filenames (`App.tsx`, `SearchView.tsx`...).
 const FILENAME_TOKEN = /^[\w./-]+\.(?:[cm]?[jt]sx?|py|json|md|s?css|html|sh|ps1|ya?ml|toml)$/i;
 
-// A candidate's `Solution:` section PROPOSES change, so it legitimately names symbols that do
+// A candidate's `Solution:` and `Benefits:` sections describe the PROPOSED state (Benefits also
+// names hypothetical additions: "e.g. a `totalPages` counter"), so they legitimately name symbols
+// that do not exist yet. Solution: section PROPOSES change, so it legitimately names symbols that do
 // not exist yet ("Export a single `LEGAL_DOCS` array", "Extract a `resetResults()` helper",
 // "expose it as `ApiError.rawBody`"). CREATE_MODE_VERBS only recognizes a handful of verbs
 // within ~60 chars, so proposals phrased any other way were flagged as fabrication -- the
 // other 4 of those 11 flags. Claims about EXISTING code live in Problem:, which stays checked.
 // Blanked per entry (a write-up may hold several AC-NNN blocks), from the `Solution:` header
 // up to the next section header, next `###` entry, or end of text.
-const SOLUTION_SECTION = /^[\s>*_-]*solution\s*:[\s\S]*?(?=^[\s>*_-]*(?:benefits|problem|files|strength)\s*:|^#{2,}\s|(?![\s\S]))/gim;
+const SOLUTION_SECTION = /^[\s>*_-]*(?:solution|benefits)\s*:[\s\S]*?(?=^[\s>*_-]*(?:problem|files|strength)\s*:|^#{2,}\s|(?![\s\S]))/gim;
 
 function stripSolutionSections(text) {
   return String(text || '').replace(SOLUTION_SECTION, '');
