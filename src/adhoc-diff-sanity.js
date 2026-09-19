@@ -223,13 +223,46 @@ function extractDeclaredTargets(task, planText = '') {
   // sentence like "Prepend a note stating X is enforced by scripts/check-doc-link.sh" has
   // an edit verb (Prepend) and a path (scripts/check-doc-link.sh) that are NOT the same
   // thing; only the tight leading-clause anchor tells target from citation apart.
-  for (const frag of String(rawText || '').split(/(?<=[.!?:;])\s+|\n+/)) {
+  //
+  // Tolerates one parenthetical aside between the path and the comma (2026-09-19,
+  // ghost-in-the-machine retroactive audit): "In src/group-b-worktree-diff.test.js
+  // (append at end, after the stacked-branch tests), add two tests:" is a completely
+  // ordinary way to write a leading "In X, ..." clause, but the old regex demanded the
+  // comma immediately after the path -- missing this declared target let a SEPARATE
+  // extraction gap (extractForbiddenPaths reading the plan's own "no other changes to
+  // `<file>`" self-scoping language as if it forbade that exact file) go unreconciled,
+  // wrongly blocking a 9-attempt-and-counting task from touching the one file it was
+  // explicitly told to edit. The aside's own comma(s) are inside the parens, so `[^)]*`
+  // stays balanced without needing real paren-nesting support.
+  for (const p of leadingInClauseTargets(rawText)) add(p);
+  // 5. The SAME leading "In `<path>`, <verb> ..." clause, but in the PLAN body instead of
+  // the task's own rawText (2026-09-19, same incident as the parenthetical fix above,
+  // second half): the model's OWN plan frequently declares its edit target this exact
+  // way -- "In `src/local-draft.js`, immediately before the `try {` ..., add exactly:" --
+  // when the human task text never named the file at all (it described a symptom/
+  // behavior, e.g. "task.localRejectCount read inside the try without null-guard", and
+  // left the model's own grep-grounded plan to pin the real site). rawText-only scoping
+  // (rule 4 above) never saw this, so a real, singular declared target went unrecognized
+  // and a self-scoping "No other file in `src/` is modified" sentence elsewhere in that
+  // SAME plan broadly forbade all of src/ -- including the one file the plan had just
+  // named as its edit target two paragraphs earlier.
+  for (const p of leadingInClauseTargets(plan)) add(p);
+  return [...out];
+}
+
+// Shared by extractDeclaredTargets' rules 4 and 5 -- a leading "In `<path>` (aside)?,
+// <verb> ..." clause, scanned against whichever text is passed (task rawText or plan
+// body). See rule 4's own header comment for the full rationale and false-positive shape
+// this stays deliberately narrow to avoid reintroducing.
+function leadingInClauseTargets(text) {
+  const out = [];
+  for (const frag of String(text || '').split(/(?<=[.!?:;])\s+|\n+/)) {
     const sentence = frag.trim();
     if (RESTRICTION_SENTENCE_RE.test(sentence)) continue;
-    const leading = /^(?:In|At)\s+[`'"]?([\w./@-]+\.\w+)[`'"]?\s*,/i.exec(sentence);
-    if (leading && EDIT_VERB_RE.test(sentence)) add(leading[1]);
+    const leading = /^(?:In|At)\s+[`'"]?([\w./@-]+\.\w+)[`'"]?\s*(?:\([^)]*\)\s*)?,/i.exec(sentence);
+    if (leading && EDIT_VERB_RE.test(sentence)) out.push(leading[1]);
   }
-  return [...out];
+  return out;
 }
 
 // Loose path equality shared by the forbidden-vs-target reconciliation. Mirrors
