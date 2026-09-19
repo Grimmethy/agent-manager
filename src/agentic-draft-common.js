@@ -17,6 +17,8 @@ const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
 const { normalizeDiffOutput } = require('./group-b-worktree-diff.js');
+const { stageDraftChanges } = require('./lib/draft-side-effects.js');
+const { appendHistoryEvent } = require('./task-history.js');
 const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
 const { writeSideFindingInbox } = require('./side-finding.js');
 
@@ -370,7 +372,7 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   };
   const bestEffortDiff = () => {
     try {
-      runGit(['add', '-A'], worktreeDir);
+      stageDraftChanges({ worktreeDir, runGit, task });
       // --full-index --binary: see group-b-worktree-diff.js's own note (2026-09-14) --
       // without both flags together, `git apply` refuses a binary patch outright (or
       // fails with "missing binary patch data") if git's own heuristic ever decides a
@@ -685,7 +687,10 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   // implemented | no-changes-needed -- capture whatever actually landed in the worktree.
   let rawDiff = '';
   try {
-    runGit(['add', '-A'], worktreeDir);
+    // stageDraftChanges: stages everything, then unstages side-effect files (lockfiles, node_modules...) a
+    // sandbox `npm install` may have rewritten -- see src/lib/draft-side-effects.js.
+    const { excluded } = stageDraftChanges({ worktreeDir, runGit, task });
+    if (excluded.length) appendHistoryEvent(task, 'advisory', `excluded side-effect file(s) from the captured diff: ${excluded.join(', ')}`);
     // --full-index --binary: see group-b-worktree-diff.js's own note (2026-09-14).
     rawDiff = runGit(['diff', '--cached', '--full-index', '--binary'], worktreeDir);
   } catch (e) {

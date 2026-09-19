@@ -155,6 +155,28 @@ test('resolveAgenticDraft(implemented): a docs-only diff for a code task -> retr
   });
 });
 
+// 2026-09-19 (PF-Client-Portal): a sandbox `npm install` rewrote package-lock.json and the harness committed it
+// to the agent/ branch. The captured diff must contain only what the draft was meant to change.
+test('resolveAgenticDraft(implemented): a lockfile rewritten by a sandbox npm install is excluded from the captured diff', () => {
+  withRealRepo((wt) => {
+    const g = (args) => execFileSync('git', args, { cwd: wt, encoding: 'utf8' });
+    fs.mkdirSync(path.join(wt, 'src'));
+    fs.writeFileSync(path.join(wt, 'src', 'app.js'), 'let a = 1;\n');
+    fs.writeFileSync(path.join(wt, 'package-lock.json'), '{"lockfileVersion":3,"libc":"glibc"}\n');
+    g(['add', '-A']); g(['commit', '-qm', 'files']);
+    fs.writeFileSync(path.join(wt, 'src', 'app.js'), 'let a = 2;\n');
+    fs.writeFileSync(path.join(wt, 'package-lock.json'), '{"lockfileVersion":3}\n'); // what npm install did
+    const task = { id: 'tlock', source: 'manual', domain: 'adhoc', promptContext: { rawText: 'Change a to 2 in src/app.js.' } };
+    const out = resolveAgenticDraft(task, {
+      result: { response: 'Changed the value of a from 1 to 2 in src/app.js.\n\nRESOLUTION: implemented\n\ndone' }, worktreeDir: wt,
+    });
+    assert.notEqual(out.blocked, true, JSON.stringify(out).slice(0, 300));
+    assert.match(task.rawDiff, /diff --git a\/src\/app\.js/);
+    assert.doesNotMatch(task.rawDiff, /package-lock\.json/, 'the side-effect lockfile change must not be in the diff');
+    assert.ok(task.history.some((e) => e.stage === 'advisory' && /excluded side-effect file\(s\).*package-lock\.json/.test(e.detail || '')), 'recorded in history');
+  });
+});
+
 // --- resolveAgenticDraft(no-changes-needed) -- adhocNoChangesClaimProblem (2026-09-04) ---
 
 test('resolveAgenticDraft(no-changes-needed): no "Already covered:" block -> retryable block with pointed feedback', () => {

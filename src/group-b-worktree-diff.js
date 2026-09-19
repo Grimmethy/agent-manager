@@ -26,6 +26,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { applyGroupB } = require('./apply-group-b.js');
+const { stageDraftChanges } = require('./lib/draft-side-effects.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
@@ -107,7 +108,7 @@ function captureGroupBDiffInWorktree({ repoRoot, pipelineDir, implementResponse,
 
   try {
     applyGroupB({ implementResponse, repoRoot: worktreeDir, pipelineDir });
-    runGit(['add', '-A'], worktreeDir);
+    stageDraftChanges({ worktreeDir, runGit, task }); // git add -A, minus side-effect files (src/lib/draft-side-effects.js)
     // --full-index --binary (2026-09-14, screaminggoatclubmt: "please dig into it" --
     // root-caused live): git diff --cached abbreviates blob SHAs in the index line by
     // default, AND omits the actual binary delta payload (just "Binary files ... differ")

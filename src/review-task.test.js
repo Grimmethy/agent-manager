@@ -1718,3 +1718,21 @@ test('buildVerdictPrompt renders a Group B implementResponse through the legible
   // inside the "--- IMPLEMENT draft ---" section with literal backslash-n sequences.
   assert.ok(!prompt.includes(implementResponse));
 });
+
+test('reviewTask puts a deterministic SCOPE CHECK in the vote prompt when the diff changes a file nothing mentions (2026-09-19: a sandbox npm install rewrote package-lock.json)', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const rawDiff = ['diff --git a/src/App.tsx b/src/App.tsx', '--- a/src/App.tsx', '+++ b/src/App.tsx', '@@ -1 +1 @@', '-a', '+b',
+    'diff --git a/package-lock.json b/package-lock.json', '--- a/package-lock.json', '+++ b/package-lock.json', '@@ -1 +1 @@', '-x', '+y', ''].join('\n');
+  const task = baseTask({
+    domain: 'default', source: 'manual', adhocResolution: 'implemented', title: 'startTour leaks a timer',
+    promptContext: { rawText: 'In src/App.tsx the timeout id is discarded.' },
+    implementResponse: 'Implemented the fix in src/App.tsx: startTour now stores its timeout id in a ref and clears any pending one before scheduling a new one, and an unmount cleanup effect clears it. RESOLUTION: implemented', rawDiff,
+  });
+  const captured = [];
+  const res = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  assert.equal(captured.length, 1, `the vote must be reached: ${JSON.stringify(res).slice(0, 300)}`);
+  const prompt = JSON.stringify(captured[0] || '');
+  assert.match(prompt, /SCOPE CHECK \(deterministic\)/);
+  assert.match(prompt, /package-lock\.json/);
+  assert.doesNotMatch(prompt.replace(/diff --git[^"]*/g, ''), /file\(s\) that NEITHER[^.]*App\.tsx/, 'a mentioned file is not listed as unnamed');
+});
