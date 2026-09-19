@@ -198,6 +198,25 @@ function hasSelfProjectSignal(checkText, selfLabel) {
 // tracked) for a note that is plainly a concrete change to this pipeline's own codebase --
 // the dominant failure of the blocked backlog. Returns { belongsToProject, actionable }
 // with both possibly rewritten. Deterministic, not a prompt tweak the 27B keeps ignoring.
+// A machine-raised finding that asks a human to CONFIRM or CHECK something ("worth a quick
+// grep of core.ts to confirm", "not visible in the diff", "worth confirming the two
+// processes use disjoint subdirectories") is an investigation prompt, not a scoped code
+// change. Queued as a derived task it can only yield documentation, which the pipeline then
+// rejects as "not a real implementation" and retries (2026-09-19, PF-Client-Portal: 22
+// minutes of reasoning-lane time on a finding whose answer lived in another repo). File it
+// as a note instead. Deliberately narrow: hedged-verification phrasing only.
+const INVESTIGATION_RE = new RegExp([
+  String.raw`\bworth (?:a )?(?:quick )?(?:grep|look|confirm\w*|check\w*|verif\w*|noting|a note)\b`,
+  String.raw`\b(?:confirm|verify|check)(?:ing)? (?:that|whether|if)\b`,
+  String.raw`\bnot (?:visible|shown|included) in (?:the |this )?(?:shown )?diff\b`,
+  String.raw`\bcannot be (?:completed|verified|confirmed) against\b`,
+  String.raw`^\s*(?:verify|confirm|investigate)\b`,
+].join('|'), 'i');
+
+function isInvestigationFinding(rawText) {
+  return INVESTIGATION_RE.test(String(rawText || ''));
+}
+
 function deriveBelongsToProject(parsed, promptContext = {}) {
   const trackedLabels = Array.isArray(promptContext.projectLabels) ? promptContext.projectLabels : [];
   const rawLabel = nullishString(parsed.belongsToProject);
@@ -299,5 +318,6 @@ module.exports = {
   validateSecondBrainPath,
   normalizeSecondBrainPathCase,
   deriveBelongsToProject,
+  isInvestigationFinding,
   reviewBrainDumpSort,
 };

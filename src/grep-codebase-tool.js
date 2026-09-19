@@ -17,7 +17,13 @@ const { lineMatches } = require('./text-match.js');
 // the query was. Confirmed live 2026-08-19: 25/27 blocked arch_import tasks had a
 // 0-hits/0-files harness-search result. Extended to match this project's own real file
 // types rather than assuming every consumer repo is JS/TS.
-const MATCH_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.sh', '.ps1', '.md'];
+// Infra/config formats added 2026-09-19: the list was code + markdown only, so a project whose
+// deployment lives in docker-compose.yml / Dockerfile / nginx.conf / .env.*.example was
+// invisible to grounding -- PF-Client-Portal's `backend-storage` volume (in docker-compose.yml)
+// "did not appear in this repo", and a task's premise was declared false. Deliberately NOT
+// .json/.html/.css: data and markup files are large-and-noisy and would eat the match budget.
+const MATCH_EXTENSIONS = ['.js', '.jsx', '.ts', '.tsx', '.py', '.sh', '.ps1', '.md', '.yml', '.yaml', '.toml', '.conf', '.example', '.sql'];
+const MATCH_BASENAMES = ['Dockerfile', 'Makefile'];
 const MAX_MATCHES = 20;
 // With context lines each hit is several lines, so fewer of them before the payload gets
 // unwieldy.
@@ -62,6 +68,15 @@ function resolvePrimaryDirs(repoRoot, allowedDirs, dir) {
 // that has no per-repo grep-dirs config -- and an omitted / "." dir walks the whole root.
 // Every existing caller (arch-import-fetch.js, the pipeline's read-only tool loop) passes
 // no `root` and hits the unchanged path below.
+// Directories never worth grepping: dependency trees, VCS metadata, the pipeline's own queue,
+// and build output / caches. A whole-repo walk (a project with no grep-dirs allowlist, or an
+// alternate root) used to descend into .venv/site-packages and build bundles (2026-09-19,
+// PF-Client-Portal: plan grounding cited hits from a .venv), burning the match budget on noise.
+const GREP_SKIP_DIRS = new Set([
+  'node_modules', '.git', 'queue',
+  '.venv', 'venv', '__pycache__', 'dist', 'build', 'coverage', '.next', '.agent-manager-cache', 'graphify-out',
+]);
+
 function grepCodebase({ query, dir, root, contextLines }) {
   const { repoRoot, grepAllowedDirs } = getConfig();
   if (!query) return [];
@@ -86,7 +101,7 @@ function grepCodebase({ query, dir, root, contextLines }) {
   // when the caller (or the model) named a specific file, so e.g. an index.html or a
   // .yaml the model explicitly points at is still searched.
   function grepOneFile(fullPath, force) {
-    if (!force && !MATCH_EXTENSIONS.includes(path.extname(fullPath))) return;
+    if (!force && !MATCH_EXTENSIONS.includes(path.extname(fullPath)) && !MATCH_BASENAMES.includes(path.basename(fullPath))) return;
     let text;
     try {
       text = fs.readFileSync(fullPath, 'utf8');
@@ -126,7 +141,7 @@ function grepCodebase({ query, dir, root, contextLines }) {
       if (hits.length >= maxMatches) return;
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
-        if (['node_modules', '.git', 'queue'].includes(entry.name)) continue;
+        if (GREP_SKIP_DIRS.has(entry.name)) continue;
         walk(fullPath);
       } else if (entry.isFile()) {
         grepOneFile(fullPath, false);

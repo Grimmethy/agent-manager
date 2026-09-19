@@ -1348,8 +1348,10 @@ test('draftTask (archImport-kind source) also finds a real match in a loaded plu
   delete require.cache[require.resolve('./plugins-manifest.js')];
   delete require.cache[require.resolve('./accessible-roots.js')];
 
+  const prevCoreRoot = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
   try {
     await withFixtureRepo(async (draftTask, dir) => {
+      process.env.AGENT_MANAGER_CORE_REPO_ROOT = dir; // plugin repos are only grounded for the core repo
       const { registerTaskSource, updateTaskSource } = require('./task-source-registry.js');
       const p = require('./prompts.js');
       registerTaskSource('sa4_probe_archimport', { priority: 80, next: () => null, emptyApproval: true, harnessSearch: 'archImport' });
@@ -1367,6 +1369,7 @@ test('draftTask (archImport-kind source) also finds a real match in a loaded plu
       assert.ok(task.promptContext.harnessFiles.some((f) => f.path === 'src/function-length-review.js' && f.root === fs.realpathSync(pluginRepo)));
     });
   } finally {
+    if (prevCoreRoot === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = prevCoreRoot;
     delete process.env.AGENT_MANAGER_PLUGINS_MANIFEST;
     delete require.cache[require.resolve('./plugins-manifest.js')];
     delete require.cache[require.resolve('./accessible-roots.js')];

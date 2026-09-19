@@ -34,6 +34,7 @@ test('resolveAccessibleRoots: no manifest at all -> just [repoRoot]', () => {
 
 test('resolveAccessibleRoots: an enabled plugin repo is included, dirname of its registerPath', () => {
   const repoRoot = makeRepoDir();
+  process.env.AGENT_MANAGER_CORE_REPO_ROOT = repoRoot;
   const pluginRepo = makeRepoDir();
   const manifestPath = tmpManifest(JSON.stringify([
     { name: 'a-plugin', registerPath: path.join(pluginRepo, 'register.js'), enabled: true },
@@ -72,6 +73,7 @@ test('resolveAccessibleRoots: dedups when a plugin resolves to the same repo as 
 
 test('resolveAccessibleRoots: multiple enabled plugins, in manifest order, root0 always primary', () => {
   const repoRoot = makeRepoDir();
+  process.env.AGENT_MANAGER_CORE_REPO_ROOT = repoRoot;
   const p1 = makeRepoDir();
   const p2 = makeRepoDir();
   const manifestPath = tmpManifest(JSON.stringify([
@@ -89,4 +91,17 @@ test('resolveAccessibleRoots: malformed manifest JSON behaves like no manifest -
   const manifestPath = tmpManifest('{ not json');
   const { resolveAccessibleRoots } = loadWith(manifestPath);
   assert.deepEqual(resolveAccessibleRoots({ repoRoot }), [fs.realpathSync(repoRoot)]);
+});
+
+test('resolveAccessibleRoots: a NON-core project never gets agent-manager plugin repos in its grounding', () => {
+  const coreRepo = makeRepoDir();
+  const otherProject = makeRepoDir();
+  const pluginRepo = makeRepoDir();
+  process.env.AGENT_MANAGER_CORE_REPO_ROOT = coreRepo;
+  const manifestPath = tmpManifest(JSON.stringify([
+    { name: 'hygiene', registerPath: path.join(pluginRepo, 'register.js'), enabled: true },
+  ]));
+  const { resolveAccessibleRoots } = loadWith(manifestPath);
+  assert.deepEqual(resolveAccessibleRoots({ repoRoot: otherProject }), [fs.realpathSync(otherProject)]);
+  assert.deepEqual(resolveAccessibleRoots({ repoRoot: coreRepo }), [fs.realpathSync(coreRepo), fs.realpathSync(pluginRepo)]);
 });

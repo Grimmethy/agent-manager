@@ -390,8 +390,9 @@ def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_pat
         }
         # applyRepoRoot is hand-set per project (see _start_pipeline) -- never let this
         # upsert silently drop it.
-        if prior.get("applyRepoRoot"):
-            entry["applyRepoRoot"] = prior["applyRepoRoot"]
+        for k in ("applyRepoRoot", "grepDirs"):
+            if prior.get(k):
+                entry[k] = prior[k]
         entries.insert(0, entry)
         PROJECT_REGISTRY_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
     except OSError as exc:
@@ -4021,6 +4022,20 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     else:
         remove_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPLY_REPO_ROOT")
         os.environ.pop("AGENT_MANAGER_APPLY_REPO_ROOT", None)
+
+    # AGENT_MANAGER_GREP_DIRS (which repo-relative dirs the pipeline's grounding grep may search)
+    # is per-project for the same reason as applyRepoRoot above. It sat in agent-manager.env as
+    # agent-manager's own layout ("src,python,scripts,docs") across project switches, so on
+    # PF-Client-Portal -- whose docker-compose.yml lives at the repo root -- a search for
+    # `backend-storage` found nothing and a task's premise was declared false (2026-09-19).
+    # Honor the registered project's grepDirs; a project with none searches its whole repo
+    # (config.js's default '.'), so clear any stale value.
+    if existing_registration and existing_registration.get("grepDirs"):
+        write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_GREP_DIRS", existing_registration["grepDirs"])
+        os.environ["AGENT_MANAGER_GREP_DIRS"] = existing_registration["grepDirs"]
+    else:
+        remove_env_value(ENV_FILE_PATH, "AGENT_MANAGER_GREP_DIRS")
+        os.environ.pop("AGENT_MANAGER_GREP_DIRS", None)
 
     env_overrides = read_env_file(ENV_FILE_PATH)
     env_overrides["AGENT_MANAGER_REPO_ROOT"] = raw_path

@@ -69,6 +69,22 @@ class StartPipelineApplyRootTest(unittest.TestCase):
         self.assertEqual(os.environ["AGENT_MANAGER_APPLY_REPO_ROOT"], "/some/apply-clone")
         self.assertIn("AGENT_MANAGER_APPLY_REPO_ROOT=/some/apply-clone", self.env_path.read_text())
 
+    def test_project_without_grep_dirs_clears_stale_value_and_with_them_sets_it(self):
+        self.env_path.write_text("AGENT_MANAGER_GREP_DIRS=src,python,scripts,docs\nOTHER=keep\n")
+        os.environ["AGENT_MANAGER_GREP_DIRS"] = "src,python,scripts,docs"
+        try:
+            self._register()
+            app._start_pipeline(str(self.repo), True, True)
+            self.assertNotIn("AGENT_MANAGER_GREP_DIRS", os.environ)
+            self.assertNotIn("AGENT_MANAGER_GREP_DIRS", self.env_path.read_text())
+            self._register(grepDirs="src,lib")
+            app._start_pipeline(str(self.repo), True, True)
+            self.assertEqual(os.environ["AGENT_MANAGER_GREP_DIRS"], "src,lib")
+            self.assertIn("AGENT_MANAGER_GREP_DIRS=src,lib", self.env_path.read_text())
+            self.assertEqual(json.loads(self.registry.read_text())[0].get("grepDirs"), "src,lib")
+        finally:
+            os.environ.pop("AGENT_MANAGER_GREP_DIRS", None)
+
     def test_registry_upsert_preserves_apply_root(self):
         self._register(applyRepoRoot="/some/apply-clone")
         app._start_pipeline(str(self.repo), True, True)
