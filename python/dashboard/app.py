@@ -1019,9 +1019,10 @@ def _expected_instance_ids() -> list[str]:
     AGENT_MANAGER_P40_* gate launch.sh itself uses). apply-task-loop is deliberately
     excluded -- it's a single-shot pass with no heartbeat file of its own (see
     launch.sh's own comment), so it never has a slot to be "offline" in."""
-    ids = ["worker-1", "reviewer", "watchdog"]
-    if is_claude_token_configured():
-        ids.append("worker-reasoning")
+    # launch.sh always starts worker-reasoning now (de-Claude'd 2026-09-01: it no longer depends
+    # on a Claude token), so it is always an expected lane -- gating it on the token made it
+    # invisible in the expected list whenever no token was set.
+    ids = ["worker-1", "worker-reasoning", "reviewer", "watchdog"]
     # Optional second-GPU lanes (2026-09-05) -- see agent-manager.env.example's
     # AGENT_MANAGER_P40_OLLAMA_URL comment. Same gate scripts/launch.sh itself uses.
     # worker-reasoning-p40 gives reasoning-tier work a second lane independent of the
@@ -1030,7 +1031,9 @@ def _expected_instance_ids() -> list[str]:
     # simultaneously").
     if os.environ.get("AGENT_MANAGER_P40_OLLAMA_URL") and os.environ.get("AGENT_MANAGER_P40_MODEL"):
         ids.append("worker-p40")
-        ids.append("worker-reasoning-p40")
+        # AGENT_MANAGER_P40_REASONING_LANE=off -- same switch launch.sh honors.
+        if (os.environ.get("AGENT_MANAGER_P40_REASONING_LANE") or "on").strip().lower() != "off":
+            ids.append("worker-reasoning-p40")
     return ids
 
 
