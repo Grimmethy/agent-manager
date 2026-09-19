@@ -486,6 +486,7 @@ function deepDivePlanPrompt(task) {
   const ctx = task.promptContext;
   const fileList = ctx.files.map((f) => `- ${f.path} (link-degree ${f.degree})`).join('\n');
   const fileContents = formatFileContents(ctx.files);
+  const fileCount = ctx.files.length;
   return [
     `You are reading ONE community of files from an external open-source project ("${ctx.projectName}"), looking for anything concretely useful to a DIFFERENT project called "agent-manager" (a local-LLM-driven task pipeline: drafting/review/apply queue, local-model-based workers, majority-vote review gates).`,
     '',
@@ -496,7 +497,7 @@ function deepDivePlanPrompt(task) {
     '',
     fileContents || '(no file content available)',
     '',
-    'Write a numbered PLAN (no code) identifying 0 to 5 specific things in the files above that are worth a verdict for agent-manager: a pattern to use close to as-is, an idea worth adapting to agent-manager\'s own context, or something plausible-looking that turns out not to apply and should be explicitly marked to ignore (with why). Pick the 5 MOST worth flagging if more genuinely qualify -- do not pad the count. It is fine and expected to find NOTHING worth flagging if this community genuinely has nothing relevant -- a fabricated or generic-sounding item is worse than an honest "nothing useful here." Do not comment on files outside the ones given above, and do not describe what the code does in general -- describe specifically what agent-manager could take from it, or why it does not apply.',
+    `Write a numbered PLAN (no code) identifying 0 to ${fileCount} specific things in the files above that are worth a verdict for agent-manager: a pattern to use close to as-is, an idea worth adapting to agent-manager's own context, or something plausible-looking that turns out not to apply and should be explicitly marked to ignore (with why). Pick the ${fileCount} MOST worth flagging if more genuinely qualify -- do not pad the count. It is fine and expected to find NOTHING worth flagging if this community genuinely has nothing relevant -- a fabricated or generic-sounding item is worse than an honest "nothing useful here." Do not comment on files outside the ones given above, and do not describe what the code does in general -- describe specifically what agent-manager could take from it, or why it does not apply.`,
     '',
     'When you cite a file, copy its path EXACTLY as it appears in the "Files in this community" list above (e.g. if the list shows "python/packages/autogen-ext/src/foo/_bar.py", cite that whole string, not a shortened guess like "src/foo/_bar.py") -- a downstream fact-check resolves your citation against the real repo, and a shortened or paraphrased path resolves to nothing and reads as fabrication even when the underlying claim is accurate.',
   ].join('\n');
