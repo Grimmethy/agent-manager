@@ -939,7 +939,14 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // as the neighboring deterministic gates above. Kept permissive enough to still pass a
   // legitimate candidate whose Solution includes an inline fenced snippet or diff hunk --
   // this only rejects PURE prose with no code shape at all.
+  //
+  // Scoped to CANDIDATE drafts (2026-09-19, PF-Client-Portal HotlistView.tsx:47): the review prompt
+  // (function-length-review.js) says a FALSE POSITIVE / UNCERTAIN verdict is "ONE short paragraph...
+  // plain prose only -- no code fence", so a prose verdict is the CORRECT output there. This gate used
+  // to reject it, so every false-positive verdict burned 3 drafts and escalated to a human. Only a draft
+  // that is a candidate (an `### AC-NNN` block, the parser's contract) owes a code shape.
   if (resolveSourceName(task) === 'function_length_review' && trimmedImplResponse
+      && /^#{2,4}\s*AC-\S+/m.test(trimmedImplResponse)
       && !/```/.test(trimmedImplResponse)
       && !/^(?:---|\+\+\+|@@)/m.test(trimmedImplResponse)
       && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)) {

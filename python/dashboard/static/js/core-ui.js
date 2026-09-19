@@ -1182,6 +1182,7 @@ async function renderQueueTab(state) {
       const col = sf.confidence === 'high' ? 'var(--bad)' : 'var(--warn)';
       return `<span title="${tip}" style="display:inline-block;margin-bottom:3px;padding:1px 5px;border:1px solid ${col};border-radius:3px;color:${col};font-size:11px">${label}</span><br>`;
     })() : '';
+    const rereviewBtn = t.rereviewable ? `<button type="button" class="secondary task-rereview-btn" data-id="${escapeAttr(t.id)}" title="Send this SAME draft back to review (no redraft) -- for when the draft was fine and the review side was wrong">Re-review</button>` : '';
     const keepBtn = sf ? `<button type="button" class="secondary task-staleness-keep-btn" data-id="${escapeAttr(t.id)}" title="Dismiss this flag -- the task stays and is not re-flagged for a while">Keep</button>` : '';
     // Stale-grounding flag (context-trim-sweep.js): the task's file-content anchoring went
     // stale and re-anchoring against current content never resolved it. Same chip + Keep
@@ -1225,6 +1226,7 @@ async function renderQueueTab(state) {
       ${showArchiveRequeue ? `<td>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Archive</button>
         <button type="button" class="secondary task-requeue-btn" data-id="${escapeAttr(t.id)}">Requeue</button>
+        ${rereviewBtn}
         ${keepBtn}
         ${trimKeepBtn}
       </td>` : ''}
@@ -1232,6 +1234,7 @@ async function renderQueueTab(state) {
         <button type="button" class="secondary task-done-btn" data-id="${escapeAttr(t.id)}">Mark Done</button>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Reject</button>
         <button type="button" class="secondary task-discuss-btn" data-id="${escapeAttr(t.id)}">Discuss</button>
+        ${rereviewBtn}
         ${keepBtn}
       </td>` : ''}
       ${showConfirmDeny ? `<td>
@@ -1314,6 +1317,9 @@ async function renderQueueTab(state) {
           ? `Confirm '${btn.dataset.id}'? Click into the row first to read the ranked root-cause report -- confirming files its RECOMMENDED FOLLOW-UP FIX as an AC-NNN candidate in Docs/PIPELINE_FIX_CANDIDATES.md for pipeline_forensics_fix to turn into a real diff.`
           : `Confirm the delete in '${btn.dataset.id}'? This lets the next apply pass run the batch for real, including the delete.`;
     btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'confirm', msg); };
+  });
+  main.querySelectorAll('.task-rereview-btn').forEach((btn) => {
+    btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'rereview', `Re-review '${btn.dataset.id}'? Its draft is kept and goes straight back to review -- no redraft.`); };
   });
   main.querySelectorAll('.task-requeue-btn').forEach((btn) => {
     btn.onclick = (e) => { e.stopPropagation(); postTaskAction(state, btn.dataset.id, 'requeue', `Requeue '${btn.dataset.id}' for a fresh draft? This resets its retry history.`); };
