@@ -16,14 +16,53 @@ function isCandidateFulfillmentSource(source) {
 
 function refreshCandidateFetchedFiles(task) {
   const pc = task && task.promptContext;
-  if (!pc || !Array.isArray(pc.fetchedFiles) || pc.fetchedFiles.length === 0) return;
+  if (!pc) return;
+  const hasFetched = Array.isArray(pc.fetchedFiles) && pc.fetchedFiles.length > 0;
+  const hasDeclared = Array.isArray(pc.files) && pc.files.some((f) => typeof f === 'string');
+  if (!hasFetched && !hasDeclared) return;
   let repoRoot;
-  try { ({ repoRoot } = getConfig()); } catch (err) { console.warn('[local-draft] getConfig failed:', err.message); return; }
+  let grepAllowedDirs = [];
+  try { ({ repoRoot, grepAllowedDirs } = getConfig()); } catch (err) { console.warn('[local-draft] getConfig failed:', err.message); return; }
   if (!repoRoot) return;
   let windowFetchedFileContent;
   try { ({ windowFetchedFileContent } = require('../sdk/candidate-fulfillment.js')); } catch (err) { console.warn('[local-draft] candidate-fulfillment require failed:', err.message); return; }
   const resolvedRoot = path.resolve(repoRoot);
   const section = pc.body || '';
+
+  // Heal a stale snapshot: a task generated BEFORE the shared Files: resolver (candidate-path-
+  // grounding.js resolveCitedFile) keeps the fetchedFiles it was created with, and a requeue keeps
+  // that stored promptContext -- so PropertyForager's arch-review-ac-1 (`Files: SearchView`, an
+  // empty fetchedFiles) re-drafted with no code even after the resolver fix. Any declared file that
+  // resolves to a real file but is missing from fetchedFiles is fetched now, and the declared entry is
+  // rewritten to its repo-relative path. Idempotent: a healthy task is left as it was.
+  if (hasDeclared) {
+    try {
+      const { resolveCitedFile } = require('../candidate-path-grounding.js');
+      if (!Array.isArray(pc.fetchedFiles)) pc.fetchedFiles = [];
+      const have = new Set(pc.fetchedFiles.map((f) => f && f.path).filter(Boolean));
+      const healed = [];
+      pc.files = pc.files.map((entry) => {
+        if (typeof entry !== 'string') return entry;
+        const r = resolveCitedFile(resolvedRoot, entry, grepAllowedDirs || []);
+        if (!(r.exists && r.isFile && r.relPath)) return entry;
+        if (!have.has(r.relPath)) {
+          try {
+            const windowed = windowFetchedFileContent(fs.readFileSync(r.resolvedPath, 'utf8'), section);
+            pc.fetchedFiles.push({ path: r.relPath, content: windowed.text, anchorConfidence: windowed.confidence });
+            have.add(r.relPath);
+            healed.push(r.relPath);
+          } catch (err) {
+            console.warn('[local-draft] could not fetch declared file:', r.relPath, err.message);
+          }
+        }
+        return r.relPath;
+      });
+      if (healed.length) appendHistoryEvent(task, 'context-refreshed', `fetched ${healed.length} declared file(s) missing from the stored snapshot: ${healed.join(', ')}`);
+    } catch (err) {
+      console.warn('[local-draft] declared-file refresh failed (advisory):', err.message);
+    }
+  }
+  if (!Array.isArray(pc.fetchedFiles) || pc.fetchedFiles.length === 0) return;
   pc.fetchedFiles = pc.fetchedFiles.map((f) => {
     if (!f || !f.path) return f;
     try {

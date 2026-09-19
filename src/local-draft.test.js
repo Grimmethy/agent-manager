@@ -3509,6 +3509,35 @@ test('refreshCandidateFetchedFiles re-reads each fetched path from the current r
   }
 });
 
+// 2026-09-19 (PropertyForager arch-review-ac-1): a task created before the shared Files: resolver kept
+// files ['SearchView'] + an EMPTY fetchedFiles, and a requeue keeps that stored promptContext, so it re-drafted
+// with no code. The refresh now fetches declared files missing from the snapshot.
+test('refreshCandidateFetchedFiles heals a stale snapshot: fetches a declared file that resolves to a real file, rewrites the entry, and is idempotent', () => {
+  const { refreshCandidateFetchedFiles } = require('./local-draft.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-heal-'));
+  fs.mkdirSync(path.join(dir, 'src', 'components'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'components', 'SearchView.tsx'), 'export function SearchView() { return null; }\n');
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  delete require.cache[require.resolve('./config.js')];
+  try {
+    const task = { source: 'arch_review', history: [], promptContext: { body: '### AC-1\nFiles: SearchView\n', files: ['SearchView', 'Ghost.ts'], fetchedFiles: [] } };
+    refreshCandidateFetchedFiles(task);
+    assert.deepEqual(task.promptContext.files, ['src/components/SearchView.tsx', 'Ghost.ts'], 'real entry rewritten, unresolvable one untouched');
+    assert.deepEqual(task.promptContext.fetchedFiles.map((f) => f.path), ['src/components/SearchView.tsx']);
+    assert.match(task.promptContext.fetchedFiles[0].content, /SearchView/);
+    assert.ok(task.history.some((e) => e.stage === 'context-refreshed'));
+    const events = task.history.length;
+    refreshCandidateFetchedFiles(task); // idempotent: no duplicate fetch, no new event
+    assert.equal(task.promptContext.fetchedFiles.length, 1);
+    assert.equal(task.history.length, events);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+    delete require.cache[require.resolve('./config.js')];
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('refreshCandidateFetchedFiles is a no-op when there are no fetchedFiles / no path-jail escape', () => {
   const { refreshCandidateFetchedFiles } = require('./local-draft.js');
   const t1 = { source: 'observability_fix', promptContext: {} };
