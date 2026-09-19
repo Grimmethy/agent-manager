@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix } = require('./fact-checker.js');
+const { checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
 // against a hash that genuinely exists, not just one that doesn't.
@@ -815,4 +815,44 @@ test('checkFileLineCitations is a no-op for a bare path with no :NNN suffix', ()
     checkFileLineCitations(draftText, sourceText).unconfirmedCitations,
     [],
   );
+});
+
+// --- checkCompletionClaimsInNote: "already in place / already inserted" claims in a
+// note are verified against the LIVE repo (file exists, named function exists in it),
+// fail-open on read errors, and return one candidate object per claim ---
+
+test('checkCompletionClaimsInNote marks a real file path + real function as found:true', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'src', 'real-file.js'),
+    'function realHelper(x) {\n  return x + 1;\n}\n',
+  );
+
+  const noteText = 'The retry loop and function realHelper in src/real-file.js are already in place, so this is done.';
+  const results = checkCompletionClaimsInNote(noteText, dir);
+  assert.equal(results.length, 1);
+  assert.equal(results[0].found, true);
+  assert.match(results[0].evidence, /realHelper.*confirmed/s);
+});
+
+test('checkCompletionClaimsInNote resolves a nonexistent path to found:false with an evidence note, without throwing (fail-open)', () => {
+  const repoRoot = makeRepo();
+  const noteText = 'The helper function ghostFn is already inserted in src/does-not-exist.js, so nothing more is needed.';
+
+  let results;
+  assert.doesNotThrow(() => {
+    results = checkCompletionClaimsInNote(noteText, repoRoot);
+  });
+  assert.equal(results.length, 1);
+  assert.equal(results[0].found, false);
+  assert.equal(typeof results[0].evidence, 'string');
+  assert.ok(results[0].evidence.length > 0, 'evidence note should be a non-empty string');
+  assert.match(results[0].evidence, /file not found: src\/does-not-exist\.js/);
+});
+
+test('checkCompletionClaimsInNote returns [] for empty or undefined noteText', () => {
+  const repoRoot = makeRepo();
+  assert.deepEqual(checkCompletionClaimsInNote('', repoRoot), []);
+  assert.deepEqual(checkCompletionClaimsInNote(undefined, repoRoot), []);
 });
