@@ -9,6 +9,7 @@ const path = require('path');
 const {
   extractFilesLine, checkCitedPaths, formatFabricatedReason,
   checkCitedSymbols, checkCitedSymbolsPerEntry, splitCandidateEntries, formatFabricatedSymbolsReason,
+  symbolCheckBlocks, formatSymbolWarnings,
 } = require('./candidate-path-grounding.js');
 
 // --- extractFilesLine -----------------------------------------------------------------
@@ -224,4 +225,25 @@ test('checkCitedSymbols: names only in Benefits: are not checked (hypothetical/p
   ].join('\n');
   assert.deepEqual(checkCitedSymbols(text, checkedFor(repo, 'src/real-one.js')).fabricated, []);
   fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('symbolCheckBlocks: warn-only by default, opt back in with AGENT_MANAGER_SYMBOL_CHECK_BLOCKING=true', () => {
+  const saved = process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING;
+  try {
+    delete process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING;
+    assert.equal(symbolCheckBlocks(), false);
+    process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING = 'true';
+    assert.equal(symbolCheckBlocks(), true);
+    process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING = 'false';
+    assert.equal(symbolCheckBlocks(), false);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING; else process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING = saved;
+  }
+});
+
+test('formatSymbolWarnings: one advisory line naming every symbol; empty in, empty out', () => {
+  assert.deepEqual(formatSymbolWarnings([]), []);
+  const [w] = formatSymbolWarnings([{ name: 'a' }, { name: 'b' }]);
+  assert.match(w, /`a`, `b`/);
+  assert.doesNotMatch(w, /fabricated/i);
 });

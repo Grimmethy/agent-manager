@@ -178,7 +178,26 @@ function formatFabricatedSymbolsReason(fabricated) {
     + 'A redraft cannot make an invented symbol real; re-file with an accurate citation, or archive if nothing applies.';
 }
 
+// The symbol check is a literal-text heuristic: it cannot tell "cites code that does not exist"
+// from "names a symbol the draft proposes", or a symbol living in a different real file. It was
+// a hard, non-retryable block; four separate false-positive classes in one day (filenames,
+// Solution:/Benefits: prose, multi-entry drafts) blocked every first arch_discovery draft for
+// PropertyForager, so it now WARNS by default: the finding rides to the review votes as
+// advisory context (task.groundingWarnings) instead of ending the draft. Path fabrication
+// (Check 0) stays a hard block. AGENT_MANAGER_SYMBOL_CHECK_BLOCKING=true restores the block.
+function symbolCheckBlocks() {
+  return process.env.AGENT_MANAGER_SYMBOL_CHECK_BLOCKING === 'true';
+}
+
+function formatSymbolWarnings(fabricated) {
+  const names = (fabricated || []).map((f) => '`' + f.name + '`');
+  if (!names.length) return [];
+  return [`symbol(s) ${names.join(', ')} not found by literal text search in the file(s) this candidate cites`];
+}
+
 module.exports = {
+  symbolCheckBlocks,
+  formatSymbolWarnings,
   extractFilesLine,
   checkCitedPaths,
   formatFabricatedReason,
