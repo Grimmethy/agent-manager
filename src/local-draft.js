@@ -184,6 +184,21 @@ ensureRegistered();
 // (observed live: 5 blocked observability_fix tasks -- "duplicate import logging").
 const REDUNDANT_LINE_RE = /^\s*(?:import logging|from logging import|(?:logger|log|_log|LOG|LOGGER)\s*=\s*logging\.getLogger\([^)]*\))\s*$/;
 
+// A plan is "mechanical enough" for the cheap editor model when it is made of concrete
+// find/replace or verbatim-move instructions (old/new literal pairs, code blocks) and does
+// NOT contain open-ended hedge words that signal the model needs to think through options.
+// 2026-09: AIDER_EDITOR_MODEL routing -- pure gate, no I/O; mirrors the HELPER_DECL_RE /
+// helpersDeclaredIn pattern (module-level _RE + small predicate).
+const MECHANICAL_LITERALS_RE = /(?:\bold[:]\s*\S|\bnew[:]\s*\S|`[^`\n]{2,}`)/i;
+const MECHANICAL_HEDGE_RE = /\b(?:consider|maybe|alternatively)\b/i;
+
+function planIsMechanicalEnough(planText, ctx) {
+  const text = String(planText || '');
+  if (!text.trim()) return false;
+  if (MECHANICAL_HEDGE_RE.test(text)) return false;
+  return MECHANICAL_LITERALS_RE.test(text);
+}
+
 // The most distinctive single line of a snippet (longest non-trivial, non-comment line) --
 // used to locate the flagged block inside the real file even when leading/trailing lines
 // of the snippet were paraphrased or reindented.
@@ -1014,7 +1029,14 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   // ending at 'plan-done'.
   appendHistoryEvent(task, 'implement-started', hasFixedLiterals ? 'fixed-literals implement pass' : 'implement pass');
   const implCallStartMs = Date.now();
-  let implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected });
+  // AIDER_EDITOR_MODEL routing (2026-09): when the plan is mechanical enough, send the
+  // first attempt through the cheap editor model; otherwise (and on every retry below)
+  // fall back to the default 27b path. editorModel is null when the gate is false or the
+  // env var is unset, so callImplementModel's existing default model is untouched.
+  const mechanical = planIsMechanicalEnough(task.planResponse, { source: task.source });
+  const editorModel = process.env.AIDER_EDITOR_MODEL && mechanical ? process.env.AIDER_EDITOR_MODEL : null;
+  console.log(`[local-draft] implement-route: mechanical=${mechanical} model=${editorModel || 'default'} planLen=${(task.planResponse || '').length}`);
+  let implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected, editorModel });
   let implLatencyMs = Date.now() - implCallStartMs;
 
   if (implResult.degenerate) {
@@ -1043,7 +1065,8 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     task.oversizedImplementRetried = true;
     const strictPrompt = buildImplementPrompt(task, task.planResponse, { strictCite: true });
     const retryStartMs = Date.now();
-    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt: strictPrompt, budget, coldLoadExpected: false });
+    // retry: drop editorModel override, escalate to default model (no editorModel field passed)
+const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt: strictPrompt, budget, coldLoadExpected: false });
     const retryLatencyMs = Date.now() - retryStartMs;
     appendHistoryEvent(
       task,
@@ -1129,7 +1152,8 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   if (!task.nonCompliantImplementRetried && !isImplementOutputCompliant(task, task.implementResponse)) {
     task.nonCompliantImplementRetried = true;
     console.warn(`[local-draft] non-compliant implement output (missing JSON and missing FALSE POSITIVE token) -- retrying once, task=${task.id}, source=${task.source}`);
-    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected: false });
+    // retry: drop editorModel override, escalate to default model (no editorModel field passed)
+const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected: false });
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
     }
