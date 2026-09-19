@@ -8,7 +8,7 @@ const path = require('path');
 
 const {
   extractFilesLine, checkCitedPaths, formatFabricatedReason,
-  checkCitedSymbols, formatFabricatedSymbolsReason,
+  checkCitedSymbols, checkCitedSymbolsPerEntry, splitCandidateEntries, formatFabricatedSymbolsReason,
 } = require('./candidate-path-grounding.js');
 
 // --- extractFilesLine -----------------------------------------------------------------
@@ -186,4 +186,30 @@ test('formatFabricatedSymbolsReason: names every fabricated symbol and starts wi
   const reason = formatFabricatedSymbolsReason([{ name: 'fakeHelper' }, { name: 'ghostFn' }]);
   assert.match(reason, /^fabricated symbol citation\(s\): `fakeHelper`, `ghostFn`/);
   assert.match(`Ungrounded draft: ${reason}`, /^ungrounded draft:\s*fabricated symbol citation/i);
+});
+
+test('checkCitedSymbolsPerEntry: each entry is checked against its OWN Files: line', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'one.js'), 'function alphaFn() {}\n');
+  fs.writeFileSync(path.join(repo, 'src', 'two.js'), 'function betaFn() {}\n');
+  const text = [
+    '### AC-001 · One', 'Files: src/one.js', '', 'Problem:', '`alphaFn` is duplicated.', '',
+    '### AC-002 · Two', 'Files: src/two.js', '', 'Problem:', '`betaFn` is duplicated and `ghostFn` is invented.',
+  ].join('\n');
+  const { fabricated } = checkCitedSymbolsPerEntry(text, repo, ['src']);
+  assert.deepEqual(fabricated.map((f) => f.name), ['ghostFn']); // betaFn is real in AC-002's file
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('checkCitedSymbolsPerEntry: a symbol real only in ANOTHER entry\'s file is still flagged', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'one.js'), 'function alphaFn() {}\n');
+  fs.writeFileSync(path.join(repo, 'src', 'two.js'), 'function betaFn() {}\n');
+  const text = ['### AC-001 · One', 'Files: src/one.js', 'Problem:', '`betaFn` lives here?'].join('\n');
+  assert.deepEqual(checkCitedSymbolsPerEntry(text, repo, ['src']).fabricated.map((f) => f.name), ['betaFn']);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('splitCandidateEntries: text without ### headers is one entry', () => {
+  assert.deepEqual(splitCandidateEntries('Files: a.js\nProblem: x'), ['Files: a.js\nProblem: x']);
 });

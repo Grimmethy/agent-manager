@@ -144,6 +144,32 @@ function checkCitedSymbols(text, checkedPaths) {
   return { fabricated, checked };
 }
 
+// A write-up can hold several `### AC-NNN` entries, each with its OWN `Files:` line, but
+// extractFilesLine() returns only the first. Checking every entry's symbols against just the
+// first entry's files flags a real symbol from a later entry's file as fabricated (confirmed
+// live 2026-09-19: AC-003's `goToClientLogin`/`authMode`, real in App.tsx, were checked
+// against AC-001's AppFooter/Login/legalContent and blocked the whole draft). Splits on `###`
+// headers; text without one is a single entry, i.e. the previous behavior.
+function splitCandidateEntries(text) {
+  const raw = String(text || '');
+  const parts = raw.split(/^(?=###\s)/m).filter((p) => p.trim());
+  return parts.length > 1 ? parts : [raw];
+}
+
+// (text, repoRoot, extraRoots) -> { fabricated: [{name}] } -- checkCitedSymbols run once per
+// entry against that entry's own resolved Files: line, names de-duplicated across entries.
+function checkCitedSymbolsPerEntry(text, repoRoot, extraRoots = []) {
+  const fabricated = [];
+  const seen = new Set();
+  for (const entry of splitCandidateEntries(text)) {
+    const { checked } = checkCitedPaths(extractFilesLine(entry), repoRoot, extraRoots);
+    for (const f of checkCitedSymbols(entry, checked).fabricated) {
+      if (!seen.has(f.name)) { seen.add(f.name); fabricated.push(f); }
+    }
+  }
+  return { fabricated };
+}
+
 function formatFabricatedSymbolsReason(fabricated) {
   const names = fabricated.map((f) => '`' + f.name + '`');
   return `fabricated symbol citation(s): ${names.join(', ')} -- not found anywhere in the cited file(s). `
@@ -155,5 +181,7 @@ module.exports = {
   checkCitedPaths,
   formatFabricatedReason,
   checkCitedSymbols,
+  splitCandidateEntries,
+  checkCitedSymbolsPerEntry,
   formatFabricatedSymbolsReason,
 };
