@@ -44,6 +44,10 @@ function readProjectRegistry() {
 // title still passes; anything below that bar is almost certainly a hallucination, not a
 // real duplicate the classifier actually found.
 const DUPLICATE_MATCH_JACCARD_THRESHOLD = 0.5;
+// Kept in sync with the same-named constants in apply-group-a.js and task-sources.js
+// (intentionally local, not imported): once an entry's text keeps changing across this
+// many sort attempts, further recoverable retries just churn -- terminal skip instead.
+const MAX_SORT_ATTEMPTS = 3;
 function isValidDuplicateMatch(candidate, existingTitles) {
   const c = String(candidate || '').trim();
   if (!c || !Array.isArray(existingTitles) || existingTitles.length === 0) return false;
@@ -138,7 +142,11 @@ function recoverableSortSkip(data, entry, brainDumpPath, reason) {
 }
 
 function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
-  const { brainDumpEntryId, rawText, existingQueuedTitles } = task.promptContext;
+  const { brainDumpEntryId, existingQueuedTitles } = task.promptContext;
+  // rawText is let (not const) so the stale-detection branch below can re-bind it to the
+  // entry's CURRENT text and re-run the sort logic against live data.
+  let rawText = task.promptContext.rawText;
+  let wasRefreshed = false;
 
   const data = loadBrainDump(brainDumpPath);
 
@@ -152,8 +160,21 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   // text into the entry's CURRENT record would silently mislabel it under a rawText it no
   // longer has. Only apply if the entry is still exactly what this task was drafted against.
   if (entry.status !== 'captured' || entry.rawText !== rawText) {
-    return recoverableSortSkip(data, entry, brainDumpPath,
-      'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text');
+    if ((entry.sortAttempt || 0) >= MAX_SORT_ATTEMPTS) {
+      // Terminal: already retried MAX_SORT_ATTEMPTS times with the entry's text still
+      // changing on every draft. Do NOT bump sortAttempt or persist anything (no
+      // recoverableSortSkip) -- just stop. task-sources.js's emission gate
+      // ((e.sortAttempt || 0) < MAX_SORT_ATTEMPTS) will not re-emit this entry.
+      return {
+        skipped: true,
+        reason: `brain-dump entry changed since this task was drafted after ${entry.sortAttempt} sort attempts -- giving up; draft a fresh sort against its current text`,
+      };
+    }
+    // Refresh: re-bind rawText to the entry's CURRENT text and fall through to the
+    // existing sort logic below so this pass classifies live text instead of skipping.
+    rawText = entry.rawText;
+    wasRefreshed = true;
+    // Intentional fall-through -- no return here.
   }
 
   if (!secondBrainDir) {

@@ -450,10 +450,14 @@ test('applyBrainDumpSort skips cleanly when the entry no longer exists (deleted 
   assert.match(result.reason, /no longer exists/);
 });
 
-test('applyBrainDumpSort refuses to apply a stale classification when the entry was edited since drafting', () => {
+test('applyBrainDumpSort refuses a stale classification terminally once sort attempts are exhausted', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
   const secondBrainDir = path.join(dir, 'secondbrain');
-  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'NEW edited text' })]);
+  // sortAttempt already at the MAX_SORT_ATTEMPTS (3) cap: a stale entry that has kept
+  // changing across 3 drafts is terminally skipped -- no further bump, no more retries.
+  // (Below the cap, a stale entry instead refreshes rawText to the entry's current text
+  // and re-runs the sort logic -- covered by the dedicated stale-refresh tests.)
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'NEW edited text', sortAttempt: 3 })]);
 
   // Task was drafted against the OLD text, before the dashboard's edit endpoint changed it.
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'OLD original text' } };
@@ -462,8 +466,10 @@ test('applyBrainDumpSort refuses to apply a stale classification when the entry 
 
   assert.equal(result.skipped, true);
   assert.match(result.reason, /changed since this task was drafted/);
+  assert.ok(!('recoverable' in result)); // terminal: not a recoverableSortSkip
   const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
   assert.equal(entries[0].status, 'captured');
+  assert.equal(entries[0].sortAttempt, 3); // not bumped again
 });
 
 test('applyBrainDumpSort skips cleanly when SECOND_BRAIN_DIR is not configured', () => {
