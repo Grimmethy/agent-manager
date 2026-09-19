@@ -2053,6 +2053,33 @@ test('nextCandidateFulfillmentTask marks a >=2-file candidate mustPreSplit, a 1-
   assert.equal(t.mustPreSplit, false, 'a Split-Depth:1 candidate is never pre-split again -- the recursion stop');
 });
 
+// 2026-09-19 (PropertyForager arch-review-ac-1): the fulfillment fetch read the EXACT repo-relative path only,
+// so a candidate whose Files: line said `SearchView` / `SearchView.tsx` fetched nothing and the drafter saw no
+// code. It now resolves entries with the same resolver the discovery-time check uses.
+test('nextCandidateFulfillmentTask fetches real content for a bare-basename and an extension-less Files: entry, and records the resolved repo-relative path', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src', 'components'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'components', 'SearchView.tsx'), 'export function SearchView() { return null; }\n');
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  for (const [name, filesLine] of [['BARE', 'SearchView.tsx'], ['NOEXT', 'SearchView'], ['EXACT', 'src/components/SearchView.tsx']]) {
+    const doc = path.join(dir, `${name}.md`);
+    fs.writeFileSync(doc, `### AC-1 · A finding\nStrength: Strong\nFiles: ${filesLine}\n\nProblem:\nx.\n\nSolution:\nchange it.\n\nBenefits:\ny.`);
+    const pc = nextCandidateFulfillmentTask(doc, 'pipeline_forensics_fix').promptContext;
+    assert.deepEqual(pc.fetchedFiles.map((f) => f.path), ['src/components/SearchView.tsx'], `${name}: the drafter is shown the real file`);
+    assert.deepEqual(pc.files, ['src/components/SearchView.tsx'], `${name}: declared files are the resolved path`);
+  }
+});
+
+test('nextCandidateFulfillmentTask keeps an unresolvable Files: entry as written (a candidate proposing a NEW file is still valid)', () => {
+  const dir = makeAdhocFixtureRepo();
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const doc = path.join(dir, 'NEW.md');
+  fs.writeFileSync(doc, '### AC-1 · New file\nStrength: Strong\nFiles: src/brand-new.ts\n\nProblem:\nx.\n\nSolution:\nadd it.\n\nBenefits:\ny.');
+  const pc = nextCandidateFulfillmentTask(doc, 'pipeline_forensics_fix').promptContext;
+  assert.deepEqual(pc.files, ['src/brand-new.ts']);
+  assert.deepEqual(pc.fetchedFiles, []);
+});
+
 test('nextCandidateFulfillmentTask marks a many-numbered-step single-file candidate mustPreSplit', () => {
   const dir = makeAdhocFixtureRepo();
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });

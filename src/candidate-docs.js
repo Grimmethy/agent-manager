@@ -130,6 +130,22 @@ function nextAvailableCandidateId(existingText) {
 // (task-sources.js) gets a real, current anchor instead of reverse-engineering position
 // from lossy prose. Optional: arch_review/arch_import_review's own candidates (hand-authored
 // or drafted without a pre-existing scan finding) have no such snippet to pass.
+// Write-time normalization of a candidate's Files: line (see candidate-path-grounding.js's
+// resolveCitedFile header for the incident): an entry that names a real file by a bare basename or
+// without its extension is rewritten to the repo-relative path, so what lands in the doc is what the
+// fulfillment fetch can actually read. Fail-open: any config/resolution problem leaves the line as the
+// model wrote it. Lazy requires keep this module dependency-light and cycle-free.
+function normalizeCandidateFiles(filesLine) {
+  if (!filesLine) return filesLine;
+  try {
+    const { normalizeFilesLine } = require('./candidate-path-grounding.js');
+    const { repoRoot, grepAllowedDirs } = require('./config.js').getConfig();
+    return normalizeFilesLine(filesLine, repoRoot, grepAllowedDirs || []);
+  } catch {
+    return filesLine;
+  }
+}
+
 function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null }) {
   const candidates = parseArchDiscoveryCandidates(implementResponse);
   if (candidates.length === 0) {
@@ -146,7 +162,7 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
     // refuses to pre-split a candidate at depth >= 1 (hard recursion stop).
     if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
     if (c.source) lines.push(`Source: ${c.source}`);
-    if (c.files) lines.push(`Files: ${c.files}`);
+    if (c.files) lines.push(`Files: ${normalizeCandidateFiles(c.files)}`);
     // dependsOnIndex -> a real Depends-On: AC-NNN line (2026-09-05, see
     // prompts.js's candidateSplitInstructions for the incident): only resolvable NOW,
     // once ids are actually being assigned in this same pass. Only valid within a single

@@ -24,7 +24,8 @@
 // site" case) is out of scope for v1 and stays a retryable `ungrounded` as today.
 
 const fs = require('fs');
-const { checkFilePaths } = require('./fact-checker.js');
+const path = require('path');
+const { checkFilePaths, resolveAgainstRepoDetailed } = require('./fact-checker.js');
 const { backtickIdentifiers } = require('./task-anchor-files.js');
 
 // The `Files:` line of an AC-NNN / deep-dive write-up. Case-insensitive, tolerant of
@@ -34,6 +35,46 @@ function extractFilesLine(text) {
   return m ? m[1].trim() : '';
 }
 
+// ONE definition of "which real file does this Files: entry name?", shared by the discovery-time
+// check (checkCitedPaths), the write-time normalization (normalizeFilesLine, used when a candidate is
+// appended to a Docs/*_CANDIDATES.md) and the fulfillment-time fetch (sdk/lib/candidate-lifecycle.js).
+// They used to disagree (2026-09-19, PropertyForager arch-review-ac-1): the check resolved an entry by
+// exact path / configured code dir / unique basename, but the fetch read the EXACT repo-relative path
+// only -- so `Files: SearchView.tsx` passed the check, then fetched nothing and the drafter saw no code;
+// and an extension-less `Files: SearchView` was never checked at all (extractFilePaths only matches
+// tokens with an extension), so it slipped through as vacuously fine.
+//
+// resolveCitedFile: exact / extraRoots prefix / unique basename (fact-checker's resolver), and for an
+// extension-less entry also probes the common code extensions. Returns
+// { claimedPath, exists, resolvedPath, resolvedVia, relPath, isFile }.
+const PROBE_EXTENSIONS = ['.tsx', '.ts', '.jsx', '.js', '.mjs', '.cjs', '.py'];
+
+function cleanEntry(raw) {
+  return String(raw || '').trim().replace(/^[`'"]+|[`'"]+$/g, '').replace(/\s*\([^)]*\)\s*$/, '').trim();
+}
+
+function resolveCitedFile(repoRoot, claimed, extraRoots = []) {
+  const claimedPath = cleanEntry(claimed);
+  const none = { claimedPath, exists: false, resolvedPath: null, resolvedVia: null, relPath: null, isFile: false };
+  if (!claimedPath || !repoRoot) return none;
+  let r = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
+  if (!r.resolvedPath && !path.extname(claimedPath)) {
+    for (const ext of PROBE_EXTENSIONS) {
+      const probed = resolveAgainstRepoDetailed(repoRoot, claimedPath + ext, extraRoots);
+      if (probed.resolvedPath) { r = { resolvedPath: probed.resolvedPath, resolvedVia: probed.resolvedVia === 'exact' ? 'extension' : probed.resolvedVia }; break; }
+    }
+  }
+  if (!r.resolvedPath) return none;
+  let isFile = false;
+  try { isFile = fs.statSync(r.resolvedPath).isFile(); } catch { /* raced away -- treated as not a file */ }
+  const relPath = path.relative(repoRoot, r.resolvedPath).split(path.sep).join('/');
+  return { claimedPath, exists: true, resolvedPath: r.resolvedPath, resolvedVia: r.resolvedVia, relPath, isFile };
+}
+
+// An extension-less Files: entry worth checking: identifier- or slash-path-shaped. Prose ("the search
+// component"), globs ("src/*") and dotfiles are skipped so they can't become false "fabricated" blocks.
+const FILE_LIKE_ENTRY = /^[A-Za-z_][\w.-]*(?:\/[\w.-]+)*$/;
+
 // (filesLine, repoRoot, extraRoots) -> { fabricated: [{claimedPath, exists, ...}], checked: [...] }
 // extraRoots is fact-checker.js's own param shape: repoRoot-relative code dirs
 // (getConfig().grepAllowedDirs) so `Files: local-client.js` still resolves to
@@ -41,8 +82,30 @@ function extractFilesLine(text) {
 function checkCitedPaths(filesLine, repoRoot, extraRoots = []) {
   if (!filesLine || !repoRoot) return { fabricated: [], checked: [] };
   const checked = checkFilePaths(filesLine, repoRoot, extraRoots);
+  // Extension-less entries (see resolveCitedFile's header): the regex above never sees them.
+  const seen = new Set(checked.map((r) => r.claimedPath));
+  for (const raw of String(filesLine).split(',')) {
+    const entry = cleanEntry(raw);
+    if (!entry || path.extname(entry) || !FILE_LIKE_ENTRY.test(entry) || seen.has(entry)) continue;
+    seen.add(entry);
+    const r = resolveCitedFile(repoRoot, entry, extraRoots);
+    checked.push({ claimedPath: entry, exists: r.exists, resolvedPath: r.resolvedPath, resolvedVia: r.resolvedVia });
+  }
   const fabricated = checked.filter((r) => r.exists === false);
   return { fabricated, checked };
+}
+
+// Rewrites each Files: entry that resolves to a real FILE by anything other than its exact
+// repo-relative path (bare basename, missing extension, code-dir prefix) to that repo-relative path, so
+// the candidate a human and the fulfillment fetch both read names the real file. Entries that already
+// are exact, or resolve to nothing, are left byte-for-byte as written.
+function normalizeFilesLine(filesLine, repoRoot, extraRoots = []) {
+  if (!filesLine || !repoRoot) return filesLine;
+  return String(filesLine).split(',').map((raw) => {
+    const r = resolveCitedFile(repoRoot, raw, extraRoots);
+    const exact = cleanEntry(raw).replace(/\\/g, '/').replace(/^\.?\//, '');
+    return (r.exists && r.isFile && r.relPath && r.relPath !== exact) ? r.relPath : raw.trim();
+  }).join(', ');
 }
 
 function formatFabricatedReason(fabricated) {
@@ -196,6 +259,8 @@ function formatSymbolWarnings(fabricated) {
 }
 
 module.exports = {
+  resolveCitedFile,
+  normalizeFilesLine,
   symbolCheckBlocks,
   formatSymbolWarnings,
   extractFilesLine,

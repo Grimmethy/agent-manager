@@ -157,3 +157,32 @@ test('applyArchDiscoveryCandidates writes a fenced Snippet: field only when a sn
   });
   assert.doesNotMatch(fs.readFileSync(docPath2, 'utf8'), /Snippet:/);
 });
+
+// 2026-09-19 (PropertyForager arch-review-ac-1): a candidate written with `Files: SearchView` (bare, no
+// extension) went into the doc verbatim and could never be fulfilled. The Files: line is now normalized
+// to the real repo-relative path when the candidate is appended; anything unresolvable is left as written.
+test('applyArchDiscoveryCandidates normalizes a bare / extension-less Files: entry to the real repo-relative path', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'cd-norm-'));
+  fs.mkdirSync(path.join(repo, 'src', 'components'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'src', 'components', 'SearchView.tsx'), 'export const SearchView = 1;\n');
+  const saved = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = repo;
+  try {
+    const candidatesPath = path.join(repo, 'Docs', 'CANDS.md');
+    const implementResponse = [
+      '### AC-001 · Bare',
+      'Strength: Strong',
+      'Files: SearchView, Ghost.ts',
+      '',
+      'Problem: p',
+      'Solution: s',
+    ].join('\n');
+    const result = applyArchDiscoveryCandidates({ implementResponse, candidatesPath });
+    assert.equal(result.candidateCount, 1);
+    const doc = fs.readFileSync(candidatesPath, 'utf8');
+    assert.match(doc, /^Files: src\/components\/SearchView\.tsx, Ghost\.ts$/m, 'real entry resolved, unresolved one left as written');
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = saved;
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
