@@ -380,13 +380,19 @@ def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_pat
     try:
         normalized_root = os.path.normpath(repo_root)
         entries = read_project_registry()
+        prior = next((e for e in entries if os.path.normpath(e.get("repoRoot", "")) == normalized_root), {})
         entries = [e for e in entries if os.path.normpath(e.get("repoRoot", "")) != normalized_root]
-        entries.insert(0, {
+        entry = {
             "repoRoot": normalized_root,
             "pipelineDir": os.path.normpath(pipeline_dir),
             "domainsPath": os.path.normpath(domains_path),
             "label": Path(normalized_root).name,
-        })
+        }
+        # applyRepoRoot is hand-set per project (see _start_pipeline) -- never let this
+        # upsert silently drop it.
+        if prior.get("applyRepoRoot"):
+            entry["applyRepoRoot"] = prior["applyRepoRoot"]
+        entries.insert(0, entry)
         PROJECT_REGISTRY_PATH.write_text(json.dumps(entries, indent=2), encoding="utf-8")
     except OSError as exc:
         logger.warning("Failed to write project registry at %s: %s", PROJECT_REGISTRY_PATH, exc)
@@ -596,6 +602,19 @@ def write_env_value(env_path: Path, key: str, value: str):
     if not found:
         lines.append(f"{key}={value}")
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def remove_env_value(env_path: Path, key: str):
+    """Drops a KEY=VALUE line from the env file if present (comments and every other
+    line untouched). No-op when the file or key doesn't exist."""
+    if not env_path.is_file():
+        return
+    kept = [
+        line for line in env_path.read_text(encoding="utf-8").splitlines()
+        if line.strip().startswith("#") or "=" not in line.strip()
+        or line.strip().partition("=")[0].strip() != key
+    ]
+    env_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
 
 
 def _active_project_setting(key: str) -> str | None:
@@ -3987,6 +4006,21 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
         if existing_registration.get("domainsPath"):
             write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_DOMAINS_PATH", existing_registration["domainsPath"])
             os.environ["AGENT_MANAGER_DOMAINS_PATH"] = existing_registration["domainsPath"]
+
+    # AGENT_MANAGER_APPLY_REPO_ROOT (the clone apply-task.js commits/pushes from, and where
+    # the *_CANDIDATES.md docs the *_fix sources read live) is per-project too. It used to
+    # sit in agent-manager.env untouched across project switches, so pointing the pipeline
+    # at a second repo left its candidate docs and its apply target on agent-manager's own
+    # clone: agent-manager's tasks got drafted against the new repo, and the new repo's
+    # diffs would have been applied and pushed to agent-manager's origin (2026-09-19,
+    # caught before any draft ran). Honor the registered project's applyRepoRoot; a project
+    # with none applies from its own repoRoot, so clear any stale value.
+    if existing_registration and existing_registration.get("applyRepoRoot"):
+        write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPLY_REPO_ROOT", existing_registration["applyRepoRoot"])
+        os.environ["AGENT_MANAGER_APPLY_REPO_ROOT"] = existing_registration["applyRepoRoot"]
+    else:
+        remove_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPLY_REPO_ROOT")
+        os.environ.pop("AGENT_MANAGER_APPLY_REPO_ROOT", None)
 
     env_overrides = read_env_file(ENV_FILE_PATH)
     env_overrides["AGENT_MANAGER_REPO_ROOT"] = raw_path
