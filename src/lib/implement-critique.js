@@ -337,7 +337,7 @@ function computeImplementBudget(task, implPrompt) {
   };
 }
 
-async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected = false }) {
+async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected = false, editorModel }) {
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
   const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
   const implStartedAt = new Date().toISOString();
