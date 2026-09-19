@@ -856,6 +856,24 @@ test('computeImplementBudget gives pipeline_debrief the same large implement bud
   assert.equal(b.implNoThink, true, 'think must be disabled the same way it is for pipeline_forensics');
 });
 
+// 2026-09-19, ghost-in-the-machine retroactive audit of the blocked/ bucket: change-review-
+// 7eecbfa (15057-char diff) and change-review-b8a6f21 (12202-char diff) both got a 0-char
+// PLAN and a "truncated mid-sentence" implement pass on every attempt, exhausting all
+// retries -- the flat 2800 "large prompt context" floor the test right below this one covers
+// (proven fine for a 9000-char diff) was NOT enough once the diff itself passed ~10KB.
+test('computeImplementBudget gives change_review a wide implement budget for a genuinely large diff, unchanged for a moderate one', () => {
+  const { computeImplementBudget } = require('./local-draft.js');
+  const bigDiffTinyPlan = { source: 'change_review', planResponse: '', promptContext: { unitDiff: 'x'.repeat(15057) } };
+  const b = computeImplementBudget(bigDiffTinyPlan, 'z'.repeat(20000));
+  assert.ok(b.implNumPredict >= 6000, `floor should clear the empty-plan starvation, got ${b.implNumPredict}`);
+  assert.ok(b.implNumPredict <= 16000, 'capped at the change_review ceiling');
+
+  // A moderate diff (already covered by the generic planChars*2 / 2800 floor) is untouched.
+  const moderateDiff = { source: 'change_review', planResponse: 'x'.repeat(2000), promptContext: { unitDiff: 'x'.repeat(9000) } };
+  const m = computeImplementBudget(moderateDiff, 'z'.repeat(9000));
+  assert.equal(m.implNumPredict, 4000, 'stays on the ordinary planChars*2 floor below the 10000-char diff threshold');
+});
+
 test('computePlanNumPredict gives a large evidence-bundle task (e.g. pipeline_debrief) the higher plan budget', () => {
   const { computePlanNumPredict } = require('./local-draft.js');
   const bigEvidence = { source: 'pipeline_debrief', promptContext: { evidenceText: 'x'.repeat(28000) } };
@@ -893,6 +911,30 @@ test('computePlanNumPredict gives ANY large promptContext the higher plan budget
   // arch_discovery) all clear the threshold too, regardless of field name.
   const observabilityFix = { source: 'observability_fix', promptContext: { candidateText: 'y'.repeat(7200) } };
   assert.equal(computePlanNumPredict(observabilityFix), 2800);
+});
+
+// 2026-09-19, ghost-in-the-machine retroactive audit: the flat 2800 the test above confirms
+// is fine for a 9000-char diff was NOT enough for change-review-7eecbfa's 15057-char diff or
+// change-review-b8a6f21's 12202-char diff -- both got a genuine 0-char PLAN on every attempt
+// (think:true's reasoning trace alone exhausted the budget), which then starved the implement
+// pass's own floor too (see computeImplementBudget's matching test). Scales past the flat
+// 2800 only once a diff clears 10000 chars, so the proven-good moderate-diff case above is
+// untouched.
+test('computePlanNumPredict scales past the flat 2800 floor for a genuinely large change_review diff', () => {
+  const { computePlanNumPredict } = require('./local-draft.js');
+  const realWorldDiff1 = { source: 'change_review', promptContext: { unitDiff: 'x'.repeat(15057) } };
+  assert.equal(computePlanNumPredict(realWorldDiff1), 6000);
+
+  const realWorldDiff2 = { source: 'change_review', promptContext: { unitDiff: 'x'.repeat(12202) } };
+  assert.equal(computePlanNumPredict(realWorldDiff2), 6000);
+
+  // Right at the threshold -- still the old flat value.
+  const atThreshold = { source: 'change_review', promptContext: { unitDiff: 'x'.repeat(10000) } };
+  assert.equal(computePlanNumPredict(atThreshold), 2800);
+
+  // Capped at the same 8000 ceiling every other source shares, for a pathologically large diff.
+  const huge = { source: 'change_review', promptContext: { unitDiff: 'x'.repeat(30000) } };
+  assert.equal(computePlanNumPredict(huge), 8000);
 });
 
 test('computeImplementBudget never returns implNumCtx below PINNED_NUM_CTX, even for a tiny fixed-literals task', () => {
