@@ -1587,6 +1587,47 @@ test('empty deep_dive draft + real harness hits -> deterministic approve, no rev
   assert.equal(captured.length, 0);
 });
 
+// 2026-09-19: arch_discovery-shaped (emptyApproval + candidateDocFormat) -- its material is
+// promptContext.files, not a search. Fixture mirrors the real registration in agent-manager-hygiene.
+{
+  const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  if (!getRegisteredSource('fixture_arch_discovery_like')) {
+    registerTaskSource('fixture_arch_discovery_like', { priority: 80, next: () => null, emptyApproval: true, candidateDocFormat: true });
+  }
+}
+
+test('arch_discovery-shaped: an EMPTY draft with real files in context -> deterministic approve (clean community), no vote', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'ad-empty-with-files', domain: 'default', source: 'fixture_arch_discovery_like',
+    title: 'Architecture discovery: x', planResponse: '0 friction points', implementResponse: '',
+    promptContext: { files: [{ path: 'src/a.ts', degree: 3, content: 'x' }] },
+  };
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured) });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(task.reviewProvider, 'deterministic-empty-approve');
+  assert.equal(captured.length, 0);
+});
+
+test('arch_discovery-shaped: ZERO files in context -> deterministic block-no-context, even for a NON-empty draft, no vote', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  for (const implementResponse of ['', '### AC-001 · Invented\nStrength: Strong\nFiles: src/x.js\n\nProblem: p\nSolution: s\nBenefits: b']) {
+    const task = {
+      id: 'ad-no-files-' + implementResponse.length, domain: 'default', source: 'fixture_arch_discovery_like',
+      title: 'Architecture discovery: y', planResponse: 'p', implementResponse,
+      promptContext: { files: [] },
+    };
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured) });
+    assert.equal(result.verdict, 'blocked');
+    assert.equal(result.blockedStage, 'review');
+    assert.equal(task.reviewProvider, 'deterministic-no-context-fail');
+    assert.match(result.blockedReason, /^Deterministic gate: fixture_arch_discovery_like was given no source files/);
+    assert.equal(captured.length, 0, 'no reviewer vote spent on a draft the model wrote without seeing any code');
+  }
+});
+
 test('empty draft for a NON-emptyApproval source is unaffected (falls through, not auto-decided here)', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = {

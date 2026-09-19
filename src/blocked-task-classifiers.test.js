@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   classifyBlockedTask, categorizeBlockedReason, hasZeroHitHarnessSearch, hasUnreliableGrounding,
-  hasInvalidPremise, hasFabricatedFilePath, hasFabricatedSymbolCitation, signatureForTask,
+  hasInvalidPremise, hasFabricatedFilePath, hasFabricatedSymbolCitation, hasNoContextFiles, signatureForTask,
   findClassifier, REASON_CATEGORIES,
 } = require('./blocked-task-classifiers.js');
 
@@ -269,4 +269,18 @@ test('explicit-false-falls-through: reviewInconclusive:false does NOT short-circ
 test('flag-without-blockedReason: reviewInconclusive:true alone (no blockedReason) is sufficient', () => {
   const result = classifyBlockedTask({ reviewInconclusive: true });
   assert.deepEqual(result, { category: 'inconclusive-review', faultSide: 'model', retryable: true, classifierName: 'inconclusive-review-flag' });
+});
+
+test('classifyBlockedTask: the "given no source files" gate is HARNESS-side and NON-retryable (a requeue re-sends the same empty stored context)', () => {
+  const task = { blockedReason: 'Deterministic gate: arch_discovery was given no source files for this task (promptContext.files is empty -- the graph likely names files that are missing or unreadable). Any draft would be ungrounded, so none is reviewed or approved.' };
+  assert.equal(hasNoContextFiles(task), true);
+  assert.deepEqual(classifyBlockedTask(task), { category: 'no-context-files', faultSide: 'harness', retryable: false, classifierName: 'no-context-files' });
+  assert.match(findClassifier('no-context-files').buildQuestion(task), /blind requeue cannot fix this/i);
+});
+
+test('the older "empty AND zero harness hits" block is NOT swept into the new non-retryable no-context-files class', () => {
+  const task = { blockedReason: 'Deterministic gate: implementResponse is empty AND the harness search that fed this task found zero hits -- nothing to review' };
+  assert.equal(hasNoContextFiles(task), false);
+  assert.notEqual(classifyBlockedTask(task).classifierName, 'no-context-files');
+  assert.equal(classifyBlockedTask(task).classifierName, 'empty-degenerate-draft'); // unchanged from before
 });
