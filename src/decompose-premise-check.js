@@ -38,7 +38,18 @@ const path = require('path');
 // overwhelmingly writes "In src/foo.js, ..." in plain prose, unlike the more disciplined
 // backtick-per-citation convention candidate-fulfillment markdown docs use.
 const PATH_RE = /`?((?:src|python|scripts|lib|docs)\/[\w./-]+\.\w{1,5})`?/g;
-const LINE_REF_RE = /(?:~?\s*line\s+|:)(\d{2,6})\b/gi;
+// The bare ":NN" alternative used to fire on ANY colon-digits pair, not just a real file:line
+// citation -- confirmed live (2026-09-18, filed as adhoc-guard-line-ref-re-against-bare-key-
+// digits): a sub-task whose own task text illustrated the bug it asked to fix by quoting the
+// example `num_ctx:49152` got wrongly flagged as a stale premise against src/decompose-
+// premise-check.js itself (148 real lines), because ":49152" parsed as a bogus "line 49152"
+// citation -- self-referentially blocking the very fix meant to prevent this class of false
+// positive. Same family as the ISO-timestamp masking above; a settings/config key:value pair
+// ("num_ctx:49152", "port:8080") is common in this pipeline's own task prose and looks
+// identical to a real line citation without a path immediately before the colon. Now requires
+// a `.ext:` immediately before the digits (`path.js:22` still matches; `num_ctx:49152` does
+// not), leaving the "line N" alternative untouched.
+const LINE_REF_RE = /(?:~?\s*line\s+|\.\w{1,5}:)(\d{2,6})\b/gi;
 
 // ISO-8601 timestamps (as appended by the "HUMAN DESIGN DECISION (answered directly from
 // the Needs Clarification picker/Discuss/Chat, <timestamp>):" answer stamps -- see

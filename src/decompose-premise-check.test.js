@@ -122,6 +122,37 @@ test('a genuine line reference elsewhere in the text still fires normally, even 
   assert.equal(result.findings[0].relPath, 'src/gone-in-a-later-decompose.js');
 });
 
+// 2026-09-19, self-referential real incident (adhoc-guard-line-ref-re-against-bare-key-
+// digits): a task whose OWN text illustrates the bug it asks to fix by quoting the example
+// `num_ctx:49152` got wrongly flagged as a stale premise against src/decompose-premise-
+// check.js itself (148 real lines) -- LINE_REF_RE's old bare ":NN" alternative parsed
+// ":49152" as a bogus line citation with no path character required before the colon, same
+// false-positive family as the ISO-timestamp case above.
+test('a bare "key:digits" config-style pair (e.g. num_ctx:49152) is not mistaken for a line citation', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: 'p',
+      rawText: 'In src/decompose-premise-check.js, read the current LINE_REF_RE and, only if it still matches a bare `key:digits` phrase like `num_ctx:49152`, tighten it to require a path character before the colon (e.g. `path.js:22` still matches, `num_ctx:49152` does not).',
+    },
+  };
+  // decompose-premise-check.js is genuinely only 148 real lines -- if ":49152" were still
+  // (wrongly) read as a line citation, this would false-positive as a stale premise.
+  assert.equal(detectStaleDecomposePremise(task, { repoRoot: '/repo', lineCountFn: () => 148 }), null);
+});
+
+test('a genuine bare-colon file:line citation (no "line" keyword) still fires normally', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: 'p',
+      rawText: 'Fix the bug at src/gone-in-a-later-decompose.js:10.',
+    },
+  };
+  const result = detectStaleDecomposePremise(task, { repoRoot: '/repo', lineCountFn: () => null });
+  assert.ok(result, 'a real "file.ext:NN" citation must still be caught');
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'src/gone-in-a-later-decompose.js');
+});
+
 test('kill switch: AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK=false disables the check entirely', () => {
   const prev = process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK;
   process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK = 'false';
