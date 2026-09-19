@@ -212,11 +212,18 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
     # serialise on that GPU's single-flight lock same as worker-1/worker-reasoning
     # already do on the host's, but reasoning-tier work is no longer bottlenecked
     # behind the host's GPU alone.
-    start_bg "worker-reasoning-p40" "${PID_DIR}/worker-reasoning-p40.pid" "${LOG_DIR}/worker-reasoning-p40.log" \
-      env OLLAMA_URL="${AGENT_MANAGER_P40_OLLAMA_URL}" \
-          LOCAL_MODEL="${AGENT_MANAGER_P40_MODEL}" \
-          AGENT_MANAGER_GPU_YIELD_APPS= \
-      bash "${SCRIPT_DIR}/local-worker.sh" worker-reasoning-p40
+    # AGENT_MANAGER_P40_REASONING_LANE=off skips this second P40 lane (2026-09-19, Grimmethy:
+    # "p40 reasoning should also be turned off") -- with the tier split off it is just a
+    # second lane on the same GPU, and both P40 lanes serialise on that GPU's lock anyway.
+    if [[ "${AGENT_MANAGER_P40_REASONING_LANE:-on}" != "off" ]]; then
+      start_bg "worker-reasoning-p40" "${PID_DIR}/worker-reasoning-p40.pid" "${LOG_DIR}/worker-reasoning-p40.log" \
+        env OLLAMA_URL="${AGENT_MANAGER_P40_OLLAMA_URL}" \
+            LOCAL_MODEL="${AGENT_MANAGER_P40_MODEL}" \
+            AGENT_MANAGER_GPU_YIELD_APPS= \
+        bash "${SCRIPT_DIR}/local-worker.sh" worker-reasoning-p40
+    else
+      printf '[launch] AGENT_MANAGER_P40_REASONING_LANE=off -- skipping worker-reasoning-p40.\n'
+    fi
   else
     printf '[launch] AGENT_MANAGER_P40_OLLAMA_URL/AGENT_MANAGER_P40_MODEL not both set -- skipping worker-p40/worker-reasoning-p40 lanes.\n'
   fi
