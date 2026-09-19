@@ -1296,3 +1296,81 @@ test('rejectRetryCheck re-escalates an adhoc task that exhausted a SECOND time a
   assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')), 'must move OUT of blocked/ this time -- not silently stay forever');
   assert.ok(fs.existsSync(path.join(needsClarificationDir, 'task-1.json')), 'the SECOND exhaustion must reach a human -- the bug was refusing to re-escalate here');
 });
+
+// --- "Invalid premise:" blocks are visible to the sweep whatever their blockedStage ----------
+// 2026-09-18 (AC-13 / AC-133): local-draft.js's premiseCheck hook stamps blockedReason
+// "Invalid premise: ..." with NO blockedStage at all, and a model-fallback verdict can arrive
+// alongside reviewInconclusive:true. The sweep's entry gate is an allow-list of blockedStage
+// values, so both shapes were invisible to it -- permanently parked in blocked/ with no
+// readmit and no escalation. Once the check that produced the verdict is fixed (full-file
+// verification, candidate-premise-check.js), these must get their one clean-slate readmit,
+// and a repeat must escalate rather than stay invisible again.
+
+const INVALID_PREMISE = 'Invalid premise: candidate cites `arch_discovery` in python/dashboard/app.py, but that name does not appear anywhere in the real fetched content of python/dashboard/app.py';
+
+function setupDirsWithNc() {
+  const d = setupDirs();
+  const needsClarificationDir = path.join(d.root, 'queue', 'needs-clarification');
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+  return { ...d, needsClarificationDir };
+}
+
+test('rejectRetryCheck re-admits a stage-less "Invalid premise:" block once, with a clean slate (AC-13 shape)', () => {
+  const { blockedDir, pendingDir, needsClarificationDir } = setupDirsWithNc();
+  writeBlockedTask(blockedDir, 'ac-13', { blockedStage: undefined, blockedReason: INVALID_PREMISE, source: 'arch_import_review' });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(pendingDir, 'ac-13.json')), 'requeued to pending');
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'ac-13.json')));
+  const t = JSON.parse(fs.readFileSync(path.join(pendingDir, 'ac-13.json'), 'utf8'));
+  assert.equal(t.premiseReadmitCount, 1, 'the one-shot guard is stamped');
+  assert.equal(t.blockedReason, undefined, 'stale block cleared');
+});
+
+test('rejectRetryCheck re-admits an "Invalid premise:" block that also carries reviewInconclusive (AC-133 shape)', () => {
+  const { blockedDir, pendingDir, needsClarificationDir } = setupDirsWithNc();
+  writeBlockedTask(blockedDir, 'ac-133', { blockedStage: 'review', reviewInconclusive: true, blockedReason: INVALID_PREMISE });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(pendingDir, 'ac-133.json')));
+});
+
+test('rejectRetryCheck escalates a stage-less "Invalid premise:" block that already used its readmit', () => {
+  const { blockedDir, pendingDir, needsClarificationDir } = setupDirsWithNc();
+  writeBlockedTask(blockedDir, 'ac-13', { blockedStage: undefined, blockedReason: INVALID_PREMISE, premiseReadmitCount: 1 });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.exhausted, 1);
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'ac-13.json')), 'no longer parked in blocked/');
+  const t = JSON.parse(fs.readFileSync(path.join(needsClarificationDir, 'ac-13.json'), 'utf8'));
+  assert.equal(t.needsClarification.reason, 'invalid-premise');
+});
+
+test('rejectRetryCheck does not touch a stage-less block whose reason is NOT an invalid-premise verdict', () => {
+  const { blockedDir, pendingDir, needsClarificationDir } = setupDirsWithNc();
+  writeBlockedTask(blockedDir, 'manual-hold', { blockedStage: undefined, blockedReason: 'held by an operator to break a crash loop' });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'manual-hold.json')));
+});
+
+test('rejectRetryCheck does not readmit a non-review block just because an OLD rejection note mentioned an invalid premise', () => {
+  const { blockedDir, pendingDir, needsClarificationDir } = setupDirsWithNc();
+  writeBlockedTask(blockedDir, 'apply-1', {
+    blockedStage: 'apply', blockedReason: 'find string not found in src/x.js',
+    priorRejectionFeedback: ['Invalid premise: something an earlier attempt said'],
+  });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'apply-1.json')));
+});
