@@ -403,3 +403,32 @@ test('listAssignableTasks: an empty/missing queue dir returns an empty list, not
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'next-claimable-task-test-'));
   assert.deepEqual(listAssignableTasks(path.join(root, 'queue'), 'worker-1', { isReasoningLane: false }), []);
 });
+
+// Regression (2026-09-19, PF-Client-Portal): the real claim path is this file run as a CLI
+// (local-worker.sh). It only loaded core sources, so every plugin-registered source (the
+// hygiene family) had no registry entry -> priority Infinity -> ranked AFTER brain_dump_sort
+// (70). Run the CLI in a subprocess with a throwaway plugin manifest registering a
+// priority-5 source, and assert it ranks first.
+test('CLI claim order loads plugin-registered sources (plugin priority beats brain_dump_sort)', () => {
+  const { spawnSync } = require('child_process');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'claim-plugin-test-'));
+  const pendingDir = path.join(root, 'queue', 'pending');
+  fs.mkdirSync(pendingDir, { recursive: true });
+  const write = (name, source) => fs.writeFileSync(path.join(pendingDir, name), JSON.stringify({ id: name, source, domain: 'default', title: name }));
+  write('a-sort.json', 'brain_dump_sort');
+  write('z-plugin.json', 'fake_plugin_source');
+
+  const registry = path.join(__dirname, 'task-source-registry.js');
+  const registerJs = path.join(root, 'register.js');
+  fs.writeFileSync(registerJs, `require(${JSON.stringify(registry)}).registerTaskSource('fake_plugin_source', { priority: 5, next: () => null });\n`);
+  const manifest = path.join(root, 'plugins.json');
+  fs.writeFileSync(manifest, JSON.stringify([{ name: 'fake', registerPath: registerJs, enabled: true }]));
+
+  const res = spawnSync('node', [path.join(__dirname, 'next-claimable-task.js'), pendingDir, 'worker-1', 'false'], {
+    env: { ...process.env, AGENT_MANAGER_PLUGINS_MANIFEST: manifest, AGENT_MANAGER_REPO_ROOT: root, AGENT_MANAGER_PIPELINE_DIR: root },
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  const order = res.stdout.split('\n').filter(Boolean);
+  assert.deepEqual(order, ['z-plugin.json', 'a-sort.json'], res.stderr);
+});

@@ -79,6 +79,21 @@ function effectivePriority(task, basePriority, resolveSourceNameFn) {
   return basePriority;
 }
 
+// Loads the FULL source registry: core sources (task-sources.js's load-time
+// registerTaskSource calls) AND out-of-tree plugin sources (config.js's ensureRegistered(),
+// which requires each enabled plugin's register.js). This module used to require only
+// task-sources.js, so in the real claim path (local-worker.sh runs this file as a CLI) every
+// plugin-registered source -- the whole hygiene family: change_review, observability_*,
+// function_length_*, performance_*, arch_* -- resolved to NO registry entry: priority
+// Infinity (sorted after everything, including brain_dump_sort at 70) and tier defaulting to
+// 'low'. The pipeline sorted brain dumps while hygiene tasks sat in pending (2026-09-19,
+// PF-Client-Portal). Best-effort: a config problem here must degrade to the old behavior,
+// never stop claiming.
+function loadSourceRegistry() {
+  require('./task-sources.js');
+  try { require('./config.js').ensureRegistered(); } catch (_) { /* best-effort */ }
+}
+
 function readTaskSafe(fullPath) {
   let mtimeMs = 0;
   try { mtimeMs = fs.statSync(fullPath).mtimeMs; } catch (_) { /* file vanished mid-scan */ }
@@ -98,7 +113,7 @@ function readTaskSafe(fullPath) {
 // every tier filter as a result -- caught by testing against the real queue before
 // shipping, not by the unit tests, which mock the registry away).
 function resolvesToTier(task, isReasoningLane) {
-  require('./task-sources.js');
+  loadSourceRegistry();
   const { reasoningTierFor } = require('./model-provider.js');
   let tier = 'low';
   if (task) {
@@ -125,7 +140,7 @@ function pickClaimableTasks(pendingDir, instanceId, { isReasoningLane = false } 
   // before getRegisteredSource() can resolve anything (see local-worker.sh's own
   // comment on this same gotcha, confirmed live 2026-08-17: requiring model-provider.js
   // alone reported every source as 'low' every time).
-  require('./task-sources.js');
+  loadSourceRegistry();
   const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
   const { hubOrderKeyForTask, compareHubKeys } = require('./hub-priority.js');
 
