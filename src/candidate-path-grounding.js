@@ -88,6 +88,26 @@ const SYMBOL_STOPWORDS = new Set([
   'new', 'delete', 'typeof', 'instanceof', 'catch', 'try', 'throw',
 ]);
 
+// A backtick-quoted filename ("`core.ts` parses the body") is a path citation, not a symbol
+// claim: a source file never contains its own name, so grepping the cited file's CONTENT for
+// it always "fails". Real path fabrication is Check 0's job (the Files: line), not this one's.
+// Confirmed live 2026-09-19: 7 of the 11 "fabricated symbols" that blocked all of
+// PropertyForager's first arch_discovery drafts were filenames (`App.tsx`, `SearchView.tsx`...).
+const FILENAME_TOKEN = /^[\w./-]+\.(?:[cm]?[jt]sx?|py|json|md|s?css|html|sh|ps1|ya?ml|toml)$/i;
+
+// A candidate's `Solution:` section PROPOSES change, so it legitimately names symbols that do
+// not exist yet ("Export a single `LEGAL_DOCS` array", "Extract a `resetResults()` helper",
+// "expose it as `ApiError.rawBody`"). CREATE_MODE_VERBS only recognizes a handful of verbs
+// within ~60 chars, so proposals phrased any other way were flagged as fabrication -- the
+// other 4 of those 11 flags. Claims about EXISTING code live in Problem:, which stays checked.
+// Blanked per entry (a write-up may hold several AC-NNN blocks), from the `Solution:` header
+// up to the next section header, next `###` entry, or end of text.
+const SOLUTION_SECTION = /^[\s>*_-]*solution\s*:[\s\S]*?(?=^[\s>*_-]*(?:benefits|problem|files|strength)\s*:|^#{2,}\s|(?![\s\S]))/gim;
+
+function stripSolutionSections(text) {
+  return String(text || '').replace(SOLUTION_SECTION, '');
+}
+
 function isCreateModeMention(text, matchIndex) {
   const before = text.slice(Math.max(0, matchIndex - 60), matchIndex);
   return CREATE_MODE_VERBS.test(before);
@@ -107,9 +127,9 @@ function checkCitedSymbols(text, checkedPaths) {
     return { fabricated: [], checked: [] }; // advisory -- unreadable file, skip
   }
 
-  const raw = String(text || '');
+  const raw = stripSolutionSections(text);
   const names = backtickIdentifiers(raw).filter(
-    (name) => name.length >= 3 && !SYMBOL_STOPWORDS.has(name.toLowerCase()),
+    (name) => name.length >= 3 && !SYMBOL_STOPWORDS.has(name.toLowerCase()) && !FILENAME_TOKEN.test(name),
   );
   const checked = [];
   const fabricated = [];

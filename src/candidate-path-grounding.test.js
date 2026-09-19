@@ -118,6 +118,44 @@ test('checkCitedSymbols: a create-mode mention ("add a `newHelper`") is not flag
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
+test('checkCitedSymbols: a backtick-quoted filename is not a symbol claim', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'core.ts'), 'export function api() {}\n');
+  const text = 'Problem: In `core.ts`, `api` drops the body; `client.ts` and `App.tsx` never see it.';
+  const { fabricated, checked } = checkCitedSymbols(text, checkedFor(repo, 'src/core.ts'));
+  assert.deepEqual(checked, ['api']);
+  assert.deepEqual(fabricated, []);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('checkCitedSymbols: names proposed in Solution: are not checked, but Problem: still is', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'real-one.js'), 'function realFn() {}\n');
+  const text = [
+    '### AC-001 · One',
+    'Files: src/real-one.js',
+    '',
+    'Problem:',
+    '`realFn` never calls `fakeHelper`.',
+    '',
+    'Solution:',
+    'Export a single `LEGAL_DOCS` array and extract a `resetResults()` helper (e.g. `Thing.rawBody`).',
+    '',
+    'Benefits:',
+    'Fewer edits.',
+    '',
+    '### AC-002 · Two',
+    'Problem:',
+    '`alsoFake` is called twice.',
+    '',
+    'Solution:',
+    'Introduce `BrandNew`.',
+  ].join('\n');
+  const { fabricated } = checkCitedSymbols(text, checkedFor(repo, 'src/real-one.js'));
+  assert.deepEqual(fabricated.map((f) => f.name).sort(), ['alsoFake', 'fakeHelper']);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
 test('checkCitedSymbols: skips stopwords and short tokens', () => {
   const repo = tmpRepo();
   fs.writeFileSync(path.join(repo, 'src', 'real-one.js'), '// real\n');
