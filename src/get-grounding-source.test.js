@@ -520,3 +520,43 @@ test('the generic source.groundingFields consumer skips an undeclared promptCont
   assert.match(out, /INCLUDED_MARKER_7c1e/);
   assert.doesNotMatch(out, /EXCLUDED_MARKER_b2d4/, 'a field not listed in groundingFields must not leak into the grounding text via this path');
 });
+
+// --- stacked tasks read the branch tip, not the shared checkout's working tree (2026-09-20, PF HUB0003-01) ---------------------------
+// The shared checkout sits on whatever branch the last apply/draft left; reviewers were shown a SIBLING hub's already-wired file, judged a
+// correct draft against it and rejected 3/3.
+test('extractLiveRepoGrounding with a groundingRef reads the stacked branch tip, not the checked-out working tree', () => {
+  const { execFileSync } = require('child_process');
+  const os2 = require('os');
+  const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
+  const bare = fs.mkdtempSync(path.join(os2.tmpdir(), 'gs-origin-'));
+  const repo = fs.mkdtempSync(path.join(os2.tmpdir(), 'gs-repo-'));
+  g(['init', '--bare', '-b', 'main', bare]);
+  g(['clone', bare, repo]);
+  g(['config', 'user.email', 't@example.com'], repo);
+  g(['config', 'user.name', 'T'], repo);
+  fs.mkdirSync(path.join(repo, 'src'));
+  fs.writeFileSync(path.join(repo, 'src', 'view.js'), 'const [located] = useState(null); // inline\n');
+  g(['add', '.'], repo); g(['commit', '-m', 'init'], repo); g(['push', 'origin', 'main'], repo);
+  // hub branch (what the task is really applied on): still inline
+  g(['checkout', '-b', 'agent/decompose-hub'], repo);
+  fs.writeFileSync(path.join(repo, 'src', 'hub-only.ts'), 'export const x = 1;\n');
+  g(['add', '.'], repo); g(['commit', '-m', 'step 1'], repo); g(['push', 'origin', 'agent/decompose-hub'], repo);
+  // a SIBLING hub's branch left checked out in the shared working tree: hook already wired in
+  g(['checkout', 'main'], repo);
+  g(['checkout', '-b', 'agent/sibling'], repo);
+  fs.writeFileSync(path.join(repo, 'src', 'view.js'), 'const { located } = usePropertyLocation(); // wired\n');
+  g(['commit', '-am', 'sibling wired'], repo);
+
+  const text = 'The draft reorders lines in src/view.js.';
+  const wrongTree = extractLiveRepoGrounding(text, repo);
+  assert.match(wrongTree[0].content, /usePropertyLocation/, 'without a ref the working tree (the sibling branch) is what gets read');
+  const atRef = extractLiveRepoGrounding(text, repo, 'agent/decompose-hub');
+  assert.equal(atRef.length, 1);
+  assert.match(atRef[0].content, /inline/);
+  assert.doesNotMatch(atRef[0].content, /usePropertyLocation/);
+  // a file that does not exist at the ref is skipped, like a missing file on disk
+  assert.deepEqual(extractLiveRepoGrounding('see src/nope.ts', repo, 'agent/decompose-hub'), []);
+  // the same ref applies to refreshFetchedFileContent's snapshot refresh
+  const refreshed = refreshFetchedFileContent([{ path: 'src/view.js', content: 'frozen' }], repo, 'agent/decompose-hub');
+  assert.match(refreshed[0].content, /inline/);
+});
