@@ -1509,7 +1509,11 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // the one place a genuinely cheap dedicated model would be reintroduced later, once
 // there's enough real atomized (small, well-scoped) task volume to justify paying for a
 // second resident model again.
-registerModelProfile('brain-dump-cheap-local', { backend: 'local', numCtx: 8192, think: false });
+// No numCtx (2026-09-20): this profile used to pin num_ctx 8192 for the small qwen2.5:3b model. With the 27B behind it, that made every
+// brain_dump_sort call ask Ollama for a DIFFERENT context than every other task's, and Ollama reloads the whole model on a context change --
+// measured in the live worker log: brain_dump_sort calls at numCtx=8192 paid loadMs=55-70s, and the next normal call reloaded again (104s).
+// It now takes the one pinned context (gpu-capacity.js PINNED_NUM_CTX) like everything else.
+registerModelProfile('brain-dump-cheap-local', { backend: 'local', think: false });
 registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping', strictOutputOnly: true });
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being

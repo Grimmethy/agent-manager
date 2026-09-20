@@ -127,6 +127,8 @@ fi
 if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; then
   printf '[launch] Repo root: %s\n' "$AGENT_MANAGER_REPO_ROOT"
 
+  # (2026-09-20: the small qwen2.5:3b utility model this comment describes is gone -- every call now uses this one model; the pre-warm
+  # still matters for the first load, and now also fixes the ONE context (gpu-capacity.js PINNED_NUM_CTX) the model is loaded with.)
   # Pre-warm the main local model BEFORE any worker daemon can claim a task (2026-09-07,
   # Grimmethy: "We need to stop the model from being unloaded... The 27b should not be
   # unloaded unless the pipeline is shut down" -- root-caused live). OLLAMA_KEEP_ALIVE=-1
@@ -156,7 +158,7 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
     printf '[launch] pre-warming local model %s (keeps it loaded first, before any task can evict it) -- this can take ~100s...\n' "$LOCAL_MODEL"
     warm_started_at=$(date +%s)
     if curl -s -m 180 "${OLLAMA_URL:-http://localhost:11434}/api/generate" \
-      -d "$(node -e 'console.log(JSON.stringify({model: process.argv[1], prompt: "hi", stream: false, keep_alive: -1}))' "$LOCAL_MODEL")" \
+      -d "$(node -e 'const { PINNED_NUM_CTX } = require(process.argv[2]); console.log(JSON.stringify({model: process.argv[1], prompt: "hi", stream: false, keep_alive: -1, options: { num_ctx: PINNED_NUM_CTX }}))' "$LOCAL_MODEL" "${SCRIPT_DIR}/../src/gpu-capacity.js")" \
       -o /dev/null -w '%{http_code}' > /tmp/agent-manager-prewarm-http-code 2>/dev/null; then
       warm_code="$(cat /tmp/agent-manager-prewarm-http-code 2>/dev/null)"
       warm_elapsed=$(( $(date +%s) - warm_started_at ))

@@ -111,3 +111,9 @@ test('resolveTimeoutMs falls back to a conservative floor tokens/sec when none i
   const withoutMeasured = resolveTimeoutMs({ promptTokens: 1000, numPredict: 1000, tokensPerSecond: undefined });
   assert.ok(withoutMeasured > withMeasured, 'an unmeasured machine should get a MORE generous timeout, not a tighter one');
 });
+
+test('one context for every call: the extended tier is folded into PINNED_NUM_CTX, and it is the raised (2026-09-20) 49152', () => {
+  const { EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
+  assert.equal(PINNED_NUM_CTX, 49152);
+  assert.equal(EXTENDED_NUM_CTX, PINNED_NUM_CTX);
+});

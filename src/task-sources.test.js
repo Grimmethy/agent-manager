@@ -62,6 +62,18 @@ test('taskIdExistsInQueue treats a renamed hub\'s former id as still queued', ()
   assert.equal(taskIdExistsInQueue('some-other-id'), false);
 });
 
+// 2026-09-20: the brain_dump_sort profile pinned num_ctx 8192 for the small model that no longer exists; against the 27B that forced a full model
+// reload (loadMs 55-70s, then again 104s for the next normal call) every time brain_dump_sort ran. It must carry no context of its own.
+test('the brain-dump-cheap-local profile pins no numCtx (every call uses the one pinned context)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-profile-test-'));
+  freshTaskSources(dir);
+  const { getModelProfile } = require('./model-profile-registry.js');
+  const profile = getModelProfile('brain-dump-cheap-local');
+  assert.ok(profile, 'profile is registered');
+  assert.equal(profile.numCtx, undefined);
+  assert.equal(profile.think, false);
+});
+
 // --- AGENT_MANAGER_TASK_SOURCES allowlist (getNextTask) --------------------------------
 // Backs the dashboard's "Project Search" run mode: project_search is priority 85 (lowest
 // of the 10 built-ins), so without a way to suppress higher-priority sources it would

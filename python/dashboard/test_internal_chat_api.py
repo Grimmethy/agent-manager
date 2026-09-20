@@ -144,17 +144,6 @@ class InternalChatApiTest(unittest.TestCase):
             self.assertIn('"type": "chunk"', body)
             self.assertIn('"type": "final"', body)
 
-    def test_local_turn_passes_use_extended_context_to_stream_plan_with_tools(self):
-        def fake_stream(**kwargs):
-            self.assertTrue(kwargs["use_extended_context"])
-            yield {"type": "final", "response": "ok"}
-
-        with mock.patch("local_tool_client.stream_plan_with_tools", side_effect=fake_stream):
-            res = self._post("/api/internal/chat/local-turn", {
-                "prompt": "hi", "maxTurns": 5, "useExtendedContext": True,
-            })
-            self.assertEqual(res.status_code, 200)
-
     def test_local_turn_surfaces_a_tool_client_error_as_an_sse_error_event(self):
         from local_tool_client import LocalToolClientError
 

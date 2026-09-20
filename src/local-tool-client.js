@@ -21,8 +21,7 @@ const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
-const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
-const { ensureHeadroomForExtendedContext } = require('./lib/implement-critique.js');
+const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
 const { injectAmplificationInstruction, extractAmplificationRequests } = require('./incident-amplification-marker.js');
 const { injectContextLogInstruction, extractContextLog, writeContextLogInbox } = require('./context-log-marker.js');
@@ -1061,10 +1060,10 @@ function pickUsage(o) {
   };
 }
 
-async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk, useExtendedContext = false }) {
+async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   if (!onChunk) {
     const res = await postJson(`${OLLAMA_URL}/api/chat`, {
-      model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: { num_ctx: useExtendedContext ? EXTENDED_NUM_CTX : PINNED_NUM_CTX },
+      model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
     }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
     return { message: res.message || {}, usage: pickUsage(res) };
   }
@@ -1074,7 +1073,7 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk, useExt
   let usage = pickUsage(null);
   let doneReason = null;
   await postJsonStream(`${OLLAMA_URL}/api/chat`, {
-    model: MODEL, messages, tools, keep_alive: KEEP_ALIVE, options: { num_ctx: useExtendedContext ? EXTENDED_NUM_CTX : PINNED_NUM_CTX },
+    model: MODEL, messages, tools, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
   }, REQUEST_TIMEOUT_MS, tokenFoldHeaders, (obj) => {
     if (obj.error || obj.done_reason === 'error') {
       streamError = obj.error || obj.done_reason || 'unknown stream error';
@@ -1268,7 +1267,7 @@ async function runWithoutToolsFallback(prompt, pipelineDir) {
 // the model regenerates that turn from a fresh sample. Mutates messages / toolCallLog /
 // turnStartLengths / turnStartLogLengths in place on each rollback. Returns
 // { message } once a call succeeds, or { flakeErr } when both recovery layers are spent.
-async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths, useExtendedContext = false }) {
+async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths }) {
   let rollbackAttempts = 0;
   for (;;) {
     let message;
@@ -1277,7 +1276,7 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
     let attemptErr = null;
     for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
       try {
-        const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk, useExtendedContext }));
+        const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }));
         if (isEmptyCompletion(turnRes.message)) {
           attemptErr = new Error('local model returned an empty completion (no content, no tool calls)');
           continue;
@@ -1372,7 +1371,7 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
 // to (a compliance gap no amount of prompt wording reliably closes), so shrinking the
 // window before the "stop exploring, edit now" nudge fires structurally bounds how much
 // re-verification a retry can do, rather than trying to argue the model out of doing it.
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, contextLogSessionId = null, orientTurnLimit = ORIENT_TURN_LIMIT, useExtendedContext = false }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, contextLogSessionId = null, orientTurnLimit = ORIENT_TURN_LIMIT }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -1675,15 +1674,6 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   let contextLogNudgeFired = false;
   const CONTEXT_LOG_NUDGE_MESSAGE = 'You forgot the mandatory CONTEXT-LOG: block. Add it now, at the end of your response.';
 
-  // Extended-context opt-in (sibling tasks "Extend imports for extended context" /
-  // "Thread parameter through chatTurnWithFlakeRecovery" provide ensureHeadroomForExtendedContext,
-  // EXTENDED_NUM_CTX and the chatTurnWithFlakeRecovery parameter). Once per run, before
-  // the first turn, make room for EXTENDED_NUM_CTX by evicting what gpu-capacity.js needs
-  // evicted; no-op path (never throws) for the default useExtendedContext=false callers.
-  if (useExtendedContext) {
-    await ensureHeadroomForExtendedContext(EXTENDED_NUM_CTX, { id: taskId, source });
-  }
-
   for (let turn = 0; turn < maxTurns; turn++) {
     // Context-budget exhaustion (see RESERVED_RESPONSE_TOKENS comment above): a normal
     // turn attempted this close to PINNED_NUM_CTX is guaranteed to get clipped by Ollama's
@@ -1740,7 +1730,6 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     const { message, usage, doneReason, flakeErr } = await chatTurnWithFlakeRecovery({
       messages, tools, tokenFoldHeaders, onChunk, instancesDir,
       toolCallLog, turnStartLengths, turnStartLogLengths,
-      useExtendedContext,
     });
     addUsage(usage);
     // Real anchor for estimateContextTokens (see its own header) -- prompt_eval_count is
