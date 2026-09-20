@@ -1,6 +1,7 @@
 'use strict';
 
 const { GIT_OWNERSHIP_RULE } = require('./lib/git-ownership.js');
+const { candidateSplitToHubEnabled } = require('./lib/candidate-split-route.js');
 
 const path = require('path');
 
@@ -126,6 +127,14 @@ const candidateSplitInstructions = [
 function isNoCandidateSplitSource(source) {
   const entry = getRegisteredSource(source);
   return !!(entry && entry.noCandidateSplit);
+}
+
+// Whether the implement prompt tells the model a `{"mode":"split"}` answer exists. A noCandidateSplit source used to be told
+// nothing about it (a doc-split of an already-decomposed candidate loops); now that its splits are ROUTED TO THE COORDINATOR HUB
+// (apply-adhoc-diff.js applyCandidateSplitAsHub) the option is safe, and it must be OFFERED -- otherwise a candidate too big for one
+// pass (PF function-length-fix-ac-2: four extractions) only reaches the hub if the model volunteers a shape it was never shown.
+function offersCandidateSplit(source) {
+  return !isNoCandidateSplitSource(source) || candidateSplitToHubEnabled();
 }
 
 // ---- Per-source plan-prompt builders ----
@@ -441,8 +450,8 @@ function archReviewImplementPrompt(task, planText) {
     // again (hard recursion stop), so the earlier "re-split forever" failure cannot recur.
     ctx.mustPreSplit
       ? `This candidate is too broad to land as one diff -- it ${(ctx.files || []).length >= 2 ? `spans ${ctx.files.length} files (${ctx.files.join(', ')})` : 'lays out several independent edit steps'}. You MUST decompose it. Output ONLY a {"mode": "split", ...} response -- do NOT attempt a single file-change diff.\n\n${candidateSplitInstructions}\n\nEach sub-candidate must touch ONE file and one logical concern, and be listed in the order it must be applied (if a later sub-candidate depends on code an earlier one adds, say so in its Problem). At least 2, covering the full original scope.`
-      : (isNoCandidateSplitSource(task.source) ? null : candidateSplitInstructions),
-    ctx.mustPreSplit || isNoCandidateSplitSource(task.source) ? null : '',
+      : (offersCandidateSplit(task.source) ? candidateSplitInstructions : null),
+    ctx.mustPreSplit || !offersCandidateSplit(task.source) ? null : '',
     ctx.mustPreSplit ? null : groupBJsonInstructions,
   ].filter((l) => l !== null).join('\n');
 }

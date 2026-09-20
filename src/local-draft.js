@@ -77,6 +77,7 @@ const { logPipelineEvent } = require('./pipeline-history.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
 const { getModelProfile } = require('./model-profile-registry.js');
 const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./lib/draft-lifecycle.js');
+const { candidateSplitToHubEnabled } = require('./lib/candidate-split-route.js');
 const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./lib/harness-search.js');
 const { usesGroupB } = require('./lib/apply-core.js');
 const { canonicalizeEdits } = require('./lib/find-canonicalize.js');
@@ -857,10 +858,6 @@ async function runPlanPass(task, {
 // or blocked history event. Returns { done: true, result } when it fully resolved the
 // task (a valid split, or a blocked invalid split), else { done: false } so the caller
 // falls through to critique.
-function candidateSplitToHubEnabled() {
-  return process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB !== 'false';
-}
-
 // A Group B `find` that differs from the file only by typographic characters (curly quotes, en/em dashes, non-breaking spaces -- the
 // model writes straight quotes, or a literal \u201c escape, for the file's real “ ”) is rewritten to the file's real text, and the
 // replacement gets the same characters back. See lib/find-canonicalize.js (PF function-length-fix-ac-3). Runs on the implement output

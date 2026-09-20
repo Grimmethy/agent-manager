@@ -360,16 +360,32 @@ test('buildImplementPrompt tells the model to output empty rather than guess whe
   assert.doesNotMatch(prompt, /```\n  try \{/); // no stale fetched content leaking through
 });
 
-test('buildImplementPrompt offers the split escape hatch for a normal candidate-fulfillment source but NOT for a noCandidateSplit one', () => {
+test('buildImplementPrompt offers the split escape hatch to a normal candidate-fulfillment source AND to a noCandidateSplit one (its split is routed to the coordinator hub)', () => {
   const withSplit = buildImplementPrompt(archReviewFulfillmentTask(), 'PLAN: ...');
   assert.match(withSplit, /"mode": "split"/);
 
-  // pipeline_forensics_fix is registered noCandidateSplit:true -- its candidates are
-  // already the forensic study's decomposition, so re-splitting just files more.
+  // pipeline_forensics_fix is registered noCandidateSplit:true -- its candidates are already the forensic study's decomposition, so a
+  // DOC split (more candidates, re-split forever) is forbidden. A split it proposes is routed to the hub instead, so the option is
+  // offered; without that a candidate too big for one pass (PF function-length-fix-ac-2) never learns it can say so.
   const forensicsFix = { ...archReviewFulfillmentTask(), source: 'pipeline_forensics_fix' };
-  const noSplit = buildImplementPrompt(forensicsFix, 'PLAN: ...');
-  assert.doesNotMatch(noSplit, /"mode": "split"/);
-  assert.match(noSplit, /Ground every "find" value/); // the rest of the prompt is intact
+  const offered = buildImplementPrompt(forensicsFix, 'PLAN: ...');
+  assert.match(offered, /"mode": "split"/);
+  assert.match(offered, /Ground every "find" value/); // the rest of the prompt is intact
+});
+
+test('buildImplementPrompt does NOT offer split to a noCandidateSplit source when the hub route is switched off (old behaviour)', () => {
+  const prev = process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB;
+  process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB = 'false';
+  try {
+    const forensicsFix = { ...archReviewFulfillmentTask(), source: 'pipeline_forensics_fix' };
+    const noSplit = buildImplementPrompt(forensicsFix, 'PLAN: ...');
+    assert.doesNotMatch(noSplit, /"mode": "split"/);
+    assert.match(noSplit, /Ground every "find" value/);
+    // a normal source is unaffected by the switch
+    assert.match(buildImplementPrompt(archReviewFulfillmentTask(), 'PLAN: ...'), /"mode": "split"/);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB; else process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB = prev;
+  }
 });
 
 test('buildImplementPrompt only flags the files that actually failed to fetch, not ones that succeeded', () => {
