@@ -2191,7 +2191,7 @@ function nextSecondBrainOpportunitiesTask() {
 // contradicting the real community file content it was given. See
 // deep-dive-grounding-check.js's own header for the incident.
 registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, skipImplementWhenNoRealFiles: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE, reportClass: 'benefit', postImplementCheck: runDeepDiveGroundingCheck });
-registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit', harnessSearch: 'projectSearch' });
+registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, preValidateCitedPaths: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit', harnessSearch: 'projectSearch' });
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
 // 2026-08-20 to run on the local model instead of requiring Claude) means this
 // falls through to the generic Group-B git-branch-diff apply path, same as arch_import

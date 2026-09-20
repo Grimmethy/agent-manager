@@ -1188,6 +1188,13 @@ const ARCH_DISCOVERY_REAL_FILES = [
   { path: 'src/candidates-doc-merge.test.js', degree: 1, content: '// real file' },
 ];
 
+// Bucket L is gated by the source's `groundedPromptFiles` registration flag (arch_discovery sets it in the hygiene plugin);
+// core names no plugin source (ADR-0022), so the tests register a stand-in the same way.
+{
+  const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  if (!getRegisteredSource('arch_discovery')) registerTaskSource('arch_discovery', { priority: 80, next: () => null, groundedPromptFiles: true });
+}
+
 function archDiscoveryTask(id, over = {}) {
   return baseTask(id, {
     source: 'arch_discovery',
@@ -1216,7 +1223,7 @@ test('bucket L: fabricated path with a unique near-miss real match -> repaired i
   assert.ok(moved.history.some((h) => h.stage === 'requeued' && /fabricated-file-path near-miss/.test(h.detail)));
 });
 
-test('bucket L: only source:arch_discovery is eligible -- a non-arch_discovery task with the same signature is left for a human', async () => {
+test('bucket L: only a source registering groundedPromptFiles is eligible -- any other task with the same signature is left for a human', async () => {
   const dir = makePipeline();
   held(dir, archDiscoveryTask('l2', { source: 'manual' }));
   const s = await needsClarificationTriage(args(dir));

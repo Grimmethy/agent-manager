@@ -37,7 +37,17 @@ As of ADR-0022 Stage G, no core `src/*.js` production file names a plugin-owned 
 Every behaviour that used to switch on `task.source === 'arch_review'` (etc.) reads a field
 off the source's registration — `directToMain`, `reviewGuidance` / `reviewCompletenessQuestion`,
 `reportClass`, `harnessSearch` / `skipImplementWhenNoHarnessHits` — or a purpose-built registry
-(`deterministic-recheck-registry.js`). `src/no-plugin-source-names.test.js` enforces this.
+(`deterministic-recheck-registry.js`). `src/no-plugin-source-names.test.js` enforces this
+(all of `src/**` and `scripts/`, with a real comment scanner).
+
+Registration fields added for the last holdouts (each opts a source into one core behaviour; leaving it off = off):
+
+| Field | Read by | Meaning |
+|---|---|---|
+| `hygieneFamily: { key, label, order?, idPrefixes, candidateDoc? }` | `hygiene-inventory.js` (Hygiene tab) | The dashboard family this source belongs to; `candidateDoc: true` = it owns a `Docs/*_CANDIDATES.md` to inventory. A family's flag counts come from the member with an `inventory({ taskState })` hook. |
+| `preValidateCitedPaths: true` | `review-task.js` | Prose drafts that cite files/lines as evidence: block a fabricated cited path before any review call (`project_search`, `arch_import`). |
+| `requireCodeShapeInCandidate: true` | `review-task.js` | A draft that is an `### AC-NNN` candidate must show a fenced code block or diff hunk; prose-only verdicts (false positive / uncertain) still pass (`function_length_review`). |
+| `groundedPromptFiles: true` | `needs-clarification-triage.js` bucket L | `promptContext.files` is a verified list of real grounded paths, so a fabricated-file-path near-miss can be auto-repaired against it (`arch_discovery`). |
 
 Known, deliberate exceptions:
 

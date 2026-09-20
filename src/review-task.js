@@ -675,7 +675,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // swap already happened above, so this only diverges for the exact stacked case.
   const groundingRef = (repoRootForCheck === workDir) ? resolveGroundingRef(task, repoRootForCheck) : null;
 
-  // Pre-fact-check gate for project_search/arch_import (2026-09-08 brain-dump request):
+  // Pre-fact-check gate for sources registering preValidateCitedPaths -- project_search / arch_import (2026-09-08 brain-dump request):
   // those two sources' drafts are plain prose citing specific files and line numbers as
   // evidence for a claim, not a Group B diff -- checkDraft's own fabricated-path handling
   // is tuned for a diff's claimed file targets, not "does this cited EVIDENCE actually
@@ -684,7 +684,9 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // fabricated file path' so blocked-task-classifiers.js's hasFabricatedFilePath treats
   // it as the same retryable:false category a real diff-side fabrication already is.
   const preValidateSource = resolveSourceName(task);
-  if (preValidateSource === 'project_search' || preValidateSource === 'arch_import') {
+  const preValidateEntry = getRegisteredSource(preValidateSource);
+  // `preValidateCitedPaths: true` on the source's registration (project_search in core, arch_import in the hygiene plugin).
+  if (preValidateEntry && preValidateEntry.preValidateCitedPaths === true) {
     const preValidation = preValidateCitedPaths(task.implementResponse || '', repoRootForCheck, factCheckExtraRoots);
     if (!preValidation.valid) {
       const reason = `ungrounded draft: fabricated file path -- pre-validation: ${preValidation.failures.join('; ')}`;
@@ -954,7 +956,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
-  // Enforce code-diff presence for function_length_review (2026-09-08 brain-dump
+  // Enforce code-diff presence for a source that registers requireCodeShapeInCandidate (function_length_review; 2026-09-08 brain-dump
   // request): its deliverable is an `### AC-NNN` candidate whose Solution shows the
   // proposed change, not just prose describing what should change -- a prose-only draft
   // routinely got voted through, then rejected downstream (fulfillment) for having
@@ -968,12 +970,14 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // plain prose only -- no code fence", so a prose verdict is the CORRECT output there. This gate used
   // to reject it, so every false-positive verdict burned 3 drafts and escalated to a human. Only a draft
   // that is a candidate (an `### AC-NNN` block, the parser's contract) owes a code shape.
-  if (resolveSourceName(task) === 'function_length_review' && trimmedImplResponse
+  // Registration flag `requireCodeShapeInCandidate: true` (function_length_review, in the hygiene plugin).
+  const codeShapeEntry = getRegisteredSource(resolveSourceName(task));
+  if (codeShapeEntry && codeShapeEntry.requireCodeShapeInCandidate === true && trimmedImplResponse
       && /^#{2,4}\s*AC-\S+/m.test(trimmedImplResponse)
       && !/```/.test(trimmedImplResponse)
       && !/^(?:---|\+\+\+|@@)/m.test(trimmedImplResponse)
       && !/^(?:\+|-)(?!\s*$)\S/m.test(trimmedImplResponse)) {
-    const reason = 'Deterministic gate: missing-code-diff -- function_length_review drafts must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all.';
+    const reason = 'Deterministic gate: missing-code-diff -- candidate drafts from this source must show the concrete change as a fenced code block or diff hunk, not prose-only commentary describing what should change. No local-model review call spent on a draft with no code shape at all.';
     task.reviewProvider = 'deterministic-missing-code-diff';
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);
