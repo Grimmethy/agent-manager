@@ -692,3 +692,43 @@ test('sanitizeTaskDisposition retains merge fields for a legitimately merged tas
   assert.equal(task.mergedAtSource, 'auto-merge', 'a real merged task keeps its mergedAtSource');
   assert.equal(task.autoMergeCommit, 'deadbeef00', 'a real merged task keeps its autoMergeCommit');
 });
+
+// The checklist said `in-progress` for a piece that was really just held for an earlier sibling's merge, so a frozen hub looked busy.
+test('sweep marks a piece that is only waiting for an earlier sibling with heldFor, and clears it once released', () => {
+  const dir = makePipeline();
+  write(dir, 'coordinating', {
+    id: 'hub-h', status: 'coordinating', history: [],
+    subTasks: [{ id: 'h-1', title: 'one', status: 'pending' }, { id: 'h-2', title: 'two', status: 'pending' }],
+  });
+  // h-1 finished but NOT merged, not stacked -> the sibling net holds h-2
+  write(dir, 'done', { id: 'h-1', terminalDisposition: 'pending-merge' });
+  write(dir, 'adhoc', { id: 'h-2', promptContext: { decomposedFrom: 'hub-h' } });
+  coordinatorSweep({ pipelineDir: dir, repoRoot: dir });
+  let hub = readParent(dir, 'coordinating', 'hub-h');
+  assert.equal(hub.subTasks[1].status, 'in-progress');
+  assert.deepEqual(hub.subTasks[1].heldFor, { id: 'h-1', status: 'pending-merge' });
+  assert.equal(hub.subTasks[0].heldFor, undefined);
+
+  // h-1 lands -> the next tick releases h-2 and the marker goes away
+  write(dir, 'done', { id: 'h-1', terminalDisposition: 'merged', mergedAt: '2026-09-20T00:00:00Z' });
+  coordinatorSweep({ pipelineDir: dir, repoRoot: dir });
+  coordinatorSweep({ pipelineDir: dir, repoRoot: dir });
+  hub = readParent(dir, 'coordinating', 'hub-h');
+  assert.equal(hub.subTasks[1].heldFor, undefined);
+});
+
+test('sweep does NOT mark a stacked piece as held when its earlier sibling is pending-merge on the same branch', () => {
+  const dir = makePipeline();
+  const branch = 'agent/decompose-hub-s';
+  write(dir, 'coordinating', {
+    id: 'hub-s', status: 'coordinating', history: [],
+    subTasks: [{ id: 's-1', title: 'one', status: 'pending' }, { id: 's-2', title: 'two', status: 'pending' }],
+  });
+  write(dir, 'done', { id: 's-1', terminalDisposition: 'pending-merge', stacked: { branch, seq: 1, total: 2 } });
+  write(dir, 'adhoc', { id: 's-2', promptContext: { decomposedFrom: 'hub-s' }, stacked: { branch, seq: 2, total: 2 } });
+  coordinatorSweep({ pipelineDir: dir, repoRoot: dir });
+  coordinatorSweep({ pipelineDir: dir, repoRoot: dir });
+  const hub = readParent(dir, 'coordinating', 'hub-s');
+  assert.equal(hub.subTasks[1].status, 'in-progress');
+  assert.equal(hub.subTasks[1].heldFor, undefined);
+});

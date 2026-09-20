@@ -266,3 +266,65 @@ test('hubHasUnmergedEarlierSibling: resolves the hub via promptContext.decompose
   const task = { id: 'child-1', promptContext: { decomposedFrom: 'hub-1' } };
   assert.equal(hubHasUnmergedEarlierSibling(dir, task).blocked, true);
 });
+
+// PropertyForager function-length-fix-ac-2 (2026-09-20): piece 1 of a stacked chain reached `pending-merge` on the shared branch, its
+// `dependsOn` was satisfied by the stacked exemption, and this net still held piece 2 -- waiting for a human to merge a half-built branch.
+// A stacked child's draft and review read the shared branch tip, so an earlier sibling pending-merge ON THAT BRANCH is already visible.
+function stackedHub(dir, { p1Status = 'pending-merge', p1Stacked = { branch: 'agent/decompose-hub-x', seq: 1, total: 2 }, writeP1 = true } = {}) {
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  writeHub(dir, { id: 'hub-x', subTasks: [{ id: 'p1', status: p1Status }, { id: 'p2', status: 'in-progress' }] });
+  if (writeP1) fs.writeFileSync(path.join(dir, 'queue', 'done', 'p1.json'), JSON.stringify({ id: 'p1', terminalDisposition: 'pending-merge', ...(p1Stacked ? { stacked: p1Stacked } : {}) }));
+}
+const p2 = (stacked) => ({ id: 'p2', promptContext: { decomposedFrom: 'hub-x' }, ...(stacked ? { stacked } : {}) });
+const SAME = { branch: 'agent/decompose-hub-x', seq: 2, total: 2 };
+
+test('hubHasUnmergedEarlierSibling: a STACKED child is not held by an earlier sibling that is pending-merge on the SAME branch', () => {
+  const dir = makePipeline();
+  stackedHub(dir);
+  assert.deepEqual(hubHasUnmergedEarlierSibling(dir, p2(SAME)), { blocked: false });
+});
+
+test('hubHasUnmergedEarlierSibling: the #340 shape still holds -- a NON-stacked child waits for a pending-merge sibling', () => {
+  const dir = makePipeline();
+  stackedHub(dir);
+  const r = hubHasUnmergedEarlierSibling(dir, p2(null));
+  assert.equal(r.blocked, true);
+  assert.equal(r.blockingSiblingId, 'p1');
+  assert.equal(r.blockingSiblingStatus, 'pending-merge');
+});
+
+test('hubHasUnmergedEarlierSibling: a stacked child on a DIFFERENT branch than its pending-merge sibling still waits', () => {
+  const dir = makePipeline();
+  stackedHub(dir);
+  assert.equal(hubHasUnmergedEarlierSibling(dir, p2({ branch: 'agent/decompose-some-other-hub', seq: 2, total: 2 })).blocked, true);
+});
+
+test('hubHasUnmergedEarlierSibling: the exemption is ONLY for pending-merge -- a stacked child still waits for a sibling that has not finished', () => {
+  for (const status of ['in-progress', 'blocked', 'needs-clarification']) {
+    const dir = makePipeline();
+    stackedHub(dir, { p1Status: status });
+    assert.equal(hubHasUnmergedEarlierSibling(dir, p2(SAME)).blocked, true, status);
+  }
+});
+
+test('hubHasUnmergedEarlierSibling: a pending-merge sibling that is NOT stacked (or whose record is missing) still holds a stacked child', () => {
+  const noStack = makePipeline();
+  stackedHub(noStack, { p1Stacked: null });
+  assert.equal(hubHasUnmergedEarlierSibling(noStack, p2(SAME)).blocked, true);
+  const missing = makePipeline();
+  stackedHub(missing, { writeP1: false });
+  assert.equal(hubHasUnmergedEarlierSibling(missing, p2(SAME)).blocked, true);
+});
+
+test('hubHasUnmergedEarlierSibling: in a 3-piece chain, a stacked piece 3 is released only when BOTH earlier pieces are pending-merge on its branch', () => {
+  const dir = makePipeline();
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  writeHub(dir, { id: 'hub-x', subTasks: [{ id: 'p1', status: 'pending-merge' }, { id: 'p2', status: 'in-progress' }, { id: 'p3', status: 'in-progress' }] });
+  const branch = 'agent/decompose-hub-x';
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'p1.json'), JSON.stringify({ id: 'p1', stacked: { branch, seq: 1, total: 3 } }));
+  const p3 = { id: 'p3', promptContext: { decomposedFrom: 'hub-x' }, stacked: { branch, seq: 3, total: 3 } };
+  assert.equal(hubHasUnmergedEarlierSibling(dir, p3).blockingSiblingId, 'p2', 'p2 has not finished yet');
+  writeHub(dir, { id: 'hub-x', subTasks: [{ id: 'p1', status: 'pending-merge' }, { id: 'p2', status: 'pending-merge' }, { id: 'p3', status: 'in-progress' }] });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'p2.json'), JSON.stringify({ id: 'p2', stacked: { branch, seq: 2, total: 3 } }));
+  assert.equal(hubHasUnmergedEarlierSibling(dir, p3).blocked, false);
+});

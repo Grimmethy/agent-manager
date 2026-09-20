@@ -22,6 +22,7 @@ const { wireDecomposedBlueprints } = require('./wire-decomposed-blueprints.js');
 const { taskCommitOnMain, STABLE_TERMINAL_STAGES } = require('./task-disposition.js');
 const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
+const { hubHasUnmergedEarlierSibling } = require('./hub-priority.js');
 
 // On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
 // verified mechanical move child's branch to main itself, instead of a human clicking
@@ -349,6 +350,17 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
       const rec = st && st.id ? findTaskRecordById(pipelineDir, st.id) : null;
       recById.set(st && st.id, rec);
       st.status = classifyChildStatus(rec);
+    }
+    // A piece that is only waiting for an earlier sibling to land (hub-priority.js hubHasUnmergedEarlierSibling) reads 'in-progress' and
+    // looks stuck; say what it is waiting for so the checklist is honest. Computed after every status above is fresh (the check reads
+    // sibling statuses off `parent`), and cleared as soon as the piece is released.
+    for (const st of parent.subTasks) {
+      const rec = st && st.id ? recById.get(st.id) : null;
+      let held = null;
+      if (st && st.status === 'in-progress' && rec && rec.task) {
+        try { const h = hubHasUnmergedEarlierSibling(pipelineDir, rec.task, parent); if (h.blocked) held = { id: h.blockingSiblingId, status: h.blockingSiblingStatus }; } catch { /* advisory */ }
+      }
+      if (st && held) st.heldFor = held; else if (st) delete st.heldFor;
     }
 
     // A non-stacked decompose hub: its move children carry no dependsOn, so nothing else

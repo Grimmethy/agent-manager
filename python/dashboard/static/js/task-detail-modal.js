@@ -172,7 +172,8 @@ function renderSubTaskChecklist(task) {
   const rows = subs.map((st) => {
     const [cls, label] = SUBTASK_STATUS_META[st.status] || ['idle', st.status || 'pending'];
     return `<div class="task-history-row"><span class="badge ${cls}">${escapeHtml(label)}</span> `
-      + `${taskLink(st.id)} ${escapeHtmlBright(st.title || '')}</div>`;
+      + `${taskLink(st.id)} ${escapeHtmlBright(st.title || '')}`
+      + (st.heldFor ? ` <span class="meta" title="Held until this earlier piece of the hub lands on main">held: waiting for ${taskLink(st.heldFor.id)} (${escapeHtml(st.heldFor.status || '?')})</span>` : '') + `</div>`;
   }).join('');
   return `<div class="field-label">Sub-tasks (${done} / ${total})</div>`
     + `<div class="bar-track" style="margin:2px 0 8px"><div class="bar-fill" style="width:${pct}%; background:var(--ok)"></div></div>`
