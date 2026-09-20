@@ -21,11 +21,26 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # of agent-manager.env itself (same file launch.bat / the dashboard read), since it should
 # also work as a one-off invocation with no daemon already running to have set them.
 ENV_FILE="${REPO_DIR}/agent-manager.env"
+# A BORROWED pass (docs/idle-pool-borrowing.md, scripts/apply-loop.sh) runs under another suite project's env. The env file below describes the
+# ACTIVE project, so sourcing it would silently point this pass back at the active project's queue and repo. Remember the project-scoped values
+# (including "unset": a project without an applyRepoRoot / grepDirs must not inherit the active project's) and restore them after the source.
+declare -A _pool_saved=()
+_pool_keys=(AGENT_MANAGER_REPO_ROOT AGENT_MANAGER_PIPELINE_DIR AGENT_MANAGER_DOMAINS_PATH AGENT_MANAGER_APPLY_REPO_ROOT AGENT_MANAGER_GREP_DIRS AGENT_MANAGER_INSTANCES_DIR)
+if [[ -n "${AGENT_MANAGER_BORROWING_FROM:-}" ]]; then
+  for _k in "${_pool_keys[@]}"; do
+    if [[ -v "$_k" ]]; then _pool_saved[$_k]="${!_k}"; else _pool_saved[$_k]="__UNSET__"; fi
+  done
+fi
 if [[ -f "$ENV_FILE" ]]; then
   set -a
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
+fi
+if [[ -n "${AGENT_MANAGER_BORROWING_FROM:-}" ]]; then
+  for _k in "${_pool_keys[@]}"; do
+    if [[ "${_pool_saved[$_k]}" == "__UNSET__" ]]; then unset "$_k"; else export "$_k=${_pool_saved[$_k]}"; fi
+  done
 fi
 
 if [[ -z "${AGENT_MANAGER_REPO_ROOT:-}" ]]; then

@@ -109,3 +109,56 @@ test('AGENT_MANAGER_POOL_BORROW=false: an idle lane never borrows', async () => 
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
   }
 });
+
+// --- reviewer + apply loop (step 3) -----------------------------------------------------------------------------------------------------------
+
+test('a reviewer whose own review/ is empty borrows a review from a pool project: the item is reviewed in the POOL project, locks/heartbeat stay home, tracked under the reviewer role', async () => {
+  const sb = sandbox();
+  fs.writeFileSync(path.join(sb.B, 'queue', 'review', 'r1.json'), JSON.stringify({ id: 'r1', domain: 'default', source: 'trouble_log', title: 't', status: 'needs-review', promptContext: {}, planResponse: 'p', implementResponse: 'i' }));
+  const child = spawn('bash', [path.join(__dirname, 'review-runner.sh'), 'review-x'], {
+    detached: true, stdio: 'ignore',
+    env: { ...sb.env, AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json') },
+  });
+  try {
+    const state = await waitFor(() => { try { const s = JSON.parse(fs.readFileSync(sb.stateFile, 'utf8')); return Object.keys(s.lastBorrowedAt || {}).some((k) => k.startsWith('reviewer|')) ? s : null; } catch { return null; } }, 90000);
+    assert.ok(state, 'the review borrow was recorded under the reviewer role');
+    assert.ok(!Object.keys(state.lastBorrowedAt).some((k) => !k.startsWith('reviewer|')), 'and NOT under the worker role');
+    assert.deepEqual(fs.readdirSync(path.join(sb.A, 'queue', 'review')), [], 'the home project was not touched');
+    const hb = JSON.parse(fs.readFileSync(path.join(sb.instancesDir, 'review-x.json'), 'utf8'));
+    assert.equal(hb.daemonPid, child.pid);
+    assert.ok(!fs.existsSync(path.join(sb.B, 'instances')));
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+});
+
+// A throwaway package dir so apply-task.sh finds an agent-manager.env that describes the ACTIVE project (A), exactly like production.
+function packageWithEnvFile(sb) {
+  const pkg = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-pkg-'));
+  fs.mkdirSync(path.join(pkg, 'scripts'));
+  for (const f of fs.readdirSync(__dirname)) if (f.endsWith('.sh')) fs.copyFileSync(path.join(__dirname, f), path.join(pkg, 'scripts', f));
+  fs.symlinkSync(path.join(__dirname, '..', 'src'), path.join(pkg, 'src'));
+  fs.symlinkSync(path.join(__dirname, '..', 'node_modules'), path.join(pkg, 'node_modules'));
+  fs.writeFileSync(path.join(pkg, 'agent-manager.env'), [
+    `AGENT_MANAGER_REPO_ROOT=${path.join(sb.root, 'repoA')}`, `AGENT_MANAGER_PIPELINE_DIR=${sb.A}`,
+    `AGENT_MANAGER_APPLY_REPO_ROOT=${path.join(sb.root, 'active-apply-clone')}`, 'AGENT_MANAGER_GREP_DIRS=active,dirs',
+    `AGENT_MANAGER_PROJECTS_PATH=${path.join(sb.root, 'projects.json')}`,
+  ].join('\n') + '\n');
+  fs.copyFileSync(path.join(sb.root, 'projects.json'), path.join(pkg, 'projects.json'));
+  return pkg;
+}
+
+test('apply-loop applies approved tasks of a pool project under THAT project\'s env, not the active project\'s (the env file must not override it)', () => {
+  const sb = sandbox();
+  const pkg = packageWithEnvFile(sb);
+  fs.mkdirSync(path.join(sb.B, 'queue', 'approved'), { recursive: true });
+  fs.mkdirSync(path.join(sb.A, 'queue', 'approved'), { recursive: true });
+  fs.writeFileSync(path.join(sb.B, 'queue', 'approved', 'a1.json'), JSON.stringify({ id: 'a1', domain: 'default', source: 'trouble_log', title: 't', status: 'approved', promptContext: {} }));
+  const r = spawnSync('bash', [path.join(pkg, 'scripts', 'apply-loop.sh'), '--once'], { encoding: 'utf8', timeout: 120000, env: { ...process.env, HOME: path.join(sb.root, 'home'), ORC_TICK_SECS: '1' } });
+  assert.match(r.stdout, /applying approved tasks of borrowed project/, r.stderr);
+  assert.deepEqual(fs.readdirSync(path.join(sb.B, 'queue', 'approved')), [], 'the pool project\'s approved task was picked up (moved on to done/blocked/...)');
+  assert.deepEqual(fs.readdirSync(path.join(sb.A, 'queue', 'approved')), [], 'the active project had none, and nothing was mis-filed there');
+  const landed = ['done', 'blocked', 'awaiting-confirm', 'coordinating'].some((d) => fs.existsSync(path.join(sb.B, 'queue', d, 'a1.json')));
+  assert.ok(landed, 'the task landed in the POOL project\'s own queue');
+  assert.ok(!['done', 'blocked'].some((d) => fs.existsSync(path.join(sb.A, 'queue', d, 'a1.json'))));
+});

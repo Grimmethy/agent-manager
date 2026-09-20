@@ -30,6 +30,10 @@ function statePath() {
   return process.env.AGENT_MANAGER_POOL_STATE_PATH || path.join(os.homedir(), '.local', 'state', 'agent-manager', 'pool-state.json');
 }
 
+// Borrowing is tracked per ROLE (worker / reviewer): a worker that found a project's draft queue empty must not hide a project that has
+// reviews waiting from the reviewer. The worker's keys are the plain realpath (unchanged); other roles are prefixed.
+function roleKey(role, pipe) { return role && role !== 'worker' ? `${role}|${pipe}` : pipe; }
+
 function real(p) {
   if (!p) return '';
   try { return fs.realpathSync(p); } catch { return path.resolve(p); }
@@ -51,10 +55,10 @@ function readState(file = statePath()) {
 }
 
 // Records that a lane just borrowed from this project (drives the least-recently-borrowed ordering). Best-effort.
-function markBorrowed(pipelineDir, { now = new Date(), file = statePath() } = {}) {
+function markBorrowed(pipelineDir, { now = new Date(), file = statePath(), role = 'worker' } = {}) {
   try {
     const state = readState(file);
-    const key = real(pipelineDir);
+    const key = roleKey(role, real(pipelineDir));
     state.lastBorrowedAt[key] = now.toISOString();
     delete state.emptyUntil[key];
     writeState(file, state);
@@ -68,10 +72,10 @@ function emptyBackoffMs() {
   return Number.isFinite(n) && n >= 0 ? n * 1000 : 5 * 60 * 1000;
 }
 
-function markEmpty(pipelineDir, { now = new Date(), file = statePath(), ttlMs = emptyBackoffMs() } = {}) {
+function markEmpty(pipelineDir, { now = new Date(), file = statePath(), ttlMs = emptyBackoffMs(), role = 'worker' } = {}) {
   try {
     const state = readState(file);
-    state.emptyUntil[real(pipelineDir)] = new Date(now.getTime() + ttlMs).toISOString();
+    state.emptyUntil[roleKey(role, real(pipelineDir))] = new Date(now.getTime() + ttlMs).toISOString();
     writeState(file, state);
   } catch { /* best-effort */ }
 }
@@ -85,7 +89,7 @@ function writeState(file, state) {
 
 // -> [{ label, repoRoot, pipelineDir, domainsPath, applyRepoRoot, grepDirs }] in borrow order. `active` = { repoRoot, pipelineDir } of the
 // project the pipeline is running now (defaults to the process env).
-function poolProjects({ projectsPath = PROJECTS_PATH, active, stateFile = statePath(), now = new Date(), includeBackedOff = false } = {}) {
+function poolProjects({ projectsPath = PROJECTS_PATH, active, stateFile = statePath(), now = new Date(), includeBackedOff = false, role = 'worker' } = {}) {
   if (!enabled()) return [];
   const act = active || { repoRoot: process.env.AGENT_MANAGER_REPO_ROOT, pipelineDir: process.env.AGENT_MANAGER_PIPELINE_DIR };
   const activePipe = real(act.pipelineDir || act.repoRoot);
@@ -100,7 +104,7 @@ function poolProjects({ projectsPath = PROJECTS_PATH, active, stateFile = stateP
     seen.add(pipe);
     if (pipe === activePipe || real(e.repoRoot) === activeRepo) return;
     if (!fs.existsSync(e.repoRoot) || !fs.existsSync(path.join(e.pipelineDir, 'queue'))) return;
-    if (!includeBackedOff && Date.parse(state.emptyUntil[pipe]) > now.getTime()) return;
+    if (!includeBackedOff && Date.parse(state.emptyUntil[roleKey(role, pipe)]) > now.getTime()) return;
     out.push({
       index, pipe,
       label: e.label || path.basename(e.repoRoot),
@@ -111,7 +115,7 @@ function poolProjects({ projectsPath = PROJECTS_PATH, active, stateFile = stateP
       grepDirs: e.grepDirs || null,
     });
   });
-  const last = (p) => Date.parse(state.lastBorrowedAt[p.pipe]) || 0;
+  const last = (p) => Date.parse(state.lastBorrowedAt[roleKey(role, p.pipe)]) || 0;
   out.sort((a, b) => last(a) - last(b) || a.index - b.index);
   return out.map(({ index, pipe, ...p }) => p);
 }
@@ -147,19 +151,21 @@ if (require.main === module) {
   // node src/pool-projects.js --mark <pipelineDir>    record a borrow
   const [flag, a, b] = process.argv.slice(2);
   if (flag === '--list') {
-    console.log(JSON.stringify(poolProjects()));
+    console.log(JSON.stringify(poolProjects({ role: a || 'worker' })));
   } else if (flag === '--env-args') {
-    const project = poolProjects().find((p) => p.label === a || real(p.pipelineDir) === real(a));
+    const project = poolProjects({ includeBackedOff: true }).find((p) => p.label === a || real(p.pipelineDir) === real(a));
     if (!project) { console.error(`pool-projects: no pool project '${a}'`); process.exit(1); }
     for (const token of poolEnvArgs(project, b || process.env.AGENT_MANAGER_INSTANCES_DIR || path.join(process.env.AGENT_MANAGER_PIPELINE_DIR || '', 'instances'))) console.log(token);
   } else if (flag === '--labels') {
-    for (const p of poolProjects()) console.log(p.pipelineDir);
+    for (const p of poolProjects({ role: a || 'worker' })) console.log(p.pipelineDir);
+  } else if (flag === '--all') {
+    for (const p of poolProjects({ includeBackedOff: true })) console.log(p.pipelineDir);
   } else if (flag === '--mark') {
-    markBorrowed(a);
+    markBorrowed(a, { role: b || 'worker' });
   } else if (flag === '--mark-empty') {
-    markEmpty(a);
+    markEmpty(a, { role: b || 'worker' });
   } else {
-    console.error('usage: pool-projects.js --list | --labels | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> | --mark-empty <pipelineDir>');
+    console.error('usage: pool-projects.js --list [role] | --labels [role] | --all | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> [role] | --mark-empty <pipelineDir> [role]');
     process.exit(2);
   }
 }

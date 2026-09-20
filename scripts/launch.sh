@@ -204,13 +204,8 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
     if is_running "$apply_pidfile"; then
       printf '[launch] apply-task loop already running (pid %s) -- skipping.\n' "$(cat "$apply_pidfile")"
     else
-      (
-        trap 'exit 0' TERM INT
-        while :; do
-          bash "${SCRIPT_DIR}/apply-task.sh"
-          sleep "${ORC_TICK_SECS:-30}"
-        done
-      ) > "${LOG_DIR}/apply-task-loop.log" 2>&1 &
+      # scripts/apply-loop.sh (2026-09-20): the same fixed-interval pass, plus a pass per pool project with approved tasks waiting (idle-pool borrowing).
+      bash "${SCRIPT_DIR}/apply-loop.sh" > "${LOG_DIR}/apply-task-loop.log" 2>&1 &
       echo $! > "$apply_pidfile"
       printf '[launch] started apply-task loop (pid %s), logging to %s\n' "$!" "${LOG_DIR}/apply-task-loop.log"
     fi

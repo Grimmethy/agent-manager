@@ -140,3 +140,17 @@ test('markEmpty puts a project on a backoff (excluded until it expires); markBor
   markBorrowed(fx.list[1].pipelineDir, { now: new Date(t0.getTime() + 1000), file: fx.stateFile });
   assert.deepEqual(list(new Date(t0.getTime() + 60 * 1000)), ['b', 'a'], 'a borrow that did work clears the backoff (and moves it to the back)');
 });
+
+test('borrowing is tracked per role: a worker finding a project empty does not hide it from the reviewer, and orderings are independent', () => {
+  const { markEmpty } = require('./pool-projects.js');
+  const fx = fixture([{ name: 'active' }, { name: 'a', pool: true }, { name: 'b', pool: true }]);
+  const active = { repoRoot: fx.list[0].repoRoot, pipelineDir: fx.list[0].pipelineDir };
+  const t0 = new Date('2026-09-20T10:00:00Z');
+  const list = (role) => poolProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active, now: new Date(t0.getTime() + 1000), role }).map((p) => p.label);
+  markEmpty(fx.list[1].pipelineDir, { now: t0, file: fx.stateFile, ttlMs: 300000, role: 'worker' });
+  assert.deepEqual(list('worker'), ['b']);
+  assert.deepEqual(list('reviewer'), ['a', 'b'], 'the reviewer still sees a');
+  markBorrowed(fx.list[1].pipelineDir, { now: t0, file: fx.stateFile, role: 'reviewer' });
+  assert.deepEqual(list('reviewer'), ['b', 'a']);
+  assert.deepEqual(list('worker'), ['b'], 'the worker ordering/backoff is untouched by reviewer borrows');
+});

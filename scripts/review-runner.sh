@@ -7,10 +7,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 source "${SCRIPT_DIR}/orc-common.sh"                                                  # load shared env loader and config — required first step before any daemon logic since everything depends on AGENT_MANAGER_REPO_ROOT being set correctly (which the .env file provides).
 readonly INSTANCE_ID="${1:-review-0}"                                              # default instance id for this review-daemon; same convention as PowerShell's `$env:InstanceID -or 'default'` pattern so logs can be grouped per-review-job.
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
+# --once (docs/idle-pool-borrowing.md): ONE tick, exit 10 (reviewed something) / 0 (nothing) -- how an idle reviewer BORROWS a tick from another suite
+# project, run as a child of the reviewer daemon under that project's env (same contract as local-worker.sh --once).
+ONCE=false
+[[ "${2:-}" == "--once" ]] && ONCE=true
+if ! "$ONCE"; then export AGENT_MANAGER_DAEMON_PID="$$"; fi
 
 # Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
-check_instance_liveness "$INSTANCE_ID" || exit 1
+"$ONCE" || check_instance_liveness "$INSTANCE_ID" || exit 1
 
 # Claim-the-heartbeat-immediately fix (2026-08-25) -- same race, same fix, as
 # local-worker.sh's identical write_heartbeat_file call added right after its own
@@ -20,7 +25,7 @@ check_instance_liveness "$INSTANCE_ID" || exit 1
 # This script's own gap before its first heartbeat write (previously at the top of the
 # main loop) is smaller than local-worker.sh's, but not zero -- write it here too rather
 # than rely on that margin staying small.
-write_heartbeat_file "$INSTANCE_ID" "starting" "${LOCAL_MODEL:-}" "" "" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"
+"$ONCE" || write_heartbeat_file "$INSTANCE_ID" "starting" "${LOCAL_MODEL:-}" "" "" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
 # Graceful stop: same reasoning as local-worker.sh's trap -- deferred until the current
 # foreground review call returns, so this exits between items rather than mid-vote.
@@ -47,6 +52,31 @@ refresh_active_model() {
   export LOCAL_MODEL
 }
 
+# Borrow a tick from another suite project when this reviewer's own review/ queue is empty (docs/idle-pool-borrowing.md): same walk as
+# local-worker.sh's borrow_from_pool, tracked under the 'reviewer' role so a project the WORKER found empty is still visible here.
+borrow_review_from_pool() {
+  [[ "${AGENT_MANAGER_POOL_BORROW:-true}" != "false" ]] || return 0
+  local pipes=() env_args=() pipe rc
+  mapfile -t pipes < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --labels reviewer 2>>"$LOG_FILE")
+  for pipe in "${pipes[@]}"; do
+    [[ -n "$pipe" ]] || continue
+    env_args=()
+    mapfile -t env_args < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$pipe" "$INSTANCES_DIR" 2>>"$LOG_FILE")
+    (( ${#env_args[@]} > 0 )) || continue
+    printf '[review-%s] home project has nothing to review -- borrowing a tick from %s\n' "$INSTANCE_ID" "$pipe"
+    rc=0
+    env "${env_args[@]}" bash "${SCRIPT_DIR}/review-runner.sh" "$INSTANCE_ID" --once || rc=$?
+    if (( rc == 10 )); then
+      node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark "$pipe" reviewer >>"$LOG_FILE" 2>&1 || true
+      did_work=true
+      return 0
+    fi
+    if (( rc != 0 )); then printf '[review-%s] borrowed tick from %s exited %s (treated as empty)\n' "$INSTANCE_ID" "$pipe" "$rc" >&2; fi
+    node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-empty "$pipe" reviewer >>"$LOG_FILE" 2>&1 || true
+  done
+  return 0
+}
+
 while :; do                                                                     # infinite iteration until script exits (or is SIGTERM'd by system). Bash doesn't have Python-style 'while True:' so uses ':' no-op as condition which always returns 0=success so loop body executes forever; same semantic effect of PowerShell's `$true` boolean we use above.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work.
   printf '[review-%s] tick: scanning queue/review/ for items to review...\n' "$INSTANCE_ID"    # status message echoing what the loop is doing — same info PowerShell logs via `Write-Verbose "Scanning $draftingPath..."`. Using printf not echo so format strings like '%d' don't get interpreted as %d literally (bash's echo sometimes enables escape sequences depending on shell; more portable via printf).
@@ -54,12 +84,13 @@ while :; do                                                                     
 
   review_dir="${QUEUE_DIR}/review"                          # queue/review/ -- the real stage name from task-sources.js's QUEUE_STATES, and where local-worker.sh's own draft pass now files a task once it's ready (status "needs-review"). Was previously scanning queue/drafting/<instance>/ for a needs-review flag local-worker.sh never actually set there -- see git history for that dead end.
 
-  [[ -d "$review_dir" && -r "$review_dir" ]]                                    || { sleep "${ORC_TICK_SECS:-30}"; continue; }    # skip tick if review/ doesn't exist or isn't readable yet (e.g. no draft has ever reached review/) — same defensive early-exit as PowerShell's `if (-not (Test-Path $Drafts) ) { continue }` pattern. Sleep first so this path can't busy-spin.
+  [[ -d "$review_dir" && -r "$review_dir" ]] || { if "$ONCE"; then exit 0; fi; sleep "${ORC_TICK_SECS:-30}"; continue; }    # skip tick if review/ doesn't exist or isn't readable yet (e.g. no draft has ever reached review/) — same defensive early-exit as PowerShell's `if (-not (Test-Path $Drafts) ) { continue }` pattern. Sleep first so this path can't busy-spin.
 
   # ComfyUI GPU lease (agent-manager-common.sh's comfyui_lease_held) -- PromptForge owns
   # the GPU for an image generation this tick.
   if comfyui_lease_held; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
   fi
@@ -246,6 +277,13 @@ while :; do                                                                     
   # end of EVERY tick regardless of whether more items were sitting right there waiting --
   # same utilization problem local-worker.sh's claim loop had (confirmed live 2026-08-15:
   # under 50% uptime on a real backlog whose individual reviews finish well under 30s).
+  # A borrowed tick reports to the daemon that ran it and ends; otherwise an idle reviewer works another suite project now.
+  if "$ONCE"; then
+    if "$did_work"; then exit 10; fi
+    exit 0
+  fi
+  if ! "$did_work"; then borrow_review_from_pool; fi
+
   if "$did_work"; then
     sleep 1
   else
