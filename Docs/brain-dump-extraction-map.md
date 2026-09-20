@@ -17,6 +17,16 @@ vault under `SECOND_BRAIN_DIR`): it is the sort's *destination*, a neighbouring 
 
 ---
 
+## 0. Decisions so far (Grimmethy, 2026-09-20)
+
+| # | Question (section 8) | Status |
+|---|---|---|
+| 1 | Single owner for `brain-dump.json` | **Being clarified, not decided.** Meaning: exactly one component reads and writes the file and everything else asks it (call / HTTP / CLI), so two programs can never overwrite each other's change. Section 8 has the failure it prevents. |
+| 2 | Is the sorter part of the repo? | **Yes.** The sorter (`brain_dump_sort`, classifier, prompts, apply) moves with Brain Dump. This settles ADR 0022 open question 1 *for Brain Dump*: its allowlist exemption and the hardcoded `brain_dump_sort` handling in `getNextTask()` become properties of the repo's own registration, not of core. |
+| 3 | Delivery: library, plugin, or separate service | **Exploring.** See section 9. |
+| 4 | Vault and project-registry adapters | **Not sure yet.** Left open. |
+| 5 | The UI | **Part of the repo**, with the rest of the code. The open work is a defined contract for how the UI talks to its host (section 7, Seam B). |
+
 ## 1. The loop
 
 ```
@@ -104,10 +114,17 @@ Statuses are few and the file is a plain list, but nothing enforces the shape: t
 **Seam A: the kernel (this is the drop-in).** Store + record schema + serials + the capture / edit / suppress / delete / read-with-task-status
 API + counts. The first job is a **single owner** for the file: today Python and Node each implement the same JSON contract.
 
-**Seam B: the UI.** The tab, Filed Findings, and the global "+ Brain Dump" capture. Split it out of the Second Brain JS file first.
+**Seam B: the UI (in the repo, decided).** The tab, Filed Findings, and the global "+ Brain Dump" capture move with the code. Split them out of the
+Second Brain JS file first. What has to be designed is the **host contract**, because today the UI reaches into agent-manager freely. The touchpoints
+to turn into an explicit interface: (1) where and how it mounts (a tab, a global capture button on every tab); (2) the summary badge / needs-attention
+counts the host shows elsewhere (`counts["brain-dump"]`); (3) the join from an entry's `queuedTaskId` to the host's live task state
+(`_brain_dump_entries_with_task_status`); (4) per-entry Discuss sessions, which today use the host's chat/discuss machinery; (5) which project's store
+the UI is looking at (the host's active project); (6) styling/theme, auth and session, and the fetch base URL, none of which the UI should assume.
 
-**Seam C: the sorter (optional module).** The `brain_dump_sort` source, classifier, prompts and apply. It depends on three host services:
-a vault (destination adapter), a project registry (routing), and a model profile. ADR 0022 Q1 already asks whether it belongs in core.
+**Seam C: the sorter (in the repo, decided).** The `brain_dump_sort` source, classifier, prompts and apply. It still depends on host services that
+must become adapters: a vault (destination), a project registry (routing), a model profile, **and**, the part that is easy to miss, the pipeline
+machinery it runs on today: a task queue, a worker lane, the GPU/model lock, deterministic review and the apply stage. Inside the repo it needs a
+"schedule this work" and "make a cheap model call" contract.
 
 **Seam D: intake.** `side-finding.js` + the sweep + the inbox. The model-client chokepoints stay in the host; they only need the marker
 functions and an inbox writer.
@@ -131,10 +148,34 @@ implementation**, keep the full suite green at every step, and only then move co
 
 ## 8. Known gaps and open questions
 
-* **Two runtimes, one JSON file, no lock.** Python rewrites the whole file; Node writes atomically; the code calls the race "theoretical and already accepted". A standalone module cannot inherit that.
+* **Two runtimes, one JSON file, no lock (decision 1).** Python rewrites the whole file; Node writes atomically; the code calls the race "theoretical and already
+  accepted". The failure it allows is a lost update: the dashboard reads the file, the pipeline appends an entry, the dashboard writes its copy back, and the
+  pipeline's entry is gone, with no error. A repo dropped into many projects cannot inherit that. Whether it has ever actually lost an entry here was not checked.
 * **Whole-file rewrite** of a 1.9 MB file on every change.
-* **Is the sorter part of the repo?** It needs a vault, a project registry and a model profile that a "drop into any project" repo may not have (ADR 0022 Q1: "lean: keep in core for now").
+* **The sorter is in the repo (decided), but it runs on agent-manager's task pipeline today.** A host without that pipeline needs the sorter to bring its own runner, or a contract for one. Also still open: the vault and the project registry (decision 4).
 * **Per-project store vs shared vault.** A project's entries are its own; the vault and the always-on sort are shared, and routing a queued task to *another* project's queue reads `projects.json`. A standalone repo needs an explicit project-registry contract.
-* **The UI shares a file with the Second Brain browser**, and `is_filed_note` couples the two views.
+* **The UI shares a file with the Second Brain browser**, and `is_filed_note` couples the two views. The UI is in the repo (decided); its host contract is section 7, Seam B.
 * **`getNextTask()` hardcodes `brain_dump_sort` as allowlist-exempt.**
 * **Line numbers here are as of `97b4bee`.** `docs/agents/codebase-map.md` still says the route list is not itemized; update it when this lands.
+
+## 9. Delivery options compared (decision 3)
+
+This system already ships all three shapes, so each option has a working precedent.
+
+| | **A. In-process plugin** | **B. Separate service** | **C. Library (npm + pip)** |
+|---|---|---|---|
+| Precedent here | `agent-manager-hygiene`: `register.js` loaded into the pipeline via `AGENT_MANAGER_REGISTER_PATH`, contract in `docs/PLUGIN_API.md`, one-way dependency, `plugin-api.test.js` | `agent-manager-chat-plugin` and the hardware plugin: own repo, own Flask app and port (7441/7442), declared in `plugins.json` with `slot`, `url`, `process`, optional `proxy {prefix, sse}`; PromptForge/AdForge/ScriptForge are standalone apps embedded as tabs | none as such (hygiene deep-imports core: "no `exports` map" is a listed wart) |
+| How the host uses it | shares the Node process and the filesystem; registers task sources, calls core helpers | host launches/lists it and proxies `/api/<prefix>/*`; the plugin can call back into the host (`internal_api_client.py` in the chat plugin) | host imports it in each runtime |
+| **Single owner of the file** (decision 1) | only if every reader goes through the plugin's module; the Python dashboard cannot, so a second implementation remains | **natural**: the service is the only thing that touches the file; everyone else uses its HTTP API | needs one implementation per language, which recreates today's two-writer problem |
+| **UI in the repo** (decision 5) | awkward: the host must serve the plugin's static files itself | **natural**: the service serves its own UI; the host embeds it (tab, sidebar slot, or a small script for the global capture button) | the host must bundle and mount it |
+| **Sorter in the repo** (decision 2) | natural in agent-manager (it *is* a task source, as today); nothing for a host with no pipeline | needs its own runner or a "schedule work / model call" contract with the host. Precedent: the chat plugin keeps worker-kill and GPU-lock authority **host-side** and reaches it over HTTP (`internal_api_client.py` -> the core dashboard's internal chat API) | same problem as A |
+| Works in a host that is **not** agent-manager | no: it depends on agent-manager's registry and queue | **yes**, if the host contract is small (mount, counts, task-status join) | only in the same language |
+| Cost | cheapest to build; tightest coupling; core internals become API | a process to run, port, health and upgrade per project; latency; a versioned HTTP contract to keep stable | two packages to release in lockstep |
+| Failure mode | a core refactor silently breaks the plugin (the contract test is the only guard) | the service is down: capture and the tab fail while the pipeline keeps running | version skew between the two language libraries |
+
+**Where this leans, not a decision.** Decisions 1, 2 and 5 together (the repo owns the store, the sorter *and* the UI) fit **B**, with a thin in-process piece
+in the host for the parts that must live in the pipeline (registering the sorter as a task source, the model-client side-finding hooks, the watchdog sweeps,
+closing the loop when a task lands). That is the same split the chat plugin already uses (a service plus a `proxy` block plus a callback client), combined with
+hygiene's `register.js`. The question that settles it: **which hosts is "any project" meant to include?** Projects that agent-manager already manages (each
+already has its own `brain-dump.json`), or arbitrary applications with no agent-manager at all (PF-Client-Portal's React app, for example)? Only the second
+needs the host-agnostic UI and the runner-for-the-sorter answers above.
