@@ -87,7 +87,9 @@ def api_task_detail(state, task_id):
 @task_bp.route("/api/task/<state>/<task_id>/archive", methods=["POST"])
 def api_task_archive(state, task_id):
     """Manual archive (Job Status > Blocked/Done tabs, per-row button): moves the task file
-    to queue/done/_archived_no_action/ via _archive_task_file (see its own header).
+    to queue/done/_archived_no_action/ via _archive_task_file (see its own header). A blocked / needs-clarification /
+    awaiting-confirm archive first stamps terminalDisposition 'abandoned' (+ manualArchive, optional JSON body `reason`) via
+    _stamp_manual_archive so the record is never left 'unclassified'.
     Load-bearing detail: src/task-sources.js's taskIdExistsInQueue() only ever checks the
     direct queue/<state>/<id>.json path, never nested subfolders, so moving a file here
     silently frees up its underlying item (a brain-dump entry, an arch_import itemId, a
@@ -98,7 +100,7 @@ def api_task_archive(state, task_id):
     down an anchor for. 'awaiting-confirm' included the same day, same reasoning -- DENYING
     a delete-containing batch (the awaiting-confirm gate's own opposite of /confirm below)
     is exactly this action too: give up on it rather than let it apply."""
-    from app import _archive_task_file, queue_dir
+    from app import _archive_task_file, _stamp_manual_archive, queue_dir
     if state not in ("blocked", "done", "needs-clarification", "awaiting-confirm"):
         abort(400, description="only a blocked, done, needs-clarification, or awaiting-confirm task can be archived")
     qdir = queue_dir()
@@ -107,11 +109,18 @@ def api_task_archive(state, task_id):
     src = qdir / state / f"{task_id}.json"
     if not src.is_file():
         abort(404)
+    dest = qdir / "done" / "_archived_no_action" / src.name
+    if dest.exists():
+        abort(409, description=f"an archived copy of '{src.stem}' already exists")
+    body = request.get_json(silent=True) or {}
+    # Record what this archive MEANS before moving it (see _stamp_manual_archive): without a disposition the task is
+    # "unclassified" forever and silently blocks anything that dependsOn it.
+    stamped = _stamp_manual_archive(src, state, body.get("reason"))
     try:
         _archive_task_file(qdir, src)
     except FileExistsError as e:
         abort(409, description=str(e))
-    return jsonify({"id": task_id, "archived": True})
+    return jsonify({"id": task_id, "archived": True, "disposition": "abandoned" if stamped else None})
 
 
 @task_bp.route("/api/task/<state>/<task_id>/rereview", methods=["POST"])
