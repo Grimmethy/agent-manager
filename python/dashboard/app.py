@@ -4173,6 +4173,7 @@ from routes.embedded_tools import embedded_tools_bp  # noqa: E402
 from routes.hardware import hardware_bp  # noqa: E402
 from routes.claude_settings import claude_settings_bp  # noqa: E402
 from routes.discovery import discovery_bp  # noqa: E402
+from routes.hygiene import hygiene_bp  # noqa: E402
 from routes.deep_dive import deep_dive_bp  # noqa: E402
 from routes.job_types import job_types_bp  # noqa: E402
 from routes.worker_models_1_more import worker_models_1_more_bp  # noqa: E402
@@ -4196,6 +4197,7 @@ app.register_blueprint(embedded_tools_bp)
 app.register_blueprint(hardware_bp)
 app.register_blueprint(claude_settings_bp)
 app.register_blueprint(discovery_bp)
+app.register_blueprint(hygiene_bp)
 app.register_blueprint(deep_dive_bp)
 app.register_blueprint(job_types_bp)
 app.register_blueprint(worker_models_1_more_bp)

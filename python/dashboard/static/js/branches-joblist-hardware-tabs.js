@@ -1002,6 +1002,7 @@ async function renderMain() {
     else if (activeTab === 'adhoc') await renderAdhocTasksTab();
     else if (activeTab === 'concepts') await renderConceptsTab();
     else if (activeTab === 'filed') await renderFiledFindingsTab();
+    else if (activeTab === 'hygiene') await renderHygieneTab();
     else await renderQueueTab(activeTab);
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
@@ -1035,7 +1036,7 @@ async function refresh() {
   // request before the last one had even resolved, and replacing the whole list with a
   // "timed out" error on every miss. enterBranchesTab()/leaveBranchesTab() now run
   // their own 15s poll that diffs in new/removed branches instead of rebuilding.
-  if (!['project', 'brain-dump', 'filed', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'].includes(activeTab)) renderMain();
+  if (!['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'].includes(activeTab)) renderMain();
 }
 
 function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
