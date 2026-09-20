@@ -290,7 +290,8 @@ async function renderBranchDetailModal(b) {
     if (hub.blockedReason) html += `<div class="meta" style="color:var(--bad);margin-top:4px">${escapeHtmlBright(hub.blockedReason)}</div>`;
     html += `<div class="task-history" style="margin-top:6px">` + (hub.subTasks || []).map((st) =>
       `<div class="task-history-row"><span class="task-history-stage">${escapeHtmlBright(st.title || st.id)}</span> `
-      + `<span class="badge ${st.status === 'done' || st.status === 'merged' ? 'ok' : st.status === 'blocked' || st.status === 'needs-clarification' ? 'bad' : ''}">${escapeHtml(st.status || '?')}</span></div>`
+      + `<span class="badge ${st.status === 'done' || st.status === 'merged' ? 'ok' : st.status === 'blocked' || st.status === 'needs-clarification' ? 'bad' : ''}">${escapeHtml(st.status || '?')}</span>`
+      + (st.heldFor ? ` <span class="meta" title="Held until this earlier piece of the hub lands on main">held: waiting for an earlier piece (${escapeHtml(st.heldFor.status || '?')})</span>` : '') + `</div>`
     ).join('') + `</div>`;
     const checks = (hub.integrationGate || {}).checks;
     if (checks && checks.length) {

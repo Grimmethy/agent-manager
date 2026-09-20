@@ -137,31 +137,52 @@ const SIBLING_RESOLVED_STATUSES = new Set([
   'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'abandoned', 'superseded', 'gone',
 ]);
 
+// A stacked chain (queueSubTasks' `after` chain, or a file-decompose stacked hub) commits every step onto ONE shared branch, and each
+// step's draft AND review read that branch's tip (stacked-grounding.js resolveGroundingRef), so an earlier sibling that is `pending-merge`
+// ON THE SAME BRANCH is visible to this child -- the very thing this check exists to guarantee. Waiting for its merge would freeze the
+// chain at "step 1 of N" until a human merged a half-built branch (PropertyForager function-length-fix-ac-2, 2026-09-20: piece 2 held
+// with dependsOn satisfied, this check the only thing left). A non-stacked sibling, or one on a different branch, still holds.
+function siblingIsOnStackedBranch(pipelineDir, siblingId, branch) {
+  if (!siblingId || !branch) return false;
+  for (const dir of ['done', path.join('done', '_archived_no_action'), 'coordinating']) {
+    try {
+      const rec = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', dir, `${siblingId}.json`), 'utf8'));
+      return !!(rec && rec.stacked && rec.stacked.branch === branch);
+    } catch { /* not in this dir */ }
+  }
+  return false;
+}
+
 // { blocked, blockingSiblingId?, blockingSiblingStatus? } for a task that may be a hub
 // child. `blocked: false` when the task isn't a hub child, its hub record can't be read,
 // it isn't listed in the hub's own subTasks, or it's first in that list (nothing earlier
 // to wait on). Otherwise reports the first (lowest-indexed) earlier sibling whose status
 // isn't in SIBLING_RESOLVED_STATUSES yet.
-function hubHasUnmergedEarlierSibling(pipelineDir, task) {
+function hubHasUnmergedEarlierSibling(pipelineDir, task, hubRecord = null) {
   const hubId = hubIdForTask(task);
   if (!hubId) return { blocked: false };
   const taskId = task && typeof task.id === 'string' ? task.id : null;
   if (!taskId) return { blocked: false };
 
-  let hub;
-  try {
-    hub = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'coordinating', `${hubId}.json`), 'utf8'));
-  } catch {
-    return { blocked: false }; // no live hub record -- nothing to sequence against
+  // `hubRecord`: the caller already holds a fresher copy (coordinator-sweep, mid-reconcile) than what is on disk.
+  let hub = hubRecord;
+  if (!hub) {
+    try {
+      hub = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'coordinating', `${hubId}.json`), 'utf8'));
+    } catch {
+      return { blocked: false }; // no live hub record -- nothing to sequence against
+    }
   }
   const subTasks = Array.isArray(hub.subTasks) ? hub.subTasks : [];
   const myIndex = subTasks.findIndex((s) => s && s.id === taskId);
   if (myIndex <= 0) return { blocked: false }; // not listed, or first in order
 
+  const myBranch = task && task.stacked && task.stacked.branch ? task.stacked.branch : null;
   for (let i = 0; i < myIndex; i += 1) {
     const sib = subTasks[i];
     if (!sib || !sib.status) continue;
     if (!SIBLING_RESOLVED_STATUSES.has(sib.status)) {
+      if (myBranch && sib.status === 'pending-merge' && siblingIsOnStackedBranch(pipelineDir, sib.id, myBranch)) continue;
       return { blocked: true, blockingSiblingId: sib.id, blockingSiblingStatus: sib.status };
     }
   }
