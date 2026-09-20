@@ -133,5 +133,5 @@ function retitleHubMembers(hub, recById) {
 
 module.exports = {
   formatHubLabel, hasHubTitlePrefix, allocateHubSerial, allocateHubSerials, hubTitle, memberTitle, memberId,
-  assignMissingHubSerials, retitleHubMembers, LABEL_RE,
+  assignMissingHubSerials, retitleHubMembers, LABEL_RE, RETITLE_SAFE_STATES,
 };

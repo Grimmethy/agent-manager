@@ -25,6 +25,7 @@ const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 const { hubHasUnmergedEarlierSibling } = require('./hub-priority.js');
 const { restackHubChain } = require('./hub-restack.js');
 const { assignMissingHubSerials, retitleHubMembers } = require('./hub-serial.js');
+const { repairStaleHubRefs } = require('./hub-rename.js');
 
 // On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
 // verified mechanical move child's branch to main itself, instead of a human clicking
@@ -382,6 +383,8 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
     // Members lead with their hub's label (hub-serial.js): queueSubTasks does it for the hubs it builds, this covers older hubs and the
     // producers that mint their own child ids. The checklist titles always follow; a member's record is only rewritten while it is idle.
     try { const n = retitleHubMembers(parent, recById); if (n) summary.membersRetitled = (summary.membersRetitled || 0) + n; } catch { /* cosmetic */ }
+    // A hub renamed to its HUB#### id (hub-rename.js) may have a member a worker was mid-way through: point its decomposedFrom at the new id once idle.
+    try { const n = repairStaleHubRefs(parent, recById); if (n) summary.staleHubRefsRepaired = (summary.staleHubRefsRepaired || 0) + n; } catch { /* cosmetic */ }
     // A piece that is only waiting for an earlier sibling to land (hub-priority.js hubHasUnmergedEarlierSibling) reads 'in-progress' and
     // looks stuck; say what it is waiting for so the checklist is honest. Computed after every status above is fresh (the check reads
     // sibling statuses off `parent`), and cleared as soon as the piece is released.
