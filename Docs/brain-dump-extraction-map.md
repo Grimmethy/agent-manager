@@ -23,8 +23,9 @@ vault under `SECOND_BRAIN_DIR`): it is the sort's *destination*, a neighbouring 
 |---|---|---|
 | 1 | Single owner for `brain-dump.json` | **Being clarified, not decided.** Meaning: exactly one component reads and writes the file and everything else asks it (call / HTTP / CLI), so two programs can never overwrite each other's change. Section 8 has the failure it prevents. |
 | 2 | Is the sorter part of the repo? | **Yes.** The sorter (`brain_dump_sort`, classifier, prompts, apply) moves with Brain Dump. This settles ADR 0022 open question 1 *for Brain Dump*: its allowlist exemption and the hardcoded `brain_dump_sort` handling in `getNextTask()` become properties of the repo's own registration, not of core. |
-| 3 | Delivery: library, plugin, or separate service | **Exploring.** See section 9. |
+| 3 | Delivery: library, plugin, or separate service | **Plugin (decided).** In this system "plugin" covers an in-process `register.js` plugin *and* a slot plugin that runs as its own service (section 9). With hosts outside agent-manager (row 6) the plugin has **two halves**: a host-side half and an agent-manager-side half (section 10). |
 | 4 | Vault and project-registry adapters | **Not sure yet.** Left open. |
+| 6 | Which hosts, and what for | **Any project with a user-facing dashboard, starting with PF-Client-Portal.** The purpose is to quickly and easily acquire **user feedback** that the system can process. This widens the goal from an operator's capture tool to an end-user feedback intake (section 10). |
 | 5 | The UI | **Part of the repo**, with the rest of the code. The open work is a defined contract for how the UI talks to its host (section 7, Seam B). |
 
 ## 1. The loop
@@ -173,9 +174,37 @@ This system already ships all three shapes, so each option has a working precede
 | Cost | cheapest to build; tightest coupling; core internals become API | a process to run, port, health and upgrade per project; latency; a versioned HTTP contract to keep stable | two packages to release in lockstep |
 | Failure mode | a core refactor silently breaks the plugin (the contract test is the only guard) | the service is down: capture and the tab fail while the pipeline keeps running | version skew between the two language libraries |
 
-**Where this leans, not a decision.** Decisions 1, 2 and 5 together (the repo owns the store, the sorter *and* the UI) fit **B**, with a thin in-process piece
+**Where this leaned before the hosts answer (superseded by the plugin decision and section 10).** Decisions 1, 2 and 5 together (the repo owns the store, the sorter *and* the UI) fit **B**, with a thin in-process piece
 in the host for the parts that must live in the pipeline (registering the sorter as a task source, the model-client side-finding hooks, the watchdog sweeps,
 closing the loop when a task lands). That is the same split the chat plugin already uses (a service plus a `proxy` block plus a callback client), combined with
 hygiene's `register.js`. The question that settles it: **which hosts is "any project" meant to include?** Projects that agent-manager already manages (each
 already has its own `brain-dump.json`), or arbitrary applications with no agent-manager at all (PF-Client-Portal's React app, for example)? Only the second
 needs the host-agnostic UI and the runner-for-the-sorter answers above.
+
+## 10. Hosts and end-user feedback (direction decided, details open)
+
+**What the hosts answer changes.** Until now Brain Dump has been the *operator's* tool: the person running agent-manager captures a note. With
+PF-Client-Portal and any future user-facing project as hosts, the input becomes **feedback from the host's own users**, and the output is still the
+existing loop: an entry, sorted, filed or turned into a task in that project's pipeline.
+
+**The two halves of the plugin.**
+
+| Half | Lives in | Owns |
+|---|---|---|
+| **Host side** | the host app (PF-CP is a React/Vite SPA over the TaxHarvest Node/Express/Prisma backend) | an embeddable feedback widget (the UI, decision 5) and an intake endpoint; page/user/version context; the host contract from section 7 Seam B |
+| **Agent-manager side** | agent-manager (`register.js`-style plugin, plus a slot service if needed) | the store (the single owner, decision 1), the sorter (decision 2), task-source registration, side-finding/intake sweeps, closing the loop |
+
+**What is true of PF today (read from the repo, 2026-09-20).**
+* The portal has **no in-app feedback intake.** `SupportView.tsx` is the billing/supporter page (Stripe checkout and portal); `docker-compose.yml` only configures a contact-email address (`CONTACT_NOTIFY_TO` / `CONTACT_FROM`).
+* **Topology.** `backend-public` (a trimmed app: only `/auth`, `/client`, `/sync`) sits behind a Cloudflare tunnel with no open ports; a separate `backend-internal` (the full app, LAN) serves the admin dashboard. All of that runs on the tower (Docker, Postgres). Agent-manager and PF's pipeline run on a *different machine*. Nothing today carries a submission from the public app to a `brain-dump.json`.
+
+**Open questions this creates (not decided).**
+1. **Who submits?** Logged-in PF clients only, anonymous visitors too, or the operator as well. This sets authentication, attribution (user id, page, app version) and abuse controls (rate limits, spam).
+2. **Transport.** How a submission gets from the host (tower, public) to the agent-manager store: agent-manager pulls, the host pushes, or the host keeps its own copy in its database and a job syncs. PF already has a `/sync` surface between its public and internal backends.
+3. **Gate before processing.** Today the sorter can turn an entry into a task in `queue/derived/` or `queue/adhoc/` that the pipeline then works on (`applyBrainDumpSort`). Feeding **untrusted end-user text** into that path is a prompt-injection and noise risk. Options: user feedback lands in a review inbox first, or is sorted and filed as a note but never auto-queued as a task.
+4. **Privacy.** Feedback can contain personal data. Where it is stored, how long, and whether it may reach a local model or the vault.
+5. **Closing the loop with the user** (a status or a reply). Not needed for a first version, but it decides whether entries need a public-facing status.
+
+**Effect on the seams (section 7).** Seam B (UI) becomes the host-side widget and must work in a React host and, ideally, any web host. Seam A's single owner is
+naturally the agent-manager-side half; the host-side half only ever calls it. A new **Seam F: the host-side intake** (widget + endpoint + transport) is the part
+that does not exist in any form today.
