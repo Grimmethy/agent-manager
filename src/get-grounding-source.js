@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { getConfig, ensureRegistered } = require('./config.js');
+const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
 // consumer's own registration file (ensureRegistered, below) calls updateTaskSource on
@@ -198,7 +199,7 @@ function resolveWithinRoot(resolvedRoot, candidate) {
 // back to the frozen snapshot content when a live read isn't possible (repoRoot unset in
 // this environment, or the file has since been deleted/moved by a merge) -- stale grounding
 // beats no grounding at all, same reasoning extractLiveRepoGrounding's own catch uses.
-function refreshFetchedFileContent(fetchedFiles, repoRoot) {
+function refreshFetchedFileContent(fetchedFiles, repoRoot, groundingRef = null) {
   if (!repoRoot) return fetchedFiles;
   const resolvedRoot = path.resolve(repoRoot);
   return fetchedFiles.map((f) => {
@@ -206,14 +207,26 @@ function refreshFetchedFileContent(fetchedFiles, repoRoot) {
     const full = resolveWithinRoot(resolvedRoot, f.path);
     if (!full) return f;
     try {
-      return { ...f, content: fs.readFileSync(full, 'utf8') };
+      return { ...f, content: readCurrent(resolvedRoot, full, f.path, groundingRef) };
     } catch (e) {
       return f; // deleted/moved since the snapshot was taken -- fall back to the frozen copy.
     }
   });
 }
 
-function extractLiveRepoGrounding(text, repoRoot) {
+// One file's CURRENT content. For a STACKED task (groundingRef = its shared branch, from stacked-grounding.js's
+// resolveGroundingRef; null for every other task) that is the branch TIP read from git's object database -- never the shared
+// checkout's working tree, which is on whatever branch the last apply or draft left it on. 2026-09-20, PF HUB0003-01: reviewers
+// were shown a working tree sitting on a sibling hub's branch (hook already wired in), judged a correct draft against it, and
+// rejected 3/3. Throws when the file is absent, matching fs.readFileSync's ENOENT for the callers' existing skip/fall-back handling.
+function readCurrent(resolvedRoot, fullPath, relPath, groundingRef) {
+  if (!groundingRef) return fs.readFileSync(fullPath, 'utf8');
+  const content = readFileAtRef(resolvedRoot, groundingRef, relPath.replace(/\\/g, '/'));
+  if (content === null) throw new Error(`${relPath} is absent at ${groundingRef}`);
+  return content;
+}
+
+function extractLiveRepoGrounding(text, repoRoot, groundingRef = null) {
   if (!text || !repoRoot) return [];
   const resolvedRoot = path.resolve(repoRoot);
   // Keyed by path so a file cited more than once keeps the FIRST real line reference seen
@@ -244,7 +257,7 @@ function extractLiveRepoGrounding(text, repoRoot) {
     if (!full) continue;
     let content;
     try {
-      content = fs.readFileSync(full, 'utf8');
+      content = readCurrent(resolvedRoot, full, candidate, groundingRef);
     } catch (e) {
       continue; // matched a path SHAPE but isn't a real file -- not evidence either way, skip.
     }
@@ -270,6 +283,14 @@ function main() {
     ({ repoRoot, pipelineDir } = getConfig());
   } catch (e) {
     console.warn(`[get-grounding-source] getConfig() failed, repoRoot will remain null: ${e?.message ?? e}`);
+  }
+
+  // null for every non-stacked task; a stacked task's files are read at its branch tip (see readCurrent). Fails open like getConfig().
+  let groundingRef = null;
+  try {
+    groundingRef = resolveGroundingRef(task, repoRoot);
+  } catch (e) {
+    console.warn(`[get-grounding-source] stacked grounding ref failed, reading the working tree: ${e?.message ?? e}`);
   }
 
   if (pc) {
@@ -305,7 +326,7 @@ function main() {
       // creation-time snapshot -- see refreshFetchedFileContent's own comment for the
       // incident (sibling candidate branches merging out from under a still-queued task)
       // this closes. Falls back to the frozen f.content when a live read isn't possible.
-      const refreshed = refreshFetchedFileContent([].concat(pc.fetchedFiles), repoRoot);
+      const refreshed = refreshFetchedFileContent([].concat(pc.fetchedFiles), repoRoot, groundingRef);
       for (const f of refreshed) {
         if (f && f.content) parts.push(String(f.content));
       }
@@ -378,7 +399,7 @@ function main() {
   // case, since even a task WITH other grounding fields can still make a claim about a
   // file none of those fields happen to cover.
   if (task.domain === 'adhoc' && task.implementResponse) {
-    const liveFiles = extractLiveRepoGrounding(task.implementResponse, repoRoot);
+    const liveFiles = extractLiveRepoGrounding(task.implementResponse, repoRoot, groundingRef);
     if (liveFiles.length > 0) {
       parts.push([
         '=== LIVE current repo content (fetched fresh at REVIEW time to check the draft\'s ' +
