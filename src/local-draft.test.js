@@ -1836,6 +1836,31 @@ test('findUnverifiedEdit: wrong-block -- find is real but far from the flagged s
   assert.equal(findUnverifiedEdit(right, files, { anchorSnippet: snippet }), null);
 });
 
+// PropertyForager function-length-fix-ac-3: the flagged block is a whole ~180-line function (the Snippet). The old rule measured the
+// edit's distance from ONE line of it (the longest), so an extraction's edit at the function header -- inserting the new components
+// above it -- read as "a different block" and was rejected on every redraft.
+test('findUnverifiedEdit: wrong-block -- an edit anywhere on the flagged FUNCTION (its header, or deep inside) is on the flagged block', () => {
+  const { findUnverifiedEdit } = require('./local-draft.js');
+  const body = Array.from({ length: 120 }, (_, i) => `  const step${i} = compute(${i}, someLongArgumentName${i}); // a reasonably long body line`);
+  const fn = ['// Full detail card for the expanded row -- the complete gated feature set:', '// hotlist save, owner-info request flow, legal warnings.',
+    'function ExpandedDetail({ detail }) {', ...body, '  return null;', '}'].join('\n');
+  const other = ['function Unrelated() {', '  const z = 1; // an unrelated helper far above', '  return z;', '}'].join('\n');
+  const content = [other, ...Array(40).fill('const filler = "padding padding padding padding padding padding padding";'), fn].join('\n');
+  // the harness snippet: 2 lines of lead-in dropped (SNIPPET_BEFORE), then the whole function
+  const snippet = fn.split('\n').slice(1).join('\n');
+  const files = [{ path: 'src/P.tsx', content }];
+  const edit = (find) => JSON.stringify({ mode: 'edit', file: 'src/P.tsx', find, replace: 'x' });
+
+  // header + its full lead-in comment (one line ABOVE the snippet): on the flagged block
+  assert.equal(findUnverifiedEdit(edit(fn.split('\n').slice(0, 3).join('\n')), files, { anchorSnippet: snippet }), null);
+  // deep inside the function, thousands of chars from the longest line: on the flagged block
+  assert.equal(findUnverifiedEdit(edit(body[3]), files, { anchorSnippet: snippet }), null);
+  assert.equal(findUnverifiedEdit(edit(body[110]), files, { anchorSnippet: snippet }), null);
+  // a genuinely different block (an unrelated function far above the flagged one) is still caught
+  const r = findUnverifiedEdit(edit('  const z = 1; // an unrelated helper far above'), files, { anchorSnippet: snippet });
+  assert.equal(r && r.problem, 'wrong-block');
+});
+
 test('findUnverifiedEdit: wrong-block check is skipped when the snippet cannot be located (no false positive)', () => {
   const { findUnverifiedEdit } = require('./local-draft.js');
   const files = [{ path: 'm.py', content: 'def a():\n    try:\n        x()\n    except OSError:\n        pass\n' }];
