@@ -185,6 +185,13 @@ while :; do
     rejected_hub_backfill_result="$(node "${PACKAGE_SRC_DIR}/rejected-hub-disposition-backfill.js" 2>>"${HOME_LOGS}/rejected-hub-disposition-backfill.log")"
     printf '[watchdog] rejected-hub-disposition-backfill: %s\n' "$rejected_hub_backfill_result" >&2
 
+    # Known-fixed-failure sweep (2026-09-20, PF function-length-fix-ac-3 sat in needs-clarification ~40 min after its failures were
+    # fixed by hand-merged PRs): src/known-fixed-failures.js lists failure classes whose fix has landed; this requeues, once, each
+    # blocked / needs-clarification task that failed on one BEFORE the fix went live. Cheap (two small readdirs). Kill switch
+    # AGENT_MANAGER_FIX_SIGNATURE_SWEEP=false.
+    fix_signature_result="$(node "${PACKAGE_SRC_DIR}/fix-signature-sweep.js" 2>>"${HOME_LOGS}/fix-signature-sweep.log")"
+    printf '[watchdog] fix-signature-sweep: %s\n' "$fix_signature_result" >&2
+
     # Blocked-cluster sweep (2026-09-12, screaminggoatclubmt: "we have 4 separate instances
     # with a bespoke solution each... a way to combine these patterns"): the concrete,
     # buildable half of that question -- normalizes queue/blocked/'s blockedReason text

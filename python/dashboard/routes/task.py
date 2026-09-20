@@ -270,7 +270,7 @@ def api_task_confirm_delete(task_id):
 
 @task_bp.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
 def api_task_requeue(state, task_id):
-    """Manual requeue (Job Status > Blocked/Done tabs, per-row button; also the Brain Dump
+    """Manual requeue (Job Status > Blocked/Needs Clarification/Done tabs, per-row button; also the Brain Dump
     tab's "Reopen" action on an archived entry's badge): moves the task back to pending/,
     stripped to the same shape a freshly-generated task has -- every drafting/review/apply
     artifact (blockedReason, doneMarker, ornithVotes, planResponse, implementResponse, etc.)
@@ -315,8 +315,8 @@ def api_task_requeue(state, task_id):
     human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
     same "always reversible" promise this endpoint already exists to uphold."""
     from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, queue_dir, read_json_safe
-    if state not in ("blocked", "done", "archived"):
-        abort(400, description="only a blocked, done, or archived task can be requeued")
+    if state not in ("blocked", "needs-clarification", "done", "archived"):
+        abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
     qdir = queue_dir()
     if not qdir:
         abort(404)
@@ -338,7 +338,19 @@ def api_task_requeue(state, task_id):
     if not data:
         abort(404)
 
-    if state == "blocked" and not (request.get_json(silent=True) or {}).get("force"):
+    # A needs-clarification task can be sent straight back for a fresh draft -- but only a NON-adhoc one. An adhoc-shaped task lives in
+    # queue/adhoc/ (nextAdhocTask only scans there), and this route writes to pending/, which would silently orphan it; those have their
+    # own /resolve and /answer routes below. (2026-09-20: a candidate-fulfillment task exhausted its retries on failures that were then
+    # fixed, and the only way back was moving its file to blocked/ by hand.)
+    if state == "needs-clarification" and (
+        data.get("domain") == "adhoc" or data.get("source") in ("manual", "derived_task")
+    ):
+        abort(400, description=(
+            "this is an adhoc-shaped task -- send it back with the file-path picker (/resolve) or the answer box (/answer), "
+            "which put it where the adhoc lane claims it; a plain requeue would strand it in pending/"
+        ))
+
+    if state in ("blocked", "needs-clarification") and not (request.get_json(silent=True) or {}).get("force"):
         repeat = _repeated_blocker_match(data)
         if repeat:
             abort(409, description=(
