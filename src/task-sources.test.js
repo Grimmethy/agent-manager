@@ -2053,6 +2053,30 @@ test('nextCandidateFulfillmentTask marks a >=2-file candidate mustPreSplit, a 1-
   assert.equal(t.mustPreSplit, false, 'a Split-Depth:1 candidate is never pre-split again -- the recursion stop');
 });
 
+// 2026-09-20 (PropertyForager function-length AC-1..3, agent-manager 46 of 50): the 4000-char guard measured the whole section, including
+// the `Snippet:` block the harness copies in verbatim (the >100-line function itself, ~10K chars), so EVERY function-length candidate was
+// "oversized" and skipped forever. The guard now measures the authored text only; a genuinely long Solution is still skipped.
+test('nextCandidateFulfillmentTask: the size guard excludes the harness-added Snippet block, but still skips a candidate whose AUTHORED text is oversized', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  const fn = Array.from({ length: 250 }, (_, i) => `  const v${i} = compute(${i}); // a long function body line to make the snippet big`).join('\n');
+  fs.writeFileSync(path.join(dir, 'src/a.js'), `function big() {\n${fn}\n}\n`);
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const snippetBlock = `Snippet:\n\`\`\`\nfunction big() {\n${fn}\n}\n\`\`\``;
+
+  const bigSnippet = path.join(dir, 'BIG_SNIPPET.md');
+  const withSnippet = `### AC-1 · Extract one helper\nStrength: Strong\nFiles: src/a.js\n${snippetBlock}\n\nProblem:\nToo long.\n\nSolution:\nExtract the compute loop into a helper.\n\nBenefits:\nShorter.`;
+  assert.ok(withSnippet.length > 4000, 'precondition: over the raw limit only because of the Snippet');
+  fs.writeFileSync(bigSnippet, withSnippet);
+  const picked = nextCandidateFulfillmentTask(bigSnippet, 'pipeline_forensics_fix');
+  assert.ok(picked, 'a candidate that is only big because of its Snippet is eligible');
+  assert.match(picked.promptContext.body, /function big\(\)/, 'the model prompt still receives the Snippet');
+
+  const bigProse = path.join(dir, 'BIG_PROSE.md');
+  fs.writeFileSync(bigProse, `### AC-2 · Rewrite everything\nStrength: Strong\nFiles: src/a.js\n${snippetBlock}\n\nProblem:\nToo long.\n\nSolution:\n${'Do a lot of things. '.repeat(250)}\n\nBenefits:\nShorter.`);
+  assert.equal(nextCandidateFulfillmentTask(bigProse, 'pipeline_forensics_fix'), null, 'an oversized AUTHORED Solution is still skipped');
+});
+
 // 2026-09-19 (PropertyForager arch-review-ac-1): the fulfillment fetch read the EXACT repo-relative path only,
 // so a candidate whose Files: line said `SearchView` / `SearchView.tsx` fetched nothing and the drafter saw no
 // code. It now resolves entries with the same resolver the discovery-time check uses.

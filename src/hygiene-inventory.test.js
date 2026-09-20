@@ -150,7 +150,7 @@ test('buildHygieneInventory: candidate docs -- waiting / oversized / dependency-
   const byId = Object.fromEntries(docInv.items.map((i) => [i.id, i]));
   assert.equal(byId['AC-1'].status, 'waiting');
   assert.equal(byId['AC-2'].status, 'ineligible');
-  assert.match(byId['AC-2'].reason, /oversized: \d+ chars > the 4000-char limit/);
+  assert.match(byId['AC-2'].reason, /oversized: \d+ chars \(excluding the Snippet\) > the 4000-char limit/);
   assert.equal(byId['AC-3'].status, 'ineligible');
   assert.match(byId['AC-3'].reason, /depends on AC-9, which is not merged/);
   assert.equal(byId['AC-4'].status, 'not-actionable');
@@ -259,4 +259,24 @@ test('buildHygieneInventory: a dependency whose task was archived with no outcom
   assert.equal(item.status, 'ineligible');
   assert.match(item.reason, /depends on AC-9, whose task was archived with no outcome recorded/);
   assert.match(item.reason, /manual-close\.js/);
+});
+
+test('candidate docs: the oversized check excludes the Snippet block (matches the fulfillment guard), so a big-Snippet candidate is waiting, not stuck', () => {
+  const { work } = docRepo();
+  const pipe = fs.mkdtempSync(path.join(os.tmpdir(), 'hyginv-pipe-snip-'));
+  const doc = path.join(work, 'Docs', 'SNIP_CANDIDATES.md');
+  const snippet = 'Snippet:\n```\n' + 'const x = 1; // a long flagged function\n'.repeat(300) + '```';
+  fs.writeFileSync(doc, [
+    '# Snip', '',
+    ['### AC-1 · Big snippet, small prose', 'Strength: Strong', 'Files: src/a.ts', snippet, '', 'Problem:', 'Too long.', '', 'Solution:', 'Extract it.', '', 'Benefits:', 'Better.', ''].join('\n'),
+    ['### AC-2 · Small snippet, big prose', 'Strength: Strong', 'Files: src/b.ts', '', 'Problem:', 'x'.repeat(5000), '', 'Solution:', 'Extract it.', '', 'Benefits:', 'Better.', ''].join('\n'),
+  ].join('\n'));
+  git(['checkout', '-q', 'main'], work); git(['add', '.'], work); git(['commit', '-qm', 'snip doc'], work); git(['push', '-q', 'origin', 'main'], work);
+  const r = fakeRegistry();
+  r.register('snip_fix', { hygieneFamily: { key: 'snip', label: 'Snip', idPrefixes: ['snip-'], candidateDoc: true }, candidatesPath: () => doc });
+  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getRegisteredSources: r.getRegisteredSources, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => true });
+  const items = Object.fromEntries(inv.families[0].candidates.docs[0].items.map((i) => [i.id, i]));
+  assert.equal(items['AC-1'].status, 'waiting');
+  assert.equal(items['AC-2'].status, 'ineligible');
+  assert.match(items['AC-2'].reason, /oversized: \d+ chars \(excluding the Snippet\)/);
 });
