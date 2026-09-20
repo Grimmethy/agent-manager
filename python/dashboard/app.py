@@ -3037,6 +3037,53 @@ def _find_task_log_anywhere(repo_root, task_id):
     return read_json_safe(Path(repo_root) / "task-logs" / f"{task_id}.json")
 
 
+_HUB_TITLE_LABEL_RE = re.compile(r"^(HUB\d{4,})(?:-\d+)?\b")
+
+
+def _hub_label_index(qdir):
+    """{hub id or any of its formerIds: hub record} for every live coordinating hub that has a HUB#### label."""
+    index = {}
+    d = qdir / "coordinating" if qdir else None
+    if not d or not d.is_dir():
+        return index
+    for f in d.glob("*.json"):
+        hub = read_json_safe(f)
+        if not hub or not hub.get("hubLabel"):
+            continue
+        index[hub.get("id") or f.stem] = hub
+        for old in hub.get("formerIds") or []:
+            index[old] = hub
+    return index
+
+
+def _hub_info_for_task(task_id, task=None, index=None, qdir=None):
+    """The HUB#### a task belongs to (2026-09-20, Grimmethy: "I don't see the HUB name when looking at the workers queue"), as
+    {"label", "seq", "total", "isHub"} or None. seq/total are the task's slot in its hub's checklist. A hub's member is found through
+    promptContext.decomposedFrom (the hub's id or one of its formerIds); a member the hub's checklist does not list, and a task whose
+    id/title already leads with HUB####, still report the label. Best-effort: a lookup problem is just "no hub"."""
+    try:
+        if qdir is None:
+            qdir = queue_dir()
+        if index is None:
+            index = _hub_label_index(qdir)
+        if task is None:
+            task, _ = _find_task_record_anywhere(qdir, task_id)
+        if task_id in index:
+            return {"label": index[task_id]["hubLabel"], "seq": None, "total": None, "isHub": True}
+        pc = (task or {}).get("promptContext") or {}
+        hub = index.get(pc.get("decomposedFrom"))
+        if hub:
+            subs = hub.get("subTasks") or []
+            pos = next((i for i, st in enumerate(subs) if st and st.get("id") == task_id), None)
+            return {"label": hub["hubLabel"], "seq": (pos + 1) if pos is not None else None, "total": len(subs), "isHub": False}
+        m = _HUB_TITLE_LABEL_RE.match(str(task_id or "")) or _HUB_TITLE_LABEL_RE.match(str((task or {}).get("title") or ""))
+        if m:
+            return {"label": m.group(1), "seq": None, "total": None, "isHub": False}
+    except Exception as e:  # noqa: BLE001 -- cosmetic
+        print(f"[hub-info] lookup failed for {task_id} (non-fatal): {e}", file=sys.stderr, flush=True)
+    return None
+
+
 def _find_task_record_anywhere(qdir, task_id):
     """(data, state) for a task id across every queue location a branch's task could be
     sitting in -- the QUEUE_STATES dirs, the manual + dated + superseded archives, and the

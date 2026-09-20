@@ -534,7 +534,9 @@ async function renderWorkers(isPoll) {
           const OPTION_LABEL_MAX = 70;
           const truncateLabel = (s) => (s.length > OPTION_LABEL_MAX ? `${s.slice(0, OPTION_LABEL_MAX - 1)}…` : s);
           const optionLabel = (t) => {
-            const base = t.title || t.id;
+            // A hub member leads with its HUB#### slot (2026-09-20) so a hub in progress is recognisable in this list.
+            const rawTitle = t.title || t.id;
+            const base = t.hub && !/^HUB\d/.test(rawTitle) ? `${hubTag(t.hub)} · ${rawTitle}` : rawTitle;
             // pinnedTo (2026-09-07, Grimmethy: "why do the 2 reasoning workers have
             // different lists? they really should share the same task list") -- a task
             // pending but already pinned to a SIBLING lane (same tier) now shows here
@@ -565,6 +567,7 @@ async function renderWorkers(isPoll) {
       </div>
       <div class="meta">
         pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
+        ${inst.currentTaskId && inst.hub ? ' · <span class="badge ok" title="This task belongs to hub ' + escapeAttr(inst.hub.label) + '" style="font-weight:700">🗂 ' + escapeHtml(hubTag(inst.hub)) + '</span>' : ''}
         ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') : ''}
         ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
         ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
@@ -1062,6 +1065,12 @@ async function setHubPriority(id, current) {
 
 // Hub Tasks row progress: BUILT pieces (finished, committed, waiting on the merge) are real progress -- a hub of pending-merge pieces used to read
 // "0 / 3 sub-tasks done" for its whole life. `done` = merged/closed; `built` = done + awaiting merge (coordinator-sweep.js childPhase).
+// "HUB0002 3/3" for a hub member, "HUB0002" for the hub itself or a member the checklist does not list (workers tab, assign dropdown).
+function hubTag(hub) {
+  if (!hub || !hub.label) return '';
+  return hub.seq && hub.total ? `${hub.label} ${hub.seq}/${hub.total}` : hub.label;
+}
+
 function hubProgressChip(t) {
   const p = t.progress;
   if (!p) return '<span style="color:var(--warn)">☑ ? sub-tasks</span>';
