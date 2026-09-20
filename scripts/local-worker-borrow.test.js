@@ -194,3 +194,61 @@ test('pool-sweeps.sh skips a project with nothing in any housekeeping stage, and
   assert.equal(bad.status, 64);
   assert.match(bad.stderr, /refusing to run outside a borrowed-project context/);
 });
+
+// --- a borrowed tick is ONE item, and the lane returns HOME between tasks (2026-09-20) ----------------------------------------------------------
+// Live: a borrowed --once tick drained the borrowed project's whole pending/ list (3 tasks, 14-25 min per lane), so PF's newly eligible work
+// waited. The lane must re-check its home project after EVERY borrowed task, and go on borrowing without an idle gap while home stays empty.
+
+// A throwaway package whose src/ is symlinks to the real one except local-draft.js, which is a stub that "drafts" successfully after a delay --
+// so several tasks can be processed for real without a model.
+function packageWithStubDraft(sb, draftMs) {
+  const pkg = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-pkg-'));
+  fs.mkdirSync(path.join(pkg, 'scripts')); fs.mkdirSync(path.join(pkg, 'src'));
+  for (const f of fs.readdirSync(__dirname)) if (fs.statSync(path.join(__dirname, f)).isFile()) fs.copyFileSync(path.join(__dirname, f), path.join(pkg, 'scripts', f));
+  const realSrc = path.join(__dirname, '..', 'src');
+  for (const f of fs.readdirSync(realSrc)) if (f !== 'local-draft.js') fs.symlinkSync(path.join(realSrc, f), path.join(pkg, 'src', f));
+  fs.writeFileSync(path.join(pkg, 'src', 'local-draft.js'), `setTimeout(() => console.log(JSON.stringify({ succeeded: true })), ${draftMs});\n`);
+  fs.symlinkSync(path.join(__dirname, '..', 'node_modules'), path.join(pkg, 'node_modules'));
+  for (const f of ['package.json', 'task-domains.json']) if (fs.existsSync(path.join(__dirname, '..', f))) fs.copyFileSync(path.join(__dirname, '..', f), path.join(pkg, f));
+  return pkg;
+}
+
+const taskFile = (dir, id) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ id, domain: 'default', source: 'trouble_log', title: id, promptContext: {} }));
+
+test('a borrowed tick takes ONE item; the lane re-checks HOME before the next borrowed one, and borrows again with no idle gap while home is empty', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 4000);
+  taskFile(path.join(sb.B, 'queue', 'pending'), 'b1');
+  taskFile(path.join(sb.B, 'queue', 'pending'), 'b2');
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const child = spawn('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x'], {
+    detached: true, stdio: ['ignore', out, out],
+    // ORC_TICK_SECS 60: an idle gap between borrowed tasks would blow the wait budget below.
+    env: { ...sb.env, ORC_TICK_SECS: '60', AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json') },
+  });
+  const claims = () => [...fs.readFileSync(logFile, 'utf8').matchAll(/\] claimed \S+\/queue\/pending\/(\w+)\.json/g)].map((m) => m[1]);
+  try {
+    assert.ok(await waitFor(() => claims().length >= 1, 60000), 'a borrowed task was claimed');
+    assert.equal(claims()[0][0], 'b', 'the first claim is a borrowed one (home was empty)');
+    // Active-project work arrives WHILE the first borrowed task is being drafted (the stub takes 4s).
+    taskFile(path.join(sb.A, 'queue', 'pending'), 'a1');
+    assert.ok(await waitFor(() => claims().length >= 3, 40000), `all three tasks were claimed without an idle gap; claims so far: ${claims().join(',')}`);
+    const order = claims();
+    assert.equal(order[1], 'a1', `home work is taken between the two borrowed tasks, not after both; order: ${order.join(',')}`);
+    assert.equal(order[2][0], 'b');
+    assert.deepEqual(new Set([order[0], order[2]]), new Set(['b1', 'b2']));
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+  }
+});
+
+test('a borrowing reviewer reviews ONE item per borrowed tick', () => {
+  const sb = sandbox();
+  for (const id of ['r1', 'r2']) fs.writeFileSync(path.join(sb.B, 'queue', 'review', `${id}.json`), JSON.stringify({ id, domain: 'default', source: 'trouble_log', title: 't', status: 'needs-review', promptContext: {}, planResponse: 'p', implementResponse: 'i' }));
+  const r = spawnSync('bash', [path.join(__dirname, 'review-runner.sh'), 'review-x', '--once'], { encoding: 'utf8', timeout: 120000, env: borrowedEnv(sb) });
+  const reviewed = (r.stdout + r.stderr).match(/\[review-review-x\] reviewing /g) || [];
+  assert.equal(reviewed.length, 1, `exactly one item is reviewed per borrowed tick; ${r.stderr}`);
+  assert.equal(r.status, 10, 'and it reports that it did work');
+});

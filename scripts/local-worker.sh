@@ -468,8 +468,9 @@ fi
 CONSECUTIVE_INFRA_FAILURES=0
 
 # Borrow a tick from another suite project (docs/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
-# Walks the pool in least-recently-borrowed order; the first project that yields work ends the walk (its task runs to the end of the pass, so
-# active-project work arriving meanwhile waits -- the other lane can take it). A project that had nothing is skipped for a few minutes
+# Walks the pool in least-recently-borrowed order; the first project that yields work ends the walk. A borrowed tick does exactly ONE item (its
+# task runs to the end of the pass, so active-project work arriving meanwhile waits for that one task -- the other lane can take it), then the
+# lane re-checks its home project immediately -- no sleep beyond the loop's usual 1s after work -- before borrowing again. A project that had nothing is skipped for a few minutes
 # (pool-projects.js --mark-empty) so an idle lane does not re-tick every empty suite project each cycle. Kill switch AGENT_MANAGER_POOL_BORROW=false.
 borrow_from_pool() {
   [[ "${AGENT_MANAGER_POOL_BORROW:-true}" != "false" ]] || return 0
@@ -577,6 +578,10 @@ while :; do                                                                     
       node -e 'try{const fs=require("fs"),p=process.argv[1],o=JSON.parse(fs.readFileSync(p,"utf8"));if(!o.claimedAt){o.claimedAt=new Date().toISOString();fs.writeFileSync(p,JSON.stringify(o,null,2));}}catch(e){}' "$wpath" 2>/dev/null || true
       process_drafting_file "$wpath"
       did_work=true
+      # A borrowed (--once) tick is ONE item, not a batch: return to the daemon so the lane re-checks its HOME project before taking anything
+      # else, then borrows again straight away if home is still empty (the daemon loop sleeps 1s after a tick that did work). 2026-09-20: a
+      # borrowed tick used to drain the borrowed project's whole pending/ list, keeping both lanes off PF's newly eligible work for 14-25 min.
+      if "$ONCE"; then break; fi
       # Intra-tick backoff gap fix (2026-08-25, proven live: an infra-shaped failure here
       # left this same loop free to immediately resume the NEXT leftover item with zero
       # delay -- the exponential backoff at the bottom of the outer `while :; do` loop only
@@ -630,7 +635,7 @@ while :; do                                                                     
   # calls completing successfully. Skipping a new claim too, on the SAME tick an infra
   # failure was already seen, means this tick backs off from Ollama entirely rather than
   # only half-backing-off -- the backlog can no longer outgrow its own drain rate.
-  if [[ -r "$pdir" ]] && ! "$TICK_HAD_INFRA_FAILURE"; then                     # check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
+  if [[ -r "$pdir" ]] && ! "$TICK_HAD_INFRA_FAILURE" && ! { "$ONCE" && "$did_work"; }; then   # a borrowed tick that already resumed its one leftover item claims nothing more. check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
     while IFS= read -r name; do
       [[ -n "$name" ]] && items+=("$name")
     done < <(node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" 2>/dev/null)
@@ -711,6 +716,7 @@ while :; do                                                                     
         # tick, not just this one's) picks the file back up automatically.
         process_drafting_file "$new_wpath"
         did_work=true
+        if "$ONCE"; then break; fi                                                 # borrowed tick = ONE item (see the leftover loop above)
         # Intra-tick backoff gap fix (2026-08-25, proven live: worker-1 claimed a fresh
         # pending item 0.63s after an infra-shaped draft-call failure on the PREVIOUS item,
         # same tick -- the exponential backoff at the bottom of the outer loop only runs
