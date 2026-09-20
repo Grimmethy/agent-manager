@@ -80,6 +80,18 @@ require('./task-sources.js');
       registerTaskSource(name, { priority: 80, next: () => null, apply: () => ({ skipped: true }), advisoryProse: true });
     }
   }
+  // The candidate-shape gate and the cited-path pre-validation are driven by registration flags (ADR-0022: core names no plugin
+  // source). function_length_review (requireCodeShapeInCandidate) and arch_import (preValidateCitedPaths) register them in
+  // production; project_search's flag is set by core's own registration.
+  if (!getRegisteredSource('function_length_review')) {
+    registerTaskSource('function_length_review', { priority: 80, next: () => null, apply: () => ({ skipped: true }), advisoryProse: true, requireCodeShapeInCandidate: true });
+  }
+  if (!getRegisteredSource('fixture_prevalidate_cited_paths')) {
+    registerTaskSource('fixture_prevalidate_cited_paths', { priority: 80, next: () => null, apply: () => ({ skipped: true }), preValidateCitedPaths: true });
+  }
+  if (!getRegisteredSource('fixture_no_flags')) {
+    registerTaskSource('fixture_no_flags', { priority: 80, next: () => null, apply: () => ({ skipped: true }), advisoryProse: true });
+  }
   // 2026-09-18: a fixture candidateFulfillment sibling opted into premiseRecheckSource,
   // plus the deterministic-recheck rule set it points at -- see premise-recheck-decision
   // test coverage below and premise-recheck-decision.js's own unit tests for the module
@@ -876,7 +888,33 @@ test('reviewTask deterministically rejects a project_search draft citing a fabri
   assert.equal(captured.length, 0, 'no review call should be spent voting on a draft with a known fabricated citation');
 });
 
-test('reviewTask does NOT apply the preValidateCitedPaths gate outside project_search/arch_import', async () => {
+test('reviewTask applies the preValidateCitedPaths gate to ANY source that registers the flag (not by source name)', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = {
+    id: 'pre-validate-flag-test', domain: 'default', source: 'fixture_prevalidate_cited_paths',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'The relevant logic lives in src/totally-made-up-file.js:12.',
+  };
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-pre-validation');
+  assert.equal(captured.length, 0);
+});
+
+test('reviewTask does NOT apply the code-shape gate to a source that does not register requireCodeShapeInCandidate', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({
+    domain: 'default', source: 'fixture_no_flags',
+    implementResponse: '### AC-9\nProblem: this function is too long and does three unrelated things.\nSolution: split it into three smaller helper functions, one per responsibility, and call each in turn.',
+  });
+  const captured = [];
+  await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  assert.notEqual(task.reviewProvider, 'deterministic-missing-code-diff');
+  assert.equal(captured.length, 1, 'a prose-only candidate from an unflagged source reaches the vote');
+});
+
+test('reviewTask does NOT apply the preValidateCitedPaths gate outside sources that register it', async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = {
     id: 'pre-validate-scope-test', domain: 'default', source: 'observability_fix',

@@ -166,7 +166,7 @@
 //      of set arithmetic. This bucket substitutes the real path for the fabricated one
 //      everywhere it appears in implementResponse and sends the repaired write-up
 //      straight to review, instead of leaving a mechanically-recoverable near-miss for a
-//      human. Scoped to source:'arch_discovery' only -- the one shape with a verified,
+//      human. Scoped to sources registering groundedPromptFiles (arch_discovery) -- the one shape with a verified,
 //      trustworthy promptContext.files list of real grounded paths; a genuinely
 //      unrecoverable fabrication (no real path is a confident match) still falls through
 //      to bucket C, unchanged.
@@ -179,6 +179,7 @@ const { classifyVote, clip } = require('./auto-confirm-review.js');
 const { hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { targetOversizedFile, oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
+const { getRegisteredSource } = require('./task-source-registry.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { surfaceDecomposeDesignQuestion } = require('./decompose-question-surface.js');
 
@@ -211,6 +212,15 @@ const MIN_RAWTEXT_FOR_REQUEUE = 400;
 // Each bucket now tracks its OWN attempt count under task.ncTriageBucketAttempts, so
 // buckets are independent budgets instead of one shared one that the first bucket to touch
 // a task exhausts for every bucket after it.
+// Bucket L only trusts a source whose promptContext.files is a VERIFIED list of real grounded paths (arch_discovery is the one
+// today). The source says so on its registration -- `groundedPromptFiles: true` -- so core names no plugin source (ADR-0022).
+function groundedFilesInPromptContext(task) {
+  // task.source itself (not resolveSourceName): this bucket was always keyed on the literal source stamp, and an
+  // adhoc-domain task must not resolve to the 'adhoc' entry here.
+  const entry = getRegisteredSource(task.source);
+  return !!entry && entry.groundedPromptFiles === true;
+}
+
 function bucketAttempts(task, bucket) {
   return (task.ncTriageBucketAttempts && task.ncTriageBucketAttempts[bucket]) || 0;
 }
@@ -549,14 +559,14 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       }
     }
 
-    // --- Bucket L: fabricated-file-path near-miss auto-repair (arch_discovery only) ---
+    // --- Bucket L: fabricated-file-path near-miss auto-repair (sources whose promptContext.files is a verified grounded list only) ---
     // Checked BEFORE the `nc.reason` allowlist below, same reasoning as bucket K:
     // reason:'fabricated-file-path' is not in that allowlist, so this would otherwise be
     // silently skipped every tick. See the top-of-file header for the full incident.
     {
       const id0 = task.id || name.replace(/\.json$/, '');
       const nc0 = task.needsClarification || {};
-      if (nc0.reason === 'fabricated-file-path' && task.source === 'arch_discovery'
+      if (nc0.reason === 'fabricated-file-path' && groundedFilesInPromptContext(task)
         && bucketAttempts(task, 'L') < MAX_REQUEUES) {
         const realPaths = Array.isArray(task.promptContext && task.promptContext.files)
           ? task.promptContext.files.map((f) => f && f.path).filter(Boolean)
