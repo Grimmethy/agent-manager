@@ -13,7 +13,17 @@ const { execFileSync } = require('child_process');
 // The metadata cache lives under $HOME/.local/state -- keep the tests out of the real one.
 process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'hyginv-home-'));
 
-const { buildHygieneInventory, makeTaskLookup, scanTaskFunnel, parseCandidateHeaders } = require('./hygiene-inventory.js');
+const { buildHygieneInventory, makeTaskLookup, scanTaskFunnel, parseCandidateHeaders, collectFamilies } = require('./hygiene-inventory.js');
+
+// Family membership is declared on each source's registration (core names no plugin source); these mirror what the hygiene plugin declares.
+const HF = {
+  observability: { key: 'observability', label: 'Observability', order: 10, idPrefixes: ['observability-'] },
+  performance: { key: 'performance', label: 'Performance', order: 20, idPrefixes: ['performance-'] },
+  function_length: { key: 'function_length', label: 'Function length', order: 30, idPrefixes: ['function-length-'] },
+  arch: { key: 'arch', label: 'Architecture', order: 50, idPrefixes: ['arch-'] },
+  change_review: { key: 'change_review', label: 'Change review', order: 60, idPrefixes: ['change-review-'] },
+};
+const TEST_FAMILIES = collectFamilies(Object.values(HF).map((h, i) => ({ name: `s${i}`, hygieneFamily: h })));
 
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
@@ -75,7 +85,7 @@ test('makeTaskLookup: finds a task in any state (incl. drafting subfolders and b
 
 test('scanTaskFunnel: per-family counts by state and disposition; only hygiene-prefixed files are counted', () => {
   const { q } = queueFixture();
-  const f = scanTaskFunnel(q);
+  const f = scanTaskFunnel(q, null, TEST_FAMILIES);
   assert.deepEqual(f.observability.byState, { pending: 1 });
   assert.deepEqual(f.observability.done, { dismissed: 1, 'pending-merge': 1, unclassified: 1 });
   assert.equal(f.observability.awaitingMerge, 1);
@@ -121,6 +131,7 @@ function fakeRegistry({ withPluginHooks = true, hookThrows = false } = {}) {
   return {
     reg,
     getRegisteredSource: (n) => reg[n] || null,
+    getRegisteredSources: () => Object.values(reg),
     register(name, cfg) { reg[name] = { name, ...cfg }; },
   };
 }
@@ -132,8 +143,8 @@ test('buildHygieneInventory: candidate docs -- waiting / oversized / dependency-
   writeTask(q, 'done', 'arch-review-ac-5', { source: 'arch_review', terminalDisposition: 'merged' });
   writeTask(q, 'pending', 'arch-review-ac-6', { source: 'arch_review' });
   const r = fakeRegistry();
-  r.register('arch_review', { candidatesPath: () => doc });
-  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => false });
+  r.register('arch_review', { hygieneFamily: { ...HF.arch, candidateDoc: true }, candidatesPath: () => doc });
+  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getRegisteredSources: r.getRegisteredSources, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => false });
   const arch = inv.families.find((f) => f.key === 'arch');
   const docInv = arch.candidates.docs[0];
   const byId = Object.fromEntries(docInv.items.map((i) => [i.id, i]));
@@ -157,8 +168,8 @@ test('buildHygieneInventory: dependency satisfied -> the dependent candidate is 
   const { work, doc } = docRepo();
   const pipe = fs.mkdtempSync(path.join(os.tmpdir(), 'hyginv-pipe3-'));
   const r = fakeRegistry();
-  r.register('arch_review', { candidatesPath: () => doc });
-  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => true });
+  r.register('arch_review', { hygieneFamily: { ...HF.arch, candidateDoc: true }, candidatesPath: () => doc });
+  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getRegisteredSources: r.getRegisteredSources, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => true });
   const item = inv.families.find((f) => f.key === 'arch').candidates.docs[0].items.find((i) => i.id === 'AC-3');
   assert.equal(item.status, 'waiting');
 });
@@ -169,19 +180,39 @@ test('buildHygieneInventory: flags come from the plugin hook (given taskState), 
   writeTask(path.join(pipe, 'queue'), 'done', 'observability-p-x-1', { terminalDisposition: 'dismissed' });
   const r = fakeRegistry();
   let received = null;
-  r.register('observability_review', { inventory: ({ taskState }) => { received = taskState('observability-p-x-1'); return { total: 3, counts: { waiting: 2, queued: 0, blocked: 0, done: 1, digest: 0, suppressed: 0, stale: 0 }, waitingByConfidence: { high: 2 }, oldestWaitingAt: '2026-09-01T00:00:00Z', items: [], doneByDisposition: {}, truncated: false, approximate: true }; } });
-  r.register('performance_review', { inventory: () => { throw new Error('boom'); } });
-  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => true });
+  r.register('observability_review', { hygieneFamily: HF.observability, inventory: ({ taskState }) => { received = taskState('observability-p-x-1'); return { total: 3, counts: { waiting: 2, queued: 0, blocked: 0, done: 1, digest: 0, suppressed: 0, stale: 0 }, waitingByConfidence: { high: 2 }, oldestWaitingAt: '2026-09-01T00:00:00Z', items: [], doneByDisposition: {}, truncated: false, approximate: true }; } });
+  r.register('performance_review', { hygieneFamily: HF.performance, inventory: () => { throw new Error('boom'); } });
+  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getRegisteredSources: r.getRegisteredSources, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => true });
   assert.deepEqual(received, { state: 'done', disposition: 'dismissed' }, 'the hook is handed a working taskState');
   const obs = inv.families.find((f) => f.key === 'observability');
-  assert.equal(obs.available, true);
   assert.equal(obs.open.waitingFlags, 2);
   assert.equal(inv.totals.waitingFlags, 2);
   const perf = inv.families.find((f) => f.key === 'performance');
   assert.equal(perf.flags, null);
   assert.ok(inv.notes.some((n) => /performance: flag inventory failed: boom/.test(n)));
-  const unused = inv.families.find((f) => f.key === 'unused_export');
-  assert.equal(unused.available, false, 'a plugin that is not loaded shows as unavailable, not as zero work');
+  assert.equal(inv.families.find((f) => f.key === 'unused_export'), undefined, 'a family nobody registered is absent -- never shown as zero work');
+});
+
+test('buildHygieneInventory: no hygiene source registered -> no families, a note, no crash; families come from registrations only', () => {
+  const { work } = docRepo();
+  const pipe = fs.mkdtempSync(path.join(os.tmpdir(), 'hyginv-pipe-none-'));
+  const none = fakeRegistry();
+  const inv = buildHygieneInventory({ getRegisteredSource: none.getRegisteredSource, getRegisteredSources: none.getRegisteredSources, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => true });
+  assert.deepEqual(inv.families, []);
+  assert.ok(inv.notes.some((n) => /no hygiene sources are registered/.test(n)));
+  assert.equal(inv.totals.inFlight, 0);
+
+  // A brand-new family declared by any source shows up with no core change; members merge, order sorts, prefixes union.
+  const r = fakeRegistry();
+  r.register('zeta_a', { hygieneFamily: { key: 'zeta', label: 'Zeta', order: 5, idPrefixes: ['zeta-'] } });
+  r.register('zeta_b', { hygieneFamily: { key: 'zeta', idPrefixes: ['zeta-', 'zed-'], candidateDoc: true }, inventory: () => null });
+  r.register('alpha', { hygieneFamily: { key: 'alpha', label: 'Alpha', order: 1, idPrefixes: ['alpha-'] } });
+  r.register('plain', {});
+  const fams = collectFamilies(r.getRegisteredSources());
+  assert.deepEqual(fams.map((f) => f.key), ['alpha', 'zeta']);
+  assert.deepEqual(fams[1], { key: 'zeta', label: 'Zeta', order: 5, prefixes: ['zeta-', 'zed-'], sources: ['zeta_a', 'zeta_b'], flagSource: 'zeta_b', docSources: ['zeta_b'] });
+  const zeta = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getRegisteredSources: r.getRegisteredSources, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => true }).families.find((f) => f.key === 'zeta');
+  assert.deepEqual(zeta.idPrefixes, ['zeta-', 'zed-']);
 });
 
 test('buildHygieneInventory: is a PURE READ of the pipeline -- the queue and repo are byte-for-byte unchanged', () => {
@@ -196,8 +227,8 @@ test('buildHygieneInventory: is a PURE READ of the pipeline -- the queue and rep
   const before = snapshot();
   const headBefore = git(['rev-parse', 'HEAD'], work);
   const r = fakeRegistry();
-  r.register('arch_review', { candidatesPath: () => doc });
-  buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => true });
+  r.register('arch_review', { hygieneFamily: { ...HF.arch, candidateDoc: true }, candidatesPath: () => doc });
+  buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getRegisteredSources: r.getRegisteredSources, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => true });
   assert.deepEqual(snapshot(), before);
   assert.equal(git(['rev-parse', 'HEAD'], work), headBefore);
   assert.equal(git(['branch', '--show-current'], work), 'main');
@@ -205,7 +236,7 @@ test('buildHygieneInventory: is a PURE READ of the pipeline -- the queue and rep
 
 test('the metadata cache is keyed by mtime+size: a changed file is re-read, and the result is identical warm or cold', () => {
   const { pipe, q } = queueFixture();
-  const cfg = { getRegisteredSource: () => null, getConfig: () => ({ repoRoot: pipe, pipelineDir: pipe }), isDependencySatisfied: () => true };
+  const cfg = { getRegisteredSource: () => null, getRegisteredSources: () => [{ name: 'observability_review', hygieneFamily: HF.observability }], getConfig: () => ({ repoRoot: pipe, pipelineDir: pipe }), isDependencySatisfied: () => true };
   const cold = buildHygieneInventory(cfg);
   const warm = buildHygieneInventory(cfg);
   for (const x of [cold, warm]) delete x.generatedAt;
@@ -222,8 +253,8 @@ test('buildHygieneInventory: a dependency whose task was archived with no outcom
   const pipe = fs.mkdtempSync(path.join(os.tmpdir(), 'hyginv-pipe5-'));
   writeTask(path.join(pipe, 'queue'), 'done/_archived_no_action', 'arch-review-ac-9', { source: 'arch_review' });
   const r = fakeRegistry();
-  r.register('arch_review', { candidatesPath: () => doc });
-  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => false });
+  r.register('arch_review', { hygieneFamily: { ...HF.arch, candidateDoc: true }, candidatesPath: () => doc });
+  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getRegisteredSources: r.getRegisteredSources, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => false });
   const item = inv.families.find((f) => f.key === 'arch').candidates.docs[0].items.find((i) => i.id === 'AC-3');
   assert.equal(item.status, 'ineligible');
   assert.match(item.reason, /depends on AC-9, whose task was archived with no outcome recorded/);

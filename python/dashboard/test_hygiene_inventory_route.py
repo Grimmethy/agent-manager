@@ -17,12 +17,15 @@ import app  # noqa: E402
 from routes import hygiene  # noqa: E402
 
 
+PREFIXES = {"observability": "observability-", "performance": "performance-", "function_length": "function-length-", "unused_export": "deadcode-", "arch": "arch-", "change_review": "change-review-"}
+
+
 def inventory(**open_by_family):
     fams = []
     for key in ("observability", "performance", "function_length", "unused_export", "arch", "change_review"):
         o = {"waitingFlags": 0, "waitingCandidates": 0, "stuckCandidates": 0, "inFlight": 0, "needsHuman": 0, "awaitingMerge": 0}
         o.update(open_by_family.get(key, {}))
-        fams.append({"key": key, "label": key, "open": o})
+        fams.append({"key": key, "label": key, "idPrefixes": [PREFIXES[key]], "open": o})
     return {"generatedAt": "2026-09-19T00:00:00Z", "projectTag": "proj", "families": fams, "totals": {}, "notes": []}
 
 
