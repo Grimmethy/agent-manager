@@ -61,7 +61,7 @@ test('sweep reconciles a mixed checklist onto the parent without completing it',
   write(dir, 'blocked', { id: 'c-c', blockedReason: 'stuck' });
 
   const summary = coordinatorSweep({ pipelineDir: dir });
-  assert.deepEqual(summary, { checked: 1, updated: 1, completed: 0, errors: 0, blocked: 1 });
+  assert.deepEqual(summary, { checked: 1, updated: 1, completed: 0, errors: 0, blocked: 1, hubsLabelled: 1, membersRetitled: 3 });
 
   const parent = readParent(dir, 'coordinating', 'parent-1');
   assert.deepEqual(parent.subTasks.map((s) => s.status), ['merged', 'done', 'blocked']);

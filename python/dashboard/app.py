@@ -997,6 +997,8 @@ def task_summary(data: dict, filename: str) -> dict:
         "progress": data.get("progress"),
         # For the Hub Tasks row's "ready to merge" (needs the stacked-hub integration gate's status as well as the piece counts).
         "integrationGate": data.get("integrationGate"),
+        "hubSerial": data.get("hubSerial"),
+        "hubLabel": data.get("hubLabel"),
         # Operator-set integer on a coordinating hub (LOWER = more urgent), stamped by
         # POST /api/task-anywhere/<id>/hub-priority. Drives the Hub Tasks tab's default
         # sort AND the worker claim order for that hub's children (src/hub-priority.js).

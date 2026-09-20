@@ -2195,7 +2195,7 @@ test('end to end: an oversized candidate is drafted as a hub-routed split and ap
     const { writeArtifact } = require('./lib/apply-core.js');
     const artifact = writeArtifact(task, dir, dir);
     assert.equal(artifact.coordinating, true);
-    assert.deepEqual(artifact.subTasks.map((t) => t.title), ['Extract the tile grid', 'Extract the boundary projection']);
+    assert.deepEqual(artifact.subTasks.map((t) => t.title), ['HUB0001 · 1/2 · Extract the tile grid', 'HUB0001 · 2/2 · Extract the boundary projection']);
 
     const queued = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).map((f) => JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', f), 'utf8')));
     assert.equal(queued.length, 2);

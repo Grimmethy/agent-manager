@@ -16,6 +16,9 @@ const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 
+// Queued hub members lead with `HUB#### · i/n · ` (hub-serial.js); most assertions here care about the piece's own title.
+const plain = (s) => String(s).replace(/^HUB\d{4,} · \d+\/\d+ · /, '');
+
 function readQueuedAdhocTasks(pipelineDir) {
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   return fs.readdirSync(adhocDir)
@@ -206,7 +209,7 @@ test('applyAdhocDiff queues each sub-task and turns the parent into a coordinato
 
   const queued = readQueuedAdhocTasks(pipelineDir);
   assert.equal(queued.length, 3);
-  assert.deepEqual(queued.map((t) => t.title).sort(), ['Piece one', 'Piece three', 'Piece two']);
+  assert.deepEqual(queued.map((t) => plain(t.title)).sort(), ['Piece one', 'Piece three', 'Piece two']);
   for (const q of queued) {
     assert.equal(q.domain, 'adhoc');
     assert.equal(q.source, 'manual');
@@ -214,9 +217,9 @@ test('applyAdhocDiff queues each sub-task and turns the parent into a coordinato
     assert.ok(q.promptContext.rawText.length > 0);
   }
   // One hub = one chain (2026-09-20): every piece depends on the one before it, whether or not the model wrote an `after` for it.
-  const first = queued.find((t) => t.title === 'Piece one');
-  const second = queued.find((t) => t.title === 'Piece two');
-  const third = queued.find((t) => t.title === 'Piece three');
+  const first = queued.find((t) => plain(t.title) === 'Piece one');
+  const second = queued.find((t) => plain(t.title) === 'Piece two');
+  const third = queued.find((t) => plain(t.title) === 'Piece three');
   assert.equal(first.dependsOn, undefined);
   assert.deepEqual(second.dependsOn, [first.id]);
   assert.deepEqual(third.dependsOn, [second.id]);
@@ -367,7 +370,7 @@ test('queueSubTasks folds a verification-only proposal into its `after` target\'
   const queued = queueSubTasks(subTasks, pipelineDir, 'parent-task-1', {});
 
   assert.equal(queued.length, 1, 'the verification-only piece must not become its own task');
-  assert.equal(queued[0].title, 'Add verification comment to task-log-reconcile test');
+  assert.equal(plain(queued[0].title), 'Add verification comment to task-log-reconcile test');
   const record = readQueuedAdhocTasks(pipelineDir)[0];
   assert.deepEqual(record.acceptanceCriteria, ['Run `node --test src/task-log-reconcile.test.js` and confirm it exits 0.']);
   assert.equal('dependsOn' in record, false, 'nothing left to depend on -- the dependency was folded away, not left dangling');
@@ -409,7 +412,7 @@ test('queueSubTasks never folds a real code-change proposal, even one that happe
   const queued = queueSubTasks(subTasks, pipelineDir, 'parent-task-4', {});
 
   assert.equal(queued.length, 2, 'two real code-change pieces must both survive as independent tasks');
-  const wirer = readQueuedAdhocTasks(pipelineDir).find((t) => t.title.startsWith('Wire widget'));
+  const wirer = readQueuedAdhocTasks(pipelineDir).find((t) => plain(t.title).startsWith('Wire widget'));
   assert.equal('acceptanceCriteria' in wirer, false);
 });
 
@@ -430,8 +433,8 @@ test('queueSubTasks: a 2-step `after` chain gets a shared stacked branch + seq 1
   ];
   const queued = queueSubTasks(subTasks, pipelineDir, 'parent-stack-1', {});
   const tasks = readQueuedAdhocTasks(pipelineDir);
-  const first = tasks.find((t) => t.title === 'Add predicate field');
-  const second = tasks.find((t) => t.title === 'Insert sweep loop requeue branch');
+  const first = tasks.find((t) => plain(t.title) === 'Add predicate field');
+  const second = tasks.find((t) => plain(t.title) === 'Insert sweep loop requeue branch');
 
   assert.equal(first.dependsOn, undefined);
   assert.ok(first.stacked && first.stacked.branch, 'root of the chain is stacked too');
@@ -454,8 +457,8 @@ test('queueSubTasks: EVERY piece of a hub joins one chain -- a proposal with no 
   ];
   const queued = queueSubTasks(subTasks, pipelineDir, 'parent-chain-all', {});
   const tasks = readQueuedAdhocTasks(pipelineDir);
-  const t = (title) => tasks.find((x) => x.title === title);
-  const id = (title) => queued.find((q) => q.title === title).id;
+  const t = (title) => tasks.find((x) => plain(x.title) === plain(title));
+  const id = (title) => queued.find((q) => plain(q.title) === plain(title)).id;
 
   const [a, b, c] = subTasks.map((x) => t(x.title));
   assert.deepEqual([a.stacked.seq, b.stacked.seq, c.stacked.seq], [1, 2, 3]);
@@ -476,7 +479,7 @@ test('queueSubTasks: a hub with two independent chains is still ONE chain (one b
   ];
   queueSubTasks(subTasks, pipelineDir, 'parent-stack-3', {});
   const tasks = readQueuedAdhocTasks(pipelineDir);
-  const byTitle = (t) => tasks.find((x) => x.title === t);
+  const byTitle = (t) => tasks.find((x) => plain(x.title) === t);
   const order = ['Chain1 Step A', 'Chain1 Step B', 'Chain2 Step A', 'Chain2 Step B'];
   assert.equal(new Set(order.map((n) => byTitle(n).stacked.branch)).size, 1);
   assert.deepEqual(order.map((n) => byTitle(n).stacked.seq), [1, 2, 3, 4]);
@@ -487,12 +490,12 @@ test('queueSubTasks: a NESTED hub (the parent is itself a stacked piece) continu
   const parent = { id: 'piece-two', stacked: { branch: 'agent/decompose-outer-hub', seq: 2, total: 3 } };
   queueSubTasks([{ title: 'N1', rawText: 'n1' }, { title: 'N2', rawText: 'n2' }], pipelineDir, parent.id, parent);
   const tasks = readQueuedAdhocTasks(pipelineDir);
-  const n1 = tasks.find((x) => x.title === 'N1');
-  const n2 = tasks.find((x) => x.title === 'N2');
+  const n1 = tasks.find((x) => plain(x.title) === 'N1');
+  const n2 = tasks.find((x) => plain(x.title) === 'N2');
   assert.equal(n1.stacked.branch, 'agent/decompose-outer-hub', 'no second branch: the ancestor hub still ends as one');
   assert.deepEqual([n1.stacked.seq, n2.stacked.seq], [2, 3], 'the first child takes the parent\'s slot, so seq>1 -> it continues the branch');
   assert.equal(n1.stacked.total, 4, 'the parent\'s one step became two');
-  assert.deepEqual(n2.dependsOn, [tasks.find((x) => x.title === 'N1').id]);
+  assert.deepEqual(n2.dependsOn, [tasks.find((x) => plain(x.title) === 'N1').id]);
 });
 
 test('queueSubTasks: a hub that folds down to ONE surviving piece is not chained; verification-only pieces never join the chain', () => {
@@ -505,7 +508,7 @@ test('queueSubTasks: a hub that folds down to ONE surviving piece is not chained
   const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
   queueSubTasks([{ title: 'Add X', rawText: 'x' }, { title: 'Verify X works', rawText: 'v' }, { title: 'Add Y', rawText: 'y' }], dir2, 'parent-fold-2', {});
   const t2 = readQueuedAdhocTasks(dir2).sort((a, b) => a.stacked.seq - b.stacked.seq);
-  assert.deepEqual(t2.map((t) => t.title), ['Add X', 'Add Y']);
+  assert.deepEqual(t2.map((t) => plain(t.title)), ['Add X', 'Add Y']);
   assert.deepEqual(t2.map((t) => t.stacked.seq), [1, 2]);
   assert.deepEqual(t2.map((t) => t.stacked.total), [2, 2], 'the folded piece is not a step');
 });
@@ -527,7 +530,7 @@ test('applyAdhocDiff end-to-end: the real incident shape (comment + confirm) que
 
   const queued = readQueuedAdhocTasks(pipelineDir);
   assert.equal(queued.length, 1);
-  assert.equal(queued[0].title, 'Add verification comment to task-log-reconcile test');
+  assert.equal(plain(queued[0].title), 'Add verification comment to task-log-reconcile test');
   assert.ok(Array.isArray(queued[0].acceptanceCriteria) && queued[0].acceptanceCriteria.length === 1);
 });
 
@@ -547,8 +550,8 @@ test('applyAdhocDiff end-to-end: the inferred `after` becomes a real dependsOn e
   applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
 
   const queued = readQueuedAdhocTasks(pipelineDir);
-  const creator = queued.find((t) => t.title === 'Create src/widget.js');
-  const wirer = queued.find((t) => t.title.startsWith('Wire widget'));
+  const creator = queued.find((t) => plain(t.title) === 'Create src/widget.js');
+  const wirer = queued.find((t) => plain(t.title).startsWith('Wire widget'));
   assert.deepEqual(wirer.dependsOn, [creator.id]);
 });
 

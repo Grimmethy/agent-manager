@@ -12,6 +12,7 @@
 //   { succeeded: false, reason: '<message>' }
 
 const fs = require('fs');
+const { hubTitle } = require('./hub-serial.js');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
@@ -343,7 +344,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     if (artifact && artifact.coordinating) {
       abandonBranch();
       closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
-      return { coordinating: true, subTasks: artifact.subTasks, reason: artifact.reason };
+      return { coordinating: true, subTasks: artifact.subTasks, reason: artifact.reason, hubSerial: artifact.hubSerial, hubLabel: artifact.hubLabel };
     }
 
     // A Group A `apply` can also return { succeeded:false, needsConfirmation:true } to
@@ -496,6 +497,12 @@ function recordApplyOutcome(task, result) {
   if (applyStage === 'coordinating') {
     task.subTasks = Array.isArray(result.subTasks) ? result.subTasks : [];
     task.progress = { done: 0, total: task.subTasks.length };
+    // HUB#### (hub-serial.js): the hub carries its serial and leads its title with it, replacing a leading candidate id ("AC-2 · ...").
+    if (result.hubSerial && result.hubLabel) {
+      task.hubSerial = result.hubSerial;
+      task.hubLabel = result.hubLabel;
+      task.title = hubTitle(result.hubLabel, task.title, task.promptContext && task.promptContext.candidateId);
+    }
     // parentHub (2026-09-08): this task IS a hub's own child re-decomposing into a new hub
     // -- promptContext.decomposedFrom already points at the owning hub, zero new plumbing.
     // Lets the dashboard's Hub Tasks tab render the real family tree instead of a root.

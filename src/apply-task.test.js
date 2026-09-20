@@ -1339,3 +1339,16 @@ test('gated default: a triage-queue push failure marks every batched task failed
   assert.match(out.results.h1.reason, /agent\/triage-queue failed after commit/);
   assert.ok(!gitRunner.calls.some((c) => c.name === 'pushMain'));
 });
+
+test('recordApplyOutcome: a coordinating result stamps the hub serial and leads the hub title with it, replacing a candidate id', () => {
+  const task = { id: 'function-length-fix-ac-2', title: 'AC-2 · Extract pure geometry', promptContext: { candidateId: 'AC-2' } };
+  recordApplyOutcome(task, { coordinating: true, subTasks: [{ id: 'HUB0004-01-a', title: 'HUB0004 · 1/2 · a', status: 'pending' }], hubSerial: 4, hubLabel: 'HUB0004' });
+  assert.equal(task.hubSerial, 4);
+  assert.equal(task.hubLabel, 'HUB0004');
+  assert.equal(task.title, 'HUB0004 · Extract pure geometry');
+  assert.equal(task.id, 'function-length-fix-ac-2', 'the record keeps its file id');
+  const legacy = { id: 'x', title: 'Untouched' };
+  recordApplyOutcome(legacy, { coordinating: true, subTasks: [] });
+  assert.equal(legacy.title, 'Untouched');
+  assert.equal(legacy.hubSerial, undefined);
+});
