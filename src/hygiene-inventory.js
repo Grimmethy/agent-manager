@@ -204,7 +204,7 @@ function parseCandidateHeaders(text) {
     out.push({
       n: parseInt(h[1], 10), title: (h[2] || '').trim().slice(0, 160),
       strength: line(/^Strength:\s*(.+)$/m) || 'Strong', files: line(/^Files:\s*(.+)$/m),
-      chars: section.length, dependsOn: line(/^Depends-On:\s*(AC-\d+)\s*$/m) || null,
+      chars: require('./sdk/lib/candidate-lifecycle.js').candidateGuardSize(section), dependsOn: line(/^Depends-On:\s*(AC-\d+)\s*$/m) || null,
       placeholder: isPlaceholder(problem) || isPlaceholder(solution),
     });
   }
@@ -229,7 +229,7 @@ function dependencyReason(dep, ts) {
 // (sdk/lib/candidate-lifecycle.js), in the same order. null = eligible.
 function ineligibleReason(c, { prefix, isDependencySatisfied, maxChars, taskState = null }) {
   if (c.dependsOn && isDependencySatisfied && !isDependencySatisfied(`${prefix}-${c.dependsOn.toLowerCase()}`)) return dependencyReason(c.dependsOn, taskState && taskState(`${prefix}-${c.dependsOn.toLowerCase()}`));
-  if (c.chars > maxChars) return `oversized: ${c.chars} chars > the ${maxChars}-char limit -- the fulfillment step skips it forever; it needs narrowing`;
+  if (c.chars > maxChars) return `oversized: ${c.chars} chars (excluding the Snippet) > the ${maxChars}-char limit -- the fulfillment step skips it forever; it needs narrowing`;
   if (c.placeholder) return 'placeholder Problem/Solution body';
   return null;
 }

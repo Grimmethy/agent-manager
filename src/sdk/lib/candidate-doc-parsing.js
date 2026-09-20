@@ -24,6 +24,12 @@ function snippetFromSection(section) {
   return m ? m[1] : null;
 }
 
+// The section without its `Snippet:` block. The Snippet is copied in by the HARNESS (the review-time flagged code, verbatim), not
+// authored by the model, so it says nothing about how big a change the candidate proposes.
+function stripSnippetField(section) {
+  return (section || '').replace(SNIPPET_FIELD_RE, '');
+}
+
 function stripWhitespace(s) {
   return s.replace(/\s+/g, '');
 }
@@ -38,5 +44,5 @@ function realIndexForStrippedIndex(content, targetStrippedCount) {
 }
 
 module.exports = {
-  readIfExists, quotedSymbolsFromSection, snippetFromSection, stripWhitespace, realIndexForStrippedIndex,
+  readIfExists, quotedSymbolsFromSection, snippetFromSection, stripSnippetField, stripWhitespace, realIndexForStrippedIndex,
 };

@@ -8,10 +8,20 @@ const { getConfig } = require('../../config.js');
 const { computePremiseEvidence } = require('../../candidate-premise-check.js');
 const { signatureForClarificationTask } = require('../../pipeline-forensics.js');
 const { appendHistoryEvent } = require('../../task-history.js');
-const { readIfExists, quotedSymbolsFromSection, snippetFromSection } = require('./candidate-doc-parsing.js');
+const { readIfExists, quotedSymbolsFromSection, snippetFromSection, stripSnippetField } = require('./candidate-doc-parsing.js');
 const { collectAnchorHits, windowFetchedFileContent } = require('./file-grounding.js');
 
 const MAX_ARCH_REVIEW_TASK_CHARS = 4000;
+
+// The size a candidate is judged on: its AUTHORED text (Problem / Solution / Benefits and the header lines), not the `Snippet:` block.
+// The limit exists so a candidate stays a change one local-model pass can draft, and only the authored text measures that. The
+// Snippet is the flagged function copied in verbatim by the harness -- and for function_length candidates that function is >100
+// lines by definition (up to 200 lines / ~10K chars), so measuring it made EVERY function-length candidate "oversized" and the
+// fulfillment step skipped it forever without a word (PropertyForager: 3 of 3; agent-manager: 46 of 50). The model prompt still
+// receives the whole section, Snippet included -- only the guard changed.
+function candidateGuardSize(section) {
+  return stripSnippetField(section).length;
+}
 
 const SIGNATURE_RE = /\b([a-z][a-z0-9_]*)::([a-z][a-z0-9-]*)\b/g;
 
@@ -127,7 +137,7 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     const strengthMatch = section.match(/^Strength:\s*(.+)$/m);
     if (!strengthMatch || strengthMatch[1].trim() !== 'Strong') continue;
 
-    if (section.length > MAX_ARCH_REVIEW_TASK_CHARS) continue;
+    if (candidateGuardSize(section) > MAX_ARCH_REVIEW_TASK_CHARS) continue;
 
     // 2026-08-24 -- caught live: a real task (arch-review-ac-10, "AC-10 · Example
     // candidate", Files: foo.js) sat permanently un-completable for weeks, repeatedly
@@ -295,4 +305,4 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
   return null;
 }
 
-module.exports = { extractCandidateSignatures, liveSignatureCount, staleSignatureReason, archiveStaleCandidate, nextCandidateFulfillmentTask, SIGNATURE_RE, MAX_ARCH_REVIEW_TASK_CHARS };
+module.exports = { extractCandidateSignatures, liveSignatureCount, staleSignatureReason, archiveStaleCandidate, nextCandidateFulfillmentTask, SIGNATURE_RE, MAX_ARCH_REVIEW_TASK_CHARS, candidateGuardSize };
