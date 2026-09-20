@@ -856,6 +856,10 @@ async function runPlanPass(task, {
 // or blocked history event. Returns { done: true, result } when it fully resolved the
 // task (a valid split, or a blocked invalid split), else { done: false } so the caller
 // falls through to critique.
+function candidateSplitToHubEnabled() {
+  return process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB !== 'false';
+}
+
 async function finalizeCandidateFulfillment(task, {
   maybeLocked, maybeLockedOn, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
 }, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
@@ -892,6 +896,23 @@ async function finalizeCandidateFulfillment(task, {
         appendHistoryEvent(task, 'blocked', reason);
         return { done: true, result: { succeeded: true, blocked: true, blockedReason: reason } };
       }
+    }
+    // A blocked split used to stop here, "for a human to narrow the fix" -- PropertyForager function-length-fix-ac-2 (a candidate that
+    // proposed four extractions), arch-review-ac-6 (a Split-Depth 1 sub-candidate still too big). Agent-manager already has a system
+    // for work that is too big for one pass: a coordinator hub of ordered adhoc sub-tasks (see apply-adhoc-diff.js). Route the
+    // well-formed split there; the review pass judges it as it does any candidate split (coverage of the original), and apply
+    // (apply-core.js writeArtifact) queues the pieces. The doc-split's re-split loop cannot recur: children are adhoc tasks that
+    // produce real diffs and carry `decomposedFrom`, which marks them as leaves. AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB=false restores
+    // the old block.
+    if (splitBlocked && !split.invalid && candidateSplitToHubEnabled()) {
+      const childDepth = (pc.splitDepth || 0) + 1;
+      task.candidateSplitProposals = split.candidates.map((c) => ({ ...c, splitDepth: childDepth }));
+      task.candidateSplitRoute = 'hub';
+      const why = atSplitCap ? 'a Split-Depth >= 1 sub-candidate' : 'a source whose candidates are already decompositions';
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `too large for one pass (${why}) -- split into ${split.candidates.length} piece(s) routed to a coordinator hub` });
+      appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), too large for one pass (${why}) -- ${split.candidates.length} piece(s) routed to a coordinator hub: ${split.candidates.map((c) => c.title).join('; ')}`);
+      concludeDraft(task);
+      return { done: true, result: { succeeded: true, blocked: false } };
     }
     if (splitBlocked) {
       const reason = atSplitCap
@@ -1195,6 +1216,10 @@ async function runDraftPasses(task, attempt, {
     // to a human). Start every attempt with a clean slate; a block in THIS run stamps them again, and main() persists the result.
     delete task.blockedStage;
     delete task.blockedReason;
+    // Same for a previous attempt's split: a redraft that produces a normal diff must not carry the old proposals into apply
+    // (writeArtifact keys on task.candidateSplitProposals first, so stale ones would file/queue a split instead of the fix).
+    delete task.candidateSplitProposals;
+    delete task.candidateSplitRoute;
 
     // Fail-fast Ollama pre-flight (src/ollama-health.js): if this draft is about to
     // hit a REAL local Ollama endpoint (no injected localCall -- unit tests pass fakes,

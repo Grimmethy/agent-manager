@@ -2946,6 +2946,11 @@ def _describe_change(data: dict) -> str | None:
     if split_proposals:
         titles = [p.get("title") for p in split_proposals if isinstance(p, dict) and p.get("title")]
         titles_text = "; ".join(titles) if titles else f"{len(split_proposals)} sub-candidates"
+        if data.get("candidateSplitRoute") == "hub":
+            return (
+                f"Too large for one pass -- split into {len(split_proposals)} chained piece(s) that become a coordinator hub "
+                f"when applied (no code on this branch): {titles_text}"
+            )[:_DESCRIPTION_MAX_CHARS]
         return (
             f"Split into {len(split_proposals)} sub-candidate(s), not yet implemented: "
             f"{titles_text}"
