@@ -125,3 +125,18 @@ test('CLI: --list prints the pool as JSON, --env-args prints one env token per l
   run('--mark', fx.list[1].pipelineDir);
   assert.ok(JSON.parse(fs.readFileSync(fx.stateFile, 'utf8')).lastBorrowedAt);
 });
+
+test('markEmpty puts a project on a backoff (excluded until it expires); markBorrowed clears it; includeBackedOff shows it anyway', () => {
+  const { markEmpty } = require('./pool-projects.js');
+  const fx = fixture([{ name: 'active' }, { name: 'a', pool: true }, { name: 'b', pool: true }]);
+  const active = { repoRoot: fx.list[0].repoRoot, pipelineDir: fx.list[0].pipelineDir };
+  const t0 = new Date('2026-09-20T10:00:00Z');
+  const list = (now, extra = {}) => poolProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active, now, ...extra }).map((p) => p.label);
+  markEmpty(fx.list[1].pipelineDir, { now: t0, file: fx.stateFile, ttlMs: 5 * 60 * 1000 });
+  assert.deepEqual(list(new Date(t0.getTime() + 60 * 1000)), ['b'], 'a is backed off');
+  assert.deepEqual(list(new Date(t0.getTime() + 60 * 1000), { includeBackedOff: true }), ['a', 'b']);
+  assert.deepEqual(list(new Date(t0.getTime() + 6 * 60 * 1000)), ['a', 'b'], 'the backoff expired');
+  markEmpty(fx.list[1].pipelineDir, { now: t0, file: fx.stateFile, ttlMs: 5 * 60 * 1000 });
+  markBorrowed(fx.list[1].pipelineDir, { now: new Date(t0.getTime() + 1000), file: fx.stateFile });
+  assert.deepEqual(list(new Date(t0.getTime() + 60 * 1000)), ['b', 'a'], 'a borrow that did work clears the backoff (and moves it to the back)');
+});

@@ -6,6 +6,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"                 # loc
 readonly INSTANCE_ID="${1:-worker-0}"                                              # allow override via argv; default to 'worker-0' matching PowerShell's $env:INSTANCE_ID if undefined (same convention across all 4 daemons so operator can grep logs for specific loop instance).
 export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                     # so local-client.js (invoked as a node child of this process) can stamp its in-flight lock records with who's holding them -- see model-inflight-lock.js; purely diagnostic, not required for the lock's own correctness.
 
+# --once (2026-09-20, docs/idle-pool-borrowing.md): ONE tick, then exit with 10 (did work), 11 (did work, infra-shaped failure) or 0 (found
+# nothing). It is how an idle lane BORROWS a tick from another suite project: the lane's daemon runs this same script again as a child under
+# that project's env (scripts/../src/pool-projects.js --env-args), heartbeating into the lane's HOME instances dir. The child must not look like a
+# second daemon, so it skips the duplicate-instance check, the "starting" heartbeat and the startup reclaim, and it never sleeps or borrows.
+ONCE=false
+[[ "${2:-}" == "--once" ]] && ONCE=true
+# Every heartbeat this lane writes carries the DAEMON's pid (write_heartbeat_file), not a borrowed child's, so dead-process-check never sees a
+# dead pid between borrowed ticks.
+if ! "$ONCE"; then export AGENT_MANAGER_DAEMON_PID="$$"; fi
+
 # Worker lanes are one per GPU, named for the GPU (src/lanes.js: worker-3090, worker-p40). Every
 # lane claims ANY pending task by priority -- there is no reasoning/worker split (2026-09-19).
 # restartTargetFor() (dead-process-check.js) restarts a lane using the same lane definition.
@@ -36,7 +46,7 @@ refresh_active_model
 # restart racing queue-watchdog's automatic one produces, confirmed live this session (an
 # EPIPE crash auto-restarted worker-1 while a second worker-1 was also started manually,
 # both racing to claim from the same drafting/worker-1/ folder).
-check_instance_liveness "$INSTANCE_ID" || exit 1
+"$ONCE" || check_instance_liveness "$INSTANCE_ID" || exit 1
 
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
@@ -60,7 +70,7 @@ STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 # write_heartbeat_file) THE MOMENT liveness is confirmed -- before any of that slower
 # setup work -- closes the window: any dead-process-check tick from here on sees a fresh
 # heartbeat with a genuinely alive pid and correctly leaves this instance alone.
-write_heartbeat_file "$INSTANCE_ID" "starting" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
+"$ONCE" || write_heartbeat_file "$INSTANCE_ID" "starting" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
 
 # Graceful stop: bash defers a trapped signal until the current foreground command
 # (e.g. the node local-draft.js call below) returns control to the shell, so this exits
@@ -433,8 +443,12 @@ process_drafting_file() {
 
 # Drafts stranded in a RETIRED lane folder (the old worker-1/worker-reasoning/worker-reasoning-p40 layout) have
 # no owner left; recover them too (never touches a folder whose heartbeat pid is alive).
-node "${PACKAGE_SRC_DIR}/reclaim-orphaned-drafts.js" --retired-lanes >>"$LOG_FILE" 2>&1 || true
-reclaim_result="$(node "${PACKAGE_SRC_DIR}/reclaim-orphaned-drafts.js" "$INSTANCE_ID" 2>>"$LOG_FILE")"
+if ! "$ONCE"; then
+  node "${PACKAGE_SRC_DIR}/reclaim-orphaned-drafts.js" --retired-lanes >>"$LOG_FILE" 2>&1 || true
+  reclaim_result="$(node "${PACKAGE_SRC_DIR}/reclaim-orphaned-drafts.js" "$INSTANCE_ID" 2>>"$LOG_FILE")"
+else
+  reclaim_result=''   # a borrowed tick never reclaims: the lane's daemon is alive, and the watchdog sweeps that project's orphans
+fi
 # Plain grep on the raw JSON, not a second node subprocess -- confirmed live: a FORCE_COLOR
 # set in the parent environment (this daemon inherited it from an interactive launch shell)
 # made node's own console.log colorize a bare number with ANSI escape codes even though
@@ -453,6 +467,34 @@ fi
 # NOT an infra failure (a real success, a non-infra block, or a genuinely idle tick).
 CONSECUTIVE_INFRA_FAILURES=0
 
+# Borrow a tick from another suite project (docs/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
+# Walks the pool in least-recently-borrowed order; the first project that yields work ends the walk (its task runs to the end of the pass, so
+# active-project work arriving meanwhile waits -- the other lane can take it). A project that had nothing is skipped for a few minutes
+# (pool-projects.js --mark-empty) so an idle lane does not re-tick every empty suite project each cycle. Kill switch AGENT_MANAGER_POOL_BORROW=false.
+borrow_from_pool() {
+  [[ "${AGENT_MANAGER_POOL_BORROW:-true}" != "false" ]] || return 0
+  local pipes=() env_args=() pipe rc
+  mapfile -t pipes < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --labels 2>>"$LOG_FILE")
+  for pipe in "${pipes[@]}"; do
+    [[ -n "$pipe" ]] || continue
+    env_args=()
+    mapfile -t env_args < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$pipe" "$INSTANCES_DIR" 2>>"$LOG_FILE")
+    (( ${#env_args[@]} > 0 )) || continue
+    printf '[worker-%s] home project has nothing to do -- borrowing a tick from %s\n' "$INSTANCE_ID" "$pipe"
+    rc=0
+    env "${env_args[@]}" bash "${SCRIPT_DIR}/local-worker.sh" "$INSTANCE_ID" --once || rc=$?
+    if (( rc == 10 || rc == 11 )); then
+      node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark "$pipe" >>"$LOG_FILE" 2>&1 || true
+      did_work=true
+      if (( rc == 11 )); then TICK_HAD_INFRA_FAILURE=true; fi
+      return 0
+    fi
+    if (( rc != 0 )); then printf '[worker-%s] borrowed tick from %s exited %s (treated as empty)\n' "$INSTANCE_ID" "$pipe" "$rc" >&2; fi
+    node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-empty "$pipe" >>"$LOG_FILE" 2>&1 || true
+  done
+  return 0
+}
+
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
   TICK_HAD_INFRA_FAILURE=false                                                   # set by process_drafting_file (a global, not a subshell -- it's called directly) when this tick's draft call failed on an apparent infra outage. Drives the backoff decision below, separate from did_work.
@@ -466,6 +508,7 @@ while :; do                                                                     
   # Yield this tick while PromptForge holds the GPU (comfyui-lease).
   if comfyui_lease_held; then
     printf '[worker-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
   fi
@@ -685,6 +728,15 @@ while :; do                                                                     
 
     done                                                                         # end per-filename loop within current tick — bash doesn't auto-close the `for name in "${items[@]}"` scope; 'done' keyword terminates it same way PowerShell closes each block with } or closing brace pattern (we use bash's explicit 'done' syntax which is required).
   fi                                                                            # close if -r "$pdir" conditional check block — same structure as PowerShell's `if (( Test-Path $pending )) { ... }` where body only runs test succeeds; we mirror that with [[ ]] && {} pattern using braces around body.
+
+  # A borrowed tick ends here: report what it did to the daemon that ran it (no sleep, no backoff, never borrows further).
+  if "$ONCE"; then
+    if "$TICK_HAD_INFRA_FAILURE"; then exit 11; fi
+    if "$did_work"; then exit 10; fi
+    exit 0
+  fi
+  # Nothing to do in the home project this tick -> work another suite project NOW rather than idle (docs/idle-pool-borrowing.md).
+  if ! "$did_work" && ! "$TICK_HAD_INFRA_FAILURE"; then borrow_from_pool; fi
 
   # Idle-only backoff: only pay the full poll interval when this tick genuinely found
   # nothing to do. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the

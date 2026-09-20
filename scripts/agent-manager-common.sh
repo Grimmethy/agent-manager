@@ -414,8 +414,10 @@ write_heartbeat_file() {
       lastHeartbeat: now, stateSince,
     };
     if (startedAt) hb.startedAt = startedAt;
+    // Borrowed-project label (docs/idle-pool-borrowing.md): set only while this lane runs a task of another suite project.
+    if (process.env.AGENT_MANAGER_BORROWING_FROM) hb.project = process.env.AGENT_MANAGER_BORROWING_FROM;
     fs.writeFileSync(hbPath, JSON.stringify(hb, null, 2));
-  ' "$hb_path" "$instance_id" "$status" "$model" "$task_id" "$pass" "$started_at" "$$"
+  ' "$hb_path" "$instance_id" "$status" "$model" "$task_id" "$pass" "$started_at" "${AGENT_MANAGER_DAEMON_PID:-$$}"
 }
 
 # Startup liveness check -- adapted from taskmesh's dead-worker detection

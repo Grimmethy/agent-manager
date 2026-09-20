@@ -111,3 +111,14 @@ test('writeHeartbeatFile does not throw when the instances directory does not ex
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('writeHeartbeatFile carries the borrowed-project label only while AGENT_MANAGER_BORROWING_FROM is set', () => {
+  const fs2 = require('fs'); const os2 = require('os'); const path2 = require('path');
+  const { writeHeartbeatFile } = require('./heartbeat.js');
+  const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'hb-project-'));
+  process.env.AGENT_MANAGER_BORROWING_FROM = 'agent-manager-hygiene';
+  try { writeHeartbeatFile(dir, 'worker-x', 'working', 'm', 't1', 'plan', null); } finally { delete process.env.AGENT_MANAGER_BORROWING_FROM; }
+  assert.equal(JSON.parse(fs2.readFileSync(path2.join(dir, 'worker-x.json'), 'utf8')).project, 'agent-manager-hygiene');
+  writeHeartbeatFile(dir, 'worker-x', 'idle', 'm', '', '', null);
+  assert.equal(JSON.parse(fs2.readFileSync(path2.join(dir, 'worker-x.json'), 'utf8')).project, undefined);
+});
