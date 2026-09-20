@@ -97,7 +97,7 @@ class TestBranchTaskLog(unittest.TestCase):
         })
         hub = app._hub_for_branch(self.q, "agent/decompose-decompose-app-py-01", [])
         self.assertIsNotNone(hub)
-        self.assertEqual(hub["progress"], {"done": 2, "total": 3})
+        self.assertEqual(hub["progress"], {"done": 2, "built": 2, "total": 3})
         self.assertFalse(hub["readyToMerge"])
 
     def test_hub_ready_when_all_done_and_gate_passed(self):

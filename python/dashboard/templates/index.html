@@ -740,6 +740,12 @@ const CONCEPT_STABLE_STATUSES = new Set(['shelved', 'shipped']);
 const SUBTASK_STATUS_META = {
   merged: ['ok', 'merged'],
   done: ['ok', 'done — awaiting merge'],
+  'pending-merge': ['ok', 'built — awaiting merge'],
+  noop: ['ok', 'no change needed'],
+  dismissed: ['ok', 'dismissed'],
+  filed: ['ok', 'filed'],
+  superseded: ['ok', 'superseded'],
+  'applied-direct': ['ok', 'applied'],
   gone: ['ok', 'done'],
   abandoned: ['idle', 'abandoned'],
   blocked: ['bad', 'blocked'],

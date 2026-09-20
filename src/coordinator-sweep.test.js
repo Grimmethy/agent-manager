@@ -65,7 +65,7 @@ test('sweep reconciles a mixed checklist onto the parent without completing it',
 
   const parent = readParent(dir, 'coordinating', 'parent-1');
   assert.deepEqual(parent.subTasks.map((s) => s.status), ['merged', 'done', 'blocked']);
-  assert.deepEqual(parent.progress, { done: 2, total: 3 });
+  assert.deepEqual(parent.progress, { done: 2, built: 2, total: 3 });
   assert.ok(parent.lastReconciledAt);
   // c-c is blocked -> hub is flagged stuck, stays in coordinating/, gets a blockedReason
   assert.ok(parent.coordinatorBlocked);
@@ -170,7 +170,7 @@ test('sweep moves the parent to done/ once every child is terminal-good (done / 
   assert.equal(done.status, 'done');
   assert.match(done.doneMarker, /coordinator complete: all 4 sub-task/);
   assert.equal(done.history.at(-1).stage, 'done');
-  assert.deepEqual(done.progress, { done: 4, total: 4 });
+  assert.deepEqual(done.progress, { done: 4, built: 4, total: 4 });
 });
 
 test('non-stacked decompose hub: a `done`-not-merged child does NOT complete the hub; completes once every child is merged', () => {
@@ -191,7 +191,7 @@ test('non-stacked decompose hub: a `done`-not-merged child does NOT complete the
     let summary = coordinatorSweep({ pipelineDir: dir });
     assert.equal(summary.completed, 0, 'a bare `done` child does not count toward a decomposeHub');
     let parent = readParent(dir, 'coordinating', 'dhub-1');
-    assert.deepEqual(parent.progress, { done: 1, total: 2 });
+    assert.deepEqual(parent.progress, { done: 1, built: 2, total: 2 });
     assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'dhub-1.json')), false, 'hub stays in coordinating/');
 
     write(dir, 'done', { id: 'm-b', mergedAt: 'y' }); // now actually landed on main
@@ -199,7 +199,7 @@ test('non-stacked decompose hub: a `done`-not-merged child does NOT complete the
     assert.equal(summary.completed, 1);
     assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'dhub-1.json')), false);
     parent = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'dhub-1.json'), 'utf8'));
-    assert.deepEqual(parent.progress, { done: 2, total: 2 });
+    assert.deepEqual(parent.progress, { done: 2, built: 2, total: 2 });
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE;
     else process.env.AGENT_MANAGER_COORDINATOR_RECONCILE_CHILD_MERGE = prev;
@@ -231,7 +231,7 @@ test('non-stacked decompose hub + AUTO_MERGE_MOVES=true: a done mechanical child
     assert.equal(child.mergedAtSource, 'coordinator-auto-merge-verified-move');
     assert.equal(child.autoMergeCommit, 'abc123def456');
     const parent = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'dhub-am.json'), 'utf8'));
-    assert.deepEqual(parent.progress, { done: 1, total: 1 });
+    assert.deepEqual(parent.progress, { done: 1, built: 1, total: 1 });
   } finally {
     if (prevA === undefined) delete process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES; else process.env.AGENT_MANAGER_COORDINATOR_AUTO_MERGE_MOVES = prevA;
     delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
@@ -627,7 +627,7 @@ test('a plain (non-decomposeHub) coordinating hub completes once every child rea
   assert.equal(summary.completed, 1, 'every child reached a real terminal disposition -- the hub must complete');
   assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'ordinary-hub.json')), false);
   const parent = readParent(dir, 'done', 'ordinary-hub');
-  assert.deepEqual(parent.progress, { done: 4, total: 4 });
+  assert.deepEqual(parent.progress, { done: 4, built: 4, total: 4 });
 });
 
 test('a plain coordinating hub does NOT complete while a child is still pending-merge (excluded from TERMINAL_GOOD on purpose)', () => {
@@ -731,4 +731,54 @@ test('sweep does NOT mark a stacked piece as held when its earlier sibling is pe
   const hub = readParent(dir, 'coordinating', 'hub-s');
   assert.equal(hub.subTasks[1].status, 'in-progress');
   assert.equal(hub.subTasks[1].heldFor, undefined);
+});
+
+// 2026-09-20 gripe: a hub of `pending-merge` pieces read "0/3 done" for its whole life and never "ready to merge". `progress.built` counts
+// finished-but-awaiting-merge pieces; `progress.done` (what COMPLETES a hub) is unchanged.
+const { childPhase, TERMINAL_GOOD } = require('./coordinator-sweep.js');
+
+test('childPhase: merged / built / open -- and it agrees with TERMINAL_GOOD for every status it knows', () => {
+  assert.equal(childPhase('pending-merge'), 'built');
+  assert.equal(childPhase('merged'), 'merged');
+  for (const s of TERMINAL_GOOD) assert.equal(childPhase(s), 'merged', s);
+  for (const s of ['in-progress', 'pending', 'blocked', 'needs-clarification', 'awaiting-confirm']) assert.equal(childPhase(s), 'open', s);
+  // strict-merge hub: a bare `done` is only built; noop-style closes are NOT enough there (unchanged rule)
+  assert.equal(childPhase('done', true), 'built');
+  assert.equal(childPhase('pending-merge', true), 'built');
+  assert.equal(childPhase('merged', true), 'merged');
+  assert.equal(childPhase('noop', true), 'open');
+});
+
+test('a hub of built-but-unmerged pieces: progress.built counts them, progress.done does not, and the hub does NOT complete', () => {
+  const dir = makePipeline();
+  write(dir, 'coordinating', { id: 'hub-b', status: 'coordinating', history: [], subTasks: [{ id: 'b1', title: 'one', status: 'pending' }, { id: 'b2', title: 'two', status: 'pending' }, { id: 'b3', title: 'three', status: 'pending' }] });
+  write(dir, 'done', { id: 'b1', terminalDisposition: 'pending-merge' });
+  write(dir, 'adhoc', { id: 'b2' });
+  write(dir, 'done', { id: 'b3', terminalDisposition: 'merged', mergedAt: '2026-09-20T00:00:00Z' });
+  coordinatorSweep({ pipelineDir: dir, repoRoot: dir });
+  let hub = readParent(dir, 'coordinating', 'hub-b');
+  assert.deepEqual(hub.progress, { done: 1, built: 2, total: 3 });
+  assert.deepEqual(hub.subTasks.map((s) => s.phase), ['built', 'open', 'merged']);
+
+  // every piece built (none merged): ready to merge, but the hub still does not complete -- completion is unchanged
+  write(dir, 'done', { id: 'b2', terminalDisposition: 'pending-merge' });
+  fs.unlinkSync(path.join(dir, 'queue', 'adhoc', 'b2.json'));
+  write(dir, 'done', { id: 'b3', terminalDisposition: 'pending-merge' });
+  const s = coordinatorSweep({ pipelineDir: dir, repoRoot: dir });
+  hub = readParent(dir, 'coordinating', 'hub-b');
+  assert.deepEqual(hub.progress, { done: 0, built: 3, total: 3 });
+  assert.equal(s.completed, 0);
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'coordinating', 'hub-b.json')), true, 'still coordinating until the pieces are really merged');
+});
+
+test('a strict-merge (non-stacked file-decompose) hub: a merged child is done, a bare done child is built', () => {
+  const dir = makePipeline();
+  write(dir, 'coordinating', { id: 'hub-s', status: 'coordinating', decomposeHub: true, history: [], subTasks: [{ id: 's1', status: 'pending' }, { id: 's2', status: 'pending' }] });
+  write(dir, 'done', { id: 's1', mergedAt: '2026-09-20T00:00:00Z', terminalDisposition: 'merged' });
+  write(dir, 'done', { id: 's2' });
+  coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runAutoMerge: () => ({ merged: false }) });
+  const hub = readParent(dir, 'coordinating', 'hub-s');
+  assert.equal(hub.progress.total, 2);
+  assert.equal(hub.progress.built, 2);
+  assert.equal(hub.progress.done, 1);
 });

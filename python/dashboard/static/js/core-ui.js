@@ -1060,6 +1060,20 @@ async function setHubPriority(id, current) {
   }
 }
 
+// Hub Tasks row progress: BUILT pieces (finished, committed, waiting on the merge) are real progress -- a hub of pending-merge pieces used to read
+// "0 / 3 sub-tasks done" for its whole life. `done` = merged/closed; `built` = done + awaiting merge (coordinator-sweep.js childPhase).
+function hubProgressChip(t) {
+  const p = t.progress;
+  if (!p) return '<span style="color:var(--warn)">☑ ? sub-tasks</span>';
+  const built = p.built != null ? Math.max(p.built, p.done || 0) : (p.done || 0);
+  const gate = (t.integrationGate || {}).status;
+  const gateClear = gate == null || gate === 'passed' || gate === 'skipped';
+  if (p.total > 0 && built === p.total && gateClear) {
+    return `<span style="color:var(--ok)" title="Every piece is built; the hub lands as one merge">✓ ready to merge — ${built} / ${p.total} built${p.done ? ` · ${p.done} merged` : ''}</span>`;
+  }
+  return `<span style="color:var(--warn)">☑ ${built} / ${p.total} built${built > (p.done || 0) ? ` · ${p.done || 0} merged` : ''}</span>`;
+}
+
 async function renderQueueTab(state) {
   if (!queueLoadedCount[state]) queueLoadedCount[state] = QUEUE_PAGE_SIZE;
   queueLoadInFlight = true;
@@ -1168,7 +1182,7 @@ async function renderQueueTab(state) {
           : state === 'coordinating'
             ? (t.coordinatorBlocked
               ? `<span style="color:var(--bad)" title="${escapeAttr(t.blockedReason || '')}">⛔ stuck ${t.progress ? `at ${t.progress.done}/${t.progress.total}` : ''}${t.coordinatorBlocked.escalated ? ' — needs a human' : ''}: ${escapeHtmlBright((t.blockedReason || '').slice(0, 90))}</span>`
-              : `<span style="color:var(--warn)">☑ ${t.progress ? `${t.progress.done} / ${t.progress.total}` : '?'} sub-tasks done</span>`)
+              : hubProgressChip(t))
             // 2026-09-08: was escapeHtml(t.blockedReason).slice(0, 80) -- sliced the
             // escaped output, not the raw text. Harmless before (worst case: a cut
             // HTML entity), but would slice straight through a <span> tag once brightening

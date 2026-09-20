@@ -280,12 +280,15 @@ async function renderBranchDetailModal(b) {
     const gate = (hub.integrationGate || {}).status;
     html += `<div class="field-label">Coordinator hub</div>`;
     html += `<div class="worker-card" style="margin:4px 0">`;
+    const hubBuilt = p.built != null ? Math.max(p.built, p.done || 0) : (p.done || 0);
     if (!hub.readyToMerge) {
       html += `<div class="badge bad" style="margin-bottom:6px">⚠ mid-flight — not ready to merge</div>`;
-    } else {
+    } else if (hub.state === 'done') {
       html += `<div class="badge ok" style="margin-bottom:6px">✓ hub complete</div>`;
+    } else {
+      html += `<div class="badge ok" style="margin-bottom:6px">✓ ready to merge — every piece is built</div>`;
     }
-    html += `<div class="meta"><a href="javascript:void(0)" data-open-hub="${escapeAttr(hub.id)}" style="cursor:pointer">${escapeHtmlBright(hub.title || hub.id)}</a> · ${p.done}/${p.total} task(s) done`
+    html += `<div class="meta"><a href="javascript:void(0)" data-open-hub="${escapeAttr(hub.id)}" style="cursor:pointer">${escapeHtmlBright(hub.title || hub.id)}</a> · ${hubBuilt}/${p.total} built${hubBuilt > (p.done || 0) ? ` · ${p.done || 0} merged` : ''}`
       + (gate ? ` · integration gate <strong>${escapeHtml(gate)}</strong>` : '') + `</div>`;
     if (hub.blockedReason) html += `<div class="meta" style="color:var(--bad);margin-top:4px">${escapeHtmlBright(hub.blockedReason)}</div>`;
     html += `<div class="task-history" style="margin-top:6px">` + (hub.subTasks || []).map((st) =>
