@@ -84,6 +84,13 @@ Members: `queueSubTasks` (adhoc-decompose and candidate-split hubs) mints ids `H
 child ids (file-decompose, product-spec), are labelled by `coordinator-sweep.js` (`assignMissingHubSerials`, oldest first; `retitleHubMembers`, which retitles a member record only while it is idle
 (adhoc / blocked / needs-clarification / awaiting-confirm / done) and always updates the hub checklist title). Their child ids are NOT renamed.
 
+### Carried partial work (2026-09-20, brain dump #1334)
+An agentic write pass that lands edits and then runs out of budget is requeued as a *continuation*. Its diff (`priorPartialDiff`) is now **applied to the next pass's fresh worktree**
+(`agentic-draft-common.js` `applyPartialDiff`; text fallback + a correction line if it does not apply) instead of pasted into the prompt. If the pass instead ends in an accepted
+`RESOLUTION: decompose` (continuation cap spent, or the auto-decompose backstop), the diff rides on the parent as `carriedPartialDiff` and `queueSubTasks` gives it to the FIRST surviving
+piece as `priorPartialDiff` (rawText prefixed `PRIOR WORK ALREADY APPLIED`), so every later piece stacks on it -- the pieces describe what REMAINS. A *rejected* decompose that carried work
+re-enters as a continuation on that diff (`reject-retry-check.js`). Both fields are cleared when a pass's captured (cumulative) diff is accepted.
+
 ### Candidate hub specifics (producer 4)
 Pieces are a **linear chain** (`after: i-1`) on one shared stacked branch, because a candidate names one function/file and parallel
 pieces would conflict at merge. Each piece's `rawText` carries `Part i of n`, the candidate `Files:`/`Problem`/`Solution`/`Benefits`

@@ -196,6 +196,7 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     if (k > 0) prevOf.set(i, survivingIndices[k - 1]);
   });
 
+  const carriedDiff = parentTask && typeof parentTask.carriedPartialDiff === 'string' && parentTask.carriedPartialDiff.trim() ? parentTask.carriedPartialDiff : null;
   const queued = [];
   subTasks.forEach((sub, i) => {
     if (foldTargets.has(i)) return; // folded into a sibling's acceptanceCriteria instead of becoming its own no-diff-possible task
@@ -209,6 +210,12 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     if (chained) {
       record.stacked = { branch: chainBranch, seq: seqOf.get(i), total: chainTotal };
       if (prevOf.has(i)) record.dependsOn = [ids[prevOf.get(i)]];
+    }
+    // Work an earlier pass of the parent already landed (agentic-draft-common.js carriedPartialDiff): the pieces describe what REMAINS on top
+    // of it, so the FIRST piece's worktree starts from it (applied as uncommitted changes) and every later piece stacks on the result.
+    if (carriedDiff && i === survivingIndices[0]) {
+      record.priorPartialDiff = carriedDiff;
+      record.promptContext.rawText = `PRIOR WORK ALREADY APPLIED: an earlier pass of the parent task made some of this change. Those edits are applied to your worktree as uncommitted changes -- run git diff to see them, and do NOT redo them. Your job is the part below, on top of them.\n\n${sub.rawText}`;
     }
     const extra = extraCriteria.get(i);
     if (extra && extra.length) record.acceptanceCriteria = extra;
@@ -282,6 +289,8 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
       return { skipped: true, reason: 'RESOLUTION: decompose but no sub-task proposals survived to apply time -- nothing queued' };
     }
     const queued = queueSubTasks(subTasks, pipelineDir, task.id, task);
+    // The diff now lives on the first piece; the hub record must not keep a second, large copy.
+    if (task.carriedPartialDiff) { task.carriedPartialDiffChars = task.carriedPartialDiff.length; delete task.carriedPartialDiff; }
     // The parent does NOT go to done/ -- it becomes a coordinator in queue/coordinating/,
     // tracking its children on a checklist and auto-completing (coordinator-sweep.js) once
     // every child reaches done/. See recordApplyOutcome + apply-task.sh for the routing.

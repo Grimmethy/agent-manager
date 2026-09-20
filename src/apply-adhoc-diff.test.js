@@ -576,3 +576,40 @@ test('applyAdhocDiff throws a clear error on a malformed diff, without leaving a
   const stray = fs.readdirSync(os.tmpdir()).filter((f) => f.includes('apply-test-4'));
   assert.equal(stray.length, 0, 'temp patch file must be cleaned up even on failure');
 });
+
+// --- carriedPartialDiff (2026-09-20) -------------------------------------------------------------------------------------------------------
+test('queueSubTasks hands a decompose\'s carriedPartialDiff to the FIRST surviving piece only, with a "prior work already applied" header', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const diff = 'diff --git a/x.tsx b/x.tsx\n--- a/x.tsx\n+++ b/x.tsx\n@@ -1 +1 @@\n-a\n+b\n';
+  queueSubTasks(
+    [{ title: 'Fix the TDZ', rawText: 'move the hook call up' }, { title: 'Swap call sites', rawText: 'use latLngToPx' }, { title: 'Verify nothing stale remains', rawText: 'Run the tests to confirm' }],
+    pipelineDir, 'parent-carry', { carriedPartialDiff: diff },
+  );
+  const tasks = readQueuedAdhocTasks(pipelineDir).sort((a, b) => a.stacked.seq - b.stacked.seq);
+  assert.equal(tasks.length, 2, 'the verification-only piece folded away');
+  assert.equal(tasks[0].priorPartialDiff, diff);
+  assert.match(tasks[0].promptContext.rawText, /^PRIOR WORK ALREADY APPLIED:/);
+  assert.match(tasks[0].promptContext.rawText, /move the hook call up/);
+  assert.equal(tasks[1].priorPartialDiff, undefined);
+  assert.doesNotMatch(tasks[1].promptContext.rawText, /PRIOR WORK ALREADY APPLIED/);
+});
+
+test('queueSubTasks with no carriedPartialDiff is unchanged', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  queueSubTasks([{ title: 'One', rawText: 'a' }, { title: 'Two', rawText: 'b' }], pipelineDir, 'parent-nocarry', {});
+  for (const t of readQueuedAdhocTasks(pipelineDir)) {
+    assert.equal(t.priorPartialDiff, undefined);
+    assert.doesNotMatch(t.promptContext.rawText, /PRIOR WORK ALREADY APPLIED/);
+  }
+});
+
+test('applyAdhocDiff (decompose) moves the carried diff onto the first piece and does not leave a second copy on the hub record', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const diff = 'diff --git a/x.tsx b/x.tsx\n--- a/x.tsx\n+++ b/x.tsx\n@@ -1 +1 @@\n-a\n+b\n';
+  const task = { id: 'parent-carry-2', adhocResolution: 'decompose', carriedPartialDiff: diff, subTaskProposals: [{ title: 'A', rawText: 'a' }, { title: 'B', rawText: 'b' }] };
+  const res = applyAdhocDiff({ task, repoRoot: os.tmpdir(), pipelineDir });
+  assert.equal(res.coordinating, true);
+  assert.equal(task.carriedPartialDiff, undefined);
+  assert.equal(task.carriedPartialDiffChars, diff.length);
+  assert.equal(readQueuedAdhocTasks(pipelineDir).filter((t) => t.priorPartialDiff === diff).length, 1);
+});

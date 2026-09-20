@@ -754,13 +754,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           '',
           String(task.agenticContinuationNote || '').slice(0, 4000),
           task.priorPartialDiff
-            ? `\nThe partial diff it already produced (build ON this, do not redo it):\n\n${String(task.priorPartialDiff).slice(0, 6000)}`
+            ? '\nThe edits it already made are ALREADY APPLIED to your worktree as uncommitted changes (agentic-draft-common.js applies the carried diff before you start). Run git diff / read the files to confirm what is there; do NOT redo those edits -- build on them.'
             : '',
           '',
           'Start editing with edit_file/write_file within your first 1-2 turns from where it left off. Finish the remaining work and end with RESOLUTION: implemented.',
         ].filter(Boolean).join('\n'));
         delete task.agenticContinuationNote;
-        delete task.priorPartialDiff;
+        // task.priorPartialDiff is KEPT: the next pass applies it to its fresh worktree (agentic-draft-common.js applyPartialDiff) and clears it
+        // once that pass's captured diff (which then includes it) is accepted.
         // keep task.isAgenticContinuation + task.agenticContinuationCount for the cap in
         // agentic-draft-common.js's resolveAgenticDraft on the next pass.
       } else if (retryableDraftBlock && task.rescopedFromDecompose === true && typeof task.rescopedRawText === 'string' && task.rescopedRawText.trim()) {
@@ -883,6 +884,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       if (isReviewRejection(task)) {
         delete task.planResponse;
         delete task.implementResponse;
+        // A REJECTED decompose that carried landed edits (carriedPartialDiff): the split was not wanted, but the work is real. Keep it as the
+        // next pass's starting point (applied to its worktree) instead of losing it -- without this the redraft began from scratch while
+        // lastGoodPlan still described those edits as "already on disk" (PropertyForager wiring piece, 2026-09-20).
+        if (typeof task.carriedPartialDiff === 'string' && task.carriedPartialDiff.trim()) {
+          task.priorPartialDiff = task.carriedPartialDiff;
+          delete task.carriedPartialDiff;
+          priorFeedback.push('The edits an earlier pass already made are kept: they are ALREADY APPLIED to your worktree as uncommitted changes (run git diff to see them). Do not redo them, and implement the rest instead of splitting it up.');
+        }
         // 2026-09-18, ghost-in-the-machine retroactive audit (pipeline_forensics blocked/
         // bucket): blockedStage/blockedReason used to survive this requeue untouched --
         // deliberately, per this branch's own prior comment ("left for priorRejectionFeedback's

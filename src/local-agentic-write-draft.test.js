@@ -528,3 +528,17 @@ test('write tier: turn cap default is 35, env override still wins', async () => 
 // scopeComplexityGate's own generalized-anchor contract is covered in the dedicated
 // scope-complexity-gate.test.js, not duplicated here.
 
+
+// --- partialDiffFallbackPrompt (2026-09-20) -----------------------------------------------------------------------------------------------
+const { partialDiffFallbackPrompt } = require('./local-agentic-write-draft.js');
+
+test('partialDiffFallbackPrompt: an applied prior diff leaves the prompt unchanged; a failed apply appends the diff as text with a correction', () => {
+  const task = { priorPartialDiff: 'diff --git a/x b/x\n+edited' };
+  assert.equal(partialDiffFallbackPrompt('P', task, { partialDiff: { applied: true } }), 'P');
+  assert.equal(partialDiffFallbackPrompt('P', task, undefined), 'P');
+  assert.equal(partialDiffFallbackPrompt('P', {}, { partialDiff: { applied: false } }), 'P', 'nothing to hand over');
+  const out = partialDiffFallbackPrompt('P', task, { partialDiff: { applied: false, reason: 'does not apply' } });
+  assert.match(out, /^P\n\nCORRECTION:/);
+  assert.match(out, /do NOT hold for this run|does NOT hold for this run/);
+  assert.match(out, /diff --git a\/x b\/x/);
+});

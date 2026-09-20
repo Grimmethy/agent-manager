@@ -463,6 +463,15 @@ function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } =
 //
 // Returns a verdict-shaped object to return from the caller on a successful split, or
 // null if no split happened (caller should return the original verdict as-is).
+// A continuation's prior edits are normally APPLIED to the fresh worktree (agentic-draft-common.js applyPartialDiff) and the requeue note says so.
+// When applying them failed (the base moved), that note is wrong for this run: hand the model the diff as text and say plainly the edits are NOT
+// on disk. Otherwise the prompt is unchanged.
+function partialDiffFallbackPrompt(prompt, task, info) {
+  const partial = info && info.partialDiff;
+  if (!partial || partial.applied || typeof task.priorPartialDiff !== 'string' || !task.priorPartialDiff.trim()) return prompt;
+  return `${prompt}\n\nCORRECTION: any note above saying a prior pass's edits are already applied does NOT hold for this run -- they could not be applied automatically. Re-apply them yourself, from this diff, then finish the remaining work:\n\n${task.priorPartialDiff.slice(0, 6000)}\n`;
+}
+
 async function runGiveUpSplit(task, verdict) {
   const autoN = Number(task.autoDecomposeCount) || 0;
   const repeatedDecompose = (Number(task.decomposeBlockCount) || 0) >= 2;
@@ -495,6 +504,13 @@ async function runGiveUpSplit(task, verdict) {
   // (needs-human-decision / no-RESOLUTION forced summary) -- clear it so recordApplyOutcome
   // routes this to the decompose/coordinator path, not queue/needs-clarification/.
   delete task.needsClarification;
+  // The pieces were written after a pass that had already landed these edits: carry them to the first piece (queueSubTasks) instead of
+  // discarding them. The give-up verdict's own capture is the most complete (it includes everything applied at the start of that pass).
+  const carried = verdict.capturedDiff || task.priorPartialDiff;
+  if (carried) {
+    task.carriedPartialDiff = carried;
+    task.implementResponse += '\n\n(NOTE: the partial edits an earlier pass landed are CARRIED into the first sub-task\'s worktree; the pieces above describe what REMAINS on top of them.)';
+  }
   delete task.priorPartialDiff;
   delete task.isAgenticContinuation;
   return {
@@ -617,9 +633,12 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   const prompt = buildWriteAgenticPrompt(task, { orientTurnLimit });
   const started = Date.now();
 
-  const doRun = runInWorktree || (async (worktreeDir) => {
+  const doRun = runInWorktree || (async (worktreeDir, info) => {
+    // A continuation's prior edits are normally APPLIED to this worktree (agentic-draft-common.js applyPartialDiff) and the requeue note says
+    // so. When that failed, the note is wrong for this run: hand the model the diff as text and say the edits are NOT on disk.
+    const runPrompt = partialDiffFallbackPrompt(prompt, task, info);
     const result = await runPlan({
-      prompt,
+      prompt: runPrompt,
       maxTurns: LOCAL_AGENTIC_WRITE_MAX_TURNS,
       source: task.source,
       taskId: task.id,
@@ -668,5 +687,5 @@ function modelStatsSafe(fn, args) {
 module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
   isLeafTask, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
-  detectExternalDependency, scopeComplexityGate, EXTERNAL_DEP_MARKERS,
+  detectExternalDependency, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
 };

@@ -311,6 +311,26 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
   return { ok: true };
 }
 
+// Applies the partial diff an earlier pass landed (task.priorPartialDiff) to the FRESH worktree as uncommitted changes, so a continuation
+// builds ON the edits instead of re-deriving them from a text description -- the redo is what burned each continuation's context
+// (PropertyForager wiring piece, 2026-09-20: 5 attempts, each re-applying the same imports/deletions before reaching new work). The diff is
+// captured `--full-index --binary` (bestEffortDiff), so `git apply` reproduces it exactly; git apply is all-or-nothing, so a failure leaves
+// the worktree untouched. Never throws: { applied, chars, reason }.
+function applyPartialDiff(worktreeDir, diff) {
+  const text = typeof diff === 'string' ? diff : '';
+  if (!text.trim()) return { applied: false, chars: 0, reason: 'empty' };
+  const file = path.join(os.tmpdir(), `agent-manager-partial-${process.pid}-${Date.now()}.patch`);
+  try {
+    fs.writeFileSync(file, text.endsWith('\n') ? text : `${text}\n`);
+    runGit(['apply', '--binary', '--whitespace=nowarn', file], worktreeDir);
+    return { applied: true, chars: text.length };
+  } catch (e) {
+    return { applied: false, chars: text.length, reason: String((e && e.message) || e).slice(0, 300) };
+  } finally {
+    try { fs.unlinkSync(file); } catch { /* best-effort */ }
+  }
+}
+
 function cleanupAdhocWorktree(resolvedRepoRoot, worktreeDir, branchName) {
   try { runGit(['worktree', 'remove', '--force', worktreeDir], resolvedRepoRoot); } catch (e) { console.error('[draft-cleanup] git worktree remove', worktreeDir, e.message, e.stack); }
   try { runGit(['branch', '-D', branchName], resolvedRepoRoot); } catch (e) { console.error('[draft-cleanup] git branch -D', branchName, e.message, e.stack); }
@@ -336,7 +356,15 @@ async function runAgenticDraftInWorktree(task, { runInWorktree, modelLabel, repo
   if (!prep.ok) return { succeeded: false, reason: prep.reason };
 
   try {
-    const result = await runInWorktree(worktreeDir);
+    // Continuation / carried-work: put the earlier pass's landed edits on disk before the model starts (see applyPartialDiff).
+    let partialDiff = null;
+    if (typeof task.priorPartialDiff === 'string' && task.priorPartialDiff.trim()) {
+      partialDiff = applyPartialDiff(worktreeDir, task.priorPartialDiff);
+      appendHistoryEvent(task, 'advisory', partialDiff.applied
+        ? `prior partial diff (${partialDiff.chars} chars) applied to the worktree -- the pass builds on it instead of redoing it`
+        : `prior partial diff could NOT be applied to the worktree (${partialDiff.reason}) -- falling back to the text description`);
+    }
+    const result = await runInWorktree(worktreeDir, { partialDiff });
     return resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedForTurnBudget });
   } finally {
     cleanupAdhocWorktree(resolvedRepoRoot, worktreeDir, branchName);
@@ -548,11 +576,12 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     task.adhocResolution = resolution;
     task.subTaskProposals = subTasks;
     task.rawDiff = '';
-    // Keep the partial-work note visible for the sub-task drafters / a human even when the
-    // split is finally accepted -- the diff itself is not carried (the pieces re-derive it
-    // against current code), but "an earlier pass got this far" is worth stating.
+    // The pieces were written by a pass whose worktree ALREADY HAD the partial edits, so they describe what REMAINS. Dropping the diff left
+    // pieces that assume imports/calls no branch contains (PropertyForager HUB0003, 2026-09-20). The diff rides on the task as
+    // carriedPartialDiff; queueSubTasks (apply-adhoc-diff.js) hands it to the first piece, whose worktree starts from it.
+    if (decomposeDiff) task.carriedPartialDiff = decomposeDiff;
     task.implementResponse = decomposeDiff
-      ? `${summary}\n\n(NOTE: an earlier pass made partial edits before this split; they were not carried forward -- each sub-task starts from current \`main\`.)`
+      ? `${summary}\n\n(NOTE: an earlier pass made partial edits before this split; they are CARRIED into the first sub-task's worktree, so the sub-tasks describe what REMAINS to be done on top of them, not the whole change.)`
       : summary;
     return { succeeded: true, blocked: false, ...meta };
   }
@@ -750,6 +779,9 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
 
   task.adhocResolution = resolution;
   task.rawDiff = trimmedDiff;
+  // The captured diff is cumulative (the worktree started with the prior partial diff applied), so it now carries that work.
+  delete task.priorPartialDiff;
+  delete task.carriedPartialDiff;
   task.implementResponse = task.rawDiff
     ? `${summary}\n\n=== DIFF ===\n${task.rawDiff}`
     : summary;
@@ -828,7 +860,7 @@ function summariseInvestigation(responseText, toolCallLog) {
 module.exports = {
   GIT_ENV, GIT_TIMEOUT_MS, runGit, priorRejectionBlock,
   RESOLUTION_RE, parseSubTaskProposals, formatSubTaskProposalsForReview, parseClarificationOptions, extractFirstJsonArray,
-  agenticWorktreePaths, prepareAdhocWorktree, cleanupAdhocWorktree,
+  agenticWorktreePaths, prepareAdhocWorktree, cleanupAdhocWorktree, applyPartialDiff,
   runAgenticDraftInWorktree, resolveAgenticDraft,
   summariseInvestigation,
   BLOCKER_TYPE_RE,
