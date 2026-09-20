@@ -200,10 +200,20 @@ function candidateDocPath(entry) {
   try { return typeof entry.candidatesPath === 'function' ? entry.candidatesPath() : entry.candidatesPath; } catch { return null; }
 }
 
+// Say WHAT is wrong with an unmet dependency. "Not merged" was misleading for the one case that never resolves by itself: a
+// dependency task archived by hand with no outcome recorded (2026-09-19, arch-review-ac-6/-7) -- nothing will ever merge it.
+function dependencyReason(dep, ts) {
+  if (ts && ts.state === 'archived' && ts.disposition === 'unclassified') {
+    return `depends on ${dep}, whose task was archived with no outcome recorded -- if the work was done by hand, close it with src/manual-close.js`;
+  }
+  if (!ts) return `depends on ${dep}, which is not merged (no task for it yet)`;
+  return `depends on ${dep}, which is not merged`;
+}
+
 // Why a Strong candidate with no task will NOT be picked up -- the same filters nextCandidateFulfillmentTask applies
 // (sdk/lib/candidate-lifecycle.js), in the same order. null = eligible.
-function ineligibleReason(c, { prefix, isDependencySatisfied, maxChars }) {
-  if (c.dependsOn && isDependencySatisfied && !isDependencySatisfied(`${prefix}-${c.dependsOn.toLowerCase()}`)) return `depends on ${c.dependsOn}, which is not merged`;
+function ineligibleReason(c, { prefix, isDependencySatisfied, maxChars, taskState = null }) {
+  if (c.dependsOn && isDependencySatisfied && !isDependencySatisfied(`${prefix}-${c.dependsOn.toLowerCase()}`)) return dependencyReason(c.dependsOn, taskState && taskState(`${prefix}-${c.dependsOn.toLowerCase()}`));
   if (c.chars > maxChars) return `oversized: ${c.chars} chars > the ${maxChars}-char limit -- the fulfillment step skips it forever; it needs narrowing`;
   if (c.placeholder) return 'placeholder Problem/Solution body';
   return null;
@@ -227,7 +237,7 @@ function inventoryCandidateDoc({ sourceName, entry, taskState, repoRoot, isDepen
     else if (ts) status = IN_FLIGHT.includes(ts.state) ? 'queued' : NEEDS_HUMAN.includes(ts.state) ? 'blocked' : 'done';
     else if (String(c.strength).trim() !== 'Strong') status = 'not-actionable';
     else {
-      reason = ineligibleReason(c, { prefix, isDependencySatisfied, maxChars });
+      reason = ineligibleReason(c, { prefix, isDependencySatisfied, maxChars, taskState });
       status = reason ? 'ineligible' : 'waiting';
     }
     items.push({ id, n: c.n, title: c.title, strength: c.strength, files: c.files, chars: c.chars, status, reason, location, taskState: ts ? ts.state : null, disposition: ts ? ts.disposition : null });

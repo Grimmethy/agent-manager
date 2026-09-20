@@ -216,3 +216,16 @@ test('the metadata cache is keyed by mtime+size: a changed file is re-read, and 
   assert.equal(after.families.find((f) => f.key === 'observability').tasks.done.merged, 1);
   assert.equal(after.families.find((f) => f.key === 'observability').tasks.done.dismissed, undefined);
 });
+
+test('buildHygieneInventory: a dependency whose task was archived with no outcome says so (and points at manual-close), not "not merged"', () => {
+  const { work, doc } = docRepo();
+  const pipe = fs.mkdtempSync(path.join(os.tmpdir(), 'hyginv-pipe5-'));
+  writeTask(path.join(pipe, 'queue'), 'done/_archived_no_action', 'arch-review-ac-9', { source: 'arch_review' });
+  const r = fakeRegistry();
+  r.register('arch_review', { candidatesPath: () => doc });
+  const inv = buildHygieneInventory({ getRegisteredSource: r.getRegisteredSource, getConfig: () => ({ repoRoot: work, pipelineDir: pipe }), isDependencySatisfied: () => false });
+  const item = inv.families.find((f) => f.key === 'arch').candidates.docs[0].items.find((i) => i.id === 'AC-3');
+  assert.equal(item.status, 'ineligible');
+  assert.match(item.reason, /depends on AC-9, whose task was archived with no outcome recorded/);
+  assert.match(item.reason, /manual-close\.js/);
+});
