@@ -70,7 +70,7 @@ const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { isClaudePaused } = require('./claude-pause.js');
 const { writeHeartbeatFile } = require('./heartbeat.js');
-const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('./gpu-capacity.js');
+const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { postJson } = require('./ollama-http.js');
 const { checkOllamaReachable } = require('./ollama-health.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
@@ -83,7 +83,7 @@ const { usesGroupB } = require('./lib/apply-core.js');
 const { canonicalizeEdits } = require('./lib/find-canonicalize.js');
 const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch } = require('./lib/draft-context.js');
 const { computePlanNumPredict, tryDeterministicScriptExtractEdit, tryDeterministicOnePassDecompose, tryDeterministicNodeModuleDecompose, tryDeterministicBlueprintDecompose, tryDeterministicLiteralEdit } = require('./lib/deterministic-extract.js');
-const { runCritiqueAndRevision, ensureHeadroomForExtendedContext, computeImplementBudget, callImplementModel } = require('./lib/implement-critique.js');
+const { runCritiqueAndRevision, computeImplementBudget, callImplementModel } = require('./lib/implement-critique.js');
 
 // 2026-09-08, Grimmethy: "fix worker-1" -- see gpu-arbiter.js's own header for the
 // incident (worker-1's qwen2.5:3b starved into repeated hard OLLAMA_TIMEOUTs by
@@ -819,34 +819,6 @@ async function runPlanPass(task, {
 // model does the judgment and measurably made it worse), this changes nothing about
 // model choice or the judgment itself -- it only removes a self-review layer already
 // shown, on real data, to almost never do anything.
-// 2026-09-07, Grimmethy: "If we need to go higher the task can request the 3b model be
-// dropped until the end of that task." A call using EXTENDED_NUM_CTX (see gpu-capacity.js's
-// own comment on it) doesn't fit on this box alongside the resident qwen2.5:3b utility
-// model -- explicitly evict it first via keep_alive:0 rather than letting Ollama's own
-// conservative peak-VRAM safety margin discover the collision mid-load, which is the exact
-// eviction/reload livelock this same session's launch.sh pre-warm fix was written to avoid
-// for the OTHER load-order case. Best-effort: a failed unload just means the upcoming
-// extended-context call may itself trigger Ollama's own eviction instead, no worse than
-// before this existed, so this must never throw or block the real call.
-//
-// 2026-09-08, Grimmethy: "I'd like to see an audit log for this error. Please harden the
-// eviction path" -- root-caused live: worker-1 and worker-reasoning both stacked up
-// repeated OLLAMA_TIMEOUTs (150s ceiling) while `ollama ps` showed ZERO models resident
-// and a fresh llama-server was cold-loading the 27B model's tensors from disk. This
-// function was the prime suspect (evicts the small model to make room, best-effort and
-// entirely UNLOGGED, so there was no way to confirm it after the fact) but couldn't be
-// proven from the audit trail that existed at the time. Two changes:
-//   1. logPipelineEvent (unified NDJSON stream, same as hard-failure/degenerate/
-//      context-budget) now records every real eviction attempt -- taskId, source,
-//      implNumCtx, the model evicted, and whether the eviction call itself succeeded --
-//      so the NEXT time this exact symptom recurs, `grep model-eviction
-//      instances/pipeline-history.log` answers "was this the cause?" directly instead of
-//      needing a live nvidia-smi/journalctl investigation to infer it.
-//   2. Returns `{ evicted }` so the caller can warn its own next real call that a cold
-//      reload is now likely -- see callImplementModel's own coldLoadExpected use just
-//      below, which adds a generous timeout bump specifically for that one call instead
-//      of leaving it to race the same 150-240s ceiling a fresh multi-minute tensor load
-//      from disk has no chance of finishing inside.
 // Token budget for the implement pass: how many tokens it may generate (implNumPredict),
 // the context window that has to hold prompt + thinking trace + that output (implNumCtx),
 // whether the task carries fixedLiterals to transcribe verbatim (hasFixedLiterals), and
@@ -1043,7 +1015,6 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   const implPrompt = buildImplementPrompt(task, task.planResponse);
   const budget = computeImplementBudget(task, implPrompt);
   const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
-  const { evicted: coldLoadExpected } = await ensureHeadroomForExtendedContext(implNumCtx, task);
 
   // Bookend to 'implement-done' below -- same -started/-done pairing plan/critique/review
   // have. A single implement call can legitimately run close to its timeout; with the
@@ -1051,7 +1022,7 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   // ending at 'plan-done'.
   appendHistoryEvent(task, 'implement-started', hasFixedLiterals ? 'fixed-literals implement pass' : 'implement pass');
   const implCallStartMs = Date.now();
-  let implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected });
+  let implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget });
   let implLatencyMs = Date.now() - implCallStartMs;
 
   if (implResult.degenerate) {
@@ -1080,7 +1051,7 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     task.oversizedImplementRetried = true;
     const strictPrompt = buildImplementPrompt(task, task.planResponse, { strictCite: true });
     const retryStartMs = Date.now();
-    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt: strictPrompt, budget, coldLoadExpected: false });
+    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt: strictPrompt, budget });
     const retryLatencyMs = Date.now() - retryStartMs;
     appendHistoryEvent(
       task,
@@ -1176,7 +1147,7 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   if (!task.nonCompliantImplementRetried && !isImplementOutputCompliant(task, task.implementResponse)) {
     task.nonCompliantImplementRetried = true;
     console.warn(`[local-draft] non-compliant implement output (missing JSON and missing FALSE POSITIVE token) -- retrying once, task=${task.id}, source=${task.source}`);
-    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected: false });
+    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget });
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
       canonicalizeImplementFinds(task);
@@ -1550,7 +1521,7 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, ensureHeadroomForExtendedContext, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard };
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on

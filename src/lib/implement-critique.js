@@ -15,11 +15,8 @@ const { usesGroupB } = require('./apply-core.js');
 const { parseJsonMaybeFenced } = require('../json-fence.js');
 const { selectAbModel } = require('../ab-model-select.js');
 const { resolveStrategy } = require('../model-strategies.js');
-const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('../gpu-capacity.js');
-const { postJson } = require('../ollama-http.js');
-const { logPipelineEvent } = require('../pipeline-history.js');
+const { PINNED_NUM_CTX } = require('../gpu-capacity.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('../local-client.js');
-const { getModelProfile } = require('../model-profile-registry.js');
 const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./harness-search.js');
 
 // For a Group B source (JSON edits, or the FALSE POSITIVE escape line) the revision must still be that shape. Any other source's
@@ -184,31 +181,6 @@ async function runCritiqueAndRevision(task, {
   appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
 }
 
-async function ensureHeadroomForExtendedContext(implNumCtx, task) {
-  if (!(implNumCtx > PINNED_NUM_CTX)) return { evicted: false };
-  const smallModel = getModelProfile('brain-dump-cheap-local')?.model;
-  if (!smallModel) return { evicted: false };
-  const ollamaUrl = process.env.OLLAMA_URL || 'http://localhost:11434';
-  let succeeded = false;
-  let errorMessage = null;
-  try {
-    await postJson(`${ollamaUrl}/api/generate`, { model: smallModel, keep_alive: 0 }, 10_000);
-    succeeded = true;
-  } catch (err) {
-    // best-effort -- see comment above -- but still logged below either way.
-    errorMessage = String((err && err.message) || err).slice(0, 300);
-  }
-  try {
-    const { pipelineDir } = getConfig();
-    logPipelineEvent(pipelineDir, 'model-eviction', {
-      taskId: task && task.id, source: task && task.source, implNumCtx,
-      evictedModel: smallModel, succeeded, errorMessage,
-      instanceId: process.env.AGENT_MANAGER_INSTANCE_ID || null,
-    });
-  } catch { /* best-effort -- see logPipelineEvent's own header */ }
-  return { evicted: succeeded };
-}
-
 function computeImplementBudget(task, implPrompt) {
   // A fixedLiterals task must reproduce that content verbatim, character for
   // character, inside a JSON string value -- JSON-string-escaping alone (every
@@ -329,7 +301,8 @@ function computeImplementBudget(task, implPrompt) {
   // computed need is almost always below the floor anyway; only the whole-document
   // sources (product_spec family, implNumPredict up to 16000) still grow past it, and a
   // one-time reload there beats a truncated spec.
-  const implNumCtx = Math.min(EXTENDED_NUM_CTX, Math.max(PINNED_NUM_CTX, Math.ceil(implPrompt.length / 3) + implNumPredict + 2048));
+  // 2026-09-20: PINNED_NUM_CTX is now large enough (49152) for every source's implement pass, so this is always the one pinned value.
+  const implNumCtx = PINNED_NUM_CTX;
   // Several sources' implement prompts explicitly tell the local model to output the empty
   // string when nothing genuinely applies (see prompts.js) -- an empty response from
   // them is a valid, intended answer, not a failed call, so the degenerate-output
@@ -375,21 +348,11 @@ function computeImplementBudget(task, implPrompt) {
   };
 }
 
-async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected = false }) {
+async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget }) {
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
   const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
   const implStartedAt = new Date().toISOString();
   const implStartMs = Date.now();
-  // coldLoadExpected (2026-09-08, see ensureHeadroomForExtendedContext's own header for
-  // the incident): ensureHeadroomForExtendedContext just evicted the small model to make
-  // room for THIS call, so a cold multi-minute tensor reload from disk is now likely --
-  // give this one call extra headroom on top of the normal throughput-based ceiling
-  // rather than let it race the same 150-240s window a fresh load has no chance of
-  // finishing inside. COLD_LOAD_TIMEOUT_BUMP_MS (3 min) is a real observed load time for
-  // the 18GB q4_K_M model this eviction path exists for.
-  const COLD_LOAD_TIMEOUT_BUMP_MS = 180_000;
-  const coldLoadTimeoutMs = coldLoadExpected ? PER_CALL_TIMEOUT_CEILING_MS + COLD_LOAD_TIMEOUT_BUMP_MS : undefined;
-
   // A/B candidate selection for the implement pass ONLY (2026-08-19, port of
   // local-worker.ps1's Select-AbModel -- see ab-model-select.js's own header for why
   // this had zero real callers on Linux until now). LOCAL_AB_MODELS is a
@@ -429,7 +392,7 @@ async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budg
       model: abModel,
     }), 'implement');
   } else {
-    implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement', timeoutMs: coldLoadTimeoutMs }), 'implement');
+    implResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: 0.4, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement' }), 'implement');
   }
 
   // Records this implement-pass call into model-stats.db (powers the dashboard's
@@ -471,4 +434,4 @@ async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budg
   return implResult;
 }
 
-module.exports = { revisionKeepsAnswerShape, runCritiqueAndRevision, ensureHeadroomForExtendedContext, computeImplementBudget, callImplementModel };
+module.exports = { revisionKeepsAnswerShape, runCritiqueAndRevision, computeImplementBudget, callImplementModel };
