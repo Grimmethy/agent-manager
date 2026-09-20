@@ -22,6 +22,8 @@ const { wireDecomposedBlueprints } = require('./wire-decomposed-blueprints.js');
 const { taskCommitOnMain, STABLE_TERMINAL_STAGES } = require('./task-disposition.js');
 const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
+const { hubHasUnmergedEarlierSibling } = require('./hub-priority.js');
+const { restackHubChain } = require('./hub-restack.js');
 
 // On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
 // verified mechanical move child's branch to main itself, instead of a human clicking
@@ -181,6 +183,23 @@ function classifyChildStatus(rec) {
 // 'pending-merge' -- a child still awaiting merge is NOT done) instead of a second,
 // independently-hand-maintained list that can drift out of sync with it again.
 const TERMINAL_GOOD = new Set(['done', 'gone', ...STABLE_TERMINAL_STAGES]);
+
+// The phase a child is in, for the hub's checklist and progress. THE one definition -- the dashboard reads `subTasks[].phase` (and
+// `progress`) off the hub record instead of keeping its own status set (python/dashboard/app.py had one that had drifted: no noop /
+// dismissed / filed / superseded, and no notion of "built").
+//   merged  finished AND landed or closed (counts toward `done`; this is what completes a hub)
+//   built   finished, code committed on the hub's branch (or its own), waiting on a merge -- real progress, shown as such, but it does
+//           NOT complete the hub (2026-09-20 gripe: a hub of pending-merge pieces read "0/3 done" for its whole life and never "ready
+//           to merge"). For a strict-merge hub a bare `done` is also only built.
+//   open    anything still in flight or stuck
+function childPhase(status, strictMergeHub = false) {
+  if (strictMergeHub) {
+    if (status === 'merged' || status === 'gone' || status === 'abandoned') return 'merged';
+    return status === 'done' || status === 'pending-merge' ? 'built' : 'open';
+  }
+  if (TERMINAL_GOOD.has(status)) return 'merged';
+  return status === 'pending-merge' ? 'built' : 'open';
+}
 
 // A child in one of these cannot progress on its own -- the pipeline has given up on it and
 // is waiting for a human. If a sibling `dependsOn` one of these, that sibling is frozen
@@ -350,6 +369,23 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
       recById.set(st && st.id, rec);
       st.status = classifyChildStatus(rec);
     }
+    // A hub built before "one hub = one stacked chain" may be mixed (some pieces stacked, some independent and stuck behind a merge):
+    // put its not-yet-started pieces onto the chain (hub-restack.js). Before the held-marker below, which reads the fresh fields.
+    try {
+      const restacked = restackHubChain(parent, recById);
+      if (restacked.length) { summary.restacked = (summary.restacked || 0) + restacked.length; appendHistoryEvent(parent, 'advisory', `restacked ${restacked.length} piece(s) onto the hub's shared branch`); }
+    } catch { /* repair is best-effort */ }
+    // A piece that is only waiting for an earlier sibling to land (hub-priority.js hubHasUnmergedEarlierSibling) reads 'in-progress' and
+    // looks stuck; say what it is waiting for so the checklist is honest. Computed after every status above is fresh (the check reads
+    // sibling statuses off `parent`), and cleared as soon as the piece is released.
+    for (const st of parent.subTasks) {
+      const rec = st && st.id ? recById.get(st.id) : null;
+      let held = null;
+      if (st && st.status === 'in-progress' && rec && rec.task) {
+        try { const h = hubHasUnmergedEarlierSibling(pipelineDir, rec.task, parent); if (h.blocked) held = { id: h.blockingSiblingId, status: h.blockingSiblingStatus }; } catch { /* advisory */ }
+      }
+      if (st && held) st.heldFor = held; else if (st) delete st.heldFor;
+    }
 
     // A non-stacked decompose hub: its move children carry no dependsOn, so nothing else
     // reconciles their merge. Confirm each `done` child against origin/<main>'s commit
@@ -361,13 +397,13 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
     }
 
     let doneCount = 0;
+    let builtCount = 0;
     for (const st of parent.subTasks) {
-      const terminal = strictMergeHub
-        ? (st.status === 'merged' || st.status === 'gone' || st.status === 'abandoned') // bare `done` is NOT enough here
-        : TERMINAL_GOOD.has(st.status);
-      if (terminal) doneCount += 1;
+      st.phase = childPhase(st.status, strictMergeHub); // bare `done` is NOT enough to complete a strict-merge hub
+      if (st.phase === 'merged') { doneCount += 1; builtCount += 1; } else if (st.phase === 'built') builtCount += 1;
     }
-    parent.progress = { done: doneCount, total: parent.subTasks.length };
+    // done = merged/closed (completion, unchanged); built = done + finished-but-awaiting-merge (what the UI shows as progress).
+    parent.progress = { done: doneCount, built: builtCount, total: parent.subTasks.length };
     parent.lastReconciledAt = new Date().toISOString();
 
     // Stuck-chain detection: surface a hub that can never complete on its own instead of
@@ -554,7 +590,7 @@ function moveToDone(srcFile, doneDir, name, parent) {
   } catch { /* best-effort -- next tick retries */ }
 }
 
-module.exports = { coordinatorSweep, classifyChildStatus, findStuckChildren, TERMINAL_GOOD, sanitizeTaskDisposition };
+module.exports = { coordinatorSweep, classifyChildStatus, childPhase, findStuckChildren, TERMINAL_GOOD, sanitizeTaskDisposition };
 
 if (require.main === module) {
   const { pipelineDir, repoRoot } = getConfig();

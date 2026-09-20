@@ -80,6 +80,7 @@ const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomai
 const { candidateSplitToHubEnabled } = require('./lib/candidate-split-route.js');
 const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./lib/harness-search.js');
 const { usesGroupB } = require('./lib/apply-core.js');
+const { canonicalizeEdits } = require('./lib/find-canonicalize.js');
 const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch } = require('./lib/draft-context.js');
 const { computePlanNumPredict, tryDeterministicScriptExtractEdit, tryDeterministicOnePassDecompose, tryDeterministicNodeModuleDecompose, tryDeterministicBlueprintDecompose, tryDeterministicLiteralEdit } = require('./lib/deterministic-extract.js');
 const { runCritiqueAndRevision, ensureHeadroomForExtendedContext, computeImplementBudget, callImplementModel } = require('./lib/implement-critique.js');
@@ -857,6 +858,21 @@ async function runPlanPass(task, {
 // or blocked history event. Returns { done: true, result } when it fully resolved the
 // task (a valid split, or a blocked invalid split), else { done: false } so the caller
 // falls through to critique.
+// A Group B `find` that differs from the file only by typographic characters (curly quotes, en/em dashes, non-breaking spaces -- the
+// model writes straight quotes, or a literal \u201c escape, for the file's real “ ”) is rewritten to the file's real text, and the
+// replacement gets the same characters back. See lib/find-canonicalize.js (PF function-length-fix-ac-3). Runs on the implement output
+// and again on any retry, before the verbatim-find check below would reject it.
+function canonicalizeImplementFinds(task) {
+  try {
+    const canon = canonicalizeEdits(task.implementResponse, task.promptContext && task.promptContext.fetchedFiles);
+    if (!canon.changed) return;
+    task.implementResponse = canon.text;
+    appendHistoryEvent(task, 'advisory', `canonicalized ${canon.fixes.length} find string(s) to the file's real typography: ${canon.fixes.map((f) => `${f.file} (${f.changedChars} char(s))`).join(', ')}`);
+  } catch (e) {
+    console.warn('[local-draft] find canonicalization failed (advisory):', (e && e.message) || e);
+  }
+}
+
 async function finalizeCandidateFulfillment(task, {
   maybeLocked, maybeLockedOn, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
 }, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
@@ -931,6 +947,7 @@ async function finalizeCandidateFulfillment(task, {
     concludeDraft(task);
     return { done: true, result: { succeeded: true, blocked: false } };
   }
+  canonicalizeImplementFinds(task);
   const anchorSnippet = extractCandidateSnippet(task.promptContext && task.promptContext.body);
   const unverified = findUnverifiedEdit(
     task.implementResponse,
@@ -965,6 +982,7 @@ async function finalizeCandidateFulfillment(task, {
     const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry' }), 'implement-retry');
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
+      canonicalizeImplementFinds(task);
     }
     const note = `retried once (${unverified.problem})`;
     recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note, promptVariant: 'strict-cite' });
@@ -979,6 +997,7 @@ async function finalizeCandidateFulfillment(task, {
     const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry' }), 'implement-retry');
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
+      canonicalizeImplementFinds(task);
     }
     appendHistoryEvent(task, 'implement-retry', 'non-compliant output (missing JSON and missing FALSE POSITIVE token) -- retried once before critique');
   }
@@ -1160,6 +1179,7 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget, coldLoadExpected: false });
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
+      canonicalizeImplementFinds(task);
     }
     appendHistoryEvent(task, 'implement-retry', 'non-compliant output (missing JSON and missing FALSE POSITIVE token) -- retried once before critique');
   }

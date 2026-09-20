@@ -168,14 +168,20 @@ function renderSubTaskChecklist(task) {
   if (!subs.length) return '';
   const total = task.progress && task.progress.total != null ? task.progress.total : subs.length;
   const done = task.progress && task.progress.done != null ? task.progress.done : 0;
-  const pct = total ? Math.round((done / total) * 100) : 0;
+  // built = merged/closed + finished-but-awaiting-merge (coordinator-sweep.js childPhase). Older hub records carry only `done`.
+  const built = task.progress && task.progress.built != null ? Math.max(task.progress.built, done) : done;
+  const donePct = total ? Math.round((done / total) * 100) : 0;
+  const builtPct = total ? Math.round((built / total) * 100) : 0;
   const rows = subs.map((st) => {
     const [cls, label] = SUBTASK_STATUS_META[st.status] || ['idle', st.status || 'pending'];
     return `<div class="task-history-row"><span class="badge ${cls}">${escapeHtml(label)}</span> `
-      + `${taskLink(st.id)} ${escapeHtmlBright(st.title || '')}</div>`;
+      + `${taskLink(st.id)} ${escapeHtmlBright(st.title || '')}`
+      + (st.heldFor ? ` <span class="meta" title="Held until this earlier piece of the hub lands on main">held: waiting for ${taskLink(st.heldFor.id)} (${escapeHtml(st.heldFor.status || '?')})</span>` : '') + `</div>`;
   }).join('');
-  return `<div class="field-label">Sub-tasks (${done} / ${total})</div>`
-    + `<div class="bar-track" style="margin:2px 0 8px"><div class="bar-fill" style="width:${pct}%; background:var(--ok)"></div></div>`
+  const summary = built > done ? `${built} / ${total} built · ${done} merged` : `${done} / ${total}`;
+  const ready = total > 0 && built === total && !task.coordinatorBlocked;
+  return `<div class="field-label">Sub-tasks (${summary})${ready ? ' <span class="badge ok" title="Every piece is built; the hub lands as one merge">✓ ready to merge</span>' : ''}</div>`
+    + `<div class="bar-track" style="margin:2px 0 8px; position:relative"><div class="bar-fill" style="position:absolute; width:${builtPct}%; background:var(--accent, #5b9dff); opacity:0.55" title="built (finished, awaiting merge)"></div><div class="bar-fill" style="position:absolute; width:${donePct}%; background:var(--ok)" title="merged"></div></div>`
     + `<div class="task-history">${rows}</div>`;
 }
 

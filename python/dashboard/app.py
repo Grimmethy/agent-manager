@@ -995,6 +995,8 @@ def task_summary(data: dict, filename: str) -> dict:
         # shows the "N of M" from `progress` without a per-row round-trip.
         "subTasks": data.get("subTasks"),
         "progress": data.get("progress"),
+        # For the Hub Tasks row's "ready to merge" (needs the stacked-hub integration gate's status as well as the piece counts).
+        "integrationGate": data.get("integrationGate"),
         # Operator-set integer on a coordinating hub (LOWER = more urgent), stamped by
         # POST /api/task-anywhere/<id>/hub-priority. Drives the Hub Tasks tab's default
         # sort AND the worker claim order for that hub's children (src/hub-priority.js).
@@ -2995,8 +2997,6 @@ _TASK_TRAILER_RE = re.compile(r"^Task:\s*(\S+)", re.MULTILINE)
 
 # Task states a hub child is "finished" in, for progress + readiness (mirrors
 # coordinator-sweep.js's TERMINAL_GOOD).
-_HUB_CHILD_DONE = {"done", "merged", "gone", "abandoned"}
-
 
 def _is_real_ship(rec):
     """Whether a done-queue task REALLY shipped code (2026-08-25, "24 of 25 'shipped'
@@ -3118,11 +3118,28 @@ def _summarize_task_record(data, state):
     }
 
 
+# Fallback ONLY for a hub record the coordinator has not re-swept since `subTasks[].phase` was introduced (it is rewritten every tick, so this
+# is transient). The real definition is coordinator-sweep.js's childPhase(); the sets below mirror it for statuses that were already there.
+_HUB_LEGACY_MERGED = {"done", "gone", "merged", "applied-direct", "filed", "dismissed", "noop", "abandoned", "superseded"}
+
+
+def _hub_child_phase(st):
+    phase = st.get("phase")
+    if phase in ("merged", "built", "open"):
+        return phase
+    status = st.get("status")
+    if status in _HUB_LEGACY_MERGED:
+        return "merged"
+    return "built" if status == "pending-merge" else "open"
+
+
 def _summarize_hub(data, state):
-    subs = data.get("subTasks") or []
-    done_n = sum(1 for st in subs if isinstance(st, dict) and st.get("status") in _HUB_CHILD_DONE)
+    subs = [st for st in (data.get("subTasks") or []) if isinstance(st, dict)]
+    phases = [_hub_child_phase(st) for st in subs]
+    done_n = sum(1 for p in phases if p == "merged")
+    built_n = sum(1 for p in phases if p in ("merged", "built"))
     gate = data.get("integrationGate") or {}
-    all_children_done = len(subs) > 0 and done_n == len(subs)
+    all_children_built = len(subs) > 0 and built_n == len(subs)
     gate_clear = gate.get("status") in (None, "passed", "skipped")
     return {
         "id": data.get("id"),
@@ -3130,16 +3147,17 @@ def _summarize_hub(data, state):
         "mode": data.get("mode"),
         "branch": data.get("branch"),
         "state": state,
-        "progress": {"done": done_n, "total": len(subs)},
+        # done = merged/closed; built = done + finished-but-awaiting-merge (see coordinator-sweep.js childPhase)
+        "progress": {"done": done_n, "built": built_n, "total": len(subs)},
         "subTasks": [
-            {"id": st.get("id"), "title": st.get("title"), "status": st.get("status")}
-            for st in subs if isinstance(st, dict)
+            {"id": st.get("id"), "title": st.get("title"), "status": st.get("status"), "phase": phase}
+            for st, phase in zip(subs, phases)
         ],
         "integrationGate": {"status": gate.get("status"), "checks": gate.get("checks")},
         "blockedReason": data.get("blockedReason"),
-        # A stacked hub is only safe to merge once every child is done AND the integration
-        # gate has actually passed (or was skipped). A hub already in done/ shipped.
-        "readyToMerge": bool(state == "done" or (all_children_done and gate_clear)),
+        # Ready to merge = every piece is BUILT (finished, committed, waiting on the merge -- not necessarily merged already) and the
+        # integration gate has passed or was skipped. A hub already in done/ shipped.
+        "readyToMerge": bool(state == "done" or (all_children_built and gate_clear)),
     }
 
 
@@ -3214,9 +3232,10 @@ def _label_for_branch(task_id, pipeline_dir, subject, repo_root=None):
                 "source": "decompose-hub",
                 "matchedTaskState": hub["state"],
                 "description": (
-                    f"Coordinator hub: {prog['done']}/{prog['total']} task(s) done"
+                    f"Coordinator hub: {prog['built']}/{prog['total']} built"
+                    + (f" ({prog['done']} merged)" if prog["built"] > prog["done"] else "")
                     + (f", integration gate {gate}" if gate else "")
-                    + ("" if hub["readyToMerge"] else " -- not ready to merge")
+                    + (" -- ready to merge" if hub["readyToMerge"] and hub["state"] != "done" else "" if hub["readyToMerge"] else " -- not ready to merge")
                 ),
             }
     return {"title": subject or task_id, "domain": None, "source": None, "matchedTaskState": None, "description": None}

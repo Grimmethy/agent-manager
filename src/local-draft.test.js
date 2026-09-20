@@ -1836,6 +1836,31 @@ test('findUnverifiedEdit: wrong-block -- find is real but far from the flagged s
   assert.equal(findUnverifiedEdit(right, files, { anchorSnippet: snippet }), null);
 });
 
+// PropertyForager function-length-fix-ac-3: the flagged block is a whole ~180-line function (the Snippet). The old rule measured the
+// edit's distance from ONE line of it (the longest), so an extraction's edit at the function header -- inserting the new components
+// above it -- read as "a different block" and was rejected on every redraft.
+test('findUnverifiedEdit: wrong-block -- an edit anywhere on the flagged FUNCTION (its header, or deep inside) is on the flagged block', () => {
+  const { findUnverifiedEdit } = require('./local-draft.js');
+  const body = Array.from({ length: 120 }, (_, i) => `  const step${i} = compute(${i}, someLongArgumentName${i}); // a reasonably long body line`);
+  const fn = ['// Full detail card for the expanded row -- the complete gated feature set:', '// hotlist save, owner-info request flow, legal warnings.',
+    'function ExpandedDetail({ detail }) {', ...body, '  return null;', '}'].join('\n');
+  const other = ['function Unrelated() {', '  const z = 1; // an unrelated helper far above', '  return z;', '}'].join('\n');
+  const content = [other, ...Array(40).fill('const filler = "padding padding padding padding padding padding padding";'), fn].join('\n');
+  // the harness snippet: 2 lines of lead-in dropped (SNIPPET_BEFORE), then the whole function
+  const snippet = fn.split('\n').slice(1).join('\n');
+  const files = [{ path: 'src/P.tsx', content }];
+  const edit = (find) => JSON.stringify({ mode: 'edit', file: 'src/P.tsx', find, replace: 'x' });
+
+  // header + its full lead-in comment (one line ABOVE the snippet): on the flagged block
+  assert.equal(findUnverifiedEdit(edit(fn.split('\n').slice(0, 3).join('\n')), files, { anchorSnippet: snippet }), null);
+  // deep inside the function, thousands of chars from the longest line: on the flagged block
+  assert.equal(findUnverifiedEdit(edit(body[3]), files, { anchorSnippet: snippet }), null);
+  assert.equal(findUnverifiedEdit(edit(body[110]), files, { anchorSnippet: snippet }), null);
+  // a genuinely different block (an unrelated function far above the flagged one) is still caught
+  const r = findUnverifiedEdit(edit('  const z = 1; // an unrelated helper far above'), files, { anchorSnippet: snippet });
+  assert.equal(r && r.problem, 'wrong-block');
+});
+
 test('findUnverifiedEdit: wrong-block check is skipped when the snippet cannot be located (no false positive)', () => {
   const { findUnverifiedEdit } = require('./local-draft.js');
   const files = [{ path: 'm.py', content: 'def a():\n    try:\n        x()\n    except OSError:\n        pass\n' }];
@@ -3099,6 +3124,115 @@ test('draftTask still runs the critique+revision pass for a non-advisoryProse so
     await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
 
     assert.equal(callCount, 3, 'plan, implement, AND critique -- a real code-diff source must be unaffected by the advisoryProse skip');
+  });
+});
+
+// 2026-09-20 (PF function-length-fix-ac-3): the file has a curly-quoted “Owner” inside a 1,000+ char JSX block; the model wrote straight
+// quotes in its `find`, so the verbatim check (and Group B apply) rejected every attempt on two characters.
+const CURLY_FILE = 'function Card() {\n  return (\n    <p>\n      Mark it as “Owner” and we follow up — within a day.\n    </p>\n  );\n}\n';
+const curlyTask = (id) => ({
+  id, domain: 'default', source: 'observability_fix', title: 'test',
+  promptContext: { candidateId: 'AC-3', title: 'x', files: ['src/Card.tsx'], fetchedFiles: [{ path: 'src/Card.tsx', content: CURLY_FILE }], body: 'Files: src/Card.tsx' },
+});
+function writeCurly(dir) { fs.mkdirSync(path.join(dir, 'src'), { recursive: true }); fs.writeFileSync(path.join(dir, 'src', 'Card.tsx'), CURLY_FILE); }
+const STRAIGHT_FIND = '    <p>\n      Mark it as "Owner" and we follow up - within a day.\n    </p>';
+
+test('draftTask canonicalizes a find that differs from the file only by curly quotes / dashes -- no find-missing retry, replacement keeps the typography', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    writeCurly(dir);
+    const task = curlyTask('typo-find-1');
+    const calls = [];
+    const localCall = async (opts) => {
+      calls.push(opts && opts.stage);
+      if (calls.length === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (calls.length === 2) return { response: JSON.stringify([{ mode: 'edit', file: 'src/Card.tsx', find: STRAIGHT_FIND, replace: '    <Tag>\n' + STRAIGHT_FIND.trim() + '\n    </Tag>' }]), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(calls.length, 3, 'plan, implement, critique -- the verbatim check passed first time, so there is NO extra strict-cite implement retry');
+    const [e] = JSON.parse(task.implementResponse);
+    assert.ok(CURLY_FILE.includes(e.find), 'the find is now an exact substring of the real file');
+    assert.match(e.find, /“Owner”.*—/s);
+    assert.match(e.replace, /“Owner”.*—/s, 'moved text keeps its curly quotes and dash');
+    assert.ok(task.history.some((h) => h.stage === 'advisory' && /canonicalized 1 find string/.test(h.detail || '')));
+    assert.ok(!task.history.some((h) => /retried once \(find-missing\)/.test(h.detail || '')));
+    assert.equal(task.status, 'needs-review');
+  });
+});
+
+test('draftTask still retries (find-missing) when the find is genuinely not in the file -- canonicalization does not paper over a real mismatch', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    writeCurly(dir);
+    const task = curlyTask('typo-find-2');
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (n <= 3) return { response: JSON.stringify([{ mode: 'edit', file: 'src/Card.tsx', find: 'text that is nowhere in this file', replace: 'x' }]), degenerate: null, attempts: 1 };
+      return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.ok(task.history.some((h) => /retried once \(find-missing\)/.test(h.detail || '')));
+    assert.ok(!task.history.some((h) => h.stage === 'advisory' && /canonicalized/.test(h.detail || '')));
+  });
+});
+
+// PF function-length-fix-ac-3, second half: the critique spotted the mismatch, the revise call answered with COMMENTARY about it, and that
+// prose replaced the draft (then died at review's meta-commentary gate, three drafts running).
+function critiqueRevisionScenario(reviseResponse) {
+  return async (draftTask, dir) => {
+    writeCurly(dir);
+    const task = curlyTask('revision-guard');
+    const original = JSON.stringify([{ mode: 'edit', file: 'src/Card.tsx', find: '  return (', replace: '  return ( // wrapped' }]);
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (n === 2) return { response: original, degenerate: null, attempts: 1 };
+      if (n === 3) return { response: 'The find string uses straight quotes but the file has curly ones.', degenerate: null, attempts: 1 }; // critique: issues flagged
+      return { response: reviseResponse, degenerate: null, attempts: 1 };                                                                   // revise
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    return { task, original };
+  };
+}
+
+test('draftTask: a revision that is commentary, not edits, is discarded -- the original draft survives', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    const { task, original } = await critiqueRevisionScenario('The critique flags a mismatch between the find string and the file. However, looking at the original draft...')(draftTask, dir);
+    assert.equal(task.critiqueOutcome, 'issues-flagged');
+    assert.equal(task.implementResponse, original, 'the original valid edits are kept');
+    assert.equal(task.revisionApplied, undefined);
+    assert.equal(task.revisionDiscarded, true);
+    assert.ok(task.history.some((h) => h.stage === 'advisory' && /critique revision discarded: not valid edits/.test(h.detail || '')));
+  });
+});
+
+test('draftTask: a revision that IS valid edits replaces the draft as before (and a FALSE POSITIVE line counts as valid)', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    const revised = JSON.stringify([{ mode: 'edit', file: 'src/Card.tsx', find: '  return (', replace: '  return ( // revised' }]);
+    const { task } = await critiqueRevisionScenario(revised)(draftTask, dir);
+    assert.equal(task.implementResponse, revised);
+    assert.equal(task.revisionApplied, true);
+    assert.equal(task.revisionDiscarded, undefined);
+  });
+  await withFixtureRepo(async (draftTask, dir) => {
+    const { task } = await critiqueRevisionScenario('FALSE POSITIVE -- the code already does this.')(draftTask, dir);
+    assert.equal(task.revisionApplied, true);
+  });
+});
+
+test('revisionKeepsAnswerShape: only Group B sources are held to the JSON / FALSE POSITIVE shape', async () => {
+  await withFixtureRepo(async () => {
+    const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const { revisionKeepsAnswerShape } = require('./lib/implement-critique.js');
+    if (!getRegisteredSource('freeform_apply_source')) registerTaskSource('freeform_apply_source', { priority: 80, next: () => null, apply: () => ({ skipped: true }) });
+    assert.equal(revisionKeepsAnswerShape({ id: 't', domain: 'default', source: 'freeform_apply_source' }, 'plain prose is fine here'), true);
+    const groupB = { id: 't', domain: 'default', source: 'observability_fix' };
+    assert.equal(revisionKeepsAnswerShape(groupB, 'plain prose is not'), false);
+    assert.equal(revisionKeepsAnswerShape(groupB, ''), false);
+    assert.equal(revisionKeepsAnswerShape(groupB, '```json\n[{"mode":"edit","file":"a","find":"b","replace":"c"}]\n```'), true);
+    assert.equal(revisionKeepsAnswerShape(groupB, '[]'), true);
   });
 });
 
