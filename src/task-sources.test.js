@@ -49,6 +49,19 @@ test('taskIdExistsInQueue finds a task inside a done-archive.js dated month buck
   assert.equal(taskIdExistsInQueue('never-existed'), false);
 });
 
+// Regression, 2026-09-20 (hub-rename.js): renaming the AC-2 hub to HUB0001 removed coordinating/function-length-fix-ac-2.json, so
+// function_length_fix re-derived the same candidate and filed a duplicate task minutes later. The renamed hub's `formerIds` keeps the old id "queued".
+test('taskIdExistsInQueue treats a renamed hub\'s former id as still queued', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-former-id-test-'));
+  const { taskIdExistsInQueue } = freshTaskSources(dir);
+  const coord = path.join(dir, 'queue', 'coordinating');
+  fs.mkdirSync(coord, { recursive: true });
+  assert.equal(taskIdExistsInQueue('function-length-fix-ac-2'), false);
+  fs.writeFileSync(path.join(coord, 'HUB0001.json'), JSON.stringify({ id: 'HUB0001', hubLabel: 'HUB0001', formerIds: ['function-length-fix-ac-2'], subTasks: [] }));
+  assert.equal(taskIdExistsInQueue('function-length-fix-ac-2'), true, 'the memo notices the new hub file');
+  assert.equal(taskIdExistsInQueue('some-other-id'), false);
+});
+
 // --- AGENT_MANAGER_TASK_SOURCES allowlist (getNextTask) --------------------------------
 // Backs the dashboard's "Project Search" run mode: project_search is priority 85 (lowest
 // of the 10 built-ins), so without a way to suppress higher-priority sources it would

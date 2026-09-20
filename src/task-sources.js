@@ -233,9 +233,31 @@ function isSoftDependencySatisfied(pipelineDir, depId) {
 // A claimed task lives at queue/drafting/<InstanceId>/<id>.json, not queue/drafting/<id>.json
 // directly (a per-instance claim subfolder) -- every task source shares this function, so a
 // task actively being drafted is correctly seen as already-queued, not regenerated.
+// A hub renamed to its HUB#### id (hub-rename.js) leaves the id of the task it was as `formerIds`. Without this the source that derived that task
+// (function_length_fix re-derives AC-2 every tick) sees no queued task under the old id and files a DUPLICATE -- seen live 2026-09-20, minutes after
+// the AC-2 hub was renamed. Memoised on the coordinating/ dir's mtime (a rename or a new hub changes it).
+const _formerHubIdsMemo = new Map(); // coordDir -> { mtimeMs, ids:Set }
+function formerHubIds(queueDir) {
+  const coordDir = path.join(queueDir, 'coordinating');
+  let mtimeMs;
+  try { mtimeMs = fs.statSync(coordDir).mtimeMs; } catch { return new Set(); }
+  const hit = _formerHubIdsMemo.get(coordDir);
+  if (hit && hit.mtimeMs === mtimeMs) return hit.ids;
+  const ids = new Set();
+  try {
+    for (const f of fs.readdirSync(coordDir)) {
+      if (!f.endsWith('.json')) continue;
+      try { const h = JSON.parse(fs.readFileSync(path.join(coordDir, f), 'utf8')); for (const x of (Array.isArray(h.formerIds) ? h.formerIds : [])) ids.add(x); } catch { /* malformed -- skip */ }
+    }
+  } catch { /* unreadable */ }
+  _formerHubIdsMemo.set(coordDir, { mtimeMs, ids });
+  return ids;
+}
+
 function taskIdExistsInQueue(id) {
   const { pipelineDir } = getConfig();
   const queueDir = path.join(pipelineDir, 'queue');
+  if (formerHubIds(queueDir).has(id)) return true;
   if (fs.existsSync(path.join(queueDir, 'done', '_archived_no_action', `${id}.json`))) return true;
   // done-archive.js's own dated month buckets (queue/done/_archived/<YYYY-MM>/, 2026-08-24)
   // -- without this, a task's underlying item (a brain-dump entry, a deep_dive community,
