@@ -424,3 +424,67 @@ test('remoteBranchExists reflects the real remote-tracking ref, independent of a
   git(['push', '-u', 'origin', 'agent/decompose-x'], repoDir);
   assert.equal(runner.remoteBranchExists('agent/decompose-x'), true);
 });
+
+// --- early merge of a hub's shared branch (2026-09-20) ----------------------------------------------------------
+// A hub is one stacked chain on one branch and is meant to land as ONE final merge, "with the flexibility to merge early". Merging the
+// branch after piece 1 (the dashboard merges it into main and deletes the remote branch) must not strand or break pieces 2..N.
+function commitFile(repoDir, file, content, msg) {
+  fs.writeFileSync(path.join(repoDir, file), content);
+  git(['add', file], repoDir);
+  git(['commit', '-m', msg], repoDir);
+}
+
+test('a hub branch merged EARLY (remote deleted): the next piece starts a fresh branch off main that already carries the earlier pieces, and merges cleanly later', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  const B = 'agent/decompose-hub';
+
+  // piece 1 (seq 1): the chain's first step creates the branch and pushes
+  git(['checkout', '-b', B], repoDir);
+  commitFile(repoDir, 'piece1.txt', 'one\n', 'piece 1');
+  git(['push', '-u', 'origin', B], repoDir);
+
+  // the human merges the branch EARLY: into main, remote branch deleted (the local copy lingers, as the pipeline's checkout keeps it)
+  git(['checkout', 'main'], repoDir);
+  git(['merge', '--no-ff', '-m', 'Merge hub branch early', B], repoDir);
+  git(['push', 'origin', 'main'], repoDir);
+  git(['push', 'origin', '--delete', B], repoDir);
+  assert.equal(runner.remoteBranchExists(B), false, 'the remote copy is really gone');
+
+  // piece 2 (seq 2) runs: prepareStackedBranch finds no remote copy and a local branch that no longer descends from main
+  assert.doesNotThrow(() => runner.prepareStackedBranch(B));
+  assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim(), B);
+  assert.equal(fs.readFileSync(path.join(repoDir, 'piece1.txt'), 'utf8'), 'one\n', 'piece 1 is present: it came in through main');
+  commitFile(repoDir, 'piece2.txt', 'two\n', 'piece 2');
+  git(['push', '-u', 'origin', B], repoDir);
+
+  // ...and the second, final merge brings ONLY piece 2 (piece 1 is already in main), with no conflict
+  git(['checkout', 'main'], repoDir);
+  git(['merge', '--no-ff', '-m', 'Merge hub branch final', B], repoDir);
+  const files = git(['ls-files'], repoDir).split('\n').filter(Boolean).sort();
+  assert.deepEqual(files, ['piece1.txt', 'piece2.txt', 'tracked.txt']);
+  assert.deepEqual(git(['log', '--format=%s', '--no-merges'], repoDir).trim().split('\n').sort(), ['init', 'piece 1', 'piece 2'], 'each piece appears exactly once');
+  assert.ok(bareDir);
+});
+
+test('a hub branch merged EARLY but the remote branch NOT deleted: the next piece continues on it, and the final merge adds only the new piece', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  const B = 'agent/decompose-hub';
+
+  git(['checkout', '-b', B], repoDir);
+  commitFile(repoDir, 'piece1.txt', 'one\n', 'piece 1');
+  git(['push', '-u', 'origin', B], repoDir);
+  git(['checkout', 'main'], repoDir);
+  git(['merge', '--no-ff', '-m', 'Merge hub branch early', B], repoDir);
+  git(['push', 'origin', 'main'], repoDir);
+
+  assert.doesNotThrow(() => runner.prepareStackedBranch(B)); // remote exists, local ⊆ origin -> sync to origin's tip (piece 1)
+  assert.equal(fs.readFileSync(path.join(repoDir, 'piece1.txt'), 'utf8'), 'one\n');
+  commitFile(repoDir, 'piece2.txt', 'two\n', 'piece 2');
+  git(['push', 'origin', B], repoDir);
+
+  git(['checkout', 'main'], repoDir);
+  git(['merge', '--no-ff', '-m', 'Merge hub branch final', B], repoDir);
+  assert.deepEqual(git(['ls-files'], repoDir).split('\n').filter(Boolean).sort(), ['piece1.txt', 'piece2.txt', 'tracked.txt']);
+});

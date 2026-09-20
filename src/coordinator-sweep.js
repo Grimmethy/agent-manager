@@ -23,6 +23,7 @@ const { taskCommitOnMain, STABLE_TERMINAL_STAGES } = require('./task-disposition
 const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 const { hubHasUnmergedEarlierSibling } = require('./hub-priority.js');
+const { restackHubChain } = require('./hub-restack.js');
 
 // On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
 // verified mechanical move child's branch to main itself, instead of a human clicking
@@ -351,6 +352,12 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
       recById.set(st && st.id, rec);
       st.status = classifyChildStatus(rec);
     }
+    // A hub built before "one hub = one stacked chain" may be mixed (some pieces stacked, some independent and stuck behind a merge):
+    // put its not-yet-started pieces onto the chain (hub-restack.js). Before the held-marker below, which reads the fresh fields.
+    try {
+      const restacked = restackHubChain(parent, recById);
+      if (restacked.length) { summary.restacked = (summary.restacked || 0) + restacked.length; appendHistoryEvent(parent, 'advisory', `restacked ${restacked.length} piece(s) onto the hub's shared branch`); }
+    } catch { /* repair is best-effort */ }
     // A piece that is only waiting for an earlier sibling to land (hub-priority.js hubHasUnmergedEarlierSibling) reads 'in-progress' and
     // looks stuck; say what it is waiting for so the checklist is honest. Computed after every status above is fresh (the check reads
     // sibling statuses off `parent`), and cleared as soon as the piece is released.

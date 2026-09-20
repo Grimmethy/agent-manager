@@ -213,11 +213,13 @@ test('applyAdhocDiff queues each sub-task and turns the parent into a coordinato
     assert.equal(q.promptContext.decomposedFrom, 'apply-test-decompose-1');
     assert.ok(q.promptContext.rawText.length > 0);
   }
-  // `after: 0` on the third proposal -> a dependsOn edge to the first sub-task's id.
-  const third = queued.find((t) => t.title === 'Piece three');
+  // One hub = one chain (2026-09-20): every piece depends on the one before it, whether or not the model wrote an `after` for it.
   const first = queued.find((t) => t.title === 'Piece one');
-  assert.deepEqual(third.dependsOn, [first.id]);
-  assert.equal(queued.find((t) => t.title === 'Piece one').dependsOn, undefined);
+  const second = queued.find((t) => t.title === 'Piece two');
+  const third = queued.find((t) => t.title === 'Piece three');
+  assert.equal(first.dependsOn, undefined);
+  assert.deepEqual(second.dependsOn, [first.id]);
+  assert.deepEqual(third.dependsOn, [second.id]);
 });
 
 // premiumPriority propagation (2026-09-07, Grimmethy: "This decompose should be the
@@ -442,27 +444,29 @@ test('queueSubTasks: a 2-step `after` chain gets a shared stacked branch + seq 1
   assert.equal(second.stacked.total, 2);
 });
 
-test('queueSubTasks: a 3-step chain gets seq 1/2/3 in order; an unrelated standalone proposal is left un-stacked', () => {
+test('queueSubTasks: EVERY piece of a hub joins one chain -- a proposal with no `after` is not left independent (PF function-length-fix-ac-2 nested hub)', () => {
   const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  // The real shape: two independent creators and a wiring piece that only names the FIRST ("after piece 0").
   const subTasks = [
-    { title: 'Step A', rawText: 'a' },
-    { title: 'Step B', rawText: 'b', after: 0 },
-    { title: 'Step C', rawText: 'c', after: 1 },
-    { title: 'Unrelated', rawText: 'u' },
+    { title: 'Create src/lib/tileGrid.ts', rawText: 'a' },
+    { title: 'Create src/hooks/usePropertyLocation.ts', rawText: 'b' },
+    { title: 'Wire the extractions into PropertyAerialView.tsx', rawText: 'c', after: 0 },
   ];
-  queueSubTasks(subTasks, pipelineDir, 'parent-stack-2', {});
+  const queued = queueSubTasks(subTasks, pipelineDir, 'parent-chain-all', {});
   const tasks = readQueuedAdhocTasks(pipelineDir);
-  const byTitle = (t) => tasks.find((x) => x.title === t);
+  const t = (title) => tasks.find((x) => x.title === title);
+  const id = (title) => queued.find((q) => q.title === title).id;
 
-  assert.equal(byTitle('Step A').stacked.seq, 1);
-  assert.equal(byTitle('Step B').stacked.seq, 2);
-  assert.equal(byTitle('Step C').stacked.seq, 3);
-  assert.equal(byTitle('Step A').stacked.branch, byTitle('Step C').stacked.branch);
-  assert.equal(byTitle('Step A').stacked.total, 3);
-  assert.equal(byTitle('Unrelated').stacked, undefined, 'a proposal with no after link stays un-stacked');
+  const [a, b, c] = subTasks.map((x) => t(x.title));
+  assert.deepEqual([a.stacked.seq, b.stacked.seq, c.stacked.seq], [1, 2, 3]);
+  assert.equal(new Set([a, b, c].map((x) => x.stacked.branch)).size, 1, 'one branch for the whole hub');
+  assert.ok([a, b, c].every((x) => x.stacked.total === 3));
+  assert.equal(a.dependsOn, undefined);
+  assert.deepEqual(b.dependsOn, [id(a.title)], 'the unlinked middle piece now waits for the first');
+  assert.deepEqual(c.dependsOn, [id(b.title)], 'the wiring piece waits for BOTH creators, via the chain');
 });
 
-test('queueSubTasks: two independent chains in one hub get two separate stacked branches', () => {
+test('queueSubTasks: a hub with two independent chains is still ONE chain (one branch, one final merge)', () => {
   const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
   const subTasks = [
     { title: 'Chain1 Step A', rawText: 'a1' },
@@ -473,12 +477,37 @@ test('queueSubTasks: two independent chains in one hub get two separate stacked 
   queueSubTasks(subTasks, pipelineDir, 'parent-stack-3', {});
   const tasks = readQueuedAdhocTasks(pipelineDir);
   const byTitle = (t) => tasks.find((x) => x.title === t);
+  const order = ['Chain1 Step A', 'Chain1 Step B', 'Chain2 Step A', 'Chain2 Step B'];
+  assert.equal(new Set(order.map((n) => byTitle(n).stacked.branch)).size, 1);
+  assert.deepEqual(order.map((n) => byTitle(n).stacked.seq), [1, 2, 3, 4]);
+});
 
-  const branch1 = byTitle('Chain1 Step A').stacked.branch;
-  const branch2 = byTitle('Chain2 Step A').stacked.branch;
-  assert.notEqual(branch1, branch2, 'each independent chain gets its own branch');
-  assert.equal(byTitle('Chain1 Step B').stacked.branch, branch1);
-  assert.equal(byTitle('Chain2 Step B').stacked.branch, branch2);
+test('queueSubTasks: a NESTED hub (the parent is itself a stacked piece) continues its parent\'s branch and takes its slot in the sequence', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const parent = { id: 'piece-two', stacked: { branch: 'agent/decompose-outer-hub', seq: 2, total: 3 } };
+  queueSubTasks([{ title: 'N1', rawText: 'n1' }, { title: 'N2', rawText: 'n2' }], pipelineDir, parent.id, parent);
+  const tasks = readQueuedAdhocTasks(pipelineDir);
+  const n1 = tasks.find((x) => x.title === 'N1');
+  const n2 = tasks.find((x) => x.title === 'N2');
+  assert.equal(n1.stacked.branch, 'agent/decompose-outer-hub', 'no second branch: the ancestor hub still ends as one');
+  assert.deepEqual([n1.stacked.seq, n2.stacked.seq], [2, 3], 'the first child takes the parent\'s slot, so seq>1 -> it continues the branch');
+  assert.equal(n1.stacked.total, 4, 'the parent\'s one step became two');
+  assert.deepEqual(n2.dependsOn, [tasks.find((x) => x.title === 'N1').id]);
+});
+
+test('queueSubTasks: a hub that folds down to ONE surviving piece is not chained; verification-only pieces never join the chain', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  queueSubTasks([{ title: 'Add a comment', rawText: 'x' }, { title: 'Run the tests to confirm', rawText: 'y' }], pipelineDir, 'parent-fold', {});
+  const only = readQueuedAdhocTasks(pipelineDir);
+  assert.equal(only.length, 1);
+  assert.equal(only[0].stacked, undefined, 'a lone piece needs no branch chain');
+
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  queueSubTasks([{ title: 'Add X', rawText: 'x' }, { title: 'Verify X works', rawText: 'v' }, { title: 'Add Y', rawText: 'y' }], dir2, 'parent-fold-2', {});
+  const t2 = readQueuedAdhocTasks(dir2).sort((a, b) => a.stacked.seq - b.stacked.seq);
+  assert.deepEqual(t2.map((t) => t.title), ['Add X', 'Add Y']);
+  assert.deepEqual(t2.map((t) => t.stacked.seq), [1, 2]);
+  assert.deepEqual(t2.map((t) => t.stacked.total), [2, 2], 'the folded piece is not a step');
 });
 
 test('applyAdhocDiff end-to-end: the real incident shape (comment + confirm) queues exactly ONE task with the confirmation folded in', () => {
