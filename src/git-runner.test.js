@@ -488,3 +488,31 @@ test('a hub branch merged EARLY but the remote branch NOT deleted: the next piec
   git(['merge', '--no-ff', '-m', 'Merge hub branch final', B], repoDir);
   assert.deepEqual(git(['ls-files'], repoDir).split('\n').filter(Boolean).sort(), ['piece1.txt', 'piece2.txt', 'tracked.txt']);
 });
+
+// --- remoteHasUnmergedWork (2026-09-20) -------------------------------------------------
+// apply-task.js's stacked seq 1 path recreates the branch off main; that is only safe when origin holds nothing on it that main lacks.
+
+test('remoteHasUnmergedWork: false when origin has no such branch', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  assert.equal(createRealGitRunner(repoDir).remoteHasUnmergedWork('agent/decompose-x'), false);
+});
+
+test('remoteHasUnmergedWork: true when origin carries pushed commits main lacks', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/decompose-x');
+  fs.writeFileSync(path.join(repoDir, 'step1.txt'), 'move 1\n');
+  git(['add', 'step1.txt'], repoDir);
+  git(['commit', '-m', 'step 1'], repoDir);
+  git(['push', '-u', 'origin', 'agent/decompose-x'], repoDir);
+  runner.checkoutMain();
+  git(['branch', '-D', 'agent/decompose-x'], repoDir);
+  assert.equal(runner.remoteHasUnmergedWork('agent/decompose-x'), true);
+});
+
+test('remoteHasUnmergedWork: false once origin\'s branch is fully merged into main', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  git(['push', 'origin', 'HEAD:refs/heads/agent/decompose-merged'], repoDir); // same commit as main: nothing main lacks
+  assert.equal(runner.remoteHasUnmergedWork('agent/decompose-merged'), false);
+});

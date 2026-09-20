@@ -1260,7 +1260,31 @@ test('stacked seq 1: creates the shared decompose branch off main (reset first)'
   assert.equal(result.succeeded, true);
   assert.equal(result.branch, 'agent/decompose-x');
   assert.deepEqual(gitRunner.calls.map((c) => c.name),
-    ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+    ['fetchMain', 'remoteHasUnmergedWork', 'resetToMain', 'deleteBranch', 'createBranch', 'add', 'commit', 'push', 'checkoutMain']);
+});
+
+// 2026-09-20 (PF HUB0003-01): a nested hub's first child was numbered seq 1, so this path deleted and recreated a branch that already
+// carried the parent chain's pushed steps -> non-fast-forward on every retry. Origin holding UNMERGED work on the branch means seq 1
+// must ride on it (prepareStackedBranch), never reset it away.
+test('stacked seq 1 with pushed, unmerged work on origin: rides on that branch instead of recreating it off main', () => {
+  const gitRunner = createFakeGitRunner({ remoteBranches: ['agent/decompose-x'], isAncestorFn: () => false });
+  const result = applyTask(baseTask({ id: 'adhoc-decompose-x-01-a', stacked: { branch: 'agent/decompose-x', seq: 1 } }),
+    { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('prepareStackedBranch'));
+  assert.ok(!names.includes('resetToMain'), 'must not reset away the pushed steps');
+  assert.ok(!names.includes('deleteBranch'), 'must not delete the branch that carries them');
+});
+
+test('stacked seq 1 whose origin branch is already merged into main: still starts fresh off main', () => {
+  const gitRunner = createFakeGitRunner({ remoteBranches: ['agent/decompose-x'], isAncestorFn: () => true });
+  const result = applyTask(baseTask({ id: 'adhoc-decompose-x-01-a', stacked: { branch: 'agent/decompose-x', seq: 1 } }),
+    { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, true);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(!names.includes('prepareStackedBranch'));
+  assert.ok(names.includes('resetToMain') && names.includes('createBranch'));
 });
 
 // 2026-09-08: seq > 1 now delegates the whole fetch/exists/ancestry decision to

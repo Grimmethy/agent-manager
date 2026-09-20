@@ -35,6 +35,13 @@ function restackHubChain(parent, recById) {
   if (branches.size !== 1) return changed; // no chain to join, or several -- not ours to merge into one
   const branch = [...branches][0];
   const siblingIds = new Set(subs.map((st) => st && st.id).filter(Boolean));
+  // A NESTED hub (this hub is itself a stacked piece of a chain on the SAME branch) occupies its parent's slot in that chain, exactly as
+  // apply-adhoc-diff.js queueSubTasks numbers it: children run firstSeq..firstSeq+n-1 of (parentTotal - 1 + n). Numbering them 1..n here
+  // instead made the first child look like the chain's start, and apply-task.js's seq===1 path resets to main and recreates the branch --
+  // discarding the parent chain's already-pushed steps (PF HUB0003-01: three identical non-fast-forward push failures, then needs-clarification).
+  const own = parent.stacked && parent.stacked.branch === branch ? parent.stacked : null;
+  const firstSeq = own ? (Number(own.seq) || 1) : 1;
+  const chainTotal = own ? (Number(own.total) || firstSeq) - 1 + subs.length : subs.length;
 
   subs.forEach((st, i) => {
     const rec = recs[i];
@@ -45,7 +52,7 @@ function restackHubChain(parent, recById) {
     const task = rec.task;
     const keep = (Array.isArray(task.dependsOn) ? task.dependsOn : []).filter((d) => !siblingIds.has(d));
     const wantDeps = prev ? [...keep, prev] : keep;
-    const wantStacked = { branch, seq: i + 1, total: subs.length };
+    const wantStacked = { branch, seq: firstSeq + i, total: chainTotal };
     const stackedOk = task.stacked && task.stacked.branch === branch && task.stacked.seq === wantStacked.seq && task.stacked.total === wantStacked.total;
     const depsOk = sameList(task.dependsOn || [], wantDeps) || (!task.dependsOn && wantDeps.length === 0);
     if (stackedOk && depsOk) return;
