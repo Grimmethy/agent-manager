@@ -441,6 +441,23 @@ while :; do
       echo $! > "$GRAPH_BUILD_LOCK"
     fi
 
+    # Idle-pool borrowing (docs/idle-pool-borrowing.md, step 4): housekeeping for the pool projects lanes borrow work from -- retries, hub
+    # reconciliation, triage -- which the sweeps above only do for the ACTIVE project. Runs in the BACKGROUND (a pool project's sweeps take
+    # tens of seconds and must never delay this tick's daemon supervision), one run at a time (flock), and each project is due at most every
+    # AGENT_MANAGER_POOL_SWEEP_INTERVAL_SECS (pool-sweeps.sh). Kill switch AGENT_MANAGER_POOL_BORROW=false.
+    if [[ "${AGENT_MANAGER_POOL_BORROW:-true}" != "false" ]]; then
+      (
+        flock -n 8 || exit 0
+        mapfile -t _pool_pipes < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --all 2>>"${HOME_LOGS}/pool-sweeps.log")
+        for _pipe in "${_pool_pipes[@]}"; do
+          [[ -n "$_pipe" ]] || continue
+          mapfile -t _pool_env < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$_pipe" "$INSTANCES_DIR" 2>>"${HOME_LOGS}/pool-sweeps.log")
+          (( ${#_pool_env[@]} > 0 )) || continue
+          env "${_pool_env[@]}" bash "${SCRIPT_DIR}/pool-sweeps.sh" || true
+        done
+      ) 8>"${INSTANCES_DIR}/.pool-sweeps.lock" >>"${HOME_LOGS}/pool-sweeps.log" 2>&1 &
+    fi
+
     _pending_dir="$QUEUE_DIR/pending"    # was "$AGENT_MANAGER_REPO_ROOT/_/pending" -- a stray "_/" prefix that matched neither local-worker.sh's own (also-wrong, now-fixed) path nor task-sources.js's real queue/pending convention. Now consistent with both.
     stale_count=0
 
