@@ -77,6 +77,13 @@ and are not steps; a hub that folds to one piece is not chained. `hub-restack.js
 `AGENT_MANAGER_HUB_RESTACK=false`) repairs older MIXED hubs: for a hub that already has a chain on one branch it puts each not-yet-started piece
 on it. Fully independent legacy hubs (no chain) and file-decompose hubs are left alone.
 
+### Hub serials and naming (2026-09-20, `src/hub-serial.js`)
+Every hub has a serial from `<pipelineDir>/queue/hub-serials.json` (`{next}`, monotonic, never reused) and a label `HUB0007`. The hub record gains `hubSerial`/`hubLabel` and its title leads with the label
+(a leading candidate id such as `AC-2 · ` is replaced; the id stays in `promptContext.candidateId`). The hub's own file id is unchanged (worklogs, task logs, its branch and `dependsOn` refer to it).
+Members: `queueSubTasks` (adhoc-decompose and candidate-split hubs) mints ids `HUB0007-02-<slug>` and titles `HUB0007 · 2/5 · <title>`. Hubs that predate serials, and producers that mint their own
+child ids (file-decompose, product-spec), are labelled by `coordinator-sweep.js` (`assignMissingHubSerials`, oldest first; `retitleHubMembers`, which retitles a member record only while it is idle
+(adhoc / blocked / needs-clarification / awaiting-confirm / done) and always updates the hub checklist title). Their child ids are NOT renamed.
+
 ### Candidate hub specifics (producer 4)
 Pieces are a **linear chain** (`after: i-1`) on one shared stacked branch, because a candidate names one function/file and parallel
 pieces would conflict at merge. Each piece's `rawText` carries `Part i of n`, the candidate `Files:`/`Problem`/`Solution`/`Benefits`

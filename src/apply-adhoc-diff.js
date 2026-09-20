@@ -18,6 +18,7 @@
 // the model said. See adhoc-agentic-draft.js's own comment on this.
 
 const fs = require('fs');
+const { allocateHubSerial, formatHubLabel, memberId, memberTitle } = require('./hub-serial.js');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
@@ -132,7 +133,10 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
   const subTasks = inferMissingAfterLinks(rawSubTasks);
   const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
   fs.mkdirSync(adhocDir, { recursive: true });
-  const ids = subTasks.map((sub, i) => `adhoc-${slugify(sub.title)}-${Date.now()}-${i}`);
+  // HUB#### serial (hub-serial.js): every member's id and title carries its hub's label so a member is recognisable as part of a hub.
+  const hubSerial = allocateHubSerial(pipelineDir);
+  const hubLabel = formatHubLabel(hubSerial);
+  const ids = subTasks.map((sub, i) => memberId(hubLabel, i + 1, slugify(sub.title)));
 
   // Fold targets computed BEFORE any file is written, so a surviving sub-task's own
   // record already carries every criterion folded into it. A verification-only proposal
@@ -199,7 +203,7 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
       id: ids[i],
       domain: 'adhoc',
       source: 'manual',
-      title: sub.title,
+      title: memberTitle(hubLabel, survivingIndices.indexOf(i) + 1, survivingIndices.length, sub.title),
       promptContext: { rawText: sub.rawText, decomposedFrom: parentTaskId },
     };
     if (chained) {
@@ -210,8 +214,10 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     if (extra && extra.length) record.acceptanceCriteria = extra;
     if (parentTask && parentTask.premiumPriority) record.premiumPriority = true;
     fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(record, null, 2) + '\n');
-    queued.push({ id: ids[i], title: sub.title });
+    queued.push({ id: ids[i], title: record.title });
   });
+  queued.hubSerial = hubSerial;
+  queued.hubLabel = hubLabel;
   return queued;
 }
 
@@ -262,6 +268,8 @@ function applyCandidateSplitAsHub(task, pipelineDir) {
     coordinating: true,
     reason: `Candidate too large for one pass -- decomposed into ${queued.length} chained sub-task(s), now coordinating: ${queued.map((t) => t.title).join('; ')}`,
     subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
+    hubSerial: queued.hubSerial,
+    hubLabel: queued.hubLabel,
   };
 }
 
@@ -281,6 +289,8 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
       coordinating: true,
       reason: `Decomposed into ${queued.length} sub-task(s), now coordinating: ${queued.map((t) => t.title).join('; ')}`,
       subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
+      hubSerial: queued.hubSerial,
+      hubLabel: queued.hubLabel,
     };
   }
 

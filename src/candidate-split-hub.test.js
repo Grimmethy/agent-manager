@@ -51,7 +51,7 @@ test('applyCandidateSplitAsHub: queues ordered adhoc children on ONE stacked bra
   assert.equal(result.coordinating, true);
   assert.match(result.reason, /Candidate too large for one pass -- decomposed into 3 chained sub-task\(s\)/);
   assert.equal(result.subTasks.length, 3);
-  assert.ok(result.subTasks.every((t) => t.status === 'pending' && /^adhoc-/.test(t.id)));
+  assert.ok(result.subTasks.every((t) => t.status === 'pending' && /^HUB0001-0\d-/.test(t.id)));
 
   const kids = adhocFiles(pipe).sort((a, b) => a.stacked.seq - b.stacked.seq);
   assert.equal(kids.length, 3);

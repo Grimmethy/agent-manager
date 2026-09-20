@@ -24,6 +24,7 @@ const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompo
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 const { hubHasUnmergedEarlierSibling } = require('./hub-priority.js');
 const { restackHubChain } = require('./hub-restack.js');
+const { assignMissingHubSerials, retitleHubMembers } = require('./hub-serial.js');
 
 // On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
 // verified mechanical move child's branch to main itself, instead of a human clicking
@@ -295,6 +296,9 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
   if (resolvedRepoRoot === undefined) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
   const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
 
+  // Label every hub that has no HUB#### yet (oldest first), before the loop below reads them.
+  try { const labelled = assignMissingHubSerials(pipelineDir); if (labelled) summary.hubsLabelled = labelled; } catch (e) { console.warn(`[coordinator-sweep] hub serial backfill failed (advisory): ${e.message}`); }
+
   let names;
   try {
     names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
@@ -375,6 +379,9 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
       const restacked = restackHubChain(parent, recById);
       if (restacked.length) { summary.restacked = (summary.restacked || 0) + restacked.length; appendHistoryEvent(parent, 'advisory', `restacked ${restacked.length} piece(s) onto the hub's shared branch`); }
     } catch { /* repair is best-effort */ }
+    // Members lead with their hub's label (hub-serial.js): queueSubTasks does it for the hubs it builds, this covers older hubs and the
+    // producers that mint their own child ids. The checklist titles always follow; a member's record is only rewritten while it is idle.
+    try { const n = retitleHubMembers(parent, recById); if (n) summary.membersRetitled = (summary.membersRetitled || 0) + n; } catch { /* cosmetic */ }
     // A piece that is only waiting for an earlier sibling to land (hub-priority.js hubHasUnmergedEarlierSibling) reads 'in-progress' and
     // looks stuck; say what it is waiting for so the checklist is honest. Computed after every status above is fresh (the check reads
     // sibling statuses off `parent`), and cleared as soon as the piece is released.
