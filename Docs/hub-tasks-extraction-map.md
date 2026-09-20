@@ -67,6 +67,16 @@ An ordinary task record (`id, domain, source, title, promptContext, createdAt, h
 * `queue/product-spec-requests/<slug>.json` with `buildHub:true`.
 * `queue/file-length-flags.json` = advisory snapshot written by the hygiene plugin's `file-length-scan.js` (nothing tasks it by itself).
 
+### One hub = one stacked chain (2026-09-20)
+`queueSubTasks` (`apply-adhoc-diff.js`) now puts EVERY surviving piece of a hub (two or more) on ONE stacked branch, in proposal order, each
+`dependsOn` the previous piece. Nothing waits on a merge (the stacked exemption in `isDependencySatisfied` and `hubHasUnmergedEarlierSibling`
+covers every sibling), the whole hub is one branch for one final merge, and merging it early is safe (a later piece that finds the branch merged
+and deleted starts a fresh one off `main`, which already carries the earlier pieces; real-git tests in `git-runner.test.js`). A NESTED hub (the
+parent is itself a stacked piece) continues its parent's branch and takes its slot in the sequence. Verification-only pieces fold into a sibling
+and are not steps; a hub that folds to one piece is not chained. `hub-restack.js` (run by `coordinator-sweep.js`; kill switch
+`AGENT_MANAGER_HUB_RESTACK=false`) repairs older MIXED hubs: for a hub that already has a chain on one branch it puts each not-yet-started piece
+on it. Fully independent legacy hubs (no chain) and file-decompose hubs are left alone.
+
 ### Candidate hub specifics (producer 4)
 Pieces are a **linear chain** (`after: i-1`) on one shared stacked branch, because a candidate names one function/file and parallel
 pieces would conflict at merge. Each piece's `rawText` carries `Part i of n`, the candidate `Files:`/`Problem`/`Solution`/`Benefits`
@@ -141,7 +151,7 @@ hook plus a review-judging hook). Suggested first step: add those hooks to the s
 behaviour as the default implementation, then move code behind them.
 
 **Invariants to keep (each was learned from a live loss):**
-1. Every piece branches from *current* `main` and merges on its own (AGENTS.md "Hub tasks"). **Known tension:** the candidate hub and any `after` chain built by `queueSubTasks` use a shared *stacked* branch, the model that lost work twice. It is intentional for same-file chains, but those hubs inherit the staleness risk and (per the 2026-09-12 finding) generic adhoc hubs have no auto-merge path: pieces land `pending-merge` for a human.
+1. Hub pieces must never wait on a human merge, and a hub should land as ONE final merge (with early merge still possible). Since 2026-09-20 every `queueSubTasks` hub is one stacked chain. **Known tension with AGENTS.md "Hub tasks"** (each piece branches from current `main` and merges independently -- the rule written after the stacked file-decompose model lost work twice): a long-lived shared branch can rot against a moving `main`; the mitigation is that hubs are short, the merge can happen early, and later pieces then continue from `main`. Generic hubs still have no auto-merge path, so the one final merge is a human click.
 2. A hub is `merged` only when every child is truly merged (commit-trailer reconcile), never on bare `done`.
 3. A non-`merged` `terminalDisposition` must never keep `mergedAt` (`sanitizeTaskDisposition`).
 4. A child carries `decomposedFrom` (or `atomic`) so it is never split again.
@@ -151,6 +161,6 @@ behaviour as the default implementation, then move code behind them.
 ## 8. Known gaps and open questions
 
 * **No auto-merge for non-mechanical hub children** (generic adhoc hubs, candidate hubs): they pile up as `pending-merge`. Concept doc records this as "NOT YET DONE".
-* **Stacked machinery is legacy for file-decompose but still the mechanism for `queueSubTasks` chains.** Retiring it (7 files, behind `=legacy` "for one release") has not happened.
+* **Stacked machinery is legacy for file-decompose but is now THE mechanism for every `queueSubTasks` hub.** Retiring it (7 files, behind `=legacy` "for one release") has not happened.
 * **Candidate hub has not yet been observed on real data end to end** (first live run: PropertyForager `function-length-fix-ac-2`, requeued 2026-09-20).
 * The concept text says "three producers"; there are now five (this file's table). `concepts.json` `concept-hub-task-integration-549f09` should be updated when the extraction is planned.
