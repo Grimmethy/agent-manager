@@ -23,10 +23,14 @@ vault under `SECOND_BRAIN_DIR`): it is the sort's *destination*, a neighbouring 
 |---|---|---|
 | 1 | Single owner for `brain-dump.json` | **Being clarified, not decided.** Meaning: exactly one component reads and writes the file and everything else asks it (call / HTTP / CLI), so two programs can never overwrite each other's change. Section 8 has the failure it prevents. |
 | 2 | Is the sorter part of the repo? | **Yes.** The sorter (`brain_dump_sort`, classifier, prompts, apply) moves with Brain Dump. This settles ADR 0022 open question 1 *for Brain Dump*: its allowlist exemption and the hardcoded `brain_dump_sort` handling in `getNextTask()` become properties of the repo's own registration, not of core. |
-| 3 | Delivery: library, plugin, or separate service | **Plugin (decided).** In this system "plugin" covers an in-process `register.js` plugin *and* a slot plugin that runs as its own service (section 9). With hosts outside agent-manager (row 6) the plugin has **two halves**: a host-side half and an agent-manager-side half (section 10). |
+| 3 | Delivery: library, plugin, or separate service | **Plugin (decided, confirmed 2026-09-20).** In this system "plugin" covers an in-process `register.js` plugin *and* a slot plugin that runs as its own service (section 9). With hosts outside agent-manager (row 6) the plugin has **two halves**: a host-side half and an agent-manager-side half (section 10). |
 | 4 | Vault and project-registry adapters | **Not sure yet.** Left open. |
-| 6 | Which hosts, and what for | **Any project with a user-facing dashboard, starting with PF-Client-Portal.** The purpose is to quickly and easily acquire **user feedback** that the system can process. This widens the goal from an operator's capture tool to an end-user feedback intake (section 10). |
 | 5 | The UI | **Part of the repo**, with the rest of the code. The open work is a defined contract for how the UI talks to its host (section 7, Seam B). |
+| 6 | Which hosts, and what for | **Any project with a user-facing dashboard, starting with PF-Client-Portal.** The purpose is to quickly and easily acquire **user feedback** that the system can process. This widens the goal from an operator's capture tool to an end-user feedback intake (section 10). |
+| 7 | Who submits | **Anyone**, but feedback is **account-linked**: a submission is tied to the submitter's account on the host. The operator has an account of their own. |
+| 8 | What happens to user feedback | **Human-gated after an initial sort, with no direct way to be automatically turned into a task.** The sorter classifies and files; only a human action promotes anything toward a task. |
+| 9 | Sorting | Feedback is **sorted by user account**: the sorter must be programmed to expect the account on every incoming user-feedback entry. |
+| 10 | Transport | Agent-manager's machine has **Tailscale access to the tower** (the host's machine), so the natural direction is agent-manager **pulling** over Tailscale. Proposed, to confirm. |
 
 ## 1. The loop
 
@@ -198,13 +202,28 @@ existing loop: an entry, sorted, filed or turned into a task in that project's p
 * The portal has **no in-app feedback intake.** `SupportView.tsx` is the billing/supporter page (Stripe checkout and portal); `docker-compose.yml` only configures a contact-email address (`CONTACT_NOTIFY_TO` / `CONTACT_FROM`).
 * **Topology.** `backend-public` (a trimmed app: only `/auth`, `/client`, `/sync`) sits behind a Cloudflare tunnel with no open ports; a separate `backend-internal` (the full app, LAN) serves the admin dashboard. All of that runs on the tower (Docker, Postgres). Agent-manager and PF's pipeline run on a *different machine*. Nothing today carries a submission from the public app to a `brain-dump.json`.
 
-**Open questions this creates (not decided).**
-1. **Who submits?** Logged-in PF clients only, anonymous visitors too, or the operator as well. This sets authentication, attribution (user id, page, app version) and abuse controls (rate limits, spam).
-2. **Transport.** How a submission gets from the host (tower, public) to the agent-manager store: agent-manager pulls, the host pushes, or the host keeps its own copy in its database and a job syncs. PF already has a `/sync` surface between its public and internal backends.
-3. **Gate before processing.** Today the sorter can turn an entry into a task in `queue/derived/` or `queue/adhoc/` that the pipeline then works on (`applyBrainDumpSort`). Feeding **untrusted end-user text** into that path is a prompt-injection and noise risk. Options: user feedback lands in a review inbox first, or is sorted and filed as a note but never auto-queued as a task.
-4. **Privacy.** Feedback can contain personal data. Where it is stored, how long, and whether it may reach a local model or the vault.
-5. **Closing the loop with the user** (a status or a reply). Not needed for a first version, but it decides whether entries need a public-facing status.
+**Answered (2026-09-20).**
+1. **Who submits?** Anyone, but every submission is linked to an account; the operator has their own. So the host must authenticate the submitter, and an entry carries the account identity.
+2. **Gate before processing.** User feedback is **human-gated after an initial sort**, and there is **no direct or automatic path from a feedback entry to a task**. Today the sorter can queue a task from an entry (`applyBrainDumpSort` -> `queue/derived/` or `queue/adhoc/`); for user feedback that branch must not exist.
+3. **Sorting by account.** The sorter must expect an account on every incoming feedback entry and sort by it.
+4. **Transport.** The agent-manager machine reaches the tower over Tailscale (checked with `tailscale status` from this machine), so a **pull** from agent-manager needs no inbound exposure of agent-manager. Which tower endpoint it pulls from is still to be chosen: `backend-public` is not host-exposed, and `backend-internal` (the full app) serves the LAN.
+
+**Still open.**
+1. **Is the operator's own account trusted?** The gate could apply to everyone, or the operator's submissions could keep today's behaviour (a note that may be queued as a task). Decide before the sorter is changed.
+2. **What "sorted by account" produces.** Grouping in the store and an account view in the UI, filing under the account in the vault, or both. Account identifiers in vault notes are personal data (see 3).
+3. **Privacy.** Where feedback and account identifiers are stored, for how long, and that only a local model reads them (the sorter uses one today).
+4. **Raw-submission store.** The host's database as the durable source of raw submissions, with agent-manager importing them (idempotently, by the host's own submission id), or agent-manager as the only store.
+5. **Closing the loop with the user** (a status or a reply). Not needed for a first version.
 
 **Effect on the seams (section 7).** Seam B (UI) becomes the host-side widget and must work in a React host and, ideally, any web host. Seam A's single owner is
 naturally the agent-manager-side half; the host-side half only ever calls it. A new **Seam F: the host-side intake** (widget + endpoint + transport) is the part
-that does not exist in any form today.
+that does not exist in any form today, now with a **pull importer** on the agent-manager side.
+
+**What the sorter (Seam C) must change for user feedback.** (a) **A new input:** the entry carries `origin {kind: "user-feedback", host, accountId, hostSubmissionId}`
+and the sorter is written to expect it. (b) **A new output rule:** the sort result groups by account. (c) **No task branch:** for `origin.kind === "user-feedback"`
+`applyBrainDumpSort`'s queue-a-task branch is unreachable, enforced structurally in the apply code and not by a field the model's output can set; the only route
+toward a task is a human action by an authenticated operator, and the resulting task records where it came from (`concept-task-provenance`). (d) **Untrusted text is
+data:** whenever a model reads it, it is quoted or fenced as user-provided content, never presented as an instruction.
+
+**Invariants added for feedback** (in addition to section 7's nine): (10) no user-feedback entry becomes a task automatically; (11) every user-feedback entry keeps its account
+identity, its host and the host's own submission id; (12) the import from a host is idempotent; (13) a human-promoted task keeps the provenance of the feedback it came from.
