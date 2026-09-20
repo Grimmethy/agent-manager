@@ -31,6 +31,7 @@ const { REASON_CATEGORIES } = require('./pipeline-self-audit.js');
 const { extractFilePaths, resolveAgainstRepo } = require('./fact-checker.js');
 const { isStaleByAge, isFabricationRepeat, hasExhaustedRetries, alreadyImplementedSignal, invalidPremiseSignal, isDecomposeLoop, candidateFilePaths, distinctivePhrases, extractCreatedSymbols, lastActivityTs, stalenessThresholdMs, symbolDefinedInRepo, envDays, FABRICATION_KEYWORDS, GIT_LOG_TIMEOUT_MS, CREATE_VERB_RE, DEFAULT_STALENESS_THRESHOLD_DAYS, GENERATED_DOC_RE, MS_PER_DAY, NON_PROGRESS_STAGES, TITLE_PREFIX_RE } = require('./staleness-audit-signals.js');
 const { normalizeTaskTokens, dupSimilarityThreshold, bdLineage, findDuplicateTask } = require('./staleness-audit-dedup.js');
+const { resolveGroundingRef, resolveAtRef } = require('./stacked-grounding.js');
 
 // Lowered from 14 (2026-08-23, Grimmethy: "Yes, lower the default" -- after confirming
 // live that the first real candidate, adhoc-brain-dump-bd-1786742554232, had been
@@ -226,7 +227,22 @@ const { normalizeTokens, jaccardSimilarity: jaccard, STOPWORDS: DUP_STOPWORDS, d
 // here to answer, deterministically or otherwise.
 const SELF_AUDIT_SOURCES = new Set(['staleness_audit', 'pipeline_self_audit']);
 
+// (repoRoot, task, cache) -> (claimedPath) => boolean, or null when the task is not stacked / its branch is not on origin. The branch lookup
+// (a fetch) is cached per branch for the sweep: many children of one hub share it.
+function stackedExistsAtRef(repoRoot, task, cache) {
+  const branch = task && task.stacked && task.stacked.branch;
+  if (!branch) return null;
+  if (!cache.has(branch)) {
+    let ref = null;
+    try { ref = resolveGroundingRef(task, repoRoot); } catch { ref = null; }
+    cache.set(branch, ref);
+  }
+  const ref = cache.get(branch);
+  return ref ? (p) => !!resolveAtRef(repoRoot, ref, p) : null;
+}
+
 function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoRoot, corpusTasks } = {}) {
+  const stackedRefCache = new Map();
   const threshold = stalenessThresholdMs();
   const cooldown = cooldownMs();
   const candidates = [];
@@ -241,19 +257,21 @@ function findStalenessCandidates(tasks, coverage = {}, now = Date.now(), { repoR
     if (isDecomposeLoop(task)) reasons.push('decompose-loop');
 
     let touchedFiles = [];
+    // A stacked task's real files live on its chain branch (null for every other task -- their behavior is unchanged).
+    const existsAtRef = repoRoot ? stackedExistsAtRef(repoRoot, task, stackedRefCache) : null;
     if (repoRoot) {
       const gitCheck = findFilesTouchedSince(repoRoot, task);
       if (gitCheck.touched) {
         reasons.push('possibly-resolved');
         touchedFiles = gitCheck.files;
       }
-      const impl = alreadyImplementedSignal(repoRoot, task);
+      const impl = alreadyImplementedSignal(repoRoot, task, existsAtRef);
       if (impl.strong) { reasons.push('already-implemented-strong'); evidence.push(...impl.strongEvidence); }
       if (impl.phraseHits.length > 0 && reasons.length > 0) {
         // only meaningful alongside another real signal -- attach as vote context, not a reason
         evidence.push(...impl.phraseHits);
       }
-      const bad = invalidPremiseSignal(repoRoot, task);
+      const bad = invalidPremiseSignal(repoRoot, task, existsAtRef);
       if (bad.hit) { reasons.push('invalid-premise'); evidence.push(...bad.evidence); }
     }
 

@@ -109,7 +109,17 @@ function distinctivePhrases(task) {
   return sharedDistinctivePhrases(line);
 }
 
-function alreadyImplementedSignal(repoRoot, task) {
+// existsAtRef (optional): (claimedPath) => boolean, "does it exist on the branch this task really builds on". A STACKED task's files live on its
+// chain branch, which the working tree at repoRoot does not show (the shared checkout sits on whatever branch the last apply or draft left it
+// on). It only ever ADDS existence to the working-tree answer; a throw or false changes nothing. 2026-09-20, PF HUB0005-01: flagged
+// `invalid-premise (retire)` because src/lib/tileGrid.ts existed only on its chain.
+function existsAnywhere(repoRoot, claimedPath, existsAtRef) {
+  if (resolveAgainstRepo(repoRoot, claimedPath)) return true;
+  if (typeof existsAtRef !== 'function') return false;
+  try { return existsAtRef(claimedPath) === true; } catch { return false; }
+}
+
+function alreadyImplementedSignal(repoRoot, task, existsAtRef = null) {
   if (!repoRoot) return { strong: false, strongEvidence: [], phraseHits: [] };
   const strongEvidence = [];
   const ctx = task.promptContext || {};
@@ -119,6 +129,7 @@ function alreadyImplementedSignal(repoRoot, task) {
     if (/[./]/.test(sym)) {
       const resolved = resolveAgainstRepo(repoRoot, sym);
       if (resolved) strongEvidence.push(`asks to create \`${sym}\` -- but ${path.relative(repoRoot, resolved)} already exists`);
+      else if (existsAnywhere(repoRoot, sym, existsAtRef)) strongEvidence.push(`asks to create \`${sym}\` -- but it already exists on this task's branch`);
     } else {
       const where = symbolDefinedInRepo(repoRoot, sym);
       if (where) strongEvidence.push(`asks to add \`${sym}\` -- but it is already defined in ${where}`);
@@ -147,12 +158,12 @@ function alreadyImplementedSignal(repoRoot, task) {
   return { strong: strongEvidence.length > 0, strongEvidence, phraseHits };
 }
 
-function invalidPremiseSignal(repoRoot, task) {
+function invalidPremiseSignal(repoRoot, task, existsAtRef = null) {
   if (!repoRoot) return { hit: false, evidence: [] };
   const ownCreateTarget = task.promptContext && task.promptContext.newFile;
   const named = candidateFilePaths(task).filter((p) => p !== ownCreateTarget);
   if (named.length === 0) return { hit: false, evidence: [] };
-  const missing = named.filter((p) => !resolveAgainstRepo(repoRoot, p));
+  const missing = named.filter((p) => !existsAnywhere(repoRoot, p, existsAtRef));
   if (missing.length !== named.length) return { hit: false, evidence: [] };
   return { hit: true, evidence: [`every file this task names is absent from the repo: ${missing.join(', ')}`] };
 }
