@@ -102,6 +102,7 @@ function renderHygiene() {
       ${stat(estText, 'of model time', estTitle, '')}
     </div>
     ${notes}
+    ${(d.families || []).length ? '' : '<div class="empty">No hygiene task sources are registered for this project -- load the agent-manager-hygiene plugin (Plugins tab) to see its backlog here.</div>'}
     <table>
       <thead><tr>
         <th>Family</th><th title="Scanner flags: waiting / total for this project">Flags</th><th title="Candidates in the docs: waiting · stuck · awaiting merge">Candidates</th>
@@ -122,9 +123,6 @@ function renderHygiene() {
 }
 
 function hygieneFamilyRows(f) {
-  if (!f.available) {
-    return `<tr><td>${escapeHtml(f.label)}</td><td colspan="6" class="stat">plugin not loaded -- none of this family's sources are registered</td></tr>`;
-  }
   const fl = f.flags; const c = f.candidates && f.candidates.totals; const o = f.open || {}; const tk = f.tasks || { done: {} };
   const done = tk.done || {};
   const otherDone = Object.entries(done).filter(([k]) => !['merged', 'dismissed', 'noop'].includes(k)).reduce((n, [, v]) => n + v, 0);

@@ -32,21 +32,16 @@ NODE_TIMEOUT_SECONDS = 45   # a cold filesystem cache on a big repo took ~14 s; 
 MIN_SAMPLES = 3
 ESTIMATE_WINDOW_DAYS = 30
 
-# family key -> task-id prefixes (must match src/hygiene-inventory.js FAMILIES)
-FAMILY_PREFIXES = {
-    "observability": ["observability-"],
-    "performance": ["performance-"],
-    "function_length": ["function-length-"],
-    "unused_export": ["deadcode-"],
-    "arch": ["arch-"],
-    "change_review": ["change-review-"],
-}
+# Task-id prefixes per family come from the inventory itself (each source's registration declares `hygieneFamily.idPrefixes`);
+# nothing here names a plugin's sources.
 
 _cache = {"key": None, "at": 0.0, "payload": None}
 
 
 def _avg_seconds_per_task(conn, prefixes):
     """(average total model seconds per task, sample count) over the last ESTIMATE_WINDOW_DAYS, or (None, n)."""
+    if not prefixes:
+        return None, 0
     where = " OR ".join("task_id LIKE ?" for _ in prefixes)
     rows = conn.execute(
         f"SELECT SUM(latency_ms) FROM model_calls WHERE ({where}) AND latency_ms IS NOT NULL "
@@ -79,7 +74,7 @@ def build_estimate(inventory):
             units = int(o.get("waitingFlags", 0)) + int(o.get("waitingCandidates", 0)) + int(o.get("inFlight", 0))
             if units == 0:
                 continue
-            avg, samples = _avg_seconds_per_task(conn, FAMILY_PREFIXES.get(fam["key"], []))
+            avg, samples = _avg_seconds_per_task(conn, fam.get("idPrefixes") or [])
             entry = {"units": units, "avgSecondsPerTask": None if avg is None else round(avg, 1), "samples": samples}
             if avg is None:
                 units_without_basis += units

@@ -26,16 +26,30 @@ const IN_FLIGHT = ['pending', 'drafting', 'review', 'approved'];
 const NEEDS_HUMAN = ['blocked', 'needs-clarification', 'awaiting-confirm', 'coordinating'];
 const QUEUE_STATES = [...IN_FLIGHT, ...NEEDS_HUMAN, 'done'];
 
-// family -> the task sources it covers, the task-id filename prefixes (so we only READ files that can belong to it --
-// done/ holds thousands), the source whose `inventory` hook holds its flags, and the sources whose candidate doc it owns.
-const FAMILIES = [
-  { key: 'observability', label: 'Observability', sources: ['observability_review', 'observability_review_digest', 'observability_fix'], prefixes: ['observability-'], flagSource: 'observability_review', docSources: ['observability_fix'] },
-  { key: 'performance', label: 'Performance', sources: ['performance_review', 'performance_fix'], prefixes: ['performance-'], flagSource: 'performance_review', docSources: ['performance_fix'] },
-  { key: 'function_length', label: 'Function length', sources: ['function_length_review', 'function_length_fix'], prefixes: ['function-length-'], flagSource: 'function_length_review', docSources: ['function_length_fix'] },
-  { key: 'unused_export', label: 'Unused exports', sources: ['unused_export'], prefixes: ['deadcode-'], flagSource: 'unused_export', docSources: [] },
-  { key: 'arch', label: 'Architecture', sources: ['arch_discovery', 'arch_review', 'arch_import', 'arch_import_review'], prefixes: ['arch-'], flagSource: null, docSources: ['arch_review', 'arch_import_review'] },
-  { key: 'change_review', label: 'Change review', sources: ['change_review', 'change_review_fix'], prefixes: ['change-review-'], flagSource: null, docSources: ['change_review_fix'] },
-];
+// The families are NOT listed here: core must not name plugin-owned sources (ADR-0022, src/no-plugin-source-names.test.js).
+// Each hygiene source declares its own membership on its registration:
+//   hygieneFamily: { key, label, order?, idPrefixes: ['observability-'], candidateDoc?: true }
+// `idPrefixes` = the task-id filename prefixes (so only files that can belong to the family are READ -- done/ holds thousands);
+// `candidateDoc: true` = this source owns a Docs/*_CANDIDATES.md the tab should inventory. A family's flags come from the
+// `inventory({ taskState })` hook of its member that has one. No plugin loaded -> no families (the tab says so).
+function collectFamilies(sources) {
+  const byKey = new Map();
+  for (const s of sources || []) {
+    const h = s && s.hygieneFamily;
+    if (!h || !h.key) continue;
+    let fam = byKey.get(h.key);
+    if (!fam) {
+      fam = { key: h.key, label: h.label || h.key, order: Number.isFinite(h.order) ? h.order : 1000, prefixes: [], sources: [], flagSource: null, docSources: [] };
+      byKey.set(h.key, fam);
+    }
+    if (Number.isFinite(h.order)) fam.order = Math.min(fam.order, h.order);
+    fam.sources.push(s.name);
+    for (const p of h.idPrefixes || []) if (!fam.prefixes.includes(p)) fam.prefixes.push(p);
+    if (!fam.flagSource && typeof s.inventory === 'function') fam.flagSource = s.name;
+    if (h.candidateDoc) fam.docSources.push(s.name);
+  }
+  return [...byKey.values()].sort((a, b) => (a.order - b.order) || a.key.localeCompare(b.key));
+}
 
 function readJson(p) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
@@ -66,7 +80,7 @@ function makeMetaCache(pipelineDir) {
       if (c && c.m === st.mtimeMs && c.s === st.size) return c;
       const d = readJson(fp);
       if (!d) return null;
-      const entry = { m: st.mtimeMs, s: st.size, source: d.source === 'deadcode_triage' ? 'unused_export' : (d.source || null), disposition: d.terminalDisposition || null };
+      const entry = { m: st.mtimeMs, s: st.size, source: d.source || null, disposition: d.terminalDisposition || null };
       data[fp] = entry;
       dirty = true;
       return entry;
@@ -127,8 +141,8 @@ function makeTaskLookup(queueDir, cache = null) {
 
 // --- task funnel -----------------------------------------------------------------------------------------------------
 
-function familyOfFile(name) {
-  return FAMILIES.find((f) => f.prefixes.some((p) => name.startsWith(p))) || null;
+function familyOfFile(name, families) {
+  return families.find((f) => f.prefixes.some((p) => name.startsWith(p))) || null;
 }
 
 function emptyTaskCounts() {
@@ -136,12 +150,13 @@ function emptyTaskCounts() {
 }
 
 // One pass over the queue dirs, READING only files whose name matches a family prefix.
-function scanTaskFunnel(queueDir, cache = null) {
-  const out = Object.fromEntries(FAMILIES.map((f) => [f.key, emptyTaskCounts()]));
+function scanTaskFunnel(queueDir, cache = null, families = [], resolveSource = (x) => x) {
+  const out = Object.fromEntries(families.map((f) => [f.key, emptyTaskCounts()]));
   const add = (fam, source, state, disposition) => {
     const c = out[fam.key];
     c.total += 1;
-    c.bySource[source || '?'] = (c.bySource[source || '?'] || 0) + 1;
+    const src = resolveSource(source) || '?';
+    c.bySource[src] = (c.bySource[src] || 0) + 1;
     if (state === 'done' || state === 'archived') {
       const d = disposition || 'unclassified';
       c.done[d] = (c.done[d] || 0) + 1;
@@ -155,11 +170,11 @@ function scanTaskFunnel(queueDir, cache = null) {
       ? (() => { try { return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).flatMap((e) => listJson(path.join(dir, e.name)).map((f) => path.join(dir, e.name, f))); } catch { return []; } })()
       : listJson(dir).map((f) => path.join(dir, f));
     for (const file of files) {
-      const fam = familyOfFile(path.basename(file));
+      const fam = familyOfFile(path.basename(file), families);
       if (!fam) continue;
       let m;
       if (cache) m = cache.meta(file);
-      else { const d = readJson(file); m = d ? { source: d.source === 'deadcode_triage' ? 'unused_export' : d.source, disposition: d.terminalDisposition || null } : null; }
+      else { const d = readJson(file); m = d ? { source: d.source || null, disposition: d.terminalDisposition || null } : null; }
       if (!m) continue;
       add(fam, m.source, state, state === 'done' || state === 'archived' ? (m.disposition || null) : null);
     }
@@ -168,7 +183,7 @@ function scanTaskFunnel(queueDir, cache = null) {
   scanDir(path.join(queueDir, 'done', '_archived_no_action'), 'archived');
   // Dated month buckets can be huge: count by filename only (never read), so the number is "how many older ones exist".
   for (const dir of archivedMonthDirs(queueDir)) {
-    for (const f of listJson(dir)) { const fam = familyOfFile(f); if (fam) out[fam.key].archivedOlder += 1; }
+    for (const f of listJson(dir)) { const fam = familyOfFile(f, families); if (fam) out[fam.key].archivedOlder += 1; }
   }
   return out;
 }
@@ -264,7 +279,7 @@ function inventoryCandidateDoc({ sourceName, entry, taskState, repoRoot, isDepen
 
 // --- assemble --------------------------------------------------------------------------------------------------------
 
-function buildHygieneInventory({ getRegisteredSource, getConfig, now = new Date(), isDependencySatisfied = null, maxChars = null }) {
+function buildHygieneInventory({ getRegisteredSource, getRegisteredSources, resolveSource = (x) => x, getConfig, now = new Date(), isDependencySatisfied = null, maxChars = null }) {
   const { repoRoot, pipelineDir } = getConfig();
   // Eligibility inputs come from the real fulfillment code so the two cannot drift apart.
   const maxCharsResolved = maxChars || require('./sdk/lib/candidate-lifecycle.js').MAX_ARCH_REVIEW_TASK_CHARS;
@@ -272,10 +287,11 @@ function buildHygieneInventory({ getRegisteredSource, getConfig, now = new Date(
   const queueDir = path.join(pipelineDir, 'queue');
   const cache = makeMetaCache(pipelineDir);
   const taskState = makeTaskLookup(queueDir, cache);
-  const funnel = scanTaskFunnel(queueDir, cache);
+  const familyDefs = collectFamilies(getRegisteredSources ? getRegisteredSources() : []);
+  const funnel = scanTaskFunnel(queueDir, cache, familyDefs, resolveSource);
   const notes = [];
 
-  const families = FAMILIES.map((fam) => {
+  const families = familyDefs.map((fam) => {
     // scanner flags -- the plugin's own hook (its id formula / skip rules), pure read
     let flags = null;
     const flagEntry = fam.flagSource ? getRegisteredSource(fam.flagSource) : null;
@@ -300,9 +316,8 @@ function buildHygieneInventory({ getRegisteredSource, getConfig, now = new Date(
     const tasks = funnel[fam.key];
     const inFlight = IN_FLIGHT.reduce((n, s) => n + (tasks.byState[s] || 0), 0);
     const needsHuman = NEEDS_HUMAN.reduce((n, s) => n + (tasks.byState[s] || 0), 0);
-    const registered = fam.sources.filter((s) => getRegisteredSource(s));
     return {
-      key: fam.key, label: fam.label, sources: registered, available: registered.length > 0,
+      key: fam.key, label: fam.label, sources: fam.sources, idPrefixes: fam.prefixes,
       flags, candidates: docs.length ? { docs, totals: cand } : null, tasks,
       // The headline numbers: what is waiting on a WORKER (flags + Strong candidates not yet tasked), what is in
       // flight, what needs a HUMAN decision, and what waits on the human MERGE.
@@ -315,6 +330,8 @@ function buildHygieneInventory({ getRegisteredSource, getConfig, now = new Date(
       },
     };
   });
+
+  if (!familyDefs.length) notes.push('no hygiene sources are registered -- is the agent-manager-hygiene plugin loaded?');
 
   // Advisory-only: the file-length scan flags oversized files but nothing tasks them automatically.
   const fl = readJson(path.join(queueDir, 'file-length-flags.json'));
@@ -334,16 +351,16 @@ function buildHygieneInventory({ getRegisteredSource, getConfig, now = new Date(
   return { generatedAt: now.toISOString(), repoRoot, projectTag: path.basename(repoRoot), families, fileLength, totals, notes };
 }
 
-module.exports = { buildHygieneInventory, makeTaskLookup, scanTaskFunnel, parseCandidateHeaders, FAMILIES };
+module.exports = { buildHygieneInventory, makeTaskLookup, scanTaskFunnel, parseCandidateHeaders, collectFamilies };
 
 if (require.main === module) {
   // Same bootstrap as the other registry-reading CLIs: built-in sources, then any AGENT_MANAGER_REGISTER_PATH plugins.
-  const { getRegisteredSource } = require('./task-source-registry.js');
+  const { getRegisteredSource, getRegisteredSources, resolveSourceName } = require('./task-source-registry.js');
   require('./task-sources.js');
   const { getConfig, ensureRegistered } = require('./config.js');
   try { ensureRegistered(); } catch { /* best-effort: built-ins still load */ }
   try {
-    process.stdout.write(JSON.stringify(buildHygieneInventory({ getRegisteredSource, getConfig })));
+    process.stdout.write(JSON.stringify(buildHygieneInventory({ getRegisteredSource, getRegisteredSources, resolveSource: (name) => resolveSourceName({ source: name }), getConfig })));
   } catch (e) {
     process.stdout.write(JSON.stringify({ error: e.message }));
     process.exitCode = 1;
