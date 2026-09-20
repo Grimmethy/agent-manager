@@ -3086,6 +3086,43 @@ def _hub_info_for_task(task_id, task=None, index=None, qdir=None):
     return None
 
 
+def _norm_path(p) -> str:
+    try:
+        return os.path.realpath(str(p)) if p else ""
+    except OSError:
+        return os.path.normpath(str(p))
+
+
+def _active_project_label() -> str | None:
+    """Registry label of the project the pipeline is running now (idle-pool borrowing: the Workers tab names the project each task belongs
+    to), else the repo directory's name."""
+    pd = get_pipeline_dir()
+    rr = get_active_repo_root()
+    for e in read_project_registry():
+        if (pd and _norm_path(e.get("pipelineDir")) == _norm_path(pd)) or (rr and _norm_path(e.get("repoRoot")) == _norm_path(rr)):
+            return e.get("label") or Path(str(e.get("repoRoot"))).name
+    return Path(rr).name if rr else None
+
+
+def _queue_dir_for_project_label(label):
+    """queue/ of the registered project called `label` (a lane borrowing from that project reports it in its heartbeat), or None."""
+    for e in read_project_registry():
+        if e.get("label") == label and e.get("pipelineDir"):
+            q = Path(e["pipelineDir"]) / "queue"
+            if q.is_dir():
+                return q
+    return None
+
+
+def _worker_project_info(hb: dict, active_label, active_qdir):
+    """(projectLabel, borrowed, qdir) for a worker heartbeat. A lane running another suite project's task writes that project's label into its
+    heartbeat (`project`); otherwise the task belongs to the active project. qdir is where that task's record and hub live."""
+    project = hb.get("project") or active_label
+    borrowed = bool(hb.get("project")) and hb.get("project") != active_label
+    qdir = (_queue_dir_for_project_label(hb["project"]) if borrowed else None) or active_qdir
+    return project, borrowed, qdir
+
+
 def _find_task_record_anywhere(qdir, task_id):
     """(data, state) for a task id across every queue location a branch's task could be
     sitting in -- the QUEUE_STATES dirs, the manual + dated + superseded archives, and the

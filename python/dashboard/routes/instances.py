@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 
-# The app.py helpers these views call (ENV_FILE_PATH, OTHER_STALE_SECONDS, PACKAGE_ROOT, WORKING_STALE_SECONDS, _expected_instance_ids, _find_task_record_anywhere, _has_instance_id_column, _hub_info_for_task, _hub_label_index, _is_live_worker_instance, _kill_and_requeue_instance, _read_pipeline_history_events, _recent_task_ids_for_instance, _relocate_task_to_pending, _scan_recently_completed_tasks, instances_dir, model_stats_db_path, parse_hb_timestamp, queue_dir, read_env_file, read_json_safe) are
+# The app.py helpers these views call (ENV_FILE_PATH, OTHER_STALE_SECONDS, PACKAGE_ROOT, WORKING_STALE_SECONDS, _expected_instance_ids, _active_project_label, _find_task_record_anywhere, _has_instance_id_column, _hub_info_for_task, _hub_label_index, _queue_dir_for_project_label, _worker_project_info, _is_live_worker_instance, _kill_and_requeue_instance, _read_pipeline_history_events, _recent_task_ids_for_instance, _relocate_task_to_pending, _scan_recently_completed_tasks, instances_dir, model_stats_db_path, parse_hb_timestamp, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
 # blueprint, so a top-level `from app import ...` is a circular import that only
 # fails when app.py is the entrypoint (how the dashboard runs). By the time a view
@@ -69,12 +69,23 @@ def api_instances():
                 "staleThresholdSeconds": None,
             })
     # HUB#### of whatever each worker is on, so a hub in progress is recognisable on the card (Workers tab).
-    from app import _hub_info_for_task, _hub_label_index, queue_dir
+    from app import _active_project_label, _hub_info_for_task, _hub_label_index, _worker_project_info, queue_dir
     qdir = queue_dir()
-    hub_index = _hub_label_index(qdir) if qdir else {}
+    active_label = _active_project_label()
+    hub_indexes = {}
     for r in results:
-        if r.get("currentTaskId") and qdir:
-            r["hub"] = _hub_info_for_task(r["currentTaskId"], index=hub_index, qdir=qdir)
+        if not r.get("currentTaskId"):
+            continue
+        # Which project the task belongs to (a lane can be running a borrowed suite project's task; docs/idle-pool-borrowing.md), and
+        # its hub looked up in THAT project's queue, not the active one's.
+        project, borrowed, task_qdir = _worker_project_info(r, active_label, qdir)
+        r["projectLabel"] = project
+        r["borrowed"] = borrowed
+        if task_qdir:
+            key = str(task_qdir)
+            if key not in hub_indexes:
+                hub_indexes[key] = _hub_label_index(task_qdir)
+            r["hub"] = _hub_info_for_task(r["currentTaskId"], index=hub_indexes[key], qdir=task_qdir)
     results.sort(key=lambda r: r.get("instanceId") or "")
     return jsonify(results)
 
