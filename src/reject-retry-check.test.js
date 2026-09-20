@@ -235,7 +235,30 @@ test('an agentic continuation is requeued to adhoc/ even past the redraft cap, w
   assert.match(out.priorRejectionFeedback.join('\n'), /CONTINUATION, not a fresh start/);
   assert.match(out.priorRejectionFeedback.join('\n'), /still need the \/api\/plugins\/marketplace route/);
   assert.equal(out.agenticContinuationNote, undefined, 'consumed');
-  assert.equal(out.priorPartialDiff, undefined, 'consumed');
+  // 2026-09-20: the diff is KEPT (the next pass applies it to its fresh worktree) and the note says the edits are already applied, instead of
+  // pasting a 6000-char slice of the diff into the prompt for the model to re-apply by hand.
+  assert.equal(out.priorPartialDiff, task.priorPartialDiff, 'kept so the next pass can apply it to its worktree');
+  assert.match(out.priorRejectionFeedback.join('\n'), /ALREADY APPLIED to your worktree/);
+  assert.doesNotMatch(out.priorRejectionFeedback.join('\n'), /diff --git a\/python\/dashboard\/app\.py/, 'the diff text is no longer pasted into the prompt');
+});
+
+test('a REJECTED decompose that carried landed edits keeps them as the next pass\'s starting point (priorPartialDiff), instead of redrafting from scratch', () => {
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'adhoc-rej-carried', domain: 'adhoc', source: 'manual', adhocResolution: 'decompose',
+    blockedStage: 'review', blockedReason: 'the decomposed sub-tasks omit the core deliverable',
+    carriedPartialDiff: 'diff --git a/x.tsx b/x.tsx\n--- a/x.tsx\n+++ b/x.tsx\n@@ -1 +1 @@\n-a\n+b\n',
+    localRejectCount: 0, history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'adhoc-rej-carried.json'), JSON.stringify(task));
+
+  rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'adhoc-rej-carried.json'), 'utf8'));
+  assert.equal(out.priorPartialDiff, task.carriedPartialDiff);
+  assert.equal(out.carriedPartialDiff, undefined);
+  assert.match(out.priorRejectionFeedback.join('\n'), /ALREADY APPLIED to your worktree/);
+  assert.match(out.priorRejectionFeedback.join('\n'), /omit the core deliverable/, 'the rejection reason is still fed forward');
 });
 
 test('an adhoc no-changes-needed rejection that exhausts retries -> queue/needs-clarification/ with a pre-filled question', () => {

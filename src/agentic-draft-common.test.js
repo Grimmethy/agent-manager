@@ -434,7 +434,74 @@ test('resolveAgenticDraft(decompose) with partial edits AT the continuation cap 
     assert.equal(task.adhocResolution, 'decompose');
     assert.equal(task.subTaskProposals.length, 2);
     assert.equal(task.rawDiff, '');
-    assert.match(task.implementResponse, /partial edits before this split; they were not carried forward/);
+    // 2026-09-20: the landed edits ride on the task (queueSubTasks gives them to the first piece) instead of being discarded.
+    assert.match(task.carriedPartialDiff, /a\.txt/);
+    assert.match(task.implementResponse, /CARRIED into the first sub-task's worktree/);
+    assert.doesNotMatch(task.implementResponse, /not carried forward/);
+  });
+});
+
+test('resolveAgenticDraft(decompose) with NO partial edits carries nothing', () => {
+  withRealRepo((wt) => {
+    const task = { id: 't2none', agenticContinuationCount: 2 };
+    resolveAgenticDraft(task, {
+      result: { response: 'RESOLUTION: decompose\n[{"title":"p1","rawText":"a"},{"title":"p2","rawText":"b"}]\nbig' },
+      worktreeDir: wt,
+    });
+    assert.equal(task.carriedPartialDiff, undefined);
+  });
+});
+
+test('resolveAgenticDraft(implemented) clears priorPartialDiff / carriedPartialDiff: the captured diff is cumulative, so it already carries that work', () => {
+  withRealRepo((wt) => {
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'changed\n');
+    const task = { id: 't-clear', priorPartialDiff: 'old diff', carriedPartialDiff: 'older diff' };
+    resolveAgenticDraft(task, { result: { response: 'RESOLUTION: implemented\nok' }, worktreeDir: wt });
+    assert.equal(task.priorPartialDiff, undefined);
+    assert.equal(task.carriedPartialDiff, undefined);
+    assert.match(task.rawDiff, /a\.txt/);
+  });
+});
+
+// --- applyPartialDiff / runAgenticDraftInWorktree (2026-09-20) --------------------------------------------------------------------------
+
+const { applyPartialDiff } = require('./agentic-draft-common.js');
+
+test('applyPartialDiff puts a captured partial diff on disk in a fresh worktree, and the next capture is cumulative', () => {
+  withRealRepo((wt) => {
+    // an earlier pass's landed work, captured exactly the way bestEffortDiff does
+    fs.writeFileSync(path.join(wt, 'a.txt'), 'edited by the earlier pass\n');
+    fs.writeFileSync(path.join(wt, 'new.txt'), 'created by the earlier pass\n');
+    execFileSync('git', ['add', '-A'], { cwd: wt });
+    const diff = execFileSync('git', ['diff', '--cached', '--full-index', '--binary'], { cwd: wt, encoding: 'utf8' });
+    execFileSync('git', ['reset', '-q', '--hard'], { cwd: wt });
+    execFileSync('git', ['clean', '-fdq'], { cwd: wt });
+    assert.equal(fs.readFileSync(path.join(wt, 'a.txt'), 'utf8'), 'original\n');
+
+    const res = applyPartialDiff(wt, diff);
+
+    assert.equal(res.applied, true);
+    assert.equal(fs.readFileSync(path.join(wt, 'a.txt'), 'utf8'), 'edited by the earlier pass\n');
+    assert.equal(fs.readFileSync(path.join(wt, 'new.txt'), 'utf8'), 'created by the earlier pass\n');
+    // the pass then makes ONE more edit; what it finally captures contains both the old and the new work
+    fs.writeFileSync(path.join(wt, 'b.txt'), 'this pass\n');
+    const task = { id: 't-cumulative' };
+    resolveAgenticDraft(task, { result: { response: 'RESOLUTION: implemented\nok' }, worktreeDir: wt });
+    assert.match(task.rawDiff, /a\.txt/);
+    assert.match(task.rawDiff, /new\.txt/);
+    assert.match(task.rawDiff, /b\.txt/);
+  });
+});
+
+test('applyPartialDiff: a diff that does not apply (base moved) reports applied:false and leaves the worktree untouched; empty input is a no-op', () => {
+  withRealRepo((wt) => {
+    const bad = 'diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-something else entirely\n+x\n';
+    const res = applyPartialDiff(wt, bad);
+    assert.equal(res.applied, false);
+    assert.ok(res.reason);
+    assert.equal(fs.readFileSync(path.join(wt, 'a.txt'), 'utf8'), 'original\n');
+    assert.equal(applyPartialDiff(wt, '').applied, false);
+    assert.equal(applyPartialDiff(wt, undefined).applied, false);
   });
 });
 
@@ -1022,4 +1089,71 @@ test('runAgenticDraftInWorktree still bases a NON-stacked task\'s worktree on ma
   } finally {
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
+});
+
+// A real origin + clone, so prepareAdhocWorktree (fetch origin, `worktree add ... origin/main`) runs for real.
+async function withOriginAndClone(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentic-common-origin-'));
+  const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' });
+  const origin = path.join(dir, 'origin.git');
+  const clone = path.join(dir, 'clone');
+  g(['init', '-q', '--bare', '-b', 'main', origin], dir);
+  g(['clone', '-q', origin, clone], dir);
+  g(['config', 'user.email', 't@t'], clone); g(['config', 'user.name', 't'], clone);
+  g(['checkout', '-q', '-b', 'main'], clone);
+  fs.writeFileSync(path.join(clone, 'a.txt'), 'original\n');
+  g(['add', '-A'], clone); g(['commit', '-qm', 'init'], clone); g(['push', '-q', 'origin', 'main'], clone);
+  try { return await fn(clone); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+test('runAgenticDraftInWorktree applies task.priorPartialDiff before the model runs and hands the outcome to runInWorktree; the result is cumulative', async () => {
+  const { runAgenticDraftInWorktree } = require('./agentic-draft-common.js');
+  await withOriginAndClone(async (clone) => {
+    const diff = 'diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-original\n+edited by the earlier pass\n';
+    const task = { id: 'cont-apply-1', priorPartialDiff: diff, history: [] };
+    let seen = null;
+    const out = await runAgenticDraftInWorktree(task, {
+      repoRoot: clone,
+      modelLabel: 'test-model',
+      runInWorktree: async (wtDir, info) => {
+        seen = { onDisk: fs.readFileSync(path.join(wtDir, 'a.txt'), 'utf8'), info };
+        fs.writeFileSync(path.join(wtDir, 'b.txt'), 'this pass\n');
+        return { response: 'RESOLUTION: implemented\nok' };
+      },
+    });
+    assert.equal(seen.onDisk, 'edited by the earlier pass\n', 'the prior edit is on disk BEFORE the model starts');
+    assert.equal(seen.info.partialDiff.applied, true);
+    assert.equal(out.blocked, false);
+    assert.match(task.rawDiff, /edited by the earlier pass/);
+    assert.match(task.rawDiff, /b\.txt/);
+    assert.equal(task.priorPartialDiff, undefined, 'cleared once the cumulative diff is captured');
+    assert.ok(task.history.some((h) => /prior partial diff .* applied to the worktree/.test(h.detail || '')));
+  });
+});
+
+test('runAgenticDraftInWorktree: a prior diff that cannot be applied is reported to runInWorktree (applied:false) and the pass still runs', async () => {
+  const { runAgenticDraftInWorktree } = require('./agentic-draft-common.js');
+  await withOriginAndClone(async (clone) => {
+    const task = { id: 'cont-apply-2', priorPartialDiff: 'diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-not what is there\n+x\n', history: [] };
+    let info = null;
+    await runAgenticDraftInWorktree(task, {
+      repoRoot: clone,
+      modelLabel: 'test-model',
+      runInWorktree: async (wtDir, i) => { info = i; return { response: 'RESOLUTION: needs-human-decision\nBLOCKER-TYPE: design-question\nwhat now?' }; },
+    });
+    assert.equal(info.partialDiff.applied, false);
+    assert.ok(task.history.some((h) => /could NOT be applied/.test(h.detail || '')));
+  });
+});
+
+test('runAgenticDraftInWorktree with no prior diff behaves as before (partialDiff null)', async () => {
+  const { runAgenticDraftInWorktree } = require('./agentic-draft-common.js');
+  await withOriginAndClone(async (clone) => {
+    let info = 'unset';
+    await runAgenticDraftInWorktree({ id: 'cont-apply-3', history: [] }, {
+      repoRoot: clone, modelLabel: 'm',
+      runInWorktree: async (wtDir, i) => { info = i; return { response: 'RESOLUTION: no-changes-needed\nAlready covered: none' }; },
+    });
+    assert.equal(info.partialDiff, null);
+  });
 });
