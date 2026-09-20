@@ -1106,6 +1106,8 @@ async function renderQueueTab(state) {
   // adhoc-domain task; resolving happens via the detail modal's own picker instead, see
   // renderTaskDetailModal).
   const showArchiveOnly = state === 'needs-clarification';
+  // A plain requeue writes to pending/, which strands an adhoc-shaped task (nextAdhocTask only scans queue/adhoc/); the server refuses those too.
+  const isAdhocShapedTask = (t) => t && (t.domain === 'adhoc' || t.source === 'manual' || t.source === 'derived_task');
   // apply-task.js's awaiting-confirm gate (src/apply-group-b.js's batchContainsDeleteMode):
   // Confirm re-runs this exact task for real (stamps deleteConfirmedAt, moves to approved/
   // for the next apply-task.sh pass); Deny is the existing generic Archive action -- no
@@ -1234,6 +1236,7 @@ async function renderQueueTab(state) {
         ${trimKeepBtn}
       </td>` : ''}
       ${showArchiveOnly ? `<td>
+        ${isAdhocShapedTask(t) ? '' : `<button type="button" class="secondary task-requeue-btn" data-id="${escapeAttr(t.id)}" title="Send it back for a fresh draft (adhoc tasks use the picker / answer box instead)">Requeue</button>`}
         <button type="button" class="secondary task-done-btn" data-id="${escapeAttr(t.id)}">Mark Done</button>
         <button type="button" class="secondary task-archive-btn" data-id="${escapeAttr(t.id)}">Reject</button>
         <button type="button" class="secondary task-discuss-btn" data-id="${escapeAttr(t.id)}">Discuss</button>
