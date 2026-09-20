@@ -423,3 +423,84 @@ test('CLI claim order loads plugin-registered sources (plugin priority beats bra
   const order = res.stdout.split('\n').filter(Boolean);
   assert.deepEqual(order, ['z-plugin.json', 'a-sort.json'], res.stderr);
 });
+
+// --- lane preference (2026-09-20): a lone task goes to the host GPU lane, not the P40 -----------------------------------
+const { preferredLaneIsIdle, lanePreferenceGraceMs } = require('./next-claimable-task.js');
+const LANES = [{ id: 'worker-3090' }, { id: 'worker-p40' }];
+
+function writeHeartbeat(pendingDir, lane, status, ageMs = 0, now = Date.now()) {
+  const dir = path.join(pendingDir, '..', '..', 'instances');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${lane}.json`), JSON.stringify({ instanceId: lane, status, lastHeartbeat: new Date(now - ageMs).toISOString() }));
+}
+
+// A task that just arrived (mtime = now), so it is inside the grace window.
+function writeFreshTask(pendingDir, id, extra = {}) {
+  const p = path.join(pendingDir, `${id}.json`);
+  fs.writeFileSync(p, JSON.stringify({ id, source: 'trouble_log', promptContext: {}, ...extra }));
+  return p;
+}
+
+test('lane preference: the P40 leaves a lone fresh task for an idle 3090; the 3090 itself still takes it', () => {
+  const pendingDir = setupPending();
+  writeFreshTask(pendingDir, 'only-one');
+  writeHeartbeat(pendingDir, 'worker-3090', 'idle');
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes: LANES }), []);
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes: LANES }), ['only-one.json']);
+});
+
+test('lane preference: with two tasks the P40 still gets the second one immediately (only the top task is held)', () => {
+  const pendingDir = setupPending();
+  writeFreshTask(pendingDir, 'a', { source: 'trouble_log' });
+  writeFreshTask(pendingDir, 'b', { source: 'unused_export' });
+  writeHeartbeat(pendingDir, 'worker-3090', 'idle');
+  const p40 = pickClaimableTasks(pendingDir, 'worker-p40', { lanes: LANES });
+  const g3090 = pickClaimableTasks(pendingDir, 'worker-3090', { lanes: LANES });
+  assert.equal(p40.length, 1);
+  assert.notEqual(p40[0], g3090[0], 'the P40 must not take the task the 3090 will take');
+});
+
+test('lane preference: the hold is time-boxed -- a task older than the grace period goes to the P40 even if the 3090 looks idle', () => {
+  const pendingDir = setupPending();
+  const p = writeFreshTask(pendingDir, 'stranded');
+  const old = new Date(Date.now() - 3 * 60 * 1000);
+  fs.utimesSync(p, old, old);
+  writeHeartbeat(pendingDir, 'worker-3090', 'idle');
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes: LANES }), ['stranded.json']);
+});
+
+test('lane preference: nothing is held when the 3090 is busy, its heartbeat is stale or missing, or the feature is off', () => {
+  const pendingDir = setupPending();
+  writeFreshTask(pendingDir, 'only-one');
+  writeHeartbeat(pendingDir, 'worker-3090', 'working');
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes: LANES }), ['only-one.json'], 'busy');
+  writeHeartbeat(pendingDir, 'worker-3090', 'idle', 5 * 60 * 1000);
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes: LANES }), ['only-one.json'], 'stale heartbeat (worker down)');
+  fs.rmSync(path.join(pendingDir, '..', '..', 'instances'), { recursive: true });
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes: LANES }), ['only-one.json'], 'no heartbeat');
+  writeHeartbeat(pendingDir, 'worker-3090', 'idle');
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes: LANES, graceMs: 0 }), ['only-one.json'], 'switched off');
+});
+
+test('lane preference: a task pinned to the P40 is never held, and a single-lane setup is unaffected', () => {
+  const pendingDir = setupPending();
+  writeFreshTask(pendingDir, 'pinned', { pinnedWorker: 'worker-p40' });
+  writeHeartbeat(pendingDir, 'worker-3090', 'idle');
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes: LANES }), ['pinned.json']);
+  const other = setupPending();
+  writeFreshTask(other, 'x');
+  writeHeartbeat(other, 'worker-3090', 'idle');
+  assert.deepEqual(pickClaimableTasks(other, 'worker-3090', { lanes: [{ id: 'worker-3090' }] }), ['x.json']);
+});
+
+test('preferredLaneIsIdle / lanePreferenceGraceMs: the primitives', () => {
+  const pendingDir = setupPending();
+  const instancesDir = path.join(pendingDir, '..', '..', 'instances');
+  writeHeartbeat(pendingDir, 'worker-3090', 'idle');
+  assert.equal(preferredLaneIsIdle({ instanceId: 'worker-p40', instancesDir, lanes: LANES }), true);
+  assert.equal(preferredLaneIsIdle({ instanceId: 'worker-3090', instancesDir, lanes: LANES }), false, 'the preferred lane never defers to itself');
+  assert.equal(preferredLaneIsIdle({ instanceId: 'worker-1', instancesDir, lanes: LANES }), false, 'not a known lane');
+  assert.equal(lanePreferenceGraceMs({}), 120000);
+  assert.equal(lanePreferenceGraceMs({ AGENT_MANAGER_LANE_PREFERENCE_GRACE_SECS: '0' }), 0);
+  assert.equal(lanePreferenceGraceMs({ AGENT_MANAGER_LANE_PREFERENCE_GRACE_SECS: '30' }), 30000);
+});

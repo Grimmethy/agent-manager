@@ -123,12 +123,43 @@ function rankPriorityOfTask(task) {
   return Infinity;
 }
 
+// Lane preference (2026-09-20, Grimmethy: "I'd like the system to default to using the 3090 over the p40 in the
+// event that there is only one task"). Every lane claims any pending task, so which lane got a lone task was
+// whichever worker happened to tick first -- often the P40 (slower), while the 3090 sat idle. The FIRST lane in
+// lanes.js (the host GPU) is the preferred one: a secondary lane leaves the top-ranked pending task for it while
+// that lane is alive and idle. The reservation is time-boxed (AGENT_MANAGER_LANE_PREFERENCE_GRACE_SECS, default 120,
+// 0 = off) so a preferred lane that is idle but can't actually claim (VRAM guard, yielding to ComfyUI) never strands
+// work: once the task has waited the grace period the secondary lane takes it. Only the top task is held -- with
+// two or more claimable, the extras still go to the secondary lane at once. Pinned tasks are never held.
+const LANE_PREFERENCE_GRACE_SECS_DEFAULT = 120;
+const PREFERRED_LANE_HEARTBEAT_FRESH_MS = 90 * 1000; // an idle lane heartbeats every tick (~30s)
+
+function lanePreferenceGraceMs(env = process.env) {
+  const raw = env.AGENT_MANAGER_LANE_PREFERENCE_GRACE_SECS;
+  const secs = raw === undefined || raw === '' ? LANE_PREFERENCE_GRACE_SECS_DEFAULT : Number(raw);
+  return Number.isFinite(secs) && secs > 0 ? secs * 1000 : 0;
+}
+
+// True when `instanceId` is a secondary lane and the preferred lane is alive and idle right now.
+function preferredLaneIsIdle({ instanceId, instancesDir, lanes, now = Date.now() }) {
+  if (!Array.isArray(lanes) || lanes.length < 2) return false;
+  const preferred = lanes[0].id;
+  if (preferred === instanceId || !lanes.some((l) => l.id === instanceId)) return false;
+  try {
+    const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, `${preferred}.json`), 'utf8'));
+    const age = now - Date.parse(hb.lastHeartbeat);
+    return hb.status === 'idle' && Number.isFinite(age) && age >= 0 && age <= PREFERRED_LANE_HEARTBEAT_FRESH_MS;
+  } catch (_) {
+    return false; // no heartbeat / unreadable -- the preferred lane isn't provably available, don't hold anything for it
+  }
+}
+
 // Returns every filename in pendingDir this instance may claim, in claim-attempt order:
 // tasks pinned to this instance first (oldest first), then everything else ranked by
 // resolved source priority ascending, then mtime ascending. The caller
 // (local-worker.sh) iterates this list attempting an atomic claim (mv -n) on each in
 // turn, same as it did with the old inline script's output.
-function pickClaimableTasks(pendingDir, instanceId) {
+function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   let names;
   try {
     names = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
@@ -183,6 +214,15 @@ function pickClaimableTasks(pendingDir, instanceId) {
 
   pinned.sort((a, b) => a.mtimeMs - b.mtimeMs);
   rankable.sort((a, b) => (a.priority - b.priority) || compareHubKeys(a.hubKey, b.hubKey) || (a.mtimeMs - b.mtimeMs));
+  // Leave the top-ranked task for an idle preferred lane (see lanePreferenceGraceMs above), while it is still fresh.
+  const now = opts.now !== undefined ? opts.now : Date.now();
+  const graceMs = opts.graceMs !== undefined ? opts.graceMs : lanePreferenceGraceMs();
+  if (graceMs > 0 && rankable.length > 0 && (now - rankable[0].mtimeMs) < graceMs) {
+    let lanes = opts.lanes;
+    if (!lanes) { try { lanes = require('./lanes.js').getLanes(); } catch (_) { lanes = []; } }
+    const instancesDir = opts.instancesDir || path.join(pipelineDir, 'instances');
+    if (preferredLaneIsIdle({ instanceId, instancesDir, lanes, now })) rankable.shift();
+  }
   return [...pinned.map((r) => r.name), ...rankable.map((r) => r.name)];
 }
 
@@ -300,7 +340,7 @@ function listAssignableTasks(queueDir, instanceId) {
   return out;
 }
 
-module.exports = { pickClaimableTasks, pickNextPendingTask, listAssignableTasks, effectivePriority, rankPriorityOfTask, BOT_ADHOC_PRIORITY_PENALTY };
+module.exports = { pickClaimableTasks, pickNextPendingTask, preferredLaneIsIdle, lanePreferenceGraceMs, listAssignableTasks, effectivePriority, rankPriorityOfTask, BOT_ADHOC_PRIORITY_PENALTY };
 
 // --- CLI --------------------------------------------------------------------------
 // Two modes:
