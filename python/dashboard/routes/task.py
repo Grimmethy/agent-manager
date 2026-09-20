@@ -123,6 +123,110 @@ def api_task_archive(state, task_id):
     return jsonify({"id": task_id, "archived": True, "disposition": "abandoned" if stamped else None})
 
 
+# Where a hub's not-yet-finished child can be sitting and safely retired (nothing is working on it), vs. where it is IN FLIGHT (a worker,
+# reviewer or apply loop may be holding it right now). queue/adhoc and queue/derived are here on purpose: QUEUE_STATES does not list them, so
+# _find_task_record_anywhere cannot see a decomposed hub's ready children.
+_HUB_RETIRABLE_STATES = ("adhoc", "derived", "pending", "blocked", "needs-clarification", "awaiting-confirm", "research")
+_HUB_IN_FLIGHT_STATES = ("review", "approved")
+
+
+def _hub_child_location(qdir, child_id):
+    """(state, path) of a hub child: a retirable dir, an in-flight dir (incl. any drafting/<lane>/), 'terminal' when it already finished or was
+    archived (nothing left to retire), 'hub' when it is itself a coordinating hub, else (None, None) (the record is gone)."""
+    for state in _HUB_RETIRABLE_STATES + _HUB_IN_FLIGHT_STATES:
+        f = qdir / state / f"{child_id}.json"
+        if f.is_file():
+            return state, f
+    drafting = qdir / "drafting"
+    if drafting.is_dir():
+        for lane in drafting.iterdir():
+            f = lane / f"{child_id}.json"
+            if lane.is_dir() and f.is_file():
+                return "drafting", f
+    if (qdir / "coordinating" / f"{child_id}.json").is_file():
+        return "hub", None
+    done = qdir / "done"
+    if (done / f"{child_id}.json").is_file() or (done / "_archived_no_action" / f"{child_id}.json").is_file() or (done / "_superseded" / f"{child_id}.json").is_file():
+        return "terminal", None
+    return None, None
+
+
+@task_bp.route("/api/hub/<hub_id>/retire", methods=["POST"])
+def api_hub_retire(hub_id):
+    """Retire a whole coordinating hub as abandoned (2026-09-20): every unfinished child AND the hub record move to
+    queue/done/_archived_no_action/ stamped terminalDisposition 'abandoned' (+ manualArchive + a history event), exactly like a single-task
+    archive, so nothing that dependsOn them is left waiting on a state that can never clear and the ids stay 'already queued' (taskIdExistsInQueue
+    checks that folder) so the same finding is not raised again.
+
+    Why a hub-level route: /api/task/<state>/<id>/archive only accepts blocked / needs-clarification / awaiting-confirm / done, so it cannot touch
+    a coordinating hub or a child still in queue/adhoc/. And archiving ONE child (say the stuck first step) would be wrong on its own: an
+    'abandoned' record counts as a satisfied dependency, so its siblings would then unblock and run. The whole hub goes together.
+
+    First driven by PF HUB0006, a phantom raised from a view of main that could not see an unmerged chain branch: its 3 children re-implemented
+    a file (src/lib/tileGrid.ts) that already existed on the chain.
+
+    All-or-nothing: refuses (409, nothing changed) if any child is in flight (review/approved/drafting: pulling a record from under a worker
+    or reviewer corrupts it), is itself a coordinating hub (retire that one first), or already has an archived copy. Children that already
+    finished (done/archived/superseded) or whose record is gone are left as they are. Body: {"reason": "<why>"} (optional).
+    Returns {"hub", "archived": [child ids], "left": {child id: why}}."""
+    from app import _archive_task_file, queue_dir, read_json_safe, logger
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    hub_file = qdir / "coordinating" / f"{hub_id}.json"
+    hub = read_json_safe(hub_file)
+    if not isinstance(hub, dict):
+        abort(404, description=f"no coordinating hub '{hub_id}'")
+    reason = ((request.get_json(silent=True) or {}).get("reason") or "").strip() or None
+    archive_dir = qdir / "done" / "_archived_no_action"
+
+    to_retire, left, blockers = [], {}, []
+    for sub in hub.get("subTasks") or []:
+        child_id = sub.get("id") if isinstance(sub, dict) else None
+        if not child_id:
+            continue
+        state, path = _hub_child_location(qdir, child_id)
+        if state is None:
+            left[child_id] = "record not found"
+        elif state == "terminal":
+            left[child_id] = "already finished or archived"
+        elif state == "hub":
+            blockers.append(f"{child_id} is itself a coordinating hub -- retire it first")
+        elif state in _HUB_IN_FLIGHT_STATES or state == "drafting":
+            blockers.append(f"{child_id} is in flight ({state}/)")
+        elif (archive_dir / f"{child_id}.json").exists():
+            blockers.append(f"an archived copy of {child_id} already exists")
+        else:
+            to_retire.append((child_id, state, path))
+    if (archive_dir / f"{hub_id}.json").exists():
+        blockers.append(f"an archived copy of the hub {hub_id} already exists")
+    if blockers:
+        abort(409, description="not retired, nothing changed: " + "; ".join(blockers))
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _stamp_and_archive(path, from_state, why_detail):
+        data = read_json_safe(path)
+        if isinstance(data, dict):
+            data.setdefault("history", []).append({"stage": "abandoned", "at": now_iso, "detail": why_detail})
+            if not data.get("terminalDisposition"):
+                data["terminalDisposition"] = "abandoned"
+            data["manualArchive"] = {"at": now_iso, "from": from_state, "reason": reason, "retiredWithHub": hub_id}
+            try:
+                path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except OSError as exc:  # best-effort stamp: the move below is what matters
+                logger.error("Could not stamp the hub-retire disposition on %s: %s", path, exc)
+        _archive_task_file(qdir, path)
+
+    archived = []
+    for child_id, state, path in to_retire:
+        _stamp_and_archive(path, state, f"retired with hub {hub_id} by a human via the dashboard" + (f" -- {reason}" if reason else ""))
+        archived.append(child_id)
+    _stamp_and_archive(hub_file, "coordinating", "hub retired by a human via the dashboard" + (f" -- {reason}" if reason else "")
+                       + (f"; retired {len(archived)} unfinished sub-task(s)" if archived else ""))
+    return jsonify({"hub": hub_id, "archived": archived, "left": left})
+
+
 @task_bp.route("/api/task/<state>/<task_id>/rereview", methods=["POST"])
 def api_task_rereview(state, task_id):
     """Re-review: send a review-stage-blocked task BACK TO REVIEW with its draft intact -- no redraft.
