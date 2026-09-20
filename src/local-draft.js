@@ -59,7 +59,7 @@ const { planTargetGuard } = require('./plan-target-guard.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
-const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
+const { resolveGroundingRef, readFileAtRef, resolveAtRef } = require('./stacked-grounding.js');
 const { runDecomposePass } = require('./decompose-pass.js');
 const { checkDraft } = require('./fact-checker.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
@@ -1326,7 +1326,10 @@ async function runDraftPasses(task, attempt, {
       // reasoning) -- adhoc always targets THIS repo's own files.
       if (resolveSourceName(task) === 'adhoc' && typeof task.planResponse === 'string' && task.planResponse) {
         const { repoRoot, grepAllowedDirs } = getConfig();
-        const preImplementGuard = planTargetGuard(task, task.planResponse, repoRoot, grepAllowedDirs);
+        // A stacked task builds on its chain branch tip, not the shared checkout's working tree (null for every non-stacked task).
+        const guardRef = resolveGroundingRef(task, repoRoot);
+        const existsAtRef = guardRef ? (p) => !!resolveAtRef(repoRoot, guardRef, p, grepAllowedDirs) : null;
+        const preImplementGuard = planTargetGuard(task, task.planResponse, repoRoot, grepAllowedDirs, existsAtRef);
         if (preImplementGuard.blocked) {
           appendHistoryEvent(task, 'blocked', preImplementGuard.reason);
           return {
