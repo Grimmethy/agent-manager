@@ -184,6 +184,23 @@ function classifyChildStatus(rec) {
 // independently-hand-maintained list that can drift out of sync with it again.
 const TERMINAL_GOOD = new Set(['done', 'gone', ...STABLE_TERMINAL_STAGES]);
 
+// The phase a child is in, for the hub's checklist and progress. THE one definition -- the dashboard reads `subTasks[].phase` (and
+// `progress`) off the hub record instead of keeping its own status set (python/dashboard/app.py had one that had drifted: no noop /
+// dismissed / filed / superseded, and no notion of "built").
+//   merged  finished AND landed or closed (counts toward `done`; this is what completes a hub)
+//   built   finished, code committed on the hub's branch (or its own), waiting on a merge -- real progress, shown as such, but it does
+//           NOT complete the hub (2026-09-20 gripe: a hub of pending-merge pieces read "0/3 done" for its whole life and never "ready
+//           to merge"). For a strict-merge hub a bare `done` is also only built.
+//   open    anything still in flight or stuck
+function childPhase(status, strictMergeHub = false) {
+  if (strictMergeHub) {
+    if (status === 'merged' || status === 'gone' || status === 'abandoned') return 'merged';
+    return status === 'done' || status === 'pending-merge' ? 'built' : 'open';
+  }
+  if (TERMINAL_GOOD.has(status)) return 'merged';
+  return status === 'pending-merge' ? 'built' : 'open';
+}
+
 // A child in one of these cannot progress on its own -- the pipeline has given up on it and
 // is waiting for a human. If a sibling `dependsOn` one of these, that sibling is frozen
 // forever (isDependencySatisfied never clears for a needs-clarification / blocked task, and
@@ -380,13 +397,13 @@ function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, run
     }
 
     let doneCount = 0;
+    let builtCount = 0;
     for (const st of parent.subTasks) {
-      const terminal = strictMergeHub
-        ? (st.status === 'merged' || st.status === 'gone' || st.status === 'abandoned') // bare `done` is NOT enough here
-        : TERMINAL_GOOD.has(st.status);
-      if (terminal) doneCount += 1;
+      st.phase = childPhase(st.status, strictMergeHub); // bare `done` is NOT enough to complete a strict-merge hub
+      if (st.phase === 'merged') { doneCount += 1; builtCount += 1; } else if (st.phase === 'built') builtCount += 1;
     }
-    parent.progress = { done: doneCount, total: parent.subTasks.length };
+    // done = merged/closed (completion, unchanged); built = done + finished-but-awaiting-merge (what the UI shows as progress).
+    parent.progress = { done: doneCount, built: builtCount, total: parent.subTasks.length };
     parent.lastReconciledAt = new Date().toISOString();
 
     // Stuck-chain detection: surface a hub that can never complete on its own instead of
@@ -573,7 +590,7 @@ function moveToDone(srcFile, doneDir, name, parent) {
   } catch { /* best-effort -- next tick retries */ }
 }
 
-module.exports = { coordinatorSweep, classifyChildStatus, findStuckChildren, TERMINAL_GOOD, sanitizeTaskDisposition };
+module.exports = { coordinatorSweep, classifyChildStatus, childPhase, findStuckChildren, TERMINAL_GOOD, sanitizeTaskDisposition };
 
 if (require.main === module) {
   const { pipelineDir, repoRoot } = getConfig();
