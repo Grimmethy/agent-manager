@@ -11,6 +11,8 @@ const { providerFor, labelFor, resolveModelProfile } = require('../model-provide
 const { getConfig, ensureRegistered } = require('../config.js');
 const { resolveSourceName, getRegisteredSource } = require('../task-source-registry.js');
 const { symbolCheckBlocks } = require('../candidate-path-grounding.js');
+const { usesGroupB } = require('./apply-core.js');
+const { parseJsonMaybeFenced } = require('../json-fence.js');
 const { selectAbModel } = require('../ab-model-select.js');
 const { resolveStrategy } = require('../model-strategies.js');
 const { PINNED_NUM_CTX, EXTENDED_NUM_CTX } = require('../gpu-capacity.js');
@@ -19,6 +21,21 @@ const { logPipelineEvent } = require('../pipeline-history.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('../local-client.js');
 const { getModelProfile } = require('../model-profile-registry.js');
 const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./harness-search.js');
+
+// For a Group B source (JSON edits, or the FALSE POSITIVE escape line) the revision must still be that shape. Any other source's
+// revision is free-form by design, so it is always kept, exactly as before.
+function revisionKeepsAnswerShape(task, revised) {
+  if (!usesGroupB(task)) return true;
+  const text = String(revised || '').trim();
+  if (!text) return false;
+  if (text.includes('FALSE POSITIVE')) return true;
+  try {
+    const parsed = parseJsonMaybeFenced(text);
+    return parsed !== null && parsed !== undefined;
+  } catch {
+    return false;
+  }
+}
 
 async function runCritiqueAndRevision(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
@@ -148,9 +165,17 @@ async function runCritiqueAndRevision(task, {
     if (recordModelCall) {
       recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reviseResult, source: task.source, stage: 'revise' });
     }
-    if (!reviseResult.degenerate) {
-      task.implementResponse = reviseResult.response;
+    // A revision that is not the answer SHAPE this source requires is not a revision. PF function-length-fix-ac-3 (2026-09-20): the
+    // critique correctly spotted a curly-vs-straight quote mismatch, and the revise call answered with commentary about it ("The critique
+    // flags a mismatch...") instead of the corrected edits; that prose replaced the draft, review's deterministic gate rejected it as
+    // meta-commentary, and all three redrafts died the same way (21 agent-manager tasks have hit the same gate). Keep the original.
+    const revised = reviseResult.response;
+    if (!reviseResult.degenerate && revisionKeepsAnswerShape(task, revised)) {
+      task.implementResponse = revised;
       task.revisionApplied = true;
+    } else if (!reviseResult.degenerate) {
+      task.revisionDiscarded = true;
+      appendHistoryEvent(task, 'advisory', `critique revision discarded: not valid edits (${String(revised || '').trim().slice(0, 80).replace(/\s+/g, ' ')}...) -- kept the original draft`);
     }
     // Revision came back degenerate: bounded to one attempt, leave original draft
     // intact rather than lose a working draft to a bad revision call.
@@ -446,4 +471,4 @@ async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budg
   return implResult;
 }
 
-module.exports = { runCritiqueAndRevision, ensureHeadroomForExtendedContext, computeImplementBudget, callImplementModel };
+module.exports = { revisionKeepsAnswerShape, runCritiqueAndRevision, ensureHeadroomForExtendedContext, computeImplementBudget, callImplementModel };
