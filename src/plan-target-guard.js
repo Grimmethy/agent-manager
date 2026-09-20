@@ -60,15 +60,18 @@ function isDeclaredCreateTarget(planText, targetPath) {
   return EXISTENCE_ACK_RE.test(before) || EXISTENCE_ACK_RE.test(after);
 }
 
-// (task, planText, repoRoot, extraRoots) -> { blocked, reason?, missing? }
-function planTargetGuard(task, planText, repoRoot, extraRoots = []) {
+// (task, planText, repoRoot, extraRoots, existsAtRef) -> { blocked, reason?, missing? }
+// existsAtRef (optional, injected so this stays a pure wrapper): (claimedPath) => boolean, "does it exist on the branch this task really builds
+// on". A STACKED task's files live on its shared branch tip, which the working tree at repoRoot does not show, so a target only that branch has
+// is real, not fabricated. It can only RESCUE a path the working-tree check called missing; a throw or a false leaves the verdict unchanged.
+function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef = null) {
   let targets = [];
   try { targets = extractDeclaredTargets(task, planText); } catch { targets = []; }
   if (!targets.length || !repoRoot) return { blocked: false };
 
   const checked = checkFilePaths(targets.join(', '), repoRoot, extraRoots);
   const missing = checked.filter(
-    (entry) => entry.exists === false && !isDeclaredCreateTarget(planText, entry.claimedPath),
+    (entry) => entry.exists === false && !existsOnBranch(existsAtRef, entry.claimedPath) && !isDeclaredCreateTarget(planText, entry.claimedPath),
   );
 
   if (missing.length === 0) return { blocked: false };
@@ -79,6 +82,11 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = []) {
     reason: 'plan cites missing-file target(s): ' + paths.join(', '),
     missing: paths,
   };
+}
+
+function existsOnBranch(existsAtRef, claimedPath) {
+  if (typeof existsAtRef !== 'function') return false;
+  try { return existsAtRef(claimedPath) === true; } catch { return false; }
 }
 
 module.exports = { planTargetGuard, isDeclaredCreateTarget };

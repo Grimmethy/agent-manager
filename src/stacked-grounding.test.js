@@ -14,7 +14,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { resolveGroundingRef, readFileAtRef, grepAtRef } = require('./stacked-grounding.js');
+const { resolveGroundingRef, readFileAtRef, grepAtRef, resolveAtRef } = require('./stacked-grounding.js');
 
 function git(args, cwd) {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
@@ -82,4 +82,32 @@ test('grepAtRef finds a pattern that only exists on the stacked branch', () => {
 test('grepAtRef returns an empty string (not a throw) when the ref exists but nothing matches', () => {
   const { repoDir } = makeStackedRepo();
   assert.equal(grepAtRef(repoDir, 'main', 'this-string-does-not-exist-anywhere'), '');
+});
+
+// --- resolveAtRef (2026-09-20, PF HUB0005-01) -----------------------------------------------------------------------------------------------
+// The plan-target guard called a stacked task's real target "missing" because only the chain branch has the file.
+test('resolveAtRef: exact path, code-dir prefix, and unique basename all resolve at the ref; a file only on main does not exist there', () => {
+  const { repoDir } = makeStackedRepo();
+  git(['checkout', 'agent/stacked-family'], repoDir);
+  fs.mkdirSync(path.join(repoDir, 'src', 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'src', 'lib', 'tileGrid.ts'), 'export const x = 1;\n');
+  fs.mkdirSync(path.join(repoDir, 'a'), { recursive: true }); fs.mkdirSync(path.join(repoDir, 'src', 'b'), { recursive: true });
+  fs.writeFileSync(path.join(repoDir, 'a', 'dup.ts'), '1'); fs.writeFileSync(path.join(repoDir, 'src', 'b', 'dup.ts'), '2');
+  git(['add', '.'], repoDir); git(['commit', '-m', 'more'], repoDir); git(['push', 'origin', 'agent/stacked-family'], repoDir);
+  git(['checkout', 'main'], repoDir);
+
+  assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', 'src/lib/tileGrid.ts'), 'src/lib/tileGrid.ts', 'exact');
+  assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', './src/lib/tileGrid.ts'), 'src/lib/tileGrid.ts', 'leading ./ tolerated');
+  assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', 'lib/tileGrid.ts', ['src']), 'src/lib/tileGrid.ts', 'prefixed with a configured code dir');
+  assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', 'tileGrid.ts'), 'src/lib/tileGrid.ts', 'a bare filename with ONE match');
+  assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', 'dup.ts'), null, 'an ambiguous bare filename is not guessed');
+  assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', 'dup.ts', ['src']), 'src/b/dup.ts', 'unless exactly one match sits under a configured code dir');
+  assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', 'src/nope.ts'), null);
+  assert.equal(fs.existsSync(path.join(repoDir, 'src', 'lib', 'tileGrid.ts')), false, 'and the working tree (main) really does not have it');
+});
+
+test('resolveAtRef never throws: an unknown ref or empty path reads as not found', () => {
+  const { repoDir } = makeStackedRepo();
+  assert.equal(resolveAtRef(repoDir, 'agent/no-such-branch', 'stacked-only.js'), null);
+  assert.equal(resolveAtRef(repoDir, 'agent/stacked-family', ''), null);
 });

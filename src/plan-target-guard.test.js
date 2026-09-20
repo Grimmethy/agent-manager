@@ -96,3 +96,34 @@ test('does not import from the draft pipeline -- only adhoc-diff-sanity.js and f
   const requires = [...src.matchAll(/require\('([^']+)'\)/g)].map((m) => m[1]);
   assert.deepEqual(requires.sort(), ['./adhoc-diff-sanity.js', './fact-checker.js'].sort());
 });
+
+// --- stacked tasks: a target that exists only on the chain branch is real (2026-09-20, PF HUB0005-01) --------------------------------------------
+test('existsAtRef rescues a plan target the working tree lacks but the stacked branch has', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Add latLngToPx to src/lib/tileGrid.ts' };
+  const planText = 'Modify `src/lib/tileGrid.ts` to export latLngToPx.';
+  assert.equal(planTargetGuard(task, planText, repo, ['src']).blocked, true, 'without a ref the file reads as fabricated');
+  const seen = [];
+  const r = planTargetGuard(task, planText, repo, ['src'], (p) => { seen.push(p); return p === 'src/lib/tileGrid.ts'; });
+  assert.equal(r.blocked, false);
+  assert.deepEqual(seen, ['src/lib/tileGrid.ts']);
+});
+
+test('existsAtRef only rescues: false, a throw, or a non-function leaves a fabricated target blocked', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Edit src/phantom.js to add a guard' };
+  const planText = 'EDIT `src/phantom.js` to add the guard.';
+  for (const cb of [() => false, () => { throw new Error('git gone'); }, 'nope', () => 'truthy-but-not-true']) {
+    const r = planTargetGuard(task, planText, repo, ['src'], cb);
+    assert.equal(r.blocked, true);
+    assert.deepEqual(r.missing, ['src/phantom.js']);
+  }
+});
+
+test('existsAtRef is not consulted for a target that exists in the working tree', () => {
+  const repo = tmpRepo();
+  let called = 0;
+  const r = planTargetGuard({ title: 'Edit src/real.js' }, 'Edit `src/real.js` to add a guard.', repo, ['src'], () => { called += 1; return false; });
+  assert.equal(r.blocked, false);
+  assert.equal(called, 0);
+});
