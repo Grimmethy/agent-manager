@@ -142,6 +142,10 @@ function distinctiveLine(snippet) {
     .sort((a, b) => b.length - a.length)[0] || '';
 }
 
+// How far (chars, ~15 lines) an edit may sit outside the flagged block and still count as "the flagged block" -- the lead-in comment,
+// the signature line above it, a helper inserted just before it.
+const WRONG_BLOCK_MARGIN_CHARS = 600;
+
 function findEditFarFromAnchor(find, content, anchorSnippet) {
   const anchor = distinctiveLine(anchorSnippet);
   if (anchor.length < 12) return false;                 // no usable anchor
@@ -149,7 +153,19 @@ function findEditFarFromAnchor(find, content, anchorSnippet) {
   const anchorIdx = content.indexOf(anchor);
   if (anchorIdx === -1) return false;                   // snippet stale/paraphrased -- can't judge, don't false-positive
   const findIdx = content.indexOf(find);
-  return findIdx !== -1 && Math.abs(findIdx - anchorIdx) > 600; // ~15 lines away = a different block
+  if (findIdx === -1) return false;
+  // The flagged block is the WHOLE snippet, not the one line distinctiveLine() picked from it. For a function-length candidate the
+  // snippet is a 100-200 line function, and a legitimate extraction edits its signature/lead-in comment (to add the new components
+  // above it) or a section deep inside -- both far from any single "longest line". PropertyForager function-length-fix-ac-3: every
+  // attempt's edit at the function header sat ~3,900 chars from the longest line and was rejected "wrong-block" (a different block
+  // than the one flagged), five redrafts in a row, until the model degraded to narrating tool calls. So when the whole snippet is
+  // located verbatim in the file, an edit is on the flagged block iff it overlaps that span (plus a margin).
+  const spanStart = content.indexOf(anchorSnippet);
+  if (spanStart !== -1) {
+    const spanEnd = spanStart + anchorSnippet.length;
+    return findIdx + find.length < spanStart - WRONG_BLOCK_MARGIN_CHARS || findIdx > spanEnd + WRONG_BLOCK_MARGIN_CHARS;
+  }
+  return Math.abs(findIdx - anchorIdx) > WRONG_BLOCK_MARGIN_CHARS; // ~15 lines away = a different block
 }
 
 module.exports = { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor };
