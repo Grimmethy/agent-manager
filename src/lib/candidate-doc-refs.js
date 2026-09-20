@@ -126,4 +126,35 @@ function readCandidatesText(candidatesPath) {
   }
 }
 
-module.exports = { highestIdAcrossRefs, readCandidatesText, defaultBranchRef, locate };
+// The doc as it is on the default branch AND on each unmerged agent/* branch that has it (remote-tracking or local),
+// for the dashboard's Hygiene tab: a candidate present on a branch but not on main is "awaiting your merge".
+// -> { main: string|null, branches: [{ ref, text }], gitAnswered: boolean }. `main` is null when git cannot answer
+// (caller falls back to the working-tree file); `branches` is capped so a repo with many branches stays cheap.
+const MAX_BRANCHES = 40;
+function readCandidateDocRefs(candidatesPath) {
+  const loc = locate(candidatesPath);
+  if (!loc) return { main: null, branches: [], gitAnswered: false };
+  const mainRef = defaultBranchRef(loc.dir);
+  if (!mainRef) return { main: null, branches: [], gitAnswered: false };
+  fetchThrottled(loc.dir);
+  let main = '';
+  try { main = git(loc.dir, ['show', `${mainRef}:${loc.rel}`]); } catch { /* not on the default branch yet -> '' */ }
+  const seen = new Set();
+  const branches = [];
+  try {
+    for (const prefix of ['refs/remotes/origin/agent/', 'refs/heads/agent/']) {
+      for (const ref of git(loc.dir, ['for-each-ref', '--format=%(refname)', prefix]).split('\n')) {
+        const r = ref.trim();
+        const name = r.replace(/^refs\/(?:remotes\/origin|heads)\//, '');
+        if (!r || seen.has(name) || branches.length >= MAX_BRANCHES) continue;
+        seen.add(name);
+        let text = '';
+        try { text = git(loc.dir, ['show', `${r}:${loc.rel}`]); } catch { continue; } // doc absent on that branch
+        branches.push({ ref: name, text });
+      }
+    }
+  } catch { /* best effort */ }
+  return { main, branches, gitAnswered: true };
+}
+
+module.exports = { highestIdAcrossRefs, readCandidatesText, readCandidateDocRefs, defaultBranchRef, locate };

@@ -280,6 +280,7 @@
 <script src="/static/js/branches-joblist-hardware-tabs.js"></script>
 <script src="/static/js/project-tab.js"></script>
 <script src="/static/js/brain-dump-and-second-brain.js"></script>
+<script src="/static/js/hygiene-tab.js"></script>
 <script>
 const TABS = [
   { key: 'project', label: '📁 Project', description: 'Pick the target repo and grep dirs, then start, stop, or force-stop the pipeline against it and watch its live run status.' },
@@ -292,6 +293,7 @@ const TABS = [
   { key: 'discovery', label: '🔍 Discovery', description: 'Watch the architecture-discovery job work through the project\'s code communities, and read the candidate write-ups it has produced.' },
   { key: 'brain-dump', label: '💭 Brain Dump', description: 'Capture quick unstructured notes and browse Second Brain files without disturbing the rest of the dashboard. Human notes only -- see Filed Findings for anything a pipeline sweep raised on its own.' },
   { key: 'filed', label: '🗂️ Filed Findings', description: 'Every finding a pipeline sweep raised on its own -- side-findings, debrief follow-ups, concept research, review/audit findings -- split out of Brain Dump (2026-09-14) so a human note never gets crowded out by machine-filed volume.' },
+  { key: 'hygiene', label: '🧹 Hygiene', description: 'How much hygiene work is waiting for the active project, read-only: scanner flags not yet tasked, candidates (waiting, stuck, awaiting your merge), tasks in flight, and a rough estimate of the model time to clear it. Hygiene findings live in flag files and candidate docs, so the queue alone never shows the pile.' },
   { key: 'concepts', label: '🔬 Concepts', description: 'Track named concepts (e.g. chat-context-trimming) that get research-fork treatment -- a running audit log of research and build work per concept, plus a self-reported (unverified) built-from-scratch vs adapted tally.' },
   { key: 'reports', label: '🕒 Time Tracking', description: 'Review how much time the pipeline has spent per job, stage, or project.' },
   { key: 'tokenfold', label: '⚡ TokenFold Savings', description: 'See how many tokens the TokenFold compression proxy has saved across all pipeline model calls, broken down per model.' },
