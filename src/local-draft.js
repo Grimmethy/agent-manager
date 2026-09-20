@@ -41,6 +41,7 @@ const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisio
 const { buildPlanGrounding } = require('./plan-grounding.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
 const { resolveAcceptanceCriteria } = require('./acceptance-criteria.js');
+const { filterCriteriaForSandbox } = require('./lib/draft-sandbox.js');
 const { runOrientPass } = require('./orient-pass.js');
 const { runPlanCritique } = require('./plan-critique.js');
 const { runSearches } = require('./project-search-fetch.js');
@@ -714,7 +715,13 @@ async function runPlanPass(task, {
   // AGENT_MANAGER_ADHOC_ACCEPTANCE=false.
   if (substanceGated && process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') {
     const ac = resolveAcceptanceCriteria(task);
-    task.acceptanceCriteria = ac.criteria;
+    // A plan-derived criterion that needs a JS toolchain (tsc, build, tests) is dropped when the draft sandbox will have none (lib/draft-sandbox.js):
+    // the draft cannot run it, and review rejects an unverified criterion (PF HUB0005-01).
+    const sandboxFiltered = filterCriteriaForSandbox({ criteria: ac.criteria, source: ac.source, repoRoot: getConfig().repoRoot });
+    if (sandboxFiltered.dropped.length) {
+      appendHistoryEvent(task, 'advisory', `dropped ${sandboxFiltered.dropped.length} plan-derived acceptance criterion(s) that need a JS toolchain the draft sandbox does not have: ${sandboxFiltered.dropped.map((c) => c.slice(0, 90)).join(' | ')}`);
+    }
+    task.acceptanceCriteria = sandboxFiltered.criteria;
     task.acceptanceCriteriaSource = ac.source;
   }
 
