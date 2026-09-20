@@ -125,3 +125,28 @@ test('kill switch AGENT_MANAGER_HUB_RESTACK=false', () => {
     assert.equal(read(dir, 'adhoc', 'p1').stacked, undefined);
   } finally { delete process.env.AGENT_MANAGER_HUB_RESTACK; }
 });
+
+// 2026-09-20, PF HUB0003: a NESTED hub (the parent is itself step 3/3 of a chain on the same branch) was renumbered 1/3..3/3, so its
+// first child looked like the chain start and apply reset the branch away, discarding steps 1-2. It must take the parent's slot.
+test('a nested hub takes its parent\'s slot in the chain: children are numbered from the parent\'s seq, not from 1', () => {
+  const dir = makePipeline();
+  put(dir, 'coordinating', { id: 'hub-n', status: 'coordinating', history: [], stacked: { branch: B, seq: 3, total: 3 }, subTasks: ['c1', 'c2', 'c3'].map((id) => ({ id, title: id, status: 'pending' })) });
+  put(dir, 'adhoc', child('c1', { stacked: { branch: B, seq: 3, total: 5 } }));
+  put(dir, 'adhoc', child('c2', { stacked: { branch: B, seq: 1, total: 3 } }));
+  put(dir, 'adhoc', child('c3'));
+  const changed = restackHubChain(read(dir, 'coordinating', 'hub-n'), recs(dir, ['c1', 'c2', 'c3']));
+  assert.deepEqual(changed.sort(), ['c2', 'c3']);
+  assert.deepEqual(read(dir, 'adhoc', 'c1').stacked, { branch: B, seq: 3, total: 5 }, 'already correct: untouched');
+  assert.deepEqual(read(dir, 'adhoc', 'c2').stacked, { branch: B, seq: 4, total: 5 });
+  assert.deepEqual(read(dir, 'adhoc', 'c3').stacked, { branch: B, seq: 5, total: 5 });
+  assert.deepEqual(restackHubChain(read(dir, 'coordinating', 'hub-n'), recs(dir, ['c1', 'c2', 'c3'])), [], 'idempotent');
+});
+
+test('a hub whose own stacked slot is on a DIFFERENT branch does not offset its children', () => {
+  const dir = makePipeline();
+  put(dir, 'coordinating', { id: 'hub-n', status: 'coordinating', history: [], stacked: { branch: 'agent/decompose-other', seq: 2, total: 2 }, subTasks: ['c1', 'c2'].map((id) => ({ id, title: id, status: 'pending' })) });
+  put(dir, 'adhoc', child('c1', { stacked: { branch: B, seq: 1, total: 2 } }));
+  put(dir, 'adhoc', child('c2'));
+  restackHubChain(read(dir, 'coordinating', 'hub-n'), recs(dir, ['c1', 'c2']));
+  assert.deepEqual(read(dir, 'adhoc', 'c2').stacked, { branch: B, seq: 2, total: 2 });
+});

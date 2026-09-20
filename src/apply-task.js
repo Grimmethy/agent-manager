@@ -263,7 +263,9 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     const stacked = task.stacked && task.stacked.branch && !commitsDirectlyToMain ? task.stacked : null;
     if (stacked) {
       const b = stacked.branch;
-      if (stacked.seq > 1) {
+      // seq 1 normally CREATES the branch off main -- but only if origin has no unmerged work on it. A hub whose seq numbering restarted
+      // inside a chain that already pushed earlier steps (or a retry after step 1's own push) must ride on that work, not delete it.
+      if (stacked.seq > 1 || gitRunner.remoteHasUnmergedWork(b)) {
         // 2026-09-08, Grimmethy: "harden it properly with tests" -- root-caused live: the
         // old branchExists(b) check here was LOCAL-only, so a stale local branch with the
         // same name (origin's real copy long since merged and deleted) made every apply

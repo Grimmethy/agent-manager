@@ -227,6 +227,15 @@ function createRealGitRunner(repoRoot) {
       doResetToMain();
       run(['checkout', '-b', name]);
     },
+    // True when origin already has this branch AND it carries commits main lacks -- i.e. pushed, unmerged work that recreating the
+    // branch off main would throw away (the next push is then rejected non-fast-forward, identically on every retry). A branch that
+    // is merged into main (or gone from origin) is not "work to keep": the caller may start fresh off main.
+    remoteHasUnmergedWork: (name) => {
+      try { run(['fetch', 'origin', name]); } catch { /* best-effort, matches fetchBranch */ }
+      const remote = `origin/${name}`;
+      try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}`]); } catch { return false; }
+      return !isAncestor(remote, `origin/${mainBranch}`);
+    },
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
     push: (branchName) => run(['push', '-u', 'origin', branchName]),
@@ -316,6 +325,12 @@ function createFakeGitRunner(opts = {}) {
       if (localExists) record('deleteBranch', name);
       record('resetToMain');
       record('createBranch', name);
+    },
+    remoteHasUnmergedWork: (name) => {
+      record('remoteHasUnmergedWork', name);
+      if (!(opts.remoteBranches || []).includes(name)) return false;
+      const isAncestor = opts.isAncestorFn || (() => false);
+      return !isAncestor(`origin/${name}`, `origin/${opts.mainBranch || 'main'}`);
     },
     add: (files) => record('add', files),
     commit: (messageFilePath) => record('commit', messageFilePath),
