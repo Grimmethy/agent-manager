@@ -2121,27 +2121,100 @@ test('draftTask accepts a split from a noCandidateSplit source when the pre-spli
   });
 });
 
-test('draftTask blocks (recursion stop) when a Split-Depth 1 candidate itself emits a split', async () => {
+const SPLIT_JSON = JSON.stringify({ mode: 'split', candidates: [
+  { title: 'Extract the tile grid', problem: 'p1', solution: 's1', benefits: 'b1', files: 'src/a.js' },
+  { title: 'Extract the boundary projection', problem: 'p2', solution: 's2', benefits: 'b2', files: 'src/a.js' },
+] });
+const splitCall = (json) => { let n = 0; return async () => { n += 1; return n === 1 ? { response: 'plan', degenerate: null, attempts: 1 } : { response: json, degenerate: null, attempts: 1 }; }; };
+const forensicsTask = (id, promptContext) => ({
+  id, domain: 'default', source: 'pipeline_forensics_fix', title: 'test',
+  promptContext: { candidateId: 'AC-10', title: 'x', files: ['src/a.js'], fetchedFiles: [{ path: 'src/a.js', content: 'const a=1;\n' }], body: 'Files: src/a.js', splitDepth: 0, mustPreSplit: false, ...promptContext },
+});
+
+// 2026-09-20 (PF function-length-fix-ac-2, arch-review-ac-6): a split that used to BLOCK "for a human to narrow the fix" -- a
+// Split-Depth >= 1 sub-candidate still too big, or a noCandidateSplit source's candidate proposing several extractions -- is routed
+// to the coordinator-hub system agent-manager already has for work that is too big for one pass.
+test('draftTask routes a split at the recursion cap (Split-Depth 1) to a coordinator hub instead of blocking', async () => {
   await withFixtureRepo(async (draftTask) => {
-    const task = {
-      id: 'pipeline-forensics-fix-depthcap-1', domain: 'default', source: 'pipeline_forensics_fix', title: 'test',
-      promptContext: {
-        candidateId: 'AC-10', title: 'x', files: ['src/a.js', 'src/b.js'],
-        fetchedFiles: [{ path: 'src/a.js', content: 'const a=1;\n' }],
-        body: 'Split-Depth: 1\nFiles: src/a.js, src/b.js', splitDepth: 1, mustPreSplit: false,
-      },
-    };
-    let n = 0;
-    const localCall = async () => {
-      n += 1;
-      if (n === 1) return { response: 'plan', degenerate: null, attempts: 1 };
-      return { response: JSON.stringify({ mode: 'split', candidates: [
-        { title: 'a', problem: 'p', solution: 's', benefits: 'b' }, { title: 'b', problem: 'p', solution: 's', benefits: 'b' },
-      ] }), degenerate: null, attempts: 1 };
-    };
-    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    const task = forensicsTask('forensics-fix-depthcap-hub-1', { body: 'Split-Depth: 1\nFiles: src/a.js', splitDepth: 1 });
+    const result = await draftTask(task, { localCall: splitCall(SPLIT_JSON), withLockFn: async (dir, fn) => fn() });
+    assert.notEqual(result.blocked, true);
+    assert.equal(task.candidateSplitRoute, 'hub');
+    assert.equal(task.candidateSplitProposals.length, 2);
+    assert.equal(task.candidateSplitProposals[0].splitDepth, 2);
+    assert.equal(task.status, 'needs-review');
+    assert.equal(task.history.some((h) => h.stage === 'blocked'), false);
+    assert.match(task.history.find((h) => h.stage === 'implement-done' && /coordinator hub/.test(h.detail || '')).detail, /Split-Depth >= 1 sub-candidate/);
+  });
+});
+
+test('draftTask routes a noCandidateSplit source\'s split (not pre-split) to a coordinator hub instead of blocking', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = forensicsTask('forensics-fix-nosplit-hub-1', {});
+    const result = await draftTask(task, { localCall: splitCall(SPLIT_JSON), withLockFn: async (dir, fn) => fn() });
+    assert.notEqual(result.blocked, true);
+    assert.equal(task.candidateSplitRoute, 'hub');
+    assert.match(task.history.find((h) => h.stage === 'implement-done' && /coordinator hub/.test(h.detail || '')).detail, /already decompositions/);
+  });
+});
+
+// The whole path for the incident shape: an over-scoped candidate -> the implement pass proposes a split -> routed to the hub at draft
+// -> apply queues ordered adhoc children and hands back a coordinating parent (nothing blocks for a human at any step).
+test('end to end: an oversized candidate is drafted as a hub-routed split and applied as ordered sub-tasks', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    const task = forensicsTask('forensics-fix-e2e-hub-1', {});
+    const result = await draftTask(task, { localCall: splitCall(SPLIT_JSON), withLockFn: async (d, fn) => fn() });
+    assert.notEqual(result.blocked, true);
+    assert.equal(task.status, 'needs-review');
+
+    const { writeArtifact } = require('./lib/apply-core.js');
+    const artifact = writeArtifact(task, dir, dir);
+    assert.equal(artifact.coordinating, true);
+    assert.deepEqual(artifact.subTasks.map((t) => t.title), ['Extract the tile grid', 'Extract the boundary projection']);
+
+    const queued = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).map((f) => JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', f), 'utf8')));
+    assert.equal(queued.length, 2);
+    assert.ok(queued.every((k) => k.promptContext.decomposedFrom === 'forensics-fix-e2e-hub-1'));
+    const second = queued.find((k) => k.stacked.seq === 2);
+    assert.match(second.promptContext.rawText, /Part 2 of 2/);
+    assert.ok(second.dependsOn && second.dependsOn.length === 1);
+  });
+});
+
+test('draftTask does NOT route to the hub when the split is malformed -- it still blocks with the invalid-split reason', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = forensicsTask('forensics-fix-invalid-split-1', { splitDepth: 1, body: 'Split-Depth: 1\nFiles: src/a.js' });
+    const oneOnly = JSON.stringify({ mode: 'split', candidates: [{ title: 'only one', problem: 'p', solution: 's', benefits: 'b' }] });
+    await draftTask(task, { localCall: splitCall(oneOnly), withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.candidateSplitRoute, undefined);
     assert.equal(task.candidateSplitProposals, undefined);
-    assert.match(task.history.find((h) => h.stage === 'blocked').detail, /already a one-level decomposition/);
+    assert.ok(task.history.some((h) => h.stage === 'blocked'));
+  });
+});
+
+test('AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB=false restores the old block for a split the recursion cap forbids', async () => {
+  const prev = process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB;
+  process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB = 'false';
+  try {
+    await withFixtureRepo(async (draftTask) => {
+      const task = forensicsTask('forensics-fix-killswitch-1', { splitDepth: 1, body: 'Split-Depth: 1\nFiles: src/a.js' });
+      await draftTask(task, { localCall: splitCall(SPLIT_JSON), withLockFn: async (dir, fn) => fn() });
+      assert.equal(task.candidateSplitProposals, undefined);
+      assert.match(task.history.find((h) => h.stage === 'blocked').detail, /already a one-level decomposition/);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB; else process.env.AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB = prev;
+  }
+});
+
+test('draftTask: a stale split from a PRIOR attempt does not survive a redraft that produces a normal fix', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = forensicsTask('forensics-fix-stale-split-1', {});
+    task.candidateSplitProposals = [{ title: 'old a', problem: 'p', solution: 's' }, { title: 'old b', problem: 'p', solution: 's' }];
+    task.candidateSplitRoute = 'hub';
+    await draftTask(task, { localCall: async () => ({ response: '[{"file":"src/a.js","find":"const a=1;","replace":"const a=2;"}]', degenerate: null, attempts: 1 }), withLockFn: async (dir, fn) => fn() });
+    assert.equal(task.candidateSplitProposals, undefined);
+    assert.equal(task.candidateSplitRoute, undefined);
   });
 });
 
@@ -2275,8 +2348,8 @@ test('draftTask never calls premiseCheck when the split is already blocked by th
       ] }), degenerate: null, attempts: 1 };
     };
     await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
-    assert.equal(premiseCheckCalls, 0, 'the recursion cap already blocks -- premiseCheck must not run');
-    assert.match(task.history.find((h) => h.stage === 'blocked').detail, /already a one-level decomposition/);
+    assert.equal(premiseCheckCalls, 0, 'a split the recursion cap forbids is routed to the hub -- premiseCheck must not run (cheapest check first)');
+    assert.equal(task.candidateSplitRoute, 'hub');
   });
 });
 

@@ -22,8 +22,9 @@ const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
 
-const IN_FLIGHT = ['pending', 'drafting', 'review', 'approved'];
-const NEEDS_HUMAN = ['blocked', 'needs-clarification', 'awaiting-confirm', 'coordinating'];
+// A coordinating hub (a decomposed task whose pieces workers are implementing) is in flight, not waiting on a human.
+const IN_FLIGHT = ['pending', 'drafting', 'review', 'approved', 'coordinating'];
+const NEEDS_HUMAN = ['blocked', 'needs-clarification', 'awaiting-confirm'];
 const QUEUE_STATES = [...IN_FLIGHT, ...NEEDS_HUMAN, 'done'];
 
 // The families are NOT listed here: core must not name plugin-owned sources (ADR-0022, src/no-plugin-source-names.test.js).

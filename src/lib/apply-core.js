@@ -80,6 +80,9 @@ function applyCandidateSplit(task, source) {
 
 function writeArtifact(task, repoRoot, pipelineDir) {
   if (Array.isArray(task.candidateSplitProposals) && task.candidateSplitProposals.length > 0) {
+    // A split the draft routed to the hub system (see apply-adhoc-diff.js's applyCandidateSplitAsHub) becomes real, ordered
+    // sub-tasks under a coordinator instead of more candidate-doc entries.
+    if (task.candidateSplitRoute === 'hub') return require('../apply-adhoc-diff.js').applyCandidateSplitAsHub(task, pipelineDir);
     return applyCandidateSplit(task, getRegisteredSource(resolveSourceName(task)));
   }
   if (!usesGroupB(task)) {
