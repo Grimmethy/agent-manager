@@ -1186,6 +1186,16 @@ async function runDraftPasses(task, attempt, {
   try {
     appendHistoryEvent(task, 'draft-started', task.localRejectCount ? `retry ${task.localRejectCount}` : undefined);
 
+    // A requeue (reject-retry-check.js) deliberately leaves the PRIOR attempt's blockedStage/blockedReason on the record -- its
+    // reason was already captured into priorRejectionFeedback, and the stamps stay for history. But this run's own gates (the
+    // postImplementCheck disposition, the grounding gate inside critique, ...) signal a block by stamping task.blockedStage during
+    // the run, and the post-critique `if (task.blockedStage)` cannot tell a stale stamp from a fresh one. So a retry whose plan,
+    // implement and critique ALL succeeded came back "blocked" with the first attempt's reason (change-review-8c6fe80: attempts 2
+    // and 3 both produced a clean draft and were recorded as 'Plan pass degenerate: truncated'; both retries burned, task escalated
+    // to a human). Start every attempt with a clean slate; a block in THIS run stamps them again, and main() persists the result.
+    delete task.blockedStage;
+    delete task.blockedReason;
+
     // Fail-fast Ollama pre-flight (src/ollama-health.js): if this draft is about to
     // hit a REAL local Ollama endpoint (no injected localCall -- unit tests pass fakes,
     // so localCall===null means the default model-provider.js pick) and it resolves to

@@ -2410,6 +2410,39 @@ test('draftTask proceeds normally when the source\'s postImplementCheck returns 
   });
 });
 
+// 2026-09-20, change-review-8c6fe80 (PF): attempt 1 blocked at the plan pass (blockedStage:'plan'); reject-retry-check requeued it
+// with blockedStage/blockedReason deliberately left on the record (for the history). Attempts 2 and 3 then produced a good plan
+// AND a good implement, but the post-critique `if (task.blockedStage)` check took the STALE stamp for a gate that fired in THIS run
+// and returned the draft as blocked with attempt 1's reason -- burning both retries and escalating a healthy task to a human.
+test('draftTask: a stale blockedStage/blockedReason from a PRIOR attempt does not block a draft whose passes all succeeded', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource('stale_blocked_state_source')) {
+      registerTaskSource('stale_blocked_state_source', { priority: 80, next: () => null, postImplementCheck: async () => ({ verdict: 'ok' }) });
+      updateTaskSource('stale_blocked_state_source', { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    const task = {
+      id: 'stale-blocked-state-1', domain: 'default', source: 'stale_blocked_state_source', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+      blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 1,
+      priorRejectionFeedback: ['A prior plan pass produced a degenerate (truncated or empty) plan ...'],
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      return n === 1 ? { response: 'a complete plan', degenerate: null, attempts: 1 } : { response: 'a well-grounded candidate', degenerate: null, attempts: 1 };
+    };
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.notEqual(result.blocked, true, 'a fully successful draft must not come back blocked by a previous attempt\'s stamp');
+    assert.equal(task.blockedStage, undefined);
+    assert.equal(task.blockedReason, undefined);
+    assert.equal(task.status, 'needs-review');
+    assert.deepEqual(task.priorRejectionFeedback, ['A prior plan pass produced a degenerate (truncated or empty) plan ...'], 'the prior feedback the requeue captured is untouched');
+    assert.equal(task.draftAttempts.at(-1).outcome, 'succeeded');
+  });
+});
+
 test('draftTask keeps postImplementCheck warnings on the task (not blocked) and clears them on the next pass', async () => {
   await withFixtureRepo(async (draftTask) => {
     const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
