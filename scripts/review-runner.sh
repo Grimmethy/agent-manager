@@ -270,6 +270,7 @@ while :; do                                                                     
     fi
     write_heartbeat_file "$INSTANCE_ID" "idle" "${LOCAL_MODEL:-}" "" "" "$STARTED_AT"
     did_work=true
+    if "$ONCE"; then break; fi   # a borrowed tick reviews ONE item, then the reviewer re-checks its home review/ before borrowing again
   done
 
   # Idle-only backoff: only pay the full poll interval when this tick genuinely found
