@@ -20,7 +20,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const PROJECTS_PATH = path.join(__dirname, '..', 'projects.json');
+const PROJECTS_PATH = process.env.AGENT_MANAGER_PROJECTS_PATH || path.join(__dirname, '..', 'projects.json');
 
 function enabled() {
   return String(process.env.AGENT_MANAGER_POOL_BORROW || '').trim().toLowerCase() !== 'false';
@@ -45,25 +45,47 @@ function readProjects(projectsPath = PROJECTS_PATH) {
 function readState(file = statePath()) {
   try {
     const s = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return s && typeof s === 'object' && s.lastBorrowedAt && typeof s.lastBorrowedAt === 'object' ? s : { lastBorrowedAt: {} };
-  } catch { return { lastBorrowedAt: {} }; }
+    if (!s || typeof s !== 'object') return { lastBorrowedAt: {}, emptyUntil: {} };
+    return { ...s, lastBorrowedAt: s.lastBorrowedAt && typeof s.lastBorrowedAt === 'object' ? s.lastBorrowedAt : {}, emptyUntil: s.emptyUntil && typeof s.emptyUntil === 'object' ? s.emptyUntil : {} };
+  } catch { return { lastBorrowedAt: {}, emptyUntil: {} }; }
 }
 
 // Records that a lane just borrowed from this project (drives the least-recently-borrowed ordering). Best-effort.
 function markBorrowed(pipelineDir, { now = new Date(), file = statePath() } = {}) {
   try {
     const state = readState(file);
-    state.lastBorrowedAt[real(pipelineDir)] = now.toISOString();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n');
-    fs.renameSync(tmp, file);
+    const key = real(pipelineDir);
+    state.lastBorrowedAt[key] = now.toISOString();
+    delete state.emptyUntil[key];
+    writeState(file, state);
   } catch { /* ordering is a nicety; never break a lane over it */ }
+}
+
+// A project a lane just visited and found nothing to do in is skipped for a while (default 5 min, AGENT_MANAGER_POOL_EMPTY_BACKOFF_SECS) so an
+// idle lane does not re-run a whole tick against every empty suite project every cycle. A borrow that DID work clears it.
+function emptyBackoffMs() {
+  const n = Number(process.env.AGENT_MANAGER_POOL_EMPTY_BACKOFF_SECS);
+  return Number.isFinite(n) && n >= 0 ? n * 1000 : 5 * 60 * 1000;
+}
+
+function markEmpty(pipelineDir, { now = new Date(), file = statePath(), ttlMs = emptyBackoffMs() } = {}) {
+  try {
+    const state = readState(file);
+    state.emptyUntil[real(pipelineDir)] = new Date(now.getTime() + ttlMs).toISOString();
+    writeState(file, state);
+  } catch { /* best-effort */ }
+}
+
+function writeState(file, state) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n');
+  fs.renameSync(tmp, file);
 }
 
 // -> [{ label, repoRoot, pipelineDir, domainsPath, applyRepoRoot, grepDirs }] in borrow order. `active` = { repoRoot, pipelineDir } of the
 // project the pipeline is running now (defaults to the process env).
-function poolProjects({ projectsPath = PROJECTS_PATH, active, stateFile = statePath() } = {}) {
+function poolProjects({ projectsPath = PROJECTS_PATH, active, stateFile = statePath(), now = new Date(), includeBackedOff = false } = {}) {
   if (!enabled()) return [];
   const act = active || { repoRoot: process.env.AGENT_MANAGER_REPO_ROOT, pipelineDir: process.env.AGENT_MANAGER_PIPELINE_DIR };
   const activePipe = real(act.pipelineDir || act.repoRoot);
@@ -78,6 +100,7 @@ function poolProjects({ projectsPath = PROJECTS_PATH, active, stateFile = stateP
     seen.add(pipe);
     if (pipe === activePipe || real(e.repoRoot) === activeRepo) return;
     if (!fs.existsSync(e.repoRoot) || !fs.existsSync(path.join(e.pipelineDir, 'queue'))) return;
+    if (!includeBackedOff && Date.parse(state.emptyUntil[pipe]) > now.getTime()) return;
     out.push({
       index, pipe,
       label: e.label || path.basename(e.repoRoot),
@@ -115,10 +138,11 @@ function poolEnvArgs(project, homeInstancesDir) {
   return [...unset.flatMap((k) => ['-u', k]), ...Object.entries(set).map(([k, v]) => `${k}=${v}`)];
 }
 
-module.exports = { enabled, poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, readProjects, PROJECTS_PATH };
+module.exports = { enabled, poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, markEmpty, readProjects, PROJECTS_PATH };
 
 if (require.main === module) {
   // node src/pool-projects.js --list                  JSON [{label, repoRoot, pipelineDir, ...}] in borrow order
+  // node src/pool-projects.js --labels                pipelineDir of each borrowable project, one per line, in borrow order (empty-backoff excluded)
   // node src/pool-projects.js --env-args <label|pipelineDir> <homeInstancesDir>   one `env` argv token per line
   // node src/pool-projects.js --mark <pipelineDir>    record a borrow
   const [flag, a, b] = process.argv.slice(2);
@@ -128,10 +152,14 @@ if (require.main === module) {
     const project = poolProjects().find((p) => p.label === a || real(p.pipelineDir) === real(a));
     if (!project) { console.error(`pool-projects: no pool project '${a}'`); process.exit(1); }
     for (const token of poolEnvArgs(project, b || process.env.AGENT_MANAGER_INSTANCES_DIR || path.join(process.env.AGENT_MANAGER_PIPELINE_DIR || '', 'instances'))) console.log(token);
+  } else if (flag === '--labels') {
+    for (const p of poolProjects()) console.log(p.pipelineDir);
   } else if (flag === '--mark') {
     markBorrowed(a);
+  } else if (flag === '--mark-empty') {
+    markEmpty(a);
   } else {
-    console.error('usage: pool-projects.js --list | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir>');
+    console.error('usage: pool-projects.js --list | --labels | --env-args <label|pipelineDir> [homeInstancesDir] | --mark <pipelineDir> | --mark-empty <pipelineDir>');
     process.exit(2);
   }
 }

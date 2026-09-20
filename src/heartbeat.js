@@ -61,6 +61,8 @@ function writeHeartbeatFile(instancesDir, instanceId, status, model, taskId, pas
   };
   if (startedAt) hb.startedAt = startedAt;
   if (daemonPid != null) hb.daemonPid = daemonPid;
+  // Set while this lane is running a borrowed project's task (docs/idle-pool-borrowing.md), so the Workers tab can say whose work it is.
+  if (process.env.AGENT_MANAGER_BORROWING_FROM) hb.project = process.env.AGENT_MANAGER_BORROWING_FROM;
   fs.writeFileSync(hbPath, JSON.stringify(hb, null, 2));
 }
 
