@@ -16,6 +16,7 @@ const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
+const { copyNodeModules } = require('./lib/draft-sandbox.js');
 const { normalizeDiffOutput } = require('./group-b-worktree-diff.js');
 const { stageDraftChanges } = require('./lib/draft-side-effects.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -308,7 +309,12 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
   } catch (e) {
     return { ok: false, reason: `could not create adhoc scratch worktree: ${e.message}` };
   }
-  return { ok: true };
+  // A private copy of the repo's installed node_modules, so a JS/TS draft can really run tsc / build / tests (see lib/draft-sandbox.js). Never
+  // fails the worktree: without it the draft simply has no toolchain, exactly as before.
+  const nodeModules = copyNodeModules(resolvedRepoRoot, worktreeDir);
+  if (nodeModules.copied) console.log(`[draft-sandbox] copied node_modules into ${path.basename(worktreeDir)} (${nodeModules.sizeMb ?? '?'} MB, ${nodeModules.ms} ms)`);
+  else if (nodeModules.reason && !/no package\.json/.test(nodeModules.reason)) console.log(`[draft-sandbox] no node_modules in the draft sandbox: ${nodeModules.reason}`);
+  return { ok: true, nodeModules };
 }
 
 // Applies the partial diff an earlier pass landed (task.priorPartialDiff) to the FRESH worktree as uncommitted changes, so a continuation
