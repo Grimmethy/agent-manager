@@ -156,5 +156,103 @@ class TestDiscardBranch(unittest.TestCase):
                 p.stop()
 
 
+    # --- local-branch cleanup (2026-09-19) ---------------------------------------------------------------
+    # The discard used to delete only the REMOTE branch. The apply repo is usually the pipeline's own
+    # checkout, so the local agent/<id> branch (and the discarded commit) stayed behind: the task kept
+    # reading pending-merge, and apply-task's prepareStackedBranch would reuse a local branch that descends
+    # from current main as "real unpushed work" and rebuild on the discarded commit.
+
+    @staticmethod
+    def _local_branches(repo):
+        out = subprocess.run(["git", "branch", "--format=%(refname:short)"], cwd=str(repo), capture_output=True, text=True, check=True)
+        return out.stdout.split()
+
+    @staticmethod
+    def _sha(repo, ref):
+        return subprocess.run(["git", "rev-parse", ref], cwd=str(repo), capture_output=True, text=True, check=True).stdout.strip()
+
+    def _discard(self, repo, branch_name):
+        patches = self._patches(repo)
+        for p in patches:
+            p.start()
+        try:
+            return self.client.post(f"/api/git/branches/{branch_name.replace('/', '%2F')}/discard")
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_discard_also_deletes_the_local_branch_and_reports_its_sha_for_recovery(self):
+        repo = make_repo_with_pushed_branch("agent/discard-local-1")
+        tip = self._sha(repo, "agent/discard-local-1")
+        self.assertIn("agent/discard-local-1", self._local_branches(repo), "sanity: the fixture leaves a local branch behind")
+
+        res = self._discard(repo, "agent/discard-local-1")
+        body = res.get_json()
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(body["succeeded"])
+        self.assertEqual(body["localBranch"], {"deleted": True, "sha": tip})
+        self.assertNotIn("agent/discard-local-1", self._local_branches(repo))
+        # Recoverable from the reported sha.
+        subprocess.run(["git", "branch", "recovered", tip], cwd=str(repo), check=True, capture_output=True)
+        self.assertIn("recovered", self._local_branches(repo))
+
+    def test_discard_deletes_a_local_branch_that_has_unpushed_commits_and_no_longer_descends_from_main(self):
+        # The PropertyForager shape: main moved on after the branch was cut, and the local copy holds a commit
+        # the remote never had (apply committed locally, push later discarded). Both are exactly what `-D` is for.
+        repo = make_repo_with_pushed_branch("agent/discard-local-2")
+        _git(["checkout", "agent/discard-local-2"], cwd=repo)
+        (repo / "extra.txt").write_text("unpushed")
+        _git(["add", "extra.txt"], cwd=repo)
+        _git(["commit", "-q", "-m", "unpushed local-only commit"], cwd=repo)
+        _git(["checkout", "main"], cwd=repo)
+        (repo / "main-moved.txt").write_text("x")
+        _git(["add", "main-moved.txt"], cwd=repo)
+        _git(["commit", "-q", "-m", "main moved on"], cwd=repo)
+        _git(["push", "origin", "main"], cwd=repo)
+
+        body = self._discard(repo, "agent/discard-local-2").get_json()
+        self.assertTrue(body["succeeded"])
+        self.assertTrue(body["localBranch"]["deleted"])
+        self.assertNotIn("agent/discard-local-2", self._local_branches(repo))
+
+    def test_discard_never_deletes_the_checked_out_branch_but_still_deletes_the_remote_and_says_so(self):
+        repo = make_repo_with_pushed_branch("agent/discard-local-3")
+        _git(["checkout", "agent/discard-local-3"], cwd=repo)
+        tip = self._sha(repo, "HEAD")
+
+        body = self._discard(repo, "agent/discard-local-3").get_json()
+        self.assertTrue(body["succeeded"], "the remote delete is the part that matters")
+        self.assertFalse(body["localBranch"]["deleted"])
+        self.assertEqual(body["localBranch"]["sha"], tip)
+        self.assertIn("checked out", body["localBranch"]["reason"])
+        self.assertIn("agent/discard-local-3", self._local_branches(repo))
+        remote = subprocess.run(["git", "ls-remote", "--heads", "origin", "agent/discard-local-3"], cwd=str(repo), capture_output=True, text=True).stdout
+        self.assertEqual(remote.strip(), "", "remote branch is gone")
+
+    def test_discard_reports_no_local_branch_when_there_is_none(self):
+        repo = make_repo_with_pushed_branch("agent/discard-local-4")
+        _git(["branch", "-D", "agent/discard-local-4"], cwd=repo)
+        body = self._discard(repo, "agent/discard-local-4").get_json()
+        self.assertTrue(body["succeeded"])
+        self.assertEqual(body["localBranch"], {"deleted": False, "reason": "no local branch"})
+
+    def test_a_failed_remote_delete_leaves_the_local_branch_alone(self):
+        repo = make_repo_with_pushed_branch("agent/discard-local-5")
+        patches = self._patches(repo)
+        for p in patches:
+            p.start()
+        try:
+            listed = app.list_unmerged_branches(force=True)
+            self.assertTrue(any(b["branch"] == "agent/discard-local-5" for b in listed))
+            _git(["remote", "set-url", "origin", str(repo.parent / "does-not-exist.git")], cwd=repo)  # a REAL push failure
+            res = self.client.post("/api/git/branches/agent%2Fdiscard-local-5/discard")
+            self.assertEqual(res.status_code, 500)
+            self.assertFalse(res.get_json()["succeeded"])
+            self.assertIn("agent/discard-local-5", self._local_branches(repo), "nothing is deleted locally when the remote delete did not happen")
+        finally:
+            for p in patches:
+                p.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

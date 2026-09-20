@@ -348,7 +348,7 @@ def api_git_discard_branch(branch):
     Mirrors api_git_merge_branch for the parts that overlap (the same-list re-validation
     gate, the apply-lock, the two-location task lookup) minus the merge/checkout/push-to-
     main steps this doesn't need."""
-    from app import _acquire_apply_lock, _archive_task_file, _invalidate_branch_cache, _release_apply_lock, _run_git, get_active_repo_root, list_unmerged_branches, logger, queue_dir, read_json_safe
+    from app import _acquire_apply_lock, _archive_task_file, _delete_local_branch, _invalidate_branch_cache, _release_apply_lock, _run_git, get_active_repo_root, list_unmerged_branches, logger, queue_dir, read_json_safe
     repo_root = get_active_repo_root()
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
@@ -365,6 +365,7 @@ def api_git_discard_branch(branch):
     if lock_fd is None:
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
 
+    local_branch = {"deleted": False, "reason": "not attempted"}
     try:
         try:
             _run_git(["push", "origin", "--delete", branch], repo_root)
@@ -376,6 +377,9 @@ def api_git_discard_branch(branch):
             # for this case.
             if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
                 raise
+        # Also drop the LOCAL copy (only reached when the remote delete succeeded or the ref was
+        # already gone) -- see _delete_local_branch for why leaving it is a real hazard.
+        local_branch = _delete_local_branch(repo_root, branch)
     except RuntimeError as e:
         return jsonify({"succeeded": False, "reason": str(e)}), 500
     finally:
@@ -420,4 +424,4 @@ def api_git_discard_branch(branch):
             task_archived = True  # already archived (e.g. by hand) -- nothing more to do
 
     _invalidate_branch_cache()
-    return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived})
+    return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch})
