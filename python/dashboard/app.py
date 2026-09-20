@@ -1621,6 +1621,40 @@ def _archive_task_file(qdir, src):
     return dest
 
 
+def _delete_local_branch(repo_root, branch):
+    """Deletes the LOCAL copy of a branch the Unmerged Branches tab just discarded.
+
+    Root-caused 2026-09-19 (PropertyForager): api_git_discard_branch deleted only the REMOTE branch, but the
+    apply repo is usually the very checkout the pipeline works in, so the local agent/<id> branch -- and the
+    discarded commit on it -- stayed behind. That kept the task reading `pending-merge` (the disposition scan
+    sees the local ref ahead of main) and, worse, apply-task's prepareStackedBranch treats a local branch that
+    descends from current main as "real unpushed work" and reuses it: the next triage batch would have rebuilt
+    on the discarded commit and pushed it back. Discard means discard.
+
+    Never deletes a branch that is checked out (that would need a checkout, i.e. moving the pipeline's working
+    tree -- reported instead) and always returns the branch's sha so the discard stays recoverable
+    (`git branch <name> <sha>`). Best-effort: a failure here is reported, never raised -- the remote delete is
+    the part that matters. `-D` (not `-d`): the whole point is that this work is NOT merged."""
+    ref = f"refs/heads/{branch}"
+    try:
+        sha = _run_git(["rev-parse", "--verify", "--quiet", ref], repo_root).strip()
+    except RuntimeError:
+        sha = ""
+    if not sha:
+        return {"deleted": False, "reason": "no local branch"}
+    try:
+        current = _run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], repo_root).strip()
+    except RuntimeError:
+        current = ""  # detached HEAD -- not on this branch
+    if current == branch:
+        return {"deleted": False, "sha": sha, "reason": "checked out in the apply repo -- switch off it and delete it by hand"}
+    try:
+        _run_git(["branch", "-D", branch], repo_root)
+    except RuntimeError as exc:
+        return {"deleted": False, "sha": sha, "reason": str(exc)[:200]}
+    return {"deleted": True, "sha": sha}
+
+
 # Repeated-blocker guard (2026-08-24, pipeline hardening, Grimmethy: "no 'repeated
 # identical blocker' escalation"). Root-caused live: two real tasks each survived a full
 # bulk-requeue pass ("get to 0 blocked", 2026-08-23) and immediately failed the exact
