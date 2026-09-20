@@ -389,8 +389,10 @@ def record_project_registry_entry(repo_root: str, pipeline_dir: str, domains_pat
             "label": Path(normalized_root).name,
         }
         # applyRepoRoot is hand-set per project (see _start_pipeline) -- never let this
-        # upsert silently drop it.
-        for k in ("applyRepoRoot", "grepDirs"):
+        # upsert silently drop it. `pool` (docs/idle-pool-borrowing.md) is the same kind of
+        # hand-set opt-in: an idle lane may borrow work from this project; switching to the
+        # project from the Project tab must not silently un-opt it.
+        for k in ("applyRepoRoot", "grepDirs", "pool"):
             if prior.get(k):
                 entry[k] = prior[k]
         entries.insert(0, entry)

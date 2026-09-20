@@ -44,7 +44,9 @@ fi                                                                              
 # ever flowed between daemons.
 PIPELINE_DIR="${AGENT_MANAGER_PIPELINE_DIR:-$AGENT_MANAGER_REPO_ROOT}"
 QUEUE_DIR="${PIPELINE_DIR}/queue"
-INSTANCES_DIR="${PIPELINE_DIR}/instances"
+# AGENT_MANAGER_INSTANCES_DIR pins the lane's SHARED runtime state (heartbeat, GPU locks/tickets) to its HOME instances dir while a borrowed
+# invocation (docs/idle-pool-borrowing.md) points PIPELINE_DIR at another suite project -- see src/instances-dir.js. Unset = the old behaviour.
+INSTANCES_DIR="${AGENT_MANAGER_INSTANCES_DIR:-${PIPELINE_DIR}/instances}"
 # This package's own src/ (where model-stats-db.js, task-sources.js etc. ship), resolved
 # relative to scripts/ itself so it's correct even when AGENT_MANAGER_REPO_ROOT points at a
 # different (consumer) project than the one this script physically lives in.

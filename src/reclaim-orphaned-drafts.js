@@ -31,6 +31,7 @@
 // Writes one line of JSON to stdout: { reclaimed: N, ids: [...] }
 
 const fs = require('fs');
+const { sharedInstancesDir } = require('./instances-dir.js');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -108,7 +109,7 @@ function pidAlive(pid) {
 // file (which would otherwise show as an offline lane forever) are removed.
 function reclaimRetiredLaneDrafts({ pipelineDir, laneIds, alive = pidAlive }) {
   const draftingRoot = path.join(pipelineDir, 'queue', 'drafting');
-  const instancesDir = path.join(pipelineDir, 'instances');
+  const instancesDir = sharedInstancesDir(pipelineDir);
   const out = { retired: [], reclaimed: 0, ids: [] };
   let dirs = [];
   try {

@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const { sharedInstancesDir } = require('../instances-dir.js');
 const gpuArbiter = require('../gpu-arbiter.js');
 const { localOllamaLockKey } = require('./draft-lifecycle.js');
 const { getConfig } = require('../config.js');
@@ -30,7 +31,7 @@ const { getConfig } = require('../config.js');
 function lockedModelFn(fn, { phase } = {}) {
   if (typeof fn !== 'function') return fn;
   return (...args) => {
-    const instancesDir = path.join(getConfig().pipelineDir, 'instances');
+    const instancesDir = sharedInstancesDir(getConfig().pipelineDir);
     return gpuArbiter.withGpu(
       instancesDir,
       { cls: 'audit', lockKey: localOllamaLockKey(), phase },

@@ -40,6 +40,7 @@
 // (src/review-task.js, the REVIEW step); the APPLY step is a separate file, src/apply-task.js.
 
 const fs = require('fs');
+const { sharedInstancesDir } = require('./instances-dir.js');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
@@ -1104,7 +1105,7 @@ async function main() {
   });
 
   const { repoRoot, pipelineDir, secondBrainDir, domainsPath, deepDiveCoveragePath } = getConfig();
-  const instancesDir = path.join(pipelineDir, 'instances');
+  const instancesDir = sharedInstancesDir(pipelineDir);
 
   let result;
   try {

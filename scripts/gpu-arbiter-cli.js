@@ -23,10 +23,10 @@ function arg(name, fallback) {
 
 function instancesDir() {
   try {
-    return path.join(require(path.join(__dirname, '..', 'src', 'config.js')).getConfig().pipelineDir, 'instances');
+    return require(path.join(__dirname, '..', 'src', 'instances-dir.js')).sharedInstancesDir(require(path.join(__dirname, '..', 'src', 'config.js')).getConfig().pipelineDir);
   } catch {
     const pd = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT;
-    return pd ? path.join(pd, 'instances') : null;
+    return pd ? require(path.join(__dirname, '..', 'src', 'instances-dir.js')).sharedInstancesDir(pd) : null;
   }
 }
 

@@ -10,6 +10,7 @@
 // calls that are otherwise an invisible coin flip at default temperature.
 
 const fs = require('fs');
+const { sharedInstancesDir } = require('./instances-dir.js');
 const os = require('os');
 const path = require('path');
 const { postJson } = require('./ollama-http.js');
@@ -34,7 +35,7 @@ function resolveInstancesDir() {
   const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
   if (!repoRoot) return null;
   const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot;
-  return path.join(pipelineDir, 'instances');
+  return sharedInstancesDir(pipelineDir);
 }
 
 // Same tolerant derivation as resolveInstancesDir() above, one level up (the pipelineDir

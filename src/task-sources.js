@@ -11,6 +11,7 @@
 // renumbering anything.
 
 const fs = require('fs');
+const { sharedInstancesDir } = require('./instances-dir.js');
 const { generationThrottled, makeSourceThrottle, liveLaneCount } = require('./generation-throttle.js');
 const path = require('path');
 const crypto = require('crypto');
@@ -2865,7 +2866,7 @@ if (require.main === module) {
   if (fs.existsSync(pendingDir)) {
     for (const f of fs.readdirSync(pendingDir)) if (f.endsWith('.json')) inFlightFiles.push(path.join(pendingDir, f));
   }
-  const instancesDir = path.join(pipelineDir, 'instances');
+  const instancesDir = sharedInstancesDir(pipelineDir);
   const alreadyPending = generationThrottled(inFlightFiles.length, instancesDir);
 
   // An already-queued lower-priority task must never block a NEW adhoc task from
