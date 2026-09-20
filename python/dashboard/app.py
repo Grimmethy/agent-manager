@@ -1621,6 +1621,49 @@ def _archive_task_file(qdir, src):
     return dest
 
 
+# States whose archive means "we are giving up on this task" (as opposed to the Done tab's tidy-up of finished work).
+_GIVE_UP_ARCHIVE_STATES = ("blocked", "needs-clarification", "awaiting-confirm")
+
+
+def _stamp_manual_archive(src, state, reason=None):
+    """Records WHAT a manual archive of an unfinished task means, on the record, before it is moved.
+
+    Root-caused 2026-09-19: the Archive button only moved the file, so a blocked/needs-clarification task archived by a
+    human sat in _archived_no_action/ with NO terminalDisposition -- "unclassified" in the Hygiene tab, and an eternal,
+    silent block for any task that dependsOn it (isDependencySatisfied only releases on merged / a no-code-coming
+    disposition). That is exactly how arch-review-ac-7 stayed ineligible after arch-review-ac-6 was archived by hand.
+
+    Stamps terminalDisposition 'abandoned' -- the disposition the coordinator sweep already infers for every
+    _archived_no_action record (coordinator-sweep.js) and that isDependencySatisfied / hub-priority already treat as "a human
+    accepted this outcome, no code is coming from this record" -- plus a `manualArchive` block {at, from, reason} and a history
+    event. Only for the give-up states (a Done-tab archive is housekeeping for finished work and keeps its own disposition), and
+    never over an existing disposition. Best-effort: an unreadable record is archived unchanged, as before.
+    """
+    if state not in _GIVE_UP_ARCHIVE_STATES:
+        return False
+    data = read_json_safe(src)
+    if not isinstance(data, dict) or data.get("terminalDisposition"):
+        return False
+    now_iso = datetime.now(timezone.utc).isoformat()
+    why = (reason or "").strip() or None
+    hist = data.get("history")
+    if not isinstance(hist, list):
+        hist = data["history"] = []
+    hist.append({
+        "stage": "abandoned",
+        "at": now_iso,
+        "detail": f"archived by a human from {state}/ via the dashboard" + (f" -- {why}" if why else ""),
+    })
+    data["terminalDisposition"] = "abandoned"
+    data["manualArchive"] = {"at": now_iso, "from": state, "reason": why}
+    try:
+        src.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        logger.error("Could not stamp the manual-archive disposition on %s: %s", src, exc)
+        return False
+    return True
+
+
 def _delete_local_branch(repo_root, branch):
     """Deletes the LOCAL copy of a branch the Unmerged Branches tab just discarded.
 
