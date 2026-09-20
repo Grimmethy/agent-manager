@@ -104,7 +104,10 @@ function buildRequestObjectGrounding(rawText) {
 // "no-changes-needed" verdict as unconfirmed even after this whole live-grounding
 // mechanism shipped. Added html/json -- the other real file types this codebase's own
 // citable sources (dashboard templates, config) actually use.
-const REPO_FILE_PATH_RE = /\b((?:src|python|scripts|docs)\/[\w./-]+\.(?:js|py|sh|md|html|json))(?::(\d+)(?:-(\d+))?)?/g;
+// 2026-09-20: the JS/TS family is [cm]?[jt]sx? (js/jsx/ts/tsx/mjs/cjs/...) -- a prose citation of a .tsx file was never live-grounded on PF's
+// TypeScript projects. The trailing \b is load-bearing, not cosmetic: with no boundary the shorter `js` alternative matched first and a
+// cited `src/config.json` was silently truncated to `src/config.js` (a file that does not exist), so it was never fetched either.
+const REPO_FILE_PATH_RE = /\b((?:src|python|scripts|docs)\/[\w./-]+\.(?:[cm]?[jt]sx?|py|sh|md|html|json))\b(?::(\d+)(?:-(\d+))?)?/g;
 // Same incident, second half of the bug: the OTHER file the draft cited (app.py) DID
 // match, but flat-truncating from the start of a 4600-line/231KB file never reached line
 // 399 where the actually-relevant route lived -- the "grounding" was still functionally

@@ -560,3 +560,26 @@ test('extractLiveRepoGrounding with a groundingRef reads the stacked branch tip,
   const refreshed = refreshFetchedFileContent([{ path: 'src/view.js', content: 'frozen' }], repo, 'agent/decompose-hub');
   assert.match(refreshed[0].content, /inline/);
 });
+
+// --- prose citations of TS/TSX and .json files (2026-09-20) ---------------------------------------------------------------------
+test('extractLiveRepoGrounding grounds a prose-cited .tsx / .ts / .mjs file (PF TypeScript projects)', () => {
+  const repoRoot = makeRepoWithFile('src/components/View.tsx', 'export function View() { return null; }\n');
+  fs.writeFileSync(path.join(repoRoot, 'src', 'util.ts'), 'export const u = 1;\n');
+  fs.writeFileSync(path.join(repoRoot, 'src', 'run.mjs'), 'export default 1;\n');
+  const found = extractLiveRepoGrounding('The draft edits src/components/View.tsx:1-3, src/util.ts and src/run.mjs.', repoRoot);
+  assert.deepEqual(found.map((f) => f.path).sort(), ['src/components/View.tsx', 'src/run.mjs', 'src/util.ts']);
+});
+
+test('extractLiveRepoGrounding does not truncate a cited .json to .js (the shorter alternative used to win)', () => {
+  const repoRoot = makeRepoWithFile('src/config.json', '{"a":1}\n');
+  const found = extractLiveRepoGrounding('It reads src/config.json for settings.', repoRoot);
+  assert.equal(found.length, 1);
+  assert.equal(found[0].path, 'src/config.json');
+  assert.equal(found[0].content, '{"a":1}\n');
+});
+
+test('extractLiveRepoGrounding still reads a trailing sentence period and a :line-range citation', () => {
+  const repoRoot = makeRepoWithFile('src/a.tsx', 'x\n');
+  assert.equal(extractLiveRepoGrounding('See src/a.tsx.', repoRoot)[0].path, 'src/a.tsx');
+  assert.equal(extractLiveRepoGrounding('See src/a.tsx:1-1 for it', repoRoot)[0].path, 'src/a.tsx');
+});
