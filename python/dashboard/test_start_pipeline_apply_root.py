@@ -91,6 +91,12 @@ class StartPipelineApplyRootTest(unittest.TestCase):
         entry = json.loads(self.registry.read_text())[0]
         self.assertEqual(entry.get("applyRepoRoot"), "/some/apply-clone")
 
+    def test_registry_upsert_preserves_the_pool_opt_in(self):
+        """Switching to a project rewrites its registry entry; the hand-set `pool: true` (idle-pool borrowing opt-in) must survive it."""
+        self._register(pool=True)
+        app._start_pipeline(str(self.repo), True, True)
+        self.assertIs(json.loads(self.registry.read_text())[0].get("pool"), True)
+
 
 if __name__ == "__main__":
     unittest.main()

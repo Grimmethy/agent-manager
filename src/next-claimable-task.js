@@ -1,6 +1,7 @@
 'use strict';
 
 const fs = require('fs');
+const { sharedInstancesDir } = require('./instances-dir.js');
 const path = require('path');
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
@@ -220,7 +221,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   if (graceMs > 0 && rankable.length > 0 && (now - rankable[0].mtimeMs) < graceMs) {
     let lanes = opts.lanes;
     if (!lanes) { try { lanes = require('./lanes.js').getLanes(); } catch (_) { lanes = []; } }
-    const instancesDir = opts.instancesDir || path.join(pipelineDir, 'instances');
+    const instancesDir = opts.instancesDir || sharedInstancesDir(pipelineDir);
     if (preferredLaneIsIdle({ instanceId, instancesDir, lanes, now })) rankable.shift();
   }
   return [...pinned.map((r) => r.name), ...rankable.map((r) => r.name)];

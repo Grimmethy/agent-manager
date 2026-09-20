@@ -34,6 +34,7 @@
 // first solving the false-redelivery problem it introduces.
 
 const fs = require('fs');
+const { sharedInstancesDir } = require('./instances-dir.js');
 const { laneById } = require('./lanes.js');
 const path = require('path');
 const { getConfig } = require('./config.js');
@@ -359,7 +360,7 @@ function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid,
 
 function main() {
   const { pipelineDir } = getConfig();
-  const instancesDir = path.join(pipelineDir, 'instances');
+  const instancesDir = sharedInstancesDir(pipelineDir);
   const cooldownPath = path.join(instancesDir, '.watchdog-restart-cooldown.json');
 
   const actions = deadProcessCheck({ instancesDir, cooldownPath });

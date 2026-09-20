@@ -3,6 +3,7 @@
 // draft-context.js -- extracted from src/local-draft.js ([[hub-task-integration]] node-module decompose).
 
 const path = require('path');
+const { sharedInstancesDir } = require('../instances-dir.js');
 const { buildPlanGrounding } = require('../plan-grounding.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('../task-history.js');
 const {
@@ -97,7 +98,7 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
   // string correctly fails the 'claude:' prefix check.
   const resolvedLabel = labelFor(task) || '';
   const resolvedCallIsLocal = !resolvedLabel.startsWith('claude:');
-  const instancesDir = path.join(getConfig().pipelineDir, 'instances');
+  const instancesDir = sharedInstancesDir(getConfig().pipelineDir);
   // Locked per-model, not globally (2026-08-25 -- see single-flight-lock.js's own header
   // for the full "worker-1 and reasoning taking turns" incident this fixes): resolvedLabel
   // IS the resolved local model name whenever resolvedCallIsLocal is true (labelFor()

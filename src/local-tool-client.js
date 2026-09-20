@@ -1,6 +1,7 @@
 'use strict';
 
 const { isGitWriteRequest, GIT_WRITE_REQUEST_REFUSAL } = require('./lib/git-ownership.js');
+const { sharedInstancesDir } = require('./instances-dir.js');
 
 // Multi-turn tool-calling loop for a plan pass, giving it a real, narrow, read-only
 // codebase-search capability via grep-codebase-tool.js. Unlike local-client.js (which only
@@ -1254,7 +1255,7 @@ function logContextAudit(entry) {
 // own plan pass.
 async function runWithoutToolsFallback(prompt, pipelineDir) {
   const { call } = require('./local-client.js');
-  const result = await withLock(path.join(pipelineDir, 'instances'), () => call({ prompt, think: true }), MODEL);
+  const result = await withLock(sharedInstancesDir(pipelineDir), () => call({ prompt, think: true }), MODEL);
   return { response: result.response, toolCallLog: [], turnsUsed: 0, toolsDisabled: true };
 }
 
@@ -1417,7 +1418,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // maybeLocked() already establishes -- held ONLY around each individual /api/chat call
   // (in chatTurnWithFlakeRecovery), not the whole multi-turn loop (tool execution between
   // turns doesn't touch the GPU and shouldn't block other lanes while it runs).
-  const instancesDir = path.join(pipelineDir, 'instances');
+  const instancesDir = sharedInstancesDir(pipelineDir);
 
   // Same TokenFold session/scope headers local-client.js sends on /api/generate.
   // Without the session header every /api/chat call hashed into its own one-off
@@ -1895,7 +1896,7 @@ if (require.main === module) {
   // waiter and yields the GPU -- the per-turn turnLock() acquires fast because this pid
   // already holds the place (see gpu-arbiter.js holdPlace / the holdsPlace fast path).
   const _arbPlace = CHAT_IS_INTERACTIVE
-    ? gpuArbiter.holdPlace(path.join(getConfig().pipelineDir, 'instances'), { cls: 'interactive', model: MODEL, phase: 'chat' })
+    ? gpuArbiter.holdPlace(sharedInstancesDir(getConfig().pipelineDir), { cls: 'interactive', model: MODEL, phase: 'chat' })
     : null;
   (async () => {
     try {
