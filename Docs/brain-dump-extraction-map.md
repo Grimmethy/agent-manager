@@ -31,6 +31,7 @@ vault under `SECOND_BRAIN_DIR`): it is the sort's *destination*, a neighbouring 
 | 8 | What happens to user feedback | **Human-gated after an initial sort, with no direct way to be automatically turned into a task.** The sorter classifies and files; only a human action promotes anything toward a task. |
 | 9 | Sorting | Feedback is **sorted by user account**: the sorter must be programmed to expect the account on every incoming user-feedback entry. |
 | 10 | Transport | Agent-manager's machine has **Tailscale access to the tower** (the host's machine), so the natural direction is agent-manager **pulling** over Tailscale. Proposed, to confirm. |
+| 11 | Is the operator's own account trusted | **Yes (decided 2026-09-20).** Submissions from the operator's account keep today's behaviour: the sorter may queue a task from them. Every other account stays behind the human gate (row 8). |
 
 ## 1. The loop
 
@@ -207,23 +208,29 @@ existing loop: an entry, sorted, filed or turned into a task in that project's p
 2. **Gate before processing.** User feedback is **human-gated after an initial sort**, and there is **no direct or automatic path from a feedback entry to a task**. Today the sorter can queue a task from an entry (`applyBrainDumpSort` -> `queue/derived/` or `queue/adhoc/`); for user feedback that branch must not exist.
 3. **Sorting by account.** The sorter must expect an account on every incoming feedback entry and sort by it.
 4. **Transport.** The agent-manager machine reaches the tower over Tailscale (checked with `tailscale status` from this machine), so a **pull** from agent-manager needs no inbound exposure of agent-manager. Which tower endpoint it pulls from is still to be chosen: `backend-public` is not host-exposed, and `backend-internal` (the full app) serves the LAN.
+5. **The operator's own account is trusted (decision 11).** Their submissions keep today's behaviour. See "How trust is decided" below.
 
 **Still open.**
-1. **Is the operator's own account trusted?** The gate could apply to everyone, or the operator's submissions could keep today's behaviour (a note that may be queued as a task). Decide before the sorter is changed.
-2. **What "sorted by account" produces.** Grouping in the store and an account view in the UI, filing under the account in the vault, or both. Account identifiers in vault notes are personal data (see 3).
-3. **Privacy.** Where feedback and account identifiers are stored, for how long, and that only a local model reads them (the sorter uses one today).
-4. **Raw-submission store.** The host's database as the durable source of raw submissions, with agent-manager importing them (idempotently, by the host's own submission id), or agent-manager as the only store.
-5. **Closing the loop with the user** (a status or a reply). Not needed for a first version.
+1. **What "sorted by account" produces.** Grouping in the store and an account view in the UI, filing under the account in the vault, or both. Account identifiers in vault notes are personal data (see 3).
+2. **Privacy.** Where feedback and account identifiers are stored, for how long, and that only a local model reads them (the sorter uses one today).
+3. **Raw-submission store.** The host's database as the durable source of raw submissions, with agent-manager importing them (idempotently, by the host's own submission id), or agent-manager as the only store.
+4. **Closing the loop with the user** (a status or a reply). Not needed for a first version.
 
 **Effect on the seams (section 7).** Seam B (UI) becomes the host-side widget and must work in a React host and, ideally, any web host. Seam A's single owner is
 naturally the agent-manager-side half; the host-side half only ever calls it. A new **Seam F: the host-side intake** (widget + endpoint + transport) is the part
 that does not exist in any form today, now with a **pull importer** on the agent-manager side.
 
 **What the sorter (Seam C) must change for user feedback.** (a) **A new input:** the entry carries `origin {kind: "user-feedback", host, accountId, hostSubmissionId}`
-and the sorter is written to expect it. (b) **A new output rule:** the sort result groups by account. (c) **No task branch:** for `origin.kind === "user-feedback"`
+and the sorter is written to expect it. (b) **A new output rule:** the sort result groups by account. (c) **No task branch:** for `origin.kind === "user-feedback"` (every account except the operator's, below)
 `applyBrainDumpSort`'s queue-a-task branch is unreachable, enforced structurally in the apply code and not by a field the model's output can set; the only route
 toward a task is a human action by an authenticated operator, and the resulting task records where it came from (`concept-task-provenance`). (d) **Untrusted text is
 data:** whenever a model reads it, it is quoted or fenced as user-provided content, never presented as an instruction.
 
-**Invariants added for feedback** (in addition to section 7's nine): (10) no user-feedback entry becomes a task automatically; (11) every user-feedback entry keeps its account
+**How trust is decided (decision 11).** Trust is decided **on the agent-manager side, at import**, by matching the host's `accountId` against an operator
+allowlist kept in agent-manager's own configuration (per host). It is never a field in the submission and never something a model's output can set, so nothing a
+submitter sends can claim it. A trusted entry is stamped `origin.kind: "operator"` and takes today's path (the sorter may queue a task, and it is still sorted by
+account); every other account is `user-feedback`. **The one new risk:** the trusted path is only as safe as the operator's account on the host. Whoever takes over that
+account can queue tasks, so strong authentication on it is part of the host-side half's job.
+
+**Invariants added for feedback** (in addition to section 7's nine): (10) no user-feedback entry becomes a task automatically, with one exception: an account on agent-manager's operator allowlist, decided at import and never by the submitter; (11) every user-feedback entry keeps its account
 identity, its host and the host's own submission id; (12) the import from a host is idempotent; (13) a human-promoted task keeps the provenance of the feedback it came from.
