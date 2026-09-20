@@ -1,6 +1,6 @@
 # Idle-GPU pool borrowing: design brief
 
-Status: **design agreed 2026-09-20, not built** · Requested by Grimmethy: "when there is no work in the currently selected repo, an idle GPU picks up tasks from the Agent Manager pool ... AM is becoming a whole suite of tools ... it would make sense to allow the whole suite to be a possible target."
+Status: **built 2026-09-20** (PRs #408 foundation, #410 worker, #411 reviewer + apply loop, #412 watchdog sweeps; live once merged, kill switch `AGENT_MANAGER_POOL_BORROW=false`) · Requested by Grimmethy: "when there is no work in the currently selected repo, an idle GPU picks up tasks from the Agent Manager pool ... AM is becoming a whole suite of tools ... it would make sense to allow the whole suite to be a possible target."
 
 ## Goal
 Long-term uptime. A lane that finds nothing claimable in the **active project** immediately works another **suite project** instead of idling. (Live example: the 3090 idled 31 minutes on 2026-09-20 while the agent-manager queue held ~167 ready adhoc + 90 derived tasks.)
@@ -44,3 +44,9 @@ Pieces:
 * Switching the active project restarts the lanes; a borrowed task in flight is left in that project's `drafting/<lane>/` and resumed later (existing behaviour for any lane restart).
 * Borrowed agent-manager tasks are self-modifying pipeline code and go through the same gates and produce branches for review, as always. No cap (decision 5) means the queue of branches to merge can grow; visible per project after a switch.
 * Project selection by `pool:true` needs an explicit list (see the open question in the design thread).
+
+## As built (differences from the plan above)
+* Borrow/backoff state is **per role** (worker / reviewer) in `pool-state.json`; an empty project is skipped for `AGENT_MANAGER_POOL_EMPTY_BACKOFF_SECS` (default 300).
+* The **apply loop** (`scripts/apply-loop.sh`, replaces the inline launch.sh loop) does not wait for idleness: applying is git work, not GPU work. `apply-task.sh` preserves the borrowed project's env across its `agent-manager.env` source.
+* **Watchdog** housekeeping for pool projects is `scripts/pool-sweeps.sh`, run by `queue-watcher.sh` in the background (flock, one at a time), per project at most every `AGENT_MANAGER_POOL_SWEEP_INTERVAL_SECS` (300) and only when the project has something in a stage housekeeping acts on. Machine-scoped sweeps (supervision, uptime, Second Brain report/graph, pipeline-health audit, drift scan) and the proactive file-decompose sweep stay home-only.
+* Heartbeats carry the daemon pid (`AGENT_MANAGER_DAEMON_PID`) and, while borrowing, a `project` label.

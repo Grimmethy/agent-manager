@@ -162,3 +162,35 @@ test('apply-loop applies approved tasks of a pool project under THAT project\'s 
   assert.ok(landed, 'the task landed in the POOL project\'s own queue');
   assert.ok(!['done', 'blocked'].some((d) => fs.existsSync(path.join(sb.A, 'queue', d, 'a1.json'))));
 });
+
+// --- watchdog housekeeping for a borrowed project (step 4) -------------------------------------------------------------------------------------
+
+function borrowedEnv(sb) {
+  return { ...sb.env, AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoB'), AGENT_MANAGER_PIPELINE_DIR: sb.B, AGENT_MANAGER_INSTANCES_DIR: sb.instancesDir, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.B, 'task-domains.json'), AGENT_MANAGER_BORROWING_FROM: 'B' };
+}
+
+test('pool-sweeps.sh runs the project-scoped sweeps under the BORROWED project: a blocked review rejection in B is retried in B, A is untouched, and it is due at most once per interval', () => {
+  const sb = sandbox();
+  fs.writeFileSync(path.join(sb.B, 'queue', 'blocked', 'b1.json'), JSON.stringify({ id: 'b1', domain: 'default', source: 'trouble_log', title: 't', status: 'blocked', blockedStage: 'review', blockedReason: 'rejected: needs work', localRejectCount: 0, history: [], promptContext: {} }));
+  const run = () => spawnSync('bash', [path.join(__dirname, 'pool-sweeps.sh')], { encoding: 'utf8', timeout: 180000, env: borrowedEnv(sb) });
+  const r1 = run();
+  assert.equal(r1.status, 0, r1.stderr);
+  assert.match(r1.stdout, /\[pool-sweeps:B\] reject-retry-check:/);
+  assert.ok(!fs.existsSync(path.join(sb.B, 'queue', 'blocked', 'b1.json')), 'retried: it left B\'s blocked/');
+  assert.ok(['pending', 'adhoc'].some((d) => fs.existsSync(path.join(sb.B, 'queue', d, 'b1.json'))), 'and was requeued inside B');
+  assert.deepEqual([...fs.readdirSync(path.join(sb.A, 'queue', 'blocked')), ...fs.readdirSync(path.join(sb.A, 'queue', 'pending'))], [], 'nothing was filed into the home project');
+  assert.ok(fs.existsSync(path.join(sb.B, 'instances', '.pool-sweeps-last')), 'the project-local due marker');
+  const r2 = run();
+  assert.equal(r2.stdout.trim(), '', 'a second run inside the interval does nothing');
+});
+
+test('pool-sweeps.sh skips a project with nothing in any housekeeping stage, and refuses to run outside a borrowed context', () => {
+  const sb = sandbox();
+  const r = spawnSync('bash', [path.join(__dirname, 'pool-sweeps.sh')], { encoding: 'utf8', timeout: 60000, env: borrowedEnv(sb) });
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout.trim(), '', 'an idle project costs no sweeps');
+  const home = { ...borrowedEnv(sb) }; delete home.AGENT_MANAGER_BORROWING_FROM;
+  const bad = spawnSync('bash', [path.join(__dirname, 'pool-sweeps.sh')], { encoding: 'utf8', timeout: 60000, env: home });
+  assert.equal(bad.status, 64);
+  assert.match(bad.stderr, /refusing to run outside a borrowed-project context/);
+});
