@@ -770,3 +770,39 @@ index 5096ba6f..5812c332 100644
 Problem: [severity: med; regression shipped in 49a4f48] Before this diff, if the /api/pipeline/start POST returned 200 OK but the spawned daemons subsequently failed to reach a running state, the next refreshPipelineStatus() poll would fall into the plain else branch and re-enable the "Start Pipeline" button, allowing the user to retry; after this diff the new else-if (pipelineStarting) branch intercepts every subsequent poll and leaves the button permanently disabled with "Starting…" text, with no timeout, cancel affordance, or other clearing path.  Failure scenario: User has projectPath = "/home/dev/myproj" set. They click "Start Pipeline". startPipeline() sets pipelineStarting = true, POSTs to /api/pipeline/start, and the server returns 200 {"status":"accepted"} (so no exception is thrown and pipelineStarting stays true). The server spawns the daemons, but they immediately crash because port 8443 is already bound by a stale process. The subsequent refreshPipelineStatus() call (at the end of startPipeline, and again every 5 s via the interval) fetches /api/pipeline/status and receives {"running": false, ...}. Because pipelineStarting is still true and status.running is false, execution hits the new else-if branch (line 1697): startBtn.disabled = true; startBtn.textContent = 'Starting...'. This repeats on every poll indefinitely. Before the diff the same poll would have hit the else branch, set startBtn.onclick = startPipeline and startBtn.disabled = false (since projectPath is non-empty), letting the user kill the stale process and click "Start Pipeline" again. After the diff the user is locked out of retrying until they perform a full page reload.
 Solution: In the else-if (pipelineStarting) branch, add a time-bounded guard: store a timestamp when pipelineStarting is set to true (e.g. pipelineStartTs = Date.now()), and in the else-if branch check if (Date.now() - pipelineStartTs > 30000) { pipelineStarting = false; /* fall through to the else branch logic */ } so the button re-enables after 30 seconds even if the daemons never report running.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 49a4f48.
+
+### AC-68 · The `*)` fallback case in `refresh_active_model` no longer assigns `CLAUDE_MODEL="$overrid (cf5ba95 ornith-worker.sh)
+Strength: Strong
+Source: change_review of cf5ba95 "Let worker-reasoning's model dropdown pick a local model too"
+Files: scripts/ornith-worker.sh
+
+Snippet:
+```
+diff --git a/scripts/ornith-worker.sh b/scripts/ornith-worker.sh
+index ac74a803..96b79fd4 100755
+--- a/scripts/ornith-worker.sh
++++ b/scripts/ornith-worker.sh
+@@ -35,32 +35,55 @@ source "${SCRIPT_DIR}/orc-common.sh"
+ # reported model regardless of which lane was actually running -- confirmed live
+ # 2026-08-17: the dashboard's Workers tab showed worker-reasoning as running "ornith:35b"
+ # even though it only ever claims adhoc tasks and never calls Ornith at all. Same
+ # "claude:<model>" label format model-provider.js's own labelFor() already uses for the
+ # Models tab, so the two stay consistent.
+ #
+ # Re-run once per tick (not just once at startup, 2026-08-18: Workers tab per-instance
+ # model dropdown) -- exports ORNITH_MODEL/CLAUDE_MODEL for this tick from
+ # dashboard-settings.json's workerModelOverrides when the dashboard has set one for THIS
+ # instanceId, else leaves whatever agent-manager.env set at launch untouched. Every node
+ # call downstream this tick (ornith-draft.js, claude-client.js via the reasoning lane)
+ # inherits the exported value, so no other call site needs to change.
++#
++# The reasoning lane's override can name EITHER backend (2026-08-18 follow-up, Grimmethy:
++# "reasoning is set to only show subscription models -- I need to be able to select from
++# both subscription and local models") -- the dropdown prefixes its value with "claude:"
++# or "ollama:" precisely so this can tell which one was picked (worker-1/reviewer's plain
++# Ornith-only dropdown ha
+```
+
+Problem: [severity: med; regression shipped in cf5ba95] The `*)` fallback case in `refresh_active_model` no longer assigns `CLAUDE_MODEL="$override"` for bare (unprefixed) model names, so a model selection stored by the pre-diff dropdown is silently ignored on the first tick after deploy.  Failure scenario: Before this diff, a user picks "opus" from the reasoning lane's dropdown; `dashboard-settings.json` records `{"workerModelOverrides":{"worker-reasoning-1":"opus"}}`. After deploy, the next tick calls `refresh_active_model`; `override` is `"opus"`, `IS_CLAUDE_LANE` is true, the `case` falls through to `*)`, which runs `unset AGENT_MANAGER_FORCE_PROVIDER; export CLAUDE_MODEL` without ever setting `CLAUDE_MODEL="opus"`. The worker then uses whatever `CLAUDE_MODEL` agent-manager.env happened to export (e.g. "sonnet" or empty→"sonnet" via the `:-sonnet` default in HEARTBEAT_MODEL), and the user's explicit "opus" choice is lost. The old code's `[[ -n "$override" ]] && CLAUDE_MODEL="$override"` handled exactly this case.
+Solution: In the `*)` branch, restore the conditional assignment before the export:
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in cf5ba95.
