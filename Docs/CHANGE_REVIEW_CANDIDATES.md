@@ -740,3 +740,33 @@ index 8b053363..250ff269 100644
 Problem: [severity: med; regression shipped in 8b29ba0] Before this diff, a successful `/api/queue/<state>` response was sufficient to render the tab body; after this diff, a second unguarded network call to `/api/job-types` is a hard prerequisite, and its failure leaves the tab blank with no error message.  Failure scenario: User opens the "done" tab. `fetchJson('/api/queue/done?limit=10&offset=0')` succeeds and returns `{"items":[…5 tasks…],"total":50}`. Control then reaches `const sourceNames = await allSourceNames();`, which calls `fetchJson('/api/job-types')`. The server returns HTTP 500 (transient error, deploy in progress, or the endpoint is temporarily removed). `fetchJson` throws (confirmed by the identical pattern in `refreshPipelineStatus` where `fetchJson` rejection is caught with `e.message`). Because this `await` sits outside any `try/catch` in `renderQueueTab`, the rejection propagates out of the async function as an unhandled promise rejection. `main.innerHTML` is never assigned; the tab body is blank and no error text is shown to the user. Before this diff, the same successful queue response would have produced the task table.
 Solution: Wrap the `allSourceNames()` call in a `try/catch` that falls back to an empty array (or a single "All task types" option), so the queue table still renders when the job-types endpoint is unavailable:
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 8b29ba0.
+
+### AC-67 · Before this diff, if the /api/pipeline/start POST returned 200 OK but the spawned daemons  (49a4f48 index.html)
+Strength: Strong
+Source: change_review of 49a4f48 "Fix Start Pipeline button flicker, add a legend to the project graph"
+Files: python/dashboard/templates/index.html
+
+Snippet:
+```
+diff --git a/python/dashboard/templates/index.html b/python/dashboard/templates/index.html
+index 5096ba6f..5812c332 100644
+--- a/python/dashboard/templates/index.html
++++ b/python/dashboard/templates/index.html
+@@ -179,24 +179,36 @@ let grepDirs = localStorage.getItem('agentManagerGrepDirs') || '';
+ let includeApply = localStorage.getItem('agentManagerIncludeApply') === 'true';
+ let skipPush = localStorage.getItem('agentManagerSkipPush') !== 'false'; // default true (don't push)
+ let browsePath = '';
+ let browserOpen = false;
+ let historyOpen = false;
+ let projectStatusInterval = null;
+ // Tracks which click this is on the Start/Stop/Force-Stop toggle button while the
+ // pipeline is running: false = not yet clicked (button reads "Stop Pipeline"), true =
+ // a graceful stop was already requested and is in flight (button reads "Force Stop
+ // Pipeline" so a stuck daemon can be killed without waiting out the grace period).
+ // Reset to false whenever the pi
+...[snippet truncated]
+```
+
+Problem: [severity: med; regression shipped in 49a4f48] Before this diff, if the /api/pipeline/start POST returned 200 OK but the spawned daemons subsequently failed to reach a running state, the next refreshPipelineStatus() poll would fall into the plain else branch and re-enable the "Start Pipeline" button, allowing the user to retry; after this diff the new else-if (pipelineStarting) branch intercepts every subsequent poll and leaves the button permanently disabled with "Starting…" text, with no timeout, cancel affordance, or other clearing path.  Failure scenario: User has projectPath = "/home/dev/myproj" set. They click "Start Pipeline". startPipeline() sets pipelineStarting = true, POSTs to /api/pipeline/start, and the server returns 200 {"status":"accepted"} (so no exception is thrown and pipelineStarting stays true). The server spawns the daemons, but they immediately crash because port 8443 is already bound by a stale process. The subsequent refreshPipelineStatus() call (at the end of startPipeline, and again every 5 s via the interval) fetches /api/pipeline/status and receives {"running": false, ...}. Because pipelineStarting is still true and status.running is false, execution hits the new else-if branch (line 1697): startBtn.disabled = true; startBtn.textContent = 'Starting...'. This repeats on every poll indefinitely. Before the diff the same poll would have hit the else branch, set startBtn.onclick = startPipeline and startBtn.disabled = false (since projectPath is non-empty), letting the user kill the stale process and click "Start Pipeline" again. After the diff the user is locked out of retrying until they perform a full page reload.
+Solution: In the else-if (pipelineStarting) branch, add a time-bounded guard: store a timestamp when pipelineStarting is set to true (e.g. pipelineStartTs = Date.now()), and in the else-if branch check if (Date.now() - pipelineStartTs > 30000) { pipelineStarting = false; /* fall through to the else branch logic */ } so the button re-enables after 30 seconds even if the daemons never report running.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 49a4f48.
