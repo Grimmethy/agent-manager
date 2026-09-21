@@ -745,7 +745,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
               || { source: 'needs-clarification-triage', bucket: 'E-decompose-loop', openQuestions: nc.openQuestions || '', blockedReason: task.blockedReason || '' },
             originalTaskId: id0,
             decomposeBlockedAt: (task.stalenessFlag && task.stalenessFlag.at) || now,
-          });
+          }, { pipelineDir }); // THIS sweep's pipeline. Without it the helper fell back to $AGENT_MANAGER_PIPELINE_DIR / the package root (2026-09-21: every run of the bucket-E tests wrote 'xxxx...' fixtures into the LIVE agent-manager queue/awaiting-confirm/, and a sweep over another project could surface into the wrong queue).
           if (surfaced) log(`${id0}: bucket E decompose question surfaced -> ${surfaced.filePath}`);
         } catch (e) {
           log(`${id0}: surfacing decompose question failed (non-fatal): ${e.message}`);

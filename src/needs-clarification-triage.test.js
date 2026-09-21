@@ -1263,3 +1263,22 @@ test('bucket L: MAX_REQUEUES cap is respected', async () => {
   assert.equal(s.requeued, 0);
   assert.ok(exists(at(dir, 'needs-clarification', 'l5.json')));
 });
+
+// 2026-09-21: bucket E surfaces a decompose design question. It must go into THIS sweep's pipeline, never wherever $AGENT_MANAGER_PIPELINE_DIR (or the package root) points:
+// before the fix every run of the bucket-E tests above wrote 'xxxx...' fixtures into the live queue/awaiting-confirm/ (decompose-question-te1/te3/te4).
+test('bucket E: the surfaced decompose design question lands in the sweep\'s own pipeline, not in $AGENT_MANAGER_PIPELINE_DIR', async () => {
+  const dir = makePipeline();
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-triage-elsewhere-'));
+  const prev = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = elsewhere;
+  try {
+    held(dir, baseTask('te-surface', {
+      stalenessFlag: { reason: 'decompose-loop', disposition: 're-scope', confidence: 'medium' },
+      history: [{ stage: 'exhausted' }, { stage: 'needs-clarification' }],
+    }));
+    await needsClarificationTriage(args(dir));
+    const mine = fs.existsSync(at(dir, 'awaiting-confirm')) ? fs.readdirSync(at(dir, 'awaiting-confirm')) : [];
+    assert.equal(mine.filter((f) => f.startsWith('decompose-question-te-surface-')).length, 1, 'surfaced into the sweep\'s own queue/awaiting-confirm/');
+    assert.equal(fs.existsSync(path.join(elsewhere, 'queue', 'awaiting-confirm')), false, 'nothing written where the env var points');
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev; }
+});
