@@ -264,3 +264,32 @@ test('stale-snippet-partial-anchor also matches a task whose cited code MOVED to
     for (const [k, v] of [['AGENT_MANAGER_REPO_ROOT', saved.r], ['AGENT_MANAGER_PIPELINE_DIR', saved.p]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
 });
+
+// --- cited-code-moved-relocated (2026-09-21): structural, whatever the failure text said ------------------------------------------------------------------------
+test('cited-code-moved-relocated matches a task whose declared file lost the Snippet to exactly one other file, and NOT a present, gone, diff-shaped or ambiguous one', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'moved-entry-'));
+  fs.mkdirSync(path.join(root, 'src', 'routes'), { recursive: true });
+  const block = ['function moved(o) {', ...Array.from({ length: 40 }, (_, i) => `  const v${i} = go(${i}); // step ${i} of the moved body`), '  return o;', '}'].join('\n');
+  const pad = (t) => Array.from({ length: 300 }, (_, i) => `const ${t}${i} = ${i}; // padding line`).join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'old.js'), `${pad('o')}\nfunction other() {}\n`);
+  fs.writeFileSync(path.join(root, 'src', 'routes', 'new.js'), `${pad('n')}\n${block}\n`);
+  const saved = { r: process.env.AGENT_MANAGER_REPO_ROOT, p: process.env.AGENT_MANAGER_PIPELINE_DIR };
+  process.env.AGENT_MANAGER_REPO_ROOT = root; process.env.AGENT_MANAGER_PIPELINE_DIR = root;
+  try {
+    const e = byId['cited-code-moved-relocated'];
+    const mk = (body, file = 'src/old.js') => stuck('t', {
+      domain: 'default', source: 'observability_fix',
+      promptContext: { body, fetchedFiles: [{ path: file, anchorConfidence: 'strong' }] }, // stored strong: the code was in place when it was minted
+      needsClarification: { reason: 'design-decision', openQuestions: 'The draft is a refusal ("FALSE POSITIVE ...").' }, history: [{ stage: 'exhausted', at: '2026-09-20T05:00:00Z' }],
+    });
+    const sec = (snip) => `### AC-7\nFiles: src/old.js\nSnippet:\n\`\`\`\n${snip}\n\`\`\`\n`;
+    assert.equal(e.applies(mk(sec(block))), true, 'moved: the Snippet is in routes/new.js only');
+    assert.equal(e.applies(mk(sec(block), 'src/routes/new.js')), false, 'the Snippet is still in the cited file: not moved');
+    assert.equal(e.applies(mk(sec(Array.from({ length: 30 }, (_, i) => `  const nothing${i} = else(${i});`).join('\n')))), false, 'gone everywhere');
+    assert.equal(e.applies(mk(sec('diff --git a/src/x.js b/src/x.js\n--- a/src/x.js\n+++ b/src/x.js\n@@ -1,2 +1,3 @@\n a\n+b'))), false, 'a diff-shaped Snippet');
+    fs.writeFileSync(path.join(root, 'src', 'routes', 'copy.js'), `${pad('c')}\n${block}\n`);
+    assert.equal(e.applies(mk(sec(block))), false, 'two files contain it: ambiguous, never guessed');
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_REPO_ROOT', saved.r], ['AGENT_MANAGER_PIPELINE_DIR', saved.p]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});

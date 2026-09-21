@@ -158,35 +158,85 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
   return { text: out.join('\n'), confidence: 'strong', anchorCount: strongHits.length, usedSnippetFuzzyMatch };
 }
 
+// The candidate HAS a Snippet and it is nowhere in this file (whole, or via findFuzzyMatch's prefix/suffix fallback). This, not a low window confidence, is what says the cited
+// code left: a file can still window "strong" through quoted symbols that merely occur elsewhere in it (observability-fix-ac-111: `abort(404)` is all over app.py).
+function snippetMissingFrom(content, section) {
+  const snippet = snippetFromSection(section);
+  return !!snippet && !looksLikeDiff(snippet) && !findFuzzyMatch(content, snippet);
+}
+
+// A change_review candidate's Snippet is a unified DIFF of some commit, not a block of source: it names a file it changed, its '+'/'-' lines never occur in the source, and
+// "the diff is not in this file" says nothing about the code having moved (change-review-fix-ac-2's diff of apply-retry-check.js would "relocate" from the test to the source).
+function looksLikeDiff(snippet) {
+  return /^diff --git /m.test(snippet) || /^@@ -\d+(?:,\d+)? \+\d+/m.test(snippet);
+}
+
 // The code a candidate points at can MOVE to another file after the candidate was written (a function extracted into its own module: function-length-fix-ac-10's
-// applyBrainDumpSort went from apply-group-a.js to apply-group-a-brain-dump.js), leaving the cited file with no anchor at all. Look for the candidate's Snippet in the
-// SIBLING files of the cited one (same directory, same extension, tests excluded) and accept a result only when exactly ONE of them matches (whole snippet, or the
-// prefix/suffix fallback of findFuzzyMatch): an ambiguous or missing match is never guessed. -> { path (repo-relative), content } | null. Best-effort, never throws.
-const RELOCATE_MAX_FILES = 500;
+// applyBrainDumpSort went from apply-group-a.js to apply-group-a-brain-dump.js; observability-fix-ac-111's report handler went from python/dashboard/app.py into
+// python/dashboard/routes/reports.py), leaving the cited file with no anchor at all. Look for the candidate's Snippet in, in order: (1) the SIBLING files of the cited one
+// (same directory), then, only if none matched, (2) the whole SUBTREE of the cited file's top-level directory (src/, python/, scripts/, ...). Same extension only, tests and
+// vendored/build directories excluded, size and count capped. A tier is accepted only when EXACTLY ONE file matches it (whole snippet, or the prefix/suffix fallback of
+// findFuzzyMatch): an ambiguous or missing match is never guessed, and an ambiguous first tier never escalates to the second.
+// -> { path (repo-relative), content } | null. Best-effort, never throws.
+const RELOCATE_MAX_FILES = 3000;
 const RELOCATE_MAX_BYTES = 600000;
+const RELOCATE_SKIP_DIRS = new Set(['node_modules', '.git', '.venv', 'venv', '__pycache__', 'dist', 'build', 'coverage', '.agent-manager-cache']);
+
+function listCandidateFiles(dir, ext, recursive, budget) {
+  const out = [];
+  const walk = (d) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (budget.left <= 0) return;
+      if (e.isDirectory()) { if (recursive && !RELOCATE_SKIP_DIRS.has(e.name)) walk(path.join(d, e.name)); continue; }
+      if (!e.isFile() || path.extname(e.name) !== ext || e.name.includes('.test.')) continue;
+      budget.left -= 1;
+      out.push(path.join(d, e.name));
+    }
+  };
+  walk(dir);
+  return out;
+}
+
+// A cheap pre-filter: the longest distinctive lines of the snippet; a file containing none of them cannot contain the (even drifted) snippet.
+function distinctiveLines(snippet) {
+  return snippet.split('\n').map((l) => l.trim()).filter((l) => l.length >= 25).sort((a, b) => b.length - a.length).slice(0, 3);
+}
+
+function uniqueMatchIn(files, snippet, root, original, lines) {
+  const found = [];
+  for (const full of files) {
+    if (full === original) continue;
+    let content;
+    try {
+      if (fs.statSync(full).size > RELOCATE_MAX_BYTES) continue;
+      content = fs.readFileSync(full, 'utf8');
+    } catch { continue; }
+    if (lines.length && !lines.some((l) => content.includes(l))) continue;
+    if (findFuzzyMatch(content, snippet)) found.push({ path: path.relative(root, full).split(path.sep).join('/'), content });
+    if (found.length > 1) return { ambiguous: true };
+  }
+  return { hit: found.length === 1 ? found[0] : null };
+}
+
 function relocateStaleAnchor(repoRoot, relPath, section) {
   try {
     const snippet = snippetFromSection(section);
-    if (!snippet || !repoRoot || !relPath) return null;
+    if (!snippet || looksLikeDiff(snippet) || !repoRoot || !relPath) return null;
     const root = path.resolve(repoRoot);
     const original = path.resolve(root, relPath);
     if (!original.startsWith(root + path.sep)) return null;
-    const dir = path.dirname(original);
     const ext = path.extname(original);
-    const found = [];
-    for (const name of fs.readdirSync(dir).slice(0, RELOCATE_MAX_FILES)) {
-      if (path.extname(name) !== ext || name.includes('.test.')) continue;
-      const full = path.join(dir, name);
-      if (full === original) continue;
-      let st;
-      try { st = fs.statSync(full); } catch { continue; }
-      if (!st.isFile() || st.size > RELOCATE_MAX_BYTES) continue;
-      const content = fs.readFileSync(full, 'utf8');
-      if (findFuzzyMatch(content, snippet)) found.push({ path: path.relative(root, full).split(path.sep).join('/'), content });
-      if (found.length > 1) return null; // ambiguous
-    }
-    return found.length === 1 ? found[0] : null;
+    const lines = distinctiveLines(snippet);
+    const tier1 = uniqueMatchIn(listCandidateFiles(path.dirname(original), ext, false, { left: 500 }), snippet, root, original, lines);
+    if (tier1.ambiguous) return null;
+    if (tier1.hit) return tier1.hit;
+    const top = path.join(root, path.relative(root, original).split(path.sep)[0]);
+    if (top === original || !fs.existsSync(top) || !fs.statSync(top).isDirectory()) return null;
+    const tier2 = uniqueMatchIn(listCandidateFiles(top, ext, true, { left: RELOCATE_MAX_FILES }), snippet, root, original, lines);
+    return tier2.hit || null;
   } catch { return null; }
 }
 
-module.exports = { collectAnchorHits, windowFetchedFileContent, relocateStaleAnchor };
+module.exports = { collectAnchorHits, windowFetchedFileContent, relocateStaleAnchor, snippetMissingFrom };

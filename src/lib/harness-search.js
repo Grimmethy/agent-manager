@@ -69,12 +69,13 @@ function refreshCandidateFetchedFiles(task) {
     try {
       const full = path.resolve(resolvedRoot, f.path);
       if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
-      const windowed = windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section);
-      if (windowed.confidence === 'none' && !f.context) {
-        // The candidate's code may have MOVED to a sibling file since it was written: follow it (unique match only).
-        let relocate;
-        try { ({ relocateStaleAnchor: relocate } = require('../sdk/lib/file-grounding.js')); } catch { relocate = null; }
-        const hit = relocate ? relocate(resolvedRoot, f.path, section) : null;
+      const fileText = fs.readFileSync(full, 'utf8');
+      const windowed = windowFetchedFileContent(fileText, section);
+      let grounding = null;
+      try { grounding = require('../sdk/lib/file-grounding.js'); } catch { grounding = null; }
+      if (grounding && !f.context && grounding.snippetMissingFrom(fileText, section)) {
+        // The candidate's Snippet is not in the file it cites: its code may have MOVED (a sibling file, a subdirectory) since it was written. Follow it (unique match only).
+        const hit = grounding.relocateStaleAnchor(resolvedRoot, f.path, section);
         if (hit) {
           const w2 = windowFetchedFileContent(hit.content, section);
           if (w2.confidence === 'strong') {
