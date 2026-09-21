@@ -88,8 +88,8 @@ const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|h
 //   1. negated verb phrases ("do not touch", "not files to edit", "does not implement") and the boilerplate are stripped from each sentence before the scan;
 //   2. with NO stated documentation deliverable the scan is exactly the legacy one (any remaining code signal wants code);
 //   3. only when the task positively states a documentation deliverable ("append ... to AGENTS.md", "create a new Markdown file at docs/...") do PATH-ONLY sentences
-//      (a code path with no edit verb and no code phrase) stop counting; a sentence with a phrase signal (implement, endpoint, new module, ...) or an affirmative edit
-//      verb on a code path still wants code.
+//      (a code path with no edit verb and no code phrase) stop counting; a sentence with a phrase signal (implement, endpoint, new module, ...), an affirmative edit
+//      verb, or one that opens with an imperative ("Lazy-load the rows in index.html") on a code path still wants code.
 const CODE_PATH_SIGNAL_RE = /\b(?:src|python|scripts|lib|app|dashboard|templates)\/|\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
 const CODE_PHRASE_SIGNAL_RE = /\b(?:implement|endpoint|route|task source|new (?:module|file|source|helper)|render\w*\(|def \w+\(|function \w+|wire (?:it|this|the|in)|add .{0,25}(?:to|in|into) \w[\w./-]*\.(?:py|js|html|sh)|api route|backend|cursor module|sweep logic)\b/i;
 const AFFIRMATIVE_EDIT_VERB_RE = /\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix|create|write|refactor|extract|move|rename)\b/i;
@@ -124,8 +124,23 @@ function scanForCodeSignals(text) {
   return { docDeliverable, tripping };
 }
 
-// A sentence still counts as asking for code when it has a phrase signal or an affirmative edit verb; a code PATH merely named, cited or described does not.
-const requestsCode = (c) => CODE_PHRASE_SIGNAL_RE.test(c) || AFFIRMATIVE_EDIT_VERB_RE.test(c);
+// A code PATH merely named, cited or described does not make a sentence a request -- but a sentence that OPENS WITH AN IMPERATIVE does, whatever the verb: "Lazy-load the job
+// rows in index.html", "Combine job types into expandable rows in index.html" (verbs no list will ever fully cover; caught in review of the first version of this gate, which
+// only honoured the listed verbs and so waved such a request through as documentation-only whenever a doc deliverable was also stated). Imperative = the first word is a plain
+// word (not a path, not a "Label:") that is not a determiner, pronoun, conjunction/copula or a documentation/citation verb (cite, describe, mention, ...): "The guard clause in
+// src/x.js", "It lives in src/x.js", "Cite src/x.js", "Files: src/x.js" and "src/x.js is cited ..." all stay non-requests. A wrong call here only blocks a documentation task
+// for a human look; the opposite mistake ships code as docs, so this leans to counting.
+const NON_IMPERATIVE_LEAD_RE = /^(?:(?:and|then|also|but|so|next|finally|plus)\s+)?(?:the|this|that|these|those|it|its|they|their|there|a|an|each|every|any|all|some|one|both|if|when|where|while|because|since|which|what|how|why|who|is|are|was|were|be|do|does|did|can|could|should|would|will|may|might|must|not|no|never|only|just|note|see|per|cite|cites|reference|mention|quote|describe|explain|state|list|include|link|summari[sz]e|name|refer|show|record|document|for|as|in|on|at|by|with|without|from|of)$/i;
+// ...AND it must aim the verb at a code file: "in / into / to / inside / within <path>.<code ext>" (an imperative that merely has a path somewhere in the sentence is not enough:
+// "Populate it with at least three rows: routes/chat.py:140-148 (...)" and "Decision 1: ... touching scripts/local-worker.sh" are documentation, and a first version of this
+// rule, dry-run over the real queue, flipped both). A "Label:" / "Decision 1:" lead is not a verb either.
+const TARGET_PATH_RE = /\b(?:in|into|to|inside|within)\s+(?:the\s+|its\s+|a\s+)?(?:[\w.-]+\/)*[\w.-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
+function opensWithImperative(c) {
+  const m = /^[\s>*\-\d.)]*([A-Za-z][A-Za-z-]*)(?=\s)/.exec(c);
+  return !!m && !NON_IMPERATIVE_LEAD_RE.test(m[1]) && TARGET_PATH_RE.test(c);
+}
+// A sentence still counts as asking for code when it has a phrase signal, an affirmative edit verb, or opens with an imperative.
+const requestsCode = (c) => CODE_PHRASE_SIGNAL_RE.test(c) || AFFIRMATIVE_EDIT_VERB_RE.test(c) || opensWithImperative(c);
 
 // rawText is the task's own (human / pipeline authored) text; combined is rawText + the drafting model's plan. When the raw text itself states a documentation deliverable it
 // GOVERNS: the plan of a documentation task is full of sentences describing what the document will cite or quote ("cite src/drift-scan.js and its runner function", a quoted

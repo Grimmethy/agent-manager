@@ -515,3 +515,35 @@ test('doc task: when the RAW text states a documentation deliverable it governs;
   const p2 = adhocDiffSubstanceProblem(adhoc('Make the reclaimer cap retries.', 'Edit src/reclaim.js to add the cap.'), createDiff('docs/research/precedent.md'));
   assert.equal(p2 && p2.code, 'docs-only');
 });
+
+// Review finding (in-app chat, PR #434): with a stated doc deliverable, a code request using a verb outside the list was waved through as documentation-only.
+test('doc task: a sentence that OPENS WITH AN IMPERATIVE on a code path wants code, whatever the verb', () => {
+  for (const sen of [
+    'Lazy-load the job rows in python/dashboard/templates/index.html.',
+    'Combine job types into expandable rows in index.html.',
+    'Debounce the search box in src/ui.js.',
+  ]) assert.equal(docOnlyBlocks(DOC_TASK_PREFIX + sen), true, sen);
+});
+
+test('doc task: sentences that merely DESCRIBE or cite a code path (determiner / pronoun / citation-verb / label / path lead) still do not want code', () => {
+  for (const sen of [
+    'The guard clause in src/foo.js is the anchor.',
+    'It lives in src/foo.js.',
+    'Cite src/foo.js and its runner function.',
+    'Mention src/foo.js as the enforcement point.',
+    'src/foo.js is cited only as an anchor.',
+    'Files: src/foo.js',
+  ]) assert.equal(docOnlyBlocks(DOC_TASK_PREFIX + sen), false, sen);
+});
+
+// The first version of the imperative rule, dry-run over the real queue, flipped two documentation tasks to "wants code": a sentence opening "Populate it with at least three
+// rows: routes/chat.py:140-148 (...)" and one opening "Decision 1: ... touching scripts/local-worker.sh". The verb must be aimed at a code file (in/into/to <path>).
+test('doc task: an imperative that only has a path somewhere in the sentence is not a code request; a labelled imperative aimed at a file is', () => {
+  for (const sen of [
+    'Populate it with at least three rows: routes/chat.py:140-148 (preempt invoked synchronously) and src/x.js (caller-dependent).',
+    'Decision 1: Timeout ceiling -- note that src/local-client.js already raised the ceiling, and ask whether to close it.',
+    'Decision 2: Retry policy -- ask whether the operator wants backoff touching scripts/local-worker.sh.',
+  ]) assert.equal(docOnlyBlocks(DOC_TASK_PREFIX + sen), false, sen);
+  assert.equal(docOnlyBlocks(DOC_TASK_PREFIX + 'Locate the handling of premiumPriority in python/dashboard/routes/chat.py.'), true);
+  assert.equal(docOnlyBlocks(DOC_TASK_PREFIX + 'Step 1: Lazy-load the job rows in index.html.'), true);
+});
