@@ -312,8 +312,10 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
   // A private copy of the repo's installed node_modules, so a JS/TS draft can really run tsc / build / tests (see lib/draft-sandbox.js). Never
   // fails the worktree: without it the draft simply has no toolchain, exactly as before.
   const nodeModules = copyNodeModules(resolvedRepoRoot, worktreeDir);
-  if (nodeModules.copied) console.log(`[draft-sandbox] copied node_modules into ${path.basename(worktreeDir)} (${nodeModules.sizeMb ?? '?'} MB, ${nodeModules.ms} ms)`);
-  else if (nodeModules.reason && !/no package\.json/.test(nodeModules.reason)) console.log(`[draft-sandbox] no node_modules in the draft sandbox: ${nodeModules.reason}`);
+  // STDERR, never stdout: local-draft.js's stdout is a machine channel (ONE JSON result line the worker JSON.parses). These two lines were console.log
+  // in #420 and made every successful PF draft read as "draft call failed" (58 wasted drafts, 4 tasks sent to needs-clarification, 2026-09-20).
+  if (nodeModules.copied) console.error(`[draft-sandbox] copied node_modules into ${path.basename(worktreeDir)} (${nodeModules.sizeMb ?? '?'} MB, ${nodeModules.ms} ms)`);
+  else if (nodeModules.reason && !/no package\.json/.test(nodeModules.reason)) console.error(`[draft-sandbox] no node_modules in the draft sandbox: ${nodeModules.reason}`);
   return { ok: true, nodeModules };
 }
 

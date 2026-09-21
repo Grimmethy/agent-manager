@@ -187,6 +187,11 @@ process_drafting_file() {
   fi
   write_heartbeat_file "$INSTANCE_ID" "working" "$draft_display_model" "$task_id" "draft" "$STARTED_AT"
   draft_result="$(node "${PACKAGE_SRC_DIR}/local-draft.js" "$wpath" 2>>"$LOG_FILE")"
+  # local-draft.js prints its result as ONE JSON line on stdout. Any stray stdout line from a module it loads would make every JSON.parse below fail and
+  # record a SUCCESSFUL draft as "draft call failed" (2026-09-20: a [draft-sandbox] log line did exactly that). Take the last line that looks like the
+  # result; keep the raw text when none does, so a real failure still shows its message.
+  draft_json_line="$(printf '%s\n' "$draft_result" | grep -E '^\{.*\}$' | tail -n 1 || true)"
+  [[ -n "$draft_json_line" ]] && draft_result="$draft_json_line"
   draft_succeeded="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.succeeded?"true":"false")}catch(e){console.log("false")}')"
   draft_blocked="$(echo "$draft_result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.blocked?"true":"false")}catch(e){console.log("false")}')"
   # needs-human-decision (2026-08-24, adhoc-agentic-draft.js's RESOLUTION: needs-human-
