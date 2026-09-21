@@ -199,6 +199,12 @@ while :; do
     derived_premise_result="$(node "${PACKAGE_SRC_DIR}/derived-premise-sweep.js" 2>>"${HOME_LOGS}/derived-premise-sweep.log")"
     printf '[watchdog] derived-premise-sweep: %s\n' "$derived_premise_result" >&2
 
+    # Fabricated-path recheck (2026-09-21, PF arch-discovery-community-5): the candidate grounding gate judged paths against a working tree that had been
+    # left on a stale branch and blocked a valid task NON-retryably. Requeues a task blocked for "fabricated file path(s)" when every one of those paths
+    # exists on origin/<main> (once per task). Deterministic. Kill switch AGENT_MANAGER_FABRICATED_PATH_RECHECK=false. See fabricated-path-recheck-sweep.js.
+    fabricated_path_result="$(node "${PACKAGE_SRC_DIR}/fabricated-path-recheck-sweep.js" 2>>"${HOME_LOGS}/fabricated-path-recheck-sweep.log")"
+    printf '[watchdog] fabricated-path-recheck-sweep: %s\n' "$fabricated_path_result" >&2
+
     # Blocked-cluster sweep (2026-09-12, screaminggoatclubmt: "we have 4 separate instances
     # with a bespoke solution each... a way to combine these patterns"): the concrete,
     # buildable half of that question -- normalizes queue/blocked/'s blockedReason text
