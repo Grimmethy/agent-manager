@@ -131,7 +131,7 @@ function rewireCoordinatorParent(pipelineDir, childId, hubId) {
     }
     appendHistoryEvent(parent, 'advisory', `child ${childId} re-decomposed into file-decompose hub ${hubId} (decompose-loop autoroute)`);
     if (parent.coordinatorBlocked) { delete parent.coordinatorBlocked; delete parent.blockedReason; }
-    try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); } catch { /* best-effort */ }
+    try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); } catch (err) { console.warn('[decompose-loop-autoroute] best-effort write failed for ' + file + ': ' + err.message); }
     return parent.id;
   }
   return null;
