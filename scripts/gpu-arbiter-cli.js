@@ -5,13 +5,17 @@
 // operator debugging). Not used by the worker/reviewer lanes -- those require() the module
 // directly.
 //
-//   node scripts/gpu-arbiter-cli.js cancel-below [--model M] [--cls interactive]
+//   node scripts/gpu-arbiter-cli.js cancel-below [--local | --key K | --model M] [--cls interactive]
 //       -> mark every lower-class GPU ticket cancelRequested + SIGKILL any active holder.
 //          Prints a JSON array: [{ pid, cls, taskId, action }]
-//   node scripts/gpu-arbiter-cli.js status [--model M]
+//   node scripts/gpu-arbiter-cli.js status [--local | --key K | --model M]
 //       -> { holder, waiting } for the dashboard.
 //
-// --model defaults to $LOCAL_MODEL. instancesDir comes from getConfig().
+// Which tickets: worker drafts key their tickets by Ollama ENDPOINT (one per GPU), so a --model key finds none of them (2026-09-21: that is why the chat's
+// takeover silently did nothing). --local = the endpoint THIS process talks to (its OLLAMA_URL, i.e. the host GPU): the chat's own GPU, the only one it may
+// take over. It REFUSES (prints [] and exits 0) if that endpoint is the P40 VM's, so a mis-set OLLAMA_URL can never let a chat turn kill the P40 lane.
+// --key K names a serialization key explicitly. With none of these, --model defaults to $LOCAL_MODEL (the old per-model key).
+// instancesDir comes from getConfig().
 
 const path = require('path');
 const arb = require(path.join(__dirname, '..', 'src', 'gpu-arbiter.js'));
@@ -31,12 +35,24 @@ function instancesDir() {
 }
 
 const cmd = process.argv[2];
-const model = arg('model', process.env.LOCAL_MODEL || '');
+const { localOllamaLockKey, p40OllamaLockKey } = require(path.join(__dirname, '..', 'src', 'lib', 'ollama-lock-key.js'));
+// The serialization key the arbiter functions look tickets up by (model is only a key when nothing better is given).
+function resolveKey() {
+  if (process.argv.includes('--local')) {
+    const key = localOllamaLockKey();
+    if (key === p40OllamaLockKey()) { process.stderr.write(`gpu-arbiter-cli: --local resolves to the P40 endpoint (${key}); refusing, the chat only takes over the host GPU\n`); return null; }
+    return key;
+  }
+  return arg('key', arg('model', process.env.LOCAL_MODEL || ''));
+}
+const model = resolveKey();
 const dir = instancesDir();
 
 if (!dir) { process.stderr.write('gpu-arbiter-cli: cannot resolve instances dir\n'); process.exit(2); }
 
-if (cmd === 'cancel-below') {
+if (model === null) {
+  process.stdout.write(cmd === 'status' ? JSON.stringify({ holder: null, waiting: [] }) : '[]');
+} else if (cmd === 'cancel-below') {
   const cls = arg('cls', 'interactive');
   let out = [];
   try { out = arb.cancelBelow(dir, model, cls); } catch (e) { process.stderr.write(`gpu-arbiter-cli: ${e.message}\n`); }

@@ -8,8 +8,9 @@ with the pipeline's worker/reviewer lanes on the same single-flight lock. When t
 busy a chat turn can sit in `flock -w 600` for many minutes. Holding the lock (the
 Reserve feature) doesn't interrupt an in-flight call -- only killing the in-flight
 `local-draft.js` / `review-task.js` child frees the GPU now. On every local-provider
-chat message we kill EVERY worker lane's in-flight draft outright -- chat takes priority
-over the pipeline, full stop (2026-09-02, Grimmethy: "Chat should preclude workers").
+chat message we kill the LOCAL-GPU worker lane's in-flight draft outright -- chat takes priority
+over that lane, full stop (2026-09-02, Grimmethy: "Chat should preclude workers") -- but ONLY that lane: the P40 lane
+runs on a separate GPU/endpoint and keeps working (2026-09-21, Grimmethy: "only take over the 3090").
 Only the `reviewer` stays age-gated (a review vote is short; and a chat turn that lands
 just as a vote completes gains little by killing it).
 A killed worker task is `mv`'d drafting/ -> pending/ first so no retry budget is burnt;
@@ -32,8 +33,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Every worker lane (one per GPU -- app.worker_lane_ids()) is preempted unconditionally; only the
-# reviewer stays age-gated.
+# The local-GPU worker lane is preempted unconditionally (see _preempt_lane_sets); the P40 lane is never; the reviewer stays age-gated.
 _PREEMPT_LANES_AGE_GATED = ("reviewer",)
 # instances/<lane>.json currentPass values in which the heartbeat `pid` is the node
 # child (local-draft.js / review-task.js), NOT the bash daemon -- safe to signal. The
@@ -87,11 +87,15 @@ def _chat_preempt_max_age_s() -> int:
         return 180
 
 
+# lanes.js's P40 lane id (a literal there): the one lane whose endpoint is NOT the chat's.
+_P40_LANE_ID = "worker-p40"
+
+
 def _preempt_lane_sets():
-    """(always_kill, age_gated) lane tuples for this chat turn: every GPU worker lane is
-    always-kill, the reviewer is age-gated."""
+    """(always_kill, age_gated) lane tuples for this chat turn. Always-kill = the LOCAL GPU lane(s) only (worker-3090): the chat runs on the host GPU and takes it over.
+    The P40 lane is a different endpoint and is never preempted (2026-09-21, Grimmethy: "only take over the 3090. P40 should remain in action"). The reviewer is age-gated."""
     from app import worker_lane_ids
-    return tuple(worker_lane_ids()), _PREEMPT_LANES_AGE_GATED
+    return tuple(l for l in worker_lane_ids() if l != _P40_LANE_ID), _PREEMPT_LANES_AGE_GATED
 
 
 def _preempt_decision(lane, kill_pid, started_epoch, now, max_age_s, always=None):
@@ -229,9 +233,13 @@ def _kill_and_requeue_instance(instance_id: str, note: str) -> dict:
 
 def _arbiter_cancel_below(cls: str = "interactive") -> list:
     """Ask the GPU arbiter (src/gpu-arbiter.js, via its CLI) to cancel every ticket below
-    `cls` -- the worker draft lanes. The arbiter marks each cancelRequested and SIGKILLs
-    any active holder; the worker daemon requeues its task. Replaces the old
-    heartbeat/pidfile/mtime reconstruction for the worker lanes. Best-effort."""
+    `cls` on the CHAT'S OWN GPU (`--local`: the endpoint the chat talks to, i.e. the host
+    GPU / worker-3090) -- never the P40 lane, which is a different endpoint and stays in
+    action (2026-09-21, Grimmethy: "the in app chat [should] only take over the 3090. P40
+    should remain in action"). The arbiter marks each cancelRequested and SIGKILLs any
+    active holder; the worker daemon requeues its task. Before this it keyed by MODEL NAME
+    while worker tickets are keyed by endpoint, so it found nothing and the chat never took
+    over any lane. Best-effort."""
     from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
     import json
     cli = PACKAGE_ROOT / "scripts" / "gpu-arbiter-cli.js"
@@ -239,7 +247,7 @@ def _arbiter_cancel_below(cls: str = "interactive") -> list:
         return []
     try:
         cp = subprocess.run(
-            ["node", str(cli), "cancel-below", "--cls", cls],
+            ["node", str(cli), "cancel-below", "--local", "--cls", cls],
             capture_output=True, text=True, timeout=15,
             env={**os.environ, **read_env_file(ENV_FILE_PATH)},
         )

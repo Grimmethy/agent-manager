@@ -22,6 +22,7 @@ const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
+const { localOllamaLockKey } = require('./lib/ollama-lock-key.js');
 const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
 const { injectAmplificationInstruction, extractAmplificationRequests } = require('./incident-amplification-marker.js');
@@ -787,7 +788,9 @@ const MODEL = process.env.LOCAL_MODEL;
 const CHAT_IS_INTERACTIVE = !!process.env.AGENT_MANAGER_PRIORITY_HOLDER;
 function turnLock(instancesDir, fn) {
   if (CHAT_IS_INTERACTIVE) {
-    return gpuArbiter.withGpu(instancesDir, { cls: 'interactive', model: MODEL, phase: 'chat' }, fn);
+    // lockKey = this process's Ollama ENDPOINT, the same key every worker draft on this GPU uses (draft-context.js): keyed by model name the chat never
+    // shared a ticket dir or flock with the lane it is supposed to take over. The P40 lane is a different endpoint, so it is never touched.
+    return gpuArbiter.withGpu(instancesDir, { cls: 'interactive', model: MODEL, lockKey: localOllamaLockKey(), phase: 'chat' }, fn);
   }
   return withLock(instancesDir, fn, MODEL);
 }
@@ -1896,7 +1899,7 @@ if (require.main === module) {
   // waiter and yields the GPU -- the per-turn turnLock() acquires fast because this pid
   // already holds the place (see gpu-arbiter.js holdPlace / the holdsPlace fast path).
   const _arbPlace = CHAT_IS_INTERACTIVE
-    ? gpuArbiter.holdPlace(sharedInstancesDir(getConfig().pipelineDir), { cls: 'interactive', model: MODEL, phase: 'chat' })
+    ? gpuArbiter.holdPlace(sharedInstancesDir(getConfig().pipelineDir), { cls: 'interactive', model: MODEL, lockKey: localOllamaLockKey(), phase: 'chat' })
     : null;
   (async () => {
     try {

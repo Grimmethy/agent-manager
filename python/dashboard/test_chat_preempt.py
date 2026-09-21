@@ -1,6 +1,6 @@
 """Tests for app.py's Chat "make GPU space" preemption (brain dump #5): for a local-provider
-chat turn BOTH worker lanes' in-flight draft are killed outright (chat precludes workers,
-2026-09-02); only the reviewer is age-gated. AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING
+chat turn the LOCAL-GPU worker lane's in-flight draft is killed outright (chat precludes workers,
+2026-09-02) but the P40 lane is never touched (2026-09-21: "only take over the 3090"); only the reviewer is age-gated. AGENT_MANAGER_CHAT_PREEMPT_SPARE_LONG_REASONING
 opts worker-reasoning back into age-gating.
 
 Run: .venv/bin/python -m unittest python.dashboard.test_chat_preempt -v
@@ -65,9 +65,32 @@ class PreemptDecisionTest(unittest.TestCase):
         for p in (None, "", "idle", "claim", "starting"):
             self.assertFalse(app._is_preemptable_child_pass(p), repr(p))
 
-    def test_lane_sets_are_every_gpu_lane_plus_age_gated_reviewer(self):
+    def test_lane_sets_are_the_local_gpu_lane_plus_age_gated_reviewer_never_the_p40(self):
         with mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40"]):
-            self.assertEqual(app._preempt_lane_sets(), (("worker-3090", "worker-p40"), ("reviewer",)))
+            self.assertEqual(app._preempt_lane_sets(), (("worker-3090",), ("reviewer",)))
+
+    def test_a_p40_only_layout_preempts_no_worker_lane(self):
+        with mock.patch.object(app, "worker_lane_ids", return_value=["worker-p40"]):
+            self.assertEqual(app._preempt_lane_sets(), ((), ("reviewer",)))
+
+
+class ArbiterCancelBelowArgsTest(unittest.TestCase):
+    """The dashboard must ask the arbiter for the chat's OWN endpoint (--local). A per-model key finds none of the worker tickets (they are keyed by endpoint), which
+    is why the takeover silently did nothing before 2026-09-21; and it must never name the P40 endpoint."""
+
+    def test_cancel_below_asks_the_arbiter_for_the_local_endpoint_only(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        with mock.patch.object(app, "read_env_file", return_value={}), mock.patch.object(chat_preempt.subprocess, "run", side_effect=fake_run):
+            chat_preempt._arbiter_cancel_below("interactive")
+        self.assertIn("cancel-below", seen["cmd"])
+        self.assertIn("--local", seen["cmd"])
+        self.assertNotIn("--model", seen["cmd"])
+        self.assertFalse(any("192.168" in str(a) or "p40" in str(a).lower() for a in seen["cmd"]), "never names the P40 endpoint")
 
 
 class PreemptPipelineTest(unittest.TestCase):

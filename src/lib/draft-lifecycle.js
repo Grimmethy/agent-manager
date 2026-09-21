@@ -6,15 +6,8 @@ const fs = require('fs');
 const { appendHistoryEvent, setHistoryPersistHook } = require('../task-history.js');
 const { resolveSourceName, getRegisteredSource } = require('../task-source-registry.js');
 
-function localOllamaLockKey() {
-  const url = process.env.OLLAMA_URL || 'http://localhost:11434';
-  try {
-    const u = new URL(url);
-    return `ollama-${u.hostname}-${u.port || (u.protocol === 'https:' ? '443' : '80')}`;
-  } catch {
-    return `ollama-${url}`;
-  }
-}
+// Defined in ./ollama-lock-key.js (shared with the interactive chat); re-exported below under the same name.
+const { localOllamaLockKey } = require('./ollama-lock-key.js');
 
 function writeTaskJson(taskPath, task) {
   // Atomic write: the history persist hook (see main()) rewrites this file on every
