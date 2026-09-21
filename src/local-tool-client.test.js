@@ -1886,3 +1886,63 @@ test('the queue_reviewed_task tool descriptions say describe a CHANGE, never a g
     }
   });
 });
+
+// --- 2026-09-21 (change-review-fix-ac-50): a char-truncated window must not lie about where paging continues -----------------------------------------------------------
+// Before: the char ceiling cut the joined slice mid-line but nextOffset stayed endLine + 1, so every line between the cut and endLine was never shown yet the model was told to
+// page PAST them. Now only whole lines that fit come back and nextOffset = the first line NOT shown.
+const pageAll = (readPage) => {
+  const seen = [];
+  let offset = 1;
+  for (let guard = 0; guard < 500 && offset != null; guard += 1) {
+    const r = readPage(offset);
+    const body = r.content.replace(/\n\.\.\.\[truncated:[^\]]*\]$/, '');
+    if (body !== '' || r.totalLines === 0) seen.push(...body.split('\n'));
+    offset = r.nextOffset;
+  }
+  return seen;
+};
+
+test('readFileTool: paging a file whose window exceeds the char ceiling visits EVERY line exactly once (no skipped lines, no duplicates)', () => {
+  withFixtureRepo((mod, dir) => {
+    const all = Array.from({ length: 300 }, (_, i) => `line ${i + 1} ${'y'.repeat(180)}`);   // ~190 chars/line: a 100-line window is ~19K chars, over the 8000 ceiling
+    fs.writeFileSync(path.join(dir, 'wide.txt'), all.join('\n'));
+    const first = mod.readFileTool({ path: 'wide.txt', offset: 1, limit: 100 });
+    assert.equal(first.truncated, true, 'premise: the ceiling bites');
+    const shown = first.content.replace(/\n\.\.\.\[truncated:[^\]]*\]$/, '').split('\n');
+    assert.equal(shown[shown.length - 1], all[shown.length - 1], 'the last returned line is complete, not cut mid-line');
+    assert.equal(first.nextOffset, shown.length + 1, 'nextOffset is the first line NOT shown');
+    assert.deepEqual(pageAll((offset) => mod.readFileTool({ path: 'wide.txt', offset, limit: 100 })), all);
+  });
+});
+
+test('readFileTool: a single line longer than the ceiling is shown as a prefix and paging CONTINUES with the next line', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'huge-first.txt'), ['x'.repeat(9000), 'second', 'third'].join('\n'));
+    const r = mod.readFileTool({ path: 'huge-first.txt', offset: 1, limit: 10 });
+    assert.equal(r.truncated, true);
+    assert.equal(r.nextOffset, 2, 'the rest of the huge line is unreachable, the following lines are not skipped');
+    assert.match(r.content, /\[truncated: slice exceeded/);
+    const next = mod.readFileTool({ path: 'huge-first.txt', offset: r.nextOffset, limit: 10 });
+    assert.equal(next.content, 'second\nthird');
+    assert.equal(next.nextOffset, null);
+  });
+});
+
+test('readFileTool: the notice names the lines actually returned', () => {
+  withFixtureRepo((mod, dir) => {
+    fs.writeFileSync(path.join(dir, 'wide2.txt'), Array.from({ length: 100 }, (_, i) => `l${i + 1} ${'z'.repeat(190)}`).join('\n'));
+    const r = mod.readFileTool({ path: 'wide2.txt', offset: 1, limit: 100 });
+    const through = r.nextOffset - 1;
+    assert.match(r.notice, new RegExp(`showing lines 1-${through} of 100`));
+  });
+});
+
+test('windowSectionText (read_task sections) pages every line exactly once across a char-truncated window, and an untruncated window is unchanged', () => {
+  const all = Array.from({ length: 250 }, (_, i) => `row ${i + 1} ${'w'.repeat(150)}`);
+  const text = all.join('\n');
+  const first = require('./local-tool-client.js').windowSectionText(text, 1, 200);
+  assert.equal(first.truncated, true);
+  assert.deepEqual(pageAll((offset) => require('./local-tool-client.js').windowSectionText(text, offset, 200)), all);
+  const small = require('./local-tool-client.js').windowSectionText('a\nb\nc\nd', 2, 2);
+  assert.deepEqual([small.content, small.nextOffset, small.truncated], ['b\nc', 4, false]);
+});
