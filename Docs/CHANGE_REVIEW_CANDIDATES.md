@@ -806,3 +806,40 @@ index ac74a803..96b79fd4 100755
 Problem: [severity: med; regression shipped in cf5ba95] The `*)` fallback case in `refresh_active_model` no longer assigns `CLAUDE_MODEL="$override"` for bare (unprefixed) model names, so a model selection stored by the pre-diff dropdown is silently ignored on the first tick after deploy.  Failure scenario: Before this diff, a user picks "opus" from the reasoning lane's dropdown; `dashboard-settings.json` records `{"workerModelOverrides":{"worker-reasoning-1":"opus"}}`. After deploy, the next tick calls `refresh_active_model`; `override` is `"opus"`, `IS_CLAUDE_LANE` is true, the `case` falls through to `*)`, which runs `unset AGENT_MANAGER_FORCE_PROVIDER; export CLAUDE_MODEL` without ever setting `CLAUDE_MODEL="opus"`. The worker then uses whatever `CLAUDE_MODEL` agent-manager.env happened to export (e.g. "sonnet" or empty→"sonnet" via the `:-sonnet` default in HEARTBEAT_MODEL), and the user's explicit "opus" choice is lost. The old code's `[[ -n "$override" ]] && CLAUDE_MODEL="$override"` handled exactly this case.
 Solution: In the `*)` branch, restore the conditional assignment before the export:
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in cf5ba95.
+
+### AC-69 · Before this diff the worker's model was fixed at launch from agent-manager.env and never c (dffc890 ornith-worker.sh)
+Strength: Strong
+Source: change_review of dffc890 "Add per-worker model override dropdown to Workers tab"
+Files: scripts/ornith-worker.sh
+
+Snippet:
+```
+diff --git a/scripts/ornith-worker.sh b/scripts/ornith-worker.sh
+index ffd11de6..ac74a803 100755
+--- a/scripts/ornith-worker.sh
++++ b/scripts/ornith-worker.sh
+@@ -25,33 +25,48 @@ readonly INSTANCE_ID="${1:-worker-0}"
+ # behind it for that whole time.
+ case "$INSTANCE_ID" in
+   worker-reasoning*) IS_CLAUDE_LANE=true ;;
+   *) IS_CLAUDE_LANE=false ;;
+ esac
+ 
+ source "${SCRIPT_DIR}/orc-common.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
+ # Note: this source is idempotent-safe because orc-common sets only unset vars (so subsequent sources don't override caller's environment).
+ 
+ # Every write_heartbeat_file call below used to hardcode "${ORNITH_MODEL:-}" as the
+ # reported model regardless of which lane was actually running -- confirmed live
+ # 2026-08-17: the dashboard's Workers tab showed worker-reasoning as running "ornith:35b"
+-# even though it only ever claims adhoc tasks and never calls Ornith at all. Computed
+-# once, here, after orc-common.sh has actually loaded CLAUDE_MODEL/ORNITH_MODEL from
+-# agent-manager.env -- same "claude:<model>" label format model-provider.js's own
+-# labelFor() already uses for the Models tab, so the two stay consistent.
+-if "$IS_CLAUDE_LANE"; then
+-  HEARTBEAT_MO
+...[snippet truncated]
+```
+
+Problem: [severity: med; regression shipped in dffc890] Before this diff the worker's model was fixed at launch from agent-manager.env and never changed; after this diff, clearing a per-instance override via the dashboard does not restore the original env value — the worker silently keeps using the last override indefinitely.  Failure scenario: Worker starts with CLAUDE_MODEL=claude-sonnet-4 (from agent-manager.env). User selects "claude-opus-4" in the Workers-tab dropdown → api_set_worker_model writes workerModelOverrides["worker-reasoning-1"]="claude-opus-4". Next tick: get_model_override returns "claude-opus-4", line 53 assigns CLAUDE_MODEL="claude-opus-4", exported. User then selects "(default)" → api_set_worker_model pops the key. Next tick: get_model_override returns "" (empty), line 53 `[[ -n "" ]] && CLAUDE_MODEL="$override"` short-circuits (test is false), CLAUDE_MODEL remains "claude-opus-4" from the prior tick, line 54 exports it, and every downstream node call (claude-client.js) continues using claude-opus-4 forever until the daemon is restarted. The docstring on api_set_worker_model explicitly promises "reverting that instance to its agent-manager.env default … on its next tick," which does not happen.
+Solution: Capture the launch-time values once (after orc-common.sh is sourced) as `readonly ORIG_CLAUDE="${CLAUDE_MODEL:-sonnet}"` / `readonly ORIG_ORNITH="${ORNITH_MODEL:-}"`, then in refresh_active_model replace the conditional-assign with an unconditional one: `CLAUDE_MODEL="${override:-$ORIG_CLAUDE}"` (and the ORNITH_MODEL equivalent), so an empty override always falls back to the original env value rather than retaining the stale prior-tick assignment.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in dffc890.
