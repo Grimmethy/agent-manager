@@ -32,6 +32,7 @@ vault under `SECOND_BRAIN_DIR`): it is the sort's *destination*, a neighbouring 
 | 9 | Sorting | Feedback is **sorted by user account**: the sorter must be programmed to expect the account on every incoming user-feedback entry. |
 | 10 | Transport | Agent-manager's machine has **Tailscale access to the tower** (the host's machine), so the natural direction is agent-manager **pulling** over Tailscale. Proposed, to confirm. |
 | 11 | Is the operator's own account trusted | **Yes (decided 2026-09-20).** Submissions from the operator's account keep today's behaviour: the sorter may queue a task from them. Every other account stays behind the human gate (row 8). |
+| 12 | PF already has its own support desk | **Found 2026-09-20 (PF `main` `e055814`):** PF-Client-Portal now has a client-facing ticket desk (kind, status, replies, page context) and its admin API answers on the tailnet. This corrects section 10's earlier claim that PF had no feedback intake. **Proposed, to confirm:** the first host adapter is an *importer* from PF's desk, not a new widget. Whether the plugin's host-side half is later *extracted from* PF's desk is open (section 10). |
 
 ## 1. The loop
 
@@ -199,26 +200,51 @@ existing loop: an entry, sorted, filed or turned into a task in that project's p
 | **Host side** | the host app (PF-CP is a React/Vite SPA over the TaxHarvest Node/Express/Prisma backend) | an embeddable feedback widget (the UI, decision 5) and an intake endpoint; page/user/version context; the host contract from section 7 Seam B |
 | **Agent-manager side** | agent-manager (`register.js`-style plugin, plus a slot service if needed) | the store (the single owner, decision 1), the sorter (decision 2), task-source registration, side-finding/intake sweeps, closing the loop |
 
-**What is true of PF today (read from the repo, 2026-09-20).**
-* The portal has **no in-app feedback intake.** `SupportView.tsx` is the billing/supporter page (Stripe checkout and portal); `docker-compose.yml` only configures a contact-email address (`CONTACT_NOTIFY_TO` / `CONTACT_FROM`).
-* **Topology.** `backend-public` (a trimmed app: only `/auth`, `/client`, `/sync`) sits behind a Cloudflare tunnel with no open ports; a separate `backend-internal` (the full app, LAN) serves the admin dashboard. All of that runs on the tower (Docker, Postgres). Agent-manager and PF's pipeline run on a *different machine*. Nothing today carries a submission from the public app to a `brain-dump.json`.
+**What is true of PF today (read from PF `main` at `e055814`, 2026-09-20).** This section first said PF had no in-app feedback intake; that was true of the
+commit I read and is no longer true.
+* **PF has a client-facing support desk** (commits `5dabdf2` .. `efd4e17`). Client side: `src/api/client.ts` (the ticket API), `FeedbackView.tsx` (a "Feedback & Support"
+  tab) and `FeedbackModal.tsx` (a small draggable, resizable window, also reachable from the top bar). A **ticket** is `{id, kind: issue | feature | feedback, subject, body,
+  status: new | open | planned | resolved | declined, pageUrl, createdAt, updatedAt, closedAt, replies[]}`; a reply is `{body, fromAdmin, createdAt, clientReadAt,
+  author: {name}}` (an admin's email is never sent to a client). Create is `POST /client/support` with `context {view, propertyAddress, propertyId}` filled in by the form
+  (what the person was looking at) and duplicate detection (`{id, duplicate?}`); also list (with an unread count), reply, and mark-read. `SupportView.tsx` is unrelated: it is the billing / supporter page.
+* **The admin half lives in the internal app** and is not in the repository I can read (the client code says so). I have **not** seen the admin endpoints, how they authenticate, or
+  whether an admin ticket record carries the submitter's account id.
+* **Topology.** `backend-public` (a trimmed app: `/auth`, `/client`, `/sync`) sits behind a Cloudflare tunnel with no open ports; `backend-internal` (the full app, port 3001) serves the
+  admin UI. Commit `ae9d9b2` gives `backend-internal` a **second binding on the tailnet interface only** (not the LAN; the address is configurable in PF's `.env`), so a machine on the tailnet
+  can reach the admin API, subject to its authentication. All of that runs on the tower. Agent-manager runs on a different machine that is on the same tailnet. **Nothing today carries a
+  ticket from PF's database to a `brain-dump.json`.**
+
+**What this changes.** PF's host-side half already exists, built by PF, and it does more than the plugin's first version needed: authenticated submitters, page context,
+duplicate detection, statuses, and two-way replies (which is "closing the loop with the user", previously deferred). So for PF the first piece of work is on the agent-manager side:
+**an importer that pulls tickets from PF's admin API over Tailscale**, turns each into a Brain Dump entry, and sorts it. The widget for *other* hosts is still the long-term goal,
+and PF's `FeedbackModal` / `FeedbackView` are a working reference for it.
+
+| PF ticket field | Brain Dump entry (proposed) |
+|---|---|
+| `id` | `origin.hostSubmissionId` (the idempotency key for the import) |
+| `kind` (`issue` / `feature` / `feedback`) | `origin.ticketKind`, an input to the sort |
+| `subject` + `body` | `rawText`, treated as untrusted text (quoted or fenced when a model reads it) |
+| `pageUrl`, `context {view, propertyAddress, propertyId}` | `origin.context` |
+| submitter account | `origin.accountId` (needs the admin API to expose it: **not verified**) |
+| `status`, `replies` | stay in PF; Brain Dump does not copy or drive them |
 
 **Answered (2026-09-20).**
 1. **Who submits?** Anyone, but every submission is linked to an account; the operator has their own. So the host must authenticate the submitter, and an entry carries the account identity.
 2. **Gate before processing.** User feedback is **human-gated after an initial sort**, and there is **no direct or automatic path from a feedback entry to a task**. Today the sorter can queue a task from an entry (`applyBrainDumpSort` -> `queue/derived/` or `queue/adhoc/`); for user feedback that branch must not exist.
 3. **Sorting by account.** The sorter must expect an account on every incoming feedback entry and sort by it.
-4. **Transport.** The agent-manager machine reaches the tower over Tailscale (checked with `tailscale status` from this machine), so a **pull** from agent-manager needs no inbound exposure of agent-manager. Which tower endpoint it pulls from is still to be chosen: `backend-public` is not host-exposed, and `backend-internal` (the full app) serves the LAN.
+4. **Transport.** The agent-manager machine reaches the tower over Tailscale (checked with `tailscale status` from this machine), so a **pull** from agent-manager needs no inbound exposure of agent-manager. The endpoint is now visible: PF's admin API on `backend-internal` is bound to the tailnet (commit `ae9d9b2`). Still to verify: the admin ticket-list endpoint and how a non-human importer authenticates to it.
 5. **The operator's own account is trusted (decision 11).** Their submissions keep today's behaviour. See "How trust is decided" below.
 
 **Still open.**
 1. **What "sorted by account" produces.** Grouping in the store and an account view in the UI, filing under the account in the vault, or both. Account identifiers in vault notes are personal data (see 3).
 2. **Privacy.** Where feedback and account identifiers are stored, for how long, and that only a local model reads them (the sorter uses one today).
-3. **Raw-submission store.** The host's database as the durable source of raw submissions, with agent-manager importing them (idempotently, by the host's own submission id), or agent-manager as the only store.
-4. **Closing the loop with the user** (a status or a reply). Not needed for a first version.
+3. **Raw-submission store.** For PF this is settled by PF's own design: the tickets live in PF's database and agent-manager would import them (idempotently, by ticket id). For a future host with no desk it is still open.
+4. **Closing the loop with the user.** For PF this already exists (statuses and replies in PF's desk). What is left is optional write-back: when a task promoted from a ticket ships, mark the ticket resolved.
+5. **What is PF's desk to Brain Dump?** (a) Brain Dump **imports from** PF's desk and PF stays the desk (least disruption, immediate value; my proposal for now), (b) PF's desk is **generalised into the plugin's host-side half** so every host, PF included, uses one widget and one ticket model (a larger change to something PF just built), or (c) both, in that order: (a) now, (b) when a second host appears.
+6. **Where is the human gate?** PF's admin desk already has human triage (`new` -> `open` -> `planned` / `declined`). Is that desk *the* gate (an imported entry is sorted and shown, and only a human action, such as marking a ticket `planned`, may promote it), or does Brain Dump keep its own review inbox on top? Either way the rule stands: no automatic path from a ticket to a task.
 
 **Effect on the seams (section 7).** Seam B (UI) becomes the host-side widget and must work in a React host and, ideally, any web host. Seam A's single owner is
-naturally the agent-manager-side half; the host-side half only ever calls it. A new **Seam F: the host-side intake** (widget + endpoint + transport) is the part
-that does not exist in any form today, now with a **pull importer** on the agent-manager side.
+naturally the agent-manager-side half; the host-side half only ever calls it. A new **Seam F: the host-side intake** (widget + endpoint + transport). For PF the widget and endpoint now exist (PF's desk); what does not exist for any host is the **pull importer** on the agent-manager side. For a future host with no desk, the widget and endpoint are still to build.
 
 **What the sorter (Seam C) must change for user feedback.** (a) **A new input:** the entry carries `origin {kind: "user-feedback", host, accountId, hostSubmissionId}`
 and the sorter is written to expect it. (b) **A new output rule:** the sort result groups by account. (c) **No task branch:** for `origin.kind === "user-feedback"` (every account except the operator's, below)
