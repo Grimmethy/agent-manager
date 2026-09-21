@@ -101,6 +101,37 @@ const MAX_READ_FILE_CHARS = 8000;
 const READ_FILE_DEFAULT_LINES = 400;
 const READ_FILE_MAX_LINES = 800;
 
+// Bound a window of lines to MAX_READ_FILE_CHARS WITHOUT lying about what came back. 2026-09-21 (change-review-fix-ac-50, found clearing needs-clarification): the char ceiling used
+// to cut the joined slice mid-line while nextOffset was still endLine + 1, so every line between the cut and endLine was never shown yet the model was told to page PAST them
+// (a comment even said "unknown exact line count when char-truncated"). Now only WHOLE lines that fit are returned, returnedThrough is the last of them, and the caller's
+// nextOffset = returnedThrough + 1, so paging visits every line exactly once. A first line that alone exceeds the ceiling is shown as a prefix and paging continues with the NEXT line.
+// -> { slice, truncated, returnedThrough }
+function boundWindow(lines, off, endLine) {
+  const whole = lines.slice(off - 1, endLine).join('\n');
+  if (whole.length <= MAX_READ_FILE_CHARS) return { slice: whole, truncated: false, returnedThrough: endLine };
+  let used = 0;
+  let kept = 0;
+  for (let i = off - 1; i < endLine; i += 1) {
+    const add = lines[i].length + (kept ? 1 : 0);
+    if (used + add > MAX_READ_FILE_CHARS) break;
+    used += add;
+    kept += 1;
+  }
+  if (kept === 0) {
+    return {
+      slice: `${lines[off - 1].slice(0, MAX_READ_FILE_CHARS)}\n...[truncated: slice exceeded ${MAX_READ_FILE_CHARS} chars, narrow the line window]`,
+      truncated: true,
+      returnedThrough: off,
+    };
+  }
+  const returnedThrough = off + kept - 1;
+  return {
+    slice: `${lines.slice(off - 1, returnedThrough).join('\n')}\n...[truncated: slice exceeded ${MAX_READ_FILE_CHARS} chars after line ${returnedThrough}; continue with offset=${returnedThrough + 1}]`,
+    truncated: true,
+    returnedThrough,
+  };
+}
+
 function readFileTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const relPath = args.path;
@@ -135,18 +166,10 @@ function readFileTool(a, b) {
   }
 
   const endLine = Math.min(totalLines, offset - 1 + limit);
-  let slice = lines.slice(offset - 1, endLine).join('\n');
-
   // Hard char ceiling still applies to the slice itself (a file with pathological line
-  // lengths must not blow the payload). If it bites, trim the slice and mark truncated.
-  let truncated = false;
-  if (slice.length > MAX_READ_FILE_CHARS) {
-    slice = `${slice.slice(0, MAX_READ_FILE_CHARS)}\n...[truncated: slice exceeded ${MAX_READ_FILE_CHARS} chars, narrow the line window]`;
-    truncated = true;
-  }
-
-  const returnedThrough = truncated ? offset : endLine; // unknown exact line count when char-truncated
-  const nextOffset = endLine < totalLines ? endLine + 1 : null;
+  // lengths must not blow the payload). If it bites, only whole lines that fit are returned.
+  const { slice, truncated, returnedThrough } = boundWindow(lines, offset, endLine);
+  const nextOffset = returnedThrough < totalLines ? returnedThrough + 1 : null;
 
   const out = { path: relPath, content: slice, offset, limit, totalLines, nextOffset, truncated };
   if (!windowGiven && nextOffset != null) {
@@ -256,14 +279,8 @@ function windowSectionText(text, offset, limit) {
     return { content: '', offset: off, limit: lim, totalLines, nextOffset: null, truncated: false };
   }
   const endLine = Math.min(totalLines, off - 1 + lim);
-  let slice = lines.slice(off - 1, endLine).join('\n');
-  let truncated = false;
-  if (slice.length > MAX_READ_FILE_CHARS) {
-    slice = `${slice.slice(0, MAX_READ_FILE_CHARS)}\n...[truncated: slice exceeded ${MAX_READ_FILE_CHARS} chars, narrow the line window]`;
-    truncated = true;
-  }
-  const returnedThrough = truncated ? off : endLine;
-  const nextOffset = endLine < totalLines ? endLine + 1 : null;
+  const { slice, truncated, returnedThrough } = boundWindow(lines, off, endLine);
+  const nextOffset = returnedThrough < totalLines ? returnedThrough + 1 : null;
   const out = { content: slice, offset: off, limit: lim, totalLines, nextOffset, truncated };
   if (nextOffset != null) {
     out.notice = windowGiven
@@ -1846,7 +1863,7 @@ module.exports = {
   resolveInsideRepo, resolveInsideRoots, TOOLS,
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS, CHAT_TOOLS,
   buildToolHandlers, buildWriteToolHandlers, buildChatToolHandlers,
-  readTaskTool, searchTasksTool, taskSummary,
+  readTaskTool, searchTasksTool, taskSummary, windowSectionText, boundWindow,
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
