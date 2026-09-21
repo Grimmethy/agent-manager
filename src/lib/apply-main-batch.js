@@ -12,7 +12,23 @@ require('../task-sources.js');
 const { TRIAGE_BRANCH, ungatedMainPushAllowed } = require('./main-push-policy.js');
 const { coAuthorTrailer, usesGroupB, applyCandidateSplit, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles } = require('./apply-core.js');
 
+// The shared checkout must never be left on the triage branch. That branch is based on whatever main was when it was first created and is never rebased, so a
+// checkout parked on it (2026-09-20, PF: 4 h, 40 commits behind main) makes every read of "the repo" (plan grounding, review's live content, the staleness
+// sweep) see ancient code: false "file absent" flags, stale rejections. Only the single fully-successful path used to return to main; a batch that staged
+// nothing, a failed commit, or a failed push stayed on the branch. This wrapper returns to main on EVERY exit once the triage branch has been entered.
+// (Ungated mode resets to main itself.) The pushed-or-local commit lives on the branch ref, so leaving the branch loses nothing.
 function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, brainDumpPath, gitRunner = createRealGitRunner(repoRoot) } = {}) {
+  const state = { enteredTriageBranch: false };
+  try {
+    return applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBrainDir, brainDumpPath, gitRunner, state });
+  } finally {
+    if (state.enteredTriageBranch) {
+      try { gitRunner.checkoutMain(); } catch { /* the next apply resets anyway */ }
+    }
+  }
+}
+
+function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBrainDir, brainDumpPath, gitRunner, state }) {
   const results = {};
   const eligible = [];
   for (const task of tasks) {
@@ -30,7 +46,7 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
   // or starts it fresh off current main (also after a human merged + deleted it).
   const gated = !ungatedMainPushAllowed();
   gitRunner.fetchMain();
-  if (gated) gitRunner.prepareStackedBranch(TRIAGE_BRANCH); else gitRunner.resetToMain();
+  if (gated) { state.enteredTriageBranch = true; gitRunner.prepareStackedBranch(TRIAGE_BRANCH); } else gitRunner.resetToMain();
 
   const staged = [];
   for (const task of eligible) {
@@ -102,7 +118,7 @@ function applyDirectToMainBatch(tasks, { repoRoot, pipelineDir, secondBrainDir, 
       }
       return { results, committed: true, pushed: false, branch: TRIAGE_BRANCH };
     }
-    try { gitRunner.checkoutMain(); } catch { /* the next apply resets anyway */ }
+    // (returning to main is the wrapper's job, on every exit)
     // NB: this wording must NOT match task-disposition.js's DIRECT_RE ("committed to main" /
     // "triage batch") or unmerged work would be reported as already shipped (applied-direct).
     for (const s of staged) {
