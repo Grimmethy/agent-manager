@@ -282,25 +282,29 @@ function applyCandidateSplitAsHub(task, pipelineDir) {
 
 const { runAcceptanceCommand } = require('./acceptance-command-gate.js');
 
+function buildDecomposedPlan(task, pipelineDir) {
+  const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
+  if (!subTasks.length) {
+    return { skipped: true, reason: 'RESOLUTION: decompose but no sub-task proposals survived to apply time -- nothing queued' };
+  }
+  const queued = queueSubTasks(subTasks, pipelineDir, task.id, task);
+  // The diff now lives on the first piece; the hub record must not keep a second, large copy.
+  if (task.carriedPartialDiff) { task.carriedPartialDiffChars = task.carriedPartialDiff.length; delete task.carriedPartialDiff; }
+  // The parent does NOT go to done/ -- it becomes a coordinator in queue/coordinating/,
+  // tracking its children on a checklist and auto-completing (coordinator-sweep.js) once
+  // every child reaches done/. See recordApplyOutcome + apply-task.sh for the routing.
+  return {
+    coordinating: true,
+    reason: `Decomposed into ${queued.length} sub-task(s), now coordinating: ${queued.map((t) => t.title).join('; ')}`,
+    subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
+    hubSerial: queued.hubSerial,
+    hubLabel: queued.hubLabel,
+  };
+}
+
 function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   if (task && task.adhocResolution === 'decompose') {
-    const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
-    if (!subTasks.length) {
-      return { skipped: true, reason: 'RESOLUTION: decompose but no sub-task proposals survived to apply time -- nothing queued' };
-    }
-    const queued = queueSubTasks(subTasks, pipelineDir, task.id, task);
-    // The diff now lives on the first piece; the hub record must not keep a second, large copy.
-    if (task.carriedPartialDiff) { task.carriedPartialDiffChars = task.carriedPartialDiff.length; delete task.carriedPartialDiff; }
-    // The parent does NOT go to done/ -- it becomes a coordinator in queue/coordinating/,
-    // tracking its children on a checklist and auto-completing (coordinator-sweep.js) once
-    // every child reaches done/. See recordApplyOutcome + apply-task.sh for the routing.
-    return {
-      coordinating: true,
-      reason: `Decomposed into ${queued.length} sub-task(s), now coordinating: ${queued.map((t) => t.title).join('; ')}`,
-      subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
-      hubSerial: queued.hubSerial,
-      hubLabel: queued.hubLabel,
-    };
+    return buildDecomposedPlan(task, pipelineDir);
   }
 
   const rawDiff = (task && task.rawDiff) || '';
