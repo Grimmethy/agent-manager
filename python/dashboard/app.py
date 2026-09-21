@@ -3329,6 +3329,28 @@ def _label_for_branch(task_id, pipeline_dir, subject, repo_root=None):
     return {"title": subject or task_id, "domain": None, "source": None, "matchedTaskState": None, "description": None}
 
 
+def _branch_content_already_on_main(repo_root, main_branch, full_ref):
+    """True when every file this branch changed (vs. where it forked from main) is byte-identical on origin/<main>: there is nothing left to merge.
+
+    Why (2026-09-21): a SQUASH merge writes a new commit on main and leaves the branch's own commits unmerged by ancestry, so `rev-list main..branch` stayed >0 and
+    the branch sat in the Unmerged Branches tab forever after its PR landed (the rolling agent/triage-queue branch after PRs squashed with --squash). Comparing
+    CONTENT, not ancestry, catches that. Conservative on purpose: any doubt (git error, no merge-base, a huge file list, a file main has since changed differently, a
+    branch that touches something main lacks) returns False, i.e. the branch stays listed. Kill switch: AGENT_MANAGER_BRANCH_LIST_HIDE_SQUASHED=false."""
+    if os.environ.get("AGENT_MANAGER_BRANCH_LIST_HIDE_SQUASHED", "").strip().lower() == "false":
+        return False
+    try:
+        base = _run_git(["merge-base", f"origin/{main_branch}", full_ref], repo_root).strip()
+        if not base:
+            return False
+        changed = [f for f in _run_git(["diff", "--name-only", "-z", base, full_ref], repo_root).split("\0") if f]
+        if not changed or len(changed) > 500:
+            return False
+        differing = _run_git(["diff", "--name-only", "-z", f"origin/{main_branch}", full_ref, "--", *changed], repo_root)
+        return not any(differing.split("\0"))
+    except (RuntimeError, subprocess.SubprocessError, OSError):
+        return False
+
+
 def _list_unmerged_branches_uncached():
     repo_root = get_active_repo_root()
     if not repo_root:
@@ -3363,6 +3385,9 @@ def _list_unmerged_branches_uncached():
         if ahead == 0:
             # Already fully merged (e.g. landed by hand, or a stale ref pending prune on
             # the remote) -- nothing for a human to act on, would just be clutter here.
+            continue
+        if _branch_content_already_on_main(repo_root, main_branch, full_ref):
+            # Landed by SQUASH (or an identical hand-applied change): the commits are "ahead" by ancestry but there is nothing left to merge.
             continue
 
         try:
