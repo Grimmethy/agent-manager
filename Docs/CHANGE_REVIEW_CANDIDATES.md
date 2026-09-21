@@ -167,3 +167,77 @@ index defe710b..ec133942 100644
 Problem: [severity: med; regression shipped in 7142ca5] New helper `windowSectionText` (introduced in this diff; did not exist before) computes `nextOffset` from the un-truncated line-window end, so after the character-limit truncation fires, a caller that pages forward with the returned `nextOffset` silently skips every line that was inside the window but cut off by the character limit; `returnedThrough` is also set to `off` (the start line) rather than the last line actually visible, making the paging notice factually wrong.  Failure scenario: A task JSON in `queue/done/` has `planResponse` = `"A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL\nM\nN\nO\nP"` (16 lines). The model calls `read_task` with `{ taskId: "abc123", section: "plan" }` (no offset/limit, so `off=1`, `lim=READ_FILE_DEFAULT_LINES`). `endLine = 16`. The joined slice is 31 chars. If `MAX_READ_FILE_CHARS` is, say, 10, the slice is cut to `"A\nB\nC\nD\nE\nF\nG\n...[truncated…]"`, `truncated=true`, `returnedThrough = off = 1`, `nextOffset = 16 < 16 → null` (no skip here because the window reaches the end). Now use a smaller window: `limit = 5`. `endLine = 5`, slice = `"A\nB\nC\nD\nE"` (9 chars). With `MAX_READ_FILE_CHARS = 5`, the slice is cut to `"A\nB\nC\n...[truncated…]"`, `truncated = true`, `returnedThrough = 1`, `nextOffset = 5 < 16 → 6`. The notice reads *"showing lines 1-1 of 16. Re-call with offset=6 for the next window."* The content actually contains parts of lines 1–3, but the notice claims only line 1 was shown, and the suggested next offset (6) skips lines 4 and 5 ("D" and "E"), which the caller will never retrieve by following the tool's own paging advice.
 Solution: When `truncated` is true, compute `returnedThrough` as the index of the last `\n` in the truncated `slice` (i.e. `slice.lastIndexOf('\n') + 1`, 1-based) and set `nextOffset` to `returnedThrough + 1` instead of `endLine + 1`, so the caller resumes at the first line that was actually cut off rather than jumping past the entire un-truncated window.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 7142ca5.
+
+### AC-52 · `api_brain_dump_capture` calls `.get("serial")` on every entry with no `isinstance(e, dict)` guard (f3d1441 routes/brain_dump.py)
+Strength: Strong
+Source: change_review of f3d1441 "Assign a stable serial number to Brain Dump entries" (re-verified against current master 2026-09-21: the handler now lives in routes/brain_dump.py)
+Files: python/dashboard/routes/brain_dump.py
+
+Snippet:
+```
+    # read_brain_dump_entries() backfills+persists a serial onto any pre-existing entry
+    # that doesn't already have one, so `entries` here is always fully migrated before
+    # next_serial is computed off it -- see _assign_brain_dump_serials()'s own header.
+    entries = read_brain_dump_entries()
+    next_serial = max((e.get("serial") or 0) for e in entries) + 1 if entries else 1
+```
+
+Problem: [severity: med; regression shipped in f3d1441] `next_serial = max((e.get("serial") or 0) for e in entries) + 1 if entries else 1` calls `.get` on every element of `entries`, but its sibling `_assign_brain_dump_serials` (python/dashboard/app.py) guards with `isinstance(e, dict)` because a hand-edited or corrupted brain-dump.json can hold a non-dict scalar. Before f3d1441 the capture path never inspected existing elements, so such a file still accepted new entries; now a single stray scalar makes every capture raise `AttributeError` and return a 500, so nothing can be captured until the file is fixed by hand.
+
+Solution: Guard the comprehension and give the empty case a default, since `if entries else 1` alone still raises `ValueError` when `entries` is non-empty but contains no dict: `next_serial = max((e.get("serial") or 0 for e in entries if isinstance(e, dict)), default=0) + 1`. Apply the same `default=0` form to the identical expression in `_assign_brain_dump_serials` (python/dashboard/app.py), which has the same empty-filter edge. Add a test that captures into a brain-dump.json containing a scalar element and into one containing only scalars.
+
+Benefits: A malformed entry no longer blocks all brain-dump capture; the two serial computations agree.
+
+### AC-53 · The Done/queue tab body now depends on a second, unguarded `/api/job-types` fetch, and a failed fetch is cached forever (8b29ba0 core-ui.js)
+Strength: Strong
+Source: change_review of 8b29ba0 "Stop losing applied work to unpushed/orphaned branches, add Done filter" (re-verified against current master 2026-09-21: the code moved from index.html to static/js/core-ui.js)
+Files: python/dashboard/static/js/core-ui.js
+
+Snippet:
+```
+function allSourceNames() {
+  if (!allSourceNamesPromise) {
+    allSourceNamesPromise = fetchJson('/api/job-types').then((jobTypes) => jobTypes.map((j) => j.name).sort());
+  }
+  return allSourceNamesPromise;
+}
+
+  const sourceNames = await allSourceNames();
+  const filterOptionsHtml = ['<option value="">All task types</option>']
+    .concat(sourceNames.map((n) => `<option value="${escapeAttr(n)}" ${n === sourceFilter ? 'selected' : ''}>${escapeHtml(n)}</option>`))
+    .join('');
+  const hubSortHtml = state === 'coordinating'
+```
+
+Problem: [severity: med; regression shipped in 8b29ba0] Before the task-type filter was added, a successful `/api/queue/<state>` response was enough to render the tab. `renderQueueTab` now does `const sourceNames = await allSourceNames();` outside any try/catch, and `allSourceNames()` is `fetchJson('/api/job-types')`, which throws on a non-2xx response. A 500 (or a network error) there rejects `renderQueueTab` before `main.innerHTML` is assigned, so the tab stays blank with no error message. Worse, `allSourceNamesPromise` memoises the REJECTED promise, so every later 5s refresh awaits the same failure and the tab stays blank until a full page reload.
+
+Solution: Make the filter list optional. In `allSourceNames()` catch the fetch failure, clear `allSourceNamesPromise = null` so a later poll retries, and resolve to `[]`; `renderQueueTab` then renders the queue table with only the "All task types" option. Add a test (the dashboard has node tests for browser JS under scripts/) where `fetchJson('/api/job-types')` rejects once and then succeeds: the first render still produces the table, the second populates the options.
+
+Benefits: A failing or slow job-types endpoint degrades to an unfiltered list instead of blanking every queue tab.
+
+### AC-54 · The Start Pipeline button can stay on "Starting..." forever if the daemons accept the request and then never appear (49a4f48 project-tab.js)
+Strength: Strong
+Source: change_review of 49a4f48 "Fix Start Pipeline button flicker, add a legend to the project graph" (re-verified against current master 2026-09-21: the code moved from index.html to static/js/project-tab.js)
+Files: python/dashboard/static/js/project-tab.js
+
+Snippet:
+```
+  } else if (pipelineStarting) {
+    // Daemons are still spinning up between the /pipeline/start call returning and this
+    // status poll actually seeing status.running -- stay in the same disabled/"Starting..."
+    // look startPipeline() itself set, rather than snapping back to a fully bright,
+    // clickable "Start Pipeline" for one poll cycle. See pipelineStarting's own comment.
+    startBtn.className = 'action';
+    startBtn.disabled = true;
+    startBtn.textContent = 'Starting...';
+  } else {
+    startBtn.className = 'action';
+    startBtn.textContent = 'Start Pipeline';
+    startBtn.onclick = startPipeline;
+```
+
+Problem: [severity: med; regression shipped in 49a4f48] `pipelineStarting` is set true by `startPipeline()` and cleared only when a poll sees `status.running || status.stoppable`, or when the POST itself throws. If `/api/pipeline/start` returns 200 but the spawned daemons die or never register, every later poll lands in the `else if (pipelineStarting)` branch, which keeps the button disabled and labelled "Starting...", so the user has no way to retry or stop until a page reload. Before 49a4f48 the next poll fell into the plain `else` branch and re-enabled "Start Pipeline".
+
+Solution: Bound the flag in time. Record `pipelineStartedAt = Date.now()` where `pipelineStarting = true` is set, and in the `else if (pipelineStarting)` branch treat the flag as expired after a named constant (for example `PIPELINE_START_GRACE_MS = 30000`, chosen against the measured time daemons take to appear in status, not a guess): clear `pipelineStarting` and fall through to the plain "Start Pipeline" branch. Add a node test that, with the flag set and a status poll reporting neither running nor stoppable, the button stays "Starting..." inside the grace period and is re-enabled after it.
+
+Benefits: A failed start recovers by itself instead of requiring a reload; the flicker fix is kept for the normal case.
