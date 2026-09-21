@@ -333,3 +333,14 @@ test('reconcile skips the whole pass (resolves nothing, writes nothing) when shi
     delete require.cache[require.resolve('./task-log-reconcile.js')];
   }
 });
+
+test('reconcile: an abandoned verdict carries the ledger reason for the vanished branch (pipelineDir is threaded through)', () => {
+  const { recordBranchRemoval } = require('./branch-removal-ledger.js');
+  const dir = tmpPipeline();
+  recordBranchRemoval(dir, { branch: 'agent/t-led', taskId: 't-led', cause: 'discarded', detail: 'discarded via the dashboard', actor: 'dashboard-discard' });
+  const withLedger = writeRec(dir, '', 't-led', [{ stage: 'applied', detail: 'agent/t-led' }]);
+  const without = writeRec(dir, '', 't-noled', [{ stage: 'applied', detail: 'agent/t-noled' }]);
+  reconcile({ pipelineDir: dir, repoRoot: undefined, argv: [] });
+  assert.match(tail(withLedger).detail, /removed \d{4}-\d{2}-\d{2} by dashboard-discard \(discarded: discarded via the dashboard\)/);
+  assert.match(tail(without).detail, /no removal recorded -- deleted outside the pipeline/);
+});

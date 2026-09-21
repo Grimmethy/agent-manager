@@ -296,3 +296,31 @@ test('requeueBlockedTask: terminalDisposition "merged" skips the branch-abandonm
   assert.equal(result.ok, true);
   assert.equal(exists(at(dir, 'pending', 't13.json')), true);
 });
+
+test('requeueBlockedTask: a successful superseded-branch delete is recorded in the branch-removal ledger; a failed one is not', async () => {
+  const { lastRemoval } = require('./branch-removal-ledger.js');
+  const dir = makePipeline();
+  const bare = fs.mkdtempSync(path.join(require('os').tmpdir(), 'rq-bare-'));
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', bare]);
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'README.md'), 'x\n');
+  execFileSync('git', ['add', 'README.md'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+  execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: dir });
+  execFileSync('git', ['push', '-q', 'origin', 'main'], { cwd: dir });
+  execFileSync('git', ['push', '-q', 'origin', 'main:agent/t14-fix'], { cwd: dir });
+
+  write(dir, 'blocked', { id: 't14', domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', history: [{ stage: 'applied', at: 'y', detail: 'agent/t14-fix' }] });
+  assert.equal((await requeueBlockedTask(dir, dir, 't14', { state: 'blocked' })).ok, true);
+  const rec = lastRemoval(dir, 'agent/t14-fix');
+  assert.equal(rec.cause, 'superseded-by-requeue');
+  assert.equal(rec.taskId, 't14');
+  assert.equal(rec.actor, 'chat-requeue');
+
+  // Same call, but the branch was never pushed: the delete fails, so nothing is claimed in the ledger.
+  write(dir, 'blocked', { id: 't15', domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', history: [{ stage: 'applied', at: 'y', detail: 'agent/t15-never-pushed' }] });
+  assert.equal((await requeueBlockedTask(dir, dir, 't15', { state: 'blocked' })).ok, true);
+  assert.equal(lastRemoval(dir, 'agent/t15-never-pushed'), null);
+});

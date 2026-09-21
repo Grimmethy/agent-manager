@@ -101,6 +101,9 @@ class TestMergeClosesTaskLog(unittest.TestCase):
             res = self.client.post(f"/api/git/branches/agent%2F{task_id}/merge")
             self.assertEqual(res.status_code, 200, res.get_json())
             self.assertTrue(res.get_json()["succeeded"])
+            # The removed branch's reason is recorded, so a later reconcile cannot read it as "work lost".
+            ledger = json.loads((repo / "queue" / "branch-removals.jsonl").read_text().splitlines()[-1])
+            self.assertEqual((ledger["branch"], ledger["cause"], ledger["actor"]), (f"agent/{task_id}", "merged", "dashboard-merge"))
 
             log_path = repo / "task-logs" / f"{task_id}.json"
             self.assertTrue(log_path.is_file())

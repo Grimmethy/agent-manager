@@ -26,6 +26,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { classifyRequeue } = require('./requeue-attribution.js');
+const { recordBranchRemoval } = require('./branch-removal-ledger.js');
 
 function readJsonSafe(fullPath) {
   try {
@@ -281,6 +282,7 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
     if (appliedBranch && repoRoot) {
       try {
         execFileSync('git', ['push', 'origin', '--delete', appliedBranch], { cwd: repoRoot, stdio: 'pipe' });
+        recordBranchRemoval(pipelineDir, { branch: appliedBranch, taskId: data.id, cause: 'superseded-by-requeue', detail: `requeued from ${state}/`, actor: 'chat-requeue' });
       } catch {
         // Non-fatal, same reasoning as the Python route's own try/except: already gone,
         // never actually pushed, or a transient network error are all fine -- the
