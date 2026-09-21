@@ -659,3 +659,46 @@ index abbd0c81..c05b3849 100644
 Problem: [severity: high; regression shipped in dc8d59a] Pre-diff, every build re-resolved each file's imports against the current file_set, so a newly-added file imported by an unchanged file produced a correct edge; post-diff, the cache-hit path reuses an edge list that was filtered by the *previous* build's file_set and can never add an edge whose target did not exist at cache-write time.  Failure scenario: repo_root=/home/user/project, grep_dirs=["backend/src"]. Build 1: only backend/src/service.py exists (content: `from new_util import helper`); backend/src/new_util.py does not exist. file_set={service.py}. _extract_edges_for_file resolves the import to /home/user/project/backend/src/new_util.py, but `target in file_set` is False, so edges=[] is cached. Build 2: backend/src/new_util.py is added (e.g. `def helper(): ...`); service.py is byte-identical (same mtime, same size). file_set={service.py, new_util.py}. service.py is a cache hit → edges=[] → no edge added. new_util.py is a cache miss → its own edges extracted (none). Graph: 2 nodes, 0 edges → both isolated → both removed → empty graph. Pre-diff Build 2 would have read service.py's text, resolved `new_util` to new_util.py, found it in file_set, and added the service.py→new_util.py edge, yielding a 2-node/1-edge graph with no isolated nodes.
 Solution: In the cache-hit branch, after loading `edges = cached["edges"]`, also re-scan the file's import statements (or, more cheaply, store the *unresolved* import specs in the cache alongside the resolved edges) and resolve them against the *current* file_set, appending any newly-valid targets to `edges` before the `graph.has_node` loop. Alternatively, invalidate the cache entry for file A whenever file_set gains a new member that A's text could resolve to (i.e., treat any file-set addition as a cache miss for all cached files that import from the same directory/package).
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in dc8d59a.
+
+### AC-65 · `api_brain_dump_capture` now calls `.get("serial")` on every element of the entries list w (f3d1441 app.py)
+Strength: Strong
+Source: change_review of f3d1441 "Assign a stable serial number to Brain Dump entries"
+Files: python/dashboard/app.py
+
+Snippet:
+```
+diff --git a/python/dashboard/app.py b/python/dashboard/app.py
+index 32109046..66ca1162 100644
+--- a/python/dashboard/app.py
++++ b/python/dashboard/app.py
+@@ -869,31 +869,54 @@ def api_summary():
+     if not qdir:
+         return jsonify(counts)
+ 
+     for state in QUEUE_STATES:
+         state_dir = qdir / state
+         counts[state] = len(list(state_dir.glob("*.json"))) if state_dir.is_dir() else 0
+     drafting_root = qdir / "drafting"
+     if drafting_root.is_dir():
+         counts["drafting"] = len(list(drafting_root.rglob("*.json")))
+     return jsonify(counts)
+ 
+ 
++def _assign_brain_dump_serials(entries: list) -> bool:
++    """Backfills a stable #N serial onto any entry that doesn't have one yet, so the
++    user has a short, stable handle to reference a specific entry by ("entry #12")
++    instead of its long slugified id. New entries get one at capture time (see
++    api_brain_dump_capture); this covers every entry that existed before that changed
++    and self-heals if brain-dump.json is ever hand-edited to drop the field. Assigns in
++    capturedAt order (oldest first) so backfilled numbers land in a sensible reading
++    order rather than dict/file order, continuing from whatever the current max already
++    is so a re-run never reassigns or collides with a number already handed out.
++    Returns True if anything changed, so the caller knows to persist it."""
++    missing = [e for e in entries if isinstance(e, dict) and not e.get("serial")]
++    if not missing:
++ 
+```
+
+Problem: [severity: med; regression shipped in f3d1441] `api_brain_dump_capture` now calls `.get("serial")` on every element of the entries list without an `isinstance(e, dict)` guard, so a non-dict scalar in the `entries` array (which the old code tolerated because it never inspected existing elements) now causes an unhandled `AttributeError` and a 500 response.  Failure scenario: `brain-dump.json` contains `{"entries": [42, {"id": "bd-1", "serial": 1, "capturedAt": "2026-01-01T00:00:00+00:00", "rawText": "hello", "status": "captured"}]}` (a stray scalar from a hand-edit). A `POST /api/brain-dump/capture` with body `{"text": "new thought"}` reaches `next_serial = max((e.get("serial") or 0) for e in entries) + 1`. The generator yields `42` first; `42.get("serial")` raises `AttributeError: 'int' object has no attribute 'get'`, which Flask turns into a 500. The pre-diff code simply appended the new entry to the list and wrote the file back, never calling `.get` on existing elements, so the same file worked fine.
+Solution: Add the same `isinstance(e, dict)` guard already used in `_assign_brain_dump_serials`: `next_serial = max((e.get("serial") or 0) for e in entries if isinstance(e, dict)) + 1 if entries else 1`
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in f3d1441.
