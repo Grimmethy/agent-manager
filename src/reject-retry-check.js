@@ -290,6 +290,14 @@ function isPlanDegenerateBlock(task) {
   return task.blockedStage === 'plan';
 }
 
+// 2026-09-21: blockedStage:'implement' -- local-draft.js's IMPLEMENT-pass degenerate check ("Implement pass degenerate: empty" / "truncated", after callImplementModel's own
+// internal retries) set NO blockedStage at all, the exact shape isPlanDegenerateBlock's header describes for the plan pass: invisible to every check here, the file sitting in
+// queue/blocked/ (status often still 'pending') forever. function-length-fix-ac-34 was stuck a day on it. Same reasoning: model variance, a bounded blind retry is right; the
+// plan is fine (it completed) so it is kept, only the unusable implement output is cleared.
+function isImplementDegenerateBlock(task) {
+  return task.blockedStage === 'implement';
+}
+
 // Same reasoning as queue-watchdog.ps1's arch_discovery/arch_import stamping (not ported
 // here, see header) -- deep_dive's own coverage tracker: without this, a community whose
 // task exhausts its retries stays eligible for nextDeepDiveTask() to re-select FOREVER
@@ -511,11 +519,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       const preImplementBlock = isPreImplementBlock(task);
       const draftFailureBlock = isDraftFailureBlock(task);
       const planDegenerateBlock = isPlanDegenerateBlock(task);
+      const implementDegenerateBlock = isImplementDegenerateBlock(task);
       // An "Invalid premise:" verdict is recognized whatever its blockedStage (or lack of
       // one) -- see invalidPremiseBeforeCheckExisted / hasInvalidPremise: it is either
       // re-admitted once or escalated by the classifier below, never left invisible.
       const invalidPremiseBlock = hasInvalidPremise(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !invalidPremiseBlock) continue;
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !invalidPremiseBlock) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -954,6 +963,10 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         delete task.planResponse;
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'plan-pass degenerate -- cleared stale plan state for a fresh plan pass');
+      } else if (implementDegenerateBlock) {
+        // The plan completed and is kept; only the unusable (empty / truncated) implement output is dropped.
+        delete task.implementResponse;
+        appendHistoryEvent(task, 'requeued', 'implement-pass degenerate -- cleared stale implement state for a fresh implement pass');
       }
 
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
@@ -993,7 +1006,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
+module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
 
 if (require.main === module) {
   main();

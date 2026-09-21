@@ -1036,7 +1036,10 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     const blockedReason = `Implement pass degenerate: ${implResult.degenerate}`;
     recordImplement(attempt, { degenerate: implResult.degenerate, attempts: implResult.attempts });
     appendHistoryEvent(task, 'blocked', blockedReason);
-    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+    // 2026-09-21: this used to carry NO blockedStage -- invisible to reject-retry-check.js's entry gate, so the task sat in queue/blocked/ forever with zero automated retry
+    // (function-length-fix-ac-34 was stuck a day on "Implement pass degenerate: empty"). Same shape the plan-pass degenerate block had until 2026-09-17; see
+    // reject-retry-check.js's isImplementDegenerateBlock. 'implement' is deliberately none of 'review'/'apply'/'pre-critique'/'pre-implement'/'draft'/'plan'.
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason, blockedStage: 'implement' } };
   }
   task.implementResponse = implResult.response;
 

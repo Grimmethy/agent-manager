@@ -59,6 +59,14 @@ const KNOWN_FIXED = [
     dirs: ['blocked', 'needs-clarification'],
     applies: (task) => { const t = failureText(task); return /draft call failed \d+ times/.test(t) && t.includes('[draft-sandbox]'); },
   },
+  {
+    id: 'implement-degenerate-invisible-block',
+    fixedIn: 'agent-manager (implement-pass degenerate now stamps blockedStage "implement", 2026-09-21)',
+    description: 'an "Implement pass degenerate: empty/truncated" block stamped no blockedStage, so reject-retry-check never saw it and the task sat in blocked/ forever',
+    dirs: ['blocked'],
+    // Only the victims that predate the stamp (no blockedStage): a task that already carries one is handled by the sweep itself.
+    applies: (task) => !task.blockedStage && /Implement pass degenerate/.test(failureText(task)),
+  },
 ];
 
 module.exports = { KNOWN_FIXED, failureText };
