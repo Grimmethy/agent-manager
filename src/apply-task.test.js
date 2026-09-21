@@ -1376,3 +1376,58 @@ test('recordApplyOutcome: a coordinating result stamps the hub serial and leads 
   assert.equal(legacy.title, 'Untouched');
   assert.equal(legacy.hubSerial, undefined);
 });
+
+// --- the shared checkout is never left on the triage branch (2026-09-20, PF) -----------------------------------------------------------------
+// The rolling triage branch is never rebased, so a checkout parked on it reads ancient code. Only the fully successful path used to return to main.
+const idxOf = (calls, name) => calls.map((c) => c.name).indexOf(name);
+const checkoutMains = (calls) => calls.filter((c) => c.name === 'checkoutMain').length;
+
+test('gated triage batch: a fully successful batch returns to main exactly once, after the push', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const gitRunner = createFakeGitRunner();
+  applyDirectToMainBatch([batchTriageTask('back-1')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(checkoutMains(gitRunner.calls), 1);
+  assert.ok(idxOf(gitRunner.calls, 'checkoutMain') > idxOf(gitRunner.calls, 'push'));
+});
+
+test('gated triage batch: a batch that stages NOTHING still returns to main (it used to stay on the triage branch)', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const name = 'batch_nothing_staged_probe';
+  if (!getRegisteredSource(name)) registerTaskSource(name, { priority: 80, next: () => null, directToMain: true, apply: () => ({ skipped: true, reason: 'nothing to add' }) });
+  const gitRunner = createFakeGitRunner();
+  const out = applyDirectToMainBatch([baseTask({ source: name, id: 'nothing-staged-1' })], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(out.committed, false);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(names.includes('prepareStackedBranch'), 'the triage branch was entered');
+  assert.ok(!names.includes('commit') && !names.includes('push'));
+  assert.equal(checkoutMains(gitRunner.calls), 1, 'and left again');
+  assert.ok(idxOf(gitRunner.calls, 'checkoutMain') > idxOf(gitRunner.calls, 'prepareStackedBranch'));
+});
+
+test('gated triage batch: a THROWN commit still returns to main, and the error still propagates', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const gitRunner = createFakeGitRunner({ failOn: 'commit', failMessage: 'index.lock exists' });
+  assert.throws(() => applyDirectToMainBatch([batchTriageTask('back-2')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner }), /index\.lock/);
+  assert.equal(checkoutMains(gitRunner.calls), 1);
+});
+
+test('gated triage batch: a failed push returns to main too (the commit stays on the branch ref)', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const gitRunner = createFakeGitRunner({ failOn: 'push', failMessage: 'remote: connection reset' });
+  const out = applyDirectToMainBatch([batchTriageTask('back-3')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(out.pushed, false);
+  assert.equal(checkoutMains(gitRunner.calls), 1);
+});
+
+test('gated triage batch: a checkoutMain that itself fails is swallowed (the next apply resets)', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const gitRunner = createFakeGitRunner({ failOn: 'checkoutMain', failMessage: 'local changes would be overwritten' });
+  const out = applyDirectToMainBatch([batchTriageTask('back-4')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(out.results['back-4'].succeeded, true);
+});
+
+ungatedTest('ungated triage batch: unchanged, no extra checkout (resetToMain already ends on main)', () => {
+  const gitRunner = createFakeGitRunner();
+  applyDirectToMainBatch([batchTriageTask('back-5')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(checkoutMains(gitRunner.calls), 0);
+});
