@@ -26,8 +26,43 @@ function uniqueIndex(haystack, needle) {
   return haystack.indexOf(needle, i + 1) === -1 ? i : -2; // -2 = ambiguous
 }
 
+// Where does the snippet's own HEAD sit in the file, at or before `beforeIndex` (within HEAD_LOOKBACK_CHARS)? Two stable anchors, in order:
+//   1. the DECLARED NAME of the function/class/def the snippet starts with, when exactly one declaration of that name exists in the file (the name survives a signature edit and a
+//      block inserted right after it, which is what breaks the exact-text matches);
+//   2. otherwise the snippet's first line with real content (>= 25 chars trimmed), when that exact text occurs exactly ONCE in the file.
+// Absent or ambiguous -> -1 (the caller keeps its estimate). Never guesses between several.
+const HEAD_LOOKBACK_CHARS = 40000;
+const DECL_RES = [
+  /^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)/,
+  /^\s*(?:export\s+)?(?:async\s+)?def\s+([A-Za-z_]\w*)/,
+  /^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)/,
+];
+function headLineIndex(content, rawSnippet, beforeIndex) {
+  if (!rawSnippet) return -1;
+  const within = (i) => (i !== -1 && i <= beforeIndex && beforeIndex - i <= HEAD_LOOKBACK_CHARS ? i : -1);
+  const lines = String(rawSnippet).split('\n').slice(0, 12);
+  // 1. the DECLARATION the snippet starts with (its name survives a signature edit and an insertion right after it)
+  for (const raw of lines) {
+    for (const re of DECL_RES) {
+      const m = re.exec(raw);
+      if (!m) continue;
+      const decl = new RegExp(re.source.replace('([A-Za-z_$][\\w$]*)', m[1].replace(/[$]/g, '\\$&')).replace('([A-Za-z_]\\w*)', m[1]), 'gm');
+      const found = [...content.matchAll(decl)];
+      if (found.length === 1) return within(found[0].index + found[0][0].search(/\S|$/));
+      return -1; // several declarations of that name: never pick one
+    }
+  }
+  // 2. no declaration in the head: its first line with real content, when that exact text occurs exactly once
+  const first = lines.map((l) => l.trim()).find((l) => l.length >= 25);
+  if (first) {
+    const i = content.indexOf(first);
+    if (i !== -1 && content.indexOf(first, i + 1) === -1) return within(i);
+  }
+  return -1;
+}
+
 // -> { index, length, partial: 'prefix' | 'suffix' } | null, positions in the REAL (unstripped) content.
-function findPartialMatch(content, strippedSnippet, strippedContent) {
+function findPartialMatch(content, strippedSnippet, strippedContent, rawSnippet) {
   const n = strippedSnippet.length;
   if (n <= MIN_PARTIAL_CHARS) return null;
   for (const kind of ['prefix', 'suffix']) {
@@ -36,10 +71,16 @@ function findPartialMatch(content, strippedSnippet, strippedContent) {
       const at = uniqueIndex(strippedContent, piece);
       if (at === -2) break; // ambiguous at this length: shorter pieces only get more ambiguous, try the other end
       if (at === -1) continue;
-      // Where the snippet would START: for a suffix match, back up by the part of the snippet that precedes it.
-      const startStripped = kind === 'prefix' ? at : Math.max(0, at - (n - len));
-      const realStart = realIndexForStrippedIndex(content, startStripped);
+      // Where the snippet would START. A prefix match starts exactly there. For a suffix match the part of the snippet BEFORE it drifted, so backing up by its old length is only
+      // an estimate and is wrong when that part has since grown (function-length-fix-ac-37: the estimate landed 94 lines late and the window missed the function). Prefer the snippet's
+      // own first distinctive line when it occurs exactly once shortly before the match; fall back to the estimate.
+      const pieceStart = realIndexForStrippedIndex(content, at);
       const realEnd = realIndexForStrippedIndex(content, at + len);
+      let realStart = kind === 'prefix' ? pieceStart : realIndexForStrippedIndex(content, Math.max(0, at - (n - len)));
+      if (kind === 'suffix') {
+        const head = headLineIndex(content, rawSnippet, pieceStart);
+        if (head !== -1) realStart = head;
+      }
       return { index: realStart, length: Math.max(realEnd - realStart, 1), partial: kind };
     }
   }
@@ -56,7 +97,7 @@ function findFuzzyMatch(content, snippet) {
   if (!strippedSnippet) return null;
   const strippedContent = stripWhitespace(content);
   const strippedIdx = strippedContent.indexOf(strippedSnippet);
-  if (strippedIdx === -1) return findPartialMatch(content, strippedSnippet, strippedContent);
+  if (strippedIdx === -1) return findPartialMatch(content, strippedSnippet, strippedContent, trimmed);
 
   const realStart = realIndexForStrippedIndex(content, strippedIdx);
   const realEnd = realIndexForStrippedIndex(content, strippedIdx + strippedSnippet.length);

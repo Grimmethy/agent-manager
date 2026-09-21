@@ -61,3 +61,29 @@ test('windowFetchedFileContent: a stale snippet in a big file is anchored strong
   const none = windowFetchedFileContent(file, '### AC-9 · Decompose\nFiles: src/x.js\nSnippet:\n```\n' + lines(40, 'zz').join('\n') + '\n```\n');
   assert.equal(none.confidence, 'none', 'an unrelated snippet still gets no anchor');
 });
+
+// --- a suffix match must not extrapolate the start when the head of the function GREW (function-length-fix-ac-37) -------------------------------------------------------------
+// The signature gained a parameter and ~60 lines were inserted right after it, so neither the whole snippet nor its prefix matches; the suffix does, but backing up by the old length of
+// the missing head lands far past the real start. Anchoring on the declared function name puts the window on the function.
+test('suffix match: when the head of the function drifted AND grew, the start is the declaration, not an extrapolation', () => {
+  const grown = BLOCK.split('\n');
+  grown[0] = 'function bigBody(opts, extra, third) {';
+  grown.splice(1, 0, ...Array.from({ length: 60 }, (_, i) => `  const added${i} = wire(${i}); // a block inserted after the snippet was written`));
+  const file = fileWith(grown.join('\n'));
+  const m = findFuzzyMatch(file, BLOCK);
+  assert.equal(m.partial, 'suffix');
+  assert.ok(file.slice(m.index).trimStart().startsWith('function bigBody(opts, extra, third) {'), `anchored at the declaration, got: ${JSON.stringify(file.slice(m.index, m.index + 40))}`);
+  const w = windowFetchedFileContent(file, `### AC-37 · Extract\nFiles: src/x.js\nSnippet:\n\`\`\`\n${BLOCK}\n\`\`\`\n`);
+  assert.equal(w.confidence, 'strong');
+  assert.ok(w.text.includes('function bigBody(opts, extra, third) {'), 'the window contains the function head');
+});
+
+test('suffix match: two declarations of the same name -> no guess, the estimate is kept (never picks one of several)', () => {
+  const grown = BLOCK.split('\n');
+  grown[0] = 'function bigBody(opts, extra) {';
+  grown.splice(1, 0, ...Array.from({ length: 60 }, (_, i) => `  const added${i} = wire(${i}); // inserted block`));
+  const file = `${FILE_PAD_BEFORE}\nfunction bigBody(other) { return 1; }\n${grown.join('\n')}\n${FILE_PAD_AFTER}\n`;
+  const m = findFuzzyMatch(file, BLOCK);
+  assert.equal(m.partial, 'suffix');
+  assert.ok(!file.slice(m.index).trimStart().startsWith('function bigBody(other)'), 'did not latch onto the wrong declaration');
+});
