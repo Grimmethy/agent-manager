@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, alreadyEscalatedSinceLastReadmission, isReviewVerdictAdvisoryProseSource } = require('./reject-retry-check.js');
+const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, isReviewVerdictAdvisoryProseSource } = require('./reject-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
@@ -1396,4 +1396,42 @@ test('rejectRetryCheck does not readmit a non-review block just because an OLD r
 
   assert.equal(summary.requeued, 0);
   assert.ok(fs.existsSync(path.join(blockedDir, 'apply-1.json')));
+});
+
+// 2026-09-21: blockedStage:'implement' -- local-draft.js's implement-pass degenerate block used to set NO blockedStage (function-length-fix-ac-34 sat a day in blocked/).
+test('isImplementDegenerateBlock recognizes blockedStage:implement only', () => {
+  assert.equal(isImplementDegenerateBlock({ blockedStage: 'implement' }), true);
+  assert.equal(isImplementDegenerateBlock({ blockedStage: 'plan' }), false);
+  assert.equal(isImplementDegenerateBlock({ blockedStage: 'draft' }), false);
+  assert.equal(isImplementDegenerateBlock({}), false);
+});
+
+test('rejectRetryCheck requeues an implement-degenerate block under the cap: keeps the good plan, drops the unusable implement output', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', {
+    status: 'pending', // never flipped to 'blocked' by local-draft.js
+    blockedStage: 'implement',
+    blockedReason: 'Implement pass degenerate: empty',
+    localRejectCount: 0,
+    planResponse: 'a complete, usable plan',
+    implementResponse: '',
+  });
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')));
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')));
+  const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-1.json'), 'utf8'));
+  assert.equal(requeued.localRejectCount, 1);
+  assert.equal(requeued.planResponse, 'a complete, usable plan', 'the plan completed: it is kept');
+  assert.equal(requeued.implementResponse, undefined);
+  assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /implement-pass degenerate/.test(h.detail || '')));
+});
+
+test('rejectRetryCheck exhausts a non-adhoc implement-degenerate block at the retry cap and leaves it in blocked/', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-1', { status: 'pending', blockedStage: 'implement', blockedReason: 'Implement pass degenerate: empty', localRejectCount: 2 });
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+  assert.equal(summary.exhausted, 1);
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')));
 });

@@ -168,3 +168,21 @@ test('a stale origin copy in derived/ does not block draining a derived task; a 
   assert.equal(has(dir, 'needs-clarification', 'victim'), false);
   assert.equal(has(dir, 'needs-clarification', 'has-pending'), true, 'a real pending copy still blocks');
 });
+
+// --- implement-degenerate-invisible-block (2026-09-21) -----------------------------------------------------------------------------------------------------------
+test('implement-degenerate-invisible-block matches a blocked task with the degenerate reason and NO blockedStage, not one that already has a stage or another reason', () => {
+  const e = byId['implement-degenerate-invisible-block'];
+  const t = (over) => stuck('x', { domain: 'default', source: 'function_length_fix', status: 'pending', blockedReason: 'Implement pass degenerate: empty', ...over });
+  assert.equal(e.applies(t({})), true);
+  assert.equal(e.applies(t({ blockedStage: 'implement' })), false, 'the sweep already handles a stamped block');
+  assert.equal(e.applies(t({ blockedReason: 'Plan pass degenerate: empty' })), false);
+  assert.equal(e.applies(t({ blockedReason: 'draft call failed 3 times' })), false);
+});
+
+test('implement-degenerate-invisible-block drains the stuck task back to pending/', () => {
+  const dir = pipeline();
+  put(dir, 'blocked', stuck('victim', { domain: 'default', source: 'function_length_fix', status: 'pending', blockedReason: 'Implement pass degenerate: empty', history: [{ stage: 'blocked', at: '2026-09-20T05:00:00Z' }] }));
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['implement-degenerate-invisible-block']] });
+  assert.deepEqual(s.requeued.map((r) => r.id), ['victim']);
+  assert.equal(has(dir, 'pending', 'victim'), true);
+});

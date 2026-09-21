@@ -3268,6 +3268,25 @@ test('arch_review (candidate-fulfillment): the plan call is NOT allowed to be em
   });
 });
 
+test('an implement pass that comes back degenerate blocks with blockedStage "implement" (it used to carry none: invisible to reject-retry-check, stuck forever)', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = {
+      id: 'arch-review-empty-implement-1', domain: 'default', source: 'arch_review', title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'a real queued change', body: 'Problem/Solution/Benefits', files: ['src/x.js'], fetchedFiles: [] },
+    };
+    let calls = 0;
+    const localCall = async () => {
+      calls += 1;
+      if (calls === 1) return { response: 'QUERY: x\n\nA complete, usable plan that names src/x.js and what to change.', degenerate: null, attempts: 1 };
+      return { response: '', degenerate: 'empty', attempts: 3 }; // the implement pass
+    };
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    assert.equal(result.blocked, true);
+    assert.match(result.blockedReason, /Implement pass degenerate: empty/);
+    assert.equal(result.blockedStage, 'implement');
+  });
+});
+
 // --- product_spec brownfield: local decompose -> fulfill (2026-08-30 redesign) --------
 // Brownfield product_spec no longer has any special routing or subscription-agent path.
 // The brownfield request goes to product_spec_outline, which is an ordinary local
