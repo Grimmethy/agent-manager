@@ -154,6 +154,8 @@ What core provides that the plugin depends on, and what the plugin provides that
 `coordinator-sweep.js`, `hub-priority.js`, `stacked-grounding.js`, `hub-status-grounding.js`, `decompose-auto-merge.js`,
 `decompose-integration-gate.js`, `rejected-hub-disposition-backfill.js`, and the dashboard hub tab/route.
 
+> **UPDATE 2026-09-21:** the destination of the producers changed. The code-decomposition family (file-decompose and its builders, loop-autoroute, the proactive sweep, the move-determinism backfill) goes to **agent-manager-hygiene**, not the hub plugin; see `Docs/hub-tasks-extraction-plan.md` sections 3-4.
+
 **Seam B: producers (movable one by one).** File-decompose (with its deterministic builders and `script-extract.js`), product-spec,
 loop-autoroute, proactive sweep. Each already communicates only through request files + the hub/child record shapes above, so they
 are the easiest to move.
