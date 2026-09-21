@@ -349,3 +349,24 @@ Solution: In `src/adhoc-staleness-flag.js`, add a guard in the `sweep` function 
 Benefits: Tasks with factually impossible premises (naming non-existent files) are automatically retired without human intervention, reducing noise in the `needs-clarification` queue and freeing human attention for genuine design decisions.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-3-needs-clarification-tasks-same-signature-derived-task-fabricated-ungrounded-cl-1789389264707
+
+### AC-136 · 3 needs-clarification tasks, same signature (manual::retryable-draft-block)
+Strength: Strong
+Files: src/agentic-draft-common.js
+
+Problem: The gate at line 713 blocks any diff that only touches documentation, regardless of whether the task's explicit deliverable *is* documentation. This causes a false positive for tasks that are correctly scoped as documentation/verification tasks, and the retry loop exhausts on a task that was already correct.
+Solution: Add a check in `src/agentic-draft-common.js` before the block at line 713: if the task's `rawText` or `promptContext` explicitly names a `docs/` file as the deliverable (e.g., "Create a new file docs/..."), allow the diff to proceed without blocking. Acceptance check: a new test in `src/agentic-draft-common.test.js` where the task's `rawText` is "Create a new file docs/verification.md recording the ground truth" and the diff only touches `docs/verification.md` should result in `blocked: false` and `adhocResolution: 'implemented'`.
+Benefits: Tasks that are correctly scoped as documentation/verification tasks will stop failing due to a false-positive "not a real implementation" block.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-3-needs-clarification-tasks-same-signature-manual-retryable-draft-block-1789395453456
+
+### AC-137 · on-demand task "adhoc-brain-dump-bd-1788686010195-aar-is-what-why-learn-not-what-so-what-n-178868881
+Strength: Strong
+Files: src/local-draft.js, src/chat-task-requeue.js
+
+Model confidence: Worth exploring
+Problem: The subject task was requeued to `adhoc/` after clarification resolution but never picked up by the draft worker, leaving it in `pending` state with no draft attempts. The draft worker's queue-polling logic may be filtering out tasks that were previously in `needs-clarification` or may have a bug in how it processes requeued tasks from the `adhoc/` directory.
+Solution: Add a diagnostic log to the draft worker's queue-polling loop that records every task it considers for dispatch, including its `currentState`, `domain`, and `history` length, to identify whether the subject task was seen but skipped or never seen at all. Acceptance check: After deploying the log, requeue a test task from `needs-clarification` to `adhoc/` and verify the log shows the task being considered for dispatch, then trace why it was not picked up.
+Benefits: This will reveal whether the draft worker is systematically ignoring requeued tasks from `needs-clarification`, which would explain why this class of tasks keeps failing to progress after human clarification.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-brain-dump-bd-1788686010195-aar-is-what-why-learn-not-what--1789699925981
