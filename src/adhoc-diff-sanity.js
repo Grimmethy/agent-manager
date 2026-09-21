@@ -78,14 +78,82 @@ const CODE_SIGNAL_RE = /\b(src|python|scripts|lib|app|dashboard|templates)\/|\.(
 // in this file, just applied to the blind-scan fallback path instead of a structured one.
 const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|handle|contain)s?|documented in|as (?:shown|described|documented|seen|specified) in|mentioned in|cited in|referenced in|defined in|lives? in|found in|per\b|see\b|(?:anchor|grounding) is real|confirmed (?:real|in)|the (?:real|grounding) (?:source|evidence))\b/i;
 
-function wantsCodeChange(combined) {
+// 2026-09-21 (needs-clarification clearing, in-app chat design review): the citation markers above cannot keep up with prose. Two genuine documentation tasks
+// (an AGENTS.md invariant note; a research note under docs/research/) were still blocked 3/3 by sentences that mention a code path only to say it is NOT to be touched
+// ("... not files to edit", "Do NOT modify any file under src/", "cited only as a grounding anchor, not an edit target"), that merely name one inside the text the
+// deliverable must contain ("the guard clause in src/foo.js"), or that are the pipeline's own boilerplate ("implement against it directly").
+// Enumerating more negative markers is unbounded, and dropping whole sentences would also wave through real code tasks ("Change the timeout in src/foo.js but do not touch
+// the tests"). An earlier draft that required an affirmative edit verb on EVERY path sentence broke real code tasks with unlisted verbs ("Combine job types into rows in
+// index.html"). So:
+//   1. negated verb phrases ("do not touch", "not files to edit", "does not implement") and the boilerplate are stripped from each sentence before the scan;
+//   2. with NO stated documentation deliverable the scan is exactly the legacy one (any remaining code signal wants code);
+//   3. only when the task positively states a documentation deliverable ("append ... to AGENTS.md", "create a new Markdown file at docs/...") do PATH-ONLY sentences
+//      (a code path with no edit verb and no code phrase) stop counting; a sentence with a phrase signal (implement, endpoint, new module, ...), an affirmative edit
+//      verb, or one that opens with an imperative ("Lazy-load the rows in index.html") on a code path still wants code.
+const CODE_PATH_SIGNAL_RE = /\b(?:src|python|scripts|lib|app|dashboard|templates)\/|\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
+const CODE_PHRASE_SIGNAL_RE = /\b(?:implement|endpoint|route|task source|new (?:module|file|source|helper)|render\w*\(|def \w+\(|function \w+|wire (?:it|this|the|in)|add .{0,25}(?:to|in|into) \w[\w./-]*\.(?:py|js|html|sh)|api route|backend|cursor module|sweep logic)\b/i;
+const AFFIRMATIVE_EDIT_VERB_RE = /\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix|create|write|refactor|extract|move|rename)\b/i;
+// A negator, up to three filler words, then an edit-ish verb: "do NOT modify", "not files to edit", "does not implement", "must not be edited".
+const NEGATED_VERB_RE = /\b(?:do\s*n[o']?t|don['’]t|does\s*n[o']?t|doesn['’]t|must\s+not|should\s+not|never|not|no)\b(?:\s+[\w'’-]+){0,3}?\s+(?:edit\w*|modif\w*|chang\w*|touch\w*|implement\w*|updat\w*|writ\w*|add\w*|alter\w*|delet\w*|creat\w*|replac\w*|rewrit\w*|insert\w*|remov\w*|fix\w*)\b/gi;
+// The sentence the needs-clarification picker appends to a human's answer ("This answer resolves the open question(s) above -- implement against it directly rather than
+// re-asking for clarification"): pipeline text, never a request to write code.
+const PIPELINE_BOILERPLATE_RE = /\bimplement against (?:it|this|that|the answer)\b[^.!?\n]*/gi;
+// An affirmative sentence whose object is a documentation file: "Append X to AGENTS.md", "Create a single NEW Markdown file at docs/research/x.md".
+const DOC_DELIVERABLE_RE = /\b(?:append|prepend|create|write|add|merge|insert|document|record|draft)\b[^.!?\n]{0,160}?(?:\.md\b|\.txt\b|\bdocs?\/|\bMarkdown\b|\bADR\b|\bREADME\b|\bAGENTS\b)/i;
+
+function stripNonRequests(sen) {
+  return sen.replace(NEGATED_VERB_RE, ' ').replace(PIPELINE_BOILERPLATE_RE, ' ');
+}
+
+// Scan one text: { docDeliverable, tripping: [code-signal sentences left after stripping citations, negations and boilerplate] }.
+function scanForCodeSignals(text) {
   // Split on sentence-ending punctuation only -- NOT a bare colon, unlike this file's
   // other sentence-scoped scans. A colon here routinely introduces elaboration that's
   // still part of the SAME citation ("The code anchor is real: src/foo.js defines ..."),
   // and splitting on it would separate the citation marker from the very code-signal
   // token it's meant to cover.
-  const sentences = String(combined || '').split(/(?<=[.!?])\s+|\n+/);
-  return sentences.some((sen) => CODE_SIGNAL_RE.test(sen) && !CITATION_CONTEXT_RE.test(sen));
+  const sentences = String(text || '').split(/(?<=[.!?])\s+|\n+/);
+  let docDeliverable = false;
+  const tripping = [];
+  for (const sen of sentences) {
+    if (CITATION_CONTEXT_RE.test(sen)) continue;
+    const cleaned = stripNonRequests(sen);
+    if (DOC_DELIVERABLE_RE.test(cleaned)) docDeliverable = true;
+    if (CODE_SIGNAL_RE.test(cleaned)) tripping.push(cleaned);
+  }
+  return { docDeliverable, tripping };
+}
+
+// A code PATH merely named, cited or described does not make a sentence a request -- but a sentence that OPENS WITH AN IMPERATIVE does, whatever the verb: "Lazy-load the job
+// rows in index.html", "Combine job types into expandable rows in index.html" (verbs no list will ever fully cover; caught in review of the first version of this gate, which
+// only honoured the listed verbs and so waved such a request through as documentation-only whenever a doc deliverable was also stated). Imperative = the first word is a plain
+// word (not a path, not a "Label:") that is not a determiner, pronoun, conjunction/copula or a documentation/citation verb (cite, describe, mention, ...): "The guard clause in
+// src/x.js", "It lives in src/x.js", "Cite src/x.js", "Files: src/x.js" and "src/x.js is cited ..." all stay non-requests. A wrong call here only blocks a documentation task
+// for a human look; the opposite mistake ships code as docs, so this leans to counting.
+const NON_IMPERATIVE_LEAD_RE = /^(?:(?:and|then|also|but|so|next|finally|plus)\s+)?(?:the|this|that|these|those|it|its|they|their|there|a|an|each|every|any|all|some|one|both|if|when|where|while|because|since|which|what|how|why|who|is|are|was|were|be|do|does|did|can|could|should|would|will|may|might|must|not|no|never|only|just|note|see|per|cite|cites|reference|mention|quote|describe|explain|state|list|include|link|summari[sz]e|name|refer|show|record|document|for|as|in|on|at|by|with|without|from|of)$/i;
+// ...AND it must aim the verb at a code file: "in / into / to / inside / within <path>.<code ext>" (an imperative that merely has a path somewhere in the sentence is not enough:
+// "Populate it with at least three rows: routes/chat.py:140-148 (...)" and "Decision 1: ... touching scripts/local-worker.sh" are documentation, and a first version of this
+// rule, dry-run over the real queue, flipped both). A "Label:" / "Decision 1:" lead is not a verb either.
+const TARGET_PATH_RE = /\b(?:in|into|to|inside|within)\s+(?:the\s+|its\s+|a\s+)?(?:[\w.-]+\/)*[\w.-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
+function opensWithImperative(c) {
+  const m = /^[\s>*\-\d.)]*([A-Za-z][A-Za-z-]*)(?=\s)/.exec(c);
+  return !!m && !NON_IMPERATIVE_LEAD_RE.test(m[1]) && TARGET_PATH_RE.test(c);
+}
+// A sentence still counts as asking for code when it has a phrase signal, an affirmative edit verb, or opens with an imperative.
+const requestsCode = (c) => CODE_PHRASE_SIGNAL_RE.test(c) || AFFIRMATIVE_EDIT_VERB_RE.test(c) || opensWithImperative(c);
+
+// rawText is the task's own (human / pipeline authored) text; combined is rawText + the drafting model's plan. When the raw text itself states a documentation deliverable it
+// GOVERNS: the plan of a documentation task is full of sentences describing what the document will cite or quote ("cite src/drift-scan.js and its runner function", a quoted
+// closing line that begins "Add ..."), which say nothing about what the task is asking for.
+function wantsCodeChange(combined, rawText = null) {
+  if (rawText) {
+    const raw = scanForCodeSignals(rawText);
+    if (raw.docDeliverable) return raw.tripping.some(requestsCode);
+  }
+  const all = scanForCodeSignals(combined);
+  if (!all.tripping.length) return false;
+  if (!all.docDeliverable) return true; // legacy behaviour, unchanged
+  return all.tripping.some(requestsCode);
 }
 
 // 2026-09-08, Grimmethy: "fix the gate" -- root-caused live (a docs-only checklist-tick
@@ -367,6 +435,19 @@ function tokenMentioned(token, summary) {
 
 // Returns null if the diff looks like a real, on-task implementation, else
 // { code, reason, retryFeedback }.
+// Does this task's text ask for a code change? The task's own "Files:" line is authoritative when present; otherwise the (negation-aware) scan above.
+function taskWantsCodeFromText(rawText, combined) {
+  const declaredFiles = extractDeclaredFiles(rawText);
+  return declaredFiles ? declaredFiles.some((p) => !isDocPath(p)) : wantsCodeChange(combined, rawText);
+}
+
+// Task-level form of the same decision (for the known-fixed-failures registry): the gate's verdict on `task` with a docs-only diff, without needing a diff.
+function taskWantsCodeChange(task) {
+  const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
+  const planText = (task && (task.planResponse || task.lastGoodPlan)) || '';
+  return taskWantsCodeFromText(rawText, `${rawText}\n${planText}`);
+}
+
 function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   if (!isAdhoc(task) || !String(rawDiff || '').trim()) return null;
   const rawText = (task.promptContext && task.promptContext.rawText) || task.title || '';
@@ -411,9 +492,7 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // path. Only falls back to CODE_SIGNAL_RE's blind scan when no Files: line exists.
   const nonDoc = files.filter((f) => !isDocPath(f.path));
   if (nonDoc.length === 0) {
-    const declaredFiles = extractDeclaredFiles(rawText);
-    const wantsCode = declaredFiles ? declaredFiles.some((p) => !isDocPath(p)) : wantsCodeChange(combined);
-    if (wantsCode) {
+    if (taskWantsCodeFromText(rawText, combined)) {
       return {
         code: 'docs-only',
         reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,
@@ -509,5 +588,5 @@ function adhocNoChangesClaimProblem(task, summary) {
 
 module.exports = {
   adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
-  extractDeclaredTargets, pathsRefEqual,
+  extractDeclaredTargets, pathsRefEqual, taskWantsCodeChange,
 };

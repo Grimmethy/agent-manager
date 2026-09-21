@@ -67,6 +67,18 @@ const KNOWN_FIXED = [
     // Only the victims that predate the stamp (no blockedStage): a task that already carries one is handled by the sweep itself.
     applies: (task) => !task.blockedStage && /Implement pass degenerate/.test(failureText(task)),
   },
+  {
+    id: 'docs-only-gate-negated-paths',
+    fixedIn: 'agent-manager (docs-only gate: negated / cited / boilerplate path mentions, 2026-09-21)',
+    description: 'adhoc-diff-sanity blocked a CORRECT docs-only diff ("the task asks for a code change") because the task text mentioned code paths only to say they are NOT to be edited, or because the model plan described what the document will cite',
+    dirs: ['blocked', 'needs-clarification'],
+    // The failure text AND a structural precondition: the fixed gate would no longer read this task as asking for code (a task that really wants code stays put).
+    applies: (task) => {
+      const t = failureText(task);
+      if (!/only (?:touches|created\/edited) documentation/.test(t) || !/code change/.test(t)) return false;
+      try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
+    },
+  },
 ];
 
 module.exports = { KNOWN_FIXED, failureText };
