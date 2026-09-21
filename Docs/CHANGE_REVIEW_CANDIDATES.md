@@ -168,6 +168,40 @@ Problem: [severity: med; regression shipped in 7142ca5] New helper `windowSectio
 Solution: When `truncated` is true, compute `returnedThrough` as the index of the last `\n` in the truncated `slice` (i.e. `slice.lastIndexOf('\n') + 1`, 1-based) and set `nextOffset` to `returnedThrough + 1` instead of `endLine + 1`, so the caller resumes at the first line that was actually cut off rather than jumping past the entire un-truncated window.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 7142ca5.
 
+### AC-51 · The new file's join separator is `'\n \n'` (newline, space, newline) while its own comment (df6f704 decode-group-b-content.js)
+Strength: Strong
+Source: change_review of df6f704 "Merge pull request #1 from Grimmethy/review-pipeline-hardening"
+Files: src/decode-group-b-content.js
+
+Snippet:
+```
+diff --git a/docs/ornith-delegation.md b/docs/ornith-delegation.md
+index 8f7017c0..190d5191 100644
+--- a/docs/ornith-delegation.md
++++ b/docs/ornith-delegation.md
+@@ -1186,12 +1186,212 @@ earlier finding's successes were all corrections **with the full original contex
+ alongside the fix** (a complete corrected plan handed back, not just a diff instruction).
+ A bare "here's the bug, fix just that" prompt — with the rest of the task left implicit,
+ assumed still in scope from a prior turn — is a different, riskier shape and produced the
+ worst fabrication in this specific delegation. **When sending a task back for correction,
+ always re-include the full original spec/prior-good-output verbatim in the same prompt,
+ never just the delta** — this matches `agent-manager`'s own `queue-watchdog.ps1` reject-retry
+ design (a fresh `pending/` requeue re-runs the *whole* Plan→Implement→Critique chain from
+ the task's full original spec, not a patch instruction against the rejected draft) rather
+ than the ad hoc raw-curl pattern used here, which is the more likely reason this pipeline's
+ existing retry path hasn't hit this exact failure yet. Reinforces the CLAUDE.md-level
+ decision (2026-07-27) to route delegations through this pipeline's adhoc queue instead of
+ raw one-off calls going forward.
++
++## Update 2026-07-28: "create new file" treated as "edit existing file," and a self-disclosed 90%-incomplete draft still got 3/3 APPROVE
++
++First real task routed through this pipeline's adhoc q
+```
+
+Problem: [severity: med; regression shipped in df6f704] The new file's join separator is `'\n \n'` (newline, space, newline) while its own comment and file header state the invariant is a NUL-delimited join whose separator "cannot appear in real source code"; because `\n \n` is a valid sequence in real source text, a fixed literal can falsely span two originally-separate fields, defeating the anti-spanning guarantee the fixedLiterals gate relies on.  Failure scenario: Input file contains the JSON `[{"content":"abc"},{"find":"\ndef"}]`. After `parseJsonMaybeFenced`, parts = `["abc", "\ndef"]` (second element begins with a real 0x0A). `parts.join('\n \n')` yields the string `abc` + `\n \n` + `\ndef` = `abc\n \n\ndef`. A fixed literal of `abc\n \ndef` (a perfectly valid three-line snippet: line "abc", a whitespace-only line containing one space, line "def") is a substring of that output, so the gate reports the literal as present. Yet neither `"abc"` nor `"\ndef"` individually contains `abc\n \ndef` — the match is entirely an artifact of the join boundary. With the intended `'\0'` separator the join would be `abc\0\ndef`, and `abc\n \ndef` would not match.
+Solution: Change line 31 from `parts.join('\n \n')` to `parts.join('\0')` so the separator is an actual NUL byte (0x00), which cannot appear in valid UTF-8 source text, restoring the stated invariant.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in df6f704.
+
 ### AC-52 · `api_brain_dump_capture` calls `.get("serial")` on every entry with no `isinstance(e, dict)` guard (f3d1441 routes/brain_dump.py)
 Strength: Strong
 Source: change_review of f3d1441 "Assign a stable serial number to Brain Dump entries" (re-verified against current master 2026-09-21: the handler now lives in routes/brain_dump.py)
