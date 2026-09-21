@@ -465,3 +465,53 @@ test('forbidden-path: a real prohibition that happens to mention a check command
 test('forbidden-path: a terse restriction with no verification markers still forbids (unchanged behaviour)', () => {
   assert.ok(extractForbiddenPaths('Fix the tab. No other files under src/ may be modified.').includes('src/'));
 });
+
+// --- 2026-09-21: a documentation task must not be blocked because it MENTIONS code paths (needs-clarification clearing) ------------------------------------------------
+// Two real tasks were blocked 3/3 with "the task asks for a code change" although the human had answered that they were documentation tasks: the blind scan counted sentences
+// that name a code path only to say it is NOT to be edited, that a document must quote, or the pipeline's own "implement against it directly" boilerplate.
+const DOC_TASK_PREFIX = 'Append a new section to AGENTS.md. ';
+const docOnlyBlocks = (rawText, plan) => {
+  const p = adhocDiffSubstanceProblem(adhoc(rawText, plan), editDiff('AGENTS.md'));
+  return !!(p && p.code === 'docs-only');
+};
+
+test('doc task: negated, cited and boilerplate mentions of code paths do not make a documentation task want code', () => {
+  for (const sen of [
+    'Do NOT modify any file under src/.',
+    'scripts/check-doc-link.sh and src/doc-accuracy-check.js are named only as existing enforcement mechanisms to MENTION in the note, not files to edit.',
+    'src/reclaim-orphaned-drafts.js is cited only as a grounding anchor for the note, not an edit target.',
+    'This piece is research/documentation only and does not implement the cap.',
+    'The note must end with a single actionable recommendation (the guard clause in src/reclaim-orphaned-drafts.js), not a menu of options.',
+    'This answer resolves the open question(s) above -- implement against it directly rather than re-asking for clarification.',
+  ]) assert.equal(docOnlyBlocks(DOC_TASK_PREFIX + sen), false, sen);
+});
+
+test('doc task: REAL code requests still want code even in a task that also has a doc deliverable, incl. sentences that also contain a negation', () => {
+  for (const sen of [
+    'Change the timeout in src/foo.js but do not touch the tests.',
+    'add a function to src/x.js, documentation only in the comment',
+    'Update the retry cap in src/a.js; this is not a documentation task.',
+    'In src/local-draft.js, immediately before the try block, add exactly:',
+    'Refactor src/a.js, do not touch src/b.js',
+    'Implement retry logic in the worker.',
+  ]) assert.equal(docOnlyBlocks(DOC_TASK_PREFIX + sen), true, sen);
+});
+
+test('doc task: with NO stated documentation deliverable the legacy scan is unchanged (a path-only sentence still wants code)', () => {
+  assert.equal(docOnlyBlocks('Combine job types into expandable rows in python/dashboard/templates/index.html.'), true);
+  assert.equal(docOnlyBlocks('Tidy the startup path in src/boot.js.'), true);
+});
+
+test('doc task: when the RAW text states a documentation deliverable it governs; the model plan describing what the note will cite does not flip it', () => {
+  const raw = 'Create a single NEW Markdown file at docs/research/precedent.md. Do NOT modify any file under src/. The note must end with one recommendation (the guard clause in src/reclaim.js), not a menu.';
+  const plan = [
+    '- `drift-scan` in `src/` (20 hits; cite `src/drift-scan.js` and its `scan`/runner function by name).',
+    '**Closing line**: "Add the poison-pill guard clause to the top of `reclaimOrphanedDrafts` in `src/reclaim.js:41`."',
+    'Show the exact check to insert at the top of `reclaimOrphanedDrafts` in `src/reclaim.js:41`.',
+  ].join('\n');
+  const p = adhocDiffSubstanceProblem(adhoc(raw, plan), createDiff('docs/research/precedent.md'));
+  assert.equal(p, null, 'a docs-only diff is the deliverable');
+  // ...but a plan that asks for code does NOT rescue a raw text with no doc deliverable
+  const p2 = adhocDiffSubstanceProblem(adhoc('Make the reclaimer cap retries.', 'Edit src/reclaim.js to add the cap.'), createDiff('docs/research/precedent.md'));
+  assert.equal(p2 && p2.code, 'docs-only');
+});

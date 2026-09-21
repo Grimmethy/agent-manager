@@ -186,3 +186,29 @@ test('implement-degenerate-invisible-block drains the stuck task back to pending
   assert.deepEqual(s.requeued.map((r) => r.id), ['victim']);
   assert.equal(has(dir, 'pending', 'victim'), true);
 });
+
+// --- docs-only-gate-negated-paths (2026-09-21) ---------------------------------------------------------------------------------------------
+// A correct docs-only diff was blocked "the task asks for a code change" because the task text named code paths only to say they are NOT to be edited.
+const DOCS_ONLY_FAIL = 'Your diff only created/edited documentation (AGENTS.md). That is not the deliverable -- the task asks for a real code change. Implement the actual change in the file(s) the plan/task names.';
+const docsTask = (id, rawText) => stuck(id, {
+  domain: 'adhoc', source: 'manual', promptContext: { rawText }, planResponse: '',
+  needsClarification: { reason: 'design-decision', openQuestions: DOCS_ONLY_FAIL },
+  history: [{ stage: 'exhausted', at: '2026-09-20T05:00:00Z', detail: '3/3' }, { stage: 'needs-clarification', at: '2026-09-20T05:00:01Z', detail: 'escalated' }],
+});
+
+test('docs-only-gate-negated-paths matches a documentation task whose text only mentions code paths, NOT a task that really asks for code', () => {
+  const e = byId['docs-only-gate-negated-paths'];
+  assert.equal(e.applies(docsTask('doc', 'Append a new section to AGENTS.md. Do NOT modify any file under src/. The two scripts (scripts/check.sh, src/x.js) are named inside the note only, not files to edit.')), true);
+  assert.equal(e.applies(docsTask('code', 'Append a note to AGENTS.md and change the timeout in src/foo.js.')), false, 'a task that really asks for a code change stays put');
+  assert.equal(e.applies(stuck('other', { domain: 'adhoc', source: 'manual', promptContext: { rawText: 'Append to AGENTS.md.' }, needsClarification: { reason: 'design-decision', openQuestions: 'The draft cites a file that does not exist.' } })), false, 'a different failure');
+});
+
+test('docs-only-gate-negated-paths drains the retry-exhausted documentation task and leaves the real-code one', () => {
+  const dir = pipeline();
+  put(dir, 'needs-clarification', docsTask('doc', 'Append a new section to AGENTS.md. Do NOT modify any file under src/.'));
+  put(dir, 'needs-clarification', docsTask('code', 'Append a note to AGENTS.md and change the timeout in src/foo.js.'));
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['docs-only-gate-negated-paths']] });
+  assert.deepEqual(s.requeued.map((r) => r.id), ['doc']);
+  assert.equal(has(dir, 'adhoc', 'doc'), true);
+  assert.equal(has(dir, 'needs-clarification', 'code'), true);
+});
