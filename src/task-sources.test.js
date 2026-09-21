@@ -3171,3 +3171,47 @@ test('product_spec_section: consumes the outline doc top-to-bottom, one Strong A
   assert.equal(task.promptContext.specRelPath, path.join('Docs', 'PRODUCT_SPEC.md'));
   assert.ok(task.promptContext.fetchedFiles.some((f) => f.path === 'server/app.py' && f.content.includes('def generate')));
 });
+
+// --- derived findings are HELD while an overlapping open task exists (2026-09-21, PF; see derived-gate.js) -----------------------------------
+function writeDerivedFixture(dir, id, rawText, extra = {}) {
+  const derivedDir = path.join(dir, 'queue', 'derived');
+  fs.mkdirSync(derivedDir, { recursive: true });
+  fs.writeFileSync(path.join(derivedDir, `${id}.json`), JSON.stringify({
+    id, title: id, source: 'derived_task', domain: 'adhoc', createdAt: new Date().toISOString(), promptContext: { rawText }, ...extra,
+  }));
+}
+
+test('nextDerivedTask skips past a derived finding held by an open overlapping task and takes the next one (the lane is never blocked)', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'adhoc'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'adhoc', 'hub-child.json'), JSON.stringify({ id: 'hub-child', source: 'manual', domain: 'adhoc', createdAt: '2026-09-21T00:00:00.000Z', promptContext: { rawText: 'Edit src/components/PropertyAerialView.tsx' } }));
+  writeDerivedFixture(dir, 'held-finding', 'tile math is duplicated in src/components/PropertyAerialView.tsx');
+  writeDerivedFixture(dir, 'free-finding', 'a stale comment in docker-compose.yml');
+  const { nextDerivedTask } = freshTaskSources(dir);
+  const task = nextDerivedTask();
+  assert.ok(task, 'the lane still gets work');
+  assert.equal(task.id, 'free-finding');
+});
+
+test('nextDerivedTask releases the held finding once the overlapping task is gone', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'adhoc'), { recursive: true });
+  const blockerPath = path.join(dir, 'queue', 'adhoc', 'hub-child.json');
+  fs.writeFileSync(blockerPath, JSON.stringify({ id: 'hub-child', source: 'manual', domain: 'adhoc', createdAt: '2026-09-21T00:00:00.000Z', promptContext: { rawText: 'Edit src/components/PropertyAerialView.tsx' } }));
+  writeDerivedFixture(dir, 'held-finding', 'tile math is duplicated in src/components/PropertyAerialView.tsx');
+  let { nextDerivedTask } = freshTaskSources(dir);
+  assert.equal(nextDerivedTask(), null, 'held while the open task names the same file');
+  fs.unlinkSync(blockerPath);
+  ({ nextDerivedTask } = freshTaskSources(dir));
+  assert.equal(nextDerivedTask().id, 'held-finding');
+});
+
+test('the hold applies to the derived source only: an adhoc task is never held by an overlapping one', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'adhoc'), { recursive: true });
+  for (const [id, at] of [['first', '2026-09-21T00:00:00.000Z'], ['second', '2026-09-21T01:00:00.000Z']]) {
+    fs.writeFileSync(path.join(dir, 'queue', 'adhoc', `${id}.json`), JSON.stringify({ id, source: 'manual', domain: 'adhoc', createdAt: at, promptContext: { rawText: 'Edit src/App.tsx' } }));
+  }
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.ok(nextAdhocTask(), 'overlapping adhoc tasks still run');
+});

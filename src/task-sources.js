@@ -29,6 +29,7 @@ const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { hubOrderKeyForTask, compareHubKeys, hubHasUnmergedEarlierSibling } = require('./hub-priority.js');
+const derivedGate = require('./derived-gate.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
 const debriefBundle = require('./debrief-bundle.js');
@@ -461,6 +462,7 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       return a.mtime - b.mtime;
     });
 
+  let derivedHoldIndex = null; // built lazily, once per call, only when the derived directory is being scanned
   for (const f of files) {
     const parsed = f.parsed;
     if (!parsed) continue;
@@ -494,6 +496,12 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
     // sibling's code actually being visible where THIS candidate will draft/review.
     if (hubHasUnmergedEarlierSibling(pipelineDir, parsed).blocked) {
       continue;
+    }
+    // A derived finding is HELD (skipped this call, never dropped) while another open code-changing task names the same file: it was raised about a
+    // moving target (usually that very task's unmerged work) and is re-judged, by derived-premise-sweep.js, once that task ends. See derived-gate.js.
+    if (dir === 'derived') {
+      if (!derivedHoldIndex) derivedHoldIndex = derivedGate.openTaskIndex(pipelineDir);
+      if (derivedGate.isHeld(parsed, derivedHoldIndex).held) continue;
     }
 
     // Spread the WHOLE file through, then force only the fields this source's contract

@@ -192,6 +192,13 @@ while :; do
     fix_signature_result="$(node "${PACKAGE_SRC_DIR}/fix-signature-sweep.js" 2>>"${HOME_LOGS}/fix-signature-sweep.log")"
     printf '[watchdog] fix-signature-sweep: %s\n' "$fix_signature_result" >&2
 
+    # Derived-finding premise sweep (2026-09-21, PF: 33 of 35 abandoned tasks died within 12 h, median 1.3 h -- findings about a fast-moving project go
+    # stale before they are worked). Deterministic, no model: retires a derived_task whose raising task was abandoned, or whose cited files are ALL
+    # gone from the working tree / origin/main, before a lane drafts it; also reports the ones held behind an overlapping open task. See
+    # derived-gate.js. Kill switches AGENT_MANAGER_DERIVED_PREMISE_SWEEP=false, AGENT_MANAGER_DERIVED_HOLD=false.
+    derived_premise_result="$(node "${PACKAGE_SRC_DIR}/derived-premise-sweep.js" 2>>"${HOME_LOGS}/derived-premise-sweep.log")"
+    printf '[watchdog] derived-premise-sweep: %s\n' "$derived_premise_result" >&2
+
     # Blocked-cluster sweep (2026-09-12, screaminggoatclubmt: "we have 4 separate instances
     # with a bespoke solution each... a way to combine these patterns"): the concrete,
     # buildable half of that question -- normalizes queue/blocked/'s blockedReason text
