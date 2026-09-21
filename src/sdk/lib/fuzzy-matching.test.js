@@ -87,3 +87,36 @@ test('suffix match: two declarations of the same name -> no guess, the estimate 
   assert.equal(m.partial, 'suffix');
   assert.ok(!file.slice(m.index).trimStart().startsWith('function bigBody(other)'), 'did not latch onto the wrong declaration');
 });
+
+// --- a small-fraction partial match is a guess, and is reported as one (review of PR #436) --------------------------------------------------------------------------------------
+// findPartialMatch tries 0.75/0.5/0.35/0.25/0.15 of the snippet. A hit that only matched the 0.25 / 0.15 tier used to come out as confidence 'strong' exactly like a whole-snippet match.
+const SNIP_SECTION = (snippet, prose = '') => `### AC-9 · Decompose bigBody\nFiles: src/x.js\nSnippet:\n\`\`\`\n${snippet}\n\`\`\`\n${prose}\nProblem: it is long.`;
+// Drift near BOTH ends, so only a short middle piece (well under 30% of the snippet) still matches.
+const shortPartialFile = () => {
+  const d = BLOCK.split('\n');
+  d.splice(8, 0, '  // drift near the start');
+  d.splice(d.length - 8, 0, '  // drift near the end');
+  return fileWith(d.join('\n'));
+};
+
+test('a small-fraction partial match places the window but is weak, with the low-confidence note -- not strong, and not none (a task is not parked for it)', () => {
+  const w = windowFetchedFileContent(shortPartialFile(), SNIP_SECTION(BLOCK));
+  assert.equal(w.confidence, 'weak');
+  assert.equal(w.usedSnippetFuzzyMatch, true);
+  assert.match(w.text, /^\[LOW-CONFIDENCE GROUNDING/);
+  assert.ok(w.text.includes('const valuea20 ='), 'the window is still centred on the located code, not head-truncated');
+});
+
+test('a quoted symbol corroborates a small-fraction partial match, keeping it strong -- whether it lands on the SAME hit (valuea1) or on another part of the code (valuea20)', () => {
+  for (const sym of ['valuea1', 'valuea20']) {
+    const w = windowFetchedFileContent(shortPartialFile(), SNIP_SECTION(BLOCK, `The function \`${sym}\` is the problem.`));
+    assert.equal(w.confidence, 'strong', sym);
+  }
+});
+
+test('a partial match of at least ~30% of the snippet stays strong (the drift-in-the-middle case above)', () => {
+  const stale = BLOCK.split('\n');
+  stale.splice(20, 0, '  // a comment added after the candidate was written');
+  const w = windowFetchedFileContent(fileWith(stale.join('\n')), SNIP_SECTION(BLOCK));
+  assert.equal(w.confidence, 'strong');
+});
