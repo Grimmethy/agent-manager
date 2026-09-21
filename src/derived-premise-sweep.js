@@ -96,7 +96,7 @@ function sweepDerivedPremise({ pipelineDir, repoRoot, mainBranch = 'main', extra
   return summary;
 }
 
-module.exports = { sweepDerivedPremise, CASCADE_STATES, PREMISE_STATES };
+module.exports = { sweepDerivedPremise, refreshMain, CASCADE_STATES, PREMISE_STATES };
 
 if (require.main === module) {
   const { getConfig } = require('./config.js');

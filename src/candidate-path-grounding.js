@@ -75,11 +75,32 @@ function resolveCitedFile(repoRoot, claimed, extraRoots = []) {
 // component"), globs ("src/*") and dotfiles are skipped so they can't become false "fabricated" blocks.
 const FILE_LIKE_ENTRY = /^[A-Za-z_][\w.-]*(?:\/[\w.-]+)*$/;
 
+// 2026-09-21 (PF arch-discovery-community-5): the working tree is MUTABLE. The shared checkout sat on a stale `agent/triage-queue` branch (no
+// dealCsv.ts) while a draft ran, so three real files read as "fabricated", the block was made non-retryable, and a valid task died. A path is
+// only invented if it is missing from the working tree AND from origin/<main> (git's object database, immune to whatever branch the checkout
+// happens to be on). Returns the repo-relative path it resolves to at that ref, or null. Never throws; an unreadable ref reads as "not found",
+// which leaves the working-tree verdict in force. Kill switch: AGENT_MANAGER_CANDIDATE_GROUNDING_MAIN_REF=false.
+function mainRefEnabled() { return process.env.AGENT_MANAGER_CANDIDATE_GROUNDING_MAIN_REF !== 'false'; }
+function resolveCitedFileAtMain(repoRoot, claimed, extraRoots = [], mainBranch = null) {
+  const claimedPath = cleanEntry(claimed);
+  if (!claimedPath || !repoRoot || !mainRefEnabled()) return null;
+  try {
+    const { resolveAtRef } = require('./stacked-grounding.js');
+    const branch = mainBranch || require('./git-runner.js').detectDefaultBranch(repoRoot);
+    const tries = path.extname(claimedPath) ? [claimedPath] : PROBE_EXTENSIONS.map((e) => claimedPath + e);
+    for (const t of tries) {
+      const hit = resolveAtRef(repoRoot, branch, t, extraRoots);
+      if (hit) return hit;
+    }
+  } catch { /* fall through: not found */ }
+  return null;
+}
+
 // (filesLine, repoRoot, extraRoots) -> { fabricated: [{claimedPath, exists, ...}], checked: [...] }
 // extraRoots is fact-checker.js's own param shape: repoRoot-relative code dirs
 // (getConfig().grepAllowedDirs) so `Files: local-client.js` still resolves to
 // `src/local-client.js` and is NOT flagged.
-function checkCitedPaths(filesLine, repoRoot, extraRoots = []) {
+function checkCitedPaths(filesLine, repoRoot, extraRoots = [], { mainBranch = null } = {}) {
   if (!filesLine || !repoRoot) return { fabricated: [], checked: [] };
   const checked = checkFilePaths(filesLine, repoRoot, extraRoots);
   // Extension-less entries (see resolveCitedFile's header): the regex above never sees them.
@@ -91,8 +112,22 @@ function checkCitedPaths(filesLine, repoRoot, extraRoots = []) {
     const r = resolveCitedFile(repoRoot, entry, extraRoots);
     checked.push({ claimedPath: entry, exists: r.exists, resolvedPath: r.resolvedPath, resolvedVia: r.resolvedVia });
   }
+  // Rescue: a working-tree miss that exists at origin/<main> is not invented (see resolveCitedFileAtMain).
+  for (const r of checked) {
+    if (r.exists !== false) continue;
+    const hit = resolveCitedFileAtMain(repoRoot, r.claimedPath, extraRoots, mainBranch);
+    if (hit) { r.exists = true; r.resolvedPath = path.join(repoRoot, hit); r.resolvedVia = 'origin-main'; }
+  }
   const fabricated = checked.filter((r) => r.exists === false);
   return { fabricated, checked };
+}
+
+// Inverse of formatFabricatedReason: the paths a "fabricated file path(s): a, b -- not present anywhere in the target repo" reason names,
+// matched against that exact producer (never a looser pattern, so it can't fire on another gate's wording). [] when it isn't one.
+const FABRICATED_REASON_RE = /fabricated file path\(s\):\s*(.+?)\s*--\s*not present anywhere in the target repo/i;
+function parseFabricatedPaths(text) {
+  const m = FABRICATED_REASON_RE.exec(String(text || ''));
+  return m ? m[1].split(',').map((x) => x.trim()).filter(Boolean) : [];
 }
 
 // Rewrites each Files: entry that resolves to a real FILE by anything other than its exact
@@ -260,6 +295,8 @@ function formatSymbolWarnings(fabricated) {
 
 module.exports = {
   resolveCitedFile,
+  resolveCitedFileAtMain,
+  parseFabricatedPaths,
   normalizeFilesLine,
   symbolCheckBlocks,
   formatSymbolWarnings,

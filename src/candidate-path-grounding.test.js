@@ -301,3 +301,68 @@ test('normalizeFilesLine: rewrites bare/extension-less entries to the real path;
   assert.equal(normalizeFilesLine('', repo, ['src']), '');
   fs.rmSync(repo, { recursive: true, force: true });
 });
+
+// --- origin/<main> rescue (2026-09-21, PF arch-discovery-community-5) ---------------------
+// A real bare origin + clone, with the checkout then moved to a stale branch that lacks the file: the exact incident shape.
+const { execFileSync } = require('child_process');
+const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+
+function staleCheckoutRepo() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cpg-main-'));
+  const origin = path.join(root, 'origin.git');
+  const work = path.join(root, 'work');
+  git(root, 'init', '-q', '--bare', '-b', 'main', origin);
+  git(root, 'clone', '-q', origin, work);
+  git(work, 'config', 'user.email', 't@t'); git(work, 'config', 'user.name', 't');
+  fs.mkdirSync(path.join(work, 'src', 'lib'), { recursive: true });
+  fs.writeFileSync(path.join(work, 'README.md'), 'x\n');
+  git(work, 'add', '-A'); git(work, 'commit', '-qm', 'base'); git(work, 'push', '-q', 'origin', 'HEAD:main');
+  git(work, 'branch', 'stale');                                  // a branch cut BEFORE the file exists
+  fs.writeFileSync(path.join(work, 'src', 'lib', 'dealCsv.ts'), '// real\n');
+  git(work, 'add', '-A'); git(work, 'commit', '-qm', 'add dealCsv'); git(work, 'push', '-q', 'origin', 'HEAD:main');
+  git(work, 'checkout', '-q', 'stale');                          // the shared checkout is left here
+  return { root, work };
+}
+
+test('checkCitedPaths: a file missing from a stale working tree but present on origin/main is NOT fabricated', () => {
+  const { root, work } = staleCheckoutRepo();
+  assert.ok(!fs.existsSync(path.join(work, 'src', 'lib', 'dealCsv.ts')), 'premise: the working tree lacks the file');
+  const { fabricated, checked } = checkCitedPaths('src/lib/dealCsv.ts', work, []);
+  assert.deepEqual(fabricated, []);
+  assert.equal(checked[0].resolvedVia, 'origin-main');
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('checkCitedPaths: a path on neither the working tree nor origin/main is STILL fabricated', () => {
+  const { root, work } = staleCheckoutRepo();
+  const { fabricated } = checkCitedPaths('src/lib/dealCsv.ts, src/lib/invented.ts', work, []);
+  assert.deepEqual(fabricated.map((f) => f.claimedPath), ['src/lib/invented.ts']);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('checkCitedPaths: an extension-less entry that exists on origin/main is rescued too', () => {
+  const { root, work } = staleCheckoutRepo();
+  assert.deepEqual(checkCitedPaths('src/lib/dealCsv', work, []).fabricated, []);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('checkCitedPaths: AGENT_MANAGER_CANDIDATE_GROUNDING_MAIN_REF=false restores the working-tree-only verdict', () => {
+  const { root, work } = staleCheckoutRepo();
+  process.env.AGENT_MANAGER_CANDIDATE_GROUNDING_MAIN_REF = 'false';
+  try {
+    assert.equal(checkCitedPaths('src/lib/dealCsv.ts', work, []).fabricated.length, 1);
+  } finally { delete process.env.AGENT_MANAGER_CANDIDATE_GROUNDING_MAIN_REF; }
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('checkCitedPaths: a non-git repo root keeps the old verdict (no throw)', () => {
+  const repo = tmpRepo();
+  assert.equal(checkCitedPaths('src/made-up.js', repo, ['src']).fabricated.length, 1);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('parseFabricatedPaths: inverts formatFabricatedReason and ignores other wording', () => {
+  const reason = formatFabricatedReason([{ claimedPath: 'a/b.ts' }, { claimedPath: 'c.ts' }]);
+  assert.deepEqual(require('./candidate-path-grounding.js').parseFabricatedPaths(`Ungrounded draft: ${reason}`), ['a/b.ts', 'c.ts']);
+  assert.deepEqual(require('./candidate-path-grounding.js').parseFabricatedPaths('fabricated symbol citation(s): `x` -- not found'), []);
+});
