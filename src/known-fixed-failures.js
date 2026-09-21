@@ -68,7 +68,9 @@ function citedCodeMovedAndRelocatable(task) {
     for (const f of declared) {
       const full = path.resolve(root, f.path);
       if (full !== root && !full.startsWith(root + path.sep)) return false;
-      if (!snippetMissingFrom(fs.readFileSync(full, 'utf8'), pc.body)) continue;
+      let text = '';
+      try { text = fs.readFileSync(full, 'utf8'); } catch (e) { if (!e || e.code !== 'ENOENT') throw e; } // a renamed / deleted cited file counts as "the snippet is not there"
+      if (!snippetMissingFrom(text, pc.body)) continue;
       const hit = relocateStaleAnchor(root, f.path, pc.body);
       if (!hit || windowFetchedFileContent(hit.content, pc.body).confidence !== 'strong') return false;
       moved += 1;

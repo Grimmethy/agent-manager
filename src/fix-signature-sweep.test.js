@@ -289,6 +289,11 @@ test('cited-code-moved-relocated matches a task whose declared file lost the Sni
     assert.equal(e.applies(mk(sec('diff --git a/src/x.js b/src/x.js\n--- a/src/x.js\n+++ b/src/x.js\n@@ -1,2 +1,3 @@\n a\n+b'))), false, 'a diff-shaped Snippet');
     fs.writeFileSync(path.join(root, 'src', 'routes', 'copy.js'), `${pad('c')}\n${block}\n`);
     assert.equal(e.applies(mk(sec(block))), false, 'two files contain it: ambiguous, never guessed');
+    fs.unlinkSync(path.join(root, 'src', 'routes', 'copy.js'));
+    fs.unlinkSync(path.join(root, 'src', 'old.js'));
+    assert.equal(e.applies(mk(sec(block))), true, 'the cited file was renamed away entirely (read fails): still followed to the one file that has the code');
+    fs.writeFileSync(path.join(root, 'src', 'routes', 'new.js'), `${pad('n')}\n${block.split('\n').slice(0, 16).join('\n')}\n  // rest differs\n${pad('z')}\n`);
+    assert.equal(e.applies(mk(sec(block))), false, 'a file sharing only the snippet\'s prologue is not where the code moved');
   } finally {
     for (const [k, v] of [['AGENT_MANAGER_REPO_ROOT', saved.r], ['AGENT_MANAGER_PIPELINE_DIR', saved.p]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }

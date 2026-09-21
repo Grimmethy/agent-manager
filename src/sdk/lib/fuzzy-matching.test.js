@@ -241,3 +241,60 @@ test('refreshCandidateFetchedFiles relocates even when the cited file still wind
     delete require.cache[require.resolve('../../config.js')];
   }
 });
+
+// --- review of PR #437 -------------------------------------------------------------------------------------------------------------------------------------------------------
+// (1) relocation accepts the WHOLE snippet only: a unique prologue/tail in an unrelated file is a coincidence, not where the code moved.
+test('relocateStaleAnchor: a file that shares only the snippet\'s unique PROLOGUE (or tail) is not a relocation target', () => {
+  const root = movedRepo();
+  fs.unlinkSync(path.join(root, 'src', 'moved.js'));                       // the real destination does not exist any more in this scenario
+  const body = BLOCK.split('\n');
+  const prologueOnly = [...body.slice(0, 16), '  // ...but the rest of this function is entirely different code', ...lines(30, 'other'), '}'].join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'lookalike.js'), `${prologueOnly}\n`);
+  assert.ok(findFuzzyMatch(fs.readFileSync(path.join(root, 'src', 'lookalike.js'), 'utf8'), BLOCK), 'premise: the prefix fallback WOULD accept this file');
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', SECTION), null, 'not guessed');
+  const tailOnly = ['function somethingElse() {', ...lines(12, 'q'), ...body.slice(-22)].join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'lookalike.js'), `${tailOnly}\n`);
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', SECTION), null, 'a shared tail is not a relocation either');
+});
+
+test('relocateStaleAnchor: a moved snippet that ALSO drifted (whole-snippet match fails) is declined, not guessed', () => {
+  const root = movedRepo();
+  const drifted = BLOCK.split('\n');
+  drifted.splice(30, 0, '  // added after the move');
+  fs.writeFileSync(path.join(root, 'src', 'moved.js'), `${drifted.join('\n')}\n`);
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', SECTION), null);
+});
+
+// (2) a cited file that was RENAMED / deleted is followed too (it used to fail the file read and be left as is).
+test('refreshCandidateFetchedFiles follows the code when the cited file itself no longer exists; a context file or a miss is left untouched', () => {
+  const root = movedRepo();
+  fs.unlinkSync(path.join(root, 'src', 'old.js'));
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = root;
+  delete require.cache[require.resolve('../../config.js')];
+  try {
+    const { refreshCandidateFetchedFiles } = require('../../local-draft.js');
+    const task = { source: 'function_length_fix', history: [], promptContext: { body: SECTION, files: ['src/old.js'], fetchedFiles: [
+      { path: 'src/old.js', anchorConfidence: 'none', content: 'stale' },
+      { path: 'src/gone-ctx.js', context: true, anchorConfidence: 'none', content: 'ctx' },
+    ] } };
+    refreshCandidateFetchedFiles(task);
+    assert.equal(task.promptContext.fetchedFiles[0].path, 'src/moved.js');
+    assert.equal(task.promptContext.fetchedFiles[0].relocatedFrom, 'src/old.js');
+    assert.equal(task.promptContext.fetchedFiles[1].content, 'ctx', 'a context file is never touched');
+
+    const miss = { source: 'function_length_fix', history: [], promptContext: { body: SECTION.replace(/const value/g, 'const other'), files: ['src/old.js'], fetchedFiles: [{ path: 'src/old.js', anchorConfidence: 'none', content: 'stale' }] } };
+    refreshCandidateFetchedFiles(miss);
+    assert.deepEqual(miss.promptContext.fetchedFiles[0], { path: 'src/old.js', anchorConfidence: 'none', content: 'stale' }, 'no relocation found: the entry is left exactly as it was');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+    delete require.cache[require.resolve('../../config.js')];
+  }
+});
+
+test('relocateStaleAnchor: a short (non-distinctive) snippet is never followed to another file', () => {
+  const root = movedRepo();
+  fs.writeFileSync(path.join(root, 'src', 'moved.js'), 'function tiny() {\n  return 1;\n}\n');
+  const tiny = '### AC-2\nFiles: src/old.js\nSnippet:\n```\nfunction tiny() {\n  return 1;\n}\n```\n';
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', tiny), null);
+});

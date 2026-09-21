@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { snippetFromSection, quotedSymbolsFromSection } = require('./candidate-doc-parsing.js');
-const { findFuzzyMatch, windowAroundIndex } = require('./fuzzy-matching.js');
+const { findFuzzyMatch, windowAroundIndex, MIN_PARTIAL_CHARS } = require('./fuzzy-matching.js');
 
 // Same literals as src/sdk/candidate-fulfillment.js (the source these were moved out of)
 // -- duplicated here rather than required back, so this module stays self-contained.
@@ -175,8 +175,8 @@ function looksLikeDiff(snippet) {
 // applyBrainDumpSort went from apply-group-a.js to apply-group-a-brain-dump.js; observability-fix-ac-111's report handler went from python/dashboard/app.py into
 // python/dashboard/routes/reports.py), leaving the cited file with no anchor at all. Look for the candidate's Snippet in, in order: (1) the SIBLING files of the cited one
 // (same directory), then, only if none matched, (2) the whole SUBTREE of the cited file's top-level directory (src/, python/, scripts/, ...). Same extension only, tests and
-// vendored/build directories excluded, size and count capped. A tier is accepted only when EXACTLY ONE file matches it (whole snippet, or the prefix/suffix fallback of
-// findFuzzyMatch): an ambiguous or missing match is never guessed, and an ambiguous first tier never escalates to the second.
+// vendored/build directories excluded, size and count capped. A tier is accepted only when EXACTLY ONE file matches it, and only on the WHOLE snippet (never findFuzzyMatch's prefix/suffix
+// fallback): an ambiguous or missing match is never guessed, and an ambiguous first tier never escalates to the second.
 // -> { path (repo-relative), content } | null. Best-effort, never throws.
 const RELOCATE_MAX_FILES = 3000;
 const RELOCATE_MAX_BYTES = 600000;
@@ -214,7 +214,10 @@ function uniqueMatchIn(files, snippet, root, original, lines) {
       content = fs.readFileSync(full, 'utf8');
     } catch { continue; }
     if (lines.length && !lines.some((l) => content.includes(l))) continue;
-    if (findFuzzyMatch(content, snippet)) found.push({ path: path.relative(root, full).split(path.sep).join('/'), content });
+    // WHOLE snippet only (whitespace drift allowed, no prefix/suffix fallback): a unique 120-char prologue or tail in an unrelated file (a shared import block, a common
+    // signature) is a coincidence, not the place the code moved to, and following it would rewrite the declared edit target (review of PR #437).
+    const m = findFuzzyMatch(content, snippet);
+    if (m && !m.partial) found.push({ path: path.relative(root, full).split(path.sep).join('/'), content });
     if (found.length > 1) return { ambiguous: true };
   }
   return { hit: found.length === 1 ? found[0] : null };
@@ -224,6 +227,9 @@ function relocateStaleAnchor(repoRoot, relPath, section) {
   try {
     const snippet = snippetFromSection(section);
     if (!snippet || looksLikeDiff(snippet) || !repoRoot || !relPath) return null;
+    // A short snippet is not distinctive enough to follow: two lines like `def f():\n    return 1` occur in any sibling (caught by local-draft.test.js: a deleted file's entry was
+    // relocated to a neighbour on exactly that). Same floor findFuzzyMatch's partial fallback uses.
+    if (snippet.replace(/\s+/g, '').length < MIN_PARTIAL_CHARS) return null;
     const root = path.resolve(repoRoot);
     const original = path.resolve(root, relPath);
     if (!original.startsWith(root + path.sep)) return null;

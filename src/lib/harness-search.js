@@ -69,7 +69,9 @@ function refreshCandidateFetchedFiles(task) {
     try {
       const full = path.resolve(resolvedRoot, f.path);
       if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
-      const fileText = fs.readFileSync(full, 'utf8');
+      // A cited file that no longer exists at all (renamed / deleted: the code lives elsewhere now) is followed like one that lost the code -- but only when relocation finds it.
+      let fileText; let fileGone = false;
+      try { fileText = fs.readFileSync(full, 'utf8'); } catch (e) { if (!e || e.code !== 'ENOENT') throw e; fileText = ''; fileGone = true; }
       const windowed = windowFetchedFileContent(fileText, section);
       let grounding = null;
       try { grounding = require('../sdk/lib/file-grounding.js'); } catch { grounding = null; }
@@ -84,6 +86,7 @@ function refreshCandidateFetchedFiles(task) {
           }
         }
       }
+      if (fileGone) return f;
       return { ...f, content: windowed.text, anchorConfidence: windowed.confidence };
     } catch (err) {
       console.warn('[local-draft] file enrich failed:', f.path, err.message);
