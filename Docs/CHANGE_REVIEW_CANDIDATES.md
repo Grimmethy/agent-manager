@@ -702,3 +702,41 @@ index 32109046..66ca1162 100644
 Problem: [severity: med; regression shipped in f3d1441] `api_brain_dump_capture` now calls `.get("serial")` on every element of the entries list without an `isinstance(e, dict)` guard, so a non-dict scalar in the `entries` array (which the old code tolerated because it never inspected existing elements) now causes an unhandled `AttributeError` and a 500 response.  Failure scenario: `brain-dump.json` contains `{"entries": [42, {"id": "bd-1", "serial": 1, "capturedAt": "2026-01-01T00:00:00+00:00", "rawText": "hello", "status": "captured"}]}` (a stray scalar from a hand-edit). A `POST /api/brain-dump/capture` with body `{"text": "new thought"}` reaches `next_serial = max((e.get("serial") or 0) for e in entries) + 1`. The generator yields `42` first; `42.get("serial")` raises `AttributeError: 'int' object has no attribute 'get'`, which Flask turns into a 500. The pre-diff code simply appended the new entry to the list and wrote the file back, never calling `.get` on existing elements, so the same file worked fine.
 Solution: Add the same `isinstance(e, dict)` guard already used in `_assign_brain_dump_serials`: `next_serial = max((e.get("serial") or 0) for e in entries if isinstance(e, dict)) + 1 if entries else 1`
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in f3d1441.
+
+### AC-66 · Before this diff, a successful `/api/queue/<state>` response was sufficient to render the  (8b29ba0 index.html)
+Strength: Strong
+Source: change_review of 8b29ba0 "Stop losing applied work to unpushed/orphaned branches, add Done filter"
+Files: python/dashboard/templates/index.html
+
+Snippet:
+```
+diff --git a/python/dashboard/templates/index.html b/python/dashboard/templates/index.html
+index 8b053363..250ff269 100644
+--- a/python/dashboard/templates/index.html
++++ b/python/dashboard/templates/index.html
+@@ -513,46 +513,87 @@ async function postTaskAction(state, id, action, confirmMessage) {
+ 
+ // Incremental loading (2026-07-26, Grimmethy: "long task lists take a while to load,
+ // we should do incremental loading, 10 at a time, expanding as the user scrolls to the
+ // bottom"). queueLoadedCount/queueHasMore persist per-state across the generic 5s
+ // refresh() poll and across tab switches (switching away and back keeps your scroll
+ // depth) -- only a full page reload resets them to the first page.
+ const QUEUE_PAGE_SIZE = 10;
+ const QUEUE_STATE_TABS = ['drafting', 'pending', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'done'];
+ const queueLoadedCount = {};
+ const queueHasMore = {};
+ let queueLoadInFlight = false;
+ 
++// Task-type filter (Job Status > Done, 2026-08-17: "Done is getting huge, need to
++// filter by task type"). Per-state so switching tabs doesn't carry a filter over to an
++// unrelated list; '' means unfiltered. Options come from /api/job-types (same source
++// catalog the Job List tab's own rows are built from) fetched once and cached module-
++// scope -- it barely changes, and re-fetching on every 5s poll would be wasteful for a
++// dropdown that just needs the name list.
++const queueSourceFilter = {};
++let allSourceNam
+```
+
+Problem: [severity: med; regression shipped in 8b29ba0] Before this diff, a successful `/api/queue/<state>` response was sufficient to render the tab body; after this diff, a second unguarded network call to `/api/job-types` is a hard prerequisite, and its failure leaves the tab blank with no error message.  Failure scenario: User opens the "done" tab. `fetchJson('/api/queue/done?limit=10&offset=0')` succeeds and returns `{"items":[…5 tasks…],"total":50}`. Control then reaches `const sourceNames = await allSourceNames();`, which calls `fetchJson('/api/job-types')`. The server returns HTTP 500 (transient error, deploy in progress, or the endpoint is temporarily removed). `fetchJson` throws (confirmed by the identical pattern in `refreshPipelineStatus` where `fetchJson` rejection is caught with `e.message`). Because this `await` sits outside any `try/catch` in `renderQueueTab`, the rejection propagates out of the async function as an unhandled promise rejection. `main.innerHTML` is never assigned; the tab body is blank and no error text is shown to the user. Before this diff, the same successful queue response would have produced the task table.
+Solution: Wrap the `allSourceNames()` call in a `try/catch` that falls back to an empty array (or a single "All task types" option), so the queue table still renders when the job-types endpoint is unavailable:
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 8b29ba0.
