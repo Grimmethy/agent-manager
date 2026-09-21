@@ -11,6 +11,7 @@ const MAX_ANCHOR_OCCURRENCES = 5;
 const LINE_CITATION_RE = /\blines?\s+(\d+)/i;
 const MAX_FETCHED_FILE_CHARS = 8000;
 const MAX_ANCHOR_REGIONS = 5;
+const MIN_CONFIDENT_PARTIAL_FRACTION = 0.3; // findPartialMatch tries 0.75, 0.5, 0.35, 0.25, 0.15 of the snippet: the two smallest tiers are the weak guesses
 const MAX_FETCHED_FILE_TOTAL_CHARS = 22000;
 const MIN_REGION_CHARS = 1400;
 const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable anchor found '
@@ -20,19 +21,28 @@ const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable an
 
 function collectAnchorHits(content, section) {
   const hits = [];
-  const seen = new Set();
-  const push = (index, length, rank) => {
+  const seen = new Map();
+  const push = (index, length, rank, extra) => {
     if (index == null || index < 0) return;
     const bucket = Math.round(index / 200);
-    if (seen.has(bucket)) return;
-    seen.add(bucket);
-    hits.push({ index, length: Math.max(length || 0, 1), rank });
+    if (seen.has(bucket)) {
+      // Another, independent signal (a quoted symbol / cited line) landing where a weak partial guess already sits corroborates it.
+      const prior = seen.get(bucket);
+      if (prior.weakPartial && !(extra && extra.weakPartial)) delete prior.weakPartial;
+      return;
+    }
+    const hit = { index, length: Math.max(length || 0, 1), rank, ...extra };
+    seen.set(bucket, hit);
+    hits.push(hit);
   };
 
   const snippet = snippetFromSection(section);
   if (snippet) {
     const match = findFuzzyMatch(content, snippet);
-    if (match) push(match.index, match.length, 0);
+    // A PARTIAL match (only the snippet's prefix or suffix was found -- fuzzy-matching.js findPartialMatch) locates the code but is a weaker claim than a whole-snippet match:
+    // when under ~30% of the snippet matched (the 0.25 and 0.15 tiers), mark the hit so windowFetchedFileContent does not present it as a confident anchor (review of PR #436). It still ranks first, and a
+    // quoted symbol that lands in the same window corroborates it (that hit is not marked, so the window stays 'strong').
+    if (match) push(match.index, match.length, 0, match.partial && match.length < snippet.length * MIN_CONFIDENT_PARTIAL_FRACTION ? { weakPartial: true } : undefined);
   }
 
   // The fenced Snippet: block's own triple backticks otherwise confuse QUOTED_SYMBOL_RE's
@@ -98,6 +108,16 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
       confidence: 'none',
       anchorCount: 0,
       usedSnippetFuzzyMatch: false,
+    };
+  }
+  // Every anchor is a small-fraction partial guess and nothing else corroborates it: use it to place the window, but say so (weak tier + the low-confidence note) rather than
+  // reporting a confident anchor. 'weak' is not 'none', so a task is not parked for it (blocked-task-classifiers / reject-retry-check key on 'none').
+  if (strongHits.every((h) => h.weakPartial)) {
+    return {
+      text: LOW_CONFIDENCE_GROUNDING_NOTE + windowAroundIndex(content, strongHits[0].index, strongHits[0].length, maxChars),
+      confidence: 'weak',
+      anchorCount: 1,
+      usedSnippetFuzzyMatch,
     };
   }
   if (strongHits.length === 1) {

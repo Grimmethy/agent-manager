@@ -1,0 +1,122 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { findFuzzyMatch, MIN_PARTIAL_CHARS } = require('./fuzzy-matching.js');
+const { windowFetchedFileContent } = require('./file-grounding.js');
+
+// A realistic big block: 40 distinct lines of code, so any 120+ char piece of it is unique in the file.
+const lines = (n, tag = 'a') => Array.from({ length: n }, (_, i) => `  const value${tag}${i} = compute(${tag}, ${i}); // step ${i} of the pipeline`);
+const BLOCK = ['function bigBody(opts) {', ...lines(40), '  return done;', '}'].join('\n');
+const FILE_PAD_BEFORE = Array.from({ length: 400 }, (_, i) => `const pad${i} = require('./pad-${i}.js'); // unrelated`).join('\n');
+const FILE_PAD_AFTER = Array.from({ length: 400 }, (_, i) => `function after${i}() { return ${i}; }`).join('\n');
+const fileWith = (block) => `${FILE_PAD_BEFORE}\n${block}\n${FILE_PAD_AFTER}\n`;
+
+test('an exact or whitespace-only match still works exactly as before (no partial marker)', () => {
+  const file = fileWith(BLOCK);
+  const exact = findFuzzyMatch(file, BLOCK);
+  assert.equal(file.slice(exact.index, exact.index + exact.length), BLOCK);
+  assert.equal(exact.partial, undefined);
+  const reflowed = BLOCK.replace(/  /g, '\t');
+  assert.equal(findFuzzyMatch(file, reflowed).partial, undefined, 'whitespace-only drift is the old stripped match');
+});
+
+test('a comment added INSIDE the snippet since it was written no longer defeats the match: the prefix locates it', () => {
+  const stale = BLOCK.split('\n');
+  stale.splice(30, 0, '  // added later: a new comment in the middle of the function');
+  const file = fileWith(stale.join('\n'));
+  assert.equal(findFuzzyMatch(file, BLOCK) && findFuzzyMatch(file, BLOCK).partial, 'prefix');
+  const m = findFuzzyMatch(file, BLOCK);
+  assert.ok(file.slice(m.index).trimStart().startsWith('function bigBody(opts) {'), 'points at the start of the function');
+});
+
+test('drift at the START of the snippet is found through the suffix, backed up to where the snippet begins', () => {
+  const stale = BLOCK.replace('function bigBody(opts) {', 'function bigBody(opts, extraParam) {');
+  const file = fileWith(stale);
+  const m = findFuzzyMatch(file, BLOCK);
+  assert.equal(m.partial, 'suffix');
+  assert.ok(Math.abs(m.index - file.indexOf('function bigBody')) < 200, 'the estimated start is near the real function start');
+});
+
+test('refuses to guess: a too-short snippet, an ambiguous piece, and unrelated text all return null', () => {
+  const file = fileWith(BLOCK);
+  assert.equal(findFuzzyMatch(file, 'const x = 1;'.repeat(2) + ' // changed'), null, 'short');
+  assert.ok(MIN_PARTIAL_CHARS >= 100);
+  // the same 60-line block twice in the file: every piece is ambiguous
+  const dup = `${BLOCK}\n${FILE_PAD_BEFORE}\n${BLOCK}`;
+  const driftedTail = `${BLOCK.split('\n').slice(0, 41).join('\n')}\n  // drift\n  return other;\n}`;
+  assert.equal(findFuzzyMatch(dup, driftedTail), null, 'ambiguous, not guessed');
+  assert.equal(findFuzzyMatch(file, lines(40, 'zz').join('\n')), null, 'unrelated');
+});
+
+test('windowFetchedFileContent: a stale snippet in a big file is anchored strongly (it fell back to confidence none before)', () => {
+  const stale = BLOCK.split('\n');
+  stale.splice(20, 0, '  // a comment added after the candidate was written');
+  const file = fileWith(stale.join('\n'));
+  assert.ok(file.length > 8000, 'premise: the file is large enough to be windowed');
+  const w = windowFetchedFileContent(file, `### AC-9 · Decompose bigBody\nFiles: src/x.js\nSnippet:\n\`\`\`\n${BLOCK}\n\`\`\`\n\nProblem: it is long.`);
+  assert.equal(w.confidence, 'strong');
+  assert.equal(w.usedSnippetFuzzyMatch, true);
+  assert.ok(w.text.includes('function bigBody(opts) {'), 'the window contains the target function');
+  const none = windowFetchedFileContent(file, '### AC-9 · Decompose\nFiles: src/x.js\nSnippet:\n```\n' + lines(40, 'zz').join('\n') + '\n```\n');
+  assert.equal(none.confidence, 'none', 'an unrelated snippet still gets no anchor');
+});
+
+// --- a suffix match must not extrapolate the start when the head of the function GREW (function-length-fix-ac-37) -------------------------------------------------------------
+// The signature gained a parameter and ~60 lines were inserted right after it, so neither the whole snippet nor its prefix matches; the suffix does, but backing up by the old length of
+// the missing head lands far past the real start. Anchoring on the declared function name puts the window on the function.
+test('suffix match: when the head of the function drifted AND grew, the start is the declaration, not an extrapolation', () => {
+  const grown = BLOCK.split('\n');
+  grown[0] = 'function bigBody(opts, extra, third) {';
+  grown.splice(1, 0, ...Array.from({ length: 60 }, (_, i) => `  const added${i} = wire(${i}); // a block inserted after the snippet was written`));
+  const file = fileWith(grown.join('\n'));
+  const m = findFuzzyMatch(file, BLOCK);
+  assert.equal(m.partial, 'suffix');
+  assert.ok(file.slice(m.index).trimStart().startsWith('function bigBody(opts, extra, third) {'), `anchored at the declaration, got: ${JSON.stringify(file.slice(m.index, m.index + 40))}`);
+  const w = windowFetchedFileContent(file, `### AC-37 · Extract\nFiles: src/x.js\nSnippet:\n\`\`\`\n${BLOCK}\n\`\`\`\n`);
+  assert.equal(w.confidence, 'strong');
+  assert.ok(w.text.includes('function bigBody(opts, extra, third) {'), 'the window contains the function head');
+});
+
+test('suffix match: two declarations of the same name -> no guess, the estimate is kept (never picks one of several)', () => {
+  const grown = BLOCK.split('\n');
+  grown[0] = 'function bigBody(opts, extra) {';
+  grown.splice(1, 0, ...Array.from({ length: 60 }, (_, i) => `  const added${i} = wire(${i}); // inserted block`));
+  const file = `${FILE_PAD_BEFORE}\nfunction bigBody(other) { return 1; }\n${grown.join('\n')}\n${FILE_PAD_AFTER}\n`;
+  const m = findFuzzyMatch(file, BLOCK);
+  assert.equal(m.partial, 'suffix');
+  assert.ok(!file.slice(m.index).trimStart().startsWith('function bigBody(other)'), 'did not latch onto the wrong declaration');
+});
+
+// --- a small-fraction partial match is a guess, and is reported as one (review of PR #436) --------------------------------------------------------------------------------------
+// findPartialMatch tries 0.75/0.5/0.35/0.25/0.15 of the snippet. A hit that only matched the 0.25 / 0.15 tier used to come out as confidence 'strong' exactly like a whole-snippet match.
+const SNIP_SECTION = (snippet, prose = '') => `### AC-9 · Decompose bigBody\nFiles: src/x.js\nSnippet:\n\`\`\`\n${snippet}\n\`\`\`\n${prose}\nProblem: it is long.`;
+// Drift near BOTH ends, so only a short middle piece (well under 30% of the snippet) still matches.
+const shortPartialFile = () => {
+  const d = BLOCK.split('\n');
+  d.splice(8, 0, '  // drift near the start');
+  d.splice(d.length - 8, 0, '  // drift near the end');
+  return fileWith(d.join('\n'));
+};
+
+test('a small-fraction partial match places the window but is weak, with the low-confidence note -- not strong, and not none (a task is not parked for it)', () => {
+  const w = windowFetchedFileContent(shortPartialFile(), SNIP_SECTION(BLOCK));
+  assert.equal(w.confidence, 'weak');
+  assert.equal(w.usedSnippetFuzzyMatch, true);
+  assert.match(w.text, /^\[LOW-CONFIDENCE GROUNDING/);
+  assert.ok(w.text.includes('const valuea20 ='), 'the window is still centred on the located code, not head-truncated');
+});
+
+test('a quoted symbol corroborates a small-fraction partial match, keeping it strong -- whether it lands on the SAME hit (valuea1) or on another part of the code (valuea20)', () => {
+  for (const sym of ['valuea1', 'valuea20']) {
+    const w = windowFetchedFileContent(shortPartialFile(), SNIP_SECTION(BLOCK, `The function \`${sym}\` is the problem.`));
+    assert.equal(w.confidence, 'strong', sym);
+  }
+});
+
+test('a partial match of at least ~30% of the snippet stays strong (the drift-in-the-middle case above)', () => {
+  const stale = BLOCK.split('\n');
+  stale.splice(20, 0, '  // a comment added after the candidate was written');
+  const w = windowFetchedFileContent(fileWith(stale.join('\n')), SNIP_SECTION(BLOCK));
+  assert.equal(w.confidence, 'strong');
+});

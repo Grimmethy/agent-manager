@@ -30,6 +30,25 @@ function anyFetchedFileMatches(task, re) {
   return files.some((f) => f && typeof f.content === 'string' && re.test(f.content));
 }
 
+// Would the CURRENT grounding fetch anchor every declared (non-context) file of this task strongly? Recomputed from the live files with the same windowing the draft
+// uses (refreshCandidateFetchedFiles re-windows on every attempt, so a requeue picks the result up). Fail-closed: any error or unreadable file is "no".
+function groundingNowReliable(task) {
+  const pc = task && task.promptContext;
+  const bad = pc && Array.isArray(pc.fetchedFiles) ? pc.fetchedFiles.filter((f) => f && !f.context && f.anchorConfidence === 'none' && f.path) : [];
+  if (!bad.length) return false;
+  try {
+    const path = require('path');
+    const fs = require('fs');
+    const root = path.resolve(require('./config.js').getConfig().repoRoot);
+    const { windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
+    return bad.every((f) => {
+      const full = path.resolve(root, f.path);
+      if (full !== root && !full.startsWith(root + path.sep)) return false;
+      return windowFetchedFileContent(fs.readFileSync(full, 'utf8'), pc.body || '').confidence === 'strong';
+    });
+  } catch { return false; }
+}
+
 const KNOWN_FIXED = [
   {
     id: 'wrong-block-whole-function-snippet',
@@ -78,6 +97,14 @@ const KNOWN_FIXED = [
       if (!/only (?:touches|created\/edited) documentation/.test(t) || !/code change/.test(t)) return false;
       try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
     },
+  },
+  {
+    id: 'stale-snippet-partial-anchor',
+    fixedIn: 'agent-manager (grounding: prefix/suffix fallback for a stale candidate Snippet, 2026-09-21)',
+    description: 'a candidate whose Snippet was edited inside (a comment or parameter added since it was written) matched nowhere, so the window fell back to blind head-truncation (anchorConfidence none) and the task was escalated as "no reliable anchor"',
+    dirs: ['blocked', 'needs-clarification'],
+    // Failure text AND a structural precondition: the new matcher really does anchor every declared file today (a candidate whose code is genuinely gone stays put).
+    applies: (task) => failureText(task).includes('could not find a reliable anchor') && groundingNowReliable(task),
   },
 ];
 
