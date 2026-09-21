@@ -52,6 +52,13 @@ const KNOWN_FIXED = [
     dirs: ['blocked', 'needs-clarification'],
     applies: (task) => /bare tool-call request or meta-commentary|consists entirely of meta-commentary/.test(failureText(task)),
   },
+  {
+    id: 'draft-sandbox-stdout-line',
+    fixedIn: 'agent-manager (draft-sandbox stdout fix, 2026-09-20)',
+    description: 'prepareAdhocWorktree logged its node_modules line to STDOUT (#420), so the worker could not JSON.parse local-draft.js output and a SUCCESSFUL draft was recorded as "draft call failed" and retried',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => { const t = failureText(task); return /draft call failed \d+ times/.test(t) && t.includes('[draft-sandbox]'); },
+  },
 ];
 
 module.exports = { KNOWN_FIXED, failureText };

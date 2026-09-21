@@ -144,3 +144,23 @@ test('a repo whose node_modules is itself a symlink still gets a real, private c
   fs.writeFileSync(path.join(wt, 'node_modules', 'pkg', 'index.js'), 'changed');
   assert.equal(fs.readFileSync(path.join(realTree, 'pkg', 'index.js'), 'utf8'), 'orig');
 });
+
+// STDOUT is local-draft.js's machine channel: one JSON result line the worker JSON.parses. #420 logged here with console.log, so every draft that copied
+// node_modules read as "draft call failed" (2026-09-20: 58 wasted drafts, 4 tasks to needs-clarification).
+test('prepareAdhocWorktree writes NOTHING to stdout, for a copy and for the "no node_modules" note alike; the note goes to stderr', () => {
+  for (const installed of [true, false]) {
+    const repo = makeProject({ installed });
+    const wt = path.join(tmp('sbx-wt-parent-'), 'wt');
+    const out = []; const err = [];
+    const origWrite = process.stdout.write; const origErr = console.error;
+    process.stdout.write = (chunk) => { out.push(String(chunk)); return true; };
+    console.error = (...a) => { err.push(a.join(' ')); };
+    let prep;
+    try { prep = prepareAdhocWorktree(repo, 'main', wt, `throwaway/adhoc-stdout-${installed}`); }
+    finally { process.stdout.write = origWrite; console.error = origErr; }
+    assert.equal(prep.ok, true);
+    assert.equal(out.join(''), '', `installed=${installed}: nothing may reach stdout`);
+    assert.match(err.join('\n'), /\[draft-sandbox\]/, `installed=${installed}: the note is on stderr`);
+    cleanupAdhocWorktree(repo, wt, `throwaway/adhoc-stdout-${installed}`);
+  }
+});

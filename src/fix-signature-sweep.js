@@ -89,7 +89,10 @@ function sweepKnownFixedFailures({ pipelineDir, entries = KNOWN_FIXED, now = new
         const hasBranch = Array.isArray(task.history) && task.history.some((h) => h && h.stage === 'applied');
         if (already || failedAfterFix || (design && !exhausted) || hasBranch || task.reviewInconclusive) { summary.skipped += 1; continue; }
         const dest = path.join(destinationDir(queueDir, task), name);
-        if (fs.existsSync(dest)) { summary.skipped += 1; continue; }
+        // In pending/ or adhoc/ an existing same-name file is a real duplicate: leave it. In derived/ it is a STALE COPY of this very task: a derived task's
+        // origin record stays there after it is claimed (taskIdExistsInQueue ignores that dir), so it is replaced by the fuller stuck record. Without this no
+        // derived-source task could ever be drained (PF, 2026-09-20: all four victims of the draft-sandbox stdout bug had one and the dry run recovered none).
+        if (fs.existsSync(dest) && path.basename(path.dirname(dest)) !== 'derived') { summary.skipped += 1; continue; }
         if (!dryRun) {
           writeJson(dest, freshShape(task, entry, dir, nowIso));
           fs.unlinkSync(filePath);

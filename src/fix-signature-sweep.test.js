@@ -124,3 +124,47 @@ test('stuckSince uses the newest blocked/needs-clarification/exhausted event, el
   const f = path.join(dir, 'queue', 'blocked', 'x.json'); fs.writeFileSync(f, '{}');
   assert.ok(Math.abs(stuckSince({ history: [] }, f) - Date.now()) < 60000);
 });
+
+// --- draft-sandbox-stdout-line (2026-09-20) -----------------------------------------------------------------------------------------------
+// A [draft-sandbox] log line on stdout made every successful PF draft read as "draft call failed"; 7 retries later the task was escalated to
+// needs-clarification with nc.reason 'design-decision' -- but it HAD been exhausted, so it is a drafting failure, not a real design question.
+const SANDBOX_FAIL = 'draft call failed 7 times in a row (most recent: [draft-sandbox] copied node_modules into agent-manager-adhoc-worktree-x (196 MB, 3253 ms) {"succeeded":true,"blocked":false})';
+const OLLAMA_FAIL = 'draft call failed 7 times in a row (most recent: {"succeeded":false,"reason":"connect ECONNREFUSED 192.168.122.29:11434"})';
+const exhaustedNc = (id, blockedReason) => stuck(id, {
+  domain: 'adhoc', source: 'derived_task', priorRejectionFeedback: [], blockedReason,
+  needsClarification: { reason: 'design-decision' },
+  history: [{ stage: 'exhausted', at: '2026-09-20T05:00:00Z', detail: '2/2' }, { stage: 'needs-clarification', at: '2026-09-20T05:00:01Z', detail: 'escalated' }],
+});
+
+test('draft-sandbox-stdout-line matches the sandbox-polluted failure and NOT a genuine draft failure', () => {
+  const e = byId['draft-sandbox-stdout-line'];
+  assert.equal(e.applies(exhaustedNc('a', SANDBOX_FAIL)), true);
+  assert.equal(e.applies(exhaustedNc('b', OLLAMA_FAIL)), false, 'a real Ollama outage is not this bug');
+  assert.equal(e.applies(exhaustedNc('c', 'draft call failed 3 times in a row (most recent: nothing to do)')), false);
+  assert.equal(e.applies(exhaustedNc('d', '[draft-sandbox] copied node_modules (196 MB)')), false, 'the sandbox line alone (no failed-draft text) is not enough');
+});
+
+test('draft-sandbox-stdout-line drains a retry-exhausted needs-clarification task back to derived/, keeping a real design question in place', () => {
+  const dir = pipeline();
+  put(dir, 'needs-clarification', exhaustedNc('victim', SANDBOX_FAIL));
+  put(dir, 'needs-clarification', { ...exhaustedNc('real-question', SANDBOX_FAIL), history: [at('2026-09-20T05:00:00Z')] }); // never exhausted: a human's call
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['draft-sandbox-stdout-line']] });
+  assert.deepEqual(s.requeued.map((r) => r.id), ['victim']);
+  assert.equal(has(dir, 'derived', 'victim'), true);
+  assert.deepEqual(read(dir, 'derived', 'victim').requeuedForFixes, ['draft-sandbox-stdout-line']);
+  assert.equal(has(dir, 'needs-clarification', 'real-question'), true);
+});
+
+test('a stale origin copy in derived/ does not block draining a derived task; a same-name file in pending/ still does', () => {
+  const dir = pipeline();
+  put(dir, 'needs-clarification', exhaustedNc('victim', SANDBOX_FAIL));
+  put(dir, 'derived', { id: 'victim', source: 'derived_task', history: [{ stage: 'created', at: '2026-09-19T00:00:00Z' }] }); // the leftover origin record
+  put(dir, 'needs-clarification', { ...exhaustedNc('has-pending', SANDBOX_FAIL), domain: 'default', source: 'trouble_log' }); // a normal task: its destination is pending/
+  put(dir, 'pending', { id: 'has-pending', status: 'pending' });
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['draft-sandbox-stdout-line']] });
+  assert.deepEqual(s.requeued.map((r) => r.id), ['victim']);
+  const fresh = read(dir, 'derived', 'victim');
+  assert.ok(fresh.history.some((h) => h.stage === 'exhausted'), 'the stale copy was replaced by the fuller stuck record (its history is kept)');
+  assert.equal(has(dir, 'needs-clarification', 'victim'), false);
+  assert.equal(has(dir, 'needs-clarification', 'has-pending'), true, 'a real pending copy still blocks');
+});

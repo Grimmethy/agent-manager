@@ -201,13 +201,13 @@ test('pool-sweeps.sh skips a project with nothing in any housekeeping stage, and
 
 // A throwaway package whose src/ is symlinks to the real one except local-draft.js, which is a stub that "drafts" successfully after a delay --
 // so several tasks can be processed for real without a model.
-function packageWithStubDraft(sb, draftMs) {
+function packageWithStubDraft(sb, draftMs, strayStdout = null) {
   const pkg = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-pkg-'));
   fs.mkdirSync(path.join(pkg, 'scripts')); fs.mkdirSync(path.join(pkg, 'src'));
   for (const f of fs.readdirSync(__dirname)) if (fs.statSync(path.join(__dirname, f)).isFile()) fs.copyFileSync(path.join(__dirname, f), path.join(pkg, 'scripts', f));
   const realSrc = path.join(__dirname, '..', 'src');
   for (const f of fs.readdirSync(realSrc)) if (f !== 'local-draft.js') fs.symlinkSync(path.join(realSrc, f), path.join(pkg, 'src', f));
-  fs.writeFileSync(path.join(pkg, 'src', 'local-draft.js'), `setTimeout(() => console.log(JSON.stringify({ succeeded: true })), ${draftMs});\n`);
+  fs.writeFileSync(path.join(pkg, 'src', 'local-draft.js'), `${strayStdout ? `console.log(${JSON.stringify(strayStdout)});` : ''}setTimeout(() => console.log(JSON.stringify({ succeeded: true })), ${draftMs});\n`);
   fs.symlinkSync(path.join(__dirname, '..', 'node_modules'), path.join(pkg, 'node_modules'));
   for (const f of ['package.json', 'task-domains.json']) if (fs.existsSync(path.join(__dirname, '..', f))) fs.copyFileSync(path.join(__dirname, '..', f), path.join(pkg, f));
   return pkg;
@@ -251,4 +251,25 @@ test('a borrowing reviewer reviews ONE item per borrowed tick', () => {
   const reviewed = (r.stdout + r.stderr).match(/\[review-review-x\] reviewing /g) || [];
   assert.equal(reviewed.length, 1, `exactly one item is reviewed per borrowed tick; ${r.stderr}`);
   assert.equal(r.status, 10, 'and it reports that it did work');
+});
+
+// A stray stdout line from a module local-draft.js loads must not turn a SUCCESSFUL draft into "draft call failed" (2026-09-20, the [draft-sandbox] line).
+test('the worker takes the JSON result line even when a stray line precedes it on stdout: the draft reaches review/, not a retry loop', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 500, '[draft-sandbox] copied node_modules into some-worktree (196 MB, 3253 ms)');
+  taskFile(path.join(sb.A, 'queue', 'pending'), 'h1');
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const child = spawn('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x'], {
+    detached: true, stdio: ['ignore', out, out],
+    env: { ...sb.env, ORC_TICK_SECS: '60', AGENT_MANAGER_POOL_BORROW: 'false', AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json') },
+  });
+  try {
+    const inReview = await waitFor(() => fs.existsSync(path.join(sb.A, 'queue', 'review', 'h1.json')), 60000);
+    assert.ok(inReview, `the draft succeeded and moved to review/; log:\n${fs.readFileSync(logFile, 'utf8').slice(-600)}`);
+    assert.doesNotMatch(fs.readFileSync(logFile, 'utf8'), /draft call failed/);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+  }
 });
