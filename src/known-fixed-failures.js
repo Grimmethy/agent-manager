@@ -44,7 +44,10 @@ function groundingNowReliable(task) {
     return bad.every((f) => {
       const full = path.resolve(root, f.path);
       if (full !== root && !full.startsWith(root + path.sep)) return false;
-      return windowFetchedFileContent(fs.readFileSync(full, 'utf8'), pc.body || '').confidence === 'strong';
+      if (windowFetchedFileContent(fs.readFileSync(full, 'utf8'), pc.body || '').confidence === 'strong') return true;
+      // the cited code may have moved to a sibling file (what refreshCandidateFetchedFiles now follows)
+      const hit = require('./sdk/lib/file-grounding.js').relocateStaleAnchor(root, f.path, pc.body || '');
+      return !!hit && windowFetchedFileContent(hit.content, pc.body || '').confidence === 'strong';
     });
   } catch { return false; }
 }

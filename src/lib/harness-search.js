@@ -63,18 +63,37 @@ function refreshCandidateFetchedFiles(task) {
     }
   }
   if (!Array.isArray(pc.fetchedFiles) || pc.fetchedFiles.length === 0) return;
+  const relocated = [];
   pc.fetchedFiles = pc.fetchedFiles.map((f) => {
     if (!f || !f.path) return f;
     try {
       const full = path.resolve(resolvedRoot, f.path);
       if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
       const windowed = windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section);
+      if (windowed.confidence === 'none' && !f.context) {
+        // The candidate's code may have MOVED to a sibling file since it was written: follow it (unique match only).
+        let relocate;
+        try { ({ relocateStaleAnchor: relocate } = require('../sdk/lib/file-grounding.js')); } catch { relocate = null; }
+        const hit = relocate ? relocate(resolvedRoot, f.path, section) : null;
+        if (hit) {
+          const w2 = windowFetchedFileContent(hit.content, section);
+          if (w2.confidence === 'strong') {
+            relocated.push({ from: f.path, to: hit.path });
+            return { ...f, path: hit.path, content: w2.text, anchorConfidence: 'strong', relocatedFrom: f.path };
+          }
+        }
+      }
       return { ...f, content: windowed.text, anchorConfidence: windowed.confidence };
     } catch (err) {
       console.warn('[local-draft] file enrich failed:', f.path, err.message);
       return f;
     }
   });
+  if (relocated.length) {
+    // Keep the declared list pointing at the file the code lives in now, and leave an audit line.
+    if (Array.isArray(pc.files)) pc.files = pc.files.map((e) => (typeof e === 'string' ? ((relocated.find((r) => r.from === e) || {}).to || e) : e));
+    appendHistoryEvent(task, 'context-refreshed', `grounding relocated (the cited code moved): ${relocated.map((r) => `${r.from} -> ${r.to}`).join(', ')}`);
+  }
 }
 
 function isEmptyApprovalSource(source) {

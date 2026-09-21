@@ -246,3 +246,21 @@ test('stale-snippet-partial-anchor matches only a task whose declared file now a
     for (const [k, v] of [['AGENT_MANAGER_REPO_ROOT', saved.r], ['AGENT_MANAGER_PIPELINE_DIR', saved.p]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
 });
+
+test('stale-snippet-partial-anchor also matches a task whose cited code MOVED to a sibling file (the registry precondition follows the relocation)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-moved-'));
+  fs.mkdirSync(path.join(root, 'src'));
+  const block = ['function moved(o) {', ...Array.from({ length: 40 }, (_, i) => `  const v${i} = go(${i}); // step ${i} of the moved body`), '  return o;', '}'].join('\n');
+  const pad = Array.from({ length: 400 }, (_, i) => `const p${i} = ${i}; // padding`).join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'old.js'), `${pad}\nfunction other() {}\n`);
+  fs.writeFileSync(path.join(root, 'src', 'new.js'), `${pad}\n${block}\n${pad}\n`);
+  const saved = { r: process.env.AGENT_MANAGER_REPO_ROOT, p: process.env.AGENT_MANAGER_PIPELINE_DIR };
+  process.env.AGENT_MANAGER_REPO_ROOT = root; process.env.AGENT_MANAGER_PIPELINE_DIR = root;
+  try {
+    const t = anchorTask('moved', `### AC-10\nFiles: src/old.js\nSnippet:\n\`\`\`\n${block}\n\`\`\`\n`);
+    t.promptContext.fetchedFiles = [{ path: 'src/old.js', anchorConfidence: 'none' }];
+    assert.equal(byId['stale-snippet-partial-anchor'].applies(t), true);
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_REPO_ROOT', saved.r], ['AGENT_MANAGER_PIPELINE_DIR', saved.p]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});

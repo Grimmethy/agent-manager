@@ -120,3 +120,63 @@ test('a partial match of at least ~30% of the snippet stays strong (the drift-in
   const w = windowFetchedFileContent(fileWith(stale.join('\n')), SNIP_SECTION(BLOCK));
   assert.equal(w.confidence, 'strong');
 });
+
+// --- relocateStaleAnchor: the cited code MOVED to a sibling file (function-length-fix-ac-10) --------------------------------------------------------------------------
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { relocateStaleAnchor } = require('./file-grounding.js');
+
+function movedRepo({ dup = false } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reloc-'));
+  fs.mkdirSync(path.join(root, 'src'));
+  const pad = (tag) => Array.from({ length: 300 }, (_, i) => `const ${tag}${i} = ${i}; // padding so the file is above the windowing threshold`).join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'old.js'), `${pad('o')}\nfunction stillHere() { return 1; }\n`);          // the cited file: the function is GONE from it
+  fs.writeFileSync(path.join(root, 'src', 'moved.js'), `${pad('m')}\n${BLOCK}\n${pad('n')}\n`);                      // where it lives now
+  fs.writeFileSync(path.join(root, 'src', 'moved.test.js'), `${BLOCK}\n`);                                             // tests are never a relocation target
+  if (dup) fs.writeFileSync(path.join(root, 'src', 'copy.js'), `${pad('c')}\n${BLOCK}\n`);
+  fs.writeFileSync(path.join(root, 'src', 'notes.md'), BLOCK);                                                        // other extension: ignored
+  fs.writeFileSync(path.join(root, 'src', 'ctx.js'), `${pad('x')}\nfunction unrelated() {}\n`);                        // a big file cited only as context
+  return root;
+}
+const SECTION = `### AC-10 · Decompose bigBody\nFiles: src/old.js\nSnippet:\n\`\`\`\n${BLOCK}\n\`\`\`\n`;
+
+test('relocateStaleAnchor: finds the ONE sibling file the cited code moved to (tests and other extensions ignored)', () => {
+  const root = movedRepo();
+  const hit = relocateStaleAnchor(root, 'src/old.js', SECTION);
+  assert.equal(hit.path, 'src/moved.js');
+  assert.ok(hit.content.includes('function bigBody(opts) {'));
+});
+
+test('relocateStaleAnchor: ambiguous (two files contain it), missing, no snippet, and a path outside the repo all return null', () => {
+  assert.equal(relocateStaleAnchor(movedRepo({ dup: true }), 'src/old.js', SECTION), null, 'two candidates: never guessed');
+  const root = movedRepo();
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', SECTION.replace(/const value/g, 'const other')), null, 'the code is gone everywhere');
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', '### AC-1\nno snippet here'), null);
+  assert.equal(relocateStaleAnchor(root, '../../etc/passwd', SECTION), null);
+});
+
+test('refreshCandidateFetchedFiles follows a moved target: rewrites the fetched entry and the declared file, marks relocatedFrom, and leaves an audit event', () => {
+  const root = movedRepo();
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = root;
+  delete require.cache[require.resolve('../../config.js')];
+  try {
+    const { refreshCandidateFetchedFiles } = require('../../local-draft.js');
+    const task = { source: 'function_length_fix', history: [], promptContext: { body: SECTION, files: ['src/old.js'], fetchedFiles: [
+      { path: 'src/old.js', anchorConfidence: 'none', content: 'stale' },
+      { path: 'src/ctx.js', context: true, anchorConfidence: 'none', content: 'ctx' },
+    ] } };
+    refreshCandidateFetchedFiles(task);
+    const f = task.promptContext.fetchedFiles;
+    assert.equal(f[0].path, 'src/moved.js');
+    assert.equal(f[0].anchorConfidence, 'strong');
+    assert.equal(f[0].relocatedFrom, 'src/old.js');
+    assert.deepEqual(task.promptContext.files, ['src/moved.js']);
+    assert.equal(f[1].path, 'src/ctx.js', 'a context-only file is never relocated');
+    assert.ok(task.history.some((h) => h.stage === 'context-refreshed' && /src\/old\.js -> src\/moved\.js/.test(h.detail)));
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+    delete require.cache[require.resolve('../../config.js')];
+  }
+});

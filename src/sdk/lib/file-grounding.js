@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { snippetFromSection, quotedSymbolsFromSection } = require('./candidate-doc-parsing.js');
 const { findFuzzyMatch, windowAroundIndex } = require('./fuzzy-matching.js');
 
@@ -156,4 +158,35 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
   return { text: out.join('\n'), confidence: 'strong', anchorCount: strongHits.length, usedSnippetFuzzyMatch };
 }
 
-module.exports = { collectAnchorHits, windowFetchedFileContent };
+// The code a candidate points at can MOVE to another file after the candidate was written (a function extracted into its own module: function-length-fix-ac-10's
+// applyBrainDumpSort went from apply-group-a.js to apply-group-a-brain-dump.js), leaving the cited file with no anchor at all. Look for the candidate's Snippet in the
+// SIBLING files of the cited one (same directory, same extension, tests excluded) and accept a result only when exactly ONE of them matches (whole snippet, or the
+// prefix/suffix fallback of findFuzzyMatch): an ambiguous or missing match is never guessed. -> { path (repo-relative), content } | null. Best-effort, never throws.
+const RELOCATE_MAX_FILES = 500;
+const RELOCATE_MAX_BYTES = 600000;
+function relocateStaleAnchor(repoRoot, relPath, section) {
+  try {
+    const snippet = snippetFromSection(section);
+    if (!snippet || !repoRoot || !relPath) return null;
+    const root = path.resolve(repoRoot);
+    const original = path.resolve(root, relPath);
+    if (!original.startsWith(root + path.sep)) return null;
+    const dir = path.dirname(original);
+    const ext = path.extname(original);
+    const found = [];
+    for (const name of fs.readdirSync(dir).slice(0, RELOCATE_MAX_FILES)) {
+      if (path.extname(name) !== ext || name.includes('.test.')) continue;
+      const full = path.join(dir, name);
+      if (full === original) continue;
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (!st.isFile() || st.size > RELOCATE_MAX_BYTES) continue;
+      const content = fs.readFileSync(full, 'utf8');
+      if (findFuzzyMatch(content, snippet)) found.push({ path: path.relative(root, full).split(path.sep).join('/'), content });
+      if (found.length > 1) return null; // ambiguous
+    }
+    return found.length === 1 ? found[0] : null;
+  } catch { return null; }
+}
+
+module.exports = { collectAnchorHits, windowFetchedFileContent, relocateStaleAnchor };
