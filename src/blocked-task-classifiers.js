@@ -52,12 +52,14 @@ function hasZeroHitHarnessSearch(task) {
 // Structurally futile, not stochastically unlucky -- HARNESS-side, not retryable.
 function hasUnreliableGrounding(task) {
   const fetchedFiles = task.promptContext && task.promptContext.fetchedFiles;
-  return Array.isArray(fetchedFiles) && fetchedFiles.some((f) => f && f.anchorConfidence === 'none');
+  // A file fetched only as CONTEXT (referenced in prose, not a declared edit target: entry.context === true) never needs an anchor -- it must not park a task whose real
+  // target anchored fine (function-length-fix-ac-24: its second file was context-only).
+  return Array.isArray(fetchedFiles) && fetchedFiles.some((f) => f && !f.context && f.anchorConfidence === 'none');
 }
 
 function buildUnreliableGroundingQuestion(task) {
   const fetchedFiles = (task.promptContext && task.promptContext.fetchedFiles) || [];
-  const badFiles = fetchedFiles.filter((f) => f && f.anchorConfidence === 'none').map((f) => f.path).filter(Boolean);
+  const badFiles = fetchedFiles.filter((f) => f && !f.context && f.anchorConfidence === 'none').map((f) => f.path).filter(Boolean);
   return [
     `The grounding-fetch could not find a reliable anchor for this candidate's cited code in `
       + `${badFiles.join(', ') || 'its target file'} -- every draft attempt sees the same `

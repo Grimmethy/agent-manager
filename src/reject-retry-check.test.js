@@ -1435,3 +1435,10 @@ test('rejectRetryCheck exhausts a non-adhoc implement-degenerate block at the re
   assert.equal(summary.requeued, 0);
   assert.ok(fs.existsSync(path.join(blockedDir, 'task-1.json')));
 });
+
+// 2026-09-21: a fetched file that is CONTEXT only (not a declared edit target) must not park a task whose real target anchored fine (function-length-fix-ac-24).
+test('hasUnreliableGrounding ignores a context-only file with anchorConfidence:none but still flags a declared one', () => {
+  const t = (files) => ({ promptContext: { fetchedFiles: files } });
+  assert.equal(hasUnreliableGrounding(t([{ path: 'src/a.js', anchorConfidence: 'strong' }, { path: 'app.py', context: true, anchorConfidence: 'none' }])), false);
+  assert.equal(hasUnreliableGrounding(t([{ path: 'src/a.js', anchorConfidence: 'none' }, { path: 'app.py', context: true, anchorConfidence: 'strong' }])), true);
+});

@@ -212,3 +212,37 @@ test('docs-only-gate-negated-paths drains the retry-exhausted documentation task
   assert.equal(has(dir, 'adhoc', 'doc'), true);
   assert.equal(has(dir, 'needs-clarification', 'code'), true);
 });
+
+// --- stale-snippet-partial-anchor (2026-09-21) ----------------------------------------------------------------------------------------------
+const anchorRepo = () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-repo-'));
+  fs.mkdirSync(path.join(root, 'src'));
+  const block = ['function bigBody(opts) {', ...Array.from({ length: 40 }, (_, i) => `  const value${i} = compute(${i}); // step ${i} of the pipeline`), '  return done;', '}'];
+  const stale = block.slice(); stale.splice(25, 0, '  // added after the candidate was written');
+  const pad = Array.from({ length: 500 }, (_, i) => `const pad${i} = ${i}; // padding line to make the file large`).join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'big.js'), `${pad}\n${stale.join('\n')}\n${pad}\n`);
+  return { root, snippet: block.join('\n') };
+};
+const anchorTask = (id, body, extra = {}) => stuck(id, {
+  domain: 'default', source: 'function_length_fix',
+  promptContext: { body, fetchedFiles: [{ path: 'src/big.js', anchorConfidence: 'none' }, ...(extra.files || [])] },
+  needsClarification: { reason: 'unreliable-grounding', openQuestions: "The grounding-fetch could not find a reliable anchor for this candidate's cited code in src/big.js -- every draft attempt sees the same unstructured, low-confidence file slice." },
+  history: [{ stage: 'blocked', at: '2026-09-20T05:00:00Z' }, { stage: 'needs-clarification', at: '2026-09-20T05:00:01Z' }],
+});
+
+test('stale-snippet-partial-anchor matches only a task whose declared file now anchors strongly (context-only files are ignored)', () => {
+  const { root, snippet } = anchorRepo();
+  const saved = { r: process.env.AGENT_MANAGER_REPO_ROOT, p: process.env.AGENT_MANAGER_PIPELINE_DIR };
+  process.env.AGENT_MANAGER_REPO_ROOT = root; process.env.AGENT_MANAGER_PIPELINE_DIR = root;
+  try {
+    const e = byId['stale-snippet-partial-anchor'];
+    const body = (snip) => `### AC-9 · Decompose bigBody\nFiles: src/big.js\nSnippet:\n\`\`\`\n${snip}\n\`\`\`\n`;
+    assert.equal(e.applies(anchorTask('fixable', body(snippet))), true, 'the drifted snippet anchors through its prefix');
+    assert.equal(e.applies(anchorTask('gone', body(Array.from({ length: 30 }, (_, i) => `  const nothingLikeThis${i} = other(${i});`).join('\n')))), false, 'code that is genuinely gone stays put');
+    assert.equal(e.applies(anchorTask('ctx', body(snippet), { files: [{ path: 'src/missing.js', context: true, anchorConfidence: 'none' }] })), true, 'a context-only file does not matter');
+    const other = anchorTask('other', body(snippet)); other.needsClarification.openQuestions = 'The draft cites a file that does not exist.';
+    assert.equal(e.applies(other), false, 'a different failure');
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_REPO_ROOT', saved.r], ['AGENT_MANAGER_PIPELINE_DIR', saved.p]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+});
