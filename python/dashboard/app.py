@@ -4490,6 +4490,20 @@ if __name__ == "__main__":
     active = get_active_repo_root()
     print(f"Dashboard reading pipeline dir: {get_pipeline_dir() if active else '(none configured yet -- use the Project tab)'}")
     print(f"Open {'https' if ssl_context else 'http'}://localhost:{port}")
+
+    # plugin_process_manager.start() was previously only ever called from the manual
+    # /api/plugins/select-slot UI action -- a slotted plugin marked active:true in
+    # plugins.json (e.g. agent-manager-chat-plugin) had no path back to running after
+    # its process died or the dashboard itself restarted. start() is idempotent
+    # (skips if its own pidfile already shows it running), so this is safe to run on
+    # every boot, including both reloader passes.
+    for _plugin in _read_plugins_manifest():
+        if _plugin.get("slot") and _plugin.get("active") and _plugin.get("process"):
+            if plugin_process_manager.start(_plugin):
+                _wait_for_plugin_health(_plugin)
+            else:
+                print(f"[dashboard] failed to auto-start active plugin '{_plugin.get('name')}' -- see "
+                      f"~/.local/state/agent-manager/logs/plugin-{_plugin.get('name')}.log", file=sys.stderr)
     # use_reloader=True alone (Werkzeug watches app.py's directory, restarts the whole
     # process on change) WITHOUT debug=True -- confirmed live 2026-07-25: a dashboard
     # process left running all night served stale API endpoints for hours after multiple
