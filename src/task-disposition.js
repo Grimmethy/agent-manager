@@ -334,7 +334,10 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
         detail: `applied to ${detail} -- branch gone, but ${landed.present} of ${landed.checked} distinctive added lines (${landed.files} file(s)) are already on ${mainBranch}: the work landed another way`.slice(0, 240),
       };
     }
-    const removal = pipelineDir ? lastRemoval(pipelineDir, detail.split(/\s/)[0]) : null;
+    // A stacked sub-task's branch is the SHARED one on record.stacked.branch, which may differ from the branch its apply detail names (same resolution as step 3): try both.
+    const removal = pipelineDir
+      ? [record.stacked && record.stacked.branch, detail.split(/\s/)[0]].filter(Boolean).map((b) => lastRemoval(pipelineDir, b)).find(Boolean) || null
+      : null;
     const why = removal
       ? `removed ${String(removal.at || '').slice(0, 10)} by ${removal.actor || 'unknown'} (${removal.cause}${removal.detail ? `: ${removal.detail}` : ''})`
       : 'no removal recorded -- deleted outside the pipeline';

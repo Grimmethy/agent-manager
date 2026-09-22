@@ -423,3 +423,12 @@ test('resolveDisposition: a still-present branch or a trailer on main is decided
   assert.equal(resolveDisposition(r, { ctx: ctx({ branches: { 'live-1': 2 } }), repoRoot: '/r', git: boom }).stage, 'pending-merge');
   assert.equal(resolveDisposition(r, { ctx: ctx({ onMain: { 'live-1': 'abc' } }), repoRoot: '/r', git: boom }).stage, 'merged');
 });
+
+test('resolveDisposition: a stacked sub-task looks the removal up under record.stacked.branch (the shared branch), not only the branch its apply detail names', () => {
+  const d = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'disp-'));
+  recordBranchRemoval(d, { branch: 'agent/decompose-shared-plan', cause: 'hub-retired', detail: 'hub retired', actor: 'hub-retire' });
+  const r = { id: 'child-1', stacked: { branch: 'agent/decompose-shared-plan' }, ...applied('agent/child-1') };
+  const out = resolveDisposition(r, { ctx: ctx(), pipelineDir: d });
+  assert.equal(out.stage, 'abandoned');
+  assert.match(out.detail, /by hub-retire \(hub-retired: hub retired\)/);
+});
