@@ -411,6 +411,86 @@ test('prepareStackedBranch: no remote copy and no local branch at all -> creates
   assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim(), 'agent/decompose-brand-new');
 });
 
+// --- remote copy exists but is itself STALE relative to main (2026-09-22) --------------
+// Root-caused live: a rolling branch (TRIAGE_BRANCH) is never explicitly rebased on its
+// own (apply-main-batch.js's own header says so) -- every branch of prepareStackedBranch's
+// logic above only ever compares LOCAL to REMOTE, never asking whether the REMOTE copy
+// itself has fallen behind current main. A human merged the branch (deleting it), but it
+// got recreated anchored to a point of main from two days earlier and every apply cycle
+// after that just kept stacking onto that same stale lineage -- silently reintroducing
+// commits that had ALREADY separately landed on main (one of which was a finding a human
+// had explicitly retracted as a false positive after the fact).
+
+test('prepareStackedBranch: remote exists but is based on a stale point of main -> rebases its commits onto current main', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  git(['checkout', '-b', 'agent/triage-queue'], repoDir);
+  commitFile(repoDir, 'candidate.md', 'entry A\n', 'append entry A');
+  git(['push', '-u', 'origin', 'agent/triage-queue'], repoDir);
+
+  // Main moves on independently (no overlap with the rolling branch's own change) --
+  // exactly what happens every time a human merges something else into master while the
+  // rolling branch sits untouched.
+  git(['checkout', 'main'], repoDir);
+  commitFile(repoDir, 'unrelated.txt', 'main moved on\n', 'unrelated main change');
+  git(['push', 'origin', 'main'], repoDir);
+  const newMainTip = git(['rev-parse', 'main'], repoDir).trim();
+
+  assert.doesNotThrow(() => runner.prepareStackedBranch('agent/triage-queue'));
+  assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim(), 'agent/triage-queue');
+  assert.doesNotThrow(
+    () => execFileSync('git', ['merge-base', '--is-ancestor', newMainTip, 'agent/triage-queue'], { cwd: repoDir, stdio: 'pipe' }),
+    'current main must now be an ancestor of the rebuilt branch',
+  );
+  assert.equal(fs.readFileSync(path.join(repoDir, 'candidate.md'), 'utf8'), 'entry A\n', 'the rolling branch\'s own real content survives the rebase');
+  assert.equal(fs.readFileSync(path.join(repoDir, 'unrelated.txt'), 'utf8'), 'main moved on\n', 'current main\'s content is now included too');
+});
+
+test('prepareStackedBranch: remote exists, stale relative to main, AND main already carries an equivalent (re-authored) version of the same change -> rebase auto-drops the now-empty duplicate, no human needed', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  git(['checkout', '-b', 'agent/triage-queue'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'candidate.md'), 'base\nappend X\n');
+  git(['add', 'candidate.md'], repoDir);
+  git(['commit', '-m', 'append X'], repoDir);
+  git(['push', '-u', 'origin', 'agent/triage-queue'], repoDir);
+
+  // Main incorporates the SAME textual change independently (e.g. a human rebased and
+  // merged a copy of this exact commit under a different sha) -- the exact shape of the
+  // real incident this test is modeled on.
+  git(['checkout', 'main'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'candidate.md'), 'base\nappend X\n');
+  git(['add', 'candidate.md'], repoDir);
+  git(['commit', '-m', 'append X (re-authored, different sha, already landed on main)'], repoDir);
+  git(['push', 'origin', 'main'], repoDir);
+
+  assert.doesNotThrow(() => runner.prepareStackedBranch('agent/triage-queue'));
+  assert.equal(fs.readFileSync(path.join(repoDir, 'candidate.md'), 'utf8'), 'base\nappend X\n', 'no duplicate content -- the already-landed change is not reapplied a second time');
+});
+
+test('prepareStackedBranch: remote exists, stale relative to main, and rebasing its commits onto main hits a REAL conflict -> throws for a human, discards nothing', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  git(['checkout', '-b', 'agent/triage-queue'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v2 -- from the rolling branch\n');
+  git(['add', 'tracked.txt'], repoDir);
+  git(['commit', '-m', 'rolling branch edits tracked.txt'], repoDir);
+  git(['push', '-u', 'origin', 'agent/triage-queue'], repoDir);
+  const branchTip = git(['rev-parse', 'agent/triage-queue'], repoDir).trim();
+
+  // Main independently makes a GENUINELY CONFLICTING edit to the same line.
+  git(['checkout', 'main'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v2 -- from main, a real conflicting edit\n');
+  git(['add', 'tracked.txt'], repoDir);
+  git(['commit', '-m', 'main edits the same line differently'], repoDir);
+  git(['push', 'origin', 'main'], repoDir);
+
+  assert.throws(() => runner.prepareStackedBranch('agent/triage-queue'), /stale point of main/);
+  // No rebase left in progress, and the remote-tracking branch's own commit is untouched.
+  assert.equal(fs.existsSync(path.join(repoDir, '.git', 'rebase-merge')), false, 'a failed rebase must be aborted, not left in progress');
+  assert.equal(git(['rev-parse', 'origin/agent/triage-queue'], repoDir).trim(), branchTip, 'the remote copy itself is never touched by a failed local rebase');
+});
+
 test('remoteBranchExists reflects the real remote-tracking ref, independent of a same-named local branch', () => {
   const { repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);
