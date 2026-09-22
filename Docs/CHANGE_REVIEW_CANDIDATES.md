@@ -425,3 +425,35 @@ index ffd11de6..ac74a803 100755
 Problem: [severity: med; regression shipped in dffc890] Before this diff the worker's model was fixed at launch from agent-manager.env and never changed; after this diff, clearing a per-instance override via the dashboard does not restore the original env value — the worker silently keeps using the last override indefinitely.  Failure scenario: Worker starts with CLAUDE_MODEL=claude-sonnet-4 (from agent-manager.env). User selects "claude-opus-4" in the Workers-tab dropdown → api_set_worker_model writes workerModelOverrides["worker-reasoning-1"]="claude-opus-4". Next tick: get_model_override returns "claude-opus-4", line 53 assigns CLAUDE_MODEL="claude-opus-4", exported. User then selects "(default)" → api_set_worker_model pops the key. Next tick: get_model_override returns "" (empty), line 53 `[[ -n "" ]] && CLAUDE_MODEL="$override"` short-circuits (test is false), CLAUDE_MODEL remains "claude-opus-4" from the prior tick, line 54 exports it, and every downstream node call (claude-client.js) continues using claude-opus-4 forever until the daemon is restarted. The docstring on api_set_worker_model explicitly promises "reverting that instance to its agent-manager.env default … on its next tick," which does not happen.
 Solution: Capture the launch-time values once (after orc-common.sh is sourced) as `readonly ORIG_CLAUDE="${CLAUDE_MODEL:-sonnet}"` / `readonly ORIG_ORNITH="${ORNITH_MODEL:-}"`, then in refresh_active_model replace the conditional-assign with an unconditional one: `CLAUDE_MODEL="${override:-$ORIG_CLAUDE}"` (and the ORNITH_MODEL equivalent), so an empty override always falls back to the original env value rather than retaining the stale prior-tick assignment.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in dffc890.
+
+### AC-60 · The pending/ claim loop previously used a pure shell `ls -1` to list files, which works wi (88c4273 local-worker.sh)
+Strength: Strong
+Source: change_review of 88c4273 "Sort the pending/ claim loop by task priority instead of alphabetical ls -1"
+Files: scripts/local-worker.sh
+
+Snippet:
+```
+diff --git a/scripts/local-worker.sh b/scripts/local-worker.sh
+index 5f0cb7c2..3e8c87a6 100755
+--- a/scripts/local-worker.sh
++++ b/scripts/local-worker.sh
+@@ -328,38 +328,71 @@ while :; do
+   drafting_instance_dir="${QUEUE_DIR}/drafting/${INSTANCE_ID}"
+   if [[ -d "$drafting_instance_dir" ]]; then
+     while IFS= read -r name; do
+       [[ "$name" == *.json ]]                                                  || continue
+       wpath="${drafting_instance_dir}/${name}"
+       [[ -f "$wpath" && -s "$wpath" ]]                                        || continue
+       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
+       process_drafting_file "$wpath"
+       did_work=true
+     done < <(ls -1 "$drafting_instance_dir" 2>/dev/null)
+   fi
+ 
+-  # Read pending/ directory listing for work items to claim — equivalent logic of PowerShell's `Get-ChildItem -Path $PENDING_DIR -Filter "*.json" | Where-Object { $_.LastWriteTime > $cutoff }` filter (we keep it simpler by reading all .json entries since our pending/ folder should only contain valid draft-state JSON files anyway; if someone dropped non-.json content that's a separate bug).
+-  # array to collect pending/ file names matching our claim criteria — bash arrays declared via `local items=()` and populated by appending with ${items+=...} syntax. Each entry is just basename (no path) since we'll reconstruct full path inside the loop below using "$PENDING/$name" pattern for the same reason PowerShell's for
+```
+
+Problem: [severity: high; regression shipped in 88c4273] The pending/ claim loop previously used a pure shell `ls -1` to list files, which works with no runtime dependencies. The new code relies on `node` and specific JS modules; if `node` is missing or the modules fail to load, the inner `try/catch` swallows the error and returns an empty list, causing the worker to silently skip all pending work.  Failure scenario: A worker instance runs on a host where `node` is not in PATH, or `PACKAGE_SRC_DIR` is misconfigured such that `task-sources.js` is missing. The `node -e ...` command fails immediately (e.g., "node: command not found" or "Cannot find module"). The `2>/dev/null` redirect hides the error. The `while IFS= read -r name` loop receives no input, so `items` remains empty. The subsequent `for name in "${items[@]}"` loop iterates zero times. The worker claims no work and idles, even if `pending/` contains 22 valid JSON tasks.
+Solution: Revert the listing logic to `ls -1 "$pdir"` and perform the priority sorting in a separate, non-fatal step (e.g., using `sort` or a fallback `ls` if the node command fails), or ensure the node command's stderr is not suppressed and its exit code is checked to fall back to the unsorted `ls` listing.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 88c4273.
