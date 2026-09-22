@@ -1,8 +1,11 @@
 from pathlib import Path
 from datetime import datetime, timezone
 import re
+import logging
 
 from flask import Blueprint, abort, jsonify
+
+logger = logging.getLogger(__name__)
 
 # NOTE: `_REPORT_PERIODS` / `second_brain_dir` live in app.py, which imports this module to
 # register the blueprint -- importing them at module top is a circular import that only
@@ -84,5 +87,6 @@ def api_report_detail(period, filename):
     try:
         content = path.read_text(encoding="utf-8")
     except OSError:
+        logger.exception("Failed to serve report file %r", path)
         abort(404)
     return jsonify({"period": period, "filename": filename, "content": content})
