@@ -298,3 +298,41 @@ test('cited-code-moved-relocated matches a task whose declared file lost the Sni
     for (const [k, v] of [['AGENT_MANAGER_REPO_ROOT', saved.r], ['AGENT_MANAGER_PIPELINE_DIR', saved.p]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
 });
+
+// --- context-only-file-falsely-parked (2026-09-22) -------------------------------------------------------------------------------------------
+// PR #436 fixed hasUnreliableGrounding to ignore context-only files, but shipped no drain
+// entry for tasks ALREADY escalated by the pre-fix version -- only for the separate
+// stale-snippet-matching bug, whose own groundingNowReliable() requires a currently-'none'
+// non-context file to re-verify and so can never fire when the sole 'none' file is
+// context-only (function-length-fix-ac-44's real shape: no live file read needed, this
+// is purely a re-run of the classifier against the task's own already-stored data).
+test('context-only-file-falsely-parked matches a task whose ONLY none-anchored file was a context-only reference, and nothing else', () => {
+  const e = byId['context-only-file-falsely-parked'];
+  const falselyParked = stuck('ac-44', {
+    promptContext: { fetchedFiles: [{ path: 'src/local-draft.js', anchorConfidence: 'strong' }, { path: 'src/gpu-guard.js', anchorConfidence: 'none', context: true }] },
+    needsClarification: { reason: 'unreliable-grounding', openQuestions: "The grounding-fetch could not find a reliable anchor for this candidate's cited code in src/gpu-guard.js." },
+  });
+  assert.equal(e.applies(falselyParked), true);
+
+  const genuinelyUnreliable = stuck('ac-x', {
+    promptContext: { fetchedFiles: [{ path: 'src/foo.js', anchorConfidence: 'none' }] },
+    needsClarification: { reason: 'unreliable-grounding', openQuestions: 'x' },
+  });
+  assert.equal(e.applies(genuinelyUnreliable), false, 'a real non-context none-anchored file must still be left for stale-snippet-partial-anchor / a human');
+
+  const differentReason = stuck('ac-y', { needsClarification: { reason: 'design-decision', openQuestions: 'x' } });
+  assert.equal(e.applies(differentReason), false, 'not an unreliable-grounding escalation at all');
+});
+
+test('context-only-file-falsely-parked drains the victim to pending/', () => {
+  const dir = pipeline();
+  put(dir, 'needs-clarification', stuck('ac-44', {
+    history: [{ stage: 'blocked', at: '2026-09-20T05:00:00Z' }, { stage: 'needs-clarification', at: '2026-09-20T05:00:01Z' }],
+    promptContext: { fetchedFiles: [{ path: 'src/local-draft.js', anchorConfidence: 'strong' }, { path: 'src/gpu-guard.js', anchorConfidence: 'none', context: true }] },
+    needsClarification: { reason: 'unreliable-grounding', openQuestions: "The grounding-fetch could not find a reliable anchor for this candidate's cited code in src/gpu-guard.js." },
+  }));
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['context-only-file-falsely-parked']] });
+  assert.deepEqual(s.requeued.map((r) => r.id), ['ac-44']);
+  assert.equal(has(dir, 'pending', 'ac-44'), true);
+  assert.equal(has(dir, 'needs-clarification', 'ac-44'), false);
+});

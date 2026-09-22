@@ -143,6 +143,33 @@ const KNOWN_FIXED = [
     dirs: ['blocked', 'needs-clarification'],
     applies: (task) => citedCodeMovedAndRelocatable(task),
   },
+  {
+    // 2026-09-22, root-caused live via function-length-fix-ac-44: PR #436's item 2
+    // ("context-only files no longer park a task") fixed hasUnreliableGrounding itself,
+    // but shipped no drain entry for the shape it fixes -- only for the snippet-matching
+    // bug (stale-snippet-partial-anchor, which requires a currently-'none' NON-context
+    // file to exist and re-verifies it now anchors 'strong'). AC-44's actual DECLARED
+    // target (src/local-draft.js) anchored 'strong' the whole time; the escalation was
+    // caused entirely by a context-only reference (src/gpu-guard.js, quoted in the
+    // candidate's own prose) that the pre-fix classifier wrongly counted. Because no
+    // non-context file was ever 'none', stale-snippet-partial-anchor's own
+    // groundingNowReliable() sees an empty `bad` list and fails closed (not fixed) --
+    // exactly the case where it should recognize there was never a real problem to
+    // re-verify. This entry re-runs the CURRENT (fixed) classifier directly: if a task
+    // was escalated as 'unreliable-grounding' but hasUnreliableGrounding(task) no
+    // longer agrees on its own stored fetchedFiles (no live file read needed -- the
+    // bug was in how the classifier counted files it already had, not in re-fetching
+    // them), the escalation itself is void.
+    id: 'context-only-file-falsely-parked',
+    fixedIn: 'agent-manager (grounding: context-only files no longer park a task, PR #436, 2026-09-21)',
+    description: 'a candidate was escalated as "unreliable-grounding" solely because a context-only reference file (quoted in the write-up\'s prose, never a declared edit target) anchored `none` -- the classifier now excludes context files, and the task\'s actual declared target(s) were never unreliable at all',
+    dirs: ['needs-clarification'],
+    applies: (task) => {
+      if (!task || !task.needsClarification || task.needsClarification.reason !== 'unreliable-grounding') return false;
+      const { hasUnreliableGrounding } = require('./blocked-task-classifiers.js');
+      return !hasUnreliableGrounding(task);
+    },
+  },
 ];
 
 module.exports = { KNOWN_FIXED, failureText };
