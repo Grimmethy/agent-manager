@@ -425,3 +425,203 @@ index ffd11de6..ac74a803 100755
 Problem: [severity: med; regression shipped in dffc890] Before this diff the worker's model was fixed at launch from agent-manager.env and never changed; after this diff, clearing a per-instance override via the dashboard does not restore the original env value — the worker silently keeps using the last override indefinitely.  Failure scenario: Worker starts with CLAUDE_MODEL=claude-sonnet-4 (from agent-manager.env). User selects "claude-opus-4" in the Workers-tab dropdown → api_set_worker_model writes workerModelOverrides["worker-reasoning-1"]="claude-opus-4". Next tick: get_model_override returns "claude-opus-4", line 53 assigns CLAUDE_MODEL="claude-opus-4", exported. User then selects "(default)" → api_set_worker_model pops the key. Next tick: get_model_override returns "" (empty), line 53 `[[ -n "" ]] && CLAUDE_MODEL="$override"` short-circuits (test is false), CLAUDE_MODEL remains "claude-opus-4" from the prior tick, line 54 exports it, and every downstream node call (claude-client.js) continues using claude-opus-4 forever until the daemon is restarted. The docstring on api_set_worker_model explicitly promises "reverting that instance to its agent-manager.env default … on its next tick," which does not happen.
 Solution: Capture the launch-time values once (after orc-common.sh is sourced) as `readonly ORIG_CLAUDE="${CLAUDE_MODEL:-sonnet}"` / `readonly ORIG_ORNITH="${ORNITH_MODEL:-}"`, then in refresh_active_model replace the conditional-assign with an unconditional one: `CLAUDE_MODEL="${override:-$ORIG_CLAUDE}"` (and the ORNITH_MODEL equivalent), so an empty override always falls back to the original env value rather than retaining the stale prior-tick assignment.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in dffc890.
+
+### AC-60 · The pending/ claim loop previously used a pure shell `ls -1` to list files, which works wi (88c4273 local-worker.sh)
+Strength: Strong
+Source: change_review of 88c4273 "Sort the pending/ claim loop by task priority instead of alphabetical ls -1"
+Files: scripts/local-worker.sh
+
+Snippet:
+```
+diff --git a/scripts/local-worker.sh b/scripts/local-worker.sh
+index 5f0cb7c2..3e8c87a6 100755
+--- a/scripts/local-worker.sh
++++ b/scripts/local-worker.sh
+@@ -328,38 +328,71 @@ while :; do
+   drafting_instance_dir="${QUEUE_DIR}/drafting/${INSTANCE_ID}"
+   if [[ -d "$drafting_instance_dir" ]]; then
+     while IFS= read -r name; do
+       [[ "$name" == *.json ]]                                                  || continue
+       wpath="${drafting_instance_dir}/${name}"
+       [[ -f "$wpath" && -s "$wpath" ]]                                        || continue
+       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
+       process_drafting_file "$wpath"
+       did_work=true
+     done < <(ls -1 "$drafting_instance_dir" 2>/dev/null)
+   fi
+ 
+-  # Read pending/ directory listing for work items to claim — equivalent logic of PowerShell's `Get-ChildItem -Path $PENDING_DIR -Filter "*.json" | Where-Object { $_.LastWriteTime > $cutoff }` filter (we keep it simpler by reading all .json entries since our pending/ folder should only contain valid draft-state JSON files anyway; if someone dropped non-.json content that's a separate bug).
+-  # array to collect pending/ file names matching our claim criteria — bash arrays declared via `local items=()` and populated by appending with ${items+=...} syntax. Each entry is just basename (no path) since we'll reconstruct full path inside the loop below using "$PENDING/$name" pattern for the same reason PowerShell's for
+```
+
+Problem: [severity: high; regression shipped in 88c4273] The pending/ claim loop previously used a pure shell `ls -1` to list files, which works with no runtime dependencies. The new code relies on `node` and specific JS modules; if `node` is missing or the modules fail to load, the inner `try/catch` swallows the error and returns an empty list, causing the worker to silently skip all pending work.  Failure scenario: A worker instance runs on a host where `node` is not in PATH, or `PACKAGE_SRC_DIR` is misconfigured such that `task-sources.js` is missing. The `node -e ...` command fails immediately (e.g., "node: command not found" or "Cannot find module"). The `2>/dev/null` redirect hides the error. The `while IFS= read -r name` loop receives no input, so `items` remains empty. The subsequent `for name in "${items[@]}"` loop iterates zero times. The worker claims no work and idles, even if `pending/` contains 22 valid JSON tasks.
+Solution: Revert the listing logic to `ls -1 "$pdir"` and perform the priority sorting in a separate, non-fatal step (e.g., using `sort` or a fallback `ls` if the node command fails), or ensure the node command's stderr is not suppressed and its exit code is checked to fall back to the unsorted `ls` listing.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 88c4273.
+
+### AC-61 · api_task_detail and api_task_anywhere previously read only from the filesystem (read_json_ (1541b0f app.py)
+Strength: Strong
+Source: change_review of 1541b0f "Extend cost tracking to the job page, Workers tab, and hourly/daily/weekly repor"
+Files: python/dashboard/app.py
+
+Snippet:
+```
+diff --git a/python/dashboard/app.py b/python/dashboard/app.py
+index 833e7f69..f71377b3 100644
+--- a/python/dashboard/app.py
++++ b/python/dashboard/app.py
+@@ -707,24 +707,33 @@ def model_stats_db_path() -> Path | None:
+ 
+ def _has_cost_usd_column(conn: sqlite3.Connection) -> bool:
+     """cost_usd (2026-08-23, Grimmethy: "Do we have any way of knowing how much these
+     tasks would cost using anthropic API?") -- model-stats-db.js's own ALTER TABLE
+     migration only runs the next time a real recordCall() fires from the Node side; this
+     Python reader can be hit BEFORE that ever happens (a fresh db, or an old one nobody's
+     written to yet today), so every query touching cost_usd guards on this first rather
+     than crashing with 'no such column' the moment someone opens the Models tab."""
+     row = conn.execute("SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'").fetchone()
+     return bool(row and row[0])
+ 
+ 
++def _has_instance_id_column(conn: sqlite3.Connection) -> bool:
++    """Same guard as _has_cost_usd_column above, for the instance_id column (2026-08-23,
++    "Where else would it make sense to track it?" -> Workers tab, per-instance cost) --
++    added in the same migration pass as cost_usd, but guarded independently since a
++    caller should never assume two separate ALTER TABLE statements landed atomically."""
++    row = conn.execute("SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'instance_id'").fetchone()
++ 
+```
+
+Problem: [severity: med; regression shipped in 1541b0f] api_task_detail and api_task_anywhere previously read only from the filesystem (read_json_safe) and returned 200 regardless of sqlite db state; after this diff they call _task_cost_summary, which executes sqlite queries with no exception handling, so a corrupt or non-SQLite db file now causes an uncaught sqlite3.DatabaseError and a 500 response.  Failure scenario: A valid task file exists at queue/done/task-abc.json. The file at the path returned by model_stats_db_path() exists (is_file() → True) but its first 16 bytes are 0x00 (a zeroed-out file, not a valid SQLite header). Before the diff: GET /api/task/done/task-abc reads the JSON, returns 200 with the task body. After the diff: GET /api/task/done/task-abc reads the JSON, then calls _task_cost_summary("task-abc"); model_stats_db_path() returns the path, is_file() is True, sqlite3.connect(...) succeeds (lazy), _has_cost_usd_column(conn) executes "SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'" which raises sqlite3.DatabaseError("file is not a database"); the try/finally in _task_cost_summary only closes the connection, the exception propagates uncaught through api_task_detail into Flask, which returns HTTP 500.
+Solution: Wrap the body of _task_cost_summary (from the sqlite3.connect line through the return) in a try/except sqlite3.Error (or bare except Exception) that returns None, restoring the "no cost data available" path and the pre-diff graceful-degradation behaviour of the task-detail endpoints.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 1541b0f.
+
+### AC-62 · `GET /api/job-types` previously always returned 200; after this diff it returns 500 when ` (14e18c1 app.py)
+Strength: Strong
+Source: change_review of 14e18c1 "Merge Agent manager > job list : we should add a field that tracks how many time"
+Files: python/dashboard/app.py
+
+Snippet:
+```
+diff --git a/python/dashboard/app.py b/python/dashboard/app.py
+index 92613e45..8b8dab3e 100644
+--- a/python/dashboard/app.py
++++ b/python/dashboard/app.py
+@@ -803,24 +803,42 @@ def write_project_links(links: dict):
+ 
+ 
+ def brain_dump_path() -> Path | None:
+     override = os.environ.get("AGENT_MANAGER_BRAIN_DUMP_PATH") or read_env_file(ENV_FILE_PATH).get(
+         "AGENT_MANAGER_BRAIN_DUMP_PATH"
+     )
+     if override:
+         return Path(override)
+     d = get_pipeline_dir()
+     return (d / "brain-dump.json") if d else None
+ 
+ 
++def job_type_counters_path() -> Path | None:
++    """Mirrors src/config.js's jobTypeCountersPath default -- job-type-counters.json in
++    pipelineDir, same env-override convention (AGENT_MANAGER_JOB_TYPE_COUNTERS_PATH) as
++    every other pipelineDir-relative state file above."""
++    override = os.environ.get("AGENT_MANAGER_JOB_TYPE_COUNTERS_PATH")
++    if override:
++        return Path(override)
++    d = get_pipeline_dir()
++    return (d / "job-type-counters.json") if d else None
++
++
++def read_job_type_counters() -> dict:
++    p = job_type_counters_path()
++    if not p:
++        return {}
++    return read_json_safe(p) or {}
++
++
+ def read_json_safe(path: Path):
+     try:
+         return json.loads(path.read_text(encoding="utf-8"))
+     except (OSError, json.JSONDecodeError):
+         return None
+ 
+ 
+ # Matches a `.` + at least 7 digits and captures the first 6 -- PowerShell's `Get-Date
+ # -Format 'o'` (used for every heartbeat/stateSince timest
+```
+
+Problem: [severity: low; regression shipped in 14e18c1] `GET /api/job-types` previously always returned 200; after this diff it returns 500 when `job-type-counters.json` contains valid JSON that is not an object.  Failure scenario: The pipeline directory contains a file `job-type-counters.json` whose content is the text `[1, 2, 3]` (e.g. left over from a manual edit or a different tool). A `GET /api/job-types` request enters `api_job_types()`, which calls `read_job_type_counters()`. That function calls `read_json_safe(p)`, which successfully parses the file and returns the list `[1, 2, 3]` (no exception, so the `except` branch is skipped). The `or {}` guard does not fire because a non-empty list is truthy, so `counters` is `[1, 2, 3]`. The list comprehension then evaluates `counters.get(name, 0)` and raises `AttributeError: 'list' object has no attribute 'get'`, producing a 500 response. Before this diff the endpoint never read that file and returned 200 unconditionally.
+Solution: In `read_job_type_counters`, replace `return read_json_safe(p) or {}` with `result = read_json_safe(p); return result if isinstance(result, dict) else {}` so that any non-object JSON value is coerced to the safe empty-dict default before the caller invokes `.get()`.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 14e18c1.
+
+### AC-63 · A non-model `OSError` (e.g. `FileNotFoundError`, `PermissionError`) raised during session- (37eb1fd app.py)
+Strength: Strong
+Source: change_review of 37eb1fd "Coordinate Discuss's local-model calls with the worker lanes' GPU lock"
+Files: python/dashboard/app.py
+
+Snippet:
+```
+diff --git a/python/dashboard/app.py b/python/dashboard/app.py
+index b0d7ddae..6ff207c8 100644
+--- a/python/dashboard/app.py
++++ b/python/dashboard/app.py
+@@ -286,30 +286,41 @@ def _discuss_provider_args(body: dict = None):
+         effort = effort or defaults["effort"]
+     else:
+         model = None
+         effort = None
+     return provider, model, effort
+ 
+ 
+ def _call_discuss(fn, *args, **kwargs):
+     """Runs a discuss_sessions.py call (start_session/send_message/end_session) and
+     turns claude_client.ClaudeClientError into a clean 4xx/5xx JSON response instead of
+     an unhandled-exception 500 -- confirmed live: a Claude-provider discuss/start with
+     CLAUDE_CODE_OAUTH_TOKEN unset previously surfaced as Flask's generic "internal
+-    error" page with no indication of what actually went wrong or how to fix it."""
++    error" page with no indication of what actually went wrong or how to fix it.
++
++    2026-08-24 -- caught live via an actual Discuss click on the local provider: worker-1
++    was mid-draft on the same Ollama model at that exact moment (Discuss has no
++    coordination with the worker lanes' own use of it -- see the standing, deliberately-
++    deferred discussion on adding a shared lock), the reply call queued behind it and hit
++    ollama_client.py's own 240s timeout, and that raised a bare TimeoutError with no
++    handling here at all -- same raw-500-with-no-explanation failure mode this function
++    already exists to prevent for the Claude sid
+```
+
+Problem: [severity: med; regression shipped in 37eb1fd] A non-model `OSError` (e.g. `FileNotFoundError`, `PermissionError`) raised during session-file I/O inside `start_session`/`send_message` is now caught and misreported as "local model call failed … may be busy with an active worker-lane task," whereas before the diff it propagated as an unhandled 500 (correctly signalling a non-model problem).  Failure scenario: A Discuss session file `/pipeline/.discuss-sessions/a1b2c3.json` is deleted out-of-band (e.g. by a cleanup script or a user). The user clicks "Send" in the Discuss UI. `app.py` calls `_call_discuss(send_message, pipeline_dir, "a1b2c3", "hello")`. Inside `send_message`, `Path.read_text()` on the session file raises `FileNotFoundError` (an `OSError` subclass). The new `except (TimeoutError, ConnectionError, OSError)` clause catches it (since `FileNotFoundError` ⊂ `OSError`) and calls `abort(502, description="local model call failed ([Errno 2] No such file or directory: '/pipeline/.discuss-sessions/a1b2c3.json') -- it may be busy with an active worker-lane task; try again shortly or switch to Claude.")`. The user is told the model is busy and should wait or switch to Claude, when the real problem is a missing file that will never resolve by waiting.
+Solution: Remove bare `OSError` from the except tuple so only the specific model-busy exceptions are caught:
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 37eb1fd.
+
+### AC-64 · Pre-diff, every build re-resolved each file's imports against the current file_set, so a n (dc8d59a build_graph.py)
+Strength: Strong
+Source: change_review of dc8d59a "Incremental project-graph builds: diff-based, not from-scratch every time"
+Files: python/build_graph.py
+
+Snippet:
+```
+diff --git a/python/build_graph.py b/python/build_graph.py
+index abbd0c81..c05b3849 100644
+--- a/python/build_graph.py
++++ b/python/build_graph.py
+@@ -113,33 +113,40 @@ TEMPLATE_RE = re.compile(r"""render_template\(\s*f?['"]([^'"]+)['"]""")
+ 
+ 
+ def get_config():
+     repo_root = os.environ.get("AGENT_MANAGER_REPO_ROOT")
+     if not repo_root:
+         raise SystemExit("AGENT_MANAGER_REPO_ROOT env var is required.")
+     repo_root = Path(repo_root)
+ 
+     pipeline_dir = Path(os.environ.get("AGENT_MANAGER_PIPELINE_DIR", str(repo_root)))
+     grep_dirs = [d.strip() for d in os.environ.get("AGENT_MANAGER_GREP_DIRS", "frontend/src,backend/src").split(",") if d.strip()]
+     graph_path = Path(os.environ.get("AGENT_MANAGER_GRAPH_PATH", str(repo_root / "graphify-out" / "graph.json")))
+     coverage_path = Path(os.environ.get("AGENT_MANAGER_COMMUNITY_COVERAGE_PATH", str(pipeline_dir / "community-coverage.json")))
++    # 2026-08-24 (Brain Dump #155): per-file mtime/size -> resolved-edges cache, see
++    # build_import_graph's own comment. Lives under instances/ alongside the OTHER
++    # build-scheduling state (.graph-build-schedule.json) thi
+...[snippet truncated]
+```
+
+Problem: [severity: high; regression shipped in dc8d59a] Pre-diff, every build re-resolved each file's imports against the current file_set, so a newly-added file imported by an unchanged file produced a correct edge; post-diff, the cache-hit path reuses an edge list that was filtered by the *previous* build's file_set and can never add an edge whose target did not exist at cache-write time.  Failure scenario: repo_root=/home/user/project, grep_dirs=["backend/src"]. Build 1: only backend/src/service.py exists (content: `from new_util import helper`); backend/src/new_util.py does not exist. file_set={service.py}. _extract_edges_for_file resolves the import to /home/user/project/backend/src/new_util.py, but `target in file_set` is False, so edges=[] is cached. Build 2: backend/src/new_util.py is added (e.g. `def helper(): ...`); service.py is byte-identical (same mtime, same size). file_set={service.py, new_util.py}. service.py is a cache hit → edges=[] → no edge added. new_util.py is a cache miss → its own edges extracted (none). Graph: 2 nodes, 0 edges → both isolated → both removed → empty graph. Pre-diff Build 2 would have read service.py's text, resolved `new_util` to new_util.py, found it in file_set, and added the service.py→new_util.py edge, yielding a 2-node/1-edge graph with no isolated nodes.
+Solution: In the cache-hit branch, after loading `edges = cached["edges"]`, also re-scan the file's import statements (or, more cheaply, store the *unresolved* import specs in the cache alongside the resolved edges) and resolve them against the *current* file_set, appending any newly-valid targets to `edges` before the `graph.has_node` loop. Alternatively, invalidate the cache entry for file A whenever file_set gains a new member that A's text could resolve to (i.e., treat any file-set addition as a cache miss for all cached files that import from the same directory/package).
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in dc8d59a.
