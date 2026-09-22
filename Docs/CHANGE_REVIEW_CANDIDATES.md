@@ -241,3 +241,187 @@ Problem: [severity: med; regression shipped in 49a4f48] `pipelineStarting` is se
 Solution: Bound the flag in time. Record `pipelineStartedAt = Date.now()` where `pipelineStarting = true` is set, and in the `else if (pipelineStarting)` branch treat the flag as expired after a named constant (for example `PIPELINE_START_GRACE_MS = 30000`, chosen against the measured time daemons take to appear in status, not a guess): clear `pipelineStarting` and fall through to the plain "Start Pipeline" branch. Add a node test that, with the flag set and a status poll reporting neither running nor stoppable, the button stays "Starting..." inside the grace period and is re-enabled after it.
 
 Benefits: A failed start recovers by itself instead of requiring a reload; the flicker fix is kept for the normal case.
+
+### AC-55 · `api_brain_dump_capture` now calls `.get("serial")` on every element of the entries list w (f3d1441 app.py)
+Strength: Strong
+Source: change_review of f3d1441 "Assign a stable serial number to Brain Dump entries"
+Files: python/dashboard/app.py
+
+Snippet:
+```
+diff --git a/python/dashboard/app.py b/python/dashboard/app.py
+index 32109046..66ca1162 100644
+--- a/python/dashboard/app.py
++++ b/python/dashboard/app.py
+@@ -869,31 +869,54 @@ def api_summary():
+     if not qdir:
+         return jsonify(counts)
+ 
+     for state in QUEUE_STATES:
+         state_dir = qdir / state
+         counts[state] = len(list(state_dir.glob("*.json"))) if state_dir.is_dir() else 0
+     drafting_root = qdir / "drafting"
+     if drafting_root.is_dir():
+         counts["drafting"] = len(list(drafting_root.rglob("*.json")))
+     return jsonify(counts)
+ 
+ 
++def _assign_brain_dump_serials(entries: list) -> bool:
++    """Backfills a stable #N serial onto any entry that doesn't have one yet, so the
++    user has a short, stable handle to reference a specific entry by ("entry #12")
++    instead of its long slugified id. New entries get one at capture time (see
++    api_brain_dump_capture); this covers every entry that existed before that changed
++    and self-heals if brain-dump.json is ever hand-edited to drop the field. Assigns in
++    capturedAt order (oldest first) so backfilled numbers land in a sensible reading
++    order rather than dict/file order, continuing from whatever the current max already
++    is so a re-run never reassigns or collides with a number already handed out.
++    Returns True if anything changed, so the caller knows to persist it."""
++    missing = [e for e in entries if isinstance(e, dict) and not e.get("serial")]
++    if not missing:
++ 
+```
+
+Problem: [severity: med; regression shipped in f3d1441] `api_brain_dump_capture` now calls `.get("serial")` on every element of the entries list without an `isinstance(e, dict)` guard, so a non-dict scalar in the `entries` array (which the old code tolerated because it never inspected existing elements) now causes an unhandled `AttributeError` and a 500 response.  Failure scenario: `brain-dump.json` contains `{"entries": [42, {"id": "bd-1", "serial": 1, "capturedAt": "2026-01-01T00:00:00+00:00", "rawText": "hello", "status": "captured"}]}` (a stray scalar from a hand-edit). A `POST /api/brain-dump/capture` with body `{"text": "new thought"}` reaches `next_serial = max((e.get("serial") or 0) for e in entries) + 1`. The generator yields `42` first; `42.get("serial")` raises `AttributeError: 'int' object has no attribute 'get'`, which Flask turns into a 500. The pre-diff code simply appended the new entry to the list and wrote the file back, never calling `.get` on existing elements, so the same file worked fine.
+Solution: Add the same `isinstance(e, dict)` guard already used in `_assign_brain_dump_serials`: `next_serial = max((e.get("serial") or 0) for e in entries if isinstance(e, dict)) + 1 if entries else 1`
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in f3d1441.
+
+### AC-56 · Before this diff, a successful `/api/queue/<state>` response was sufficient to render the  (8b29ba0 index.html)
+Strength: Strong
+Source: change_review of 8b29ba0 "Stop losing applied work to unpushed/orphaned branches, add Done filter"
+Files: python/dashboard/templates/index.html
+
+Snippet:
+```
+diff --git a/python/dashboard/templates/index.html b/python/dashboard/templates/index.html
+index 8b053363..250ff269 100644
+--- a/python/dashboard/templates/index.html
++++ b/python/dashboard/templates/index.html
+@@ -513,46 +513,87 @@ async function postTaskAction(state, id, action, confirmMessage) {
+ 
+ // Incremental loading (2026-07-26, Grimmethy: "long task lists take a while to load,
+ // we should do incremental loading, 10 at a time, expanding as the user scrolls to the
+ // bottom"). queueLoadedCount/queueHasMore persist per-state across the generic 5s
+ // refresh() poll and across tab switches (switching away and back keeps your scroll
+ // depth) -- only a full page reload resets them to the first page.
+ const QUEUE_PAGE_SIZE = 10;
+ const QUEUE_STATE_TABS = ['drafting', 'pending', 'review', 'approved', 'blocked', 'needs-clarification', 'awaiting-confirm', 'done'];
+ const queueLoadedCount = {};
+ const queueHasMore = {};
+ let queueLoadInFlight = false;
+ 
++// Task-type filter (Job Status > Done, 2026-08-17: "Done is getting huge, need to
++// filter by task type"). Per-state so switching tabs doesn't carry a filter over to an
++// unrelated list; '' means unfiltered. Options come from /api/job-types (same source
++// catalog the Job List tab's own rows are built from) fetched once and cached module-
++// scope -- it barely changes, and re-fetching on every 5s poll would be wasteful for a
++// dropdown that just needs the name list.
++const queueSourceFilter = {};
++let allSourceNam
+```
+
+Problem: [severity: med; regression shipped in 8b29ba0] Before this diff, a successful `/api/queue/<state>` response was sufficient to render the tab body; after this diff, a second unguarded network call to `/api/job-types` is a hard prerequisite, and its failure leaves the tab blank with no error message.  Failure scenario: User opens the "done" tab. `fetchJson('/api/queue/done?limit=10&offset=0')` succeeds and returns `{"items":[…5 tasks…],"total":50}`. Control then reaches `const sourceNames = await allSourceNames();`, which calls `fetchJson('/api/job-types')`. The server returns HTTP 500 (transient error, deploy in progress, or the endpoint is temporarily removed). `fetchJson` throws (confirmed by the identical pattern in `refreshPipelineStatus` where `fetchJson` rejection is caught with `e.message`). Because this `await` sits outside any `try/catch` in `renderQueueTab`, the rejection propagates out of the async function as an unhandled promise rejection. `main.innerHTML` is never assigned; the tab body is blank and no error text is shown to the user. Before this diff, the same successful queue response would have produced the task table.
+Solution: Wrap the `allSourceNames()` call in a `try/catch` that falls back to an empty array (or a single "All task types" option), so the queue table still renders when the job-types endpoint is unavailable:
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 8b29ba0.
+
+### AC-57 · Before this diff, if the /api/pipeline/start POST returned 200 OK but the spawned daemons  (49a4f48 index.html)
+Strength: Strong
+Source: change_review of 49a4f48 "Fix Start Pipeline button flicker, add a legend to the project graph"
+Files: python/dashboard/templates/index.html
+
+Snippet:
+```
+diff --git a/python/dashboard/templates/index.html b/python/dashboard/templates/index.html
+index 5096ba6f..5812c332 100644
+--- a/python/dashboard/templates/index.html
++++ b/python/dashboard/templates/index.html
+@@ -179,24 +179,36 @@ let grepDirs = localStorage.getItem('agentManagerGrepDirs') || '';
+ let includeApply = localStorage.getItem('agentManagerIncludeApply') === 'true';
+ let skipPush = localStorage.getItem('agentManagerSkipPush') !== 'false'; // default true (don't push)
+ let browsePath = '';
+ let browserOpen = false;
+ let historyOpen = false;
+ let projectStatusInterval = null;
+ // Tracks which click this is on the Start/Stop/Force-Stop toggle button while the
+ // pipeline is running: false = not yet clicked (button reads "Stop Pipeline"), true =
+ // a graceful stop was already requested and is in flight (button reads "Force Stop
+ // Pipeline" so a stuck daemon can be killed without waiting out the grace period).
+ // Reset to false whenever the pi
+...[snippet truncated]
+```
+
+Problem: [severity: med; regression shipped in 49a4f48] Before this diff, if the /api/pipeline/start POST returned 200 OK but the spawned daemons subsequently failed to reach a running state, the next refreshPipelineStatus() poll would fall into the plain else branch and re-enable the "Start Pipeline" button, allowing the user to retry; after this diff the new else-if (pipelineStarting) branch intercepts every subsequent poll and leaves the button permanently disabled with "Starting…" text, with no timeout, cancel affordance, or other clearing path.  Failure scenario: User has projectPath = "/home/dev/myproj" set. They click "Start Pipeline". startPipeline() sets pipelineStarting = true, POSTs to /api/pipeline/start, and the server returns 200 {"status":"accepted"} (so no exception is thrown and pipelineStarting stays true). The server spawns the daemons, but they immediately crash because port 8443 is already bound by a stale process. The subsequent refreshPipelineStatus() call (at the end of startPipeline, and again every 5 s via the interval) fetches /api/pipeline/status and receives {"running": false, ...}. Because pipelineStarting is still true and status.running is false, execution hits the new else-if branch (line 1697): startBtn.disabled = true; startBtn.textContent = 'Starting...'. This repeats on every poll indefinitely. Before the diff the same poll would have hit the else branch, set startBtn.onclick = startPipeline and startBtn.disabled = false (since projectPath is non-empty), letting the user kill the stale process and click "Start Pipeline" again. After the diff the user is locked out of retrying until they perform a full page reload.
+Solution: In the else-if (pipelineStarting) branch, add a time-bounded guard: store a timestamp when pipelineStarting is set to true (e.g. pipelineStartTs = Date.now()), and in the else-if branch check if (Date.now() - pipelineStartTs > 30000) { pipelineStarting = false; /* fall through to the else branch logic */ } so the button re-enables after 30 seconds even if the daemons never report running.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 49a4f48.
+
+### AC-58 · The `*)` fallback case in `refresh_active_model` no longer assigns `CLAUDE_MODEL="$overrid (cf5ba95 ornith-worker.sh)
+Strength: Strong
+Source: change_review of cf5ba95 "Let worker-reasoning's model dropdown pick a local model too"
+Files: scripts/ornith-worker.sh
+
+Snippet:
+```
+diff --git a/scripts/ornith-worker.sh b/scripts/ornith-worker.sh
+index ac74a803..96b79fd4 100755
+--- a/scripts/ornith-worker.sh
++++ b/scripts/ornith-worker.sh
+@@ -35,32 +35,55 @@ source "${SCRIPT_DIR}/orc-common.sh"
+ # reported model regardless of which lane was actually running -- confirmed live
+ # 2026-08-17: the dashboard's Workers tab showed worker-reasoning as running "ornith:35b"
+ # even though it only ever claims adhoc tasks and never calls Ornith at all. Same
+ # "claude:<model>" label format model-provider.js's own labelFor() already uses for the
+ # Models tab, so the two stay consistent.
+ #
+ # Re-run once per tick (not just once at startup, 2026-08-18: Workers tab per-instance
+ # model dropdown) -- exports ORNITH_MODEL/CLAUDE_MODEL for this tick from
+ # dashboard-settings.json's workerModelOverrides when the dashboard has set one for THIS
+ # instanceId, else leaves whatever agent-manager.env set at launch untouched. Every node
+ # call downstream this tick (ornith-draft.js, claude-client.js via the reasoning lane)
+ # inherits the exported value, so no other call site needs to change.
++#
++# The reasoning lane's override can name EITHER backend (2026-08-18 follow-up, Grimmethy:
++# "reasoning is set to only show subscription models -- I need to be able to select from
++# both subscription and local models") -- the dropdown prefixes its value with "claude:"
++# or "ollama:" precisely so this can tell which one was picked (worker-1/reviewer's plain
++# Ornith-only dropdown ha
+```
+
+Problem: [severity: med; regression shipped in cf5ba95] The `*)` fallback case in `refresh_active_model` no longer assigns `CLAUDE_MODEL="$override"` for bare (unprefixed) model names, so a model selection stored by the pre-diff dropdown is silently ignored on the first tick after deploy.  Failure scenario: Before this diff, a user picks "opus" from the reasoning lane's dropdown; `dashboard-settings.json` records `{"workerModelOverrides":{"worker-reasoning-1":"opus"}}`. After deploy, the next tick calls `refresh_active_model`; `override` is `"opus"`, `IS_CLAUDE_LANE` is true, the `case` falls through to `*)`, which runs `unset AGENT_MANAGER_FORCE_PROVIDER; export CLAUDE_MODEL` without ever setting `CLAUDE_MODEL="opus"`. The worker then uses whatever `CLAUDE_MODEL` agent-manager.env happened to export (e.g. "sonnet" or empty→"sonnet" via the `:-sonnet` default in HEARTBEAT_MODEL), and the user's explicit "opus" choice is lost. The old code's `[[ -n "$override" ]] && CLAUDE_MODEL="$override"` handled exactly this case.
+Solution: In the `*)` branch, restore the conditional assignment before the export:
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in cf5ba95.
+
+### AC-59 · Before this diff the worker's model was fixed at launch from agent-manager.env and never c (dffc890 ornith-worker.sh)
+Strength: Strong
+Source: change_review of dffc890 "Add per-worker model override dropdown to Workers tab"
+Files: scripts/ornith-worker.sh
+
+Snippet:
+```
+diff --git a/scripts/ornith-worker.sh b/scripts/ornith-worker.sh
+index ffd11de6..ac74a803 100755
+--- a/scripts/ornith-worker.sh
++++ b/scripts/ornith-worker.sh
+@@ -25,33 +25,48 @@ readonly INSTANCE_ID="${1:-worker-0}"
+ # behind it for that whole time.
+ case "$INSTANCE_ID" in
+   worker-reasoning*) IS_CLAUDE_LANE=true ;;
+   *) IS_CLAUDE_LANE=false ;;
+ esac
+ 
+ source "${SCRIPT_DIR}/orc-common.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
+ # Note: this source is idempotent-safe because orc-common sets only unset vars (so subsequent sources don't override caller's environment).
+ 
+ # Every write_heartbeat_file call below used to hardcode "${ORNITH_MODEL:-}" as the
+ # reported model regardless of which lane was actually running -- confirmed live
+ # 2026-08-17: the dashboard's Workers tab showed worker-reasoning as running "ornith:35b"
+-# even though it only ever claims adhoc tasks and never calls Ornith at all. Computed
+-# once, here, after orc-common.sh has actually loaded CLAUDE_MODEL/ORNITH_MODEL from
+-# agent-manager.env -- same "claude:<model>" label format model-provider.js's own
+-# labelFor() already uses for the Models tab, so the two stay consistent.
+-if "$IS_CLAUDE_LANE"; then
+-  HEARTBEAT_MO
+...[snippet truncated]
+```
+
+Problem: [severity: med; regression shipped in dffc890] Before this diff the worker's model was fixed at launch from agent-manager.env and never changed; after this diff, clearing a per-instance override via the dashboard does not restore the original env value — the worker silently keeps using the last override indefinitely.  Failure scenario: Worker starts with CLAUDE_MODEL=claude-sonnet-4 (from agent-manager.env). User selects "claude-opus-4" in the Workers-tab dropdown → api_set_worker_model writes workerModelOverrides["worker-reasoning-1"]="claude-opus-4". Next tick: get_model_override returns "claude-opus-4", line 53 assigns CLAUDE_MODEL="claude-opus-4", exported. User then selects "(default)" → api_set_worker_model pops the key. Next tick: get_model_override returns "" (empty), line 53 `[[ -n "" ]] && CLAUDE_MODEL="$override"` short-circuits (test is false), CLAUDE_MODEL remains "claude-opus-4" from the prior tick, line 54 exports it, and every downstream node call (claude-client.js) continues using claude-opus-4 forever until the daemon is restarted. The docstring on api_set_worker_model explicitly promises "reverting that instance to its agent-manager.env default … on its next tick," which does not happen.
+Solution: Capture the launch-time values once (after orc-common.sh is sourced) as `readonly ORIG_CLAUDE="${CLAUDE_MODEL:-sonnet}"` / `readonly ORIG_ORNITH="${ORNITH_MODEL:-}"`, then in refresh_active_model replace the conditional-assign with an unconditional one: `CLAUDE_MODEL="${override:-$ORIG_CLAUDE}"` (and the ORNITH_MODEL equivalent), so an empty override always falls back to the original env value rather than retaining the stale prior-tick assignment.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in dffc890.
