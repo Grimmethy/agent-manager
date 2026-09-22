@@ -180,6 +180,7 @@ const { hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { targetOversizedFile, oversizedFiles } = require('./decompose-loop-autoroute.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { getRegisteredSource } = require('./task-source-registry.js');
+const { REASON_CATEGORIES } = require('./blocked-task-classifiers.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { surfaceDecomposeDesignQuestion } = require('./decompose-question-surface.js');
 
@@ -292,6 +293,19 @@ const IN_PROGRESS_RE = /\bgot close\b|\bverified facts\b|\bfor the next pass\b|\
 // own comment on the incident this fixes.
 const BUDGET_EXHAUSTED_RE = /ran out of (?:turn|context)(?:[/ ](?:turn|context))? budget/i;
 const COMPLETABLE_NOT_DESIGN_RE = /no further code changes? or decisions? (?:are |is )?(?:needed|required)|not (?:a|any) design (?:uncertainty|question|decision)|has(?:n'?t| not) (?:yet )?been executed/i;
+
+// 2026-09-22 (needs-clarification bucket review): reject-retry-check.js now stamps an
+// exhausted candidate-fulfillment/review-verdict/adhoc task with classifyBlockedTask's
+// own precise, retryable category (fabricated-ungrounded-claim, refusal-no-changes-needed,
+// empty-degenerate-draft, truncated-draft, inconclusive-review, json-parse-failure,
+// harness-search-zero-results) instead of a blanket 'design-decision' -- these are the
+// SAME exhausted tasks the buckets below were always meant to triage (a resolution-signal
+// check, a majority vote, a stale-citation flag -- none of it keys on the literal reason
+// string past this gate; only buckets H/invalid-premise and I/unreliable-grounding branch
+// on the exact value). Excluding them here would silently reproduce the exact
+// 'infra-error' dead zone bucket H/I's own header describes (see line ~86 above) for
+// every one of these categories instead.
+const RETRYABLE_CLASSIFIER_CATEGORIES = new Set(REASON_CATEGORIES.map((c) => c.key).concat(['inconclusive-review', 'harness-search-zero-results']));
 
 // 2026-09-08, root-caused live (autodecomp-...-04-system-and-project-js): the drafter's
 // own text said "not a design question -- a pass-budget overrun," which matches
@@ -632,7 +646,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
 
     const nc = task.needsClarification || {};
     const reason = nc.reason;
-    if (reason !== 'design-decision' && reason !== 'invalid-premise' && reason !== 'unreliable-grounding') {
+    if (reason !== 'design-decision' && reason !== 'invalid-premise' && reason !== 'unreliable-grounding' && !RETRYABLE_CLASSIFIER_CATEGORIES.has(reason)) {
       continue;                                                          // not ours
     }
 
