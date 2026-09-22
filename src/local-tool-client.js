@@ -1220,6 +1220,12 @@ const ORIENT_TURN_LIMIT = Number(process.env.AGENT_MANAGER_AGENTIC_ORIENT_TURNS)
 // widened to keep real margin above a typical completion instead of barely clearing it.
 const RESERVED_RESPONSE_TOKENS = 2500;
 
+// Chat's own degenerate-final-answer threshold (see runPlanWithTools' voluntary-stop
+// site and runForcedSummaryTurn's 'degenerate' reason). Deliberately low -- this only
+// needs to catch genuinely contentless replies ("I", "You"), not real short answers a
+// human chat message can legitimately end on ("Yes.", "Sounds good.").
+const CHAT_DEGENERATE_ANSWER_MAX_LEN = 12;
+
 // Same rough chars-per-token estimate local-client.js's own estimateTokens() uses --
 // duplicated rather than imported since it's a one-line arithmetic heuristic, not worth
 // the shared-module treatment given to normalizeTokens/distinctivePhrases. Only ever
@@ -1579,6 +1585,8 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       ? 'This conversation has grown too large to safely continue -- you are nearly out of context room and can no longer call tools.'
       : reason === 'voluntary-stop'
       ? 'Your last message ended without a RESOLUTION: line.'
+      : reason === 'degenerate'
+      ? 'Your last message was too short to be a real answer.'
       : 'You are out of turns and can no longer call tools.';
     // budgetWarning (2026-09-08, root-caused live): a real forced-summary turn with
     // reason:'context' answered RESOLUTION: decompose and got cut off mid-string writing
@@ -1589,10 +1597,21 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     const budgetWarning = reason === 'context'
       ? ' You have very little context room left, so be CONCISE: if you use RESOLUTION: decompose, keep each sub-task rawText to 2-3 sentences -- a short answer that finishes beats a long one that gets cut off.'
       : '';
-    messages.push({
-      role: 'user',
-      content: `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires.${budgetWarning} If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`,
-    });
+    // isChatCaller: never ask for a RESOLUTION: line -- that sentinel is the PIPELINE's
+    // own agentic-draft convention (resolveAgenticDraft et al.), meaningless for a chat
+    // conversation. Root-caused live 2026-09-22 (Grimmethy: "It's not responding how I'd
+    // expect"): this instruction used to be unconditional, so 'voluntary-stop' (which
+    // fires below on almost every ordinary chat reply, since a normal conversational
+    // answer never naturally contains "RESOLUTION:") forced EVERY chat turn through this
+    // demand -- one real session showed the model complying with "RESOLUTION:
+    // no-changes-needed" as its entire answer to "What's the goal of this project?", and
+    // another showed this turn's own compliance-retry (below) overwriting a real answer
+    // with a near-empty one. See the voluntary-stop call site's own comment for why that
+    // trigger no longer fires for chat at all now.
+    const content = isChatCaller
+      ? `${leadIn} Using only what you have already learned, give your best complete answer now -- a real, substantive reply, not a placeholder or a single word.${budgetWarning}`
+      : `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires.${budgetWarning} If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`;
+    messages.push({ role: 'user', content });
     turnsUsed += 1;
     const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
       messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
@@ -1621,7 +1640,12 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     // forced-summary turn, ignoring the RESOLUTION: instruction entirely. One bounded
     // retry with a short, unambiguous instruction gives the model a real second chance
     // before this gets flagged as non-compliant for whoever reads the result downstream.
-    if (!HAS_RESOLUTION_RE.test(summaryContent)) {
+    // isChatCaller never asked for RESOLUTION above, so there is nothing to check
+    // compliance against -- skip this whole retry block, which otherwise applied
+    // unconditionally and could overwrite a real chat answer with a shorter, worse one
+    // whenever the "longer of the two" comparison below picked the retry (see this
+    // function's own header on isChatCaller for the live incident this caused).
+    if (!isChatCaller && !HAS_RESOLUTION_RE.test(summaryContent)) {
       turnStartLengths.push(messages.length);
       turnStartLogLengths.push(toolCallLog.length);
       messages.push({
@@ -1648,7 +1672,11 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         if (retryContent.length > summaryContent.length) summaryContent = retryContent;
       }
     }
-    const compliant = HAS_RESOLUTION_RE.test(summaryContent);
+    // isChatCaller has no sentinel to comply with -- "compliant" is a pipeline-only
+    // concept (resolveAgenticDraft etc.), so leave it trivially true rather than false
+    // (HAS_RESOLUTION_RE never matches chat prose), which would mislabel every chat
+    // forced-summary as forcedSummaryNonCompliant for no reason.
+    const compliant = isChatCaller || HAS_RESOLUTION_RE.test(summaryContent);
     return withUsage({
       response: summaryContent || (lastMessage && lastMessage.content) || '',
       toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true, forcedSummaryReason: reason,
@@ -1814,8 +1842,30 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       // output. Same remedy as the cap path -- one more no-tools turn asking only for the
       // sentinel -- gated on the caller opting in and the line genuinely being absent (a
       // clean finish still returns immediately, as before).
-      if (forceSummaryOnCap && !HAS_RESOLUTION_RE.test(content)) {
+      //
+      // NOT for isChatCaller (2026-09-22, root-caused live -- Grimmethy: "It's not
+      // responding how I'd expect"): a normal, complete chat reply never naturally
+      // contains "RESOLUTION:", so this fired on essentially every ordinary chat turn,
+      // forcing the model through runForcedSummaryTurn's RESOLUTION demand and its
+      // compliance-retry -- confirmed live producing both a bogus "RESOLUTION:
+      // no-changes-needed" answer to a plain question, and (via the retry's
+      // longer-of-two-replies fallback) a real answer getting overwritten with a
+      // near-empty one. Chat gets its own, much narrower safety net just below instead:
+      // only a genuinely degenerate (empty or near-empty) final answer gets one retry,
+      // and that retry never mentions RESOLUTION.
+      if (forceSummaryOnCap && !isChatCaller && !HAS_RESOLUTION_RE.test(content)) {
         return runForcedSummaryTurn('voluntary-stop');
+      }
+      // Chat's own safety net: a voluntary stop that produced next to nothing (the "I" /
+      // "You" shape the RESOLUTION-demand bug above used to cause, but also a genuine
+      // model hiccup independent of that) gets one retry asking for a real answer, same
+      // as the pipeline's cap-hit paths get via runForcedSummaryTurn('context'/'turns')
+      // -- just without ever asking for a sentinel that means nothing here. Threshold is
+      // deliberately low (below any real one- or two-word chat answer like "Yes." or
+      // "Sounds good.") so this only catches genuinely contentless replies.
+      if (forceSummaryOnCap && isChatCaller && content.trim().length > 0
+          && content.trim().length < CHAT_DEGENERATE_ANSWER_MAX_LEN) {
+        return runForcedSummaryTurn('degenerate');
       }
       return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
     }
