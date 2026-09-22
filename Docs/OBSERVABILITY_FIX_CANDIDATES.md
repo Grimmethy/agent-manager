@@ -3168,3 +3168,32 @@ Add a single `console.warn` call inside the `catch` block, before the `premise =
 
 Benefits:
 Once fixed, any operator tailing `stdout`/`stderr` or a CI log will immediately see a warning line identifying which source's `premiseCheck` threw, what the error was, and that the split proceeded without the advisory guard. This turns a silent, indefinite degradation of a safety mechanism into a single, greppable, one-line signal that is visible the moment the first invocation after a regression occurs, while preserving the existing guarantee that a throwing advisory hook never blocks a real split.
+
+### AC-173 · AC-160a: Log warning and raise RuntimeError on lock-acquisition timeout in `_acquire_apply_lock`
+Strength: Strong
+Split-Depth: 1
+Files: python/dashboard/app.py
+
+Problem:
+The timeout branch in `_acquire_apply_lock` (the `if time.time() >= deadline:` block inside the `except BlockingIOError` handler) silently closes the lock fd and returns `None`. This makes a lock-contention timeout indistinguishable from any other falsy return, gives operators no greppable log line, and allows a caller to treat the failure as a benign skip rather than a real error.
+
+Solution:
+In the `if time.time() >= deadline:` branch, before the existing `lock_fd.close()` call, emit `logging.warning(...)` that includes the resolved lock-file path (`lock_dir / "apply-task.lock"`), the `timeout_seconds` value, and a note that `apply-task.sh` is the likely holder. After `lock_fd.close()`, replace `return None` with `raise RuntimeError(...)` whose message mirrors the warning text (lock path, timeout duration, likely holder). The `logging` module is already imported and used elsewhere in this file (e.g. `logging.warning` in `record_project_used`), so no new import is needed.
+
+Benefits:
+Every timeout event produces a timestamped, greppable line in the dashboard log. The failure is now an unambiguous exception that cannot be silently treated as a benign skip, making the code's intent explicit and the error path testable.
+
+### AC-174 · AC-160b: Handle RuntimeError from `_acquire_apply_lock` at the merge-click call site
+Strength: Strong
+Split-Depth: 1
+Files: python/dashboard/app.py
+Depends-On: AC-173
+
+Problem:
+After AC-160a lands, `_acquire_apply_lock` raises `RuntimeError` on timeout instead of returning `None`. The merge-click handler (the caller in the same file) currently checks the return value for `None` and has no `try/except RuntimeError` around the call. Without this update the new exception will propagate as an unhandled 500, and the existing `if lock_fd is None:` guard becomes dead code.
+
+Solution:
+Locate the call site(s) of `_acquire_apply_lock` in the merge-click handler path (search for `_acquire_apply_lock(` in `app.py`). Wrap the call in `try/except RuntimeError`. In the `except` handler: log the caught exception at `logging.error` level (or rely on the warning already emitted in AC-160a), and return a user-facing error response (HTTP 503 or the project's equivalent error envelope) with a message such as "apply-task lock is busy; please retry in a few seconds." Remove or adjust any existing `if lock_fd is None:` guard that was the sole None-check, since that path is no longer reachable. If any other call site of `_acquire_apply_lock` exists, apply the same treatment.
+
+Benefits:
+The user receives a clear, actionable 503 message instead of a generic 500 crash. The dead `None`-check is removed, reducing confusion. All call sites are covered so no path silently crashes on the new exception.
