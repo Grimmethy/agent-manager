@@ -551,3 +551,43 @@ index 92613e45..8b8dab3e 100644
 Problem: [severity: low; regression shipped in 14e18c1] `GET /api/job-types` previously always returned 200; after this diff it returns 500 when `job-type-counters.json` contains valid JSON that is not an object.  Failure scenario: The pipeline directory contains a file `job-type-counters.json` whose content is the text `[1, 2, 3]` (e.g. left over from a manual edit or a different tool). A `GET /api/job-types` request enters `api_job_types()`, which calls `read_job_type_counters()`. That function calls `read_json_safe(p)`, which successfully parses the file and returns the list `[1, 2, 3]` (no exception, so the `except` branch is skipped). The `or {}` guard does not fire because a non-empty list is truthy, so `counters` is `[1, 2, 3]`. The list comprehension then evaluates `counters.get(name, 0)` and raises `AttributeError: 'list' object has no attribute 'get'`, producing a 500 response. Before this diff the endpoint never read that file and returned 200 unconditionally.
 Solution: In `read_job_type_counters`, replace `return read_json_safe(p) or {}` with `result = read_json_safe(p); return result if isinstance(result, dict) else {}` so that any non-object JSON value is coerced to the safe empty-dict default before the caller invokes `.get()`.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 14e18c1.
+
+### AC-63 · A non-model `OSError` (e.g. `FileNotFoundError`, `PermissionError`) raised during session- (37eb1fd app.py)
+Strength: Strong
+Source: change_review of 37eb1fd "Coordinate Discuss's local-model calls with the worker lanes' GPU lock"
+Files: python/dashboard/app.py
+
+Snippet:
+```
+diff --git a/python/dashboard/app.py b/python/dashboard/app.py
+index b0d7ddae..6ff207c8 100644
+--- a/python/dashboard/app.py
++++ b/python/dashboard/app.py
+@@ -286,30 +286,41 @@ def _discuss_provider_args(body: dict = None):
+         effort = effort or defaults["effort"]
+     else:
+         model = None
+         effort = None
+     return provider, model, effort
+ 
+ 
+ def _call_discuss(fn, *args, **kwargs):
+     """Runs a discuss_sessions.py call (start_session/send_message/end_session) and
+     turns claude_client.ClaudeClientError into a clean 4xx/5xx JSON response instead of
+     an unhandled-exception 500 -- confirmed live: a Claude-provider discuss/start with
+     CLAUDE_CODE_OAUTH_TOKEN unset previously surfaced as Flask's generic "internal
+-    error" page with no indication of what actually went wrong or how to fix it."""
++    error" page with no indication of what actually went wrong or how to fix it.
++
++    2026-08-24 -- caught live via an actual Discuss click on the local provider: worker-1
++    was mid-draft on the same Ollama model at that exact moment (Discuss has no
++    coordination with the worker lanes' own use of it -- see the standing, deliberately-
++    deferred discussion on adding a shared lock), the reply call queued behind it and hit
++    ollama_client.py's own 240s timeout, and that raised a bare TimeoutError with no
++    handling here at all -- same raw-500-with-no-explanation failure mode this function
++    already exists to prevent for the Claude sid
+```
+
+Problem: [severity: med; regression shipped in 37eb1fd] A non-model `OSError` (e.g. `FileNotFoundError`, `PermissionError`) raised during session-file I/O inside `start_session`/`send_message` is now caught and misreported as "local model call failed … may be busy with an active worker-lane task," whereas before the diff it propagated as an unhandled 500 (correctly signalling a non-model problem).  Failure scenario: A Discuss session file `/pipeline/.discuss-sessions/a1b2c3.json` is deleted out-of-band (e.g. by a cleanup script or a user). The user clicks "Send" in the Discuss UI. `app.py` calls `_call_discuss(send_message, pipeline_dir, "a1b2c3", "hello")`. Inside `send_message`, `Path.read_text()` on the session file raises `FileNotFoundError` (an `OSError` subclass). The new `except (TimeoutError, ConnectionError, OSError)` clause catches it (since `FileNotFoundError` ⊂ `OSError`) and calls `abort(502, description="local model call failed ([Errno 2] No such file or directory: '/pipeline/.discuss-sessions/a1b2c3.json') -- it may be busy with an active worker-lane task; try again shortly or switch to Claude.")`. The user is told the model is busy and should wait or switch to Claude, when the real problem is a missing file that will never resolve by waiting.
+Solution: Remove bare `OSError` from the except tuple so only the specific model-busy exceptions are caught:
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 37eb1fd.
