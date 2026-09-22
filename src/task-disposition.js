@@ -37,6 +37,7 @@ const { execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { classifyApplyOutcome } = require('./apply-outcome-classifiers.js');
+const { lastRemoval } = require('./branch-removal-ledger.js');
 
 const TERMINAL_STAGES = new Set([
   'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'pending-merge', 'abandoned', 'superseded',
@@ -176,13 +177,42 @@ function isNoopApplyDetail(detail) {
 const DIRECT_RE = /committed to (?:master|main)|triage batch/i;
 const BRANCH_DETAIL_RE = /^agent\//;
 
+// Is the work a task's recorded diff describes already on origin/<main>? Compares the diff's distinctive ADDED lines (>= 20 chars trimmed) against the
+// current content of the same files on <main>. Deliberately conservative: it needs >= MIN_LINES such lines and >= 90% of them present, and a diff that
+// is not a unified diff with `+++ b/<path>` headers, or a file <main> no longer has (moved / deleted since), simply gives no verdict -- the caller then
+// keeps its old, harsher reading. Returns { present, checked, files } or null.
+const MIN_LANDED_LINES = 5;
+const LANDED_FRACTION = 0.9;
+function diffAlreadyOnMain(git, repoRoot, mainBranch, rawDiff) {
+  if (!repoRoot || typeof rawDiff !== 'string' || !rawDiff) return null;
+  const byFile = new Map();
+  let file = null;
+  for (const line of rawDiff.split('\n')) {
+    const h = /^\+\+\+ b\/(.+)$/.exec(line);
+    if (h) { file = h[1].trim(); if (!byFile.has(file)) byFile.set(file, []); continue; }
+    if (!file || !line.startsWith('+') || line.startsWith('+++')) continue;
+    const t = line.slice(1).trim();
+    if (t.length >= 20) byFile.get(file).push(t);
+  }
+  let present = 0; let checked = 0; let files = 0;
+  for (const [f, added] of byFile) {
+    if (!added.length) continue;
+    const content = git(repoRoot, ['show', `origin/${mainBranch}:${f}`]);
+    if (!content) continue; // gone / moved since: no evidence either way for this file
+    const have = new Set(content.split('\n').map((l) => l.trim()));
+    files += 1;
+    for (const t of added) { checked += 1; if (have.has(t)) present += 1; }
+  }
+  return checked >= MIN_LANDED_LINES && present / checked >= LANDED_FRACTION ? { present, checked, files } : null;
+}
+
 // record -> { stage, detail } to append, or null when there is nothing to do (the task
 // was never applied, or it already carries a terminal event).
 //
 // Pass a `ctx` from buildShipContext() to resolve a whole sweep with zero per-record git
 // calls (the fast path). Without it, falls back to a direct git probe per id (fine for a
 // single record, e.g. from the dashboard right after a merge).
-function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainOverride, ctx, allowReopenFrom } = {}) {
+function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainOverride, ctx, allowReopenFrom, pipelineDir } = {}) {
   if (!record || typeof record !== 'object') return null;
   const history = record.history;
   const applied = lastAppliedEvent(history);
@@ -293,8 +323,25 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
 
   // 6. The apply detail names an agent/<id> branch, but it is gone AND not on <main>:
   //    the work was lost. The loud one.
+  //    Two facts soften the bare verdict (2026-09-21, throughput analysis: 20 tasks read "work lost", and of five checked by content three had their whole
+  //    diff on master already): (a) the task's own recorded diff may already be on <main> -- landed another way (a sibling task, a re-do, a squash merge
+  //    with no trailer) -- which is `superseded`, not lost; (b) branch-removal-ledger.js may know why the branch was deleted.
   if (BRANCH_DETAIL_RE.test(detail)) {
-    return { stage: 'abandoned', detail: `applied to ${detail} -- branch gone, not on ${mainBranch}: work lost` };
+    const landed = diffAlreadyOnMain(git, repoRoot, mainBranch, record.rawDiff);
+    if (landed) {
+      return {
+        stage: 'superseded',
+        detail: `applied to ${detail} -- branch gone, but ${landed.present} of ${landed.checked} distinctive added lines (${landed.files} file(s)) are already on ${mainBranch}: the work landed another way`.slice(0, 240),
+      };
+    }
+    // A stacked sub-task's branch is the SHARED one on record.stacked.branch, which may differ from the branch its apply detail names (same resolution as step 3): try both.
+    const removal = pipelineDir
+      ? [record.stacked && record.stacked.branch, detail.split(/\s/)[0]].filter(Boolean).map((b) => lastRemoval(pipelineDir, b)).find(Boolean) || null
+      : null;
+    const why = removal
+      ? `removed ${String(removal.at || '').slice(0, 10)} by ${removal.actor || 'unknown'} (${removal.cause}${removal.detail ? `: ${removal.detail}` : ''})`
+      : 'no removal recorded -- deleted outside the pipeline';
+    return { stage: 'abandoned', detail: `applied to ${detail} -- branch gone, not on ${mainBranch}: work lost; ${why}`.slice(0, 320) };
   }
 
   // 7. Unclassifiable apply outcome from a non-branch source -- delegate to the
@@ -305,4 +352,4 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   return { stage: classified.stage, detail: classified.detail };
 }
 
-module.exports = { resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain, isNoopApplyDetail, realGit };
+module.exports = { diffAlreadyOnMain, resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain, isNoopApplyDetail, realGit };

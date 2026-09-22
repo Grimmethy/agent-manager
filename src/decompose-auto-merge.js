@@ -28,6 +28,7 @@ const path = require('path');
 const fs = require('fs');
 const { runIntegrationGate, realExec } = require('./decompose-integration-gate.js');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
+const { recordBranchRemoval } = require('./branch-removal-ledger.js');
 
 const BRANCH_REF = 'refs/decompose-automerge/branch';
 const MAIN_REF = 'refs/decompose-automerge/main';
@@ -47,7 +48,7 @@ function isMechanicalMoveChild(task) {
  *   `no-branch` / `gate-errored` / `push-race` / `setup-failed` are transient -- retry next tick.
  */
 function autoMergeVerifiedMoveChild({
-  repoRoot, childId, childTask, mainBranch = 'master',
+  repoRoot, childId, childTask, mainBranch = 'master', pipelineDir = null,
   exec = realExec, runGate = runIntegrationGate,
 }) {
   if (!repoRoot || !childId) return { merged: false, reason: 'setup-failed', detail: 'no repoRoot/childId' };
@@ -126,7 +127,10 @@ function autoMergeVerifiedMoveChild({
     }
 
     // 5. Best-effort: drop the now fully-merged remote branch.
-    try { exec('git', ['push', 'origin', '--delete', branch], { cwd: repoRoot }); } catch { /* best-effort */ }
+    try {
+      exec('git', ['push', 'origin', '--delete', branch], { cwd: repoRoot });
+      recordBranchRemoval(pipelineDir, { branch, taskId: childId, cause: 'merged', detail: `auto-merged into ${mainBranch} (decompose move child)`, actor: 'decompose-auto-merge' });
+    } catch { /* best-effort */ }
 
     cleanup();
     return { merged: true, mergeCommit };

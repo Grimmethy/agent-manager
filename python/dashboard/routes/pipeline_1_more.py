@@ -243,6 +243,9 @@ def api_git_merge_branch(branch):
         _run_git(["push", "origin", main_branch], repo_root)
         try:
             _run_git(["push", "origin", "--delete", branch], repo_root)
+            from branch_removals import record_branch_removal
+            record_branch_removal(queue_dir(), branch, "merged", task_id=branch.removeprefix("agent/"),
+                                  detail=f"merged into {main_branch} via the dashboard", actor="dashboard-merge")
         except RuntimeError as e:
             # Non-fatal -- the merge to main already succeeded and is the part that
             # matters; a leftover now-fully-merged remote branch is harmless clutter
@@ -377,6 +380,9 @@ def api_git_discard_branch(branch):
             # for this case.
             if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
                 raise
+        from branch_removals import record_branch_removal
+        record_branch_removal(queue_dir(), branch, "discarded", task_id=branch.removeprefix("agent/"),
+                              detail="discarded via the dashboard Unmerged Branches tab", actor="dashboard-discard")
         # Also drop the LOCAL copy (only reached when the remote delete succeeded or the ref was
         # already gone) -- see _delete_local_branch for why leaving it is a real hazard.
         local_branch = _delete_local_branch(repo_root, branch)

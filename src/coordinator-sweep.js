@@ -98,7 +98,7 @@ function reconcileDecomposeChildMerges(pipelineDir, repoRoot, subTasks, recById,
     // 1. Auto-merge a verified mechanical move (opt-in).
     if (autoMerge && !_childMergeConfirmed.has(st.id) && !_autoMergeGaveUp.has(st.id)
         && !rec.task.autoMergeBlocked && isMechanicalMoveChild(rec.task)) {
-      const r = runAutoMerge({ repoRoot, childId: st.id, childTask: rec.task, mainBranch });
+      const r = runAutoMerge({ repoRoot, childId: st.id, childTask: rec.task, mainBranch, pipelineDir });
       if (r.merged) {
         _childMergeConfirmed.add(st.id);
         rec.task.mergedAt = new Date().toISOString();

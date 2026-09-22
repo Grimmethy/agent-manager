@@ -234,7 +234,7 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } 
 
     let outcome;
     try {
-      outcome = resolveDisposition(record, { repoRoot, ctx, allowReopenFrom });
+      outcome = resolveDisposition(record, { repoRoot, ctx, allowReopenFrom, pipelineDir });
     } catch (err) {
       console.error(`task-log-reconcile: resolve failed for ${id}: ${err.message}`);
       summary.errors += 1;

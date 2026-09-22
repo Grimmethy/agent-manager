@@ -69,6 +69,20 @@ test('happy path: clean merge + gate pass -> pushes HEAD:master, returns merged 
   assert.ok(exec.calls.some((c) => c === `push origin --delete agent/${MECH_CHILD.id}`));
 });
 
+test('a successful branch delete after the merge is recorded in the branch-removal ledger; a failed delete is not', () => {
+  const fsx = require('fs'); const osx = require('os'); const pathx = require('path');
+  const { lastRemoval } = require('./branch-removal-ledger.js');
+  const run = (fail) => {
+    const pipelineDir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'dam-led-'));
+    autoMergeVerifiedMoveChild({ repoRoot: '/repo', childId: MECH_CHILD.id, childTask: MECH_CHILD, mainBranch: 'master', pipelineDir, exec: fakeExec({ fail }), runGate: () => ({ ok: true, checks: [] }) });
+    return lastRemoval(pipelineDir, `agent/${MECH_CHILD.id}`);
+  };
+  const rec = run({});
+  assert.equal(rec.cause, 'merged');
+  assert.equal(rec.actor, 'decompose-auto-merge');
+  assert.equal(run({ '--delete': 'remote ref does not exist' }), null);
+});
+
 test('dirty merge -> reason:conflict + conflictFiles, no push', () => {
   const exec = fakeExec({ fail: { 'merge --no-ff': 'CONFLICT (content): Merge conflict in x' }, out: { conflictFiles: 'python/dashboard/templates/index.html\n' } });
   const r = autoMergeVerifiedMoveChild({

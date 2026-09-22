@@ -488,6 +488,9 @@ def api_task_requeue(state, task_id):
             if repo_root:
                 try:
                     _run_git(["push", "origin", "--delete", applied_branch], repo_root)
+                    from branch_removals import record_branch_removal
+                    record_branch_removal(qdir, applied_branch, "superseded-by-requeue", task_id=task_id,
+                                          detail=f"requeued from {state}/", actor="dashboard-requeue")
                 except RuntimeError as e:
                     # Non-fatal, same reasoning as api_git_merge_branch's own post-merge
                     # branch delete -- already gone, never actually pushed, or a transient

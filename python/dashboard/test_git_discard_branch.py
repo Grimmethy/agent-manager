@@ -256,3 +256,44 @@ class TestDiscardBranch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBranchRemovalLedger(unittest.TestCase):
+    """Every in-app path that deletes a branch records WHY in queue/branch-removals.jsonl, so a later
+    task-log-reconcile no longer has to call the vanished branch a bare "work lost"."""
+
+    def setUp(self):
+        app._invalidate_branch_cache()
+        self.client = app.app.test_client()
+
+    def _patches(self, repo):
+        return TestDiscardBranch._patches(self, repo)
+
+    def test_discard_records_a_removal_entry(self):
+        repo = make_repo_with_pushed_branch("agent/ledger-test-1")
+        patches = self._patches(repo)
+        for p in patches:
+            p.start()
+        try:
+            res = self.client.post("/api/git/branches/agent%2Fledger-test-1/discard")
+            self.assertTrue(res.get_json()["succeeded"])
+            lines = (repo / "queue" / "branch-removals.jsonl").read_text().splitlines()
+            entry = json.loads(lines[-1])
+            self.assertEqual(entry["branch"], "agent/ledger-test-1")
+            self.assertEqual(entry["cause"], "discarded")
+            self.assertEqual(entry["taskId"], "ledger-test-1")
+            self.assertEqual(entry["actor"], "dashboard-discard")
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_writer_is_best_effort_and_validates_cause(self):
+        from branch_removals import record_branch_removal
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(record_branch_removal(d, "origin/agent/x", "merged", task_id="x"))
+            self.assertEqual(json.loads((Path(d) / "branch-removals.jsonl").read_text())["branch"], "agent/x")
+            self.assertFalse(record_branch_removal(d, "agent/x", "because"))
+            self.assertFalse(record_branch_removal(None, "agent/x", "merged"))
+            blocker = Path(d) / "afile"
+            blocker.write_text("x")
+            self.assertFalse(record_branch_removal(blocker / "sub", "agent/x", "merged"))

@@ -221,10 +221,12 @@ test('non-stacked decompose hub + AUTO_MERGE_MOVES=true: a done mechanical child
     write(dir, 'done', { id: 'am-x', promptContext: { deterministicApply: 'script-extract', sourceFile: 'python/dashboard/templates/index.html' } });
 
     const seen = [];
-    const runAutoMerge = (a) => { seen.push(a.childId); return { merged: true, mergeCommit: 'abc123def456' }; };
+    let handedDir = null;
+    const runAutoMerge = (a) => { seen.push(a.childId); handedDir = a.pipelineDir; return { merged: true, mergeCommit: 'abc123def456' }; };
     const summary = coordinatorSweep({ pipelineDir: dir, repoRoot: dir, runAutoMerge });
 
     assert.deepEqual(seen, ['am-x'], 'auto-merge was attempted for the mechanical child');
+    assert.equal(handedDir, dir, 'the sweep hands the pipelineDir through so the auto-merge can record its branch removal');
     assert.equal(summary.completed, 1);
     const child = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', 'am-x.json'), 'utf8'));
     assert.ok(child.mergedAt);

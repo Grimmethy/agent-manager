@@ -350,3 +350,85 @@ test('resolveDisposition: a gated triage-batch task whose commit later reached m
   const out = resolveDisposition(r, { ctx: ctx({ onMain: { 'arch-discovery-community-3': 'abc123def456' } }) });
   assert.equal(out.stage, 'merged');
 });
+
+// --- 2026-09-21: a gone branch is no longer a bare "work lost" (throughput analysis of denied branches) ---
+const { diffAlreadyOnMain } = require('./task-disposition.js');
+const { recordBranchRemoval } = require('./branch-removal-ledger.js');
+const fsx = require('fs');
+const osx = require('os');
+const pathx = require('path');
+
+const ADDED = [
+  '  const alpha = computeTheFirstDistinctiveValue(input);',
+  '  const beta = computeTheSecondDistinctiveValue(input);',
+  '  const gamma = computeTheThirdDistinctiveValue(input);',
+  '  const delta = computeTheFourthDistinctiveValue(input);',
+  '  const epsilon = computeTheFifthDistinctiveValue(input);',
+];
+const diffOf = (file, lines) => `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1,1 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join('\n')}\n`;
+// A fake git: `show origin/master:<file>` returns files[file], everything else ''.
+const gitWith = (files) => (root, args) => (args[0] === 'show' ? (files[args[1].replace(/^origin\/master:/, '')] || '') : '');
+
+test('diffAlreadyOnMain: every distinctive added line is on main -> a verdict', () => {
+  const r = diffAlreadyOnMain(gitWith({ 'src/a.js': `${ADDED.join('\n')}\nother` }), '/r', 'master', diffOf('src/a.js', ADDED));
+  assert.deepEqual(r, { present: 5, checked: 5, files: 1 });
+});
+
+test('diffAlreadyOnMain: half of the lines present is NOT enough', () => {
+  assert.equal(diffAlreadyOnMain(gitWith({ 'src/a.js': ADDED.slice(0, 2).join('\n') }), '/r', 'master', diffOf('src/a.js', ADDED)), null);
+});
+
+test('diffAlreadyOnMain: fewer than 5 distinctive lines gives no verdict (too little evidence), and short/boilerplate lines are ignored', () => {
+  const few = ADDED.slice(0, 4);
+  assert.equal(diffAlreadyOnMain(gitWith({ 'src/a.js': few.join('\n') }), '/r', 'master', diffOf('src/a.js', few)), null);
+  const padded = [...few, '}', '});', '  return x;'];
+  assert.equal(diffAlreadyOnMain(gitWith({ 'src/a.js': padded.join('\n') }), '/r', 'master', diffOf('src/a.js', padded)), null);
+});
+
+test('diffAlreadyOnMain: a file main no longer has, a non-diff body, or no repo gives no verdict', () => {
+  assert.equal(diffAlreadyOnMain(gitWith({}), '/r', 'master', diffOf('src/gone.js', ADDED)), null);
+  assert.equal(diffAlreadyOnMain(gitWith({ 'src/a.js': ADDED.join('\n') }), '/r', 'master', 'just some prose about a change'), null);
+  assert.equal(diffAlreadyOnMain(gitWith({ 'src/a.js': ADDED.join('\n') }), null, 'master', diffOf('src/a.js', ADDED)), null);
+  assert.equal(diffAlreadyOnMain(gitWith({ 'src/a.js': ADDED.join('\n') }), '/r', 'master', undefined), null);
+});
+
+test('resolveDisposition: branch gone but its diff is already on main -> superseded, not "work lost"', () => {
+  const r = { id: 'gone-1', rawDiff: diffOf('src/a.js', ADDED), ...applied('agent/gone-1') };
+  const out = resolveDisposition(r, { ctx: ctx(), repoRoot: '/r', git: gitWith({ 'src/a.js': ADDED.join('\n') }) });
+  assert.equal(out.stage, 'superseded');
+  assert.match(out.detail, /5 of 5 distinctive added lines/);
+  assert.doesNotMatch(out.detail, /work lost/);
+});
+
+test('resolveDisposition: branch gone, diff NOT on main, no ledger entry -> abandoned and says nothing recorded a removal', () => {
+  const d = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'disp-'));
+  const r = { id: 'gone-2', rawDiff: diffOf('src/a.js', ADDED), ...applied('agent/gone-2') };
+  const out = resolveDisposition(r, { ctx: ctx(), repoRoot: '/r', git: gitWith({ 'src/a.js': 'unrelated' }), pipelineDir: d });
+  assert.equal(out.stage, 'abandoned');
+  assert.match(out.detail, /branch gone, not on master: work lost; no removal recorded -- deleted outside the pipeline/);
+});
+
+test('resolveDisposition: branch gone, diff NOT on main, ledger knows why -> abandoned carrying the recorded cause', () => {
+  const d = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'disp-'));
+  recordBranchRemoval(d, { branch: 'agent/gone-3', taskId: 'gone-3', cause: 'superseded-by-requeue', detail: 'requeued from blocked/', actor: 'dashboard-requeue', now: new Date('2026-09-21T10:00:00Z') });
+  const r = { id: 'gone-3', ...applied('agent/gone-3') };
+  const out = resolveDisposition(r, { ctx: ctx(), pipelineDir: d });
+  assert.equal(out.stage, 'abandoned');
+  assert.match(out.detail, /removed 2026-09-21 by dashboard-requeue \(superseded-by-requeue: requeued from blocked\/\)/);
+});
+
+test('resolveDisposition: a still-present branch or a trailer on main is decided BEFORE the content check (no git call is made)', () => {
+  const boom = () => { throw new Error('git must not be consulted'); };
+  const r = { id: 'live-1', rawDiff: diffOf('src/a.js', ADDED), ...applied('agent/live-1') };
+  assert.equal(resolveDisposition(r, { ctx: ctx({ branches: { 'live-1': 2 } }), repoRoot: '/r', git: boom }).stage, 'pending-merge');
+  assert.equal(resolveDisposition(r, { ctx: ctx({ onMain: { 'live-1': 'abc' } }), repoRoot: '/r', git: boom }).stage, 'merged');
+});
+
+test('resolveDisposition: a stacked sub-task looks the removal up under record.stacked.branch (the shared branch), not only the branch its apply detail names', () => {
+  const d = fsx.mkdtempSync(pathx.join(osx.tmpdir(), 'disp-'));
+  recordBranchRemoval(d, { branch: 'agent/decompose-shared-plan', cause: 'hub-retired', detail: 'hub retired', actor: 'hub-retire' });
+  const r = { id: 'child-1', stacked: { branch: 'agent/decompose-shared-plan' }, ...applied('agent/child-1') };
+  const out = resolveDisposition(r, { ctx: ctx(), pipelineDir: d });
+  assert.equal(out.stage, 'abandoned');
+  assert.match(out.detail, /by hub-retire \(hub-retired: hub retired\)/);
+});
