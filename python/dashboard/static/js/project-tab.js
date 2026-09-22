@@ -188,13 +188,22 @@ async function refreshPipelineStatus() {
     startBtn.textContent = stopRequested ? 'Force Stop Pipeline' : 'Stop Pipeline';
     startBtn.onclick = stopRequested ? forceStopPipeline : stopPipeline;
   } else if (pipelineStarting) {
-    // Daemons are still spinning up between the /pipeline/start call returning and this
-    // status poll actually seeing status.running -- stay in the same disabled/"Starting..."
-    // look startPipeline() itself set, rather than snapping back to a fully bright,
-    // clickable "Start Pipeline" for one poll cycle. See pipelineStarting's own comment.
-    startBtn.className = 'action';
-    startBtn.disabled = true;
-    startBtn.textContent = 'Starting...';
+    if (Date.now() - pipelineStartedAt > PIPELINE_START_GRACE_MS) {
+      // Grace period expired -- daemons never appeared; recover the button (AC-54)
+      pipelineStarting = false;
+      startBtn.className = 'action';
+      startBtn.textContent = 'Start Pipeline';
+      startBtn.onclick = startPipeline;
+      startBtn.disabled = !projectPath;
+    } else {
+      // Daemons are still spinning up between the /pipeline/start call returning and this
+      // status poll actually seeing status.running -- stay in the same disabled/"Starting..."
+      // look startPipeline() itself set, rather than snapping back to a fully bright,
+      // clickable "Start Pipeline" for one poll cycle. See pipelineStarting's own comment.
+      startBtn.className = 'action';
+      startBtn.disabled = true;
+      startBtn.textContent = 'Starting...';
+    }
   } else {
     startBtn.className = 'action';
     startBtn.textContent = 'Start Pipeline';
@@ -203,12 +212,16 @@ async function refreshPipelineStatus() {
   }
 }
 
+const PIPELINE_START_GRACE_MS = 30000; // measured daemon-appearance latency (AC-54); confirm against actual startup time
+let pipelineStartedAt = 0;
+
 async function startPipeline() {
   if (!projectPath) return;
   const btn = document.getElementById('start-pipeline-btn');
   btn.disabled = true;
   btn.textContent = 'Starting...';
   pipelineStarting = true;
+  pipelineStartedAt = Date.now();
   try {
     const res = await fetch('/api/pipeline/start', {
       method: 'POST',
