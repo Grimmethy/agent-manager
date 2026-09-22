@@ -63,18 +63,41 @@ function refreshCandidateFetchedFiles(task) {
     }
   }
   if (!Array.isArray(pc.fetchedFiles) || pc.fetchedFiles.length === 0) return;
+  const relocated = [];
   pc.fetchedFiles = pc.fetchedFiles.map((f) => {
     if (!f || !f.path) return f;
     try {
       const full = path.resolve(resolvedRoot, f.path);
       if (full !== resolvedRoot && !full.startsWith(resolvedRoot + path.sep)) return f;
-      const windowed = windowFetchedFileContent(fs.readFileSync(full, 'utf8'), section);
+      // A cited file that no longer exists at all (renamed / deleted: the code lives elsewhere now) is followed like one that lost the code -- but only when relocation finds it.
+      let fileText; let fileGone = false;
+      try { fileText = fs.readFileSync(full, 'utf8'); } catch (e) { if (!e || e.code !== 'ENOENT') throw e; fileText = ''; fileGone = true; }
+      const windowed = windowFetchedFileContent(fileText, section);
+      let grounding = null;
+      try { grounding = require('../sdk/lib/file-grounding.js'); } catch { grounding = null; }
+      if (grounding && !f.context && grounding.snippetMissingFrom(fileText, section)) {
+        // The candidate's Snippet is not in the file it cites: its code may have MOVED (a sibling file, a subdirectory) since it was written. Follow it (unique match only).
+        const hit = grounding.relocateStaleAnchor(resolvedRoot, f.path, section);
+        if (hit) {
+          const w2 = windowFetchedFileContent(hit.content, section);
+          if (w2.confidence === 'strong') {
+            relocated.push({ from: f.path, to: hit.path });
+            return { ...f, path: hit.path, content: w2.text, anchorConfidence: 'strong', relocatedFrom: f.path };
+          }
+        }
+      }
+      if (fileGone) return f;
       return { ...f, content: windowed.text, anchorConfidence: windowed.confidence };
     } catch (err) {
       console.warn('[local-draft] file enrich failed:', f.path, err.message);
       return f;
     }
   });
+  if (relocated.length) {
+    // Keep the declared list pointing at the file the code lives in now, and leave an audit line.
+    if (Array.isArray(pc.files)) pc.files = pc.files.map((e) => (typeof e === 'string' ? ((relocated.find((r) => r.from === e) || {}).to || e) : e));
+    appendHistoryEvent(task, 'context-refreshed', `grounding relocated (the cited code moved): ${relocated.map((r) => `${r.from} -> ${r.to}`).join(', ')}`);
+  }
 }
 
 function isEmptyApprovalSource(source) {

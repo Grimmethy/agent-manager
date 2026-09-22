@@ -44,8 +44,38 @@ function groundingNowReliable(task) {
     return bad.every((f) => {
       const full = path.resolve(root, f.path);
       if (full !== root && !full.startsWith(root + path.sep)) return false;
-      return windowFetchedFileContent(fs.readFileSync(full, 'utf8'), pc.body || '').confidence === 'strong';
+      if (windowFetchedFileContent(fs.readFileSync(full, 'utf8'), pc.body || '').confidence === 'strong') return true;
+      // the cited code may have moved to a sibling file (what refreshCandidateFetchedFiles now follows)
+      const hit = require('./sdk/lib/file-grounding.js').relocateStaleAnchor(root, f.path, pc.body || '');
+      return !!hit && windowFetchedFileContent(hit.content, pc.body || '').confidence === 'strong';
     });
+  } catch { return false; }
+}
+
+// The cited code MOVED: a declared (non-context) file whose live content no longer contains the candidate's Snippet, although it IS in exactly one other file (recomputed from the live
+// repo, not from the stored anchorConfidence: a task minted while the code was in place stored 'strong', and a file can window 'strong' through symbols that merely occur elsewhere in it).
+// Fail-closed like groundingNowReliable.
+function citedCodeMovedAndRelocatable(task) {
+  const pc = task && task.promptContext;
+  const declared = pc && Array.isArray(pc.fetchedFiles) ? pc.fetchedFiles.filter((f) => f && !f.context && f.path) : [];
+  if (!declared.length || !pc.body) return false;
+  try {
+    const path = require('path');
+    const fs = require('fs');
+    const root = path.resolve(require('./config.js').getConfig().repoRoot);
+    const { windowFetchedFileContent, relocateStaleAnchor, snippetMissingFrom } = require('./sdk/lib/file-grounding.js');
+    let moved = 0;
+    for (const f of declared) {
+      const full = path.resolve(root, f.path);
+      if (full !== root && !full.startsWith(root + path.sep)) return false;
+      let text = '';
+      try { text = fs.readFileSync(full, 'utf8'); } catch (e) { if (!e || e.code !== 'ENOENT') throw e; } // a renamed / deleted cited file counts as "the snippet is not there"
+      if (!snippetMissingFrom(text, pc.body)) continue;
+      const hit = relocateStaleAnchor(root, f.path, pc.body);
+      if (!hit || windowFetchedFileContent(hit.content, pc.body).confidence !== 'strong') return false;
+      moved += 1;
+    }
+    return moved > 0;
   } catch { return false; }
 }
 
@@ -105,6 +135,13 @@ const KNOWN_FIXED = [
     dirs: ['blocked', 'needs-clarification'],
     // Failure text AND a structural precondition: the new matcher really does anchor every declared file today (a candidate whose code is genuinely gone stays put).
     applies: (task) => failureText(task).includes('could not find a reliable anchor') && groundingNowReliable(task),
+  },
+  {
+    id: 'cited-code-moved-relocated',
+    fixedIn: 'agent-manager (grounding follows a candidate\'s code to the file it moved to, 2026-09-21)',
+    description: 'a candidate\'s code moved to another file (a function extracted into a sibling module, a handler moved into routes/) so the cited file had no anchor and every draft saw the wrong file, ending in refusals, mismatched find strings or an escalation whatever the failure text said',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => citedCodeMovedAndRelocatable(task),
   },
 ];
 

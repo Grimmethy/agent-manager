@@ -120,3 +120,181 @@ test('a partial match of at least ~30% of the snippet stays strong (the drift-in
   const w = windowFetchedFileContent(fileWith(stale.join('\n')), SNIP_SECTION(BLOCK));
   assert.equal(w.confidence, 'strong');
 });
+
+// --- relocateStaleAnchor: the cited code MOVED to a sibling file (function-length-fix-ac-10) --------------------------------------------------------------------------
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { relocateStaleAnchor } = require('./file-grounding.js');
+
+function movedRepo({ dup = false } = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reloc-'));
+  fs.mkdirSync(path.join(root, 'src'));
+  const pad = (tag) => Array.from({ length: 300 }, (_, i) => `const ${tag}${i} = ${i}; // padding so the file is above the windowing threshold`).join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'old.js'), `${pad('o')}\nfunction stillHere() { return 1; }\n`);          // the cited file: the function is GONE from it
+  fs.writeFileSync(path.join(root, 'src', 'moved.js'), `${pad('m')}\n${BLOCK}\n${pad('n')}\n`);                      // where it lives now
+  fs.writeFileSync(path.join(root, 'src', 'moved.test.js'), `${BLOCK}\n`);                                             // tests are never a relocation target
+  if (dup) fs.writeFileSync(path.join(root, 'src', 'copy.js'), `${pad('c')}\n${BLOCK}\n`);
+  fs.writeFileSync(path.join(root, 'src', 'notes.md'), BLOCK);                                                        // other extension: ignored
+  fs.writeFileSync(path.join(root, 'src', 'ctx.js'), `${pad('x')}\nfunction unrelated() {}\n`);                        // a big file cited only as context
+  return root;
+}
+const SECTION = `### AC-10 · Decompose bigBody\nFiles: src/old.js\nSnippet:\n\`\`\`\n${BLOCK}\n\`\`\`\n`;
+
+test('relocateStaleAnchor: finds the ONE sibling file the cited code moved to (tests and other extensions ignored)', () => {
+  const root = movedRepo();
+  const hit = relocateStaleAnchor(root, 'src/old.js', SECTION);
+  assert.equal(hit.path, 'src/moved.js');
+  assert.ok(hit.content.includes('function bigBody(opts) {'));
+});
+
+test('relocateStaleAnchor: ambiguous (two files contain it), missing, no snippet, and a path outside the repo all return null', () => {
+  assert.equal(relocateStaleAnchor(movedRepo({ dup: true }), 'src/old.js', SECTION), null, 'two candidates: never guessed');
+  const root = movedRepo();
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', SECTION.replace(/const value/g, 'const other')), null, 'the code is gone everywhere');
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', '### AC-1\nno snippet here'), null);
+  assert.equal(relocateStaleAnchor(root, '../../etc/passwd', SECTION), null);
+});
+
+test('refreshCandidateFetchedFiles follows a moved target: rewrites the fetched entry and the declared file, marks relocatedFrom, and leaves an audit event', () => {
+  const root = movedRepo();
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = root;
+  delete require.cache[require.resolve('../../config.js')];
+  try {
+    const { refreshCandidateFetchedFiles } = require('../../local-draft.js');
+    const task = { source: 'function_length_fix', history: [], promptContext: { body: SECTION, files: ['src/old.js'], fetchedFiles: [
+      { path: 'src/old.js', anchorConfidence: 'none', content: 'stale' },
+      { path: 'src/ctx.js', context: true, anchorConfidence: 'none', content: 'ctx' },
+    ] } };
+    refreshCandidateFetchedFiles(task);
+    const f = task.promptContext.fetchedFiles;
+    assert.equal(f[0].path, 'src/moved.js');
+    assert.equal(f[0].anchorConfidence, 'strong');
+    assert.equal(f[0].relocatedFrom, 'src/old.js');
+    assert.deepEqual(task.promptContext.files, ['src/moved.js']);
+    assert.equal(f[1].path, 'src/ctx.js', 'a context-only file is never relocated');
+    assert.ok(task.history.some((h) => h.stage === 'context-refreshed' && /src\/old\.js -> src\/moved\.js/.test(h.detail)));
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+    delete require.cache[require.resolve('../../config.js')];
+  }
+});
+
+test('relocateStaleAnchor tier 2: code moved into a SUBDIRECTORY (no sibling has it) is found by the top-level subtree search; vendored directories are skipped', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reloc-deep-'));
+  const pad = (tag) => Array.from({ length: 300 }, (_, i) => `const ${tag}${i} = ${i}; // padding so the file is above the windowing threshold`).join('\n');
+  fs.mkdirSync(path.join(root, 'src', 'routes'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'src', 'node_modules', 'dep'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'src', 'app.js'), `${pad('a')}\nfunction remaining() {}\n`);          // cited file: the code left
+  fs.writeFileSync(path.join(root, 'src', 'routes', 'reports.js'), `${pad('r')}\n${BLOCK}\n`);          // where it lives now
+  fs.writeFileSync(path.join(root, 'src', 'node_modules', 'dep', 'vendored.js'), `${BLOCK}\n`);         // must never be a target
+  assert.equal(relocateStaleAnchor(root, 'src/app.js', SECTION.replace('src/old.js', 'src/app.js')).path, 'src/routes/reports.js');
+  // a SECOND copy in another subdirectory makes tier 2 ambiguous -> null
+  fs.mkdirSync(path.join(root, 'src', 'other'));
+  fs.writeFileSync(path.join(root, 'src', 'other', 'copy.js'), `${pad('c')}\n${BLOCK}\n`);
+  assert.equal(relocateStaleAnchor(root, 'src/app.js', SECTION), null);
+});
+
+test('relocateStaleAnchor: an ambiguous sibling tier never escalates to the subtree, and a top-level file has no subtree to search', () => {
+  const root = movedRepo({ dup: true }); // two siblings contain it
+  fs.mkdirSync(path.join(root, 'src', 'deep'));
+  fs.writeFileSync(path.join(root, 'src', 'deep', 'only.js'), `${BLOCK}\n`);
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', SECTION), null);
+  fs.writeFileSync(path.join(root, 'top.js'), 'x');
+  assert.equal(relocateStaleAnchor(root, 'top.js', SECTION), null);
+});
+
+// --- the trigger is "the Snippet is missing from the cited file", not a low window confidence ------------------------------------------------------------------------------
+const { snippetMissingFrom } = require('./file-grounding.js');
+
+test('snippetMissingFrom: true only when a real source Snippet is absent (a diff-shaped Snippet, no Snippet, or a present one is never "moved")', () => {
+  const file = fileWith(BLOCK);
+  assert.equal(snippetMissingFrom(file, SECTION), false, 'present');
+  assert.equal(snippetMissingFrom(file, SECTION.replace(/const value/g, 'const other')), true, 'absent');
+  assert.equal(snippetMissingFrom(file, '### AC-1\nno snippet'), false, 'no Snippet: nothing to say');
+  const diffSection = '### AC-2\nSnippet:\n```\ndiff --git a/src/x.js b/src/x.js\n--- a/src/x.js\n+++ b/src/x.js\n@@ -10,3 +10,4 @@ function f() {\n   const a = 1;\n+  const b = 2;\n```\n';
+  assert.equal(snippetMissingFrom(file, diffSection), false, 'a unified diff (change_review) says nothing about code moving');
+  assert.equal(relocateStaleAnchor(movedRepo(), 'src/old.js', diffSection), null);
+});
+
+test('refreshCandidateFetchedFiles relocates even when the cited file still windows (weak/strong, never none) through quoted symbols that occur elsewhere in it (observability-fix-ac-111: abort(404) is all over app.py)', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reloc-strong-'));
+  fs.mkdirSync(path.join(root, 'app', 'routes'), { recursive: true });
+  const pad = (tag) => Array.from({ length: 300 }, (_, i) => `def ${tag}${i}(): abort(404)  # padding handler ${i} with a shared symbol`).join('\n');
+  fs.writeFileSync(path.join(root, 'app', 'main.py'), `${pad('m')}\n`);                                   // cited file: still has many abort(404) but NOT the candidate's snippet
+  fs.writeFileSync(path.join(root, 'app', 'routes', 'reports.py'), `${pad('r')}\n${BLOCK}\n`);            // where the code lives now
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = root;
+  delete require.cache[require.resolve('../../config.js')];
+  try {
+    const { refreshCandidateFetchedFiles } = require('../../local-draft.js');
+    const body = `### AC-111 · File-serving exception swallowed by bare \`abort(404)\`\nFiles: app/main.py\nSnippet:\n\`\`\`\n${BLOCK}\n\`\`\`\n\nProblem: the handler calls \`abort(404)\` and never logs the exception.`;
+    const { windowFetchedFileContent } = require('./file-grounding.js');
+    assert.notEqual(windowFetchedFileContent(fs.readFileSync(path.join(root, 'app', 'main.py'), 'utf8'), body).confidence, 'none', 'premise: the stale file does NOT window to none (a quoted symbol anchors it weakly), so a confidence-none trigger would never fire');
+    const task = { source: 'observability_fix', history: [], promptContext: { body, files: ['app/main.py'], fetchedFiles: [{ path: 'app/main.py', anchorConfidence: 'strong', content: 'stale' }] } };
+    refreshCandidateFetchedFiles(task);
+    assert.equal(task.promptContext.fetchedFiles[0].path, 'app/routes/reports.py');
+    assert.deepEqual(task.promptContext.files, ['app/routes/reports.py']);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+    delete require.cache[require.resolve('../../config.js')];
+  }
+});
+
+// --- review of PR #437 -------------------------------------------------------------------------------------------------------------------------------------------------------
+// (1) relocation accepts the WHOLE snippet only: a unique prologue/tail in an unrelated file is a coincidence, not where the code moved.
+test('relocateStaleAnchor: a file that shares only the snippet\'s unique PROLOGUE (or tail) is not a relocation target', () => {
+  const root = movedRepo();
+  fs.unlinkSync(path.join(root, 'src', 'moved.js'));                       // the real destination does not exist any more in this scenario
+  const body = BLOCK.split('\n');
+  const prologueOnly = [...body.slice(0, 16), '  // ...but the rest of this function is entirely different code', ...lines(30, 'other'), '}'].join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'lookalike.js'), `${prologueOnly}\n`);
+  assert.ok(findFuzzyMatch(fs.readFileSync(path.join(root, 'src', 'lookalike.js'), 'utf8'), BLOCK), 'premise: the prefix fallback WOULD accept this file');
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', SECTION), null, 'not guessed');
+  const tailOnly = ['function somethingElse() {', ...lines(12, 'q'), ...body.slice(-22)].join('\n');
+  fs.writeFileSync(path.join(root, 'src', 'lookalike.js'), `${tailOnly}\n`);
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', SECTION), null, 'a shared tail is not a relocation either');
+});
+
+test('relocateStaleAnchor: a moved snippet that ALSO drifted (whole-snippet match fails) is declined, not guessed', () => {
+  const root = movedRepo();
+  const drifted = BLOCK.split('\n');
+  drifted.splice(30, 0, '  // added after the move');
+  fs.writeFileSync(path.join(root, 'src', 'moved.js'), `${drifted.join('\n')}\n`);
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', SECTION), null);
+});
+
+// (2) a cited file that was RENAMED / deleted is followed too (it used to fail the file read and be left as is).
+test('refreshCandidateFetchedFiles follows the code when the cited file itself no longer exists; a context file or a miss is left untouched', () => {
+  const root = movedRepo();
+  fs.unlinkSync(path.join(root, 'src', 'old.js'));
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = root;
+  delete require.cache[require.resolve('../../config.js')];
+  try {
+    const { refreshCandidateFetchedFiles } = require('../../local-draft.js');
+    const task = { source: 'function_length_fix', history: [], promptContext: { body: SECTION, files: ['src/old.js'], fetchedFiles: [
+      { path: 'src/old.js', anchorConfidence: 'none', content: 'stale' },
+      { path: 'src/gone-ctx.js', context: true, anchorConfidence: 'none', content: 'ctx' },
+    ] } };
+    refreshCandidateFetchedFiles(task);
+    assert.equal(task.promptContext.fetchedFiles[0].path, 'src/moved.js');
+    assert.equal(task.promptContext.fetchedFiles[0].relocatedFrom, 'src/old.js');
+    assert.equal(task.promptContext.fetchedFiles[1].content, 'ctx', 'a context file is never touched');
+
+    const miss = { source: 'function_length_fix', history: [], promptContext: { body: SECTION.replace(/const value/g, 'const other'), files: ['src/old.js'], fetchedFiles: [{ path: 'src/old.js', anchorConfidence: 'none', content: 'stale' }] } };
+    refreshCandidateFetchedFiles(miss);
+    assert.deepEqual(miss.promptContext.fetchedFiles[0], { path: 'src/old.js', anchorConfidence: 'none', content: 'stale' }, 'no relocation found: the entry is left exactly as it was');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+    delete require.cache[require.resolve('../../config.js')];
+  }
+});
+
+test('relocateStaleAnchor: a short (non-distinctive) snippet is never followed to another file', () => {
+  const root = movedRepo();
+  fs.writeFileSync(path.join(root, 'src', 'moved.js'), 'function tiny() {\n  return 1;\n}\n');
+  const tiny = '### AC-2\nFiles: src/old.js\nSnippet:\n```\nfunction tiny() {\n  return 1;\n}\n```\n';
+  assert.equal(relocateStaleAnchor(root, 'src/old.js', tiny), null);
+});
