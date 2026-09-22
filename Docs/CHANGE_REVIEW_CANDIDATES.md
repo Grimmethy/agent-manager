@@ -494,3 +494,60 @@ index 833e7f69..f71377b3 100644
 Problem: [severity: med; regression shipped in 1541b0f] api_task_detail and api_task_anywhere previously read only from the filesystem (read_json_safe) and returned 200 regardless of sqlite db state; after this diff they call _task_cost_summary, which executes sqlite queries with no exception handling, so a corrupt or non-SQLite db file now causes an uncaught sqlite3.DatabaseError and a 500 response.  Failure scenario: A valid task file exists at queue/done/task-abc.json. The file at the path returned by model_stats_db_path() exists (is_file() → True) but its first 16 bytes are 0x00 (a zeroed-out file, not a valid SQLite header). Before the diff: GET /api/task/done/task-abc reads the JSON, returns 200 with the task body. After the diff: GET /api/task/done/task-abc reads the JSON, then calls _task_cost_summary("task-abc"); model_stats_db_path() returns the path, is_file() is True, sqlite3.connect(...) succeeds (lazy), _has_cost_usd_column(conn) executes "SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'" which raises sqlite3.DatabaseError("file is not a database"); the try/finally in _task_cost_summary only closes the connection, the exception propagates uncaught through api_task_detail into Flask, which returns HTTP 500.
 Solution: Wrap the body of _task_cost_summary (from the sqlite3.connect line through the return) in a try/except sqlite3.Error (or bare except Exception) that returns None, restoring the "no cost data available" path and the pre-diff graceful-degradation behaviour of the task-detail endpoints.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 1541b0f.
+
+### AC-62 · `GET /api/job-types` previously always returned 200; after this diff it returns 500 when ` (14e18c1 app.py)
+Strength: Strong
+Source: change_review of 14e18c1 "Merge Agent manager > job list : we should add a field that tracks how many time"
+Files: python/dashboard/app.py
+
+Snippet:
+```
+diff --git a/python/dashboard/app.py b/python/dashboard/app.py
+index 92613e45..8b8dab3e 100644
+--- a/python/dashboard/app.py
++++ b/python/dashboard/app.py
+@@ -803,24 +803,42 @@ def write_project_links(links: dict):
+ 
+ 
+ def brain_dump_path() -> Path | None:
+     override = os.environ.get("AGENT_MANAGER_BRAIN_DUMP_PATH") or read_env_file(ENV_FILE_PATH).get(
+         "AGENT_MANAGER_BRAIN_DUMP_PATH"
+     )
+     if override:
+         return Path(override)
+     d = get_pipeline_dir()
+     return (d / "brain-dump.json") if d else None
+ 
+ 
++def job_type_counters_path() -> Path | None:
++    """Mirrors src/config.js's jobTypeCountersPath default -- job-type-counters.json in
++    pipelineDir, same env-override convention (AGENT_MANAGER_JOB_TYPE_COUNTERS_PATH) as
++    every other pipelineDir-relative state file above."""
++    override = os.environ.get("AGENT_MANAGER_JOB_TYPE_COUNTERS_PATH")
++    if override:
++        return Path(override)
++    d = get_pipeline_dir()
++    return (d / "job-type-counters.json") if d else None
++
++
++def read_job_type_counters() -> dict:
++    p = job_type_counters_path()
++    if not p:
++        return {}
++    return read_json_safe(p) or {}
++
++
+ def read_json_safe(path: Path):
+     try:
+         return json.loads(path.read_text(encoding="utf-8"))
+     except (OSError, json.JSONDecodeError):
+         return None
+ 
+ 
+ # Matches a `.` + at least 7 digits and captures the first 6 -- PowerShell's `Get-Date
+ # -Format 'o'` (used for every heartbeat/stateSince timest
+```
+
+Problem: [severity: low; regression shipped in 14e18c1] `GET /api/job-types` previously always returned 200; after this diff it returns 500 when `job-type-counters.json` contains valid JSON that is not an object.  Failure scenario: The pipeline directory contains a file `job-type-counters.json` whose content is the text `[1, 2, 3]` (e.g. left over from a manual edit or a different tool). A `GET /api/job-types` request enters `api_job_types()`, which calls `read_job_type_counters()`. That function calls `read_json_safe(p)`, which successfully parses the file and returns the list `[1, 2, 3]` (no exception, so the `except` branch is skipped). The `or {}` guard does not fire because a non-empty list is truthy, so `counters` is `[1, 2, 3]`. The list comprehension then evaluates `counters.get(name, 0)` and raises `AttributeError: 'list' object has no attribute 'get'`, producing a 500 response. Before this diff the endpoint never read that file and returned 200 unconditionally.
+Solution: In `read_job_type_counters`, replace `return read_json_safe(p) or {}` with `result = read_json_safe(p); return result if isinstance(result, dict) else {}` so that any non-object JSON value is coerced to the safe empty-dict default before the caller invokes `.get()`.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 14e18c1.
