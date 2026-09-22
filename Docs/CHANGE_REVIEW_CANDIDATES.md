@@ -591,3 +591,37 @@ index b0d7ddae..6ff207c8 100644
 Problem: [severity: med; regression shipped in 37eb1fd] A non-model `OSError` (e.g. `FileNotFoundError`, `PermissionError`) raised during session-file I/O inside `start_session`/`send_message` is now caught and misreported as "local model call failed … may be busy with an active worker-lane task," whereas before the diff it propagated as an unhandled 500 (correctly signalling a non-model problem).  Failure scenario: A Discuss session file `/pipeline/.discuss-sessions/a1b2c3.json` is deleted out-of-band (e.g. by a cleanup script or a user). The user clicks "Send" in the Discuss UI. `app.py` calls `_call_discuss(send_message, pipeline_dir, "a1b2c3", "hello")`. Inside `send_message`, `Path.read_text()` on the session file raises `FileNotFoundError` (an `OSError` subclass). The new `except (TimeoutError, ConnectionError, OSError)` clause catches it (since `FileNotFoundError` ⊂ `OSError`) and calls `abort(502, description="local model call failed ([Errno 2] No such file or directory: '/pipeline/.discuss-sessions/a1b2c3.json') -- it may be busy with an active worker-lane task; try again shortly or switch to Claude.")`. The user is told the model is busy and should wait or switch to Claude, when the real problem is a missing file that will never resolve by waiting.
 Solution: Remove bare `OSError` from the except tuple so only the specific model-busy exceptions are caught:
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 37eb1fd.
+
+### AC-64 · Pre-diff, every build re-resolved each file's imports against the current file_set, so a n (dc8d59a build_graph.py)
+Strength: Strong
+Source: change_review of dc8d59a "Incremental project-graph builds: diff-based, not from-scratch every time"
+Files: python/build_graph.py
+
+Snippet:
+```
+diff --git a/python/build_graph.py b/python/build_graph.py
+index abbd0c81..c05b3849 100644
+--- a/python/build_graph.py
++++ b/python/build_graph.py
+@@ -113,33 +113,40 @@ TEMPLATE_RE = re.compile(r"""render_template\(\s*f?['"]([^'"]+)['"]""")
+ 
+ 
+ def get_config():
+     repo_root = os.environ.get("AGENT_MANAGER_REPO_ROOT")
+     if not repo_root:
+         raise SystemExit("AGENT_MANAGER_REPO_ROOT env var is required.")
+     repo_root = Path(repo_root)
+ 
+     pipeline_dir = Path(os.environ.get("AGENT_MANAGER_PIPELINE_DIR", str(repo_root)))
+     grep_dirs = [d.strip() for d in os.environ.get("AGENT_MANAGER_GREP_DIRS", "frontend/src,backend/src").split(",") if d.strip()]
+     graph_path = Path(os.environ.get("AGENT_MANAGER_GRAPH_PATH", str(repo_root / "graphify-out" / "graph.json")))
+     coverage_path = Path(os.environ.get("AGENT_MANAGER_COMMUNITY_COVERAGE_PATH", str(pipeline_dir / "community-coverage.json")))
++    # 2026-08-24 (Brain Dump #155): per-file mtime/size -> resolved-edges cache, see
++    # build_import_graph's own comment. Lives under instances/ alongside the OTHER
++    # build-scheduling state (.graph-build-schedule.json) thi
+...[snippet truncated]
+```
+
+Problem: [severity: high; regression shipped in dc8d59a] Pre-diff, every build re-resolved each file's imports against the current file_set, so a newly-added file imported by an unchanged file produced a correct edge; post-diff, the cache-hit path reuses an edge list that was filtered by the *previous* build's file_set and can never add an edge whose target did not exist at cache-write time.  Failure scenario: repo_root=/home/user/project, grep_dirs=["backend/src"]. Build 1: only backend/src/service.py exists (content: `from new_util import helper`); backend/src/new_util.py does not exist. file_set={service.py}. _extract_edges_for_file resolves the import to /home/user/project/backend/src/new_util.py, but `target in file_set` is False, so edges=[] is cached. Build 2: backend/src/new_util.py is added (e.g. `def helper(): ...`); service.py is byte-identical (same mtime, same size). file_set={service.py, new_util.py}. service.py is a cache hit → edges=[] → no edge added. new_util.py is a cache miss → its own edges extracted (none). Graph: 2 nodes, 0 edges → both isolated → both removed → empty graph. Pre-diff Build 2 would have read service.py's text, resolved `new_util` to new_util.py, found it in file_set, and added the service.py→new_util.py edge, yielding a 2-node/1-edge graph with no isolated nodes.
+Solution: In the cache-hit branch, after loading `edges = cached["edges"]`, also re-scan the file's import statements (or, more cheaply, store the *unresolved* import specs in the cache alongside the resolved edges) and resolve them against the *current* file_set, appending any newly-valid targets to `edges` before the `graph.has_node` loop. Alternatively, invalidate the cache entry for file A whenever file_set gains a new member that A's text could resolve to (i.e., treat any file-set addition as a cache miss for all cached files that import from the same directory/package).
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in dc8d59a.
