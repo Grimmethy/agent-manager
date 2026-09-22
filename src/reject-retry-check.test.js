@@ -396,11 +396,31 @@ test('an advisoryProse review-verdict source (e.g. performance_review) exhausted
   const p = path.join(d.needsClarificationDir, 'perf-review-1.json');
   assert.ok(fs.existsSync(p), 'landed in needs-clarification/, not stuck in blocked/ forever');
   const out = JSON.parse(fs.readFileSync(p, 'utf8'));
-  assert.equal(out.needsClarification.reason, 'design-decision');
+  // 2026-09-22: the reason now reflects classifyBlockedTask's own precise, retryable
+  // category (this blockedReason's "refusal to render a verdict" matches the
+  // refusal-no-changes-needed keyword class) instead of a blanket 'design-decision' --
+  // see reject-retry-check.js's own comment at this assignment for the full incident.
+  assert.equal(out.needsClarification.reason, 'refusal-no-changes-needed');
   assert.match(out.needsClarification.openQuestions, /earlier rejection: missing GENUINE label/);
   assert.match(out.needsClarification.openQuestions, /refusal to render a verdict/);
   assert.match(out.needsClarification.openQuestions, /GENUINE\/FALSE POSITIVE\/UNCERTAIN/);
   assert.ok(out.history.some((h) => h.stage === 'needs-clarification'));
+  clearRegistry();
+});
+
+test('an exhausted candidate-fulfillment task with an unclassifiable blockedReason still falls back to design-decision', () => {
+  clearRegistry();
+  registerTaskSource('fixture_observability_fix', { priority: 80, next: () => null, candidateFulfillment: true });
+  const d = setupAdhocDirs();
+  const task = {
+    id: 'obs-fix-genuine', source: 'fixture_observability_fix', blockedStage: 'review',
+    blockedReason: 'REJECT (votes: 2/3 real)', // matches no REASON_CATEGORIES keyword, no structural classifier
+    localRejectCount: 2, priorRejectionFeedback: [], history: [],
+  };
+  fs.writeFileSync(path.join(d.blockedDir, 'obs-fix-genuine.json'), JSON.stringify(task));
+  rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  const out = JSON.parse(fs.readFileSync(path.join(d.needsClarificationDir, 'obs-fix-genuine.json'), 'utf8'));
+  assert.equal(out.needsClarification.reason, 'design-decision', 'uncategorized still falls back to design-decision, unchanged for genuine questions');
   clearRegistry();
 });
 

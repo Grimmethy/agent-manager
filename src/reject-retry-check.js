@@ -734,8 +734,27 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           // with an honest reason:'infra-error' -- not design-decision -- so forensics and
           // the triage sweep see it for what it is. (nc.reason already carries non-
           // design-decision values elsewhere: external-dependency, unreliable-grounding.)
+          //
+          // 2026-09-22 (needs-clarification bucket review): every OTHER exhausted
+          // candidate-fulfillment/review-verdict/adhoc task got blanket-labeled
+          // 'design-decision' regardless of what actually blocked it -- classifyBlockedTask
+          // already ran above (line ~650) and, since it's retryable:true here (a
+          // non-retryable verdict would have escalated immediately and never reached this
+          // branch), its category is a precise, real cause: a stale/fabricated citation
+          // (fabricated-ungrounded-claim), a refusal instead of a diff
+          // (refusal-no-changes-needed), a degenerate plan/implement, a JSON parse
+          // failure, or an inconclusive-review flake that happened three times running.
+          // Confirmed live: 9+ of the real 26-task needs-clarification bucket were exactly
+          // this -- a stale citation or a refusal, not a product/architecture question --
+          // yet every one read 'design-decision', indistinguishable from a genuine one.
+          // 'uncategorized' still falls back to 'design-decision' (unchanged behavior for
+          // the majority that really are open questions). needs-clarification-triage.js's
+          // own reason allowlist is extended in the same PR to keep every one of these
+          // categories triage-eligible -- exactly the class of gap its own comments
+          // describe fixing for 'infra-error' (see this file's own header there).
+          const exhaustedCategory = classification.category !== 'uncategorized' ? classification.category : 'design-decision';
           task.needsClarification = {
-            reason: task.infraErrorBefore ? 'infra-error' : 'design-decision',
+            reason: task.infraErrorBefore ? 'infra-error' : exhaustedCategory,
             openQuestions: isFulfillment ? buildExhaustedFulfillmentQuestion(task)
               : isReviewVerdict ? buildExhaustedReviewVerdictQuestion(task)
                 : buildExhaustedAdhocQuestion(task),

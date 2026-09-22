@@ -324,6 +324,24 @@ test('reason ambiguous -> not ours, skipped', async () => {
   assert.equal(s.checked, 0);
 });
 
+// 2026-09-22: reject-retry-check.js now stamps an exhausted candidate-fulfillment task
+// with classifyBlockedTask's own precise category instead of a blanket 'design-decision'
+// -- these newly-precise reasons must stay triage-eligible (the buckets below the
+// allowlist gate never branched on the literal 'design-decision' string; only the initial
+// gate did), or every one of them silently reproduces the exact 'infra-error' dead zone
+// this file's own header (bucket H/I) describes fixing.
+test('a precise classifyBlockedTask category (e.g. refusal-no-changes-needed) is triage-eligible, identically to design-decision', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('t-precise', {
+    localRejectCount: 2, turnBudgetExhausted: true, adhocResolution: 'needs-human-decision',
+    priorRejectionFeedback: ['x'], implementResponse: 'blah',
+    needsClarification: { reason: 'refusal-no-changes-needed', openQuestions: DEGEN_OQ },
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued], [1, 1], 'processed and requeued exactly like a design-decision task with the same openQuestions would be');
+  assert.ok(exists(at(dir, 'adhoc', 't-precise.json')));
+});
+
 test('kill switch AGENT_MANAGER_NC_TRIAGE=false -> zeroed summary, nothing touched', async () => {
   const dir = makePipeline();
   held(dir, baseTask('t13'));
