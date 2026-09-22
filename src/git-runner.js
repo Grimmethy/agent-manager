@@ -213,7 +213,32 @@ function createRealGitRunner(repoRoot) {
             throw new Error(`prepareStackedBranch: local ${name} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic sync`);
           }
         }
-        run(['checkout', '-B', name, remote]); // local missing, or ⊆ origin (stale/behind/identical)
+        // A ROLLING branch (e.g. TRIAGE_BRANCH) is never explicitly rebased on its own --
+        // apply-main-batch.js's own header says so plainly ("based on whatever main was
+        // when it was first created and is never rebased"). Every branch of the logic
+        // above only ever compares LOCAL to REMOTE; none of it ever asks whether the
+        // REMOTE copy itself has fallen behind current main. Root-caused live 2026-09-22:
+        // a human merged the branch and deleted it, but a near-concurrent apply cycle
+        // recreated it (a real race, or simply this same "trust origin blindly" gap on an
+        // OLDER cycle, well before that merge) anchored to a point of main from TWO DAYS
+        // earlier -- every apply after that just kept stacking onto that same stale
+        // lineage, silently re-including commits that had already separately landed on
+        // main (identical SHAs -- confirmed live), one of which was a finding a human had
+        // explicitly retracted as a false positive after the fact.
+        try { run(['fetch', 'origin', mainBranch]); } catch { /* best-effort, matches fetchMain elsewhere */ }
+        if (!isAncestor(`origin/${mainBranch}`, remote)) {
+          run(['checkout', '-B', name, remote]);
+          try {
+            run(['rebase', `origin/${mainBranch}`]);
+          } catch (e) {
+            try { run(['rebase', '--abort']); } catch { /* best-effort */ }
+            throw new Error(
+              `prepareStackedBranch: ${remote} is based on a stale point of ${mainBranch} (main has moved on since this rolling branch was last built) and rebasing its still-unmerged commits onto the current tip failed -- needs a human to reconcile, not an automatic sync: ${e.message}`,
+            );
+          }
+          return;
+        }
+        run(['checkout', '-B', name, remote]); // local missing, or ⊆ origin (stale/behind/identical); remote itself is current
         return;
       }
       if (localExists && isAncestor(`origin/${mainBranch}`, name)) {
