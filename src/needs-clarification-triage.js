@@ -330,6 +330,11 @@ const REQUEUE_STRIP_FIELDS = [
   'turnBudgetExhaustedBefore', 'adhocResolution', 'subTaskProposals', 'preDrafted',
   'priorRejectionFeedback', 'rawDiff', 'implementResponse', 'blockedReason', 'blockedStage',
   'claimedAt', 'forcedSummaryNonCompliant',
+  // Kept in sync with reject-retry-check.js's READMIT_CLEAN_SLATE_FIELDS (see that list's
+  // own comment) -- a stale reviewInconclusive flag surviving a clean-slate requeue here
+  // would disguise a later genuine review-stage rejection the same way it did there
+  // (pipeline-forensics-fix-ac-133, 2026-09-22).
+  'reviewInconclusive',
 ];
 
 // 2026-09-17, root-caused live: every bucket below strips REQUEUE_STRIP_FIELDS (which

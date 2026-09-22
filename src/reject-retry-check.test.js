@@ -1362,6 +1362,39 @@ test('rejectRetryCheck re-admits an "Invalid premise:" block that also carries r
   assert.ok(fs.existsSync(path.join(pendingDir, 'ac-133.json')));
 });
 
+// 2026-09-22, root-caused live via the REAL pipeline-forensics-fix-ac-133 (not the test
+// fixture above, which shares its name by coincidence of the AC number): the clean-slate
+// readmit above strips blockedReason/blockedStage/premiseReadmitCount etc but historically
+// left `reviewInconclusive` sitting on the task -- a leftover from the *first* block (the
+// one that just got readmitted), not describing whatever block comes next. If the very
+// next draft attempt then earns a completely different, genuine two-vote review REJECT,
+// the stale flag made isReviewRejection() misread it as the same stochastic gate flake and
+// the task fell through every branch of the sweep's entry gate -- invisible forever, with
+// a real rejection reason on record and no route to a redraft or an escalation.
+test('rejectRetryCheck clears the stale reviewInconclusive flag on an invalid-premise readmit, so a LATER genuine review rejection is not silently swallowed', () => {
+  const { blockedDir, pendingDir, needsClarificationDir } = setupDirsWithNc();
+  writeBlockedTask(blockedDir, 'ac-133-real', { blockedStage: 'review', reviewInconclusive: true, blockedReason: INVALID_PREMISE });
+
+  // Tick 1: the stale-premise block gets its one clean-slate readmit.
+  const first = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+  assert.equal(first.requeued, 1);
+  const readmitted = JSON.parse(fs.readFileSync(path.join(pendingDir, 'ac-133-real.json'), 'utf8'));
+  assert.equal(readmitted.reviewInconclusive, undefined, 'the flag from the readmitted block must not survive into the fresh attempt');
+
+  // Simulate the next draft attempt landing a genuine, unrelated review-stage REJECT.
+  readmitted.blockedStage = 'review';
+  readmitted.blockedReason = 'REJECT: the implement draft is a meta-commentary refusal, not a code change.';
+  readmitted.localVotes = [{ verdict: 'REJECT' }, { verdict: 'REJECT' }];
+  fs.unlinkSync(path.join(pendingDir, 'ac-133-real.json'));
+  fs.writeFileSync(path.join(blockedDir, 'ac-133-real.json'), JSON.stringify(readmitted, null, 2));
+
+  // Tick 2: this must be treated as a normal review rejection (requeued for a blind
+  // redraft under the cap), not silently skipped.
+  const second = rejectRetryCheck({ blockedDir, pendingDir, needsClarificationDir, recordModelOutcome: () => {} });
+  assert.equal(second.requeued, 1, 'a genuine review rejection after an invalid-premise readmit must still be visible to the sweep');
+  assert.ok(fs.existsSync(path.join(pendingDir, 'ac-133-real.json')));
+});
+
 test('rejectRetryCheck escalates a stage-less "Invalid premise:" block that already used its readmit', () => {
   const { blockedDir, pendingDir, needsClarificationDir } = setupDirsWithNc();
   writeBlockedTask(blockedDir, 'ac-13', { blockedStage: undefined, blockedReason: INVALID_PREMISE, premiseReadmitCount: 1 });
