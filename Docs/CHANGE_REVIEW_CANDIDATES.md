@@ -457,3 +457,40 @@ index 5f0cb7c2..3e8c87a6 100755
 Problem: [severity: high; regression shipped in 88c4273] The pending/ claim loop previously used a pure shell `ls -1` to list files, which works with no runtime dependencies. The new code relies on `node` and specific JS modules; if `node` is missing or the modules fail to load, the inner `try/catch` swallows the error and returns an empty list, causing the worker to silently skip all pending work.  Failure scenario: A worker instance runs on a host where `node` is not in PATH, or `PACKAGE_SRC_DIR` is misconfigured such that `task-sources.js` is missing. The `node -e ...` command fails immediately (e.g., "node: command not found" or "Cannot find module"). The `2>/dev/null` redirect hides the error. The `while IFS= read -r name` loop receives no input, so `items` remains empty. The subsequent `for name in "${items[@]}"` loop iterates zero times. The worker claims no work and idles, even if `pending/` contains 22 valid JSON tasks.
 Solution: Revert the listing logic to `ls -1 "$pdir"` and perform the priority sorting in a separate, non-fatal step (e.g., using `sort` or a fallback `ls` if the node command fails), or ensure the node command's stderr is not suppressed and its exit code is checked to fall back to the unsorted `ls` listing.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 88c4273.
+
+### AC-61 · api_task_detail and api_task_anywhere previously read only from the filesystem (read_json_ (1541b0f app.py)
+Strength: Strong
+Source: change_review of 1541b0f "Extend cost tracking to the job page, Workers tab, and hourly/daily/weekly repor"
+Files: python/dashboard/app.py
+
+Snippet:
+```
+diff --git a/python/dashboard/app.py b/python/dashboard/app.py
+index 833e7f69..f71377b3 100644
+--- a/python/dashboard/app.py
++++ b/python/dashboard/app.py
+@@ -707,24 +707,33 @@ def model_stats_db_path() -> Path | None:
+ 
+ def _has_cost_usd_column(conn: sqlite3.Connection) -> bool:
+     """cost_usd (2026-08-23, Grimmethy: "Do we have any way of knowing how much these
+     tasks would cost using anthropic API?") -- model-stats-db.js's own ALTER TABLE
+     migration only runs the next time a real recordCall() fires from the Node side; this
+     Python reader can be hit BEFORE that ever happens (a fresh db, or an old one nobody's
+     written to yet today), so every query touching cost_usd guards on this first rather
+     than crashing with 'no such column' the moment someone opens the Models tab."""
+     row = conn.execute("SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'").fetchone()
+     return bool(row and row[0])
+ 
+ 
++def _has_instance_id_column(conn: sqlite3.Connection) -> bool:
++    """Same guard as _has_cost_usd_column above, for the instance_id column (2026-08-23,
++    "Where else would it make sense to track it?" -> Workers tab, per-instance cost) --
++    added in the same migration pass as cost_usd, but guarded independently since a
++    caller should never assume two separate ALTER TABLE statements landed atomically."""
++    row = conn.execute("SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'instance_id'").fetchone()
++ 
+```
+
+Problem: [severity: med; regression shipped in 1541b0f] api_task_detail and api_task_anywhere previously read only from the filesystem (read_json_safe) and returned 200 regardless of sqlite db state; after this diff they call _task_cost_summary, which executes sqlite queries with no exception handling, so a corrupt or non-SQLite db file now causes an uncaught sqlite3.DatabaseError and a 500 response.  Failure scenario: A valid task file exists at queue/done/task-abc.json. The file at the path returned by model_stats_db_path() exists (is_file() → True) but its first 16 bytes are 0x00 (a zeroed-out file, not a valid SQLite header). Before the diff: GET /api/task/done/task-abc reads the JSON, returns 200 with the task body. After the diff: GET /api/task/done/task-abc reads the JSON, then calls _task_cost_summary("task-abc"); model_stats_db_path() returns the path, is_file() is True, sqlite3.connect(...) succeeds (lazy), _has_cost_usd_column(conn) executes "SELECT COUNT(*) FROM pragma_table_info('model_calls') WHERE name = 'cost_usd'" which raises sqlite3.DatabaseError("file is not a database"); the try/finally in _task_cost_summary only closes the connection, the exception propagates uncaught through api_task_detail into Flask, which returns HTTP 500.
+Solution: Wrap the body of _task_cost_summary (from the sqlite3.connect line through the return) in a try/except sqlite3.Error (or bare except Exception) that returns None, restoring the "no cost data available" path and the pre-diff graceful-degradation behaviour of the task-detail endpoints.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 1541b0f.
