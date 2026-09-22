@@ -68,6 +68,20 @@ const READMIT_CLEAN_SLATE_FIELDS = [
   'isAgenticContinuation', 'agenticContinuationCount', 'agenticContinuationNote', 'priorPartialDiff',
   'adhocDiffSubstanceFeedback', 'adhocNoChangesClaimFeedback', 'premiseReadmitCount',
   '_prevBlockSignature',
+  // 2026-09-22, root-caused live via pipeline-forensics-fix-ac-133: reviewInconclusive is
+  // stamped by local-draft.js/implement-critique.js's OWN stochastic gate flake at the time
+  // of ONE specific block (e.g. an "Invalid premise:" postImplementCheck rejection) so
+  // isReviewRejection() can tell that flake apart from a genuine reviewer REJECT. It was
+  // missing from this list, so a clean-slate readmit (invalid-premise or forbidden-path)
+  // left it sitting on the task -- and if the NEXT draft attempt then earned a real,
+  // two-vote review-stage REJECT (a completely different block, unrelated to the one that
+  // set the flag), isReviewRejection() still read the stale flag and returned false. That
+  // silently dropped the task out of every branch in this sweep's entry gate: not a review
+  // rejection, not any retryable-draft/pre-critique/pre-implement/invalid-premise shape
+  // either -- invisible forever, parked in blocked/ with a genuine rejection reason and no
+  // path to a redraft OR an escalation. Confirmed live: pipeline-forensics-fix-ac-133 sat
+  // blocked 3 days with two clean REJECT votes on record, silently skipped by every tick.
+  'reviewInconclusive',
 ];
 
 // 2026-09-16: a source registered with deterministicReview (brain_dump_sort today) that was
