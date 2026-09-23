@@ -362,6 +362,32 @@ test('buildVerdictPrompt gives a candidateSplitProposals draft its own carve-out
   assert.doesNotMatch(prompt, /does it contain real, complete code/i);
 });
 
+// S3-a of the hub-tasks extraction (2026-09-23): the ORIGINAL REQUEST injection (this
+// test) and the fact-check hard-block carve-out (isDecomposeProposal, further down in
+// review-task.js) both read hub-review-detection.js's swap point now, not an inline field
+// check duplicated in two places. Proves an override actually changes
+// buildVerdictPrompt's behavior for a task the DEFAULT predicate would say no to (not
+// 'manual', no candidateSplitProposals), and restores the default afterward since the
+// module is a process-wide singleton shared across every test in this file. (The separate
+// "COVERAGE IS THE MAIN TEST" carve-out text a few lines below in review-task.js is gated
+// by task.candidateSplitProposals directly, not this hook -- deliberately out of scope
+// here, see the PR description.)
+test('buildVerdictPrompt honors an overridden decompose-proposal detection instead of the default field check', () => {
+  const { setDecomposeProposalDetection } = require('./hub-review-detection.js');
+  const task = baseTask({
+    domain: 'default', source: 'trouble_log', // NOT 'manual', no candidateSplitProposals -- the default predicate must say false
+    promptContext: { rawText: 'the full original ask, ORIGINAL-REQUEST-MARKER-XYZ' },
+  });
+  try {
+    setDecomposeProposalDetection({ isDecomposeOrSplitProposal: () => true });
+    const prompt = buildVerdictPrompt(task, { flags: [] }, '');
+    assert.match(prompt, /ORIGINAL REQUEST \(full text/);
+    assert.match(prompt, /ORIGINAL-REQUEST-MARKER-XYZ/);
+  } finally {
+    setDecomposeProposalDetection(null); // restore the default -- singleton state shared across this whole suite
+  }
+});
+
 test('buildVerdictPrompt injects the full ORIGINAL REQUEST for a decompose proposal so coverage is checkable', () => {
   const task = baseTask({
     domain: 'default', source: 'manual', adhocResolution: 'decompose',
