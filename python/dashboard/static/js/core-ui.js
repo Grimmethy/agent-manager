@@ -143,11 +143,11 @@ function renderTabButton(tab, indent) {
 
 // --- Manifest-driven dashboard tab: tab-bar merge (piece 3 of 6; Docs/
 // hub-tasks-extraction-plan.md section 5). Fail-safe by construction: mergePluginTabs()
-// always rebuilds TABS from CORE_TABS first, so a plugin that vanishes or gets disabled
-// simply drops back out, and a single malformed tab is skipped rather than corrupting the
-// whole nav. What a plugin's row actually does when clicked (loading its ui/ script,
-// piece 2's route) is wired up by the renderer dispatch in a later piece -- this piece only
-// gets the row into the nav bar.
+// always rebuilds TABS from CORE_TABS first, so a plugin that vanishes, gets disabled, or
+// declares a malformed tab simply drops back out and never corrupts the whole nav. What a
+// plugin's row actually does when clicked (loading its ui/ script, piece 2's route) is
+// wired up by the renderer dispatch in a later piece -- this piece only gets the row into
+// the nav bar.
 // NOT `= CORE_TABS`: core-ui.js loads via <script src> before the inline <script> block in
 // index.html that defines CORE_TABS, so referencing it here at top-level (not inside a
 // function body) would throw ReferenceError immediately and abort the rest of this file's
@@ -165,11 +165,43 @@ function isValidPluginTab(tab) {
   return true;
 }
 
+// Drops the row with this key wherever it lives (top-level or inside a group's children).
+// Used only for a *deliberately disabled* replaces-declaring plugin -- see mergePluginTabs
+// below -- never for a merely-malformed one, which still gets the CORE_TABS fallback as a
+// safety net.
+function removeTabByKey(tabs, key) {
+  const idx = tabs.findIndex((t) => t.key === key);
+  if (idx !== -1) { tabs.splice(idx, 1); return true; }
+  for (const t of tabs) {
+    if (t.group && Array.isArray(t.children)) {
+      const cIdx = t.children.findIndex((c) => c.key === key);
+      if (cIdx !== -1) { t.children.splice(cIdx, 1); return true; }
+    }
+  }
+  return false;
+}
+
 function mergePluginTabs(plugins, manifestTabsEnabled) {
   const tabs = CORE_TABS.map((t) => (t.children ? { ...t, children: [...t.children] } : { ...t }));
   if (manifestTabsEnabled !== false) {
     for (const p of plugins || []) {
-      if (!p || p.enabled === false || !isValidPluginTab(p.tab)) continue;
+      if (!p) continue;
+      if (p.enabled === false) {
+        // A disabled plugin that declares `replaces` claimed ownership of a hardcoded
+        // CORE_TABS row -- hide that row too instead of silently falling back to it, so
+        // disabling a plugin in the Plugins tab actually hides its tab rather than
+        // swapping back to a functionally-identical core implementation the user can't
+        // tell apart from the plugin being on (Grimmethy, 2026-09-23: disabling
+        // promptforge left the tab fully visible and clickable). Only acts on a
+        // structurally valid declaration -- a disabled AND malformed plugin can't be
+        // trusted to say which row it meant, so that row keeps its CORE_TABS fallback,
+        // same as the "malformed while enabled" case below.
+        if (isValidPluginTab(p.tab) && typeof p.tab.replaces === 'string' && p.tab.replaces.trim()) {
+          removeTabByKey(tabs, p.tab.replaces);
+        }
+        continue;
+      }
+      if (!isValidPluginTab(p.tab)) continue;
       const tab = p.tab;
       const row = { key: tab.key, label: tab.label, description: tab.description, pluginName: p.name, pluginScript: tab.script };
       const replaces = tab.replaces;
@@ -244,12 +276,14 @@ function findTabByKey(key) {
 }
 
 // Enable/disable lifecycle: active-tab redirect (piece 5 of 6; Docs/
-// hub-tasks-extraction-plan.md section 5). CORE_TABS rows can never disappear
-// (mergePluginTabs always rebuilds TABS from CORE_TABS first, per piece 3), so the only
-// way findTabByKey(activeTab) comes back empty is that activeTab names a plugin-declared
-// tab whose plugin was just disabled, removed, or dropped a `replaces` that used to cover
-// this key -- switchToTab() runs the real leave/enter transition rather than just
-// reassigning activeTab, so the tab we're leaving still gets its own cleanup hook.
+// hub-tasks-extraction-plan.md section 5). A CORE_TABS row survives mergePluginTabs()
+// UNLESS a plugin both declared `replaces` for it and was then deliberately disabled (see
+// mergePluginTabs' own comment, 2026-09-23) -- so findTabByKey(activeTab) can now come back
+// empty either because activeTab named a plugin-declared tab whose plugin was disabled,
+// removed, or dropped a `replaces` that used to cover this key, OR because that plugin's
+// disable just took its replaced CORE_TABS row down with it. Either way the handling is the
+// same: switchToTab() runs the real leave/enter transition rather than just reassigning
+// activeTab, so the tab we're leaving still gets its own cleanup hook.
 function redirectFromGoneActiveTab(fallbackKey = 'project') {
   if (findTabByKey(activeTab)) return false;
   switchToTab(fallbackKey);
