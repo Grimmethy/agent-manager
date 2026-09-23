@@ -171,11 +171,22 @@ function runJsTests(repoRoot, files) {
   }
 }
 
+// Defaults to the repo's own .venv when the caller doesn't name an interpreter -- plain
+// `python3` is whatever's on PATH, which on this machine is the bare system interpreter
+// with no project dependencies installed (confirmed live: every test that imports app.py
+// failed with "ModuleNotFoundError: No module named 'flask'", a false regression signal
+// for 100% of Python-touching commits, not a real one -- Flask lives only in
+// <repoRoot>/.venv, same venv the dashboard itself is actually launched with).
+function defaultPythonBin(repoRoot) {
+  const venvPy = path.join(repoRoot, '.venv', 'bin', 'python');
+  return fs.existsSync(venvPy) ? venvPy : 'python3';
+}
+
 function runPyTests(repoRoot, files, pythonBin) {
   if (!files.length) return null;
   const modules = files.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'));
   try {
-    execFileSync(pythonBin || 'python3', ['-m', 'unittest', ...modules], {
+    execFileSync(pythonBin || defaultPythonBin(repoRoot), ['-m', 'unittest', ...modules], {
       cwd: repoRoot, timeout: RUN_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(),
     });
     return { ran: files, passed: true, failures: [] };
