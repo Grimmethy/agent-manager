@@ -29,16 +29,29 @@ const fs = require('fs');
 const { runIntegrationGate, realExec } = require('./decompose-integration-gate.js');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 const { recordBranchRemoval } = require('./branch-removal-ledger.js');
+const { isVerifiedMechanicalMove } = require('./mechanical-move-registry.js');
+// Required only for their registerMechanicalMoveKind() side effect (see each file's own
+// registration call) -- this kernel file should know NOTHING about the string
+// 'script-extract'/'one-pass-decompose' beyond "ask the registry." Temporary: today both
+// producer and kernel live in this same repo/process, so this require is how the
+// registration actually reaches decompose-auto-merge.js's process (queue-watcher.sh runs
+// coordinator-sweep.js as its own one-shot `node` process -- see
+// mechanical-move-registry.js's header). Once the file-decompose family moves to hygiene
+// (S4a), these two requires are deleted and hygiene registers its own kinds at its own
+// plugin load time instead.
+require('./script-extract.js');
+require('./decompose-one-pass.js');
 
 const BRANCH_REF = 'refs/decompose-automerge/branch';
 const MAIN_REF = 'refs/decompose-automerge/main';
 
 // A move child whose apply is a pure deterministic relocation -- never an LLM-authored
-// change. Only these auto-merge; a `flask-blueprint` / `module-extract` / drifted move
-// stays `pending-merge` for a human.
+// change. Resolved through mechanical-move-registry.js's verifyMove hook (S3 of the
+// hub-tasks extraction, 2026-09-23) instead of a hardcoded kind-name check; only a
+// registered kind's own verifyMove says yes -- a `flask-blueprint` / `module-extract` /
+// drifted move, or any unregistered kind, stays `pending-merge` for a human, same as before.
 function isMechanicalMoveChild(task) {
-  const pc = task && task.promptContext;
-  return !!pc && (pc.deterministicApply === 'script-extract' || pc.deterministicApply === 'one-pass-decompose');
+  return isVerifiedMechanicalMove(task);
 }
 
 /**

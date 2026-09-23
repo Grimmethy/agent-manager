@@ -105,4 +105,11 @@ function planIsFullyMechanicalHtml(request, validation) {
   return moves.every((_, i) => meta[i] && meta[i].deterministicApplyOk === true);
 }
 
+// verifyMove hook (S3 of the hub-tasks extraction, 2026-09-23) -- see
+// mechanical-move-registry.js's header and script-extract.js's own registration for the
+// full design. A `deterministicApply: 'one-pass-decompose'` task is the SINGLE deterministic
+// commit planIsFullyMechanicalHtml above already gated on every move resolving cleanly, so
+// there is nothing left to re-verify at merge time either.
+require('./mechanical-move-registry.js').registerMechanicalMoveKind('one-pass-decompose', { verifyMove: () => true });
+
 module.exports = { buildOnePassGroupBChanges, spliceScriptTags, scriptTagFor, planIsFullyMechanicalHtml };

@@ -213,6 +213,14 @@ function buildExtraction(html, names, { newFileUrl, isHtml = true } = {}) {
   return { ok: true, newFileContent, newHtml, results: located.results };
 }
 
+// verifyMove hook (S3 of the hub-tasks extraction, 2026-09-23, mechanical-move-registry.js's
+// own header has the full design): a `deterministicApply: 'script-extract'` move child's
+// symbols were already proven to resolve at plan time (file-decompose-to-hub.js's
+// validatePlan) -- membership in this kind IS the proof, so verifyMove is a plain true.
+// This declares that fact where the kind is actually implemented, so decompose-auto-merge.js
+// (hub KERNEL code) never needs to know the string 'script-extract' exists.
+require('./mechanical-move-registry.js').registerMechanicalMoveKind('script-extract', { verifyMove: () => true });
+
 module.exports = {
   findScriptBlocks, htmlLineFor, parsesCleanly, findParamsClose, findBodyClose,
   locateFunction, locateFunctions, buildExtraction,

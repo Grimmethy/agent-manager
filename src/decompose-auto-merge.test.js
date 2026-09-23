@@ -41,6 +41,18 @@ test('isMechanicalMoveChild: only script-extract / one-pass-decompose', () => {
   assert.equal(isMechanicalMoveChild(null), false);
 });
 
+// verifyMove hook (S3 of the hub-tasks extraction, 2026-09-23): proves isMechanicalMoveChild
+// actually reads mechanical-move-registry.js's live registry rather than a hardcoded kind
+// list baked into this file -- a brand-new kind neither script-extract.js nor
+// decompose-one-pass.js knows about becomes mechanical the moment something registers it,
+// with zero changes to decompose-auto-merge.js itself.
+test('isMechanicalMoveChild recognizes a kind registered after this file loaded, via the live registry (not a hardcoded list)', () => {
+  const { registerMechanicalMoveKind } = require('./mechanical-move-registry.js');
+  registerMechanicalMoveKind('test-only-future-hygiene-kind', { verifyMove: (task) => task.promptContext.symbols?.length > 0 });
+  assert.equal(isMechanicalMoveChild({ promptContext: { deterministicApply: 'test-only-future-hygiene-kind', symbols: ['x'] } }), true);
+  assert.equal(isMechanicalMoveChild({ promptContext: { deterministicApply: 'test-only-future-hygiene-kind', symbols: [] } }), false, 'the registered verifyMove, not just kind membership, decides the outcome');
+});
+
 test('non-mechanical child is refused outright (no git touched)', () => {
   const exec = fakeExec();
   const r = autoMergeVerifiedMoveChild({
