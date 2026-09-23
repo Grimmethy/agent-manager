@@ -15,7 +15,7 @@ plugins_bp = Blueprint("plugins-bp", __name__)
 
 @plugins_bp.route("/api/plugins")
 def api_plugins():
-    from app import PLUGINS_MANIFEST_PATH, _read_plugins_manifest
+    from app import PLUGINS_MANIFEST_PATH, _manifest_tabs_enabled, _read_plugins_manifest
     manifest = _read_plugins_manifest()
     for p in manifest:
         if p.get("slot"):
@@ -23,6 +23,7 @@ def api_plugins():
     return jsonify({
         "plugins": manifest,
         "manifestPath": str(PLUGINS_MANIFEST_PATH),
+        "manifestTabsEnabled": _manifest_tabs_enabled(),
     })
 
 

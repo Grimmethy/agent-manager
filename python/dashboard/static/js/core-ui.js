@@ -141,6 +141,69 @@ function renderTabButton(tab, indent) {
   return btn;
 }
 
+// --- Manifest-driven dashboard tab: tab-bar merge (piece 3 of 6; Docs/
+// hub-tasks-extraction-plan.md section 5). Fail-safe by construction: mergePluginTabs()
+// always rebuilds TABS from CORE_TABS first, so a plugin that vanishes or gets disabled
+// simply drops back out, and a single malformed tab is skipped rather than corrupting the
+// whole nav. What a plugin's row actually does when clicked (loading its ui/ script,
+// piece 2's route) is wired up by the renderer dispatch in a later piece -- this piece only
+// gets the row into the nav bar.
+let TABS = CORE_TABS;
+
+function isValidPluginTab(tab) {
+  if (!tab || typeof tab !== 'object') return false;
+  if (typeof tab.key !== 'string' || !tab.key.trim()) return false;
+  if (typeof tab.label !== 'string' || !tab.label.trim()) return false;
+  if (tab.kind !== 'script') return false;
+  if (typeof tab.script !== 'string' || !tab.script.trim()) return false;
+  return true;
+}
+
+function mergePluginTabs(plugins, manifestTabsEnabled) {
+  const tabs = CORE_TABS.map((t) => (t.children ? { ...t, children: [...t.children] } : { ...t }));
+  if (manifestTabsEnabled !== false) {
+    for (const p of plugins || []) {
+      if (!p || p.enabled === false || !isValidPluginTab(p.tab)) continue;
+      const tab = p.tab;
+      const row = { key: tab.key, label: tab.label, description: tab.description, pluginName: p.name, pluginScript: tab.script };
+      const replaces = tab.replaces;
+      let replaced = false;
+      if (replaces) {
+        for (let i = 0; i < tabs.length && !replaced; i++) {
+          if (tabs[i].key === replaces) { tabs[i] = row; replaced = true; }
+          else if (tabs[i].group && Array.isArray(tabs[i].children)) {
+            const idx = tabs[i].children.findIndex((c) => c.key === replaces);
+            if (idx !== -1) { tabs[i].children[idx] = row; replaced = true; }
+          }
+        }
+      }
+      if (replaced) continue;
+      if (tab.group) {
+        let groupRow = tabs.find((t) => t.group === tab.group);
+        if (!groupRow) { groupRow = { group: tab.group, children: [] }; tabs.push(groupRow); }
+        groupRow.children.push(row);
+      } else {
+        tabs.push(row);
+      }
+    }
+  }
+  TABS = tabs;
+  return tabs; // also returned (not just assigned to the module-level TABS) so callers --
+               // including the Node vm-sandboxed test, since a vm context's top-level
+               // `let` bindings aren't visible as sandbox properties from the outside --
+               // can inspect the merge result directly.
+}
+
+async function syncPluginTabs() {
+  try {
+    const data = await fetchJson('/api/plugins');
+    mergePluginTabs(data.plugins, data.manifestTabsEnabled);
+  } catch (e) {
+    // Fail-safe: leave TABS as whatever it already was (CORE_TABS on the very first
+    // failure) rather than let a plugin-listing error block the rest of the dashboard.
+  }
+}
+
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
@@ -1523,6 +1586,8 @@ async function renderPluginsTab() {
           body: JSON.stringify({ name: cb.dataset.name, enabled: cb.checked }),
         });
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).description || r.status);
+        await syncPluginTabs();
+        renderNav();
         await renderPluginsTab();
       } catch (e) {
         alert('Could not update plugin: ' + e.message);
@@ -1549,6 +1614,8 @@ async function renderPluginsTab() {
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(body.description || r.status);
+      await syncPluginTabs();
+      renderNav();
       await renderPluginsTab();
     } catch (e) {
       msg.textContent = 'Could not add plugin: ' + e.message;

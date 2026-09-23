@@ -137,6 +137,49 @@ class ResolvePluginUiAssetTest(PluginUiAssetTestBase):
         self.assertIn("no registerPath", error)
 
 
+class ManifestTabsKillSwitchTest(PluginUiAssetTestBase):
+    """AGENT_MANAGER_MANIFEST_TABS=false turns the whole feature back off (section 5),
+    without touching plugins.json -- checked both by the resolver's own gate and by the
+    GET /api/plugins flag the tab-bar merge reads."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_env_var = os.environ.get("AGENT_MANAGER_MANIFEST_TABS")
+
+    def tearDown(self):
+        if self._orig_env_var is None:
+            os.environ.pop("AGENT_MANAGER_MANIFEST_TABS", None)
+        else:
+            os.environ["AGENT_MANAGER_MANIFEST_TABS"] = self._orig_env_var
+        super().tearDown()
+
+    def test_enabled_by_default(self):
+        self.assertTrue(app._manifest_tabs_enabled())
+
+    def test_disabled_by_env_var(self):
+        os.environ["AGENT_MANAGER_MANIFEST_TABS"] = "false"
+        self.assertFalse(app._manifest_tabs_enabled())
+
+    def test_case_insensitive_and_whitespace_tolerant(self):
+        os.environ["AGENT_MANAGER_MANIFEST_TABS"] = "  FALSE  "
+        self.assertFalse(app._manifest_tabs_enabled())
+
+    def test_resolver_refuses_a_valid_tab_when_disabled(self):
+        os.environ["AGENT_MANAGER_MANIFEST_TABS"] = "false"
+        self._write_manifest([self._entry()])
+        _, error, status = app._resolve_plugin_ui_asset("hub-tasks-plugin", "hub-tasks.js")
+        self.assertEqual(status, 404)
+        self.assertIn("disabled", error)
+
+    def test_get_plugins_reports_the_flag(self):
+        self._write_manifest([self._entry()])
+        resp = self.client.get("/api/plugins")
+        self.assertEqual(resp.get_json()["manifestTabsEnabled"], True)
+        os.environ["AGENT_MANAGER_MANIFEST_TABS"] = "false"
+        resp = self.client.get("/api/plugins")
+        self.assertEqual(resp.get_json()["manifestTabsEnabled"], False)
+
+
 class PluginUiAssetRouteTest(PluginUiAssetTestBase):
     def test_serves_js_with_javascript_mimetype(self):
         self._write_manifest([self._entry()])

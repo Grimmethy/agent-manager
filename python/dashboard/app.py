@@ -3961,6 +3961,14 @@ def _write_plugins_manifest(entries: list) -> None:
 # static-file route in later pieces) treat an invalid `tab` as absent rather than crashing --
 # the dashboard must behave exactly as today when no plugin declares a usable tab.
 
+def _manifest_tabs_enabled() -> bool:
+    """Kill switch for the whole feature (section 5): AGENT_MANAGER_MANIFEST_TABS=false
+    turns every plugin-declared tab back off, both in GET /api/plugins (which the tab-bar
+    merge reads) and in the ui/ asset route, without touching plugins.json itself. Enabled
+    by default -- purely additive with no plugin declaring a tab."""
+    return os.environ.get("AGENT_MANAGER_MANIFEST_TABS", "true").strip().lower() != "false"
+
+
 def _validate_plugin_tab(tab) -> str | None:
     """Validates a plugin manifest entry's optional 'tab' dict. Returns an error string or
     None. Does not check that `script` exists on disk -- the file route (a later piece)
@@ -3998,6 +4006,8 @@ def _resolve_plugin_ui_asset(name: str, filename: str) -> tuple[Path | None, str
     once it has opted in with a well-formed tab. Within that, only .js/.css files that
     resolve (after following symlinks) inside the plugin's own ui/ directory are served;
     request-supplied '..' segments and symlink escapes are both refused."""
+    if not _manifest_tabs_enabled():
+        return None, "manifest-driven dashboard tabs are disabled (AGENT_MANAGER_MANIFEST_TABS=false)", 404
     manifest = _read_plugins_manifest()
     entry = next((p for p in manifest if p.get("name") == name), None)
     if entry is None:
