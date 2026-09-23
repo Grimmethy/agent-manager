@@ -116,6 +116,34 @@ test('a hub child sorts ahead of an unrelated task at the same source priority; 
   assert.deepEqual(items, ['hub-child.json', 'plain-adhoc.json']);
 });
 
+// S1 of the hub-tasks extraction (2026-09-23): this path resolves the SAME hubOrder hook
+// from the task's registered source that nextAdhocTask() does (task-sources.js), rather
+// than calling hub-priority.js directly -- proves the two claim paths can't drift apart
+// even when a registration overrides the default, which is the "the two must never
+// disagree" invariant this file's own header already documents for the tier split.
+test('a hubOrder override on the adhoc registration is honored here too, not just by nextAdhocTask', () => {
+  const pendingDir = setupPending();
+  const coordDir = path.join(pendingDir, '..', 'coordinating');
+  fs.mkdirSync(coordDir, { recursive: true });
+  fs.writeFileSync(path.join(coordDir, 'hub-x.json'),
+    JSON.stringify({ id: 'hub-x', status: 'coordinating', createdAt: '2026-09-01T00:00:00Z' }));
+
+  writeTask(pendingDir, 'plain-adhoc', { source: 'adhoc' });
+  writeTask(pendingDir, 'hub-child', { source: 'adhoc', parentHub: 'hub-x' });
+
+  const { updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  const original = getRegisteredSource('adhoc').hubOrder;
+  updateTaskSource('adhoc', {
+    hubOrder: { orderCandidate: () => ({ isHubWork: false, hubKey: { isHubChild: false } }), compareKeys: () => 0, siblingHolds: () => false },
+  });
+  try {
+    const items = pickClaimableTasks(pendingDir, 'worker-reasoning');
+    assert.deepEqual(items, ['plain-adhoc.json', 'hub-child.json'], 'with hub prioritization disabled by the override, plain mtime FIFO must decide instead');
+  } finally {
+    updateTaskSource('adhoc', { hubOrder: original }); // restore -- this registry is shared across every test in this file
+  }
+});
+
 // --- effectivePriority (bot-vs-human adhoc split + premiumPriority pin, 2026-09-07) ---
 
 test('effectivePriority: an adhoc task with no humanQueued marker is demoted by BOT_ADHOC_PRIORITY_PENALTY', () => {

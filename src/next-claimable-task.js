@@ -175,7 +175,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   // alone reported every source as 'low' every time).
   loadSourceRegistry();
   const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
-  const { hubOrderKeyForTask, compareHubKeys } = require('./hub-priority.js');
+  const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
 
   // <queue>/pending -> pipelineDir (hub-priority.js re-joins queue/coordinating itself).
   const pipelineDir = path.join(pendingDir, '..', '..');
@@ -208,13 +208,27 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     // nextAdhocTask()'s hub ordering -- same "the two must never disagree" discipline this
     // file's own header already documents for the tier split. Non-hub tasks get noHubKey
     // (rank Infinity), so hub children sort ahead of unrelated work at the same priority.
-    const hk = task ? hubOrderKeyForTask(pipelineDir, task, hubKeyCache) : { isHubChild: false };
+    // Resolved through the task's own registered source's `hubOrder` hook (S1 of the
+    // hub-tasks extraction, 2026-09-23; same derived_task-carries-domain-adhoc special case
+    // rankPriorityOfTask above already needs, so a derived_task-specific override stays
+    // reachable), falling back to hub-priority.js's default bundle -- today's behaviour --
+    // when a registration hasn't declared one.
+    const registeredName = task && task.source === 'derived_task' ? 'derived_task' : (task ? resolveSourceName(task) : null);
+    const registered = registeredName ? getRegisteredSource(registeredName) : null;
+    const hubOrder = (registered && registered.hubOrder) || DEFAULT_HUB_ORDER;
+    const hk = task ? hubOrder.orderCandidate(pipelineDir, task, hubKeyCache).hubKey : { isHubChild: false };
     const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt } : noHubKey;
     rankable.push({ name, priority, mtimeMs, hubKey });
   }
 
   pinned.sort((a, b) => a.mtimeMs - b.mtimeMs);
-  rankable.sort((a, b) => (a.priority - b.priority) || compareHubKeys(a.hubKey, b.hubKey) || (a.mtimeMs - b.mtimeMs));
+  // Comparator itself stays on the DEFAULT bundle's compareKeys: this is a single global
+  // sort across tasks that may resolve to different sources, and every source's hub records
+  // share the same kernel/shape today, so there is exactly one meaningful way to compare a
+  // { rank, createdAt } pair regardless of which registration produced it. A per-task
+  // compareKeys override would only make sense once a hub-tasks plugin can register a
+  // genuinely different record shape -- not needed by S1.
+  rankable.sort((a, b) => (a.priority - b.priority) || DEFAULT_HUB_ORDER.compareKeys(a.hubKey, b.hubKey) || (a.mtimeMs - b.mtimeMs));
   // Leave the top-ranked task for an idle preferred lane (see lanePreferenceGraceMs above), while it is still fresh.
   const now = opts.now !== undefined ? opts.now : Date.now();
   const graceMs = opts.graceMs !== undefined ? opts.graceMs : lanePreferenceGraceMs();
