@@ -1145,6 +1145,32 @@ test('recordApplyOutcome does not stamp parentHub when the task has no owning hu
   assert.equal(Object.prototype.hasOwnProperty.call(task, 'parentHub'), false);
 });
 
+// S2 of the hub-tasks extraction (2026-09-23): recordApplyOutcome resolves the coordinating
+// stamping through hub-apply-routing.js's swap point instead of doing it inline -- proves a
+// registered override actually runs (a future hub-tasks plugin's own hub-record shape),
+// and that the default is restored afterward since this module is a process-wide singleton
+// shared across every test in the suite.
+test('recordApplyOutcome runs an overridden hub-apply-routing implementation instead of the default stamping', () => {
+  const { setHubApplyRouting } = require('./hub-apply-routing.js');
+  const calls = [];
+  setHubApplyRouting({ applyCoordinatingOutcome: (task, result) => { calls.push([task.id, result.subTasks.length]); task.customHubField = 'from-the-override'; } });
+  try {
+    const task = { id: 'parent-override-1', history: [] };
+    const result = { coordinating: true, reason: 'x', subTasks: [{ id: 'a', title: 'a', status: 'pending' }] };
+    const stage = recordApplyOutcome(task, result);
+
+    assert.equal(stage, 'coordinating');
+    assert.deepEqual(calls, [['parent-override-1', 1]]);
+    assert.equal(task.customHubField, 'from-the-override');
+    // The override owns ALL of the stamping -- the default's subTasks/progress fields must
+    // NOT also appear, or the two implementations would be running on top of each other.
+    assert.equal(task.subTasks, undefined);
+    assert.equal(task.progress, undefined);
+  } finally {
+    setHubApplyRouting(null); // restore the default -- singleton state shared across this whole suite
+  }
+});
+
 // coAuthorTrailer (2026-08-20, Grimmethy: "It's showing that ornith authored the script
 // which implies that the program is inaccurately representing model used"): the
 // commit-message Co-Authored-By trailer must name the REAL model that drafted the
