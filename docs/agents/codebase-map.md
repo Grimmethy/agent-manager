@@ -116,6 +116,17 @@ about," verified to still exist as of this writing.
 - `src/concepts.js` — the Concept Chart registry (`createConcept`, `recordConceptResearch`, `getConceptTimeline`), backed by concepts.json (gitignored pipeline-generated state, present on a live host, not in the repo — same category as `queue/`).
 - `SecondBrain/Research/*.md` — the human-readable writeup a concept's row points at.
 
+## Recurring work processes
+
+Not "where is the code" but "how do we do this again" — the other kind of thing worth
+finding from here before re-deriving it from scratch.
+
+| Process | Doc |
+|---|---|
+| Splitting a subsystem out into its own repo (Hub Tasks, Brain Dump, ...) | `docs/agents/repo-extraction-playbook.md` |
+| Hand-resolving a needs-clarification task without bypassing the pipeline's review/apply gates | `docs/agents/manual-nc-resolution.md` |
+| Reviewing an unmerged branch (hub membership, sibling sub-tasks) | `docs/agents/unmerged-branch-review.md` |
+
 ## Known gaps
 
 `app.py:8137` carries a comment banner reading "Decomposed route blueprints

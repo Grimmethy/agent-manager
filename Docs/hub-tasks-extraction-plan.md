@@ -115,6 +115,12 @@ turn that runs out is to **split it into narrower turns with the facts pre-suppl
 
 ## 8. The process (to become an automated job)
 
+**Generalized into `docs/agents/repo-extraction-playbook.md`** (2026-09-23, after building
+S0) — that doc is now the canonical copy, kept current across every extraction, with the
+lessons actually learned building S0 (verification-pass discipline, browser-JS
+load-order testing, the worktree/`gh pr merge` gotcha). This section stays as the
+record of the first time it was written down, specific to this extraction.
+
 Grimmethy wants this documented well enough for the system to run itself. As run in this session, for "extract subsystem X into its own repo":
 
 1. **Map** the target: every part, the record shapes, the seams (`hub-tasks-extraction-map.md` is the artefact).

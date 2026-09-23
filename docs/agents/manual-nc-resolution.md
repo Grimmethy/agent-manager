@@ -34,9 +34,11 @@ applies, test output that really ran) rather than fabricated.
 ## Steps
 
 1. **Diagnose and fix in a real throwaway worktree**, branched off `origin/master` (or
-   the relevant base), never in the shared checkout or `agent-manager-manual` (see
-   `docs/agents/codebase-map.md`'s "shared checkout risk" caveat, or ask if unsure which
-   worktree is safe to touch). Run the real tests. Do not commit or push this worktree —
+   the relevant base), never in the shared checkout (see `docs/agents/repo-extraction-
+   playbook.md`'s "Worktrees" section for why) or `agent-manager-manual` — that one's
+   for multi-commit work meant to be pushed and merged, not a disposable diff-capture
+   worktree; ask if unsure which worktree is safe to touch. Run the real tests. Do not
+   commit or push this worktree —
    it exists only to produce a verified diff; delete it (`git worktree remove --force`)
    once the diff is captured.
 2. **One task = one diff.** If the fix bundles a substantive change with a *derived*
