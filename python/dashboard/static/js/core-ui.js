@@ -210,6 +210,83 @@ async function syncPluginTabs() {
   }
 }
 
+// --- Manifest-driven dashboard tab: renderer registry, loader and dispatch (piece 4 of 6;
+// Docs/hub-tasks-extraction-plan.md section 5). This is the riskiest piece -- it sits on
+// the path every tab click already runs -- so the contract is narrow and the failure mode
+// is contained: a plugin's ui/<script>.js is loaded as a plain classic <script> (same-origin,
+// piece 2's route) and is expected to call registerPluginTabRenderer(key, fn) at load time;
+// renderPluginTab() is the only thing that invokes fn(), inside a try/catch that writes any
+// failure (load error, or a script that never registered) into #main as a plain error panel
+// -- never into the nav, never thrown up to renderMain's own caller. A broken plugin script
+// can only ever break its own tab.
+const pluginTabRenderers = {};
+const pluginTabScriptLoads = {};
+
+// Exposed so a loaded plugin script can hand back its render function; not called by
+// anything else in core.
+function registerPluginTabRenderer(key, renderFn) {
+  if (typeof key === 'string' && key && typeof renderFn === 'function') {
+    pluginTabRenderers[key] = renderFn;
+  }
+}
+
+// TABS is a flat list of core rows plus, per piece 3, `{group, children}` rows -- searches
+// one level of children, matching how renderNav() itself walks the structure.
+function findTabByKey(key) {
+  for (const t of TABS) {
+    if (t.key === key) return t;
+    if (Array.isArray(t.children)) {
+      const child = t.children.find((c) => c.key === key);
+      if (child) return child;
+    }
+  }
+  return null;
+}
+
+// tab.pluginScript is validated server-side (app._validate_plugin_tab) to be 'ui/<file>.js'
+// with no '..' segments; the route itself (piece 2) is the actual security boundary, this
+// just builds the matching URL -- the route's own path segment is literally 'ui/', so the
+// leading 'ui/' here is stripped rather than sent twice.
+function pluginTabAssetUrl(tab) {
+  const rel = tab.pluginScript.replace(/^ui\//, '');
+  return `/api/plugins/${encodeURIComponent(tab.pluginName)}/ui/${rel.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+function loadPluginTabScript(tab) {
+  if (pluginTabScriptLoads[tab.key]) return pluginTabScriptLoads[tab.key];
+  const promise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = pluginTabAssetUrl(tab);
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`failed to load ${s.src}`));
+    document.head.appendChild(s);
+  }).catch((e) => {
+    // Don't cache a failed load -- a transient error (plugin restarting, etc.) shouldn't
+    // permanently blacklist the tab; the next click retries.
+    delete pluginTabScriptLoads[tab.key];
+    throw e;
+  });
+  pluginTabScriptLoads[tab.key] = promise;
+  return promise;
+}
+
+async function renderPluginTab(tab) {
+  const main = document.getElementById('main');
+  try {
+    if (!pluginTabRenderers[tab.key]) {
+      main.innerHTML = `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
+      await loadPluginTabScript(tab);
+    }
+    const renderFn = pluginTabRenderers[tab.key];
+    if (typeof renderFn !== 'function') {
+      throw new Error(`${tab.pluginScript} loaded but never called registerPluginTabRenderer('${tab.key}', ...)`);
+    }
+    await renderFn();
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Could not load the "${escapeHtml(tab.label)}" tab (plugin ${escapeHtml(tab.pluginName)}): ${escapeHtml(e.message)}</div>`;
+  }
+}
+
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';

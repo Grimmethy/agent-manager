@@ -1007,7 +1007,16 @@ async function renderMain() {
     else if (activeTab === 'concepts') await renderConceptsTab();
     else if (activeTab === 'filed') await renderFiledFindingsTab();
     else if (activeTab === 'hygiene') await renderHygieneTab();
-    else await renderQueueTab(activeTab);
+    else {
+      // Manifest-driven dashboard tab dispatch (piece 4; Docs/hub-tasks-extraction-plan.md
+      // section 5): activeTab matches a plugin-declared tab's key iff findTabByKey() finds
+      // a row with a pluginScript on it (set by piece 3's mergePluginTabs). Anything else
+      // falls through to the generic queue-state renderer exactly as before this feature
+      // existed.
+      const pluginTab = findTabByKey(activeTab);
+      if (pluginTab && pluginTab.pluginScript) await renderPluginTab(pluginTab);
+      else await renderQueueTab(activeTab);
+    }
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
   }
