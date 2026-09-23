@@ -93,6 +93,26 @@ function severityForTab(tabKey, count) {
   return null;
 }
 
+// The shared "switch active tab" transition: runs whichever tab we're leaving's own
+// leave*Tab hook, updates activeTab, re-renders the nav, then runs the destination's own
+// enter*Tab hook (or the generic renderMain() for everything else). Both onclick handlers
+// in renderTabButton below use this, and so does redirectFromGoneActiveTab() (piece 5;
+// Docs/hub-tasks-extraction-plan.md section 5) -- the redirect needs the real leave/enter
+// semantics, not just an activeTab assignment, so it reuses this instead of duplicating it.
+function switchToTab(key) {
+  if (activeTab === 'project' && key !== 'project') leaveProjectTab();
+  if (activeTab === 'brain-dump' && key !== 'brain-dump') leaveBrainDumpTab();
+  if (activeTab === 'branches' && key !== 'branches') leaveBranchesTab();
+  if (activeTab === 'hygiene' && key !== 'hygiene') leaveHygieneTab();
+  activeTab = key;
+  renderNav();
+  if (key === 'project') enterProjectTab();
+  else if (key === 'brain-dump') enterBrainDumpTab();
+  else if (key === 'branches') enterBranchesTab();
+  else if (key === 'hygiene') enterHygieneTab();
+  else renderMain();
+}
+
 function renderTabButton(tab, indent) {
   const btn = document.createElement('button');
   btn.className = tab.key === activeTab ? 'active' : '';
@@ -110,34 +130,14 @@ function renderTabButton(tab, indent) {
       + `<span style="color:var(--muted)">${inProgress}</span>`
       + ` <span style="color:var(--bad); font-weight:600">${blocked}</span>`
       + `</span>`;
-    btn.onclick = () => {
-      if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
-      if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
-      if (activeTab === 'branches' && tab.key !== 'branches') leaveBranchesTab();
-      if (activeTab === 'hygiene' && tab.key !== 'hygiene') leaveHygieneTab();
-      activeTab = tab.key;
-      renderNav();
-      renderMain();
-    };
+    btn.onclick = () => switchToTab(tab.key);
     return btn;
   }
   const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'plugins' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
   const severity = severityForTab(tab.key, count);
   const dot = severity ? `<span class="status-dot ${severity}"></span>` : '';
   btn.innerHTML = `<span>${tab.label}</span><span class="count">${dot}${count}</span>`;
-  btn.onclick = () => {
-    if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
-    if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
-    if (activeTab === 'branches' && tab.key !== 'branches') leaveBranchesTab();
-    if (activeTab === 'hygiene' && tab.key !== 'hygiene') leaveHygieneTab();
-    activeTab = tab.key;
-    renderNav();
-    if (tab.key === 'project') enterProjectTab();
-    else if (tab.key === 'brain-dump') enterBrainDumpTab();
-    else if (tab.key === 'branches') enterBranchesTab();
-    else if (tab.key === 'hygiene') enterHygieneTab();
-    else renderMain();
-  };
+  btn.onclick = () => switchToTab(tab.key);
   return btn;
 }
 
@@ -241,6 +241,19 @@ function findTabByKey(key) {
     }
   }
   return null;
+}
+
+// Enable/disable lifecycle: active-tab redirect (piece 5 of 6; Docs/
+// hub-tasks-extraction-plan.md section 5). CORE_TABS rows can never disappear
+// (mergePluginTabs always rebuilds TABS from CORE_TABS first, per piece 3), so the only
+// way findTabByKey(activeTab) comes back empty is that activeTab names a plugin-declared
+// tab whose plugin was just disabled, removed, or dropped a `replaces` that used to cover
+// this key -- switchToTab() runs the real leave/enter transition rather than just
+// reassigning activeTab, so the tab we're leaving still gets its own cleanup hook.
+function redirectFromGoneActiveTab(fallbackKey = 'project') {
+  if (findTabByKey(activeTab)) return false;
+  switchToTab(fallbackKey);
+  return true;
 }
 
 // tab.pluginScript is validated server-side (app._validate_plugin_tab) to be 'ui/<file>.js'

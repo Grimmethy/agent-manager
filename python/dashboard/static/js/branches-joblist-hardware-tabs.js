@@ -1029,6 +1029,15 @@ async function refresh() {
   } catch (e) {
     document.getElementById('pipeline-status').textContent = 'disconnected';
   }
+  // Re-sync plugin-declared tabs every cycle (piece 5; Docs/hub-tasks-extraction-plan.md
+  // section 5) so a plugin toggled off/removed from elsewhere (another browser tab, a
+  // pipeline restart, a hand-edited plugins.json) drops its nav row promptly instead of
+  // only at next page load. If the row the user is currently looking at is the one that
+  // just vanished, redirectFromGoneActiveTab() runs the full leave/enter transition to a
+  // safe fallback tab itself (via switchToTab) -- in that case skip the render calls below,
+  // which would otherwise double-render on top of what the redirect already did.
+  await syncPluginTabs();
+  if (redirectFromGoneActiveTab()) return;
   renderNav();
   // Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a
   // user's in-progress folder browsing or a half-typed capture note isn't wiped out by
