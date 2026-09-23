@@ -109,6 +109,33 @@ test('mergePluginTabs skips a plugin with a malformed tab rather than throwing',
   sameShape(merged, FAKE_CORE_TABS);
 });
 
+test('mergePluginTabs hides a top-level CORE_TABS row when the disabled plugin that replaces it is well-formed', () => {
+  const sb = loadSandbox();
+  const merged = sb.mergePluginTabs([{ name: 'p', enabled: false, tab: scriptTab({ replaces: 'plugins' }) }], true);
+  assert.equal(merged.length, FAKE_CORE_TABS.length - 1);
+  assert.equal(merged.find((t) => t.key === 'plugins'), undefined);
+});
+
+test('mergePluginTabs hides a grouped CORE_TABS row (coordinating) when the disabled plugin that replaces it is well-formed', () => {
+  const sb = loadSandbox();
+  const merged = sb.mergePluginTabs([{ name: 'p', enabled: false, tab: scriptTab({ replaces: 'coordinating' }) }], true);
+  const jobStatus = merged.find((t) => t.group === 'Job Status');
+  assert.equal(jobStatus.children.length, 1);
+  assert.equal(jobStatus.children.find((c) => c.key === 'coordinating'), undefined);
+});
+
+test('mergePluginTabs keeps the CORE_TABS fallback when the disabled plugin\'s own tab declaration is malformed', () => {
+  const sb = loadSandbox();
+  const merged = sb.mergePluginTabs([{ name: 'p', enabled: false, tab: { key: 'x', replaces: 'plugins' } }], true);
+  sameShape(merged, FAKE_CORE_TABS);
+});
+
+test('mergePluginTabs leaves an unrelated CORE_TABS row alone when a disabled plugin replaces a different key', () => {
+  const sb = loadSandbox();
+  const merged = sb.mergePluginTabs([{ name: 'p', enabled: false, tab: scriptTab({ replaces: 'nonexistent-key' }) }], true);
+  sameShape(merged, FAKE_CORE_TABS);
+});
+
 test('mergePluginTabs honours the kill switch: manifestTabsEnabled === false drops every plugin tab', () => {
   const sb = loadSandbox();
   const merged = sb.mergePluginTabs([{ name: 'hub-tasks-plugin', enabled: true, tab: scriptTab() }], false);

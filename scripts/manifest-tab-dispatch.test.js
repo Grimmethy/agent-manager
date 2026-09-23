@@ -171,4 +171,17 @@ test('renderMain dispatches a plugin-tab activeTab through renderPluginTab inste
   assert.match(body, /pluginTab\.pluginScript/);
   assert.match(body, /renderPluginTab\(pluginTab\)/);
   assert.match(body, /renderQueueTab\(activeTab\)/);
+
+  // The plugin-tab check must run BEFORE the hardcoded per-key branches (2026-09-23 fix) --
+  // otherwise a key with its own hardcoded branch (like 'promptforge', which predates the
+  // manifest mechanism and still has one for when no plugin owns it) always wins that
+  // branch and a plugin's `tab.replaces` never actually takes effect at render time, even
+  // while the plugin is enabled and its row is correctly in TABS.
+  const pluginCheckIdx = body.indexOf('if (pluginTab && pluginTab.pluginScript)');
+  const promptforgeBranchIdx = body.indexOf("else if (activeTab === 'promptforge')");
+  assert.ok(pluginCheckIdx !== -1 && promptforgeBranchIdx !== -1);
+  assert.ok(
+    pluginCheckIdx < promptforgeBranchIdx,
+    'plugin-tab dispatch must be checked before the hardcoded promptforge branch',
+  );
 });

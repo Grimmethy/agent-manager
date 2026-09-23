@@ -990,7 +990,20 @@ async function renderHardwareTab() {
 
 async function renderMain() {
   try {
-    if (activeTab === 'workers') await renderWorkers(true);
+    // Plugin-owned tab dispatch runs FIRST, ahead of every hardcoded branch below --
+    // including the 'promptforge' one. Without this, a plugin's `tab.replaces` never
+    // actually takes effect at render time: activeTab === 'promptforge' would always hit
+    // the hardcoded branch and call core's own renderPromptForgeTab(), even while the
+    // promptforge plugin is enabled and declares a pluginScript row for that exact key
+    // (found live 2026-09-23 -- the manifest route served the plugin's script fine, but
+    // renderMain() never actually called it, so the plugin was never really "in control"
+    // the way docs/PLUGIN_API.md's contract describes). findTabByKey() only returns a row
+    // with `pluginScript` set when mergePluginTabs() put one there for the CURRENT
+    // enabled/replaces state, so a disabled or absent plugin falls straight through to
+    // the hardcoded branches exactly as before.
+    const pluginTab = findTabByKey(activeTab);
+    if (pluginTab && pluginTab.pluginScript) await renderPluginTab(pluginTab);
+    else if (activeTab === 'workers') await renderWorkers(true);
     else if (activeTab === 'hardware') await renderHardwareTab();
     else if (activeTab === 'models') await renderModelsTab();
     else if (activeTab === 'joblist') await renderJobListTab();
@@ -1007,16 +1020,10 @@ async function renderMain() {
     else if (activeTab === 'concepts') await renderConceptsTab();
     else if (activeTab === 'filed') await renderFiledFindingsTab();
     else if (activeTab === 'hygiene') await renderHygieneTab();
-    else {
-      // Manifest-driven dashboard tab dispatch (piece 4; Docs/hub-tasks-extraction-plan.md
-      // section 5): activeTab matches a plugin-declared tab's key iff findTabByKey() finds
-      // a row with a pluginScript on it (set by piece 3's mergePluginTabs). Anything else
-      // falls through to the generic queue-state renderer exactly as before this feature
-      // existed.
-      const pluginTab = findTabByKey(activeTab);
-      if (pluginTab && pluginTab.pluginScript) await renderPluginTab(pluginTab);
-      else await renderQueueTab(activeTab);
-    }
+    // Anything left (no plugin row, no hardcoded branch above) is a plain queue-state key
+    // -- the plugin check for this same activeTab already ran once, at the top of this
+    // function, before any hardcoded branch got a chance to run.
+    else await renderQueueTab(activeTab);
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
   }
