@@ -12,7 +12,7 @@
 //   { succeeded: false, reason: '<message>' }
 
 const fs = require('fs');
-const { hubTitle } = require('./hub-serial.js');
+const { getHubApplyRouting } = require('./hub-apply-routing.js');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
@@ -496,21 +496,13 @@ function recordApplyOutcome(task, result) {
   const applyStage = result.coordinating ? 'coordinating'
     : result.needsConfirmation ? 'awaiting-confirm'
       : (result.succeeded ? 'applied' : 'apply-failed');
+  // Hub-apply-routing hook (S2 of the hub-tasks extraction, 2026-09-23): the hub-record
+  // stamping this used to do inline (subTasks/progress init, hubSerial/hubLabel/title,
+  // parentHub) is resolved through hub-apply-routing.js's swap point instead, so this file
+  // doesn't need to know the hub record's shape once the kernel moves out. Defaults to
+  // exactly today's behaviour.
   if (applyStage === 'coordinating') {
-    task.subTasks = Array.isArray(result.subTasks) ? result.subTasks : [];
-    task.progress = { done: 0, total: task.subTasks.length };
-    // HUB#### (hub-serial.js): the hub carries its serial and leads its title with it, replacing a leading candidate id ("AC-2 · ...").
-    if (result.hubSerial && result.hubLabel) {
-      task.hubSerial = result.hubSerial;
-      task.hubLabel = result.hubLabel;
-      task.title = hubTitle(result.hubLabel, task.title, task.promptContext && task.promptContext.candidateId);
-    }
-    // parentHub (2026-09-08): this task IS a hub's own child re-decomposing into a new hub
-    // -- promptContext.decomposedFrom already points at the owning hub, zero new plumbing.
-    // Lets the dashboard's Hub Tasks tab render the real family tree instead of a root.
-    if (task.promptContext && task.promptContext.decomposedFrom) {
-      task.parentHub = task.promptContext.decomposedFrom;
-    }
+    getHubApplyRouting().applyCoordinatingOutcome(task, result);
   }
   // An apply-failed task lands in queue/blocked/ next (apply-task.sh's own move), the same
   // directory reject-retry-check.js scans for blockedStage==='review' to auto-requeue. A
