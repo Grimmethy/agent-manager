@@ -15,7 +15,7 @@ const path = require('path');
 const fs = require('fs');
 const {
   findAffectedTestFiles, runScopedTests, parseNodeTestFailures, parsePyTestFailures,
-  MAX_REVERSE_DEP_FILES, MAX_TEST_FILES,
+  MAX_REVERSE_DEP_FILES, MAX_TEST_FILES, RUN_TIMEOUT_MS,
 } = require('./scoped-test-runner.js');
 
 function tmpRepo() {
@@ -169,6 +169,31 @@ test('runScopedTests: prefers a repo-local .venv interpreter over bare python3 w
   write(repo, 'test_thing.py', 'raise SystemExit("should never actually be imported by the fake venv script")\n');
   const result = runScopedTests(repo, ['thing.py']);
   assert.equal(result.passed, true, 'the fake venv script exits 0 without ever importing test_thing.py');
+});
+
+test('runScopedTests: a test file that times out is inconclusive (null), not a failure', { timeout: RUN_TIMEOUT_MS + 20000 }, () => {
+  // Exact shape of a real live bug: src/local-draft.test.js legitimately waits on a real
+  // `flock` for up to 600s under GPU-lane contention with the live pipeline -- this gate
+  // always runs DURING live pipeline processing, so that contention is the normal case,
+  // not an edge case. Confirmed live: a timeout was reported as `passed: false`, which
+  // change-review.js's fileDeterministicTestFailureFinding would auto-file as a "high
+  // severity confirmed regression" for a file that never actually failed an assertion --
+  // it just didn't finish in time. Necessarily slow (waits out the real timeout) since this
+  // module intentionally never mocks its own child-process execution -- see file header.
+  const repo = tmpRepo();
+  write(repo, 'src/thing.js', 'module.exports = {};\n');
+  // A promise that never resolves gets caught almost instantly by node's OWN test-runner
+  // heuristic ("event loop resolved with nothing left pending") -- not a real timeout, and
+  // not the SIGTERM path this test needs to exercise. A real `flock` wait keeps the process
+  // genuinely BUSY/alive, which is what actually makes execFileSync's own `timeout` option
+  // fire -- reproduced here with a real blocking `sleep` past RUN_TIMEOUT_MS.
+  write(repo, 'src/thing.test.js', [
+    "const test = require('node:test');",
+    "const { execSync } = require('child_process');",
+    `test('takes too long', () => { execSync('sleep ${Math.ceil(RUN_TIMEOUT_MS / 1000) + 10}'); });`,
+  ].join('\n'));
+  const result = runScopedTests(repo, ['src/thing.js']);
+  assert.equal(result, null, 'a timeout must degrade to null (inconclusive), the same as no-coverage-exists -- never a hard pass or fail');
 });
 
 test('runScopedTests: a real FAILING Python test reports passed:false', () => {
