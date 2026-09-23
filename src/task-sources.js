@@ -17,7 +17,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { execSync, execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
-const { registerTaskSource, getRegisteredSources, resolveSourceName } = require('./task-source-registry.js');
+const { registerTaskSource, getRegisteredSources, getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
@@ -28,7 +28,7 @@ const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-a
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { hubOrderKeyForTask, compareHubKeys, hubHasUnmergedEarlierSibling } = require('./hub-priority.js');
+const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
 const derivedGate = require('./derived-gate.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
@@ -137,6 +137,42 @@ function depWorkIsOnMainBranch(repoRoot, depId) {
 // the identical class of deadlock on a dependsOn edge instead.
 const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'abandoned', 'superseded']);
 
+// Default dependency-release predicate (S1 of the hub-tasks extraction, 2026-09-23) -- the
+// exact checks this function inlined before the hook existed. Resolved through the
+// DEPENDENCY's own registered source (its record shape decides what "released" means, e.g.
+// a stacked hub kernel's own semantics), via `dependencyRelease.releaseSignals(record)` on
+// that registration; falls back to this bundle when the source hasn't declared one.
+function defaultReleaseSignals(record) {
+  // 'applied-direct' commits straight to main (directToMain sources) -- the code is
+  // already there just as surely as a 'merged' mergedAt stamp says it is.
+  if (record && (record.mergedAt || record.terminalDisposition === 'applied-direct')) return true;
+  if (record && NO_CODE_COMING_DISPOSITIONS.has(record.terminalDisposition)) return true;
+  // Stacked file-decompose child (file-decompose-to-hub.js `mode: 'stacked'`): the whole
+  // stack commits onto ONE shared branch and merges to main as a single unit later, so a
+  // per-step merge to main is NEVER the release signal for the next step. Reaching
+  // queue/done/ means this move's diff is committed on the shared branch -- that IS "the
+  // previous step is done", which is all the next step waits on.
+  if (record && record.stacked && record.stacked.branch) return true;
+  return false;
+}
+
+const DEFAULT_DEPENDENCY_RELEASE = { releaseSignals: defaultReleaseSignals };
+
+function releaseSignalsForRecord(record) {
+  try {
+    // A derived_task record carries domain:'adhoc' (same "drafts/applies exactly like
+    // adhoc, but ranks/registers under its own name" quirk rankPriorityOfTask already
+    // special-cases in next-claimable-task.js) -- resolveSourceName(record) would always
+    // answer 'adhoc' and a derived_task-specific override would never be reachable.
+    const registeredName = record && record.source === 'derived_task' ? 'derived_task' : resolveSourceName(record);
+    const source = getRegisteredSource(registeredName);
+    if (source && source.dependencyRelease && typeof source.dependencyRelease.releaseSignals === 'function') {
+      return source.dependencyRelease.releaseSignals(record);
+    }
+  } catch { /* unresolvable source -- fall through to the default */ }
+  return defaultReleaseSignals(record);
+}
+
 function isDependencySatisfied(pipelineDir, depId) {
   const trimmed = (depId || '').trim();
   if (!trimmed) return true; // a blank/malformed entry blocks nothing -- not this function's job to validate authoring mistakes
@@ -147,16 +183,7 @@ function isDependencySatisfied(pipelineDir, depId) {
   for (const candidate of candidates) {
     try {
       const data = JSON.parse(fs.readFileSync(candidate, 'utf8'));
-      // 'applied-direct' commits straight to main (directToMain sources) -- the code is
-      // already there just as surely as a 'merged' mergedAt stamp says it is.
-      if (data && (data.mergedAt || data.terminalDisposition === 'applied-direct')) return true;
-      if (data && NO_CODE_COMING_DISPOSITIONS.has(data.terminalDisposition)) return true;
-      // Stacked file-decompose child (file-decompose-to-hub.js `mode: 'stacked'`): the
-      // whole stack commits onto ONE shared branch and merges to main as a single unit
-      // later, so a per-step merge to main is NEVER the release signal for the next step.
-      // Reaching queue/done/ means this move's diff is committed on the shared branch --
-      // that IS "the previous step is done", which is all the next step waits on.
-      if (data && data.stacked && data.stacked.branch) return true;
+      if (releaseSignalsForRecord(data)) return true;
     } catch {
       // not found here, or unparseable -- try the next candidate location / fall through
     }
@@ -403,6 +430,16 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
     return null;
   }
 
+  // Hub-order hook (S1 of the hub-tasks extraction, 2026-09-23): looked up by this
+  // directory's OWN registered name ('adhoc' or 'derived_task'), not resolveSourceName(task)
+  // -- a derived_task record carries domain:'adhoc' so resolveSourceName would always answer
+  // 'adhoc' and a derived_task-specific override would never be reachable from here. Falls
+  // back to hub-priority.js's own default bundle (today's behaviour) when a registration
+  // hasn't declared one.
+  const registeredName = dir === 'derived' ? 'derived_task' : 'adhoc';
+  const registered = getRegisteredSource(registeredName);
+  const hubOrder = (registered && registered.hubOrder) || DEFAULT_HUB_ORDER;
+
   // File-decompose children (task.atomic===true, set by file-decompose-to-hub.js) are an
   // already-in-progress multi-step job -- a stuck one blocks its whole hub AND every
   // sibling still waiting on `dependsOn` -- so they jump ahead of ordinary/brain-dump adhoc
@@ -442,21 +479,19 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       const mtime = fs.statSync(full).mtimeMs;
       let parsed = null;
       try { parsed = JSON.parse(fs.readFileSync(full, 'utf8')); } catch { /* handled below via null parsed */ }
-      const hubKey = parsed ? hubOrderKeyForTask(pipelineDir, parsed, hubKeyCache) : { isHubChild: false };
-      return {
-        full, mtime, parsed,
-        isPremium: !!(parsed && parsed.premiumPriority),
-        // `atomic` file-decompose children keep the bump even if their hub record can't be
-        // read this tick; a generic decompose child only counts while its hub is live.
-        isHubWork: !!(parsed && parsed.atomic) || hubKey.isHubChild,
-        hubKey,
-      };
+      // `atomic` file-decompose children keep the bump even if their hub record can't be
+      // read this tick; a generic decompose child only counts while its hub is live --
+      // orderCandidate folds both checks into isHubWork.
+      const { isHubWork, hubKey } = parsed
+        ? hubOrder.orderCandidate(pipelineDir, parsed, hubKeyCache)
+        : { isHubWork: false, hubKey: { isHubChild: false } };
+      return { full, mtime, parsed, isPremium: !!(parsed && parsed.premiumPriority), isHubWork, hubKey };
     })
     .sort((a, b) => {
       if (a.isPremium !== b.isPremium) return a.isPremium ? -1 : 1;
       if (a.isHubWork !== b.isHubWork) return a.isHubWork ? -1 : 1;
       if (a.isHubWork && b.isHubWork) {
-        const byHub = compareHubKeys(a.hubKey, b.hubKey);
+        const byHub = hubOrder.compareKeys(a.hubKey, b.hubKey);
         if (byHub !== 0) return byHub;
       }
       return a.mtime - b.mtime;
@@ -494,7 +529,7 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
     // not a replacement for it -- catches the case a dependsOn edge either wasn't
     // declared for, or was satisfied by the stacked-branch exemption without the
     // sibling's code actually being visible where THIS candidate will draft/review.
-    if (hubHasUnmergedEarlierSibling(pipelineDir, parsed).blocked) {
+    if (hubOrder.siblingHolds(pipelineDir, parsed)) {
       continue;
     }
     // A derived finding is HELD (skipped this call, never dropped) while another open code-changing task names the same file: it was raised about a
@@ -1441,7 +1476,7 @@ function adhocReviewCompletenessQuestion(task) {
 // tiered LOCAL agentic draft ladder (harness-search -> read-only agentic -> write agentic
 // in an isolated worktree -- see local-draft.js's draftAdhocBranch). 2026-09-01: no
 // longer a Claude route.
-registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion, reportClass: 'benefit' });
+registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdhocTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion, reportClass: 'benefit', hubOrder: DEFAULT_HUB_ORDER, dependencyRelease: DEFAULT_DEPENDENCY_RELEASE });
 // derived_task -- pipeline-DERIVED follow-up work routed here by brain_dump_sort when the
 // source brain-dump entry carries a `raisedBy` (a pipeline_debrief Now-What item, a
 // side-finding). Adhoc-shaped (domain:'adhoc', so drafts/applies via the exact adhoc
@@ -1452,7 +1487,7 @@ registerTaskSource('adhoc', { priority: taskPriority('adhoc', 10), next: nextAdh
 // preempting deterministic sources. next-claimable-task.js honours this 48 rather than
 // adhoc's 10 + BOT_ADHOC_PRIORITY_PENALTY. apply/reviewGuidance mirror adhoc's for the
 // rare code path that looks this source up by its literal name.
-registerTaskSource('derived_task', { priority: taskPriority('derived_task', 48), next: nextDerivedTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion, reportClass: 'housekeeping' });
+registerTaskSource('derived_task', { priority: taskPriority('derived_task', 48), next: nextDerivedTask, apply: applyAdhocDiff, reasoningTier: 'high', reviewGuidance: adhocReviewGuidance, reviewCompletenessQuestion: adhocReviewCompletenessQuestion, reportClass: 'housekeeping', hubOrder: DEFAULT_HUB_ORDER, dependencyRelease: DEFAULT_DEPENDENCY_RELEASE });
 // research_task (Brain Dump #1 follow-up, 2026-08-17): same "drop everything, personal
 // task" priority tier as adhoc. reasoningTier: 'high' keeps it on the worker-reasoning
 // lane, but research is the ONE draft path with no local implementation -- WebSearch/

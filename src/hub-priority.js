@@ -189,6 +189,29 @@ function hubHasUnmergedEarlierSibling(pipelineDir, task, hubRecord = null) {
   return { blocked: false };
 }
 
+// Default hub-order hook bundle (hub-tasks extraction S1, 2026-09-23). task-sources.js and
+// next-claimable-task.js resolve `orderCandidate`/`compareKeys`/`siblingHolds` through a
+// source registration's optional `hubOrder` field instead of calling this file's named
+// exports directly -- a future hub-tasks plugin registration can supply its own hub-order
+// semantics there without either caller needing to change. Every source that doesn't
+// declare `hubOrder` (i.e. everything except adhoc/derived_task today) falls back to this
+// bundle, which is exactly the inline behaviour both callers already had -- unchanged
+// unless a registration opts into something else.
+function orderCandidate(pipelineDir, task, cache) {
+  const hubKey = hubOrderKeyForTask(pipelineDir, task, cache);
+  return { isHubWork: !!(task && task.atomic) || hubKey.isHubChild, hubKey };
+}
+
+function siblingHolds(pipelineDir, task, hubRecord) {
+  return hubHasUnmergedEarlierSibling(pipelineDir, task, hubRecord).blocked;
+}
+
+const DEFAULT_HUB_ORDER = {
+  orderCandidate,
+  compareKeys: compareHubKeys,
+  siblingHolds,
+};
+
 module.exports = {
   UNRANKED_HUB_PRIORITY,
   normalizeHubPriority,
@@ -197,4 +220,5 @@ module.exports = {
   hubOrderKeyForTask,
   compareHubKeys,
   hubHasUnmergedEarlierSibling,
+  DEFAULT_HUB_ORDER,
 };

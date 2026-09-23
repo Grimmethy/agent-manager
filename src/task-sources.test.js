@@ -1139,6 +1139,32 @@ test('nextAdhocTask falls back to ordinary ordering once a child\'s hub is no lo
   assert.equal(task.id, 'adhoc-older-ordinary-1', 'with no live hub, the orphaned child competes on plain mtime');
 });
 
+// S1 of the hub-tasks extraction (2026-09-23): 'adhoc's hubOrder hook is resolved from its
+// own source registration, not called on hub-priority.js directly -- proves a registration
+// can actually override the ordering nextAdhocTask uses, which is the whole point of
+// putting a hook there. A hub-tasks plugin would register something like this in place of
+// the DEFAULT_HUB_ORDER bundle every source falls back to today.
+test('nextAdhocTask honors a hubOrder override on the adhoc registration instead of the default bundle', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeHubFile(dir, { id: 'hub-a', title: 'hub a', status: 'coordinating', createdAt: '2026-09-01T00:00:00Z' });
+  writeAdhocFile(dir, 'a-older-ordinary.json', { id: 'adhoc-older-ordinary-1', title: 'older ordinary' });
+  writeAdhocFile(dir, 'b-newer-hub-child.json', {
+    id: 'adhoc-newer-hub-child', title: 'newer hub child', promptContext: { decomposedFrom: 'hub-a' },
+  });
+
+  const { updateTaskSource } = require('./task-source-registry.js');
+  const { nextAdhocTask } = freshTaskSources(dir);
+  // Override: hub work is never prioritized (isHubWork always false) -- inverts the
+  // default's "hub children jump the ordinary queue" behavior, proving the sort actually
+  // reads this registration's hook rather than hub-priority.js's own exports.
+  updateTaskSource('adhoc', {
+    hubOrder: { orderCandidate: () => ({ isHubWork: false, hubKey: { isHubChild: false } }), compareKeys: () => 0, siblingHolds: () => false },
+  });
+  const task = nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-older-ordinary-1', 'with hub prioritization disabled by the override, plain mtime FIFO must decide instead');
+});
+
 // dependsOn (2026-08-22, Grimmethy: "We need some systematic way to prioritize what
 // order adhoc tasks get completed in. Those with dependencies on new adhoc tasks are
 // absolutely going to need to be done after the dependency is completed") -- satisfied
@@ -1322,6 +1348,29 @@ test('nextAdhocTask treats "applied-direct" (committed straight to main) as sati
   });
   const { nextAdhocTask } = freshTaskSources(dir);
   assert.ok(nextAdhocTask(), 'code committed straight to main is on main -- must satisfy the dependency');
+});
+
+// S1 of the hub-tasks extraction (2026-09-23): the release predicate is resolved from the
+// DEPENDENCY's own registered source's dependencyRelease hook, not called on the inline
+// default directly -- proves a registration can actually override what "released" means,
+// which is the whole point of putting a hook there.
+test('nextAdhocTask honors a dependencyRelease override on the dependency\'s own registered source', () => {
+  const dir = makeAdhocFixtureRepo();
+  // No mergedAt, no terminalDisposition, no stacked branch -- the default predicate must
+  // NOT release this yet.
+  writeDoneFile(dir, 'adhoc-prereq-1', { id: 'adhoc-prereq-1', domain: 'adhoc', status: 'done' });
+  writeAdhocFile(dir, 'dependent.json', {
+    id: 'adhoc-dependent-1', title: 'x', dependsOn: ['adhoc-prereq-1'],
+  });
+
+  const { updateTaskSource } = require('./task-source-registry.js');
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'sanity: the default predicate must not release this dependency yet');
+
+  updateTaskSource('adhoc', { dependencyRelease: { releaseSignals: () => true } });
+  const task = nextAdhocTask();
+  assert.ok(task, 'the override must release the dependency even though none of the default signals are present');
+  assert.equal(task.id, 'adhoc-dependent-1');
 });
 
 test('nextAdhocTask still correctly waits when the dependency is "pending-merge" -- real code exists and genuinely has not landed', () => {
