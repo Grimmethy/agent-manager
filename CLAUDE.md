@@ -34,10 +34,12 @@ Single-context — one `CONTEXT.md` (to be created) and `docs/adr/` at the repo 
 
 ### Codebase map
 
-Where a dashboard tab, backend route, or core pipeline mechanism actually lives in the
-source tree — grown incrementally, not exhaustive. See `docs/agents/codebase-map.md`. If
-you had to grep, guess, or browser-search for a path that isn't listed there, add a row
-for it once you find it — that's the whole maintenance model; nothing else keeps it fresh.
+**Check `docs/agents/codebase-map.md` first** — before grepping, guessing, or
+browser-searching for where a dashboard tab, backend route, or core pipeline mechanism
+lives in the source tree. It's grown incrementally, not exhaustive, so it won't always
+have the answer — but it's the cheapest lookup and the whole point is to check it before
+falling back to a slower search. If it doesn't have what you need, add a row once you
+find it — that's the whole maintenance model; nothing else keeps it fresh.
 
 ### Reviewing an unmerged branch
 
