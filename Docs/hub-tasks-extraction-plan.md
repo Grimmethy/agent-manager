@@ -46,11 +46,33 @@ What moves into hygiene with the file-decompose family: `file-decompose-to-hub`,
 `proactive-file-decompose-sweep`, `decompose-move-determinism-backfill`. This **replaces the S4 the chat first proposed** ("move the four
 producers to hub-tasks"): producers 1 and 4 (adhoc decompose, candidate oversize) stay with the kernel; the decompose family goes to hygiene.
 
-### Design points the layering raises (open until built)
-1. **How hygiene files a hub.** Direct import of hub-tasks code would create plugin-to-plugin dependencies; today plugins depend only on core.
-   Proposal: a **core-owned hub-intake hook** that hub-tasks implements and hygiene calls. Hub-tasks absent means hygiene degrades to advisory flags.
+### Design points the layering raises
+1. **How hygiene files a hub -- shape decided 2026-09-23, implementation deferred to S5.** Checked live 2026-09-23: hygiene files
+   NO hub today at all -- confirmed via `agent-manager-hygiene/docs/HUB_TASKS.md` section 4 ("`queueSubTasks`/hub machinery is
+   reached only through `local-draft.js` + `apply-core.js` dispatch; the plugin has no hub code of its own"). Hygiene only sets
+   registration flags (`candidateFulfillment`, `noCandidateSplit`, `premiseCheck`) and writes candidate-doc text; CORE alone decides
+   whether a candidate becomes a hub. So this is forward-looking prep for S5 (when the kernel actually leaves core), not a live gap
+   -- **do not build it before S5 actually needs it** (nothing would call it in the meantime).
+
+   Decided shape, to build as part of S5:
+   - A new core module (name TBD at build time, e.g. `hub-intake.js`) exposing `registerHubIntake(impl)` / `getHubIntake()` --
+     **one process-wide swap point, not a per-source registry** (same reasoning as S2's `hub-apply-routing.js`: there is only ever
+     one hub kernel live at a time). `impl.fileHub({ task, pipelineDir, subTaskProposals })` returns the same
+     `{coordinating:true, subTasks, reason, hubSerial, hubLabel}` shape `hub-apply-routing.js` already standardized in S2.
+   - Core ships a default registration (today's `queueSubTasks` / `applyCandidateSplitAsHub`) at build time, so landing this hook
+     changes nothing until the kernel itself actually moves behind it in the same S5 window -- same discipline as S1-S3a.
+   - Also exposes a plain query, `hubIntakeAvailable()`.
+   - **Degrade behavior (Grimmethy, 2026-09-23):** when no hub intake is registered, a `noCandidateSplit` source's oversized
+     candidate falls back to **blocked for a human**, exactly the pre-PR #391 behavior -- but the blocked reason text must name
+     the actual fix (load/register the `agent-manager-hub-tasks` plugin), not a generic "narrow the fix by hand" message. This is
+     `candidate-split-route.js`'s call alone; it stays the one place that decides blocked-vs-hub.
+   - **Hygiene awareness (Grimmethy, 2026-09-23): hygiene checks `hubIntakeAvailable()` itself**, not blind to whether splitting is
+     possible -- this is a plugin calling a CORE-exposed query function, so the plugin-depends-only-on-core rule still holds;
+     hygiene never imports or references hub-tasks directly. Lets a hygiene source's own implement prompt (or its candidate-doc
+     guidance) change its wording when a split genuinely cannot happen right now, instead of unconditionally offering
+     `{"mode":"split"}` and only finding out it is unusable once `candidate-split-route.js` blocks it downstream.
 2. **Who verifies a mechanical move.** `decompose-auto-merge.js` and `decompose-integration-gate.js` are kernel code but know mechanical-move
-   kinds. Proposal: a producer-supplied `verifyMove` hook the kernel calls.
+   kinds. Proposal: a producer-supplied `verifyMove` hook the kernel calls. Not yet discussed -- open.
 3. **Repo-level decompose creates new repos** (a remote, git history, plugin registration): outward-facing. The plan-to-pieces stage can be
    automated; **creating the remote and registering it needs an explicit human gate** (the system deliberately cannot push or merge itself).
 
@@ -141,6 +163,7 @@ decompose (section 3) is the detect-and-plan half of this same process, so its d
 ## 9. Open
 
 * Confirm decisions 6 and 7 (defaults today).
-* Hub-intake hook and `verifyMove` hook shapes (section 3) are proposals, not verified against the code beyond reading.
+* Hub-intake hook shape is now decided (section 3, 2026-09-23) but not built -- deferred to S5, since nothing calls it before then.
+* `verifyMove` hook shape (section 3) is still an unverified proposal -- not yet discussed.
 * Where the product-spec producer lives.
 * Whether the manifest tab slot should also let the three iframe companions declare their tabs (separate, later).

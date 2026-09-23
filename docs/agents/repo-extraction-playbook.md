@@ -12,7 +12,7 @@ or half-built the one you're about to start):
 
 | Target | Status | Doc |
 |---|---|---|
-| Hub Tasks → `agent-manager-hub-tasks` | S0 (manifest tab slot) done, PR #455 merged 2026-09-23. S1–S6 not started. | `Docs/hub-tasks-extraction-plan.md` |
+| Hub Tasks → `agent-manager-hub-tasks` | S0 done (PR #455). S1 (claim-ordering/dependency-release hooks, PR #459), S2 (apply-result routing hook, PR #460), S3-a (decompose/split-proposal detection hook, narrowed from full S3, PR #461) all merged 2026-09-23. Hub-intake hook shape decided (section 3) but deferred to S5. S3's `verifyMove` hook, S4-S6 not started. | `Docs/hub-tasks-extraction-plan.md` |
 | Brain Dump → standalone plugin repo | Still in the decision phase — no sequenced plan yet (single owner for `brain-dump.json`, vault/project-registry adapters both undecided) | `Docs/brain-dump-extraction-map.md` |
 
 ## The process
