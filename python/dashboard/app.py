@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from flask import Flask, jsonify, render_template, abort, request, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
@@ -3952,6 +3952,89 @@ def _read_plugins_manifest() -> list:
 
 def _write_plugins_manifest(entries: list) -> None:
     PLUGINS_MANIFEST_PATH.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+
+
+# --- Manifest-driven dashboard tab (Docs/hub-tasks-extraction-plan.md section 5) --------
+# A plugins.json entry may declare a `tab` object so its own dashboard tab is served from
+# the plugin's repo instead of a hardcoded row in templates/index.html. `_validate_plugin_tab`
+# is the schema gate: callers (api_plugins_add today; the tab-bar merge and the plugin
+# static-file route in later pieces) treat an invalid `tab` as absent rather than crashing --
+# the dashboard must behave exactly as today when no plugin declares a usable tab.
+
+def _manifest_tabs_enabled() -> bool:
+    """Kill switch for the whole feature (section 5): AGENT_MANAGER_MANIFEST_TABS=false
+    turns every plugin-declared tab back off, both in GET /api/plugins (which the tab-bar
+    merge reads) and in the ui/ asset route, without touching plugins.json itself. Enabled
+    by default -- purely additive with no plugin declaring a tab."""
+    return os.environ.get("AGENT_MANAGER_MANIFEST_TABS", "true").strip().lower() != "false"
+
+
+def _validate_plugin_tab(tab) -> str | None:
+    """Validates a plugin manifest entry's optional 'tab' dict. Returns an error string or
+    None. Does not check that `script` exists on disk -- the file route (a later piece)
+    does that at request time, since the plugin directory can change after this entry is
+    written."""
+    if not isinstance(tab, dict):
+        return "tab must be an object"
+    unknown = set(tab) - {"key", "label", "description", "group", "kind", "script", "replaces"}
+    if unknown:
+        return f"tab has unknown key(s): {', '.join(sorted(unknown))}"
+    for field in ("key", "label"):
+        if not isinstance(tab.get(field), str) or not tab[field].strip():
+            return f"tab.{field} must be a non-empty string"
+    if tab.get("kind") != "script":
+        return "tab.kind must be 'script' (the only supported kind)"
+    script = tab.get("script")
+    if not isinstance(script, str) or not script.strip():
+        return "tab.script must be a non-empty string"
+    script_path = PurePosixPath(script)
+    if script_path.is_absolute() or ".." in script_path.parts:
+        return "tab.script must be a relative path with no '..' segments"
+    if script_path.parts[:1] != ("ui",) or script_path.suffix != ".js":
+        return "tab.script must be under 'ui/' and end in '.js'"
+    for field in ("description", "group", "replaces"):
+        if field in tab and (not isinstance(tab[field], str) or not tab[field].strip()):
+            return f"tab.{field} must be a non-empty string"
+    return None
+
+
+def _resolve_plugin_ui_asset(name: str, filename: str) -> tuple[Path | None, str | None, int]:
+    """Resolves an asset under a plugin's 'ui/' directory for the plugin-served dashboard
+    tab (piece 2). Returns (path, None, 200) on success, or (None, error, status) on
+    failure. Refuses to serve anything for a plugin that is missing, disabled, or has no
+    valid tab declared (piece 1's schema gate) -- a plugin only gets a static-file route
+    once it has opted in with a well-formed tab. Within that, only .js/.css files that
+    resolve (after following symlinks) inside the plugin's own ui/ directory are served;
+    request-supplied '..' segments and symlink escapes are both refused."""
+    if not _manifest_tabs_enabled():
+        return None, "manifest-driven dashboard tabs are disabled (AGENT_MANAGER_MANIFEST_TABS=false)", 404
+    manifest = _read_plugins_manifest()
+    entry = next((p for p in manifest if p.get("name") == name), None)
+    if entry is None:
+        return None, f"no plugin named '{name}'", 404
+    if entry.get("enabled") is False:
+        return None, f"plugin '{name}' is not enabled", 404
+    if _validate_plugin_tab(entry.get("tab")) is not None:
+        return None, f"plugin '{name}' has no valid tab declared", 404
+    register_path = entry.get("registerPath")
+    if not register_path:
+        return None, f"plugin '{name}' has no registerPath to serve ui/ assets from", 404
+
+    requested = PurePosixPath(filename)
+    if requested.is_absolute() or ".." in requested.parts:
+        return None, "filename must be a relative path with no '..' segments", 400
+    if requested.suffix not in (".js", ".css"):
+        return None, "only .js and .css files are served", 400
+
+    ui_dir = Path(os.path.realpath(os.path.join(os.path.dirname(register_path), "ui")))
+    target = Path(os.path.realpath(str(ui_dir / filename)))
+    try:
+        target.relative_to(ui_dir)
+    except ValueError:
+        return None, "resolved path escapes the plugin's ui/ directory", 403
+    if not target.is_file():
+        return None, f"no such file: {filename}", 404
+    return target, None, 200
 
 
 # --- Marketplace (plugin catalog) -------------------------------------------------------

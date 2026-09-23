@@ -282,7 +282,11 @@
 <script src="/static/js/brain-dump-and-second-brain.js"></script>
 <script src="/static/js/hygiene-tab.js"></script>
 <script>
-const TABS = [
+// CORE_TABS is the hardcoded tab-bar row set. TABS (core-ui.js) starts as a copy of it and
+// folds in any plugin-declared `tab` on top (Docs/hub-tasks-extraction-plan.md section 5,
+// piece 3) -- with no plugin declaring a tab, TABS === CORE_TABS in content and the
+// dashboard behaves exactly as before this feature existed.
+const CORE_TABS = [
   { key: 'project', label: '📁 Project', description: 'Pick the target repo and grep dirs, then start, stop, or force-stop the pipeline against it and watch its live run status.' },
   { key: 'workers', label: '👷 Workers', description: 'See every running agent instance across the local-model and reasoning lanes, with per-instance status and model selection.' },
   { key: 'hardware', label: '🖥️ Hardware', description: 'Live CPU/RAM/disk/GPU utilization, VRAM used vs total, and CPU/GPU temperature vs their 24h rolling average, with a temperature history graph.' },
@@ -1057,6 +1061,10 @@ document.getElementById('main').addEventListener('click', (e) => {
 // grill with docs buttons." Structured as a single panel (grillRenderPanel's shape),
 // not a per-card toggle like the Brain Dump tab's version -- there's only ever one note
 // open here at a time, so no need for that version's brainDumpDiscussingId guard.
+// No separate syncPluginTabs() call needed here: refresh() (piece 5; Docs/
+// hub-tasks-extraction-plan.md section 5) already syncs plugin tabs and checks the
+// active-tab redirect before its own first renderNav(), so the very first call below
+// already folds in any plugin-declared tab before the first paint.
 refresh();  // always -- populates counts + renders nav regardless of which tab is active
 if (activeTab === 'project') enterProjectTab();
 setInterval(refresh, 5000);

@@ -93,6 +93,26 @@ function severityForTab(tabKey, count) {
   return null;
 }
 
+// The shared "switch active tab" transition: runs whichever tab we're leaving's own
+// leave*Tab hook, updates activeTab, re-renders the nav, then runs the destination's own
+// enter*Tab hook (or the generic renderMain() for everything else). Both onclick handlers
+// in renderTabButton below use this, and so does redirectFromGoneActiveTab() (piece 5;
+// Docs/hub-tasks-extraction-plan.md section 5) -- the redirect needs the real leave/enter
+// semantics, not just an activeTab assignment, so it reuses this instead of duplicating it.
+function switchToTab(key) {
+  if (activeTab === 'project' && key !== 'project') leaveProjectTab();
+  if (activeTab === 'brain-dump' && key !== 'brain-dump') leaveBrainDumpTab();
+  if (activeTab === 'branches' && key !== 'branches') leaveBranchesTab();
+  if (activeTab === 'hygiene' && key !== 'hygiene') leaveHygieneTab();
+  activeTab = key;
+  renderNav();
+  if (key === 'project') enterProjectTab();
+  else if (key === 'brain-dump') enterBrainDumpTab();
+  else if (key === 'branches') enterBranchesTab();
+  else if (key === 'hygiene') enterHygieneTab();
+  else renderMain();
+}
+
 function renderTabButton(tab, indent) {
   const btn = document.createElement('button');
   btn.className = tab.key === activeTab ? 'active' : '';
@@ -110,35 +130,174 @@ function renderTabButton(tab, indent) {
       + `<span style="color:var(--muted)">${inProgress}</span>`
       + ` <span style="color:var(--bad); font-weight:600">${blocked}</span>`
       + `</span>`;
-    btn.onclick = () => {
-      if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
-      if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
-      if (activeTab === 'branches' && tab.key !== 'branches') leaveBranchesTab();
-      if (activeTab === 'hygiene' && tab.key !== 'hygiene') leaveHygieneTab();
-      activeTab = tab.key;
-      renderNav();
-      renderMain();
-    };
+    btn.onclick = () => switchToTab(tab.key);
     return btn;
   }
   const count = (tab.key === 'workers' || tab.key === 'models' || tab.key === 'joblist' || tab.key === 'plugins' || tab.key === 'deepdive') ? '' : (counts[tab.key] ?? '');
   const severity = severityForTab(tab.key, count);
   const dot = severity ? `<span class="status-dot ${severity}"></span>` : '';
   btn.innerHTML = `<span>${tab.label}</span><span class="count">${dot}${count}</span>`;
-  btn.onclick = () => {
-    if (activeTab === 'project' && tab.key !== 'project') leaveProjectTab();
-    if (activeTab === 'brain-dump' && tab.key !== 'brain-dump') leaveBrainDumpTab();
-    if (activeTab === 'branches' && tab.key !== 'branches') leaveBranchesTab();
-    if (activeTab === 'hygiene' && tab.key !== 'hygiene') leaveHygieneTab();
-    activeTab = tab.key;
-    renderNav();
-    if (tab.key === 'project') enterProjectTab();
-    else if (tab.key === 'brain-dump') enterBrainDumpTab();
-    else if (tab.key === 'branches') enterBranchesTab();
-    else if (tab.key === 'hygiene') enterHygieneTab();
-    else renderMain();
-  };
+  btn.onclick = () => switchToTab(tab.key);
   return btn;
+}
+
+// --- Manifest-driven dashboard tab: tab-bar merge (piece 3 of 6; Docs/
+// hub-tasks-extraction-plan.md section 5). Fail-safe by construction: mergePluginTabs()
+// always rebuilds TABS from CORE_TABS first, so a plugin that vanishes or gets disabled
+// simply drops back out, and a single malformed tab is skipped rather than corrupting the
+// whole nav. What a plugin's row actually does when clicked (loading its ui/ script,
+// piece 2's route) is wired up by the renderer dispatch in a later piece -- this piece only
+// gets the row into the nav bar.
+// NOT `= CORE_TABS`: core-ui.js loads via <script src> before the inline <script> block in
+// index.html that defines CORE_TABS, so referencing it here at top-level (not inside a
+// function body) would throw ReferenceError immediately and abort the rest of this file's
+// execution, silently undefining renderNav and everything below it. TABS starts empty and
+// is populated by the first mergePluginTabs() call (syncPluginTabs(), bottom of
+// index.html, which runs after CORE_TABS exists).
+let TABS = [];
+
+function isValidPluginTab(tab) {
+  if (!tab || typeof tab !== 'object') return false;
+  if (typeof tab.key !== 'string' || !tab.key.trim()) return false;
+  if (typeof tab.label !== 'string' || !tab.label.trim()) return false;
+  if (tab.kind !== 'script') return false;
+  if (typeof tab.script !== 'string' || !tab.script.trim()) return false;
+  return true;
+}
+
+function mergePluginTabs(plugins, manifestTabsEnabled) {
+  const tabs = CORE_TABS.map((t) => (t.children ? { ...t, children: [...t.children] } : { ...t }));
+  if (manifestTabsEnabled !== false) {
+    for (const p of plugins || []) {
+      if (!p || p.enabled === false || !isValidPluginTab(p.tab)) continue;
+      const tab = p.tab;
+      const row = { key: tab.key, label: tab.label, description: tab.description, pluginName: p.name, pluginScript: tab.script };
+      const replaces = tab.replaces;
+      let replaced = false;
+      if (replaces) {
+        for (let i = 0; i < tabs.length && !replaced; i++) {
+          if (tabs[i].key === replaces) { tabs[i] = row; replaced = true; }
+          else if (tabs[i].group && Array.isArray(tabs[i].children)) {
+            const idx = tabs[i].children.findIndex((c) => c.key === replaces);
+            if (idx !== -1) { tabs[i].children[idx] = row; replaced = true; }
+          }
+        }
+      }
+      if (replaced) continue;
+      if (tab.group) {
+        let groupRow = tabs.find((t) => t.group === tab.group);
+        if (!groupRow) { groupRow = { group: tab.group, children: [] }; tabs.push(groupRow); }
+        groupRow.children.push(row);
+      } else {
+        tabs.push(row);
+      }
+    }
+  }
+  TABS = tabs;
+  return tabs; // also returned (not just assigned to the module-level TABS) so callers --
+               // including the Node vm-sandboxed test, since a vm context's top-level
+               // `let` bindings aren't visible as sandbox properties from the outside --
+               // can inspect the merge result directly.
+}
+
+async function syncPluginTabs() {
+  try {
+    const data = await fetchJson('/api/plugins');
+    mergePluginTabs(data.plugins, data.manifestTabsEnabled);
+  } catch (e) {
+    // Fail-safe: leave TABS as whatever it already was (CORE_TABS on the very first
+    // failure) rather than let a plugin-listing error block the rest of the dashboard.
+  }
+}
+
+// --- Manifest-driven dashboard tab: renderer registry, loader and dispatch (piece 4 of 6;
+// Docs/hub-tasks-extraction-plan.md section 5). This is the riskiest piece -- it sits on
+// the path every tab click already runs -- so the contract is narrow and the failure mode
+// is contained: a plugin's ui/<script>.js is loaded as a plain classic <script> (same-origin,
+// piece 2's route) and is expected to call registerPluginTabRenderer(key, fn) at load time;
+// renderPluginTab() is the only thing that invokes fn(), inside a try/catch that writes any
+// failure (load error, or a script that never registered) into #main as a plain error panel
+// -- never into the nav, never thrown up to renderMain's own caller. A broken plugin script
+// can only ever break its own tab.
+const pluginTabRenderers = {};
+const pluginTabScriptLoads = {};
+
+// Exposed so a loaded plugin script can hand back its render function; not called by
+// anything else in core.
+function registerPluginTabRenderer(key, renderFn) {
+  if (typeof key === 'string' && key && typeof renderFn === 'function') {
+    pluginTabRenderers[key] = renderFn;
+  }
+}
+
+// TABS is a flat list of core rows plus, per piece 3, `{group, children}` rows -- searches
+// one level of children, matching how renderNav() itself walks the structure.
+function findTabByKey(key) {
+  for (const t of TABS) {
+    if (t.key === key) return t;
+    if (Array.isArray(t.children)) {
+      const child = t.children.find((c) => c.key === key);
+      if (child) return child;
+    }
+  }
+  return null;
+}
+
+// Enable/disable lifecycle: active-tab redirect (piece 5 of 6; Docs/
+// hub-tasks-extraction-plan.md section 5). CORE_TABS rows can never disappear
+// (mergePluginTabs always rebuilds TABS from CORE_TABS first, per piece 3), so the only
+// way findTabByKey(activeTab) comes back empty is that activeTab names a plugin-declared
+// tab whose plugin was just disabled, removed, or dropped a `replaces` that used to cover
+// this key -- switchToTab() runs the real leave/enter transition rather than just
+// reassigning activeTab, so the tab we're leaving still gets its own cleanup hook.
+function redirectFromGoneActiveTab(fallbackKey = 'project') {
+  if (findTabByKey(activeTab)) return false;
+  switchToTab(fallbackKey);
+  return true;
+}
+
+// tab.pluginScript is validated server-side (app._validate_plugin_tab) to be 'ui/<file>.js'
+// with no '..' segments; the route itself (piece 2) is the actual security boundary, this
+// just builds the matching URL -- the route's own path segment is literally 'ui/', so the
+// leading 'ui/' here is stripped rather than sent twice.
+function pluginTabAssetUrl(tab) {
+  const rel = tab.pluginScript.replace(/^ui\//, '');
+  return `/api/plugins/${encodeURIComponent(tab.pluginName)}/ui/${rel.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+function loadPluginTabScript(tab) {
+  if (pluginTabScriptLoads[tab.key]) return pluginTabScriptLoads[tab.key];
+  const promise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = pluginTabAssetUrl(tab);
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`failed to load ${s.src}`));
+    document.head.appendChild(s);
+  }).catch((e) => {
+    // Don't cache a failed load -- a transient error (plugin restarting, etc.) shouldn't
+    // permanently blacklist the tab; the next click retries.
+    delete pluginTabScriptLoads[tab.key];
+    throw e;
+  });
+  pluginTabScriptLoads[tab.key] = promise;
+  return promise;
+}
+
+async function renderPluginTab(tab) {
+  const main = document.getElementById('main');
+  try {
+    if (!pluginTabRenderers[tab.key]) {
+      main.innerHTML = `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
+      await loadPluginTabScript(tab);
+    }
+    const renderFn = pluginTabRenderers[tab.key];
+    if (typeof renderFn !== 'function') {
+      throw new Error(`${tab.pluginScript} loaded but never called registerPluginTabRenderer('${tab.key}', ...)`);
+    }
+    await renderFn();
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Could not load the "${escapeHtml(tab.label)}" tab (plugin ${escapeHtml(tab.pluginName)}): ${escapeHtml(e.message)}</div>`;
+  }
 }
 
 function renderNav() {
@@ -1523,6 +1682,8 @@ async function renderPluginsTab() {
           body: JSON.stringify({ name: cb.dataset.name, enabled: cb.checked }),
         });
         if (!r.ok) throw new Error((await r.json().catch(() => ({}))).description || r.status);
+        await syncPluginTabs();
+        renderNav();
         await renderPluginsTab();
       } catch (e) {
         alert('Could not update plugin: ' + e.message);
@@ -1549,6 +1710,8 @@ async function renderPluginsTab() {
       });
       const body = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(body.description || r.status);
+      await syncPluginTabs();
+      renderNav();
       await renderPluginsTab();
     } catch (e) {
       msg.textContent = 'Could not add plugin: ' + e.message;

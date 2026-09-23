@@ -1,4 +1,4 @@
-from flask import Blueprint, abort, jsonify, request
+from flask import Blueprint, abort, jsonify, request, send_file
 
 import plugin_process_manager
 from pathlib import Path
@@ -15,7 +15,7 @@ plugins_bp = Blueprint("plugins-bp", __name__)
 
 @plugins_bp.route("/api/plugins")
 def api_plugins():
-    from app import PLUGINS_MANIFEST_PATH, _read_plugins_manifest
+    from app import PLUGINS_MANIFEST_PATH, _manifest_tabs_enabled, _read_plugins_manifest
     manifest = _read_plugins_manifest()
     for p in manifest:
         if p.get("slot"):
@@ -23,6 +23,7 @@ def api_plugins():
     return jsonify({
         "plugins": manifest,
         "manifestPath": str(PLUGINS_MANIFEST_PATH),
+        "manifestTabsEnabled": _manifest_tabs_enabled(),
     })
 
 
@@ -47,11 +48,12 @@ def api_plugins_toggle():
 
 @plugins_bp.route("/api/plugins/add", methods=["POST"])
 def api_plugins_add():
-    from app import _pipeline_running, _plugin_name_from_path, _read_plugins_manifest, _restart_pipeline, _write_plugins_manifest
+    from app import _pipeline_running, _plugin_name_from_path, _read_plugins_manifest, _restart_pipeline, _validate_plugin_tab, _write_plugins_manifest
     body = request.get_json(silent=True) or {}
     register_path = (body.get("registerPath") or "").strip()
     name = (body.get("name") or "").strip() or _plugin_name_from_path(register_path)
     description = (body.get("description") or "").strip()
+    tab = body.get("tab")
 
     if not register_path:
         abort(400, description="registerPath is required")
@@ -60,6 +62,10 @@ def api_plugins_add():
         abort(400, description="registerPath must be an absolute path")
     if not p.is_file() or p.suffix != ".js":
         abort(400, description=f"registerPath must point at an existing .js file (got {register_path})")
+    if tab is not None:
+        tab_error = _validate_plugin_tab(tab)
+        if tab_error:
+            abort(400, description=f"tab: {tab_error}")
 
     manifest = _read_plugins_manifest()
     if any(pl.get("name") == name for pl in manifest):
@@ -68,6 +74,8 @@ def api_plugins_add():
         abort(409, description="that registerPath is already registered")
 
     entry = {"name": name, "registerPath": register_path, "enabled": True, "description": description}
+    if tab is not None:
+        entry["tab"] = tab
     manifest.append(entry)
     _write_plugins_manifest(manifest)
     restarted = False
@@ -313,6 +321,22 @@ def api_plugins_update():
         "latestVersion": new_version,
         "restarted": restarted,
     })
+
+
+@plugins_bp.route("/api/plugins/<name>/ui/<path:filename>")
+def api_plugin_ui_asset(name, filename):
+    """Serves a .js/.css asset out of a plugin's own ui/ directory (piece 2 of the
+    manifest-driven dashboard tab; Docs/hub-tasks-extraction-plan.md section 5). This is
+    how a plugin's tab content reaches the browser without an iframe: the tab-bar merge
+    (a later piece) points the dashboard at this route for `tab.script`, and a plugin may
+    load further same-origin assets (additional scripts, a stylesheet) from here too.
+    Containment and file-type checks live in `_resolve_plugin_ui_asset`."""
+    from app import _resolve_plugin_ui_asset
+    path, error, status = _resolve_plugin_ui_asset(name, filename)
+    if error:
+        abort(status, description=error)
+    mimetype = "text/css" if path.suffix == ".css" else "application/javascript"
+    return send_file(path, mimetype=mimetype, max_age=0)
 
 
 @plugins_bp.route("/api/plugins/select-slot", methods=["POST"])

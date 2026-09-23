@@ -1007,7 +1007,16 @@ async function renderMain() {
     else if (activeTab === 'concepts') await renderConceptsTab();
     else if (activeTab === 'filed') await renderFiledFindingsTab();
     else if (activeTab === 'hygiene') await renderHygieneTab();
-    else await renderQueueTab(activeTab);
+    else {
+      // Manifest-driven dashboard tab dispatch (piece 4; Docs/hub-tasks-extraction-plan.md
+      // section 5): activeTab matches a plugin-declared tab's key iff findTabByKey() finds
+      // a row with a pluginScript on it (set by piece 3's mergePluginTabs). Anything else
+      // falls through to the generic queue-state renderer exactly as before this feature
+      // existed.
+      const pluginTab = findTabByKey(activeTab);
+      if (pluginTab && pluginTab.pluginScript) await renderPluginTab(pluginTab);
+      else await renderQueueTab(activeTab);
+    }
   } catch (e) {
     document.getElementById('main').innerHTML = `<div class="empty">Error loading data: ${e.message}</div>`;
   }
@@ -1020,6 +1029,15 @@ async function refresh() {
   } catch (e) {
     document.getElementById('pipeline-status').textContent = 'disconnected';
   }
+  // Re-sync plugin-declared tabs every cycle (piece 5; Docs/hub-tasks-extraction-plan.md
+  // section 5) so a plugin toggled off/removed from elsewhere (another browser tab, a
+  // pipeline restart, a hand-edited plugins.json) drops its nav row promptly instead of
+  // only at next page load. If the row the user is currently looking at is the one that
+  // just vanished, redirectFromGoneActiveTab() runs the full leave/enter transition to a
+  // safe fallback tab itself (via switchToTab) -- in that case skip the render calls below,
+  // which would otherwise double-render on top of what the redirect already did.
+  await syncPluginTabs();
+  if (redirectFromGoneActiveTab()) return;
   renderNav();
   // Project and Brain Dump tabs manage their own rendering (enter*Tab/leave*Tab) so a
   // user's in-progress folder browsing or a half-typed capture note isn't wiped out by

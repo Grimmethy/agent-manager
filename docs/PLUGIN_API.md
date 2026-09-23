@@ -61,6 +61,108 @@ Known, deliberate exceptions:
   topology-derived (extending `--dump-topology` with `description`/`domain` + a frozen
   fallback) is a self-contained dashboard refactor, tracked separately.
 
+## Dashboard tab (optional)
+
+A script-loaded plugin (`registerPath`, no server `url`) may declare its own row in the
+dashboard's tab bar instead of core hardcoding one for it. This is the manifest-driven
+dashboard tab (`Docs/hub-tasks-extraction-plan.md` section 5, built as six small pieces on
+`feat/manifest-tab-slot-schema`) — the precondition for moving a whole UI-owning subsystem
+such as Hub Tasks into its own plugin repo. A working example lives at
+`test-fixtures/manifest-tab-example-plugin/` (see "End-to-end proof" below).
+
+### Declaring a tab
+
+Add a `tab` object to the plugin's `plugins.json` entry — by hand, or via `POST
+/api/plugins/add`'s optional `tab` field:
+
+```json
+{
+  "name": "my-plugin",
+  "registerPath": "/path/to/my-plugin/register.js",
+  "enabled": true,
+  "tab": {
+    "key": "my-tab",
+    "label": "My Tab",
+    "kind": "script",
+    "script": "ui/my-tab.js",
+    "description": "optional -- becomes the nav button's title tooltip",
+    "group": "optional -- join or create a nav group with this name",
+    "replaces": "optional -- take over an existing tab's key/slot instead of adding a new row"
+  }
+}
+```
+
+`app._validate_plugin_tab` (`python/dashboard/app.py`) is the schema gate: `key` and
+`label` must be non-empty strings, `kind` must currently be `'script'` (the only supported
+kind), and `script` must be a relative path under `ui/` ending in `.js` with no `..`
+segments. A missing or invalid `tab` behaves exactly like a plugin with no tab at all --
+this is purely additive, never a hard failure, and nothing else about the plugin is
+affected.
+
+### Serving the script
+
+`script` names a file under the plugin directory's own `ui/` subfolder
+(`dirname(registerPath)/ui/`). Core serves it -- and any other `.js`/`.css` file under that
+same `ui/` directory (a stylesheet, or further scripts the main one loads) -- at:
+
+    GET /api/plugins/<name>/ui/<path-under-ui>
+
+only for a plugin that is currently enabled and has a valid `tab` declared
+(`app._resolve_plugin_ui_asset`). Containment is checked with `os.path.realpath`, not
+string matching, so a symlink inside `ui/` that points outside it is refused (403), same as
+a `..` segment in the request (400). `AGENT_MANAGER_MANIFEST_TABS=false` is a kill switch
+for the whole feature: both this route and the tab-bar merge below drop every
+plugin-declared tab back to nothing, without touching `plugins.json`.
+
+### The tab's own script
+
+`script` is loaded as a plain same-origin classic `<script>` (not a module) the first time
+its tab is visited, and is expected to call a core-provided global at its own top level:
+
+```js
+registerPluginTabRenderer('my-tab', function renderMyTab() {
+  document.getElementById('main').innerHTML = '...'; // exactly like any other render*Tab
+});
+```
+
+`key` must match the `tab.key` from `plugins.json`. The registered function is called every
+time the tab is (re-)rendered -- including the dashboard's generic 5s poll cycle, same as
+every other tab -- so it should be safe to call repeatedly (compare
+`renderJobListTab`/`renderWorkers`/etc. elsewhere in `core-ui.js` for the existing
+convention). A script load failure, a script that never registers, or the renderer
+throwing are all caught and shown as a plain error panel inside that tab's own `#main`
+content -- never thrown up into the nav or the rest of the dashboard (`renderPluginTab`,
+`python/dashboard/static/js/core-ui.js`).
+
+### Lifecycle
+
+The nav re-syncs every 5s poll cycle (`refresh()`, `core-ui.js`), not just at page load, so
+a plugin toggled off or removed elsewhere (another browser tab, a pipeline restart, a
+hand-edited `plugins.json`) drops its row promptly. If the tab a user is currently looking
+at is the one that just disappeared, `redirectFromGoneActiveTab()` runs the dashboard's
+normal tab-switch transition (`switchToTab()`) to a safe fallback (`'project'` by default)
+instead of leaving them on a dead tab.
+
+### End-to-end proof
+
+`test-fixtures/manifest-tab-example-plugin/` (`register.js` + `ui/example-tab.js`) is a
+real, minimal, working plugin using this mechanism -- not a mock. Two tests exercise it
+against the exact same on-disk bytes from both directions:
+`python/dashboard/test_manifest_tab_fixture_e2e.py` registers it, fetches it back through
+the real route, and checks the served body is byte-identical to the file on disk (plus the
+enable/disable and kill-switch gates); `scripts/manifest-tab-fixture-e2e.test.js` takes
+that same file's real content and runs it for real through core-ui.js's renderer dispatch
+(`vm`, no mocked plugin script), asserting it registers and renders exactly as the fixture
+promises.
+
+### Not yet built
+
+Only a script-loaded plugin (`registerPath`, no server) can declare a tab today -- a
+server-slotted plugin (`slot`/`url`, e.g. the Hardware tab's plugins) cannot yet. Moving an
+existing hardcoded tab (Hub Tasks, or the PromptForge/AdForge/ScriptForge iframe
+companions) onto this mechanism is separate follow-up work, tracked in
+`Docs/hub-tasks-extraction-plan.md`.
+
 ## Known warts
 
 - **Deep imports, no `exports` map.** A plugin reaching past this contract into a private
