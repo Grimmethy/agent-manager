@@ -1061,7 +1061,10 @@ document.getElementById('main').addEventListener('click', (e) => {
 // grill with docs buttons." Structured as a single panel (grillRenderPanel's shape),
 // not a per-card toggle like the Brain Dump tab's version -- there's only ever one note
 // open here at a time, so no need for that version's brainDumpDiscussingId guard.
-syncPluginTabs().then(renderNav);  // fold in any plugin-declared tab before the first paint
+// No separate syncPluginTabs() call needed here: refresh() (piece 5; Docs/
+// hub-tasks-extraction-plan.md section 5) already syncs plugin tabs and checks the
+// active-tab redirect before its own first renderNav(), so the very first call below
+// already folds in any plugin-declared tab before the first paint.
 refresh();  // always -- populates counts + renders nav regardless of which tab is active
 if (activeTab === 'project') enterProjectTab();
 setInterval(refresh, 5000);
