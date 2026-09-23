@@ -1,4 +1,4 @@
-from flask import Blueprint, abort, jsonify, request
+from flask import Blueprint, abort, jsonify, request, send_file
 
 import plugin_process_manager
 from pathlib import Path
@@ -320,6 +320,22 @@ def api_plugins_update():
         "latestVersion": new_version,
         "restarted": restarted,
     })
+
+
+@plugins_bp.route("/api/plugins/<name>/ui/<path:filename>")
+def api_plugin_ui_asset(name, filename):
+    """Serves a .js/.css asset out of a plugin's own ui/ directory (piece 2 of the
+    manifest-driven dashboard tab; Docs/hub-tasks-extraction-plan.md section 5). This is
+    how a plugin's tab content reaches the browser without an iframe: the tab-bar merge
+    (a later piece) points the dashboard at this route for `tab.script`, and a plugin may
+    load further same-origin assets (additional scripts, a stylesheet) from here too.
+    Containment and file-type checks live in `_resolve_plugin_ui_asset`."""
+    from app import _resolve_plugin_ui_asset
+    path, error, status = _resolve_plugin_ui_asset(name, filename)
+    if error:
+        abort(status, description=error)
+    mimetype = "text/css" if path.suffix == ".css" else "application/javascript"
+    return send_file(path, mimetype=mimetype, max_age=0)
 
 
 @plugins_bp.route("/api/plugins/select-slot", methods=["POST"])

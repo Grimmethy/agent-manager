@@ -3990,6 +3990,43 @@ def _validate_plugin_tab(tab) -> str | None:
     return None
 
 
+def _resolve_plugin_ui_asset(name: str, filename: str) -> tuple[Path | None, str | None, int]:
+    """Resolves an asset under a plugin's 'ui/' directory for the plugin-served dashboard
+    tab (piece 2). Returns (path, None, 200) on success, or (None, error, status) on
+    failure. Refuses to serve anything for a plugin that is missing, disabled, or has no
+    valid tab declared (piece 1's schema gate) -- a plugin only gets a static-file route
+    once it has opted in with a well-formed tab. Within that, only .js/.css files that
+    resolve (after following symlinks) inside the plugin's own ui/ directory are served;
+    request-supplied '..' segments and symlink escapes are both refused."""
+    manifest = _read_plugins_manifest()
+    entry = next((p for p in manifest if p.get("name") == name), None)
+    if entry is None:
+        return None, f"no plugin named '{name}'", 404
+    if entry.get("enabled") is False:
+        return None, f"plugin '{name}' is not enabled", 404
+    if _validate_plugin_tab(entry.get("tab")) is not None:
+        return None, f"plugin '{name}' has no valid tab declared", 404
+    register_path = entry.get("registerPath")
+    if not register_path:
+        return None, f"plugin '{name}' has no registerPath to serve ui/ assets from", 404
+
+    requested = PurePosixPath(filename)
+    if requested.is_absolute() or ".." in requested.parts:
+        return None, "filename must be a relative path with no '..' segments", 400
+    if requested.suffix not in (".js", ".css"):
+        return None, "only .js and .css files are served", 400
+
+    ui_dir = Path(os.path.realpath(os.path.join(os.path.dirname(register_path), "ui")))
+    target = Path(os.path.realpath(str(ui_dir / filename)))
+    try:
+        target.relative_to(ui_dir)
+    except ValueError:
+        return None, "resolved path escapes the plugin's ui/ directory", 403
+    if not target.is_file():
+        return None, f"no such file: {filename}", 404
+    return target, None, 200
+
+
 # --- Marketplace (plugin catalog) -------------------------------------------------------
 # The catalog is a static, pre-generated JSON file (plugins-catalog.json) at the package
 # root. These helpers only read and validate it, and expose it via GET
