@@ -342,7 +342,7 @@ def _call_discuss(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except ClaudeClientError as e:
         abort(502, description=str(e))
-    except (TimeoutError, ConnectionError, OSError) as e:
+    except (TimeoutError, ConnectionError) as e:
         abort(502, description=f"local model call failed ({e}) -- it may be busy with an active worker-lane task; try again shortly or switch to Claude.")
 
 
