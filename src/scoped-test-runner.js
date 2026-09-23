@@ -158,6 +158,14 @@ function childEnv() {
   return env;
 }
 
+// A timeout is NOT a failure -- confirmed live: src/local-draft.test.js's own header
+// documents it can legitimately wait on a real `flock` for up to 600s under GPU-lane
+// contention with the live pipeline (the exact condition this gate always runs under,
+// since it executes DURING live pipeline processing). Conflating "didn't finish in
+// RUN_TIMEOUT_MS" with "asserted something false" would auto-file a false "confirmed
+// regression" on every commit touching a lock-contending file. `passed: null` marks this
+// inconclusive -- same "stay silent, let the LLM decide" treatment as no-coverage-exists,
+// never folded into a hard pass or fail.
 function runJsTests(repoRoot, files) {
   if (!files.length) return null;
   try {
@@ -166,8 +174,9 @@ function runJsTests(repoRoot, files) {
     });
     return { ran: files, passed: true, failures: [] };
   } catch (e) {
+    const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
     const out = `${e.stdout || ''}${e.stderr || ''}`;
-    return { ran: files, passed: false, failures: parseNodeTestFailures(out), raw: out.slice(0, 4000), timedOut: e.signal === 'SIGTERM' };
+    return { ran: files, passed: timedOut ? null : false, failures: parseNodeTestFailures(out), raw: out.slice(0, 4000), timedOut };
   }
 }
 
@@ -191,8 +200,9 @@ function runPyTests(repoRoot, files, pythonBin) {
     });
     return { ran: files, passed: true, failures: [] };
   } catch (e) {
+    const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
     const out = `${e.stdout || ''}${e.stderr || ''}`;
-    return { ran: files, passed: false, failures: parsePyTestFailures(out), raw: out.slice(0, 4000), timedOut: e.signal === 'SIGTERM' };
+    return { ran: files, passed: timedOut ? null : false, failures: parsePyTestFailures(out), raw: out.slice(0, 4000), timedOut };
   }
 }
 
@@ -215,8 +225,20 @@ function runScopedTests(repoRoot, changedFiles, opts = {}) {
   try { jsResult = runJsTests(repoRoot, affected.js); } catch { /* degrade below */ }
   try { pyResult = runPyTests(repoRoot, affected.py, opts.pythonBin); } catch { /* degrade below */ }
   if (!jsResult && !pyResult) return null;
+  // Combine per-suite verdicts: a real `false` (an actual assertion failed) always wins --
+  // that's a genuine confirmed regression regardless of what the other suite did. Absent
+  // that, a `null` (timed out -- inconclusive, not "passed") makes the combined result
+  // inconclusive too, since claiming `passed: true` when one suite never actually finished
+  // would be just as wrong as claiming `passed: false`. Only true+true (or a suite that
+  // didn't run at all) combines to true.
+  const verdicts = [jsResult ? jsResult.passed : undefined, pyResult ? pyResult.passed : undefined]
+    .filter((v) => v !== undefined);
+  const anyFalse = verdicts.includes(false);
+  const anyNull = verdicts.includes(null);
+  const passed = anyFalse ? false : anyNull ? null : true;
+  if (passed === null) return null;
   return {
-    passed: (jsResult ? jsResult.passed : true) && (pyResult ? pyResult.passed : true),
+    passed,
     ran: [...(jsResult ? jsResult.ran : []), ...(pyResult ? pyResult.ran : [])],
     failures: [...((jsResult && jsResult.failures) || []), ...((pyResult && pyResult.failures) || [])],
     jsRaw: jsResult && jsResult.raw,
@@ -233,4 +255,5 @@ module.exports = {
   parsePyTestFailures,
   MAX_REVERSE_DEP_FILES,
   MAX_TEST_FILES,
+  RUN_TIMEOUT_MS,
 };
