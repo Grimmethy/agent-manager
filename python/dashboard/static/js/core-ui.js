@@ -148,7 +148,13 @@ function renderTabButton(tab, indent) {
 // whole nav. What a plugin's row actually does when clicked (loading its ui/ script,
 // piece 2's route) is wired up by the renderer dispatch in a later piece -- this piece only
 // gets the row into the nav bar.
-let TABS = CORE_TABS;
+// NOT `= CORE_TABS`: core-ui.js loads via <script src> before the inline <script> block in
+// index.html that defines CORE_TABS, so referencing it here at top-level (not inside a
+// function body) would throw ReferenceError immediately and abort the rest of this file's
+// execution, silently undefining renderNav and everything below it. TABS starts empty and
+// is populated by the first mergePluginTabs() call (syncPluginTabs(), bottom of
+// index.html, which runs after CORE_TABS exists).
+let TABS = [];
 
 function isValidPluginTab(tab) {
   if (!tab || typeof tab !== 'object') return false;

@@ -53,6 +53,17 @@ function scriptTab(overrides) {
   return { key: 'hub-tasks', label: 'Hub Tasks', kind: 'script', script: 'ui/hub-tasks.js', ...overrides };
 }
 
+test('core-ui.js executes cleanly with CORE_TABS undefined -- it loads via <script src> in index.html BEFORE the inline <script> block that defines CORE_TABS, so a top-level (not function-body) reference to it would throw and silently undefine every function below it, including renderNav', () => {
+  const source = fs.readFileSync(CORE_UI_JS, 'utf8');
+  const sandbox = { console };
+  vm.createContext(sandbox);
+  assert.doesNotThrow(() => {
+    new vm.Script(source, { filename: CORE_UI_JS }).runInContext(sandbox);
+  });
+  assert.equal(typeof sandbox.renderNav, 'function');
+  assert.equal(typeof sandbox.mergePluginTabs, 'function');
+});
+
 test('isValidPluginTab accepts a well-formed tab', () => {
   const sb = loadSandbox();
   assert.equal(sb.isValidPluginTab(scriptTab()), true);
