@@ -70,6 +70,94 @@ class PluginsManifestTest(unittest.TestCase):
         self.assertEqual(app._plugin_name_from_path("/media/x/agent-manager-hygiene/register.js"), "agent-manager-hygiene")
         self.assertEqual(app._plugin_name_from_path("/media/x/imagegen/register.js"), "imagegen")
 
+    def test_tab_passes_through_read(self):
+        tab = {"key": "hub-tasks", "label": "Hub Tasks", "kind": "script", "script": "ui/hub-tasks.js"}
+        entry = {"name": "x", "registerPath": "/x/register.js", "enabled": True, "description": "", "tab": tab}
+        app._write_plugins_manifest([entry])
+        self.assertEqual(app._read_plugins_manifest()[0]["tab"], tab)
+
+
+class ValidatePluginTabTest(unittest.TestCase):
+    """Docs/hub-tasks-extraction-plan.md section 5: a plugins.json entry may carry
+    `tab: {key, label, description?, group?, kind:'script', script:'ui/<file>.js',
+    replaces?}` so its dashboard tab is served from the plugin's own repo. This is the
+    schema gate every later piece (static-file route, tab-bar merge, renderer dispatch)
+    relies on to treat a malformed tab as absent rather than crashing."""
+
+    def _valid(self, **overrides):
+        tab = {"key": "hub-tasks", "label": "Hub Tasks", "kind": "script", "script": "ui/hub-tasks.js"}
+        tab.update(overrides)
+        return tab
+
+    def test_valid_minimal_tab(self):
+        self.assertIsNone(app._validate_plugin_tab(self._valid()))
+
+    def test_valid_with_all_optional_fields(self):
+        tab = self._valid(description="Hub coordination", group="Job Status", replaces="coordinating")
+        self.assertIsNone(app._validate_plugin_tab(tab))
+
+    def test_not_a_dict(self):
+        self.assertEqual(app._validate_plugin_tab("hub-tasks"), "tab must be an object")
+        self.assertEqual(app._validate_plugin_tab(None), "tab must be an object")
+
+    def test_unknown_key_rejected(self):
+        err = app._validate_plugin_tab(self._valid(icon="star"))
+        self.assertIn("unknown key", err)
+        self.assertIn("icon", err)
+
+    def test_missing_or_empty_key(self):
+        tab = self._valid()
+        del tab["key"]
+        self.assertEqual(app._validate_plugin_tab(tab), "tab.key must be a non-empty string")
+        self.assertEqual(app._validate_plugin_tab(self._valid(key="  ")), "tab.key must be a non-empty string")
+
+    def test_missing_or_empty_label(self):
+        tab = self._valid()
+        del tab["label"]
+        self.assertEqual(app._validate_plugin_tab(tab), "tab.label must be a non-empty string")
+
+    def test_kind_must_be_script(self):
+        self.assertEqual(
+            app._validate_plugin_tab(self._valid(kind="iframe")),
+            "tab.kind must be 'script' (the only supported kind)",
+        )
+
+    def test_script_must_be_non_empty_string(self):
+        self.assertEqual(
+            app._validate_plugin_tab(self._valid(script="")),
+            "tab.script must be a non-empty string",
+        )
+
+    def test_script_must_be_relative(self):
+        self.assertEqual(
+            app._validate_plugin_tab(self._valid(script="/etc/passwd")),
+            "tab.script must be a relative path with no '..' segments",
+        )
+
+    def test_script_rejects_path_traversal(self):
+        self.assertEqual(
+            app._validate_plugin_tab(self._valid(script="ui/../../../etc/passwd")),
+            "tab.script must be a relative path with no '..' segments",
+        )
+
+    def test_script_must_be_under_ui_dir(self):
+        self.assertEqual(
+            app._validate_plugin_tab(self._valid(script="static/hub-tasks.js")),
+            "tab.script must be under 'ui/' and end in '.js'",
+        )
+
+    def test_script_must_end_in_js(self):
+        self.assertEqual(
+            app._validate_plugin_tab(self._valid(script="ui/hub-tasks.py")),
+            "tab.script must be under 'ui/' and end in '.js'",
+        )
+
+    def test_optional_string_fields_reject_empty(self):
+        for field in ("description", "group", "replaces"):
+            with self.subTest(field=field):
+                err = app._validate_plugin_tab(self._valid(**{field: "  "}))
+                self.assertEqual(err, f"tab.{field} must be a non-empty string")
+
 
 if __name__ == "__main__":
     unittest.main()

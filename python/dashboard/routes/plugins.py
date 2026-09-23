@@ -47,11 +47,12 @@ def api_plugins_toggle():
 
 @plugins_bp.route("/api/plugins/add", methods=["POST"])
 def api_plugins_add():
-    from app import _pipeline_running, _plugin_name_from_path, _read_plugins_manifest, _restart_pipeline, _write_plugins_manifest
+    from app import _pipeline_running, _plugin_name_from_path, _read_plugins_manifest, _restart_pipeline, _validate_plugin_tab, _write_plugins_manifest
     body = request.get_json(silent=True) or {}
     register_path = (body.get("registerPath") or "").strip()
     name = (body.get("name") or "").strip() or _plugin_name_from_path(register_path)
     description = (body.get("description") or "").strip()
+    tab = body.get("tab")
 
     if not register_path:
         abort(400, description="registerPath is required")
@@ -60,6 +61,10 @@ def api_plugins_add():
         abort(400, description="registerPath must be an absolute path")
     if not p.is_file() or p.suffix != ".js":
         abort(400, description=f"registerPath must point at an existing .js file (got {register_path})")
+    if tab is not None:
+        tab_error = _validate_plugin_tab(tab)
+        if tab_error:
+            abort(400, description=f"tab: {tab_error}")
 
     manifest = _read_plugins_manifest()
     if any(pl.get("name") == name for pl in manifest):
@@ -68,6 +73,8 @@ def api_plugins_add():
         abort(409, description="that registerPath is already registered")
 
     entry = {"name": name, "registerPath": register_path, "enabled": True, "description": description}
+    if tab is not None:
+        entry["tab"] = tab
     manifest.append(entry)
     _write_plugins_manifest(manifest)
     restarted = False

@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from flask import Flask, jsonify, render_template, abort, request, Response, stream_with_context
 from werkzeug.exceptions import HTTPException
@@ -3952,6 +3952,42 @@ def _read_plugins_manifest() -> list:
 
 def _write_plugins_manifest(entries: list) -> None:
     PLUGINS_MANIFEST_PATH.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
+
+
+# --- Manifest-driven dashboard tab (Docs/hub-tasks-extraction-plan.md section 5) --------
+# A plugins.json entry may declare a `tab` object so its own dashboard tab is served from
+# the plugin's repo instead of a hardcoded row in templates/index.html. `_validate_plugin_tab`
+# is the schema gate: callers (api_plugins_add today; the tab-bar merge and the plugin
+# static-file route in later pieces) treat an invalid `tab` as absent rather than crashing --
+# the dashboard must behave exactly as today when no plugin declares a usable tab.
+
+def _validate_plugin_tab(tab) -> str | None:
+    """Validates a plugin manifest entry's optional 'tab' dict. Returns an error string or
+    None. Does not check that `script` exists on disk -- the file route (a later piece)
+    does that at request time, since the plugin directory can change after this entry is
+    written."""
+    if not isinstance(tab, dict):
+        return "tab must be an object"
+    unknown = set(tab) - {"key", "label", "description", "group", "kind", "script", "replaces"}
+    if unknown:
+        return f"tab has unknown key(s): {', '.join(sorted(unknown))}"
+    for field in ("key", "label"):
+        if not isinstance(tab.get(field), str) or not tab[field].strip():
+            return f"tab.{field} must be a non-empty string"
+    if tab.get("kind") != "script":
+        return "tab.kind must be 'script' (the only supported kind)"
+    script = tab.get("script")
+    if not isinstance(script, str) or not script.strip():
+        return "tab.script must be a non-empty string"
+    script_path = PurePosixPath(script)
+    if script_path.is_absolute() or ".." in script_path.parts:
+        return "tab.script must be a relative path with no '..' segments"
+    if script_path.parts[:1] != ("ui",) or script_path.suffix != ".js":
+        return "tab.script must be under 'ui/' and end in '.js'"
+    for field in ("description", "group", "replaces"):
+        if field in tab and (not isinstance(tab[field], str) or not tab[field].strip()):
+            return f"tab.{field} must be a non-empty string"
+    return None
 
 
 # --- Marketplace (plugin catalog) -------------------------------------------------------
