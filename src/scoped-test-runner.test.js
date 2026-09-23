@@ -156,6 +156,21 @@ test('runScopedTests: a real passing Python test reports passed:true', () => {
   assert.deepEqual(result.ran, ['test_thing.py']);
 });
 
+test('runScopedTests: prefers a repo-local .venv interpreter over bare python3 when one exists', () => {
+  const repo = tmpRepo();
+  // A fake "venv" whose interpreter is really just a shell script proving it (not the
+  // system python3) got invoked -- exact shape of the bug this guards: real regression
+  // was `python3 -m unittest` picking up a system interpreter that lacks the project's
+  // actual dependencies (confirmed live: 100% of python-covering commits false-failed on
+  // "No module named 'flask'" because plain `python3` has no access to <repoRoot>/.venv).
+  write(repo, '.venv/bin/python', '#!/bin/sh\necho "VENV_PYTHON_RAN"\nexit 0\n');
+  fs.chmodSync(path.join(repo, '.venv/bin/python'), 0o755);
+  write(repo, 'thing.py', '');
+  write(repo, 'test_thing.py', 'raise SystemExit("should never actually be imported by the fake venv script")\n');
+  const result = runScopedTests(repo, ['thing.py']);
+  assert.equal(result.passed, true, 'the fake venv script exits 0 without ever importing test_thing.py');
+});
+
 test('runScopedTests: a real FAILING Python test reports passed:false', () => {
   const repo = tmpRepo();
   write(repo, 'thing.py', 'def add(a, b):\n    return a - b\n');
