@@ -57,6 +57,7 @@ const { getRegisteredSource, resolveSourceName } = require('./task-source-regist
 const { decideEmptyApprovalOutcome } = require('./empty-approval-decision.js');
 const { decidePremiseRecheckOutcome } = require('./premise-recheck-decision.js');
 const { detectTruncatedImplementResponse } = require('./validate-implement-truncation.js');
+const { getDecomposeProposalDetection } = require('./hub-review-detection.js');
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene: observability/performance/function-length/arch/
@@ -414,8 +415,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   // "no silently dropped requirement" guidance below has something concrete to verify.
   // (Root-caused live 2026-09-02: a decompose that dropped the core deliverable -- an
   // /api endpoint -- was approved 2/3 because the reviewer only ever saw the title.)
-  const isSplitProposal = !!task.candidateSplitProposals
-    || (task.source === 'manual' && task.adhocResolution === 'decompose');
+  // Hub-review-detection hook (S3-a of the hub-tasks extraction, 2026-09-23): resolved
+  // through hub-review-detection.js's swap point rather than an inline field check, so
+  // this file doesn't need to know the proposal shape once the kernel moves out. Defaults
+  // to exactly today's behaviour.
+  const isSplitProposal = getDecomposeProposalDetection().isDecomposeOrSplitProposal(task);
   const originalAsk = task.promptContext
     && (task.promptContext.rawText || task.promptContext.body);
   if (isSplitProposal && originalAsk) {
@@ -755,7 +759,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // live: function-length-...reject-retry-check-js-90 (RETRYABLE_WITH_BACKOFF),
   // performance-...uptime-log-js-58 (START_MS). Still handed to the vote via
   // buildVerdictPrompt -- just not an automatic no-review block.
-  const isDecomposeProposal = (task.source === 'manual' && task.adhocResolution === 'decompose') || !!task.candidateSplitProposals;
+  const isDecomposeProposal = getDecomposeProposalDetection().isDecomposeOrSplitProposal(task);
   const isProposalNotClaim = isDecomposeProposal || isAdvisoryProseSource(resolveSourceName(task));
   const highPrecisionFlags = isProposalNotClaim
     ? []
