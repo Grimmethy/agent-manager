@@ -155,18 +155,4 @@ function getCostSummary() {
   }
 }
 
-// Reads back per-source MIN/MAX/AVG(turns_used) (2026-08-26, see recordCall's own
-// turnsUsed comment) -- same real-stdout-capture shape as getCostSummary() above, same
-// best-effort fail-to-null philosophy: a Job List column failing to render a turns stat
-// is not worth breaking the page over.
-function getTurnsSummary() {
-  try {
-    const stdout = execFileSync('node', ['--no-warnings', SCRIPT_PATH, 'turns-summary'], { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8' });
-    return JSON.parse(stdout);
-  } catch (e) {
-    console.warn(`[model-stats] turns-summary failed: ${e.message}\n${e.stack}`);
-    return null;
-  }
-}
-
-module.exports = { recordCall, recordOutcome, getCostSummary, getTurnsSummary };
+module.exports = { recordCall, recordOutcome, getCostSummary };
