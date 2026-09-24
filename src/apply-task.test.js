@@ -1414,7 +1414,21 @@ test('gated default: a triage-queue push failure marks every batched task failed
   assert.equal(out.pushed, false);
   assert.equal(out.results.h1.succeeded, false);
   assert.match(out.results.h1.reason, /agent\/triage-queue failed after commit/);
+  assert.ok(gitRunner.calls.some((c) => c.name === 'retryPushAfterRebase'), 'a rebase+retry was attempted before giving up');
   assert.ok(!gitRunner.calls.some((c) => c.name === 'pushMain'));
+});
+
+// 2026-09-24: the common case a bare push rejection actually represents -- origin moved
+// between this run's fetch and its own push (e.g. a different apply tick landed first).
+// retryPushAfterRebase's fetch+rebase+push recovers without ever surfacing a failure.
+test('gated default: a triage-queue push failure that recovers via retryPushAfterRebase succeeds like a normal push', () => {
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  const gitRunner = createFakeGitRunner({ failOn: 'push', failMessage: 'remote: rejected (non-fast-forward)', retryPushSucceeds: true });
+  const out = applyDirectToMainBatch([batchTriageTask('h2')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(out.pushed, true);
+  assert.equal(out.results.h2.succeeded, true);
+  assert.match(out.results.h2.doneMarker, /agent\/triage-queue/);
+  assert.ok(gitRunner.calls.some((c) => c.name === 'retryPushAfterRebase'));
 });
 
 test('recordApplyOutcome: a coordinating result stamps the hub serial and leads the hub title with it, replacing a candidate id', () => {
