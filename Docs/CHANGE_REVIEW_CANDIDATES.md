@@ -1683,3 +1683,37 @@ index 30254f99..fa20e923 100644
 Problem: [severity: high; regression shipped in ee40159] The `subprocess.TimeoutExpired` handler previously returned a structured HTTP 504 JSON response; it now re-raises the exception, causing Flask to return an unstructured 500 error and breaking the documented client contract for the timeout case.  Failure scenario: A client issues `POST /api/task/approved/TASK-123/apply`. The `apply-runner.ps1 -TaskId TASK-123` subprocess (e.g., a large `git push` over a slow link) exceeds the 300 s timeout, so `subprocess.run(..., timeout=300)` raises `subprocess.TimeoutExpired`. Before the diff the handler caught it and returned HTTP 504 with body `{"id": "TASK-123", "applied": false, "reason": "apply-runner.ps1 -TaskId did not finish within 300s (still may complete -- check the Done/Blocked tabs)"}`. After the diff the handler logs and executes a bare `raise`; no further `except` clause exists in `api_task_apply`, so the exception propagates to Flask's default error handler, which returns HTTP 500 with an HTML page (or a generic JSON envelope in JSON mode) that contains neither the `applied` field nor the `reason` string. Any dashboard JavaScript that checks `response.status === 504` to display the "still running" message, or that reads `body.reason`, will fail.
 Solution: In `python/dashboard/app.py`, replace the `raise` at the end of the `except subprocess.TimeoutExpired as e:` block with the original return statement: `return jsonify({"id": task_id, "applied": False, "reason": "apply-runner.ps1 -TaskId did not finish within 300s (still may complete -- check the Done/Blocked tabs)"}), 504` (keeping the `logger.error(...)` call above it for observability).
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in ee40159.
+
+### AC-109 · A task sentence that genuinely requests a code change but happens to contain the standalon (1120da6 adhoc-diff-sanity.js)
+Strength: Strong
+Source: change_review of 1120da6 "Merge pull request #303 from Grimmethy/fix/docs-only-gate-citation-aware"
+Files: src/adhoc-diff-sanity.js
+
+Snippet:
+```
+diff --git a/src/adhoc-diff-sanity.js b/src/adhoc-diff-sanity.js
+index 57742dce..dddce0d9 100644
+--- a/src/adhoc-diff-sanity.js
++++ b/src/adhoc-diff-sanity.js
+@@ -55,24 +55,48 @@ function parseChangedFiles(diff) {
+ 
+ // --- classification helpers -----------------------------------------------
+ 
+ const DOC_PATH_RE = /(^|\/)(docs?|adr)(\/|$)|(^|\/)(README|CHANGELOG|CHANGES|HISTORY|CONTRIBUTING|AGENTS)(\.[\w-]+)?$|\.(md|mdx|markdown|rst|txt|adoc)$/i;
+ const isDocPath = (p) => DOC_PATH_RE.test(p);
+ 
+ // Does the task text ask for actual code, not just prose? A pure "write an ADR for X"
+ // task has none of these; job-list ("renderJobListTab() in index.html") and second-brain
+ // ("a new task source in src/task-sources.js") both do. Fallback only -- see
+ // extractDeclaredFiles below for why the task's own "Files:" line is checked FIRST.
+ const CODE_SIGNAL_RE = /\b(src|python|scripts|lib|app|dashboard|templates)\/|\.(js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b|\b(implement|endpoint|route|task source|new (?:module|file|source|helper)|render\w*\(|def \w+\(|function \w+|wire (?:it|this|the|in)|add .{0,25}(?:to|in|into) \w[\w./-]*\.(?:py|js|html|sh)|api route|backend|cursor module|sweep logic)\b/i;
+ 
++// 2026-09-16, pipeline hardening: CODE_SIGNAL_RE.test(combined) is a blind whole-blob scan
++// -- it can't tell "this src/ path is the edit target" from "this src/ path is cited as
++// existing context" any more than the Files:-line-absent fallback it guards. Confirmed
++// live, 4+ i
+```
+
+Problem: [severity: med; regression shipped in 1120da6] A task sentence that genuinely requests a code change but happens to contain the standalone word "see" or "per" is no longer detected as wanting code, so the docs-only gate silently passes a docs-only diff that the pre-diff blind scan would have blocked.  Failure scenario: Task text: `"See src/foo.js and fix the race condition in the handler."` with a diff that only creates `docs/adr/0042-race-fix.md`. Trace: `wantsCodeChange` splits into one sentence. `CODE_SIGNAL_RE.test("See src/foo.js and fix the race condition in the handler.")` → true (matches `src/`). `CITATION_CONTEXT_RE.test(same)` → true (matches `\bsee\b`, case-insensitive). Therefore `CODE_SIGNAL_RE.test(sen) && !CITATION_CONTEXT_RE.test(sen)` → `true && false` → false. `sentences.some(...)` → false. `wantsCodeChange` returns false. The gate at line 363 (`wantsCode = … : wantsCodeChange(combined)`) evaluates to false, so the `if (wantsCode)` block is skipped and `adhocDiffSubstanceProblem` returns null (no problem). Before this diff, `CODE_SIGNAL_RE.test(combined)` on the same blob returned true, the gate fired, and the docs-only diff was blocked with `code: 'docs-only'`.
+Solution: Remove the bare `per\b` and `see\b` alternatives from `CITATION_CONTEXT_RE` (they are too broad to serve as citation markers), or replace them with more specific multi-word phrases (e.g. `per the (?:spec|docs|design)`, `see (?:the|this|above) (?:spec|doc|section)`) so that a sentence like "See src/foo.js and fix the bug" is not excluded from the code-signal scan.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 1120da6.
