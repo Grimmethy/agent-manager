@@ -82,16 +82,15 @@ about," verified to still exist as of this writing.
 **Watchdog sweeps**
 - `src/coordinator-sweep.js` — detects and re-routes a stuck coordinator hub.
 - `src/blocked-drain.js` — auto-requeues blocked tasks sharing a signature a landed fix just resolved.
-- `src/decompose-loop-autoroute.js` — a stuck oversized-file task auto-authors its own file-decompose plan.
+- decompose-loop-autoroute.js (moved to agent-manager-hygiene's src/, S4a of the hub-tasks extraction, 2026-09-24) — a stuck oversized-file task auto-authors its own file-decompose plan.
 - `src/staleness-audit.js` — sweeps brain-dump tasks resolved by hand outside the pipeline.
 - `src/context-trim-sweep.js` — the turn-budget-exhaustion faux-clarification requeue-with-grounding sweep.
 
 **Hub coordination / decompose**
-- `src/file-decompose-to-hub.js` — coordinator hub of bounded "move these symbols verbatim" tasks (`validatePlan()`, `staticCheckMove`/`staticCheckScriptExtractMove`).
-- `src/decompose-pass.js`, `src/file-decompose-plan-pass.js` — routing rules that turn an oversized-file task into a decomposition instead of a hand-written fix.
-- `src/script-extract.js` — the real V8-parser oracle behind a deterministic, zero-model-call script-extract move.
-- `src/decompose-move-determinism-backfill.js` — re-evaluates deterministic-eligibility for a child minted before its symbols happened to resolve cleanly.
-- `src/hub-priority.js` — per-hub `hubPriority` tag driving both the Hub Tasks tab sort and worker claim order.
+- Most of the file-decompose PRODUCER family moved to agent-manager-hygiene's src/ (S4a of the hub-tasks extraction, 2026-09-24 -- see `Docs/hub-tasks-extraction-plan.md`): file-decompose-to-hub.js (coordinator hub of bounded "move these symbols verbatim" tasks -- `validatePlan()`, `staticCheckMove`/`staticCheckScriptExtractMove`), file-decompose-plan-pass.js, decompose-node-module.js, decompose-flask-blueprint.js, decompose-one-pass.js, decompose-move-determinism-backfill.js (re-evaluates deterministic-eligibility for a child minted before its symbols happened to resolve cleanly), proactive-file-decompose-sweep.js, hot-file-guard.js. Their two Python AST helpers moved with them to agent-manager-hygiene's scripts/. `src/decompose-pass.js` (a DIFFERENT, unrelated preliminary-decompose pass) stays in core.
+- `src/script-extract.js` — the real V8-parser oracle behind a deterministic, zero-model-call script-extract move. Deliberately did NOT move with the rest of the family (S4a) -- `scripts/extract-core-ui.js`, a standalone dev CLI, requires it directly and can't depend on an optional plugin. Registers its own mechanical-move/deterministic-review/deterministic-draft hooks in this same file.
+- `src/hub-priority.js` — per-hub `hubPriority` tag driving both the Hub Tasks tab sort and worker claim order (hub KERNEL, stays in core).
+- `src/mechanical-move-registry.js`, `src/decompose-review-registry.js`, `src/hub-apply-routing.js`, `src/hub-review-detection.js`, `src/file-length-flags-reader.js` — the hooks/registries that let the file-decompose family live in a separate repo without the kernel hardcoding its internals (S1-S4a).
 
 **Drafting, requeue, review**
 - `src/local-draft.js` — the plan/implement/critique tier ladder (`runStalenessFastpath`, `tryDeterministicScriptExtractEdit`).

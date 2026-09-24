@@ -30,17 +30,14 @@ const { runIntegrationGate, realExec } = require('./decompose-integration-gate.j
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 const { recordBranchRemoval } = require('./branch-removal-ledger.js');
 const { isVerifiedMechanicalMove } = require('./mechanical-move-registry.js');
-// Required only for their registerMechanicalMoveKind() side effect (see each file's own
-// registration call) -- this kernel file should know NOTHING about the string
-// 'script-extract'/'one-pass-decompose' beyond "ask the registry." Temporary: today both
-// producer and kernel live in this same repo/process, so this require is how the
-// registration actually reaches decompose-auto-merge.js's process (queue-watcher.sh runs
-// coordinator-sweep.js as its own one-shot `node` process -- see
-// mechanical-move-registry.js's header). Once the file-decompose family moves to hygiene
-// (S4a), these two requires are deleted and hygiene registers its own kinds at its own
-// plugin load time instead.
+// script-extract.js stays in core (also required directly by scripts/extract-core-ui.js,
+// a standalone dev CLI that can't depend on an optional plugin) -- this require reaches
+// its registerMechanicalMoveKind('script-extract', ...) side effect normally, same as any
+// other same-repo require. decompose-one-pass.js moved to agent-manager-hygiene (S4a of
+// the hub-tasks extraction, 2026-09-24), which now registers its own kind at its own
+// plugin load time (register.js, required by config.js's ensureRegistered() --
+// coordinator-sweep.js calls that at its own load).
 require('./script-extract.js');
-require('./decompose-one-pass.js');
 
 const BRANCH_REF = 'refs/decompose-automerge/branch';
 const MAIN_REF = 'refs/decompose-automerge/main';

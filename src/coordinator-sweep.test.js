@@ -15,6 +15,12 @@ process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
 const { coordinatorSweep, classifyChildStatus, sanitizeTaskDisposition } = require('./coordinator-sweep.js');
 
+// This file's own auto-merge fixtures use 'script-extract' as a realistic stand-in
+// mechanical move; the kind is registered automatically since coordinator-sweep.js
+// requires decompose-auto-merge.js, which requires script-extract.js (stays in core --
+// also required directly by scripts/extract-core-ui.js, a standalone dev CLI that can't
+// depend on an optional plugin).
+
 function makePipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coordinator-sweep-test-'));
   for (const s of ['coordinating', 'adhoc', 'blocked', 'needs-clarification', 'done', 'done/_archived_no_action', 'done/_archived/2026-08']) {

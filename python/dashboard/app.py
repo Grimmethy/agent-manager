@@ -4398,16 +4398,24 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     # trigger; the periodic queue-watchdog tick still runs it every 24h regardless of
     # whether a project switch happens to trigger it in between.
     try:
-        _decompose_log_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
-        _decompose_log_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen(
-            ["node", str(SRC_DIR / "proactive-file-decompose-sweep.js"), "--force"],
-            env=child_env,
-            cwd=str(SRC_DIR),
-            stdout=(_decompose_log_dir / "proactive-file-decompose-sweep.log").open("a"),
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        # S4a of the hub-tasks extraction (2026-09-24): proactive-file-decompose-sweep.js
+        # moved to agent-manager-hygiene. Resolved off AGENT_MANAGER_REGISTER_PATH the same
+        # crude "first registered plugin" way scripts/queue-watcher.sh's own equivalent
+        # `_hygiene_src` derivation already does -- skipped (not an error) if the hygiene
+        # plugin isn't installed, same as that script's guard.
+        _register_path = (os.environ.get("AGENT_MANAGER_REGISTER_PATH") or "").split(",")[0].strip()
+        _proactive_sweep = Path(os.path.dirname(_register_path)) / "src" / "proactive-file-decompose-sweep.js" if _register_path else None
+        if _proactive_sweep and _proactive_sweep.is_file():
+            _decompose_log_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
+            _decompose_log_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.Popen(
+                ["node", str(_proactive_sweep), "--force"],
+                env=child_env,
+                cwd=str(_proactive_sweep.parent),
+                stdout=(_decompose_log_dir / "proactive-file-decompose-sweep.log").open("a"),
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
     except OSError as exc:
         logger.warning("Could not spawn proactive-file-decompose-sweep on project select: %s", exc)
 

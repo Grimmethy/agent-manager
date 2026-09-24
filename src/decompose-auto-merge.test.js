@@ -4,6 +4,17 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { autoMergeVerifiedMoveChild, isMechanicalMoveChild } = require('./decompose-auto-merge.js');
 
+// 'script-extract' is registered automatically -- decompose-auto-merge.js requires
+// script-extract.js (which stays in core; also required directly by
+// scripts/extract-core-ui.js, a standalone dev CLI that can't depend on an optional
+// plugin). 'one-pass-decompose' moved to agent-manager-hygiene with decompose-one-pass.js
+// (S4a of the hub-tasks extraction, 2026-09-24), so this file's own test process has
+// nothing to register it -- registered here instead, decoupled from the real producer,
+// since this file's job is to test the MERGE MACHINERY given an already-mechanical kind,
+// not whether a producer's own verifyMove logic is correct (trivially `() => true` there
+// too -- membership in the kind IS the proof, per mechanical-move-registry.js's header).
+require('./mechanical-move-registry.js').registerMechanicalMoveKind('one-pass-decompose', { verifyMove: () => true });
+
 // The merge mechanics below run under the explicit ungated opt-in (lib/main-push-policy.js); the
 // gated default (fails closed, never pushes) is tested at the bottom.
 process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = 'true';

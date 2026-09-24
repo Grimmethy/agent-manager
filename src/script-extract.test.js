@@ -218,3 +218,107 @@ test('locateFunctions handles a realistic mix of plain and async declarations wi
   assert.equal(result.ok, true);
   assert.deepEqual(result.results.map((r) => r.status), ['OK', 'OK', 'OK']);
 });
+
+// --- Deterministic-review hook registration (S4a of the hub-tasks extraction, 2026-09-24)
+// -----------------------------------------------------------------------------------------
+// Exercises the registered verify() end to end (real HTML/JS fixtures + a real repo
+// checkout) -- see decompose-review-registry.js's / this file's own registerDeterministicReview
+// call for the full design.
+
+const os = require('os');
+const path = require('path');
+const fs = require('fs');
+const { verifyDeterministicDraft } = require('./decompose-review-registry.js');
+
+function makeFixtureRepo() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'script-extract-review-test-'));
+}
+
+function writeHtmlWithFn(repoRoot, relPath, scriptBody) {
+  const abs = path.join(repoRoot, relPath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, `<html><body>\n<script>\n${scriptBody}\n</script>\n</body></html>\n`);
+}
+
+function writeJsWithFn(repoRoot, relPath, body) {
+  const abs = path.join(repoRoot, relPath);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  fs.writeFileSync(abs, `'use strict';\n\n${body}`);
+}
+
+test('registered "script-extract" review: a byte-exact re-derivation -> ok:true', () => {
+  const repoRoot = makeFixtureRepo();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\nfunction b() { return 2; }\n');
+  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
+  const extraction = buildExtraction(html, ['a']);
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: extraction.newFileContent },
+      { mode: 'edit', file: 'index.html', find: html, replace: extraction.newHtml },
+    ]),
+  };
+  assert.deepEqual(verifyDeterministicDraft(task, repoRoot), { ok: true });
+});
+
+test('registered "script-extract" review: a plain .js source (no <script> block) byte-exact re-derivation -> ok:true', () => {
+  const repoRoot = makeFixtureRepo();
+  writeJsWithFn(repoRoot, 'src/thing.js', 'function a() { return 1; }\nfunction b() { return 2; }\n');
+  const source = fs.readFileSync(path.join(repoRoot, 'src/thing.js'), 'utf8');
+  const extraction = buildExtraction(source, ['a'], { isHtml: false });
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'src/thing.js', newFile: 'src/lib/a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'src/lib/a.js', content: extraction.newFileContent },
+      { mode: 'edit', file: 'src/thing.js', find: source, replace: extraction.newSource },
+    ]),
+  };
+  assert.deepEqual(verifyDeterministicDraft(task, repoRoot), { ok: true });
+});
+
+test('registered "script-extract" review: tampered content (does not byte-match a fresh re-derivation) -> ok:false', () => {
+  const repoRoot = makeFixtureRepo();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\n');
+  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: 'function a() { return 999; }\n' }, // tampered
+      { mode: 'edit', file: 'index.html', find: html, replace: '<html><body></body></html>' },
+    ]),
+  };
+  const result = verifyDeterministicDraft(task, repoRoot);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /does not byte-match/);
+});
+
+test('registered "script-extract" review: symbols drifted since plan-validation -> ok:false with a clear reason', () => {
+  const repoRoot = makeFixtureRepo();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function somethingElseEntirely() {}\n');
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: 'function a() {}\n' },
+      { mode: 'edit', file: 'index.html', find: 'x', replace: 'y' },
+    ]),
+  };
+  const result = verifyDeterministicDraft(task, repoRoot);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /no longer resolve/);
+});
+
+test('registered "script-extract" review: correctly-shaped Group-B JSON that byte-mismatches still hard-rejects (ok:false)', () => {
+  const repoRoot = makeFixtureRepo();
+  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\n');
+  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
+  const task = {
+    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
+    implementResponse: JSON.stringify([
+      { mode: 'create', file: 'a.js', content: 'function a() { return 999; }\n' },
+      { mode: 'edit', file: 'index.html', find: html, replace: '<html><body></body></html>' },
+    ]),
+  };
+  const result = verifyDeterministicDraft(task, repoRoot);
+  assert.notEqual(result, null);
+  assert.equal(result.ok, false);
+});

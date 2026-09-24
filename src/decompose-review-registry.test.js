@@ -106,23 +106,15 @@ test('verifyOnePassStyleRederivation: a read failure returns ok:false with a rea
   assert.match(result.reason, /could not re-read/);
 });
 
-// Run last: exercises clearDeterministicReviewRegistry, which wipes the SAME process-wide
-// singleton the four producer files register their real kinds into -- restores those four
-// immediately afterward so any other test file sharing this process isn't left with an
-// empty registry.
+// Three of the four producers that register a kind here as a module-load side effect
+// (decompose-one-pass.js, decompose-node-module.js, decompose-flask-blueprint.js) moved to
+// agent-manager-hygiene (S4a of the hub-tasks extraction, 2026-09-24); script-extract.js
+// stays in core but isn't transitively required by this file. Either way, this file's own
+// test process has no "production state" left to restore, so clearing is simply the end
+// state.
 test('clearDeterministicReviewRegistry empties the registry', () => {
   registerDeterministicReview('test-kind-for-clear', { verify: () => ({ ok: true }) });
   assert.deepEqual(verifyDeterministicDraft({ promptContext: { deterministicApply: 'test-kind-for-clear' } }, '/tmp'), { ok: true });
   clearDeterministicReviewRegistry();
   assert.equal(verifyDeterministicDraft({ promptContext: { deterministicApply: 'test-kind-for-clear' } }, '/tmp'), null);
-
-  // Restore production state (re-triggers each producer's own registerDeterministicReview call).
-  delete require.cache[require.resolve('./script-extract.js')];
-  delete require.cache[require.resolve('./decompose-one-pass.js')];
-  delete require.cache[require.resolve('./decompose-node-module.js')];
-  delete require.cache[require.resolve('./decompose-flask-blueprint.js')];
-  require('./script-extract.js');
-  require('./decompose-one-pass.js');
-  require('./decompose-node-module.js');
-  require('./decompose-flask-blueprint.js');
 });
