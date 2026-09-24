@@ -493,19 +493,6 @@ Resolve the cap inside `extractSideFindings` at call time (reading `process.env`
 Benefits:
 Tests and alternate callers can vary the cap without cache-busting or process-level env mutation. The policy is co-located with the function that enforces it, making the dependency explicit rather than implicit in module-load order. If the team treats the cap as a genuine deployment-time constant, the change is harmless; if it ever needs to be per-call, the refactor is already in place.
 
-### AC-38 · Global singleton `persistHook` couples history logging to a hidden persistence strategy
-Strength: Strong
-Files: src/task-history.js, src/local-draft.js
-
-Problem:
-`appendHistoryEvent` in `src/task-history.js` depends on a module-level `let persistHook` that is set externally via `setHistoryPersistHook`. This creates a hidden global-state dependency: a reader of `appendHistoryEvent` cannot determine from its signature or local context whether the call will trigger a disk write, because that decision is governed by mutable state set elsewhere in the process. It also tightly couples the history-logging mechanism to a specific persistence strategy, making it difficult to unit-test `appendHistoryEvent` in isolation without managing the hook's lifecycle or mocking the global.
-
-Solution:
-Refactor `appendHistoryEvent` to accept an optional `persist` function parameter (or an options object containing it). Callers that require persistence, such as `local-draft.js`, pass their specific hook function explicitly. Remove the module-level `let persistHook` and the `setHistoryPersistHook` setter entirely, so the dependency is visible in the function signature rather than hidden in shared mutable state.
-
-Benefits:
-Dependencies become explicit in the function signature, eliminating hidden global state. Unit tests can pass a stub or `undefined` without managing a global hook's lifecycle. The separation of concerns between logging and persistence becomes clear, and the module is no longer coupled to any particular persistence implementation.
-
 ### AC-39 · `checkGpuContention` hard-codes `node:sqlite` and an assumed DB schema
 Strength: Strong
 Files: src/requeue-attribution.js
