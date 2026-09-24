@@ -1213,12 +1213,13 @@ test('reviewTask STILL deterministically blocks a non-decompose manual task citi
 // something it structurally cannot fit in context.
 
 // S4a of the hub-tasks extraction (2026-09-24): the byte-exact/tampered/drifted
-// re-derivation tests that used to live here moved to
-// agent-manager-hygiene/src/script-extract.test.js along with script-extract.js itself --
-// they test the REGISTERED verify() function's actual extraction/byte-compare logic,
-// which is that repo's responsibility now, not this dispatcher's. What remains here is
-// only the kind-gate/shape-fallthrough behavior (still needing a real HTML fixture for
-// the reviewTask() integration tests further down), which needs no real producer at all.
+// re-derivation tests that used to live here moved to script-extract.test.js -- they test
+// the REGISTERED verify() function's actual extraction/byte-compare logic, which belongs
+// with script-extract.js itself (still in this repo -- see its own header for why it did
+// NOT move to agent-manager-hygiene with the rest of the file-decompose family), not this
+// dispatcher's own test file. What remains here is only the kind-gate/shape-fallthrough
+// behavior (still needing a real HTML fixture for the reviewTask() integration tests
+// further down), which needs no real producer at all.
 function writeHtmlWithFn(repoRoot, relPath, scriptBody) {
   const abs = path.join(repoRoot, relPath);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
@@ -1275,8 +1276,8 @@ test('verifyDeterministicScriptExtractDraft: valid 2-element JSON but the wrong 
 });
 
 // The "correctly-shaped JSON that byte-mismatches still hard-rejects" boundary case moved
-// to agent-manager-hygiene/src/script-extract.test.js with the rest of the byte-compare
-// coverage (S4a, 2026-09-24) -- same reasoning as the block comment above.
+// to script-extract.test.js with the rest of the byte-compare coverage (S4a, 2026-09-24)
+// -- same reasoning as the block comment above.
 
 // S4a of the hub-tasks extraction (2026-09-24): proves verifyDeterministicScriptExtractDraft
 // dispatches through decompose-review-registry.js's live registry rather than calling a
@@ -1304,7 +1305,9 @@ test('verifyDeterministicScriptExtractDraft honors an overridden "script-extract
 // one-pass draft was blocked twice by a reviewer misreading the reduced template as "a
 // truncated fragment". The byte-exact/tampered-content coverage moved to
 // agent-manager-hygiene/src/decompose-node-module.test.js with decompose-node-module.js
-// itself (S4a, 2026-09-24) -- same reasoning as script-extract's identical move above.
+// itself (S4a, 2026-09-24, unlike script-extract.js -- see its own header for why that one
+// stayed in this repo) -- same "moves with the producer" reasoning as script-extract's
+// coverage above, just the other direction.
 
 test('verifyDeterministicOnePassDecomposeDraft: not a decompose task -> null (falls through to normal review)', () => {
   const { verifyDeterministicOnePassDecomposeDraft } = require('./review-task.js');
