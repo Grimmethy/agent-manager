@@ -53,6 +53,35 @@ function cleanEntry(raw) {
   return String(raw || '').trim().replace(/^[`'"]+|[`'"]+$/g, '').replace(/\s*\([^)]*\)\s*$/, '').trim();
 }
 
+// 2026-09-24 (arch-discovery-community-19 false positive): a plain `.split(',')` on the
+// Files: line breaks a legitimate parenthetical annotation apart at the commas INSIDE it --
+// `Files: budget-health module (functions: computeBudgetHealthy, estimateBudgetCeiling,
+// usageTokenCount)` split into "budget-health module (functions: computeBudgetHealthy",
+// " estimateBudgetCeiling", " usageTokenCount)". cleanEntry's own trailing-paren strip only
+// catches a *complete* `(...)` group, so the two inner fragments survive as bare
+// FILE_LIKE_ENTRY-shaped identifiers, get probed as file paths, fail to resolve (they're
+// function names, not files), and the whole real, well-grounded finding gets blocked as
+// "fabricated" -- confirmed live: estimateBudgetCeiling has existed in budget-monitor.js
+// since 2026-08-17. Splits only on a comma OUTSIDE any parenthesized span, so the
+// annotation stays intact as one entry for cleanEntry's existing whole-group strip to handle.
+function splitFilesLineEntries(filesLine) {
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  const s = String(filesLine || '');
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '(') depth++;
+    else if (c === ')') depth = Math.max(0, depth - 1);
+    else if (c === ',' && depth === 0) {
+      out.push(s.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
 function resolveCitedFile(repoRoot, claimed, extraRoots = []) {
   const claimedPath = cleanEntry(claimed);
   const none = { claimedPath, exists: false, resolvedPath: null, resolvedVia: null, relPath: null, isFile: false };
@@ -105,7 +134,7 @@ function checkCitedPaths(filesLine, repoRoot, extraRoots = [], { mainBranch = nu
   const checked = checkFilePaths(filesLine, repoRoot, extraRoots);
   // Extension-less entries (see resolveCitedFile's header): the regex above never sees them.
   const seen = new Set(checked.map((r) => r.claimedPath));
-  for (const raw of String(filesLine).split(',')) {
+  for (const raw of splitFilesLineEntries(filesLine)) {
     const entry = cleanEntry(raw);
     if (!entry || path.extname(entry) || !FILE_LIKE_ENTRY.test(entry) || seen.has(entry)) continue;
     seen.add(entry);
@@ -301,6 +330,7 @@ module.exports = {
   symbolCheckBlocks,
   formatSymbolWarnings,
   extractFilesLine,
+  splitFilesLineEntries,
   checkCitedPaths,
   formatFabricatedReason,
   checkCitedSymbols,
