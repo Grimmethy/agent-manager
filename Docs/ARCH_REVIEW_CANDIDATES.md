@@ -453,3 +453,42 @@ Extract the filename pattern (the directory, the prefix, and the signature-inter
 
 Benefits:
 The hidden contract becomes a visible, importable dependency: a reader of either file can follow the import to see exactly what naming convention is in effect. A change to the pattern is a one-line edit in the shared module rather than a coordinated two-file change, eliminating the class of silent breakage where files are written but never consumed. The convention is also trivially unit-testable in isolation, and the coupling is now discoverable through standard "who imports this?" tooling rather than through a comment.
+
+### AC-35 · Four near-identical deterministic gate functions in one file
+Strength: Strong
+Files: src/lib/deterministic-extract.js, src/deterministic-draft-registry.js
+
+Problem:
+`deterministic-extract.js` exports four functions — `tryDeterministicScriptExtractEdit`, `tryDeterministicOnePassDecompose`, `tryDeterministicNodeModuleDecompose`, and `tryDeterministicBlueprintDecompose` — whose bodies are structurally identical: each checks `ctx.deterministicApply` against its own kind string, evaluates a kind-specific predicate on the context shape, and then delegates to the single shared `tryRegisteredDeterministicDraft(task, attempt)`. The file's own header acknowledges these "now only gate on their own kind and dispatch here" and points to `deterministic-draft-registry.js` as the real design home, yet the gate (kind check + predicate + dispatch) is still hand-written four times. Adding a fifth deterministic kind requires a fifth copy of the same `if (!(ctx && ctx.deterministicApply === …)) return null; return tryRegisteredDeterministicDraft(…)` shape, and the set of supported kinds is scattered across four functions rather than one table. The per-kind predicate is the only thing that genuinely varies, but it is interleaved with the shared dispatch, so variation and invariant are not separated.
+
+Solution:
+Collapse the four wrappers into a single data-driven gate. Introduce one internal `tryDeterministic(task, attempt)` that reads `ctx.deterministicApply`, looks up the matching entry in a small array or `Map` of `{ kind, predicate }` pairs, runs the predicate, and calls `tryRegisteredDeterministicDraft` exactly once. The four public named exports remain as thin one-liners that delegate to this shared gate (or callers migrate to a single entry point), so the external API is unchanged. The per-kind predicates become the only per-kind data, and the null-gate contract plus dispatch live in exactly one place.
+
+Benefits:
+Adding a new deterministic kind is now a one-line table entry (kind string + predicate) instead of a new exported function with a copy-pasted guard. The invariant "check kind → check predicate → delegate" is stated once, eliminating the risk that a future edit to the dispatch or null-contract is applied to three of the four functions and missed on the fourth. The file's stated intent (the registry is the design home) is made structurally true rather than merely documented.
+
+### AC-36 · Two parallel git-execution paths in stacked-grounding.js
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+`stacked-grounding.js` defines a shared `runGit(args, cwd)` helper that sets `GIT_ENV`, `GIT_TIMEOUT_MS`, utf-8 encoding, and `cwd`, and both `readFileAtRef` and `grepAtRef` route through it. However, `resolveAtRef` bypasses the helper entirely and inlines its own `execFileSync('git', ['ls-tree', …], { cwd, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 64*1024*1024 })`, re-declaring the same environment hardening and timeout. The "how do we run git safely" decision (no terminal prompt, no interactive GCM, bounded timeout, bounded buffer) is now expressed in two places. If the timeout, env hardening, or buffer policy changes, a reader must remember to update both `runGit` and the inline call, and a change to one silently diverges from the other. The reason the author inlined rather than extended the helper is that `resolveAtRef` needs a larger `maxBuffer` than the other two commands, which the current `runGit` signature cannot express — a tell that the helper's interface is too narrow for the module's own needs.
+
+Solution:
+Extend `runGit` to accept an optional options-override parameter (e.g. `runGit(args, cwd, { maxBuffer })`) that merges caller-supplied values over the defaults, or split into a small internal `gitExec(args, cwd, opts)` that both `runGit` and `resolveAtRef` call. `resolveAtRef` then routes through the same executor, passing its larger buffer as a parameter rather than re-declaring the full `execFileSync` call. The git-invocation contract (env, timeout, encoding, buffer policy) lives in exactly one place.
+
+Benefits:
+A single change to the timeout, env hardening, or buffer default propagates to all git calls automatically. The module no longer contains two independent expressions of the same safety policy, removing the divergence risk. The helper's interface now matches the module's actual needs, so future git commands that require different buffers or options can be added without introducing yet another inline `execFileSync`.
+
+### AC-37 · MAX_SIDE_FINDINGS_PER_RESPONSE frozen from env at module load
+Strength: Worth exploring
+Files: src/side-finding.js
+
+Problem:
+`side-finding.js` resolves `const MAX_SIDE_FINDINGS_PER_RESPONSE = Number(process.env.AGENT_MANAGER_MAX_SIDE_FINDINGS_PER_RESPONSE) || 3;` once at require time into a module-level const, then reads that const inside `extractSideFindings`. The cap is a per-response policy, but it is bound to the process environment at load. A test or an alternate caller that wants a different cap must set the env var and bust the `require.cache` to re-require the module — the same load-time-freeze pattern flagged elsewhere in this codebase. The severity is mitigated by the fact that the value is also exported (so it is at least visible in the interface) and the default of 3 is a sane constant, but it still couples a tunable policy to global load-time state rather than to the call site.
+
+Solution:
+Resolve the cap inside `extractSideFindings` at call time (reading `process.env` on each invocation) or accept an optional `maxFindings` parameter that defaults to the current constant. Either approach makes the policy a per-call decision rather than a load-time one, while preserving the existing default and the exported constant for backward compatibility.
+
+Benefits:
+Tests and alternate callers can vary the cap without cache-busting or process-level env mutation. The policy is co-located with the function that enforces it, making the dependency explicit rather than implicit in module-load order. If the team treats the cap as a genuine deployment-time constant, the change is harmless; if it ever needs to be per-call, the refactor is already in place.
