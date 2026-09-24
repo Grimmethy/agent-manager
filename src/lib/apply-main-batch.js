@@ -118,12 +118,23 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
     try {
       gitRunner.push(TRIAGE_BRANCH);
     } catch (pushErr) {
-      // Same rationale as the ungated path: the commit is real, reviewed work -- kept on the local
-      // branch (prepareStackedBranch trusts a strictly-ahead local copy next tick), not rolled back.
-      for (const s of staged) {
-        results[s.task.id] = { succeeded: false, reason: `push of ${TRIAGE_BRANCH} failed after commit (kept local, not rolled back): ${pushErr.message}` };
+      // 2026-09-24: an ordinary non-fast-forward rejection (origin moved between this run's
+      // fetch and its own push -- e.g. a different apply tick landed first) used to leave
+      // this commit orphaned for prepareStackedBranch's NEXT call to find as genuine
+      // two-sided divergence and refuse to touch until a human reconciled it by hand
+      // (confirmed live twice in two days: 2026-09-23, then four more times on 2026-09-24).
+      // Retry once via fetch+rebase+push -- these are simple appends to different lines of
+      // the same candidate doc, not real code, so a clean rebase is the common case -- before
+      // falling back to the old "kept local, not rolled back" outcome.
+      const recovered = typeof gitRunner.retryPushAfterRebase === 'function' && gitRunner.retryPushAfterRebase(TRIAGE_BRANCH);
+      if (!recovered) {
+        // Same rationale as the ungated path: the commit is real, reviewed work -- kept on the local
+        // branch (prepareStackedBranch trusts a strictly-ahead local copy next tick), not rolled back.
+        for (const s of staged) {
+          results[s.task.id] = { succeeded: false, reason: `push of ${TRIAGE_BRANCH} failed after commit (kept local, not rolled back): ${pushErr.message}` };
+        }
+        return { results, committed: true, pushed: false, branch: TRIAGE_BRANCH };
       }
-      return { results, committed: true, pushed: false, branch: TRIAGE_BRANCH };
     }
     // (returning to main is the wrapper's job, on every exit)
     // NB: this wording must NOT match task-disposition.js's DIRECT_RE ("committed to main" /

@@ -329,7 +329,7 @@ test('prepareStackedBranch: remote exists, local is STRICTLY AHEAD (a prior push
   assert.equal(fs.existsSync(path.join(repoDir, 'step2.txt')), true);
 });
 
-test('prepareStackedBranch: remote exists but has diverged from local -> throws, discards neither side', () => {
+test('prepareStackedBranch: remote exists but has diverged from local -> rescues local to a backup branch and resets to origin, discarding nothing', () => {
   const { bareDir, repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);
   runner.createBranch('agent/decompose-x');
@@ -353,10 +353,18 @@ test('prepareStackedBranch: remote exists but has diverged from local -> throws,
   git(['add', 'step2-other.txt'], otherClone);
   git(['commit', '-m', 'a different step 2, pushed independently'], otherClone);
   git(['push', 'origin', 'agent/decompose-x'], otherClone);
+  const otherTip = git(['rev-parse', 'agent/decompose-x'], otherClone).trim();
   runner.checkoutMain();
 
-  assert.throws(() => runner.prepareStackedBranch('agent/decompose-x'), /diverged/);
-  assert.equal(git(['rev-parse', 'agent/decompose-x'], repoDir).trim(), localTip, 'local commit must still be right there, untouched');
+  assert.doesNotThrow(() => runner.prepareStackedBranch('agent/decompose-x'));
+  // The branch itself now matches origin's (the other side's) tip -- the pipeline can keep going.
+  assert.equal(git(['rev-parse', 'agent/decompose-x'], repoDir).trim(), otherTip, 'agent/decompose-x resets to origin\'s tip');
+  // Local's own unique commit was never dropped -- it lives on a rescue branch, both locally and pushed.
+  const rescueBranches = git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/agent/decompose-x-rescued-*'], repoDir).trim().split('\n').filter(Boolean);
+  assert.equal(rescueBranches.length, 1, 'exactly one rescue branch was created');
+  assert.equal(git(['rev-parse', rescueBranches[0]], repoDir).trim(), localTip, 'the rescue branch points at local\'s original tip');
+  const remoteRescue = git(['ls-remote', bareDir, `refs/heads/${rescueBranches[0]}`], repoDir).trim();
+  assert.ok(remoteRescue.includes(localTip), 'the rescue branch was also pushed to origin');
 });
 
 // 2026-09-07 real incident + 2026-09-08 fix -- the two scenarios that matter when origin
@@ -660,4 +668,66 @@ test('assertCleanTree passes on a clean tree and throws the stable DIRTY_CLONE_E
   assert.doesNotThrow(() => runner.assertCleanTree(), 'untracked files never block checkout/rebase');
   fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v1\ndirty\n');
   assert.throws(() => runner.assertCleanTree(), (e) => e.message.startsWith(DIRTY_CLONE_ERROR_PREFIX) && /tracked\.txt/.test(e.message));
+});
+
+// --- retryPushAfterRebase (2026-09-24) ---------------------------------------------------
+// Reproduces the ordinary case behind the divergence incidents above one level earlier: a
+// push rejected non-fast-forward because someone else pushed to the SAME branch first, on a
+// change that doesn't actually conflict (a real triage-batch append only ever touches the
+// end of a shared candidate doc). retryPushAfterRebase should recover from this without any
+// human involvement.
+test('retryPushAfterRebase: a non-conflicting push rejection recovers via fetch+rebase+push', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/triage-queue');
+  git(['push', '-u', 'origin', 'agent/triage-queue'], repoDir);
+  // Someone else pushes first...
+  const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-other-clone-'));
+  git(['clone', bareDir, otherClone]);
+  git(['config', 'user.email', 'test@example.com'], otherClone);
+  git(['config', 'user.name', 'Test'], otherClone);
+  git(['checkout', 'agent/triage-queue'], otherClone);
+  fs.writeFileSync(path.join(otherClone, 'other-entry.txt'), 'someone else\'s batch\n');
+  git(['add', 'other-entry.txt'], otherClone);
+  git(['commit', '-m', 'their triage batch'], otherClone);
+  git(['push', 'origin', 'agent/triage-queue'], otherClone);
+  // ...then local commits its own, non-overlapping batch and its push is rejected.
+  fs.writeFileSync(path.join(repoDir, 'my-entry.txt'), 'my batch\n');
+  git(['add', 'my-entry.txt'], repoDir);
+  git(['commit', '-m', 'my triage batch'], repoDir);
+  const myTip = git(['rev-parse', 'HEAD'], repoDir).trim();
+  assert.throws(() => git(['push', 'origin', 'agent/triage-queue'], repoDir), /rejected|non-fast-forward/);
+
+  assert.equal(runner.retryPushAfterRebase('agent/triage-queue'), true);
+  assert.equal(git(['status', '--porcelain'], repoDir).trim(), '', 'rebase left a clean tree');
+  assert.ok(fs.existsSync(path.join(repoDir, 'other-entry.txt')), 'their entry is present');
+  assert.ok(fs.existsSync(path.join(repoDir, 'my-entry.txt')), 'my entry is present');
+  const remoteTip = git(['ls-remote', bareDir, 'refs/heads/agent/triage-queue'], repoDir).trim().split(/\s+/)[0];
+  assert.equal(remoteTip, git(['rev-parse', 'agent/triage-queue'], repoDir).trim(), 'the rebased commit actually landed on origin');
+  assert.notEqual(remoteTip, myTip, 'the commit was rebased onto a new base, so its own SHA changed');
+});
+
+test('retryPushAfterRebase: a REAL conflict aborts cleanly and returns false, leaving local as it was', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/triage-queue');
+  git(['push', '-u', 'origin', 'agent/triage-queue'], repoDir);
+  const otherClone = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-other-clone-'));
+  git(['clone', bareDir, otherClone]);
+  git(['config', 'user.email', 'test@example.com'], otherClone);
+  git(['config', 'user.name', 'Test'], otherClone);
+  git(['checkout', 'agent/triage-queue'], otherClone);
+  fs.writeFileSync(path.join(otherClone, 'tracked.txt'), 'v1\ntheir conflicting line\n');
+  git(['add', 'tracked.txt'], otherClone);
+  git(['commit', '-m', 'their conflicting edit'], otherClone);
+  git(['push', 'origin', 'agent/triage-queue'], otherClone);
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v1\nmy conflicting line\n');
+  git(['add', 'tracked.txt'], repoDir);
+  git(['commit', '-m', 'my conflicting edit'], repoDir);
+  const myTip = git(['rev-parse', 'HEAD'], repoDir).trim();
+  assert.throws(() => git(['push', 'origin', 'agent/triage-queue'], repoDir), /rejected|non-fast-forward/);
+
+  assert.equal(runner.retryPushAfterRebase('agent/triage-queue'), false);
+  assert.equal(git(['status', '--porcelain'], repoDir).trim(), '', 'the aborted rebase leaves a clean tree');
+  assert.equal(git(['rev-parse', 'agent/triage-queue'], repoDir).trim(), myTip, 'local is untouched -- the failed rebase changed nothing');
 });
