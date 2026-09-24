@@ -596,3 +596,68 @@ test('remoteHasUnmergedWork: false once origin\'s branch is fully merged into ma
   git(['push', 'origin', 'HEAD:refs/heads/agent/decompose-merged'], repoDir); // same commit as main: nothing main lacks
   assert.equal(runner.remoteHasUnmergedWork('agent/decompose-merged'), false);
 });
+
+// 2026-09-23 (change_review backlog incident): in a DEDICATED apply clone (the one
+// AGENT_MANAGER_APPLY_REPO_ROOT names) stray uncommitted content must never ride through resetToMain's
+// stash/pop -- it re-dirtied the tree every cycle and aborted every checkout/rebase in the triage batch.
+function withApplyRoot(root, fn) {
+  const saved = process.env.AGENT_MANAGER_APPLY_REPO_ROOT;
+  if (root === undefined) delete process.env.AGENT_MANAGER_APPLY_REPO_ROOT; else process.env.AGENT_MANAGER_APPLY_REPO_ROOT = root;
+  try { return fn(); } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_APPLY_REPO_ROOT; else process.env.AGENT_MANAGER_APPLY_REPO_ROOT = saved;
+  }
+}
+
+test('dedicated apply clone: resetToMain quarantines stray content to a patch under .git/ and does NOT pop it back', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v1\nSTRAY FIXTURE\n');
+  fs.writeFileSync(path.join(repoDir, 'stray-untracked.txt'), 'untracked stray\n');
+  withApplyRoot(repoDir, () => createRealGitRunner(repoDir).resetToMain());
+
+  assert.equal(git(['status', '--porcelain'], repoDir).trim(), '', 'tree is clean after the reset -- nothing carried forward');
+  assert.equal(git(['stash', 'list'], repoDir).trim(), '', 'no stash left behind');
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\n');
+  const qdir = path.join(repoDir, '.git', 'agent-manager-quarantine');
+  const patches = fs.readdirSync(qdir);
+  assert.equal(patches.length, 1, 'the stray content is preserved, recoverably');
+  const body = fs.readFileSync(path.join(qdir, patches[0]), 'utf8');
+  assert.match(body, /STRAY FIXTURE/);
+  assert.match(body, /untracked stray/);
+});
+
+test('a NON-dedicated checkout keeps the old round-trip: resetToMain still pops the stash back', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v1\nlive WIP\n');
+  withApplyRoot(undefined, () => createRealGitRunner(repoDir).resetToMain());
+  assert.equal(fs.readFileSync(path.join(repoDir, 'tracked.txt'), 'utf8'), 'v1\nlive WIP\n');
+  assert.equal(fs.existsSync(path.join(repoDir, '.git', 'agent-manager-quarantine')), false);
+});
+
+test('dedicated apply clone: a resetToMain with nothing dirty quarantines nothing', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  withApplyRoot(repoDir, () => createRealGitRunner(repoDir).resetToMain());
+  assert.equal(fs.existsSync(path.join(repoDir, '.git', 'agent-manager-quarantine')), false);
+});
+
+test('quarantineDirtyTree self-heals a dedicated apply clone (the batch pre-flight), and is a no-op anywhere else', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v1\nSTRAY\n');
+  assert.equal(withApplyRoot(undefined, () => createRealGitRunner(repoDir).quarantineDirtyTree()), null);
+  assert.match(git(['status', '--porcelain'], repoDir), /tracked\.txt/, 'not dedicated -> left alone');
+
+  const patch = withApplyRoot(repoDir, () => createRealGitRunner(repoDir).quarantineDirtyTree());
+  assert.ok(patch && fs.existsSync(patch));
+  assert.equal(git(['status', '--porcelain'], repoDir).trim(), '');
+  assert.equal(git(['stash', 'list'], repoDir).trim(), '');
+});
+
+test('assertCleanTree passes on a clean tree and throws the stable DIRTY_CLONE_ERROR_PREFIX naming the files on a dirty one', () => {
+  const { DIRTY_CLONE_ERROR_PREFIX } = require('./git-runner.js');
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = withApplyRoot(undefined, () => createRealGitRunner(repoDir));
+  assert.doesNotThrow(() => runner.assertCleanTree());
+  fs.writeFileSync(path.join(repoDir, 'untracked-only.txt'), 'x');
+  assert.doesNotThrow(() => runner.assertCleanTree(), 'untracked files never block checkout/rebase');
+  fs.writeFileSync(path.join(repoDir, 'tracked.txt'), 'v1\ndirty\n');
+  assert.throws(() => runner.assertCleanTree(), (e) => e.message.startsWith(DIRTY_CLONE_ERROR_PREFIX) && /tracked\.txt/.test(e.message));
+});

@@ -46,7 +46,14 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
   // or starts it fresh off current main (also after a human merged + deleted it).
   const gated = !ungatedMainPushAllowed();
   gitRunner.fetchMain();
-  if (gated) { state.enteredTriageBranch = true; gitRunner.prepareStackedBranch(TRIAGE_BRANCH); } else gitRunner.resetToMain();
+  if (gated) {
+    // Pre-flight BEFORE entering the branch: a dirty apply clone aborts prepareStackedBranch's `checkout -B` / `rebase`
+    // (2026-09-23: ~266 change_review tasks blocked one-by-one on it). Self-heal a dedicated clone, else fail once, loudly.
+    if (typeof gitRunner.quarantineDirtyTree === 'function') gitRunner.quarantineDirtyTree();
+    if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
+    state.enteredTriageBranch = true;
+    gitRunner.prepareStackedBranch(TRIAGE_BRANCH);
+  } else gitRunner.resetToMain();
 
   const staged = [];
   for (const task of eligible) {

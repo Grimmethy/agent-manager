@@ -1457,3 +1457,35 @@ ungatedTest('ungated triage batch: unchanged, no extra checkout (resetToMain alr
   applyDirectToMainBatch([batchTriageTask('back-5')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
   assert.equal(checkoutMains(gitRunner.calls), 0);
 });
+
+// 2026-09-23 (change_review backlog incident): the GATED triage batch checks the clone up front.
+test('gated applyDirectToMainBatch: a dirty apply clone fails the batch ONCE at the pre-flight -- before entering the triage branch', () => {
+  const saved = process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  try {
+    const gitRunner = createFakeGitRunner({ dirtyTree: 'Docs/OBSERVABILITY_FIX_CANDIDATES.md' });
+    assert.throws(
+      () => applyDirectToMainBatch([batchTriageTask('dirty-1'), batchTriageTask('dirty-2')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner }),
+      /apply clone is dirty .*OBSERVABILITY_FIX_CANDIDATES\.md/,
+    );
+    const names = gitRunner.calls.map((c) => c.name);
+    assert.deepEqual(names.filter((n) => ['quarantineDirtyTree', 'assertCleanTree'].includes(n)), ['quarantineDirtyTree', 'assertCleanTree'], 'self-heal is attempted first, then the assert');
+    assert.ok(!names.includes('prepareStackedBranch'), 'never reaches the checkout/rebase that used to abort once per task');
+    assert.ok(!names.includes('checkoutMain'), 'never entered the triage branch, so nothing to return from');
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH; else process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = saved;
+  }
+});
+
+test('gated applyDirectToMainBatch: a clean apply clone proceeds to prepareStackedBranch after the pre-flight', () => {
+  const saved = process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH;
+  try {
+    const gitRunner = createFakeGitRunner();
+    applyDirectToMainBatch([batchTriageTask('clean-1')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+    const names = gitRunner.calls.map((c) => c.name);
+    assert.ok(names.indexOf('assertCleanTree') !== -1 && names.indexOf('assertCleanTree') < names.indexOf('prepareStackedBranch'));
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH; else process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = saved;
+  }
+});

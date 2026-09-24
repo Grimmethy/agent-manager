@@ -107,7 +107,7 @@ test('applyRetryCheck returns an all-zero summary when queue/blocked/ does not e
     pendingDir: path.join(root, 'queue', 'pending'),
     recordModelOutcome: () => {},
   });
-  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, resolved: 0, errors: 0, errorDetails: [] });
+  assert.deepEqual(summary, { checked: 0, requeued: 0, exhausted: 0, resolved: 0, released: 0, held: 0, errors: 0, errorDetails: [] });
 });
 
 // 2026-09-17 (decompose_design_question AC-60/AC-61): git-runner.js's resetToMain()/
@@ -265,4 +265,52 @@ test('applyRetryCheck without needsClarificationDir keeps the original stamp-onc
 
   assert.equal(summary.exhausted, 1);
   assert.ok(fs.existsSync(path.join(blockedDir, 'stuck.json')));
+});
+
+// 2026-09-23 (change_review backlog incident): a dirty apply clone is INFRASTRUCTURE, not a draft failure.
+const DIRTY_REASON = 'applyDirectToMainBatch crashed before producing a result: Command failed: git checkout -B agent/triage-queue origin/agent/triage-queue\nerror: Your local changes to the following files would be overwritten by checkout:\n\tDocs/OBSERVABILITY_FIX_CANDIDATES.md';
+
+test('applyRetryCheck: an infra (dirty apply clone) failure is HELD -- not requeued, no retry burned -- while the clone is still dirty', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const approvedDir = path.join(root, 'queue', 'approved');
+  writeBlockedTask(blockedDir, 'infra-1', { blockedReason: DIRTY_REASON, applyRetryCount: 1 });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {}, isApplyCloneClean: () => false });
+
+  assert.equal(summary.held, 1);
+  assert.equal(summary.requeued, 0);
+  assert.equal(fs.existsSync(path.join(pendingDir, 'infra-1.json')), false, 'no redraft');
+  const held = JSON.parse(fs.readFileSync(path.join(blockedDir, 'infra-1.json'), 'utf8'));
+  assert.equal(held.applyRetryCount, 1, 'retry count untouched');
+  assert.equal(held.history.filter((h) => h.stage === 'infra-held').length, 1);
+
+  applyRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {}, isApplyCloneClean: () => false });
+  const again = JSON.parse(fs.readFileSync(path.join(blockedDir, 'infra-1.json'), 'utf8'));
+  assert.equal(again.history.filter((h) => h.stage === 'infra-held').length, 1, 'stamped once, never re-fired per tick');
+});
+
+test('applyRetryCheck: once the apply clone is clean, an infra failure is released to approved/ to RE-APPLY (no redraft), even at the retry cap', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const approvedDir = path.join(root, 'queue', 'approved');
+  writeBlockedTask(blockedDir, 'infra-2', { blockedReason: DIRTY_REASON, applyRetryCount: 2, implementResponse: '### AC-1 · x' });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {}, isApplyCloneClean: () => true });
+
+  assert.equal(summary.released, 1);
+  assert.equal(summary.exhausted, 0, 'the cap is for draft failures, not infra');
+  assert.equal(fs.existsSync(path.join(pendingDir, 'infra-2.json')), false);
+  const released = JSON.parse(fs.readFileSync(path.join(approvedDir, 'infra-2.json'), 'utf8'));
+  assert.equal(released.implementResponse, '### AC-1 · x', 'the approved result is kept as-is');
+  assert.equal(released.blockedStage, undefined);
+  assert.equal(released.blockedReason, undefined);
+  assert.equal(released.status, 'approved');
+});
+
+test('applyRetryCheck: the rebase-on-dirty-tree and assertCleanTree messages are also classed as infra; a real patch conflict is not', () => {
+  const { isInfraApplyFailure } = require('./apply-retry-check.js');
+  const mk = (blockedReason) => ({ blockedStage: 'apply', blockedReason });
+  assert.equal(isInfraApplyFailure(mk('git rebase origin/master\nerror: cannot rebase: You have unstaged changes.')), true);
+  assert.equal(isInfraApplyFailure(mk('apply clone is dirty (uncommitted tracked changes: a.md) -- refusing')), true);
+  assert.equal(isInfraApplyFailure(mk('git apply failed: patch does not apply')), false);
+  assert.equal(isInfraApplyFailure({ blockedStage: 'review', blockedReason: DIRTY_REASON }), false);
 });
