@@ -427,3 +427,29 @@ Extract the shared register/get/clear pattern into a small factory or base modul
 
 Benefits:
 A single source of truth for the registry contract means a change to error semantics, validation, or logging is made once and propagates to both registries automatically. Reduces the surface area for drift: the two registries can no longer silently diverge on edge-case behaviour (e.g., one throws a `TypeError` while the other throws a `RangeError` for a duplicate key). New registries added to the codebase can adopt the same contract with a one-line instantiation rather than copying and adapting boilerplate.
+
+### AC-33 · Global mutable persistence hook in task-history.js
+Strength: Strong
+Files: src/task-history.js, src/local-draft.js, src/review-task.js
+
+Problem:
+`setHistoryPersistHook` assigns to a module-level `let persistHook` inside `task-history.js`, creating a process-wide mutable singleton that is invisible in the signature of `appendHistoryEvent`. Any module that calls `setHistoryPersistHook`—such as `local-draft.js` or `review-task.js`—silently alters the behavior of every subsequent `appendHistoryEvent` call in that process, regardless of which task or pipeline stage is being processed. The "opt-in per process" comment masks the fact that the hook is actually bound at module-load time, so two pipeline stages or test cases registering different hooks in the same process will interfere with each other, and it is impossible to give different tasks different persistence behaviors within a single process.
+
+Solution:
+Remove the module-level `persistHook` variable and `setHistoryPersistHook` entirely. Instead, add an optional trailing parameter to `appendHistoryEvent(task, stage, detail, persistHook?)`. When the parameter is omitted or `undefined`, the function behaves exactly as it does today with no hook registered (no persistence side-effect). Callers that previously called `setHistoryPersistHook(fn)` simply pass `fn` as the fourth argument at each call site. This makes the dependency explicit in the function signature, scopes persistence behavior to the individual call, and eliminates the hidden global.
+
+Benefits:
+The coupling between unrelated modules disappears: `local-draft.js` and `review-task.js` no longer share a hidden mutable channel, and each call site declares its own persistence behavior. Test isolation improves because a test that registers a hook no longer leaks it into subsequent tests in the same process. The function's contract becomes self-documenting—any reader of `appendHistoryEvent` can see at a glance whether persistence is possible without hunting for a setter elsewhere.
+
+### AC-34 · Hidden filename contract between requeue-attribution.js and pipeline-forensics.js
+Strength: Strong
+Files: src/requeue-attribution.js, src/pipeline-forensics.js
+
+Problem:
+`checkAndEscalate` in `requeue-attribution.js` writes a file to `queue/forensics-requests/requeue-attribution-<sig>.json`, and a comment in that file explicitly states that `pipeline-forensics.js`'s `coverageEntryActive` check is "keyed on this exact filename." The two modules are therefore coupled through an implicit filename convention that is not enforced by any shared constant, type, or interface. A reader of `requeue-attribution.js`'s public interface has no way to know that `pipeline-forensics.js` depends on the exact string format, and if either side changes its pattern the other will silently break—files will be written but never picked up, with no error or log to indicate the mismatch.
+
+Solution:
+Extract the filename pattern (the directory, the prefix, and the signature-interpolation format) into a small shared utility module, e.g. `src/lib/forensics-request-naming.js`, that exports a single function such as `forensicsRequestPath(sig)`. Both `requeue-attribution.js` and `pipeline-forensics.js` import and call that function instead of each hard-coding the string. The shared module becomes the single source of truth for the naming contract, and any future change to the pattern is made in one place.
+
+Benefits:
+The hidden contract becomes a visible, importable dependency: a reader of either file can follow the import to see exactly what naming convention is in effect. A change to the pattern is a one-line edit in the shared module rather than a coordinated two-file change, eliminating the class of silent breakage where files are written but never consumed. The convention is also trivially unit-testable in isolation, and the coupling is now discoverable through standard "who imports this?" tooling rather than through a comment.
