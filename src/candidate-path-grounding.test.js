@@ -7,7 +7,7 @@ const os = require('os');
 const path = require('path');
 
 const {
-  extractFilesLine, checkCitedPaths, formatFabricatedReason,
+  extractFilesLine, splitFilesLineEntries, checkCitedPaths, formatFabricatedReason,
   checkCitedSymbols, checkCitedSymbolsPerEntry, splitCandidateEntries, formatFabricatedSymbolsReason,
   symbolCheckBlocks, formatSymbolWarnings, resolveCitedFile, normalizeFilesLine,
 } = require('./candidate-path-grounding.js');
@@ -79,6 +79,42 @@ test('checkCitedPaths: only considers path-extensioned tokens (a directory citat
   const repo = tmpRepo();
   const { fabricated } = checkCitedPaths('src/dashboard/, src/real-one.js', repo, ['src']);
   assert.equal(fabricated.length, 0); // "src/dashboard/" has no file extension -> not extracted at all
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+// --- splitFilesLineEntries / parenthetical-annotation regression (2026-09-24, arch-discovery-community-19) ---
+
+test('splitFilesLineEntries: does not split on a comma INSIDE parentheses', () => {
+  const entries = splitFilesLineEntries('budget-health module (functions: computeBudgetHealthy, estimateBudgetCeiling, usageTokenCount)');
+  assert.deepEqual(entries, ['budget-health module (functions: computeBudgetHealthy, estimateBudgetCeiling, usageTokenCount)']);
+});
+
+test('splitFilesLineEntries: still splits normally on commas OUTSIDE parentheses', () => {
+  const entries = splitFilesLineEntries('src/a.js, budget-health module (functions: x, y), src/b.js');
+  assert.deepEqual(entries.map((e) => e.trim()), ['src/a.js', 'budget-health module (functions: x, y)', 'src/b.js']);
+});
+
+test('checkCitedPaths: a parenthetical function-list annotation never surfaces its individual function names as separately-fabricated "files" (arch-discovery-community-19 regression -- estimateBudgetCeiling is a real function, not a made-up path)', () => {
+  const repo = tmpRepo();
+  const { fabricated } = checkCitedPaths(
+    'budget-health module (functions: computeBudgetHealthy, estimateBudgetCeiling, usageTokenCount)',
+    repo, ['src'],
+  );
+  const claimed = fabricated.map((f) => f.claimedPath);
+  assert.ok(!claimed.includes('estimateBudgetCeiling'), `must not flag a function name pulled out of the parenthetical; got ${JSON.stringify(claimed)}`);
+  assert.ok(!claimed.includes('computeBudgetHealthy'));
+  assert.ok(!claimed.includes('usageTokenCount'));
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test('checkCitedPaths: a real module cited via a parenthetical function-list annotation is NOT fabricated', () => {
+  const repo = tmpRepo();
+  fs.writeFileSync(path.join(repo, 'src', 'budget-monitor.js'), '// real\nfunction estimateBudgetCeiling(){}\n');
+  const { fabricated } = checkCitedPaths(
+    'src/budget-monitor.js (functions: computeBudgetHealthy, estimateBudgetCeiling, usageTokenCount)',
+    repo, ['src'],
+  );
+  assert.equal(fabricated.length, 0);
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
