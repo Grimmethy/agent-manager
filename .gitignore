@@ -42,7 +42,10 @@ second-brain-opportunities.json
 done-archive-state.json
 job-type-counters.json
 change-review-cursor.json
+change-review-cursor.lowpriority.json
 change-review-skipped.json
+change-review-aged-out.json
+community-dirty-signals.json
 # Scanner false-positive / inconclusive-review ledgers (agent-manager-hygiene's
 # suppression-store.js). When pipelineDir == repoRoot (the self-hosting pipeline) these
 # land at repo root, where git-runner.js's `git stash push -u` before every resetToMain()
