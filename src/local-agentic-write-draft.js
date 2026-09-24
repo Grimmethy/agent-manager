@@ -33,7 +33,7 @@ const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsFo
 const { detectContradictoryLiteralAcceptance } = require('./acceptance-criteria.js');
 const { detectStaleDecomposePremise } = require('./decompose-premise-check.js');
 const { runDecomposePass } = require('./decompose-pass.js');
-const { oversizedFiles } = require('./decompose-loop-autoroute.js');
+const { oversizedFiles } = require('./file-length-flags-reader.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
 
