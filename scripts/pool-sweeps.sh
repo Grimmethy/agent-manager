@@ -39,7 +39,7 @@ if ! "$active"; then exit 0; fi
 
 # Order matters the same way it does in queue-watcher.sh: retries and reconciliation first, triage after.
 SWEEPS=(
-  reject-retry-check apply-retry-check coordinator-sweep rejected-hub-disposition-backfill fix-signature-sweep derived-premise-sweep fabricated-path-recheck-sweep
+  reject-retry-check apply-retry-check coordinator-sweep rejected-hub-disposition-backfill fix-signature-sweep derived-premise-sweep fabricated-path-recheck-sweep expiry-sweep
   blocked-cluster-sweep task-log-reconcile auto-confirm-review adhoc-staleness-flag context-trim-sweep
   side-finding-sweep context-log-sweep needs-clarification-triage product-spec-to-hub file-decompose-to-hub
   decompose-move-determinism-backfill decompose-loop-autoroute merged-work-sweep

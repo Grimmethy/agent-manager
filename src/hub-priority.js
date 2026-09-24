@@ -134,7 +134,7 @@ function compareHubKeys(a, b) {
 //                      is a SEPARATE record this check will see on its own merits
 //   gone            -- the task record can't be found at all (aged out, hand-removed)
 const SIBLING_RESOLVED_STATUSES = new Set([
-  'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'abandoned', 'superseded', 'gone',
+  'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'abandoned', 'superseded', 'aged-out', 'gone',
 ]);
 
 // A stacked chain (queueSubTasks' `after` chain, or a file-decompose stacked hub) commits every step onto ONE shared branch, and each

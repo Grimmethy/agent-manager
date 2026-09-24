@@ -32,6 +32,9 @@
 //                     is already live via a LATER or PARALLEL change (a sibling task, a
 //                     manual edit, a retired candidate). A human judgement, never inferred
 //                     -- the reconcile sweep only respects it, it never assigns it.
+//   aged-out       -- a QUEUED task retired unworked because its subject went stale while it waited (a change_review of a commit older than
+//                     the source's recency window). Deliberately NOT `abandoned` ("work lost -- the one an audit must never miss"): nothing
+//                     was lost, it was retired on purpose. Stamped by expiry-sweep.js; the reconcile sweep only respects it.
 
 const { execFileSync } = require('child_process');
 const { detectDefaultBranch } = require('./git-runner.js');
@@ -40,7 +43,7 @@ const { classifyApplyOutcome } = require('./apply-outcome-classifiers.js');
 const { lastRemoval } = require('./branch-removal-ledger.js');
 
 const TERMINAL_STAGES = new Set([
-  'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'pending-merge', 'abandoned', 'superseded',
+  'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'pending-merge', 'abandoned', 'superseded', 'aged-out',
 ]);
 
 // Terminal states the reconcile sweep must never re-open. `pending-merge` is deliberately

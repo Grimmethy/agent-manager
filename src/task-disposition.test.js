@@ -237,7 +237,8 @@ test('a superseded tail is respected as terminal -- the sweep never re-opens it'
 });
 
 test('TERMINAL_STAGES is the closed vocabulary', () => {
-  assert.deepEqual([...TERMINAL_STAGES].sort(), ['abandoned', 'applied-direct', 'dismissed', 'filed', 'merged', 'noop', 'pending-merge', 'superseded']);
+  // 'aged-out' (2026-09-24): a QUEUED task retired unworked by expiry-sweep.js -- deliberately not 'abandoned' ("work lost").
+  assert.deepEqual([...TERMINAL_STAGES].sort(), ['abandoned', 'aged-out', 'applied-direct', 'dismissed', 'filed', 'merged', 'noop', 'pending-merge', 'superseded']);
 });
 
 // --- realGit / buildShipContext against REAL git (2026-09-14 root-cause) --------------
