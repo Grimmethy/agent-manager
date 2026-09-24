@@ -14,7 +14,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getConfig } = require('./config.js');
+const { getConfig, ensureRegistered } = require('./config.js');
 const { findTaskRecordById } = require('./forensic-bundle.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { runIntegrationGate, realExec } = require('./decompose-integration-gate.js');
@@ -26,6 +26,20 @@ const { hubHasUnmergedEarlierSibling } = require('./hub-priority.js');
 const { restackHubChain } = require('./hub-restack.js');
 const { assignMissingHubSerials, retitleHubMembers } = require('./hub-serial.js');
 const { repairStaleHubRefs } = require('./hub-rename.js');
+
+// S4a of the hub-tasks extraction (2026-09-24): populate the registry with this repo's
+// built-ins AND any AGENT_MANAGER_REGISTER_PATH plugin sources (agent-manager-hygiene)
+// BEFORE isMechanicalMoveChild/decompose-review-registry's dispatch ever runs -- this
+// sweep runs as its own one-shot `node coordinator-sweep.js` process (queue-watcher.sh),
+// so a plugin's registerMechanicalMoveKind/registerDeterministicReview call (once the
+// file-decompose family moves to hygiene) only reaches THIS process if something loads
+// the plugin here. Matches apply-task.js / review-task.js, which already call this at
+// load for the exact same reason. Confirmed live 2026-09-24: this sweep had never called
+// it at all -- harmless today (mechanical-move-registry.js/decompose-review-registry.js
+// are populated by requires still inside THIS repo), but would have silently made every
+// mechanical-move-kind / deterministic-review lookup here always miss once those
+// registrations move to a plugin.
+ensureRegistered();
 
 // On by default (2026-09-09, after a shakeout release as opt-in): the sweep merges a
 // verified mechanical move child's branch to main itself, instead of a human clicking
