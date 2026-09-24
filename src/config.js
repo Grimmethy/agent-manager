@@ -177,6 +177,16 @@ function getConfig() {
   const archImportCandidatesPath = process.env.AGENT_MANAGER_ARCH_IMPORT_CANDIDATES_PATH || path.join(applyRepoRoot, 'Docs', 'ARCH_IMPORT_CANDIDATES.md');
   const communityCoveragePath = process.env.AGENT_MANAGER_COMMUNITY_COVERAGE_PATH || resolveCommunityCoveragePath(repoRoot, pipelineDir);
   const graphPath = process.env.AGENT_MANAGER_GRAPH_PATH || resolveGraphPath(repoRoot);
+  // Owned exclusively by change_review's per-commit dirty-flagging (2026-09-24) --
+  // arch_discovery only ever reads it. Deliberately a SEPARATE file from
+  // communityCoveragePath: that file is already owned by the daily build_graph.py rebuild,
+  // and two independent processes (a Python cron and a Node per-commit hook) writing the
+  // same file invites a lost-update race neither side would ever see locally. See
+  // SecondBrain/Research/architecture-review.md's staleness section for why this exists
+  // alongside (not instead of) arch_discovery's own content-hash staleness check --
+  // redundant, structurally independent detection of the same "this community changed"
+  // fact, so a bug in one path doesn't silently blind the whole mechanism.
+  const communityDirtySignalsPath = process.env.AGENT_MANAGER_COMMUNITY_DIRTY_SIGNALS_PATH || path.join(pipelineDir, 'community-dirty-signals.json');
   const domainsPath = process.env.AGENT_MANAGER_DOMAINS_PATH || path.join(pipelineDir, 'task-domains.json');
   // project_search's apply target lives OUTSIDE any single project's repo root by design
   // (see ADR-0018) -- a cross-project lead ledger, not something scoped to repoRoot the way
@@ -414,7 +424,7 @@ function getConfig() {
 
   return {
     repoRoot, applyRepoRoot, pipelineDir, secondBrainDir, grepAllowedDirs, unusedScanDirs, unusedSearchDirs, registerPath,
-    troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, graphPath, domainsPath,
+    troubleLogPath, archReviewCandidatesPath, archImportCandidatesPath, communityCoveragePath, communityDirtySignalsPath, graphPath, domainsPath,
     projectSearchIndexPath,
     deepDiveCoveragePath, deepDiveClonesDir, deepDiveAnalysisDir, importCoveragePath, observabilityCoveragePath,
     observabilityFixCandidatesPath, performanceFixCandidatesPath,
