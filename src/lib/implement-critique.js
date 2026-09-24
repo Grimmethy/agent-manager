@@ -18,6 +18,8 @@ const { resolveStrategy } = require('../model-strategies.js');
 const { PINNED_NUM_CTX } = require('../gpu-capacity.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('../local-client.js');
 const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./harness-search.js');
+const fs = require('fs');
+const path = require('path');
 
 // For a Group B source (JSON edits, or the FALSE POSITIVE escape line) the revision must still be that shape. Any other source's
 // revision is free-form by design, so it is always kept, exactly as before.
@@ -66,6 +68,22 @@ async function runCritiqueAndRevision(task, {
     }
   } catch (err) {
     console.warn('[local-draft] pre-critique missing-file check failed (advisory):', (err && err.message) || err);
+  }
+
+  // Advisory find-string uniqueness check (HUB0043): flags edit-mode items whose find
+  // string matches 0 times (would fail at apply time) or >1 times (ambiguous target).
+  // Same best-effort contract as the missing-file check above -- any failure leaves
+  // task.preFilterFlags untouched and critique proceeds unchanged.
+  try {
+    const findFlags = checkFindStrings(task.implementResponse || '', getConfig().repoRoot);
+    if (findFlags.length) {
+      const existing = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
+      const seen = new Set(existing.map((f) => `${f.type} ${f.detail}`));
+      const added = findFlags.filter((f) => !seen.has(`${f.type} ${f.detail}`));
+      if (added.length) task.preFilterFlags = [...existing, ...added];
+    }
+  } catch (err) {
+    console.warn('[local-draft] pre-critique find-string check failed (advisory):', (err && err.message) || err);
   }
 
   const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
@@ -434,4 +452,34 @@ async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budg
   return implResult;
 }
 
-module.exports = { revisionKeepsAnswerShape, runCritiqueAndRevision, computeImplementBudget, callImplementModel };
+// Deterministic find-string uniqueness check for Group B edit items.
+// Mirrors src/apply-group-b.js applyOneChange's matchCount logic: 0 → not found, >1 → ambiguous.
+// Returns [] on parse failure or non-array; skips create/delete items and missing files.
+function checkFindStrings(implementResponse, repoRoot) {
+  let items;
+  try {
+    items = parseJsonMaybeFenced(implementResponse);
+  } catch {
+    return [];
+  }
+  if (!items) return [];
+  if (!Array.isArray(items)) items = [items];
+  const flags = [];
+  for (const item of items) {
+    if (!item || item.mode !== 'edit') continue;
+    if (typeof item.find !== 'string' || item.find === '') continue;
+    if (!item.file) continue;
+    const resolved = path.resolve(repoRoot, item.file);
+    if (!fs.existsSync(resolved)) continue;
+    const text = fs.readFileSync(resolved, 'utf8');
+    const matchCount = text.split(item.find).length - 1;
+    if (matchCount === 0) {
+      flags.push({ type: 'find_not_found', detail: `find string not found in ${item.file}` });
+    } else if (matchCount > 1) {
+      flags.push({ type: 'find_ambiguous', detail: `find string matches ${matchCount} times in ${item.file} (ambiguous)` });
+    }
+  }
+  return flags;
+}
+
+module.exports = { revisionKeepsAnswerShape, runCritiqueAndRevision, computeImplementBudget, callImplementModel, checkFindStrings };
