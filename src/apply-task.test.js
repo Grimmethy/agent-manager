@@ -197,7 +197,8 @@ test('artifact write failure rolls back the branch before any add/commit/push', 
   const names = gitRunner.calls.map((c) => c.name);
   // First deleteBranch is the defensive pre-cleanup before createBranch; second is the
   // real rollback after the artifact write failure.
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch']);
+  // The trailing resetToMain (2026-09-24) clears the partial write abandonBranch() leaves uncommitted in the working tree.
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch', 'resetToMain']);
 });
 
 // Regression, 2026-08-22: an empty implementResponse (several Group B sources are
@@ -485,7 +486,8 @@ test('candidateSplitProposals: throws (rolls back the branch) when the resolved 
   assert.equal(result.succeeded, false);
   assert.match(result.reason, /no registered candidatesPath/);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch']);
+  // The trailing resetToMain (2026-09-24) clears the partial write abandonBranch() leaves uncommitted in the working tree.
+  assert.deepEqual(names, ['fetchMain', 'resetToMain', 'deleteBranch', 'createBranch', 'checkoutMain', 'deleteBranch', 'resetToMain']);
 });
 
 ungatedTest('arch_import: same direct-to-main shape as arch_discovery (both sources share DIRECT_TO_MAIN_SOURCES)', () => {
@@ -1325,7 +1327,8 @@ test('stacked seq 2: rides on top of the existing shared branch via prepareStack
     { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
   assert.equal(result.succeeded, true);
   const names = gitRunner.calls.map((c) => c.name);
-  assert.deepEqual(names, ['fetchMain', 'prepareStackedBranch', 'checkoutTracking', 'add', 'commit', 'push', 'checkoutMain']);
+  // quarantineDirtyTree + assertCleanTree (2026-09-24): the pre-flight the triage batch already had -- neither resets or deletes anything.
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree', 'prepareStackedBranch', 'checkoutTracking', 'add', 'commit', 'push', 'checkoutMain']);
   assert.ok(!names.includes('resetToMain'), 'must not reset directly -- prior steps live on this branch');
   assert.ok(!names.includes('deleteBranch'), 'must not delete the shared branch directly');
 });
@@ -1340,6 +1343,30 @@ test('stacked child: a write failure steps off the branch but does NOT delete it
   const names = gitRunner.calls.map((c) => c.name);
   assert.ok(names.includes('checkoutMain'));
   assert.ok(!names.includes('deleteBranch'), 'the shared branch carries committed prior steps -- never delete on cleanup');
+  // ...but the partial write it left uncommitted IS cleared (resetToMain acts on main only; the stacked branch keeps its commits).
+  assert.ok(names.lastIndexOf('resetToMain') > names.indexOf('checkoutMain'), 'cleared after stepping off the branch');
+});
+
+// 2026-09-24 (apply-clone dirt incident): the single-task path gets the same pre-flight as the triage batch.
+test('stacked seq 2 on a dirty apply clone: fails ONCE up front with the stable message, before prepareStackedBranch touches anything', () => {
+  const { DIRTY_CLONE_ERROR_PREFIX } = require('./git-runner.js');
+  const { isInfraApplyFailure } = require('./apply-retry-check.js');
+  const gitRunner = createFakeGitRunner({ dirtyTree: 'Docs/ARCH_REVIEW_CANDIDATES.md', existingBranches: ['agent/decompose-x'], remoteBranches: ['agent/decompose-x'], isAncestorFn: () => true });
+  const result = applyTask(baseTask({ id: 'adhoc-decompose-x-02-b', stacked: { branch: 'agent/decompose-x', seq: 2 } }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  assert.equal(result.succeeded, false);
+  assert.ok(result.reason.startsWith(DIRTY_CLONE_ERROR_PREFIX) && /ARCH_REVIEW_CANDIDATES\.md/.test(result.reason), result.reason);
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.deepEqual(names, ['fetchMain', 'quarantineDirtyTree', 'assertCleanTree'], 'self-heal is attempted first, then the assert -- and nothing after it');
+  // The message must land where apply-retry-check treats it as INFRASTRUCTURE (held, no retry burned, released once clean), not a draft failure.
+  assert.equal(isInfraApplyFailure({ blockedStage: 'apply', blockedReason: result.reason }), true);
+});
+
+test('a normal (non-stacked) apply is unchanged: resetToMain already clears stray content, so no extra pre-flight calls', () => {
+  const gitRunner = createFakeGitRunner();
+  applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.ok(!names.includes('assertCleanTree') && !names.includes('quarantineDirtyTree'));
+  assert.equal(names[1], 'resetToMain');
 });
 
 // --- Gated default (2026-09-19): nothing reaches main without a human merge ----------------------
