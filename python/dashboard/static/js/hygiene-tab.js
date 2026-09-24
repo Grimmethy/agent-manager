@@ -31,7 +31,7 @@ const HYGIENE_STATUS_HELP = {
   done: 'Reviewed and closed -- see the disposition. dismissed / noop = the review found nothing to change (a scanner false positive).',
   digest: 'Low confidence: not reviewed yet; will be reviewed in the daily batched digest task.',
   suppressed: 'A review already judged this a false positive (or it was suppressed by hand); it is not re-reviewed.',
-  stale: 'The file changed or is gone, so the flag no longer applies.',
+  stale: 'The file changed or is gone, so the flag no longer applies. (Change review: the commit is older than the review window, so it was aged out and will not be reviewed.)',
 };
 
 function hygieneBadge(status, title) {
