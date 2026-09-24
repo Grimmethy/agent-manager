@@ -401,3 +401,29 @@ Add an optional `projectsDir?` parameter to `computeBudgetHealthy(projectsDir?)`
 
 Benefits:
 Tests no longer need the set-env → delete-from-cache → re-require dance, eliminating a class of flaky, order-dependent test failures. CI sandboxes and multi-agent deployments can scan arbitrary transcript stores in the same process without global mutation. The module's interface honestly reflects its one degree of freedom (the scan target), making the code easier to reason about and compose.
+
+### AC-31 · Registry mutation bypasses the `scope:'core'` guard
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`registerTaskSource` wraps the caller-supplied `config.next` in a closure that evaluates the `sourceEligibleHere` guard at invocation time, so that every call to `next` re-checks the `scope:'core'` eligibility before delegating to the original function. However, `updateTaskSource` performs a raw `Object.assign` onto the existing registry entry, replacing `next` with whatever the caller supplies. Because the update path never re-applies the `sourceEligibleHere` wrapper, a plugin can initially register a source with `scope:'core'` (installing the guard wrapper at registration time) and then later call `updateTaskSource` to swap in a new `next` implementation that executes without any scope check. The result is that a core-scoped task source can silently run on non-core projects, violating the architectural boundary the guard was introduced to protect.
+
+Solution:
+Route all mutations of a registered source's `next` field through a single internal setter (or make `updateTaskSource` re-apply the `sourceEligibleHere` wrapper to the incoming `next` before assigning it). The wrapper should capture the source's declared `scope` at registration time and re-validate on every invocation, so the eligibility contract is invariant across the source's lifetime regardless of how many times `next` is replaced.
+
+Benefits:
+Closes the bypass so the `scope:'core'` guarantee holds for the entire lifetime of a registered source, not just at the moment of initial registration. Eliminates a class of subtle plugin-privilege-escalation bugs where a seemingly benign update call silently removes a security boundary. Makes the registry's contract easier to reason about because there is exactly one code path that can place a function into the `next` slot, and that path always enforces the guard.
+
+### AC-32 · Duplicated registry boilerplate across task-source and model-profile registries
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/model-profile-registry.js
+
+Problem:
+`task-source-registry.js` and `model-profile-registry.js` each independently implement the same three-operation registry contract: `register` (throws on duplicate key), `get` (returns `undefined` for a missing key), and `clear` (iterates keys and deletes each). The logic is line-for-line equivalent apart from the entity name. Any future change to the registry contract—adding input validation, structured error types, logging hooks, or a different collision policy—must be implemented and tested in both files, and the two copies can drift independently over time.
+
+Solution:
+Extract the shared register/get/clear pattern into a small factory or base module (e.g., `createRegistry(entityLabel)`) that both registries instantiate, passing only the label used in error messages and any entity-specific validation hook. Each registry file then retains only its domain-specific logic (such as the `sourceEligibleHere` wrapping in the task-source registry) while delegating the generic bookkeeping to the shared implementation.
+
+Benefits:
+A single source of truth for the registry contract means a change to error semantics, validation, or logging is made once and propagates to both registries automatically. Reduces the surface area for drift: the two registries can no longer silently diverge on edge-case behaviour (e.g., one throws a `TypeError` while the other throws a `RangeError` for a duplicate key). New registries added to the codebase can adopt the same contract with a one-line instantiation rather than copying and adapting boilerplate.
