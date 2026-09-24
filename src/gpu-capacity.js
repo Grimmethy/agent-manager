@@ -14,7 +14,6 @@
 
 const SAFETY_MARGIN_FRACTION = 0.15; // unclaimed headroom, proportional to total VRAM (not a fixed MiB carve-out) -- scales with card size instead of being tuned for one specific GPU.
 const MIN_NUM_CTX = 2048;
-const DEFAULT_NUM_CTX = 8192; // fallback when no live VRAM reading is available at all -- the value this system used before this module existed.
 
 // 2026-08-23, Grimmethy: "Go ahead with option B" (one-time reload to a larger fixed
 // context, then hold it steady) -- see resolveNumCtx()'s own comment for the incident
@@ -161,7 +160,6 @@ module.exports = {
   resolveTimeoutMs,
   SAFETY_MARGIN_FRACTION,
   MIN_NUM_CTX,
-  DEFAULT_NUM_CTX,
   PINNED_NUM_CTX,
   EXTENDED_NUM_CTX,
   HARD_TIMEOUT_CEILING_MS,
