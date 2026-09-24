@@ -559,3 +559,29 @@ Benefits:
 A stats-recording failure becomes a logged, diagnosable event instead of a silent data gap — the same visibility `get_turns_summary` already provides for its read path. The "never break the feature" contract is preserved (still no exception), but the operator can now see *why* the Models tab is missing rows, which is the exact class of blind spot the file's own incident comment is trying to eliminate.
 
 NOTE: Flag 3 was not applied as a "mistaken" flag because the draft's Problem section did not claim the current code *violates* the file's stated contract; it correctly noted the contract is satisfied (no exception propagates) and framed the missing log as a visibility gap beyond what the contract requires. The corrected Problem section makes this distinction explicit.
+
+### AC-43 · `stacked-grounding.js` duplicates git-runner's remote-branch existence check
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The module's own header comment states that `resolveGroundingRef` reuses `git-runner.js`'s real adapter (the same fetch + refs/remotes/origin/* existence check that `apply-task.js`'s `prepareStackedBranch` already depends on) to avoid a second hand-rolled check. However, the implementation contradicts this by calling `runner.fetchBranch(branch)` and `runner.remoteBranchExists(branch)` directly rather than delegating to a unified helper inside `git-runner.js`. This creates a tight coupling to the internal API of `git-runner.js`—specifically the assumption that `createRealGitRunner` returns an object exposing exactly those two methods—while failing to centralize the logic. If `git-runner.js` refactors its existence-check mechanism (e.g., switching to `git ls-remote` or caching results), `stacked-grounding.js` will break silently or require a coordinated change, violating the "one place to get it right" principle the module claims to implement.
+
+Solution:
+Move the `fetchBranch` + `remoteBranchExists` logic into `git-runner.js` as a single public method (e.g., `runner.resolveRemoteBranch(branch)` or `runner.isRemoteBranchAvailable(branch)`). `stacked-grounding.js` should call that one method instead of orchestrating the two-step sequence itself. This ensures the "real adapter" logic lives in one place and that `stacked-grounding.js` depends on a stable, documented interface rather than an implementation detail of the runner's internal state.
+
+Benefits:
+Eliminates the risk of `stacked-grounding.js` breaking when `git-runner.js` internals change. Makes the dependency explicit and testable: `stacked-grounding.js` can mock a single `resolveRemoteBranch` method rather than mocking two separate methods and their side effects. Aligns the code with its own stated design principle of centralizing the "which git ref" decision.
+
+### AC-44 · `incident-amplification.js` bypasses `side-finding.js`'s extraction/dedup pipeline
+Strength: Worth exploring
+Files: src/incident-amplification.js, src/side-finding.js
+
+Problem:
+`incident-amplification.js` calls `writeSideFindingInbox` directly for each grep hit, bypassing `extractSideFindings` and the associated deduplication logic (title-based dedup, placeholder filtering, max-count enforcement) that `side-finding.js` provides. The comment in `incident-amplification.js` claims it reuses "side-finding.js/side-finding-sweep.js's already-built filing+dedup machinery end to end," but it only reuses the filing part (`writeSideFindingInbox`), not the dedup part. If `grepCodebase` returns multiple hits for the same file:line (e.g., due to multi-line matches or repeated patterns), `incident-amplification.js` will file multiple identical side-findings, whereas `extractSideFindings` would have deduplicated them. This creates an inconsistency in the side-finding inbox: some entries are deduplicated (from model responses), others are not (from incident amplification), forcing `side-finding-sweep.js` to handle both cases and contradicting the claim that no new dedup logic is needed.
+
+Solution:
+Refactor `incident-amplification.js` to construct a synthetic text block containing the grep hits in the `SIDE-FINDING:` format, then pass it through `extractSideFindings` to leverage the existing dedup and filtering logic. Alternatively, extract the dedup logic from `extractSideFindings` into a separate `deduplicateFindings` function that both `extractSideFindings` and `incident-amplification.js` can call. Either approach ensures all side-findings, regardless of source, go through the same dedup pipeline.
+
+Benefits:
+Ensures consistent deduplication behavior across all side-finding sources. Reduces the risk of duplicate entries in the inbox that would otherwise require additional handling in `side-finding-sweep.js`. Makes the "reuses existing machinery" claim accurate and reduces the surface area for dedup-related bugs.
