@@ -1717,3 +1717,37 @@ index 57742dce..dddce0d9 100644
 Problem: [severity: med; regression shipped in 1120da6] A task sentence that genuinely requests a code change but happens to contain the standalone word "see" or "per" is no longer detected as wanting code, so the docs-only gate silently passes a docs-only diff that the pre-diff blind scan would have blocked.  Failure scenario: Task text: `"See src/foo.js and fix the race condition in the handler."` with a diff that only creates `docs/adr/0042-race-fix.md`. Trace: `wantsCodeChange` splits into one sentence. `CODE_SIGNAL_RE.test("See src/foo.js and fix the race condition in the handler.")` → true (matches `src/`). `CITATION_CONTEXT_RE.test(same)` → true (matches `\bsee\b`, case-insensitive). Therefore `CODE_SIGNAL_RE.test(sen) && !CITATION_CONTEXT_RE.test(sen)` → `true && false` → false. `sentences.some(...)` → false. `wantsCodeChange` returns false. The gate at line 363 (`wantsCode = … : wantsCodeChange(combined)`) evaluates to false, so the `if (wantsCode)` block is skipped and `adhocDiffSubstanceProblem` returns null (no problem). Before this diff, `CODE_SIGNAL_RE.test(combined)` on the same blob returned true, the gate fired, and the docs-only diff was blocked with `code: 'docs-only'`.
 Solution: Remove the bare `per\b` and `see\b` alternatives from `CITATION_CONTEXT_RE` (they are too broad to serve as citation markers), or replace them with more specific multi-word phrases (e.g. `per the (?:spec|docs|design)`, `see (?:the|this|above) (?:spec|doc|section)`) so that a sentence like "See src/foo.js and fix the bug" is not excluded from the code-signal scan.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 1120da6.
+
+### AC-110 · Removing `OSError` from the except tuple in `_call_discuss` narrows the caught set from al (b016e3f app.py)
+Strength: Strong
+Source: change_review of b016e3f "Merge AC-63 · A non-model `OSError` (e.g. `FileNotFoundError`, `PermissionError`"
+Files: python/dashboard/app.py
+
+Snippet:
+```
+diff --git a/python/dashboard/app.py b/python/dashboard/app.py
+index 951e8e12..d9653a8c 100644
+--- a/python/dashboard/app.py
++++ b/python/dashboard/app.py
+@@ -333,25 +333,25 @@ def _call_discuss(fn, *args, **kwargs):
+     was mid-draft on the same Ollama model at that exact moment (Discuss has no
+     coordination with the worker lanes' own use of it -- see the standing, deliberately-
+     deferred discussion on adding a shared lock), the reply call queued behind it and hit
+     ollama_client.py's own 240s timeout, and that raised a bare TimeoutError with no
+     handling here at all -- same raw-500-with-no-explanation failure mode this function
+     already exists to prevent for the Claude side, just never extended to Ollama's own
+     connection/timeout errors."""
+     from claude_client import ClaudeClientError
+     try:
+         return fn(*args, **kwargs)
+     except ClaudeClientError as e:
+         abort(502, description=str(e))
+-    except (TimeoutError, ConnectionError, OSError) as e:
++    except (TimeoutError, ConnectionError) as e:
+         abort(502, description=f"local model call failed (
+...[snippet truncated]
+```
+
+Problem: [severity: high; regression shipped in b016e3f] Removing `OSError` from the except tuple in `_call_discuss` narrows the caught set from all `OSError` subclasses to only `TimeoutError` and `ConnectionError`, so `FileNotFoundError` and `PermissionError` (both `OSError` subclasses that are neither) now propagate uncaught as raw 500s instead of being converted to a 502 with an actionable message.  Failure scenario: A brain-dump discuss/start request arrives via `routes/brain_dump.py:297` (`_call_discuss(start_session, pipeline_dir, entry_id, entry["rawText"], kind="brain-dump", …)`). The project's `pipeline_dir` has been deleted or its permissions revoked (e.g. an admin removed the directory between requests). `start_session` (from `discuss_sessions`) attempts to open a session JSON file under that directory and raises `FileNotFoundError`. Before the diff, the `except (TimeoutError, ConnectionError, OSError)` clause caught it and returned HTTP 502 with the body "local model call failed ([Errno 2] No such file or directory: …) -- it may be busy with an active worker-lane task; try again shortly or switch to Claude." After the diff, `FileNotFoundError` is neither a `TimeoutError` nor a `ConnectionError`, so it escapes `_call_discuss`, Flask's default error handler fires, and the user sees a bare 500 "Internal Server Error" page with no explanation — the exact failure mode the function's docstring says it "already exists to prevent." The commit message itself names `FileNotFoundError` and `PermissionError` as the errors raised during the session call, confirming they are reachable in practice.
+Solution: Restore `OSError` in the tuple: `except (TimeoutError, ConnectionError, OSError) as e:` (or simply `except OSError as e:`, since both `TimeoutError` and `ConnectionError` are `OSError` subclasses in CPython 3). This matches the sibling `_call_chat` function in the same file, which still catches all three.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in b016e3f.
