@@ -112,4 +112,15 @@ function planIsFullyMechanicalHtml(request, validation) {
 // there is nothing left to re-verify at merge time either.
 require('./mechanical-move-registry.js').registerMechanicalMoveKind('one-pass-decompose', { verifyMove: () => true });
 
+// Deterministic-review hook (S4a of the hub-tasks extraction, 2026-09-24,
+// decompose-review-registry.js's own header has the full design). Moved verbatim from
+// review-task.js's former verifyDeterministicOnePassDecomposeDraft branch -- the shared
+// "N creates + one edit" shape check/byte-compare lives in
+// verifyOnePassStyleRederivation, this kind only supplies its own rebuild.
+require('./decompose-review-registry.js').registerDeterministicReview('one-pass-decompose', {
+  verify: (task, repoRoot) => require('./decompose-review-registry.js').verifyOnePassStyleRederivation(
+    task, repoRoot, (sourceText, sourceFile, moves) => buildOnePassGroupBChanges(sourceText, sourceFile, moves),
+  ),
+});
+
 module.exports = { buildOnePassGroupBChanges, spliceScriptTags, scriptTagFor, planIsFullyMechanicalHtml };

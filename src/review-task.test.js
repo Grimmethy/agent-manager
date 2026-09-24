@@ -1368,6 +1368,25 @@ test('verifyDeterministicScriptExtractDraft: correctly-shaped Group-B JSON that 
   assert.equal(result.ok, false);
 });
 
+// S4a of the hub-tasks extraction (2026-09-24): proves verifyDeterministicScriptExtractDraft
+// dispatches through decompose-review-registry.js's live registry rather than calling
+// script-extract.js's logic inline -- an override changes the outcome with zero changes to
+// review-task.js itself. Restores the real registration afterward since the module is a
+// process-wide singleton shared across every test file.
+test('verifyDeterministicScriptExtractDraft honors an overridden "script-extract" registration', () => {
+  const { registerDeterministicReview } = require('./decompose-review-registry.js');
+  const task = { promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] }, implementResponse: '[]' };
+  registerDeterministicReview('script-extract', { verify: () => ({ ok: true, fromOverride: true }) });
+  try {
+    const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
+    assert.deepEqual(verifyDeterministicScriptExtractDraft(task, '/tmp'), { ok: true, fromOverride: true });
+  } finally {
+    // Restore the real script-extract.js registration.
+    delete require.cache[require.resolve('./script-extract.js')];
+    require('./script-extract.js');
+  }
+});
+
 // --- Deterministic ONE-PASS / node-module decompose review gate (2026-09-09) ------------
 // A whole fully-mechanical file-decompose filed as ONE task ([[hub-task-integration]]):
 // N `create` changes + one `edit`, re-derivable byte-for-byte, and a diff (index.html:
