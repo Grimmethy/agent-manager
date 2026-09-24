@@ -74,6 +74,30 @@ function isFindStringMiss(task) {
   return isApplyFailure(task) && FIND_NOT_FOUND_RE.test(String(task.blockedReason || ''));
 }
 
+// 2026-09-23 (change_review backlog incident): a dirty apply clone aborts `git checkout -B` / `git rebase`
+// ("Your local changes to the following files would be overwritten", "cannot rebase: You have unstaged
+// changes", or git-runner.js's own assertCleanTree "apply clone is dirty"). That is INFRASTRUCTURE -- the
+// draft was fine, the review approved it. Treating it like a draft failure requeued ~266 tasks for a full
+// redraft + re-review each (and pushed some to the retry cap, i.e. toward a human), only to fail the same way.
+// Such a task is held untouched (no retry burned) while the clone is dirty, then released straight back to
+// approved/ to RE-APPLY its already-approved result, no model call spent.
+const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following files would be overwritten|cannot rebase: you have unstaged changes/i;
+function isInfraApplyFailure(task) {
+  return isApplyFailure(task) && INFRA_APPLY_RE.test(String(task.blockedReason || ''));
+}
+
+// True when the apply clone has no uncommitted tracked changes (the exact condition checkout/rebase need).
+// Any error reading it counts as NOT clean: releasing into a broken clone would just re-fail.
+function defaultIsApplyCloneClean() {
+  try {
+    const { applyRepoRoot } = getConfig();
+    const out = require('child_process').execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: applyRepoRoot, encoding: 'utf8', stdio: 'pipe', timeout: 30_000 });
+    return out.trim() === '';
+  } catch {
+    return false;
+  }
+}
+
 function buildExhaustedApplyQuestion(task) {
   return [
     `An apply failure survived ${MAX_APPLY_RETRIES} automatic redraft attempts: ${String(task.blockedReason || '(no reason recorded)')}`,
@@ -107,8 +131,8 @@ function landAsResolvedFalsePositive(task, name, filePath, approvedDir) {
   fs.unlinkSync(filePath);
 }
 
-function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approvedDir, pipelineDir, repoRoot, extraRoots, decideResolved = decideFindingResolved, recordModelOutcome = defaultRecordModelOutcome }) {
-  const summary = { checked: 0, requeued: 0, exhausted: 0, resolved: 0, errors: 0, errorDetails: [] };
+function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approvedDir, pipelineDir, repoRoot, extraRoots, decideResolved = decideFindingResolved, recordModelOutcome = defaultRecordModelOutcome, isApplyCloneClean = defaultIsApplyCloneClean }) {
+  const summary = { checked: 0, requeued: 0, exhausted: 0, resolved: 0, released: 0, held: 0, errors: 0, errorDetails: [] };
   const approvedDirResolved = approvedDir || (pipelineDir ? path.join(pipelineDir, 'queue', 'approved') : null);
   let names = [];
   try {
@@ -135,6 +159,34 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
       // happens to still carry stale fields, same "only act on the specific stage this
       // check owns" reasoning reject-retry-check.js's own isReviewRejection() guard uses.
       if (!isApplyFailure(task)) continue;
+
+      // Infra short-circuit -- see isInfraApplyFailure's own header. Before the retry-count logic and regardless of
+      // applyRetryCount: the failure says nothing about this task, so it neither burns a retry nor gets redrafted.
+      if (isInfraApplyFailure(task)) {
+        if (approvedDirResolved && isApplyCloneClean()) {
+          step = 'record';
+          delete task.blockedReason;
+          delete task.blockedStage;
+          task.status = 'approved';
+          appendHistoryEvent(task, 'approved', 'apply-retry-check: apply-clone infrastructure failure cleared -- re-applying the already-approved result, no redraft');
+          step = 'write';
+          fs.mkdirSync(approvedDirResolved, { recursive: true });
+          fs.writeFileSync(path.join(approvedDirResolved, name), JSON.stringify(task, null, 2));
+          step = 'unlink';
+          fs.unlinkSync(filePath);
+          summary.released++;
+        } else {
+          const alreadyHeld = Array.isArray(task.history) && task.history.some((h) => h && h.stage === 'infra-held');
+          if (!alreadyHeld) {
+            step = 'record';
+            appendHistoryEvent(task, 'infra-held', 'apply-clone infrastructure failure -- held (no retry burned) until the apply clone is clean');
+            step = 'write';
+            fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+          }
+          summary.held++;
+        }
+        continue;
+      }
 
       // Diverged-history short-circuit -- see isDivergedHistoryFailure's own header.
       // Regardless of retryCount: retrying reproduces the identical git-state failure,
@@ -252,7 +304,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { applyRetryCheck, isDivergedHistoryFailure };
+module.exports = { applyRetryCheck, isDivergedHistoryFailure, isInfraApplyFailure };
 
 if (require.main === module) {
   main();

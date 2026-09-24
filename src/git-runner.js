@@ -10,6 +10,8 @@
 // which one it was given.
 
 const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 
 const GIT_ENV = {
@@ -18,6 +20,10 @@ const GIT_ENV = {
   GCM_INTERACTIVE: 'never',
 };
 const GIT_TIMEOUT_MS = 60_000;
+
+// Stable prefix of the error assertCleanTree() throws. apply-retry-check.js matches on it to treat the
+// failure as INFRASTRUCTURE (a git-state problem, not a draft-quality one): no retry burned, no redraft.
+const DIRTY_CLONE_ERROR_PREFIX = 'apply clone is dirty';
 
 /**
  * Detects the repo's real default branch instead of assuming "main" -- reproduced live
@@ -58,7 +64,44 @@ function createRealGitRunner(repoRoot) {
   function isAncestor(a, b) {
     try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
   }
+  // A DEDICATED apply clone is the one AGENT_MANAGER_APPLY_REPO_ROOT names (never the shared
+  // interactive checkout, never any other repo). Nothing legitimate is ever left uncommitted in it, so
+  // uncommitted content there is always stray -- and must NOT be carried forward (see quarantineStash).
+  const dedicatedApplyClone = (() => {
+    const a = process.env.AGENT_MANAGER_APPLY_REPO_ROOT;
+    return !!a && path.resolve(a) === path.resolve(repoRoot);
+  })();
+  function stashTip() {
+    try { return run(['rev-parse', '-q', '--verify', 'refs/stash']).trim(); } catch { return ''; }
+  }
+  // 2026-09-23 (change_review backlog incident): doResetToMain used to pop its auto-stash straight back
+  // onto the reset tree, so any stray content in the apply clone (test fixtures leaked into
+  // Docs/*_CANDIDATES.md) rode through EVERY reset forever and kept aborting `git checkout`/`git rebase`
+  // in the triage batch -- ~266 change_review tasks blocked over ~22h. In a dedicated apply clone the
+  // stash is instead written to a patch under .git/ (never dirties the tree; recoverable) and dropped.
+  // Returns the patch path, or null when it could not be preserved (the caller then falls back to the
+  // old pop, so work is never destroyed).
+  function quarantineStash() {
+    try {
+      const gitDir = run(['rev-parse', '--absolute-git-dir']).trim();
+      const dir = path.join(gitDir, 'agent-manager-quarantine');
+      fs.mkdirSync(dir, { recursive: true });
+      const patch = execFileSync('git', ['stash', 'show', '-p', '--include-untracked', 'stash@{0}'], {
+        cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 256 * 1024 * 1024,
+      });
+      if (!patch.trim()) return null;
+      const file = path.join(dir, `stray-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}.patch`);
+      fs.writeFileSync(file, patch);
+      run(['stash', 'drop']);
+      console.error(`[git-runner] QUARANTINED uncommitted content found in the dedicated apply clone (${repoRoot}) -> ${file}. Stray content there is never carried forward; find what wrote it.`);
+      return file;
+    } catch (e) {
+      console.error(`[git-runner] could not quarantine the apply-clone stash (${e.message}); falling back to pop`);
+      return null;
+    }
+  }
   function doResetToMain() {
+    const stashBefore = stashTip();
     try {
       run(['stash', 'push', '-u', '-m', `agent-manager auto-stash before reset ${new Date().toISOString()}`]);
     } catch (e) {
@@ -107,6 +150,8 @@ function createRealGitRunner(repoRoot) {
     // thrown -- the reset itself already succeeded, and git leaves the stash entry intact
     // on a failed pop for manual recovery, so this can never make things worse than the
     // old never-popped behavior, only better.
+    const stashCreated = stashTip() !== '' && stashTip() !== stashBefore;
+    if (dedicatedApplyClone && stashCreated && quarantineStash()) return;
     try {
       run(['stash', 'pop']);
     } catch (e) {
@@ -140,6 +185,22 @@ function createRealGitRunner(repoRoot) {
     // git-ignored is never even stashed in the first place, `git stash -u` skips it
     // outright), independent of this pop fix.
     resetToMain: doResetToMain,
+    // Batch pre-flight (2026-09-23): the gated triage batch switches branches with `checkout -B` and
+    // `rebase`, both of which abort on a dirty tracked file -- and used to do so once PER TASK, one
+    // blocked task each. quarantineDirtyTree() self-heals a dedicated apply clone (no-op elsewhere);
+    // assertCleanTree() then fails the batch once, up front, with a stable, recognisable message.
+    quarantineDirtyTree: () => {
+      if (!dedicatedApplyClone) return null;
+      if (!run(['status', '--porcelain', '--untracked-files=normal']).trim()) return null;
+      run(['stash', 'push', '-u', '-m', `agent-manager quarantine before triage batch ${new Date().toISOString()}`]);
+      return quarantineStash();
+    },
+    assertCleanTree: () => {
+      const lines = run(['status', '--porcelain', '--untracked-files=no']).split('\n').filter(Boolean);
+      if (!lines.length) return;
+      const files = lines.map((l) => l.slice(3)).slice(0, 8).join(', ');
+      throw new Error(`${DIRTY_CLONE_ERROR_PREFIX} (uncommitted tracked changes: ${files}) -- refusing to switch branches; this is a git-state problem, not a draft problem. Find what wrote to ${repoRoot} and clean it.`);
+    },
     createBranch: (name) => run(['checkout', '-b', name]),
     checkoutMain: () => run(['checkout', mainBranch]),
     // Checkout an EXISTING branch (stacked file-decompose: move N+1 rides on top of the
@@ -301,6 +362,11 @@ function createFakeGitRunner(opts = {}) {
     mainBranch: opts.mainBranch || 'main',
     fetchMain: () => record('fetchMain'),
     resetToMain: () => record('resetToMain'),
+    quarantineDirtyTree: () => { record('quarantineDirtyTree'); return null; },
+    assertCleanTree: () => {
+      record('assertCleanTree');
+      if (opts.dirtyTree) throw new Error(`${DIRTY_CLONE_ERROR_PREFIX} (uncommitted tracked changes: ${opts.dirtyTree}) -- simulated`);
+    },
     createBranch: (name) => record('createBranch', name),
     checkoutMain: () => record('checkoutMain'),
     checkoutBranch: (name) => record('checkoutBranch', name),
@@ -364,4 +430,4 @@ function createFakeGitRunner(opts = {}) {
   };
 }
 
-module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch };
+module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch, DIRTY_CLONE_ERROR_PREFIX };

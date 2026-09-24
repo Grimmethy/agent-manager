@@ -245,3 +245,54 @@ test('parsePyTestFailures: extracts FAIL and ERROR lines', () => {
   const out = 'FAIL: test_a (module.T)\nERROR: test_b (module.T)\nok\n';
   assert.deepEqual(parsePyTestFailures(out), ['test_a (module.T)', 'test_b (module.T)']);
 });
+
+// 2026-09-23 (change_review backlog incident): the child `node --test` must never inherit the LIVE
+// pipeline's write targets -- config.js derives every Docs/*_CANDIDATES.md path from
+// AGENT_MANAGER_APPLY_REPO_ROOT, so a covering test that reaches for getConfig() wrote fixtures into the
+// real apply clone and blocked ~266 change_review tasks.
+function withEnv(vars, fn) {
+  const saved = {};
+  for (const k of Object.keys(vars)) { saved[k] = process.env[k]; process.env[k] = vars[k]; }
+  try { return fn(); } finally {
+    for (const k of Object.keys(vars)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+}
+
+test('childEnv: live pipeline roots and path overrides are replaced/stripped, unrelated env is kept', () => {
+  const { childEnv } = require('./scoped-test-runner.js');
+  withEnv({
+    AGENT_MANAGER_APPLY_REPO_ROOT: '/live/apply', AGENT_MANAGER_REPO_ROOT: '/live/repo', AGENT_MANAGER_REGISTER_PATH: '/live/register.js',
+    AGENT_MANAGER_ARCH_CANDIDATES_PATH: '/live/Docs/ARCH.md', AGENT_MANAGER_CHANGE_REVIEW_CURSOR_PATH: '/live/cursor.json',
+    NODE_TEST_CONTEXT: 'child-v8', KEEP_ME: 'yes',
+  }, () => {
+    const env = childEnv('/sandbox');
+    assert.equal(env.AGENT_MANAGER_APPLY_REPO_ROOT, '/sandbox');
+    assert.equal(env.AGENT_MANAGER_REPO_ROOT, '/sandbox');
+    assert.equal(env.AGENT_MANAGER_REGISTER_PATH, undefined);
+    assert.equal(env.AGENT_MANAGER_ARCH_CANDIDATES_PATH, undefined);
+    assert.equal(env.AGENT_MANAGER_CHANGE_REVIEW_CURSOR_PATH, undefined);
+    assert.equal(env.NODE_TEST_CONTEXT, undefined);
+    assert.equal(env.KEEP_ME, 'yes');
+  });
+});
+
+test('runScopedTests: a real covering test run under a live-looking env sees a throwaway sandbox, never the live roots', () => {
+  const repo = tmpRepo();
+  write(repo, 'src/thing.js', 'module.exports = 1;\n');
+  write(repo, 'src/thing.test.js', [
+    "const test = require('node:test');",
+    "const assert = require('node:assert/strict');",
+    "const os = require('os');",
+    "test('env is sandboxed', () => {",
+    "  for (const k of ['AGENT_MANAGER_APPLY_REPO_ROOT', 'AGENT_MANAGER_REPO_ROOT']) {",
+    "    assert.ok(process.env[k].startsWith(os.tmpdir()), k + ' must be a sandbox, got ' + process.env[k]);",
+    "    assert.notEqual(process.env[k], '/live/apply');",
+    "  }",
+    "  assert.equal(process.env.AGENT_MANAGER_REGISTER_PATH, undefined);",
+    "});",
+  ].join('\n'));
+  withEnv({ AGENT_MANAGER_APPLY_REPO_ROOT: '/live/apply', AGENT_MANAGER_REPO_ROOT: '/live/repo', AGENT_MANAGER_REGISTER_PATH: '/live/register.js' }, () => {
+    const result = runScopedTests(repo, ['src/thing.js']);
+    assert.equal(result.passed, true, result.raw || JSON.stringify(result));
+  });
+});

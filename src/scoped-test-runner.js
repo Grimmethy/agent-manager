@@ -149,13 +149,42 @@ function parsePyTestFailures(output) {
 // for a fixture that fails every time run directly. Strips it (and anything else in the
 // same family, defensively) so this gate's own verdict never depends on whether ITS
 // caller happens to be running under a test runner.
-function childEnv() {
+//
+// 2026-09-23 (change_review backlog incident): it must ALSO never hand the child the live
+// pipeline's write targets. This runs inside the live pipeline process, so process.env carries
+// AGENT_MANAGER_APPLY_REPO_ROOT (the real agent-manager-apply clone) and the plugin registration
+// path; config.js derives every Docs/*_CANDIDATES.md path from applyRepoRoot, so a covering test
+// that reaches for getConfig() (hygiene's change-review.test.js does -- 177 fixture lines appended
+// to CHANGE_REVIEW_CANDIDATES.md in one reproduced run) writes its fixtures into the REAL apply
+// clone. A dirty apply clone aborts every `git checkout`/`git rebase` in the triage batch, which
+// blocked ~266 change_review tasks. Tests pin the roots they need themselves; anything they don't
+// pin must fall back to a default, never to the live path.
+const LIVE_PATH_ENV = [
+  'AGENT_MANAGER_APPLY_REPO_ROOT',
+  'AGENT_MANAGER_REPO_ROOT',
+  'AGENT_MANAGER_CORE_REPO_ROOT',
+  'AGENT_MANAGER_REGISTER_PATH',
+  'AGENT_MANAGER_DOMAINS_PATH',
+];
+// `sandboxRoot` (a throwaway dir the caller owns) stands in for the two roots getConfig() requires
+// at load time, so a test that pins nothing still gets a valid, harmless location.
+function childEnv(sandboxRoot) {
   const env = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (k.startsWith('NODE_TEST_')) continue;
+    if (LIVE_PATH_ENV.includes(k) || /^AGENT_MANAGER_.*_(CANDIDATES|COVERAGE|CURSOR)_PATH$/.test(k)) continue;
     env[k] = v;
   }
+  if (sandboxRoot) {
+    env.AGENT_MANAGER_REPO_ROOT = sandboxRoot;
+    env.AGENT_MANAGER_APPLY_REPO_ROOT = sandboxRoot;
+  }
   return env;
+}
+
+function withSandbox(fn) {
+  const sandbox = fs.mkdtempSync(path.join(require('os').tmpdir(), 'scoped-test-sandbox-'));
+  try { return fn(sandbox); } finally { try { fs.rmSync(sandbox, { recursive: true, force: true }); } catch { /* best-effort */ } }
 }
 
 // A timeout is NOT a failure -- confirmed live: src/local-draft.test.js's own header
@@ -169,9 +198,9 @@ function childEnv() {
 function runJsTests(repoRoot, files) {
   if (!files.length) return null;
   try {
-    execFileSync('node', ['--test', ...files], {
-      cwd: repoRoot, timeout: RUN_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(),
-    });
+    withSandbox((sandbox) => execFileSync('node', ['--test', ...files], {
+      cwd: repoRoot, timeout: RUN_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(sandbox),
+    }));
     return { ran: files, passed: true, failures: [] };
   } catch (e) {
     const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
@@ -195,9 +224,9 @@ function runPyTests(repoRoot, files, pythonBin) {
   if (!files.length) return null;
   const modules = files.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'));
   try {
-    execFileSync(pythonBin || defaultPythonBin(repoRoot), ['-m', 'unittest', ...modules], {
-      cwd: repoRoot, timeout: RUN_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(),
-    });
+    withSandbox((sandbox) => execFileSync(pythonBin || defaultPythonBin(repoRoot), ['-m', 'unittest', ...modules], {
+      cwd: repoRoot, timeout: RUN_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(sandbox),
+    }));
     return { ran: files, passed: true, failures: [] };
   } catch (e) {
     const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
@@ -247,6 +276,7 @@ function runScopedTests(repoRoot, changedFiles, opts = {}) {
 }
 
 module.exports = {
+  childEnv,
   findAffectedTestFiles,
   runScopedTests,
   runJsTests,
