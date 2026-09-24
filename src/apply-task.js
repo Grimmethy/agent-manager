@@ -273,6 +273,11 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         // current main -- identically, every retry, never self-correcting. See
         // git-runner.js's prepareStackedBranch for the full ahead/behind/diverged
         // reasoning (same discipline resetToMain() already applies to mainBranch itself).
+        // Pre-flight (2026-09-24, same fix as the triage batch's, lib/apply-main-batch.js): prepareStackedBranch's `checkout -B` / `rebase`
+        // abort on a dirty tracked file, and resetToMain() -- the only other thing here that clears stray content -- is deliberately NOT
+        // called on this path. Self-heal a dedicated apply clone (quarantine to a patch under .git/), else fail once with a clear message.
+        if (typeof gitRunner.quarantineDirtyTree === 'function') gitRunner.quarantineDirtyTree();
+        if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
         gitRunner.prepareStackedBranch(b);
       } else {
         gitRunner.resetToMain();
@@ -325,6 +330,11 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       // guarantee against a partial multi-file write surviving a mid-batch failure.
       if (branchName) {
         abandonBranch();
+        // abandonBranch() only moves the branch pointer -- the partial write is still uncommitted in the working tree. Left there it
+        // survives until some later apply happens to reset (2026-09-16: a failed arch_discovery apply left 3 candidates dirty in the
+        // apply clone for ~8 days, and every reset's stash+pop kept reviving them). Clear it NOW: in a dedicated apply clone
+        // resetToMain() quarantines it to a patch under .git/ (recoverable), never a silent discard.
+        try { gitRunner.resetToMain(); } catch (_) { /* best-effort cleanup */ }
       } else {
         // No branch to abandon -- just discard whatever partial write landed on main's
         // own working tree so it can't ride along uncommitted into a later, unrelated apply.
