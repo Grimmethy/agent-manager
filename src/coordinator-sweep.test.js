@@ -6,6 +6,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// coordinator-sweep.js now calls ensureRegistered() at load time (S4a of the hub-tasks
+// extraction, 2026-09-24), which reads AGENT_MANAGER_REPO_ROOT via getConfig() -- same
+// forced (not `||`-defaulted) guard review-task.test.js/apply-task.test.js already use,
+// for the same reason (an ambient real value must never leak through).
+process.env.AGENT_MANAGER_REPO_ROOT = require('os').tmpdir();
+process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
+
 const { coordinatorSweep, classifyChildStatus, sanitizeTaskDisposition } = require('./coordinator-sweep.js');
 
 function makePipeline() {
