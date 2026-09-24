@@ -309,6 +309,91 @@ require('./decompose-review-registry.js').registerDeterministicReview('script-ex
   },
 });
 
+// Deterministic-draft hook (S4a of the hub-tasks extraction, 2026-09-24, found live while
+// verifying the file move -- see deterministic-draft-registry.js's own header for the full
+// design). Moved verbatim from lib/deterministic-extract.js's former
+// tryDeterministicScriptExtractEdit -- see that file's own history / the extensive header
+// comment removed there for the full incident this closes (a review model can't hold a
+// 600K-char diff in context; the same applies at draft time to a model asked to WRITE one).
+require('./deterministic-draft-registry.js').registerDeterministicDraft('script-extract', {
+  tryDraft(task, attempt) {
+    const { getConfig } = require('./config.js');
+    const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
+    const { appendHistoryEvent } = require('./task-history.js');
+    const { recordPlan, recordImplement, recordCritique } = require('./draft-attempt-record.js');
+    const { concludeDraft } = require('./lib/draft-lifecycle.js');
+    const { captureGroupBDiffInWorktree } = require('./group-b-worktree-diff.js');
+    const fs = require('fs');
+    const path = require('path');
+
+    const ctx = task.promptContext;
+    let repoRoot;
+    try { ({ repoRoot } = getConfig()); } catch { return null; }
+    if (!repoRoot) return null;
+
+    // groundingRef (resolveGroundingRef, null for any non-stacked task): a stacked
+    // sub-task must read the shared branch's tip, not the plain working tree (main's
+    // content), or it derives its create/edit pair from the wrong base -- see
+    // decompose-review-registry.js's own script-extract registration for the matching
+    // review-side incident this mirrors.
+    const groundingRef = resolveGroundingRef(task, repoRoot);
+    let html;
+    if (groundingRef) {
+      html = readFileAtRef(repoRoot, groundingRef, ctx.sourceFile);
+      if (html === null) return null;
+    } else {
+      const absSource = path.join(repoRoot, ctx.sourceFile);
+      try { html = fs.readFileSync(absSource, 'utf8'); } catch { return null; }
+    }
+
+    const isHtml = /\.html?$/.test(ctx.sourceFile);
+    const extraction = buildExtraction(html, ctx.symbols, { isHtml });
+    if (!extraction.ok) {
+      // Drifted since plan-validation time -- fall through to the normal path rather
+      // than trust a check that's no longer true. Advisory only, never a block.
+      appendHistoryEvent(task, 'advisory', `deterministic script-extract check no longer holds (${extraction.problems.map((p) => `${p.name}: ${p.status}`).join('; ')}) -- falling through to the normal drafting path`);
+      return null;
+    }
+
+    const groupBChanges = [
+      { mode: 'create', file: ctx.newFile, content: extraction.newFileContent },
+      { mode: 'edit', file: ctx.sourceFile, find: html, replace: isHtml ? extraction.newHtml : extraction.newSource },
+    ];
+
+    const { pipelineDir } = getConfig();
+    let rawDiff;
+    try {
+      rawDiff = captureGroupBDiffInWorktree({
+        repoRoot, pipelineDir, implementResponse: JSON.stringify(groupBChanges), worktreeSuffix: task.id, task,
+      });
+    } catch (e) {
+      appendHistoryEvent(task, 'advisory', `deterministic script-extract diff capture failed (${String((e && e.message) || e).slice(0, 200)}) -- falling through to the normal drafting path`);
+      return null;
+    }
+    if (!rawDiff) {
+      appendHistoryEvent(task, 'advisory', 'deterministic script-extract move produced an empty diff against real origin content -- falling through to the normal drafting path');
+      return null;
+    }
+
+    task.planResponse = 'Deterministic script-extract move: every named symbol resolves to a real, unambiguous top-level function declaration via script-extract.js\'s V8-parser oracle -- no search terms or model judgment needed.';
+    recordPlan(attempt, { text: task.planResponse, attempts: 0 });
+    appendHistoryEvent(task, 'plan-done', 'deterministic script-extract, no model call');
+
+    task.implementResponse = JSON.stringify(groupBChanges);
+    task.rawDiff = rawDiff;
+    task.adhocResolution = 'implemented';
+    recordImplement(attempt, { text: task.implementResponse, note: `deterministic script-extract move (${ctx.symbols.length} symbol(s), V8-parser-verified)` });
+    appendHistoryEvent(task, 'implement-done', `deterministic script-extract move: ${ctx.symbols.length} symbol(s) moved to ${ctx.newFile}, no model call`);
+
+    task.critiqueOutcome = 'no-issues';
+    recordCritique(attempt, { outcome: 'no-issues' });
+    appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic move, nothing for a critique pass to add)');
+
+    concludeDraft(task);
+    return { succeeded: true, blocked: false };
+  },
+});
+
 module.exports = {
   findScriptBlocks, htmlLineFor, parsesCleanly, findParamsClose, findBodyClose,
   locateFunction, locateFunctions, buildExtraction,

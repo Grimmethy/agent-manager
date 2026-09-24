@@ -1212,92 +1212,19 @@ test('reviewTask STILL deterministically blocks a non-decompose manual task citi
 // extraction fresh and requires an exact byte match instead of asking a model to skim
 // something it structurally cannot fit in context.
 
+// S4a of the hub-tasks extraction (2026-09-24): the byte-exact/tampered/drifted
+// re-derivation tests that used to live here moved to script-extract.test.js -- they test
+// the REGISTERED verify() function's actual extraction/byte-compare logic, which belongs
+// with script-extract.js itself (still in this repo -- see its own header for why it did
+// NOT move to agent-manager-hygiene with the rest of the file-decompose family), not this
+// dispatcher's own test file. What remains here is only the kind-gate/shape-fallthrough
+// behavior (still needing a real HTML fixture for the reviewTask() integration tests
+// further down), which needs no real producer at all.
 function writeHtmlWithFn(repoRoot, relPath, scriptBody) {
   const abs = path.join(repoRoot, relPath);
   fs.mkdirSync(path.dirname(abs), { recursive: true });
   fs.writeFileSync(abs, `<html><body>\n<script>\n${scriptBody}\n</script>\n</body></html>\n`);
 }
-
-test('verifyDeterministicScriptExtractDraft: a byte-exact re-derivation -> ok:true', () => {
-  const { repoRoot } = makeFixture();
-  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\nfunction b() { return 2; }\n');
-  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
-  const { buildExtraction } = require('./script-extract.js');
-  const extraction = buildExtraction(html, ['a']);
-  const task = {
-    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
-    implementResponse: JSON.stringify([
-      { mode: 'create', file: 'a.js', content: extraction.newFileContent },
-      { mode: 'edit', file: 'index.html', find: html, replace: extraction.newHtml },
-    ]),
-  };
-  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
-  assert.deepEqual(verifyDeterministicScriptExtractDraft(task, repoRoot), { ok: true });
-});
-
-// 2026-09-13: real incident. `moveTemplateFor` (file-decompose-plan-pass.js, 2026-09-08)
-// extended kind:'script-extract' to plain .js/.mjs/.cjs sources, and the draft-side
-// short-circuit (local-draft.js's tryDeterministicScriptExtractEdit) was updated to pass
-// isHtml:false for them -- but this gate's own buildExtraction call was never updated,
-// so it always defaulted to isHtml:true. For a real .js source (no <script> block at
-// all) that made locateFunctions fail outright with an EMPTY problems array, hard-
-// rejecting a byte-correct draft 3 times running until the task escalated to
-// needs-clarification (src/sdk/candidate-fulfillment.js -> candidate-doc-parsing.js).
-function writeJsWithFn(repoRoot, relPath, body) {
-  const abs = path.join(repoRoot, relPath);
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  fs.writeFileSync(abs, `'use strict';\n\n${body}`);
-}
-
-test('verifyDeterministicScriptExtractDraft: a plain .js source (no <script> block) byte-exact re-derivation -> ok:true', () => {
-  const { repoRoot } = makeFixture();
-  writeJsWithFn(repoRoot, 'src/thing.js', 'function a() { return 1; }\nfunction b() { return 2; }\n');
-  const source = fs.readFileSync(path.join(repoRoot, 'src/thing.js'), 'utf8');
-  const { buildExtraction } = require('./script-extract.js');
-  const extraction = buildExtraction(source, ['a'], { isHtml: false });
-  const task = {
-    promptContext: { deterministicApply: 'script-extract', sourceFile: 'src/thing.js', newFile: 'src/lib/a.js', symbols: ['a'] },
-    implementResponse: JSON.stringify([
-      { mode: 'create', file: 'src/lib/a.js', content: extraction.newFileContent },
-      { mode: 'edit', file: 'src/thing.js', find: source, replace: extraction.newSource },
-    ]),
-  };
-  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
-  assert.deepEqual(verifyDeterministicScriptExtractDraft(task, repoRoot), { ok: true });
-});
-
-test('verifyDeterministicScriptExtractDraft: tampered content (does not byte-match a fresh re-derivation) -> ok:false', () => {
-  const { repoRoot } = makeFixture();
-  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\n');
-  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
-  const task = {
-    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
-    implementResponse: JSON.stringify([
-      { mode: 'create', file: 'a.js', content: 'function a() { return 999; }\n' }, // tampered
-      { mode: 'edit', file: 'index.html', find: html, replace: '<html><body></body></html>' },
-    ]),
-  };
-  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
-  const result = verifyDeterministicScriptExtractDraft(task, repoRoot);
-  assert.equal(result.ok, false);
-  assert.match(result.reason, /does not byte-match/);
-});
-
-test('verifyDeterministicScriptExtractDraft: symbols drifted since plan-validation -> ok:false with a clear reason', () => {
-  const { repoRoot } = makeFixture();
-  writeHtmlWithFn(repoRoot, 'index.html', 'function somethingElseEntirely() {}\n');
-  const task = {
-    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
-    implementResponse: JSON.stringify([
-      { mode: 'create', file: 'a.js', content: 'function a() {}\n' },
-      { mode: 'edit', file: 'index.html', find: 'x', replace: 'y' },
-    ]),
-  };
-  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
-  const result = verifyDeterministicScriptExtractDraft(task, repoRoot);
-  assert.equal(result.ok, false);
-  assert.match(result.reason, /no longer resolve/);
-});
 
 test('verifyDeterministicScriptExtractDraft: returns null (not applicable) for an ordinary task', () => {
   const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
@@ -1348,42 +1275,26 @@ test('verifyDeterministicScriptExtractDraft: valid 2-element JSON but the wrong 
   assert.equal(verifyDeterministicScriptExtractDraft(task, '/tmp'), null);
 });
 
-// Once the shape genuinely IS confirmed Group-B JSON, a content/drift mismatch stays a
-// real hard reject -- unchanged by this fix (covered by the "tampered content" and
-// "symbols drifted" tests above); this test just makes the boundary explicit.
-test('verifyDeterministicScriptExtractDraft: correctly-shaped Group-B JSON that byte-mismatches still hard-rejects (ok:false), only the SHAPE checks became advisory', () => {
-  const { repoRoot } = makeFixture();
-  writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\n');
-  const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
-  const task = {
-    promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
-    implementResponse: JSON.stringify([
-      { mode: 'create', file: 'a.js', content: 'function a() { return 999; }\n' },
-      { mode: 'edit', file: 'index.html', find: html, replace: '<html><body></body></html>' },
-    ]),
-  };
-  const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
-  const result = verifyDeterministicScriptExtractDraft(task, repoRoot);
-  assert.notEqual(result, null);
-  assert.equal(result.ok, false);
-});
+// The "correctly-shaped JSON that byte-mismatches still hard-rejects" boundary case moved
+// to script-extract.test.js with the rest of the byte-compare coverage (S4a, 2026-09-24)
+// -- same reasoning as the block comment above.
 
 // S4a of the hub-tasks extraction (2026-09-24): proves verifyDeterministicScriptExtractDraft
-// dispatches through decompose-review-registry.js's live registry rather than calling
-// script-extract.js's logic inline -- an override changes the outcome with zero changes to
-// review-task.js itself. Restores the real registration afterward since the module is a
-// process-wide singleton shared across every test file.
+// dispatches through decompose-review-registry.js's live registry rather than calling a
+// producer's logic inline -- an override changes the outcome with zero changes to
+// review-task.js itself. This repo's own test process has no default 'script-extract'
+// registration to restore (that lives in agent-manager-hygiene now), so clearing is
+// simply the end state -- same discipline as decompose-review-registry.test.js's own
+// clear test.
 test('verifyDeterministicScriptExtractDraft honors an overridden "script-extract" registration', () => {
-  const { registerDeterministicReview } = require('./decompose-review-registry.js');
+  const { registerDeterministicReview, clearDeterministicReviewRegistry } = require('./decompose-review-registry.js');
   const task = { promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] }, implementResponse: '[]' };
   registerDeterministicReview('script-extract', { verify: () => ({ ok: true, fromOverride: true }) });
   try {
     const { verifyDeterministicScriptExtractDraft } = require('./review-task.js');
     assert.deepEqual(verifyDeterministicScriptExtractDraft(task, '/tmp'), { ok: true, fromOverride: true });
   } finally {
-    // Restore the real script-extract.js registration.
-    delete require.cache[require.resolve('./script-extract.js')];
-    require('./script-extract.js');
+    clearDeterministicReviewRegistry();
   }
 });
 
@@ -1392,58 +1303,11 @@ test('verifyDeterministicScriptExtractDraft honors an overridden "script-extract
 // N `create` changes + one `edit`, re-derivable byte-for-byte, and a diff (index.html:
 // ~370K chars) far larger than the review model's context. Caught live: the index.html
 // one-pass draft was blocked twice by a reviewer misreading the reduced template as "a
-// truncated fragment".
-
-test('verifyDeterministicOnePassDecomposeDraft (node-module): a byte-exact re-derivation -> ok:true', () => {
-  const { repoRoot } = makeFixture();
-  const rel = 'src/mod.js';
-  const abs = path.join(repoRoot, rel);
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  fs.writeFileSync(abs, [
-    "'use strict';",
-    "const fs = require('fs');",
-    '',
-    'function alpha(x) { return x + 1; }',
-    'function beta(x) { return alpha(x) * 2; }',
-    'function keep() { return fs.existsSync("x"); }',
-    '',
-    'module.exports = { alpha, beta, keep };',
-    '',
-  ].join('\n'));
-  const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
-  const moves = [{ newFile: 'src/mod-math.js', symbols: ['alpha', 'beta'] }];
-  const built = buildNodeModuleOnePassChanges(fs.readFileSync(abs, 'utf8'), rel, moves);
-  assert.equal(built.ok, true, built.ok ? '' : built.reason);
-
-  const task = {
-    promptContext: { deterministicApply: 'node-module-decompose', sourceFile: rel, moves },
-    implementResponse: JSON.stringify(built.changes),
-  };
-  const { verifyDeterministicOnePassDecomposeDraft } = require('./review-task.js');
-  assert.deepEqual(verifyDeterministicOnePassDecomposeDraft(task, repoRoot), { ok: true, moduleCount: 1 });
-});
-
-test('verifyDeterministicOnePassDecomposeDraft: tampered create content -> ok:false (drift)', () => {
-  const { repoRoot } = makeFixture();
-  const rel = 'src/mod.js';
-  const abs = path.join(repoRoot, rel);
-  fs.mkdirSync(path.dirname(abs), { recursive: true });
-  fs.writeFileSync(abs, "'use strict';\n\nfunction alpha(x) { return x + 1; }\nfunction beta(x) { return x; }\n\nmodule.exports = { alpha, beta };\n");
-  const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
-  const moves = [{ newFile: 'src/mod-a.js', symbols: ['alpha'] }];
-  const built = buildNodeModuleOnePassChanges(fs.readFileSync(abs, 'utf8'), rel, moves);
-  const changes = JSON.parse(JSON.stringify(built.changes));
-  changes[0].content = changes[0].content.replace('x + 1', 'x + 999'); // tamper
-
-  const task = {
-    promptContext: { deterministicApply: 'node-module-decompose', sourceFile: rel, moves },
-    implementResponse: JSON.stringify(changes),
-  };
-  const { verifyDeterministicOnePassDecomposeDraft } = require('./review-task.js');
-  const r = verifyDeterministicOnePassDecomposeDraft(task, repoRoot);
-  assert.equal(r.ok, false);
-  assert.match(r.reason, /no longer byte-matches/);
-});
+// truncated fragment". The byte-exact/tampered-content coverage moved to
+// agent-manager-hygiene/src/decompose-node-module.test.js with decompose-node-module.js
+// itself (S4a, 2026-09-24, unlike script-extract.js -- see its own header for why that one
+// stayed in this repo) -- same "moves with the producer" reasoning as script-extract's
+// coverage above, just the other direction.
 
 test('verifyDeterministicOnePassDecomposeDraft: not a decompose task -> null (falls through to normal review)', () => {
   const { verifyDeterministicOnePassDecomposeDraft } = require('./review-task.js');
@@ -1455,18 +1319,54 @@ test('verifyDeterministicOnePassDecomposeDraft: not a decompose task -> null (fa
   ), null, 'a non-JSON agentic retry on the same task falls through, not a hard reject');
 });
 
+// These 4 reviewTask() integration tests exercise THIS file's own
+// dispatch/short-circuit/groundingRef-threading behavior, not script-extract.js's actual
+// byte-extraction logic (already covered directly by the dedicated
+// verifyDeterministicScriptExtractDraft tests above and, end to end, by
+// decompose-review-registry.js's own tests) -- so they register a trivial local fake
+// 'script-extract' kind instead of building real HTML fixtures through buildExtraction.
+// The fake only checks the edit's `find` against the actual file content (grounding-ref-
+// aware, same as the real verify's own read path) -- sufficient to drive reviewTask's real
+// approve/reject/zero-model-call/stacked-branch
+// behavior without needing real symbol extraction, which is hygiene's job to verify now
+// (see script-extract.test.js there).
+function registerFakeScriptExtractReview() {
+  const { registerDeterministicReview } = require('./decompose-review-registry.js');
+  registerDeterministicReview('script-extract', {
+    verify(task, repoRoot, groundingRef) {
+      const ctx = task.promptContext;
+      let parsed;
+      try { parsed = JSON.parse(task.implementResponse); } catch { return null; }
+      if (!Array.isArray(parsed) || parsed.length !== 2) return null;
+      const [createChange, editChange] = parsed;
+      if (!(createChange && createChange.mode === 'create' && createChange.file === ctx.newFile)) return null;
+      if (!(editChange && editChange.mode === 'edit' && editChange.file === ctx.sourceFile)) return null;
+      let actual;
+      if (groundingRef) {
+        const { readFileAtRef } = require('./stacked-grounding.js');
+        actual = readFileAtRef(repoRoot, groundingRef, ctx.sourceFile);
+      } else {
+        try { actual = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch (e) {
+          return { ok: false, reason: `could not re-read ${ctx.sourceFile}: ${e.message}` };
+        }
+      }
+      if (editChange.find !== actual) return { ok: false, reason: 'edit find does not byte-match current repo state (fake test verify)' };
+      return { ok: true };
+    },
+  });
+}
+
 test('reviewTask auto-approves a script-extract move deterministically -- zero model calls, even though the diff is huge', async () => {
+  registerFakeScriptExtractReview();
   const { repoRoot, domainsPath } = makeFixture();
   writeHtmlWithFn(repoRoot, 'index.html', 'function a() { return 1; }\nfunction b() { return 2; }\n');
   const html = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8');
-  const { buildExtraction } = require('./script-extract.js');
-  const extraction = buildExtraction(html, ['a']);
   const task = {
     id: 'script-extract-review-1', domain: 'default', source: 'manual', title: 'test',
     promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
     implementResponse: JSON.stringify([
-      { mode: 'create', file: 'a.js', content: extraction.newFileContent },
-      { mode: 'edit', file: 'index.html', find: html, replace: extraction.newHtml },
+      { mode: 'create', file: 'a.js', content: 'function a() { return 1; }\n' },
+      { mode: 'edit', file: 'index.html', find: html, replace: '<html><body>\n<script>\nfunction b() { return 2; }\n</script>\n</body></html>\n' },
     ]),
   };
   const captured = [];
@@ -1479,6 +1379,7 @@ test('reviewTask auto-approves a script-extract move deterministically -- zero m
 });
 
 test('reviewTask deterministically rejects a script-extract move whose diff no longer matches current repo state -- zero model calls', async () => {
+  registerFakeScriptExtractReview();
   const { repoRoot, domainsPath } = makeFixture();
   writeHtmlWithFn(repoRoot, 'index.html', 'function somethingElseEntirely() {}\n');
   const task = {
@@ -1531,18 +1432,17 @@ function makeGitFixtureWithStackedSourceFile() {
 }
 
 test('reviewTask auto-approves a stacked script-extract move derived from the shared stacked branch, not main', async () => {
+  registerFakeScriptExtractReview();
   const { repoRoot, domainsPath } = makeGitFixtureWithStackedSourceFile();
   const { execFileSync: exec2 } = require('child_process');
   const stackedHtml = exec2('git', ['show', 'origin/agent/stacked-script-extract:index.html'], { cwd: repoRoot, encoding: 'utf8' });
-  const { buildExtraction } = require('./script-extract.js');
-  const extraction = buildExtraction(stackedHtml, ['a']);
   const task = {
     id: 'script-extract-stacked-review-1', domain: 'default', source: 'manual', title: 'test',
     stacked: { branch: 'agent/stacked-script-extract', seq: 2, total: 3 },
     promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
     implementResponse: JSON.stringify([
-      { mode: 'create', file: 'a.js', content: extraction.newFileContent },
-      { mode: 'edit', file: 'index.html', find: stackedHtml, replace: extraction.newHtml },
+      { mode: 'create', file: 'a.js', content: 'function a() { return 1; }\n' },
+      { mode: 'edit', file: 'index.html', find: stackedHtml, replace: '<html><body>\n<script>\nfunction siblingAlreadyMoved() { return 2; }\n</script>\n</body></html>\n' },
     ]),
   };
   const captured = [];
@@ -1555,17 +1455,16 @@ test('reviewTask auto-approves a stacked script-extract move derived from the sh
 });
 
 test('reviewTask rejects a stacked script-extract move derived from MAIN instead of the shared stacked branch (the exact bug this closes)', async () => {
+  registerFakeScriptExtractReview();
   const { repoRoot, domainsPath } = makeGitFixtureWithStackedSourceFile();
   const mainHtml = fs.readFileSync(path.join(repoRoot, 'index.html'), 'utf8'); // main's content -- missing the sibling move
-  const { buildExtraction } = require('./script-extract.js');
-  const extraction = buildExtraction(mainHtml, ['a']);
   const task = {
     id: 'script-extract-stacked-review-2', domain: 'default', source: 'manual', title: 'test',
     stacked: { branch: 'agent/stacked-script-extract', seq: 2, total: 3 },
     promptContext: { deterministicApply: 'script-extract', sourceFile: 'index.html', newFile: 'a.js', symbols: ['a'] },
     implementResponse: JSON.stringify([
-      { mode: 'create', file: 'a.js', content: extraction.newFileContent },
-      { mode: 'edit', file: 'index.html', find: mainHtml, replace: extraction.newHtml },
+      { mode: 'create', file: 'a.js', content: 'function a() { return 1; }\n' },
+      { mode: 'edit', file: 'index.html', find: mainHtml, replace: '<html><body></body></html>\n' },
     ]),
   };
   const captured = [];

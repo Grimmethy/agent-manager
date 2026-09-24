@@ -331,12 +331,24 @@ while :; do
     spec_hub_result="$(node "${PACKAGE_SRC_DIR}/product-spec-to-hub.js" 2>>"${HOME_LOGS}/product-spec-to-hub.log")"
     printf '[watchdog] product-spec-to-hub: %s\n' "$spec_hub_result" >&2
 
+    # The file-decompose family (S4a of the hub-tasks extraction, 2026-09-24) moved to
+    # agent-manager-hygiene -- Docs/hub-tasks-extraction-plan.md. Resolved off
+    # AGENT_MANAGER_REGISTER_PATH the same way file-length-scan.js already was below; every
+    # invocation in this family is skipped (not fatal) if the hygiene plugin isn't
+    # installed, same discipline as that existing check.
+    _hygiene_src=""
+    if [[ -n "${AGENT_MANAGER_REGISTER_PATH:-}" ]]; then
+      _hygiene_src="$(dirname "${AGENT_MANAGER_REGISTER_PATH%%,*}")/src"
+    fi
+
     # file-decompose-to-hub: a human-authored decomposition plan in
     # queue/file-decompose-requests/ (module boundaries for an oversized file) becomes a
     # coordinator hub of small, bounded "move these named symbols verbatim" tasks the local
     # model CAN do, plus a final wiring task. Disable with AGENT_MANAGER_FILE_DECOMPOSE_TO_HUB=false.
-    file_decompose_result="$(node "${PACKAGE_SRC_DIR}/file-decompose-to-hub.js" 2>>"${HOME_LOGS}/file-decompose-to-hub.log")"
-    printf '[watchdog] file-decompose-to-hub: %s\n' "$file_decompose_result" >&2
+    if [[ -n "$_hygiene_src" ]] && [[ -f "${_hygiene_src}/file-decompose-to-hub.js" ]]; then
+      file_decompose_result="$(node "${_hygiene_src}/file-decompose-to-hub.js" 2>>"${HOME_LOGS}/file-decompose-to-hub.log")"
+      printf '[watchdog] file-decompose-to-hub: %s\n' "$file_decompose_result" >&2
+    fi
 
     # decompose-move-determinism-backfill (2026-09-07, Grimmethy: "if we could find a way
     # to make more of this process deterministic so that the model only has to call a
@@ -347,8 +359,10 @@ while :; do
     # each un-stamped child's OWN move (not the whole hub, which can be stale once sibling
     # moves have landed) and stamps it the moment it's eligible. Disable with
     # AGENT_MANAGER_DECOMPOSE_DETERMINISM_BACKFILL=false.
-    determinism_backfill_result="$(node "${PACKAGE_SRC_DIR}/decompose-move-determinism-backfill.js" 2>>"${HOME_LOGS}/decompose-move-determinism-backfill.log")"
-    printf '[watchdog] decompose-move-determinism-backfill: %s\n' "$determinism_backfill_result" >&2
+    if [[ -n "$_hygiene_src" ]] && [[ -f "${_hygiene_src}/decompose-move-determinism-backfill.js" ]]; then
+      determinism_backfill_result="$(node "${_hygiene_src}/decompose-move-determinism-backfill.js" 2>>"${HOME_LOGS}/decompose-move-determinism-backfill.log")"
+      printf '[watchdog] decompose-move-determinism-backfill: %s\n' "$determinism_backfill_result" >&2
+    fi
 
     # decompose-loop autoroute: a task stuck in needs-clarification/blocked with a
     # `decompose-loop` staleness flag (every draft chose "decompose", never produced pieces)
@@ -356,14 +370,16 @@ while :; do
     # symbol extraction -> the model only groups names), filed as a file-decompose request;
     # the stuck task is re-pointed at the resulting hub. One local model call per newly
     # stuck task. Disable with AGENT_MANAGER_DECOMPOSE_LOOP_AUTOROUTE=false.
-    autoroute_result="$(node "${PACKAGE_SRC_DIR}/decompose-loop-autoroute.js" 2>>"${HOME_LOGS}/decompose-loop-autoroute.log")"
-    printf '[watchdog] decompose-loop-autoroute: %s\n' "$autoroute_result" >&2
+    if [[ -n "$_hygiene_src" ]] && [[ -f "${_hygiene_src}/decompose-loop-autoroute.js" ]]; then
+      autoroute_result="$(node "${_hygiene_src}/decompose-loop-autoroute.js" 2>>"${HOME_LOGS}/decompose-loop-autoroute.log")"
+      printf '[watchdog] decompose-loop-autoroute: %s\n' "$autoroute_result" >&2
+    fi
 
     # file-length-scan (agent-manager-hygiene): advisory only -- refreshes
     # queue/file-length-flags.json with every tracked source file over AGENT_MANAGER_MAX_FILE_LINES
     # (500). No task generation, no apply gate. Skipped if the hygiene plugin isn't installed.
-    if [[ -n "${AGENT_MANAGER_REGISTER_PATH:-}" ]]; then
-      _fl_scan="$(dirname "${AGENT_MANAGER_REGISTER_PATH%%,*}")/src/file-length-scan.js"
+    if [[ -n "$_hygiene_src" ]]; then
+      _fl_scan="${_hygiene_src}/file-length-scan.js"
       if [[ -f "$_fl_scan" ]] && [[ "${AGENT_MANAGER_FILE_LENGTH_SCAN:-}" != "false" ]]; then
         fl_scan_result="$(node "$_fl_scan" 2>>"${HOME_LOGS}/file-length-scan.log")"
         printf '[watchdog] file-length-scan: %s\n' "$fl_scan_result" >&2
@@ -376,8 +392,10 @@ while :; do
     # gated to once per 24h internally (isDue/markChecked); runs the file-length-scan
     # result from THIS same tick, so it always sees fresh flags. Disable with
     # AGENT_MANAGER_PROACTIVE_FILE_DECOMPOSE=false.
-    proactive_decompose_result="$(node "${PACKAGE_SRC_DIR}/proactive-file-decompose-sweep.js" 2>>"${HOME_LOGS}/proactive-file-decompose-sweep.log")"
-    printf '[watchdog] proactive-file-decompose-sweep: %s\n' "$proactive_decompose_result" >&2
+    if [[ -n "$_hygiene_src" ]] && [[ -f "${_hygiene_src}/proactive-file-decompose-sweep.js" ]]; then
+      proactive_decompose_result="$(node "${_hygiene_src}/proactive-file-decompose-sweep.js" 2>>"${HOME_LOGS}/proactive-file-decompose-sweep.log")"
+      printf '[watchdog] proactive-file-decompose-sweep: %s\n' "$proactive_decompose_result" >&2
+    fi
 
     # merged-work-sweep (2026-09-18): wires verify-merged-work.js -- built 2026-09-16,
     # never previously called from anywhere -- into a periodic pass. Cheaply pre-filters

@@ -59,20 +59,14 @@ const { decidePremiseRecheckOutcome } = require('./premise-recheck-decision.js')
 const { detectTruncatedImplementResponse } = require('./validate-implement-truncation.js');
 const { getDecomposeProposalDetection } = require('./hub-review-detection.js');
 const { verifyDeterministicDraft } = require('./decompose-review-registry.js');
-// Required only for their registerDeterministicReview() side effect (see each file's own
-// registration call) -- this kernel file should never need script-extract.js's/
-// decompose-one-pass.js's/decompose-node-module.js's/decompose-flask-blueprint.js's actual
-// implementations again, only whatever registered against each kind. Temporary: today
-// producer and kernel live in the same repo/process, and review-task.js runs as its own
-// CLI entrypoint (`node review-task.js <review.json>`), so this require is how the
-// registration actually reaches ITS process -- same reasoning as
-// decompose-auto-merge.js's identical temporary bridge from S3. Once the file-decompose
-// family moves to hygiene (S4a), these four requires are deleted and hygiene registers
-// its own kinds at its own plugin load time instead.
+// script-extract.js stays in core (also required directly by scripts/extract-core-ui.js,
+// a standalone dev CLI that can't depend on an optional plugin) -- this require reaches
+// its registerDeterministicReview('script-extract', ...) side effect normally, same as any
+// other same-repo require. decompose-one-pass.js/decompose-node-module.js/
+// decompose-flask-blueprint.js moved to agent-manager-hygiene (S4a of the hub-tasks
+// extraction, 2026-09-24), which now registers their own kinds at its own plugin load
+// time (register.js, required by ensureRegistered() below).
 require('./script-extract.js');
-require('./decompose-one-pass.js');
-require('./decompose-node-module.js');
-require('./decompose-flask-blueprint.js');
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene: observability/performance/function-length/arch/
