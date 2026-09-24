@@ -843,3 +843,42 @@ index ffd11de6..ac74a803 100755
 Problem: [severity: med; regression shipped in dffc890] Before this diff the worker's model was fixed at launch from agent-manager.env and never changed; after this diff, clearing a per-instance override via the dashboard does not restore the original env value — the worker silently keeps using the last override indefinitely.  Failure scenario: Worker starts with CLAUDE_MODEL=claude-sonnet-4 (from agent-manager.env). User selects "claude-opus-4" in the Workers-tab dropdown → api_set_worker_model writes workerModelOverrides["worker-reasoning-1"]="claude-opus-4". Next tick: get_model_override returns "claude-opus-4", line 53 assigns CLAUDE_MODEL="claude-opus-4", exported. User then selects "(default)" → api_set_worker_model pops the key. Next tick: get_model_override returns "" (empty), line 53 `[[ -n "" ]] && CLAUDE_MODEL="$override"` short-circuits (test is false), CLAUDE_MODEL remains "claude-opus-4" from the prior tick, line 54 exports it, and every downstream node call (claude-client.js) continues using claude-opus-4 forever until the daemon is restarted. The docstring on api_set_worker_model explicitly promises "reverting that instance to its agent-manager.env default … on its next tick," which does not happen.
 Solution: Capture the launch-time values once (after orc-common.sh is sourced) as `readonly ORIG_CLAUDE="${CLAUDE_MODEL:-sonnet}"` / `readonly ORIG_ORNITH="${ORNITH_MODEL:-}"`, then in refresh_active_model replace the conditional-assign with an unconditional one: `CLAUDE_MODEL="${override:-$ORIG_CLAUDE}"` (and the ORNITH_MODEL equivalent), so an empty override always falls back to the original env value rather than retaining the stale prior-tick assignment.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in dffc890.
+
+### AC-70 · `detectDegenerate` is a general-purpose degenerate check used by all callers (e.g. `claude (fa4a432 local-client.js)
+Strength: Strong
+Source: change_review of fa4a432 "feat(local-client): wire a draft-content truncation guard into detectDegenerate "
+Files: src/local-client.js
+
+Snippet:
+```
+diff --git a/src/local-client.js b/src/local-client.js
+index c9c5d444..aee4e2e3 100644
+--- a/src/local-client.js
++++ b/src/local-client.js
+@@ -9,24 +9,25 @@
+ // (these have been observed to self-heal), and a majority-vote helper for judgment
+ // calls that are otherwise an invisible coin flip at default temperature.
+ 
+ const fs = require('fs');
+ const os = require('os');
+ const path = require('path');
+ const { postJson } = require('./ollama-http.js');
+ const inflightLock = require('./model-inflight-lock.js');
+ const gpuCapacity = require('./gpu-capacity.js');
+ const localThroughput = require('./local-throughput.js');
+ const { currentDateLine } = require('./current-date-line.js');
+ const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
++const { isDraftTruncated } = require('./draft-truncation-guard.js');
+ const { injectAmplificationInstruction, extractAmplificationRequests } = require('./incident-amplification-marker.js');
+ const { runAmplificationSweep } = require('./incident-amplification.js');
+ const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
+ const { logPipelineEvent } = require('./pipeline-history.js');
+ 
+ // Deliberately NOT config.js's getConfig() -- that throws if AGENT_MANAGER_REPO_ROOT is
+ // unset, which would turn every caller of this module (including test files that require
+ // it without setting up a full pipeline env) into a hard cr
+```
+
+Problem: [severity: med; regression shipped in fa4a432] `detectDegenerate` is a general-purpose degenerate check used by all callers (e.g. `claude-client.js` line 312 calls it on every response), but the newly wired `isDraftTruncated` applies draft-specific heuristics (last non-empty line starts with `|`) to every response, so any valid non-draft response whose final non-empty line is a markdown table row is now incorrectly discarded as truncated.  Failure scenario: `claude-client.js` calls `detectDegenerate(result.response, { allowEmpty: false })` on a review/analysis response whose text is `"Here is the comparison:\n\n| Feature | Old | New |\n|---------|-----|-----|\n| Speed | 100 | 200 |"` with `doneReason` of `'stop'`. Before this diff, `detectDegenerate` returns `null` (the response is valid). After this diff, `isDraftTruncated` sees the last non-empty line `| Speed | 100 | 200 |` starts with `|`, returns `true`, and `detectDegenerate` returns `'truncated'` — the valid response is discarded and the caller retries or fails.
+Solution: Gate the `isDraftTruncated` call so it only runs for draft-generation calls (e.g. add an `isDraft` option to `detectDegenerate`'s options object, defaulting to `false`, and only invoke `isDraftTruncated` when `isDraft` is true; have the draft-generation call site in `local-draft.js` pass `{ isDraft: true }`). Alternatively, restrict the `|`-prefix rule to only fire when the text also contains a `## IMPLEMENT` heading (i.e. the text actually looks like a draft), making the heuristic self-gating.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in fa4a432.
