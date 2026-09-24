@@ -704,6 +704,18 @@ function planIsFullyMechanicalNodeModule(request, validation) {
   return moves.every((_, i) => meta[i] && meta[i].nodeModuleApplyOk === true);
 }
 
+// Deterministic-review hook (S4a of the hub-tasks extraction, 2026-09-24,
+// decompose-review-registry.js's own header has the full design). Moved verbatim from
+// review-task.js's former verifyDeterministicOnePassDecomposeDraft branch -- the shared
+// "N creates + one edit" shape check/byte-compare lives in
+// verifyOnePassStyleRederivation, this kind only supplies its own rebuild (needs repoRoot,
+// unlike the other two kinds, to resolve relative require()s).
+require('./decompose-review-registry.js').registerDeterministicReview('node-module-decompose', {
+  verify: (task, repoRoot) => require('./decompose-review-registry.js').verifyOnePassStyleRederivation(
+    task, repoRoot, (sourceText, sourceFile, moves, rr) => buildNodeModuleOnePassChanges(sourceText, sourceFile, moves, rr),
+  ),
+});
+
 module.exports = {
   buildNodeModuleExtraction,
   buildNodeModuleOnePassChanges,

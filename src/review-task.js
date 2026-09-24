@@ -58,6 +58,21 @@ const { decideEmptyApprovalOutcome } = require('./empty-approval-decision.js');
 const { decidePremiseRecheckOutcome } = require('./premise-recheck-decision.js');
 const { detectTruncatedImplementResponse } = require('./validate-implement-truncation.js');
 const { getDecomposeProposalDetection } = require('./hub-review-detection.js');
+const { verifyDeterministicDraft } = require('./decompose-review-registry.js');
+// Required only for their registerDeterministicReview() side effect (see each file's own
+// registration call) -- this kernel file should never need script-extract.js's/
+// decompose-one-pass.js's/decompose-node-module.js's/decompose-flask-blueprint.js's actual
+// implementations again, only whatever registered against each kind. Temporary: today
+// producer and kernel live in the same repo/process, and review-task.js runs as its own
+// CLI entrypoint (`node review-task.js <review.json>`), so this require is how the
+// registration actually reaches ITS process -- same reasoning as
+// decompose-auto-merge.js's identical temporary bridge from S3. Once the file-decompose
+// family moves to hygiene (S4a), these four requires are deleted and hygiene registers
+// its own kinds at its own plugin load time instead.
+require('./script-extract.js');
+require('./decompose-one-pass.js');
+require('./decompose-node-module.js');
+require('./decompose-flask-blueprint.js');
 
 // Populate the registry with this repo's built-ins AND any AGENT_MANAGER_REGISTER_PATH
 // plugin sources (agent-manager-hygiene: observability/performance/function-length/arch/
@@ -186,134 +201,31 @@ function logFactCheckAudit(pipelineDir, entry) {
 // match is a strictly STRONGER guarantee than an LLM skim of a diff it can't even fit in
 // context -- same "don't ask a model to verify what code can verify with certainty"
 // principle as this pipeline's other deterministic gates just above/below this one.
+// Deterministic-review hook (S4a of the hub-tasks extraction, 2026-09-24): the actual
+// re-derivation/byte-compare logic (all the reasoning above about WHY this gate exists
+// still applies) now lives in script-extract.js's own registerDeterministicReview call --
+// see decompose-review-registry.js's header. This file only gates on the kind and
+// dispatches, so it never needs script-extract.js's implementation, only whatever
+// registered against 'script-extract'.
 function verifyDeterministicScriptExtractDraft(task, repoRoot, groundingRef) {
   const ctx = task.promptContext;
   if (!(ctx && ctx.deterministicApply === 'script-extract')) return null;
-  // 2026-09-07, Grimmethy ("review blocked the decompose task again, forensic analysis
-  // mode"), root-caused live: promptContext.deterministicApply describes TASK-level
-  // ELIGIBILITY (set once, persists across every future attempt) -- it does NOT mean
-  // THIS specific draft attempt actually went through local-draft.js's
-  // tryDeterministicScriptExtractEdit short-circuit. That short-circuit already falls
-  // through to the normal agentic drafting path (returns null, advisory-only) whenever
-  // its own re-derivation drifts from current repo state -- confirmed exactly this
-  // happened for the real stuck task: its history shows "implement-started ... adhoc:
-  // local-agentic-write (multi-turn edit/write/run_bash...)" (the NORMAL agentic path,
-  // producing a 108,459-char transcript), yet this gate still ran the byte-exact
-  // Group-B JSON check against it and hard-rejected with "implementResponse is not
-  // valid JSON" -- rejecting a genuine agentic draft purely because it was never
-  // SUPPOSED to be JSON in the first place, with zero real review of its actual content.
-  // A shape mismatch here means ONLY "this draft did not take the deterministic path" --
-  // return null (this gate does not apply) so it falls through to the NORMAL review
-  // path below, which can fact-check/vote on it like any other agentic draft, same
-  // "advisory-only, never trust a stale assumption" discipline the draft side of this
-  // exact feature already uses. Once the shape IS confirmed to genuinely be Group-B
-  // JSON, a CONTENT mismatch (checked further below) is a different, more specific
-  // signal -- that stays a hard reject, unchanged.
-  let parsed;
-  try { parsed = JSON.parse(task.implementResponse); } catch {
-    return null;
-  }
-  if (!Array.isArray(parsed) || parsed.length !== 2) {
-    return null;
-  }
-  const [createChange, editChange] = parsed;
-  if (!(createChange && createChange.mode === 'create' && createChange.file === ctx.newFile)) {
-    return null;
-  }
-  if (!(editChange && editChange.mode === 'edit' && editChange.file === ctx.sourceFile)) {
-    return null;
-  }
-  // 2026-09-09, root-caused live (file-decompose-hub-autodecomp-adhoc-add-job-stage-
-  // groups-...): reading the plain repoRoot working tree here silently APPROVED a stacked
-  // sub-task's diff against the wrong base (main, missing earlier sibling moves) --
-  // "byte-match a fresh re-derivation" passed because it re-derived against the SAME wrong
-  // base the draft itself used, so the mismatch only surfaced later as a real `git apply`
-  // failure. groundingRef (from resolveGroundingRef, null for any non-stacked task) reads
-  // the real stacked branch tip via git's object database instead.
-  let html;
-  if (groundingRef) {
-    const { readFileAtRef } = require('./stacked-grounding.js');
-    html = readFileAtRef(repoRoot, groundingRef, ctx.sourceFile);
-    if (html === null) return { ok: false, reason: `could not re-read ${ctx.sourceFile} at ${groundingRef}` };
-  } else {
-    try { html = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch (e) {
-      return { ok: false, reason: `could not re-read ${ctx.sourceFile}: ${e.message}` };
-    }
-  }
-  const { buildExtraction } = require('./script-extract.js');
-  // isHtml must match the draft side's own detection (file-decompose-to-hub.js:130) --
-  // a plain .js/.mjs/.cjs source has no <script> block, so the default isHtml:true here
-  // made locateFunctions fail outright (0 problems, since there's no per-symbol result to
-  // report) and hard-rejected every real, correct .js-source script-extract move. Confirmed
-  // live 2026-09-13: src/sdk/candidate-fulfillment.js decompose stuck in needs-clarification
-  // after 3 identical "symbols no longer resolve against current repo state: " (blank)
-  // rejections, even though the draft's extraction was byte-correct each time.
-  const isHtml = /\.html?$/.test(ctx.sourceFile);
-  const fresh = buildExtraction(html, ctx.symbols, { isHtml });
-  if (!fresh.ok) {
-    return { ok: false, reason: `symbols no longer resolve against current repo state: ${fresh.problems.map((p) => `${p.name}: ${p.status}`).join('; ')}` };
-  }
-  if (createChange.content !== fresh.newFileContent) {
-    return { ok: false, reason: 'create content does not byte-match a fresh re-derivation of the same extraction' };
-  }
-  // isHtml:false -> buildExtraction returns `newSource` (whole rewritten file), not
-  // `newHtml` (there is no <script>-tag insertion point to rewrite) -- matches the
-  // draft-side ternary in local-draft.js's tryDeterministicScriptExtractEdit exactly.
-  const freshReplace = isHtml ? fresh.newHtml : fresh.newSource;
-  if (editChange.find !== html || editChange.replace !== freshReplace) {
-    return { ok: false, reason: 'edit find/replace does not byte-match a fresh re-derivation of the same extraction' };
-  }
-  return { ok: true };
+  return verifyDeterministicDraft(task, repoRoot, groundingRef);
 }
 
 // Same principle as verifyDeterministicScriptExtractDraft above, for a WHOLE fully-
 // mechanical file-decompose filed as one deterministic task ([[hub-task-integration]]):
 //   deterministicApply='one-pass-decompose'  -> HTML, decompose-one-pass.js
 //   deterministicApply='node-module-decompose' -> src/*.js, decompose-node-module.js
-// Both produce N `create` changes + one `edit`, re-derivable byte-for-byte from current
-// repo state by the same V8-parser oracle the draft used, and both produce a diff far too
-// large for the review model's context window (index.html: ~370K chars) -- so an LLM
-// "does this look right" skim is strictly weaker than re-deriving and requiring an exact
-// match. 2026-09-09: caught live -- the index.html one-pass draft (74 fns -> 5 modules)
-// was blocked TWICE by a reviewer that misread the legitimately-reduced template as "a
-// truncated fragment ending mid-script".
+//   deterministicApply='blueprint-decompose' -> Flask blueprint, decompose-flask-blueprint.js
+// Deterministic-review hook (S4a of the hub-tasks extraction, 2026-09-24): the shared
+// re-derivation/byte-compare logic (verifyOnePassStyleRederivation) and each kind's own
+// `rebuild` registration now live in decompose-review-registry.js / each producer's own
+// file -- see their headers. This file only gates on the kind and dispatches.
 function verifyDeterministicOnePassDecomposeDraft(task, repoRoot) {
-  const ctx = task.promptContext;
-  const kind = ctx && ctx.deterministicApply;
+  const kind = task.promptContext && task.promptContext.deterministicApply;
   if (kind !== 'one-pass-decompose' && kind !== 'node-module-decompose' && kind !== 'blueprint-decompose') return null;
-  if (!(ctx.sourceFile && Array.isArray(ctx.moves) && ctx.moves.length >= 1)) return null;
-
-  let parsed;
-  try { parsed = JSON.parse(task.implementResponse); } catch { return null; }
-  if (!Array.isArray(parsed) || parsed.length < 2) return null;
-  const creates = parsed.slice(0, -1);
-  const edit = parsed[parsed.length - 1];
-  if (!creates.every((c) => c && c.mode === 'create' && typeof c.content === 'string')) return null;
-  if (!(edit && edit.mode === 'edit' && edit.file === ctx.sourceFile && typeof edit.find === 'string' && typeof edit.replace === 'string')) return null;
-
-  let sourceText;
-  try { sourceText = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch (e) {
-    return { ok: false, reason: `could not re-read ${ctx.sourceFile}: ${e.message}` };
-  }
-
-  let fresh;
-  if (kind === 'one-pass-decompose') {
-    const { buildOnePassGroupBChanges } = require('./decompose-one-pass.js');
-    fresh = buildOnePassGroupBChanges(sourceText, ctx.sourceFile, ctx.moves);
-  } else if (kind === 'node-module-decompose') {
-    const { buildNodeModuleOnePassChanges } = require('./decompose-node-module.js');
-    fresh = buildNodeModuleOnePassChanges(sourceText, ctx.sourceFile, ctx.moves, repoRoot);
-  } else {
-    const { buildBlueprintOnePassChanges } = require('./decompose-flask-blueprint.js');
-    fresh = buildBlueprintOnePassChanges(sourceText, ctx.sourceFile, ctx.moves);
-  }
-  if (!fresh || !fresh.ok) {
-    return { ok: false, reason: `plan no longer re-derives cleanly against current repo state: ${(fresh && fresh.reason) || 'unknown'}` };
-  }
-  if (JSON.stringify(fresh.changes) !== JSON.stringify(parsed)) {
-    return { ok: false, reason: `the ${creates.length}-module split no longer byte-matches a fresh re-derivation (${ctx.sourceFile} drifted between draft and review)` };
-  }
-  return { ok: true, moduleCount: creates.length };
+  return verifyDeterministicDraft(task, repoRoot);
 }
 
 const NON_IMPL_PATTERNS = [

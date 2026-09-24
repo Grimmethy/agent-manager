@@ -188,6 +188,19 @@ function planIsFullyMechanicalBlueprint(request, validation) {
   return moves.every((_, i) => meta[i] && meta[i].blueprintApplyOk === true);
 }
 
+// Deterministic-review hook (S4a of the hub-tasks extraction, 2026-09-24,
+// decompose-review-registry.js's own header has the full design). Moved verbatim from
+// review-task.js's former verifyDeterministicOnePassDecomposeDraft branch -- the shared
+// "N creates + one edit" shape check/byte-compare lives in
+// verifyOnePassStyleRederivation, this kind only supplies its own rebuild. Not registered
+// against mechanical-move-registry.js (S3) -- a flask-blueprint move was never eligible
+// for auto-merge, only for this review-time re-derivation check.
+require('./decompose-review-registry.js').registerDeterministicReview('blueprint-decompose', {
+  verify: (task, repoRoot) => require('./decompose-review-registry.js').verifyOnePassStyleRederivation(
+    task, repoRoot, (sourceText, sourceFile, moves) => buildBlueprintOnePassChanges(sourceText, sourceFile, moves),
+  ),
+});
+
 module.exports = {
   buildBlueprintExtraction,
   buildBlueprintOnePassChanges,

@@ -37,6 +37,8 @@
 // for its actual symbol moves, the same way an .html decompose already could.
 
 const vm = require('vm');
+const fs = require('fs');
+const path = require('path');
 
 // Every non-src <script>...</script> block, with the 1-based HTML line of its opening tag
 // and the JS body's starting character offset within the full HTML text.
@@ -220,6 +222,92 @@ function buildExtraction(html, names, { newFileUrl, isHtml = true } = {}) {
 // This declares that fact where the kind is actually implemented, so decompose-auto-merge.js
 // (hub KERNEL code) never needs to know the string 'script-extract' exists.
 require('./mechanical-move-registry.js').registerMechanicalMoveKind('script-extract', { verifyMove: () => true });
+
+// Deterministic-review hook (S4a of the hub-tasks extraction, 2026-09-24,
+// decompose-review-registry.js's own header has the full design). Moved verbatim from
+// review-task.js's former verifyDeterministicScriptExtractDraft -- see its own extensive
+// header comment there before this move (2026-09-07 incident: a review model can't hold
+// a 600K-char diff in context, so re-deriving and requiring an exact byte match is a
+// strictly stronger guarantee than an LLM skim).
+require('./decompose-review-registry.js').registerDeterministicReview('script-extract', {
+  verify(task, repoRoot, groundingRef) {
+    const ctx = task.promptContext;
+    // 2026-09-07, Grimmethy ("review blocked the decompose task again, forensic analysis
+    // mode"), root-caused live: promptContext.deterministicApply describes TASK-level
+    // ELIGIBILITY (set once, persists across every future attempt) -- it does NOT mean
+    // THIS specific draft attempt actually went through local-draft.js's
+    // tryDeterministicScriptExtractEdit short-circuit. That short-circuit already falls
+    // through to the normal agentic drafting path (returns null, advisory-only) whenever
+    // its own re-derivation drifts from current repo state -- confirmed exactly this
+    // happened for the real stuck task: its history shows "implement-started ... adhoc:
+    // local-agentic-write (multi-turn edit/write/run_bash...)" (the NORMAL agentic path,
+    // producing a 108,459-char transcript), yet this gate still ran the byte-exact
+    // Group-B JSON check against it and hard-rejected with "implementResponse is not
+    // valid JSON" -- rejecting a genuine agentic draft purely because it was never
+    // SUPPOSED to be JSON in the first place, with zero real review of its actual content.
+    // A shape mismatch here means ONLY "this draft did not take the deterministic path" --
+    // return null (this gate does not apply) so it falls through to the NORMAL review
+    // path below, which can fact-check/vote on it like any other agentic draft, same
+    // "advisory-only, never trust a stale assumption" discipline the draft side of this
+    // exact feature already uses. Once the shape IS confirmed to genuinely be Group-B
+    // JSON, a CONTENT mismatch (checked further below) is a different, more specific
+    // signal -- that stays a hard reject, unchanged.
+    let parsed;
+    try { parsed = JSON.parse(task.implementResponse); } catch {
+      return null;
+    }
+    if (!Array.isArray(parsed) || parsed.length !== 2) {
+      return null;
+    }
+    const [createChange, editChange] = parsed;
+    if (!(createChange && createChange.mode === 'create' && createChange.file === ctx.newFile)) {
+      return null;
+    }
+    if (!(editChange && editChange.mode === 'edit' && editChange.file === ctx.sourceFile)) {
+      return null;
+    }
+    // 2026-09-09, root-caused live (file-decompose-hub-autodecomp-adhoc-add-job-stage-
+    // groups-...): reading the plain repoRoot working tree here silently APPROVED a stacked
+    // sub-task's diff against the wrong base (main, missing earlier sibling moves) --
+    // "byte-match a fresh re-derivation" passed because it re-derived against the SAME wrong
+    // base the draft itself used, so the mismatch only surfaced later as a real `git apply`
+    // failure. groundingRef (from resolveGroundingRef, null for any non-stacked task) reads
+    // the real stacked branch tip via git's object database instead.
+    let html;
+    if (groundingRef) {
+      const { readFileAtRef } = require('./stacked-grounding.js');
+      html = readFileAtRef(repoRoot, groundingRef, ctx.sourceFile);
+      if (html === null) return { ok: false, reason: `could not re-read ${ctx.sourceFile} at ${groundingRef}` };
+    } else {
+      try { html = fs.readFileSync(path.join(repoRoot, ctx.sourceFile), 'utf8'); } catch (e) {
+        return { ok: false, reason: `could not re-read ${ctx.sourceFile}: ${e.message}` };
+      }
+    }
+    // isHtml must match the draft side's own detection (file-decompose-to-hub.js:130) --
+    // a plain .js/.mjs/.cjs source has no <script> block, so the default isHtml:true here
+    // made locateFunctions fail outright (0 problems, since there's no per-symbol result to
+    // report) and hard-rejected every real, correct .js-source script-extract move. Confirmed
+    // live 2026-09-13: src/sdk/candidate-fulfillment.js decompose stuck in needs-clarification
+    // after 3 identical "symbols no longer resolve against current repo state: " (blank)
+    // rejections, even though the draft's extraction was byte-correct each time.
+    const isHtml = /\.html?$/.test(ctx.sourceFile);
+    const fresh = buildExtraction(html, ctx.symbols, { isHtml });
+    if (!fresh.ok) {
+      return { ok: false, reason: `symbols no longer resolve against current repo state: ${fresh.problems.map((p) => `${p.name}: ${p.status}`).join('; ')}` };
+    }
+    if (createChange.content !== fresh.newFileContent) {
+      return { ok: false, reason: 'create content does not byte-match a fresh re-derivation of the same extraction' };
+    }
+    // isHtml:false -> buildExtraction returns `newSource` (whole rewritten file), not
+    // `newHtml` (there is no <script>-tag insertion point to rewrite) -- matches the
+    // draft-side ternary in local-draft.js's tryDeterministicScriptExtractEdit exactly.
+    const freshReplace = isHtml ? fresh.newHtml : fresh.newSource;
+    if (editChange.find !== html || editChange.replace !== freshReplace) {
+      return { ok: false, reason: 'edit find/replace does not byte-match a fresh re-derivation of the same extraction' };
+    }
+    return { ok: true };
+  },
+});
 
 module.exports = {
   findScriptBlocks, htmlLineFor, parsesCleanly, findParamsClose, findBodyClose,
