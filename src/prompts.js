@@ -340,11 +340,11 @@ function adhocPlanPrompt(task) {
 function unusedExportPlanPrompt(task) {
   const ctx = task.promptContext;
   const stable = [
-    'This is a judgment call, NOT a code-change task. Determine whether the flagged symbol (defined in the given file, both shown below) is genuinely dead code or a false positive.',
+    'This is a judgment call, NOT a code-change task (yet). Determine whether the flagged symbol (defined in the given file, both shown below) is genuinely dead code or a false positive.',
     'Write a numbered PLAN that is actually a REASONED VERDICT:',
-    '- "genuinely dead, safe to remove"',
-    '- "keep — here\'s why the low call-site count is a false positive (e.g. barrel/re-export pattern the grep can\'t see)"',
-    '- "uncertain — here\'s what would need to be checked that isn\'t given here"',
+    '- "GENUINE -- here\'s why this export is really unused and safe to remove"',
+    '- "FALSE POSITIVE -- here\'s why the low call-site count is misleading (e.g. barrel/re-export pattern the grep can\'t see)"',
+    '- "UNCERTAIN -- here\'s what would need to be checked that isn\'t given here"',
     'Do not default to removing without engaging with architectural patterns like factory/strategy where duplicate-looking names are correct by design.',
   ];
   const volatile = [
@@ -360,20 +360,37 @@ function unusedExportPlanPrompt(task) {
   return assemblePrompt(stable, volatile);
 }
 
-// unused_export's implement pass has the identical gap observability_review's just had
-// fixed (2026-07-26) -- registered only a buildPlanPrompt, so it silently fell through to
-// the same mismatched genericFallbackImplementPrompt. Never actually confirmed live
-// (queue/dead-code-flags.json has never existed in this pipeline's real history, so no
-// real unused_export task has ever been drafted) -- fixed anyway for consistency, since
-// the design gap is identical and would hit the exact same failure the moment the scanner
-// is ever actually run.
+// Structured, two-outcome shape (2026-09-24, mirroring function_length_review's own
+// review/fix split): a GENUINE verdict now produces a real, vetted `### AC-NNN` candidate
+// -- dead_code_fix (the consumer) turns it into an actual removal diff. Before this, the
+// verdict was thrown away entirely (applyVerdictOnly never wrote it anywhere), so even a
+// confident "safe to remove" call had nowhere to go. FALSE POSITIVE/UNCERTAIN stay a plain
+// recorded prose verdict, unchanged -- there's genuinely nothing to remove in those cases.
 function unusedExportImplementPrompt(task, planText) {
+  const ctx = task.promptContext;
   return [
-    'Your plan above is the final REASONED VERDICT for this dead-code candidate -- there is no further code change to make in this task (removing genuinely dead code would be a separate follow-up task, not this one).',
+    'Your plan above is the final REASONED VERDICT for this dead-code candidate in OUR OWN project.',
     '',
     planText,
     '',
-    'Write ONE short paragraph (2-4 sentences) recording the verdict for a human to read later: genuinely-dead/false-positive/uncertain, and why. Plain prose only -- no JSON, no code fence, no "steps".',
+    'If the verdict is FALSE POSITIVE or UNCERTAIN: write ONE short paragraph (2-4 sentences) recording why, for a human to read later. Plain prose only -- no JSON, no code fence, no "steps", no candidate block.',
+    '',
+    'If the verdict is GENUINE: write ONE removal candidate for it, in EXACTLY this format (must match this parser exactly or it cannot be consumed downstream):',
+    '',
+    '### AC-NNN · Title',
+    'Strength: Strong',
+    `Files: ${ctx.definedIn || '(the file this export is defined in)'}`,
+    '',
+    'Problem:',
+    'A paragraph describing why this export is genuinely dead code, grounded in the call-site search you were given above.',
+    '',
+    'Solution:',
+    `A paragraph describing exactly what to remove: the export itself in ${ctx.definedIn || '(its file)'}, and -- if any of the call sites shown above turn out to be real references rather than false matches (e.g. a comment, a string, an unrelated identically-named symbol) -- each one, by file and line. Scoped to exactly this symbol, nothing broader.`,
+    '',
+    'Benefits:',
+    'A paragraph describing what improves once removed (less surface area, no misleading unused code for a future reader to puzzle over).',
+    '',
+    '(Pick an AC-NNN number that looks reasonable; the harness re-derives the real one deterministically regardless of what you write here.)',
   ].join('\n');
 }
 

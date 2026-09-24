@@ -394,6 +394,21 @@ while :; do
       fi
     fi
 
+    # unused-export-scan (agent-manager-hygiene, 2026-09-24): refreshes
+    # queue/dead-code-flags.json with low-usage export candidates for the unused_export
+    # task source. Unlike file-length-scan.js above, this is O(exports x repo size) --
+    # self-throttled internally to once per AGENT_MANAGER_UNUSED_EXPORT_SCAN_INTERVAL_MS
+    # (default 24h) via its own isDue()/markChecked(), so it's cheap to call on every tick
+    # like the others -- most calls are a no-op schedule check. Skipped if the hygiene
+    # plugin isn't installed. Disable with AGENT_MANAGER_UNUSED_EXPORT_SCAN=false.
+    if [[ -n "$_hygiene_src" ]]; then
+      _ue_scan="${_hygiene_src}/unused-export-scan.js"
+      if [[ -f "$_ue_scan" ]] && [[ "${AGENT_MANAGER_UNUSED_EXPORT_SCAN:-}" != "false" ]]; then
+        ue_scan_result="$(node "$_ue_scan" 2>>"${HOME_LOGS}/unused-export-scan.log")"
+        printf '[watchdog] unused-export-scan: %s\n' "$ue_scan_result" >&2
+      fi
+    fi
+
     # proactive-file-decompose-sweep (2026-09-14): decompose-loop-autoroute above only
     # reacts to an ALREADY-stuck task -- a file file-length-scan just re-flagged, with
     # nothing currently blocked on it, gets no auto-authored plan at all otherwise. Time-
