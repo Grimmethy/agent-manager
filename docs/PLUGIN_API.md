@@ -61,6 +61,31 @@ Known, deliberate exceptions:
   topology-derived (extending `--dump-topology` with `description`/`domain` + a frozen
   fallback) is a self-contained dashboard refactor, tracked separately.
 
+## Expiring queued work (optional)
+
+A source whose queued tasks go stale WHILE they wait (change_review: a review of a commit that has since aged past the source's recency window)
+may declare an `expiry` field on its registration. Core's `expiry-sweep.js` (run by the queue watchdog, throttled to once per 30 minutes) then
+retires such tasks without core knowing anything about the source:
+
+```js
+registerTaskSource('my_source', {
+  // ...
+  expiry: {
+    idPrefixes: ['my-source-'],                  // only task files with these filename prefixes are read
+    findExpired({ tasks, now }) {                // tasks: [{ id, task }] -- only this source's own queue/pending/ tasks. Pure; batch your lookups.
+      return [{ id, action: 'archive' | 'apply', reason }];
+    },
+    record({ results, now }) {},                 // optional; after the moves -- keep the source's own bookkeeping here
+  },
+});
+```
+
+- `archive` stamps `terminalDisposition: 'aged-out'` and moves the file to `queue/done/_archived_no_action/`. Reversible, and the id stays reserved
+  (`taskIdExistsInQueue` checks that folder) so the generator cannot recreate it. `aged-out` is deliberately not `abandoned` (the "work lost" audit).
+- `apply` sends a task that already holds an approved result to `queue/approved/` so apply closes it with no redraft.
+- Only `queue/pending/` is ever scanned; a task a worker holds (`drafting/`, `review/`, `approved/`) is in flight and untouched.
+- Kill switch `AGENT_MANAGER_EXPIRY_SWEEP=false`; interval `AGENT_MANAGER_EXPIRY_SWEEP_MINUTES` (default 30).
+
 ## Dashboard tab (optional)
 
 A script-loaded plugin (`registerPath`, no server `url`) may declare its own row in the

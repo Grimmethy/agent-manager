@@ -90,11 +90,10 @@ def api_task_archive(state, task_id):
     to queue/done/_archived_no_action/ via _archive_task_file (see its own header). A blocked / needs-clarification /
     awaiting-confirm archive first stamps terminalDisposition 'abandoned' (+ manualArchive, optional JSON body `reason`) via
     _stamp_manual_archive so the record is never left 'unclassified'.
-    Load-bearing detail: src/task-sources.js's taskIdExistsInQueue() only ever checks the
-    direct queue/<state>/<id>.json path, never nested subfolders, so moving a file here
-    silently frees up its underlying item (a brain-dump entry, an arch_import itemId, a
-    deep_dive community) for reconsideration next time its source generator runs -- with
-    zero source-specific logic needed on this end. 'needs-clarification' included since
+    Load-bearing detail (CORRECTED 2026-09-24 -- this used to say the opposite): src/task-sources.js's taskIdExistsInQueue() DOES
+    check queue/done/_archived_no_action/<id>.json (and the dated _archived/<YYYY-MM>/ buckets), so an archived task's id stays
+    reserved and its generator will NOT recreate it. Retiring a task therefore does not "free" its underlying item for reconsideration;
+    it is closed for good unless the archived file is moved back. 'needs-clarification' included since
     2026-08-16 -- "reject the dump" (Discuss session on context-aware-file-path-prefetch-
     job.md) is exactly this action for a held task the user decides isn't worth chasing
     down an anchor for. 'awaiting-confirm' included the same day, same reasoning -- DENYING

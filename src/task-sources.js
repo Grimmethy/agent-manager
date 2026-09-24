@@ -135,7 +135,7 @@ function depWorkIsOnMainBranch(repoRoot, depId) {
 // tell "genuinely resolved" apart from "still blocked". Same reasoning hub-priority.js's
 // SIBLING_RESOLVED_STATUSES already applies to hub sibling sequencing, applied here to
 // the identical class of deadlock on a dependsOn edge instead.
-const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'abandoned', 'superseded']);
+const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'abandoned', 'superseded', 'aged-out']);
 
 // Default dependency-release predicate (S1 of the hub-tasks extraction, 2026-09-23) -- the
 // exact checks this function inlined before the hook existed. Resolved through the
