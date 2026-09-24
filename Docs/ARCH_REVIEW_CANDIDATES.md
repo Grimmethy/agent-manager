@@ -401,3 +401,174 @@ Add an optional `projectsDir?` parameter to `computeBudgetHealthy(projectsDir?)`
 
 Benefits:
 Tests no longer need the set-env → delete-from-cache → re-require dance, eliminating a class of flaky, order-dependent test failures. CI sandboxes and multi-agent deployments can scan arbitrary transcript stores in the same process without global mutation. The module's interface honestly reflects its one degree of freedom (the scan target), making the code easier to reason about and compose.
+
+### AC-31 · Registry mutation bypasses the `scope:'core'` guard
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`registerTaskSource` wraps the caller-supplied `config.next` in a closure that evaluates the `sourceEligibleHere` guard at invocation time, so that every call to `next` re-checks the `scope:'core'` eligibility before delegating to the original function. However, `updateTaskSource` performs a raw `Object.assign` onto the existing registry entry, replacing `next` with whatever the caller supplies. Because the update path never re-applies the `sourceEligibleHere` wrapper, a plugin can initially register a source with `scope:'core'` (installing the guard wrapper at registration time) and then later call `updateTaskSource` to swap in a new `next` implementation that executes without any scope check. The result is that a core-scoped task source can silently run on non-core projects, violating the architectural boundary the guard was introduced to protect.
+
+Solution:
+Route all mutations of a registered source's `next` field through a single internal setter (or make `updateTaskSource` re-apply the `sourceEligibleHere` wrapper to the incoming `next` before assigning it). The wrapper should capture the source's declared `scope` at registration time and re-validate on every invocation, so the eligibility contract is invariant across the source's lifetime regardless of how many times `next` is replaced.
+
+Benefits:
+Closes the bypass so the `scope:'core'` guarantee holds for the entire lifetime of a registered source, not just at the moment of initial registration. Eliminates a class of subtle plugin-privilege-escalation bugs where a seemingly benign update call silently removes a security boundary. Makes the registry's contract easier to reason about because there is exactly one code path that can place a function into the `next` slot, and that path always enforces the guard.
+
+### AC-32 · Duplicated registry boilerplate across task-source and model-profile registries
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/model-profile-registry.js
+
+Problem:
+`task-source-registry.js` and `model-profile-registry.js` each independently implement the same three-operation registry contract: `register` (throws on duplicate key), `get` (returns `undefined` for a missing key), and `clear` (iterates keys and deletes each). The logic is line-for-line equivalent apart from the entity name. Any future change to the registry contract—adding input validation, structured error types, logging hooks, or a different collision policy—must be implemented and tested in both files, and the two copies can drift independently over time.
+
+Solution:
+Extract the shared register/get/clear pattern into a small factory or base module (e.g., `createRegistry(entityLabel)`) that both registries instantiate, passing only the label used in error messages and any entity-specific validation hook. Each registry file then retains only its domain-specific logic (such as the `sourceEligibleHere` wrapping in the task-source registry) while delegating the generic bookkeeping to the shared implementation.
+
+Benefits:
+A single source of truth for the registry contract means a change to error semantics, validation, or logging is made once and propagates to both registries automatically. Reduces the surface area for drift: the two registries can no longer silently diverge on edge-case behaviour (e.g., one throws a `TypeError` while the other throws a `RangeError` for a duplicate key). New registries added to the codebase can adopt the same contract with a one-line instantiation rather than copying and adapting boilerplate.
+
+### AC-33 · Global mutable persistence hook in task-history.js
+Strength: Strong
+Files: src/task-history.js, src/local-draft.js, src/review-task.js
+
+Problem:
+`setHistoryPersistHook` assigns to a module-level `let persistHook` inside `task-history.js`, creating a process-wide mutable singleton that is invisible in the signature of `appendHistoryEvent`. Any module that calls `setHistoryPersistHook`—such as `local-draft.js` or `review-task.js`—silently alters the behavior of every subsequent `appendHistoryEvent` call in that process, regardless of which task or pipeline stage is being processed. The "opt-in per process" comment masks the fact that the hook is actually bound at module-load time, so two pipeline stages or test cases registering different hooks in the same process will interfere with each other, and it is impossible to give different tasks different persistence behaviors within a single process.
+
+Solution:
+Remove the module-level `persistHook` variable and `setHistoryPersistHook` entirely. Instead, add an optional trailing parameter to `appendHistoryEvent(task, stage, detail, persistHook?)`. When the parameter is omitted or `undefined`, the function behaves exactly as it does today with no hook registered (no persistence side-effect). Callers that previously called `setHistoryPersistHook(fn)` simply pass `fn` as the fourth argument at each call site. This makes the dependency explicit in the function signature, scopes persistence behavior to the individual call, and eliminates the hidden global.
+
+Benefits:
+The coupling between unrelated modules disappears: `local-draft.js` and `review-task.js` no longer share a hidden mutable channel, and each call site declares its own persistence behavior. Test isolation improves because a test that registers a hook no longer leaks it into subsequent tests in the same process. The function's contract becomes self-documenting—any reader of `appendHistoryEvent` can see at a glance whether persistence is possible without hunting for a setter elsewhere.
+
+### AC-34 · Hidden filename contract between requeue-attribution.js and pipeline-forensics.js
+Strength: Strong
+Files: src/requeue-attribution.js, src/pipeline-forensics.js
+
+Problem:
+`checkAndEscalate` in `requeue-attribution.js` writes a file to `queue/forensics-requests/requeue-attribution-<sig>.json`, and a comment in that file explicitly states that `pipeline-forensics.js`'s `coverageEntryActive` check is "keyed on this exact filename." The two modules are therefore coupled through an implicit filename convention that is not enforced by any shared constant, type, or interface. A reader of `requeue-attribution.js`'s public interface has no way to know that `pipeline-forensics.js` depends on the exact string format, and if either side changes its pattern the other will silently break—files will be written but never picked up, with no error or log to indicate the mismatch.
+
+Solution:
+Extract the filename pattern (the directory, the prefix, and the signature-interpolation format) into a small shared utility module, e.g. `src/lib/forensics-request-naming.js`, that exports a single function such as `forensicsRequestPath(sig)`. Both `requeue-attribution.js` and `pipeline-forensics.js` import and call that function instead of each hard-coding the string. The shared module becomes the single source of truth for the naming contract, and any future change to the pattern is made in one place.
+
+Benefits:
+The hidden contract becomes a visible, importable dependency: a reader of either file can follow the import to see exactly what naming convention is in effect. A change to the pattern is a one-line edit in the shared module rather than a coordinated two-file change, eliminating the class of silent breakage where files are written but never consumed. The convention is also trivially unit-testable in isolation, and the coupling is now discoverable through standard "who imports this?" tooling rather than through a comment.
+
+### AC-35 · Four near-identical deterministic gate functions in one file
+Strength: Strong
+Files: src/lib/deterministic-extract.js, src/deterministic-draft-registry.js
+
+Problem:
+`deterministic-extract.js` exports four functions — `tryDeterministicScriptExtractEdit`, `tryDeterministicOnePassDecompose`, `tryDeterministicNodeModuleDecompose`, and `tryDeterministicBlueprintDecompose` — whose bodies are structurally identical: each checks `ctx.deterministicApply` against its own kind string, evaluates a kind-specific predicate on the context shape, and then delegates to the single shared `tryRegisteredDeterministicDraft(task, attempt)`. The file's own header acknowledges these "now only gate on their own kind and dispatch here" and points to `deterministic-draft-registry.js` as the real design home, yet the gate (kind check + predicate + dispatch) is still hand-written four times. Adding a fifth deterministic kind requires a fifth copy of the same `if (!(ctx && ctx.deterministicApply === …)) return null; return tryRegisteredDeterministicDraft(…)` shape, and the set of supported kinds is scattered across four functions rather than one table. The per-kind predicate is the only thing that genuinely varies, but it is interleaved with the shared dispatch, so variation and invariant are not separated.
+
+Solution:
+Collapse the four wrappers into a single data-driven gate. Introduce one internal `tryDeterministic(task, attempt)` that reads `ctx.deterministicApply`, looks up the matching entry in a small array or `Map` of `{ kind, predicate }` pairs, runs the predicate, and calls `tryRegisteredDeterministicDraft` exactly once. The four public named exports remain as thin one-liners that delegate to this shared gate (or callers migrate to a single entry point), so the external API is unchanged. The per-kind predicates become the only per-kind data, and the null-gate contract plus dispatch live in exactly one place.
+
+Benefits:
+Adding a new deterministic kind is now a one-line table entry (kind string + predicate) instead of a new exported function with a copy-pasted guard. The invariant "check kind → check predicate → delegate" is stated once, eliminating the risk that a future edit to the dispatch or null-contract is applied to three of the four functions and missed on the fourth. The file's stated intent (the registry is the design home) is made structurally true rather than merely documented.
+
+### AC-36 · Two parallel git-execution paths in stacked-grounding.js
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+`stacked-grounding.js` defines a shared `runGit(args, cwd)` helper that sets `GIT_ENV`, `GIT_TIMEOUT_MS`, utf-8 encoding, and `cwd`, and both `readFileAtRef` and `grepAtRef` route through it. However, `resolveAtRef` bypasses the helper entirely and inlines its own `execFileSync('git', ['ls-tree', …], { cwd, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, maxBuffer: 64*1024*1024 })`, re-declaring the same environment hardening and timeout. The "how do we run git safely" decision (no terminal prompt, no interactive GCM, bounded timeout, bounded buffer) is now expressed in two places. If the timeout, env hardening, or buffer policy changes, a reader must remember to update both `runGit` and the inline call, and a change to one silently diverges from the other. The reason the author inlined rather than extended the helper is that `resolveAtRef` needs a larger `maxBuffer` than the other two commands, which the current `runGit` signature cannot express — a tell that the helper's interface is too narrow for the module's own needs.
+
+Solution:
+Extend `runGit` to accept an optional options-override parameter (e.g. `runGit(args, cwd, { maxBuffer })`) that merges caller-supplied values over the defaults, or split into a small internal `gitExec(args, cwd, opts)` that both `runGit` and `resolveAtRef` call. `resolveAtRef` then routes through the same executor, passing its larger buffer as a parameter rather than re-declaring the full `execFileSync` call. The git-invocation contract (env, timeout, encoding, buffer policy) lives in exactly one place.
+
+Benefits:
+A single change to the timeout, env hardening, or buffer default propagates to all git calls automatically. The module no longer contains two independent expressions of the same safety policy, removing the divergence risk. The helper's interface now matches the module's actual needs, so future git commands that require different buffers or options can be added without introducing yet another inline `execFileSync`.
+
+### AC-37 · MAX_SIDE_FINDINGS_PER_RESPONSE frozen from env at module load
+Strength: Worth exploring
+Files: src/side-finding.js
+
+Problem:
+`side-finding.js` resolves `const MAX_SIDE_FINDINGS_PER_RESPONSE = Number(process.env.AGENT_MANAGER_MAX_SIDE_FINDINGS_PER_RESPONSE) || 3;` once at require time into a module-level const, then reads that const inside `extractSideFindings`. The cap is a per-response policy, but it is bound to the process environment at load. A test or an alternate caller that wants a different cap must set the env var and bust the `require.cache` to re-require the module — the same load-time-freeze pattern flagged elsewhere in this codebase. The severity is mitigated by the fact that the value is also exported (so it is at least visible in the interface) and the default of 3 is a sane constant, but it still couples a tunable policy to global load-time state rather than to the call site.
+
+Solution:
+Resolve the cap inside `extractSideFindings` at call time (reading `process.env` on each invocation) or accept an optional `maxFindings` parameter that defaults to the current constant. Either approach makes the policy a per-call decision rather than a load-time one, while preserving the existing default and the exported constant for backward compatibility.
+
+Benefits:
+Tests and alternate callers can vary the cap without cache-busting or process-level env mutation. The policy is co-located with the function that enforces it, making the dependency explicit rather than implicit in module-load order. If the team treats the cap as a genuine deployment-time constant, the change is harmless; if it ever needs to be per-call, the refactor is already in place.
+
+### AC-39 · `checkGpuContention` hard-codes `node:sqlite` and an assumed DB schema
+Strength: Strong
+Files: src/requeue-attribution.js
+
+Problem:
+`checkGpuContention` in `src/requeue-attribution.js` dynamically requires `node:sqlite` and assumes a `model-stats.db` file with a specific schema (`model_calls` table with `task_id`, `started_at`, `latency_ms`). This is a tight, implicit coupling to a particular runtime environment and database structure. If `node:sqlite` is unavailable (older Node versions, alternative runtimes) or the schema changes, the function silently returns `false`, potentially missing real GPU-contention signals. The dependency is not declared in any interface or configuration, making it hard to detect or substitute.
+
+Solution:
+Introduce a `GpuContentionChecker` interface (or a simple function-type contract) and make `classifyRequeue` accept an optional `checkGpuContention` parameter. The default implementation can continue to use `node:sqlite`, but tests and alternative environments can inject a mock or a different backend. This makes the dependency explicit and swappable without modifying the attribution logic.
+
+Benefits:
+Testability improves because the checker can be mocked without requiring a real SQLite database or the `node:sqlite` module. Migration to a different database backend or runtime no longer requires editing the attribution module. The dependency on GPU-contention data is now explicitly declared in the function signature rather than hidden behind a dynamic `require`.
+
+### AC-40 · Streaming read loop in `stream_plan_with_tools` has no timeout — a mid-stream stall parks the worker thread forever
+Strength: Strong
+Files: python/dashboard/local_tool_client.py
+
+Problem:
+`run_plan_with_tools` wraps its `subprocess.run(...)` in a `try/except subprocess.TimeoutExpired` block and normalizes a hang into `LocalToolClientError` — the file's own comment documents this as a live, caught-in-production gap. But `stream_plan_with_tools`, which the file identifies as the primary path for the Chat panel's live-streamed replies, has no equivalent protection on the part that actually blocks: the `for line in proc.stdout:` loop. `SUBPROCESS_TIMEOUT_S` (6000 s) is applied only to the post-loop `proc.wait(timeout=...)`, which is reached only after the child has already closed its stdout. The timeout therefore bounds the gap between "last line read" and "process reaped," not the time the process spends producing (or failing to produce) output. If `local-tool-client.js` starts emitting chunks and then stalls mid-stream (a stuck tool call, a hung Ollama request, a deadlock in the GPU single-flight lock the file itself references), the `for line in proc.stdout` loop blocks indefinitely. `subprocess.TimeoutExpired` is never raised because no `subprocess.run`/`wait` is in flight. The `finally` block's `proc.kill()` is never reached because the generator is still suspended inside the `for`. The Flask worker thread is parked forever, the user sees a frozen Chat panel, and the caller's `except LocalToolClientError` (and app.py's `TimeoutError`/`ConnectionError`/`OSError` trio, per claude_client.py's own comment) never fires. This is the exact class of bug the sibling function was patched to fix, left unpatched in the function that is used more.
+
+Solution:
+Give the read loop a real deadline. Because the blocking read itself (`for line in proc.stdout:`) is where the stall occurs, a simple monotonic-clock check inside the loop body cannot work — the loop body never executes while the read is blocked. The deadline must be enforced on the read operation itself. Drive the read from a helper thread that calls `proc.stdout.readline()` under a lock while the main thread enforces the deadline, or use `select`/`poll` on the stdout file descriptor with a timeout. When the deadline is exceeded, call `proc.kill()` and raise `LocalToolClientError` with the same "may be queued behind a slow or stuck worker-lane task" message the sibling uses. The key requirement is that the blocking read — not the post-loop wait — carries the deadline, so a mid-stream stall is bounded and normalized into the one exception type callers already catch.
+
+Benefits:
+A mid-stream hang becomes a bounded, typed failure instead of a permanent worker-thread leak — the same guarantee `run_plan_with_tools` already provides and the file's own comments claim is the point of the module. The Chat panel's error handling, which only knows `LocalToolClientError` plus the builtin trio, actually works for the streaming path, matching the non-streaming path. No new exception type, no caller changes; the two siblings finally share the same timeout exception type on the failure path.
+
+### AC-41 · `claude_client.generate` and `ollama_client.generate` return different shapes despite a documented "same return shape" contract
+Strength: Worth exploring
+Files: python/dashboard/claude_client.py, python/dashboard/ollama_client.py
+
+Problem:
+`claude_client.generate`'s docstring states its contract explicitly: "Same return shape as ollama_client.generate(): {response, thinking}." But the actual return value includes five keys — `response`, `thinking`, `degenerate`, `model`, `sessionId` — while `ollama_client.generate` returns only `response` and `thinking`. The two functions that are documented as interface-interchangeable (the whole reason `claude_client.generate` keeps `think`/`temperature`/`num_predict` in its signature so callers built against the Ollama interface don't need a separate call shape per provider) do not in fact have the same result shape. A caller that does `result["model"]` or `result["sessionId"]` works on Claude and raises `KeyError` on Ollama; a caller that does `result.get("model")` gets a value on Claude and `None` on Ollama with no signal that the field is provider-specific. The `model` field is also asymmetric in meaning: on Claude it is a prefixed string (`f"claude:{resolved_model}"`) added specifically for model-stats.db disambiguation, while on Ollama it is absent entirely. The "one interface, two providers" abstraction the headers promise is only half-true: interchangeability holds at the argument level but not at the result level, and the result is what downstream code (model_stats_client.record_call, the Discuss/Grill panels) actually consumes.
+
+Solution:
+Have `ollama_client.generate` also return the full five-key shape — `degenerate: None`, `model: f"ollama:{MODEL}"`, `sessionId: None` — so both providers return the same keys and callers can index uniformly. The `model` value must use the same `provider:model` prefix convention that `claude_client.generate` uses (`f"claude:{resolved_model}"`), since that prefix is what model-stats.db relies on for disambiguation; using the raw model name would break that consumer. This is the lower-risk option: it only adds keys, never removes or renames, so existing `result["response"]`/`result["thinking"]` access is untouched. The alternative — dropping the "same return shape" claim from `claude_client.generate`'s docstring and documenting the two shapes explicitly — leaves the caller-side `KeyError`/`None` asymmetry in place and is the weaker fix.
+
+Benefits:
+The provider-abstraction the module headers promise actually holds at the result level, not just the argument level. Callers in the Discuss/Grill/Chat panels and in model_stats_client.record_call can read `model`, `degenerate`, and `sessionId` without a per-provider branch or a `KeyError` risk, and the "models should be fully interchangeable" principle the ollama_client header cites is honored in the return value, not just the env-var handling.
+
+### AC-42 · `_run_event` in model_stats_client swallows non-zero exits with no log — a stats-recording failure is indistinguishable from a successful record
+Strength: Worth exploring
+Files: python/dashboard/model_stats_client.py
+
+Problem:
+`_run_event` is the single choke point for `record_call` and `record_outcome`. It calls `subprocess.run(..., capture_output=True, timeout=15)` and then does nothing with the result — no `returncode` check, no stderr read. The only failure path it handles is the exception path (`OSError`, `subprocess.SubprocessError`), which is logged via `logger.warning`. But a non-zero exit — the normal way `model-stats-db.js` reports a failure (bad event name, a write error to model-stats.db, a malformed payload) — produces a `CompletedProcess` with `returncode != 0` and a populated `stderr`, and `_run_event` discards both silently. The file's stated contract is that every function "swallows its own errors" so stats recording never breaks the real feature; the current code satisfies that contract (no exception propagates), but it does so by silently discarding a non-zero exit with no log, which is more than the contract requires to be silent. If model-stats.db becomes unwritable (disk full, permissions, a lock held by another process), every `record_call`/`record_outcome` in the dashboard's interactive sessions fails with zero signal. The Models tab simply shows fewer rows, and the operator has no way to distinguish "the session wasn't recorded" from "the recording failed." The file's own 2026-09-06 comment about a real incident where model-stats.db had zero per-turn token data identifies exactly this class of blind spot. Notably, `get_turns_summary` in the same file *does* check `proc.returncode != 0` and returns `None` — so the correct pattern already exists in the file; `_run_event` simply doesn't apply it.
+
+Solution:
+In `_run_event`, after `subprocess.run` returns, check `result.returncode != 0` and, if so, emit a `logger.warning` with the event name and the stripped `stderr` (or the exit code if stderr is empty), matching the log format the exception path already uses. Keep the swallow — do not raise — so the "never break the real feature" contract holds. The fix is to make the swallow visible, not to make it loud. This is a one-line behavioral change with no caller impact.
+
+Benefits:
+A stats-recording failure becomes a logged, diagnosable event instead of a silent data gap — the same visibility `get_turns_summary` already provides for its read path. The "never break the feature" contract is preserved (still no exception), but the operator can now see *why* the Models tab is missing rows, which is the exact class of blind spot the file's own incident comment is trying to eliminate.
+
+NOTE: Flag 3 was not applied as a "mistaken" flag because the draft's Problem section did not claim the current code *violates* the file's stated contract; it correctly noted the contract is satisfied (no exception propagates) and framed the missing log as a visibility gap beyond what the contract requires. The corrected Problem section makes this distinction explicit.
+
+### AC-43 · `stacked-grounding.js` duplicates git-runner's remote-branch existence check
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The module's own header comment states that `resolveGroundingRef` reuses `git-runner.js`'s real adapter (the same fetch + refs/remotes/origin/* existence check that `apply-task.js`'s `prepareStackedBranch` already depends on) to avoid a second hand-rolled check. However, the implementation contradicts this by calling `runner.fetchBranch(branch)` and `runner.remoteBranchExists(branch)` directly rather than delegating to a unified helper inside `git-runner.js`. This creates a tight coupling to the internal API of `git-runner.js`—specifically the assumption that `createRealGitRunner` returns an object exposing exactly those two methods—while failing to centralize the logic. If `git-runner.js` refactors its existence-check mechanism (e.g., switching to `git ls-remote` or caching results), `stacked-grounding.js` will break silently or require a coordinated change, violating the "one place to get it right" principle the module claims to implement.
+
+Solution:
+Move the `fetchBranch` + `remoteBranchExists` logic into `git-runner.js` as a single public method (e.g., `runner.resolveRemoteBranch(branch)` or `runner.isRemoteBranchAvailable(branch)`). `stacked-grounding.js` should call that one method instead of orchestrating the two-step sequence itself. This ensures the "real adapter" logic lives in one place and that `stacked-grounding.js` depends on a stable, documented interface rather than an implementation detail of the runner's internal state.
+
+Benefits:
+Eliminates the risk of `stacked-grounding.js` breaking when `git-runner.js` internals change. Makes the dependency explicit and testable: `stacked-grounding.js` can mock a single `resolveRemoteBranch` method rather than mocking two separate methods and their side effects. Aligns the code with its own stated design principle of centralizing the "which git ref" decision.
+
+### AC-44 · `incident-amplification.js` bypasses `side-finding.js`'s extraction/dedup pipeline
+Strength: Worth exploring
+Files: src/incident-amplification.js, src/side-finding.js
+
+Problem:
+`incident-amplification.js` calls `writeSideFindingInbox` directly for each grep hit, bypassing `extractSideFindings` and the associated deduplication logic (title-based dedup, placeholder filtering, max-count enforcement) that `side-finding.js` provides. The comment in `incident-amplification.js` claims it reuses "side-finding.js/side-finding-sweep.js's already-built filing+dedup machinery end to end," but it only reuses the filing part (`writeSideFindingInbox`), not the dedup part. If `grepCodebase` returns multiple hits for the same file:line (e.g., due to multi-line matches or repeated patterns), `incident-amplification.js` will file multiple identical side-findings, whereas `extractSideFindings` would have deduplicated them. This creates an inconsistency in the side-finding inbox: some entries are deduplicated (from model responses), others are not (from incident amplification), forcing `side-finding-sweep.js` to handle both cases and contradicting the claim that no new dedup logic is needed.
+
+Solution:
+Refactor `incident-amplification.js` to construct a synthetic text block containing the grep hits in the `SIDE-FINDING:` format, then pass it through `extractSideFindings` to leverage the existing dedup and filtering logic. Alternatively, extract the dedup logic from `extractSideFindings` into a separate `deduplicateFindings` function that both `extractSideFindings` and `incident-amplification.js` can call. Either approach ensures all side-findings, regardless of source, go through the same dedup pipeline.
+
+Benefits:
+Ensures consistent deduplication behavior across all side-finding sources. Reduces the risk of duplicate entries in the inbox that would otherwise require additional handling in `side-finding-sweep.js`. Makes the "reuses existing machinery" claim accurate and reduces the surface area for dedup-related bugs.
