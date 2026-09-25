@@ -329,3 +329,26 @@ Mark the enclosing sweep function as async and replace each fs.readdirSync(state
 
 Benefits:
 The event loop is no longer held hostage for the cumulative duration of all directory reads. Concurrent requests, socket handlers, and timer callbacks can interleave between individual readdir calls, eliminating the latency spike that scaled with entry count. Under load—especially on network-backed or slow filesystems where a single readdir can take several milliseconds—the server maintains responsive throughput instead of stalling. The change is a drop-in async refactor with no new dependencies, no API surface change, and no behavioral difference for the sweep's own logic.
+
+### AC-17 · Parallelize independent majority-vote inference calls
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+The `majorityVote` function issues *n* (default 3) independent LLM inference calls with identical parameters in a sequential loop, each `await call(…)` blocking until the previous inference completes before the next is dispatched. Because the calls share no data dependency, ordering constraint, or shared mutable state, serializing them adds pure latency with no functional benefit: with a per-call latency of *t* seconds the wall-clock cost is *n × t* (e.g. 3 × 8 s = 24 s) rather than ≈ *t* when the calls run concurrently.
+
+Solution:
+Replace the sequential loop with a single `Promise.all` over `Array.from({ length: n }, …)` that fires all *n* `call(…)` promises at once. Each per-promise `.then(onFulfilled, onRejected)` preserves the original per-call error isolation so a single failed vote still lands in `voteErrors` without rejecting the batch. The downstream tallying code that reads the `votes` and `voteErrors` arrays is unchanged. No new dependency is introduced—only `Promise.all` and `Array.from`, both available in the Node runtime this project already targets.
+
+Benefits:
+Wall-clock latency drops from *n × t* to ≈ max(t₁…tₙ) (roughly *t* for identical calls), cutting the majority-vote step from ~24 s to ~8 s in the 3-call default. The function's public contract—returning the same `votes` array and `voteErrors` array with the same tally semantics—is preserved, so no caller needs to change.
