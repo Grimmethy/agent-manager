@@ -38,17 +38,17 @@ class PreemptDecisionTest(unittest.TestCase):
         self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 179, self.NOW, 180, always=False)[0], "kill")
 
     def test_age_gated_lane_old_call_is_spared(self):
-        self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 181, self.NOW, 180, always=False)[0], "spare")
-        self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 3600, self.NOW, 180, always=False)[0], "spare")
+        self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 181, self.NOW, 180, always=False)[0], "spared")
+        self.assertEqual(app._preempt_decision("reviewer", 99, self.NOW - 3600, self.NOW, 180, always=False)[0], "spared")
 
     def test_age_gated_lane_unknown_age_is_spared_not_killed(self):
-        self.assertEqual(app._preempt_decision("reviewer", 99, None, self.NOW, 180, always=False)[0], "spare")
+        self.assertEqual(app._preempt_decision("reviewer", 99, None, self.NOW, 180, always=False)[0], "spared")
 
     def test_default_always_kills_any_gpu_lane_and_spares_the_reviewer(self):
         # `always` not passed -> every lane except the age-gated reviewer is always-kill.
         self.assertEqual(app._preempt_decision("worker-3090", 7, self.NOW - 9999, self.NOW, 180)[0], "kill")
         self.assertEqual(app._preempt_decision("worker-p40", 7, self.NOW - 9999, self.NOW, 180)[0], "kill")
-        self.assertEqual(app._preempt_decision("reviewer", 7, self.NOW - 9999, self.NOW, 180)[0], "spare")
+        self.assertEqual(app._preempt_decision("reviewer", 7, self.NOW - 9999, self.NOW, 180)[0], "spared")
 
     def test_is_preemptable_child_pass(self):
         for p in ("plan", "implement", "critique", "harness-search", "local-agentic",
@@ -184,7 +184,7 @@ class PreemptPipelineTest(unittest.TestCase):
             self._task("reviewer", "t-rv", claimed_epoch=time.time() - 600)  # >180s -> spared
             summary = app._preempt_pipeline_for_chat()
             self.assertIsNone(rv.poll())
-            self.assertEqual({s["lane"]: s["action"] for s in summary}.get("reviewer"), "spare")
+            self.assertEqual({s["lane"]: s["action"] for s in summary}.get("reviewer"), "spared")
 
 
 if __name__ == "__main__":
