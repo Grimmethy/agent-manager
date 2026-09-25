@@ -217,3 +217,51 @@ test('isBudgetHealthy: falls back to a trailing-5h window and flags usedFallback
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// AC-80 (2026-09-25): a fixed CACHE_TTL_MS alone left a rate-limit event invisible to
+// every caller for up to the full TTL window after Claude Code wrote it -- the exact
+// "hard gate" this module's header promises. The fix adds a stat-only (no file content
+// read) mtime check so a cache hit still notices a same-window write. Full TTL (5 min
+// default) so a plain age-based expiry would NOT catch this on its own -- only the mtime
+// check can.
+test('isBudgetHealthy notices a rate-limit event written AFTER the cache, well inside the TTL window, without reading file content again', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'budget-monitor-test-'));
+  const cachePath = path.join(dir, 'cache.json');
+  const prevCachePath = process.env.BUDGET_MONITOR_CACHE_PATH;
+  process.env.BUDGET_MONITOR_CACHE_PATH = cachePath;
+  try {
+    const now = Date.now();
+    writeTranscript(dir, [
+      { type: 'assistant', timestamp: new Date(now - 60 * 1000).toISOString(), message: { usage: { input_tokens: 42 } } },
+    ]);
+    withFreshBudgetMonitor(dir, (bm) => {
+      const first = bm.isBudgetHealthy();
+      assert.equal(first.healthy, true, 'no rate-limit hit yet -- healthy');
+      assert.equal(fs.existsSync(cachePath), true, 'cache file must exist after the first call');
+
+      // A NEW rate-limit event lands in a second transcript file, timestamped (and
+      // mtime'd) strictly after the cache write -- explicit utimesSync avoids flakiness
+      // from same-second mtime resolution on some filesystems.
+      const rateLimitFile = path.join(dir, 'session-2.jsonl');
+      const hitTs = new Date(now).toISOString();
+      // No parseable reset time on purpose -- computeBudgetHealthy() treats an unparsed
+      // rate-limit hit as unhealthy "until real usage is observed" regardless of clock
+      // time, keeping this test's outcome independent of what time of day it runs.
+      fs.writeFileSync(rateLimitFile, JSON.stringify({
+        type: 'assistant', timestamp: hitTs, error: 'rate_limit',
+        message: { content: [{ text: "You've hit your session limit" }] },
+      }) + '\n');
+      const cachedAtMs = JSON.parse(fs.readFileSync(cachePath, 'utf8'))._cachedAt;
+      const futureMtime = new Date(cachedAtMs + 5000);
+      fs.utimesSync(rateLimitFile, futureMtime, futureMtime);
+
+      const second = bm.isBudgetHealthy();
+      assert.equal(second.healthy, false, 'the new rate-limit hit must be visible on the very next call, not after waiting out CACHE_TTL_MS');
+      assert.ok(second.lastRateLimit, 'must reflect the real recompute, not the stale cached "healthy" result');
+    });
+  } finally {
+    if (prevCachePath === undefined) delete process.env.BUDGET_MONITOR_CACHE_PATH;
+    else process.env.BUDGET_MONITOR_CACHE_PATH = prevCachePath;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

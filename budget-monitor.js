@@ -42,13 +42,45 @@ const CACHE_PATH = process.env.BUDGET_MONITOR_CACHE_PATH
 const CACHE_TTL_MS = Number(process.env.BUDGET_MONITOR_CACHE_TTL_MS) || 5 * 60 * 1000;
 
 function readCache() {
+  let cached;
   try {
-    const cached = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'));
-    if (Date.now() - cached._cachedAt < CACHE_TTL_MS) return cached._result;
+    cached = JSON.parse(fs.readFileSync(CACHE_PATH, 'utf8'));
   } catch {
-    // missing/corrupt/stale -- fall through to a fresh computation
+    return null; // missing/corrupt -- fall through to a fresh computation
   }
-  return null;
+  if (Date.now() - cached._cachedAt >= CACHE_TTL_MS) return null; // hard ceiling either way
+
+  // AC-80 (2026-09-25): a fixed TTL alone left a real rate-limit event invisible to every
+  // caller for up to CACHE_TTL_MS after Claude Code wrote it -- exactly the "hard gate"
+  // this module's own header promises. A prior draft attempt tried to close that by
+  // calling a content-reading mtime check on every cache HIT, which reintroduced the same
+  // O(519 files/114MB) readFileSync+JSON.parse cost this cache exists to eliminate.
+  // newestJsonlMtimeMs below never reads file CONTENT -- only fs.statSync() (a single
+  // cheap syscall per file, no disk read, no JSON parsing) -- so a cache HIT stays cheap
+  // while still noticing a same-window write instead of waiting out the full TTL.
+  try {
+    if (newestJsonlMtimeMs(listJsonlFiles(PROJECTS_DIR)) > cached._cachedAt) return null;
+  } catch {
+    // the staleness check itself failing is not a reason to distrust an otherwise-
+    // TTL-valid cache -- fall through to trusting it, same as before this change.
+  }
+  return cached._result;
+}
+
+// Stat-only (no readFileSync, no JSON.parse) -- see readCache()'s own comment on why that
+// distinction is load-bearing here. A file that vanishes between listJsonlFiles() building
+// the list and this statting it (rotated/deleted concurrently) is skipped, not fatal.
+function newestJsonlMtimeMs(files) {
+  let newest = 0;
+  for (const f of files) {
+    try {
+      const mtimeMs = fs.statSync(f).mtimeMs;
+      if (mtimeMs > newest) newest = mtimeMs;
+    } catch {
+      // gone/inaccessible -- doesn't count toward "newest", also can't be missed content
+    }
+  }
+  return newest;
 }
 
 function writeCache(result) {
