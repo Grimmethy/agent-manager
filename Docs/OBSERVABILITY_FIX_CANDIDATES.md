@@ -3335,3 +3335,26 @@ Add a single `console.warn` call at the top of the catch block, before the `[]` 
 
 Benefits:
 Once the warning is in place, any transient or permanent API failure (route rename, auth-middleware regression, network blip) produces an immediately visible console entry naming the affected instance and carrying the full error object, so a developer can open DevTools, filter on `[core-ui]`, and see exactly which instance(s) failed and why. The dashboard still degrades gracefully to empty lists, but the failure is no longer indistinguishable from a legitimate empty result, eliminating the "silent broken dashboard" failure mode.
+
+### AC-181 · Silent swallow of assignable-tasks fetch failure in worker-card rendering
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
+```
+
+Problem:
+In the per-instance parallel fetch block that populates `assignableByInstance`, the `catch (e)` handler binds the caught exception to `e` and then immediately assigns `assignableByInstance[inst.instanceId] = []` without ever reading `e`. There is no `console.warn`, no `console.error`, no rethrow, and no flag set for later inspection. The resulting empty array is byte-for-byte identical to the success path when the API legitimately returns zero assignable tasks (`r.items` is an empty list). An operator viewing the Workers tab therefore cannot distinguish "this worker has no pending work" from "the `/api/instances/<id>/assignable-tasks` endpoint is 500-ing or the route was renamed during a deploy," and there is zero trace in the browser console, server logs, or any other channel that a failure occurred.
+
+Solution:
+Inside the existing `catch (e)` block, before the fallback assignment, emit a single `console.warn` call that names the affected instance and includes the caught error object: `console.warn('[core-ui] assignable-tasks fetch failed for instance ' + inst.instanceId + ':', e);`. The subsequent `assignableByInstance[inst.instanceId] = []` line is left unchanged so the graceful-degradation contract (card still renders, the rest of the `Promise.all` batch is unaffected) is preserved. No new dependency, no metrics primitive, no rethrow — just the one `console.warn` line that the project's existing browser-JS logging convention already supports.
+
+Benefits:
+A developer or operator who opens DevTools on the dashboard can immediately see which instance(s) failed, the HTTP status or network error that caused it, and the timestamp, turning an invisible silent failure into a one-line diagnostic. During a bad deploy or a route rename, instead of every worker card quietly showing an empty task list, the console will list each affected instance and the underlying error, letting the operator distinguish "genuinely no work" from "API is down" in seconds rather than by process of elimination. The fix is a single added line, introduces no new dependency, and does not alter the existing graceful-degradation behaviour.
