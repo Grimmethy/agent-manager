@@ -681,3 +681,32 @@ Delete the `require('../task-sources.js')` line from both `src/lib/prompt-assemb
 
 Benefits:
 Eliminates a load-time failure surface that is unrelated to the actual work of prompt formatting, removes a misleading hard edge from a pure formatting module into the task-source registry, and makes each module independently testable and analyzable without pulling in the entire task-source dependency tree.
+
+### AC-74 · Export readJsonSafe from task-anywhere.js so it becomes a shared importable primitive
+Strength: Strong
+Split-Depth: 1
+Files: src/task-anywhere.js
+
+Problem:
+task-anywhere.js defines a file-private helper `readJsonSafe(fullPath)` (a try/catch around `JSON.parse(fs.readFileSync(fullPath, 'utf8'))` that returns `null` on any error) and uses it throughout `findTaskAnywhere`, but it is NOT in the module's export list: `module.exports = { findTaskAnywhere, QUEUE_STATES };`. Meanwhile fabricated-path-recheck-sweep.js carries its own byte-for-byte-equivalent local `readJson(p)` (same `JSON.parse(fs.readFileSync(p,'utf8'))` in a try/catch returning `null`). The two are duplicated safe-JSON-read implementations, and the sweep cannot drop its copy because the canonical one is not importable.
+
+Solution:
+Add `readJsonSafe` to the export list. Change the final line `module.exports = { findTaskAnywhere, QUEUE_STATES };` to `module.exports = { findTaskAnywhere, QUEUE_STATES, readJsonSafe };`. Nothing else changes: the `readJsonSafe` function body and its existing internal callers inside `findTaskAnywhere` are left exactly as they are.
+
+Benefits:
+readJsonSafe becomes a shared, importable primitive with zero behavioural change to task-anywhere.js itself; a downstream module can now import the single canonical safe-JSON-read instead of re-declaring an identical copy.
+
+### AC-75 · Route fabricated-path-recheck-sweep.js through the shared read/atomic-write primitives and delete its local helpers
+Strength: Strong
+Split-Depth: 1
+Files: src/fabricated-path-recheck-sweep.js
+Depends-On: AC-74
+
+Problem:
+The sweep defines two local helpers and uses both: `function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }` (called at `const task = readJson(filePath);`) and `function writeJson(p, data) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(data, null, 2)); }` (called at `writeJson(dest, fresh);`). The read helper duplicates task-anywhere.js's `readJsonSafe`, and the write helper is a plain non-atomic `fs.writeFileSync` that bypasses the shared atomic primitive `writeJsonAtomicSync` in atomic-write.js (which temp-file-writes in the same directory, fsyncs, then renames — the crash-safety guarantee the rest of the pipeline relies on). A crash mid-write here can leave a truncated, unparseable task file. Note the one real behavioural gap: `writeJsonAtomicSync`/`writeAtomicSync` open the temp file with `fs.openSync(tmp, 'w')`, which does NOT create the parent directory and throws if it is absent, whereas the local `writeJson` created it first via `fs.mkdirSync(path.dirname(p), { recursive: true })`.
+
+Solution:
+At the top of the file add two imports: `const { readJsonSafe } = require('./task-anywhere.js');` and `const { writeJsonAtomicSync } = require('./atomic-write.js');`. Replace the read call site `const task = readJson(filePath);` with `const task = readJsonSafe(filePath);`. Replace the write call site `writeJson(dest, fresh);` with the atomic write while preserving the directory-creation the local helper performed: `fs.mkdirSync(path.dirname(dest), { recursive: true }); writeJsonAtomicSync(dest, fresh);`. Delete both local helper definitions (`function readJson(p) {...}` and `function writeJson(p, data) {...}`). Keep `const fs = require('fs');` because `fs` is still used by `fs.readdirSync`, `fs.existsSync(dest)`, `fs.unlinkSync(filePath)`, and the retained `fs.mkdirSync`. Do not modify atomic-write.js — it already exports `writeJsonAtomicSync`.
+
+Benefits:
+The sweep now shares the single canonical safe-JSON-read (no duplicated `readJson`) and writes task files through the shared atomic primitive, gaining the same crash-safety guarantee as the rest of the pipeline. `writeJsonAtomicSync` emits identical JSON bytes to the old `writeJson` (`JSON.stringify(data, null, 2)`), so the on-disk content is unchanged and the only behavioural change is that the write is now atomic; the retained `fs.mkdirSync` keeps the parent-directory creation that the atomic primitive does not perform.
