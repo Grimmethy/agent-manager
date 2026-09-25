@@ -74,6 +74,24 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
         self.assertEqual(resp.get_json()["serial"], 8)
 
+    # AC-55, 2026-09-25: a stray non-dict scalar in the entries list (e.g. from a hand-edit
+    # of brain-dump.json) used to crash next_serial's computation with an unguarded
+    # `.get("serial")` -- Test A reproduces the exact failure scenario the task named;
+    # Test B (identical to test_capture_increments_serial_over_existing_entries above)
+    # confirms the guard doesn't change behavior for well-formed entries.
+    def test_capture_test_a_survives_a_stray_non_dict_entry_the_exact_ac55_failure_scenario(self):
+        self._seed([42, {"id": "bd-1", "serial": 1, "capturedAt": "2026-01-01T00:00:00+00:00",
+                          "rawText": "hello", "status": "captured"}])
+        resp = self.client.post("/api/brain-dump/capture", json={"text": "new thought"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual(resp.get_json()["serial"], 2)
+
+    def test_capture_test_b_still_increments_correctly_with_only_well_formed_entries(self):
+        self._seed([{"id": "bd-old", "serial": 7, "rawText": "x", "status": "sorted"}])
+        resp = self.client.post("/api/brain-dump/capture", json={"text": "next"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual(resp.get_json()["serial"], 8)
+
     def test_capture_rejects_empty_text(self):
         resp = self.client.post("/api/brain-dump/capture", json={"text": "   "})
         self.assertEqual(resp.status_code, 400)
