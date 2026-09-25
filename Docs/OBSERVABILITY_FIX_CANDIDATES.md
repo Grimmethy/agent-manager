@@ -3266,3 +3266,26 @@ Add a single `console.error('[pipeline-map] fetch failed:', e);` statement insid
 
 Benefits:
 Any developer with DevTools open immediately sees a labeled, greppable breadcrumb in the console the moment the pipeline-map fetch fails, including the full exception object (status code, response body, or parse-error message) that distinguishes a 404 from a 500 from a malformed-JSON error. This eliminates the need to hunt through the Network tab to diagnose a blank tab, reduces mean-time-to-diagnosis for deploy regressions or server bugs affecting this endpoint, and makes the failure visible in any shared console-log capture without changing the user-facing behavior of the dashboard.
+
+### AC-178 · Swallowed fetch error in per-instance assignable-tasks catch
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
+```
+
+Problem:
+Inside the `Promise.all` that populates `assignableByInstance`, the `catch (e)` block performs a single assignment (`assignableByInstance[inst.instanceId] = []`) and discards the captured error `e` with no `console.warn`, no `console.error`, no rethrow, and no flag on the stored value. The result is that a failed fetch of `/api/instances/<id>/assignable-tasks` (a 500, a network blip, a 404 after a rename) produces the exact same observable state—`[]` in `assignableByInstance`—as a legitimate empty task list. An operator reading the dashboard sees "no assignable tasks" on a worker card and cannot distinguish "the lane is genuinely idle" from "the API is broken," and there is zero trace in the browser console to diagnose the failure.
+
+Solution:
+Add a single `console.warn` line at the top of the `catch` block, before the existing assignment, that names the instance and includes the error object: `console.warn('[core-ui] failed to fetch assignable-tasks for ' + inst.instanceId + ':', e);`. This preserves the graceful-degradation contract (the `Promise.all` still resolves, other instances are unaffected, and the caller still receives `[]` for the failed instance) while producing one greppable console line that identifies which instance failed and why. No rethrow is appropriate because the caller (the dashboard render path) cannot meaningfully act on a per-instance fetch failure; logging is the correct surface. No new dependency or metrics primitive is introduced—`console.warn` is the established logging primitive already used throughout this project's JS code.
+
+Benefits:
+A developer or operator who notices a worker card showing an unexpectedly empty task list can open the browser console and immediately see which instance's fetch failed and the underlying error (HTTP status, network message, etc.), turning a silent, unexplained empty state into a one-line diagnostic. Systemic endpoint breakage (e.g., a bad deploy that 500s the assignable-tasks route) becomes visible on first dashboard load rather than remaining invisible until someone manually inspects the network tab. The fix is a single line, changes no data shape, adds no dependency, and does not alter the `Promise.all` flow or the caller-visible contract.
