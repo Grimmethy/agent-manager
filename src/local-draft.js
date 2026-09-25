@@ -633,7 +633,7 @@ async function runPlanPass(task, {
   delete task._hubStatusGrounding; // transient -- baked into planPrompt
 
   const planNumPredict = computePlanNumPredict(task);
-  const callPlan = (temperature = 0.4) => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', ...researchPlanTools }), 'plan');
+  const callPlan = (temperature = 0.4) => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', isDraft: true, ...researchPlanTools }), 'plan');
   const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
 
   // Records the plan pass into model-stats.db, same as callImplementModel's own
@@ -958,7 +958,7 @@ async function finalizeCandidateFulfillment(task, {
     task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
     task.priorRejectionFeedback.push(correction);
     const retryPrompt = `${implPrompt}\n\n${correction}`;
-    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry' }), 'implement-retry');
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
       canonicalizeImplementFinds(task);
@@ -973,7 +973,7 @@ async function finalizeCandidateFulfillment(task, {
   if (!task.nonCompliantImplementRetried && !isImplementOutputCompliant(task, task.implementResponse)) {
     task.nonCompliantImplementRetried = true;
     console.warn(`[local-draft] non-compliant implement output (missing JSON and missing FALSE POSITIVE token) -- retrying once, task=${task.id}, source=${task.source}`);
-    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry' }), 'implement-retry');
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
     if (!retryResult.degenerate) {
       task.implementResponse = retryResult.response;
       canonicalizeImplementFinds(task);

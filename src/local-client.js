@@ -171,7 +171,7 @@ const MODEL = process.env.LOCAL_MODEL;
 // between) paid a full cold reload (~114s observed) on the next turn.
 const KEEP_ALIVE = process.env.LOCAL_KEEP_ALIVE || process.env.ORNITH_KEEP_ALIVE || '30m';
 
-function detectDegenerate(text, { allowEmpty = false, doneReason } = {}) {
+function detectDegenerate(text, { allowEmpty = false, doneReason, isDraft = false } = {}) {
   // 2026-09-05, Grimmethy: root-caused a whole cluster of blocked pipeline_forensics_fix
   // tasks (AC-4/6/8/20) whose PLAN pass came back non-empty, real-looking, non-degenerate
   // text that just... stopped mid-sentence ("**Scope:** `src/local-tool-client.js` only.
@@ -197,7 +197,14 @@ function detectDegenerate(text, { allowEmpty = false, doneReason } = {}) {
   // unclosed markdown table row, a missing IMPLEMENT body, or an odd code-fence count.
   // Silent (false) on empty/whitespace input, so this is safe to check before the
   // empty-response check below.
-  if (isDraftTruncated(text)) return 'truncated';
+  // Gated on isDraft (AC-70, 2026-09-25): a plan/implement draft's own markdown-table/
+  // code-fence shape is what this heuristic looks for, but detectDegenerate is generic
+  // and shared by every caller including claude-client.js's review/analysis calls, whose
+  // final non-empty line can legitimately BE a markdown table row (a comparison table,
+  // for instance) with no truncation at all. Applying the draft heuristic there discarded
+  // valid responses as false positives. Defaults to false so every existing caller keeps
+  // today's behavior unless it explicitly opts in as a real draft call.
+  if (isDraft && isDraftTruncated(text)) return 'truncated';
   if (!text || text.trim().length === 0) return allowEmpty ? null : 'empty';
 
   // The local model sometimes writes the literal two-character JSON-style empty-string
@@ -502,7 +509,7 @@ async function call(opts, maxRetries = 2) {
         recordConceptBuildTally(resolvePipelineDir(), opts.conceptId, report.kind);
       }
     }
-    const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty, doneReason: result.done_reason });
+    const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty, doneReason: result.done_reason, isDraft: opts.isDraft });
     if (!degenerate) return { ...result, degenerate: null, attempts: attempt + 1 };
     lastDegenerate = degenerate;
     // Logged for THIS attempt, not just once the whole call gives up -- so a later
