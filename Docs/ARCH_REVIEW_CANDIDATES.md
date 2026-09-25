@@ -628,19 +628,6 @@ Add a parity test (Node, reading `python/dashboard/app.py` as text and extractin
 Benefits:
 Drift between the Node task lookup and the dashboard is caught by CI instead of by a task going missing, at the cost of one small test.
 
-### AC-61 · Core-scope gate enforced redundantly in two layers with no test pinning the load-bearing one
-Strength: Strong
-Files: src/task-source-registry.js, src/lib/task-selection.js, src/lib/source-scope.js
-
-Problem:
-The `scope: 'core'` eligibility check is applied in two independent places using two different mechanisms: `registerTaskSource` wraps a core source's `next()` to return `null` on a non-core repo, and `getNextTask` separately calls `sourceEligibleHere` and skips the source. For the `getNextTask` path the inline check is redundant because the wrapper already nulls the task, but the wrapper is the only protection for the documented always-run watchdog sweeps that call a source directly. The test suite exercises both layers only by registering through the registry (which installs the wrapper), so no test confirms that the wrapper alone is what saves the watchdog path. A future reader who sees the `sourceEligibleHere` call in `getNextTask` and removes it as "redundant" will leave the invariant half-enforced, and the half that remains is invisible from the selection layer.
-
-Solution:
-Designate the registry wrapper as the single authoritative enforcement point for all callers (it is the only place that can protect direct watchdog calls), and reduce the inline `sourceEligibleHere` check in `getNextTask` to a documented defensive pass-through with a comment explaining it is redundant. Alternatively, remove the wrapper and have both `getNextTask` and the sweep call `sourceEligibleHere` explicitly. In either case, add a test that registers a core source and asserts that the *registered* (wrapped) `next()` returns `null` when invoked directly on a non-core repo, so the load-bearing layer is pinned by a test rather than by a comment.
-
-Benefits:
-A reader can immediately tell which layer is authoritative for which caller, eliminating the silent-drift risk where one layer is removed and the invariant is only half-enforced. The test suite gains a direct assertion on the mechanism that actually protects the watchdog path, so a regression in that path is caught at test time rather than discovered in production.
-
 ### AC-63 · uptime-log.js re-declares heartbeat thresholds that dead-process-check.js owns, with a comment claiming shared semantics
 Strength: Strong
 Files: src/uptime-log.js, src/dead-process-check.js
