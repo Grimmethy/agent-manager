@@ -572,3 +572,32 @@ Refactor `incident-amplification.js` to construct a synthetic text block contain
 
 Benefits:
 Ensures consistent deduplication behavior across all side-finding sources. Reduces the risk of duplicate entries in the inbox that would otherwise require additional handling in `side-finding-sweep.js`. Makes the "reuses existing machinery" claim accurate and reduces the surface area for dedup-related bugs.
+
+### AC-49 · Rename checkGpuContention to defaultGpuContentionChecker
+Strength: Strong
+Split-Depth: 1
+Files: src/requeue-attribution.js
+
+Problem:
+checkGpuContention hard-codes require('node:sqlite') and an assumed model_calls schema (task_id, started_at, latency_ms) with no way for a caller or test to substitute a different implementation. The function name gives no indication it is a default that could be overridden.
+
+Solution:
+Rename the existing function checkGpuContention(taskId, atMs, repoRoot) to defaultGpuContentionChecker(taskId, atMs, repoRoot). The body, parameters, return type, and error-handling semantics stay identical. This is a pure rename to establish the 'default implementation' role before the injection point is added at the call site.
+
+Benefits:
+Makes the default-implementation role explicit in the name, matching the existing pattern in the same file where classifyViaFallbackModel defaults to callBackend. Unblocks the next step (adding an injectable parameter at the call site) without changing any behaviour.
+
+### AC-50 · Add injectable checkGpuContention parameter at the call site
+Strength: Strong
+Split-Depth: 1
+Files: src/requeue-attribution.js
+Depends-On: AC-49
+
+Problem:
+The classification entry point (the function that invokes the GPU-contention check as its step-2 deterministic signal) calls the now-renamed defaultGpuContentionChecker directly with no way to substitute a mock or alternative implementation, so tests must either stand up a real node:sqlite database or accept the silent-false path.
+
+Solution:
+In the function that currently calls defaultGpuContentionChecker(taskId, atMs, repoRoot), append an optional trailing parameter (e.g. checkGpuContention) of the same (taskId, atMs, repoRoot) => boolean shape. Inside that function, select the active checker with const checker = checkGpuContention || defaultGpuContentionChecker; and call checker(taskId, atMs, repoRoot) in place of the direct call. Existing callers that pass no extra argument are unaffected because the parameter is optional and appended last. This mirrors the existing injectable-callModel pattern already used by classifyViaFallbackModel in the same file.
+
+Benefits:
+Tests can inject a stub that returns true or false without touching node:sqlite or the model-stats.db schema. Production behaviour is unchanged when no checker is supplied. Follows the file's own established injection convention (callModel || callBackend), keeping the change idiomatic and low-risk.
