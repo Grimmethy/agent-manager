@@ -3463,7 +3463,8 @@ def _invalidate_branch_cache():
 def _acquire_apply_lock(timeout_seconds=5):
     lock_dir = Path.home() / ".local" / "state" / "agent-manager" / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_fd = open(lock_dir / "apply-task.lock", "w")
+    lock_path = lock_dir / "apply-task.lock"
+    lock_fd = open(lock_path, "w")
     deadline = time.time() + timeout_seconds
     while True:
         try:
@@ -3472,7 +3473,17 @@ def _acquire_apply_lock(timeout_seconds=5):
         except BlockingIOError:
             if time.time() >= deadline:
                 lock_fd.close()
-                return None
+                # A silent None return here used to leave no trace of WHY a caller aborted
+                # 409 -- indistinguishable in the logs from any other 409. apply-task.sh is
+                # the well-known usual holder (see this function's header comment).
+                logging.warning(
+                    "could not acquire %s within %ss -- apply-task.sh (or another dashboard "
+                    "operation) is likely still holding it", lock_path, timeout_seconds,
+                )
+                raise RuntimeError(
+                    f"could not acquire {lock_path} within {timeout_seconds}s -- apply-task.sh "
+                    "(or another dashboard operation) is likely still holding it"
+                )
             time.sleep(0.5)
 
 
