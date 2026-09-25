@@ -601,3 +601,83 @@ In the function that currently calls defaultGpuContentionChecker(taskId, atMs, r
 
 Benefits:
 Tests can inject a stub that returns true or false without touching node:sqlite or the model-stats.db schema. Production behaviour is unchanged when no checker is supplied. Follows the file's own established injection convention (callModel || callBackend), keeping the change idiomatic and low-risk.
+
+### AC-59 · Duplicated JSON I/O with Non-Atomic Writes Bypassing the Shared Atomic Primitive
+Strength: Strong
+Files: src/fabricated-path-recheck-sweep.js, src/task-anywhere.js, src/atomic-write.js
+
+Problem:
+`fabricated-path-recheck-sweep.js` defines its own `readJson` and `writeJson` helpers that reimplement logic already present in `task-anywhere.js` (`readJsonSafe`) and in the project's shared `atomic-write.js` module. Critically, the local `writeJson` helper in `fabricated-path-recheck-sweep.js` calls `fs.writeFileSync` directly, which is a non-atomic operation. The project has an explicit architectural decision—documented in the header of `atomic-write.js`—to route all JSON persistence through the atomic write primitive so that a crash mid-write cannot leave a truncated or corrupted file on disk. By bypassing that primitive, `fabricated-path-recheck-sweep.js` introduces a single point in the pipeline where a crash during a write can silently corrupt a task-state file, while every other module in the same community enjoys the durability guarantee. The duplication also means any future fix to the read/write helpers (e.g., adding schema validation, encoding handling, or locking) must be applied in two or three places, increasing the chance of drift.
+
+Solution:
+Remove the local `readJson`/`writeJson` helpers from `fabricated-path-recheck-sweep.js` and replace their call sites with imports from the shared modules: use `readJsonSafe` (or an equivalent exported from `task-anywhere.js` / a small shared utility) for reads, and `writeJsonAtomicSync` from `atomic-write.js` for writes. If `readJsonSafe` currently lives inside `task-anywhere.js` and is not exported, extract it into a small shared `json-io.js` module that both `task-anywhere.js` and `fabricated-path-recheck-sweep.js` import, so the read path is also single-sourced. No behavioural change is required; the public API of the sweep script stays the same.
+
+Benefits:
+A single, atomic write path eliminates the crash-corruption window in `fabricated-path-recheck-sweep.js` and brings its durability guarantee in line with the rest of the pipeline. Removing the duplicated helpers reduces the surface area that must be updated when the JSON I/O contract changes (encoding, schema validation, file locking). Reviewers and future contributors no longer need to wonder whether a given module respects the atomic-write invariant; the answer is uniformly "yes" because there is only one implementation.
+
+### AC-61 · Core-scope gate enforced redundantly in two layers with no test pinning the load-bearing one
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/task-selection.js, src/lib/source-scope.js
+
+Problem:
+The `scope: 'core'` eligibility check is applied in two independent places using two different mechanisms: `registerTaskSource` wraps a core source's `next()` to return `null` on a non-core repo, and `getNextTask` separately calls `sourceEligibleHere` and skips the source. For the `getNextTask` path the inline check is redundant because the wrapper already nulls the task, but the wrapper is the only protection for the documented always-run watchdog sweeps that call a source directly. The test suite exercises both layers only by registering through the registry (which installs the wrapper), so no test confirms that the wrapper alone is what saves the watchdog path. A future reader who sees the `sourceEligibleHere` call in `getNextTask` and removes it as "redundant" will leave the invariant half-enforced, and the half that remains is invisible from the selection layer.
+
+Solution:
+Designate the registry wrapper as the single authoritative enforcement point for all callers (it is the only place that can protect direct watchdog calls), and reduce the inline `sourceEligibleHere` check in `getNextTask` to a documented defensive pass-through with a comment explaining it is redundant. Alternatively, remove the wrapper and have both `getNextTask` and the sweep call `sourceEligibleHere` explicitly. In either case, add a test that registers a core source and asserts that the *registered* (wrapped) `next()` returns `null` when invoked directly on a non-core repo, so the load-bearing layer is pinned by a test rather than by a comment.
+
+Benefits:
+A reader can immediately tell which layer is authoritative for which caller, eliminating the silent-drift risk where one layer is removed and the invariant is only half-enforced. The test suite gains a direct assertion on the mechanism that actually protects the watchdog path, so a regression in that path is caught at test time rather than discovered in production.
+
+### AC-63 · uptime-log.js re-declares heartbeat thresholds that dead-process-check.js owns, with a comment claiming shared semantics
+Strength: Strong
+Files: src/uptime-log.js, src/dead-process-check.js
+
+Problem:
+`uptime-log.js` locally declares `STALE_HEARTBEAT_SECONDS = 300` and `WORKER_ZOMBIE_THRESHOLD_SECONDS = 1200`, and its header comment explicitly promises that "down" means the same thing here as it does to the daemon that actually restarts processes (i.e., `dead-process-check.js`). But the constants are copy-pasted, not imported. If someone in `dead-process-check.js` tunes the zombie threshold from 1200 to 900, `uptime-log.js` silently keeps using 1200, and the system report's downtime accounting will disagree with the daemon's actual restart decisions. The comment becomes a lie, and no test in this community pins the two files together.
+
+Solution:
+Extract both constants into a shared `heartbeat-thresholds.js` module that both `uptime-log.js` and `dead-process-check.js` import, and update `dead-process-check.js` to read its thresholds from that shared module rather than defining them locally. Add a test that asserts `uptime-log.js`'s stale/heartbeat computation matches `dead-process-check.js`'s for a representative set of `(ageSec, isWorker)` inputs, so the "same meaning" claim is enforced by the test suite rather than asserted in a comment.
+
+Benefits:
+The "what counts as stale" policy has a single owner, eliminating the silent-divergence risk where a tuning change in one file silently desynchronizes the system report from the daemon's restart decisions. The test provides a regression net: if the two files ever drift, CI fails rather than the report being subtly wrong in production.
+
+NOTE: Flag 1 was applied by making the shared-file approach the primary recommendation and explicitly requiring `dead-process-check.js` to be modified to import from it, rather than assuming it already exports the constants.
+
+### AC-69 · SDK re-export surface leaks test-only internals and couples read/write paths
+Strength: Strong
+Files: src/sdk/candidate-fulfillment.js, src/sdk/lib/candidate-lifecycle.js
+
+Problem:
+`candidate-fulfillment.js` builds its public `module.exports` by spreading `...candidateDocs` (the AC-NNN write-side namespace) alongside `nextCandidateFulfillmentTask`, `windowFetchedFileContent`, and a block of low-level helpers (`findFuzzyMatch`, `windowAroundIndex`, `collectAnchorHits`, `snippetFromSection`, `quotedSymbolsFromSection`) that the module's own comment labels as "exported for the plugin's own grounding tests." The module header frames the file as "one import for the whole candidate lifecycle," but the boundary between the documented public API and test-only internals is drawn only by a comment, not by any structural separation. A consumer importing `candidate-fulfillment` for `nextCandidateFulfillmentTask` transitively receives the write-side `candidateDocs` namespace and the fuzzy-matching/grounding primitives, with no structural way to distinguish stable contract from implementation detail. Any rename of a helper (e.g. `collectAnchorHits`) becomes a breaking change to the SDK surface even though it was never part of the documented API.
+
+Solution:
+Split the test-only helpers out of `candidate-fulfillment.js`'s `module.exports`. Move them to the `./lib/*` modules where they already live, and have the plugin's grounding tests import them from those lib modules directly. The SDK's exported surface should then match exactly what `docs/PLUGIN_API.md` documents: the two lifecycle functions plus the documented write-side namespace, with no comment-only boundary.
+
+Benefits:
+The SDK surface becomes a true contract: what is exported is what is documented, and what is documented is what is exported. Renaming or refactoring internal helpers no longer risks breaking a downstream consumer who happened to destructure them. The read/fulfill path is no longer structurally coupled to the write path through a shared export object, and the "one import" convenience no longer silently drags in five grounding primitives that plugins are not meant to depend on.
+
+### AC-70 · `coverageEntryActiveLocal` is a misleading pass-through that fragments ownership
+Strength: Strong
+Files: src/lib/task-audit.js, src/pipeline-forensics.js
+
+Problem:
+`coverageEntryActiveLocal(entry, now)` in `task-audit.js` is defined as a one-line delegation: `return pipelineForensics.coverageEntryActive(entry, now);`. The `Local` suffix implies local logic or a local override, but there is none—the function is a pure alias. The other three exports in the same file (`markPipelineHealthAuditChecked`, `markUiVisibilityAuditChecked`, `markPipelineDebriefReported`) do real work (lazy `require` of sibling audit modules, writing the debrief coverage file), so the pass-through stands out as anomalous. A caller reading `task-audit.js` cannot tell whether the `Local` suffix implies different semantics (it does not), and the indirection forces a second hop to `pipeline-forensics.js` for what is a single function whose true home is there. This fragments ownership: the function's implementation lives in `pipeline-forensics.js`, but it is re-exposed here under a misleading name, making the real owner harder to find.
+
+Solution:
+Drop `coverageEntryActiveLocal` from `task-audit.js` and have callers import `coverageEntryActive` from `pipeline-forensics.js` directly. If the pass-through exists to provide a dependency-injection seam (so tests can stub the audit module), rename it to reflect that role (e.g. `coverageEntryActive` without the `Local` suffix) and add a one-line comment documenting the seam, rather than a suffix that implies local behavior that does not exist.
+
+Benefits:
+Ownership of `coverageEntryActive` is unambiguous: it lives in `pipeline-forensics.js` and is imported from there. The `task-audit.js` module presents a consistent surface where every export does distinct work. Callers no longer need to wonder whether the `Local` suffix changes behavior, and a grep for the function's implementation lands in one place instead of two.
+
+### AC-71 · Remove dead `require('../task-sources.js')` from prompt-assembly and prompt-blocks
+Strength: Strong
+Files: src/lib/prompt-assembly.js, src/lib/prompt-blocks.js
+
+Problem:
+Both `prompt-assembly.js` and `prompt-blocks.js` open with a bare side-effect `require('../task-sources.js')` that neither file's code ever references. Every exported function in both files operates solely on its own parameters; no symbol from `task-sources.js` is destructured, called, or read. The require was inherited from the parent module (`src/prompts.js`) where it was needed, but the extracted functions carry no logical dependency on it. This creates a hidden coupling and failure surface: if `task-sources.js` or anything it transitively requires throws at load time, or if a future refactor introduces a require cycle back through these files, `assemblePrompt` and the four block functions will crash despite performing no work that could interact with task-sources. It also inflates the apparent coupling in any dependency-graph analysis and makes each module harder to reason about in isolation.
+
+Solution:
+Delete the `require('../task-sources.js')` line from both `src/lib/prompt-assembly.js` and `src/lib/prompt-blocks.js`. No exported function's behaviour changes. If a future function genuinely needs a task-source symbol, the require can be added back at that point with a clear, local justification.
+
+Benefits:
+Eliminates a load-time failure surface that is unrelated to the actual work of prompt formatting, removes a misleading hard edge from a pure formatting module into the task-source registry, and makes each module independently testable and analyzable without pulling in the entire task-source dependency tree.
