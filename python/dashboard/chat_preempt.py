@@ -99,7 +99,7 @@ def _preempt_lane_sets():
 
 
 def _preempt_decision(lane, kill_pid, started_epoch, now, max_age_s, always=None):
-    """Pure. -> (action, reason). action in {"kill", "spare", "skip"}.
+    """Pure. -> (action, reason). action in {"kill", "spared", "skip"}.
     kill_pid: the resolved in-flight node child pid (or None). started_epoch: unix time
     the call/task started (or None = age unknown). `always`: whether this lane is
     unconditionally preempted -- defaults to "not an age-gated lane" when not passed, so
@@ -111,11 +111,15 @@ def _preempt_decision(lane, kill_pid, started_epoch, now, max_age_s, always=None
     if always:
         return ("kill", "always")
     if started_epoch is None:
-        return ("spare", "age unknown")
+        return ("spared", "age unknown")
     age = now - started_epoch
     if age < max_age_s:
         return ("kill", f"{int(age)}s old (< {max_age_s}s)")
-    return ("spare", f"{int(age)}s old")
+    # AC-78, 2026-09-25: "spared" (not "spare") -- the separately-extracted chat-plugin
+    # frontend's own chat script filters the preempt SSE frame on
+    # `l.action === 'spared'`; the mismatch silently dropped every spared lane from the
+    # "spared: <lanes>" status line the user actually sees.
+    return ("spared", f"{int(age)}s old")
 
 
 def _read_fresh_model_locks(inst_dir: Path) -> dict:
