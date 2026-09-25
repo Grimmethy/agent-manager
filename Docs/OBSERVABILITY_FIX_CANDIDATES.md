@@ -3243,3 +3243,26 @@ Add a single `console.error('renderJobListTab: failed to fetch /api/job-types', 
 
 Benefits:
 Once the one-line log is in place, any future failure of `/api/job-types` immediately surfaces in the browser Console with a function-scoped message and the full error object (status, message, stack), letting a developer identify the root cause in seconds rather than hunting through the Network tab. The graceful-degradation behavior is unchanged — the job list still renders without the supplementary columns — so no user-facing regression is introduced. The fix costs zero dependencies, zero API changes, and zero downstream code modifications.
+
+### AC-177 · Swallowed fetch error in pipeline-map tab initialization
+Strength: Strong
+Files: python/dashboard/static/js/branches-joblist-hardware-tabs.js
+Snippet:
+```
+  let pipelineMap;
+  try {
+    pipelineMap = await fetchJson('/api/pipeline-map');
+  } catch (e) {
+    pipelineMap = null;
+  }
+  const activeByName = {};
+```
+
+Problem:
+The `catch (e)` block that guards the `fetchJson('/api/pipeline-map')` call assigns `pipelineMap = null` and discards the exception object entirely. Because the downstream code null-guards `pipelineMap` before populating the `*ByName` maps, the tab degrades gracefully to an empty render — but the *reason* for the null is lost. A 404 (endpoint removed in a deploy), a 500 (server-side bug), and a `fetchJson` JSON-parse failure all collapse into the same silent `null` with zero console output. A developer investigating a blank pipeline-map section must open DevTools → Network, locate the failing request, and manually inspect the response body; the JavaScript error trail is a dead end because the exception is never logged.
+
+Solution:
+Add a single `console.error('[pipeline-map] fetch failed:', e);` statement inside the `catch` block, immediately before the existing `pipelineMap = null;` assignment. This uses the browser `console` primitive — the only logging mechanism available in this project's browser-side JS — and introduces no new dependency. The graceful-degradation control flow is preserved: `pipelineMap` is still set to `null`, the tab still renders (just empty), and no exception propagates to break the rest of the tab's initialization. The log message includes a stable `[pipeline-map]` prefix so it is greppable in console output and distinguishable from other fetch failures in the same file.
+
+Benefits:
+Any developer with DevTools open immediately sees a labeled, greppable breadcrumb in the console the moment the pipeline-map fetch fails, including the full exception object (status code, response body, or parse-error message) that distinguishes a 404 from a 500 from a malformed-JSON error. This eliminates the need to hunt through the Network tab to diagnose a blank tab, reduces mean-time-to-diagnosis for deploy regressions or server bugs affecting this endpoint, and makes the failure visible in any shared console-log capture without changing the user-facing behavior of the dashboard.
