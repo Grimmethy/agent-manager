@@ -904,6 +904,51 @@ test('runPlanWithTools with forceSummaryOnCap does NOT add a turn when an early 
   });
 });
 
+// --- source:'chat' never demands a RESOLUTION line (2026-09-22) ----------------------
+// Root-caused live (Grimmethy: "It's not responding how I'd expect"): the voluntary-stop
+// check above has no caller-shape awareness, so it fired on essentially every ordinary
+// chat reply -- a normal conversational answer never naturally contains "RESOLUTION:".
+// Confirmed live in two real sessions: one got "RESOLUTION: no-changes-needed" as its
+// entire answer to "What's the goal of this project?" (the model complying with the
+// forced demand), another got a near-empty "You" (the forced-summary turn's own
+// compliance-retry overwrote a real answer with a shorter, non-compliant one via the
+// "keep whichever reply is longer" fallback).
+
+test('runPlanWithTools with source:"chat" returns a normal voluntary-stop reply as-is, with no RESOLUTION demand', async () => {
+  const normalReply = { role: 'assistant', content: 'The dashboard\'s Project tab is what starts and monitors the pipeline.' };
+  await withMockedChat([normalReply], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: 'what does the Project tab do?', source: 'chat', forceSummaryOnCap: true });
+    assert.equal(result.turnsUsed, 1);
+    assert.equal(result.forcedSummary, undefined, 'a real, non-degenerate chat answer must not trigger any forced-summary turn');
+    assert.equal(result.response, normalReply.content);
+    assert.equal(sentBodies.length, 1, 'only the one real turn -- no RESOLUTION-demanding follow-up turn was ever sent');
+  });
+});
+
+test('runPlanWithTools with source:"chat" retries a degenerate (near-empty) voluntary stop without ever mentioning RESOLUTION', async () => {
+  const degenerate = { role: 'assistant', content: 'You' };
+  const realAnswer = { role: 'assistant', content: 'You can start the pipeline from the Project tab -- click Start Pipeline once a repo is configured.' };
+  await withMockedChat([degenerate, realAnswer], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: 'status', source: 'chat', forceSummaryOnCap: true });
+    assert.equal(result.forcedSummary, true);
+    assert.equal(result.forcedSummaryReason, 'degenerate');
+    assert.equal(result.response, realAnswer.content);
+    assert.equal(result.forcedSummaryNonCompliant, undefined, 'RESOLUTION-compliance is a pipeline-only concept -- chat must never be flagged non-compliant against a sentinel it was never asked for');
+    const retryPrompt = sentBodies[sentBodies.length - 1].messages.at(-1).content;
+    assert.doesNotMatch(retryPrompt, /RESOLUTION/, 'the retry nudge sent to the model must never mention the pipeline\'s RESOLUTION: sentinel');
+  });
+});
+
+test('runPlanWithTools with source:"chat" does not treat a real short answer as degenerate', async () => {
+  const shortButReal = { role: 'assistant', content: 'Sounds good to me.' };
+  await withMockedChat([shortButReal], async (mod, _dir, { sentBodies }) => {
+    const result = await mod.runPlanWithTools({ prompt: 'should I go ahead?', source: 'chat', forceSummaryOnCap: true });
+    assert.equal(result.forcedSummary, undefined, 'a real, complete short reply must not be treated as degenerate');
+    assert.equal(result.response, shortButReal.content);
+    assert.equal(sentBodies.length, 1);
+  });
+});
+
 // --- Forced-summary-turn RESOLUTION compliance (2026-09-16) --------------------------
 // runForcedSummaryTurn explicitly demands a RESOLUTION: line, but nothing ever checked
 // whether the model actually complied -- confirmed live, a real task's forced-summary
