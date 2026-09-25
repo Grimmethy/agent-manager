@@ -681,3 +681,32 @@ Delete the `require('../task-sources.js')` line from both `src/lib/prompt-assemb
 
 Benefits:
 Eliminates a load-time failure surface that is unrelated to the actual work of prompt formatting, removes a misleading hard edge from a pure formatting module into the task-source registry, and makes each module independently testable and analyzable without pulling in the entire task-source dependency tree.
+
+### AC-60 · `task-anywhere.js` hand-syncs its queue-state list with the dashboard and nothing tests that they match
+Strength: Worth exploring
+Files: src/task-anywhere.js, python/dashboard/app.py
+
+Problem:
+`src/task-anywhere.js` defines `QUEUE_STATES` (8 directory names) and its comment says it is "kept in sync by hand with python/dashboard/app.py's own QUEUE_STATES (app.py:301)". On master the real definition is at `python/dashboard/app.py:202`, so the comment's line reference is already stale, and the two lists are identical only by coincidence of nobody having changed either since. No test compares them: `src/task-anywhere.test.js` and `src/migrate-history-status-note.test.js` exercise `QUEUE_STATES` from the JS side only. Adding, renaming or reordering a queue directory in one language without the other would make the Node lookup and the dashboard disagree about where a task lives, silently (a task in the new directory is invisible to one side).
+
+Solution:
+Add a parity test (Node, reading `python/dashboard/app.py` as text and extracting the `QUEUE_STATES = [...]` literal) asserting it equals `task-anywhere.js`'s exported `QUEUE_STATES` in both membership and order, and fix the stale `app.py:301` reference in the comment. Do not restructure the search logic and do not route it through `config.js`: no config-driven task-location mechanism exists for this (the sibling sweeps hardcode their own directory lists, e.g. `fabricated-path-recheck-sweep.js` `DIRS`). A shared JSON list read by both languages is an acceptable alternative if the parity test proves too brittle.
+
+Benefits:
+Drift between the Node task lookup and the dashboard is caught by CI instead of by a task going missing, at the cost of one small test.
+
+### AC-66 · `deterministic-recheck-registry.js` bundles two unrelated registries with different lifecycles and keying schemes
+Strength: Strong
+Files: src/deterministic-recheck-registry.js, src/pipeline-forensics.test.js
+
+Problem:
+The module exports two distinct registries side by side: a source-keyed deterministic-recheck registry (register/get/clear keyed by task-source name, storing `perFileRules`/`repoWideRules` config objects) and a rule-keyed pre-dispatch gate registry (register/get/clear keyed by rule ID, storing detector functions). The gate registry additionally self-registers a built-in `sequential-await-in-loop` detector at module load time, making the module stateful by import, while the recheck registry is purely passive. These two mechanisms have different keying schemes, different consumers, different extension points, and different lifecycles, yet they share a single module identity. Any change to gate semantics or recheck semantics forces both to live in the same file, and importing the module carries an implicit side effect that the rest of the codebase (e.g. `model-profile-registry.js`) does not exhibit.
+
+Solution:
+Split the module into two separate modules: one for source-keyed deterministic-recheck registration (register/get/clear/list for `perFileRules`/`repoWideRules`) and one for rule-keyed pre-dispatch gate registration (register/get/clear for gate detectors). Within the new gate module, preserve the codebase’s “single swap point” discipline (as seen in `hub-review-detection.js`): keep the default `sequential-await-in-loop` detector defined inside the gate module and expose a `set`/`get` (or `register`/`get`) swap mechanism for it, rather than moving the default implementation to a bootstrap file. Update imports in `pipeline-forensics.test.js` and any other consumers to pull each registry from its own module.
+
+Benefits:
+Each module has a single responsibility and a single, predictable import side-effect profile (none). Changes to gate semantics no longer require touching the recheck module and vice-versa. The test file's import list becomes a clear statement of which registries are under test, removing the ambiguity that currently forces the `try/catch` workaround. New contributors can reason about one registry at a time without mentally separating two interleaved concerns.
+
+NOTE (verified against master, 2026-09-25): the recheck half of `deterministic-recheck-registry.js` is a documented plugin API (`docs/PLUGIN_API.md` lists `registerDeterministicRecheck`, `getDeterministicRecheck`, `getRecheckSources`, `clearDeterministicRecheckRegistry`), and the hygiene plugin registers through it, so keep those exports at the existing path. The pre-dispatch gate functions (`registerPreDispatchGate` and friends) are NOT in the documented API, so they are the half to move to a new module; if any plugin already imports them, re-export from the old path. Also keep the file free of external requires (`silent-catch-plan-cap.js` cites that as a hot-path constraint the module holds). AC-68's claim of different verb shapes is wrong: both registries already use register/get/clear; ignore any candidate built on it.
+
