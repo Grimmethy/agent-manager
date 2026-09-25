@@ -123,10 +123,13 @@ def api_brain_dump_capture():
         abort(500, description="no active project configured")
 
     # read_brain_dump_entries() backfills+persists a serial onto any pre-existing entry
-    # that doesn't already have one, so `entries` here is always fully migrated before
+    # that doesn't already have one, so every DICT entry here is fully migrated before
     # next_serial is computed off it -- see _assign_brain_dump_serials()'s own header.
+    # That backfill skips non-dict entries rather than removing them (a stray scalar from
+    # a hand-edited brain-dump.json survives in the list), so this filters the same way
+    # _assign_brain_dump_serials's own max() does, rather than crashing on e.get(...).
     entries = read_brain_dump_entries()
-    next_serial = max((e.get("serial") or 0) for e in entries) + 1 if entries else 1
+    next_serial = max((e.get("serial") or 0) for e in entries if isinstance(e, dict)) + 1 if entries else 1
 
     entry_id = f"bd-{int(datetime.now(timezone.utc).timestamp() * 1000)}-{slugify_for_id(text)}"
     entry = {
