@@ -214,8 +214,9 @@ def api_git_merge_branch(branch):
             ),
         }), 409
 
-    lock_fd = _acquire_apply_lock()
-    if lock_fd is None:
+    try:
+        lock_fd = _acquire_apply_lock()
+    except RuntimeError:
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
 
     main_branch = match["mainBranch"]
@@ -364,8 +365,9 @@ def api_git_discard_branch(branch):
     if not match:
         abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 
-    lock_fd = _acquire_apply_lock()
-    if lock_fd is None:
+    try:
+        lock_fd = _acquire_apply_lock()
+    except RuntimeError:
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
 
     local_branch = {"deleted": False, "reason": "not attempted"}
