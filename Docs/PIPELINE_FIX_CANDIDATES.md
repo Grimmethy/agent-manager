@@ -370,3 +370,13 @@ Solution: Add a diagnostic log to the draft worker's queue-polling loop that rec
 Benefits: This will reveal whether the draft worker is systematically ignoring requeued tasks from `needs-clarification`, which would explain why this class of tasks keeps failing to progress after human clarification.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-brain-dump-bd-1788686010195-aar-is-what-why-learn-not-what--1789699925981
+
+### AC-142 · 6 needs-clarification tasks, same signature (change_review_fix::refusal-no-changes-needed)
+Strength: Strong
+Files: src/local-draft.js, src/prompts.js
+
+Problem: The implement prompt does not explicitly require a failing test for correctness-regression fixes, and the false-positive refusal heuristic incorrectly flags valid shell-script fixes as non-existent files.
+Solution: In `src/prompts.js`, add a mandatory instruction to the implement prompt: "For correctness-regression fixes, you MUST include a test that fails without the fix and passes with it." In `src/local-draft.js`, adjust the false-positive detection to exclude shell-script files (`*.sh`) from the "file does not exist" heuristic, or require the model to provide a diff hunk before triggering refusal. Acceptance check: Re-run AC-58; it should pass review without "FALSE POSITIVE" or "missing test" rejections.
+Benefits: Correctness-regression fix tasks with shell-script targets will stop failing due to false-positive refusals and missing tests.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-6-needs-clarification-tasks-same-signature-change-review-fix-refusal-no-changes--1790159131012
