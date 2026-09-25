@@ -3312,3 +3312,26 @@ Bind the caught exception and emit a single diagnostic line to `process.stderr` 
 
 Benefits:
 An operator running the CLI now sees a one-line, path-specific diagnostic on stderr the moment a classification attempt fails, naming both the offending path and the underlying error message. This converts a silent misclassification (a `direct`-eligible path silently routed through the non-direct pipeline) into an immediately visible, greppable signal, while leaving the machine-readable stdout output and the conservative fallback semantics completely unchanged.
+
+### AC-180 · Silent catch discards fetch error in assignable-tasks batch
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
+```
+
+Problem:
+In the `Promise.all` batch that populates `assignableByInstance`, each per-instance `fetchJson` call to `/api/instances/<id>/assignable-tasks` is wrapped in a try/catch whose catch block binds the error to `e` and then immediately assigns `[]` to the map entry with no other statement. The exception object is never logged, rethrown, or surfaced in any form. If the route returns a 500, a 404 after a refactor, or the network drops mid-request, every affected worker card renders an empty task list that is visually identical to a legitimate "no assignable tasks" response, and the browser DevTools console shows no trace of the failure. A developer investigating "why are my task lists empty?" has zero diagnostic signal to distinguish a broken endpoint from an empty queue.
+
+Solution:
+Add a single `console.warn` call at the top of the catch block, before the `[]` fallback assignment, that includes the instance identifier and the caught error object for stack inspection. Specifically, insert `console.warn('[core-ui] assignable-tasks fetch failed for ' + inst.instanceId + ':', e);` as the first statement inside the catch. This uses only the standard browser `console.warn` primitive (no new dependency, no metrics system required), preserves the existing graceful-degradation behavior (the batch continues, the card shows an empty list), and makes the failure visible in DevTools for diagnosis. No rethrow is added because the caller is a `Promise.all` over independent per-instance fetches and cannot meaningfully act on a single instance's failure.
+
+Benefits:
+Once the warning is in place, any transient or permanent API failure (route rename, auth-middleware regression, network blip) produces an immediately visible console entry naming the affected instance and carrying the full error object, so a developer can open DevTools, filter on `[core-ui]`, and see exactly which instance(s) failed and why. The dashboard still degrades gracefully to empty lists, but the failure is no longer indistinguishable from a legitimate empty result, eliminating the "silent broken dashboard" failure mode.
