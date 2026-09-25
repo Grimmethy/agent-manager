@@ -51,12 +51,31 @@ test('detectDegenerate does not false-positive on real short JSON containing quo
 // full case set on the pure detector itself; this just proves the wiring.
 test('detectDegenerate flags a content-truncated draft (unclosed PLAN table row) as "truncated", even with no doneReason', () => {
   const draft = '| Step | Action |\n|------|--------|\n| 1    | partial text';
-  assert.equal(detectDegenerate(draft), 'truncated');
+  assert.equal(detectDegenerate(draft, { isDraft: true }), 'truncated');
 });
 
 test('detectDegenerate does not flag a well-formed draft as truncated', () => {
   const draft = '| Step | Action |\n|------|--------|\n| 1    | Do A   |\n\n## IMPLEMENT\n\ndo thing B\n';
-  assert.equal(detectDegenerate(draft), null);
+  assert.equal(detectDegenerate(draft, { isDraft: true }), null);
+});
+
+// AC-70, 2026-09-25: isDraftTruncated is gated on isDraft (default false) precisely so a
+// non-draft caller's legitimate markdown-table-ending response isn't misread as a
+// truncated draft -- see local-client.js's own header on this check for the incident.
+// Test A (fails on the pre-fix code, passes after): the EXACT regression scenario from
+// the task -- a non-draft (isDraft not set) response whose final line is a markdown
+// table row must NOT be flagged truncated. Before this fix, isDraftTruncated ran
+// unconditionally and this assertion would fail with 'truncated' instead of null.
+test('Test A: detectDegenerate does NOT apply the draft-truncation heuristic to a non-draft call (isDraft unset) -- the exact AC-70 regression scenario', () => {
+  const nonDraftResponse = 'Here is the comparison:\n\n| Feature | Old | New |\n|---------|-----|-----|\n| Speed | 100 | 200 |';
+  assert.equal(detectDegenerate(nonDraftResponse), null);
+});
+
+// Test B (must still pass after the fix): a genuinely truncated DRAFT (isDraft: true)
+// must still be caught -- the fix gates the heuristic, it must not disable it outright.
+test('Test B: detectDegenerate still catches a genuinely truncated draft when isDraft is explicitly true', () => {
+  const truncatedDraft = '| Step | Action |\n|------|--------|\n| 1    | partial text';
+  assert.equal(detectDegenerate(truncatedDraft, { isDraft: true }), 'truncated');
 });
 
 test('detectDegenerate still flags repeated-character garbage', () => {
