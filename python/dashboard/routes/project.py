@@ -113,9 +113,12 @@ def api_project_sync():
     # (same lock, same reasoning as api_git_merge_branch above).
     active_root = get_active_repo_root()
     is_active = bool(active_root) and os.path.realpath(active_root) == os.path.realpath(str(repo_root))
-    lock_fd = _acquire_apply_lock() if is_active else None
-    if is_active and lock_fd is None:
-        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+    lock_fd = None
+    if is_active:
+        try:
+            lock_fd = _acquire_apply_lock()
+        except RuntimeError:
+            abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
 
     try:
         current_branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], repo_root).strip()
