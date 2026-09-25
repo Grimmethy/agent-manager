@@ -1401,26 +1401,33 @@ def _task_cost_summary(task_id: str) -> dict | None:
         return None
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        if not _has_cost_usd_column(conn):
-            return None
-        row = conn.execute(
-            "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*), SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END), "
-            "COALESCE(SUM(latency_ms), 0) "
-            "FROM model_calls WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
-        # Hypothetical: what this SAME task would have cost if every one of its calls --
-        # including any that ran locally -- had gone through the API (2026-08-23,
-        # Grimmethy: "I'd like estimates for if we had used the API. Even if we used the
-        # local models."). None when the column isn't migrated in yet, same "no data" vs.
-        # "real $0" distinction the rest of this function already makes.
-        hypothetical_cost_usd = None
-        if _has_hypothetical_cost_column(conn):
-            h_row = conn.execute(
-                "SELECT COALESCE(SUM(hypothetical_cost_usd), 0) FROM model_calls WHERE task_id = ? AND hypothetical_cost_usd IS NOT NULL",
+        try:
+            if not _has_cost_usd_column(conn):
+                return None
+            row = conn.execute(
+                "SELECT COALESCE(SUM(cost_usd), 0), COUNT(*), SUM(CASE WHEN cost_usd IS NOT NULL THEN 1 ELSE 0 END), "
+                "COALESCE(SUM(latency_ms), 0) "
+                "FROM model_calls WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
-            hypothetical_cost_usd = h_row[0]
+            # Hypothetical: what this SAME task would have cost if every one of its calls --
+            # including any that ran locally -- had gone through the API (2026-08-23,
+            # Grimmethy: "I'd like estimates for if we had used the API. Even if we used the
+            # local models."). None when the column isn't migrated in yet, same "no data" vs.
+            # "real $0" distinction the rest of this function already makes.
+            hypothetical_cost_usd = None
+            if _has_hypothetical_cost_column(conn):
+                h_row = conn.execute(
+                    "SELECT COALESCE(SUM(hypothetical_cost_usd), 0) FROM model_calls WHERE task_id = ? AND hypothetical_cost_usd IS NOT NULL",
+                    (task_id,),
+                ).fetchone()
+                hypothetical_cost_usd = h_row[0]
+        except sqlite3.DatabaseError:
+            # is_file() only confirms the path exists -- a zeroed-out or otherwise
+            # corrupt file (SQLite doesn't validate the header until first real access)
+            # reaches here instead. Same "no data yet" contract as the missing-file case
+            # above, rather than a 500 for every caller of this task's detail view.
+            return None
     finally:
         conn.close()
     total_cost, total_calls, calls_with_cost, total_latency_ms = row
