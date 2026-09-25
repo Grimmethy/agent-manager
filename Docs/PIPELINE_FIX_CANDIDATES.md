@@ -380,3 +380,23 @@ Solution: In `src/prompts.js`, add a mandatory instruction to the implement prom
 Benefits: Correctness-regression fix tasks with shell-script targets will stop failing due to false-positive refusals and missing tests.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-6-needs-clarification-tasks-same-signature-change-review-fix-refusal-no-changes--1790159131012
+
+### AC-143 · on-demand task "adhoc-write-the-research-note-mapping-sidekiq-super-fetch-onto-agent-manager-with-th
+Strength: Strong
+Files: src/adhoc-diff-sanity.js
+
+Problem: The `docs-only` gate at line 498 unconditionally blocks documentation-only diffs, even when the task explicitly asks for a documentation file to be created. The `taskWantsCodeFromText` heuristic misclassifies documentation-creation tasks as code-change tasks, and `extractDeclaredTargets` fails to recognize the documentation file as a declared target.
+Solution: Modify the `docs-only` gate at line 498 to check if the task explicitly asks for a documentation file to be created (e.g., by checking for "create" + "docs/" or "create" + ".md" in the task's raw text). If so, skip the `docs-only` block. Acceptance check: Add a test case in `src/agentic-draft-common.test.js` where the task asks to create a documentation file, and assert that the `docs-only` block is not triggered.
+Benefits: Tasks that explicitly ask for documentation files to be created will no longer be blocked by the `docs-only` gate, allowing them to ship successfully.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-write-the-research-note-mapping-sidekiq-super-fetch-onto-ag-1790098940482
+
+### AC-144 · on-demand task "function-length-fix-ac-34"
+Strength: Strong
+Files: src/decompose-premise-check.js
+
+Problem: The `missing-file` check in `detectStaleDecomposePremise` treats any cited path that is not on disk as a stale premise, even when the task's explicit goal is to create that file. This causes a false positive on creation tasks, blocking them before the implement pass can run.
+Solution: Modify `detectStaleDecomposePremise` to skip the `missing-file` finding if the task's `title` or `rawText` contains a creation intent keyword (e.g., "create", "new file", "add") in proximity to the cited path. Acceptance check: Add a test case where `rawText` is "Create src/new-file.js with a new function" and `lineCountFn` returns `null`; assert that `result` is `null` (no finding).
+Benefits: Creation tasks that cite the file they intend to create will no longer be blocked by the premise check, allowing the implement pass to proceed.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-function-length-fix-ac-34-1790098950143
