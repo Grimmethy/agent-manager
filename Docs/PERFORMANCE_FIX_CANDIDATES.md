@@ -260,3 +260,26 @@ In src/dead-process-check.js, locate the call site where deadProcessCheck is inv
 
 Benefits:
 The CLI correctly awaits the parallel read batch before iterating the resolved actions array, preserving the existing output format and exit-code semantics. Prevents the 'iterating over a Promise' bug that would silently produce no restart/flag output.
+
+### AC-14 · Replace synchronous file reads in blocked-cluster-sweep loop with async fs.promises.readFile
+Strength: Strong
+Files: src/blocked-cluster-sweep.js
+Snippet:
+```
+  }
+
+  const byFingerprint = new Map(); // fingerprint -> { count, taskIds: [], exampleReasons: Set, sources: Set }
+  for (const f of files) {
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(path.join(blockedDir, f), 'utf8'));
+```
+
+Problem:
+The sweep iterates over every file in `blockedDir` with a `for…of` loop and calls `fs.readFileSync` on each one. Because `readFileSync` is a blocking syscall, the entire Node.js event loop is suspended for the duration of each disk read plus the subsequent `JSON.parse`. With N blocked-task files (unbounded by design—one file per blocked task), the cumulative stall is N × (syscall + disk latency + parse time). In an agent-manager service that concurrently handles spawn, status polling, and task dispatch, this stall delays every in-flight timer callback, socket read, and `setInterval`-driven health check for the full duration of the sweep, and the cost grows linearly as the blocked-task population grows.
+
+Solution:
+Make the enclosing function `async` and replace each `fs.readFileSync(path.join(blockedDir, f), 'utf8')` call with `await fs.promises.readFile(path.join(blockedDir, f), 'utf8')`. `fs.promises` is part of the same `fs` module already imported in the file, so no new dependency is introduced. The loop body has no cross-iteration data dependency beyond the shared `byFingerprint` Map (safe to mutate sequentially), so a plain sequential `await` loop preserves the existing ordering semantics while yielding control back to the event loop between each disk read. The `try/catch` around each read and the `JSON.parse` step remain unchanged. If the caller does not already `await` the sweep function, it must be updated to do so; this is a one-line change at the call-site.
+
+Benefits:
+The event loop is no longer monopolised for the duration of the sweep. Between each file read the process can service pending timers, network I/O, and other agent-lifecycle operations, eliminating the multi-hundred-millisecond (or longer) stall that currently degrades every concurrent operation in the service. The fix is a drop-in replacement using only the `fs` module already in scope, introduces no new dependency, and keeps the code structure and grouping logic identical—only the I/O call changes from synchronous to asynchronous.
