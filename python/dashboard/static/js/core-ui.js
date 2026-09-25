@@ -1198,6 +1198,20 @@ function allSourceNames() {
   return allSourceNamesPromise;
 }
 
+// AC-56, 2026-09-25: /api/job-types failing must not blank out an otherwise-successful
+// task list -- renderQueueTab's own fetch already succeeded and has real data worth
+// rendering regardless. Extracted from renderQueueTab as its own named, dependency-
+// injectable function (sourceNamesFn defaults to the real allSourceNames) specifically so
+// this fallback behavior is unit-testable without a DOM -- this file has no other test
+// coverage today, and a full jsdom harness for the rest of it is out of scope for this fix.
+async function safeSourceNames(sourceNamesFn = allSourceNames) {
+  try {
+    return await sourceNamesFn();
+  } catch {
+    return [];
+  }
+}
+
 function wireQueueSourceFilter(state) {
   const select = document.getElementById('queue-source-filter');
   if (!select) return;
@@ -1300,7 +1314,7 @@ async function renderQueueTab(state) {
   queueHasMore[state] = queueLoadedCount[state] < total;
   const main = document.getElementById('main');
 
-  const sourceNames = await allSourceNames();
+  const sourceNames = await safeSourceNames();
   const filterOptionsHtml = ['<option value="">All task types</option>']
     .concat(sourceNames.map((n) => `<option value="${escapeAttr(n)}" ${n === sourceFilter ? 'selected' : ''}>${escapeHtml(n)}</option>`))
     .join('');
@@ -1848,3 +1862,9 @@ function pipelineFlagBadges(s) {
   if (s.hasCustomApply && !s.directToMain) badges.push('<span class="badge idle" title="Has its own registered apply() instead of the generic Group B diff path">custom-apply</span>');
   return badges.join(' ') || '<span class="meta">—</span>';
 }
+
+// AC-56, 2026-09-25: this file is loaded as a plain global <script> in the browser
+// (`module` is undefined there, so this is a no-op in production) -- the guard exists
+// solely so safeSourceNames is requireable from a Node test, the first test coverage
+// this file has ever had.
+if (typeof module !== 'undefined') module.exports = { safeSourceNames };
