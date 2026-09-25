@@ -3289,3 +3289,26 @@ Add a single `console.warn` line at the top of the `catch` block, before the exi
 
 Benefits:
 A developer or operator who notices a worker card showing an unexpectedly empty task list can open the browser console and immediately see which instance's fetch failed and the underlying error (HTTP status, network message, etc.), turning a silent, unexplained empty state into a one-line diagnostic. Systemic endpoint breakage (e.g., a bad deploy that 500s the assignable-tasks route) becomes visible on first dashboard load rather than remaining invisible until someone manually inspects the network tab. The fix is a single line, changes no data shape, adds no dependency, and does not alter the `Promise.all` flow or the caller-visible contract.
+
+### AC-179 · Silent catch in mainPartition hides classification failures from the operator
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+Snippet:
+```
+      const t = JSON.parse(fs.readFileSync(p, 'utf8'));
+      const reg = getRegisteredSource(resolveSourceName(t));
+      if (reg && reg.directToMain === true) direct.push(p); else other.push(p);
+    } catch {
+      other.push(p);
+    }
+  }
+```
+
+Problem:
+In `mainPartition()`, the `catch` clause that guards the per-path classification loop (read file → parse JSON → look up registry flag) is completely bare: it simply does `other.push(p)` and moves on. Because the function's sole output is a machine-readable JSON blob on stdout, the operator who invoked the CLI has no channel—stderr, console, or otherwise—through which to learn that a path landed in `other` due to a failure (missing file, permission error, truncated JSON, or a throw inside `getRegisteredSource`/`resolveSourceName`) rather than a legitimate "not directToMain" determination. A one-character path typo or a transient I/O hiccup produces an identical, perfectly valid JSON response, making the misclassification indistinguishable from a correct classification.
+
+Solution:
+Bind the caught exception and emit a single diagnostic line to `process.stderr` before the fallback push, e.g. `process.stderr.write(\`mainPartition: could not classify "${p}", defaulting to "other": ${err.message}\n\`)`. This uses only `process.stderr.write`, a primitive the project already relies on elsewhere, and does not alter the stdout JSON contract, the fallback routing, or any caller-visible behaviour on the happy path. No new dependency, no logging framework, no metric is introduced.
+
+Benefits:
+An operator running the CLI now sees a one-line, path-specific diagnostic on stderr the moment a classification attempt fails, naming both the offending path and the underlying error message. This converts a silent misclassification (a `direct`-eligible path silently routed through the non-direct pipeline) into an immediately visible, greppable signal, while leaving the machine-readable stdout output and the conservative fallback semantics completely unchanged.
