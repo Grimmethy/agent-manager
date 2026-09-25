@@ -1428,6 +1428,14 @@ async function runDraftPasses(task, attempt, {
       const guardResult = missingFileCheck(task.implementResponse, repoRoot, grepAllowedDirs);
       if (guardResult.blocked) {
         appendHistoryEvent(task, 'blocked', guardResult.reason);
+        // HUB0091 grounding-refresh fallback: the FALSE-POSITIVE/fabrication was
+        // detected (the draft names a file that resolves nowhere) -- BEFORE this
+        // escalates to a blocked/needs-clarification dead end, try one
+        // deterministic re-grounding: if the target symbol lives in exactly one
+        // OTHER real file, refresh promptContext to it (line-anchored window,
+        // no localRejectCount advance) and requeue as immediately re-draftable.
+        const refresh = tryGroundingRefreshFallback(task);
+        if (refresh) return refresh;
         return {
           succeeded: true,
           blocked: true,
@@ -1445,6 +1453,14 @@ async function runDraftPasses(task, attempt, {
     // already stamped blockedStage/blockedReason -- dispose it exactly like the
     // postImplementCheck disposition in runImplementPass, before concludeDraft.
     if (task.blockedStage) {
+      // HUB0091 grounding-refresh fallback: between this FALSE-POSITIVE-style
+      // rejection and the needs-clarification escalation that follows it (a
+      // blockedStage:'review' rejection that burns MAX_LOCAL_REJECT_RETRIES then
+      // parks with a human), try one deterministic re-grounding against the
+      // single other real file holding the target symbol. No localRejectCount
+      // advance, no review-task.js routing -- the refreshed task re-drafts now.
+      const refresh = tryGroundingRefreshFallback(task);
+      if (refresh) return refresh;
       return { succeeded: true, blocked: true, blockedReason: task.blockedReason };
     }
 
@@ -1534,7 +1550,112 @@ async function main() {
   process.stdout.write(JSON.stringify(result));
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard };
+// ---------------------------------------------------------------------------
+// HUB0091 grounding-refresh fallback (draft-time): fired BETWEEN FALSE-POSITIVE
+// detection (a candidate whose premise/edits no longer land -- the model's FALSE
+// POSITIVE verdict / non-compliant implement output) and the needs-clarification
+// escalation that would otherwise park it with a human. The draft's cited files
+// are stale (anchorConfidence 'none', empty context -- see
+// blocked-task-classifiers.js's hasUnreliableGrounding), so before escalating we
+// try one deterministic re-grounding:
+//   (a) extract ONE target symbol from the candidate body
+//       (task.promptContext.rawText -- the same field acceptance-criteria.js reads);
+//   (b) grep the repo, constrained to getConfig().grepAllowedDirs (the same
+//       accessible-roots surface the pre-implement guard in runDraftPasses uses
+//       -- repoRoot + grepAllowedDirs);
+//   (c) if EXACTLY ONE different file (not already in promptContext.files) holds
+//       the symbol, refresh promptContext.files to it and promptContext.fetchedFiles
+//       to a line-anchored content WINDOW around the real symbol definition
+//       (bounded slice, not a whole-file read -- the candidate-path-grounding /
+//       context-trim-sweep windowing convention), anchorConfidence 'strong'
+//       (never 'none' -- 'none' + no context is what the unreliable-grounding
+//       classifier treats as bad grounding);
+//   (d) log a 'grounding-refresh' history event via appendHistoryEvent and clear
+//       the stale block stamps so the task is immediately re-draftable.
+// It does NOT touch task.localRejectCount (no increment, no assignment) -- the
+// MAX_LOCAL_REJECT_RETRIES budget in reject-retry-check.js is untouched, and the
+// requeue path here never routes through review-task.js (no import, no call).
+function tryGroundingRefreshFallback(task) {
+  try {
+    if (task.source === 'staleness_audit') return null;
+    const pc = (task && task.promptContext) || {};
+    // (a) single target symbol from the candidate body -- first plausible
+    //     identifier (length >= 4 avoids 'the'/'not'/'and' noise; no LLM call).
+    const rawText = String(pc.rawText || '');
+    const symMatch = rawText.match(/`?([A-Za-z_$][A-Za-z0-9_$]{3,})`?/);
+    if (!symMatch) return null;
+    const symbol = symMatch[1];
+
+    // (b) repo grep via the config's accessible roots (repoRoot + grepAllowedDirs).
+    let repoRoot, grepAllowedDirs;
+    try { ({ repoRoot, grepAllowedDirs } = require('./config.js').getConfig()); } catch { return null; }
+    if (!repoRoot) return null;
+    const dirs = (Array.isArray(grepAllowedDirs) ? grepAllowedDirs : []).filter(Boolean);
+
+    const alreadyGrounded = (pc.fetchedFiles || []).some((f) => f && f.context && f.anchorConfidence && f.anchorConfidence !== 'none');
+    if (alreadyGrounded) return null; // nothing to fix -- only fire on the ungrounded shape
+    const currentFiles = new Set((Array.isArray(pc.files) ? pc.files : []).map((f) => (f && f.path) ? f.path : String(f || '')));
+    // Bounded literal-text scan of the accessible roots (depth-limited, code/
+    // doc extensions only) -- the same dirs the rest of the draft path greps
+    // (getConfig().grepAllowedDirs), so the search stays in-repo.
+    const candidates = new Set();
+    const symRe = new RegExp(`\\b${symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+    const scan = (dir, depth) => {
+      if (depth > 4 || candidates.size > 50) return;
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) { if (!/^\.|^node_modules$/.test(e.name)) scan(full, depth + 1); continue; }
+        if (!/\.(js|ts|jsx|tsx|mjs|cjs|py|sh|md|json)$/.test(e.name)) continue;
+        try { if (symRe.test(fs.readFileSync(full, 'utf8'))) candidates.add(path.relative(repoRoot, full).split(path.sep).join('/')); } catch { /* unreadable -- skip */ }
+      }
+    };
+    const roots = dirs.length ? dirs : [''];
+    for (const d of roots) scan(path.join(repoRoot, d), 0);
+    if (candidates.size === 0) return null;
+
+    // (c) gate on EXACTLY ONE different file (different from every currently
+    //     cited file) -- otherwise fall through to the needs-clarification
+    //     escalation, untouched.
+    const differentFiles = [...candidates].filter((p) => !currentFiles.has(p));
+    if (differentFiles.length !== 1) return null;
+    const target = differentFiles[0];
+
+    // Line-anchored window around the real symbol definition (bounded slice of
+    // ~40 lines, same windowing convention as context-trim-sweep.js's
+    // windowFile / candidate-path-grounding's anchored fetch -- NEVER a whole
+    // file read).
+    const abs = path.isAbsolute(target) ? target : path.join(repoRoot, target);
+    let context = '';
+    try {
+      const lines = fs.readFileSync(abs, 'utf8').split('\n');
+      let defLine = -1;
+      const re = new RegExp(`\\b${symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*[=(]`);
+      for (let i = 0; i < lines.length; i++) { if (re.test(lines[i])) { defLine = i; break; } }
+      const start = Math.max(0, defLine - 20);
+      const end = Math.min(lines.length - 1, (defLine >= 0 ? defLine : 0) + 20);
+      context = lines.slice(start, end + 1).join('\n').slice(0, 24000);
+    } catch { return null; }
+    if (!context) return null;
+
+    pc.files = [target];
+    pc.fetchedFiles = [{ path: target, context, anchorConfidence: 'strong' }];
+    // (d) history event + immediate re-draftability (no localRejectCount touch,
+    //     no review-task.js routing -- clear the stale stamps only).
+    try { appendHistoryEvent(task, 'grounding-refresh', `grounding-refresh: refreshed to ${target}, symbol ${symbol}`); } catch { /* best-effort */ }
+    delete task.blockedStage;
+    delete task.blockedReason;
+    delete task.needsClarification;
+    delete task.priorRejectionFeedback;
+    delete task.implementResponse; // stale FALSE-POSITIVE output -- force a fresh redraft against the real file
+    return { succeeded: true, blocked: false, requeued: true, groundingRefresh: { symbol, target } };
+  } catch {
+    return null; // any failure falls straight through to the existing escalation
+  }
+}
+
+module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on
