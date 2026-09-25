@@ -260,3 +260,95 @@ In src/dead-process-check.js, locate the call site where deadProcessCheck is inv
 
 Benefits:
 The CLI correctly awaits the parallel read batch before iterating the resolved actions array, preserving the existing output format and exit-code semantics. Prevents the 'iterating over a Promise' bug that would silently produce no restart/flag output.
+
+### AC-14 · Replace synchronous file reads in blocked-cluster-sweep loop with async fs.promises.readFile
+Strength: Strong
+Files: src/blocked-cluster-sweep.js
+Snippet:
+```
+  }
+
+  const byFingerprint = new Map(); // fingerprint -> { count, taskIds: [], exampleReasons: Set, sources: Set }
+  for (const f of files) {
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(path.join(blockedDir, f), 'utf8'));
+```
+
+Problem:
+The sweep iterates over every file in `blockedDir` with a `for…of` loop and calls `fs.readFileSync` on each one. Because `readFileSync` is a blocking syscall, the entire Node.js event loop is suspended for the duration of each disk read plus the subsequent `JSON.parse`. With N blocked-task files (unbounded by design—one file per blocked task), the cumulative stall is N × (syscall + disk latency + parse time). In an agent-manager service that concurrently handles spawn, status polling, and task dispatch, this stall delays every in-flight timer callback, socket read, and `setInterval`-driven health check for the full duration of the sweep, and the cost grows linearly as the blocked-task population grows.
+
+Solution:
+Make the enclosing function `async` and replace each `fs.readFileSync(path.join(blockedDir, f), 'utf8')` call with `await fs.promises.readFile(path.join(blockedDir, f), 'utf8')`. `fs.promises` is part of the same `fs` module already imported in the file, so no new dependency is introduced. The loop body has no cross-iteration data dependency beyond the shared `byFingerprint` Map (safe to mutate sequentially), so a plain sequential `await` loop preserves the existing ordering semantics while yielding control back to the event loop between each disk read. The `try/catch` around each read and the `JSON.parse` step remain unchanged. If the caller does not already `await` the sweep function, it must be updated to do so; this is a one-line change at the call-site.
+
+Benefits:
+The event loop is no longer monopolised for the duration of the sweep. Between each file read the process can service pending timers, network I/O, and other agent-lifecycle operations, eliminating the multi-hundred-millisecond (or longer) stall that currently degrades every concurrent operation in the service. The fix is a drop-in replacement using only the `fs` module already in scope, introduces no new dependency, and keeps the code structure and grouping logic identical—only the I/O call changes from synchronous to asynchronous.
+
+### AC-15 · Parallelize majority-vote LLM calls with Promise.all
+Strength: Strong
+Files: src/claude-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, model, effort, timeoutMs, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      // allowSideFindings:false -- a vote is a binary classifier, not an exploratory pass;
+```
+
+Problem:
+The `majorityVote` function issues `n` independent classification calls (default `n = 3`) sequentially inside a `for` loop, awaiting each `classify` invocation before starting the next. Because every call evaluates the same prompt with the same parameters and carries no data dependency on the previous iteration, the total wall-clock latency is the sum of all individual call durations (T₁ + T₂ + T₃). For LLM round-trips that each take several seconds, this serial pattern multiplies the user-visible wait by the vote count with no correctness benefit.
+
+Solution:
+Replace the serial `for` loop with a concurrent dispatch: build an array of `n` promises via `Array.from({ length: n }, …)`, where each element wraps a single `classify` call in its own `try/catch` that resolves to a `{ result, error }` pair. Await the entire array with `Promise.all` (every inner promise is guaranteed to settle because the catch swallows rejections into the structured return value). After the single `await`, iterate the settled array once, pushing successful results into `votes` and caught errors into `voteErrors`, preserving the original "collect all, report failures" semantics without introducing `Promise.allSettled` or any new dependency.
+
+Benefits:
+Total latency for the voting step drops from the sum of `n` call durations to the maximum of them, cutting the wall-clock time for the default three-vote configuration by roughly two-thirds (e.g., three 4-second calls go from ≈12 s to ≈4 s). The fix uses only the `Promise` primitive already available in the Node runtime, introduces no new dependency, and keeps the existing error-collection contract intact so downstream majority-agreement logic and any partial-failure logging behave exactly as before.
+
+### AC-16 · Replace blocking readdirSync in sweep loop with async fs.promises.readdir
+Strength: Strong
+Files: src/fix-signature-sweep.js
+Snippet:
+```
+  for (const entry of entries) {
+    if (!state.firstSeen[entry.id]) { state.firstSeen[entry.id] = nowIso; summary.newEntries.push(entry.id); }
+    const liveAt = Date.parse(state.firstSeen[entry.id]);
+    for (const dir of entry.dirs || ['blocked', 'needs-clarification']) {
+      const stateDir = path.join(queueDir, dir);
+      let names;
+      try { names = fs.readdirSync(stateDir).filter((f) => f.endsWith('.json')); } catch { continue; }
+```
+
+Problem:
+The sweep function iterates over a collection of state entries and, on each iteration, calls fs.readdirSync to list a per-entry state directory. Because readdirSync is a synchronous filesystem call, it blocks the Node.js event loop for the duration of each directory read. When the entry collection contains dozens or hundreds of items, the cumulative blocking time grows linearly, and during that window the process cannot service incoming HTTP requests, flush network buffers, or perform any other non-blocking I/O. The result is a latency spike proportional to collection size and filesystem speed, which degrades every concurrently in-flight request on the same event loop.
+
+Solution:
+Mark the enclosing sweep function as async and replace each fs.readdirSync(stateDir) call inside the loop with await fs.promises.readdir(stateDir). The try/catch that already guards the sync call maps directly onto the async version: wrap the await in the same try block and keep the catch { continue; } fallback. Because the loop body now awaits, the iterations execute sequentially but the event loop is free between each directory read, allowing other I/O and timers to progress. No new dependency is introduced—fs.promises is part of the Node.js standard library and is already available wherever fs is imported. If the current caller invokes the sweep function without awaiting it, add a single await (or .then) at the call site so the returned Promise is handled; no other call-site changes are needed because the function's observable side-effects (file writes, state mutations) are unchanged.
+
+Benefits:
+The event loop is no longer held hostage for the cumulative duration of all directory reads. Concurrent requests, socket handlers, and timer callbacks can interleave between individual readdir calls, eliminating the latency spike that scaled with entry count. Under load—especially on network-backed or slow filesystems where a single readdir can take several milliseconds—the server maintains responsive throughput instead of stalling. The change is a drop-in async refactor with no new dependencies, no API surface change, and no behavioral difference for the sweep's own logic.
+
+### AC-17 · Parallelize independent majority-vote inference calls
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+The `majorityVote` function issues *n* (default 3) independent LLM inference calls with identical parameters in a sequential loop, each `await call(…)` blocking until the previous inference completes before the next is dispatched. Because the calls share no data dependency, ordering constraint, or shared mutable state, serializing them adds pure latency with no functional benefit: with a per-call latency of *t* seconds the wall-clock cost is *n × t* (e.g. 3 × 8 s = 24 s) rather than ≈ *t* when the calls run concurrently.
+
+Solution:
+Replace the sequential loop with a single `Promise.all` over `Array.from({ length: n }, …)` that fires all *n* `call(…)` promises at once. Each per-promise `.then(onFulfilled, onRejected)` preserves the original per-call error isolation so a single failed vote still lands in `voteErrors` without rejecting the batch. The downstream tallying code that reads the `votes` and `voteErrors` arrays is unchanged. No new dependency is introduced—only `Promise.all` and `Array.from`, both available in the Node runtime this project already targets.
+
+Benefits:
+Wall-clock latency drops from *n × t* to ≈ max(t₁…tₙ) (roughly *t* for identical calls), cutting the majority-vote step from ~24 s to ~8 s in the 3-call default. The function's public contract—returning the same `votes` array and `voteErrors` array with the same tally semantics—is preserved, so no caller needs to change.

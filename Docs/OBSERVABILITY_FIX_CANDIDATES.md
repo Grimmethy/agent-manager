@@ -3197,3 +3197,164 @@ Locate the call site(s) of `_acquire_apply_lock` in the merge-click handler path
 
 Benefits:
 The user receives a clear, actionable 503 message instead of a generic 500 crash. The dead `None`-check is removed, reducing confusion. All call sites are covered so no path silently crashes on the new exception.
+
+### AC-175 · Swallowed fetch error in loadProjectHistory
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+  try {
+    const data = await fetchJson('/api/projects/history');
+    projectHistory = data.projects || [];
+  } catch (e) {
+    projectHistory = [];
+  }
+  const list = document.getElementById('project-history-list');
+```
+
+Problem:
+In `loadProjectHistory()`, the `catch (e)` block assigns `projectHistory = []` and discards the error object `e` without any logging call. The graceful-degradation intent is correct — a failed `/api/projects/history` fetch should not crash the UI — but because the project has no metrics or telemetry stack, the browser console is the sole diagnostic channel. Silently dropping `e` means a real backend regression (a 500 from a broken migration, a removed route) is indistinguishable from a legitimate empty list: the dropdown simply renders blank, there is no `console.error` or `console.warn` entry, and a developer staring at an inexplicably empty history list has no signal in DevTools to point at the failing request.
+
+Solution:
+Add a single `console.error('loadProjectHistory: failed to fetch project history', e);` line inside the existing `catch (e)` block, immediately before the `projectHistory = []` fallback assignment. This uses only the `console.error` primitive already available in the browser runtime, changes no control flow, adds no dependency, and does not rethrow (there is no caller to catch the rejection — this is a fire-and-forget UI populator invoked from the page-load sequence). The rest of the function body, including the `list.innerHTML` rendering that follows the try/catch, is left untouched.
+
+Benefits:
+Once the fix is in place, any failure of the `/api/projects/history` endpoint produces a clearly-labelled entry in DevTools → Console that names the function, carries the original error object (status code, message, stack), and is searchable by the string `loadProjectHistory`. A developer investigating an empty dropdown can immediately distinguish "server returned an empty array" (no console entry) from "the request failed" (one red console.error with the error payload), reducing mean-time-to-diagnose for backend regressions from "stare at the network tab and guess" to a single console search. No UX behaviour changes; the dropdown still renders empty on failure exactly as before.
+
+### AC-176 · Add console.error to silent catch in renderJobListTab
+Strength: Strong
+Files: python/dashboard/static/js/branches-joblist-hardware-tabs.js
+Snippet:
+```
+  let jobTypes;
+  try {
+    jobTypes = await fetchJson('/api/job-types');
+  } catch (e) {
+    jobTypes = null;
+  }
+  // 2026-08-26, Grimmethy: "After looking at pipeline map I've realized that it really
+```
+
+Problem:
+In `renderJobListTab()`, the `catch` block around `fetchJson('/api/job-types')` binds the error to `e` and then discards it entirely, setting `jobTypes = null` with no log, no warning, and no user-visible indicator. Because this project has no metrics or telemetry system, the browser DevTools Console is the sole observability channel for this client-side code path. If `/api/job-types` begins failing in production (server 500, schema-migration shape change, proxy timeout), the dashboard renders a job list with silently missing description/domain/priority/worker-type columns, and a developer investigating the missing data sees nothing in the Console — they must independently open the Network tab, locate the failed request, and correlate it, a non-obvious debugging step.
+
+Solution:
+Add a single `console.error('renderJobListTab: failed to fetch /api/job-types', e);` as the first statement inside the existing `catch` block, before `jobTypes = null;`. This is the only change. Do not rethrow (the graceful-degradation contract is correct and intentional per the 2026-08-26 Grimmethy comment). Do not add any logging framework, metric, or telemetry dependency — the project has none, and `console.error` is the correct and only primitive for browser-side JS in this codebase. Do not alter any other part of `renderJobListTab()`; the downstream code already handles `jobTypes === null` correctly.
+
+Benefits:
+Once the one-line log is in place, any future failure of `/api/job-types` immediately surfaces in the browser Console with a function-scoped message and the full error object (status, message, stack), letting a developer identify the root cause in seconds rather than hunting through the Network tab. The graceful-degradation behavior is unchanged — the job list still renders without the supplementary columns — so no user-facing regression is introduced. The fix costs zero dependencies, zero API changes, and zero downstream code modifications.
+
+### AC-177 · Swallowed fetch error in pipeline-map tab initialization
+Strength: Strong
+Files: python/dashboard/static/js/branches-joblist-hardware-tabs.js
+Snippet:
+```
+  let pipelineMap;
+  try {
+    pipelineMap = await fetchJson('/api/pipeline-map');
+  } catch (e) {
+    pipelineMap = null;
+  }
+  const activeByName = {};
+```
+
+Problem:
+The `catch (e)` block that guards the `fetchJson('/api/pipeline-map')` call assigns `pipelineMap = null` and discards the exception object entirely. Because the downstream code null-guards `pipelineMap` before populating the `*ByName` maps, the tab degrades gracefully to an empty render — but the *reason* for the null is lost. A 404 (endpoint removed in a deploy), a 500 (server-side bug), and a `fetchJson` JSON-parse failure all collapse into the same silent `null` with zero console output. A developer investigating a blank pipeline-map section must open DevTools → Network, locate the failing request, and manually inspect the response body; the JavaScript error trail is a dead end because the exception is never logged.
+
+Solution:
+Add a single `console.error('[pipeline-map] fetch failed:', e);` statement inside the `catch` block, immediately before the existing `pipelineMap = null;` assignment. This uses the browser `console` primitive — the only logging mechanism available in this project's browser-side JS — and introduces no new dependency. The graceful-degradation control flow is preserved: `pipelineMap` is still set to `null`, the tab still renders (just empty), and no exception propagates to break the rest of the tab's initialization. The log message includes a stable `[pipeline-map]` prefix so it is greppable in console output and distinguishable from other fetch failures in the same file.
+
+Benefits:
+Any developer with DevTools open immediately sees a labeled, greppable breadcrumb in the console the moment the pipeline-map fetch fails, including the full exception object (status code, response body, or parse-error message) that distinguishes a 404 from a 500 from a malformed-JSON error. This eliminates the need to hunt through the Network tab to diagnose a blank tab, reduces mean-time-to-diagnosis for deploy regressions or server bugs affecting this endpoint, and makes the failure visible in any shared console-log capture without changing the user-facing behavior of the dashboard.
+
+### AC-178 · Swallowed fetch error in per-instance assignable-tasks catch
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
+```
+
+Problem:
+Inside the `Promise.all` that populates `assignableByInstance`, the `catch (e)` block performs a single assignment (`assignableByInstance[inst.instanceId] = []`) and discards the captured error `e` with no `console.warn`, no `console.error`, no rethrow, and no flag on the stored value. The result is that a failed fetch of `/api/instances/<id>/assignable-tasks` (a 500, a network blip, a 404 after a rename) produces the exact same observable state—`[]` in `assignableByInstance`—as a legitimate empty task list. An operator reading the dashboard sees "no assignable tasks" on a worker card and cannot distinguish "the lane is genuinely idle" from "the API is broken," and there is zero trace in the browser console to diagnose the failure.
+
+Solution:
+Add a single `console.warn` line at the top of the `catch` block, before the existing assignment, that names the instance and includes the error object: `console.warn('[core-ui] failed to fetch assignable-tasks for ' + inst.instanceId + ':', e);`. This preserves the graceful-degradation contract (the `Promise.all` still resolves, other instances are unaffected, and the caller still receives `[]` for the failed instance) while producing one greppable console line that identifies which instance failed and why. No rethrow is appropriate because the caller (the dashboard render path) cannot meaningfully act on a per-instance fetch failure; logging is the correct surface. No new dependency or metrics primitive is introduced—`console.warn` is the established logging primitive already used throughout this project's JS code.
+
+Benefits:
+A developer or operator who notices a worker card showing an unexpectedly empty task list can open the browser console and immediately see which instance's fetch failed and the underlying error (HTTP status, network message, etc.), turning a silent, unexplained empty state into a one-line diagnostic. Systemic endpoint breakage (e.g., a bad deploy that 500s the assignable-tasks route) becomes visible on first dashboard load rather than remaining invisible until someone manually inspects the network tab. The fix is a single line, changes no data shape, adds no dependency, and does not alter the `Promise.all` flow or the caller-visible contract.
+
+### AC-179 · Silent catch in mainPartition hides classification failures from the operator
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+Snippet:
+```
+      const t = JSON.parse(fs.readFileSync(p, 'utf8'));
+      const reg = getRegisteredSource(resolveSourceName(t));
+      if (reg && reg.directToMain === true) direct.push(p); else other.push(p);
+    } catch {
+      other.push(p);
+    }
+  }
+```
+
+Problem:
+In `mainPartition()`, the `catch` clause that guards the per-path classification loop (read file → parse JSON → look up registry flag) is completely bare: it simply does `other.push(p)` and moves on. Because the function's sole output is a machine-readable JSON blob on stdout, the operator who invoked the CLI has no channel—stderr, console, or otherwise—through which to learn that a path landed in `other` due to a failure (missing file, permission error, truncated JSON, or a throw inside `getRegisteredSource`/`resolveSourceName`) rather than a legitimate "not directToMain" determination. A one-character path typo or a transient I/O hiccup produces an identical, perfectly valid JSON response, making the misclassification indistinguishable from a correct classification.
+
+Solution:
+Bind the caught exception and emit a single diagnostic line to `process.stderr` before the fallback push, e.g. `process.stderr.write(\`mainPartition: could not classify "${p}", defaulting to "other": ${err.message}\n\`)`. This uses only `process.stderr.write`, a primitive the project already relies on elsewhere, and does not alter the stdout JSON contract, the fallback routing, or any caller-visible behaviour on the happy path. No new dependency, no logging framework, no metric is introduced.
+
+Benefits:
+An operator running the CLI now sees a one-line, path-specific diagnostic on stderr the moment a classification attempt fails, naming both the offending path and the underlying error message. This converts a silent misclassification (a `direct`-eligible path silently routed through the non-direct pipeline) into an immediately visible, greppable signal, while leaving the machine-readable stdout output and the conservative fallback semantics completely unchanged.
+
+### AC-180 · Silent catch discards fetch error in assignable-tasks batch
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
+```
+
+Problem:
+In the `Promise.all` batch that populates `assignableByInstance`, each per-instance `fetchJson` call to `/api/instances/<id>/assignable-tasks` is wrapped in a try/catch whose catch block binds the error to `e` and then immediately assigns `[]` to the map entry with no other statement. The exception object is never logged, rethrown, or surfaced in any form. If the route returns a 500, a 404 after a refactor, or the network drops mid-request, every affected worker card renders an empty task list that is visually identical to a legitimate "no assignable tasks" response, and the browser DevTools console shows no trace of the failure. A developer investigating "why are my task lists empty?" has zero diagnostic signal to distinguish a broken endpoint from an empty queue.
+
+Solution:
+Add a single `console.warn` call at the top of the catch block, before the `[]` fallback assignment, that includes the instance identifier and the caught error object for stack inspection. Specifically, insert `console.warn('[core-ui] assignable-tasks fetch failed for ' + inst.instanceId + ':', e);` as the first statement inside the catch. This uses only the standard browser `console.warn` primitive (no new dependency, no metrics system required), preserves the existing graceful-degradation behavior (the batch continues, the card shows an empty list), and makes the failure visible in DevTools for diagnosis. No rethrow is added because the caller is a `Promise.all` over independent per-instance fetches and cannot meaningfully act on a single instance's failure.
+
+Benefits:
+Once the warning is in place, any transient or permanent API failure (route rename, auth-middleware regression, network blip) produces an immediately visible console entry naming the affected instance and carrying the full error object, so a developer can open DevTools, filter on `[core-ui]`, and see exactly which instance(s) failed and why. The dashboard still degrades gracefully to empty lists, but the failure is no longer indistinguishable from a legitimate empty result, eliminating the "silent broken dashboard" failure mode.
+
+### AC-181 · Silent swallow of assignable-tasks fetch failure in worker-card rendering
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
+```
+
+Problem:
+In the per-instance parallel fetch block that populates `assignableByInstance`, the `catch (e)` handler binds the caught exception to `e` and then immediately assigns `assignableByInstance[inst.instanceId] = []` without ever reading `e`. There is no `console.warn`, no `console.error`, no rethrow, and no flag set for later inspection. The resulting empty array is byte-for-byte identical to the success path when the API legitimately returns zero assignable tasks (`r.items` is an empty list). An operator viewing the Workers tab therefore cannot distinguish "this worker has no pending work" from "the `/api/instances/<id>/assignable-tasks` endpoint is 500-ing or the route was renamed during a deploy," and there is zero trace in the browser console, server logs, or any other channel that a failure occurred.
+
+Solution:
+Inside the existing `catch (e)` block, before the fallback assignment, emit a single `console.warn` call that names the affected instance and includes the caught error object: `console.warn('[core-ui] assignable-tasks fetch failed for instance ' + inst.instanceId + ':', e);`. The subsequent `assignableByInstance[inst.instanceId] = []` line is left unchanged so the graceful-degradation contract (card still renders, the rest of the `Promise.all` batch is unaffected) is preserved. No new dependency, no metrics primitive, no rethrow — just the one `console.warn` line that the project's existing browser-JS logging convention already supports.
+
+Benefits:
+A developer or operator who opens DevTools on the dashboard can immediately see which instance(s) failed, the HTTP status or network error that caused it, and the timestamp, turning an invisible silent failure into a one-line diagnostic. During a bad deploy or a route rename, instead of every worker card quietly showing an empty task list, the console will list each affected instance and the underlying error, letting the operator distinguish "genuinely no work" from "API is down" in seconds rather than by process of elimination. The fix is a single added line, introduces no new dependency, and does not alter the existing graceful-degradation behaviour.
