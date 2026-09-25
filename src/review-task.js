@@ -52,7 +52,7 @@ const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
-const { unnamedChangedFiles } = require('./lib/draft-side-effects.js');
+const { unnamedChangedFiles, changedFilesOfDiff } = require('./lib/draft-side-effects.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { decideEmptyApprovalOutcome } = require('./empty-approval-decision.js');
 const { decidePremiseRecheckOutcome } = require('./premise-recheck-decision.js');
@@ -181,6 +181,60 @@ function isEffectivelyEmpty(trimmed) {
 // dspy.settings.GLOBAL_HISTORY. Same call signature as before; no call site changed.
 function logFactCheckAudit(pipelineDir, entry) {
   logPipelineEvent(pipelineDir, 'fact-check-block', entry);
+}
+
+// HUB0090 · 2/2 · review-time relocation-validation (sibling of HUB0091's draft-time
+// grounding-refresh fallback in local-draft.js -- that one re-fetches BEFORE drafting,
+// this one forgives at review time): the ungrounded-url/ungrounded-field deterministic
+// gate compares the draft's symbols against the frozen fetchedFiles window, but that
+// window is a truncated slice (AC-61; see arch-import-premise-check.js's 2026-09-18
+// comment) and the draft may legitimately edit a file OUTSIDE the frozen list -- e.g. a
+// symbol moved by a decompose that landed after the frozen snapshot was taken. Before
+// that gate auto-rejects, check per flagged target symbol: (a) does the frozen file at
+// CURRENT HEAD still contain it (re-fetched whole, past the window) -- if yes the symbol
+// was only truncated out of the window, not missing; (b) if the frozen file lacks it but
+// the file the draft is actually editing contains it -- the draft is a valid relocation.
+// Either way the gate is not disqualifying and the draft goes on to the normal vote.
+// Conservative on purpose: a symbol found in NEITHER the frozen file at HEAD nor any of
+// the draft's own files stays flagged and the original auto-reject runs unchanged.
+function readRepoFileAtHead(repoRoot, relPath) {
+  try { return fs.readFileSync(path.resolve(repoRoot, relPath), 'utf8'); }
+  catch { return null; } // file gone at HEAD (deleted/renamed) -- caller treats as "lacks symbol"
+}
+function validateRelocatedDraftSymbols(task, flags, repoRoot) {
+  const draftFiles = [...new Set(changedFilesOfDiff((task && task.rawDiff) || ''))];
+  const frozenFiles = (((task && task.promptContext) || {}).fetchedFiles) || [];
+  const frozen = Array.isArray(frozenFiles) ? frozenFiles.filter((f) => f && typeof f.path === 'string') : [];
+  const validated = [];
+  const remaining = [];
+  for (const flag of flags) {
+    const symbol = (flag && typeof flag.detail === 'string' && flag.detail) || null;
+    if (!symbol) { remaining.push(flag); continue; }
+    let hit = null;
+    for (const f of frozen) {
+      // AC-61 variant: fetchedFiles[].context is a windowed, truncated slice of each
+      // file -- "does the frozen file still contain the symbol" must be answered against
+      // the file at current HEAD, so re-fetch the whole file when the window lacks it.
+      const inWindow = typeof f.context === 'string' && f.context.includes(symbol);
+      const frozenFull = inWindow ? '(window)' : readRepoFileAtHead(repoRoot, f.path);
+      if (frozenFull === '(window)' || (frozenFull !== null && frozenFull.includes(symbol))) {
+        hit = { type: flag.type, symbol, frozenFile: f.path, draftFile: null, ac61Refetch: frozenFull !== '(window)', note: 'symbol present in the frozen file (outside the truncated window)' };
+        break;
+      }
+      // Relocation: frozen file LACKS the symbol at HEAD while the draft's own edited
+      // file CONTAINS it -- pass the gate, don't auto-reject.
+      const draftFile = draftFiles.find((d) => {
+        const content = readRepoFileAtHead(repoRoot, d);
+        return content !== null && content.includes(symbol);
+      });
+      if (draftFile) {
+        hit = { type: flag.type, symbol, frozenFile: f.path, draftFile, ac61Refetch: true, note: 'symbol absent from the frozen file at HEAD but present in the draft\'s own file -- valid relocation' };
+        break;
+      }
+    }
+    if (hit) validated.push(hit); else remaining.push(flag);
+  }
+  return { validated, remaining };
 }
 
 // Deterministic review gate for a script-extract decompose move (see local-draft.js's
@@ -667,9 +721,25 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // buildVerdictPrompt -- just not an automatic no-review block.
   const isDecomposeProposal = getDecomposeProposalDetection().isDecomposeOrSplitProposal(task);
   const isProposalNotClaim = isDecomposeProposal || isAdvisoryProseSource(resolveSourceName(task));
-  const highPrecisionFlags = isProposalNotClaim
+  let highPrecisionFlags = isProposalNotClaim
     ? []
     : (factCheck.flags || []).filter((f) => f.type === 'ungrounded-url' || f.type === 'ungrounded-field');
+  // HUB0090 · 2/2 · relocation-validation branch: a draft whose edited file is not in the
+  // frozen Files: list is NOT auto-rejected when the flagged target symbol has genuinely
+  // moved (frozen file lacks it at current HEAD, the draft's file carries it) or was only
+  // truncated out of the frozen window (AC-61). Only flags it cannot explain stay for the
+  // original gate below, which is untouched and still reachable.
+  if (highPrecisionFlags.length > 0) {
+    const relocation = validateRelocatedDraftSymbols(task, highPrecisionFlags, repoRootForCheck);
+    if (relocation.validated.length > 0) {
+      const draftFilesList = changedFilesOfDiff(task.rawDiff || '').join(', ') || '(no diff)';
+      for (const v of relocation.validated) {
+        appendHistoryEvent(task, 'relocation-validated',
+          `HUB0090: ${v.type} symbol "${v.symbol}" -- ${v.note}; frozenFile: ${v.frozenFile}; draftFile: ${v.draftFile || '(draft edits: ' + draftFilesList + ')'}; ac61Refetch: ${v.ac61Refetch}`);
+      }
+      highPrecisionFlags = relocation.remaining;
+    }
+  }
   if (highPrecisionFlags.length > 0) {
     const detail = highPrecisionFlags.map((f) => `${f.type}: ${f.detail}`).join('; ');
     const reason = `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ${detail}. This fact-check flag is high-precision (almost never a false positive) and treated as disqualifying, not merely advisory context a vote could ignore -- no local-model review call spent on a draft already known to contain a hallucinated value.`;
