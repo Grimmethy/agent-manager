@@ -3197,3 +3197,26 @@ Locate the call site(s) of `_acquire_apply_lock` in the merge-click handler path
 
 Benefits:
 The user receives a clear, actionable 503 message instead of a generic 500 crash. The dead `None`-check is removed, reducing confusion. All call sites are covered so no path silently crashes on the new exception.
+
+### AC-175 · Swallowed fetch error in loadProjectHistory
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+  try {
+    const data = await fetchJson('/api/projects/history');
+    projectHistory = data.projects || [];
+  } catch (e) {
+    projectHistory = [];
+  }
+  const list = document.getElementById('project-history-list');
+```
+
+Problem:
+In `loadProjectHistory()`, the `catch (e)` block assigns `projectHistory = []` and discards the error object `e` without any logging call. The graceful-degradation intent is correct — a failed `/api/projects/history` fetch should not crash the UI — but because the project has no metrics or telemetry stack, the browser console is the sole diagnostic channel. Silently dropping `e` means a real backend regression (a 500 from a broken migration, a removed route) is indistinguishable from a legitimate empty list: the dropdown simply renders blank, there is no `console.error` or `console.warn` entry, and a developer staring at an inexplicably empty history list has no signal in DevTools to point at the failing request.
+
+Solution:
+Add a single `console.error('loadProjectHistory: failed to fetch project history', e);` line inside the existing `catch (e)` block, immediately before the `projectHistory = []` fallback assignment. This uses only the `console.error` primitive already available in the browser runtime, changes no control flow, adds no dependency, and does not rethrow (there is no caller to catch the rejection — this is a fire-and-forget UI populator invoked from the page-load sequence). The rest of the function body, including the `list.innerHTML` rendering that follows the try/catch, is left untouched.
+
+Benefits:
+Once the fix is in place, any failure of the `/api/projects/history` endpoint produces a clearly-labelled entry in DevTools → Console that names the function, carries the original error object (status code, message, stack), and is searchable by the string `loadProjectHistory`. A developer investigating an empty dropdown can immediately distinguish "server returned an empty array" (no console entry) from "the request failed" (one red console.error with the error payload), reducing mean-time-to-diagnose for backend regressions from "stare at the network tab and guess" to a single console search. No UX behaviour changes; the dropdown still renders empty on failure exactly as before.
