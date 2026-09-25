@@ -306,3 +306,26 @@ Replace the serial `for` loop with a concurrent dispatch: build an array of `n` 
 
 Benefits:
 Total latency for the voting step drops from the sum of `n` call durations to the maximum of them, cutting the wall-clock time for the default three-vote configuration by roughly two-thirds (e.g., three 4-second calls go from ≈12 s to ≈4 s). The fix uses only the `Promise` primitive already available in the Node runtime, introduces no new dependency, and keeps the existing error-collection contract intact so downstream majority-agreement logic and any partial-failure logging behave exactly as before.
+
+### AC-16 · Replace blocking readdirSync in sweep loop with async fs.promises.readdir
+Strength: Strong
+Files: src/fix-signature-sweep.js
+Snippet:
+```
+  for (const entry of entries) {
+    if (!state.firstSeen[entry.id]) { state.firstSeen[entry.id] = nowIso; summary.newEntries.push(entry.id); }
+    const liveAt = Date.parse(state.firstSeen[entry.id]);
+    for (const dir of entry.dirs || ['blocked', 'needs-clarification']) {
+      const stateDir = path.join(queueDir, dir);
+      let names;
+      try { names = fs.readdirSync(stateDir).filter((f) => f.endsWith('.json')); } catch { continue; }
+```
+
+Problem:
+The sweep function iterates over a collection of state entries and, on each iteration, calls fs.readdirSync to list a per-entry state directory. Because readdirSync is a synchronous filesystem call, it blocks the Node.js event loop for the duration of each directory read. When the entry collection contains dozens or hundreds of items, the cumulative blocking time grows linearly, and during that window the process cannot service incoming HTTP requests, flush network buffers, or perform any other non-blocking I/O. The result is a latency spike proportional to collection size and filesystem speed, which degrades every concurrently in-flight request on the same event loop.
+
+Solution:
+Mark the enclosing sweep function as async and replace each fs.readdirSync(stateDir) call inside the loop with await fs.promises.readdir(stateDir). The try/catch that already guards the sync call maps directly onto the async version: wrap the await in the same try block and keep the catch { continue; } fallback. Because the loop body now awaits, the iterations execute sequentially but the event loop is free between each directory read, allowing other I/O and timers to progress. No new dependency is introduced—fs.promises is part of the Node.js standard library and is already available wherever fs is imported. If the current caller invokes the sweep function without awaiting it, add a single await (or .then) at the call site so the returned Promise is handled; no other call-site changes are needed because the function's observable side-effects (file writes, state mutations) are unchanged.
+
+Benefits:
+The event loop is no longer held hostage for the cumulative duration of all directory reads. Concurrent requests, socket handlers, and timer callbacks can interleave between individual readdir calls, eliminating the latency spike that scaled with entry count. Under load—especially on network-backed or slow filesystems where a single readdir can take several milliseconds—the server maintains responsive throughput instead of stalling. The change is a drop-in async refactor with no new dependencies, no API surface change, and no behavioral difference for the sweep's own logic.
