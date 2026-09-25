@@ -283,3 +283,26 @@ Make the enclosing function `async` and replace each `fs.readFileSync(path.join(
 
 Benefits:
 The event loop is no longer monopolised for the duration of the sweep. Between each file read the process can service pending timers, network I/O, and other agent-lifecycle operations, eliminating the multi-hundred-millisecond (or longer) stall that currently degrades every concurrent operation in the service. The fix is a drop-in replacement using only the `fs` module already in scope, introduces no new dependency, and keeps the code structure and grouping logic identical—only the I/O call changes from synchronous to asynchronous.
+
+### AC-15 · Parallelize majority-vote LLM calls with Promise.all
+Strength: Strong
+Files: src/claude-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, model, effort, timeoutMs, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      // allowSideFindings:false -- a vote is a binary classifier, not an exploratory pass;
+```
+
+Problem:
+The `majorityVote` function issues `n` independent classification calls (default `n = 3`) sequentially inside a `for` loop, awaiting each `classify` invocation before starting the next. Because every call evaluates the same prompt with the same parameters and carries no data dependency on the previous iteration, the total wall-clock latency is the sum of all individual call durations (T₁ + T₂ + T₃). For LLM round-trips that each take several seconds, this serial pattern multiplies the user-visible wait by the vote count with no correctness benefit.
+
+Solution:
+Replace the serial `for` loop with a concurrent dispatch: build an array of `n` promises via `Array.from({ length: n }, …)`, where each element wraps a single `classify` call in its own `try/catch` that resolves to a `{ result, error }` pair. Await the entire array with `Promise.all` (every inner promise is guaranteed to settle because the catch swallows rejections into the structured return value). After the single `await`, iterate the settled array once, pushing successful results into `votes` and caught errors into `voteErrors`, preserving the original "collect all, report failures" semantics without introducing `Promise.allSettled` or any new dependency.
+
+Benefits:
+Total latency for the voting step drops from the sum of `n` call durations to the maximum of them, cutting the wall-clock time for the default three-vote configuration by roughly two-thirds (e.g., three 4-second calls go from ≈12 s to ≈4 s). The fix uses only the `Promise` primitive already available in the Node runtime, introduces no new dependency, and keeps the existing error-collection contract intact so downstream majority-agreement logic and any partial-failure logging behave exactly as before.
