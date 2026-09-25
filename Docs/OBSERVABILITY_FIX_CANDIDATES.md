@@ -3220,3 +3220,26 @@ Add a single `console.error('loadProjectHistory: failed to fetch project history
 
 Benefits:
 Once the fix is in place, any failure of the `/api/projects/history` endpoint produces a clearly-labelled entry in DevTools → Console that names the function, carries the original error object (status code, message, stack), and is searchable by the string `loadProjectHistory`. A developer investigating an empty dropdown can immediately distinguish "server returned an empty array" (no console entry) from "the request failed" (one red console.error with the error payload), reducing mean-time-to-diagnose for backend regressions from "stare at the network tab and guess" to a single console search. No UX behaviour changes; the dropdown still renders empty on failure exactly as before.
+
+### AC-176 · Add console.error to silent catch in renderJobListTab
+Strength: Strong
+Files: python/dashboard/static/js/branches-joblist-hardware-tabs.js
+Snippet:
+```
+  let jobTypes;
+  try {
+    jobTypes = await fetchJson('/api/job-types');
+  } catch (e) {
+    jobTypes = null;
+  }
+  // 2026-08-26, Grimmethy: "After looking at pipeline map I've realized that it really
+```
+
+Problem:
+In `renderJobListTab()`, the `catch` block around `fetchJson('/api/job-types')` binds the error to `e` and then discards it entirely, setting `jobTypes = null` with no log, no warning, and no user-visible indicator. Because this project has no metrics or telemetry system, the browser DevTools Console is the sole observability channel for this client-side code path. If `/api/job-types` begins failing in production (server 500, schema-migration shape change, proxy timeout), the dashboard renders a job list with silently missing description/domain/priority/worker-type columns, and a developer investigating the missing data sees nothing in the Console — they must independently open the Network tab, locate the failed request, and correlate it, a non-obvious debugging step.
+
+Solution:
+Add a single `console.error('renderJobListTab: failed to fetch /api/job-types', e);` as the first statement inside the existing `catch` block, before `jobTypes = null;`. This is the only change. Do not rethrow (the graceful-degradation contract is correct and intentional per the 2026-08-26 Grimmethy comment). Do not add any logging framework, metric, or telemetry dependency — the project has none, and `console.error` is the correct and only primitive for browser-side JS in this codebase. Do not alter any other part of `renderJobListTab()`; the downstream code already handles `jobTypes === null` correctly.
+
+Benefits:
+Once the one-line log is in place, any future failure of `/api/job-types` immediately surfaces in the browser Console with a function-scoped message and the full error object (status, message, stack), letting a developer identify the root cause in seconds rather than hunting through the Network tab. The graceful-degradation behavior is unchanged — the job list still renders without the supplementary columns — so no user-facing regression is introduced. The fix costs zero dependencies, zero API changes, and zero downstream code modifications.
