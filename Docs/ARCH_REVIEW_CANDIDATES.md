@@ -615,6 +615,19 @@ Remove the local `readJson`/`writeJson` helpers from `fabricated-path-recheck-sw
 Benefits:
 A single, atomic write path eliminates the crash-corruption window in `fabricated-path-recheck-sweep.js` and brings its durability guarantee in line with the rest of the pipeline. Removing the duplicated helpers reduces the surface area that must be updated when the JSON I/O contract changes (encoding, schema validation, file locking). Reviewers and future contributors no longer need to wonder whether a given module respects the atomic-write invariant; the answer is uniformly "yes" because there is only one implementation.
 
+### AC-60 · `task-anywhere.js` hand-syncs its queue-state list with the dashboard and nothing tests that they match
+Strength: Worth exploring
+Files: src/task-anywhere.js, python/dashboard/app.py
+
+Problem:
+`src/task-anywhere.js` defines `QUEUE_STATES` (8 directory names) and its comment says it is "kept in sync by hand with python/dashboard/app.py's own QUEUE_STATES (app.py:301)". On master the real definition is at `python/dashboard/app.py:202`, so the comment's line reference is already stale, and the two lists are identical only by coincidence of nobody having changed either since. No test compares them: `src/task-anywhere.test.js` and `src/migrate-history-status-note.test.js` exercise `QUEUE_STATES` from the JS side only. Adding, renaming or reordering a queue directory in one language without the other would make the Node lookup and the dashboard disagree about where a task lives, silently (a task in the new directory is invisible to one side).
+
+Solution:
+Add a parity test (Node, reading `python/dashboard/app.py` as text and extracting the `QUEUE_STATES = [...]` literal) asserting it equals `task-anywhere.js`'s exported `QUEUE_STATES` in both membership and order, and fix the stale `app.py:301` reference in the comment. Do not restructure the search logic and do not route it through `config.js`: no config-driven task-location mechanism exists for this (the sibling sweeps hardcode their own directory lists, e.g. `fabricated-path-recheck-sweep.js` `DIRS`). A shared JSON list read by both languages is an acceptable alternative if the parity test proves too brittle.
+
+Benefits:
+Drift between the Node task lookup and the dashboard is caught by CI instead of by a task going missing, at the cost of one small test.
+
 ### AC-61 · Core-scope gate enforced redundantly in two layers with no test pinning the load-bearing one
 Strength: Strong
 Files: src/task-source-registry.js, src/lib/task-selection.js, src/lib/source-scope.js
@@ -642,6 +655,21 @@ Benefits:
 The "what counts as stale" policy has a single owner, eliminating the silent-divergence risk where a tuning change in one file silently desynchronizes the system report from the daemon's restart decisions. The test provides a regression net: if the two files ever drift, CI fails rather than the report being subtly wrong in production.
 
 NOTE: Flag 1 was applied by making the shared-file approach the primary recommendation and explicitly requiring `dead-process-check.js` to be modified to import from it, rather than assuming it already exports the constants.
+
+### AC-66 · `deterministic-recheck-registry.js` bundles two unrelated registries with different lifecycles and keying schemes
+Strength: Strong
+Files: src/deterministic-recheck-registry.js, src/pipeline-forensics.test.js
+
+Problem:
+The module exports two distinct registries side by side: a source-keyed deterministic-recheck registry (register/get/clear keyed by task-source name, storing `perFileRules`/`repoWideRules` config objects) and a rule-keyed pre-dispatch gate registry (register/get/clear keyed by rule ID, storing detector functions). The gate registry additionally self-registers a built-in `sequential-await-in-loop` detector at module load time, making the module stateful by import, while the recheck registry is purely passive. These two mechanisms have different keying schemes, different consumers, different extension points, and different lifecycles, yet they share a single module identity. Any change to gate semantics or recheck semantics forces both to live in the same file, and importing the module carries an implicit side effect that the rest of the codebase (e.g. `model-profile-registry.js`) does not exhibit.
+
+Solution:
+Split the module into two separate modules: one for source-keyed deterministic-recheck registration (register/get/clear/list for `perFileRules`/`repoWideRules`) and one for rule-keyed pre-dispatch gate registration (register/get/clear for gate detectors). Within the new gate module, preserve the codebase’s “single swap point” discipline (as seen in `hub-review-detection.js`): keep the default `sequential-await-in-loop` detector defined inside the gate module and expose a `set`/`get` (or `register`/`get`) swap mechanism for it, rather than moving the default implementation to a bootstrap file. Update imports in `pipeline-forensics.test.js` and any other consumers to pull each registry from its own module.
+
+Benefits:
+Each module has a single responsibility and a single, predictable import side-effect profile (none). Changes to gate semantics no longer require touching the recheck module and vice-versa. The test file's import list becomes a clear statement of which registries are under test, removing the ambiguity that currently forces the `try/catch` workaround. New contributors can reason about one registry at a time without mentally separating two interleaved concerns.
+
+NOTE (verified against master, 2026-09-25): the recheck half of `deterministic-recheck-registry.js` is a documented plugin API (`docs/PLUGIN_API.md` lists `registerDeterministicRecheck`, `getDeterministicRecheck`, `getRecheckSources`, `clearDeterministicRecheckRegistry`), and the hygiene plugin registers through it, so keep those exports at the existing path. The pre-dispatch gate functions (`registerPreDispatchGate` and friends) are NOT in the documented API, so they are the half to move to a new module; if any plugin already imports them, re-export from the old path. Also keep the file free of external requires (`silent-catch-plan-cap.js` cites that as a hot-path constraint the module holds). AC-68's claim of different verb shapes is wrong: both registries already use register/get/clear; ignore any candidate built on it.
 
 ### AC-69 · SDK re-export surface leaks test-only internals and couples read/write paths
 Strength: Strong
@@ -682,31 +710,31 @@ Delete the `require('../task-sources.js')` line from both `src/lib/prompt-assemb
 Benefits:
 Eliminates a load-time failure surface that is unrelated to the actual work of prompt formatting, removes a misleading hard edge from a pure formatting module into the task-source registry, and makes each module independently testable and analyzable without pulling in the entire task-source dependency tree.
 
-### AC-60 · `task-anywhere.js` hand-syncs its queue-state list with the dashboard and nothing tests that they match
-Strength: Worth exploring
-Files: src/task-anywhere.js, python/dashboard/app.py
-
-Problem:
-`src/task-anywhere.js` defines `QUEUE_STATES` (8 directory names) and its comment says it is "kept in sync by hand with python/dashboard/app.py's own QUEUE_STATES (app.py:301)". On master the real definition is at `python/dashboard/app.py:202`, so the comment's line reference is already stale, and the two lists are identical only by coincidence of nobody having changed either since. No test compares them: `src/task-anywhere.test.js` and `src/migrate-history-status-note.test.js` exercise `QUEUE_STATES` from the JS side only. Adding, renaming or reordering a queue directory in one language without the other would make the Node lookup and the dashboard disagree about where a task lives, silently (a task in the new directory is invisible to one side).
-
-Solution:
-Add a parity test (Node, reading `python/dashboard/app.py` as text and extracting the `QUEUE_STATES = [...]` literal) asserting it equals `task-anywhere.js`'s exported `QUEUE_STATES` in both membership and order, and fix the stale `app.py:301` reference in the comment. Do not restructure the search logic and do not route it through `config.js`: no config-driven task-location mechanism exists for this (the sibling sweeps hardcode their own directory lists, e.g. `fabricated-path-recheck-sweep.js` `DIRS`). A shared JSON list read by both languages is an acceptable alternative if the parity test proves too brittle.
-
-Benefits:
-Drift between the Node task lookup and the dashboard is caught by CI instead of by a task going missing, at the cost of one small test.
-
-### AC-66 · `deterministic-recheck-registry.js` bundles two unrelated registries with different lifecycles and keying schemes
+### AC-74 · Export readJsonSafe from task-anywhere.js so it becomes a shared importable primitive
 Strength: Strong
-Files: src/deterministic-recheck-registry.js, src/pipeline-forensics.test.js
+Split-Depth: 1
+Files: src/task-anywhere.js
 
 Problem:
-The module exports two distinct registries side by side: a source-keyed deterministic-recheck registry (register/get/clear keyed by task-source name, storing `perFileRules`/`repoWideRules` config objects) and a rule-keyed pre-dispatch gate registry (register/get/clear keyed by rule ID, storing detector functions). The gate registry additionally self-registers a built-in `sequential-await-in-loop` detector at module load time, making the module stateful by import, while the recheck registry is purely passive. These two mechanisms have different keying schemes, different consumers, different extension points, and different lifecycles, yet they share a single module identity. Any change to gate semantics or recheck semantics forces both to live in the same file, and importing the module carries an implicit side effect that the rest of the codebase (e.g. `model-profile-registry.js`) does not exhibit.
+task-anywhere.js defines a file-private helper `readJsonSafe(fullPath)` (a try/catch around `JSON.parse(fs.readFileSync(fullPath, 'utf8'))` that returns `null` on any error) and uses it throughout `findTaskAnywhere`, but it is NOT in the module's export list: `module.exports = { findTaskAnywhere, QUEUE_STATES };`. Meanwhile fabricated-path-recheck-sweep.js carries its own byte-for-byte-equivalent local `readJson(p)` (same `JSON.parse(fs.readFileSync(p,'utf8'))` in a try/catch returning `null`). The two are duplicated safe-JSON-read implementations, and the sweep cannot drop its copy because the canonical one is not importable.
 
 Solution:
-Split the module into two separate modules: one for source-keyed deterministic-recheck registration (register/get/clear/list for `perFileRules`/`repoWideRules`) and one for rule-keyed pre-dispatch gate registration (register/get/clear for gate detectors). Within the new gate module, preserve the codebase’s “single swap point” discipline (as seen in `hub-review-detection.js`): keep the default `sequential-await-in-loop` detector defined inside the gate module and expose a `set`/`get` (or `register`/`get`) swap mechanism for it, rather than moving the default implementation to a bootstrap file. Update imports in `pipeline-forensics.test.js` and any other consumers to pull each registry from its own module.
+Add `readJsonSafe` to the export list. Change the final line `module.exports = { findTaskAnywhere, QUEUE_STATES };` to `module.exports = { findTaskAnywhere, QUEUE_STATES, readJsonSafe };`. Nothing else changes: the `readJsonSafe` function body and its existing internal callers inside `findTaskAnywhere` are left exactly as they are.
 
 Benefits:
-Each module has a single responsibility and a single, predictable import side-effect profile (none). Changes to gate semantics no longer require touching the recheck module and vice-versa. The test file's import list becomes a clear statement of which registries are under test, removing the ambiguity that currently forces the `try/catch` workaround. New contributors can reason about one registry at a time without mentally separating two interleaved concerns.
+readJsonSafe becomes a shared, importable primitive with zero behavioural change to task-anywhere.js itself; a downstream module can now import the single canonical safe-JSON-read instead of re-declaring an identical copy.
 
-NOTE (verified against master, 2026-09-25): the recheck half of `deterministic-recheck-registry.js` is a documented plugin API (`docs/PLUGIN_API.md` lists `registerDeterministicRecheck`, `getDeterministicRecheck`, `getRecheckSources`, `clearDeterministicRecheckRegistry`), and the hygiene plugin registers through it, so keep those exports at the existing path. The pre-dispatch gate functions (`registerPreDispatchGate` and friends) are NOT in the documented API, so they are the half to move to a new module; if any plugin already imports them, re-export from the old path. Also keep the file free of external requires (`silent-catch-plan-cap.js` cites that as a hot-path constraint the module holds). AC-68's claim of different verb shapes is wrong: both registries already use register/get/clear; ignore any candidate built on it.
+### AC-75 · Route fabricated-path-recheck-sweep.js through the shared read/atomic-write primitives and delete its local helpers
+Strength: Strong
+Split-Depth: 1
+Files: src/fabricated-path-recheck-sweep.js
+Depends-On: AC-74
 
+Problem:
+The sweep defines two local helpers and uses both: `function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }` (called at `const task = readJson(filePath);`) and `function writeJson(p, data) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(data, null, 2)); }` (called at `writeJson(dest, fresh);`). The read helper duplicates task-anywhere.js's `readJsonSafe`, and the write helper is a plain non-atomic `fs.writeFileSync` that bypasses the shared atomic primitive `writeJsonAtomicSync` in atomic-write.js (which temp-file-writes in the same directory, fsyncs, then renames — the crash-safety guarantee the rest of the pipeline relies on). A crash mid-write here can leave a truncated, unparseable task file. Note the one real behavioural gap: `writeJsonAtomicSync`/`writeAtomicSync` open the temp file with `fs.openSync(tmp, 'w')`, which does NOT create the parent directory and throws if it is absent, whereas the local `writeJson` created it first via `fs.mkdirSync(path.dirname(p), { recursive: true })`.
+
+Solution:
+At the top of the file add two imports: `const { readJsonSafe } = require('./task-anywhere.js');` and `const { writeJsonAtomicSync } = require('./atomic-write.js');`. Replace the read call site `const task = readJson(filePath);` with `const task = readJsonSafe(filePath);`. Replace the write call site `writeJson(dest, fresh);` with the atomic write while preserving the directory-creation the local helper performed: `fs.mkdirSync(path.dirname(dest), { recursive: true }); writeJsonAtomicSync(dest, fresh);`. Delete both local helper definitions (`function readJson(p) {...}` and `function writeJson(p, data) {...}`). Keep `const fs = require('fs');` because `fs` is still used by `fs.readdirSync`, `fs.existsSync(dest)`, `fs.unlinkSync(filePath)`, and the retained `fs.mkdirSync`. Do not modify atomic-write.js — it already exports `writeJsonAtomicSync`.
+
+Benefits:
+The sweep now shares the single canonical safe-JSON-read (no duplicated `readJson`) and writes task files through the shared atomic primitive, gaining the same crash-safety guarantee as the rest of the pipeline. `writeJsonAtomicSync` emits identical JSON bytes to the old `writeJson` (`JSON.stringify(data, null, 2)`), so the on-disk content is unchanged and the only behavioural change is that the write is now atomic; the retained `fs.mkdirSync` keeps the parent-directory creation that the atomic primitive does not perform.
