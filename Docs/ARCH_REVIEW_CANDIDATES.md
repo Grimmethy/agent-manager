@@ -615,18 +615,18 @@ Remove the local `readJson`/`writeJson` helpers from `fabricated-path-recheck-sw
 Benefits:
 A single, atomic write path eliminates the crash-corruption window in `fabricated-path-recheck-sweep.js` and brings its durability guarantee in line with the rest of the pipeline. Removing the duplicated helpers reduces the surface area that must be updated when the JSON I/O contract changes (encoding, schema validation, file locking). Reviewers and future contributors no longer need to wonder whether a given module respects the atomic-write invariant; the answer is uniformly "yes" because there is only one implementation.
 
-### AC-61 · Core-scope gate enforced redundantly in two layers with no test pinning the load-bearing one
-Strength: Strong
-Files: src/task-source-registry.js, src/lib/task-selection.js, src/lib/source-scope.js
+### AC-60 · `task-anywhere.js` hand-syncs its queue-state list with the dashboard and nothing tests that they match
+Strength: Worth exploring
+Files: src/task-anywhere.js, python/dashboard/app.py
 
 Problem:
-The `scope: 'core'` eligibility check is applied in two independent places using two different mechanisms: `registerTaskSource` wraps a core source's `next()` to return `null` on a non-core repo, and `getNextTask` separately calls `sourceEligibleHere` and skips the source. For the `getNextTask` path the inline check is redundant because the wrapper already nulls the task, but the wrapper is the only protection for the documented always-run watchdog sweeps that call a source directly. The test suite exercises both layers only by registering through the registry (which installs the wrapper), so no test confirms that the wrapper alone is what saves the watchdog path. A future reader who sees the `sourceEligibleHere` call in `getNextTask` and removes it as "redundant" will leave the invariant half-enforced, and the half that remains is invisible from the selection layer.
+`src/task-anywhere.js` defines `QUEUE_STATES` (8 directory names) and its comment says it is "kept in sync by hand with python/dashboard/app.py's own QUEUE_STATES (app.py:301)". On master the real definition is at `python/dashboard/app.py:202`, so the comment's line reference is already stale, and the two lists are identical only by coincidence of nobody having changed either since. No test compares them: `src/task-anywhere.test.js` and `src/migrate-history-status-note.test.js` exercise `QUEUE_STATES` from the JS side only. Adding, renaming or reordering a queue directory in one language without the other would make the Node lookup and the dashboard disagree about where a task lives, silently (a task in the new directory is invisible to one side).
 
 Solution:
-Designate the registry wrapper as the single authoritative enforcement point for all callers (it is the only place that can protect direct watchdog calls), and reduce the inline `sourceEligibleHere` check in `getNextTask` to a documented defensive pass-through with a comment explaining it is redundant. Alternatively, remove the wrapper and have both `getNextTask` and the sweep call `sourceEligibleHere` explicitly. In either case, add a test that registers a core source and asserts that the *registered* (wrapped) `next()` returns `null` when invoked directly on a non-core repo, so the load-bearing layer is pinned by a test rather than by a comment.
+Add a parity test (Node, reading `python/dashboard/app.py` as text and extracting the `QUEUE_STATES = [...]` literal) asserting it equals `task-anywhere.js`'s exported `QUEUE_STATES` in both membership and order, and fix the stale `app.py:301` reference in the comment. Do not restructure the search logic and do not route it through `config.js`: no config-driven task-location mechanism exists for this (the sibling sweeps hardcode their own directory lists, e.g. `fabricated-path-recheck-sweep.js` `DIRS`). A shared JSON list read by both languages is an acceptable alternative if the parity test proves too brittle.
 
 Benefits:
-A reader can immediately tell which layer is authoritative for which caller, eliminating the silent-drift risk where one layer is removed and the invariant is only half-enforced. The test suite gains a direct assertion on the mechanism that actually protects the watchdog path, so a regression in that path is caught at test time rather than discovered in production.
+Drift between the Node task lookup and the dashboard is caught by CI instead of by a task going missing, at the cost of one small test.
 
 ### AC-63 · uptime-log.js re-declares heartbeat thresholds that dead-process-check.js owns, with a comment claiming shared semantics
 Strength: Strong
@@ -642,6 +642,21 @@ Benefits:
 The "what counts as stale" policy has a single owner, eliminating the silent-divergence risk where a tuning change in one file silently desynchronizes the system report from the daemon's restart decisions. The test provides a regression net: if the two files ever drift, CI fails rather than the report being subtly wrong in production.
 
 NOTE: Flag 1 was applied by making the shared-file approach the primary recommendation and explicitly requiring `dead-process-check.js` to be modified to import from it, rather than assuming it already exports the constants.
+
+### AC-66 · `deterministic-recheck-registry.js` bundles two unrelated registries with different lifecycles and keying schemes
+Strength: Strong
+Files: src/deterministic-recheck-registry.js, src/pipeline-forensics.test.js
+
+Problem:
+The module exports two distinct registries side by side: a source-keyed deterministic-recheck registry (register/get/clear keyed by task-source name, storing `perFileRules`/`repoWideRules` config objects) and a rule-keyed pre-dispatch gate registry (register/get/clear keyed by rule ID, storing detector functions). The gate registry additionally self-registers a built-in `sequential-await-in-loop` detector at module load time, making the module stateful by import, while the recheck registry is purely passive. These two mechanisms have different keying schemes, different consumers, different extension points, and different lifecycles, yet they share a single module identity. Any change to gate semantics or recheck semantics forces both to live in the same file, and importing the module carries an implicit side effect that the rest of the codebase (e.g. `model-profile-registry.js`) does not exhibit.
+
+Solution:
+Split the module into two separate modules: one for source-keyed deterministic-recheck registration (register/get/clear/list for `perFileRules`/`repoWideRules`) and one for rule-keyed pre-dispatch gate registration (register/get/clear for gate detectors). Within the new gate module, preserve the codebase’s “single swap point” discipline (as seen in `hub-review-detection.js`): keep the default `sequential-await-in-loop` detector defined inside the gate module and expose a `set`/`get` (or `register`/`get`) swap mechanism for it, rather than moving the default implementation to a bootstrap file. Update imports in `pipeline-forensics.test.js` and any other consumers to pull each registry from its own module.
+
+Benefits:
+Each module has a single responsibility and a single, predictable import side-effect profile (none). Changes to gate semantics no longer require touching the recheck module and vice-versa. The test file's import list becomes a clear statement of which registries are under test, removing the ambiguity that currently forces the `try/catch` workaround. New contributors can reason about one registry at a time without mentally separating two interleaved concerns.
+
+NOTE (verified against master, 2026-09-25): the recheck half of `deterministic-recheck-registry.js` is a documented plugin API (`docs/PLUGIN_API.md` lists `registerDeterministicRecheck`, `getDeterministicRecheck`, `getRecheckSources`, `clearDeterministicRecheckRegistry`), and the hygiene plugin registers through it, so keep those exports at the existing path. The pre-dispatch gate functions (`registerPreDispatchGate` and friends) are NOT in the documented API, so they are the half to move to a new module; if any plugin already imports them, re-export from the old path. Also keep the file free of external requires (`silent-catch-plan-cap.js` cites that as a hot-path constraint the module holds). AC-68's claim of different verb shapes is wrong: both registries already use register/get/clear; ignore any candidate built on it.
 
 ### AC-69 · SDK re-export surface leaks test-only internals and couples read/write paths
 Strength: Strong
