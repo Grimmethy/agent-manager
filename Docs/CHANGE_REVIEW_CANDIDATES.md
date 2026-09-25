@@ -1751,39 +1751,3 @@ index 951e8e12..d9653a8c 100644
 Problem: [severity: high; regression shipped in b016e3f] Removing `OSError` from the except tuple in `_call_discuss` narrows the caught set from all `OSError` subclasses to only `TimeoutError` and `ConnectionError`, so `FileNotFoundError` and `PermissionError` (both `OSError` subclasses that are neither) now propagate uncaught as raw 500s instead of being converted to a 502 with an actionable message.  Failure scenario: A brain-dump discuss/start request arrives via `routes/brain_dump.py:297` (`_call_discuss(start_session, pipeline_dir, entry_id, entry["rawText"], kind="brain-dump", …)`). The project's `pipeline_dir` has been deleted or its permissions revoked (e.g. an admin removed the directory between requests). `start_session` (from `discuss_sessions`) attempts to open a session JSON file under that directory and raises `FileNotFoundError`. Before the diff, the `except (TimeoutError, ConnectionError, OSError)` clause caught it and returned HTTP 502 with the body "local model call failed ([Errno 2] No such file or directory: …) -- it may be busy with an active worker-lane task; try again shortly or switch to Claude." After the diff, `FileNotFoundError` is neither a `TimeoutError` nor a `ConnectionError`, so it escapes `_call_discuss`, Flask's default error handler fires, and the user sees a bare 500 "Internal Server Error" page with no explanation — the exact failure mode the function's docstring says it "already exists to prevent." The commit message itself names `FileNotFoundError` and `PermissionError` as the errors raised during the session call, confirming they are reachable in practice.
 Solution: Restore `OSError` in the tuple: `except (TimeoutError, ConnectionError, OSError) as e:` (or simply `except OSError as e:`, since both `TimeoutError` and `ConnectionError` are `OSError` subclasses in CPython 3). This matches the sibling `_call_chat` function in the same file, which still catches all three.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in b016e3f.
-
-### AC-111 · A task whose `source` field names an unregistered source (and is not the literal string `' (5405b63 next-claimable-task.js)
-Strength: Strong
-Source: change_review of 5405b63 "feat: hub-order and dependency-release claim hooks (S1 of the hub-tasks extracti"
-Files: src/next-claimable-task.js
-
-Snippet:
-```
-diff --git a/src/next-claimable-task.js b/src/next-claimable-task.js
-index 1712f4e3..e51001ac 100644
---- a/src/next-claimable-task.js
-+++ b/src/next-claimable-task.js
-@@ -166,25 +166,25 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
-     names = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
-   } catch (_) {
-     return [];
-   }
- 
-   // Side-effect requires: task-sources.js's registerTaskSource() calls populate
-   // task-source-registry.js's registry as a load-time side effect -- must be required
-   // before getRegisteredSource() can resolve anything (see local-worker.sh's own
-   // comment on this same gotcha, confirmed live 2026-08-17: requiring model-provider.js
-   // alone reported every source as 'low' every time).
-   loadSourceRegistry();
-   const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
--  const { hubOrderKeyForTask, compareHubKeys } = require('./hub-priority.js');
-+  const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
- 
-   // <queue>/pending -> pipelineDir (hub-priority.js re-joins queue/coordinating itself).
-   const pipelineDir = path.join(pendingDir, '..', '.
-...[snippet truncated]
-```
-
-Problem: [severity: high; regression shipped in 5405b63] A task whose `source` field names an unregistered source (and is not the literal string `'derived_task'`) now throws an unhandled exception out of `pickClaimableTasks`, aborting claimable-task selection for every worker, whereas before this diff the same task was processed normally (ungated, as the existing catch comment documents).  Failure scenario: A pending task file `pending/abc.json` contains `{"source": "unregistered-xyz", "priority": 10}`. `pickClaimableTasks(pendingDir, 'worker-1')` is called. The loop reaches this task. The existing guarded block (the `try { … } catch (_) { /* unresolvable source -- not gated */ }` a few lines above) catches the throw from `resolveSourceName(task)` and lets the task proceed ungated. Execution then reaches the new line `const registeredName = task && task.source === 'derived_task' ? 'derived_task' : (task ? resolveSourceName(task) : null);`. Because `task.source` is `'unregistered-xyz'` (not `'derived_task'`), the ternary's else-branch evaluates `resolveSourceName(task)`, which throws (the same "unresolvable source" condition the adjacent catch comment names). No try/catch surrounds this call, so the exception propagates out of `pickClaimableTasks`, and every worker's task-claiming loop halts until the offending file is removed. Before this diff, the corresponding line was `const hk = task ? hubOrderKeyForTask(pipelineDir, task, hubKeyCache) : { isHubChild: false };`, which never calls `resolveSourceName` and therefore never throws for this input.
-Solution: Wrap the new `registeredName` / `registered` / `hubOrder` / `hk` block in a try/catch that falls back to `DEFAULT_HUB_ORDER` and `{ isHubChild: false }` on throw, mirroring the guard pattern already used two lines above and in `releaseSignalsForRecord` (task-sources.js, hunk 6).
-Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 5405b63.
