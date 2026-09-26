@@ -771,3 +771,18 @@ test('prepareStackedBranch: fetch failing for a NON-missing-ref reason leaves th
 
   assert.ok(git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/agent/triage-y'], repoDir).trim());
 });
+
+test('annotateGitTimeout: a timed-out git call names the command and the cap, and keeps the original message', () => {
+  const { annotateGitTimeout } = require('./git-runner.js');
+  const err = Object.assign(new Error('spawnSync git ETIMEDOUT'), { code: 'ETIMEDOUT' });
+  const out = annotateGitTimeout(err, ['push', '-u', 'origin', 'agent/triage-queue', '--verbose'], 60000);
+  assert.equal(out, err, 'same error object, so e.status / e.code checks elsewhere still work');
+  assert.match(err.message, /^git push -u origin agent\/triage-queue timed out after 60000ms \(ETIMEDOUT\): spawnSync git ETIMEDOUT$/);
+  assert.equal(annotateGitTimeout(err, ['push'], 60000).message, err.message, 'annotating twice does not stack');
+});
+
+test('annotateGitTimeout: non-timeout errors are left untouched', () => {
+  const { annotateGitTimeout } = require('./git-runner.js');
+  const err = Object.assign(new Error('fatal: not a git repository'), { status: 128 });
+  assert.equal(annotateGitTimeout(err, ['status'], 60000).message, 'fatal: not a git repository');
+});

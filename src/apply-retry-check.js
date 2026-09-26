@@ -82,8 +82,19 @@ function isFindStringMiss(task) {
 // Such a task is held untouched (no retry burned) while the clone is dirty, then released straight back to
 // approved/ to RE-APPLY its already-approved result, no model call spent.
 const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following files would be overwritten|cannot rebase: you have unstaged changes/i;
+// 2026-09-26: a git subprocess hitting git-runner.js's 60s cap ("spawnSync git ETIMEDOUT", or its annotated form "git <cmd> timed out
+// after <n>ms") is also infrastructure -- the apply clone sits on the same rotational disk as the model files (IO pressure avg300 ~13%),
+// and 23 such timeouts across 3 days hit already-approved drafts (arch_discovery community-12 burned all 2 apply retries on it and was
+// escalated as a 'design-decision'). Same treatment as a dirty clone: re-apply the approved result, no redraft. Unlike a dirty clone this
+// can recur every time, so it is bounded: after APPLY_TIMEOUT_MAX_RELEASES releases it falls through to the normal retry/escalation path.
+const GIT_TIMEOUT_RE = /spawnSync git ETIMEDOUT|\bgit [\w-]+[^\n]{0,80} timed out after \d+ms/i;
+const APPLY_TIMEOUT_MAX_RELEASES = 4;
+function isGitTimeoutApplyFailure(task) {
+  return isApplyFailure(task) && GIT_TIMEOUT_RE.test(String(task.blockedReason || ''))
+    && (Number(task.applyTimeoutReleases) || 0) < APPLY_TIMEOUT_MAX_RELEASES;
+}
 function isInfraApplyFailure(task) {
-  return isApplyFailure(task) && INFRA_APPLY_RE.test(String(task.blockedReason || ''));
+  return isApplyFailure(task) && (INFRA_APPLY_RE.test(String(task.blockedReason || '')) || isGitTimeoutApplyFailure(task));
 }
 
 // True when the apply clone has no uncommitted tracked changes (the exact condition checkout/rebase need).
@@ -165,6 +176,7 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
       if (isInfraApplyFailure(task)) {
         if (approvedDirResolved && isApplyCloneClean()) {
           step = 'record';
+          if (isGitTimeoutApplyFailure(task)) task.applyTimeoutReleases = (Number(task.applyTimeoutReleases) || 0) + 1;
           delete task.blockedReason;
           delete task.blockedStage;
           task.status = 'approved';

@@ -314,3 +314,37 @@ test('applyRetryCheck: the rebase-on-dirty-tree and assertCleanTree messages are
   assert.equal(isInfraApplyFailure(mk('git apply failed: patch does not apply')), false);
   assert.equal(isInfraApplyFailure({ blockedStage: 'review', blockedReason: DIRTY_REASON }), false);
 });
+
+// 2026-09-26: a git subprocess timeout at apply is infrastructure (arch-discovery-community-12: approved 2/3, then 3 x
+// "spawnSync git ETIMEDOUT" burned both apply retries and escalated as a 'design-decision').
+const TIMEOUT_REASON = 'applyDirectToMainBatch crashed before producing a result: spawnSync git ETIMEDOUT\n    at Object.spawnSync (node:internal/child_process:1120:20)';
+const TIMEOUT_REASON_ANNOTATED = 'applyDirectToMainBatch crashed before producing a result: git push -u origin agent/triage-queue timed out after 60000ms (ETIMEDOUT): spawnSync git ETIMEDOUT';
+
+test('applyRetryCheck: a git ETIMEDOUT apply failure is released to approved/ to re-apply (no redraft, no retry burned), and counted', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const approvedDir = path.join(root, 'queue', 'approved');
+  writeBlockedTask(blockedDir, 'to-1', { blockedReason: TIMEOUT_REASON, applyRetryCount: 2, implementResponse: '### AC-1 · x' });
+  writeBlockedTask(blockedDir, 'to-2', { blockedReason: TIMEOUT_REASON_ANNOTATED, applyRetryCount: 0, implementResponse: '### AC-2 · y' });
+
+  const summary = applyRetryCheck({ blockedDir, pendingDir, approvedDir, recordModelOutcome: () => {}, isApplyCloneClean: () => true });
+
+  assert.equal(summary.released, 2);
+  assert.equal(summary.exhausted, 0);
+  for (const id of ['to-1', 'to-2']) {
+    const r = JSON.parse(fs.readFileSync(path.join(approvedDir, `${id}.json`), 'utf8'));
+    assert.equal(r.applyTimeoutReleases, 1);
+    assert.equal(r.status, 'approved');
+    assert.equal(r.blockedReason, undefined);
+  }
+  assert.equal(fs.existsSync(path.join(pendingDir, 'to-1.json')), false, 'no redraft');
+});
+
+test('applyRetryCheck: after APPLY_TIMEOUT_MAX_RELEASES timeouts the failure is no longer infra and takes the normal retry/escalation path', () => {
+  const { isInfraApplyFailure } = require('./apply-retry-check.js');
+  const mk = (n) => ({ blockedStage: 'apply', blockedReason: TIMEOUT_REASON, applyTimeoutReleases: n });
+  assert.equal(isInfraApplyFailure(mk(0)), true);
+  assert.equal(isInfraApplyFailure(mk(3)), true);
+  assert.equal(isInfraApplyFailure(mk(4)), false);
+  assert.equal(isInfraApplyFailure({ blockedStage: 'review', blockedReason: TIMEOUT_REASON }), false);
+  assert.equal(isInfraApplyFailure({ blockedStage: 'apply', blockedReason: 'git apply failed: patch does not apply' }), false);
+});
