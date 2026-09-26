@@ -52,6 +52,16 @@ function detectDefaultBranch(repoRoot) {
   return 'main';
 }
 
+// A timed-out git call surfaced only as "spawnSync git ETIMEDOUT", which names neither the command nor the limit --
+// 23 such failures across the apply loop (2026-09-24, 2026-09-26) could not be traced to a step. Prefix the message
+// with the command and the cap; the original message stays after it, so anything matching "spawnSync git ETIMEDOUT" still does.
+function annotateGitTimeout(err, args, timeoutMs) {
+  if (err && err.code === 'ETIMEDOUT' && !/timed out after \d+ms/.test(String(err.message))) {
+    err.message = `git ${(args || []).slice(0, 4).join(' ')} timed out after ${timeoutMs}ms (ETIMEDOUT): ${err.message}`;
+  }
+  return err;
+}
+
 /**
  * Production adapter: real git via child_process, against a real repoRoot on disk.
  * @param {string} repoRoot - Absolute path to the git repo to operate on.
@@ -59,7 +69,11 @@ function detectDefaultBranch(repoRoot) {
 function createRealGitRunner(repoRoot) {
   const mainBranch = detectDefaultBranch(repoRoot);
   function run(args) {
-    return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+    try {
+      return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+    } catch (e) {
+      throw annotateGitTimeout(e, args, GIT_TIMEOUT_MS);
+    }
   }
   function isAncestor(a, b) {
     try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
@@ -500,4 +514,4 @@ function createFakeGitRunner(opts = {}) {
   };
 }
 
-module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch, DIRTY_CLONE_ERROR_PREFIX };
+module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch, annotateGitTimeout, DIRTY_CLONE_ERROR_PREFIX };
