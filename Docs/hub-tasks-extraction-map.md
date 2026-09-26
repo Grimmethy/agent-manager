@@ -150,9 +150,16 @@ What core provides that the plugin depends on, and what the plugin provides that
 
 ## 7. Extraction guidance
 
-**Seam A: the hub kernel (should move together).** `queueSubTasks` + `applyAdhocDiff` decompose branch + `applyCandidateSplitAsHub`,
-`coordinator-sweep.js`, `hub-priority.js`, `stacked-grounding.js`, `hub-status-grounding.js`, `decompose-auto-merge.js`,
-`decompose-integration-gate.js`, `rejected-hub-disposition-backfill.js`, and the dashboard hub tab/route.
+**Seam A: the hub kernel (should move together).** `queueSubTasks` + `applyAdhocDiff` decompose branch (`applyCandidateSplitAsHub`
+already moved, S4b), `coordinator-sweep.js`, `hub-priority.js`, `hub-serial.js`, `hub-rename.js`, `hub-restack.js`,
+`hub-status-grounding.js`, `decompose-auto-merge.js`, `decompose-integration-gate.js`, `rejected-hub-disposition-backfill.js`, and the
+dashboard hub tab/route.
+
+> **CORRECTION 2026-09-25 (verified against the code while scoping S5):** `stacked-grounding.js` does **not** belong in this list --
+> despite the name, it's a generic git-ref grounding utility (`resolveGroundingRef`/`readFileAtRef`/`grepAtRef`/`resolveAtRef`) with no
+> hub-specific logic, required by 14 files across the codebase (`fact-checker.js`, `review-task.js`, `local-draft.js`,
+> `context-trim-sweep.js`, `staleness-audit.js`, ...). Moving it would flip the dependency direction for all of them. `hub-rename.js`
+> and `hub-restack.js` were missing from this list entirely (both required by `coordinator-sweep.js`) -- added above.
 
 > **UPDATE 2026-09-21:** the destination of the producers changed. The code-decomposition family (file-decompose and its builders, loop-autoroute, the proactive sweep, the move-determinism backfill) goes to **agent-manager-hygiene**, not the hub plugin; see `Docs/hub-tasks-extraction-plan.md` sections 3-4.
 
