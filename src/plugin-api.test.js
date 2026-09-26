@@ -34,6 +34,10 @@ const CONTRACT = {
   './model-profile-registry.js': { functions: ['clearModelProfileRegistry'] },
   './apply-adhoc-diff.js': { functions: ['queueSubTasks', 'applyAdhocDiff'] },
   './candidate-split-hub-route.js': { functions: ['setCandidateSplitHubFiler', 'getCandidateSplitHubFiler'] },
+  './decompose-pass-route.js': { functions: ['setDecomposePassRunner', 'getDecomposePassRunner', 'runDecomposePassIfAvailable'] },
+  './agentic-draft-common.js': { functions: ['parseSubTaskProposals'] },
+  './local-client.js': { functions: ['call'] },
+  './claude-client.js': { functions: ['call'] },
 };
 
 // prompts.js/task-sources.js require AGENT_MANAGER_REPO_ROOT at load (getConfig()).

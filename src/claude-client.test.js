@@ -609,7 +609,8 @@ test('call() extracts a CONCEPT-BUILD report and records the tally on concepts.j
 // try/catch around callOnce() at all, so ANY thrown error -- this one included --
 // already propagates straight out on the first attempt, consuming none of maxRetries.
 // Confirmed the same holds for every real caller of call()/claude-client.js
-// (research-agentic-draft.js, decompose-pass.js): none wraps it in a retry loop of
+// (research-agentic-draft.js, decompose-pass.js in the agent-manager-hub-tasks plugin):
+// none wraps it in a retry loop of
 // their own either. The sibling sub-task asking to "catch the DRAFT_TURN_LIMIT_EXCEEDED
 // error... and rethrow immediately without consuming retry attempts" needed no source
 // change as a result -- only this test, proving the already-correct behavior.

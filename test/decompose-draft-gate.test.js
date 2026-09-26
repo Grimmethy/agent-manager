@@ -7,15 +7,26 @@
 //       proposal objects; reformatted is true when the JSON array sat inside a
 //       larger prose blob, false when the draft was the bare array itself.
 //     { ok: false, reason }                -- prose-only / wrong-shape.
-// Test (E) additionally drives the gate over a mocked runDecomposePass two-draft
-// retry (prose-only draft 1, prose-only draft 2) and asserts the 27B model path
-// is never invoked when both drafts fail the gate.
+// Test (E) additionally drives the gate over a minimal decompose-pass stand-in's
+// two-draft retry (prose-only draft 1, prose-only draft 2) and asserts no third
+// attempt happens when both drafts fail the gate.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const { validateDecomposeDraft } = require('../src/lib/decompose-draft-gate.js');
-const { runDecomposePass } = require('../src/decompose-pass.js');
+
+// runDecomposePass itself moved to the agent-manager-hub-tasks plugin (S4b of the
+// hub-tasks extraction, 2026-09-25) -- its own parsing behavior is tested there
+// (src/decompose-pass.test.js in that repo). This file's real subject is
+// decompose-draft-gate.js (core, unmoved); test (E) below only needs a minimal local
+// double that reproduces the one-model-call-per-attempt contract the gate integration
+// cares about -- in this test `call` always returns prose the real parser would reject
+// too, so the real and fake versions return the same null either way.
+async function fakeRunDecomposePass(task, { call }) {
+  await call({});
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // (A) prose-only rejection: a natural-language draft with no JSON array anywhere
@@ -89,47 +100,45 @@ test('(D) wrong-shape drafts are rejected like prose', () => {
 });
 
 // ---------------------------------------------------------------------------
-// (E) integration: gate over a mocked runDecomposePass two-draft retry.
-//     Both drafts come back prose-only -> the gate rejects both -> no 27B call.
+// (E) integration: the gate over a two-draft retry using a minimal decompose-pass
+//     stand-in (see fakeRunDecomposePass above). Both drafts come back prose-only ->
+//     the gate rejects both, exactly one model call per attempt, no third attempt.
+//     Real escalation-avoidance (claudeCall never invoked) is the moved
+//     runDecomposePass's own behavior now, covered by its test in the
+//     agent-manager-hub-tasks plugin.
 // ---------------------------------------------------------------------------
-test('(E) both drafts fail the gate: runDecomposePass called exactly twice, 27B model never invoked', async () => {
+test('(E) both drafts fail the gate: the decompose pass is called exactly twice, no third attempt', async () => {
   const PROSE_ONLY =
     'This should be split into two pieces, one for the parser and one for the printer.';
 
-  // Injectable model call (the same { call } seam src/decompose-pass.test.js uses).
-  // It stands in for the local 27B model pass: every invocation it performs
+  // Injectable model call (the same { call } seam the plugin's decompose-pass.test.js
+  // uses). It stands in for the local 27B model pass: every invocation it performs
   // counts as a 27B call.
   let calls = 0;
   const call = async () => {
     calls += 1;
     return PROSE_ONLY; // both drafts fail the gate on purpose
   };
-  const claudeCall = async () => {
-    calls += 1; // if the pass ever escalated to the slow model, we would see it
-    throw new Error('27B escalation must not happen when both drafts fail');
-  };
 
   // The two-draft retry: draft 1 -> gate -> if rejected, draft 2 -> gate.
   const gateResults = [];
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const draft = await runDecomposePass(
+    const draft = await fakeRunDecomposePass(
       { source: 'manual', promptContext: { rawText: 'Split this task.' } },
-      { call, claudeCall },
+      { call },
     );
     const gated = validateDecomposeDraft(draft == null ? '' : String(draft));
     gateResults.push(gated);
     if (gated.ok) break;
   }
 
-  assert.equal(calls, 2, 'runDecomposePass made exactly one model call per draft (one retry)');
+  assert.equal(calls, 2, 'the decompose pass made exactly one model call per draft (one retry)');
   assert.equal(gateResults.length, 2, 'both drafts went through the gate');
   for (const gated of gateResults) {
     assert.equal(gated.ok, false, 'a prose-only draft must be rejected by the gate');
     assert.ok(!('subTasks' in gated));
   }
-  // 27B model identifier: the local 27B pass is the `call` seam above (the slow
-  // claude-style escalation is `claudeCall`). When both drafts fail, the retry
-  // loop stops after the second draft -- it must never invoke the 27B model
-  // again for a third attempt.
-  assert.ok(calls <= 2, 'no extra 27B model call occurred after both drafts failed');
+  // When both drafts fail, the retry loop stops after the second draft -- it must
+  // never invoke the decompose pass again for a third attempt.
+  assert.ok(calls <= 2, 'no extra decompose-pass call occurred after both drafts failed');
 });

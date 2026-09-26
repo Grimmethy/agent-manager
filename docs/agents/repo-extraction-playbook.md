@@ -12,7 +12,7 @@ or half-built the one you're about to start):
 
 | Target | Status | Doc |
 |---|---|---|
-| Hub Tasks → `agent-manager-hub-tasks` | S0 done (PR #455). S1 (claim-ordering/dependency-release hooks, PR #459), S2 (apply-result routing hook, PR #460), S3-a (decompose/split-proposal detection hook, narrowed from full S3, PR #461) all merged 2026-09-23. S4a done 2026-09-24 (file-decompose family moved to hygiene, PR #468). **S4b in progress, 2026-09-25**: repo scaffolded, then producer 4 (candidate split) moved -- `candidateSplitToSubTasks`/`applyCandidateSplitAsHub` now live in the plugin, dispatched through a new narrow swap point (`candidate-split-hub-route.js`, built ahead of the fuller S5 hub-intake hook since S4b needed *something*). Producer 1 (adhoc decompose) not yet moved -- still needs its own producer hook in `local-draft.js`. Hub-intake hook shape decided (section 3) but the fuller generalization deferred to S5. S3's `verifyMove` hook, S5-S6 not started. | `Docs/hub-tasks-extraction-plan.md` |
+| Hub Tasks → `agent-manager-hub-tasks` | S0 done (PR #455). S1 (claim-ordering/dependency-release hooks, PR #459), S2 (apply-result routing hook, PR #460), S3-a (decompose/split-proposal detection hook, narrowed from full S3, PR #461) all merged 2026-09-23. S4a done 2026-09-24 (file-decompose family moved to hygiene, PR #468). **S4b done, 2026-09-25**: repo scaffolded, then both task-level producers moved -- producer 4 (candidate split, `candidate-split-hub-route.js`) and producer 1 (adhoc decompose, `decompose-pass-route.js`; the latter's swap point degrades gracefully rather than throwing, since it's on the hot path for every adhoc draft — see the Worktrees section's incident note). Their caller-side dispatch logic stays in core. Hub-intake hook shape decided (section 3) but the fuller generalization deferred to S5. S3's `verifyMove` hook, S5-S6 not started. | `Docs/hub-tasks-extraction-plan.md` |
 | Brain Dump → standalone plugin repo | Still in the decision phase — no sequenced plan yet (single owner for `brain-dump.json`, vault/project-registry adapters both undecided) | `Docs/brain-dump-extraction-map.md` |
 
 ## The process
@@ -118,3 +118,20 @@ extraction/refactor work in the `agent-manager-manual` worktree instead: branch 
 can't be checked out twice), do the work, push, and merge with `gh pr merge` from there.
 (`docs/agents/manual-nc-resolution.md` references this same caveat for hand-resolving a
 needs-clarification task — this is the doc that promise pointed at.)
+
+**The same rule applies to every plugin's checkout, not just core's.** Confirmed live
+2026-09-25 during the hub-tasks extraction's producer-1 move: editing files (even just
+`git checkout <branch>` plus new untracked files, no commit) directly inside
+`agent-manager-hub-tasks`'s checkout took the live pipeline down, because that exact
+directory is what `plugins.json`'s `registerPath` points at — `AGENT_MANAGER_REGISTER_PATH`
+resolution reads whatever is on disk at that path, not a specific git ref, so a branch
+checkout changes live behavior the instant it happens, with no commit or merge needed.
+The new `register.js` required a core module (`decompose-pass-route.js`) that only existed
+in the separate core worktree, not yet merged into the live `agent-manager` checkout —
+every worker tick's `require()` then threw before printing any output, which surfaced as
+opaque empty `draft call failed for X:` lines, not an obvious stack trace. **Fix going
+forward: `git worktree add ../<plugin>-manual -b <branch> origin/master` for every plugin
+repo the same way core already gets a `-manual` worktree**, and only touch the plugin's
+live checkout directory with a plain `git pull --ff-only` after the PR is merged — never a
+branch checkout or an uncommitted edit. (This incident is why `agent-manager-hub-tasks`
+now has a sibling `agent-manager-hub-tasks-manual` worktree.)

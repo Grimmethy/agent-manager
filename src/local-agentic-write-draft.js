@@ -32,7 +32,7 @@ const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js'
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { detectContradictoryLiteralAcceptance } = require('./acceptance-criteria.js');
 const { detectStaleDecomposePremise } = require('./decompose-premise-check.js');
-const { runDecomposePass } = require('./decompose-pass.js');
+const { runDecomposePassIfAvailable } = require('./decompose-pass-route.js');
 const { oversizedFiles } = require('./file-length-flags-reader.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
@@ -483,7 +483,7 @@ async function runGiveUpSplit(task, verdict) {
     return null;
   }
   const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
-  const split = await runDecomposePass(task, {
+  const split = await runDecomposePassIfAvailable(task, {
     mode,
     priorAttemptBlock: priorAttemptAnalysisBlock(task),
   });
@@ -610,7 +610,7 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   if (process.env.AGENT_MANAGER_SCOPE_GATE !== 'false') {
     const gate = scopeComplexityGate(task);
     if (gate && gate.shouldDecompose) {
-      const split = await runDecomposePass(task, {
+      const split = await runDecomposePassIfAvailable(task, {
         mode: 'preliminary',
         priorAttemptBlock: gate.reason,
       });
