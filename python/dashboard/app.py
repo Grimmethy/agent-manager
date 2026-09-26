@@ -3285,6 +3285,37 @@ def _hub_for_branch(qdir, branch, commit_task_ids):
     return None
 
 
+class _DefaultHubDataProvider:
+    """Swap point for "how does the dashboard look up hub data for a task/branch" (S5d
+    of the hub-tasks extraction, 2026-09-25) -- the Python-side twin of the JS hooks
+    (hub-apply-routing.js, apply-branch-prep-route.js, split-coverage-judging-route.js).
+    Default = today's file-based lookup, moved here as static methods rather than a fresh
+    reimplementation. Same "always-installed default" shape: every task/branch lookup
+    needs SOME hub-data answer, and None is a valid one ("not part of a hub"), so there is
+    no "unregistered" state.
+
+    _summarize_hub / _hub_child_phase / _hub_label_index stay as plain module functions,
+    not part of this interface -- they are internal helpers of the default implementation
+    (used only by _hub_for_branch / tests), not something a caller reaches directly."""
+
+    hub_for_branch = staticmethod(_hub_for_branch)
+    hub_info_for_task = staticmethod(_hub_info_for_task)
+
+
+_hub_data_provider = _DefaultHubDataProvider()
+
+
+def get_hub_data_provider():
+    return _hub_data_provider
+
+
+def set_hub_data_provider(provider):
+    """A single swap point, not a registry -- same discipline as the JS-side hooks.
+    Passing None restores the default; used by tests to reset state between runs."""
+    global _hub_data_provider
+    _hub_data_provider = provider or _DefaultHubDataProvider()
+
+
 def _label_for_branch(task_id, pipeline_dir, subject, repo_root=None):
     """Best-effort human label: the originating task's own title/domain/source (plus a
     plain-English description of what it actually changed, see _describe_change) if a
@@ -3317,7 +3348,7 @@ def _label_for_branch(task_id, pipeline_dir, subject, repo_root=None):
         # A stacked file-decompose branch (agent/decompose-<slug>) carries N tasks, not
         # one -- `task_id` here is "decompose-<slug>", which is no task's id. Its owning
         # coordinator hub IS findable, and is the right label + status source.
-        hub = _hub_for_branch(qdir, f"agent/{task_id}", [])
+        hub = get_hub_data_provider().hub_for_branch(qdir, f"agent/{task_id}", [])
         if hub:
             prog = hub["progress"]
             gate = hub["integrationGate"]["status"]
@@ -3407,7 +3438,7 @@ def _list_unmerged_branches_uncached():
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
         qdir = (pipeline_dir / "queue") if pipeline_dir else None
-        hub = _hub_for_branch(qdir, branch, [task_id])
+        hub = get_hub_data_provider().hub_for_branch(qdir, branch, [task_id])
         branches.append({
             "branch": branch,
             "taskId": task_id,
