@@ -80,7 +80,7 @@ about," verified to still exist as of this writing.
 - `docs/PLUGIN_API.md` + `src/plugin-api.test.js` — the plugin contract and the CI test that enforces it.
 
 **Watchdog sweeps**
-- `src/coordinator-sweep.js` — detects and re-routes a stuck coordinator hub.
+- coordinator-sweep.js (moved to agent-manager-hub-tasks's src/, S5e of the hub-tasks extraction, 2026-09-25) — detects and re-routes a stuck coordinator hub.
 - `src/blocked-drain.js` — auto-requeues blocked tasks sharing a signature a landed fix just resolved.
 - decompose-loop-autoroute.js (moved to agent-manager-hygiene's src/, S4a of the hub-tasks extraction, 2026-09-24) — a stuck oversized-file task auto-authors its own file-decompose plan.
 - `src/staleness-audit.js` — sweeps brain-dump tasks resolved by hand outside the pipeline.
