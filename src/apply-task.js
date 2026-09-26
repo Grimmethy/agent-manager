@@ -13,6 +13,7 @@
 
 const fs = require('fs');
 const { getHubApplyRouting } = require('./hub-apply-routing.js');
+const { getApplyBranchPrep } = require('./apply-branch-prep-route.js');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
@@ -255,40 +256,11 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // takes the normal agent/<id> branch path below and waits for a human merge.
     const commitsDirectlyToMain = !!(registered && registered.directToMain === true) && ungatedMainPushAllowed();
 
-    // Stacked file-decompose child (file-decompose-to-hub.js `mode: 'stacked'`): every
-    // move + the wiring step commits onto ONE shared branch, in sequence. Step 1 creates
-    // it off main; step N>1 rides on top of what step N-1 committed -- so it must NOT
-    // resetToMain() (that would throw the prior steps away). isDependencySatisfied() has
-    // already confirmed step N-1 reached queue/done/ before this task was claimed.
-    const stacked = task.stacked && task.stacked.branch && !commitsDirectlyToMain ? task.stacked : null;
-    if (stacked) {
-      const b = stacked.branch;
-      // seq 1 normally CREATES the branch off main -- but only if origin has no unmerged work on it. A hub whose seq numbering restarted
-      // inside a chain that already pushed earlier steps (or a retry after step 1's own push) must ride on that work, not delete it.
-      if (stacked.seq > 1 || gitRunner.remoteHasUnmergedWork(b)) {
-        // 2026-09-08, Grimmethy: "harden it properly with tests" -- root-caused live: the
-        // old branchExists(b) check here was LOCAL-only, so a stale local branch with the
-        // same name (origin's real copy long since merged and deleted) made every apply
-        // attempt check out ancient history and fail to apply a diff computed against
-        // current main -- identically, every retry, never self-correcting. See
-        // git-runner.js's prepareStackedBranch for the full ahead/behind/diverged
-        // reasoning (same discipline resetToMain() already applies to mainBranch itself).
-        // Pre-flight (2026-09-24, same fix as the triage batch's, lib/apply-main-batch.js): prepareStackedBranch's `checkout -B` / `rebase`
-        // abort on a dirty tracked file, and resetToMain() -- the only other thing here that clears stray content -- is deliberately NOT
-        // called on this path. Self-heal a dedicated apply clone (quarantine to a patch under .git/), else fail once with a clear message.
-        if (typeof gitRunner.quarantineDirtyTree === 'function') gitRunner.quarantineDirtyTree();
-        if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
-        gitRunner.prepareStackedBranch(b);
-      } else {
-        gitRunner.resetToMain();
-        try { gitRunner.deleteBranch(b); } catch (_) { /* no stale branch */ }
-        gitRunner.createBranch(b);
-      }
-    } else {
-      gitRunner.resetToMain();
-    }
-
-    const branchName = commitsDirectlyToMain ? null : (stacked ? stacked.branch : `agent/${task.id}`);
+    // Branch preparation (stacked file-decompose child vs. the ordinary agent/<id>
+    // branch) is a swap point as of S5b of the hub-tasks extraction (2026-09-25) -- see
+    // apply-branch-prep-route.js for the real logic (moved there verbatim as the default,
+    // always-installed implementation; there is no "unregistered" state here).
+    const { branchName, stacked } = getApplyBranchPrep().prepareApplyBranch(task, { gitRunner, commitsDirectlyToMain });
 
     // Abandon this apply's branch checkout on an early-return path. For a normal throwaway
     // agent/<id> branch that means delete it. For a STACKED decompose branch it does NOT:
