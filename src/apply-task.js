@@ -143,6 +143,9 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         pipelineDir,
       });
       if (result.skipped) {
+        // Stale guard (HUB0092 · 1/3): a stale+skipped result is not a real outcome --
+        // failed path, never {succeeded:true, doneMarker} into queue/done/.
+        if (result.stale) return { succeeded: false, reason: `stale result (skipped) -- not marked done${result.reason ? `: ${result.reason}` : ''}` };
         // A recoverable skip already bumped the entry's sortAttempt inside applyBrainDumpSort,
         // so nextBrainDumpSortTask regenerates it under a fresh id (…-a1) rather than the
         // entry being dead behind this task's own record in done/.
@@ -160,7 +163,11 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         implementResponse: task.implementResponse,
         indexPath: projectSearchIndexPath,
       });
-      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      if (result.skipped) {
+        // Stale guard (HUB0092 · 1/3): a stale+skipped result takes the failed path, never done/.
+        if (result.stale) return { succeeded: false, reason: `stale result (skipped) -- not marked done${result.reason ? `: ${result.reason}` : ''}` };
+        return { succeeded: true, doneMarker: result.reason };
+      }
       return { succeeded: true, doneMarker: `${result.findingCount} finding(s) (${result.strongCount} strong) appended to ${result.file}` };
     }
 
@@ -173,7 +180,11 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         analysisDir: deepDiveAnalysisDir,
         coveragePath: deepDiveCoveragePath,
       });
-      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      if (result.skipped) {
+        // Stale guard (HUB0092 · 1/3): a stale+skipped result takes the failed path, never done/.
+        if (result.stale) return { succeeded: false, reason: `stale result (skipped) -- not marked done${result.reason ? `: ${result.reason}` : ''}` };
+        return { succeeded: true, doneMarker: result.reason };
+      }
       return { succeeded: true, doneMarker: `${result.itemCount} action item(s) appended to ${result.file}` };
     }
 
@@ -185,7 +196,11 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // never a {file}/{files} in the first place, on a domain with nothing to commit at all.
     if (task.domain === 'path_prefetch_resolve') {
       const result = applyPathPrefetchResolve({ implementResponse: task.implementResponse, task, pipelineDir });
-      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      if (result.skipped) {
+        // Stale guard (HUB0092 · 1/3): a stale+skipped result takes the failed path, never done/.
+        if (result.stale) return { succeeded: false, reason: `stale result (skipped) -- not marked done${result.reason ? `: ${result.reason}` : ''}` };
+        return { succeeded: true, doneMarker: result.reason };
+      }
       return { succeeded: true, doneMarker: `suggested ${result.paths.length} path(s) for ${result.heldTaskId} (confident: ${result.confident})` };
     }
 
@@ -238,7 +253,11 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // for a task that never touches that repo at all.
     if (task.domain === 'research') {
       const result = applyResearchTask({ task, secondBrainDir });
-      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      if (result.skipped) {
+        // Stale guard (HUB0092 · 1/3): a stale+skipped result takes the failed path, never done/.
+        if (result.stale) return { succeeded: false, reason: `stale result (skipped) -- not marked done${result.reason ? `: ${result.reason}` : ''}` };
+        return { succeeded: true, doneMarker: result.reason };
+      }
       closeOriginatingBrainDumpEntry(task, brainDumpPath, `Researched and filed to ${result.file} -- Task: ${task.id}`);
       return { succeeded: true, doneMarker: `research write-up filed to ${result.file}` };
     }
@@ -317,6 +336,13 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
 
     if (artifact && artifact.skipped) {
       abandonBranch();
+      // Stale guard (HUB0092 · 1/3): a stale+skipped result is NOT a real outcome -- it
+      // must take the same failed path a genuine apply failure takes, never
+      // {succeeded:true, doneMarker} into queue/done/. Deliberately NOT closing the
+      // originating Brain Dump entry either: that entry is for a real resolution.
+      if (artifact.stale) {
+        return { succeeded: false, reason: `stale result (skipped) -- not marked done${artifact.reason ? `: ${artifact.reason}` : ''}` };
+      }
       closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
       return { succeeded: true, doneMarker: artifact.reason };
     }
@@ -472,6 +498,20 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
 // comment on the apply-failed branch for why the stamping matters, not just the history
 // event.
 function recordApplyOutcome(task, result) {
+  // Stale-result guard (HUB0092 · 1/3): a result flagged stale:true (its producer --
+  // e.g. applyDirectToMainBatch's own per-task check, HUB0092 · 2/3 -- has already
+  // decided the recorded change no longer matches the task's current state) must
+  // NEVER be recorded as a success: no 'applied' stage, no task.status of 'done', no
+  // done-marker history event. Normalize it to a plain apply-failure HERE, before any
+  // stage mapping below, so it takes the exact same failed/needs-attention path a real
+  // apply failure takes (queue/blocked/ + blockedStage:'apply' + blockedReason +
+  // history event). A stale+skipped result -- shaped {succeeded:true, doneMarker} by a
+  // skipped-handling block -- is covered by this same rewrite: its succeeded/doneMarker
+  // are dropped, so nothing below can read them as a success and the noop-stamp block
+  // further down is unreachable for it (applyStage is 'apply-failed', not 'applied').
+  if (result && result.stale) {
+    result = { succeeded: false, reason: `stale result -- not recorded as applied${result.reason ? `: ${result.reason}` : ''}` };
+  }
   // Precedence matches apply-task.sh's move logic: `coordinating` (a decomposed parent
   // that now tracks its sub-tasks) and `needsConfirmation` (a human hold) are both checked
   // before succeeded/failed -- neither reports succeeded:true but neither is a failure.
