@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import subprocess
 
-# The app.py helpers these views call (ENV_FILE_PATH, _COMMIT_LOG_FIELD_SEP, _COMMIT_LOG_RECORD_SEP, _TASK_TRAILER_RE, _acquire_apply_lock, _archive_task_file, _find_task_log_anywhere, _find_task_record_anywhere, _hub_for_branch, _invalidate_branch_cache, _pipeline_running, _pipeline_stoppable, _release_apply_lock, _run_git, _start_pipeline, _stop_pipeline, _summarize_task_record, _sync_live_checkout, get_active_repo_root, get_pipeline_dir, list_unmerged_branches, logger, queue_dir, read_env_file, read_json_safe) are
+# The app.py helpers these views call (ENV_FILE_PATH, _COMMIT_LOG_FIELD_SEP, _COMMIT_LOG_RECORD_SEP, _TASK_TRAILER_RE, _acquire_apply_lock, _archive_task_file, _find_task_log_anywhere, _find_task_record_anywhere, _invalidate_branch_cache, _pipeline_running, _pipeline_stoppable, _release_apply_lock, _run_git, _start_pipeline, _stop_pipeline, _summarize_task_record, _sync_live_checkout, get_active_repo_root, get_hub_data_provider, get_pipeline_dir, list_unmerged_branches, logger, queue_dir, read_env_file, read_json_safe) are
 # imported lazily inside each view: app.py imports THIS module to register the
 # blueprint, so a top-level `from app import ...` is a circular import that only
 # fails when app.py is the entrypoint (how the dashboard runs). By the time a view
@@ -85,7 +85,7 @@ def api_git_branch_commits(branch):
     the Unmerged Branches tab previously only ever showed the tip commit's subject line,
     so selecting a multi-commit branch gave no way to see what it actually did short of
     a manual `git log` on the box running the dashboard."""
-    from app import _COMMIT_LOG_FIELD_SEP, _COMMIT_LOG_RECORD_SEP, _TASK_TRAILER_RE, _find_task_log_anywhere, _find_task_record_anywhere, _hub_for_branch, _run_git, _summarize_task_record, get_active_repo_root, get_pipeline_dir, list_unmerged_branches
+    from app import _COMMIT_LOG_FIELD_SEP, _COMMIT_LOG_RECORD_SEP, _TASK_TRAILER_RE, _find_task_log_anywhere, _find_task_record_anywhere, _run_git, _summarize_task_record, get_active_repo_root, get_hub_data_provider, get_pipeline_dir, list_unmerged_branches
     repo_root = get_active_repo_root()
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
@@ -147,7 +147,7 @@ def api_git_branch_commits(branch):
                     data, state = log_data, "task-log"
             if data:
                 c["task"] = _summarize_task_record(data, state)
-    hub = _hub_for_branch(qdir, branch, commit_task_ids)
+    hub = get_hub_data_provider().hub_for_branch(qdir, branch, commit_task_ids)
     return jsonify({"branch": branch, "mainBranch": main_branch, "commits": commits, "hub": hub})
 
 
