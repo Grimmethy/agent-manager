@@ -231,6 +231,12 @@ def api_models_usage():
             GROUP BY model, stage
             ORDER BY model, stage
         """).fetchall()
+    except sqlite3.DatabaseError:
+        # is_file() only proves the path exists: a db file the Node side has not created its
+        # model_calls table in yet ("no such table"), or a zeroed/corrupt one (same failure
+        # class as _task_cost_summary, AC-61), would otherwise 500 this route and blank the
+        # Models tab. "No usage recorded" is the truthful answer for both (change_review AC-79).
+        return jsonify([])
     finally:
         conn.close()
 
