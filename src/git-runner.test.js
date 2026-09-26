@@ -731,3 +731,43 @@ test('retryPushAfterRebase: a REAL conflict aborts cleanly and returns false, le
   assert.equal(git(['status', '--porcelain'], repoDir).trim(), '', 'the aborted rebase leaves a clean tree');
   assert.equal(git(['rev-parse', 'agent/triage-queue'], repoDir).trim(), myTip, 'local is untouched -- the failed rebase changed nothing');
 });
+
+test('prepareStackedBranch: branch deleted on origin but stale local tracking ref remains -> not resurrected', () => {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/triage-x');
+  fs.writeFileSync(path.join(repoDir, 'discarded.txt'), 'rejected candidate\n');
+  git(['add', 'discarded.txt'], repoDir);
+  git(['commit', '-m', 'Triage batch'], repoDir);
+  git(['push', '-u', 'origin', 'agent/triage-x'], repoDir);
+  runner.checkoutMain();
+  git(['branch', '-D', 'agent/triage-x'], repoDir);
+  // A human discards the branch on the remote; this clone is never `fetch --prune`d, so its
+  // refs/remotes/origin/agent/triage-x survives (the live 2026-09-25 resurrection trigger).
+  git(['branch', '-D', 'agent/triage-x'], bareDir);
+  assert.ok(git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/agent/triage-x'], repoDir).trim());
+
+  runner.prepareStackedBranch('agent/triage-x');
+
+  assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim(), 'agent/triage-x');
+  assert.equal(fs.existsSync(path.join(repoDir, 'discarded.txt')), false, 'discarded commits must not come back');
+  assert.throws(() => git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/agent/triage-x'], repoDir));
+});
+
+test('prepareStackedBranch: fetch failing for a NON-missing-ref reason leaves the tracking ref alone', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/triage-y');
+  fs.writeFileSync(path.join(repoDir, 'keep.txt'), 'real\n');
+  git(['add', 'keep.txt'], repoDir);
+  git(['commit', '-m', 'Triage batch'], repoDir);
+  git(['push', '-u', 'origin', 'agent/triage-y'], repoDir);
+  runner.checkoutMain();
+  git(['branch', '-D', 'agent/triage-y'], repoDir);
+  // Point origin at an unreachable path: fetch and ls-remote both fail, neither says "gone".
+  git(['remote', 'set-url', 'origin', path.join(os.tmpdir(), 'no-such-remote-dir-xyz')], repoDir);
+
+  try { runner.prepareStackedBranch('agent/triage-y'); } catch { /* downstream steps may fail offline; only the ref matters */ }
+
+  assert.ok(git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/agent/triage-y'], repoDir).trim());
+});

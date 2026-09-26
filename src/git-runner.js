@@ -254,7 +254,21 @@ function createRealGitRunner(repoRoot) {
     //     (2026-09-07 reasoning) -- now reached by an actual staleness check instead of
     //     by trusting whatever name happens to exist locally.
     prepareStackedBranch: (name) => {
-      try { run(['fetch', 'origin', name]); } catch { /* best-effort, matches fetchBranch */ }
+      try {
+        run(['fetch', 'origin', name]);
+      } catch {
+        // Best-effort, matches fetchBranch. But a fetch of a branch that was DELETED on the
+        // remote fails without pruning this clone's own refs/remotes/origin/<name>, and the
+        // remoteExists check below reads that stale ref as "origin has it". Confirmed live
+        // 2026-09-25: a human discarded agent/triage-queue on the remote, this clone's stale
+        // tracking ref (never `fetch --prune`d) made the next batch rebuild it from the old
+        // tip, rebase it onto main and push the discarded commits straight back -- three
+        // times in three hours. ls-remote exit 2 = "no such ref on the remote" (any other
+        // failure, e.g. the network being down, proves nothing, so the ref is left alone).
+        let gone = false;
+        try { run(['ls-remote', '--exit-code', '--heads', 'origin', name]); } catch (e) { gone = e && e.status === 2; }
+        if (gone) { try { run(['update-ref', '-d', `refs/remotes/origin/${name}`]); } catch { /* already absent */ } }
+      }
       const remote = `origin/${name}`;
       const remoteExists = (() => {
         try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}`]); return true; } catch { return false; }
