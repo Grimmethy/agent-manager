@@ -63,8 +63,8 @@ function readInboxItems(pipelineDir) {
     const filePath = path.join(dir, name);
     try {
       const record = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      if (record && record.title && record.body) out.push({ record, filePath });
-    } catch { /* malformed -- skip, cleaned up below regardless */ }
+      if (record && record.title && record.body) out.push({ record, filePath }); else out.push({ record: null, filePath });
+    } catch { out.push({ record: null, filePath }); }
   }
   return out;
 }
@@ -95,6 +95,7 @@ async function sweep({ pipelineDir, dryRun = false, now = Date.now() }) {
   const machineEntries = data.entries.filter((e) => e && e.raisedBy && !e.suppressed);
 
   for (const { record, filePath } of items) {
+    if (!record) continue;
     try {
       const mine = normalizeTokens(`${record.title} ${record.body}`);
       let best = null;
