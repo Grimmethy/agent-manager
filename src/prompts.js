@@ -131,7 +131,7 @@ function isNoCandidateSplitSource(source) {
 
 // Whether the implement prompt tells the model a `{"mode":"split"}` answer exists. A noCandidateSplit source used to be told
 // nothing about it (a doc-split of an already-decomposed candidate loops); now that its splits are ROUTED TO THE COORDINATOR HUB
-// (apply-adhoc-diff.js applyCandidateSplitAsHub) the option is safe, and it must be OFFERED -- otherwise a candidate too big for one
+// (applyCandidateSplitAsHub, agent-manager-hub-tasks plugin) the option is safe, and it must be OFFERED -- otherwise a candidate too big for one
 // pass (PF function-length-fix-ac-2: four extractions) only reaches the hub if the model volunteers a shape it was never shown.
 function offersCandidateSplit(source) {
   return !isNoCandidateSplitSource(source) || candidateSplitToHubEnabled();

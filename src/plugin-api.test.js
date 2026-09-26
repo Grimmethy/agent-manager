@@ -32,6 +32,8 @@ const CONTRACT = {
   './git-runner.js': { functions: ['detectDefaultBranch'] },
   './deterministic-recheck-registry.js': { functions: ['registerDeterministicRecheck', 'getDeterministicRecheck', 'getRecheckSources', 'clearDeterministicRecheckRegistry'] },
   './model-profile-registry.js': { functions: ['clearModelProfileRegistry'] },
+  './apply-adhoc-diff.js': { functions: ['queueSubTasks', 'applyAdhocDiff'] },
+  './candidate-split-hub-route.js': { functions: ['setCandidateSplitHubFiler', 'getCandidateSplitHubFiler'] },
 };
 
 // prompts.js/task-sources.js require AGENT_MANAGER_REPO_ROOT at load (getConfig()).
