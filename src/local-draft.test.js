@@ -17,6 +17,57 @@ const os = require('os');
 const path = require('path');
 const { EventEmitter } = require('events');
 
+// The real decompose-pass primitive (prompt building + parsing) moved to the
+// agent-manager-hub-tasks plugin (S4b of the hub-tasks extraction, 2026-09-25); core now
+// calls it through decompose-pass-route.js's swap point. Many tests below exercise the
+// preliminary decompose check via the ordinary `localCall` stub they already pass to
+// draftTask, expecting the same prompt markers and one-call-per-attempt behaviour the real
+// decompose-pass.js had -- so this file registers a faithful local double, globally, for
+// the whole suite (reusing parseSubTaskProposals, which stays in core and is unchanged)
+// rather than requiring each test to register its own. Individual tests that care about
+// the split verdict itself, or about the no-runner-registered degrade path, override or
+// clear this around their own body.
+const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+const { parseSubTaskProposals: fakeParseSubTaskProposals } = require('./agentic-draft-common.js');
+function fakeStripReasoningBlock(text) {
+  let out = (text || '').replace(/<think>[\s\S]*?<\/think>/gi, '');
+  const openIdx = out.search(/<think>/i);
+  if (openIdx !== -1) out = out.slice(0, openIdx);
+  return out.trim();
+}
+function fakeExtractSubTasks(text) {
+  const raw = fakeStripReasoningBlock(text);
+  const objMatch = raw.match(/\{[\s\S]*\}/);
+  if (objMatch) {
+    try {
+      const obj = JSON.parse(objMatch[0]);
+      if (obj && obj.one_pass === true) return null;
+      if (obj && Array.isArray(obj.subtasks)) {
+        const subs = fakeParseSubTaskProposals(JSON.stringify(obj.subtasks));
+        return subs && subs.length >= 2 ? { subTasks: subs } : null;
+      }
+    } catch { /* fall through to array parse */ }
+  }
+  const subs = fakeParseSubTaskProposals(raw);
+  return subs && subs.length >= 2 ? { subTasks: subs } : null;
+}
+const FAKE_DECOMPOSE_PASS = {
+  async runDecomposePass(task, { mode = 'preliminary', call } = {}) {
+    const prompt = (mode === 'post-exhaustion' || mode === 'repeated-decompose')
+      ? 'Answer with ONLY a JSON array, nothing else:'
+      : 'Answer with ONLY a JSON object, nothing else:';
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature: 0.3, source: (task && task.source) || 'adhoc' });
+    } catch {
+      return null;
+    }
+    return fakeExtractSubTasks(result && result.response);
+  },
+};
+test.before(() => setDecomposePassRunner(FAKE_DECOMPOSE_PASS));
+test.after(() => setDecomposePassRunner(null));
+
 // The hygiene sources -- observability/performance/function-length _review + _fix
 // (2026-08-27) and arch_review/arch_import/arch_discovery/unused_export (2026-08-27,
 // Phase 2) -- moved to the out-of-tree agent-manager-hygiene plugin, so requiring
@@ -229,6 +280,10 @@ test('an ordinary adhoc task with no brainDumpEntryId keeps the standard plan-pa
 // 2026-09-02: the preliminary decompose check. A fresh adhoc task, after its blind plan
 // and BEFORE any agentic tier, gets one cheap model call that can split it. A split routes
 // straight to needs-review with adhocResolution: 'decompose' -- no tier ever runs.
+// The actual decompose-pass primitive (prompt building + parsing) moved to the
+// agent-manager-hub-tasks plugin (S4b of the hub-tasks extraction, 2026-09-25); FAKE_DECOMPOSE_PASS
+// above (registered globally for this file) mirrors its real prompt markers and parsing, so
+// splittingLocalCall's prompt-sniffing keeps working unchanged.
 const DECOMPOSE_JSON = JSON.stringify({
   one_pass: false,
   subtasks: [
@@ -265,6 +320,28 @@ test('adhoc: the preliminary check splits a fresh task straight to decompose, no
     assert.equal(task.status, 'needs-review');
     assert.ok((task.history || []).some((e) => /preliminary size check -> decompose/.test(e.detail || '')));
   });
+});
+
+test('adhoc: the preliminary check is a no-op when no decompose-pass runner is registered (plugin not loaded) -- falls through to the normal tier, does not block', async () => {
+  setDecomposePassRunner(null); // this file's test.before default -- restored below, not left null for later tests
+  try {
+    await withFixtureRepo(async (draftTask) => {
+      const task = { id: 'adhoc-nodegrade', domain: 'adhoc', source: 'manual', title: 'big thing', promptContext: { rawText: 'build the plugin catalog, endpoints and UI' } };
+      let tierRan = false;
+      const markTier = async () => { tierRan = true; return { applied: false, succeeded: true, reason: 'stub tier' }; };
+
+      await draftTask(task, {
+        localCall: async () => ({ response: PLAN_STUB, degenerate: null, attempts: 1 }),
+        withLockFn: async (d, fn) => fn(),
+        draftAdhocViaLocalAgenticWriteFn: markTier,
+      });
+
+      assert.equal(tierRan, true, 'with no decompose-pass runner registered, the preliminary check is skipped and the normal tier runs');
+      assert.notEqual(task.adhocResolution, 'decompose');
+    });
+  } finally {
+    setDecomposePassRunner(FAKE_DECOMPOSE_PASS);
+  }
 });
 
 // Root-caused live 2026-09-14 (pidfile-gate acceptance test task, 4 straight review

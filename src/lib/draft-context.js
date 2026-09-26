@@ -15,7 +15,7 @@ const { getConfig, ensureRegistered } = require('../config.js');
 const { withLock: defaultWithLock } = require('../single-flight-lock.js');
 const gpuArbiter = require('../gpu-arbiter.js');
 const { parseClarificationOptions, formatSubTaskProposalsForReview } = require('../agentic-draft-common.js');
-const { runDecomposePass } = require('../decompose-pass.js');
+const { runDecomposePassIfAvailable } = require('../decompose-pass-route.js');
 const { checkDraft } = require('../fact-checker.js');
 const { resolveSourceName, getRegisteredSource } = require('../task-source-registry.js');
 const { isClaudePaused } = require('../claude-pause.js');
@@ -228,7 +228,7 @@ async function draftAdhocBranch(task, {
     && !task.atomic // a file-decompose child IS the output of a decomposition -- re-splitting it loops
     && task.adhocResolution !== 'decompose';
   if (preliminaryDecomposeEnabled && isFreshAdhoc) {
-    const split = await maybeLocked(resolvedCallIsLocal !== false, () => runDecomposePass(task, { mode: 'preliminary', call: resolvedLocalCall }), 'decompose-check');
+    const split = await maybeLocked(resolvedCallIsLocal !== false, () => runDecomposePassIfAvailable(task, { mode: 'preliminary', call: resolvedLocalCall }), 'decompose-check');
     delete task._decomposeHint; // transient -- consumed by preliminaryPrompt above; never persist
     if (split && split.subTasks.length >= 2) {
       appendHistoryEvent(task, 'implement-started', `adhoc: preliminary size check -> decompose (${split.subTasks.length} pieces)`);

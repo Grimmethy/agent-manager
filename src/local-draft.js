@@ -61,7 +61,6 @@ const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
 const { resolveGroundingRef, readFileAtRef, resolveAtRef } = require('./stacked-grounding.js');
-const { runDecomposePass } = require('./decompose-pass.js');
 const { checkDraft } = require('./fact-checker.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');

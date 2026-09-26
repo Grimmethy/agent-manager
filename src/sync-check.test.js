@@ -95,7 +95,11 @@ function extractPythonFrozensetLiterals(text, varName) {
 }
 
 test('every real maybeLocked() pass label is covered by _PREEMPT_CHILD_PASSES (app.py)', () => {
-  const jsFiles = ['src/local-draft.js', 'src/orient-pass.js', 'src/decompose-pass.js', 'src/review-task.js'];
+  // decompose-pass.js moved to the agent-manager-hub-tasks plugin (S4b, 2026-09-25) -- it
+  // never called maybeLocked() itself (its callers, draft-context.js and
+  // local-agentic-write-draft.js, already wrap the call), so dropping it from this scan
+  // changes nothing real.
+  const jsFiles = ['src/local-draft.js', 'src/orient-pass.js', 'src/review-task.js'];
   const realLabels = new Set();
   for (const f of jsFiles) {
     for (const label of extractMaybeLockedLabels(read(f))) realLabels.add(label);

@@ -490,13 +490,15 @@ test('write tier: buildWriteAgenticPrompt folds in the plan (with a blind-plan d
 test('write tier: backstop runs the deterministic split when a decomposeBlockCount>=2 task punts to needsClarification', async () => {
   await withRepo(async () => {
     delete require.cache[require.resolve('./agentic-draft-common.js')];
-    delete require.cache[require.resolve('./decompose-pass.js')];
     const adc = require('./agentic-draft-common.js');
-    const dp = require('./decompose-pass.js');
+    // runDecomposePass itself moved to the agent-manager-hub-tasks plugin (S4b of the
+    // hub-tasks extraction, 2026-09-25); local-agentic-write-draft.js now calls it
+    // through decompose-pass-route.js's swap point, so this test registers a local
+    // fake filer there instead of monkey-patching the (now plugin-owned) module.
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
     const realRun = adc.runAgenticDraftInWorktree;
-    const realDec = dp.runDecomposePass;
     adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: false, needsClarification: true, response: 'ran out of turns' });
-    dp.runDecomposePass = async () => ({ subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] });
+    setDecomposePassRunner({ runDecomposePass: async () => ({ subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] }) });
     try {
       const { draftAdhocViaLocalAgenticWrite } = freshModule();
       const task = { id: 'wbk', source: 'manual', decomposeBlockCount: 2, needsClarification: { reason: 'x' }, promptContext: { rawText: 'big multi-part thing' } };
@@ -508,7 +510,7 @@ test('write tier: backstop runs the deterministic split when a decomposeBlockCou
       assert.equal(task.autoDecomposeCount, 1);
     } finally {
       adc.runAgenticDraftInWorktree = realRun;
-      dp.runDecomposePass = realDec;
+      setDecomposePassRunner(null);
     }
   });
 });
