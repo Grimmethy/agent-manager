@@ -44,9 +44,36 @@ SWEEPS=(
   side-finding-sweep context-log-sweep needs-clarification-triage product-spec-to-hub file-decompose-to-hub
   decompose-move-determinism-backfill decompose-loop-autoroute merged-work-sweep
 )
+
+# Several sweeps above moved out of this repo's own src/ into a plugin -- the
+# file-decompose family to agent-manager-hygiene (S4a, 2026-09-24), coordinator-sweep /
+# rejected-hub-disposition-backfill to agent-manager-hub-tasks (S5e, 2026-09-25). The
+# `[[ -f ... ]] || continue` guard below used to skip a moved sweep FOREVER for every
+# borrowed pool project with no error at all -- confirmed live while fixing S5e: the S4a
+# move already broke this exact loop for four sweeps (product-spec-to-hub,
+# file-decompose-to-hub, decompose-move-determinism-backfill, decompose-loop-autoroute),
+# undetected until now. Resolve each family's plugin root by NAME (S5a's
+# resolve-plugin-root.js) once, same as queue-watcher.sh's own equivalent fix.
+_resolve_plugin_root() { node "${PACKAGE_SRC_DIR}/resolve-plugin-root.js" "$1" 2>/dev/null; }
+_hygiene_root="$(_resolve_plugin_root agent-manager-hygiene)"
+_hub_tasks_root="$(_resolve_plugin_root agent-manager-hub-tasks)"
+HYGIENE_SWEEPS=(product-spec-to-hub file-decompose-to-hub decompose-move-determinism-backfill decompose-loop-autoroute)
+HUB_TASKS_SWEEPS=(coordinator-sweep rejected-hub-disposition-backfill)
+
 for s in "${SWEEPS[@]}"; do
-  [[ -f "${PACKAGE_SRC_DIR}/${s}.js" ]] || continue
-  out="$(node "${PACKAGE_SRC_DIR}/${s}.js" 2>>"${HOME_LOGS}/pool-${s}.log")"
+  base="$PACKAGE_SRC_DIR"
+  if [[ " ${HYGIENE_SWEEPS[*]} " == *" $s "* ]]; then
+    if [[ -z "$_hygiene_root" ]]; then continue; fi  # optional family -- silently skip if not installed, same as queue-watcher.sh
+    base="${_hygiene_root}/src"
+  elif [[ " ${HUB_TASKS_SWEEPS[*]} " == *" $s "* ]]; then
+    if [[ -z "$_hub_tasks_root" ]]; then
+      printf '[pool-sweeps:%s] ERROR: agent-manager-hub-tasks plugin not found/enabled -- %s NOT running for this borrowed project this tick.\n' "$LABEL" "$s" >&2
+      continue
+    fi
+    base="${_hub_tasks_root}/src"
+  fi
+  [[ -f "${base}/${s}.js" ]] || continue
+  out="$(node "${base}/${s}.js" 2>>"${HOME_LOGS}/pool-${s}.log")"
   printf '[pool-sweeps:%s] %s: %s\n' "$LABEL" "$s" "$out"
 done
 node "${PACKAGE_SRC_DIR}/done-archive.js" --check-due >>"${HOME_LOGS}/pool-done-archive.log" 2>&1 || true

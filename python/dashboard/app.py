@@ -3215,7 +3215,7 @@ def _summarize_task_record(data, state):
 
 # Fallback ONLY for a hub record the coordinator has not re-swept since `subTasks[].phase` was introduced (it is rewritten every tick, so this
 # is transient). The real definition is coordinator-sweep.js's childPhase(); the sets below mirror it for statuses that were already there.
-_HUB_LEGACY_MERGED = {"done", "gone", "merged", "applied-direct", "filed", "dismissed", "noop", "abandoned", "superseded"}
+_HUB_LEGACY_MERGED = {"done", "gone", "merged", "applied-direct", "filed", "dismissed", "noop", "abandoned", "superseded", "aged-out"}
 
 
 def _hub_child_phase(st):

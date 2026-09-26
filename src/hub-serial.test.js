@@ -9,9 +9,6 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-// coordinator-sweep.js now calls ensureRegistered() at load time (S4a of the hub-tasks
-// extraction, 2026-09-24), which reads AGENT_MANAGER_REPO_ROOT via getConfig() -- same
-// forced (not `||`-defaulted) guard review-task.test.js/apply-task.test.js already use.
 process.env.AGENT_MANAGER_REPO_ROOT = require('os').tmpdir();
 process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
@@ -20,7 +17,6 @@ const {
   assignMissingHubSerials, retitleHubMembers,
 } = require('./hub-serial.js');
 const { queueSubTasks } = require('./apply-adhoc-diff.js');
-const { coordinatorSweep } = require('./coordinator-sweep.js');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'hub-serial-'));
 const put = (dir, state, rec) => {
@@ -101,17 +97,10 @@ test('retitleHubMembers: checklist titles always follow; idle member records are
   assert.equal(retitleHubMembers(hub, recs), 0, 'idempotent');
 });
 
-test('coordinatorSweep labels a pre-serial hub and its idle members end to end', () => {
-  const dir = tmp();
-  put(dir, 'coordinating', { id: 'function-length-fix-ac-2', title: 'AC-2 · Extract pure geometry', createdAt: '2026-09-20T01:00:00Z', promptContext: { candidateId: 'AC-2' },
-    subTasks: [{ id: 'p1', title: 'Piece one', status: 'pending' }, { id: 'p2', title: 'Piece two', status: 'pending' }] });
-  put(dir, 'adhoc', { id: 'p1', title: 'Piece one', source: 'manual', domain: 'adhoc' });
-  put(dir, 'adhoc', { id: 'p2', title: 'Piece two', source: 'manual', domain: 'adhoc' });
-  const summary = coordinatorSweep({ pipelineDir: dir, repoRoot: null });
-  assert.equal(summary.hubsLabelled, 1);
-  const hub = read(dir, 'coordinating', 'function-length-fix-ac-2');
-  assert.equal(hub.title, 'HUB0001 · Extract pure geometry');
-  assert.equal(hub.hubLabel, 'HUB0001');
-  assert.deepEqual(hub.subTasks.map((s) => s.title), ['HUB0001 · 1/2 · Piece one', 'HUB0001 · 2/2 · Piece two']);
-  assert.equal(read(dir, 'adhoc', 'p2').title, 'HUB0001 · 2/2 · Piece two');
-});
+// The "coordinatorSweep labels a pre-serial hub and its idle members end to end"
+// integration test that used to live here moved with coordinator-sweep.js itself (S5e of
+// the hub-tasks extraction, 2026-09-25) -- it's exactly the same coverage (hubsLabelled,
+// real title rewrites via a real sweep call), just now in agent-manager-hub-tasks's own
+// coordinator-sweep.test.js, which core can no longer require directly. This file's own
+// tests above/below exercise assignMissingHubSerials/retitleHubMembers directly, without
+// needing the real sweep.

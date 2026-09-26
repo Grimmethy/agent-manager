@@ -61,16 +61,24 @@ class TestSummarizeHub(unittest.TestCase):
         self.assertEqual(h["progress"], {"done": 3, "built": 4, "total": 5})
 
     def test_the_fallback_agrees_with_the_coordinators_definition_for_every_terminal_status(self):
-        """Drift guard: node's childPhase() over TERMINAL_GOOD + pending-merge must equal this module's fallback."""
+        """Drift guard: node's childPhase() over TERMINAL_GOOD + pending-merge must equal this module's fallback.
+
+        coordinator-sweep.js moved to the agent-manager-hub-tasks plugin (S5e of the
+        hub-tasks extraction, 2026-09-25) -- located by name via _resolve_plugin_root
+        (S5a/S5d's mechanism), same as every other cross-repo lookup in this codebase.
+        Skipped, not failed, if the plugin isn't installed: this guard has nothing to
+        compare against without it."""
         import json
         import subprocess
-        core = Path(app.__file__).resolve().parent.parent.parent
+        hub_tasks_root = app._resolve_plugin_root("agent-manager-hub-tasks")
+        if not hub_tasks_root or not (hub_tasks_root / "src" / "coordinator-sweep.js").is_file():
+            self.skipTest("agent-manager-hub-tasks plugin not installed")
         script = (
             "const {childPhase,TERMINAL_GOOD}=require('./src/coordinator-sweep.js');"
             "const all=[...TERMINAL_GOOD,'pending-merge','in-progress','pending','blocked','needs-clarification','awaiting-confirm'];"
             "process.stdout.write(JSON.stringify(Object.fromEntries(all.map(s=>[s,childPhase(s)]))))"
         )
-        out = subprocess.run(["node", "-e", script], cwd=str(core), capture_output=True, text=True, timeout=60)
+        out = subprocess.run(["node", "-e", script], cwd=str(hub_tasks_root), capture_output=True, text=True, timeout=60)
         self.assertEqual(out.returncode, 0, out.stderr[-300:])
         for status, phase in json.loads(out.stdout).items():
             self.assertEqual(app._hub_child_phase({"status": status}), phase, status)

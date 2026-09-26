@@ -177,22 +177,33 @@ while :; do
     apply_retry_result="$(node "${PACKAGE_SRC_DIR}/apply-retry-check.js" 2>>"${HOME_LOGS}/apply-retry-check.log")"
     printf '[watchdog] apply-retry-check: %s\n' "$apply_retry_result" >&2
 
-    # Coordinator sweep: a RESOLUTION: decompose parent lives in queue/coordinating/ with a
-    # sub-task checklist; this reconciles each child's real state onto the parent and moves
-    # the parent to done/ once every child is finished. Cheap (one small readdir), so it
-    # runs every tick like the retry checks above.
-    coordinator_result="$(node "${PACKAGE_SRC_DIR}/coordinator-sweep.js" 2>>"${HOME_LOGS}/coordinator-sweep.log")"
-    printf '[watchdog] coordinator-sweep: %s\n' "$coordinator_result" >&2
+    # Coordinator sweep + rejected-hub-disposition-backfill moved to
+    # agent-manager-hub-tasks (S5e of the hub-tasks extraction, 2026-09-25) -- resolved by
+    # NAME via resolve_plugin_root (S5a), same mechanism the hygiene sweeps below already
+    # use. Unlike those optional sweeps, this is NOT skippable: every in-flight hub depends
+    # on coordinator-sweep running every tick to reconcile, so a missing plugin is a loud
+    # stderr error, not a silent no-op forever.
+    _hub_tasks_root="$(resolve_plugin_root "agent-manager-hub-tasks")"
+    if [[ -z "$_hub_tasks_root" ]]; then
+      printf '[watchdog] ERROR: agent-manager-hub-tasks plugin not found/enabled -- coordinator-sweep and rejected-hub-disposition-backfill are NOT running this tick. Every in-flight hub goes unreconciled until this plugin loads. Check plugins.json.\n' >&2
+    else
+      # Coordinator sweep: a RESOLUTION: decompose parent lives in queue/coordinating/ with
+      # a sub-task checklist; this reconciles each child's real state onto the parent and
+      # moves the parent to done/ once every child is finished. Cheap (one small readdir),
+      # so it runs every tick like the retry checks above.
+      coordinator_result="$(node "${_hub_tasks_root}/src/coordinator-sweep.js" 2>>"${HOME_LOGS}/coordinator-sweep.log")"
+      printf '[watchdog] coordinator-sweep: %s\n' "$coordinator_result" >&2
 
-    # One-time historical backfill (2026-09-14, screaminggoatclubmt: "should we be
-    # archiving this pile of adhoc tasks?" -> "Fold it into the watchdog sweep."):
-    # coordinator-sweep above only fixes a hub still sitting in coordinating/ at the
-    # moment it runs -- this relabels + archives the 28 real hubs that were already
-    # (mis)closed into done/'s top level as 'merged' before that fix landed. Idempotent
-    # and cheap (one readdir) once the historical pile is cleared, so safe to leave
-    # running every tick indefinitely rather than pull back out.
-    rejected_hub_backfill_result="$(node "${PACKAGE_SRC_DIR}/rejected-hub-disposition-backfill.js" 2>>"${HOME_LOGS}/rejected-hub-disposition-backfill.log")"
-    printf '[watchdog] rejected-hub-disposition-backfill: %s\n' "$rejected_hub_backfill_result" >&2
+      # One-time historical backfill (2026-09-14, screaminggoatclubmt: "should we be
+      # archiving this pile of adhoc tasks?" -> "Fold it into the watchdog sweep."):
+      # coordinator-sweep above only fixes a hub still sitting in coordinating/ at the
+      # moment it runs -- this relabels + archives the 28 real hubs that were already
+      # (mis)closed into done/'s top level as 'merged' before that fix landed. Idempotent
+      # and cheap (one readdir) once the historical pile is cleared, so safe to leave
+      # running every tick indefinitely rather than pull back out.
+      rejected_hub_backfill_result="$(node "${_hub_tasks_root}/src/rejected-hub-disposition-backfill.js" 2>>"${HOME_LOGS}/rejected-hub-disposition-backfill.log")"
+      printf '[watchdog] rejected-hub-disposition-backfill: %s\n' "$rejected_hub_backfill_result" >&2
+    fi
 
     # Known-fixed-failure sweep (2026-09-20, PF function-length-fix-ac-3 sat in needs-clarification ~40 min after its failures were
     # fixed by hand-merged PRs): src/known-fixed-failures.js lists failure classes whose fix has landed; this requeues, once, each

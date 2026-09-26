@@ -127,7 +127,7 @@ These are the places an extraction has to either take with it or leave a clean i
 | `prompts.js` | `candidateSplitInstructions`, decompose directives, hub status grounding (`hub-status-grounding.js`) |
 | `needs-clarification-triage.js`, `reject-retry-check.js`, `adhoc-staleness-flag.js` | decompose-loop / decompose-review-blind buckets, `stalenessFlag.reason:'decompose-loop'` that feeds producer 5 |
 | `task-disposition.js`, `task-log-reconcile.js`, `coordinator-sweep.js` | terminal dispositions; `sanitizeTaskDisposition` (a non-`merged` disposition must not keep `mergedAt`) |
-| `scripts/queue-watcher.sh` | invokes: `coordinator-sweep`, `rejected-hub-disposition-backfill`, `product-spec-to-hub`, `file-decompose-to-hub`, `decompose-move-determinism-backfill`, and the loop-autoroute / proactive sweeps (each with its own log in `~/.local/state/agent-manager/logs/`) |
+| `scripts/queue-watcher.sh`, `scripts/pool-sweeps.sh` | invoke: `coordinator-sweep`, `rejected-hub-disposition-backfill` (resolved via `resolve_plugin_root('agent-manager-hub-tasks')`, S5a/S5e -- loud error, not silent skip, if missing), `product-spec-to-hub`, `file-decompose-to-hub`, `decompose-move-determinism-backfill`, and the loop-autoroute / proactive sweeps (resolved via `resolve_plugin_root('agent-manager-hygiene')`, optional/silent if missing) (each with its own log in `~/.local/state/agent-manager/logs/`). `pool-sweeps.sh`'s own copy of this resolution had the identical bug, undetected since S4a until fixed alongside S5e (2026-09-25). |
 | dashboard | `templates/index.html` (Hub Tasks tab, `key:'coordinating'`), `static/js/core-ui.js` (hub sort, family tree, `hubDepth`), `routes/task_anywhere_1_more.py` (`POST /api/task-anywhere/<id>/hub-priority`), `app.py` (`_summarize_hub`, `_hub_for_branch`, `_annotate_hub_sibling_conflicts`, branch description for hub-routed splits), Hygiene tab counts a coordinating hub as in flight |
 
 ## 5. Operational surface
@@ -150,16 +150,21 @@ What core provides that the plugin depends on, and what the plugin provides that
 
 ## 7. Extraction guidance
 
-**Seam A: the hub kernel (should move together).** `queueSubTasks` + `applyAdhocDiff` decompose branch (`applyCandidateSplitAsHub`
-already moved, S4b), `coordinator-sweep.js`, `hub-priority.js`, `hub-serial.js`, `hub-rename.js`, `hub-restack.js`,
-`hub-status-grounding.js`, `decompose-auto-merge.js`, `decompose-integration-gate.js`, `rejected-hub-disposition-backfill.js`, and the
-dashboard hub tab/route.
+**Seam A: the hub kernel.** **Moved (S5e, 2026-09-25):** `coordinator-sweep.js`, `hub-rename.js`, `hub-restack.js`,
+`decompose-auto-merge.js`, `decompose-integration-gate.js`, `rejected-hub-disposition-backfill.js`, `wire-decomposed-blueprints.js`
+(`applyCandidateSplitAsHub` already moved, S4b). **Stays in core, permanently:** `queueSubTasks` + `applyAdhocDiff`'s decompose branch
+(`task-sources.js` calls `applyAdhocDiff` directly), `hub-priority.js` (S1 already hooked ordering separately), `hub-serial.js`
+(`apply-adhoc-diff.js` and `hub-apply-routing.js` need it directly), `hub-status-grounding.js` (`local-draft.js` and
+`local-agentic-write-draft.js` need it directly), and the dashboard hub tab/route (S5d hooked the *data* those routes serve; the tab
+itself stays hardcoded in core, per that step's own recommendation).
 
-> **CORRECTION 2026-09-25 (verified against the code while scoping S5):** `stacked-grounding.js` does **not** belong in this list --
-> despite the name, it's a generic git-ref grounding utility (`resolveGroundingRef`/`readFileAtRef`/`grepAtRef`/`resolveAtRef`) with no
-> hub-specific logic, required by 14 files across the codebase (`fact-checker.js`, `review-task.js`, `local-draft.js`,
-> `context-trim-sweep.js`, `staleness-audit.js`, ...). Moving it would flip the dependency direction for all of them. `hub-rename.js`
-> and `hub-restack.js` were missing from this list entirely (both required by `coordinator-sweep.js`) -- added above.
+> **CORRECTIONS 2026-09-25 (verified against the code while scoping/executing S5):** `stacked-grounding.js` does **not** belong in
+> this list -- despite the name, it's a generic git-ref grounding utility (`resolveGroundingRef`/`readFileAtRef`/`grepAtRef`/
+> `resolveAtRef`) with no hub-specific logic, required by 14 files across the codebase. `hub-rename.js`, `hub-restack.js`, and
+> `wire-decomposed-blueprints.js` were missing from earlier versions of this list (all three required only by `coordinator-sweep.js`).
+> **`hub-serial.js` and `hub-status-grounding.js` were wrongly listed as movable** -- both have core-side callers that don't move
+> (see above); this is the real, load-bearing correction: "the hub kernel" that moves is the reconciliation sweep and its private
+> helpers, not the filing primitive (`queueSubTasks`) core's own decompose branch calls into forever.
 
 > **UPDATE 2026-09-21:** the destination of the producers changed. The code-decomposition family (file-decompose and its builders, loop-autoroute, the proactive sweep, the move-determinism backfill) goes to **agent-manager-hygiene**, not the hub plugin; see `Docs/hub-tasks-extraction-plan.md` sections 3-4.
 
