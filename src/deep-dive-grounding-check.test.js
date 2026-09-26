@@ -200,3 +200,34 @@ test('runGroundingCheck skips the model call when the task has no real files fet
   assert.deepEqual(r, { verdict: 'ok' });
   assert.equal(calls, 0);
 });
+
+// --- AC-75: real path-shaped citations that can never be in a community's file subset ---
+// Shapes measured on real done/ deep_dive tasks (omnigent-ai/omnigent 53, 94, 133).
+
+test('checkFabricatedSymbols does not flag the project name / slug / community name', () => {
+  const t = task({ promptContext: { projectName: 'omnigent-ai/omnigent', projectSlug: 'omnigent-ai-omnigent', communityName: 'web/src/pages' } });
+  assert.deepEqual(checkFabricatedSymbols(t, 'Deep dive: `omnigent-ai/omnigent` covers `web/src/pages`.'), []);
+});
+
+test('checkFabricatedSymbols does not flag a Node builtin API path', () => {
+  assert.deepEqual(checkFabricatedSymbols(task(), 'It persists via `fs.promises.writeFile` and `path.join`.'), []);
+});
+
+test('checkFabricatedSymbols checks a cited file name by its stem, not its extension', () => {
+  const t = task({ promptContext: { files: [{ path: 'web/src/blocks.tsx', content: 'export function SystemMessage() {}' }] } });
+  assert.deepEqual(checkFabricatedSymbols(t, 'Rendered by `SystemMessage.tsx`.'), []);
+  const bad = checkFabricatedSymbols(t, 'Rendered by `GhostMessage.tsx`.');
+  assert.equal(bad.length, 1);
+  assert.equal(bad[0].kind, 'import');
+});
+
+test('checkFabricatedSymbols still flags a fabricated non-builtin dotted path and an unrelated slug', () => {
+  assert.equal(checkFabricatedSymbols(task(), 'Uses `made_up.helpers.thing`.').length, 1);
+  assert.equal(checkFabricatedSymbols(task(), 'See `someone-else/other-repo`.').length, 1);
+});
+
+test('checkFabricatedSymbols still flags a fabricated file name that merely starts like a Node builtin (AC-75)', () => {
+  for (const name of ['util.py', 'events.js', 'stream.ts']) {
+    assert.equal(checkFabricatedSymbols(task(), `See \`${name}\`.`).length, 1, name);
+  }
+});

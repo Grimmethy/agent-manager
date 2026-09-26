@@ -30,6 +30,7 @@
 // Kill switch: AGENT_MANAGER_DEEP_DIVE_GROUNDING_CHECK=false.
 
 const { call: localCall } = require('./local-client.js');
+const { builtinModules } = require('module');
 
 // 2026 'Cheap Verifiers, Large Blind Spots' caveat: Check 2 (this cheap model) is a better-than-nothing second layer, NOT a substitute for Check 1's deterministic match -- its blind spot is largest in this cheap/cheap config. See src/deterministic-recheck-registry.js header.
 //
@@ -77,6 +78,28 @@ const PATH_SHAPED_SYMBOL_RE = /`([A-Za-z_][\w-]*(?:[./][A-Za-z_][\w-]*)+)`/g;
 const ALL_LIST_RE = /__all__\s*=\s*\[([\s\S]*?)\]/g;
 const ALL_LIST_ITEM_RE = /['"]([\w.]+)['"]/g;
 
+// Path-shaped citations that are real but can never appear in a community's file subset
+// (change_review AC-75; measured on the 21 real deep_dive tasks in queue/: 3 write-ups fired
+// this check and all 3 were false positives): the project's own slug/name/community name
+// (`omnigent-ai/omnigent`), and a Node builtin API path (`fs.promises.writeFile`). Class-shaped
+// hallucinations, the incidents this check exists for, are unaffected.
+function isKnownExternalPath(symbol, task) {
+  const pc = (task && task.promptContext) || {};
+  if ([pc.projectName, pc.projectSlug, pc.communityName].some((v) => typeof v === 'string' && v && v === symbol)) return true;
+  // A file name that merely starts like a builtin (`util.py`, `events.js`) is a project file, not the API.
+  if (FILE_EXT_SEGMENT_RE.test(symbol.split(/[./]/).pop())) return false;
+  return builtinModules.includes(symbol.split(/[./]/)[0]) && symbol.includes('.');
+}
+
+// The part of a path-shaped citation that identifies the cited thing. A file name's extension
+// is not the identifier (`SystemMessage.tsx` cites `SystemMessage`, never `tsx`).
+const FILE_EXT_SEGMENT_RE = /^(?:tsx?|jsx?|mjs|cjs|py|json|md|css|html?|ya?ml|toml|rs|go|java|rb|sh)$/i;
+function citedIdentifier(symbol) {
+  const parts = symbol.split(/[./]/);
+  const last = parts[parts.length - 1];
+  return FILE_EXT_SEGMENT_RE.test(last) && parts.length > 1 ? parts[parts.length - 2] : last;
+}
+
 function checkFabricatedSymbols(task, implementResponse) {
   const files = realFilesOf(task);
   if (!files.length) return [];
@@ -102,7 +125,8 @@ function checkFabricatedSymbols(task, implementResponse) {
   PATH_SHAPED_SYMBOL_RE.lastIndex = 0;
   while ((m = PATH_SHAPED_SYMBOL_RE.exec(implementResponse))) {
     const symbol = m[1];
-    const finalSegment = symbol.split(/[./]/).pop();
+    if (isKnownExternalPath(symbol, task)) continue;
+    const finalSegment = citedIdentifier(symbol);
     if (!combined.includes(symbol) && !combined.includes(finalSegment)) {
       flag('import', symbol, `the draft cites \`${symbol}\`, but neither that path nor its final segment (\`${finalSegment}\`) appears anywhere in the real fetched content of any file in this community`);
     }
