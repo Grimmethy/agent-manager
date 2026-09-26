@@ -173,8 +173,22 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     return { skipped: true, reason: 'brain-dump entry was suppressed since this task was queued -- not sorting it' };
   }
   if (entry.status !== 'captured' || entry.rawText !== rawText) {
-    return recoverableSortSkip(data, entry, brainDumpPath,
-      'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text');
+    // Stale (HUB0050 2/3): this task was drafted against text the entry no longer has,
+    // so re-classifying THIS task's response will NEVER apply -- it is not a
+    // recoverable classification miss. Going through recoverableSortSkip here (the old
+    // path) burned one of the entry's MAX_SORT_ATTEMPTS slots on a condition a fresh
+    // sort under a new id simply supersedes, and its recoverable:true shape let
+    // apply-task.js phrase it as "sort not applied (retrying)" on a done task. Emit a
+    // distinct non-success stale shape instead: no sortAttempt write (the entry is left
+    // exactly as-is, status still 'captured' for the fresh sort), no recoverable flag,
+    // and success:false so the caller's stale check (apply-group-a.js) can route it
+    // away from the done transition.
+    return {
+      skipped: true,
+      stale: true,
+      success: false,
+      reason: 'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text',
+    };
   }
 
   if (!secondBrainDir) {
