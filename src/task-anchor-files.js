@@ -20,8 +20,8 @@ const fs = require('fs');
 const path = require('path');
 const { extractForbiddenPaths } = require('./adhoc-diff-sanity.js');
 const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
+const { resolveAgainstRepoDetailed } = require('./fact-checker.js');
 
-const DEFAULT_PREFIXES = ['', 'src/', 'python/', 'python/dashboard/', 'python/dashboard/templates/', 'scripts/', 'lib/', 'docs/', 'docs/adr/'];
 const MAX_FILES = 6;
 const MAX_CHARS_PER_FILE = 16000;
 
@@ -43,17 +43,16 @@ function escapeRe(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// A bare "staleness-audit.js" -> its real repo path, IF exactly one exists across the
-// common prefixes (ambiguous / missing -> null, never a guess).
+// A bare "staleness-audit.js" -> its real repo path, IF exactly one exists anywhere in the
+// repo (ambiguous / missing -> null, never a guess). 2026-09-26: this used to walk its own
+// short, hardcoded DEFAULT_PREFIXES list -- delegates to fact-checker.js's
+// resolveAgainstRepoDetailed instead (the same general basename tree-walk already used for
+// citation/fabrication checking elsewhere), rather than maintaining a second, narrower
+// implementation of the same "find this bare filename in the repo" operation.
 function resolveBareFilename(repoRoot, name) {
-  const found = [];
-  for (const pre of DEFAULT_PREFIXES) {
-    const rel = pre + name;
-    try {
-      if (fs.statSync(path.join(repoRoot, rel)).isFile()) found.push(rel);
-    } catch { /* not here */ }
-  }
-  return found.length === 1 ? found[0] : null;
+  const { resolvedPath } = resolveAgainstRepoDetailed(repoRoot, name);
+  if (!resolvedPath) return null;
+  return path.relative(repoRoot, resolvedPath).split(path.sep).join('/');
 }
 
 // docs/adr/NNNN references ("mirroring 0018's project_search precedent") -> the real file.
