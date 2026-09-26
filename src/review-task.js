@@ -57,6 +57,7 @@ const { getRegisteredSource, resolveSourceName } = require('./task-source-regist
 const { decideEmptyApprovalOutcome } = require('./empty-approval-decision.js');
 const { decidePremiseRecheckOutcome } = require('./premise-recheck-decision.js');
 const { detectTruncatedImplementResponse } = require('./validate-implement-truncation.js');
+const { classifyNullOutcome } = require('./advisory-null-outcome.js');
 const { getDecomposeProposalDetection } = require('./hub-review-detection.js');
 const { getSplitCoverageJudging } = require('./split-coverage-judging-route.js');
 const { verifyDeterministicDraft } = require('./decompose-review-registry.js');
@@ -593,6 +594,22 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict: 'skipped' };
+  }
+
+  // Honest null outcome (2026-09-27, advisory-null-outcome.js): a pipeline_forensics `NO CLEAR ROOT CAUSE -- <signal>`, a
+  // pipeline_debrief `NO CONFIDENT INEFFICIENCY -- <signal>` line or a pipeline_health_audit `FALSE POSITIVE -- <why>` is the
+  // form the prompts instruct for "the evidence supports no finding". The LLM vote kept rejecting it (3/3 forensics nulls 2/2
+  // REJECT despite reviewGuidance saying a null is valid; 4/4 health-audit FALSE POSITIVE lines as "refusals"), so the only way
+  // through was fabrication. A well-formed null is approved mechanically -- no fact-check, no vote -- and falls through to the
+  // normal path for anything else. Same shape as the deterministic-review branch above.
+  const nullOutcome = classifyNullOutcome(resolveSourceName(task), rawImplementResponse);
+  if (nullOutcome) {
+    task.reviewedAt = new Date().toISOString();
+    task.reviewProvider = 'deterministic-null-outcome';
+    task.localVerdict = `Auto-approved: honest null outcome (${nullOutcome.kind}) -- deterministic, no vote.`;
+    recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: null });
+    appendHistoryEvent(task, 'approved', `deterministic-null-outcome: ${nullOutcome.kind}`);
+    return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
   }
 
   const domainCfg = getDomainConfig(domainsPath, task.domain);
