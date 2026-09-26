@@ -397,9 +397,16 @@ const PLAN_TARGETS_HINT = 'Implement the actual change in the file(s) the plan/t
 const ALL_N_TESTS_RE = /\ball\s+(\d+)\s+tests?\b/i;
 const N_TESTS_CLAIM_RE = /\b(\d+)\s+tests?\s+(?:pass(?:es|ed|ing)?|added)\b/i;
 
+// `kind` separates a QUANTITY claim about the diff ("12 tests added") from a STATUS report
+// ("All 14 tests pass" -- the N tests in the file, which can far exceed what this diff adds
+// when it extends an existing test file; change_review AC-72 caught the 1054f01 regression
+// where a truthful "All 5 tests pass" after adding 1 test to a 4-test file was rejected).
 function extractClaimedTestCount(summary) {
-  const m = ALL_N_TESTS_RE.exec(summary) || N_TESTS_CLAIM_RE.exec(summary);
-  return m ? Number(m[1]) : null;
+  const all = ALL_N_TESTS_RE.exec(summary);
+  if (all) return { count: Number(all[1]), kind: 'status' };
+  const m = N_TESTS_CLAIM_RE.exec(summary);
+  if (!m) return null;
+  return { count: Number(m[1]), kind: /added/i.test(m[0]) ? 'added' : 'status' };
 }
 
 // Counts distinct test definitions ADDED by the diff (Python def test_..., JS it()/test()).
@@ -502,8 +509,13 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   }
 
   // 4. A checkable "all N tests pass/added" claim contradicted by the diff's own test defs.
-  const claimedTests = extractClaimedTestCount(summary);
-  if (claimedTests !== null) {
+  const claimed = extractClaimedTestCount(summary);
+  // A status claim ("All N tests pass") equals the diff's added tests only when the diff
+  // CREATES every file it touches (a brand-new test file); against an edited existing file the
+  // two are different numbers, so only an explicit "N tests added" claim is comparable there.
+  const comparable = claimed !== null && (claimed.kind === 'added' || files.every((f) => f.kind === 'create'));
+  if (comparable) {
+    const claimedTests = claimed.count;
     const actualTests = countAddedTestDefs(rawDiff);
     if (actualTests < claimedTests) {
       return {
