@@ -58,6 +58,7 @@ const { decideEmptyApprovalOutcome } = require('./empty-approval-decision.js');
 const { decidePremiseRecheckOutcome } = require('./premise-recheck-decision.js');
 const { detectTruncatedImplementResponse } = require('./validate-implement-truncation.js');
 const { getDecomposeProposalDetection } = require('./hub-review-detection.js');
+const { getSplitCoverageJudging } = require('./split-coverage-judging-route.js');
 const { verifyDeterministicDraft } = require('./decompose-review-registry.js');
 // script-extract.js stays in core (also required directly by scripts/extract-core-ui.js,
 // a standalone dev CLI that can't depend on an optional plugin) -- this require reaches
@@ -380,12 +381,12 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   // this file doesn't need to know the proposal shape once the kernel moves out. Defaults
   // to exactly today's behaviour.
   const isSplitProposal = getDecomposeProposalDetection().isDecomposeOrSplitProposal(task);
-  const originalAsk = task.promptContext
-    && (task.promptContext.rawText || task.promptContext.body);
-  if (isSplitProposal && originalAsk) {
-    lines.push('');
-    lines.push('--- ORIGINAL REQUEST (full text -- the sub-tasks below must TOGETHER cover every concrete deliverable named here) ---');
-    lines.push(String(originalAsk).length > 8000 ? `${String(originalAsk).slice(0, 8000)}\n...[truncated]` : String(originalAsk));
+  // Coverage-judging hook (S5c of the hub-tasks extraction, 2026-09-25): the text below
+  // moved to split-coverage-judging-route.js as the default, always-installed
+  // implementation -- see that file's own header for the interface and a note on a
+  // pre-existing behavior found (not fixed) while extracting it.
+  for (const line of getSplitCoverageJudging().originalAskInjectionLines(task, isSplitProposal)) {
+    lines.push(line);
   }
   lines.push('');
   lines.push('--- PLAN ---');
@@ -440,15 +441,12 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   lines.push('Also REJECT if the draft consists mainly of meta-commentary, hedging, or a refusal ("I cannot verify this...", "I do not have enough information...", "this cannot be confirmed...") standing in for the real content the task asked for. A draft expressing uncertainty about its OWN claim is itself a reason to reject, not something to average into "seems fine." IMPORTANT EXCEPTION: this rule is about hedging PROSE, not about a genuinely EMPTY response (zero characters, or effectively so) -- several task types below are explicitly instructed to output nothing when there is nothing real to report, and that is NOT the same failure as writing evasive text instead of answering. If the draft is truly empty, judge it ONLY by the source-specific rule below (if any); do not reject an empty draft under this rule merely for containing no implementation.');
   // The PLAN section is drafted BLIND for every adhoc task, and each source's own
   // judging carve-out, now live on the source's reviewGuidance (see resolveDynamicReviewField).
-  // candidateSplitProposals stays an explicit check here -- it is a task field, not a source.
+  // A hub-routed candidate split's coverage-guidance override (S5c) wins over the source's
+  // own reviewGuidance when present -- see split-coverage-judging-route.js.
   const registeredSource = getRegisteredSource(resolveSourceName(task));
-  if (task.candidateSplitProposals) {
-    // 2026-08-26, root-caused live via arch-review-ac-4 -- see prompts.js's
-    // candidateSplitInstructions and local-draft.js's parseCandidateSplit for the full
-    // incident/design. A split proposal deliberately has no diff, and the generic
-    // "does it contain real, complete code" completeness question would reject every
-    // correct split on sight for exactly that reason.
-    lines.push('This candidate-fulfillment drafter judged the original candidate too large/risky to implement safely in one atomic JSON edit, and produced a JSON array of smaller sub-candidates instead of a diff -- there is deliberately no code or diff here, and that is NOT a reason to reject. Judge ONLY the actual SPLIT in the IMPLEMENT draft below. COVERAGE IS THE MAIN TEST: enumerate every concrete deliverable in the ORIGINAL REQUEST shown above; for each, point at the sub-candidate that delivers it. REJECT if any named deliverable -- especially the core change, not just peripheral pieces -- is left uncovered by every sub-candidate. Then: is each sub-candidate concrete, independently implementable as a single small edit on its own (not still vague, not itself obviously too large)? Does each have a real title/problem/solution, not a placeholder or a bare reference back to the original candidate? Reject if a requirement was dropped, a sub-candidate is too vague/large to actually help, or a sub-candidate is not genuinely well-formed -- never merely because no code was written, and never because splitting wasn\'t strictly necessary (that\'s a judgment call the drafter is allowed to make conservatively).');
+  const coverageOverride = getSplitCoverageJudging().coverageGuidanceOverride(task);
+  if (coverageOverride) {
+    lines.push(coverageOverride);
   } else {
     const guidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task);
     if (guidance) lines.push(guidance);
@@ -460,11 +458,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   if (unnamed.length) {
     lines.push(`SCOPE CHECK (deterministic): the diff also changes ${unnamed.length} file(s) that NEITHER the task, the plan NOR the draft's own summary mention: ${unnamed.slice(0, 8).join(', ')}. REJECT if any of them is unrelated to the task (for example a lockfile, config or generated file rewritten as a side effect); APPROVE only if you can say why each is needed.`);
   }
-  const completenessQuestion = task.candidateSplitProposals
-    // "real, complete code" directly contradicts the split carve-out above, whose whole
-    // point is that no code was written yet.
-    ? 'Does it contain a well-formed JSON array of sub-candidates, each with a real title/problem/solution, that together cover the original candidate with nothing dropped?'
-    : resolveDynamicReviewField(
+  // "real, complete code" directly contradicts the split carve-out above, whose whole
+  // point is that no code was written yet -- the S5c override wins over the source's own
+  // reviewCompletenessQuestion when present, same precedence as coverageOverride above.
+  const completenessQuestion = getSplitCoverageJudging().completenessQuestionOverride(task)
+    || resolveDynamicReviewField(
         registeredSource && registeredSource.reviewCompletenessQuestion, task)
       || 'Does it contain real, complete code (not a bare tool-call request, not meta-commentary like "let me read the file first", not a partial fragment)?';
   lines.push(`Before answering, check the draft against the TASK above point by point: does it touch every file/requirement the task named? ${completenessQuestion} Does anything in it contradict the real grounding source or fact-check above?`);
