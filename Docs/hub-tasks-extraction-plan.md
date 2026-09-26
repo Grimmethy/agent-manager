@@ -85,7 +85,7 @@ producers to hub-tasks"): producers 1 and 4 (adhoc decompose, candidate oversize
 | **S2** | Hook: **apply-result routing** (`{coordinating:true}`, hub apply). | S1 |
 | **S3** | Hooks: **review-judging + draft-decompose** (`review-task.js`, `local-draft.js`), plus the hub-intake and `verifyMove` hooks from section 3. | S2 |
 | **S4a** | Move the decompose family to **hygiene** (section 3). | S1-S3 |
-| **S4b** | Create `agent-manager-hub-tasks`; move the task-level producers. | S1-S3 |
+| **S4b** | Create `agent-manager-hub-tasks`; move the task-level producers. **Repo scaffolded 2026-09-25** (public, `https://github.com/Grimmethy/agent-manager-hub-tasks`): `package.json` (`file:../agent-manager` dep), no-op `register.js`, smoke test, README. Registered in `plugins.json` with `enabled:false` -- no behaviour change yet. Moving producer 1 (adhoc decompose) and producer 4 (candidate split) behind it is still open. | S1-S3 |
 | **S5** | Move the hub kernel (`coordinator-sweep`, `hub-serial`, `stacked-grounding`, `hub-status-grounding`, `decompose-auto-merge`, `decompose-integration-gate`, `rejected-hub-disposition-backfill`, `queueSubTasks`/`applyAdhocDiff` decompose branch). **`queue-watcher.sh`'s sweep call must change in the same commit** or the sweep silently stops. The Hub Tasks tab moves via S0. This is the one deploy window that freezes hub production. | S4, S0 |
 | **S6** | Retire the legacy stacked machinery. | S5 in production |
 
