@@ -29,7 +29,29 @@ const {
   normalizeSecondBrainPathCase,
   deriveBelongsToProject,
 } = require('./brain-dump-sort-classify.js');
-const { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort, closeBrainDumpEntryResolved, readProjectRegistry } = require('./apply-group-a-brain-dump.js');
+const { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort: applyBrainDumpSortCore, closeBrainDumpEntryResolved, readProjectRegistry } = require('./apply-group-a-brain-dump.js');
+
+// Stale-result routing (HUB0050 2/3): applyBrainDumpSort's staleness guard (the entry
+// was edited or re-captured after this task was drafted) no longer takes the
+// recoverableSortSkip path -- it returns a distinct non-success shape carrying
+// `stale: true` and `success: false`, with NO sortAttempt bump (see the guard's own
+// comment in apply-group-a-brain-dump.js). Re-state that non-success status here so a
+// stale sort result is never routed into the apply-task.js done transition as a
+// recoverable retry miss: stale is terminal for THIS task's pass (the entry stays
+// 'captured' and a FRESH sort task under a new id classifies the current text), while
+// genuinely recoverable skips (malformed JSON, rejected path, ...) still go through
+// recoverableSortSkip untouched -- same sortAttempt bump, same recoverable:true, same
+// MAX_SORT_ATTEMPTS bound (task-sources.js's nextBrainDumpSortTask regenerates under a
+// fresh ...-aN id until sortAttempt >= MAX_SORT_ATTEMPTS). Same exported name as
+// before, so module.exports and every require('./apply-group-a.js') call site are
+// unchanged.
+function applyBrainDumpSort(args) {
+  const result = applyBrainDumpSortCore(args);
+  if (result && result.stale) {
+    return { skipped: true, stale: true, success: false, reason: result.reason };
+  }
+  return result;
+}
 const { parseProjectSearchFindings, applyProjectSearchFindings, parseDeepDiveItems, applyDeepDiveFindings, applyForensicsReport, parseDebriefNowWhatItems, applyDebriefReport } = require('./apply-group-a-report-appenders.js');
 
 // brain_dump_sort entries get MAX_SORT_ATTEMPTS classification passes before the entry is
