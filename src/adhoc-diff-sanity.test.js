@@ -350,16 +350,34 @@ const editWithTestDefs = (p, n) => {
   return `diff --git a/${p} b/${p}\nindex 1a2b3c..4d5e6f 100644\n--- a/${p}\n+++ b/${p}\n@@ -1 +1,${n + 1} @@\n x\n${defs}`;
 };
 
-test('false-test-count-claim: summary claims more tests than the diff actually adds', () => {
+const createTestFileDiff = (p, n) => {
+  const defs = Array.from({ length: n }, (_, i) => `+def test_case_${i}():\n+    assert True\n`).join('');
+  return `diff --git a/${p} b/${p}\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1,${n * 2} @@\n${defs}`;
+};
+
+test('false-test-count-claim: an "N tests added" claim above what the diff adds is flagged', () => {
   const t = adhoc('Add tests for the history collector in python/dashboard/test_hardware_stats.py.');
-  const p = adhocDiffSubstanceProblem(t, editWithTestDefs('python/dashboard/test_hardware_stats.py', 1), 'Implemented. All 3 tests pass.');
+  const p = adhocDiffSubstanceProblem(t, editWithTestDefs('python/dashboard/test_hardware_stats.py', 1), 'Implemented. 3 tests added.');
   assert.equal(p.code, 'false-test-count-claim');
   assert.match(p.reason, /claims 3 tests but the diff only adds 1/);
 });
 
+test('false-test-count-claim: "All N tests pass" over a brand-new test file with fewer defs is flagged', () => {
+  const t = adhoc('Add tests for the history collector in python/dashboard/test_hardware_stats.py.');
+  const p = adhocDiffSubstanceProblem(t, createTestFileDiff('python/dashboard/test_hardware_stats.py', 1), 'Implemented. All 3 tests pass.');
+  assert.equal(p.code, 'false-test-count-claim');
+});
+
+test('false-test-count-claim: a truthful "All N tests pass" after adding fewer than N tests to an EXISTING file is not flagged (AC-72)', () => {
+  const t = adhoc('Add an edge-case test to python/dashboard/test_hardware_stats.py');
+  assert.equal(adhocDiffSubstanceProblem(t, editWithTestDefs('python/dashboard/test_hardware_stats.py', 1), 'Added the test. All 5 tests pass.'), null);
+  assert.equal(adhocDiffSubstanceProblem(t, editWithTestDefs('python/dashboard/test_hardware_stats.py', 1), 'Added the test. 5 tests pass.'), null);
+});
+
 test('false-test-count-claim: a matching count is not flagged', () => {
   const t = adhoc('Add tests for the history collector in python/dashboard/test_hardware_stats.py.');
-  assert.equal(adhocDiffSubstanceProblem(t, editWithTestDefs('python/dashboard/test_hardware_stats.py', 3), 'Implemented. All 3 tests pass.'), null);
+  assert.equal(adhocDiffSubstanceProblem(t, editWithTestDefs('python/dashboard/test_hardware_stats.py', 3), 'Implemented. 3 tests added.'), null);
+  assert.equal(adhocDiffSubstanceProblem(t, createTestFileDiff('python/dashboard/test_hardware_stats.py', 3), 'Implemented. All 3 tests pass.'), null);
 });
 
 test('false-test-count-claim: no test-count claim in the summary is never checked', () => {
