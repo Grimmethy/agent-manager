@@ -150,3 +150,27 @@ test('runSoWhatCitationCheck flags a citation that only appears OUTSIDE the SO W
   const r = runSoWhatCitationCheck(task(), draft);
   assert.equal(r.verdict, 'ungrounded');
 });
+
+// --- advisory-null-outcome.js: a justified null line INSIDE the report passes (real shape: trailing line after WHAT / SO WHAT) ---
+
+test('runSoWhatCitationCheck: an honest null written as a justified NO CONFIDENT INEFFICIENCY line inside the report passes with no citation', () => {
+  const report = [
+    'WHAT',
+    'All 3 shipped tasks share one source and one call profile.',
+    '',
+    'SO WHAT',
+    'None of the four flag categories cleanly apply.',
+    '',
+    'NO CONFIDENT INEFFICIENCY -- the one additional signal that would be needed is a model_calls row showing the plan or critique stage.',
+  ].join('\n');
+  assert.equal(runSoWhatCitationCheck(task(), report).verdict, 'ok');
+});
+
+test('runSoWhatCitationCheck: an uncited report that flags something (numbered NOW WHAT) is still rejected even if it mentions the phrase', () => {
+  const report = [
+    'WHAT', 'x', '', 'SO WHAT', 'Across all 3 tasks the plan stage is redundant.', '',
+    'NO CONFIDENT INEFFICIENCY does not apply \u2014 the evidence does show real, bounded waste in the plan stage.', '',
+    'NOW WHAT', '1. Skip the plan pass -- Files: src/a.js. Why: redundant.',
+  ].join('\n');
+  assert.equal(runSoWhatCitationCheck(task(), report).verdict, 'ungrounded');
+});

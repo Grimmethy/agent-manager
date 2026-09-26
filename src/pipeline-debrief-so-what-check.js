@@ -27,6 +27,8 @@
 //
 // Kill switch: AGENT_MANAGER_PIPELINE_DEBRIEF_SO_WHAT_CHECK=false.
 
+const { classifyNullOutcome } = require('./advisory-null-outcome.js');
+
 const COMPLETED_BLOCK_RE = /### COMPLETED (\d+):/g;
 const NO_CONFIDENT_RE = /^\s*NO CONFIDENT INEFFICIENCY\b/i;
 
@@ -68,6 +70,7 @@ function runSoWhatCitationCheck(task, implementResponse) {
   const text = String(implementResponse || '');
   if (!text.trim()) return { verdict: 'ok' }; // empty is handled by the degenerate-output gate, not this check
   if (NO_CONFIDENT_RE.test(text.trim())) return { verdict: 'ok' }; // a valid, correct terminal outcome -- nothing to cite
+  if (classifyNullOutcome('pipeline_debrief', text)) return { verdict: 'ok' }; // the same null as a justified line inside the report (advisory-null-outcome.js): nothing to cite
 
   const completedNumbers = realCompletedNumbers(task);
   const taskIds = realTaskIds(task);

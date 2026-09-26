@@ -1,5 +1,7 @@
 'use strict';
 
+const { classifyNullOutcome } = require('./advisory-null-outcome.js');
+
 // apply-group-a-report-appenders.js -- extracted from src/apply-group-a.js ([[hub-task-integration]] node-module decompose).
 
 const fs = require('fs');
@@ -174,7 +176,7 @@ function applyForensicsReport({ implementResponse, task }) {
   const text = (implementResponse || '').trim();
 
   if (/^NO CLEAR ROOT CAUSE\b/m.test(text)) {
-    return { skipped: true, reason: 'forensic study found no clear root cause; nothing filed' };
+    return { skipped: true, reason: 'forensic study found no clear root cause (no-op); nothing to file' };
   }
   if (!task || !task.forensicsReportConfirmedAt) {
     return {
@@ -261,6 +263,18 @@ function applyDebriefReport({ implementResponse, task }) {
 
   if (!text) {
     return { skipped: true, reason: 'debrief report came back empty; nothing to hold or archive' };
+  }
+  // Honest null (advisory-null-outcome.js): the audit found nothing, so there is no NOW WHAT to route and nothing for a human to
+  // confirm (auto-confirm-review.js would DENY a bare null and the report would just park in awaiting-confirm/). Close as a no-op
+  // but still archive the window it audited, exactly what a human confirm would have triggered. `taskIds` may be empty.
+  if (classifyNullOutcome('pipeline_debrief', text)) {
+    const nullTaskIds = (task && task.promptContext && Array.isArray(task.promptContext.taskIds)) ? task.promptContext.taskIds : [];
+    const { pipelineDir: nullPipelineDir } = getConfig();
+    const archived = nullTaskIds.length ? archiveSpecificDoneTasks({ pipelineDir: nullPipelineDir, taskIds: nullTaskIds }) : { moved: 0, missing: 0, errors: [] };
+    return {
+      skipped: true,
+      reason: `no confident inefficiency (no-op): nothing to do -- audited ${nullTaskIds.length} task(s), archived ${archived.moved}, already-moved ${archived.missing}${archived.errors.length ? `, ${archived.errors.length} error(s)` : ''}`,
+    };
   }
   if (!task || !task.debriefReportConfirmedAt) {
     return {

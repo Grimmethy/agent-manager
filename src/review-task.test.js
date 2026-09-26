@@ -179,6 +179,43 @@ test('brain_dump_sort takes the deterministic-review path -- a valid classificat
   assert.equal(voteCalled, false);
 });
 
+test('an honest null from an advisory report source is approved deterministically with no vote (advisory-null-outcome)', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const cases = [
+    ['pipeline_forensics', 'NO CLEAR ROOT CAUSE -- the bundle has zero model_calls rows and zero contrast winners, so a counterfactual cannot be grounded; the trace of the subject is the one missing signal.'],
+    ['pipeline_health_audit', 'FALSE POSITIVE -- a live operational event (pending backlog plus Ollama timeouts), not a code defect: none of the matched files shows a root cause worth patching.'],
+    ['pipeline_debrief', ['WHAT', 'x', '', 'SO WHAT', 'None of the four flag categories cleanly apply.', '', 'NO CONFIDENT INEFFICIENCY -- the one additional signal needed is a model_calls row showing a plan or critique call.'].join('\n')],
+  ];
+  for (const [source, response] of cases) {
+    const task = { id: `null-${source}`, source, domain: 'default', title: `t ${source}`, implementResponse: response, planResponse: 'p', promptContext: {} };
+    let voteCalled = false;
+    const outcomes = [];
+    const result = await reviewTask(task, {
+      repoRoot, secondBrainDir, domainsPath,
+      localMajorityVote: async () => { voteCalled = true; throw new Error('vote must not be called for an honest null'); },
+      recordModelOutcome: (o) => outcomes.push(o.outcome),
+    });
+    assert.equal(result.verdict, 'approved', source);
+    assert.equal(task.reviewProvider, 'deterministic-null-outcome', source);
+    assert.equal(voteCalled, false, source);
+    assert.deepEqual(outcomes, ['approved'], source);
+    assert.ok(task.history.some((h) => h.stage === 'approved' && /^deterministic-null-outcome: /.test(h.detail)), source);
+  }
+});
+
+test('a report that merely mentions a null phrase is NOT auto-approved (falls through to the normal review path)', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  const task = { id: 'not-null', source: 'pipeline_forensics', domain: 'default', title: 't', implementResponse: 'ROOT CAUSE 1: the retry cap is 2.\n\nNO CLEAR ROOT CAUSE -- for the second failure the evidence gives no trace to rank against at all here.', planResponse: 'p', promptContext: {} };
+  try {
+    await reviewTask(task, {
+      repoRoot, secondBrainDir, domainsPath,
+      localMajorityVote: async () => ({ verdict: 'APPROVE', votes: [], response: 'APPROVE: ok' }),
+      recordModelOutcome: () => {},
+    });
+  } catch (e) { /* the normal path may need more fixture; only the routing matters here */ }
+  assert.notEqual(task.reviewProvider, 'deterministic-null-outcome');
+});
+
 test('brain_dump_sort deterministic review BLOCKS a malformed classification with a specific reason (informed retry, not a dead end)', async () => {
   const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
   const task = brainDumpSortTask({ implementResponse: 'let me read the vault first' });

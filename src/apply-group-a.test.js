@@ -1449,6 +1449,52 @@ test('applyDebriefReport: first pass holds the report for human confirmation', (
   assert.equal(r.needsConfirmation, true);
 });
 
+const NULL_DEBRIEF_REPORT = [
+  'WHAT',
+  '2 brain_dump_sort tasks shipped, each one model call on the implement stage.',
+  '',
+  'SO WHAT',
+  'None of the four flag categories cleanly apply.',
+  '',
+  'NO CONFIDENT INEFFICIENCY -- the one additional signal that would be needed is a model_calls row showing a plan or critique call.',
+].join('\n');
+
+test('applyDebriefReport: an honest null closes as a no-op WITHOUT a human hold and still archives its window (advisory-null-outcome)', () => {
+  const { isNoopApplyDetail } = require('./task-disposition.js');
+  const dir = makeDebriefPipeline();
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'n1.json'), JSON.stringify({ id: 'n1' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'n2.json'), JSON.stringify({ id: 'n2' }));
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'left-alone.json'), JSON.stringify({ id: 'left-alone' }));
+  const prev = process.env.AGENT_MANAGER_PIPELINE_DIR;
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  try {
+    const task = { id: 't-null', title: 'Pipeline debrief: null', promptContext: { taskIds: ['n1', 'n2'] } }; // NOT confirmed: no hold expected
+    const r = applyDebriefReport({ implementResponse: NULL_DEBRIEF_REPORT, task });
+    assert.equal(r.needsConfirmation, undefined);
+    assert.equal(r.skipped, true);
+    assert.match(r.reason, /archived 2/);
+    assert.equal(isNoopApplyDetail(r.reason), true, 'apply-task stamps terminalDisposition noop from this reason');
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'n1.json')), false);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'n2.json')), false);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', 'left-alone.json')), true);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev;
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
+  }
+});
+
+test('applyForensicsReport: a NO CLEAR ROOT CAUSE report skips cleanly and its reason reads as a no-op', () => {
+  const { applyForensicsReport } = require('./apply-group-a-report-appenders.js');
+  const { isNoopApplyDetail } = require('./task-disposition.js');
+  const r = applyForensicsReport({ implementResponse: 'NO CLEAR ROOT CAUSE -- no trace was captured for the subject and there are no winner tasks to contrast against.', task: { id: 'f1' } });
+  assert.equal(r.skipped, true);
+  assert.equal(isNoopApplyDetail(r.reason), true);
+});
+
 test('applyDebriefReport: empty implement response -> clean skip, no archive attempted', () => {
   const r = applyDebriefReport({ implementResponse: '   ', task: { id: 't' } });
   assert.equal(r.skipped, true);
