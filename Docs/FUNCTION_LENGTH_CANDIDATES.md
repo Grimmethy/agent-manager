@@ -5759,3 +5759,7085 @@ Extract two helpers scoped to this function. First, `parseCandidateSections(rawT
 
 Benefits:
 `parseCandidateSections` can be unit-tested with fixture strings in isolation, verifying that the `indexOf` boundary logic handles edge cases (empty file, missing delimiters, trailing whitespace) without any filesystem access. `evaluateCandidate` makes the two external dependencies (`readWindowed`, `taskIdExistsInQueue`) visible in its signature, so a reviewer immediately sees what the function reads from disk and what external state it consults, and a mock can be injected in tests. The top-level function shrinks to a short orchestration sequence that is trivially reviewable, and future changes to the candidate-file format or the queue-lookup contract are localized to a single helper rather than scattered through a long body.
+
+### AC-51 · Decompose `api_task_requeue` into path-resolution, branch-abandonment, and record-building helpers
+Strength: Strong
+Files: python/dashboard/routes/task.py
+Snippet:
+```
+
+@task_bp.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
+def api_task_requeue(state, task_id):
+    """Manual requeue (Job Status > Blocked/Needs Clarification/Done tabs, per-row button; also the Brain Dump
+    tab's "Reopen" action on an archived entry's badge): moves the task back to pending/,
+    stripped to the same shape a freshly-generated task has -- every drafting/review/apply
+    artifact (blockedReason, doneMarker, ornithVotes, planResponse, implementResponse, etc.)
+    is dropped, not carried forward. ornithRejectCount resets to 0 deliberately: a manual
+    requeue is a deliberate human do-over, not a continuation of the same automatic retry
+    cycle queue-watchdog.ps1's Invoke-RejectRetryCheck already runs for review-stage
+    rejections (capped at $MaxOrnithRejectRetries=2) -- carrying the old count forward would
+    let a manually-requeued task block again after fewer real attempts than a task hitting
+    that cap for the first time gets.
+
+    2026-09-06, real incident: a stacked file-decompose sub-task (seq 2 of 5, sharing one
+    branch with its 4 siblings -- see file-decompose-to-hub.js) blocked on a sustained
+    Ollama infra outage. Its `stacked` field -- {branch, seq, total}, the ONLY thing that
+    ties it back to the shared branch and its position in the sequence -- is a TOP-LEVEL
+    task field, not part of promptContext, so the "fresh" rebuild below silently dropped it
+    on every requeue: a human clicking Requeue on a stuck stacked sub-task would have
+    detached it from its hub, breaking the coordination with no error and no visible sign
+    anything was wrong until the wiring step later found the branch missing pieces.
+    `dependsOn` (also file-decompose-to-hub.js, and consumed by nextAdhocTask's/
+    coordinator-sweep.js's dependency gate) is the identical shape -- a top-level field a
+    generic reset has no way to know matters.
+
+    2026-09-06, same requeue, second field: `atomic` (also file-decompose-to-hub.js) was
+    STILL being dropped by this same allowlist gap even after the stacked/dependsOn fix
+    above -- confirmed live, the requeued sub-task's own local-draft.js pre-split check
+    (`!task.atomic`, the guard that exists specifically because "a file-decompose child IS
+    the output of a decomposition; re-splitting it loops") saw `atomic: undefined` and let
+    the model try to decompose it AGAIN, producing a malformed 2-piece split and blocking a
+    second time. `noDecompose` (set alongside `atomic` by the same code, currently unread
+    elsewhere but the same coordination-field shape) is preserved too rather than assuming
+    it stays unused forever. All four preserved explicitly now, when present, rather than
+    trusting this allowlist to anticipate every future coordination field one at a time.
+
+    'archived' is a distinct pseudo-state (not a real QUEUE_STATES member) for a task
+    api_task_archive moved to done/_archived_no_action/ -- _task_state_index reports it as
+    'archived', not 'done', so this must be handled as a separate lookup path rather than
+    falling through to state_dir/task_id.json, which would 404 (real gap found 2026-08-17
+    auditing the "always reversible" promise: an archived item couldn't actually be
+    un-archived through the UI before this). 2026-08-24: also checks done-archive.js's own
+    dated month buckets (queue/done/_archived/<YYYY-MM>/) -- a task the AUTOMATIC daily
+    archive pass moved there is just as "archived" and must be just as requeueable as one a
+    human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
+    same "always reversible" promise this endpoint already exists to uphold."""
+    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, queue_dir, read_json_safe
+    if state not in ("blocked", "needs-clarification", "done", "archived"):
+        abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    if state == "archived":
+        src = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+        if not src.is_file():
+            archived_root = qdir / "done" / "_archived"
+            if archived_root.is_dir():
+                for month_dir in archived_root.iterdir():
+                    if not month_dir.is_dir():
+                        continue
+                    candidate = month_dir / f"{task_id}.json"
+                    if candidate.is_file():
+                        src = candidate
+                        break
+    else:
+        src = qdir / state / f"{task_id}.json"
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    # A needs-clarification task can be sent straight back for a fresh draft -- but only a NON-adhoc one. An adhoc-shaped task lives in
+    # queue/adhoc/ (nextAdhocTask only scans there), and this route writes to pending/, which would silently orphan it; those have their
+    # own /resolve and /answer routes below. (2026-09-20: a candidate-fulfillment task exhausted its retries on failures that were then
+    # fixed, and the only way back was moving its file to blocked/ by hand.)
+    if state == "needs-clarification" and (
+        data.get("domain") == "adhoc" or data.get("source") in ("manual", "derived_task")
+    ):
+        abort(400, description=(
+            "this is an adhoc-shaped task -- send it back with the file-path picker (/resolve) or the answer box (/answer), "
+            "which put it where the adhoc lane claims it; a plain requeue would strand it in pending/"
+        ))
+
+    if state in ("blocked", "needs-clarification") and not (request.get_json(silent=True) or {}).get("force"):
+        repeat = _repeated_blocker_match(data)
+        if repeat:
+            abort(409, description=(
+                "This task's rejection looks like the same underlying problem as an "
+                f"earlier attempt: \"{repeat[:220]}\" -- redrafting alone hasn't fixed "
+                "this before and likely won't now without a real change. Diagnose the "
+                "actual root cause first (or confirm you already have), then requeue "
+                "again to proceed anyway."
+            ))
+
+    # If this task was already applied to a branch that never merged (task-disposition.js's
+    # 'pending-merge' -- an agent/<id> branch exists, ahead of main, unmerged), a requeue is
+    # about to redo the same work from scratch on a FRESH branch, so the old one is now
+    # abandoned, not merely forgotten. Without this, this endpoint silently orphaned the
+    # prior branch: it stayed pushed to GitHub, unmerged, with no PR and no record anywhere
+    # that a later attempt superseded it. Confirmed live 2026-09-13:
+    # adhoc-add-spec-comment-at-call-site-in-src-local-draft-js-1789232601161-1's
+    # forbidden-path-gate-blocked branch sat dangling until a human noticed and deleted it
+    # by hand. Guarded on terminalDisposition != 'merged' so a task record that (rarely)
+    # reached done/ with its branch already merged is never touched.
+    if data.get("terminalDisposition") != "merged":
+        applied_branch = None
+        for ev in reversed(data.get("history") or []):
+            if isinstance(ev, dict) and ev.get("stage") == "applied" and ev.get("detail"):
+                applied_branch = ev["detail"]
+                break
+        if applied_branch:
+            from app import _invalidate_branch_cache, _run_git
+            repo_root = get_active_repo_root()
+            repo_root = Path(repo_root) if repo_root else None
+            if repo_root:
+                try:
+                    _run_git(["push", "origin", "--delete", applied_branch], repo_root)
+                    from branch_removals import record_branch_removal
+                    record_branch_removal(qdir, applied_branch, "superseded-by-requeue", task_id=task_id,
+                                          detail=f"requeued from {state}/", actor="dashboard-requeue")
+                except RuntimeError as e:
+                    # Non-fatal, same reasoning as api_git_merge_branch's own post-merge
+                    # branch delete -- already gone, never actually pushed, or a transient
+                    # network error are all fine; the requeue itself must not fail here.
+                    logger.warning(
+                        "Non-fatal: could not delete superseded branch %r for requeued task %r: %s",
+                        applied_branch, task_id, e,
+                    )
+                _invalidate_branch_cache()
+            abandon_iso = datetime.now(timezone.utc).isoformat()
+            abandon_detail = f"superseded by a manual requeue from {state}/; prior branch {applied_branch} deleted"
+            data.setdefault("history", []).append({
+                "stage": "abandoned", "at": abandon_iso, "detail": abandon_detail,
+            })
+            data["terminalDisposition"] = "abandoned"
+            # NOT closing out task-logs/<id>.json here (contrast api_git_merge_branch's
+            # 'merged' handling): that file is committed only on the task's OWN branch, and
+            # for an unmerged branch it was never on <main> to begin with -- there is
+            # nothing on disk in this checkout to update. task-log-reconcile.js's own
+            # 'abandoned' disposition (see task-disposition.js's header) has the identical
+            # scope: it marks the queue/ record, it does not retroactively rescue a
+            # never-merged branch's task-log onto main.
+
+    pending_dir = qdir / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    dest = pending_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in pending/")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # history must never be replaced -- it's the one append-only, complete log of
+    # everything that happened to this task (see task-history.js and AGENTS.md's task-log
+    # section), and a manual requeue is exactly the kind of step whose OWN reason (plus
+    # whatever blockedReason/priorRejectionFeedback drove it) needs to survive in that log,
+    # not vanish the moment the task starts its next draft cycle. Root-caused live
+    # 2026-09-12: this endpoint used to stamp a brand-new one-entry array here, discarding
+    # every prior event -- including the real blockedReason a `blocked` history event
+    # already carried -- for observability-fix-ac-158 and others, so the ONLY trace left
+    # of why a task ever blocked was this note's bare "manually requeued from blocked/".
+    old_history = data.get("history")
+    history = list(old_history) if isinstance(old_history, list) else []
+    history.append({
+        "stage": "requeued",
+        "at": now_iso,
+        "note": f"manually requeued from {state}/",
+        # The exact fields a fresh rebuild used to drop silently -- carried into the log
+        # entry itself so they're never lost even though the rebuilt task below won't
+        # carry them forward as live working state.
+        "blockedReasonAtRequeue": data.get("blockedReason"),
+        "priorRejectionFeedbackAtRequeue": data.get("priorRejectionFeedback"),
+    })
+    fresh = {
+        "id": data.get("id", task_id),
+        "domain": data.get("domain"),
+        "source": data.get("source"),
+        "title": data.get("title"),
+        "promptContext": data.get("promptContext"),
+        "status": "pending",
+        "createdAt": data.get("createdAt", now_iso),
+        "history": history,
+    }
+    # Coordination fields (see this endpoint's own docstring) -- never part of the
+    # drafting/review/apply history this reset is meant to clear, so always carried over
+    # verbatim when present rather than silently dropped.
+    if "stacked" in data:
+        fresh["stacked"] = data["stacked"]
+    if "dependsOn" in data:
+        fresh["dependsOn"] = data["dependsOn"]
+    if "atomic" in data:
+        fresh["atomic"] = data["atomic"]
+    if "noDecompose" in data:
+        fresh["noDecompose"] = data["noDecompose"]
+    dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
+    src.unlink()
+    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
+    return jsonify({"id": task_id, "requeued": True})
+```
+
+Problem:
+The `api_task_requeue` handler is 194 lines (≈110 executable after stripping the incident-history docstring and inline `#` comments). More importantly than raw length, it interleaves five independently-testable responsibilities on a single call stack: (1) resolving the source `.json` path across the flat `state/` layout and the archived month-bucket scan, (2) the adhoc-task guard, (3) the repeated-blocker guard, (4) a 35-line branch-abandonment cluster that shells out to `git push --delete`, invalidates a module-level cache, appends to a separate `branch_removals` log, and mutates `data["terminalDisposition"]`, and (5) building the "fresh" pending record with coordination-field carryover (stacked, dependsOn, atomic, noDecompose) — the exact logic whose bug caused the 2026-09-06 stacked/atomic incidents. Because all five share one function, a change to the branch-abandonment side-effects (e.g., adding a second remote, or making the cache invalidation conditional) forces a reviewer to re-verify the path-resolution and record-building logic, and none of the five pieces can be unit-tested in isolation without spinning up the full Flask app and a fake git repo.
+
+Solution:
+Extract three helpers into the same module above the route: `_resolve_requeue_source` (pure path logic, returns `Path | None`), `_abandon_superseded_branch` (the git/cache/history/disposition side-effect cluster, non-fatal on `RuntimeError`), and `_build_fresh_requeue_record` (pure data transform that preserves history and coordination fields while dropping drafting artifacts). The route handler then becomes a ~55-line linear pipeline: validate state → resolve source → read JSON → two guard checks → call the three helpers → write dest → unlink source → audit-log → return. The concrete shape of the change:
+
+```python
+# --- New helpers (inserted above the route in the same module) ---
+
+def _resolve_requeue_source(qdir: Path, state: str, task_id: str) -> Path | None:
+    """Return the source .json path for a requeue, or None if not found."""
+    if state == "archived":
+        src = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+        if src.is_file():
+            return src
+        archived_root = qdir / "done" / "_archived"
+        if archived_root.is_dir():
+            for month_dir in sorted(archived_root.iterdir()):
+                if not month_dir.is_dir():
+                    continue
+                candidate = month_dir / f"{task_id}.json"
+                if candidate.is_file():
+                    return candidate
+        return None
+    return qdir / state / f"{task_id}.json"
+
+
+def _abandon_superseded_branch(data: dict, qdir: Path, state: str, task_id: str) -> None:
+    """Delete the superseded branch on the remote, invalidate the cache,
+    stamp 'abandoned' in history, and set terminalDisposition.
+    Non-fatal on git errors (branch may already be gone)."""
+    if data.get("terminalDisposition") == "merged":
+        return
+    applied_branch = None
+    for ev in reversed(data.get("history") or []):
+        if isinstance(ev, dict) and ev.get("stage") == "applied" and ev.get("detail"):
+            applied_branch = ev["detail"]
+            break
+    if not applied_branch:
+        return
+    from app import _invalidate_branch_cache, _run_git, get_active_repo_root, logger
+    repo_root = get_active_repo_root()
+    repo_root = Path(repo_root) if repo_root else None
+    if repo_root:
+        try:
+            _run_git(["push", "origin", "--delete", applied_branch], repo_root)
+            from branch_removals import record_branch_removal
+            record_branch_removal(
+                qdir, applied_branch, "superseded-by-requeue",
+                task_id=task_id, detail=f"requeued from {state}/",
+                actor="dashboard-requeue",
+            )
+        except RuntimeError as e:
+            logger.warning(
+                "Non-fatal: could not delete superseded branch %r "
+                "for requeued task %r: %s", applied_branch, task_id, e,
+            )
+        _invalidate_branch_cache()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    data.setdefault("history", []).append({
+        "stage": "abandoned", "at": now_iso,
+        "detail": (
+            f"superseded by a manual requeue from {state}/; "
+            f"prior branch {applied_branch} deleted"
+        ),
+    })
+    data["terminalDisposition"] = "abandoned"
+
+
+def _build_fresh_requeue_record(data: dict, task_id: str, state: str, now_iso: str) -> dict:
+    """Construct the fresh pending/ task dict, preserving history and
+    coordination fields while dropping drafting/review/apply artifacts."""
+    old_history = data.get("history")
+    history = list(old_history) if isinstance(old_history, list) else []
+    history.append({
+        "stage": "requeued", "at": now_iso,
+        "note": f"manually requeued from {state}/",
+        "blockedReasonAtRequeue": data.get("blockedReason"),
+        "priorRejectionFeedbackAtRequeue": data.get("priorRejectionFeedback"),
+    })
+    fresh = {
+        "id": data.get("id", task_id),
+        "domain": data.get("domain"),
+        "source": data.get("source"),
+        "title": data.get("title"),
+        "promptContext": data.get("promptContext"),
+        "status": "pending",
+        "createdAt": data.get("createdAt", now_iso),
+        "history": history,
+    }
+    for field in ("stacked", "dependsOn", "atomic", "noDecompose"):
+        if field in data:
+            fresh[field] = data[field]
+    return fresh
+
+
+# --- Slimmed route handler (replaces the 194-line body) ---
+
+@task_bp.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
+def api_task_requeue(state, task_id):
+    """<docstring unchanged — incident history and cross-file contracts>"""
+    from app import (
+        _record_manual_requeue, _repeated_blocker_match,
+        logger, queue_dir, read_json_safe,
+    )
+
+    if state not in ("blocked", "needs-clarification", "done", "archived"):
+        abort(400, description=(
+            "only a blocked, needs-clarification, done, or archived task can be requeued"
+        ))
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+
+    src = _resolve_requeue_source(qdir, state, task_id)
+    if src is None or not src.is_file():
+        abort(404)
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    # adhoc guard
+    if state == "needs-clarification" and (
+        data.get("domain") == "adhoc"
+        or data.get("source") in ("manual", "derived_task")
+    ):
+        abort(400, description=(
+            "adhoc / manually-derived tasks in needs-clarification cannot be requeued; "
+            "resolve the clarification first"
+        ))
+
+    # repeated-blocker guard
+    if state in ("blocked", "needs-clarification") and not (
+        request.get_json(silent=True) or {}
+    ).get("force"):
+        repeat = _repeated_blocker_match(data)
+        if repeat:
+            abort(409, description=(
+                f"same blocker already recorded: {repeat}; "
+                "pass {\"force\": true} to override"
+            ))
+
+    _abandon_superseded_branch(data, qdir, state, task_id)
+
+    pending_dir = qdir / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    dest = pending_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in pending/")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    fresh = _build_fresh_requeue_record(data, task_id, state, now_iso)
+    dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
+    src.unlink()
+    _record_manual_requeue(
+        data,
+        reason_hint=f"manually requeued from {state}/",
+        requeue_writer="operator-manual",
+    )
+    return jsonify({"id": task_id, "requeued": True})
+```
+
+Benefits:
+Each helper is independently unit-testable without a Flask app or a real git repository: `_resolve_requeue_source` is exercised with a temporary `tmp_path` tree; `_abandon_superseded_branch` is tested by monkey-patching `_run_git` and `_invalidate_branch_cache` and asserting the `history` append and `terminalDisposition` stamp; `_build_fresh_requeue_record` is a pure function verified against fixture dicts that reproduce the 2026-09-06 stacked/atomic regression. The branch-abandonment helper also becomes directly callable from a future "sweep unmerged branches" endpoint without duplicating the git-push, cache-invalidation, and audit-log sequence. Review scope shrinks: a PR touching only the path-resolution logic no longer requires a reviewer to re-read the 35-line git block, and vice-versa. The route handler itself reads top-to-bottom as a linear precondition → act → persist pipeline, which matches how the endpoint is actually reasoned about in incident post-mortems.
+
+### AC-52 · Decompose renderHardwareTab into per-section renderers
+Strength: Strong
+Files: python/dashboard/static/js/branches-joblist-hardware-tabs.js
+Snippet:
+```
+}
+
+async function renderHardwareTab() {
+  const main = document.getElementById('main');
+  const [data, watchConfig] = await Promise.all([
+    fetchJson('/api/hardware/stats'),
+    fetchJson('/api/hardware/watch-config').catch(() => ({})),
+  ]);
+  // Hardware is a swappable plugin slot (2026-09-05) -- "available: false" means no
+  // plugin is currently active/running for it, distinct from a plugin running but
+  // still warming up its first sample (which instead shows normally with nulls/no
+  // history yet, same as before this change).
+  if (data.available === false) {
+    main.innerHTML = `
+      <div class="empty">Hardware monitoring is off -- pick a plugin on the
+        <a href="#" onclick="activeTab='plugins'; renderNav(); renderMain(); return false;">Plugins tab</a>.</div>`;
+    return;
+  }
+  const watchChecklistHtml = renderWatchConfigChecklist(watchConfig || {});
+  const cur = data.current || {};
+  const avg = data.averages || {};
+  const history = data.history || [];
+  const ram = cur.ram || {};
+  const disk = cur.disk || {};
+  // Multi-GPU (2026-09-05): prefer the full "gpus" list (both this repo's plugins can
+  // report it -- see hardware_stats.py's _gpus()/goatmon_adapter.py's "gpus" key) so
+  // every GPU on the box gets its own labeled section, not just whichever one a
+  // legacy single-"gpu" heuristic picked as "primary". Falls back to a one-item list
+  // from the singular "gpu" field for any plugin that only ever reports one.
+  const gpuList = (cur.gpus && cur.gpus.length) ? cur.gpus : (cur.gpu ? [cur.gpu] : []);
+  const gpuLabel = (g, i) => g.name || `GPU ${g.index != null ? g.index : i}`;
+  // History rows carry the same "gpus" (or singular "gpu") shape per sample -- match
+  // by array position, since a GPU's index/name is stable across samples on one box.
+  const gpuHistoryValue = (entry, i, field) => {
+    if (entry.gpus && entry.gpus[i]) return entry.gpus[i][field];
+    if (i === 0 && entry.gpu) return entry.gpu[field];
+    return null;
+  };
+  const gpuAvg = (i, field) => {
+    const values = history.map(e => gpuHistoryValue(e, i, field)).filter(v => v != null);
+    return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
+  };
+
+  const tempStat = (label, curVal, avgVal) => `
+    <div class="stat"><strong>${fmtTemp(curVal)}</strong>${escapeHtml(label)} temp (24h avg ${fmtTemp(avgVal)})</div>`;
+
+  const gpuSections = gpuList.length ? gpuList.map((g, i) => `
+    <div class="field-label">${escapeHtml(gpuLabel(g, i))}</div>
+    <div class="stat-row">
+      <div class="stat"><strong>${fmtPercent(g.utilizationPercent)}</strong>utilization (24h avg ${fmtPercent(gpuAvg(i, 'utilizationPercent'))})</div>
+      <div class="stat"><strong>${fmtMiB(g.vramUsedMiB)} / ${fmtMiB(g.vramTotalMiB)}</strong>VRAM used</div>
+      <div class="stat"><strong>${fmtTemp(g.temperatureCelsius)}</strong>temp (24h avg ${fmtTemp(gpuAvg(i, 'temperatureCelsius'))})</div>
+    </div>
+    ${renderSparkline(history, e => gpuHistoryValue(e, i, 'utilizationPercent'), gpuAvg(i, 'utilizationPercent'), `${gpuLabel(g, i)} utilization`)}
+    ${renderSparkline(history, e => gpuHistoryValue(e, i, 'vramUsedMiB'), gpuAvg(i, 'vramUsedMiB'), `${gpuLabel(g, i)} VRAM used`)}
+    ${renderSparkline(history, e => gpuHistoryValue(e, i, 'temperatureCelsius'), gpuAvg(i, 'temperatureCelsius'), `${gpuLabel(g, i)} temperature`)}
+  `).join('') : `<div class="field-label">GPU</div><div class="meta">No GPU detected.</div>`;
+
+  main.innerHTML = `
+    ${watchChecklistHtml}
+    <div class="field-label">System</div>
+    <div class="stat-row">
+      <div class="stat"><strong>${fmtPercent(cur.cpuPercent)}</strong>CPU utilization (24h avg ${fmtPercent(avg.cpuPercent)})</div>
+      <div class="stat"><strong>${fmtBytes(ram.usedBytes)} / ${fmtBytes(ram.totalBytes)}</strong>RAM used</div>
+      <div class="stat"><strong>${fmtBytes(disk.usedBytes)} / ${fmtBytes(disk.totalBytes)}</strong>disk used</div>
+      ${tempStat('CPU', cur.cpuTemperatureCelsius, avg.cpuTemperatureCelsius)}
+    </div>
+    ${renderSparkline(history, e => e.cpuTemperatureCelsius, avg.cpuTemperatureCelsius, 'CPU temperature')}
+    ${renderSparkline(history, e => e.cpuPercent, avg.cpuPercent, 'CPU utilization')}
+    ${renderSparkline(history, e => e.ram ? e.ram.usedBytes : null, avg.ramUsedBytes, 'RAM used')}
+    ${renderSparkline(history, e => e.disk ? e.disk.usedBytes : null, avg.diskUsedBytes, 'disk used')}
+
+    ${gpuSections}
+
+    ${cur.filesystems && cur.filesystems.length ? `
+    <div class="field-label">Filesystems</div>
+    <table style="width:100%; border-collapse:collapse;">
+      <tr><th class="meta" style="text-align:left; padding:2px 8px 2px 0;">Mount</th>
+          <th class="meta" style="text-align:left; padding:2px 8px;">Device</th>
+          <th class="meta" style="text-align:left; padding:2px 8px;">Type</th>
+          <th class="meta" style="text-align:right; padding:2px 0;">Used / total</th></tr>
+      ${cur.filesystems.map(fs => `
+        <tr>
+          <td class="meta" style="padding:2px 8px 2px 0; word-break:break-all;">${escapeHtml(fs.mountPoint)}${fs.readOnly ? ' <span class="badge idle">ro</span>' : ''}</td>
+          <td class="meta" style="padding:2px 8px; font-family:monospace;">${escapeHtml(fs.device)}</td>
+          <td class="meta" style="padding:2px 8px;">${escapeHtml(fs.type)}</td>
+          <td class="meta" style="padding:2px 0; text-align:right;">${fmtBytes(fs.usedBytes)} / ${fmtBytes(fs.totalBytes)}</td>
+        </tr>`).join('')}
+    </table>` : ''}
+
+    ${(cur.power || (cur.runaways && cur.runaways.length)) ? `
+    <div class="field-label">Power &amp; runaway processes</div>
+    <div class="stat-row">
+      ${cur.power && cur.power.packageWatts != null
+        ? `<div class="stat"><strong>${cur.power.packageWatts.toFixed(1)} W</strong>package power${avg.powerPackageWatts != null ? ` (24h avg ${avg.powerPackageWatts.toFixed(1)} W)` : ''}</div>`
+        : ''}
+    </div>
+    ${cur.power && cur.power.rails && cur.power.rails.length ? `
+    <table style="width:100%; border-collapse:collapse; margin-top:6px;">
+      ${cur.power.rails.map(r => `
+        <tr><td class="meta" style="padding:2px 8px 2px 0;">${escapeHtml(r.name)}</td>
+            <td class="meta" style="padding:2px 0;">${r.watts.toFixed(2)} W</td></tr>`).join('')}
+    </table>` : ''}
+    ${cur.runaways && cur.runaways.length ? `
+    <table style="width:100%; border-collapse:collapse; margin-top:6px;">
+      ${cur.runaways.map(a => `
+        <tr><td class="meta" style="padding:2px 8px 2px 0; color:var(--bad);">pid ${a.pid}</td>
+            <td class="meta" style="padding:2px 0;">${escapeHtml(a.headline)}</td></tr>`).join('')}
+    </table>` : `<div class="meta" style="margin-top:6px;">No runaway processes detected.</div>`}
+    ` : ''}
+
+    ${cur.processes && cur.processes.length ? `
+    <div class="field-label">Top processes by CPU</div>
+    <table style="width:100%; border-collapse:collapse;">
+      <tr><th class="meta" style="text-align:left; padding:2px 8px 2px 0;">Process</th>
+          <th class="meta" style="text-align:right; padding:2px 8px;">PID</th>
+          <th class="meta" style="text-align:right; padding:2px 8px;">CPU</th>
+          <th class="meta" style="text-align:right; padding:2px 8px;">RAM</th>
+          <th class="meta" style="text-align:right; padding:2px 8px;">Threads</th>
+          <th class="meta" style="text-align:right; padding:2px 8px;">GPU</th>
+          <th class="meta" style="text-align:left; padding:2px 0;">User / scope</th></tr>
+      ${cur.processes.map(p => `
+        <tr>
+          <td class="meta" style="padding:2px 8px 2px 0;">${escapeHtml(p.name)}</td>
+          <td class="meta" style="padding:2px 8px; text-align:right;">${p.pid}</td>
+          <td class="meta" style="padding:2px 8px; text-align:right;">${fmtPercent(p.cpuPercent)}</td>
+          <td class="meta" style="padding:2px 8px; text-align:right;">${fmtBytes(p.rssBytes)}</td>
+          <td class="meta" style="padding:2px 8px; text-align:right;">${p.threads}</td>
+          <td class="meta" style="padding:2px 8px; text-align:right;">${p.gpuPercent ? fmtPercent(p.gpuPercent) : '-'}</td>
+          <td class="meta" style="padding:2px 0;">${escapeHtml(p.user || '-')} &middot; ${escapeHtml(p.scopeLabel || '-')}</td>
+        </tr>`).join('')}
+    </table>` : ''}
+
+    <div class="meta" style="margin-top:14px">${history.length} sample${history.length === 1 ? '' : 's'} in the last 24h &middot; sampled every 10s.</div>
+  `;
+}
+```
+
+Problem:
+`renderHardwareTab` is a 134-line async function that interleaves five independently-conditional UI sections (system stats, per-GPU cards, filesystems table, power/runaways, top-processes table). Each section has its own data-shape guards, its own table/row rendering, and its own helper closures (`gpuHistoryValue`, `gpuAvg`, `tempStat`) that are defined at the top-level function scope and pollute the namespace of the other four sections. Changing the filesystems table requires scrolling past GPU logic and the power section; changing the multi-GPU fallback logic produces a 134-line diff hunk that a reviewer must re-read in full. The branching is real (five distinct conditional blocks, nested guards in two of them), not a flat template or a big switch/case, so the length is a genuine maintainability cost.
+
+Solution:
+Extract each of the five sections into a small named function that returns an HTML string: `renderSystemSection(cur, avg, history)`, `renderGpuSection(cur, history)`, `renderFilesystemsSection(cur)`, `renderPowerSection(cur, avg)`, and `renderProcessesSection(cur)`. The GPU helper closures (`gpuHistoryValue`, `gpuAvg`) move inside `renderGpuSection` where they are actually used; `tempStat` moves inside `renderSystemSection`. The original `renderHardwareTab` becomes a ~25-line orchestrator that fetches data, handles the `available === false` early return, and concatenates the five section outputs into `main.innerHTML`. No new imports, no new globals, no behavioural change.
+
+Benefits:
+Each section function is a pure string-returning function of a small, explicit input tuple, making it trivially unit-testable in a DOM-less harness (e.g., "given a `cur` with two GPUs and three history samples, does the GPU section render both cards?"). A reviewer diffing a power-section change now sees a 25-line hunk in `renderPowerSection` instead of a 134-line hunk. The GPU helper closures are scoped to the one function that uses them, eliminating accidental cross-section coupling. The orchestrator remains the single place that knows about the fetch, the early-return, and the overall page layout.
+
+```diff
+--- a/python/dashboard/static/js/branches-joblist-hardware-tabs.js
++++ b/python/dashboard/static/js/branches-joblist-hardware-tabs.js
+@@ -856,134 +856,17 @@
+-async function renderHardwareTab() {
+-  const main = document.getElementById('main');
+-  const [data, watchConfig] = await Promise.all([
+-    fetchJson('/api/hardware/stats'),
+-    fetchJson('/api/hardware/watch-config').catch(() => ({})),
+-  ]);
+-  if (data.available === false) {
+-    main.innerHTML = `
+-      <div class="empty">Hardware monitoring is off -- pick a plugin on the
+-        <a href="#" onclick="activeTab='plugins'; renderNav(); renderMain(); return false;">Plugins tab</a>.</div>`;
+-    return;
+-  }
+-  const watchChecklistHtml = renderWatchConfigChecklist(watchConfig || {});
+-  const cur = data.current || {};
+-  const avg = data.averages || {};
+-  const history = data.history || [];
+-  const ram = cur.ram || {};
+-  const disk = cur.disk || {};
+-  const tempStat = (label, curVal, avgVal) => `...`;
+-  const gpuHistoryValue = (entry, i, field) => { ... };
+-  const gpuAvg = (i, field) => { ... };
+-  const gpuSections = ...;
+-  main.innerHTML = `
+-    ${watchChecklistHtml}
+-    <div class="field-label">System</div>
+-    ... (system stats + sparklines)
+-    ${gpuSections}
+-    ... (filesystems table)
+-    ... (power & runaways)
+-    ... (top processes)
+-    <div class="meta">...</div>
+-  `;
+-}
++// ─��� Section renderers (each returns an HTML string) ──────────────────
++
++function renderSystemSection(cur, avg, history) {
++  const ram = cur.ram || {};
++  const disk = cur.disk || {};
++  const tempStat = (label, curVal, avgVal) => `
++    <div class="stat"><strong>${fmtTemp(curVal)}</strong>${escapeHtml(label)} temp (24h avg ${fmtTemp(avgVal)})</div>`;
++  return `
++    <div class="field-label">System</div>
++    <div class="stat-row">
++      <div class="stat"><strong>${fmtPercent(cur.cpuPercent)}</strong>CPU utilization (24h avg ${fmtPercent(avg.cpuPercent)})</div>
++      <div class="stat"><strong>${fmtBytes(ram.usedBytes)} / ${fmtBytes(ram.totalBytes)}</strong>RAM used</div>
++      <div class="stat"><strong>${fmtBytes(disk.usedBytes)} / ${fmtBytes(disk.totalBytes)}</strong>disk used</div>
++      ${tempStat('CPU', cur.cpuTemperatureCelsius, avg.cpuTemperatureCelsius)}
++    </div>
++    ${renderSparkline(history, e => e.cpuTemperatureCelsius, avg.cpuTemperatureCelsius, 'CPU temperature')}
++    ${renderSparkline(history, e => e.cpuPercent, avg.cpuPercent, 'CPU utilization')}
++    ${renderSparkline(history, e => e.ram ? e.ram.usedBytes : null, avg.ramUsedBytes, 'RAM used')}
++    ${renderSparkline(history, e => e.disk ? e.disk.usedBytes : null, avg.diskUsedBytes, 'disk used')}`;
++}
++
++function renderGpuSection(cur, history) {
++  const gpuList = (cur.gpus && cur.gpus.length) ? cur.gpus : (cur.gpu ? [cur.gpu] : []);
++  const gpuLabel = (g, i) => g.name || `GPU ${g.index != null ? g.index : i}`;
++  const gpuHistoryValue = (entry, i, field) => {
++    if (entry.gpus && entry.gpus[i]) return entry.gpus[i][field];
++    if (i === 0 && entry.gpu) return entry.gpu[field];
++    return null;
++  };
++  const gpuAvg = (i, field) => {
++    const values = history.map(e => gpuHistoryValue(e, i, field)).filter(v => v != null);
++    return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
++  };
++  if (!gpuList.length)
++    return `<div class="field-label">GPU</div><div class="meta">No GPU detected.</div>`;
++  return gpuList.map((g, i) => `
++    <div class="field-label">${escapeHtml(gpuLabel(g, i))}</div>
++    <div class="stat-row">
++      <div class="stat"><strong>${fmtPercent(g.utilizationPercent)}</strong>utilization (24h avg ${fmtPercent(gpuAvg(i, 'utilizationPercent'))})</div>
++      <div class="stat"><strong>${fmtMiB(g.vramUsedMiB)} / ${fmtMiB(g.vramTotalMiB)}</strong>VRAM used</div>
++      <div class="stat"><strong>${fmtTemp(g.temperatureCelsius)}</strong>temp (24h avg ${fmtTemp(gpuAvg(i, 'temperatureCelsius'))})</div>
++    </div>
++    ${renderSparkline(history, e => gpuHistoryValue(e, i, 'utilizationPercent'), gpuAvg(i, 'utilizationPercent'), `${gpuLabel(g, i)} utilization`)}
++    ${renderSparkline(history, e => gpuHistoryValue(e, i, 'vramUsedMiB'), gpuAvg(i, 'vramUsedMiB'), `${gpuLabel(g, i)} VRAM used`)}
++    ${renderSparkline(history, e => gpuHistoryValue(e, i, 'temperatureCelsius'), gpuAvg(i, 'temperatureCelsius'), `${gpuLabel(g, i)} temperature`)}
++  `).join('');
++}
++
++function renderFilesystemsSection(cur) {
++  if (!cur.filesystems || !cur.filesystems.length) return '';
++  return `
++    <div class="field-label">Filesystems</div>
++    <table style="width:100%; border-collapse:collapse;">
++      <tr><th class="meta" style="text-align:left; padding:2px 8px 2px 0;">Mount</th>
++          <th class="meta" style="text-align:left; padding:2px 8px;">Device</th>
++          <th class="meta" style="text-align:left; padding:2px 8px;">Type</th>
++          <th class="meta" style="text-align:right; padding:2px 0;">Used / total</th></tr>
++      ${cur.filesystems.map(fs => `
++        <tr>
++          <td class="meta" style="padding:2px 8px 2px 0; word-break:break-all;">${escapeHtml(fs.mountPoint)}${fs.readOnly ? ' <span class="badge idle">ro</span>' : ''}</td>
++          <td class="meta" style="padding:2px 8px; font-family:monospace;">${escapeHtml(fs.device)}</td>
++          <td class="meta" style="padding:2px 8px;">${escapeHtml(fs.type)}</td>
++          <td class="meta" style="padding:2px 0; text-align:right;">${fmtBytes(fs.usedBytes)} / ${fmtBytes(fs.totalBytes)}</td>
++        </tr>`).join('')}
++    </table>`;
++}
++
++function renderPowerSection(cur, avg) {
++  if (!cur.power && !(cur.runaways && cur.runaways.length)) return '';
++  return `
++    <div class="field-label">Power &amp; runaway processes</div>
++    <div class="stat-row">
++      ${cur.power && cur.power.packageWatts != null
++        ? `<div class="stat"><strong>${cur.power.packageWatts.toFixed(1)} W</strong>package power${avg.powerPackageWatts != null ? ` (24h avg ${avg.powerPackageWatts.toFixed(1)} W)` : ''}</div>`
++        : ''}
++    </div>
++    ${cur.power && cur.power.rails && cur.power.rails.length ? `
++    <table style="width:100%; border-collapse:collapse; margin-top:6px;">
++      ${cur.power.rails.map(r => `
++        <tr><td class="meta" style="padding:2px 8px 2px 0;">${escapeHtml(r.name)}</td>
++            <td class="meta" style="padding:2px 0;">${r.watts.toFixed(2)} W</td></tr>`).join('')}
++    </table>` : ''}
++    ${cur.runaways && cur.runaways.length ? `
++    <table style="width:100%; border-collapse:collapse; margin-top:6px;">
++      ${cur.runaways.map(a => `
++        <tr><td class="meta" style="padding:2px 8px 2px 0; color:var(--bad);">pid ${a.pid}</td>
++            <td class="meta" style="padding:2px 0;">${escapeHtml(a.headline)}</td></tr>`).join('')}
++    </table>` : `<div class="meta" style="margin-top:6px;">No runaway processes detected.</div>`}`;
++}
++
++function renderProcessesSection(cur) {
++  if (!cur.processes || !cur.processes.length) return '';
++  return `
++    <div class="field-label">Top processes by CPU</div>
++    <table style="width:100%; border-collapse:collapse;">
++      <tr><th class="meta" style="text-align:left; padding:2px 8px 2px 0;">Process</th>
++          <th class="meta" style="text-align:right; padding:2px 8px;">PID</th>
++          <th class="meta" style="text-align:right; padding:2px 8px;">CPU</th>
++          <th class="meta" style="text-align:right; padding:2px 8px;">RAM</th>
++          <th class="meta" style="text-align:right; padding:2px 8px;">Threads</th>
++          <th class="meta" style="text-align:right; padding:2px 8px;">GPU</th>
++          <th class="meta" style="text-align:left; padding:2px 0;">User / scope</th></tr>
++      ${cur.processes.map(p => `
++        <tr>
++          <td class="meta" style="padding:2px 8px 2px 0;">${escapeHtml(p.name)}</td>
++          <td class="meta" style="padding:2px 8px; text-align:right;">${p.pid}</td>
++          <td class="meta" style="padding:2px 8px; text-align:right;">${fmtPercent(p.cpuPercent)}</td>
++          <td class="meta" style="padding:2px 8px; text-align:right;">${fmtBytes(p.rssBytes)}</td>
++          <td class="meta" style="padding:2px 8px; text-align:right;">${p.threads}</td>
++          <td class="meta" style="padding:2px 8px; text-align:right;">${p.gpuPercent ? fmtPercent(p.gpuPercent) : '-'}</td>
++          <td class="meta" style="padding:2px 0;">${escapeHtml(p.user || '-')} &middot; ${escapeHtml(p.scopeLabel || '-')}</td>
++        </tr>`).join('')}
++    </table>`;
++}
++
++// ── Orchestrator ──────────────────────────────────────────────────────
++
++async function renderHardwareTab() {
++  const main = document.getElementById('main');
++  const [data, watchConfig] = await Promise.all([
++    fetchJson('/api/hardware/stats'),
++    fetchJson('/api/hardware/watch-config').catch(() => ({})),
++  ]);
++  if (data.available === false) {
++    main.innerHTML = `
++      <div class="empty">Hardware monitoring is off -- pick a plugin on the
++        <a href="#" onclick="activeTab='plugins'; renderNav(); renderMain(); return false;">Plugins tab</a>.</div>`;
++    return;
++  }
++  const cur = data.current || {};
++  const avg = data.averages || {};
++  const history = data.history || [];
++  main.innerHTML = `
++    ${renderWatchConfigChecklist(watchConfig || {})}
++    ${renderSystemSection(cur, avg, history)}
++    ${renderGpuSection(cur, history)}
++    ${renderFilesystemsSection(cur)}
++    ${renderPowerSection(cur, avg)}
++    ${renderProcessesSection(cur)}
++    <div class="meta" style="margin-top:14px">${history.length} sample${history.length === 1 ? '' : 's'} in the last 24h &middot; sampled every 10s.</div>`;
++}
+```
+
+### AC-53 · Decompose renderPluginsTab into per-responsibility helpers
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+}
+
+async function renderPluginsTab() {
+  const main = document.getElementById('main');
+  let data;
+  try {
+    data = await fetchJson('/api/plugins');
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Could not load plugins: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  const slotted = plugins => plugins.filter((p) => p.slot);
+  const unslotted = plugins => plugins.filter((p) => !p.slot);
+  const allPlugins = data.plugins || [];
+  const rows = unslotted(allPlugins).map((p) => {
+    const enabled = p.enabled !== false;
+    return `
+      <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+        <label style="display:flex; align-items:center; gap:8px; margin-top:2px; cursor:pointer;">
+          <input type="checkbox" class="plugin-toggle" data-name="${escapeAttr(p.name)}" ${enabled ? 'checked' : ''}>
+        </label>
+        <div style="flex:1; min-width:0;">
+          <div style="font-weight:600;">${escapeHtml(p.name)} ${enabled ? '' : '<span class="badge idle" style="margin-left:6px;">disabled</span>'}</div>
+          ${p.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(p.description)}</div>` : ''}
+          <div class="meta" style="margin-top:4px; word-break:break-all; font-family:monospace; font-size:11px; color:var(--muted);">${escapeHtml(p.registerPath || '(no path)')}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  // Slotted plugins (e.g. "hardware-tab") are mutually exclusive -- a radio group, not
+  // independent checkboxes, since exactly one (or none) actually runs at a time and
+  // switching genuinely starts/stops the underlying process (see /api/plugins/select-slot).
+  const slotGroups = {};
+  slotted(allPlugins).forEach((p) => { (slotGroups[p.slot] = slotGroups[p.slot] || []).push(p); });
+  const slotSections = Object.entries(slotGroups).map(([slot, members]) => {
+    const radioName = `slot-${slot}`;
+    const noneChecked = !members.some((m) => m.active) ? 'checked' : '';
+    const options = [`
+      <label style="display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer;">
+        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="" ${noneChecked}>
+        <span>None (stop monitoring)</span>
+      </label>`, ...members.map((m) => {
+      const badge = m.running
+        ? '<span class="badge ok" style="margin-left:6px;">running</span>'
+        : '<span class="badge idle" style="margin-left:6px;">stopped</span>';
+      return `
+      <label style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px; cursor:pointer;">
+        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="${escapeAttr(m.name)}" ${m.active ? 'checked' : ''} style="margin-top:2px;">
+        <span>
+          <div style="font-weight:600;">${escapeHtml(m.name)}${badge}</div>
+          ${m.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(m.description)}</div>` : ''}
+        </span>
+      </label>`;
+    })];
+    return `
+      <div style="padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+        <div class="field-label" style="margin-bottom:6px;">${escapeHtml(slot)} source</div>
+        <div style="display:flex; flex-direction:column; gap:2px;" id="slot-group-${escapeAttr(slot)}">${options.join('')}</div>
+        <div class="meta slot-status" style="margin-top:6px;"></div>
+      </div>`;
+  }).join('');
+
+  main.innerHTML = `
+    <h2 style="margin-top:0;">Plugins</h2>
+    ${slotSections}
+    <div class="meta" style="margin-bottom:14px;">
+      Only enabled plugins register their task sources. A change here restarts the pipeline if it is running so an
+      in-flight draft for a now-disabled source can't stall. Manifest: <span style="font-family:monospace;">${escapeHtml(data.manifestPath || 'plugins.json')}</span>
+    </div>
+    <div id="plugins-list">${rows || '<div class="empty">No plugins registered yet -- add one below.</div>'}</div>
+
+    <h3 style="margin-top:22px;">Add a plugin</h3>
+    <div style="display:flex; flex-direction:column; gap:8px; max-width:640px;">
+      <input type="text" id="plugin-add-path" placeholder="Absolute path to the plugin's register.js (e.g. /media/model-cache/github/agent-manager-imagegen/register.js)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <input type="text" id="plugin-add-name" placeholder="Name (optional -- defaults to the plugin folder name)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <input type="text" id="plugin-add-desc" placeholder="Description (optional)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <button class="action" id="plugin-add-btn" style="align-self:flex-start;">Add plugin</button>
+      <div id="plugin-add-msg" class="meta"></div>
+    </div>
+
+    <h3 style="margin-top:22px;">Available plugins</h3>
+    <div id="marketplace-note" class="meta" style="margin-bottom:10px;"></div>
+    <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
+
+  main.querySelectorAll('.slot-radio').forEach((radio) => {
+    radio.onchange = async () => {
+      const slot = radio.dataset.slot;
+      const name = radio.value || null;
+      const group = main.querySelector(`#slot-group-${slot}`);
+      const statusEl = group ? group.closest('div').parentElement.querySelector('.slot-status') : null;
+      group.querySelectorAll('input').forEach((r) => { r.disabled = true; });
+      if (statusEl) statusEl.textContent = name ? `Starting ${name}...` : 'Stopping...';
+      try {
+        const r = await fetch('/api/plugins/select-slot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slot, name }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.description || r.status);
+        if (name && !body.healthy) {
+          if (statusEl) statusEl.textContent = `${name} started but did not report healthy in time -- check its log.`;
+        }
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not switch plugin: ' + e.message);
+        await renderPluginsTab();
+      }
+    };
+  });
+
+  main.querySelectorAll('.plugin-toggle').forEach((cb) => {
+    cb.onchange = async () => {
+      cb.disabled = true;
+      try {
+        const r = await fetch('/api/plugins/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: cb.dataset.name, enabled: cb.checked }),
+        });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).description || r.status);
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not update plugin: ' + e.message);
+        cb.checked = !cb.checked;
+        cb.disabled = false;
+      }
+    };
+  });
+
+  const addBtn = main.querySelector('#plugin-add-btn');
+  addBtn.onclick = async () => {
+    const msg = main.querySelector('#plugin-add-msg');
+    const registerPath = main.querySelector('#plugin-add-path').value.trim();
+    const name = main.querySelector('#plugin-add-name').value.trim();
+    const description = main.querySelector('#plugin-add-desc').value.trim();
+    if (!registerPath) { msg.textContent = 'A register.js path is required.'; return; }
+    addBtn.disabled = true;
+    msg.textContent = 'Adding...';
+    try {
+      const r = await fetch('/api/plugins/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ registerPath, name, description }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.description || r.status);
+      await renderPluginsTab();
+    } catch (e) {
+      msg.textContent = 'Could not add plugin: ' + e.message;
+      addBtn.disabled = false;
+    }
+  };
+
+  // Marketplace: fetch catalog entries annotated with install status and render
+  // Install / Update / Installed controls per entry. 402/403 surface via showToast.
+  (async () => {
+    const listEl = main.querySelector('#marketplace-list');
+    const noteEl = main.querySelector('#marketplace-note');
+    let mkt;
+    try {
+      mkt = await fetchJson('/api/plugins/marketplace');
+    } catch (e) {
+      listEl.innerHTML = '<div class="meta">Could not load marketplace: ' + escapeHtml(e.message) + '</div>';
+      return;
+    }
+    if (mkt.catalogError) {
+      noteEl.textContent = mkt.catalogError;
+    }
+    const entries = mkt.plugins || mkt.entries || [];
+    if (!entries.length) {
+      listEl.innerHTML = '<div class="meta">No plugins available in the catalog.</div>';
+      return;
+    }
+    listEl.innerHTML = entries.map((p) => {
+      const installed = p.installed === true;
+      const updateAvail = p.updateAvailable === true;
+      let priceText = '';
+      if (p.pricing && p.pricing.model && p.pricing.model !== 'free') {
+        const cur = p.pricing.currency || '';
+        const amt = p.pricing.amount_cents != null ? (p.pricing.amount_cents / 100) : 0;
+        const interval = p.pricing.interval || '';
+        priceText = escapeHtml(cur + ' ' + amt + (interval ? ' / ' + interval : ''));
+      }
+      let controlHtml = '';
+      if (installed && updateAvail) {
+        controlHtml = '<button class="action" data-mkt-action="update" data-id="' + escapeAttr(p.id) + '">Update</button>';
+      } else if (installed) {
+        controlHtml = '<span class="badge ok" style="margin-top:2px;">Installed</span>';
+      } else {
+        const isPaid = p.pricing && p.pricing.model && p.pricing.model !== 'free';
+        const paidStyle = isPaid ? ' style="opacity:0.7; border-style:dashed;" title="Paid plugin -- requires a license"' : '';
+        controlHtml = '<button class="action" data-mkt-action="install" data-id="' + escapeAttr(p.id) + '"' + paidStyle + '>Install</button>';
+      }
+      const versionLine = p.installedVersion
+        ? '<div class="meta" style="margin-top:2px; font-size:11px;">Installed: ' + escapeHtml(p.installedVersion) + (updateAvail ? ' <span class="badge idle" style="margin-left:4px;">update available</span>' : '') + '</div>'
+        : '';
+      return '<div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">'
+        + '<div style="flex:1; min-width:0;">'
+        + '<div style="font-weight:600;">' + escapeHtml(p.name) + (priceText ? ' <span class="meta" style="margin-left:8px;">' + priceText + '</span>' : '') + '</div>'
+        + '<div class="meta" style="margin-top:2px;">' + escapeHtml(p.summary || '') + '</div>'
+        + versionLine
+// ... [truncated for review: this function continues for 36 more line(s) not shown]
+```
+
+Problem:
+The 236-line `renderPluginsTab` interleaves five distinct responsibilities—fetching and rendering unslotted toggle rows, building slotted radio-group sections, assembling the page shell and add-plugin form, wiring three separate event-handler loops, and fetching plus rendering the marketplace catalog—each with its own data source, UI paradigm, and failure mode. A developer changing the marketplace pricing display must scroll past roughly 170 lines of unrelated toggle and radio code; a developer updating the slot-switching API contract must locate the handler buried among the toggle and add-plugin handlers. All five sections share one top-level scope with no per-section error isolation, so a DOM-query bug in one section can silently break another. The inline-CSS template strings inflate the line count, but the root issue is that five independently testable units share one call stack and one `main` reference.
+
+Solution:
+Extract each responsibility into its own named function so the top-level orchestrator drops to roughly 25 lines of sequencing. The concrete shape is:
+
+```js
+// core-ui.js — replaces the single 236-line renderPluginsTab
+
+async function renderPluginsTab() {
+  const main = document.getElementById('main');
+  let data;
+  try {
+    data = await fetchJson('/api/plugins');
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Could not load plugins: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+
+  const all = data.plugins || [];
+  const unslotted = all.filter(p => !p.slot);
+  const slotted   = all.filter(p => p.slot);
+
+  main.innerHTML = `
+    <h2 style="margin-top:0;">Plugins</h2>
+    ${buildSlotSections(slotted)}
+    <div id="plugins-list">${buildUnslottedRows(unslotted)}</div>
+    ${buildAddPluginForm()}
+    <div id="marketplace-list"></div>
+    <div id="marketplace-note"></div>`;
+
+  wireSlotRadios(main);
+  wirePluginToggles(main);
+  wireAddPluginForm(main);
+  renderMarketplace(main);
+}
+
+function buildUnslottedRows(plugins) { /* existing checkbox-row template */ }
+function buildSlotSections(plugins)   { /* existing radio-group template */ }
+function buildAddPluginForm()         { /* existing form markup */ }
+
+function wireSlotRadios(main) {
+  main.querySelectorAll('.slot-radio').forEach(radio => {
+    radio.onchange = async () => { /* existing select-slot handler */ };
+  });
+}
+
+function wirePluginToggles(main) {
+  main.querySelectorAll('.plugin-toggle').forEach(cb => {
+    cb.onchange = async () => { /* existing toggle handler */ };
+  });
+}
+
+function wireAddPluginForm(main) {
+  const btn = main.querySelector('#plugin-add-btn');
+  btn.onclick = async () => { /* existing add handler */ };
+}
+
+async function renderMarketplace(main) {
+  const listEl = main.querySelector('#marketplace-list');
+  const noteEl = main.querySelector('#marketplace-note');
+  let mkt;
+  try { mkt = await fetchJson('/api/plugins/marketplace'); }
+  catch (e) { noteEl.textContent = e.message; return; }
+  /* existing catalog card rendering */
+}
+```
+
+Each extracted function takes a data array or a `main` element and returns/renders HTML, making it independently unit-testable with a mock DOM node or a plain data fixture.
+
+Benefits:
+Once decomposed, a change to the marketplace card layout touches only `renderMarketplace` and its template—no scrolling through toggle or radio code. The three event-wiring functions can be tested in isolation by constructing a minimal DOM stub and asserting that the correct `fetchJson` URL is called on the right user action. Code review diffs become scoped to one responsibility at a time, and the single shared top-level scope (where a typo in one `querySelector` could silently break a sibling section) is replaced by per-function error boundaries. The top-level function becomes a readable table-of-contents that a new contributor can scan in under ten seconds.
+
+### AC-54 · Extract event-wiring and async I/O from renderTaskDetailModal
+Strength: Strong
+Files: python/dashboard/static/js/task-detail-modal.js
+Snippet:
+```
+}
+
+function renderTaskDetailModal(task) {
+  const backdrop = document.getElementById('modal-backdrop');
+  const content = document.getElementById('modal-content');
+  let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}</h2>`;
+  // "Send to Chat" (2026-09-01) -- dumps this task's key context into the System Chat
+  // panel as a user message (via sendTextToChat -> POST /api/chat/inject, no model call)
+  // so a follow-up can be had about it. Button sits in the modal's top action area, same
+  // .secondary style as Discuss/Edit/Delete. Wired below (task-send-to-chat) rather than
+  // inlined so the multi-line payload isn't quote-escaping trouble in an onclick string.
+  // Premium Priority toggle (2026-09-07, Grimmethy: "I'll need a way in app to be able
+  // to set that premium priority slot for any specific task. I am getting tired of
+  // manually selecting it for the worker queue every pass.") -- POSTs
+  // /api/task-anywhere/<id>/premium-priority, which finds the task wherever it currently
+  // sits (pending/blocked/needs-clarification/drafting/adhoc) and stamps/clears
+  // task.premiumPriority; next-claimable-task.js's effectivePriority() then sorts it
+  // ahead of EVERY other task, every tick, until this is turned off again or the task
+  // reaches done -- unlike the Workers tab's per-instance assign-task pin (one-shot,
+  // cleared the moment it's claimed), this is meant to be "set once, forget it."
+  const premiumOn = !!task.premiumPriority;
+  html += `<div style="margin:8px 0 4px">`
+    + `<button type="button" class="secondary" id="task-send-to-chat">Send to Chat</button> `
+    + `<button type="button" class="${premiumOn ? 'action' : 'secondary'}" id="task-premium-priority" title="${premiumOn ? 'Currently claimed ahead of everything else in the queue, every pass, until turned off or the task completes. Click to turn off.' : 'Always claim this task first, every pass, regardless of source or age -- stays on until you turn it off or the task completes.'}">${premiumOn ? '★ Premium Priority (on)' : '☆ Set Premium Priority'}</button>`
+    + `</div>`;
+  if (task._foundState) html += `<div class="field-label">Queue State</div><div>${escapeHtml(task._foundState)}</div>`;
+  html += `<div><strong>${escapeHtmlBright(task.title || '')}</strong></div>`;
+  // Hub back-link (2026-09-06, Grimmethy: "when a task is a sub-task of a hub I should be
+  // able to click into the hub task from the top of the sub task's task log") -- the
+  // inverse of renderSubTaskChecklist just below (which shows a hub's children): a
+  // decomposed sub-task's promptContext.decomposedFrom already names its owning hub's id
+  // (file-decompose-to-hub.js, applyAdhocDiff's own decompose path), but nothing ever
+  // surfaced it -- a human landing on a stuck sub-task (like the stacked file-decompose
+  // incident this same night) had no one-click way back to the hub coordinating it.
+  // taskLink() + the existing data-open-task-anywhere delegation below already do the
+  // rest -- the hub could be in coordinating/, done/, or blocked/, so this doesn't guess.
+  if (task.promptContext && task.promptContext.decomposedFrom) {
+    html += `<div class="field-label">Part of Hub</div><div>${taskLink(task.promptContext.decomposedFrom)}</div>`;
+  }
+  html += renderSubTaskChecklist(task);
+  html += renderRelatedTasks(task);
+  // Task metadata (2026-08-26, Grimmethy: "At the top of every task I'd like to see a
+  // bit of meta data. How much machine time was spent on the task and a list of all the
+  // files it touched") -- totalLatencyMs sums real wall-clock time across every model
+  // call this task made (see _task_cost_summary's own comment: recorded for local Ollama
+  // calls the same as Claude ones, unlike totalCostUsd which is $0, not absent, for an
+  // all-local task). _filesTouched is server-computed from whichever shape this task's
+  // actual on-disk change came in (a unified diff, or a Group B JSON change list) --
+  // empty for a task that never wrote to the filesystem at all (a verdict-only audit, a
+  // split proposal), not an error.
+  if (task._costSummary && task._costSummary.totalLatencyMs != null) {
+    html += `<div class="field-label">Machine Time</div><div>${fmtDuration(task._costSummary.totalLatencyMs / 1000)} across ${task._costSummary.totalCalls} model call(s)</div>`;
+  }
+  if (task._filesTouched) {
+    const filesLabel = task._filesTouched.length
+      ? task._filesTouched.map(f => `<code>${escapeHtml(f)}</code>`).join('<br>')
+      : '<span class="meta">no files touched</span>';
+    html += `<div class="field-label">Files Touched (${task._filesTouched.length})</div><div>${filesLabel}</div>`;
+  }
+  // Estimated Anthropic API cost for this ONE task (2026-08-23, Grimmethy: "We should
+  // include estimated cost tracking in the job page itself") -- api_task_detail/
+  // api_task_anywhere sum every model_calls row for this task_id server-side (a task can
+  // carry several real calls: plan, implement, critique, revision), since task.abCallId
+  // on the task itself only ever holds the MOST RECENT one. _costSummary is null (not a
+  // zeroed object) when the db/column isn't available or no calls exist yet for this
+  // task at all -- shown only when there's something real to show.
+  if (task._costSummary) {
+    const cs = task._costSummary;
+    // hypotheticalCostUsd (2026-08-23, Grimmethy: "Clarification on the anthropic
+    // costs. I'd like estimates for if we had used the API. Even if we used the local
+    // models.") -- unlike totalCostUsd (real spend, $0 for an all-local task), this is
+    // always a real number: what THIS task would have cost had every one of its calls,
+    // local or not, gone through the API.
+    const realLabel = cs.totalCostUsd > 0
+      ? `${fmtUsd(cs.totalCostUsd)} real (${cs.callsWithCost}/${cs.totalCalls} call(s) via Claude)`
+      : `$0 real -- all ${cs.totalCalls} call(s) ran locally`;
+    const hLabel = cs.hypotheticalCostUsd != null ? ` · ${fmtUsd(cs.hypotheticalCostUsd)} est. if every call had used the API` : '';
+    html += `<div class="field-label">Estimated API Cost</div><div>${realLabel}${hLabel}</div>`;
+  }
+  // Request / Input (2026-08-30, Grimmethy: "I get no indication of what actually
+  // happened") -- the task's actual INPUT (what the model was asked to act on). Different
+  // sources stash it under different promptContext keys; app.py's _task_input_summary
+  // normalises them into a [{label, text}] list so a blocked product_spec task shows its
+  // ~2KB request brief (promptContext.requestText) instead of just a truncated title.
+  if (task._requestInput && task._requestInput.length) {
+    for (const item of task._requestInput) {
+      html += `<div class="field-label">${escapeHtml(item.label)}</div><pre>${escapeHtml(item.text)}</pre>`;
+    }
+  }
+  html += `<div class="field-label">Domain / Source</div><div>${task.domain || ''} / ${task.source || ''}</div>`;
+  if (task.blockedReason) html += `<div class="field-label">Blocked Reason</div><div style="color:var(--bad)">${escapeHtmlBright(task.blockedReason)}</div>`;
+  if (task.branch) html += `<div class="field-label">Branch</div><div>${task.branch}</div>`;
+  if (task.promptContext && task.promptContext.prefetchedPaths && task.promptContext.prefetchedPaths.length) {
+    html += `<div class="field-label">Prefetched Paths</div><div>${task.promptContext.prefetchedPaths.map(p => `<code>${escapeHtml(p)}</code>`).join('<br>')}</div>`;
+  }
+  // staleness_audit (2026-08-22, Grimmethy: "I don't have information in the task page
+  // about when it was actually set up. The pipeline history only shows the newest
+  // staleness audit. All previous steps are missing.") -- this task's OWN
+  // task.history[] only ever covers its own short life (created -> drafted -> reviewed);
+  // the thing a human actually needs to judge "is this really stale" is the ORIGINAL
+  // flagged task's own dates, which staleness-audit.js now stamps as structured fields
+  // (originalTitle/originalCreatedAt/originalLastActivityAt) specifically so this can
+  // render them directly instead of leaving them buried in evidenceText's prose (which
+  // only the drafting MODEL ever reads).
+  if (task.source === 'staleness_audit' && task.promptContext && task.promptContext.originalTaskId) {
+    const pc = task.promptContext;
+    html += `<div class="field-label">Original Flagged Task</div><div>`
+      + `<code>${escapeHtml(pc.originalTaskId)}</code>`
+      + (pc.originalTitle ? `<br>${escapeHtml(pc.originalTitle)}` : '')
+      + `<br><span class="meta">Created: ${pc.originalCreatedAt ? new Date(pc.originalCreatedAt).toLocaleString() : 'unknown'}`
+      + ` &middot; Last activity: ${pc.originalLastActivityAt ? new Date(pc.originalLastActivityAt).toLocaleString() : 'unknown'}</span>`
+      + (pc.reasons && pc.reasons.length ? `<br><span class="meta">Flagged: ${pc.reasons.map(escapeHtml).join(', ')}</span>` : '')
+      + `</div>`;
+  }
+  html += renderForensicsStudyBlock(task);
+  // For advisoryProse sources (pipeline_forensics) the deliverable IS implementResponse --
+  // a root-cause report, not a diff. Rendered dead last under a generic "Implement" label,
+  // it reads as buried; hoist it right below the study framing so the modal leads with the
+  // conclusion. The bottom-of-modal block is then skipped (reportShown).
+  let reportShown = false;
+  if (PROSE_REPORT_SOURCES.has(task.source) && task.implementResponse) {
+    html += `<div class="field-label">Root-Cause Report</div><pre>${escapeHtmlBright(task.implementResponse)}</pre>`;
+    reportShown = true;
+  }
+  if (task.needsClarification) html += renderClarificationPicker(task);
+  // Pipeline History: task.history[] (task-history.js's appendHistoryEvent -- see that
+  // module for the schema). Was written correctly the whole time this session but never
+  // rendered anywhere in the app -- the data existed only if you went and read the raw
+  // task JSON off disk yourself, which defeats the point of a per-step timeline being a
+  // dashboard feature at all. Entries come in two shapes: older ones only ever have
+  // `status` (no `stage`, no `detail`) from before task-history.js existed -- render both
+  // so a task whose life started before this feature shipped doesn't just show a gap.
+  if (task.history && task.history.length) {
+    const liveBadge = TASK_DETAIL_LIVE_STATES.has(task._foundState || '')
+      ? ` <span class="meta" title="this task is mid-pass; new steps appear here automatically">● live</span>` : '';
+    html += `<div class="field-label">Pipeline History${liveBadge}</div><div class="task-history">`;
+    html += task.history.map(h => {
+      const label = h.stage || h.status || '?';
+      const when = h.at ? new Date(h.at).toLocaleString() : '';
+      const detail = h.detail || h.note || '';
+      return `<div class="task-history-row"><span class="task-history-stage">${escapeHtml(label)}</span> `
+        + `<span class="meta">${escapeHtml(when)}</span>`
+        + (detail ? `<div class="meta">${escapeHtml(detail)}</div>` : '')
+        + `</div>`;
+    }).join('') + `</div>`;
+  }
+  // Draft Attempts: one collapsible record per draftTask() run (draft-attempt-record.js).
+  // task.planResponse / task.implementResponse below only ever show the LAST run; this is
+  // the per-attempt history -- every earlier plan, every tier's decline reason + response,
+  // every tier-3 worktree diff -- so following up on a task that failed N times no longer
+  // means re-investigating from scratch.
+  html += renderDraftAttempts(task);
+  html += renderWorkLog(task);
+  html += renderHarnessHits(task);
+  html += renderEvidenceBundle(task);
+  // A "degenerate: empty" block means the model returned nothing for that pass -- the
+  // field is absent, not present-and-empty, so without this the modal just omits the
+  // section and the timeline is the only hint anything ran. Say it explicitly.
+  const emptyPlan = !task.planResponse && /plan pass degenerate/i.test(task.blockedReason || '');
+  const emptyImpl = !task.implementResponse && /implement pass degenerate/i.test(task.blockedReason || '');
+  if (task.planResponse) html += `<div class="field-label">Plan</div><pre>${escapeHtmlBright(task.planResponse)}</pre>`;
+  else if (emptyPlan) html += `<div class="field-label">Plan</div><pre class="meta">(the plan pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
+  if (task.implementResponse && !reportShown) html += `<div class="field-label">Implement</div><pre>${escapeHtmlBright(task.implementResponse)}</pre>`;
+  else if (emptyImpl) html += `<div class="field-label">Implement</div><pre class="meta">(the implement pass returned an empty response — nothing was drafted; see Blocked Reason above)</pre>`;
+  content.innerHTML = html;
+  backdrop.classList.add('open');
+  // Jump to another task from an in-modal link (the forensic study's failing/winner ids) --
+  // same delegated pattern the Recent Tasks / Workers lists use.
+  content.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
+    link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
+  });
+  if (task.needsClarification) wireClarificationPicker(task.id);
+  // "Send to Chat" button handler (declared in the modal HTML above). 2026-09-07: used
+  // to dump this task's title/source/blockedReason/request/plan/implement text into the
+  // System Chat panel as one user message -- measured live at ~13k chars / a real
+  // 10,713-token first turn (65% of the local chat's 16,384-token window,
+  // instances/context-budget-audit.log), most of which the conversation often never
+  // needed. Now injects just the id + title; the model has real lookup tools
+  // (read_task/search_tasks, local-tool-client.js) to pull the rest -- summary first,
+  // then one specific section (plan/implement/history/blockedReason) only if a question
+  // actually needs it -- instead of paying for the whole blob on every single click. See
+  // concept-send-to-chat-307f1b's research for the two gaps this closes (no lookup tool
+  // existed, no search existed) and the plan behind this change.
+  // VERIFIED 2026-09-08 (this file): button created at line 221; this handler reads ONLY
+  // task.id (line 387) and task.title (line 388) -- none of blockedReason/request/plan/
+  // implement -- and hard-caps the payload at <=200 chars before sendTextToChat
+  // (core-ui.js:783), which POSTs the { text } verbatim to /api/chat/inject with no
+  // further expansion. That is the full, complete scope of what gets injected.
+  const taskSendToChatBtn = document.getElementById('task-send-to-chat');
+  if (taskSendToChatBtn) {
+    taskSendToChatBtn.onclick = async () => {
+      taskSendToChatBtn.disabled = true;
+      try {
+        const parts = [`# ${task.id}`];
+        if (task.title) parts.push('title: ' + task.title);
+        let text = parts.join('\n\n');
+        if (text.length > 200) text = text.slice(0, 199) + '…'; // hard cap: sendTextToChat must never receive >200 chars
+        await sendTextToChat(text); // POSTs, expands the sidebar, tells the plugin iframe to refresh; throws on !ok
+        showToast('Sent to chat', 'info');
+      } catch (e) {
+        showToast('Could not send to chat: ' + e.message);
+      } finally {
+// ... [truncated for review: this function continues for 27 more line(s) not shown]
+```
+
+Problem:
+renderTaskDetailModal spans 227 lines and mixes two distinct responsibilities: building the modal's HTML string (≈150 lines of linear `if (task.X) html += …` field appends) and wiring post-render DOM events (≈45 lines of click-delegation, clarification-picker binding, and an async send-to-chat handler that disables the button, makes a network call, and manages disabled-state transitions). The async handler in particular violates the function's implicit contract of "produce a string and set innerHTML" — a future change to the chat payload forces a reader to scroll through 150 lines of `<div>` concatenation to find the `onclick`, and the handler cannot be unit-tested in isolation without exercising the entire HTML builder.
+
+Solution:
+Extract the event-wiring block (task-link delegation, clarification-picker binding, and the async send-to-chat handler) into a new `wireTaskDetailModalEvents(content, task)` function called at the end of `renderTaskDetailModal` after `content.innerHTML = html`. The linear field-appending stays in place — splitting 18 two-line conditionals into 18 one-line calls adds ceremony without reducing cognitive load. Optionally, the pipeline-history `.map()` block (≈15 lines with its own loop, badge ternary, and date formatting) can be extracted into `renderPipelineHistory(task)` returning an HTML string.
+
+```diff
+--- a/python/dashboard/static/js/task-detail-modal.js
++++ b/python/dashboard/static/js/task-detail-modal.js
+@@ -207,6 +207,7 @@ function renderTaskDetailModal(task) {
+   const backdrop = document.getElementById('modal-backdrop');
+   const content = document.getElementById('modal-content');
+   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}</h2>`;
+   /* … all existing html += … lines unchanged … */
+   content.innerHTML = html;
+   backdrop.classList.add('open');
+-  content.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
+-    link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
+-  });
+-  if (task.needsClarification) wireClarificationPicker(task.id);
+-  const taskSendToChatBtn = document.getElementById('task-send-to-chat');
+-  if (taskSendToChatBtn) {
+-    taskSendToChatBtn.onclick = async () => {
+-      taskSendToChatBtn.disabled = true;
+-      try {
+-        const parts = [`# ${task.id}`];
+-        if (task.title) parts.push('title: ' + task.title);
+-        let text = parts.join('\n\n');
+-        if (text.length > 200) text = text.slice(0, 199) + '\u2026';
+-        await sendTextToChat(text);
+-        showToast('Sent to chat', 'info');
+-      } catch (e) {
+-        showToast('Could not send to chat: ' + e.message);
+-      } finally {
+-        taskSendToChatBtn.disabled = false;
+-      }
+-    };
+-  }
++  wireTaskDetailModalEvents(content, task);
+ }
++
++function wireTaskDetailModalEvents(content, task) {
++  content.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
++    link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
++  });
++  if (task.needsClarification) wireClarificationPicker(task.id);
++  const taskSendToChatBtn = document.getElementById('task-send-to-chat');
++  if (taskSendToChatBtn) {
++    taskSendToChatBtn.onclick = async () => {
++      taskSendToChatBtn.disabled = true;
++      try {
++        const parts = [`# ${task.id}`];
++        if (task.title) parts.push('title: ' + task.title);
++        let text = parts.join('\n\n');
++        if (text.length > 200) text = text.slice(0, 199) + '\u2026';
++        await sendTextToChat(text);
++        showToast('Sent to chat', 'info');
++      } catch (e) {
++        showToast('Could not send to chat: ' + e.message);
++      } finally {
++        taskSendToChatBtn.disabled = false;
++      }
++    };
++  }
++}
+```
+
+Benefits:
+renderTaskDetailModal drops from 227 to roughly 170 lines, and every remaining line serves the single concern of "build the modal's HTML." The 50+ lines of event wiring and async I/O now live in wireTaskDetailModalEvents, which is independently testable (mock sendTextToChat, assert button disabled-state transitions) without exercising the HTML builder. A reviewer changing the chat payload sees a 20-line function instead of scrolling past 150 lines of `<div>` concatenation. The linear field-appending stays readable top-to-bottom in its original order, which is exactly the reading order a developer needs when adding a new task field.
+
+### AC-55 · Decompose resolveAgenticDraft resolution-class branches into named handlers
+Strength: Strong
+Files: src/agentic-draft-common.js
+Snippet:
+```
+// neutral: reads only `result.response` / `result.degenerate` and stages the worktree's
+// diff. `retriedForTurnBudget` only tunes the "did not end with RESOLUTION" note.
+function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedForTurnBudget = false }) {
+  const summary = (result && result.response) || '';
+  // Both cleared on every outcome; set true again below only for the specific
+  // draft-stage blocks a redraft could plausibly fix, which reject-retry-check.js then
+  // requeues (bounded, with grounding) instead of leaving them to dead-end in blocked/.
+  // A stale true from an earlier attempt must not survive a later one.
+  //   turnBudgetExhausted  -- ran the whole turn budget, made zero edits, no diff
+  //   retryableDraftBlock  -- the broader "adhoc tier-3 block that is redraft-eligible"
+  //                           marker (turn-budget exhaustion OR a malformed decompose)
+  task.turnBudgetExhausted = false;
+  task.retryableDraftBlock = false;
+  // draft-attempt-record.js: the caller records this tier's real output, tool activity,
+  // and -- on a NON-clean outcome (degenerate / no RESOLUTION line / bad decompose) where
+  // resolveAgenticDraft otherwise stages nothing -- whatever the model left in the
+  // worktree, so a 20-turn tier-3 run that ends up blocked is no longer a black box.
+  // All additive on the returned object; callers read succeeded/blocked/blockedReason/
+  // needsClarification exactly as before. bestEffortDiff is best-effort (the worktree is
+  // still alive here; cleanup runs in runAgenticDraftInWorktree's outer finally).
+  const meta = {
+    response: summary,
+    toolCallLog: (result && result.toolCallLog) || undefined,
+    turnsUsed: result && result.turnsUsed,
+  };
+  const bestEffortDiff = () => {
+    try {
+      stageDraftChanges({ worktreeDir, runGit, task });
+      // --full-index --binary: see group-b-worktree-diff.js's own note (2026-09-14) --
+      // without both flags together, `git apply` refuses a binary patch outright (or
+      // fails with "missing binary patch data") if git's own heuristic ever decides a
+      // produced file is binary (a literal NUL byte in otherwise-ordinary source content
+      // is enough), even though the file itself is perfectly normal text. Costs nothing
+      // for the common text-patch case.
+      // normalizeDiffOutput (not a bare .trim()): see its own header note -- a bare
+      // .trim() strips the trailing blank line a `GIT binary patch` section structurally
+      // requires (corrupt binary patch at apply time), and for an ordinary text diff
+      // fails to restore the exactly-one trailing newline `git apply` needs (the
+      // original 2026-09-08 incident this shared helper exists to fix).
+      return normalizeDiffOutput(runGit(['diff', '--cached', '--full-index', '--binary'], worktreeDir)) || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  if (result && result.degenerate) {
+    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass degenerate: ${result.degenerate}${retriedForTurnBudget ? ' (retried once at a larger turn budget)' : ''}`, ...meta, capturedDiff: bestEffortDiff() };
+  }
+
+  const resolutionMatch = summary.match(RESOLUTION_RE);
+  const resolution = resolutionMatch ? resolutionMatch[1].toLowerCase() : null;
+  if (modelLabel) task.draftModel = modelLabel;
+  meta.resolution = resolution || undefined;
+
+  if (!resolution) {
+    // Fix (2026-08-31, bra-1788142124203): the run hit its turn cap and even
+    // runPlanWithTools' forced final no-tools turn (result.forcedSummary) didn't yield a
+    // parseable RESOLUTION. Hard-blocking here throws the whole run away as "cannot
+    // determine outcome". Instead hand it to a human as a clarification, carrying the
+    // transcript and whatever partial work landed in the worktree -- the same terminal
+    // shape a real RESOLUTION: needs-human-decision produces.
+    if (result && result.forcedSummary) {
+      const capturedDiff = bestEffortDiff();
+      const edits = ((result && result.toolCallLog) || [])
+        .filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
+      // The failure class this whole grounding change targets: the model spent its entire
+      // turn budget exploring and never edited a single file (no edit/write calls, empty
+      // worktree). A hardcoded "needs-human-decision" placeholder is neither a real
+      // question nor a retryable state -- record a clean, honest block that
+      // reject-retry-check.js can requeue once with the plan + prior-investigation map.
+      if (edits === 0 && !capturedDiff) {
+        task.turnBudgetExhausted = true;
+        task.retryableDraftBlock = true;
+        // Sticky (survives reject-retry-check's reset of turnBudgetExhausted): a leaf that
+        // has demonstrably blown a full budget with zero edits is NOT confirmed-atomic --
+        // local-agentic-write-draft.js's leafDecomposeLocked() reads this to let it
+        // choose RESOLUTION: decompose on the next pass.
+        task.turnBudgetExhaustedBefore = true;
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: 'Agentic implement pass exhausted its turn budget without making any edits -- likely needs grounding or a smaller scope',
+          ...meta,
+          capturedDiff: undefined,
+        };
+      }
+      // Otherwise the model got somewhere (partial work in the worktree, or the forced
+      // summary produced real content) -- keep the existing human-clarification path.
+      task.adhocResolution = 'needs-human-decision';
+      task.rawDiff = '';
+      task.implementResponse = summary
+        || '(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity for what it had investigated)';
+      // 2026-09-16, pipeline hardening: result.forcedSummaryNonCompliant means the model
+      // ignored runPlanWithTools' own explicit, bounded, twice-repeated demand for a
+      // RESOLUTION: line -- a mechanical gate/model-compliance failure, NOT the same kind
+      // of thing as a genuine RESOLUTION: needs-human-decision the model actually chose.
+      // Confirmed live: this exact shape stranded a task with a fully correct diff already
+      // sitting in its own history behind a human-only queue, twice in a row, because
+      // nothing distinguished "the model declined to decide" from "the model never even
+      // tried to answer the question this turn asked." Stamped here so a future triage
+      // pass (or a human reading the task) can tell the two apart without re-deriving it
+      // from the raw transcript.
+      if (result && result.forcedSummaryNonCompliant) task.forcedSummaryNonCompliant = true;
+      return { succeeded: true, blocked: false, needsClarification: true, ...meta, capturedDiff };
+    }
+    const budgetNote = retriedForTurnBudget
+      ? ' -- ran out of turns twice in a row; a larger budget alone will not fix this'
+      : '';
+    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}`, ...meta, capturedDiff: bestEffortDiff() };
+  }
+
+  if (resolution === 'decompose') {
+    const afterResolution = summary.slice(resolutionMatch.index + resolutionMatch[0].length);
+    const subTasks = parseSubTaskProposals(afterResolution);
+    const n = subTasks ? subTasks.length : 0;
+
+    if (n === 0) {
+      // The model reached a conclusion ("this is too big, split it") but produced no
+      // usable sub-task JSON at all.
+      //
+      // If it made REAL edits first, that is "I did part of it then ran low on turns/
+      // confidence" -- redirect to a CONTINUATION (finish what you started) exactly like
+      // the n >= 2 branch below, rather than blocking and throwing the partial work away.
+      // Confirmed live 2026-09-02 (second-brain note-graph task): two passes each made
+      // several successful edit_file calls, then answered RESOLUTION: decompose with
+      // malformed JSON -- every retry restarted from origin/master.
+      const partialDiff = bestEffortDiff();
+      const priorContinuations = Number(task.agenticContinuationCount) || 0;
+      if (partialDiff && priorContinuations < MAX_AGENTIC_CONTINUATIONS) {
+        task.agenticContinuationCount = priorContinuations + 1;
+        task.agenticContinuationNote = summary;
+        task.priorPartialDiff = partialDiff;
+        task.retryableDraftBlock = true;
+        task.isAgenticContinuation = true;
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose with no usable pieces -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish`,
+          ...meta,
+          capturedDiff: partialDiff,
+        };
+      }
+      // No partial work (or continuation budget spent): redraft-eligible with a format
+      // reminder. Sticky count of "said decompose, gave nothing usable" passes: local-
+      // agentic-write-draft.js's repeated-decompose backstop fires once this reaches 2 (do
+      // the split in a single clean call rather than requeue toward escalation).
+      // reject-retry-check.js does not reset it.
+      task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
+      task.retryableDraftBlock = true;
+      return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it', ...meta, capturedDiff: bestEffortDiff() };
+    }
+
+    if (n === 1) {
+      // A "decompose" into exactly ONE sub-task is the model saying "this is atomic" --
+      // usually it just could not commit to editing. Treat the single sub-task as a
+      // sharper re-scope of THIS task and requeue once (reject-retry-check.js swaps in the
+      // sharper rawText). If it decomposes-to-one AGAIN after being re-scoped, that is a
+      // real signal it needs a human -- escalate instead of looping.
+      if (task.rescopedFromDecompose === true) {
+        task.adhocResolution = 'needs-human-decision';
+        task.rawDiff = '';
+        task.implementResponse = `${summary}\n\n(decomposed to a single atomic sub-task twice without implementing it -- needs a human)`;
+        return { succeeded: true, blocked: false, needsClarification: true, ...meta };
+      }
+      task.rescopedFromDecompose = true;
+      task.rescopedRawText = subTasks[0].rawText;
+      // Also a "said decompose, not implementable as given" pass -- counts toward the
+      // repeated-decompose backstop (see the n === 0 branch).
+      task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
+      task.retryableDraftBlock = true;
+      return { succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass', ...meta, capturedDiff: bestEffortDiff() };
+    }
+
+    // A pass that made REAL edits and then answered RESOLUTION: decompose is not "this
+    // can't be one change" -- it is "I did part of it and ran low on turns/confidence."
+    // Accepting the split here discards that partial work (rawDiff = '') AND routinely
+    // drops whatever the model already finished from the sub-task list (root-caused live
+    // 2026-09-02 via the plugins-marketplace endpoint task: tier 3 wrote the catalog
+    // validators in app.py, then split into "seed file" + "test file" and the endpoint
+    // itself -- the actual deliverable -- silently vanished). Redirect it to a CONTINUATION
+    // (finish what you started), same mechanism the needs-human-decision branch uses,
+    // bounded by MAX_AGENTIC_CONTINUATIONS. Only once that budget is spent and it STILL
+    // wants to split do we accept the decompose.
+    const decomposeDiff = bestEffortDiff();
+    const continuations = Number(task.agenticContinuationCount) || 0;
+    if (decomposeDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+      task.agenticContinuationCount = continuations + 1;
+      task.agenticContinuationNote = summary;
+      task.priorPartialDiff = decomposeDiff;
+      task.retryableDraftBlock = true;
+      task.isAgenticContinuation = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish before any split`,
+        ...meta,
+        capturedDiff: decomposeDiff,
+      };
+    }
+
+    task.adhocResolution = resolution;
+    task.subTaskProposals = subTasks;
+// ... [truncated for review: this function continues for 222 more line(s) not shown]
+```
+
+Problem:
+The 422-line `resolveAgenticDraft` function contains six or more distinct decision paths (degenerate, no-resolution-with-forced-summary, no-resolution-without-forced-summary, decompose-with-0/1/≥2 subtasks, and the remaining resolution classes), each with its own preconditions, a distinct subset of `task.*` state mutations (`turnBudgetExhausted`, `retryableDraftBlock`, `turnBudgetExhaustedBefore`, `agenticContinuationCount`, `decomposeBlockCount`, `rescopedFromDecompose`, `adhocResolution`, `subTaskProposals`, `forcedSummaryNonCompliant`), and a distinct return shape. The branches are nested rather than flat: the `!resolution` path splits on `forcedSummary` → `edits===0` vs. else, and the `decompose` path splits on `n===0` / `n===1` / `n≥2` and then on `partialDiff && continuations < MAX` within each. Verifying that the correct flags are set and stale ones cleared in every path requires holding the entire state machine in working memory, and every new failure class adds another nested branch mid-function.
+
+Solution:
+Extract each resolution-class branch into a small, clearly-named handler function (≤ ~60 lines each) that owns its own `task.*` mutations and returns the same shape. The dispatcher resets cross-cutting flags, computes `meta` and `bestEffortDiff` once, then delegates. The concrete change to the top of the function and the first two handlers:
+
+```diff
+--- a/src/agentic-draft-common.js
++++ b/src/agentic-draft-common.js
+@@ -1,12 +1,14 @@
+ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedForTurnBudget = false }) {
+   const summary = (result && result.response) || '';
+   task.turnBudgetExhausted = false;
+   task.retryableDraftBlock = false;
++  // (existing meta / bestEffortDiff setup unchanged)
++
++  if (result && result.degenerate) {
++    return handleDegenerate({ task, result, meta, bestEffortDiff, retriedForTurnBudget });
++  }
+ 
+   const resolutionMatch = summary.match(RESOLUTION_RE);
+   const resolution = resolutionMatch ? resolutionMatch[1].toLowerCase() : null;
+   if (modelLabel) task.draftModel = modelLabel;
+   meta.resolution = resolution || undefined;
+ 
+-  // [~400 lines of nested if/else branches for degenerate, !resolution, decompose, implement, needs-human-decision]
++  if (!resolution) {
++    return handleNoResolution({ task, result, summary, meta, bestEffortDiff, retriedForTurnBudget });
++  }
++  if (resolution === 'decompose') {
++    return handleDecompose({ task, summary, resolutionMatch, subTasks: parseSubTaskProposals(
++      summary.slice(resolutionMatch.index + resolutionMatch[0].length)
++    ), meta, bestEffortDiff });
++  }
++  return handleOtherResolution({ task, resolution, summary, meta, bestEffortDiff, retriedForTurnBudget });
+ }
++
++function handleDegenerate({ task, result, meta, bestEffortDiff, retriedForTurnBudget }) {
++  return {
++    succeeded: true, blocked: true,
++    blockedReason: `Agentic implement pass degenerate: ${result.degenerate}${retriedForTurnBudget ? ' (retried once at a larger turn budget)' : ''}`,
++    ...meta, capturedDiff: bestEffortDiff(),
++  };
++}
++
++function handleNoResolution({ task, result, summary, meta, bestEffortDiff, retriedForTurnBudget }) {
++  if (result && result.forcedSummary) {
++    const capturedDiff = bestEffortDiff();
++    const edits = ((result.toolCallLog) || []).filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
++    if (edits === 0 && !capturedDiff) {
++      task.turnBudgetExhausted = true;
++      task.retryableDraftBlock = true;
++      task.turnBudgetExhaustedBefore = true;
++      return { succeeded: true, blocked: true, blockedReason: '…exhausted its turn budget without making any edits…', ...meta, capturedDiff: undefined };
++    }
++    task.adhocResolution = 'needs-human-decision';
++    task.rawDiff = '';
++    task.implementResponse = summary || '(…ran out of turns…)';
++    if (result.forcedSummaryNonCompliant) task.forcedSummaryNonCompliant = true;
++    return { succeeded: true, blocked: false, needsClarification: true, ...meta, capturedDiff };
++  }
++  return { succeeded: true, blocked: true, blockedReason: 'No resolution marker found', ...meta, capturedDiff: bestEffortDiff() };
++}
++
++function handleDecompose({ task, summary, resolutionMatch, subTasks, meta, bestEffortDiff }) {
++  const n = subTasks ? subTasks.length : 0;
++  if (n === 0) return handleDecomposeZeroSubTasks({ task, summary, meta, bestEffortDiff });
++  if (n === 1) return handleDecomposeOneSubTask({ task, subTasks, summary, meta, bestEffortDiff });
++  return handleDecomposeMultiple({ task, subTasks, meta, bestEffortDiff });
++}
++
++// handleDecomposeZeroSubTasks, handleDecomposeOneSubTask, handleDecomposeMultiple,
++// handleOtherResolution — each ≤ 60 lines, each owns its task.* mutations, each returns.
+```
+
+The existing inline incident comments (2026-08-31, 2026-09-02, 2026-09-16) move with their respective handlers. The `bestEffortDiff` closure and `meta` object stay in the dispatcher and are forwarded. Before cutting, confirm the truncated tail does not contain a branch that mutates state and then falls through to a later branch; if such fall-through exists, the seam is at the fall-through point rather than the resolution-class boundary.
+
+Benefits:
+Each handler is ≤ ~60 lines with its `task.*` mutations local and visible in one screen, so a reviewer verifying a single return path no longer needs to track 10+ flags across 6+ nested branches. Adding a new failure class becomes a new handler function; existing handlers are untouched and cannot be clobbered. Unit-testing a specific path (e.g. "decompose with 0 subtasks + partial diff → continuation") calls `handleDecomposeZeroSubTasks` directly with a fixture rather than mocking the entire 422-line entry point, and no other branch can interfere.
+
+### AC-56 · Extract restoreFilesAfterFailedApply from applyAdhocDiff
+Strength: Strong
+Files: src/apply-adhoc-diff.js
+Snippet:
+```
+}
+
+function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
+  if (task && task.adhocResolution === 'decompose') {
+    return buildDecomposedPlan(task, pipelineDir);
+  }
+
+  const rawDiff = (task && task.rawDiff) || '';
+  if (!rawDiff.trim()) {
+    const reason = task && task.adhocResolution === 'no-changes-needed'
+      ? `no code change needed: ${(task.implementResponse || '').slice(0, 300)}`
+      : 'adhoc agentic draft produced no diff';
+    return { skipped: true, reason };
+  }
+
+  const patchPath = path.join(os.tmpdir(), `adhoc-apply-${task.id}-${process.pid}.patch`);
+  fs.writeFileSync(patchPath, rawDiff.endsWith('\n') ? rawDiff : `${rawDiff}\n`);
+  try {
+    // --numstat lists touched files without needing the patch already applied -- run
+    // first so a malformed patch fails via the SAME `git apply` error path either way
+    // (numstat also validates the patch parses, though not that it applies cleanly).
+    // --recount here too (see the real `git apply` call below for why) -- confirmed live
+    // 2026-08-18: this call has no --recount of its own, so a hunk with a wrong stated
+    // line-count rejected THIS call as "corrupt patch" before ever reaching the real
+    // apply below, even after --recount was added there alone.
+    const numstat = execFileSync('git', ['apply', '--numstat', '--recount', patchPath], {
+      cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS,
+    });
+    const files = numstat.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => line.split('\t').pop());
+    if (files.length === 0) {
+      throw new Error('git apply --numstat reported no files touched by this diff');
+    }
+
+    // --recount: confirmed live 2026-08-18 -- a real, otherwise-valid diff from
+    // adhoc-agentic-draft.js's agentic capture (`git diff` against an isolated worktree)
+    // failed here with "corrupt patch at line 68" on a plain `git apply`, while `git apply
+    // --check --recount` against the identical bytes succeeded cleanly. The hunk header's
+    // stated line counts didn't match the actual hunk body -- recount ignores the stated
+    // counts and recalculates them from the body instead, which is exactly the tolerance
+    // needed for a diff captured this way (not hand-written, so a header/body mismatch is
+    // a capture-format quirk, not a sign of real corruption -- --numstat above already
+    // proved the patch parses and lists real files before this point).
+    try {
+      execFileSync('git', ['apply', '--recount', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+    } catch (plainApplyErr) {
+      // 2026-08-24 (pipeline hardening -- caught live: a real task's diff conflicted with
+      // an unrelated sibling task's own change that landed on the SAME file in between
+      // this draft's worktree being cut and apply actually running -- the classic
+      // "patch went stale because something else nearby changed" failure, not a
+      // malformed or genuinely wrong diff). Plain `git apply` only ever does literal
+      // context-line matching -- it has no way to tell "the code I'm editing is still
+      // there, just a few lines further down" from "this code is genuinely gone." A
+      // real three-way merge (using the base/ours/theirs blob content the diff's own
+      // `index` lines already point at -- this worktree shares the repo's object
+      // database, so those blobs are all reachable) resolves exactly this class of
+      // conflict automatically, the same way `git apply --3way`/`git am --3way` are
+      // git's own documented answer to "the plain apply failed, try harder before
+      // giving up." Only attempted as a fallback, never instead of the plain apply --
+      // a clean context-based apply is unambiguous and should always be preferred when
+      // it works.
+      try {
+        execFileSync('git', ['apply', '--3way', '--recount', patchPath], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+      } catch (threeWayErr) {
+        // Unlike plain `git apply` (atomic -- either applies cleanly or leaves the
+        // working tree untouched), a FAILED `--3way` attempt still writes real
+        // <<<<<<< ours / ======= / >>>>>>> theirs conflict markers directly into the
+        // working tree file before returning failure -- confirmed live writing this
+        // fix's own test. Left alone, a genuine conflict (not just a stale-context
+        // shift) would leave corrupted source sitting in the repo under an "apply
+        // failed" report that reads as "nothing changed." Restore every file this
+        // patch touches to its real HEAD content before rethrowing, so a failed
+        // attempt -- 3-way or plain -- has the exact same "untouched" guarantee.
+        for (const file of files) {
+          try {
+            // `HEAD --` (not bare `--`, which means "from the index") -- confirmed live
+            // writing this fix: a failed --3way conflict leaves the INDEX itself marked
+            // unmerged (stage U), and plain `git checkout -- <file>` refuses to touch an
+            // unmerged path ("error: path is unmerged") entirely. Checking out an actual
+            // commit-ish resets both the index and working tree regardless of merge state.
+            execFileSync('git', ['checkout', 'HEAD', '--', file], { cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+          } catch (restoreErr) {
+            // Fails for a file this patch CREATES (mode:"create" has no HEAD entry to
+            // restore from) -- the failed --3way attempt may have still written a stray
+            // file there. Best-effort remove it rather than leave a leftover conflict-
+            // marker file sitting in the repo untracked; per-file (not a blanket git
+            // clean) so an unrelated pre-existing untracked file elsewhere is never
+            // touched.
+            try { fs.unlinkSync(path.join(repoRoot, file)); } catch (unlinkErr) {
+              if (unlinkErr.code !== 'ENOENT') {
+                console.warn(`[apply-adhoc-diff] failed to remove stray file after failed apply: ${file} -- ${unlinkErr.message || String(unlinkErr)}`);
+              }
+            }
+          }
+        }
+        // Surface the PLAIN apply's error (what a human/redraft decision should
+        // actually see), not the 3-way attempt's, since 3-way's own failure mode
+        // ("Failed to merge in the changes") is less informative about the real
+        // underlying conflict than the plain apply's own message.
+        throw plainApplyErr;
+      }
+    }
+
+    // Component 2 opt-in acceptance gate: the patch is now applied to repoRoot (which
+    // apply-task.js has already branched to agent/<id>); run the task-authored command
+    // against that state BEFORE apply-task.js commits. A failure throws -- same terminal
+    // shape as a failed git apply, so the task goes to blocked/ with the branch left for
+    // inspection. Only fires when the task supplies acceptanceCommand AND the flag is on.
+    const acceptanceCommand = task && task.promptContext && task.promptContext.acceptanceCommand;
+    if (process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE_COMMAND === 'true'
+        && typeof acceptanceCommand === 'string' && acceptanceCommand.trim()) {
+      const gate = runAcceptanceCommand({ repoRoot, command: acceptanceCommand, exec });
+      if (!gate.ok) {
+        const detail = (gate.checks[0] && gate.checks[0].detail) || 'no output';
+        throw new Error(`acceptance command failed after apply -- branch left for inspection: ${detail}`);
+      }
+    }
+
+    return { files };
+  } catch (e) {
+    if (/^acceptance command failed/.test(e.message || '')) throw e;
+    const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
+    throw new Error(`git apply failed: ${detail}`);
+  } finally {
+    try { fs.unlinkSync(patchPath); } catch (_) { /* best-effort cleanup */ }
+  }
+}
+```
+
+Problem:
+`applyAdhocDiff` runs 124 lines and nests three `try/catch` levels in its failure path. The innermost block — a per-file loop that attempts `git checkout HEAD -- <file>` and falls back to `fs.unlinkSync` when the file has no HEAD entry — is a self-contained cleanup routine with no dependency on the surrounding error-propagation chain. Its presence inside the `threeWayErr` catch is what pushes the main apply path to depth 3, and it is the only part of the function that cannot be unit-tested in isolation without standing up the full `git apply` → `--3way` → conflict-marker scenario. The remaining length (validation, patch write, plain-apply, 3way-fallback, acceptance gate, `finally` cleanup) is an irreducible linear pipeline whose comments encode live debugging history (2026-08-18, 2026-08-24) and must stay in place.
+
+Solution:
+Extract the per-file restore loop into a top-level helper `restoreFilesAfterFailedApply(files, repoRoot)` placed immediately above `applyAdhocDiff`, then replace the inline loop in the `threeWayErr` catch with a single call. The helper is a pure function of its two arguments; it needs no closure over `patchPath`, `plainApplyErr`, or the `finally` block. The concrete change is:
+
+```diff
++ function restoreFilesAfterFailedApply(files, repoRoot) {
++   for (const file of files) {
++     try {
++       execFileSync('git', ['checkout', 'HEAD', '--', file], {
++         cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS,
++       });
++     } catch (restoreErr) {
++       try {
++         fs.unlinkSync(path.join(repoRoot, file));
++       } catch (unlinkErr) {
++         if (unlinkErr.code !== 'ENOENT') {
++           console.warn(
++             `[apply-adhoc-diff] failed to remove stray file after failed apply: ${file} -- ${unlinkErr.message || String(unlinkErr)}`,
++           );
++         }
++       }
++     }
++   }
++ }
++
+  function applyAdhocDiff(/* …unchanged signature… */) {
+    /* …unchanged guard, patch-write, validate, plain-apply… */
+      try {
+        execFileSync('git', ['apply', '--3way', '--recount', patchPath], {
+          cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS,
+        });
+      } catch (threeWayErr) {
+-       for (const file of files) {
+-         try {
+-           execFileSync('git', ['checkout', 'HEAD', '--', file'], {
+-             cwd: repoRoot, encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS,
+-           });
+-         } catch (restoreErr) {
+-           try { fs.unlinkSync(path.join(repoRoot, file)); } catch (unlinkErr) {
+-             if (unlinkErr.code !== 'ENOENT') {
+-               console.warn(`[apply-adhoc-diff] failed to remove stray file after failed apply: ${file} -- ${unlinkErr.message || String(unlinkErr)}`);
+-             }
+-           }
+-         }
+-       }
++       restoreFilesAfterFailedApply(files, repoRoot);
+        throw plainApplyErr;
+      }
+    /* …unchanged acceptance-gate, return, finally… */
+  }
+```
+
+No other lines in the function are touched. The `--recount` / `--3way` / `HEAD --` comments, the acceptance-command gate, and the `finally` block that unlinks `patchPath` all remain exactly where they are.
+
+Benefits:
+Nesting depth in the failure path drops from 3 to 2, so a reader tracing a `--3way` conflict sees `restoreFilesAfterFailedApply(files, repoRoot); throw plainApplyErr;` instead of a 15-line inline loop. The helper gains an independent unit-test surface: feed it `['new-file.js']` with `execFileSync` mocked to throw, and assert `fs.unlinkSync` fires without standing up the full git-apply scenario. A third test case (`unlinkSync` throwing with a non-`ENOENT` code) can assert the `console.warn` path. The main function lands at roughly 105 lines — just under the 100-line heuristic threshold — and reads as a single linear pipeline: guard → write patch → validate → apply-with-fallback → gate → return.
+
+### AC-57 · Decompose applyBrainDumpSort into five focused helpers
+Strength: Strong
+Files: src/apply-group-a-brain-dump.js
+Snippet:
+```
+}
+
+function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
+  const { brainDumpEntryId, rawText, existingQueuedTitles } = task.promptContext;
+
+  const data = loadBrainDump(brainDumpPath);
+
+  const entry = findEntry(data, brainDumpEntryId);
+  if (!entry) {
+    // Terminal: the entry is gone, there is nothing to regenerate.
+    return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` };
+  }
+  // The entry may have been edited (the dashboard's PUT resets status back to 'captured' on
+  // a text change) or otherwise changed since this task was drafted -- classifying stale
+  // text into the entry's CURRENT record would silently mislabel it under a rawText it no
+  // longer has. Only apply if the entry is still exactly what this task was drafted against.
+  if (entry.suppressed) {
+    // A human retired this finding after its sort task was queued -- sorting it now would
+    // still file a note or queue a task for something they already dismissed.
+    return { skipped: true, reason: 'brain-dump entry was suppressed since this task was queued -- not sorting it' };
+  }
+  if (entry.status !== 'captured' || entry.rawText !== rawText) {
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text');
+  }
+
+  if (!secondBrainDir) {
+    // Terminal: no vault configured, no retry will help.
+    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
+  }
+
+  const result = parseBrainDumpSortResult(implementResponse);
+  if (!result) {
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      'implement pass did not return a valid classification JSON');
+  }
+
+  const trackedLabels = readProjectRegistry().map((p) => p.label).filter(Boolean);
+  result.secondBrainPath = normalizeSecondBrainPathCase(result.secondBrainPath, trackedLabels);
+  result.secondBrainPath = path.normalize(result.secondBrainPath);
+  // normalizeSecondBrainPathCase above only corrects against the CANONICAL_TOP_LEVEL
+  // constant + the project registry's own label spelling -- it trusts the registry, not
+  // the disk. If a tracked project's real on-disk folder casing has ever drifted from
+  // its registry label (a manual rename, or the label recorded before the folder existed),
+  // that correction can hand validateSecondBrainPath's OWN on-disk conflict check a
+  // spelling that doesn't match what's actually there, tripping its "different-case
+  // duplicate" rejection for a folder that in fact already exists -- the silent no-op
+  // this whole task is about. Resolve the first segment against disk directly, but only
+  // when exactly one entry matches case-insensitively (0 or 2+ matches is ambiguous or
+  // missing -- leave the path as-is and let validateSecondBrainPath's own rejection,
+  // "different-case duplicate" included, be the fallback).
+  if (secondBrainDir) {
+    const segments = result.secondBrainPath.split(/[\\/]/).filter(Boolean);
+    if (segments.length > 0) {
+      let entries;
+      try {
+        entries = fs.readdirSync(secondBrainDir, { withFileTypes: true })
+          .filter((e) => e.isDirectory() && !e.name.startsWith('.'));
+      } catch {
+        entries = [];
+      }
+      const matches = entries.filter((e) => e.name.toLowerCase() === segments[0].toLowerCase());
+      if (matches.length === 1 && matches[0].name !== segments[0]) {
+        segments[0] = matches[0].name;
+        result.secondBrainPath = segments.join('/');
+      }
+    }
+  }
+  const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir, trackedLabels);
+  if (namingError) {
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      `rejected secondBrainPath "${result.secondBrainPath}": ${namingError}`);
+  }
+
+  // Deterministic belongsToProject recovery -- the classifier routinely leaves this null
+  // for a note that is plainly a concrete change to this pipeline's own code (the dominant
+  // failure of the blocked backlog). May also flip actionable true.
+  {
+    const derived = deriveBelongsToProject(result, task.promptContext);
+    result.belongsToProject = derived.belongsToProject;
+    result.actionable = derived.actionable;
+  }
+
+  // Origin routing: a finding raised by project X's pipeline is about project X, whatever
+  // the classifier guessed. Overrides the label; and a note filed under a DIFFERENT tracked
+  // project's vault folder moves to X's folder when that folder exists.
+  {
+    const origin = originProjectFor(entry, readProjectRegistry());
+    if (origin && origin.label) {
+      result.belongsToProject = origin.label;
+      const segments = result.secondBrainPath.split(/[\\/]/).filter(Boolean);
+      if (segments.length > 1 && segments[0] !== origin.label
+          && trackedLabels.includes(segments[0])
+          && fs.existsSync(path.join(secondBrainDir, origin.label))) {
+        segments[0] = origin.label;
+        result.secondBrainPath = segments.join('/');
+      }
+    }
+  }
+
+  // Investigation-shaped machine findings become notes, never code tasks (see
+  // isInvestigationFinding's header). Applied AFTER origin routing so the note still files
+  // under the raising project's vault folder.
+  if (entry.raisedBy && isInvestigationFinding(rawText)) {
+    result.belongsToProject = null;
+    result.actionable = false;
+  }
+
+  // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
+  // change -- "investigate X, document findings" needs real web research, not a diff
+  // against any tracked project. Only when NO tracked project was named/recovered -- a
+  // note tied to a project routes to that project's queue below, never to research.
+  if (result.requiresResearch && !result.belongsToProject) {
+    if (!pipelineDir) {
+      return { skipped: true, reason: 'no pipelineDir available -- cannot queue a research task' };
+    }
+    const queuedId = `research-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+    const researchTask = {
+      id: queuedId,
+      domain: 'research',
+      source: 'research_task',
+      title: rawText.slice(0, 120),
+      promptContext: { rawText, brainDumpEntryId, secondBrainPath: result.secondBrainPath, tags: result.tags },
+    };
+    const researchDir = path.join(pipelineDir, 'queue', 'research');
+    fs.mkdirSync(researchDir, { recursive: true });
+    writeJsonAtomicSync(path.join(researchDir, `${queuedId}.json`), researchTask);
+
+    // Same audit-trail cross-reference convention the adhoc branch below already uses --
+    // an entry findable in the note it will eventually gain real content in, not the
+    // record of truth (brain-dump.json's queuedTaskId/queuedAt is that).
+    const fullPath = path.join(secondBrainDir, result.secondBrainPath);
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    const stamp = new Date().toISOString().slice(0, 10);
+    appendMarkdownLineAtomic(fullPath, `\n- **${stamp}** Queued as research task \`${queuedId}\` -- ${rawText}\n`);
+
+    entry.status = 'actioned';
+    entry.queuedTaskId = queuedId;
+    entry.queuedAt = new Date().toISOString();
+    fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+    writeJsonAtomicSync(brainDumpPath, data);
+
+    return { file: fullPath, queuedTaskId: queuedId, researchQueued: true };
+  }
+
+  // A note naming a tracked project IS work -- queue a real adhoc task in that project's
+  // own queue. The old `result.actionable &&` precondition is dropped (2026-09-03, user:
+  // "a note describing a concrete change to a tracked project always becomes a work task"):
+  // a project-labelled note the classifier forgot to mark actionable is still a task, and
+  // deriveBelongsToProject already forces actionable when it recovers a self-project label.
+  const matchedProject = result.belongsToProject
+    ? readProjectRegistry().find((p) => p.label === result.belongsToProject)
+    : null;
+
+  if (result.belongsToProject && !matchedProject) {
+    // reviewBrainDumpSort should have blocked a non-tracked label; if one slipped through,
+    // don't silently downgrade it to a passive note -- that masks the misclassification.
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`);
+  }
+
+  if (matchedProject) {
+    const validDomains = (() => {
+      try {
+        return Object.keys(JSON.parse(fs.readFileSync(matchedProject.domainsPath, 'utf8')));
+      } catch (err) {
+        const reason = err && err.message ? err.message : String(err);
+        process.stderr.write(`[apply-group-a] failed to read domains from ${matchedProject.domainsPath}: ${reason}\n`);
+        return [];
+      }
+    })();
+
+    if (validDomains.includes('adhoc')) {
+      const queuedId = `adhoc-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+      // A brain-dump entry with a `raisedBy` was machine-filed (side-finding-sweep.js:
+      // a pipeline_debrief Now-What item, or any pass's writeSideFindingInbox side
+      // finding) -- NOT a human handing the pipeline a task. Route it to queue/derived/
+      // (source: derived_task, priority 48) instead of queue/adhoc/ (priority 10, preempts
+      // every deterministic source), so this whole class is its own throttleable Job List
+      // lane. A human-typed entry has no raisedBy and stays genuine adhoc. If it still
+      // needs clarification (below), it goes to needs-clarification either way -- a human
+      // resolving it there re-files it as real adhoc, which is correct (they vouched for it).
+      const isDerived = !!(entry && entry.raisedBy);
+      const adhocTask = {
+        id: queuedId,
+        domain: 'adhoc',
+        source: isDerived ? 'derived_task' : 'brain_dump',
+        title: rawText.slice(0, 120),
+        promptContext: isDerived
+          ? { rawText, brainDumpEntryId, derivedFrom: entry.raisedBy }
+          : { rawText, brainDumpEntryId },
+      };
+
+      // Path-prefetch (context-aware-file-path-prefetch-job.md, 2026-08-16): resolve
+      // anchor keywords from this task's title/rawText against the target project's own
+      // dependency graph BEFORE it's ever claimed for drafting, so the plan/implement
+      // passes already have real, validated file paths in promptContext instead of the
+      // model searching for them (or worse, inventing them) from scratch on every call.
+      // 'greenfield' (no graph built yet for this project) is explicitly NOT an error --
+      // per the Discuss session's own note, that's just "nothing to prefetch," and the
+      // task queues normally. 'no-match'/'ambiguous' are the two cases the Grill Me/
+      // Discuss sessions asked to be held for a human rather than silently guessed at:
+// ... [truncated for review: this function continues for 135 more line(s) not shown]
+```
+
+Problem:
+The 335-line body of `applyBrainDumpSort` interleaves at least five distinct responsibilities—precondition guards, path normalisation and on-disk resolution, an ownership-correction pipeline, a research-task queuing branch, and a project-task (adhoc/derived) queuing branch—each with its own branching, side-effects, and failure mode. Because they share a single scope, a reader must hold the entire correction pipeline in working memory to know which later branch a given mutation feeds into, and a unit test for any one concern (e.g. "does origin routing reassign the first path segment?") must stub `loadBrainDump`, `parseBrainDumpSortResult`, `validateSecondBrainPath`, `fs.readdirSync`, `writeJsonAtomicSync`, and `appendMarkdownLineAtomic` just to reach the line under test. The ~40 % comment density is a symptom of this conflation, not a cause: the comments exist because the reader cannot infer branch boundaries from the code structure alone.
+
+Solution:
+Extract the five responsibilities into top-level helper functions and reduce `applyBrainDumpSort` to a thin coordinator that sequences them. The concrete shape of the change is:
+
+```javascript
+// ── 1. Guards (pure, no I/O beyond loadBrainDump) ──────────────────
+function checkSortPreconditions({ entry, rawText, secondBrainDir, implementResponse, brainDumpPath, data }) {
+  if (!entry)
+    return { skipped: true, reason: `brain-dump entry … no longer exists` };
+  if (entry.suppressed)
+    return { skipped: true, reason: '…suppressed…' };
+  if (entry.status !== 'captured' || entry.rawText !== rawText)
+    return recoverableSortSkip(data, entry, brainDumpPath, '…changed…');
+  if (!secondBrainDir)
+    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured…' };
+  const result = parseBrainDumpSortResult(implementResponse);
+  if (!result)
+    return recoverableSortSkip(data, entry, brainDumpPath, '…invalid JSON…');
+  return { ok: true, result };
+}
+
+// ── 2. Path normalise → disk-resolve → validate ────────────────────
+function resolveAndValidateSecondBrainPath(result, secondBrainDir, trackedLabels) {
+  result.secondBrainPath = normalizeSecondBrainPathCase(result.secondBrainPath, trackedLabels);
+  result.secondBrainPath = path.normalize(result.secondBrainPath);
+  if (secondBrainDir) { /* …existing readdir logic… */ }
+  const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir, trackedLabels);
+  if (namingError) return { ok: false, error: namingError };
+  return { ok: true };
+}
+
+// ── 3. Ownership-correction pipeline (mutates result in place) ─────
+function applyOwnershipCorrections(result, entry, rawText) {
+  const derived = deriveBelongsToProject(result, /* promptContext */);
+  result.belongsToProject = derived.belongsToProject;
+  result.actionable = derived.actionable;
+  const origin = originProjectFor(entry, readProjectRegistry());
+  if (origin?.label) { /* …existing reassign logic… */ }
+  if (entry.raisedBy && isInvestigationFinding(rawText)) {
+    result.belongsToProject = null;
+    result.actionable = false;
+  }
+}
+
+// ── 4. Research-task branch (self-contained I/O) ───────────────────
+function queueResearchTask({ result, entry, rawText, brainDumpEntryId, brainDumpPath, secondBrainDir, pipelineDir, data }) {
+  const queuedId = `research-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+  /* …existing mkdir / writeJson / appendMarkdown / entry mutation… */
+  return { file: fullPath, queuedTaskId: queuedId, researchQueued: true };
+}
+
+// ── 5. Project-task branch (adhoc / derived / needs-clarification) ─
+function queueProjectTask({ result, entry, rawText, brainDumpEntryId, matchedProject, secondBrainDir, data, brainDumpPath }) {
+  /* …domain read, adhoc/derived selection, path-prefetch,
+     needs-clarification routing, file writes… */
+}
+
+// ── Thin coordinator (≈ 40 lines) ──────────────────────────────────
+function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
+  const { brainDumpEntryId, rawText } = task.promptContext;
+  const data  = loadBrainDump(brainDumpPath);
+  const entry = findEntry(data, brainDumpEntryId);
+
+  const guard = checkSortPreconditions({ entry, rawText, secondBrainDir, implementResponse, brainDumpPath, data });
+  if (!guard.ok) return guard;
+
+  const { result } = guard;
+  const trackedLabels = readProjectRegistry().map(p => p.label).filter(Boolean);
+
+  const pathOk = resolveAndValidateSecondBrainPath(result, secondBrainDir, trackedLabels);
+  if (!pathOk.ok)
+    return recoverableSortSkip(data, entry, brainDumpPath, `rejected secondBrainPath …: ${pathOk.error}`);
+
+  applyOwnershipCorrections(result, entry, rawText);
+
+  if (result.requiresResearch && !result.belongsToProject)
+    return queueResearchTask({ result, entry, rawText, brainDumpEntryId, brainDumpPath, secondBrainDir, pipelineDir, data });
+
+  const matchedProject = result.belongsToProject
+    ? readProjectRegistry().find(p => p.label === result.belongsToProject)
+    : null;
+  if (result.belongsToProject && !matchedProject)
+    return recoverableSortSkip(data, entry, brainDumpPath, `belongsToProject … does not match…`);
+  if (matchedProject)
+    return queueProjectTask({ result, entry, rawText, brainDumpEntryId, matchedProject, secondBrainDir, data, brainDumpPath });
+
+  /* …fallback: file as passive note… */
+}
+```
+
+Each helper is scoped to exactly one concern, takes only the state it needs, and returns a well-defined shape. The coordinator is a linear sequence of guard → resolve → correct → route, with no branching hidden inside a 335-line body.
+
+Benefits:
+Once decomposed, each helper is independently unit-testable with plain-object fixtures (no need to stub the full I/O stack), a PR that touches only path validation shows a ~30-line diff instead of 335 lines of context, adding a new correction pass is a one-line append to `applyOwnershipCorrections` rather than an insertion into the middle of a monolithic body, and the coordinator's control flow is readable in a single screen—making it straightforward to verify that every early-return path is reachable and that no branch silently falls through to an unintended default.
+
+### AC-58 · Decompose applyRetryCheck four-branch loop into named decision helpers
+Strength: Strong
+Files: src/apply-retry-check.js
+Snippet:
+```
+}
+
+function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approvedDir, pipelineDir, repoRoot, extraRoots, decideResolved = decideFindingResolved, recordModelOutcome = defaultRecordModelOutcome }) {
+  const summary = { checked: 0, requeued: 0, exhausted: 0, resolved: 0, errors: 0, errorDetails: [] };
+  const approvedDirResolved = approvedDir || (pipelineDir ? path.join(pipelineDir, 'queue', 'approved') : null);
+  let names = [];
+  try {
+    names = fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'));
+  } catch (e) {
+    return summary; // blocked/ doesn't exist yet -- nothing to check.
+  }
+
+  for (const name of names) {
+    const filePath = path.join(blockedDir, name);
+    // Tracks the operation actually in flight when the catch below fires, so
+    // errorDetails' step reflects reality instead of always reading "write" for a
+    // failure that happened during read/parse/record -- see this variable's own
+    // reassignments just ahead of each real operation it names.
+    let step = 'read';
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      if (!raw) continue;
+      step = 'parse';
+      const task = JSON.parse(raw);
+      summary.checked++;
+
+      // Only a genuine apply-stage failure is eligible -- never a review rejection that
+      // happens to still carry stale fields, same "only act on the specific stage this
+      // check owns" reasoning reject-retry-check.js's own isReviewRejection() guard uses.
+      if (!isApplyFailure(task)) continue;
+
+      // Diverged-history short-circuit -- see isDivergedHistoryFailure's own header.
+      // Regardless of retryCount: retrying reproduces the identical git-state failure,
+      // structurally, not stochastically, so there is no reason to wait for the cap.
+      if (isDivergedHistoryFailure(task) && needsClarificationDir) {
+        const alreadyEscalated = Array.isArray(task.history) && task.history.some((h) => h.stage === 'needs-clarification');
+        if (!alreadyEscalated) {
+          task.needsClarification = {
+            reason: 'git-state-diverged',
+            openQuestions: [
+              `Apply failed because the pipeline's own working checkout and origin/<main> have diverged (each has commits the other lacks) -- a git-state problem, not a content/draft-quality one: ${String(task.blockedReason || '')}`,
+              'A fresh redraft cannot fix this -- the SAME diverged branch will reject any diff. Reconcile the branch by hand (confirm which side'
+                + ' has the real intended history, then either fast-forward, rebase, or reset the working checkout to match), then requeue this task.',
+            ],
+          };
+          step = 'record';
+          appendHistoryEvent(task, 'needs-clarification', 'escalated immediately -- diverged git history, a blind retry cannot differ');
+          if (pipelineDir) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'apply-retry-check:diverged-history', pipelineDir });
+          step = 'write';
+          fs.mkdirSync(needsClarificationDir, { recursive: true });
+          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+          step = 'unlink';
+          fs.unlinkSync(filePath);
+          summary.exhausted++;
+          continue;
+        }
+      }
+
+      // Checked before the retry-count logic, regardless of retryCount: a resolved finding
+      // needs no further redraft, and a task ALREADY at the cap (the AC-169 state) is
+      // exactly the one that would otherwise never be looked at again.
+      if (isFindStringMiss(task) && approvedDirResolved) {
+        step = 'resolve';
+        const resolved = decideResolved(task, { repoRoot, extraRoots });
+        if (resolved) {
+          landAsResolvedFalsePositive(task, name, filePath, approvedDirResolved);
+          summary.resolved++;
+          continue;
+        }
+      }
+
+      const retryCount = Number(task.applyRetryCount) || 0;
+      if (retryCount >= MAX_APPLY_RETRIES) {
+        const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
+        // Exhaustion used to be a permanent dead end -- stamp 'exhausted' and stay in
+        // blocked/ forever, nothing ever reading it back out (reject-retry-check.js closed
+        // the same gap for review rejections 2026-09-17/18). Escalate to a human instead.
+        // Deliberately NOT gated on alreadyStamped: tasks stamped on an earlier tick (before
+        // this existed) are exactly the ones stuck right now.
+        if (needsClarificationDir && !alreadyEscalatedSinceLastReadmission(task)) {
+          step = 'record';
+          task.needsClarification = { reason: 'design-decision', openQuestions: buildExhaustedApplyQuestion(task) };
+          if (!alreadyStamped) appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_APPLY_RETRIES} apply retries used`);
+          appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting apply retries');
+          if (pipelineDir) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'apply-retry-check:retry-cap-exhausted', pipelineDir });
+          step = 'write';
+          fs.mkdirSync(needsClarificationDir, { recursive: true });
+          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+          step = 'unlink';
+          fs.unlinkSync(filePath);
+          summary.exhausted++;
+          continue;
+        }
+        // Same "stamp once, never re-fire" guard reject-retry-check.js uses -- without
+        // it this branch would re-append an 'exhausted' history event on every single
+        // watchdog tick for as long as the task sits here, unbounded.
+        if (alreadyStamped) { summary.exhausted++; continue; }
+        step = 'record';
+        appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_APPLY_RETRIES} apply retries used`);
+        step = 'write';
+        fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+        summary.exhausted++;
+        continue;
+      }
+
+      task.applyRetryCount = retryCount + 1;
+
+      step = 'record';
+      recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'apply-watchdog', outcomeReason: task.blockedReason || null });
+      appendHistoryEvent(task, 'requeued', task.blockedReason || undefined);
+
+      step = 'write';
+      const newPath = path.join(pendingDir, name);
+      fs.mkdirSync(pendingDir, { recursive: true });
+      fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
+      step = 'unlink';
+      fs.unlinkSync(filePath);
+      summary.requeued++;
+    } catch (e) {
+      summary.errors++;
+      const detail = { task: name, step, message: e.message, code: e.code ?? null };
+      summary.errorDetails.push(detail);
+      console.error(JSON.stringify(detail));
+    }
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The 126-line `applyRetryCheck` inlines four distinct business rules—diverged-history escalation, false-positive resolution, retry-cap exhaustion, and normal requeue—each with its own preconditions, side-effect sequence, and summary counter. Two of those rules (diverged-history and retry-exhaustion) share a near-identical escalate-to-needsClarificationDir mechanic (mkdir → write → unlink → increment) that is copy-pasted verbatim, and the `step` bookkeeping variable exists only because all four paths are inlined in a single try/catch. A future change to the escalation write format, the addition of a file lock, or a change to the JSON shape must be made in two places, and no single rule can be unit-tested in isolation without mocking the entire 126-line function.
+
+Solution:
+Extract the duplicated escalation block into a single `escalateToNeedsClarification` helper, then lift each of the four decision branches into its own named function that returns a small action string. The main loop body shrinks to scaffolding (readdir guard, read/parse, summary bookkeeping) plus a short sequential dispatch. Concretely:
+
+```js
+// Shared escalation mechanic (was duplicated in diverged-history and retry-exhausted branches)
+function escalateToNeedsClarification({ task, name, blockedPath, needsClarificationDir, summary }) {
+  fs.mkdirSync(needsClarificationDir, { recursive: true });
+  fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
+  fs.unlinkSync(blockedPath);
+  summary.exhausted++;
+}
+
+// One decision branch each; each returns an action string or 'skip'
+function handleDivergedHistory(task, ctx) { /* … */ return 'escalated'; }
+function handleResolvedFinding(task, ctx)  { /* … */ return 'resolved'; }
+function handleRetryExhaustion(task, ctx)  { /* … */ return 'exhausted'; }
+function handleNormalRequeue(task, ctx)    { /* … */ return 'requeued'; }
+
+// Main function shrinks to ~40 lines of scaffolding + dispatch
+function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approvedDir,
+                           pipelineDir, repoRoot, extraRoots,
+                           decideResolved = decideFindingResolved,
+                           recordModelOutcome = defaultRecordModelOutcome }) {
+  const summary = { checked: 0, requeued: 0, exhausted: 0, resolved: 0, errors: 0, errorDetails: [] };
+  const approvedDirResolved = approvedDir || (pipelineDir ? path.join(pipelineDir, 'queue', 'approved') : null);
+
+  let names;
+  try {
+    names = fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'));
+  } catch { return summary; }
+
+  const ctx = { pendingDir, needsClarificationDir, approvedDirResolved, pipelineDir,
+                repoRoot, extraRoots, decideResolved, recordModelOutcome, summary };
+
+  for (const name of names) {
+    const filePath = path.join(blockedDir, name);
+    let step = 'read';
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      if (!raw) continue;
+      step = 'parse';
+      const task = JSON.parse(raw);
+      summary.checked++;
+      if (!isApplyFailure(task)) continue;
+
+      if (handleDivergedHistory(task, ctx) === 'escalated') continue;
+      if (handleResolvedFinding(task, ctx) === 'resolved')  continue;
+      if (handleRetryExhaustion(task, ctx) === 'exhausted') continue;
+      handleNormalRequeue(task, ctx);
+    } catch (e) {
+      summary.errors++;
+      const detail = { task: name, step, message: e.message, code: e.code ?? null };
+      summary.errorDetails.push(detail);
+      console.error(JSON.stringify(detail));
+    }
+  }
+  return summary;
+}
+```
+
+The `step` variable and the outer try/catch stay in the caller so error-detail reporting is unchanged; each helper receives a `ctx` object carrying the directories, callbacks, and summary it needs.
+
+Benefits:
+The main function drops from 126 to roughly 40 lines of loop scaffolding and a four-line dispatch, making the control flow scannable at a glance. Each decision helper is 15–30 lines, single-purpose, and independently unit-testable with a stub `task` object and a mock `ctx`—no need to exercise the full readdir/read/parse pipeline. The duplicated escalation write now lives in exactly one function, so adding a lock, changing the JSON shape, or altering the unlink order is a one-place edit. Reviewers can evaluate each business rule in isolation during code review rather than tracking four interleaved side-effect sequences through a single 126-line body.
+
+### AC-170 · Extract doResetToMain and prepareStackedBranch from createRealGitRunner factory body
+Strength: Strong
+Files: src/git-runner.js
+Snippet:
+```
+ * @param {string} repoRoot - Absolute path to the git repo to operate on.
+ */
+function createRealGitRunner(repoRoot) {
+  const mainBranch = detectDefaultBranch(repoRoot);
+  function run(args) {
+    return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+  }
+  function isAncestor(a, b) {
+    try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
+  }
+  function doResetToMain() {
+    try {
+      run(['stash', 'push', '-u', '-m', `agent-manager auto-stash before reset ${new Date().toISOString()}`]);
+    } catch (e) {
+      throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
+    }
+    run(['checkout', mainBranch]);
+    run(['fetch', 'origin', mainBranch]);
+    const remote = `origin/${mainBranch}`;
+    const originInLocal = isAncestor(remote, mainBranch);
+    const localInOrigin = isAncestor(mainBranch, remote);
+    if (originInLocal && !localInOrigin) {
+      if (ungatedMainPushAllowed()) {
+        try {
+          run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
+        } catch (e) {
+          throw new Error(`resetToMain: local ${mainBranch} is ahead of origin but fast-forwarding it to origin failed (push rejected -- e.g. a protected branch or a race): ${e.message}`);
+        }
+      } else {
+        // Local main holds commits origin lacks. The old behavior pushed them to origin/main
+        // unattended -- exactly what must never happen without a human gate (see
+        // lib/main-push-policy.js). Preserve them on a rescue BRANCH (pushed best-effort, so a
+        // reset never destroys work) and fall through to the reset. A human decides about them.
+        const rescue = `agent/rescued-${mainBranch}-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
+        try {
+          run(['branch', rescue, mainBranch]);
+        } catch (e) {
+          throw new Error(`resetToMain: local ${mainBranch} is ahead of origin and could not be rescued to ${rescue} before the reset: ${e.message}`);
+        }
+        try { run(['push', '-u', 'origin', rescue]); } catch { /* best-effort: the local rescue branch still exists */ }
+        console.error(`[git-runner] local ${mainBranch} had commit(s) origin lacks; NOT pushed to ${mainBranch} (no ungated main pushes) -- kept on ${rescue} for a human to review/merge`);
+      }
+    } else if (!originInLocal && !localInOrigin) {
+      throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
+    }
+    run(['reset', '--hard', remote]);
+    // Pop the stash created above right back onto the now-reset tree (2026-09-14, fixing
+    // the "never popped" hazard this function used to carry -- see the header comment on
+    // the returned object below for the full incident history). Confirmed live: the
+    // dedicated AGENT_MANAGER_APPLY_REPO_ROOT worktree this runs against is never
+    // interactively edited, so there is no live human WIP this could clobber -- unlike
+    // the pre-2026-09-07 shape where resetToMain() ran directly against the same checkout
+    // a human sometimes edits live, popping immediately was NOT safe (a stray edit could
+    // ride back onto the tree right before an automated commit). "No stash entries found"
+    // (the overwhelmingly common case -- nothing was stashed) is swallowed as a no-op;
+    // any other pop failure (e.g. a real conflict) is logged and swallowed rather than
+    // thrown -- the reset itself already succeeded, and git leaves the stash entry intact
+    // on a failed pop for manual recovery, so this can never make things worse than the
+    // old never-popped behavior, only better.
+    try {
+      run(['stash', 'pop']);
+    } catch (e) {
+      const msg = e.stderr ? e.stderr.toString() : e.message;
+      if (!/no stash entries found/i.test(msg)) {
+        console.error(`[git-runner] stash pop after resetToMain failed (stash entry left in place for manual recovery): ${msg}`);
+      }
+    }
+  }
+  return {
+    mainBranch,
+    fetchMain: () => run(['fetch', 'origin', mainBranch]),
+    // Auto-stash before the hard reset instead of silently destroying uncommitted work --
+    // this exact `git reset --hard` wiped real, unrecoverable work TWICE in one session
+    // (see docs/pipeline-incident-2026-07-19.md and its 2026-07-21 repeat) because this
+    // repo is sometimes edited live in the same working tree the pipeline operates on.
+    // `-u` includes untracked files. Stashing when there's nothing to stash is a harmless
+    // no-op (git prints "No local changes to save", exits 0) -- no separate status check
+    // needed. A stash failure (e.g. an in-progress merge/rebase) must not silently fall
+    // through to the destructive reset below, so it's re-thrown with context rather than
+    // swallowed.
+    //
+    // FIXED (2026-09-14, was a HAZARD since 2026-09-03): the stash created above is now
+    // popped right after the hard reset (see doResetToMain()) instead of being left as a
+    // graveyard -- so any untracked/tracked content swept up here round-trips back onto
+    // the tree instead of silently vanishing. This used to matter enormously: when
+    // pipelineDir === repoRoot, every pipeline runtime-state file lands inside repoRoot,
+    // and 90 scanner false-positive suppressions were lost this way over 3 days before
+    // the ledgers were ignored. src/pipeline-state-gitignored.test.js still enforces the
+    // getConfig()-path .gitignore invariant as defense-in-depth (a state file that's
+    // git-ignored is never even stashed in the first place, `git stash -u` skips it
+    // outright), independent of this pop fix.
+    resetToMain: doResetToMain,
+    createBranch: (name) => run(['checkout', '-b', name]),
+    checkoutMain: () => run(['checkout', mainBranch]),
+    // Checkout an EXISTING branch (stacked file-decompose: move N+1 rides on top of the
+    // branch move N already committed to, so it must not reset it away).
+    checkoutBranch: (name) => run(['checkout', name]),
+    branchExists: (name) => {
+      try { run(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]); return true; }
+      catch { return false; }
+    },
+    // 2026-09-08, added alongside prepareStackedBranch below -- checks the REMOTE copy
+    // specifically (refs/remotes/origin/<name>), distinct from branchExists' local-only
+    // check. A caller must never treat "a local ref with this name exists" as proof the
+    // branch is real/current -- see prepareStackedBranch's own header for the incident.
+    remoteBranchExists: (name) => {
+      try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${name}`]); return true; }
+      catch { return false; }
+    },
+    // Best-effort fetch of one non-main branch (stacked decompose: pick up a prior step's
+    // commit if this host's local ref is behind or missing). A failure is non-fatal.
+    fetchBranch: (name) => {
+      try { return run(['fetch', 'origin', name]); } catch { return ''; }
+    },
+    // Reset-or-create a local branch to track origin/<name> exactly (stacked decompose,
+    // when the local ref is missing or stale but origin has the prior step's commit).
+    checkoutTracking: (name) => run(['checkout', '-B', name, `origin/${name}`]),
+    deleteBranch: (name) => run(['branch', '-D', name]),
+    // 2026-09-08, Grimmethy: "harden it properly with tests" -- root-caused live: apply-
+    // task.js's stacked-decompose handling (seq > 1) used to trust branchExists(name)
+    // (a LOCAL-only check) as proof the branch was safe to check out, with no check that
+    // the local copy was actually current. A 5-day-old, unrelated local branch with the
+    // SAME name -- leftover cruft, origin's real copy long since merged and deleted --
+    // made every apply attempt check out that stale tree and then fail to apply a diff
+    // computed against current main, identically, every single retry (not a race; a
+    // permanently wrong decision that would never self-correct). This is the single,
+    // self-contained decision resetToMain() already models for the analogous "is my
+    // local copy of mainBranch safe to sync from origin" question -- same ahead/behind/
+    // diverged reasoning, applied here to a per-hub scratch branch instead:
+    //   - origin has it, local doesn't (or local ⊆ origin, i.e. stale/behind/identical):
+    //     sync local to origin's tip. Always safe -- local has nothing origin lacks.
+    //   - origin has it AND local is STRICTLY ahead (real unpushed commits, e.g. a prior
+    //     step's own push failed after a successful commit): trust local as-is, matching
+    //     the old default behavior -- never silently discard real unpushed work.
+    //   - origin has it and the two have diverged: surface loudly for a human, exactly
+    //     like resetToMain's own diverged case -- never guess which side to keep.
+    //   - origin doesn't have it, but local descends from CURRENT main: plausibly real,
+    //     unpushed work from a step whose push never even started -- trust it.
+    //   - origin doesn't have it, and local (if any) does NOT descend from current main:
+    //     this is the exact stale-branch case that caused the incident. Discard any such
+    //     local branch and fall back to resetToMain() + a fresh branch off it, the same
+    //     "the whole prior chain already merged" fallback the seq===1 path already uses
+    //     (2026-09-07 reasoning) -- now reached by an actual staleness check instead of
+    //     by trusting whatever name happens to exist locally.
+    prepareStackedBranch: (name) => {
+      try { run(['fetch', 'origin', name]); } catch { /* best-effort, matches fetchBranch */ }
+      const remote = `origin/${name}`;
+      const remoteExists = (() => {
+        try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}`]); return true; } catch { return false; }
+      })();
+      const localExists = (() => {
+        try { run(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]); return true; } catch { return false; }
+      })();
+      if (remoteExists) {
+        if (localExists) {
+          const originInLocal = isAncestor(remote, name); // origin ⊆ local (local ahead or equal)
+          const localInOrigin = isAncestor(name, remote); // local ⊆ origin (local behind or equal)
+          if (originInLocal && !localInOrigin) {
+            run(['checkout', name]); // real unpushed commits -- trust local as-is.
+            return;
+          }
+          if (!originInLocal && !localInOrigin) {
+            throw new Error(`prepareStackedBranch: local ${name} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic sync`);
+          }
+        }
+        // A ROLLING branch (e.g. TRIAGE_BRANCH) is never explicitly rebased on its own --
+        // apply-main-batch.js's own header says so plainly ("based on whatever main was
+        // when it was first created and is never rebased"). Every branch of the logic
+        // above only ever compares LOCAL to REMOTE; none of it ever asks whether the
+        // REMOTE copy itself has fallen behind current main. Root-caused live 2026-09-22:
+        // a human merged the branch and deleted it, but a near-concurrent apply cycle
+        // recreated it (a real race, or simply this same "trust origin blindly" gap on an
+        // OLDER cycle, well before that merge) anchored to a point of main from TWO DAYS
+        // earlier -- every apply after that just kept stacking onto that same stale
+        // lineage, silently re-including commits that had already separately landed on
+        // main (identical SHAs -- confirmed live), one of which was a finding a human had
+        // explicitly retracted as a false positive after the fact.
+        try { run(['fetch', 'origin', mainBranch]); } catch { /* best-effort, matches fetchMain elsewhere */ }
+        if (!isAncestor(`origin/${mainBranch}`, remote)) {
+          run(['checkout', '-B', name, remote]);
+          try {
+            run(['rebase', `origin/${mainBranch}`]);
+          } catch (e) {
+            try { run(['rebase', '--abort']); } catch { /* best-effort */ }
+            throw new Error(
+              `prepareStackedBranch: ${remote} is based on a stale point of ${mainBranch} (main has moved on since this rolling branch was last built) and rebasing its still-unmerged commits onto the current tip failed -- needs a human to reconcile, not an automatic sync: ${e.message}`,
+            );
+          }
+          return;
+        }
+        run(['checkout', '-B', name, remote]); // local missing, or ⊆ origin (stale/behind/identical); remote itself is current
+        return;
+      }
+      if (localExists && isAncestor(`origin/${mainBranch}`, name)) {
+        run(['checkout', name]); // no remote copy, but local is real work off current main
+        return;
+      }
+      // No remote copy, and no trustworthy local copy -- discard any stale local branch
+      // and start this step fresh off current main (2026-09-07 fallback reasoning: origin
+      // having nothing can only mean the whole prior chain already merged).
+      if (localExists) { try { run(['branch', '-D', name]); } catch { /* best-effort */ } }
+      doResetToMain();
+// ... [truncated for review: this function continues for 4 more line(s) not shown]
+```
+
+Problem:
+The 204-line `createRealGitRunner` factory buries two independently complex, multi-branch operations—`doResetToMain` (stash → checkout → fetch → two-way ancestor check → push-or-rescue → hard reset → conditional stash pop) and `prepareStackedBranch` (fetch → remote/local existence → four-way ancestor matrix → stale-main rebase → fallback reset)—as anonymous closures inside a single function body. Neither can be unit-tested in isolation because they close over `run`, `isAncestor`, `mainBranch`, and `repoRoot`; the only way to exercise the rescue-branch path or the diverged-throw path is to invoke the factory against a real repository. The remaining ~80 lines are a dozen one-liner method definitions and factory wiring, which are fine, but they force a reader to scroll through two dense decision trees just to find the API surface.
+
+Solution:
+Lift `doResetToMain` and `prepareStackedBranch` to module-level named functions that receive a small context object (`{ run, isAncestor, mainBranch }`), and promote the two tiny helpers (`makeRun`, `makeIsAncestor`) alongside them. The factory shrinks to a ~40-line wiring block that constructs the context and returns the flat API object. The incident-history comments (2026-07-19, 2026-09-08, 2026-09-14, 2026-09-22) move with the code they annotate. The one-liner methods stay in the returned object; no new module boundary is introduced for the helpers.
+
+```diff
++ // ── shared helpers (promoted from factory body) ──
++ function makeRun(repoRoot) {
++   return (args) =>
++     execFileSync('git', args, {
++       cwd: repoRoot, stdio: 'pipe', encoding: 'utf8',
++       env: GIT_ENV, timeout: GIT_TIMEOUT_MS,
++     });
++ }
++
++ function makeIsAncestor(run) {
++   return (a, b) => {
++     try { run(['merge-base', '--is-ancestor', a, b]); return true; }
++     catch { return false; }
++   };
++ }
++
++ // ── extracted: was inline closure in createRealGitRunner ──
++ // [incident-history comments 2026-07-19 / 2026-09-08 move here]
++ function doResetToMain({ run, isAncestor, mainBranch }) {
++   // … body unchanged: stash, checkout, fetch, ancestor matrix,
++   //   push-or-rescue, reset --hard, conditional stash pop …
++ }
++
++ // [incident-history comments 2026-09-14 / 2026-09-22 move here]
++ function prepareStackedBranch({ run, isAncestor, mainBranch, doResetToMain }) {
++   return (name) => {
++     // … body unchanged: fetch, remote/local existence,
++     //   4-way ancestor matrix, stale-main rebase, fallback …
++   };
++ }
++
+  // ── factory: now short, purely wiring ──
+  function createRealGitRunner(repoRoot) {
+    const mainBranch = detectDefaultBranch(repoRoot);
+    const run        = makeRun(repoRoot);
+    const isAncestor = makeIsAncestor(run);
+    const resetToMain = () => doResetToMain({ run, isAncestor, mainBranch });
+
+    return {
+      mainBranch,
+      fetchMain:        () => run(['fetch', 'origin', mainBranch]),
+      resetToMain,
+      createBranch:     (name) => run(['checkout', '-b', name]),
+      checkoutMain:     () => run(['checkout', mainBranch]),
+      checkoutBranch:   (name) => run(['checkout', name]),
+      branchExists:     (name) => { try { run(['rev-parse','--verify','--quiet',`refs/heads/${name}`]); return true; } catch { return false; } },
+      remoteBranchExists: (name) => { try { run(['rev-parse','--verify','--quiet',`refs/remotes/origin/${name}`]); return true; } catch { return false; } },
+      fetchBranch:      (name) => { try { return run(['fetch','origin',name]); } catch { return ''; } },
+      checkoutTracking: (name) => run(['checkout','-B',name,`origin/${name}`]),
+      deleteBranch:     (name) => run(['branch','-D',name]),
+-     // [~60 lines of doResetToMain closure removed from here]
+-     // [~70 lines of prepareStackedBranch closure removed from here]
+      prepareStackedBranch: prepareStackedBranch({ run, isAncestor, mainBranch, doResetToMain: resetToMain }),
+    };
+  }
+```
+
+Benefits:
+Both extracted functions become named, importable units. A test can call `doResetToMain({ run: mockRun, isAncestor: mockAnc, mainBranch: 'main' })` with a scripted `mockRun` and assert the exact git-argument sequence—including the rescue-branch path and the diverged-throw path—without touching a real repository. The factory drops from 204 lines to roughly 40 lines of wiring, so a reader sees the full API surface immediately without scrolling through two dense decision trees. Adding a new git operation becomes a one-liner in the returned object rather than an insertion between two complex closures. Review diffs for changes to either complex operation no longer interleave with unrelated one-liner edits in the factory body.
+
+### AC-171 · Decompose renderDiscoveryTab into pure row-builder functions
+Strength: Strong
+Files: python/dashboard/static/js/analytics-and-discovery.js
+Snippet:
+```
+}
+
+async function renderDiscoveryTab() {
+  const d = await fetchJson('/api/discovery');
+  discoveryCandidatesCache = d.candidates || [];
+  const main = document.getElementById('main');
+  if (!d.available) {
+    main.innerHTML = '<div class="empty">No discovery state found for the active project -- community-coverage.json and the candidates doc appear once the project graph is built and arch_discovery has run.</div>';
+    return;
+  }
+
+  const reviewed = d.communities.filter(c => c.lastReviewedAt).length;
+  const inFlight = d.tasks.filter(t => t.state !== 'done');
+  const doneRuns = d.tasks.filter(t => t.state === 'done');
+  const nextCommunity = d.communities.find(c => c.id === d.nextCommunityId);
+  const stats = `
+    <div class="stat-row">
+      <div class="stat"><strong>${reviewed} / ${d.communities.length}</strong>communities reviewed</div>
+      <div class="stat"><strong>${inFlight.length}</strong>runs in flight</div>
+      <div class="stat"><strong>${doneRuns.length}</strong>runs completed</div>
+      <div class="stat"><strong>${d.candidates.length}</strong>candidates produced</div>
+      <div class="stat"><strong>${nextCommunity ? escapeHtml(nextCommunity.name) : '--'}</strong>next up</div>
+    </div>`;
+
+  // Same order the job itself works in (nextArchDiscoveryTask's oldest-first rotation,
+  // never-reviewed before any real timestamp), so the top of the table is always "what
+  // discovery cares about right now".
+  const sortedCommunities = [...d.communities].sort((a, b) =>
+    (a.lastReviewedAt || '').localeCompare(b.lastReviewedAt || ''));
+  // Only rows with something to say (in queue, next up, or actually reviewed) show by
+  // default; the untouched tail collapses to a one-line count.
+  const interesting = sortedCommunities.filter(c =>
+    c.inFlightState || c.id === d.nextCommunityId || c.lastReviewedAt);
+  const communities = discoveryShowAllCommunities ? sortedCommunities : interesting;
+  const hiddenCount = sortedCommunities.length - communities.length;
+  const communityRows = communities.map(c => {
+    const status = c.inFlightState
+      ? `<span class="badge warn">in queue: ${escapeHtml(c.inFlightState)}</span>`
+      : c.id === d.nextCommunityId
+        ? '<span class="badge ok">next up</span>'
+        : c.lastReviewedAt
+          ? '<span class="badge idle">reviewed</span>'
+          : '<span class="badge idle">never reviewed</span>';
+    return `<tr>
+      <td>#${c.id} ${escapeHtml(c.name || '')}</td>
+      <td>${status}</td>
+      <td>${c.lastReviewedAt ? new Date(c.lastReviewedAt).toLocaleString() : ''}</td>
+      <td>${c.lastCandidateCount ?? ''}</td>
+    </tr>`;
+  }).join('');
+
+  const stateBadge = (s) => {
+    const cls = s === 'done' ? 'ok' : s === 'blocked' ? 'bad'
+      : (s === 'needs-clarification' || s === 'awaiting-confirm') ? 'warn' : 'idle';
+    return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+  };
+  const runRows = d.tasks.map(t => {
+    // Whichever field carries the run's actual outcome -- same signal priority as
+    // _adhoc_task_excerpt server-side.
+    const result = t.blockedReason
+      ? `<span style="color:var(--bad)">${escapeHtmlBright(t.blockedReason.slice(0, 140))}${t.blockedReason.length > 140 ? '…' : ''}</span>`
+      : t.doneMarker
+        ? escapeHtml(t.doneMarker)
+        : t.hasImplement ? 'draft written' : t.hasPlan ? 'plan written' : '';
+    return `<tr class="clickable" data-task-id="${escapeAttr(t.id)}" title="Click for the full readout (plan, draft, review verdicts)">
+      <td>${escapeHtmlBright(t.title)}</td>
+      <td>${stateBadge(t.state)}</td>
+      <td>${t.createdAt ? new Date(t.createdAt).toLocaleString() : ''}</td>
+      <td class="meta">${result}</td>
+    </tr>`;
+  }).join('');
+  const runsTable = d.tasks.length === 0
+    ? '<div class="empty">No arch-discovery runs in the queue yet.</div>'
+    : `<table><thead><tr><th>Run</th><th>State</th><th>Created</th><th>Result</th></tr></thead><tbody>${runRows}</tbody></table>`;
+
+  const candidateRows = d.candidates.map(c => `
+    <tr class="clickable" data-candidate-id="${c.id}" title="Click to read the full write-up">
+      <td><span class="bd-serial">AC-${String(c.id).padStart(3, '0')}</span></td>
+      <td>${escapeHtmlBright(c.title)}</td>
+      <td>${c.strength ? `<span class="badge ${c.strength === 'Strong' ? 'ok' : 'idle'}">${escapeHtml(c.strength)}</span>` : ''}</td>
+      <td class="meta">${c.files.slice(0, 3).map(escapeHtml).join(', ')}${c.files.length > 3 ? ` +${c.files.length - 3} more` : ''}</td>
+    </tr>`).join('');
+  const candidatesTable = d.candidates.length === 0
+    ? '<div class="empty">No candidates written yet.</div>'
+    : `<table><thead><tr><th>ID</th><th>Candidate</th><th>Strength</th><th>Files</th></tr></thead><tbody>${candidateRows}</tbody></table>`;
+
+  const communityToggle = (discoveryShowAllCommunities || hiddenCount > 0)
+    ? `<div style="margin:8px 0 0"><button class="secondary" id="discovery-show-all">${
+        discoveryShowAllCommunities
+          ? 'Show active communities only'
+          : `Show all ${sortedCommunities.length} communities (${hiddenCount} never reviewed hidden)`
+      }</button></div>`
+    : '';
+
+  // Runs and candidates first -- they're what this tab exists to surface; the (large)
+  // community rotation table is reference material below them.
+  main.innerHTML = stats
+    + `<div class="field-label">Discovery Runs</div>` + runsTable
+    + `<div class="field-label">Candidates Produced${d.candidatesPath ? ` <span style="text-transform:none;letter-spacing:0">(${escapeHtml(d.candidatesPath)})</span>` : ''}</div>`
+    + candidatesTable
+    + `<div class="field-label">Communities (rotation order)</div>`
+    + `<table><thead><tr><th>Community</th><th>Status</th><th>Last Reviewed</th><th>Candidates Last Run</th></tr></thead><tbody>${communityRows}</tbody></table>`
+    + communityToggle;
+
+  main.querySelectorAll('tr[data-task-id]').forEach(row => {
+    row.onclick = () => openTaskAnywhere(row.dataset.taskId);
+  });
+  main.querySelectorAll('tr[data-candidate-id]').forEach(row => {
+    row.onclick = () => openDiscoveryCandidate(parseInt(row.dataset.candidateId, 10));
+  });
+  const toggleBtn = document.getElementById('discovery-show-all');
+  if (toggleBtn) toggleBtn.onclick = () => {
+    discoveryShowAllCommunities = !discoveryShowAllCommunities;
+    renderDiscoveryTab();
+  };
+}
+```
+
+Problem:
+`renderDiscoveryTab` is 114 lines and interleaves four independent row-mapping strategies (community status badges with a 4-way ternary and sort/filter pipeline, run-result extraction with a 4-way `blockedReason → doneMarker → hasImplement → hasPlan` chain, candidate strength badges, and stats aggregation) plus a separate DOM event-wiring block. None of those four mapping blocks can be unit-tested in isolation today without invoking the whole function and a live DOM, and the densest branching (the run-result chain) is buried in the middle of a long template-literal assembly, making it the hardest section to reason about in context.
+
+Solution:
+Extract each mapping block into a small, pure function that takes the already-fetched `d` object and returns an HTML string (or a `{rows, toggle}` pair for the community section), then reduce the orchestrator to a ~20-line fetch → assemble → wire-events sequence. The concrete shape:
+
+```javascript
+// --- extracted pure builders (no DOM, no fetch) ---
+
+function buildStatsHtml(d) {
+  const reviewed  = d.communities.filter(c => c.lastReviewedAt).length;
+  const inFlight  = d.tasks.filter(t => t.state !== 'done');
+  const doneRuns  = d.tasks.filter(t => t.state === 'done');
+  const next      = d.communities.find(c => c.id === d.nextCommunityId);
+  return `
+    <div class="stat-row">
+      <div class="stat"><strong>${reviewed} / ${d.communities.length}</strong> communities reviewed</div>
+      <div class="stat"><strong>${inFlight.length}</strong> runs in flight</div>
+      <div class="stat"><strong>${doneRuns.length}</strong> runs completed</div>
+      <div class="stat"><strong>${d.candidates.length}</strong> candidates produced</div>
+      <div class="stat"><strong>${next ? escapeHtml(next.name) : '--'}</strong> next up</div>
+    </div>`;
+}
+
+function buildCommunityRows(d) {
+  const sorted = [...d.communities].sort((a, b) =>
+    (a.lastReviewedAt || '').localeCompare(b.lastReviewedAt || ''));
+  const interesting = sorted.filter(c =>
+    c.inFlightState || c.id === d.nextCommunityId || c.lastReviewedAt);
+  const visible = discoveryShowAllCommunities ? sorted : interesting;
+  const rows = visible.map(c => {
+    const status = c.inFlightState
+      ? `<span class="badge warn">in queue: ${escapeHtml(c.inFlightState)}</span>`
+      : c.id === d.nextCommunityId
+        ? '<span class="badge ok">next up</span>'
+        : c.lastReviewedAt
+          ? '<span class="badge idle">reviewed</span>'
+          : '<span class="badge idle">never reviewed</span>';
+    return `<tr>
+      <td>#${c.id} ${escapeHtml(c.name || '')}</td>
+      <td>${status}</td>
+      <td>${c.lastReviewedAt ? new Date(c.lastReviewedAt).toLocaleString() : ''}</td>
+      <td>${c.lastCandidateCount ?? ''}</td>
+    </tr>`;
+  }).join('');
+  const hiddenCount = sorted.length - visible.length;
+  const toggle = (discoveryShowAllCommunities || hiddenCount > 0)
+    ? `<div style="margin:8px 0 0"><button class="secondary" id="discovery-show-all">${
+        discoveryShowAllCommunities
+          ? 'Show active communities only'
+          : `Show all ${sorted.length} communities (${hiddenCount} never reviewed hidden)`
+      }</button></div>`
+    : '';
+  return { rows, toggle };
+}
+
+function buildRunsTable(d) {
+  const stateBadge = (s) => {
+    const cls = s === 'done' ? 'ok' : s === 'blocked' ? 'bad'
+      : (s === 'needs-clarification' || s === 'awaiting-confirm') ? 'warn' : 'idle';
+    return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+  };
+  const rows = d.tasks.map(t => {
+    const result = t.blockedReason
+      ? `<span style="color:var(--bad)">${escapeHtmlBright(t.blockedReason.slice(0, 140))}${t.blockedReason.length > 140 ? '\u2026' : ''}</span>`
+      : t.doneMarker ? escapeHtml(t.doneMarker)
+      : t.hasImplement ? 'draft written' : t.hasPlan ? 'plan written' : '';
+    return `<tr class="clickable" data-task-id="${escapeAttr(t.id)}" title="Click for the full readout">
+      <td>${escapeHtmlBright(t.title)}</td>
+      <td>${stateBadge(t.state)}</td>
+      <td>${t.createdAt ? new Date(t.createdAt).toLocaleString() : ''}</td>
+      <td class="meta">${result}</td>
+    </tr>`;
+  }).join('');
+  return d.tasks.length === 0
+    ? '<div class="empty">No arch-discovery runs in the queue yet.</div>'
+    : `<table><thead><tr><th>Run</th><th>State</th><th>Created</th><th>Result</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function buildCandidatesTable(d) {
+  const rows = d.candidates.map(c => `
+    <tr class="clickable" data-candidate-id="${c.id}" title="Click to read the full write-up">
+      <td><span class="bd-serial">AC-${String(c.id).padStart(3, '0')}</span></td>
+      <td>${escapeHtmlBright(c.title)}</td>
+      <td>${c.strength ? `<span class="badge ${c.strength === 'Strong' ? 'ok' : 'idle'}">${escapeHtml(c.strength)}</span>` : ''}</td>
+      <td class="meta">${c.files.slice(0, 3).map(escapeHtml).join(', ')}${c.files.length > 3 ? ` +${c.files.length - 3} more` : ''}</td>
+    </tr>`).join('');
+  return d.candidates.length === 0
+    ? '<div class="empty">No candidates written yet.</div>'
+    : `<table><thead><tr><th>ID</th><th>Candidate</th><th>Strength</th><th>Files</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function wireDiscoveryEvents(main) {
+  main.querySelectorAll('tr[data-task-id]').forEach(row => {
+    row.onclick = () => openTaskAnywhere(row.dataset.taskId);
+  });
+  main.querySelectorAll('tr[data-candidate-id]').forEach(row => {
+    row.onclick = () => openDiscoveryCandidate(parseInt(row.dataset.candidateId, 10));
+  });
+  const toggleBtn = document.getElementById('discovery-show-all');
+  if (toggleBtn) toggleBtn.onclick = () => {
+    discoveryShowAllCommunities = !discoveryShowAllCommunities;
+    renderDiscoveryTab();
+  };
+}
+
+// --- slimmed orchestrator (~20 lines) ---
+
+async function renderDiscoveryTab() {
+  const d = await fetchJson('/api/discovery');
+  discoveryCandidatesCache = d.candidates || [];
+  const main = document.getElementById('main');
+  if (!d.available) {
+    main.innerHTML = '<div class="empty">No discovery state found for the active project.</div>';
+    return;
+  }
+  const { rows: communityRows, toggle: communityToggle } = buildCommunityRows(d);
+  main.innerHTML = buildStatsHtml(d)
+    + `<div class="field-label">Discovery Runs</div>` + buildRunsTable(d)
+    + `<div class="field-label">Candidates Produced${d.candidatesPath ? ` <span style="text-transform:none;letter-spacing:0">(${escapeHtml(d.candidatesPath)})</span>` : ''}</div>`
+    + buildCandidatesTable(d)
+    + `<div class="field-label">Communities (rotation order)</div>`
+    + `<table><thead><tr><th>Community</th><th>Status</th><th>Last Reviewed</th><th>Candidates Last Run</th></tr></thead><tbody>${communityRows}</tbody></table>`
+    + communityToggle;
+  wireDiscoveryEvents(main);
+}
+```
+
+No API or DOM contract changes; the `innerHTML` output is byte-identical if the builders are transcribed faithfully. The only shared mutable state is the existing module-level `discoveryShowAllCommunities` flag, which `buildCommunityRows` reads and `wireDiscoveryEvents` toggles—same as today.
+
+Benefits:
+Each extracted builder is a pure function of the `d` object (plus the one module-level flag for the community section), so any of the four can be unit-tested with a fixture object and a string-equality assertion without a DOM or network. The densest branching—the run-result extraction chain—becomes a 15-line function with a single, obvious entry point instead of a nested ternary buried in a 114-line body. Code review diffs become scoped to one builder at a time, and the orchestrator reads as a linear "fetch → assemble → wire" pipeline that a new contributor can follow in under a minute.
+
+### AC-172 · Decompose enterProjectTab to isolate server-state sync logic
+Strength: Strong
+Files: python/dashboard/static/js/project-tab.js
+Snippet:
+```
+async function enterProjectTab() {
+  // Sync the path input from the server's actual active project on every tab entry, before
+  // rendering it. Without this, the input only ever reflected localStorage -- if the active
+  // project changed via any OTHER route (hand-editing agent-manager.env, another browser tab,
+  // launch.bat) the input would silently keep showing a stale path while "Last configured
+  // project" below it correctly showed the truth. Since Start Pipeline acts on the input's
+  // value, not on activeRepoRoot, that mismatch could launch a pipeline against the wrong
+  // project with no warning. Only overrides on tab entry, not on the 3s poll thereafter, so a
+  // deliberate browse-a-different-project session isn't fought by this sync mid-use.
+  //
+  // Compares against lastSyncedActiveRepoRoot (the last server value we actually observed),
+  // NOT against projectPath -- comparing against projectPath meant a typed-but-not-yet-started
+  // path (Start Pipeline never ran, so activeRepoRoot on the server never changed) got silently
+  // overwritten back to the server's stale/placeholder activeRepoRoot on every single tab
+  // revisit, since the two never stopped disagreeing. Bug: "Project File Path ... resets to a
+  // non-existent default path each time I navigate to it" (2026-08-18). Only a genuine change
+  // in what the server reports since we last looked now counts as "external".
+  try {
+    const status = await fetchJson('/api/pipeline/status');
+    if (status.activeRepoRoot && status.activeRepoRoot !== lastSyncedActiveRepoRoot) {
+      lastSyncedActiveRepoRoot = status.activeRepoRoot;
+      if (status.activeRepoRoot !== projectPath) setProjectPath(status.activeRepoRoot);
+    }
+    // Same reasoning as the path sync above: reflect whatever's actually configured
+    // server-side (env file / another tab / launch.bat) rather than only ever showing
+    // this browser's last local choice.
+    if (typeof status.includeApply === 'boolean') {
+      includeApply = status.includeApply;
+      localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    }
+    if (typeof status.skipPush === 'boolean') {
+      skipPush = status.skipPush;
+      localStorage.setItem('agentManagerSkipPush', String(skipPush));
+    }
+  } catch (e) { /* dashboard's own status check failed -- fall back to whatever's cached */ }
+
+  const main = document.getElementById('main');
+  main.innerHTML = `
+    <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
+      <div class="path-row">
+        <select id="project-select" style="flex:1;"><option value="">Loading projects...</option></select>
+        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}" list="project-history-list" autocomplete="off" style="display:none;">
+        <datalist id="project-history-list"></datalist>
+        <button class="secondary" id="history-toggle">History...</button>
+        <button class="secondary" id="browse-toggle">Browse...</button>
+        <button class="secondary" id="sync-btn" title="Fetch origin and fast-forward this checkout onto it">Sync with GitHub</button>
+        <button class="action" id="build-btn">Build Graph</button>
+      </div>
+      <div id="history-panel" class="browser-panel" style="display:none"></div>
+      <div class="path-row">
+        <input id="project-grepdirs-input" type="text" placeholder="src, frontend/src, backend/src (optional -- comma-separated, leave blank to scan the whole path)" value="${escapeAttr(grepDirs)}">
+      </div>
+      <div class="path-row" id="pipeline-toggles-row" style="gap:16px;align-items:center;">
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;">
+          <input type="checkbox" id="include-apply-toggle" ${includeApply ? 'checked' : ''}>
+          Enable Apply Runner (writes/commits changes)
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}" title="Applied work is always pushed now (2026-08-17) -- an unpushed branch was silently losing real work over time. This only controls whether the local checkout returns to main after each apply, or stays on the applied branch for inspection.">
+          <input type="checkbox" id="skip-push-toggle" ${!includeApply ? 'disabled' : ''} ${!skipPush ? 'checked' : ''}>
+          Return to main after each apply (unchecked: stay on the applied branch)
+        </label>
+        <span class="meta" style="font-size:0.85em;">Which job types run is now controlled from the Job List tab. Applied work is always pushed to the remote for durability, regardless of this toggle.</span>
+      </div>
+      <div id="browser-panel" class="browser-panel" style="display:none"></div>
+      <div id="pipeline-panel" class="worker-card"></div>
+      <div id="project-status-area" style="flex:1;min-height:0;display:flex;flex-direction:column;"></div>
+    </div>
+  `;
+  lastRenderedStatusKey = null;  // fresh tab entry -- force the first poll to actually render
+  document.getElementById('project-path-input').addEventListener('change', (e) => {
+    setProjectPath(e.target.value.trim());
+    lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
+    refreshProjectStatus();
+  });
+  document.getElementById('include-apply-toggle').addEventListener('change', (e) => {
+    includeApply = e.target.checked;
+    localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    const pushToggle = document.getElementById('skip-push-toggle');
+    pushToggle.disabled = !includeApply;
+    pushToggle.closest('label').style.opacity = includeApply ? '' : '.5';
+    if (!includeApply) { pushToggle.checked = false; skipPush = true; localStorage.setItem('agentManagerSkipPush', 'true'); }
+  });
+  document.getElementById('skip-push-toggle').addEventListener('change', (e) => {
+    skipPush = !e.target.checked;
+    localStorage.setItem('agentManagerSkipPush', String(skipPush));
+  });
+  document.getElementById('project-select').addEventListener('change', (e) => {
+    if (!e.target.value) return;
+    setProjectPath(e.target.value);
+    document.getElementById('project-path-input').value = projectPath;
+    lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
+    refreshProjectStatus();
+  });
+  document.getElementById('browse-toggle').onclick = () => {
+    browserOpen = !browserOpen;
+    document.getElementById('browser-panel').style.display = browserOpen ? 'block' : 'none';
+    // Manual path entry only makes sense while actively browsing -- otherwise the
+    // dropdown (populated from Second Brain's referenced projects) is the only way
+    // to pick a project, per the actual ask.
+    document.getElementById('project-select').style.display = browserOpen ? 'none' : '';
+    document.getElementById('project-path-input').style.display = browserOpen ? '' : 'none';
+    if (browserOpen) { browsePath = projectPath || ''; loadBrowsePanel(); }
+  };
+  document.getElementById('history-toggle').onclick = () => {
+    historyOpen = !historyOpen;
+    document.getElementById('history-panel').style.display = historyOpen ? 'block' : 'none';
+    if (historyOpen) renderHistoryPanel();
+  };
+  document.getElementById('project-grepdirs-input').addEventListener('change', (e) => {
+    grepDirs = e.target.value.trim();
+    localStorage.setItem('agentManagerGrepDirs', grepDirs);
+  });
+  document.getElementById('build-btn').onclick = triggerBuild;
+  document.getElementById('sync-btn').onclick = triggerSync;
+
+  await loadProjectHistory();
+  await loadProjectDropdown();
+  await refreshPipelineStatus();
+  await refreshProjectStatus();
+  projectStatusInterval = setInterval(() => { refreshPipelineStatus(); refreshProjectStatus(); }, 3000);
+}
+```
+
+Problem:
+`enterProjectTab` is 121 lines that interleave a subtle server-state sync comparison, a ~30-line HTML template string, ~40 lines of coupled event wiring, and a short init sequence. The sync block at the top contains a two-variable comparison (`lastSyncedActiveRepoRoot` vs `projectPath`) that already produced a real bug on 2026-08-18 (documented in the inline comment); that logic is buried 15 lines into a function whose remaining 106 lines are layout and wiring, making it easy for a future edit to land in the wrong place or miss a related handler. The HTML string inflates the line count and pushes the sync logic further from the function's entry point, obscuring "what happens first."
+
+Solution:
+Extract three named helpers and leave a thin ~10-line orchestrator. The critical extraction is `syncProjectTabStateFromServer()`, which owns the `lastSyncedActiveRepoRoot` / `projectPath` comparison and the `includeApply` / `skipPush` persistence in one independently-callable, unit-testable unit. The HTML template becomes `projectTabHTML()` (pure string, no logic). All DOM listeners move into `wireProjectTabEvents()`. The new `enterProjectTab` body is just: call sync, set innerHTML, wire events, load history/dropdown, start the interval.
+
+```js
+// ── 1. Server-state sync (the subtle, bug-prone part) ──────────────────
+async function syncProjectTabStateFromServer() {
+  try {
+    const status = await fetchJson('/api/pipeline/status');
+    if (status.activeRepoRoot && status.activeRepoRoot !== lastSyncedActiveRepoRoot) {
+      lastSyncedActiveRepoRoot = status.activeRepoRoot;
+      if (status.activeRepoRoot !== projectPath) setProjectPath(status.activeRepoRoot);
+    }
+    if (typeof status.includeApply === 'boolean') {
+      includeApply = status.includeApply;
+      localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    }
+    if (typeof status.skipPush === 'boolean') {
+      skipPush = status.skipPush;
+      localStorage.setItem('agentManagerSkipPush', String(skipPush));
+    }
+  } catch (e) { /* fall back to cached values */ }
+}
+
+// ── 2. HTML layout (pure string, no logic) ─────────────────────────────
+function projectTabHTML() {
+  return `
+    <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
+      <div class="path-row">
+        <select id="project-select" style="flex:1;"><option value="">Loading projects...</option></select>
+        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project"
+               value="${escapeAttr(projectPath)}" list="project-history-list"
+               autocomplete="off" style="display:none;">
+        <datalist id="project-history-list"></datalist>
+        <button class="secondary" id="history-toggle">History...</button>
+        <button class="secondary" id="browse-toggle">Browse...</button>
+        <button class="secondary" id="sync-btn" title="Fetch origin and fast-forward this checkout onto it">Sync with GitHub</button>
+        <button class="action" id="build-btn">Build Graph</button>
+      </div>
+      <div id="history-panel" class="browser-panel" style="display:none"></div>
+      <div class="path-row">
+        <input id="project-grepdirs-input" type="text"
+               placeholder="src, frontend/src, backend/src (optional -- comma-separated, leave blank to scan the whole path)"
+               value="${escapeAttr(grepDirs)}">
+      </div>
+      <div class="path-row" id="pipeline-toggles-row" style="gap:16px;align-items:center;">
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;">
+          <input type="checkbox" id="include-apply-toggle" ${includeApply ? 'checked' : ''}>
+          Enable Apply Runner (writes/commits changes)
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}"
+               title="Applied work is always pushed now (2026-08-17) -- an unpushed branch was silently losing real work over time. This only controls whether the local checkout returns to main after each apply, or stays on the applied branch for inspection.">
+          <input type="checkbox" id="skip-push-toggle" ${!includeApply ? 'disabled' : ''} ${!skipPush ? 'checked' : ''}>
+          Return to main after each apply (unchecked: stay on the applied branch)
+        </label>
+        <span class="meta" style="font-size:0.85em;">Which job types run is now controlled from the Job List tab. Applied work is always pushed to the remote for durability, regardless of this toggle.</span>
+      </div>
+      <div id="browser-panel" class="browser-panel" style="display:none"></div>
+      <div id="pipeline-panel" class="worker-card"></div>
+      <div id="project-status-area" style="flex:1;min-height:0;display:flex;flex-direction:column;"></div>
+    </div>`;
+}
+
+// ── 3. Event wiring (all DOM listeners in one place) ───────────────────
+function wireProjectTabEvents() {
+  document.getElementById('project-path-input').addEventListener('change', (e) => {
+    setProjectPath(e.target.value.trim());
+    lastRenderedStatusKey = null;
+    refreshProjectStatus();
+  });
+  document.getElementById('include-apply-toggle').addEventListener('change', (e) => {
+    includeApply = e.target.checked;
+    localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    const pushToggle = document.getElementById('skip-push-toggle');
+    pushToggle.disabled = !includeApply;
+    pushToggle.closest('label').style.opacity = includeApply ? '' : '.5';
+    if (!includeApply) { pushToggle.checked = false; skipPush = true; localStorage.setItem('agentManagerSkipPush', 'true'); }
+  });
+  document.getElementById('skip-push-toggle').addEventListener('change', (e) => {
+    skipPush = !e.target.checked;
+    localStorage.setItem('agentManagerSkipPush', String(skipPush));
+  });
+  document.getElementById('project-select').addEventListener('change', (e) => {
+    if (!e.target.value) return;
+    setProjectPath(e.target.value);
+    document.getElementById('project-path-input').value = projectPath;
+    lastRenderedStatusKey = null;
+    refreshProjectStatus();
+  });
+  document.getElementById('browse-toggle').onclick = () => {
+    browserOpen = !browserOpen;
+    document.getElementById('browser-panel').style.display = browserOpen ? 'block' : 'none';
+    document.getElementById('project-select').style.display = browserOpen ? 'none' : '';
+    document.getElementById('project-path-input').style.display = browserOpen ? '' : 'none';
+    if (browserOpen) { browsePath = projectPath || ''; loadBrowsePanel(); }
+  };
+  document.getElementById('history-toggle').onclick = () => {
+    historyOpen = !historyOpen;
+    document.getElementById('history-panel').style.display = historyOpen ? 'block' : 'none';
+    if (historyOpen) renderHistoryPanel();
+  });
+  document.getElementById('project-grepdirs-input').addEventListener('change', (e) => {
+    grepDirs = e.target.value.trim();
+    localStorage.setItem('agentManagerGrepDirs', grepDirs);
+  });
+  document.getElementById('build-btn').onclick = triggerBuild;
+  document.getElementById('sync-btn').onclick = triggerSync;
+}
+
+// ── 4. Thin orchestrator (the new enterProjectTab) ─────────────────────
+async function enterProjectTab() {
+  await syncProjectTabStateFromServer();
+
+  const main = document.getElementById('main');
+  main.innerHTML = projectTabHTML();
+  lastRenderedStatusKey = null;
+
+  wireProjectTabEvents();
+
+  await loadProjectHistory();
+  await loadProjectDropdown();
+  await refreshPipelineStatus();
+  await refreshProjectStatus();
+  projectStatusInterval = setInterval(() => { refreshPipelineStatus(); refreshProjectStatus(); }, 3000);
+}
+```
+
+Benefits:
+The sync comparison that caused the 2026-08-18 bug becomes a standalone ~15-line function whose entire purpose is that logic; it can be unit-tested with a stubbed `fetchJson` without mocking `document` or running the full 121-line orchestrator. Adding a new toggle or handler means opening `wireProjectTabEvents()` (~35 lines) rather than scanning 121 lines. Changing the layout means editing `projectTabHTML()` in isolation. The new `enterProjectTab` body is 10 lines of named calls, making the "what happens on tab entry" flow immediately readable and the sync step unmissable.
+
+### AC-173 · Extract classification dispatch and outcome application from autoConfirmReview
+Strength: Strong
+Files: src/auto-confirm-review.js
+Snippet:
+```
+}
+
+async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote, candidatesPath }) {
+  const summary = { checked: 0, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
+  if (process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW === 'false') return summary;
+
+  const dir = path.join(pipelineDir, 'queue', 'awaiting-confirm');
+  const approvedDir = path.join(pipelineDir, 'queue', 'approved');
+  const archiveDir = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+  const fixCandidatesPath = candidatesPath || (getConfig().pipelineFixCandidatesPath);
+
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return summary; // no awaiting-confirm/ dir -- nothing to do
+  }
+
+  for (const name of names) {
+    const file = path.join(dir, name);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue;
+    }
+    if (task.autoConfirmReviewedAt) continue; // already reviewed once -- left for a human
+
+    summary.checked += 1;
+    const isForensics = task.source === 'pipeline_forensics';
+    const isDebrief = task.source === 'pipeline_debrief';
+    const deleteItems = (isForensics || isDebrief) ? [] : parseDeleteItems(task.implementResponse);
+
+    let prompt;
+    let gateStamp;
+    if (isForensics) {
+      prompt = buildForensicsConfirmPrompt(task, readCandidatesDoc(fixCandidatesPath));
+      gateStamp = 'forensicsReportConfirmedAt';
+    } else if (isDebrief) {
+      prompt = buildDebriefConfirmPrompt(task);
+      gateStamp = 'debriefReportConfirmedAt';
+    } else if (deleteItems.length && batchContainsDeleteMode(task.implementResponse)) {
+      const refMap = gatherDeleteReferences(repoRoot, grepDirs, deleteItems.map((i) => i.file), task);
+      prompt = buildDeleteConfirmPrompt(task, deleteItems, refMap);
+      gateStamp = 'deleteConfirmedAt';
+    } else {
+      // A hold we don't recognise -- don't guess. Leave it for a human, but stamp so we
+      // don't re-check every tick.
+      task.autoConfirmReviewedAt = new Date().toISOString();
+      task.autoConfirmDecision = 'escalate';
+      task.autoConfirmReviewNote = 'auto-confirm review does not recognise this hold type -- left for a human';
+      appendHistoryEvent(task, 'advisory', task.autoConfirmReviewNote);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch (err) {
+        const taskId = task.id || (task.implementResponse ? task.implementResponse.slice(0, 8) : 'unknown');
+        console.error(`[auto-confirm-review] escalate write failed: file=${file} task=${taskId} code=${err.code || ''} message=${err.message}`);
+        summary.errors += 1;
+      }
+      continue;
+    }
+
+    let vote;
+    try {
+      vote = await majorityVote({
+        prompt,
+        classify: classifyVote(['CONFIRM', 'DENY'], 15),
+        n: isDebrief ? DEBRIEF_VOTES : AUTO_CONFIRM_VOTES,
+        minAgreeing: isDebrief ? DEBRIEF_MIN_AGREEING : AUTO_CONFIRM_MIN_AGREEING,
+        temperature: 0.2,
+        source: task.source,
+      });
+    } catch (e) {
+      // Every vote hard-failed (infra). Do NOT stamp -- next tick retries.
+      appendHistoryEvent(task, 'advisory', `auto-confirm review could not run (${(e && e.message || 'vote error').slice(0, 160)}) -- will retry`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch { /* best-effort */ }
+      summary.errors += 1;
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    if (vote.confident && vote.verdict === 'CONFIRM') {
+      const reason = voteReason(vote, 'CONFIRM');
+      task[gateStamp] = now; // 'forensicsReportConfirmedAt' or 'deleteConfirmedAt' -- the field apply-task.js's gate checks
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'confirm';
+      task.autoConfirmReviewNote = reason;
+      task.status = 'approved';
+      appendHistoryEvent(task, 'approved', `auto-confirmed (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
+      try {
+        const result = moveTaskFile(file, approvedDir, name, task);
+        if (result) summary.confirmed += 1;
+        else { console.error(`auto-confirm: moveTaskFile returned falsy for ${name} (${file}): ${result}`); summary.errors += 1; }
+      } catch (err) { console.error(`auto-confirm: moveTaskFile threw for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
+    } else if (vote.confident && vote.verdict === 'DENY') {
+      const reason = voteReason(vote, 'DENY');
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'deny';
+      task.autoConfirmReviewNote = reason;
+      task.status = 'done';
+      task.doneMarker = `auto-denied at confirm gate: ${reason}`;
+      appendHistoryEvent(task, 'archived', `auto-denied (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
+      try {
+        if (moveTaskFile(file, archiveDir, name, task)) summary.denied += 1;
+        else summary.errors += 1;
+      } catch (err) { console.error(`auto-confirm: moveTaskFile threw (DENY) for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
+    } else {
+      // No confident majority -- leave for a human.
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'escalate';
+      task.autoConfirmReviewNote = `no confident CONFIRM/DENY majority (votes: ${vote.realVoteCount}/${vote.requestedVotes})`;
+      appendHistoryEvent(task, 'advisory', `auto-confirm review inconclusive (${task.autoConfirmReviewNote}) -- held for a human`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch { summary.errors += 1; }
+    }
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The 117-line autoConfirmReview function carries two independent branching axes — a 4-way classification dispatch (forensics / debrief / delete / unknown) and a 3-way outcome dispatch (CONFIRM / DENY / inconclusive) — producing 12 distinct code paths through the loop body. Each outcome branch repeats the same shape (mutate 4–5 task fields, call appendHistoryEvent, move or write the file, bump a summary counter), so adding a fourth hold type or a new stamp field requires touching copy-pasted logic in three places. The combined reading burden makes a 17-line-over-threshold function feel like a 60-line one.
+
+Solution:
+Extract two named helpers scoped to this function: classifyAndBuildPrompt (the if/else-if/else-if/else block that decides what to vote on, returning a prompt + gateStamp or an escalate signal) and applyVoteOutcome (the CONFIRM/DENY/inconclusive block that mutates fields, appends history, moves the file, and returns the summary-counter key). The coordinator loop then shrinks to: scan directory → per-file: classify → vote → apply → bump counter.
+
+```diff
+--- a/src/auto-confirm-review.js
++++ b/src/auto-confirm-review.js
+@@ -290,6 +290,52 @@
++function classifyAndBuildPrompt(task, { repoRoot, grepDirs, fixCandidatesPath }) {
++  const isForensics = task.source === 'pipeline_forensics';
++  const isDebrief   = task.source === 'pipeline_debrief';
++  const deleteItems = (isForensics || isDebrief) ? [] : parseDeleteItems(task.implementResponse);
++
++  if (isForensics) {
++    return { prompt: buildForensicsConfirmPrompt(task, readCandidatesDoc(fixCandidatesPath)), gateStamp: 'forensicsReportConfirmedAt' };
++  }
++  if (isDebrief) {
++    return { prompt: buildDebriefConfirmPrompt(task), gateStamp: 'debriefReportConfirmedAt' };
++  }
++  if (deleteItems.length && batchContainsDeleteMode(task.implementResponse)) {
++    const refMap = gatherDeleteReferences(repoRoot, grepDirs, deleteItems.map((i) => i.file), task);
++    return { prompt: buildDeleteConfirmPrompt(task, deleteItems, refMap), gateStamp: 'deleteConfirmedAt' };
++  }
++  return { escalate: true, note: 'unrecognised hold type -- left for a human' };
++}
++
++function applyVoteOutcome(task, file, name, { verdict, vote, gateStamp, approvedDir, archiveDir, now }) {
++  const reason = voteReason(vote, verdict);
++  task.autoConfirmReviewedAt = now;
++  task.autoConfirmDecision   = verdict.toLowerCase();
++  task.autoConfirmReviewNote = reason;
++
++  if (verdict === 'CONFIRM') {
++    task[gateStamp] = now;
++    task.status = 'approved';
++    appendHistoryEvent(task, 'approved', `auto-confirmed (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
++    return moveTaskFile(file, approvedDir, name, task) ? 'confirmed' : null;
++  }
++  if (verdict === 'DENY') {
++    task.status = 'done';
++    task.doneMarker = `auto-denied at confirm gate: ${reason}`;
++    appendHistoryEvent(task, 'archived', `auto-denied (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
++    return moveTaskFile(file, archiveDir, name, task) ? 'denied' : null;
++  }
++  appendHistoryEvent(task, 'advisory', `auto-confirm review inconclusive (${reason}) -- held for a human`);
++  fs.writeFileSync(file, JSON.stringify(task, null, 2));
++  return 'escalated';
++}
+```
+
+Benefits:
+Each extracted helper is independently unit-testable without exercising the full loop: classifyAndBuildPrompt can be tested with fixture tasks for all four hold types, and applyVoteOutcome can be tested against a temp directory for all three verdicts (including the write-failure path). The coordinator drops to roughly 55 lines of linear flow (scan → classify → vote → apply → count), so a reviewer can verify the control structure in one pass. Future edits — adding a fifth hold type, changing a stamp field, or introducing a new outcome — touch exactly one helper instead of three interleaved branches.
+
+### AC-174 · Decompose validatePlan into three strategy functions
+Strength: Strong
+Files: src/file-decompose-to-hub.js
+Snippet:
+```
+// hardProblems block the whole plan (hub filed blocked, no children). Shared deps do not
+// block -- they are threaded into the move + wiring prompts.
+function validatePlan(repoRoot, request) {
+  const hardProblems = [];
+  const moveMeta = [];
+  const allMovedSymbols = new Set();
+  for (const m of request.moves) for (const s of (m.symbols || [])) allMovedSymbols.add(s);
+
+  // A plain CommonJS source (src/*.js) -- neither an HTML <script> nor a .py. Run the
+  // whole plan through decompose-node-module.js once: it chains the N moves and only
+  // succeeds if EVERY move is a self-contained set of top-level function declarations
+  // (references only each other + require()d names + JS globals). ok -> every move gets
+  // nodeModuleApplyOk (the .js analogue of deterministicApplyOk); not-ok -> one hard
+  // problem with the exact reason. The move `kind` (script-extract vs module-extract) is
+  // irrelevant here -- .js wiring is require()/module.exports either way.
+  //
+  // 2026-09-14, screaminggoatclubmt: "Harden [this]" -- caught live: this branch used to
+  // match ANY .js source by extension alone, with zero regard for whether it's actually a
+  // Node CommonJS module. python/dashboard/static/js/*.js files are loaded via a plain
+  // browser `<script src>` tag (see index.html) -- no bundler, no Node runtime, `require`
+  // is not a defined identifier there at all. The produced split used real
+  // require()/module.exports wiring anyway, which would have thrown "require is not
+  // defined" the instant the browser loaded it, breaking the Models/Deep-Dive/Discovery/
+  // Tokenfold tabs -- caught before merge only because this session verifies every branch
+  // for real before recommending one. looksLikeNodeCommonJsModule (require()/module.exports
+  // ANYWHERE in the source) gates this branch now; every real Node module in this repo has
+  // at least one of those (confirmed: 0 occurrences across every static/js/*.js file,
+  // 20+ each across a sample of real src/*.js modules). A file that fails this gate falls
+  // through to the generic per-move loop below, which already handles `script-extract`
+  // moves in a browser-safe way (staticCheckScriptExtractMove, verbatim extraction, no
+  // require()/module.exports wiring at all) -- built and proven for plain .js sources
+  // back on 2026-09-08 (review-task.js), just never reachable for THIS class of file
+  // because this earlier, broader check always intercepted it first.
+  if (/\.(js|mjs|cjs)$/.test(request.sourceFile || '')) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null && looksLikeNodeCommonJsModule(sourceText)) {
+      const built = buildNodeModuleOnePassChanges(sourceText, request.sourceFile, request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })), repoRoot);
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], nodeModuleApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+      return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+    }
+    // Unreadable, OR readable but not a CommonJS module -- fall through to the generic
+    // per-move loop below rather than returning here.
+  }
+
+  // A .py source whose plan is ALL flask-blueprint moves: run the whole plan through
+  // decompose-flask-blueprint.js once (AST extract + py_compile). ok -> every move gets
+  // blueprintApplyOk and fileHub short-circuits to a single deterministic one-pass task
+  // (no hub, no per-move 27B agentic pass -- which on a large app.py runs out of turn
+  // budget before finishing: the 2026-09-09 blueprint hub). not-ok -> one hard problem.
+  // A MIXED .py plan (some blueprint, some not) still falls through to the per-move path.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_BLUEPRINT !== 'false'
+      && /\.py$/.test(request.sourceFile || '') && request.moves.length
+      && request.moves.every((m) => m.kind === 'flask-blueprint' && m.blueprint)) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null) {
+      const built = buildBlueprintOnePassChanges(sourceText, request.sourceFile,
+        request.moves.map((m) => ({ newFile: m.newFile, blueprint: m.blueprint, symbols: m.symbols || [] })));
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], blueprintApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+    } else {
+      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  }
+
+  for (const move of request.moves) {
+    const symbols = move.symbols || [];
+    const meta = { sharedDeps: [], neededImports: [] };
+    if (symbols.length === 0) {
+      hardProblems.push(`${move.newFile}: move has no symbols`);
+      moveMeta.push(meta);
+      continue;
+    }
+    if (move.kind === 'script-extract') {
+      const seCheck = staticCheckScriptExtractMove(repoRoot, request.sourceFile, symbols);
+      if (seCheck && seCheck.resolvable) {
+        if (!seCheck.ok) {
+          hardProblems.push(`${move.newFile}: ${seCheck.missing.join(', ')} could not be located as top-level function declarations in ${request.sourceFile}`);
+        } else {
+          // Every symbol resolves cleanly -- this move can skip the model entirely at
+          // apply time (see local-draft.js's tryDeterministicScriptExtractEdit).
+          meta.deterministicApplyOk = true;
+        }
+      }
+      moveMeta.push(meta);
+      continue;
+    }
+    const check = staticCheckMove(repoRoot, request.sourceFile, symbols);
+    if (check) {
+      if (check.missing && check.missing.length) {
+        hardProblems.push(`${move.newFile}: ${check.missing.join(', ')} not defined at module scope in ${request.sourceFile}`);
+      }
+      const strays = Object.entries(check.externalRefs || {});
+      if (strays.length) {
+        hardProblems.push(`${move.newFile}: ${strays.map(([s, lines]) => `${s} is still referenced elsewhere in ${request.sourceFile} (line(s) ${lines.slice(0, 6).join(', ')})`).join('; ')} -- not a self-contained move`);
+      }
+      // `app` is expected for a flask-blueprint move (every @app.route becomes
+      // @<bp>.route); anything else that resolves to an app.py module-level name and is
+      // not itself being moved becomes a cross-module import.
+      meta.sharedDeps = (check.sharedDeps || []).filter((d) => {
+        if (d === 'app' && move.kind === 'flask-blueprint') return false;
+        return !allMovedSymbols.has(d);
+      });
+      meta.neededImports = check.neededImports || [];
+    }
+    moveMeta.push(meta);
+  }
+  return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+}
+```
+
+Problem:
+`validatePlan` is a 118-line three-way dispatch where each branch (Node CommonJS one-pass, Flask blueprint one-pass, generic per-move) is a self-contained validation strategy with its own gate condition, builder call, and result shape. The branches are mutually exclusive and independently testable, yet they are welded into a single function. Adding a fourth strategy (Rust, Go, a new Python framework) requires editing the entire 118-line body and risks the other two branches. The generic per-move loop itself contains a sub-branch (`script-extract` vs. generic) that is logically distinct. Even after stripping the ~30 lines of comments, the three branches are ~85 lines of different logic sharing only the input/output contract — a structural smell, not a padding one.
+
+Solution:
+Extract three strategy functions that each return `true` if they handled the plan (caller returns immediately) or `false` to fall through, plus a thin ~15-line dispatcher. The full decomposition, with every branch preserved verbatim, is:
+
+```js
+// ── Strategy 1: Node CommonJS one-pass ──────────────────────────────────────
+function validateNodeCommonJsPlan(repoRoot, request, hardProblems, moveMeta) {
+  if (!/\.(js|mjs|cjs)$/.test(request.sourceFile || '')) return false;
+  let sourceText = null;
+  try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); }
+  catch { /* unreadable → advisory only, fall through */ }
+  if (sourceText == null || !looksLikeNodeCommonJsModule(sourceText)) return false;
+
+  const built = buildNodeModuleOnePassChanges(
+    sourceText, request.sourceFile,
+    request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })),
+    repoRoot,
+  );
+  if (built.ok) {
+    for (const _m of request.moves)
+      moveMeta.push({ sharedDeps: [], neededImports: [], nodeModuleApplyOk: true });
+  } else {
+    hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+    for (const _m of request.moves)
+      moveMeta.push({ sharedDeps: [], neededImports: [] });
+  }
+  return true;
+}
+
+// ── Strategy 2: Flask blueprint one-pass ────────────────────────────────────
+function validateFlaskBlueprintPlan(repoRoot, request, hardProblems, moveMeta) {
+  if (process.env.AGENT_MANAGER_DECOMPOSE_BLUEPRINT === 'false') return false;
+  if (!/\.py$/.test(request.sourceFile || '')) return false;
+  if (!request.moves.length) return false;
+  if (!request.moves.every((m) => m.kind === 'flask-blueprint' && m.blueprint)) return false;
+
+  let sourceText = null;
+  try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); }
+  catch { /* unreadable → advisory only */ }
+
+  if (sourceText != null) {
+    const built = buildBlueprintOnePassChanges(
+      sourceText, request.sourceFile,
+      request.moves.map((m) => ({ newFile: m.newFile, blueprint: m.blueprint, symbols: m.symbols || [] })),
+    );
+    if (built.ok) {
+      for (const _m of request.moves)
+        moveMeta.push({ sharedDeps: [], neededImports: [], blueprintApplyOk: true });
+    } else {
+      hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+      for (const _m of request.moves)
+        moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+  } else {
+    for (const _m of request.moves)
+      moveMeta.push({ sharedDeps: [], neededImports: [] });
+  }
+  return true;
+}
+
+// ── Strategy 3: Generic per-move validation ───────────────────────────────��─
+function validateGenericMoves(repoRoot, request, hardProblems, moveMeta, allMovedSymbols) {
+  for (const move of request.moves) {
+    const symbols = move.symbols || [];
+    const meta = { sharedDeps: [], neededImports: [] };
+
+    if (symbols.length === 0) {
+      hardProblems.push(`${move.newFile}: move has no symbols`);
+      moveMeta.push(meta);
+      continue;
+    }
+
+    if (move.kind === 'script-extract') {
+      const seCheck = staticCheckScriptExtractMove(repoRoot, request.sourceFile, symbols);
+      if (seCheck && seCheck.resolvable) {
+        if (!seCheck.ok) {
+          hardProblems.push(
+            `${move.newFile}: ${seCheck.missing.join(', ')} could not be located ` +
+            `as top-level function declarations in ${request.sourceFile}`,
+          );
+        } else {
+          meta.deterministicApplyOk = true;
+        }
+      }
+      moveMeta.push(meta);
+      continue;
+    }
+
+    const check = staticCheckMove(repoRoot, request.sourceFile, symbols);
+    if (check) {
+      if (check.missing && check.missing.length) {
+        hardProblems.push(
+          `${move.newFile}: ${check.missing.join(', ')} not defined at module scope in ${request.sourceFile}`,
+        );
+      }
+      const strays = Object.entries(check.externalRefs || {});
+      if (strays.length) {
+        hardProblems.push(
+          `${move.newFile}: ${strays
+            .map(([s, lines]) =>
+              `${s} is still referenced elsewhere in ${request.sourceFile} ` +
+              `(line(s) ${lines.slice(0, 6).join(', ')})`
+            )
+            .join('; ')} -- not a self-contained move`,
+        );
+      }
+      meta.sharedDeps = (check.sharedDeps || []).filter((d) => {
+        if (d === 'app' && move.kind === 'flask-blueprint') return false;
+        return !allMovedSymbols.has(d);
+      });
+      meta.neededImports = check.neededImports || [];
+    }
+    moveMeta.push(meta);
+  }
+}
+
+// ── Thin dispatcher (replaces the old 118-line validatePlan) ───────────────
+function validatePlan(repoRoot, request) {
+  const hardProblems = [];
+  const moveMeta = [];
+  const allMovedSymbols = new Set();
+  for (const m of request.moves)
+    for (const s of (m.symbols || [])) allMovedSymbols.add(s);
+
+  if (validateNodeCommonJsPlan(repoRoot, request, hardProblems, moveMeta))
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  if (validateFlaskBlueprintPlan(repoRoot, request, hardProblems, moveMeta))
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+
+  validateGenericMoves(repoRoot, request, hardProblems, moveMeta, allMovedSymbols);
+  return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+}
+```
+
+Benefits:
+Each strategy becomes independently unit-testable: `validateNodeCommonJsPlan` can be tested with a mock `buildNodeModuleOnePassChanges` without touching the blueprint or generic paths, and vice-versa. Adding a fourth strategy (e.g. `validateRustCratePlan`) is a new ~25-line function plus one `if` line in the dispatcher, not a 118→150-line edit. The top-level function now reads as "try A, try B, else C" in 15 lines, making the three-way mutual-exclusion obvious at a glance. The extraction is mechanical — every branch, gate, and result-push is preserved verbatim — so there is no behaviour change.
+
+### AC-175 · Decompose `callOnce` into testable pipeline stages
+Strength: Strong
+Files: src/claude-client.js
+Snippet:
+```
+}
+
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+  assertSubscriptionAuthAvailable();
+  // cwd lets a caller run this against a real project directory instead of the
+  // isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
+  // dump entry: "Claude in the agent-manager has no access to... the system it's
+  // housed inside") pass the active project's repoRoot here alongside a read-only
+  // allowedTools list, so Read/Grep/Glob actually resolve real files instead of an
+  // empty directory. Falls back to CLAUDE_CWD (the isolated scratch dir) for every
+  // caller that doesn't explicitly ask for this -- the existing, safer default.
+  const workDir = cwd || CLAUDE_CWD;
+  fs.mkdirSync(workDir, { recursive: true });
+
+  // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header) --
+  // same treatment as local-client.js's callOnce(), the sibling chokepoint.
+  let effectivePrompt = allowSideFindings ? injectSideFindingInstruction(prompt) : prompt;
+  // Incident Amplification (2026-09-08) -- opt-in, default false, same reasoning as
+  // local-client.js's callOnce().
+  if (allowAmplification) effectivePrompt = injectAmplificationInstruction(effectivePrompt);
+  if (conceptId) effectivePrompt = injectConceptBuildInstruction(effectivePrompt);
+  const datedPrompt = `${currentDateLine()}\n\n${effectivePrompt}`;
+  // Hard ceiling (see DRAFT_MAX_TURNS above, brain-dump bd-1788707820332) -- a
+  // caller asking for 61 turns gets 20, a caller asking for 1 keeps 1.
+  const effectiveMaxTurns = Math.min(maxTurns, DRAFT_MAX_TURNS);
+  const args = [
+    '-p', datedPrompt,
+    '--output-format', 'json',
+    '--model', model || MODEL,
+    '--max-turns', String(effectiveMaxTurns),
+    '--permission-mode', permissionMode,
+  ];
+  // low/medium/high/xhigh/max -- see CLI --effort. Falls back to the CLI's own default
+  // (currently "high") when neither the call site nor CLAUDE_EFFORT sets one, same
+  // "don't invent a value the caller didn't ask for" reasoning as `model` above.
+  const effortLevel = effort || process.env.CLAUDE_EFFORT;
+  if (effortLevel) args.push('--effort', effortLevel);
+  // No --allowedTools by default -- this module is used as a plain text-completion
+  // backend (drafting/critiquing/reviewing prompt text), the same shape as Ollama's
+  // /api/generate, not an agentic session. Callers that genuinely need tool access can
+  // pass allowedTools explicitly.
+  //
+  // But leaving tools implicitly available (the CLI's own default) combined with
+  // --max-turns 1 is a live footgun, confirmed 2026-08-16: a prompt that reads as a
+  // request to go investigate something (a Discuss reply like "please look it up and
+  // see if we can find usable information") pushes the model to attempt a built-in
+  // tool call (e.g. WebFetch) as its one turn instead of returning text, and the CLI
+  // then exits with "Reached maximum number of turns (1)" -- the raw JSON of that
+  // error is what a caller (e.g. discuss_sessions.py) sees, with no completion at all.
+  // When the caller hasn't opted into tools via allowedTools, explicitly pass
+  // `--tools ''` (the CLI's own documented way to disable the built-in set entirely,
+  // distinct from --allowedTools which only narrows an already-available set) so a
+  // plain-text-completion call can never spend its single turn attempting a tool call
+  // it was never meant to have.
+  if (allowedTools) {
+    args.push('--allowedTools', allowedTools);
+  } else {
+    args.push('--tools', '');
+  }
+  if (MAX_BUDGET_USD) args.push('--max-budget-usd', MAX_BUDGET_USD);
+  // 2026-08-24 (Chat panel, Brain Dump #153: "very similar to the claude terminal I have
+  // been using externally") -- resume threads --resume <sessionId> so the CLI's OWN
+  // session storage carries real conversation context forward between calls, instead of
+  // every caller having to rebuild a full prompt+transcript from scratch each turn the
+  // way discuss_sessions.py's Discuss/Grill callers already do. `result.sessionId` from a
+  // prior callOnce() (parsed.session_id, already returned below) is what a caller passes
+  // back in here for its next message.
+  if (resume) args.push('--resume', resume);
+
+  // addDirs (2026-08-31, system-wide Chat panel): extra directories the `claude` CLI is
+  // allowed to Read/Grep/Glob/Edit/Write in, on top of `cwd`. The dashboard's Chat panel
+  // roots `cwd` at the agent-manager repo and passes one entry per registered
+  // plugin/project repo, so a single conversation can span every codebase the system
+  // knows about. Omitted by every other caller -- unchanged single-`cwd` behaviour.
+  for (const d of Array.isArray(addDirs) ? addDirs : []) {
+    if (d) args.push('--add-dir', d);
+  }
+
+  // sandbox (2026-08-24, sandbox.js): only adhoc-agentic-draft.js's agentic call passes
+  // this -- the one real Bash-capable, unattended tool-use path in this codebase (see
+  // sandbox.js's own header). Every other caller omits it and this branch never runs,
+  // completely unchanged behavior. Fails OPEN with a flagged return field, not closed --
+  // a hardening layer on top of existing behavior must never become a new single point of
+  // failure that halts real work; the caller (adhoc-agentic-draft.js) is responsible for
+  // surfacing sandboxUnavailable somewhere visible (task.sandboxUnavailable) rather than
+  // silently degrading.
+  let execBin = CLAUDE_BIN;
+  let execArgs = args;
+  let sandboxUnavailable = false;
+  if (sandbox) {
+    const wrapped = wrapWithSandbox(CLAUDE_BIN, args, { workDir, ...sandbox });
+    if (wrapped.available) {
+      execBin = wrapped.command;
+      execArgs = wrapped.args;
+    } else {
+      sandboxUnavailable = true;
+      console.error('[claude-client] sandbox requested but bwrap is not available on this host -- running unsandboxed (see sandbox.js AGENT_MANAGER_ADHOC_SANDBOX)');
+    }
+  }
+
+  let stdout;
+  try {
+    stdout = execFileSync(execBin, execArgs, {
+      encoding: 'utf8',
+      // timeoutMs lets a caller running a genuinely long agentic session (real
+      // Read/Grep/Glob/Edit/Write/Bash investigation + implementation + test runs, not
+      // this module's usual single-completion call) override the 300s default sized for
+      // that ordinary case -- see adhoc-agentic-draft.js, the first caller that needs it.
+      timeout: timeoutMs || REQUEST_TIMEOUT_MS,
+      maxBuffer: 32 * 1024 * 1024,
+      cwd: workDir,
+      env: buildChildEnv(),
+    });
+  } catch (e) {
+    const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
+    // Non-zero exit whose output mentions the turn limit (the CLI's own
+    // "Reached maximum number of turns (N)" failure, confirmed live 2026-08-16)
+    // -- surface it as the same structured error as the JSON-parsed path below
+    // so a caller can detect exhaustion uniformly instead of pattern-matching
+    // free text.
+    if (/(?:max(?:imum)?[ -]?turns?|turn budget)/i.test(detail)) {
+      const turnLimitErr = new Error(`Draft turn limit exceeded (claude -p non-zero exit): ${detail}`);
+      turnLimitErr.code = 'DRAFT_TURN_LIMIT_EXCEEDED';
+      turnLimitErr.maxTurns = effectiveMaxTurns;
+      throw turnLimitErr;
+    }
+    throw new Error(`claude -p failed: ${detail}`);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (e) {
+    throw new Error(`claude -p returned non-JSON output with --output-format json: ${stdout.slice(0, 500)}`);
+  }
+
+  // Turn-limit exhaustion detected in the CLI's own JSON (confirmed live shape:
+  // stop_reason "tool_use" with num_turns at the requested ceiling, e.g. 31/31 in
+  // the 2026-08-23 adhoc-draft failure) -- throw the structured error here,
+  // before the caller can mistake an exhausted run for a completed one. This is
+  // the code the retry-exclusion consumer (call()'s loop / adhoc-agentic-draft.js)
+  // keys on rather than pattern-matching stop_reason/num_turns itself.
+  if (
+    parsed.stop_reason === 'tool_use' &&
+    parsed.num_turns != null &&
+    parsed.num_turns >= effectiveMaxTurns
+  ) {
+    const turnLimitErr = new Error(
+      `Draft turn limit exceeded: ${parsed.num_turns} turns reached the ceiling of ${effectiveMaxTurns}.`
+    );
+    turnLimitErr.code = 'DRAFT_TURN_LIMIT_EXCEEDED';
+    turnLimitErr.maxTurns = effectiveMaxTurns;
+    turnLimitErr.numTurns = parsed.num_turns;
+    throw turnLimitErr;
+  }
+
+  return {
+    response: parsed.result || '',
+    thinking: '',
+    // total_cost_usd is a client-side estimate per Claude Code's own docs, and is
+    // largely moot here anyway since a subscription-authenticated call isn't billed
+    // per-token -- kept only as an observability breadcrumb, never treated as billing.
+    costUsd: parsed.total_cost_usd,
+    sessionId: parsed.session_id,
+    // stopReason/numTurns (2026-08-23, Grimmethy: "Fix: Claude agentic adhoc drafts that
+    // exhaust their turn budget get blindly retried at the same budget, wasting real
+    // spend") -- previously discarded entirely, even though the raw CLI JSON always
+    // carries them (confirmed live in a real failure: stop_reason":"tool_use",
+    // "num_turns":31). Without these, a caller has no way to tell "ran out of turns
+    // mid-investigation" apart from any other incomplete response -- see
+    // adhoc-agentic-draft.js's own turn-exhaustion retry, the first real consumer.
+    stopReason: parsed.stop_reason || null,
+    numTurns: parsed.num_turns != null ? parsed.num_turns : null,
+    sandboxUnavailable,
+  };
+}
+```
+
+Problem:
+The `callOnce` function in `src/claude-client.js` is ~174 lines (≈100 lines of executable code plus ~70 lines of historical/rationale comments) and interleaves five independently-testable responsibilities: prompt-injection string assembly, CLI argument construction with 7+ optional flags and non-obvious interactions (`allowedTools` vs `--tools ''`, `effort` fallback chain), sandbox binary/args wrapping, synchronous process execution with two distinct turn-limit detection paths (non-zero exit regex *and* JSON `stop_reason`), and final result-shaping into the module's return contract. Because all five live in one body, a caller who wants to unit-test a single concern—e.g. "does the arg builder emit `--tools ''` when `allowedTools` is absent?"—must mock `execFileSync`, `fs.mkdirSync`, the sandbox wrapper, and three prompt injectors. Every new CLI flag, new injection type, or new error class forces a reader to hold the entire body in working memory to verify a sibling branch wasn't broken.
+
+Solution:
+Extract three pure or near-pure helpers from the top of `callOnce` so the remaining body becomes a ~50-line linear pipeline where each step is a named call. The extracted pieces are: (1) `buildPrompt` — applies side-finding / amplification / concept-build injections and prepends the date line, returning a string; (2) `buildArgs` — assembles the CLI argument array from the options object, handling the `allowedTools`/`--tools ''` branch, the `effort` env fallback, and the `addDirs` loop, returning `{ args, effectiveMaxTurns }`; (3) `detectTurnLimit` — takes the parsed JSON and the effective ceiling, returns a tagged `Error` or `null`, unifying the two turn-limit detection paths into one function. The sandbox-wrapping block and the `execFileSync` call stay inline in `callOnce` because they are inherently side-effectful and short. The historical comments move to the headers of the extracted helpers or a module-level doc block so institutional knowledge is preserved.
+
+```js
+// ── extracted: pure, no I/O ──────────────────────────────────────────
+function buildPrompt(prompt, { allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+  let p = allowSideFindings ? injectSideFindingInstruction(prompt) : prompt;
+  if (allowAmplification) p = injectAmplificationInstruction(p);
+  if (conceptId) p = injectConceptBuildInstruction(p);
+  return `${currentDateLine()}\n\n${p}`;
+}
+
+function buildArgs({ model, effort, maxTurns, permissionMode, allowedTools, resume, addDirs }) {
+  const effectiveMaxTurns = Math.min(maxTurns, DRAFT_MAX_TURNS);
+  const args = [
+    '-p', '', // placeholder; caller splices in buildPrompt result
+    '--output-format', 'json',
+    '--model', model || MODEL,
+    '--max-turns', String(effectiveMaxTurns),
+    '--permission-mode', permissionMode,
+  ];
+  const effortLevel = effort || process.env.CLAUDE_EFFORT;
+  if (effortLevel) args.push('--effort', effortLevel);
+  if (allowedTools) { args.push('--allowedTools', allowedTools); }
+  else { args.push('--tools', ''); }
+  if (MAX_BUDGET_USD) args.push('--max-budget-usd', MAX_BUDGET_USD);
+  if (resume) args.push('--resume', resume);
+  for (const d of Array.isArray(addDirs) ? addDirs : []) {
+    if (d) args.push('--add-dir', d);
+  }
+  return { args, effectiveMaxTurns };
+}
+
+// ── extracted: turn-limit detection (deduplicated) ───────────────────
+function detectTurnLimit(parsed, effectiveMaxTurns) {
+  if (parsed.stop_reason === 'tool_use' &&
+      parsed.num_turns != null &&
+      parsed.num_turns >= effectiveMaxTurns) {
+    const err = new Error(
+      `Draft turn limit exceeded: ${parsed.num_turns} turns reached the ceiling of ${effectiveMaxTurns}.`
+    );
+    err.code = 'DRAFT_TURN_LIMIT_EXCEEDED';
+    err.maxTurns = effectiveMaxTurns;
+    err.numTurns = parsed.num_turns;
+    return err;
+  }
+  return null;
+}
+
+// ── refactored callOnce: linear pipeline, each step named ────────────
+async function callOnce(opts) {
+  assertSubscriptionAuthAvailable();
+  const workDir = opts.cwd || CLAUDE_CWD;
+  fs.mkdirSync(workDir, { recursive: true });
+
+  const datedPrompt = buildPrompt(opts.prompt, opts);
+  const { args, effectiveMaxTurns } = buildArgs(opts);
+  args[1] = datedPrompt; // splice in the prompt (index 1 = value of '-p')
+
+  // sandbox wrapping (unchanged logic, ~12 lines)
+  let execBin = CLAUDE_BIN, execArgs = args, sandboxUnavailable = false;
+  if (opts.sandbox) { /* …same wrapWithSandbox block… */ }
+
+  // execute
+  let stdout;
+  try {
+    stdout = execFileSync(execBin, execArgs, { /* …same options… */ });
+  } catch (e) {
+    const detail = (e.stdout || e.stderr || e.message || '').toString().slice(0, 2000);
+    if (/(?:max(?:imum)?[ -]?turns?|turn budget)/i.test(detail)) {
+      const err = new Error(`Draft turn limit exceeded (claude -p non-zero exit): ${detail}`);
+      err.code = 'DRAFT_TURN_LIMIT_EXCEEDED';
+      err.maxTurns = effectiveMaxTurns;
+      throw err;
+    }
+    throw new Error(`claude -p failed: ${detail}`);
+  }
+
+  // parse + validate
+  let parsed;
+  try { parsed = JSON.parse(stdout); }
+  catch { throw new Error(`claude -p returned non-JSON output: ${stdout.slice(0, 500)}`); }
+
+  const turnErr = detectTurnLimit(parsed, effectiveMaxTurns);
+  if (turnErr) throw turnErr;
+
+  return {
+    response: parsed.result || '',
+    thinking: '',
+    costUsd: parsed.total_cost_usd,
+    sessionId: parsed.session_id,
+    stopReason: parsed.stop_reason || null,
+    numTurns: parsed.num_turns != null ? parsed.num_turns : null,
+    sandboxUnavailable,
+  };
+}
+```
+
+Benefits:
+Each extracted helper is independently unit-testable with zero mocking of `execFileSync`, `fs`, or the sandbox layer: `buildArgs({ allowedTools: undefined, … })` returns an array you can assert on directly; `buildPrompt("hi", { allowAmplification: true })` returns a string; `detectTurnLimit({ stop_reason: 'tool_use', num_turns: 5 }, 5)` returns a tagged error. Adding a new CLI flag becomes a one-line change inside `buildArgs` covered by its own test, rather than a surgical edit inside a 174-line body where a missed `else` branch for `--tools ''` would be easy to overlook. Reviewers can approve or reject each helper in isolation, and the `callOnce` body reads as a five-step pipeline whose intent is visible at a glance.
+
+### AC-176 · Decompose reconcile() into four single-responsibility helpers
+Strength: Strong
+Files: src/task-log-reconcile.js
+Snippet:
+```
+}
+
+function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } = {}) {
+  const report = argv.includes('--report');
+  const reclassify = argv.includes('--reclassify');
+  const backfill = argv.includes('--backfill') || reclassify;
+  const dryRun = argv.includes('--dry-run');
+  // 2026-09-08, Grimmethy: root-caused live a false "abandoned -- branch gone, work
+  // lost" verdict on TWO separate, genuinely still-open agent/<id> branches. Both were
+  // real, reviewed, tested work -- confirmed alive on origin the whole time -- but this
+  // routine tick had never fetched, so buildShipContext()'s git for-each-ref only ever
+  // saw whatever refs/remotes/origin/agent/* happened to already be cached locally,
+  // which one sibling apply's own git operations on this SAME shared repoRoot can
+  // perturb between ticks (confirmed: one of the two read correctly as pending-merge on
+  // one tick, then flipped to abandoned 17 minutes later with no merge in between).
+  // `abandoned` is a STABLE_TERMINAL_STAGE -- once wrong, it never self-heals. Fetch is
+  // now unconditional on every tick (still cheap/bounded/best-effort, same as before) so
+  // the routine path is never working from a staler view of origin than a --backfill run
+  // would have used. `--no-fetch` is the explicit opt-out for a sandboxed/offline run
+  // that wants to trust local refs on purpose.
+  const doFetch = !argv.includes('--no-fetch');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  // Under --reclassify, records already closed as `noop` are re-resolved (a FALSE-POSITIVE
+  // dismissal recorded before the `dismissed` stage existed). `abandoned` reopens too, as
+  // of the same 2026-09-08 fix above -- a wrong "work lost" verdict deserves the same
+  // audit-triggered correction path noop already had; re-resolving it now runs against a
+  // freshly-fetched ctx, so a genuinely still-open branch reclassifies correctly instead
+  // of being re-confirmed as lost by the same stale-ref bug that produced it.
+  const allowReopenFrom = reclassify ? new Set(['noop', 'abandoned']) : undefined;
+
+  if (doFetch && repoRoot) {
+    const fetch = fetchFn || (() => execFileSync('git', ['-C', repoRoot, 'fetch', 'origin', '--quiet'], { stdio: 'ignore', timeout: 60000 }));
+    try { fetch(); } catch { /* offline -- use local refs */ }
+  }
+
+  const state = loadState(pipelineDir);
+  const ctx = repoRoot ? buildShipContext(repoRoot) : null;
+
+  if (shipContextLooksBroken(ctx, { repoRoot, commitCountFn })) {
+    console.error(`[task-log-reconcile] onMainIds is empty despite origin/${ctx.mainBranch} having real merge history -- buildShipContext likely failed silently (see task-disposition.js's own maxBuffer fix). Skipping this reconcile pass entirely rather than risk a false merged/abandoned verdict; will retry next tick.`);
+    return { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0, skippedReason: 'onMainIds-empty' };
+  }
+
+  const summary = { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0 };
+  const pendingList = [];
+  const abandonedList = [];
+
+  for (const { id, file } of candidateRecords(doneDir, { backfill, state })) {
+    const record = readJson(file);
+    if (record === null) { summary.errors += 1; continue; }
+    summary.scanned += 1;
+
+    let outcome;
+    try {
+      outcome = resolveDisposition(record, { repoRoot, ctx, allowReopenFrom, pipelineDir });
+    } catch (err) {
+      console.error(`task-log-reconcile: resolve failed for ${id}: ${err.message}`);
+      summary.errors += 1;
+      continue;
+    }
+    if (!outcome) {
+      // Stable states that need no further work: already carries a non-pending terminal
+      // event, OR the record was never applied at all (a blocked / needs-clarification task
+      // that reached done/). Remember either so it is not re-read every tick -- without this
+      // the ~2000 never-applied done records get a full readdir+parse pass forever.
+      const tail = Array.isArray(record.history) && record.history[record.history.length - 1];
+      const closed = tail && STABLE_TERMINAL_STAGES.has(tail.stage);
+      if (closed || !lastAppliedEvent(record.history)) {
+        state.resolvedIds.add(id); state.pendingIds.delete(id);
+      }
+      continue;
+    }
+
+    const tail = record.history[record.history.length - 1];
+    // Nothing to append when the resolved stage already IS the tail: the pending-merge
+    // re-check, and (under --reclassify) a noop record that stays noop because its verdict
+    // was inconclusive, not a false positive.
+    const tailUnchanged = tail && tail.stage === outcome.stage;
+    if (!tailUnchanged && !dryRun) {
+      appendHistoryEvent(record, outcome.stage, outcome.detail);
+      record.terminalDisposition = outcome.stage;
+      if (outcome.stage === 'merged' && !record.mergedAt) {
+        record.mergedAt = new Date().toISOString();
+        record.mergedAtSource = 'task-log-reconcile';
+      }
+      if ((outcome.stage === 'merged' || outcome.stage === 'applied-direct')
+        && (record.source === 'pipeline_self_audit' || record.source === 'pipeline_forensics_fix')) {
+        const req = deriveAmplificationRequestFromFix(record);
+        if (req) {
+          try {
+            runAmplificationSweep({
+              rootCauseSummary: req.rootCauseSummary, query: req.query, excludeFiles: req.excludeFiles,
+              root: repoRoot, pipelineDir, source: record.source, taskId: record.id, stage: 'task-log-reconcile',
+            });
+          } catch (e) { /* best-effort -- never break reconcile over an amplification sweep */ }
+        }
+      }
+      try {
+        fs.writeFileSync(file, JSON.stringify(record, null, 2));
+      } catch (err) {
+        console.error(`task-log-reconcile: write failed for ${id}: ${err.message}`);
+        summary.errors += 1;
+        continue;
+      }
+    }
+
+    if (!tailUnchanged) { summary.resolved += 1; summary[outcome.stage] = (summary[outcome.stage] || 0) + 1; }
+    if (outcome.stage === 'pending-merge') {
+      state.pendingIds.add(id); state.resolvedIds.delete(id);
+      pendingList.push(`${record.id} -- ${outcome.detail}`);
+    } else {
+      state.resolvedIds.add(id); state.pendingIds.delete(id);
+      if (outcome.stage === 'abandoned') abandonedList.push(`${record.id} -- ${outcome.detail}`);
+    }
+  }
+
+  if (!dryRun) saveState(pipelineDir, state);
+
+  if (report) {
+    if (pendingList.length) {
+      console.error(`\n[task-log-reconcile] ${pendingList.length} task(s) PENDING MERGE (agent/<id> branch ahead of main):`);
+      for (const l of pendingList) console.error(`  ${l}`);
+    }
+    if (abandonedList.length) {
+      console.error(`\n[task-log-reconcile] ${abandonedList.length} task(s) ABANDONED (applied, branch gone, not on main -- work lost):`);
+      for (const l of abandonedList) console.error(`  ${l}`);
+    }
+    if (!pendingList.length && !abandonedList.length) console.error('[task-log-reconcile] no pending-merge or abandoned tasks this pass.');
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The `reconcile` function in `src/task-log-reconcile.js` is approximately 130 lines (roughly 100 lines of executable code after stripping the 2026-09-08 root-cause comment block and the `--reclassify` rationale). It interleaves four separable concerns: (1) deriving a config object from `argv` flags, (2) the per-record resolution loop with stable-state checking and history bookkeeping, (3) a fire-and-forget amplification sweep guarded by a compound stage-and-source predicate, and (4) a pure stdout report. None of these four pieces can be unit-tested in isolation without mocking the entire pipeline (fs, git fetch, `resolveDisposition`), and the amplification block—already the most likely site of future growth (new sources, new sweep parameters)—is buried three levels deep inside the loop body, making it easy to miss during review.
+
+Solution:
+Extract four small, clearly-named helpers and reduce `reconcile` to an orchestration shell of roughly 70 lines. `parseReconcileConfig(argv)` returns the five booleans plus the `allowReopenFrom` set; `isStableOrNeverApplied(record)` encapsulates the terminal-stage / never-applied predicate; `maybeRunAmplification(record, outcome, repoRoot, pipelineDir)` owns the guard predicates, the `deriveAmplificationRequestFromFix` call, and the best-effort `try/catch`; `printReconcileReport(pendingList, abandonedList)` handles all `console.error` output. The existing explanatory comments (root-cause block, `--reclassify` rationale) stay attached to the call sites or move to `parseReconcileConfig` so the "why" is preserved.
+
+```diff
+--- a/src/task-log-reconcile.js
++++ b/src/task-log-reconcile.js
+@@ -185,6 +185,36 @@
++function parseReconcileConfig(argv) {
++  const report     = argv.includes('--report');
++  const reclassify = argv.includes('--reclassify');
++  const backfill   = argv.includes('--backfill') || reclassify;
++  const dryRun     = argv.includes('--dry-run');
++  const doFetch    = !argv.includes('--no-fetch');
++  const allowReopenFrom = reclassify ? new Set(['noop', 'abandoned']) : undefined;
++  return { report, reclassify, backfill, dryRun, doFetch, allowReopenFrom };
++}
++
++function isStableOrNeverApplied(record) {
++  const tail = Array.isArray(record.history) && record.history[record.history.length - 1];
++  return (tail && STABLE_TERMINAL_STAGES.has(tail.stage)) || !lastAppliedEvent(record.history);
++}
++
++function maybeRunAmplification(record, outcome, repoRoot, pipelineDir) {
++  if (outcome.stage !== 'merged' && outcome.stage !== 'applied-direct') return;
++  if (record.source !== 'pipeline_self_audit' && record.source !== 'pipeline_forensics_fix') return;
++  const req = deriveAmplificationRequestFromFix(record);
++  if (!req) return;
++  try {
++    runAmplificationSweep({
++      rootCauseSummary: req.rootCauseSummary,
++      query: req.query,
++      excludeFiles: req.excludeFiles,
++      root: repoRoot,
++      pipelineDir,
++      source: record.source,
++      taskId: record.id,
++      stage: 'task-log-reconcile',
++    });
++  } catch { /* best-effort: never block reconciliation on sweep failure */ }
++}
++
++function printReconcileReport(pendingList, abandonedList) {
++  if (pendingList.length) {
++    console.error(`\n[task-log-reconcile] ${pendingList.length} task(s) PENDING MERGE (agent/<id> branch ahead of main):`);
++    for (const l of pendingList) console.error(`  ${l}`);
++  }
++  if (abandonedList.length) {
++    console.error(`\n[task-log-reconcile] ${abandonedList.length} task(s) ABANDONED (applied, branch gone, not on main -- work lost):`);
++    for (const l of abandonedList) console.error(`  ${l}`);
++  }
++  if (!pendingList.length && !abandonedList.length) {
++    console.error('[task-log-reconcile] no pending-merge or abandoned tasks this pass.');
++  }
++}
++
+ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } = {}) {
+-  const report     = argv.includes('--report');
+-  const reclassify = argv.includes('--reclassify');
+-  const backfill   = argv.includes('--backfill') || reclassify;
+-  const dryRun     = argv.includes('--dry-run');
+-  // …(2026-09-08 root-cause comment block, ~15 lines)
+-  const doFetch    = !argv.includes('--no-fetch');
++  const { report, reclassify, backfill, dryRun, doFetch, allowReopenFrom } = parseReconcileConfig(argv);
+   const doneDir = path.join(pipelineDir, 'queue', 'done');
+-  // …(--reclassify rationale comment, ~5 lines)
+-  const allowReopenFrom = reclassify ? new Set(['noop', 'abandoned']) : undefined;
+ 
+   if (doFetch && repoRoot) { /* …unchanged… */ }
+   const state = loadState(pipelineDir);
+@@ loop body @@
+-    if (!outcome) {
+-      const tail = Array.isArray(record.history) && record.history[record.history.length - 1];
+-      const closed = tail && STABLE_TERMINAL_STAGES.has(tail.stage);
+-      if (closed || !lastAppliedEvent(record.history)) {
++    if (!outcome) {
++      if (isStableOrNeverApplied(record)) {
+         state.resolvedIds.add(id);
+         state.pendingIds.delete(id);
+       }
+       continue;
+@@
+-      if ((outcome.stage === 'merged' || outcome.stage === 'applied-direct')
+-          && (record.source === 'pipeline_self_audit' || record.source === 'pipeline_forensics_fix')) {
+-        const req = deriveAmplificationRequestFromFix(record);
+-        if (req) {
+-          try {
+-            runAmplificationSweep({ … });
+-          } catch (e) { /* … */ }
+-        }
+-      }
++      maybeRunAmplification(record, outcome, repoRoot, pipelineDir);
+@@
+-  if (report) {
+-    if (pendingList.length) { … }
+-    if (abandonedList.length) { … }
+-    if (!pendingList.length && !abandonedList.length) { … }
+-  }
++  if (report) printReconcileReport(pendingList, abandonedList);
+ 
+   return summary;
+ }
+```
+
+Benefits:
+Each helper is independently unit-testable: `isStableOrNeverApplied` can be exercised against fixture records with no fs or git mocking; `maybeRunAmplification` can be tested with a stubbed `runAmplificationSweep` to verify the guard predicates and confirm it never throws; `parseReconcileConfig` is a pure function of `argv`; `printReconcileReport` can be tested by capturing `console.error`. Adding a new amplification source or sweep variant touches only the 12-line `maybeRunAmplification` body rather than the middle of a 55-line loop. A reviewer reading the loop can skip the named call and trust the contract, reducing cognitive load. The main `reconcile` function drops to roughly 70 lines of orchestration, well under any length threshold, with zero behavioural change.
+
+### AC-177 · Decompose `api_task_requeue` into testable helpers
+Strength: Strong
+Files: python/dashboard/routes/task.py
+Snippet:
+```
+
+@task_bp.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
+def api_task_requeue(state, task_id):
+    """Manual requeue (Job Status > Blocked/Needs Clarification/Done tabs, per-row button; also the Brain Dump
+    tab's "Reopen" action on an archived entry's badge): moves the task back to pending/,
+    stripped to the same shape a freshly-generated task has -- every drafting/review/apply
+    artifact (blockedReason, doneMarker, ornithVotes, planResponse, implementResponse, etc.)
+    is dropped, not carried forward. ornithRejectCount resets to 0 deliberately: a manual
+    requeue is a deliberate human do-over, not a continuation of the same automatic retry
+    cycle queue-watchdog.ps1's Invoke-RejectRetryCheck already runs for review-stage
+    rejections (capped at $MaxOrnithRejectRetries=2) -- carrying the old count forward would
+    let a manually-requeued task block again after fewer real attempts than a task hitting
+    that cap for the first time gets.
+
+    2026-09-06, real incident: a stacked file-decompose sub-task (seq 2 of 5, sharing one
+    branch with its 4 siblings -- see file-decompose-to-hub.js) blocked on a sustained
+    Ollama infra outage. Its `stacked` field -- {branch, seq, total}, the ONLY thing that
+    ties it back to the shared branch and its position in the sequence -- is a TOP-LEVEL
+    task field, not part of promptContext, so the "fresh" rebuild below silently dropped it
+    on every requeue: a human clicking Requeue on a stuck stacked sub-task would have
+    detached it from its hub, breaking the coordination with no error and no visible sign
+    anything was wrong until the wiring step later found the branch missing pieces.
+    `dependsOn` (also file-decompose-to-hub.js, and consumed by nextAdhocTask's/
+    coordinator-sweep.js's dependency gate) is the identical shape -- a top-level field a
+    generic reset has no way to know matters.
+
+    2026-09-06, same requeue, second field: `atomic` (also file-decompose-to-hub.js) was
+    STILL being dropped by this same allowlist gap even after the stacked/dependsOn fix
+    above -- confirmed live, the requeued sub-task's own local-draft.js pre-split check
+    (`!task.atomic`, the guard that exists specifically because "a file-decompose child IS
+    the output of a decomposition; re-splitting it loops") saw `atomic: undefined` and let
+    the model try to decompose it AGAIN, producing a malformed 2-piece split and blocking a
+    second time. `noDecompose` (set alongside `atomic` by the same code, currently unread
+    elsewhere but the same coordination-field shape) is preserved too rather than assuming
+    it stays unused forever. All four preserved explicitly now, when present, rather than
+    trusting this allowlist to anticipate every future coordination field one at a time.
+
+    'archived' is a distinct pseudo-state (not a real QUEUE_STATES member) for a task
+    api_task_archive moved to done/_archived_no_action/ -- _task_state_index reports it as
+    'archived', not 'done', so this must be handled as a separate lookup path rather than
+    falling through to state_dir/task_id.json, which would 404 (real gap found 2026-08-17
+    auditing the "always reversible" promise: an archived item couldn't actually be
+    un-archived through the UI before this). 2026-08-24: also checks done-archive.js's own
+    dated month buckets (queue/done/_archived/<YYYY-MM>/) -- a task the AUTOMATIC daily
+    archive pass moved there is just as "archived" and must be just as requeueable as one a
+    human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
+    same "always reversible" promise this endpoint already exists to uphold."""
+    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, queue_dir, read_json_safe
+    if state not in ("blocked", "needs-clarification", "done", "archived"):
+        abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    if state == "archived":
+        src = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+        if not src.is_file():
+            archived_root = qdir / "done" / "_archived"
+            if archived_root.is_dir():
+                for month_dir in archived_root.iterdir():
+                    if not month_dir.is_dir():
+                        continue
+                    candidate = month_dir / f"{task_id}.json"
+                    if candidate.is_file():
+                        src = candidate
+                        break
+    else:
+        src = qdir / state / f"{task_id}.json"
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    # A needs-clarification task can be sent straight back for a fresh draft -- but only a NON-adhoc one. An adhoc-shaped task lives in
+    # queue/adhoc/ (nextAdhocTask only scans there), and this route writes to pending/, which would silently orphan it; those have their
+    # own /resolve and /answer routes below. (2026-09-20: a candidate-fulfillment task exhausted its retries on failures that were then
+    # fixed, and the only way back was moving its file to blocked/ by hand.)
+    if state == "needs-clarification" and (
+        data.get("domain") == "adhoc" or data.get("source") in ("manual", "derived_task")
+    ):
+        abort(400, description=(
+            "this is an adhoc-shaped task -- send it back with the file-path picker (/resolve) or the answer box (/answer), "
+            "which put it where the adhoc lane claims it; a plain requeue would strand it in pending/"
+        ))
+
+    if state in ("blocked", "needs-clarification") and not (request.get_json(silent=True) or {}).get("force"):
+        repeat = _repeated_blocker_match(data)
+        if repeat:
+            abort(409, description=(
+                "This task's rejection looks like the same underlying problem as an "
+                f"earlier attempt: \"{repeat[:220]}\" -- redrafting alone hasn't fixed "
+                "this before and likely won't now without a real change. Diagnose the "
+                "actual root cause first (or confirm you already have), then requeue "
+                "again to proceed anyway."
+            ))
+
+    # If this task was already applied to a branch that never merged (task-disposition.js's
+    # 'pending-merge' -- an agent/<id> branch exists, ahead of main, unmerged), a requeue is
+    # about to redo the same work from scratch on a FRESH branch, so the old one is now
+    # abandoned, not merely forgotten. Without this, this endpoint silently orphaned the
+    # prior branch: it stayed pushed to GitHub, unmerged, with no PR and no record anywhere
+    # that a later attempt superseded it. Confirmed live 2026-09-13:
+    # adhoc-add-spec-comment-at-call-site-in-src-local-draft-js-1789232601161-1's
+    # forbidden-path-gate-blocked branch sat dangling until a human noticed and deleted it
+    # by hand. Guarded on terminalDisposition != 'merged' so a task record that (rarely)
+    # reached done/ with its branch already merged is never touched.
+    if data.get("terminalDisposition") != "merged":
+        applied_branch = None
+        for ev in reversed(data.get("history") or []):
+            if isinstance(ev, dict) and ev.get("stage") == "applied" and ev.get("detail"):
+                applied_branch = ev["detail"]
+                break
+        if applied_branch:
+            from app import _invalidate_branch_cache, _run_git
+            repo_root = get_active_repo_root()
+            repo_root = Path(repo_root) if repo_root else None
+            if repo_root:
+                try:
+                    _run_git(["push", "origin", "--delete", applied_branch], repo_root)
+                    from branch_removals import record_branch_removal
+                    record_branch_removal(qdir, applied_branch, "superseded-by-requeue", task_id=task_id,
+                                          detail=f"requeued from {state}/", actor="dashboard-requeue")
+                except RuntimeError as e:
+                    # Non-fatal, same reasoning as api_git_merge_branch's own post-merge
+                    # branch delete -- already gone, never actually pushed, or a transient
+                    # network error are all fine; the requeue itself must not fail here.
+                    logger.warning(
+                        "Non-fatal: could not delete superseded branch %r for requeued task %r: %s",
+                        applied_branch, task_id, e,
+                    )
+                _invalidate_branch_cache()
+            abandon_iso = datetime.now(timezone.utc).isoformat()
+            abandon_detail = f"superseded by a manual requeue from {state}/; prior branch {applied_branch} deleted"
+            data.setdefault("history", []).append({
+                "stage": "abandoned", "at": abandon_iso, "detail": abandon_detail,
+            })
+            data["terminalDisposition"] = "abandoned"
+            # NOT closing out task-logs/<id>.json here (contrast api_git_merge_branch's
+            # 'merged' handling): that file is committed only on the task's OWN branch, and
+            # for an unmerged branch it was never on <main> to begin with -- there is
+            # nothing on disk in this checkout to update. task-log-reconcile.js's own
+            # 'abandoned' disposition (see task-disposition.js's header) has the identical
+            # scope: it marks the queue/ record, it does not retroactively rescue a
+            # never-merged branch's task-log onto main.
+
+    pending_dir = qdir / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    dest = pending_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in pending/")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # history must never be replaced -- it's the one append-only, complete log of
+    # everything that happened to this task (see task-history.js and AGENTS.md's task-log
+    # section), and a manual requeue is exactly the kind of step whose OWN reason (plus
+    # whatever blockedReason/priorRejectionFeedback drove it) needs to survive in that log,
+    # not vanish the moment the task starts its next draft cycle. Root-caused live
+    # 2026-09-12: this endpoint used to stamp a brand-new one-entry array here, discarding
+    # every prior event -- including the real blockedReason a `blocked` history event
+    # already carried -- for observability-fix-ac-158 and others, so the ONLY trace left
+    # of why a task ever blocked was this note's bare "manually requeued from blocked/".
+    old_history = data.get("history")
+    history = list(old_history) if isinstance(old_history, list) else []
+    history.append({
+        "stage": "requeued",
+        "at": now_iso,
+        "note": f"manually requeued from {state}/",
+        # The exact fields a fresh rebuild used to drop silently -- carried into the log
+        # entry itself so they're never lost even though the rebuilt task below won't
+        # carry them forward as live working state.
+        "blockedReasonAtRequeue": data.get("blockedReason"),
+        "priorRejectionFeedbackAtRequeue": data.get("priorRejectionFeedback"),
+    })
+    fresh = {
+        "id": data.get("id", task_id),
+        "domain": data.get("domain"),
+        "source": data.get("source"),
+        "title": data.get("title"),
+        "promptContext": data.get("promptContext"),
+        "status": "pending",
+        "createdAt": data.get("createdAt", now_iso),
+        "history": history,
+    }
+    # Coordination fields (see this endpoint's own docstring) -- never part of the
+    # drafting/review/apply history this reset is meant to clear, so always carried over
+    # verbatim when present rather than silently dropped.
+    if "stacked" in data:
+        fresh["stacked"] = data["stacked"]
+    if "dependsOn" in data:
+        fresh["dependsOn"] = data["dependsOn"]
+    if "atomic" in data:
+        fresh["atomic"] = data["atomic"]
+    if "noDecompose" in data:
+        fresh["noDecompose"] = data["noDecompose"]
+    dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
+    src.unlink()
+    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
+    return jsonify({"id": task_id, "requeued": True})
+```
+
+Problem:
+The 194-line `api_task_requeue` route bundles four concerns that each carry independent failure modes and external dependencies: archived-source resolution with a month-bucket fallback search, two pre-requeue guard clauses, a non-fatal git `push --delete` branch-cleanup block with its own `try/except` and in-place mutation of `data["history"]` and `data["terminalDisposition"]`, and a task-rebuild step whose coordination-field allowlist has already caused two production incidents. Because the branch-cleanup logic is inlined between the guards and the `write_text` call, a unit test for "requeue correctly deletes the old branch" must mock file I/O, the adhoc guard, the blocker check, and the rebuild simultaneously. The coordination-field allowlist (stacked, dependsOn, atomic, noDecompose) is buried between a git block and a `write_text` call, making it invisible to a reviewer scanning for "which fields survive a requeue."
+
+Solution:
+Extract three module-level helpers above the route and reduce the route body to a ~35-line linear orchestration (validate → resolve → guard → cleanup → rebuild → persist → respond). The two guard clauses stay inline because they are 5–8-line pure aborts tightly coupled to `state`. The concrete change:
+
+```python
+# --- extracted helpers (same module, above the route) ---
+
+def _resolve_requeue_source(qdir: Path, state: str, task_id: str) -> Path:
+    """Locate the task file. Archived tasks may live in _archived_no_action/
+    or in a dated month bucket under _archived/."""
+    if state == "archived":
+        src = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+        if not src.is_file():
+            archived_root = qdir / "done" / "_archived"
+            if archived_root.is_dir():
+                for month_dir in archived_root.iterdir():
+                    if not month_dir.is_dir():
+                        continue
+                    candidate = month_dir / f"{task_id}.json"
+                    if candidate.is_file():
+                        src = candidate
+                        break
+    else:
+        src = qdir / state / f"{task_id}.json"
+    return src
+
+
+def _cleanup_superseded_branch(data: dict, qdir: Path, state: str, task_id: str) -> None:
+    """If the task was applied to an unmerged branch, delete that branch and
+    record the abandonment. Non-fatal: git/network errors are logged, not raised."""
+    if data.get("terminalDisposition") == "merged":
+        return
+    applied_branch = None
+    for ev in reversed(data.get("history") or []):
+        if isinstance(ev, dict) and ev.get("stage") == "applied" and ev.get("detail"):
+            applied_branch = ev["detail"]
+            break
+    if not applied_branch:
+        return
+
+    from app import _invalidate_branch_cache, _run_git
+    repo_root = get_active_repo_root()
+    repo_root = Path(repo_root) if repo_root else None
+    if repo_root:
+        try:
+            _run_git(["push", "origin", "--delete", applied_branch], repo_root)
+            from branch_removals import record_branch_removal
+            record_branch_removal(
+                qdir, applied_branch, "superseded-by-requeue",
+                task_id=task_id, detail=f"requeued from {state}/",
+                actor="dashboard-requeue",
+            )
+        except RuntimeError as e:
+            logger.warning(
+                "Non-fatal: could not delete superseded branch %r for requeued task %r: %s",
+                applied_branch, task_id, e,
+            )
+        _invalidate_branch_cache()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    data.setdefault("history", []).append({
+        "stage": "abandoned",
+        "at": now_iso,
+        "detail": f"superseded by a manual requeue from {state}/; prior branch {applied_branch} deleted",
+    })
+    data["terminalDisposition"] = "abandoned"
+
+
+def _build_fresh_requeue(data: dict, task_id: str, state: str, now_iso: str) -> dict:
+    """Rebuild the task to its fresh pending shape, preserving history and
+    coordination fields (stacked, dependsOn, atomic, noDecompose)."""
+    old_history = data.get("history")
+    history = list(old_history) if isinstance(old_history, list) else []
+    history.append({
+        "stage": "requeued",
+        "at": now_iso,
+        "note": f"manually requeued from {state}/",
+        "blockedReasonAtRequeue": data.get("blockedReason"),
+        "priorRejectionFeedbackAtRequeue": data.get("priorRejectionFeedback"),
+    })
+    fresh = {
+        "id": data.get("id", task_id),
+        "domain": data.get("domain"),
+        "source": data.get("source"),
+        "title": data.get("title"),
+        "promptContext": data.get("promptContext"),
+        "status": "pending",
+        "createdAt": data.get("createdAt", now_iso),
+        "history": history,
+    }
+    for field in ("stacked", "dependsOn", "atomic", "noDecompose"):
+        if field in data:
+            fresh[field] = data[field]
+    return fresh
+
+
+# --- the route becomes a short orchestration ---
+
+@task_bp.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
+def api_task_requeue(state, task_id):
+    """[docstring unchanged]"""
+    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, queue_dir, read_json_safe
+
+    if state not in ("blocked", "needs-clarification", "done", "archived"):
+        abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+
+    src = _resolve_requeue_source(qdir, state, task_id)
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    # adhoc guard
+    if state == "needs-clarification" and (
+        data.get("domain") == "adhoc" or data.get("source") in ("manual", "derived_task")
+    ):
+        abort(400, description=(
+            "this is an adhoc-shaped task -- send it back with the file-path picker (/resolve) "
+            "or the answer box (/answer), which put it where the adhoc lane claims it; "
+            "a plain requeue would strand it in pending/"
+        ))
+
+    # repeated-blocker guard
+    if state in ("blocked", "needs-clarification") and not (request.get_json(silent=True) or {}).get("force"):
+        repeat = _repeated_blocker_match(data)
+        if repeat:
+            abort(409, description=(
+                f"This task's rejection looks like the same underlying problem as an earlier "
+                f"attempt: \"{repeat[:220]}\" -- redrafting alone hasn't fixed this before and "
+                "likely won't now without a real change. Diagnose the actual root cause first "
+                "(or confirm you already have), then requeue again to proceed anyway."
+            ))
+
+    # branch cleanup (non-fatal internally)
+    _cleanup_superseded_branch(data, qdir, state, task_id)
+
+    # rebuild & persist
+    pending_dir = qdir / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    dest = pending_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in pending/")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    fresh = _build_fresh_requeue(data, task_id, state, now_iso)
+    dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
+    src.unlink()
+    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
+    return jsonify({"id": task_id, "requeued": True})
+```
+
+Benefits:
+Each extracted helper becomes independently unit-testable with a temp-dir fixture and one stubbed external call. `_cleanup_superseded_branch` can be tested by asserting the `data` dict mutation and the single `_run_git` invocation without exercising file I/O, the adhoc guard, or the blocker check. `_build_fresh_requeue` makes the coordination-field allowlist a single greppable, testable function whose contract ("which fields survive a requeue") is visible at the call site rather than buried between a git block and a `write_text`. The route body drops to ~35 lines of linear orchestration where each step is a named call, making the control flow and the non-fatal error boundary of the git block immediately legible in code review.
+
+### AC-178 · Decompose renderWorkers into named, testable helpers
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+// === true) is skipped, and only when focus is currently inside one of this tab's own
+// selects, i.e. the operator is actively mid-choice. The next 5s tick tries again.
+async function renderWorkers(isPoll) {
+  if (isPoll) {
+    const active = document.activeElement;
+    if (active && (active.classList.contains('worker-type-select') || active.classList.contains('worker-task-select'))) {
+      return;
+    }
+    // Top up the completed-tasks log with anything newer than what's already loaded --
+    // see refreshNewestCompletedTasks's own header note. Only on the real poll cycle,
+    // not every action-triggered re-render (assign-task, filter click, expand/collapse).
+    await refreshNewestCompletedTasks();
+  }
+  // run-log vs recent-tasks (2026-09-08, Grimmethy: "This looks like it's only showing
+  // fully completed tasks. I want to see a log of every time an agent is run and the
+  // outcome of that run."): a drafting worker's real activity includes attempts that
+  // never reach a terminal task state at all (a hard OLLAMA_TIMEOUT, mid-GPU-contention,
+  // never produces a usable response) -- /api/instances/<id>/run-log surfaces those too,
+  // merged with every model_calls row regardless of outcome. reviewer has no equivalent
+  // call-level data (review-task.js's majorityVote never calls recordCall, see that
+  // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
+  const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
+  const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
+    fetchJson('/api/instances'),
+    fetchJson('/api/worker-models'),
+    fetchJson('/api/models/cost-summary'),
+    // Only fetch for whichever card is currently expanded -- no point loading this for
+    // every instance on every 5s poll when at most one card shows it at a time.
+    expandedWorkerId
+      ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/${expandedIsWorker ? 'run-log' : 'recent-tasks'}`)
+      : Promise.resolve(null),
+  ]);
+  // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
+  // follow-up, Grimmethy after live-testing the override: "the only tasks I have
+  // access to... are pipeline debrief tasks. The task I want, autodecomp, is in
+  // drafting. I need access to the full list of available jobs, they should however be
+  // whats available for that specific worker type"). Per-instance now, not one shared
+  // list: /api/instances/<id>/assignable-tasks tier-filters for THAT lane and also
+  // surfaces tasks already claimed by other lanes (queue/drafting/<lane>/), not just
+  // queue/pending/ -- a plain worker-model-style shared list can't express either of
+  // those. Fetched only for worker-* instances (canAssignTask), in parallel.
+  const assignableByInstance = {};
+  await Promise.all(instances.filter(canAssignTask).map(async (inst) => {
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
+  const overrides = workerModels.overrides || {};
+  // Per-instance cumulative estimated API cost (2026-08-23, "Where else would it make
+  // sense to track it?" -> Workers tab): AGENT_MANAGER_INSTANCE_ID is stamped onto every
+  // real model_calls row now (see model-stats-client.js's own recordCall) -- keyed here
+  // by instanceId so each worker-card can show its own running total, same "estimate,
+  // not a bill" framing as the Models tab's own widget.
+  const costByInstance = Object.fromEntries((costSummary.byInstance || []).map((i) => [i.instanceId, i.totalCost]));
+  const main = document.getElementById('main');
+  const fetchedAt = Date.now();
+  instances.forEach(i => { i._fetchedAtMs = fetchedAt; });
+  instancesForTimers = instances;
+  // Clear the optimistic pending-assign marker the moment real data confirms it --
+  // either the pin took (currentTaskId now matches) or the operator/pipeline moved on
+  // to something else for this instance since (a stale marker pointing at a taskId this
+  // instance is no longer even working toward would be actively misleading, worse than
+  // no marker at all).
+  instances.forEach((inst) => {
+    // Any real currentTaskId -- matching the pin (success) or not (moved on to
+    // something else meanwhile) -- means the "waiting to pick this up" state is over.
+    if (pendingWorkerAssign[inst.instanceId] && inst.currentTaskId) {
+      delete pendingWorkerAssign[inst.instanceId];
+    }
+  });
+  const filterBar = `
+    <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+      <div></div>
+      <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
+        <input type="checkbox" id="claude-pause-toggle" ${workerModels.claudePaused ? 'checked' : ''}>
+        Pause Claude (preserve subscription tokens)
+      </label>
+    </div>
+  `;
+  const shown = instances;
+  if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
+  // Preserve scroll position across the full innerHTML replace below -- same isPoll
+  // "don't yank state out from under the operator" reasoning as the dropdown guard
+  // above, needed here because the completed-tasks log (renderCompletedTasksSection)
+  // can push #main well past one screen, and a poll landing mid-scroll would otherwise
+  // silently reset the operator back to the top every 5s.
+  const scrollY = window.scrollY;
+  main.innerHTML = filterBar + (shown.length === 0
+    ? '<div class="empty">No workers match this filter.</div>'
+    : shown.map(inst => `
+    <div class="worker-card clickable" data-instance-id="${escapeAttr(inst.instanceId)}">
+      <div class="row">
+        <span class="id">${inst.instanceId}</span>
+        ${(() => {
+          const kind = modelKindForInstance(inst);
+          if (!kind) return '';
+          const current = overrides[inst.instanceId] || '';
+          const optionsFor = (label, values) => values.length
+            ? `<optgroup label="${escapeAttr(label)}">${values.map(m => `<option value="${escapeAttr(m.value)}" ${m.value === current ? 'selected' : ''}>${m.label}</option>`).join('')}</optgroup>`
+            : '';
+          let body;
+          if (kind === 'mixed') {
+            // Prefixed so local-worker.sh's refresh_active_model can tell which backend
+            // was picked -- see that function's own comment for why this is the fix for
+            // "reasoning only shows subscription models."
+            body = optionsFor('Claude (subscription)', (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))
+              + optionsFor('Local (Ollama)', (workerModels.ollamaModels || []).map(m => ({ value: `ollama:${m}`, label: m })));
+          } else {
+            body = (workerModels.ollamaModels || []).map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`).join('');
+          }
+          return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
+        })()}
+        ${canAssignTask(inst) ? (() => {
+          const items = assignableByInstance[inst.instanceId] || [];
+          // Grouped by source (task TYPE) so the picker shows "pipeline_debrief (7)"
+          // etc first, rather than one flat list where a deep single-type backlog
+          // buries everything else (see selectedWorkerTaskType's own header comment).
+          const bySource = {};
+          items.forEach((t) => {
+            const key = t.source || 'unknown';
+            (bySource[key] = bySource[key] || []).push(t);
+          });
+          const sourceKeys = Object.keys(bySource).sort();
+          const selectedType = selectedWorkerTaskType[inst.instanceId] || '';
+          // Keep the previously-picked type visible even if its bucket happens to be
+          // empty on THIS particular poll (its last task just got claimed elsewhere, or
+          // this instance's own assignable-tasks fetch above hit its catch and fell back
+          // to [] for one cycle) -- 2026-09-07, same complaint as isPoll above: a
+          // transient empty bucket used to collapse the whole drill-down back to the
+          // type-only picker, which looked identical to "your selection got reset" even
+          // though selectedWorkerTaskType was never actually cleared.
+          if (selectedType && !sourceKeys.includes(selectedType)) sourceKeys.push(selectedType);
+          sourceKeys.sort();
+          const typeSelect = `<select class="worker-type-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order -- includes tasks already claimed by other workers, tier-filtered for this worker type">
+            <option value="">(assign a task…)</option>
+            ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${(bySource[k] || []).length})</option>`).join('')}
+          </select>`;
+          if (!selectedType) return typeSelect;
+          const tasksOfSelectedType = bySource[selectedType] || [];
+          // A native <select> sizes itself to its widest <option> text -- an untruncated
+          // task title (adhoc/decompose titles especially routinely run 80-100+ chars)
+          // pushed this whole control off the right edge of the worker card (2026-09-07,
+          // Grimmethy: "when I open the manual task that has long task names it sets the
+          // selector to the size of the largest... names should be truncated"). Truncate
+          // what's SHOWN; the option's own `title` attribute (native hover tooltip) and
+          // `data-title` (read by setWorkerTask's confirm-dialog text) both still carry
+          // the full, untruncated title -- nothing is actually lost, just not rendered
+          // into the control's own width.
+          const OPTION_LABEL_MAX = 70;
+          const truncateLabel = (s) => (s.length > OPTION_LABEL_MAX ? `${s.slice(0, OPTION_LABEL_MAX - 1)}…` : s);
+          const optionLabel = (t) => {
+            // A hub member leads with its HUB#### slot (2026-09-20) so a hub in progress is recognisable in this list.
+            const rawTitle = t.title || t.id;
+            const base = t.hub && !/^HUB\d/.test(rawTitle) ? `${hubTag(t.hub)} · ${rawTitle}` : rawTitle;
+            // pinnedTo (2026-09-07, Grimmethy: "why do the 2 reasoning workers have
+            // different lists? they really should share the same task list") -- a task
+            // pending but already pinned to a SIBLING lane (same tier) now shows here
+            // too instead of being invisible; picking it just re-pins it to this lane
+            // instead (no kill needed, nothing is running on it yet, unlike the
+            // "⚠ running on" case below).
+            let full = base;
+            if (t.location && t.location !== 'pending') full = `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}`;
+            else if (t.pinnedTo) full = `📌 pinned to ${t.pinnedTo} — ${base}`;
+            // premiumPriority (2026-09-07, Grimmethy: "I am getting tired of manually
+            // selecting it for the worker queue every pass") -- surfaces here so the
+            // operator can SEE this task is already set to always-claim-first and
+            // doesn't need to keep re-picking it via this very dropdown.
+            if (t.premiumPriority) full = `★ ${full}`;
+            return truncateLabel(full);
+          };
+          const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Pick a specific ${escapeAttr(selectedType)} task to assign to this worker">
+            <option value="">${tasksOfSelectedType.length ? `(choose a ${escapeHtml(selectedType)} task…)` : `(no ${escapeHtml(selectedType)} tasks right now)`}</option>
+            ${tasksOfSelectedType.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}" title="${escapeAttr(t.title || t.id)}">${escapeHtml(optionLabel(t))}</option>`).join('')}
+          </select>`;
+          return typeSelect + taskSelect;
+        })() : ''}
+        <div class="badge-col">
+          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
+          ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
+          <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
+        </div>
+      </div>
+      <div class="meta">
+        pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
+        ${inst.currentTaskId && inst.projectLabel ? ' · <span class="badge ' + (inst.borrowed ? 'warn' : 'idle') + '" title="' + (inst.borrowed ? 'Borrowed: this lane is idle in the active project and is working a task of ' + escapeAttr(inst.projectLabel) + ' (idle-pool borrowing)' : 'This task belongs to the active project') + '">📁 ' + escapeHtml(inst.projectLabel) + (inst.borrowed ? ' (borrowed)' : '') + '</span>' : ''}
+        ${inst.currentTaskId && inst.hub ? ' · <span class="badge ok" title="This task belongs to hub ' + escapeAttr(inst.hub.label) + '" style="font-weight:700">🗂 ' + escapeHtml(hubTag(inst.hub)) + '</span>' : ''}
+        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') : ''}
+        ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
+        ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
+      </div>
+      ${expandedWorkerId === inst.instanceId ? `
+      <div class="worker-recent-tasks">
+        <div class="meta" style="margin-top:8px; font-weight:600">${inst.instanceId === 'reviewer' ? 'Last 10 reviewed tasks' : 'Recent runs (every attempt, including failures)'}</div>
+        ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
+      </div>` : ''}
+    </div>
+  `).join('')) + renderCompletedTasksSection();
+  window.scrollTo(0, scrollY);
+  setupCompletedTasksObserver();
+// ... [truncated for review: this function continues for 41 more line(s) not shown]
+```
+
+Problem:
+`renderWorkers` is 241 lines long because it interleaves at least six distinct responsibilities—poll-cycle guard, multi-endpoint fan-out fetch, state reconciliation, per-card model-select construction, per-card task-assignment dropdown, and per-card meta/badge rendering—into a single body. Two of those responsibilities (the model-select and task-assignment dropdowns) are implemented as IIFEs embedded inside a template literal within a `map()` callback, making them syntactically inseparable from the surrounding HTML string. The task-assignment `optionLabel` closure alone applies five independent formatting rules (`hubTag()` prefix, `t.pinnedTo` pin indicator, `t.premiumPriority` star prefix, `t.location` "running on" warning, and length truncation), each of which is a one-line branch that currently cannot be unit-tested in isolation. A change to any single rule (e.g., renaming `premiumPriority` to a new field) forces the developer to navigate through the poll guard, the four parallel `fetchJson` calls, the per-instance `assignable-tasks` loop, and the model-select IIFE to locate the correct spot, and a regression in any one of those is invisible to the others.
+
+Solution:
+Extract each responsibility into a named function so the top-level `renderWorkers` becomes a short orchestrator that calls them in sequence. The two IIFE blocks become standalone `renderModelSelect` and `renderTaskAssignSelect` functions; the `optionLabel` logic inside `renderTaskAssignSelect` keeps all five formatting rules with their correct field names (`t.pinnedTo`, `t.premiumPriority`, `t.location`, `hubTag(t.hub)`) and the truncation guard. The fetch block and poll guard become `fetchWorkerData` and `pollGuardAndRefresh`. The concrete shape of the two most critical extractions:
+
+```js
+// --- extracted from the IIFE inside the map() callback ---
+
+function renderModelSelect(inst, overrides, workerModels) {
+  const kind = modelKindForInstance(inst);
+  if (!kind) return '';
+  const current = overrides[inst.instanceId] || '';
+  const optionsFor = (label, values) => values.length
+    ? `<optgroup label="${escapeAttr(label)}">${values.map(m =>
+        `<option value="${escapeAttr(m.value)}" ${m.value === current ? 'selected' : ''}>${m.label}</option>`
+      ).join('')}</optgroup>`
+    : '';
+  let body;
+  if (kind === 'mixed') {
+    body = optionsFor('Claude (subscription)',
+        (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))
+      + optionsFor('Local (Ollama)',
+        (workerModels.ollamaModels || []).map(m => ({ value: `ollama:${m}`, label: m })));
+  } else {
+    body = (workerModels.ollamaModels || []).map(m =>
+      `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`
+    ).join('');
+  }
+  return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
+}
+
+function renderTaskAssignSelect(inst, assignableByInstance) {
+  if (!canAssignTask(inst)) return '';
+  const items = assignableByInstance[inst.instanceId] || [];
+  const bySource = {};
+  items.forEach((t) => { const k = t.source || 'unknown'; (bySource[k] = bySource[k] || []).push(t); });
+  const sourceKeys = Object.keys(bySource).sort();
+  const selectedType = selectedWorkerTaskType[inst.instanceId] || '';
+  if (selectedType && !sourceKeys.includes(selectedType)) sourceKeys.push(selectedType);
+  sourceKeys.sort();
+
+  const typeSelect = `<select class="worker-type-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()">
+    <option value="">(assign a task…)</option>
+    ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${(bySource[k] || []).length})</option>`).join('')}
+  </select>`;
+  if (!selectedType) return typeSelect;
+
+  const tasksOfSelectedType = bySource[selectedType] || [];
+  const OPTION_LABEL_MAX = 70;
+  const truncateLabel = (s) => s.length > OPTION_LABEL_MAX ? `${s.slice(0, OPTION_LABEL_MAX - 1)}…` : s;
+
+  const optionLabel = (t) => {
+    const rawTitle = t.title || t.id;
+    const base = t.hub && !/^HUB\d/.test(rawTitle) ? `${hubTag(t.hub)} · ${rawTitle}` : rawTitle;
+    let full = base;
+    if (t.location && t.location !== 'pending') {
+      full = `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}`;
+    } else if (t.pinnedTo) {
+      full = `📌 pinned to ${t.pinnedTo} — ${base}`;
+    }
+    if (t.premiumPriority) full = `★ ${full}`;
+    return truncateLabel(full);
+  };
+
+  const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()">
+    <option value="">${tasksOfSelectedType.length ? `(choose a ${escapeHtml(selectedType)} task…)` : `(no ${escapeHtml(selectedType)} tasks right now)`}</option>
+    ${tasksOfSelectedType.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}" title="${escapeAttr(t.title || t.id)}">${escapeHtml(optionLabel(t))}</option>`).join('')}
+  </select>`;
+  return typeSelect + taskSelect;
+}
+
+// --- top-level orchestrator (replaces the 241-line body) ---
+async function renderWorkers(isPoll) {
+  await pollGuardAndRefresh(isPoll);
+  const data = await fetchWorkerData(expandedWorkerId, expandedIsWorker);
+  const { instances, workerModels, costSummary, recentTasks, assignableByInstance } = data;
+  const overrides = workerModels.overrides || {};
+  const costByInstance = Object.fromEntries((costSummary.byInstance || []).map(i => [i.instanceId, i.totalCost]));
+  reconcilePendingAssign(instances);
+  // …render loop now calls renderModelSelect / renderTaskAssignSelect / renderWorkerMeta
+}
+```
+
+Benefits:
+Each extracted function can be snapshot- or unit-tested with a mock task object or `workerModels` stub without exercising the poll guard, the four parallel fetches, or the per-instance `assignable-tasks` loop. A regression in the `t.pinnedTo` prefix, the `t.premiumPriority` star, the `t.location` "running on" warning, or the `hubTag()` formatting is caught by a single `renderTaskAssignSelect` test. The `map()` callback in the render loop shrinks from roughly 120 lines of nested template-plus-IIFE to about ten lines of template that call three named helpers, making the surrounding HTML structure immediately legible. Code review of a change to the model-select logic no longer requires scrolling past the poll guard and fetch block, and vice versa.
+
+### AC-179 · Decompose renderPluginsTab into single-responsibility helpers
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+}
+
+async function renderPluginsTab() {
+  const main = document.getElementById('main');
+  let data;
+  try {
+    data = await fetchJson('/api/plugins');
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Could not load plugins: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  const slotted = plugins => plugins.filter((p) => p.slot);
+  const unslotted = plugins => plugins.filter((p) => !p.slot);
+  const allPlugins = data.plugins || [];
+  const rows = unslotted(allPlugins).map((p) => {
+    const enabled = p.enabled !== false;
+    return `
+      <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+        <label style="display:flex; align-items:center; gap:8px; margin-top:2px; cursor:pointer;">
+          <input type="checkbox" class="plugin-toggle" data-name="${escapeAttr(p.name)}" ${enabled ? 'checked' : ''}>
+        </label>
+        <div style="flex:1; min-width:0;">
+          <div style="font-weight:600;">${escapeHtml(p.name)} ${enabled ? '' : '<span class="badge idle" style="margin-left:6px;">disabled</span>'}</div>
+          ${p.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(p.description)}</div>` : ''}
+          <div class="meta" style="margin-top:4px; word-break:break-all; font-family:monospace; font-size:11px; color:var(--muted);">${escapeHtml(p.registerPath || '(no path)')}</div>
+        </div>
+      </div>`;
+  }).join('');
+
+  // Slotted plugins (e.g. "hardware-tab") are mutually exclusive -- a radio group, not
+  // independent checkboxes, since exactly one (or none) actually runs at a time and
+  // switching genuinely starts/stops the underlying process (see /api/plugins/select-slot).
+  const slotGroups = {};
+  slotted(allPlugins).forEach((p) => { (slotGroups[p.slot] = slotGroups[p.slot] || []).push(p); });
+  const slotSections = Object.entries(slotGroups).map(([slot, members]) => {
+    const radioName = `slot-${slot}`;
+    const noneChecked = !members.some((m) => m.active) ? 'checked' : '';
+    const options = [`
+      <label style="display:flex; align-items:center; gap:8px; padding:8px 10px; cursor:pointer;">
+        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="" ${noneChecked}>
+        <span>None (stop monitoring)</span>
+      </label>`, ...members.map((m) => {
+      const badge = m.running
+        ? '<span class="badge ok" style="margin-left:6px;">running</span>'
+        : '<span class="badge idle" style="margin-left:6px;">stopped</span>';
+      return `
+      <label style="display:flex; align-items:flex-start; gap:8px; padding:8px 10px; cursor:pointer;">
+        <input type="radio" name="${escapeAttr(radioName)}" class="slot-radio" data-slot="${escapeAttr(slot)}" value="${escapeAttr(m.name)}" ${m.active ? 'checked' : ''} style="margin-top:2px;">
+        <span>
+          <div style="font-weight:600;">${escapeHtml(m.name)}${badge}</div>
+          ${m.description ? `<div class="meta" style="margin-top:2px;">${escapeHtml(m.description)}</div>` : ''}
+        </span>
+      </label>`;
+    })];
+    return `
+      <div style="padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+        <div class="field-label" style="margin-bottom:6px;">${escapeHtml(slot)} source</div>
+        <div style="display:flex; flex-direction:column; gap:2px;" id="slot-group-${escapeAttr(slot)}">${options.join('')}</div>
+        <div class="meta slot-status" style="margin-top:6px;"></div>
+      </div>`;
+  }).join('');
+
+  main.innerHTML = `
+    <h2 style="margin-top:0;">Plugins</h2>
+    ${slotSections}
+    <div class="meta" style="margin-bottom:14px;">
+      Only enabled plugins register their task sources. A change here restarts the pipeline if it is running so an
+      in-flight draft for a now-disabled source can't stall. Manifest: <span style="font-family:monospace;">${escapeHtml(data.manifestPath || 'plugins.json')}</span>
+    </div>
+    <div id="plugins-list">${rows || '<div class="empty">No plugins registered yet -- add one below.</div>'}</div>
+
+    <h3 style="margin-top:22px;">Add a plugin</h3>
+    <div style="display:flex; flex-direction:column; gap:8px; max-width:640px;">
+      <input type="text" id="plugin-add-path" placeholder="Absolute path to the plugin's register.js (e.g. /media/model-cache/github/agent-manager-imagegen/register.js)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <input type="text" id="plugin-add-name" placeholder="Name (optional -- defaults to the plugin folder name)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <input type="text" id="plugin-add-desc" placeholder="Description (optional)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
+      <button class="action" id="plugin-add-btn" style="align-self:flex-start;">Add plugin</button>
+      <div id="plugin-add-msg" class="meta"></div>
+    </div>
+
+    <h3 style="margin-top:22px;">Available plugins</h3>
+    <div id="marketplace-note" class="meta" style="margin-bottom:10px;"></div>
+    <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
+
+  main.querySelectorAll('.slot-radio').forEach((radio) => {
+    radio.onchange = async () => {
+      const slot = radio.dataset.slot;
+      const name = radio.value || null;
+      const group = main.querySelector(`#slot-group-${slot}`);
+      const statusEl = group ? group.closest('div').parentElement.querySelector('.slot-status') : null;
+      group.querySelectorAll('input').forEach((r) => { r.disabled = true; });
+      if (statusEl) statusEl.textContent = name ? `Starting ${name}...` : 'Stopping...';
+      try {
+        const r = await fetch('/api/plugins/select-slot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slot, name }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.description || r.status);
+        if (name && !body.healthy) {
+          if (statusEl) statusEl.textContent = `${name} started but did not report healthy in time -- check its log.`;
+        }
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not switch plugin: ' + e.message);
+        await renderPluginsTab();
+      }
+    };
+  });
+
+  main.querySelectorAll('.plugin-toggle').forEach((cb) => {
+    cb.onchange = async () => {
+      cb.disabled = true;
+      try {
+        const r = await fetch('/api/plugins/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: cb.dataset.name, enabled: cb.checked }),
+        });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).description || r.status);
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not update plugin: ' + e.message);
+        cb.checked = !cb.checked;
+        cb.disabled = false;
+      }
+    };
+  });
+
+  const addBtn = main.querySelector('#plugin-add-btn');
+  addBtn.onclick = async () => {
+    const msg = main.querySelector('#plugin-add-msg');
+    const registerPath = main.querySelector('#plugin-add-path').value.trim();
+    const name = main.querySelector('#plugin-add-name').value.trim();
+    const description = main.querySelector('#plugin-add-desc').value.trim();
+    if (!registerPath) { msg.textContent = 'A register.js path is required.'; return; }
+    addBtn.disabled = true;
+    msg.textContent = 'Adding...';
+    try {
+      const r = await fetch('/api/plugins/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ registerPath, name, description }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.description || r.status);
+      await renderPluginsTab();
+    } catch (e) {
+      msg.textContent = 'Could not add plugin: ' + e.message;
+      addBtn.disabled = false;
+    }
+  };
+
+  // Marketplace: fetch catalog entries annotated with install status and render
+  // Install / Update / Installed controls per entry. 402/403 surface via showToast.
+  (async () => {
+    const listEl = main.querySelector('#marketplace-list');
+    const noteEl = main.querySelector('#marketplace-note');
+    let mkt;
+    try {
+      mkt = await fetchJson('/api/plugins/marketplace');
+    } catch (e) {
+      listEl.innerHTML = '<div class="meta">Could not load marketplace: ' + escapeHtml(e.message) + '</div>';
+      return;
+    }
+    if (mkt.catalogError) {
+      noteEl.textContent = mkt.catalogError;
+    }
+    const entries = mkt.plugins || mkt.entries || [];
+    if (!entries.length) {
+      listEl.innerHTML = '<div class="meta">No plugins available in the catalog.</div>';
+      return;
+    }
+    listEl.innerHTML = entries.map((p) => {
+      const installed = p.installed === true;
+      const updateAvail = p.updateAvailable === true;
+      let priceText = '';
+      if (p.pricing && p.pricing.model && p.pricing.model !== 'free') {
+        const cur = p.pricing.currency || '';
+        const amt = p.pricing.amount_cents != null ? (p.pricing.amount_cents / 100) : 0;
+        const interval = p.pricing.interval || '';
+        priceText = escapeHtml(cur + ' ' + amt + (interval ? ' / ' + interval : ''));
+      }
+      let controlHtml = '';
+      if (installed && updateAvail) {
+        controlHtml = '<button class="action" data-mkt-action="update" data-id="' + escapeAttr(p.id) + '">Update</button>';
+      } else if (installed) {
+        controlHtml = '<span class="badge ok" style="margin-top:2px;">Installed</span>';
+      } else {
+        const isPaid = p.pricing && p.pricing.model && p.pricing.model !== 'free';
+        const paidStyle = isPaid ? ' style="opacity:0.7; border-style:dashed;" title="Paid plugin -- requires a license"' : '';
+        controlHtml = '<button class="action" data-mkt-action="install" data-id="' + escapeAttr(p.id) + '"' + paidStyle + '>Install</button>';
+      }
+      const versionLine = p.installedVersion
+        ? '<div class="meta" style="margin-top:2px; font-size:11px;">Installed: ' + escapeHtml(p.installedVersion) + (updateAvail ? ' <span class="badge idle" style="margin-left:4px;">update available</span>' : '') + '</div>'
+        : '';
+      return '<div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">'
+        + '<div style="flex:1; min-width:0;">'
+        + '<div style="font-weight:600;">' + escapeHtml(p.name) + (priceText ? ' <span class="meta" style="margin-left:8px;">' + priceText + '</span>' : '') + '</div>'
+        + '<div class="meta" style="margin-top:2px;">' + escapeHtml(p.summary || '') + '</div>'
+        + versionLine
+// ... [truncated for review: this function continues for 36 more line(s) not shown]
+```
+
+Problem:
+`renderPluginsTab` spans roughly 236 lines and interleaves five independent responsibilities—fetching the plugin list, building unslotted-checkbox HTML rows, building slotted-radio-group sections, wiring three separate event-handler families, and running an async marketplace fetch-and-render. Each responsibility has its own data shape, failure mode, and test surface, yet they share one function body. A change to marketplace pricing forces a reader to re-scan the entire body to confirm the toggle handler is untouched, and a new slot type requires understanding the radio-group template amid unrelated marketplace code. The length is a symptom of five jobs in one scope, not of any single job being inherently large.
+
+Solution:
+Extract five named helpers that live in the same file, above `renderPluginsTab`, and reduce the original to a ~25-line orchestrator that fetches data, builds two HTML fragments, sets `innerHTML`, and calls the wiring/render helpers. Each helper takes only what it needs (the plugin array or the populated `#main` element) so it can be unit-tested in isolation. No template string, `fetch` call, or `escapeHtml`/`escapeAttr` usage changes—only scope moves.
+
+```diff
+--- a/python/dashboard/static/js/core-ui.js
++++ b/python/dashboard/static/js/core-ui.js
+@@ renderPluginsTab @@
++// --- extracted helpers (same file, above renderPluginsTab) ---
++
++function buildUnslottedRows(plugins) {
++  const unslotted = plugins.filter((p) => !p.slot);
++  return unslotted.map((p) => {
++    const enabled = p.enabled !== false;
++    return `
++      <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px;">
++        …(existing template, verbatim)
++      </div>`;
++  }).join('');
++}
++
++function buildSlotSections(plugins) {
++  const slotted = plugins.filter((p) => p.slot);
++  const groups = {};
++  slotted.forEach((p) => { (groups[p.slot] = groups[p.slot] || []).push(p); });
++  return Object.entries(groups).map(([slot, members]) => {
++    …(existing radio-group template, verbatim)
++  }).join('');
++}
++
++function wireSlotRadios(main) {
++  main.querySelectorAll('.slot-radio').forEach((radio) => {
++    radio.onchange = async () => { …(existing handler body, verbatim) };
++  });
++}
++
++function wirePluginToggles(main) {
++  main.querySelectorAll('.plugin-toggle').forEach((cb) => {
++    cb.onchange = async () => { …(existing handler body, verbatim) };
++  });
++}
++
++function wireAddPluginButton(main) {
++  const addBtn = main.querySelector('#plugin-add-btn');
++  addBtn.onclick = async () => { …(existing handler body, verbatim) };
++}
++
++async function renderMarketplace(main) {
++  const listEl = main.querySelector('#marketplace-list');
++  const noteEl = main.querySelector('#marketplace-note');
++  …(existing IIFE body, verbatim)
++}
++
+ // --- main function, now a thin orchestrator ---
+ async function renderPluginsTab() {
+   const main = document.getElementById('main');
+   let data;
+   try {
+     data = await fetchJson('/api/plugins');
+   } catch (e) {
+     main.innerHTML = `<div class="empty">Could not load plugins: ${escapeHtml(e.message)}</div>`;
+     return;
+   }
+   const allPlugins = data.plugins || [];
++  const rows = buildUnslottedRows(allPlugins);
++  const slotSections = buildSlotSections(allPlugins);
+ 
+   main.innerHTML = `
+     <h2 style="margin-top:0;">Plugins</h2>
+     ${slotSections}
+     …(static form + marketplace placeholder, unchanged)
+     <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
+ 
++  wireSlotRadios(main);
++  wirePluginToggles(main);
++  wireAddPluginButton(main);
++  renderMarketplace(main);
+ }
+```
+
+Benefits:
+Each extracted helper is a pure or near-pure unit that can be exercised with a fixture array (for the two `build*` functions) or a JSDOM stub (for the three `wire*` functions and `renderMarketplace`), so a regression in one handler no longer requires re-reading the other four. Code review diffs shrink to the single helper that changed. The orchestrator reads top-to-bottom as a five-line pipeline—fetch, build, mount, wire, render—making the control flow and error boundary obvious at a glance.
+
+### AC-180 · Decompose coordinatorSweep into stage-scoped helpers
+Strength: Strong
+Files: src/coordinator-sweep.js
+Snippet:
+```
+}
+
+function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, runWiring = runStackedWiring, runAutoMerge = autoMergeVerifiedMoveChild } = {}) {
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  let resolvedRepoRoot = repoRoot;
+  if (resolvedRepoRoot === undefined) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
+  const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
+
+  // Label every hub that has no HUB#### yet (oldest first), before the loop below reads them.
+  try { const labelled = assignMissingHubSerials(pipelineDir); if (labelled) summary.hubsLabelled = labelled; } catch (e) { console.warn(`[coordinator-sweep] hub serial backfill failed (advisory): ${e.message}`); }
+
+  let names;
+  try {
+    names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    if (err.code === 'ENOENT') { console.warn(`[coordinator-sweep] ${coordDir} does not exist yet -- nothing to sweep`); return summary; }
+    summary.errors += 1;
+    console.error(`[coordinator-sweep] readdirSync failed for ${coordDir}: ${err.code || 'UNKNOWN'} -- ${err.message}`);
+    return summary;
+  }
+
+  for (const name of names) {
+    const file = path.join(coordDir, name);
+    let parent;
+    try {
+      parent = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue; // a malformed coordinating file is not this sweep's problem to fix
+    }
+    if (!Array.isArray(parent.subTasks) || parent.subTasks.length === 0) {
+      // A coordinating parent with no checklist is a bug upstream -- complete it out so it
+      // does not sit here forever.
+      //
+      // 2026-09-14, screaminggoatclubmt: "fix the mislabeling" -- a hub that carries
+      // `coordinatorBlocked` from the moment it was filed (file-decompose-to-hub.js's
+      // fileBlockedHub(): validatePlan() found a hard problem, subTasks was `[]` from
+      // creation, ZERO children were ever attempted) was being routed through
+      // stampHubMerged() exactly like a hub whose children ALL genuinely shipped, so its
+      // history read "created -> merged -> done" and the dashboard reported it as a
+      // successful merge. Confirmed live: 33 `Decompose <file> -- plan needs revision`
+      // records in queue/done/ carry this exact false "merged" disposition. Route the
+      // rejected-at-creation case through `noop` instead (task-disposition.js's own
+      // definition: "the apply produced no change... no code change") -- still stamps
+      // mergedAt so any (unlikely, since no children ever existed) dependsOn sibling isn't
+      // blocked forever, per stampHubMerged's own reasoning, just without the false
+      // "merged" label.
+      const rejectedAtCreation = !!parent.coordinatorBlocked;
+      parent.status = 'done';
+      parent.doneMarker = rejectedAtCreation
+        ? 'coordinator hub rejected at creation -- no sub-tasks were ever filed'
+        : 'coordinator had no sub-tasks -- completed';
+      stampHubMerged(parent, rejectedAtCreation ? {
+        disposition: 'noop',
+        detail: 'coordinator hub: plan rejected at creation, no sub-tasks were ever filed',
+      } : undefined);
+      appendHistoryEvent(parent, 'done', parent.doneMarker);
+      // 2026-09-14, screaminggoatclubmt: "fold it into the watchdog sweep" -- file
+      // straight into done/_archived_no_action/ instead of done/'s top level for the
+      // rejected-at-creation case: it produced zero real work, so there is nothing for a
+      // human to review or a dependent to wait on, the exact "no action" meaning this
+      // folder already carries elsewhere (staleness-auto-archive.js's own DENY-vote and
+      // archive-recommendation paths file directly here the same way, with no human
+      // click in between -- established precedent for an automated sweep to use this
+      // folder, not only the dashboard's own Archive button). Otherwise these hubs would
+      // just sit in done/'s top level for up to done-archive.js's 30-day retention window
+      // before its generic time-based pass finally moved them. The genuine
+      // all-children-succeeded case is unaffected -- it still lands in done/ normally.
+      const destDir = rejectedAtCreation ? path.join(doneDir, '_archived_no_action') : doneDir;
+      if (rejectedAtCreation) {
+        appendHistoryEvent(parent, 'archived', 'Auto-archived: coordinator hub rejected at creation, no sub-tasks were ever filed -- nothing to review or wait on');
+      }
+      moveToDone(file, destDir, name, parent);
+      summary.checked += 1;
+      summary.completed += 1;
+      continue;
+    }
+
+    summary.checked += 1;
+    const recById = new Map();
+    for (const st of parent.subTasks) {
+      const rec = st && st.id ? findTaskRecordById(pipelineDir, st.id) : null;
+      recById.set(st && st.id, rec);
+      st.status = classifyChildStatus(rec);
+    }
+    // A hub built before "one hub = one stacked chain" may be mixed (some pieces stacked, some independent and stuck behind a merge):
+    // put its not-yet-started pieces onto the chain (hub-restack.js). Before the held-marker below, which reads the fresh fields.
+    try {
+      const restacked = restackHubChain(parent, recById);
+      if (restacked.length) { summary.restacked = (summary.restacked || 0) + restacked.length; appendHistoryEvent(parent, 'advisory', `restacked ${restacked.length} piece(s) onto the hub's shared branch`); }
+    } catch { /* repair is best-effort */ }
+    // Members lead with their hub's label (hub-serial.js): queueSubTasks does it for the hubs it builds, this covers older hubs and the
+    // producers that mint their own child ids. The checklist titles always follow; a member's record is only rewritten while it is idle.
+    try { const n = retitleHubMembers(parent, recById); if (n) summary.membersRetitled = (summary.membersRetitled || 0) + n; } catch { /* cosmetic */ }
+    // A hub renamed to its HUB#### id (hub-rename.js) may have a member a worker was mid-way through: point its decomposedFrom at the new id once idle.
+    try { const n = repairStaleHubRefs(parent, recById); if (n) summary.staleHubRefsRepaired = (summary.staleHubRefsRepaired || 0) + n; } catch { /* cosmetic */ }
+    // A piece that is only waiting for an earlier sibling to land (hub-priority.js hubHasUnmergedEarlierSibling) reads 'in-progress' and
+    // looks stuck; say what it is waiting for so the checklist is honest. Computed after every status above is fresh (the check reads
+    // sibling statuses off `parent`), and cleared as soon as the piece is released.
+    for (const st of parent.subTasks) {
+      const rec = st && st.id ? recById.get(st.id) : null;
+      let held = null;
+      if (st && st.status === 'in-progress' && rec && rec.task) {
+        try { const h = hubHasUnmergedEarlierSibling(pipelineDir, rec.task, parent); if (h.blocked) held = { id: h.blockingSiblingId, status: h.blockingSiblingStatus }; } catch { /* advisory */ }
+      }
+      if (st && held) st.heldFor = held; else if (st) delete st.heldFor;
+    }
+
+    // A non-stacked decompose hub: its move children carry no dependsOn, so nothing else
+    // reconciles their merge. Confirm each `done` child against origin/<main>'s commit
+    // trailer and flip it to `merged` -- then the hub only completes on all-MERGED, so its
+    // mergedAt stamp is honest and dependents don't unblock against a pre-split main.
+    const strictMergeHub = parent.decomposeHub === true && parent.mode !== 'stacked';
+    if (strictMergeHub) {
+      reconcileDecomposeChildMerges(pipelineDir, resolvedRepoRoot, parent.subTasks, recById, parent, runAutoMerge);
+    }
+
+    let doneCount = 0;
+    let builtCount = 0;
+    for (const st of parent.subTasks) {
+      st.phase = childPhase(st.status, strictMergeHub); // bare `done` is NOT enough to complete a strict-merge hub
+      if (st.phase === 'merged') { doneCount += 1; builtCount += 1; } else if (st.phase === 'built') builtCount += 1;
+    }
+    // done = merged/closed (completion, unchanged); built = done + finished-but-awaiting-merge (what the UI shows as progress).
+    parent.progress = { done: doneCount, built: builtCount, total: parent.subTasks.length };
+    parent.lastReconciledAt = new Date().toISOString();
+
+    // Stuck-chain detection: surface a hub that can never complete on its own instead of
+    // leaving it frozen at partial progress. The hub STAYS in coordinating/ so the sweep
+    // keeps reconciling it (and auto-clears / auto-completes if the children get unstuck);
+    // what changes is a `coordinatorBlocked` marker + a `blockedReason` the dashboard
+    // renders, and after a grace period an `escalated` flag + a louder history event.
+    if (doneCount < parent.subTasks.length) {
+      const stuck = findStuckChildren(parent.subTasks, recById);
+      const now = new Date().toISOString();
+      if (stuck.length > 0) {
+        const signature = stuck.map((s) => `${s.id}:${s.why}`).sort().join(' | ');
+        if (!parent.coordinatorBlocked || parent.coordinatorBlocked.signature !== signature) {
+          parent.coordinatorBlocked = { signature, since: now, children: stuck, escalated: false };
+          appendHistoryEvent(parent, 'blocked', `coordinator stuck: ${stuck.map((s) => `${s.id} -- ${s.why}`).join('; ')}`.slice(0, 500));
+          summary.blocked = (summary.blocked || 0) + 1;
+        }
+        parent.blockedReason = `${stuck.length} sub-task(s) can't proceed: ${stuck.map((s) => `${s.id.replace(/^adhoc-/, '')} (${s.why})`).join('; ')}`.slice(0, 400);
+        const escalateMs = stuckEscalateMs();
+        const stuckForMs = Date.now() - Date.parse(parent.coordinatorBlocked.since || now);
+        if (escalateMs > 0 && stuckForMs >= escalateMs && !parent.coordinatorBlocked.escalated) {
+          parent.coordinatorBlocked.escalated = true;
+          parent.coordinatorBlocked.escalatedAt = now;
+          appendHistoryEvent(parent, 'advisory',
+            `coordinator hub stuck ${Math.floor(stuckForMs / 86400000)}d -- needs a human: resolve/requeue/archive ${stuck.map((s) => s.id).join(', ')}, or archive this hub`);
+          summary.escalated = (summary.escalated || 0) + 1;
+        }
+      } else if (parent.coordinatorBlocked) {
+        delete parent.coordinatorBlocked;
+        delete parent.blockedReason;
+        appendHistoryEvent(parent, 'advisory', 'coordinator unblocked -- sub-tasks progressing again');
+        summary.unblocked = (summary.unblocked || 0) + 1;
+      }
+    }
+
+    const allChildrenDone = doneCount === parent.subTasks.length;
+
+    // A child went back to work (e.g. a human requeued the wiring step after a gate
+    // failure) -- re-arm the gate so the next all-done transition re-checks the branch.
+    if (!allChildrenDone && parent.integrationGate
+        && ['failed', 'errored'].includes(parent.integrationGate.status)) {
+      parent.integrationGate = { status: 'pending', reArmedAt: new Date().toISOString() };
+      delete parent.blockedReason;
+      delete parent.coordinatorBlocked;
+    }
+
+    // Stacked all-blueprint decompose hub: every move child committed its Blueprint module
+    // to the branch, but nothing registered them yet. Do the `register_blueprint` splice
+    // deterministically now, before the gate. On failure the hub stays in coordinating/
+    // with a blockedReason; on success wiringPending clears and the next tick runs the gate
+    // against the wired branch.
+    if (allChildrenDone && parent.mode === 'stacked' && parent.wiringPending
+        && (!parent.integrationGate || parent.integrationGate.status === 'pending')) {
+      const res = runWiring(parent, resolvedRepoRoot);
+      const now = new Date().toISOString();
+      if (res && res.ok) {
+        parent.wiringPending = false;
+        appendHistoryEvent(parent, 'advisory', res.skipped
+          ? `blueprint wiring already present on ${parent.branch}`
+          : `wired ${res.registered} blueprint(s) onto ${parent.branch}${res.sha ? ` @ ${res.sha.slice(0, 10)}` : ''}`);
+        summary.wired = (summary.wired || 0) + 1;
+      } else {
+        parent.blockedReason = `deterministic blueprint wiring failed on ${parent.branch}: ${res && res.detail ? res.detail : 'unknown'}`.slice(0, 600);
+        parent.coordinatorBlocked = {
+          signature: 'blueprint-wiring:failed', since: now, escalated: false,
+          children: [{ id: parent.subTasks[parent.subTasks.length - 1].id, why: (res && res.detail) || 'wiring failed' }],
+        };
+        appendHistoryEvent(parent, 'blocked', parent.blockedReason);
+        summary.wiringFailed = (summary.wiringFailed || 0) + 1;
+      }
+      try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); summary.updated += 1; }
+      catch (err) { console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`); summary.errors += 1; }
+      continue;
+    }
+
+    // Stacked decompose hub: children done is necessary but not sufficient -- the shared
+// ... [truncated for review: this function continues for 54 more line(s) not shown]
+```
+
+Problem:
+`coordinatorSweep` is a 254-line function that interleaves at least nine logically distinct responsibilities—empty-subtask completion, status classification with three best-effort repair passes, held-for-sibling annotation, strict-merge reconciliation, progress folding, stuck-detection with escalation timers, gate re-arming, blueprint wiring, and final gate execution with completion and file write—into a single loop body with multiple early-`continue` exits. The 2026-09-14 "rejected-at-creation" change is a concrete example of the cost: a reviewer had to trace all 254 lines to confirm the new `rejectedAtCreation` branch did not accidentally interact with the stuck-detection or wiring paths below it. No individual stage can be unit-tested in isolation without exercising the entire function, and the shared mutable `parent` object is mutated across all nine stages with no visible read/write boundary per stage.
+
+Solution:
+Extract each stage into a clearly-named, independently-testable helper function that receives only the fields it reads or mutates. The main `coordinatorSweep` becomes a ~60-line orchestration loop that calls `handleEmptySubTaskHub`, `classifyAndRepair`, `annotateHeldFor`, `reconcileDecomposeChildMerges`, `computeProgress`, `detectStuckAndEscalate`, `rearmGateIfNeeded`, `tryBlueprintWiring`, and `runGateAndComplete` in sequence. The three best-effort repair calls (restack, retitle, stale-ref) stay grouped inside `classifyAndRepair` because they share the same try/catch-and-continue pattern and are each only 2–3 lines; splitting them further would add indirection without reducing cognitive load. The early-`continue` paths become explicit return values (`tryBlueprintWiring` returns `true` when it handled the hub this tick).
+
+Benefits:
+Each helper can be unit-tested with a synthetic `parent` object and stubbed I/O without touching the filesystem, the wiring path, or the gate. Change isolation is concrete: the 2026-09-14 fix becomes a self-contained edit to `handleEmptySubTaskHub` with zero risk of altering stuck-detection or wiring logic. The shared-state surface is bounded—each helper receives only the fields it needs, making the read/write boundaries per stage visible to a reviewer. The orchestration loop reads top-to-bottom as a state machine with named transitions rather than a wall of interleaved mutations.
+
+```javascript
+// src/coordinator-sweep.js (post-decomposition)
+//
+// The 254-line coordinatorSweep is split into a ~60-line orchestration
+// loop plus nine stage-scoped helpers.  Each helper receives only the
+// fields it reads or mutates, so the shared `parent` object's
+// read/write boundary is visible per stage.
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { getConfig } from './config.js';
+import { assignMissingHubSerials } from './hub-serials.js';
+import { findTaskRecordById, classifyChildStatus, childPhase } from './task-records.js';
+import { restackHubChain, retitleHubMembers, repairStaleHubRefs } from './hub-repairs.js';
+import { hubHasUnmergedEarlierSibling } from './sibling-check.js';
+import { reconcileDecomposeChildMerges } from './strict-merge.js';
+import { findStuckChildren, stuckEscalateMs } from './stuck-detect.js';
+import { runStackedGate, runStackedWiring, autoMergeVerifiedMoveChild } from './gates.js';
+import { stampHubMerged, appendHistoryEvent, moveToDone } from './hub-lifecycle.js';
+
+// ─────────────────────────────────────────────────────────────────────
+//  Orchestration loop (was the 254-line body)
+// ─────────────────────────────────────────────────────────────────────
+export function coordinatorSweep({
+  pipelineDir,
+  repoRoot,
+  runGate = runStackedGate,
+  runWiring = runStackedWiring,
+  runAutoMerge = autoMergeVerifiedMoveChild,
+} = {}) {
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  const doneDir  = path.join(pipelineDir, 'queue', 'done');
+
+  let resolvedRepoRoot = repoRoot;
+  if (resolvedRepoRoot === undefined) {
+    try { ({ repoRoot: resolvedRepoRoot } = getConfig()); }
+    catch { resolvedRepoRoot = null; }
+  }
+
+  const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
+
+  // Advisory: back-fill missing hub serials before the sweep.
+  try {
+    const labelled = assignMissingHubSerials(pipelineDir);
+    if (labelled) summary.hubsLabelled = labelled;
+  } catch (e) {
+    console.warn(`[coordinator-sweep] hub serial backfill failed (advisory): ${e.message}`);
+  }
+
+  let names;
+  try {
+    names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      console.warn(`[coordinator-sweep] ${coordDir} does not exist yet -- nothing to sweep`);
+      return summary;
+    }
+    summary.errors += 1;
+    console.error(`[coordinator-sweep] readdirSync failed for ${coordDir}: ${err.code || 'UNKNOWN'} -- ${err.message}`);
+    return summary;
+  }
+
+  for (const name of names) {
+    const file = path.join(coordDir, name);
+    let parent;
+    try { parent = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch { summary.errors += 1; continue; }
+
+    // Stage 1 ─ empty-subtask completion (early exit)
+    if (!Array.isArray(parent.subTasks) || parent.subTasks.length === 0) {
+      handleEmptySubTaskHub(parent, file, name, doneDir, summary);
+      continue;
+    }
+
+    summary.checked += 1;
+
+    // Stage 2 ─ classify + best-effort repairs
+    const recById = classifyAndRepair(parent, pipelineDir, summary);
+
+    // Stage 3 ─ held-for-sibling annotation
+    annotateHeldFor(parent, recById, pipelineDir);
+
+    // Stage 4 ─ strict-merge reconciliation
+    const strictMergeHub = parent.decomposeHub === true && parent.mode !== 'stacked';
+    if (strictMergeHub) {
+      reconcileDecomposeChildMerges(
+        pipelineDir, resolvedRepoRoot,
+        parent.subTasks, recById, parent, runAutoMerge,
+      );
+    }
+
+    // Stage 5 ─ progress fold
+    const { doneCount } = computeProgress(parent, strictMergeHub);
+
+    // Stage 6 ─ stuck-detection + escalation
+    detectStuckAndEscalate(parent, recById, doneCount, pipelineDir, summary);
+
+    // Stage 7 ─ gate re-arm
+    rearmGateIfNeeded(parent, doneCount, parent.subTasks.length);
+
+    // Stage 8 ─ blueprint wiring (may consume the tick)
+    if (tryBlueprintWiring(parent, file, name, resolvedRepoRoot, runWiring, summary)) {
+      continue;
+    }
+
+    // Stage 9 ─ gate execution + completion + write
+    runGateAndComplete(parent, file, name, doneDir, resolvedRepoRoot,
+                       runGate, runAutoMerge, summary);
+  }
+
+  return summary;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Stage 1 – empty-subtask completion
+// ─────────────────────────────────────────────────────────────────────
+function handleEmptySubTaskHub(parent, file, name, doneDir, summary) {
+  const rejectedAtCreation = !!parent.coordinatorBlocked;
+
+  parent.status = 'done';
+  parent.doneMarker = rejectedAtCreation
+    ? 'coordinator hub rejected at creation -- no sub-tasks were ever filed'
+    : 'coordinator had no sub-tasks -- completed';
+
+  stampHubMerged(parent, rejectedAtCreation
+    ? { disposition: 'noop',
+        detail: 'coordinator hub: plan rejected at creation, no sub-tasks were ever filed' }
+    : undefined);
+
+  appendHistoryEvent(parent, 'done', parent.doneMarker);
+
+  const destDir = rejectedAtCreation
+    ? path.join(doneDir, '_archived_no_action')
+    : doneDir;
+
+  if (rejectedAtCreation) {
+    appendHistoryEvent(parent, 'archived',
+      'Auto-archived: coordinator hub rejected at creation, no sub-tasks were ever filed -- nothing to review or wait on');
+  }
+
+  moveToDone(file, destDir, name, parent);
+  summary.checked += 1;
+  summary.completed += 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Stage 2 – classify + best-effort repairs
+// ─────────────────────────────────────────────────────────────────────
+function classifyAndRepair(parent, pipelineDir, summary) {
+  const recById = new Map();
+  for (const st of parent.subTasks) {
+    const rec = st && st.id ? findTaskRecordById(pipelineDir, st.id) : null;
+    recById.set(st && st.id, rec);
+    st.status = classifyChildStatus(rec);
+  }
+
+  // Three independent advisory repairs; each swallows its own errors.
+  try {
+    const restacked = restackHubChain(parent, recById);
+    if (restacked.length) {
+      summary.restacked = (summary.restacked || 0) + restacked.length;
+      appendHistoryEvent(parent, 'advisory',
+        `restacked ${restacked.length} piece(s) onto the hub's shared branch`);
+    }
+  } catch { /* best-effort */ }
+
+  try {
+    const n = retitleHubMembers(parent, recById);
+    if (n) summary.membersRetitled = (summary.membersRetitled || 0) + n;
+  } catch { /* cosmetic */ }
+
+  try {
+    const n = repairStaleHubRefs(parent, recById);
+    if (n) summary.staleHubRefsRepaired = (summary.staleHubRefsRepaired || 0) + n;
+  } catch { /* cosmetic */ }
+
+  return recById;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Stage 3 – held-for-sibling annotation
+// ─────────────────────────────────────────────────────────────────────
+function annotateHeldFor(parent, recById, pipelineDir) {
+  for (const st of parent.subTasks) {
+    const rec = st && st.id ? recById.get(st.id) : null;
+    let held = null;
+    if (st && st.status === 'in-progress' && rec && rec.task) {
+      try {
+        const h = hubHasUnmergedEarlierSibling(pipelineDir, rec.task, parent);
+        if (h.blocked) held = { id: h.blockingSiblingId, status: h.blockingSiblingStatus };
+      } catch { /* advisory */ }
+    }
+    if (st && held) st.heldFor = held;
+    else if (st) delete st.heldFor;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Stage 5 – progress fold
+// ─────────────────────────────────────────────────────────────────────
+function computeProgress(parent, strictMergeHub) {
+  let doneCount = 0;
+  let builtCount = 0;
+  for (const st of parent.subTasks) {
+    st.phase = childPhase(st.status, strictMergeHub);
+    if (st.phase === 'merged') { doneCount += 1; builtCount += 1; }
+    else if (st.phase === 'built') builtCount += 1;
+  }
+  parent.progress = { done: doneCount, built: builtCount, total: parent.subTasks.length };
+  parent.lastReconciledAt = new Date().toISOString();
+  return { doneCount, builtCount };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Stage 6 – stuck-detection + escalation
+// ─────────────────────────────────────────────────────────────────────
+function detectStuckAndEscalate(parent, recById, doneCount, pipelineDir, summary) {
+  if (doneCount >= parent.subTasks.length) return;
+
+  const stuck = findStuckChildren(parent.subTasks, recById);
+  const now = new Date().toISOString();
+
+  if (stuck.length > 0) {
+    const signature = stuck.map((s) => `${s.id}:${s.why}`).sort().join(' | ');
+
+    if (!parent.coordinatorBlocked
+        || parent.coordinatorBlocked.signature !== signature) {
+      parent.coordinatorBlocked = {
+        signature, since: now, children: stuck, escalated: false,
+      };
+      appendHistoryEvent(parent, 'blocked',
+        `coordinator stuck: ${stuck.map((s) => `${s.id} -- ${s.why}`).join('; ')}`.slice(0, 500));
+      summary.blocked = (summary.blocked || 0) + 1;
+    }
+
+    parent.blockedReason =
+      `${stuck.length} sub-task(s) can't proceed: ${stuck
+        .map((s) => `${s.id.replace(/^adhoc-/, '')} (${s.why})`).join('; ')}`
+        .slice(0, 400);
+
+    const escalateMs = stuckEscalateMs();
+    const stuckForMs = Date.now() - Date.parse(parent.coordinatorBlocked.since || now);
+    if (escalateMs > 0 && stuckForMs >= escalateMs && !parent.coordinatorBlocked.escalated) {
+      parent.coordinatorBlocked.escalated = true;
+      parent.coordinatorBlocked.escalatedAt = now;
+      appendHistoryEvent(parent, 'advisory',
+        `coordinator hub stuck ${Math.floor(stuckForMs / 86400000)}d -- needs a human: ` +
+        `resolve/requeue/archive ${stuck.map((s) => s.id).join(', ')}, or archive this hub`);
+      summary.escalated = (summary.escalated || 0) + 1;
+    }
+  } else if (parent.coordinatorBlocked) {
+    delete parent.coordinatorBlocked;
+    delete parent.blockedReason;
+    appendHistoryEvent(parent, 'advisory',
+      'coordinator unblocked -- sub-tasks progressing again');
+    summary.unblocked = (summary.unblocked || 0) + 1;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Stage 7 – gate re-arm
+// ─────────────────────────────────────────────────────────────────────
+function rearmGateIfNeeded(parent, doneCount, total) {
+  if (doneCount === total) return;
+  if (parent.integrationGate
+      && ['failed', 'errored'].includes(parent.integrationGate.status)) {
+    parent.integrationGate = { status: 'pending', reArmedAt: new Date().toISOString() };
+    delete parent.blockedReason;
+    delete parent.coordinatorBlocked;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Stage 8 – blueprint wiring
+//  Returns true when wiring was attempted this tick (caller should
+//  `continue`); false when the hub is not in a wiring-eligible state.
+// ─────────────────────────────────────────────────────────────────────
+function tryBlueprintWiring(parent, file, name, resolvedRepoRoot, runWiring, summary) {
+  const allDone = parent.progress.done === parent.subTasks.length;
+  if (!(allDone
+        && parent.mode === 'stacked'
+        && parent.wiringPending
+        && (!parent.integrationGate || parent.integrationGate.status === 'pending'))) {
+    return false;
+  }
+
+  const res = runWiring(parent, resolvedRepoRoot);
+  const now = new Date().toISOString();
+
+  if (res && res.ok) {
+    parent.wiringPending = false;
+    appendHistoryEvent(parent, 'advisory',
+      res.skipped
+        ? `blueprint wiring already present on ${parent.branch}`
+        : `wired ${res.registered} blueprint(s) onto ${parent.branch}` +
+          `${res.sha ? ` @ ${res.sha.slice(0, 10)}` : ''}`);
+    summary.wired = (summary.wired || 0) + 1;
+  } else {
+    parent.blockedReason =
+      `deterministic blueprint wiring failed on ${parent.branch}: ` +
+      `${res && res.detail ? res.detail : 'unknown'}`.slice(0, 600);
+    parent.coordinatorBlocked = {
+      signature: 'blueprint-wiring:failed',
+      since: now,
+      escalated: false,
+      children: [{
+        id: parent.subTasks[parent.subTasks.length - 1].id,
+        why: (res && res.detail) || 'wiring failed',
+      }],
+    };
+    appendHistoryEvent(parent, 'blocked', parent.blockedReason);
+    summary.wiringFailed = (summary.wiringFailed || 0) + 1;
+  }
+
+  try {
+    fs.writeFileSync(file, JSON.stringify(parent, null, 2));
+    summary.updated += 1;
+  } catch (err) {
+    console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`);
+    summary.errors += 1;
+  }
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+//  Stage 9 – gate execution + completion + file write
+// ─────────────────────────────────────────────────────────────────────
+function runGateAndComplete(parent, file, name, doneDir, resolvedRepoRoot,
+                            runGate, runAutoMerge, summary) {
+  const allMerged = parent.progress.done === parent.subTasks.length;
+
+  if (allMerged) {
+    // All children merged – run the integration gate, then complete.
+    const gateResult = runGate(parent, resolvedRepoRoot);
+    if (gateResult && gateResult.ok) {
+      parent.integrationGate = { status: 'passed', at: new Date().toISOString() };
+      parent.status = 'done';
+      parent.doneMarker = `all ${parent.subTasks.length} sub-tasks merged; gate passed`;
+      stampHubMerged(parent, {
+        disposition: 'merged',
+        detail: `gate passed; ${parent.subTasks.length} sub-task(s) on ${parent.branch}`,
+      });
+      appendHistoryEvent(parent, 'done', parent.doneMarker);
+      moveToDone(file, doneDir, name, parent);
+      summary.completed += 1;
+    } else {
+      parent.integrationGate = {
+        status: gateResult && gateResult.status || 'failed',
+        detail: (gateResult && gateResult.detail) || 'gate failed',
+        at: new Date().toISOString(),
+      };
+      parent.blockedReason = `integration gate ${parent.integrationGate.status}`;
+      appendHistoryEvent(parent, 'advisory',
+        `integration gate ${parent.integrationGate.status}: ` +
+        `${(gateResult && gateResult.detail) || 'no detail'}`.slice(0, 400));
+    }
+  } else if (parent.integrationGate && parent.integrationGate.status === 'pending') {
+    // Partial progress – run gate on what is merged so far.
+    const gateResult = runGate(parent, resolvedRepoRoot);
+    if (gateResult && gateResult.ok) {
+      parent.integrationGate.status = 'passed';
+      parent.integrationGate.at = new Date().toISOString();
+    } else {
+      parent.integrationGate.status = gateResult && gateResult.status || 'failed';
+      parent.integrationGate.detail = (gateResult && gateResult.detail) || 'gate failed';
+      parent.integrationGate.at = new Date().toISOString();
+    }
+  }
+
+  // Persist the hub state.
+  try {
+    fs.writeFileSync(file, JSON.stringify(parent, null, 2));
+    summary.updated += 1;
+  } catch (err) {
+    console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`);
+    summary.errors += 1;
+  }
+}
+```
+
+### AC-181 · Extract complex git-runner operations to module scope
+Strength: Strong
+Files: src/git-runner.js
+Snippet:
+```
+ * @param {string} repoRoot - Absolute path to the git repo to operate on.
+ */
+function createRealGitRunner(repoRoot) {
+  const mainBranch = detectDefaultBranch(repoRoot);
+  function run(args) {
+    return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+  }
+  function isAncestor(a, b) {
+    try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
+  }
+  function doResetToMain() {
+    try {
+      run(['stash', 'push', '-u', '-m', `agent-manager auto-stash before reset ${new Date().toISOString()}`]);
+    } catch (e) {
+      throw new Error(`auto-stash before resetToMain failed, reset aborted to avoid destroying work: ${e.message}`);
+    }
+    run(['checkout', mainBranch]);
+    run(['fetch', 'origin', mainBranch]);
+    const remote = `origin/${mainBranch}`;
+    const originInLocal = isAncestor(remote, mainBranch);
+    const localInOrigin = isAncestor(mainBranch, remote);
+    if (originInLocal && !localInOrigin) {
+      if (ungatedMainPushAllowed()) {
+        try {
+          run(['push', 'origin', `${mainBranch}:${mainBranch}`]);
+        } catch (e) {
+          throw new Error(`resetToMain: local ${mainBranch} is ahead of origin but fast-forwarding it to origin failed (push rejected -- e.g. a protected branch or a race): ${e.message}`);
+        }
+      } else {
+        // Local main holds commits origin lacks. The old behavior pushed them to origin/main
+        // unattended -- exactly what must never happen without a human gate (see
+        // lib/main-push-policy.js). Preserve them on a rescue BRANCH (pushed best-effort, so a
+        // reset never destroys work) and fall through to the reset. A human decides about them.
+        const rescue = `agent/rescued-${mainBranch}-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
+        try {
+          run(['branch', rescue, mainBranch]);
+        } catch (e) {
+          throw new Error(`resetToMain: local ${mainBranch} is ahead of origin and could not be rescued to ${rescue} before the reset: ${e.message}`);
+        }
+        try { run(['push', '-u', 'origin', rescue]); } catch { /* best-effort: the local rescue branch still exists */ }
+        console.error(`[git-runner] local ${mainBranch} had commit(s) origin lacks; NOT pushed to ${mainBranch} (no ungated main pushes) -- kept on ${rescue} for a human to review/merge`);
+      }
+    } else if (!originInLocal && !localInOrigin) {
+      throw new Error(`resetToMain: local ${mainBranch} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic reset`);
+    }
+    run(['reset', '--hard', remote]);
+    // Pop the stash created above right back onto the now-reset tree (2026-09-14, fixing
+    // the "never popped" hazard this function used to carry -- see the header comment on
+    // the returned object below for the full incident history). Confirmed live: the
+    // dedicated AGENT_MANAGER_APPLY_REPO_ROOT worktree this runs against is never
+    // interactively edited, so there is no live human WIP this could clobber -- unlike
+    // the pre-2026-09-07 shape where resetToMain() ran directly against the same checkout
+    // a human sometimes edits live, popping immediately was NOT safe (a stray edit could
+    // ride back onto the tree right before an automated commit). "No stash entries found"
+    // (the overwhelmingly common case -- nothing was stashed) is swallowed as a no-op;
+    // any other pop failure (e.g. a real conflict) is logged and swallowed rather than
+    // thrown -- the reset itself already succeeded, and git leaves the stash entry intact
+    // on a failed pop for manual recovery, so this can never make things worse than the
+    // old never-popped behavior, only better.
+    try {
+      run(['stash', 'pop']);
+    } catch (e) {
+      const msg = e.stderr ? e.stderr.toString() : e.message;
+      if (!/no stash entries found/i.test(msg)) {
+        console.error(`[git-runner] stash pop after resetToMain failed (stash entry left in place for manual recovery): ${msg}`);
+      }
+    }
+  }
+  return {
+    mainBranch,
+    fetchMain: () => run(['fetch', 'origin', mainBranch]),
+    // Auto-stash before the hard reset instead of silently destroying uncommitted work --
+    // this exact `git reset --hard` wiped real, unrecoverable work TWICE in one session
+    // (see docs/pipeline-incident-2026-07-19.md and its 2026-07-21 repeat) because this
+    // repo is sometimes edited live in the same working tree the pipeline operates on.
+    // `-u` includes untracked files. Stashing when there's nothing to stash is a harmless
+    // no-op (git prints "No local changes to save", exits 0) -- no separate status check
+    // needed. A stash failure (e.g. an in-progress merge/rebase) must not silently fall
+    // through to the destructive reset below, so it's re-thrown with context rather than
+    // swallowed.
+    //
+    // FIXED (2026-09-14, was a HAZARD since 2026-09-03): the stash created above is now
+    // popped right after the hard reset (see doResetToMain()) instead of being left as a
+    // graveyard -- so any untracked/tracked content swept up here round-trips back onto
+    // the tree instead of silently vanishing. This used to matter enormously: when
+    // pipelineDir === repoRoot, every pipeline runtime-state file lands inside repoRoot,
+    // and 90 scanner false-positive suppressions were lost this way over 3 days before
+    // the ledgers were ignored. src/pipeline-state-gitignored.test.js still enforces the
+    // getConfig()-path .gitignore invariant as defense-in-depth (a state file that's
+    // git-ignored is never even stashed in the first place, `git stash -u` skips it
+    // outright), independent of this pop fix.
+    resetToMain: doResetToMain,
+    createBranch: (name) => run(['checkout', '-b', name]),
+    checkoutMain: () => run(['checkout', mainBranch]),
+    // Checkout an EXISTING branch (stacked file-decompose: move N+1 rides on top of the
+    // branch move N already committed to, so it must not reset it away).
+    checkoutBranch: (name) => run(['checkout', name]),
+    branchExists: (name) => {
+      try { run(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]); return true; }
+      catch { return false; }
+    },
+    // 2026-09-08, added alongside prepareStackedBranch below -- checks the REMOTE copy
+    // specifically (refs/remotes/origin/<name>), distinct from branchExists' local-only
+    // check. A caller must never treat "a local ref with this name exists" as proof the
+    // branch is real/current -- see prepareStackedBranch's own header for the incident.
+    remoteBranchExists: (name) => {
+      try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${name}`]); return true; }
+      catch { return false; }
+    },
+    // Best-effort fetch of one non-main branch (stacked decompose: pick up a prior step's
+    // commit if this host's local ref is behind or missing). A failure is non-fatal.
+    fetchBranch: (name) => {
+      try { return run(['fetch', 'origin', name]); } catch { return ''; }
+    },
+    // Reset-or-create a local branch to track origin/<name> exactly (stacked decompose,
+    // when the local ref is missing or stale but origin has the prior step's commit).
+    checkoutTracking: (name) => run(['checkout', '-B', name, `origin/${name}`]),
+    deleteBranch: (name) => run(['branch', '-D', name]),
+    // 2026-09-08, Grimmethy: "harden it properly with tests" -- root-caused live: apply-
+    // task.js's stacked-decompose handling (seq > 1) used to trust branchExists(name)
+    // (a LOCAL-only check) as proof the branch was safe to check out, with no check that
+    // the local copy was actually current. A 5-day-old, unrelated local branch with the
+    // SAME name -- leftover cruft, origin's real copy long since merged and deleted --
+    // made every apply attempt check out that stale tree and then fail to apply a diff
+    // computed against current main, identically, every single retry (not a race; a
+    // permanently wrong decision that would never self-correct). This is the single,
+    // self-contained decision resetToMain() already models for the analogous "is my
+    // local copy of mainBranch safe to sync from origin" question -- same ahead/behind/
+    // diverged reasoning, applied here to a per-hub scratch branch instead:
+    //   - origin has it, local doesn't (or local ⊆ origin, i.e. stale/behind/identical):
+    //     sync local to origin's tip. Always safe -- local has nothing origin lacks.
+    //   - origin has it AND local is STRICTLY ahead (real unpushed commits, e.g. a prior
+    //     step's own push failed after a successful commit): trust local as-is, matching
+    //     the old default behavior -- never silently discard real unpushed work.
+    //   - origin has it and the two have diverged: surface loudly for a human, exactly
+    //     like resetToMain's own diverged case -- never guess which side to keep.
+    //   - origin doesn't have it, but local descends from CURRENT main: plausibly real,
+    //     unpushed work from a step whose push never even started -- trust it.
+    //   - origin doesn't have it, and local (if any) does NOT descend from current main:
+    //     this is the exact stale-branch case that caused the incident. Discard any such
+    //     local branch and fall back to resetToMain() + a fresh branch off it, the same
+    //     "the whole prior chain already merged" fallback the seq===1 path already uses
+    //     (2026-09-07 reasoning) -- now reached by an actual staleness check instead of
+    //     by trusting whatever name happens to exist locally.
+    prepareStackedBranch: (name) => {
+      try { run(['fetch', 'origin', name]); } catch { /* best-effort, matches fetchBranch */ }
+      const remote = `origin/${name}`;
+      const remoteExists = (() => {
+        try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}`]); return true; } catch { return false; }
+      })();
+      const localExists = (() => {
+        try { run(['rev-parse', '--verify', '--quiet', `refs/heads/${name}`]); return true; } catch { return false; }
+      })();
+      if (remoteExists) {
+        if (localExists) {
+          const originInLocal = isAncestor(remote, name); // origin ⊆ local (local ahead or equal)
+          const localInOrigin = isAncestor(name, remote); // local ⊆ origin (local behind or equal)
+          if (originInLocal && !localInOrigin) {
+            run(['checkout', name]); // real unpushed commits -- trust local as-is.
+            return;
+          }
+          if (!originInLocal && !localInOrigin) {
+            throw new Error(`prepareStackedBranch: local ${name} and ${remote} have diverged (each has commit(s) the other lacks) -- needs a human to reconcile, not an automatic sync`);
+          }
+        }
+        // A ROLLING branch (e.g. TRIAGE_BRANCH) is never explicitly rebased on its own --
+        // apply-main-batch.js's own header says so plainly ("based on whatever main was
+        // when it was first created and is never rebased"). Every branch of the logic
+        // above only ever compares LOCAL to REMOTE; none of it ever asks whether the
+        // REMOTE copy itself has fallen behind current main. Root-caused live 2026-09-22:
+        // a human merged the branch and deleted it, but a near-concurrent apply cycle
+        // recreated it (a real race, or simply this same "trust origin blindly" gap on an
+        // OLDER cycle, well before that merge) anchored to a point of main from TWO DAYS
+        // earlier -- every apply after that just kept stacking onto that same stale
+        // lineage, silently re-including commits that had already separately landed on
+        // main (identical SHAs -- confirmed live), one of which was a finding a human had
+        // explicitly retracted as a false positive after the fact.
+        try { run(['fetch', 'origin', mainBranch]); } catch { /* best-effort, matches fetchMain elsewhere */ }
+        if (!isAncestor(`origin/${mainBranch}`, remote)) {
+          run(['checkout', '-B', name, remote]);
+          try {
+            run(['rebase', `origin/${mainBranch}`]);
+          } catch (e) {
+            try { run(['rebase', '--abort']); } catch { /* best-effort */ }
+            throw new Error(
+              `prepareStackedBranch: ${remote} is based on a stale point of ${mainBranch} (main has moved on since this rolling branch was last built) and rebasing its still-unmerged commits onto the current tip failed -- needs a human to reconcile, not an automatic sync: ${e.message}`,
+            );
+          }
+          return;
+        }
+        run(['checkout', '-B', name, remote]); // local missing, or ⊆ origin (stale/behind/identical); remote itself is current
+        return;
+      }
+      if (localExists && isAncestor(`origin/${mainBranch}`, name)) {
+        run(['checkout', name]); // no remote copy, but local is real work off current main
+        return;
+      }
+      // No remote copy, and no trustworthy local copy -- discard any stale local branch
+      // and start this step fresh off current main (2026-09-07 fallback reasoning: origin
+      // having nothing can only mean the whole prior chain already merged).
+      if (localExists) { try { run(['branch', '-D', name]); } catch { /* best-effort */ } }
+      doResetToMain();
+// ... [truncated for review: this function continues for 4 more line(s) not shown]
+```
+
+Problem:
+The `createRealGitRunner` factory is ~204 lines, but the bulk of that length comes from two genuinely complex inner functions — `doResetToMain` (~55 lines) and `prepareStackedBranch` (~70 lines) — that are trapped inside the closure alongside ~9 trivial one-liner wrappers. `prepareStackedBranch` in particular is a self-contained five-branch decision procedure (remote-ahead, local-ahead, diverged, local-off-main, stale-local) with its own error paths and incident history, yet it is unreachable from any test without constructing the entire runner object and exercising the other eleven properties first. The two complex functions share only three dependencies (`run`, `isAncestor`, `mainBranch`), so their coupling to the factory is incidental, not structural.
+
+Solution:
+Promote `doResetToMain` and `prepareStackedBranch` to module-scope functions that accept `(repoRoot, mainBranch, …)` as explicit parameters, and reduce the factory to a thin object-literal of one-liners that delegate to them. The `run` and `isAncestor` helpers move to module scope as well so the extracted functions can call them directly. The nine trivial wrappers (`fetchMain`, `checkoutMain`, `checkoutBranch`, `branchExists`, `remoteBranchExists`, `fetchBranch`, `checkoutTracking`, `deleteBranch`, `createBranch`) stay in the factory — extracting them would add indirection for no gain.
+
+```diff
+--- a/src/git-runner.js
++++ b/src/git-runner.js
+@@
++// ── module-scope helpers ──────────────────────────────────────────────
++
++function runInRepo(repoRoot, args) {
++  return execFileSync('git', args, {
++    cwd: repoRoot, stdio: 'pipe', encoding: 'utf8',
++    env: GIT_ENV, timeout: GIT_TIMEOUT_MS,
++  });
++}
++
++function isAncestor(repoRoot, a, b) {
++  try { runInRepo(repoRoot, ['merge-base', '--is-ancestor', a, b]); return true; }
++  catch { return false; }
++}
++
++// ── complex operations (independently testable) ───────────────────────
++
++function doResetToMain(repoRoot, mainBranch) {
++  const run = (args) => runInRepo(repoRoot, args);
++  const ancestor = (a, b) => isAncestor(repoRoot, a, b);
++  /* body identical to current inner doResetToMain */
++}
++
++function prepareStackedBranch(repoRoot, mainBranch, name) {
++  const run = (args) => runInRepo(repoRoot, args);
++  const ancestor = (a, b) => isAncestor(repoRoot, a, b);
++  /* body identical to current inline prepareStackedBranch */
++}
++
+ // ── factory ───────────────────────────────────────────────────────────
+ function createRealGitRunner(repoRoot) {
+   const mainBranch = detectDefaultBranch(repoRoot);
+   const run = (args) => runInRepo(repoRoot, args);
+   return {
+     mainBranch,
+     fetchMain: () => run(['fetch', 'origin', mainBranch]),
+-    resetToMain: doResetToMain,
++    resetToMain: () => doResetToMain(repoRoot, mainBranch),
+     createBranch: (name) => run(['checkout', '-b', name]),
+     checkoutMain: () => run(['checkout', mainBranch]),
+     checkoutBranch: (name) => run(['checkout', name]),
+     branchExists: (name) => { /* unchanged */ },
+     remoteBranchExists: (name) => { /* unchanged */ },
+     fetchBranch: (name) => { /* unchanged */ },
+     checkoutTracking: (name) => run(['checkout', '-B', name, `origin/${name}`]),
+     deleteBranch: (name) => run(['branch', '-D', name]),
+-    prepareStackedBranch: (name) => { /* ~70-line inline body */ },
++    prepareStackedBranch: (name) => prepareStackedBranch(repoRoot, mainBranch, name),
+   };
+ }
+```
+
+Benefits:
+Each complex operation becomes a top-level, named, independently-importable unit. A test that wants to verify "diverged → throws" or "stale-local → fetches then checks out" can call `prepareStackedBranch(fixtureRepo, 'main', 'feature/x')` directly with a fixture repository, without constructing the full runner or touching the nine trivial wrappers. Review scope shrinks: a change to the stacked-branch decision tree no longer appears in the same diff hunk as a one-line `checkoutMain` wrapper. The factory itself drops to roughly 25 lines of self-evident delegation, making the object's surface area immediately scannable.
+
+### AC-182 · Decompose renderDiscoveryTab into named builder functions
+Strength: Strong
+Files: python/dashboard/static/js/analytics-and-discovery.js
+Snippet:
+```
+}
+
+async function renderDiscoveryTab() {
+  const d = await fetchJson('/api/discovery');
+  discoveryCandidatesCache = d.candidates || [];
+  const main = document.getElementById('main');
+  if (!d.available) {
+    main.innerHTML = '<div class="empty">No discovery state found for the active project -- community-coverage.json and the candidates doc appear once the project graph is built and arch_discovery has run.</div>';
+    return;
+  }
+
+  const reviewed = d.communities.filter(c => c.lastReviewedAt).length;
+  const inFlight = d.tasks.filter(t => t.state !== 'done');
+  const doneRuns = d.tasks.filter(t => t.state === 'done');
+  const nextCommunity = d.communities.find(c => c.id === d.nextCommunityId);
+  const stats = `
+    <div class="stat-row">
+      <div class="stat"><strong>${reviewed} / ${d.communities.length}</strong>communities reviewed</div>
+      <div class="stat"><strong>${inFlight.length}</strong>runs in flight</div>
+      <div class="stat"><strong>${doneRuns.length}</strong>runs completed</div>
+      <div class="stat"><strong>${d.candidates.length}</strong>candidates produced</div>
+      <div class="stat"><strong>${nextCommunity ? escapeHtml(nextCommunity.name) : '--'}</strong>next up</div>
+    </div>`;
+
+  // Same order the job itself works in (nextArchDiscoveryTask's oldest-first rotation,
+  // never-reviewed before any real timestamp), so the top of the table is always "what
+  // discovery cares about right now".
+  const sortedCommunities = [...d.communities].sort((a, b) =>
+    (a.lastReviewedAt || '').localeCompare(b.lastReviewedAt || ''));
+  // Only rows with something to say (in queue, next up, or actually reviewed) show by
+  // default; the untouched tail collapses to a one-line count.
+  const interesting = sortedCommunities.filter(c =>
+    c.inFlightState || c.id === d.nextCommunityId || c.lastReviewedAt);
+  const communities = discoveryShowAllCommunities ? sortedCommunities : interesting;
+  const hiddenCount = sortedCommunities.length - communities.length;
+  const communityRows = communities.map(c => {
+    const status = c.inFlightState
+      ? `<span class="badge warn">in queue: ${escapeHtml(c.inFlightState)}</span>`
+      : c.id === d.nextCommunityId
+        ? '<span class="badge ok">next up</span>'
+        : c.lastReviewedAt
+          ? '<span class="badge idle">reviewed</span>'
+          : '<span class="badge idle">never reviewed</span>';
+    return `<tr>
+      <td>#${c.id} ${escapeHtml(c.name || '')}</td>
+      <td>${status}</td>
+      <td>${c.lastReviewedAt ? new Date(c.lastReviewedAt).toLocaleString() : ''}</td>
+      <td>${c.lastCandidateCount ?? ''}</td>
+    </tr>`;
+  }).join('');
+
+  const stateBadge = (s) => {
+    const cls = s === 'done' ? 'ok' : s === 'blocked' ? 'bad'
+      : (s === 'needs-clarification' || s === 'awaiting-confirm') ? 'warn' : 'idle';
+    return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+  };
+  const runRows = d.tasks.map(t => {
+    // Whichever field carries the run's actual outcome -- same signal priority as
+    // _adhoc_task_excerpt server-side.
+    const result = t.blockedReason
+      ? `<span style="color:var(--bad)">${escapeHtmlBright(t.blockedReason.slice(0, 140))}${t.blockedReason.length > 140 ? '…' : ''}</span>`
+      : t.doneMarker
+        ? escapeHtml(t.doneMarker)
+        : t.hasImplement ? 'draft written' : t.hasPlan ? 'plan written' : '';
+    return `<tr class="clickable" data-task-id="${escapeAttr(t.id)}" title="Click for the full readout (plan, draft, review verdicts)">
+      <td>${escapeHtmlBright(t.title)}</td>
+      <td>${stateBadge(t.state)}</td>
+      <td>${t.createdAt ? new Date(t.createdAt).toLocaleString() : ''}</td>
+      <td class="meta">${result}</td>
+    </tr>`;
+  }).join('');
+  const runsTable = d.tasks.length === 0
+    ? '<div class="empty">No arch-discovery runs in the queue yet.</div>'
+    : `<table><thead><tr><th>Run</th><th>State</th><th>Created</th><th>Result</th></tr></thead><tbody>${runRows}</tbody></table>`;
+
+  const candidateRows = d.candidates.map(c => `
+    <tr class="clickable" data-candidate-id="${c.id}" title="Click to read the full write-up">
+      <td><span class="bd-serial">AC-${String(c.id).padStart(3, '0')}</span></td>
+      <td>${escapeHtmlBright(c.title)}</td>
+      <td>${c.strength ? `<span class="badge ${c.strength === 'Strong' ? 'ok' : 'idle'}">${escapeHtml(c.strength)}</span>` : ''}</td>
+      <td class="meta">${c.files.slice(0, 3).map(escapeHtml).join(', ')}${c.files.length > 3 ? ` +${c.files.length - 3} more` : ''}</td>
+    </tr>`).join('');
+  const candidatesTable = d.candidates.length === 0
+    ? '<div class="empty">No candidates written yet.</div>'
+    : `<table><thead><tr><th>ID</th><th>Candidate</th><th>Strength</th><th>Files</th></tr></thead><tbody>${candidateRows}</tbody></table>`;
+
+  const communityToggle = (discoveryShowAllCommunities || hiddenCount > 0)
+    ? `<div style="margin:8px 0 0"><button class="secondary" id="discovery-show-all">${
+        discoveryShowAllCommunities
+          ? 'Show active communities only'
+          : `Show all ${sortedCommunities.length} communities (${hiddenCount} never reviewed hidden)`
+      }</button></div>`
+    : '';
+
+  // Runs and candidates first -- they're what this tab exists to surface; the (large)
+  // community rotation table is reference material below them.
+  main.innerHTML = stats
+    + `<div class="field-label">Discovery Runs</div>` + runsTable
+    + `<div class="field-label">Candidates Produced${d.candidatesPath ? ` <span style="text-transform:none;letter-spacing:0">(${escapeHtml(d.candidatesPath)})</span>` : ''}</div>`
+    + candidatesTable
+    + `<div class="field-label">Communities (rotation order)</div>`
+    + `<table><thead><tr><th>Community</th><th>Status</th><th>Last Reviewed</th><th>Candidates Last Run</th></tr></thead><tbody>${communityRows}</tbody></table>`
+    + communityToggle;
+
+  main.querySelectorAll('tr[data-task-id]').forEach(row => {
+    row.onclick = () => openTaskAnywhere(row.dataset.taskId);
+  });
+  main.querySelectorAll('tr[data-candidate-id]').forEach(row => {
+    row.onclick = () => openDiscoveryCandidate(parseInt(row.dataset.candidateId, 10));
+  });
+  const toggleBtn = document.getElementById('discovery-show-all');
+  if (toggleBtn) toggleBtn.onclick = () => {
+    discoveryShowAllCommunities = !discoveryShowAllCommunities;
+    renderDiscoveryTab();
+  };
+}
+```
+
+Problem:
+`renderDiscoveryTab` spans 114 lines and interleaves five distinct responsibilities—data fetch with an early-exit guard, derived-state computation (stats, sort, filter, hidden-count), three independent table builders (community rows, run rows with an inline `stateBadge` helper, candidate rows), page assembly into `main.innerHTML`, and three separate event-wiring blocks. The length is not merely "a lot of HTML"; it is a composition of concerns that share a single `d` scope and a single mutable `discoveryShowAllCommunities` flag, making it impossible to unit-test any one table builder in isolation without mocking `fetchJson`, the DOM, and module-level state. The inline `stateBadge` arrow function is unnameable and untestable in its current position.
+
+Solution:
+Extract five pure, independently-callable helpers—`buildStatsHtml(d)`, `buildCommunityTable(d)`, `stateBadge(s)` (hoisted to module scope), `buildRunsTable(d)`, `buildCandidatesTable(d)`—plus one DOM-binding function `wireDiscoveryEvents(main)`. The orchestrator `renderDiscoveryTab` shrinks to roughly 25 lines: fetch, guard, concatenate the builders in the same order with the same separator strings, then call the event-wiring function. Each builder owns its slice of `d` and introduces no new shared temporaries. The concrete change is shown below:
+
+```js
+// ---- extracted helpers (pure, independently testable) ----
+
+function buildStatsHtml(d) {
+  const reviewed = d.communities.filter(c => c.lastReviewedAt).length;
+  const inFlight = d.tasks.filter(t => t.state !== 'done');
+  const doneRuns = d.tasks.filter(t => t.state === 'done');
+  const nextCommunity = d.communities.find(c => c.id === d.nextCommunityId);
+  return `
+    <div class="stat-row">
+      <div class="stat"><strong>${reviewed} / ${d.communities.length}</strong>communities reviewed</div>
+      <div class="stat"><strong>${inFlight.length}</strong>runs in flight</div>
+      <div class="stat"><strong>${doneRuns.length}</strong>runs completed</div>
+      <div class="stat"><strong>${d.candidates.length}</strong>candidates produced</div>
+      <div class="stat"><strong>${nextCommunity ? escapeHtml(nextCommunity.name) : '--'}</strong>next up</div>
+    </div>`;
+}
+
+function stateBadge(s) {
+  const cls = s === 'done' ? 'ok' : s === 'blocked' ? 'bad'
+    : (s === 'needs-clarification' || s === 'awaiting-confirm') ? 'warn' : 'idle';
+  return `<span class="badge ${cls}">${escapeHtml(s)}</span>`;
+}
+
+function buildCommunityTable(d) {
+  const sortedCommunities = [...d.communities].sort((a, b) =>
+    (a.lastReviewedAt || '').localeCompare(b.lastReviewedAt || ''));
+  const interesting = sortedCommunities.filter(c =>
+    c.inFlightState || c.id === d.nextCommunityId || c.lastReviewedAt);
+  const communities = discoveryShowAllCommunities ? sortedCommunities : interesting;
+  const hiddenCount = sortedCommunities.length - communities.length;
+
+  const communityRows = communities.map(c => {
+    const status = c.inFlightState
+      ? `<span class="badge warn">in queue: ${escapeHtml(c.inFlightState)}</span>`
+      : c.id === d.nextCommunityId
+        ? '<span class="badge ok">next up</span>'
+        : c.lastReviewedAt
+          ? '<span class="badge idle">reviewed</span>'
+          : '<span class="badge idle">never reviewed</span>';
+    return `<tr>
+      <td>#${c.id} ${escapeHtml(c.name || '')}</td>
+      <td>${status}</td>
+      <td>${c.lastReviewedAt ? new Date(c.lastReviewedAt).toLocaleString() : ''}</td>
+      <td>${c.lastCandidateCount ?? ''}</td>
+    </tr>`;
+  }).join('');
+
+  const communityToggle = (discoveryShowAllCommunities || hiddenCount > 0)
+    ? `<div style="margin:8px 0 0"><button class="secondary" id="discovery-show-all">${
+        discoveryShowAllCommunities
+          ? 'Show active communities only'
+          : `Show all ${sortedCommunities.length} communities (${hiddenCount} never reviewed hidden)`
+      }</button></div>`
+    : '';
+
+  return `<table><thead><tr><th>Community</th><th>Status</th><th>Last Reviewed</th><th>Candidates Last Run</th></tr></thead><tbody>${communityRows}</tbody></table>`
+    + communityToggle;
+}
+
+function buildRunsTable(d) {
+  const runRows = d.tasks.map(t => {
+    const result = t.blockedReason
+      ? `<span style="color:var(--bad)">${escapeHtmlBright(t.blockedReason.slice(0, 140))}${t.blockedReason.length > 140 ? '…' : ''}</span>`
+      : t.doneMarker
+        ? escapeHtml(t.doneMarker)
+        : t.hasImplement ? 'draft written' : t.hasPlan ? 'plan written' : '';
+    return `<tr class="clickable" data-task-id="${escapeAttr(t.id)}" title="Click for the full readout (plan, draft, review verdicts)">
+      <td>${escapeHtmlBright(t.title)}</td>
+      <td>${stateBadge(t.state)}</td>
+      <td>${t.createdAt ? new Date(t.createdAt).toLocaleString() : ''}</td>
+      <td class="meta">${result}</td>
+    </tr>`;
+  }).join('');
+  return d.tasks.length === 0
+    ? '<div class="empty">No arch-discovery runs in the queue yet.</div>'
+    : `<table><thead><tr><th>Run</th><th>State</th><th>Created</th><th>Result</th></tr></thead><tbody>${runRows}</tbody></table>`;
+}
+
+function buildCandidatesTable(d) {
+  const candidateRows = d.candidates.map(c => `
+    <tr class="clickable" data-candidate-id="${c.id}" title="Click to read the full write-up">
+      <td><span class="bd-serial">AC-${String(c.id).padStart(3, '0')}</span></td>
+      <td>${escapeHtmlBright(c.title)}</td>
+      <td>${c.strength ? `<span class="badge ${c.strength === 'Strong' ? 'ok' : 'idle'}">${escapeHtml(c.strength)}</span>` : ''}</td>
+      <td class="meta">${c.files.slice(0, 3).map(escapeHtml).join(', ')}${c.files.length > 3 ? ` +${c.files.length - 3} more` : ''}</td>
+    </tr>`).join('');
+  return d.candidates.length === 0
+    ? '<div class="empty">No candidates written yet.</div>'
+    : `<table><thead><tr><th>ID</th><th>Candidate</th><th>Strength</th><th>Files</th></tr></thead><tbody>${candidateRows}</tbody></table>`;
+}
+
+function wireDiscoveryEvents(main) {
+  main.querySelectorAll('tr[data-task-id]').forEach(row => {
+    row.onclick = () => openTaskAnywhere(row.dataset.taskId);
+  });
+  main.querySelectorAll('tr[data-candidate-id]').forEach(row => {
+    row.onclick = () => openDiscoveryCandidate(parseInt(row.dataset.candidateId, 10));
+  });
+  const toggleBtn = document.getElementById('discovery-show-all');
+  if (toggleBtn) toggleBtn.onclick = () => {
+    discoveryShowAllCommunities = !discoveryShowAllCommunities;
+    renderDiscoveryTab();
+  };
+}
+
+// ---- slimmed-down orchestrator (~25 lines) ----
+
+async function renderDiscoveryTab() {
+  const d = await fetchJson('/api/discovery');
+  discoveryCandidatesCache = d.candidates || [];
+  const main = document.getElementById('main');
+  if (!d.available) {
+    main.innerHTML = '<div class="empty">No discovery state found for the active project -- community-coverage.json and the candidates doc appear once the project graph is built and arch_discovery has run.</div>';
+    return;
+  }
+
+  main.innerHTML = buildStatsHtml(d)
+    + `<div class="field-label">Discovery Runs</div>` + buildRunsTable(d)
+    + `<div class="field-label">Candidates Produced${d.candidatesPath ? ` <span style="text-transform:none;letter-spacing:0">(${escapeHtml(d.candidatesPath)})</span>` : ''}</div>`
+    + buildCandidatesTable(d)
+    + `<div class="field-label">Communities (rotation order)</div>`
+    + buildCommunityTable(d);
+
+  wireDiscoveryEvents(main);
+}
+```
+
+Benefits:
+Each table builder becomes a pure function of `d` (plus the already-module-level `discoveryShowAllCommunities` for the community table), so a developer can call `buildRunsTable(mockPayload)` in a unit test with no DOM, no `fetch`, and no module-state setup. The `stateBadge` helper gains a name and a stable location, making it referenceable from other render paths if needed. The orchestrator reads as a five-line recipe—fetch, guard, compose, wire—rather than a 114-line monolith, which cuts the cognitive cost of reviewing a change to, say, the candidate table from "trace 114 lines of interleaved template and logic" to "read a 20-line pure function." No behavior changes, no new dependencies, no architectural shift; it is a straightforward extract-method refactor that the line-count scanner is (correctly, if bluntly) nudging toward.
+
+### AC-183 · Decompose enterProjectTab: extract sync logic, template, and event wiring
+Strength: Strong
+Files: python/dashboard/static/js/project-tab.js
+Snippet:
+```
+async function enterProjectTab() {
+  // Sync the path input from the server's actual active project on every tab entry, before
+  // rendering it. Without this, the input only ever reflected localStorage -- if the active
+  // project changed via any OTHER route (hand-editing agent-manager.env, another browser tab,
+  // launch.bat) the input would silently keep showing a stale path while "Last configured
+  // project" below it correctly showed the truth. Since Start Pipeline acts on the input's
+  // value, not on activeRepoRoot, that mismatch could launch a pipeline against the wrong
+  // project with no warning. Only overrides on tab entry, not on the 3s poll thereafter, so a
+  // deliberate browse-a-different-project session isn't fought by this sync mid-use.
+  //
+  // Compares against lastSyncedActiveRepoRoot (the last server value we actually observed),
+  // NOT against projectPath -- comparing against projectPath meant a typed-but-not-yet-started
+  // path (Start Pipeline never ran, so activeRepoRoot on the server never changed) got silently
+  // overwritten back to the server's stale/placeholder activeRepoRoot on every single tab
+  // revisit, since the two never stopped disagreeing. Bug: "Project File Path ... resets to a
+  // non-existent default path each time I navigate to it" (2026-08-18). Only a genuine change
+  // in what the server reports since we last looked now counts as "external".
+  try {
+    const status = await fetchJson('/api/pipeline/status');
+    if (status.activeRepoRoot && status.activeRepoRoot !== lastSyncedActiveRepoRoot) {
+      lastSyncedActiveRepoRoot = status.activeRepoRoot;
+      if (status.activeRepoRoot !== projectPath) setProjectPath(status.activeRepoRoot);
+    }
+    // Same reasoning as the path sync above: reflect whatever's actually configured
+    // server-side (env file / another tab / launch.bat) rather than only ever showing
+    // this browser's last local choice.
+    if (typeof status.includeApply === 'boolean') {
+      includeApply = status.includeApply;
+      localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    }
+    if (typeof status.skipPush === 'boolean') {
+      skipPush = status.skipPush;
+      localStorage.setItem('agentManagerSkipPush', String(skipPush));
+    }
+  } catch (e) { /* dashboard's own status check failed -- fall back to whatever's cached */ }
+
+  const main = document.getElementById('main');
+  main.innerHTML = `
+    <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
+      <div class="path-row">
+        <select id="project-select" style="flex:1;"><option value="">Loading projects...</option></select>
+        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}" list="project-history-list" autocomplete="off" style="display:none;">
+        <datalist id="project-history-list"></datalist>
+        <button class="secondary" id="history-toggle">History...</button>
+        <button class="secondary" id="browse-toggle">Browse...</button>
+        <button class="secondary" id="sync-btn" title="Fetch origin and fast-forward this checkout onto it">Sync with GitHub</button>
+        <button class="action" id="build-btn">Build Graph</button>
+      </div>
+      <div id="history-panel" class="browser-panel" style="display:none"></div>
+      <div class="path-row">
+        <input id="project-grepdirs-input" type="text" placeholder="src, frontend/src, backend/src (optional -- comma-separated, leave blank to scan the whole path)" value="${escapeAttr(grepDirs)}">
+      </div>
+      <div class="path-row" id="pipeline-toggles-row" style="gap:16px;align-items:center;">
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;">
+          <input type="checkbox" id="include-apply-toggle" ${includeApply ? 'checked' : ''}>
+          Enable Apply Runner (writes/commits changes)
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}" title="Applied work is always pushed now (2026-08-17) -- an unpushed branch was silently losing real work over time. This only controls whether the local checkout returns to main after each apply, or stays on the applied branch for inspection.">
+          <input type="checkbox" id="skip-push-toggle" ${!includeApply ? 'disabled' : ''} ${!skipPush ? 'checked' : ''}>
+          Return to main after each apply (unchecked: stay on the applied branch)
+        </label>
+        <span class="meta" style="font-size:0.85em;">Which job types run is now controlled from the Job List tab. Applied work is always pushed to the remote for durability, regardless of this toggle.</span>
+      </div>
+      <div id="browser-panel" class="browser-panel" style="display:none"></div>
+      <div id="pipeline-panel" class="worker-card"></div>
+      <div id="project-status-area" style="flex:1;min-height:0;display:flex;flex-direction:column;"></div>
+    </div>
+  `;
+  lastRenderedStatusKey = null;  // fresh tab entry -- force the first poll to actually render
+  document.getElementById('project-path-input').addEventListener('change', (e) => {
+    setProjectPath(e.target.value.trim());
+    lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
+    refreshProjectStatus();
+  });
+  document.getElementById('include-apply-toggle').addEventListener('change', (e) => {
+    includeApply = e.target.checked;
+    localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    const pushToggle = document.getElementById('skip-push-toggle');
+    pushToggle.disabled = !includeApply;
+    pushToggle.closest('label').style.opacity = includeApply ? '' : '.5';
+    if (!includeApply) { pushToggle.checked = false; skipPush = true; localStorage.setItem('agentManagerSkipPush', 'true'); }
+  });
+  document.getElementById('skip-push-toggle').addEventListener('change', (e) => {
+    skipPush = !e.target.checked;
+    localStorage.setItem('agentManagerSkipPush', String(skipPush));
+  });
+  document.getElementById('project-select').addEventListener('change', (e) => {
+    if (!e.target.value) return;
+    setProjectPath(e.target.value);
+    document.getElementById('project-path-input').value = projectPath;
+    lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
+    refreshProjectStatus();
+  });
+  document.getElementById('browse-toggle').onclick = () => {
+    browserOpen = !browserOpen;
+    document.getElementById('browser-panel').style.display = browserOpen ? 'block' : 'none';
+    // Manual path entry only makes sense while actively browsing -- otherwise the
+    // dropdown (populated from Second Brain's referenced projects) is the only way
+    // to pick a project, per the actual ask.
+    document.getElementById('project-select').style.display = browserOpen ? 'none' : '';
+    document.getElementById('project-path-input').style.display = browserOpen ? '' : 'none';
+    if (browserOpen) { browsePath = projectPath || ''; loadBrowsePanel(); }
+  };
+  document.getElementById('history-toggle').onclick = () => {
+    historyOpen = !historyOpen;
+    document.getElementById('history-panel').style.display = historyOpen ? 'block' : 'none';
+    if (historyOpen) renderHistoryPanel();
+  };
+  document.getElementById('project-grepdirs-input').addEventListener('change', (e) => {
+    grepDirs = e.target.value.trim();
+    localStorage.setItem('agentManagerGrepDirs', grepDirs);
+  });
+  document.getElementById('build-btn').onclick = triggerBuild;
+  document.getElementById('sync-btn').onclick = triggerSync;
+
+  await loadProjectHistory();
+  await loadProjectDropdown();
+  await refreshPipelineStatus();
+  await refreshProjectStatus();
+  projectStatusInterval = setInterval(() => { refreshPipelineStatus(); refreshProjectStatus(); }, 3000);
+}
+```
+
+Problem:
+`enterProjectTab` spans 121 lines and mixes four distinct responsibilities—server-state reconciliation, HTML template construction, six separate event-handler attachments, and the async load sequence—into a single flat body. The sync block (roughly 15 lines of conditional logic guarding `lastSyncedActiveRepoRoot`, `projectPath`, `includeApply`, and `skipPush`) is the only section with real branching and a documented 2026-08-18 regression, yet it is interleaved with ~35 lines of static markup and ~40 lines of repetitive `getElementById` → `addEventListener` → `localStorage` wiring. Because the sync logic is not independently callable, exercising it in a test requires rendering the full DOM, stubbing `fetchJson`, and driving the entire tab-entry sequence. The repetitive handler pattern also makes adding a new toggle a two-scroll exercise: find the `id` in the template string, then locate the correct handler among six others.
+
+Solution:
+Split the body into four named, single-purpose functions: `syncServerState()` (the async fetch-and-reconcile block, now directly testable with a mocked `fetchJson`), `projectTabTemplate()` (returns the HTML string, no logic), `wirePathSelection()` / `wirePipelineToggles()` / `wirePanelsAndActions()` (group the six handlers by concern so the id-to-handler mapping is local), and a slim `enterProjectTab()` entry point that calls them in order. The 2026-08-18 regression comments move directly above the 15 lines of logic they explain, rather than being buried between markup and handlers.
+
+Benefits:
+The sync block becomes unit-testable in isolation—mock `fetchJson`, call `syncServerState()`, assert the four mutated variables. Adding a new pipeline toggle is a one-function edit in `wirePipelineToggles()` plus one line in the template, with no scrolling through unrelated handlers. The entry-point body drops from 121 lines to roughly 15, reading as a checklist rather than a monolith, and the regression-context comments are co-located with the code they document.
+
+```js
+// ── 1. Server-state reconciliation (extracted, independently testable) ──
+async function syncServerState() {
+  try {
+    const status = await fetchJson('/api/pipeline/status');
+    if (status.activeRepoRoot && status.activeRepoRoot !== lastSyncedActiveRepoRoot) {
+      lastSyncedActiveRepoRoot = status.activeRepoRoot;
+      if (status.activeRepoRoot !== projectPath) setProjectPath(status.activeRepoRoot);
+    }
+    if (typeof status.includeApply === 'boolean') {
+      includeApply = status.includeApply;
+      localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    }
+    if (typeof status.skipPush === 'boolean') {
+      skipPush = status.skipPush;
+      localStorage.setItem('agentManagerSkipPush', String(skipPush));
+    }
+  } catch (e) { /* fall back to cached values */ }
+}
+
+// ── 2. HTML template (pure string, no logic) ──
+function projectTabTemplate() {
+  return `
+    <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
+      <div class="path-row">
+        <select id="project-select" style="flex:1;"><option value="">Loading projects...</option></select>
+        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project"
+               value="${escapeAttr(projectPath)}" list="project-history-list"
+               autocomplete="off" style="display:none;">
+        <datalist id="project-history-list"></datalist>
+        <button class="secondary" id="history-toggle">History...</button>
+        <button class="secondary" id="browse-toggle">Browse...</button>
+        <button class="secondary" id="sync-btn" title="Fetch origin and fast-forward">Sync with GitHub</button>
+        <button class="action" id="build-btn">Build Graph</button>
+      </div>
+      <div id="history-panel" class="browser-panel" style="display:none"></div>
+      <div class="path-row">
+        <input id="project-grepdirs-input" type="text"
+               placeholder="src, frontend/src, backend/src (optional)"
+               value="${escapeAttr(grepDirs)}">
+      </div>
+      <div class="path-row" id="pipeline-toggles-row" style="gap:16px;align-items:center;">
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;">
+          <input type="checkbox" id="include-apply-toggle" ${includeApply ? 'checked' : ''}>
+          Enable Apply Runner (writes/commits changes)
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}"
+               title="Applied work is always pushed now (2026-08-17)…">
+          <input type="checkbox" id="skip-push-toggle"
+                 ${!includeApply ? 'disabled' : ''} ${!skipPush ? 'checked' : ''}>
+          Return to main after each apply
+        </label>
+        <span class="meta" style="font-size:0.85em;">
+          Which job types run is now controlled from the Job List tab.
+        </span>
+      </div>
+      <div id="browser-panel" class="browser-panel" style="display:none"></div>
+      <div id="pipeline-panel" class="worker-card"></div>
+      <div id="project-status-area" style="flex:1;min-height:0;display:flex;flex-direction:column;"></div>
+    </div>`;
+}
+
+// ── 3. Event wiring, grouped by concern ──
+function wirePathSelection() {
+  document.getElementById('project-path-input').addEventListener('change', (e) => {
+    setProjectPath(e.target.value.trim());
+    lastRenderedStatusKey = null;
+    refreshProjectStatus();
+  });
+  document.getElementById('project-select').addEventListener('change', (e) => {
+    if (!e.target.value) return;
+    setProjectPath(e.target.value);
+    document.getElementById('project-path-input').value = projectPath;
+    lastRenderedStatusKey = null;
+    refreshProjectStatus();
+  });
+  document.getElementById('project-grepdirs-input').addEventListener('change', (e) => {
+    grepDirs = e.target.value.trim();
+    localStorage.setItem('agentManagerGrepDirs', grepDirs);
+  });
+}
+
+function wirePipelineToggles() {
+  document.getElementById('include-apply-toggle').addEventListener('change', (e) => {
+    includeApply = e.target.checked;
+    localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    const pushToggle = document.getElementById('skip-push-toggle');
+    pushToggle.disabled = !includeApply;
+    pushToggle.closest('label').style.opacity = includeApply ? '' : '.5';
+    if (!includeApply) { pushToggle.checked = false; skipPush = true; localStorage.setItem('agentManagerSkipPush', 'true'); }
+  });
+  document.getElementById('skip-push-toggle').addEventListener('change', (e) => {
+    skipPush = !e.target.checked;
+    localStorage.setItem('agentManagerSkipPush', String(skipPush));
+  });
+}
+
+function wirePanelsAndActions() {
+  document.getElementById('browse-toggle').onclick = () => {
+    browserOpen = !browserOpen;
+    document.getElementById('browser-panel').style.display = browserOpen ? 'block' : 'none';
+    document.getElementById('project-select').style.display = browserOpen ? 'none' : '';
+    document.getElementById('project-path-input').style.display = browserOpen ? '' : 'none';
+    if (browserOpen) { browsePath = projectPath || ''; loadBrowsePanel(); }
+  };
+  document.getElementById('history-toggle').onclick = () => {
+    historyOpen = !historyOpen;
+    document.getElementById('history-panel').style.display = historyOpen ? 'block' : 'none';
+    if (historyOpen) renderHistoryPanel();
+  };
+  document.getElementById('build-btn').onclick = triggerBuild;
+  document.getElementById('sync-btn').onclick = triggerSync;
+}
+
+// ── 4. Entry point: short, readable sequence ──
+async function enterProjectTab() {
+  await syncServerState();
+
+  const main = document.getElementById('main');
+  main.innerHTML = projectTabTemplate();
+  lastRenderedStatusKey = null;
+
+  wirePathSelection();
+  wirePipelineToggles();
+  wirePanelsAndActions();
+
+  await loadProjectHistory();
+  await loadProjectDropdown();
+  await refreshPipelineStatus();
+  await refreshProjectStatus();
+  projectStatusInterval = setInterval(() => { refreshPipelineStatus(); refreshProjectStatus(); }, 3000);
+}
+```
+
+### AC-184 · Decompose autoConfirmReview into classification, outcome, and orchestrator
+Strength: Strong
+Files: src/auto-confirm-review.js
+Snippet:
+```
+}
+
+async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote, candidatesPath }) {
+  const summary = { checked: 0, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
+  if (process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW === 'false') return summary;
+
+  const dir = path.join(pipelineDir, 'queue', 'awaiting-confirm');
+  const approvedDir = path.join(pipelineDir, 'queue', 'approved');
+  const archiveDir = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+  const fixCandidatesPath = candidatesPath || (getConfig().pipelineFixCandidatesPath);
+
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return summary; // no awaiting-confirm/ dir -- nothing to do
+  }
+
+  for (const name of names) {
+    const file = path.join(dir, name);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue;
+    }
+    if (task.autoConfirmReviewedAt) continue; // already reviewed once -- left for a human
+
+    summary.checked += 1;
+    const isForensics = task.source === 'pipeline_forensics';
+    const isDebrief = task.source === 'pipeline_debrief';
+    const deleteItems = (isForensics || isDebrief) ? [] : parseDeleteItems(task.implementResponse);
+
+    let prompt;
+    let gateStamp;
+    if (isForensics) {
+      prompt = buildForensicsConfirmPrompt(task, readCandidatesDoc(fixCandidatesPath));
+      gateStamp = 'forensicsReportConfirmedAt';
+    } else if (isDebrief) {
+      prompt = buildDebriefConfirmPrompt(task);
+      gateStamp = 'debriefReportConfirmedAt';
+    } else if (deleteItems.length && batchContainsDeleteMode(task.implementResponse)) {
+      const refMap = gatherDeleteReferences(repoRoot, grepDirs, deleteItems.map((i) => i.file), task);
+      prompt = buildDeleteConfirmPrompt(task, deleteItems, refMap);
+      gateStamp = 'deleteConfirmedAt';
+    } else {
+      // A hold we don't recognise -- don't guess. Leave it for a human, but stamp so we
+      // don't re-check every tick.
+      task.autoConfirmReviewedAt = new Date().toISOString();
+      task.autoConfirmDecision = 'escalate';
+      task.autoConfirmReviewNote = 'auto-confirm review does not recognise this hold type -- left for a human';
+      appendHistoryEvent(task, 'advisory', task.autoConfirmReviewNote);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch (err) {
+        const taskId = task.id || (task.implementResponse ? task.implementResponse.slice(0, 8) : 'unknown');
+        console.error(`[auto-confirm-review] escalate write failed: file=${file} task=${taskId} code=${err.code || ''} message=${err.message}`);
+        summary.errors += 1;
+      }
+      continue;
+    }
+
+    let vote;
+    try {
+      vote = await majorityVote({
+        prompt,
+        classify: classifyVote(['CONFIRM', 'DENY'], 15),
+        n: isDebrief ? DEBRIEF_VOTES : AUTO_CONFIRM_VOTES,
+        minAgreeing: isDebrief ? DEBRIEF_MIN_AGREEING : AUTO_CONFIRM_MIN_AGREEING,
+        temperature: 0.2,
+        source: task.source,
+      });
+    } catch (e) {
+      // Every vote hard-failed (infra). Do NOT stamp -- next tick retries.
+      appendHistoryEvent(task, 'advisory', `auto-confirm review could not run (${(e && e.message || 'vote error').slice(0, 160)}) -- will retry`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch { /* best-effort */ }
+      summary.errors += 1;
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    if (vote.confident && vote.verdict === 'CONFIRM') {
+      const reason = voteReason(vote, 'CONFIRM');
+      task[gateStamp] = now; // 'forensicsReportConfirmedAt' or 'deleteConfirmedAt' -- the field apply-task.js's gate checks
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'confirm';
+      task.autoConfirmReviewNote = reason;
+      task.status = 'approved';
+      appendHistoryEvent(task, 'approved', `auto-confirmed (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
+      try {
+        const result = moveTaskFile(file, approvedDir, name, task);
+        if (result) summary.confirmed += 1;
+        else { console.error(`auto-confirm: moveTaskFile returned falsy for ${name} (${file}): ${result}`); summary.errors += 1; }
+      } catch (err) { console.error(`auto-confirm: moveTaskFile threw for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
+    } else if (vote.confident && vote.verdict === 'DENY') {
+      const reason = voteReason(vote, 'DENY');
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'deny';
+      task.autoConfirmReviewNote = reason;
+      task.status = 'done';
+      task.doneMarker = `auto-denied at confirm gate: ${reason}`;
+      appendHistoryEvent(task, 'archived', `auto-denied (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
+      try {
+        if (moveTaskFile(file, archiveDir, name, task)) summary.denied += 1;
+        else summary.errors += 1;
+      } catch (err) { console.error(`auto-confirm: moveTaskFile threw (DENY) for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
+    } else {
+      // No confident majority -- leave for a human.
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'escalate';
+      task.autoConfirmReviewNote = `no confident CONFIRM/DENY majority (votes: ${vote.realVoteCount}/${vote.requestedVotes})`;
+      appendHistoryEvent(task, 'advisory', `auto-confirm review inconclusive (${task.autoConfirmReviewNote}) -- held for a human`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch { summary.errors += 1; }
+    }
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The 117-line `autoConfirmReview` body interleaves four distinct responsibilities—directory scanning and file I/O, hold-type classification with prompt construction, vote orchestration, and outcome application (three branches that each stamp different fields, write to a different directory, and emit a different history event)—in a single scope. Because the classification dispatch and the three-branch outcome logic are inline in the `for…of` loop, adding a fifth hold type or changing how DENY archives requires navigating the full body, and neither sub-responsibility is independently unit-testable without invoking the entire loop with mocked `fs`, `majorityVote`, and `moveTaskFile`.
+
+Solution:
+Extract two focused helpers scoped to this function: `resolveConfirmContext(task, ctx)` which encapsulates the four-way hold-type dispatch (forensics / debrief / delete / unknown) and returns a uniform `{ prompt, gateStamp }` or `{ escalate: true }` shape; and `applyOutcome({ task, file, name, decision, reason, vote, now, gateStamp, dirs, summary })` which encapsulates the shared "stamp three fields → append history → persist → bump summary" skeleton across the confirm / deny / escalate branches. The outer `autoConfirmReview` is reduced to a ~50-line orchestrator: env-guard → readdir → loop { read → skip-if-done → `resolveConfirmContext` → `majorityVote` → `applyOutcome` }.
+
+Benefits:
+A reader tracing the happy path sees only the ~50-line orchestrator and jumps into a helper only when needed. Adding a new hold type is a single `if` inside `resolveConfirmContext` with zero risk to the other branches. Changing the DENY archive path is one line in `applyOutcome`. Both helpers are pure-enough to unit-test in isolation: `resolveConfirmContext` can be called with a fixture task and asserted on its return shape without any I/O, and `applyOutcome` can be tested with a stubbed `moveTaskFile` and a mutable summary object.
+
+```js
+// ── extracted helper 1 ───────────────────────────────────────────────
+function resolveConfirmContext(task, { repoRoot, grepDirs, fixCandidatesPath }) {
+  const isForensics = task.source === 'pipeline_forensics';
+  const isDebrief   = task.source === 'pipeline_debrief';
+  const deleteItems = (isForensics || isDebrief)
+    ? []
+    : parseDeleteItems(task.implementResponse);
+
+  if (isForensics) {
+    return {
+      prompt:    buildForensicsConfirmPrompt(task, readCandidatesDoc(fixCandidatesPath)),
+      gateStamp: 'forensicsReportConfirmedAt',
+    };
+  }
+  if (isDebrief) {
+    return {
+      prompt:    buildDebriefConfirmPrompt(task),
+      gateStamp: 'debriefReportConfirmedAt',
+    };
+  }
+  if (deleteItems.length && batchContainsDeleteMode(task.implementResponse)) {
+    const refMap = gatherDeleteReferences(
+      repoRoot, grepDirs, deleteItems.map((i) => i.file), task,
+    );
+    return {
+      prompt:    buildDeleteConfirmPrompt(task, deleteItems, refMap),
+      gateStamp: 'deleteConfirmedAt',
+    };
+  }
+  return { escalate: true };
+}
+
+// ── extracted helper 2 ───────────────────────────────────────────────
+function applyOutcome({ task, file, name, decision, reason, vote, now,
+                        gateStamp, dirs, summary }) {
+  const { approvedDir, archiveDir } = dirs;
+  const voteStr = `votes: ${vote.realVoteCount}/${vote.requestedVotes}`;
+
+  task.autoConfirmReviewedAt = now;
+  task.autoConfirmDecision   = decision;
+  task.autoConfirmReviewNote = reason;
+
+  if (decision === 'confirm') {
+    task[gateStamp] = now;
+    task.status     = 'approved';
+    appendHistoryEvent(task, 'approved', `auto-confirmed (${voteStr}): ${reason}`);
+    try {
+      const ok = moveTaskFile(file, approvedDir, name, task);
+      if (ok) summary.confirmed += 1;
+      else { console.error(`auto-confirm: moveTaskFile falsy for ${name}`); summary.errors += 1; }
+    } catch (err) {
+      console.error(`auto-confirm: moveTaskFile threw (CONFIRM) ${name}: ${err?.message || err}`);
+      summary.errors += 1;
+    }
+  } else if (decision === 'deny') {
+    task.status     = 'done';
+    task.doneMarker = `auto-denied at confirm gate: ${reason}`;
+    appendHistoryEvent(task, 'archived', `auto-denied (${voteStr}): ${reason}`);
+    try {
+      if (moveTaskFile(file, archiveDir, name, task)) summary.denied += 1;
+      else summary.errors += 1;
+    } catch (err) {
+      console.error(`auto-confirm: moveTaskFile threw (DENY) ${name}: ${err?.message || err}`);
+      summary.errors += 1;
+    }
+  } else { // 'escalate'
+    appendHistoryEvent(task, 'advisory',
+      `auto-confirm review inconclusive (${reason}) -- held for a human`);
+    try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+    catch { summary.errors += 1; }
+  }
+}
+
+// ── slimmed orchestrator (~50 lines) ─────────────────────────────────
+async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote, candidatesPath }) {
+  const summary = { checked: 0, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
+  if (process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW === 'false') return summary;
+
+  const dir             = path.join(pipelineDir, 'queue', 'awaiting-confirm');
+  const approvedDir     = path.join(pipelineDir, 'queue', 'approved');
+  const archiveDir      = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+  const fixCandidatesPath = candidatesPath || getConfig().pipelineFixCandidatesPath;
+  const dirs = { approvedDir, archiveDir };
+
+  let names;
+  try { names = fs.readdirSync(dir).filter((f) => f.endsWith('.json')); }
+  catch { return summary; }
+
+  for (const name of names) {
+    const file = path.join(dir, name);
+    let task;
+    try { task = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch { summary.errors += 1; continue; }
+
+    if (task.autoConfirmReviewedAt) continue;
+    summary.checked += 1;
+
+    const ctx = resolveConfirmContext(task, { repoRoot, grepDirs, fixCandidatesPath });
+    if (ctx.escalate) {
+      const now = new Date().toISOString();
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision   = 'escalate';
+      task.autoConfirmReviewNote = 'unrecognised hold type -- left for a human';
+      appendHistoryEvent(task, 'advisory', task.autoConfirmReviewNote);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch (err) {
+        console.error(`[auto-confirm-review] escalate write failed: ${file} ${err.code || ''} ${err.message}`);
+        summary.errors += 1;
+      }
+      continue;
+    }
+
+    let vote;
+    try {
+      vote = await majorityVote({
+        prompt:      ctx.prompt,
+        classify:    classifyVote(['CONFIRM', 'DENY'], 15),
+        n:           task.source === 'pipeline_debrief' ? DEBRIEF_VOTES : AUTO_CONFIRM_VOTES,
+        minAgreeing: task.source === 'pipeline_debrief' ? DEBRIEF_MIN_AGREEING : AUTO_CONFIRM_MIN_AGREEING,
+        temperature: 0.2,
+        source:      task.source,
+      });
+    } catch (e) {
+      appendHistoryEvent(task, 'advisory',
+        `auto-confirm review could not run (${(e?.message || 'vote error').slice(0, 160)}) -- will retry`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch { /* best-effort */ }
+      summary.errors += 1;
+      continue;
+    }
+
+    const now      = new Date().toISOString();
+    const decision = vote.confident ? vote.verdict.toLowerCase() : 'escalate';
+    const reason   = vote.confident
+      ? voteReason(vote, vote.verdict)
+      : `no confident CONFIRM/DENY majority (votes: ${vote.realVoteCount}/${vote.requestedVotes})`;
+
+    applyOutcome({ task, file, name, decision, reason, vote, now,
+                   gateStamp: ctx.gateStamp, dirs, summary });
+  }
+
+  return summary;
+}
+```
+
+### AC-185 · Decompose validatePlan into per-regime helpers
+Strength: Strong
+Files: src/file-decompose-to-hub.js
+Snippet:
+```
+// hardProblems block the whole plan (hub filed blocked, no children). Shared deps do not
+// block -- they are threaded into the move + wiring prompts.
+function validatePlan(repoRoot, request) {
+  const hardProblems = [];
+  const moveMeta = [];
+  const allMovedSymbols = new Set();
+  for (const m of request.moves) for (const s of (m.symbols || [])) allMovedSymbols.add(s);
+
+  // A plain CommonJS source (src/*.js) -- neither an HTML <script> nor a .py. Run the
+  // whole plan through decompose-node-module.js once: it chains the N moves and only
+  // succeeds if EVERY move is a self-contained set of top-level function declarations
+  // (references only each other + require()d names + JS globals). ok -> every move gets
+  // nodeModuleApplyOk (the .js analogue of deterministicApplyOk); not-ok -> one hard
+  // problem with the exact reason. The move `kind` (script-extract vs module-extract) is
+  // irrelevant here -- .js wiring is require()/module.exports either way.
+  //
+  // 2026-09-14, screaminggoatclubmt: "Harden [this]" -- caught live: this branch used to
+  // match ANY .js source by extension alone, with zero regard for whether it's actually a
+  // Node CommonJS module. python/dashboard/static/js/*.js files are loaded via a plain
+  // browser `<script src>` tag (see index.html) -- no bundler, no Node runtime, `require`
+  // is not a defined identifier there at all. The produced split used real
+  // require()/module.exports wiring anyway, which would have thrown "require is not
+  // defined" the instant the browser loaded it, breaking the Models/Deep-Dive/Discovery/
+  // Tokenfold tabs -- caught before merge only because this session verifies every branch
+  // for real before recommending one. looksLikeNodeCommonJsModule (require()/module.exports
+  // ANYWHERE in the source) gates this branch now; every real Node module in this repo has
+  // at least one of those (confirmed: 0 occurrences across every static/js/*.js file,
+  // 20+ each across a sample of real src/*.js modules). A file that fails this gate falls
+  // through to the generic per-move loop below, which already handles `script-extract`
+  // moves in a browser-safe way (staticCheckScriptExtractMove, verbatim extraction, no
+  // require()/module.exports wiring at all) -- built and proven for plain .js sources
+  // back on 2026-09-08 (review-task.js), just never reachable for THIS class of file
+  // because this earlier, broader check always intercepted it first.
+  if (/\.(js|mjs|cjs)$/.test(request.sourceFile || '')) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null && looksLikeNodeCommonJsModule(sourceText)) {
+      const built = buildNodeModuleOnePassChanges(sourceText, request.sourceFile, request.moves.map((m) => ({ newFile: m.newFile, symbols: m.symbols || [] })), repoRoot);
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], nodeModuleApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+      return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+    }
+    // Unreadable, OR readable but not a CommonJS module -- fall through to the generic
+    // per-move loop below rather than returning here.
+  }
+
+  // A .py source whose plan is ALL flask-blueprint moves: run the whole plan through
+  // decompose-flask-blueprint.js once (AST extract + py_compile). ok -> every move gets
+  // blueprintApplyOk and fileHub short-circuits to a single deterministic one-pass task
+  // (no hub, no per-move 27B agentic pass -- which on a large app.py runs out of turn
+  // budget before finishing: the 2026-09-09 blueprint hub). not-ok -> one hard problem.
+  // A MIXED .py plan (some blueprint, some not) still falls through to the per-move path.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_BLUEPRINT !== 'false'
+      && /\.py$/.test(request.sourceFile || '') && request.moves.length
+      && request.moves.every((m) => m.kind === 'flask-blueprint' && m.blueprint)) {
+    let sourceText = null;
+    try { sourceText = fs.readFileSync(path.join(repoRoot, request.sourceFile), 'utf8'); } catch { /* unreadable -> advisory only */ }
+    if (sourceText != null) {
+      const built = buildBlueprintOnePassChanges(sourceText, request.sourceFile,
+        request.moves.map((m) => ({ newFile: m.newFile, blueprint: m.blueprint, symbols: m.symbols || [] })));
+      if (built.ok) {
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [], blueprintApplyOk: true });
+      } else {
+        hardProblems.push(`${request.sourceFile}: ${built.reason}`);
+        for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+      }
+    } else {
+      for (const _m of request.moves) moveMeta.push({ sharedDeps: [], neededImports: [] });
+    }
+    return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+  }
+
+  for (const move of request.moves) {
+    const symbols = move.symbols || [];
+    const meta = { sharedDeps: [], neededImports: [] };
+    if (symbols.length === 0) {
+      hardProblems.push(`${move.newFile}: move has no symbols`);
+      moveMeta.push(meta);
+      continue;
+    }
+    if (move.kind === 'script-extract') {
+      const seCheck = staticCheckScriptExtractMove(repoRoot, request.sourceFile, symbols);
+      if (seCheck && seCheck.resolvable) {
+        if (!seCheck.ok) {
+          hardProblems.push(`${move.newFile}: ${seCheck.missing.join(', ')} could not be located as top-level function declarations in ${request.sourceFile}`);
+        } else {
+          // Every symbol resolves cleanly -- this move can skip the model entirely at
+          // apply time (see local-draft.js's tryDeterministicScriptExtractEdit).
+          meta.deterministicApplyOk = true;
+        }
+      }
+      moveMeta.push(meta);
+      continue;
+    }
+    const check = staticCheckMove(repoRoot, request.sourceFile, symbols);
+    if (check) {
+      if (check.missing && check.missing.length) {
+        hardProblems.push(`${move.newFile}: ${check.missing.join(', ')} not defined at module scope in ${request.sourceFile}`);
+      }
+      const strays = Object.entries(check.externalRefs || {});
+      if (strays.length) {
+        hardProblems.push(`${move.newFile}: ${strays.map(([s, lines]) => `${s} is still referenced elsewhere in ${request.sourceFile} (line(s) ${lines.slice(0, 6).join(', ')})`).join('; ')} -- not a self-contained move`);
+      }
+      // `app` is expected for a flask-blueprint move (every @app.route becomes
+      // @<bp>.route); anything else that resolves to an app.py module-level name and is
+      // not itself being moved becomes a cross-module import.
+      meta.sharedDeps = (check.sharedDeps || []).filter((d) => {
+        if (d === 'app' && move.kind === 'flask-blueprint') return false;
+        return !allMovedSymbols.has(d);
+      });
+      meta.neededImports = check.neededImports || [];
+    }
+    moveMeta.push(meta);
+  }
+  return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+}
+```
+
+Problem:
+`validatePlan` is ~118 lines long because it inlines three structurally different validation regimes that merely share an accumulator shape: a CommonJS one-pass branch (read file → `looksLikeNodeCommonJsModule` gate → `buildNodeModuleOnePassChanges` → early return), a Flask-blueprint one-pass branch (read file → `buildBlueprintOnePassChanges` → early return), and a generic per-move loop whose body itself contains three sub-branches (`symbols.length === 0`, `script-extract`, and the generic `staticCheckMove` path). The two one-pass branches are near-duplicates of each other (read → build → push `moveMeta` per move → return), differing only in the builder call and the `*ApplyOk` flag name, so any change to `moveMeta` population or the `hardProblems` message format must be made in two places. The generic loop's `script-extract` sub-branch is a self-contained check that cannot be unit-tested without invoking the entire 118-line function. The length is a symptom of real branching complexity, not a long linear literal, so decomposition is a genuine maintainability improvement.
+
+Solution:
+Extract the per-move body (the largest single block and the most independently testable unit) into a named function `validateGenericMove` that takes the move, the request context, and the pre-built `allMovedSymbols` set, and returns `{ meta, hardProblems }`. The two one-pass branches remain inline in `validatePlan` because they have a subtle asymmetry the original code relies on: the `.js` branch falls through to the generic loop when the file is unreadable or fails the CommonJS gate, whereas the `.py` branch returns immediately even when unreadable (with empty `moveMeta`). Forcing both through a shared helper would require an extra flag to encode that distinction, which is less clear than keeping them explicit. The concrete change is the extraction of the per-move body:
+
+```js
+function validateGenericMove(repoRoot, request, move, allMovedSymbols) {
+  const symbols = move.symbols || [];
+  const meta = { sharedDeps: [], neededImports: [] };
+  const hardProblems = [];
+
+  if (symbols.length === 0) {
+    hardProblems.push(`${move.newFile}: move has no symbols`);
+    return { meta, hardProblems };
+  }
+
+  if (move.kind === 'script-extract') {
+    const seCheck = staticCheckScriptExtractMove(repoRoot, request.sourceFile, symbols);
+    if (seCheck && seCheck.resolvable) {
+      if (!seCheck.ok) {
+        hardProblems.push(
+          `${move.newFile}: ${seCheck.missing.join(', ')} could not be located as top-level function declarations in ${request.sourceFile}`
+        );
+      } else {
+        meta.deterministicApplyOk = true;
+      }
+    }
+    return { meta, hardProblems };
+  }
+
+  const check = staticCheckMove(repoRoot, request.sourceFile, symbols);
+  if (check) {
+    if (check.missing && check.missing.length) {
+      hardProblems.push(
+        `${move.newFile}: ${check.missing.join(', ')} not defined at module scope in ${request.sourceFile}`
+      );
+    }
+    const strays = Object.entries(check.externalRefs || {});
+    if (strays.length) {
+      hardProblems.push(
+        `${move.newFile}: ${strays
+          .map(([s, lines]) => `${s} is still referenced elsewhere in ${request.sourceFile} (line(s) ${lines.slice(0, 6).join(', ')})`)
+          .join('; ')} -- not a self-contained move`
+      );
+    }
+    meta.sharedDeps = (check.sharedDeps || []).filter((d) => {
+      if (d === 'app' && move.kind === 'flask-blueprint') return false;
+      return !allMovedSymbols.has(d);
+    });
+    meta.neededImports = check.neededImports || [];
+  }
+
+  return { meta, hardProblems };
+}
+```
+
+`validatePlan` then replaces the inline `for (const move of request.moves) { … }` body with:
+
+```js
+  const hardProblems = [];
+  const moveMeta = [];
+  for (const move of request.moves) {
+    const { meta, hardProblems: moveProblems } = validateGenericMove(repoRoot, request, move, allMovedSymbols);
+    hardProblems.push(...moveProblems);
+    moveMeta.push(meta);
+  }
+  return { ok: hardProblems.length === 0, hardProblems, moveMeta };
+```
+
+Benefits:
+`validateGenericMove` can be unit-tested in isolation: feed a `script-extract` move and assert `deterministicApplyOk` is set, feed a move with empty `symbols` and assert the "no symbols" hard problem, or feed a generic move with a stubbed `staticCheckMove` return and verify the `sharedDeps` / `neededImports` / stray-reference logic. The two one-pass branches remain visible at the top of `validatePlan` where their asymmetry (fall-through vs. early-return on unreadable) is immediately apparent, and the duplicated `for (const _m of request.moves) moveMeta.push(...)` loops that previously appeared in all three regimes are now each local to their branch, so a change to `moveMeta` shape is a one-line edit per branch rather than a search-and-replace across a 118-line function.
+
+### AC-186 · Decompose `loadSecondBrainBrowser` into fetch, render, and handler functions
+Strength: Strong
+Files: python/dashboard/static/js/brain-dump-and-second-brain.js
+Snippet:
+```
+}
+
+async function loadSecondBrainBrowser() {
+  const panel = document.getElementById('bd-browser');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty">Loading...</div>';
+  let data;
+  try {
+    data = await fetchJson('/api/second-brain/browse?path=' + encodeURIComponent(brainDumpBrowsePath));
+  } catch (e) {
+    // brainDumpBrowsePath is persisted in localStorage across sessions -- a folder it
+    // points at can legitimately stop existing between visits (renamed, merged, deleted
+    // outside the dashboard entirely, e.g. by hand or by another tool), which otherwise
+    // permanently wedges this panel on a dead 404 with no way back short of clearing
+    // localStorage yourself. Confirmed live 2026-08-16: the "projects"/"Projects"
+    // case-duplicate folders got merged, and a browser that had "projects" saved from
+    // before the merge 404'd here forever after. Fall back to root once rather than
+    // leaving a stale path permanently wedged.
+    if (brainDumpBrowsePath !== '') {
+      brainDumpBrowsePath = '';
+      localStorage.setItem('agentManagerBrainDumpBrowsePath', '');
+      try {
+        data = await fetchJson('/api/second-brain/browse?path=');
+      } catch (e2) {
+        panel.innerHTML = `<div class="empty">Could not browse: ${e2.message}</div>`;
+        return;
+      }
+    } else {
+      panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
+      return;
+    }
+  }
+
+  if (!data.configured) {
+    panel.innerHTML = '<div class="empty">SECOND_BRAIN_DIR is not configured for the active project.</div>';
+    return;
+  }
+
+  // A plain path-as-text crumb here previously gave no way back to the root except
+  // clicking "up" once per level -- easy to end up parked deep in a small folder (e.g.
+  // Decisions/, 2 files) after a "jump to file" link, with no obvious cue you're not
+  // looking at the whole second brain. Every segment (including "Second Brain" itself)
+  // is now a clickable jump-to-that-level link, reusing the same [data-nav] wiring the
+  // existing browser-entry rows already use below (attribute selector, not class-scoped).
+  const crumbSegments = data.path ? data.path.split('/') : [];
+  let crumbHtml = `<span class="crumb-link" data-nav="">Second Brain</span>`;
+  let acc = '';
+  for (const seg of crumbSegments) {
+    acc = acc ? `${acc}/${seg}` : seg;
+    crumbHtml += ` / <span class="crumb-link" data-nav="${escapeAttr(acc)}">${escapeHtml(seg)}</span>`;
+  }
+  let html = `<div class="browser-crumb">${crumbHtml}</div>`;
+  if (data.parent !== null) {
+    html += `<div class="browser-entry" data-nav="${escapeAttr(data.parent)}"><span>.. (up)</span></div>`;
+  }
+  for (const entry of data.entries) {
+    if (entry.isDir) {
+      // Population count: direct children only (files + subfolders) -- null means the
+      // folder couldn't be read (permissions), distinct from a genuinely empty "0".
+      const countLabel = entry.count === null ? '?' : entry.count;
+      html += `<div class="browser-entry" data-nav="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}/</span><span class="entry-count">${countLabel}</span></div>`;
+    } else {
+      const active = entry.path === brainDumpSelectedFile ? ' active' : '';
+      // Notes linked to a real GitHub repo (via /api/second-brain/sync-github-projects)
+      // get a one-click way to make that repo the pipeline's active project, or a badge
+      // if it already is -- the actual ask: buttons in Second Brain that set a project
+      // active, so every GitHub project is reachable AND actionable from here.
+      let projectControl = '';
+      if (entry.repoPath) {
+        projectControl = entry.isActiveProject
+          ? `<span class="badge ok" title="${escapeAttr(entry.repoPath)}">Active Project</span>`
+          : `<button type="button" class="secondary set-active-project" data-repo-path="${escapeAttr(entry.repoPath)}" title="Stop the current pipeline and start it against ${escapeAttr(entry.repoPath)}">Set Active</button>`;
+      } else if (entry.name.toLowerCase().endsWith('.md') && !entry.name.startsWith('_')) {
+        // Project-starter notes (not yet linked to any repo, and not a _template.md-style
+        // scaffold) get a way to actually become a project -- the ask: "turn these project
+        // starters into actual projects" via a button next to the note.
+        projectControl = `<button type="button" class="secondary create-github-project" data-note-path="${escapeAttr(entry.path)}" title="Create a new git repo seeded from this note's content">Create GitHub Project</button>`;
+      }
+      html += `<div class="browser-entry${active}" data-file="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}</span>${projectControl}</div>`;
+    }
+  }
+  panel.innerHTML = html;
+
+  panel.querySelectorAll('[data-nav]').forEach((el) => {
+    el.onclick = () => {
+      brainDumpBrowsePath = el.dataset.nav;
+      localStorage.setItem('agentManagerBrainDumpBrowsePath', brainDumpBrowsePath);
+      loadSecondBrainBrowser();
+    };
+  });
+  panel.querySelectorAll('.set-active-project').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation(); // don't also trigger the row's data-file "open note" handler
+      const repoPath = btn.dataset.repoPath;
+      if (!confirm(`Stop the current pipeline (if running) and start it against:\n${repoPath}\n\nStarts in the safe default (no apply/no push) -- switch that on later from the Project tab if you want it to write changes.`)) return;
+      btn.disabled = true;
+      btn.textContent = 'Switching...';
+      try {
+        await fetch('/api/pipeline/stop', { method: 'POST' });
+        const resp = await fetch('/api/pipeline/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: repoPath, includeApply: false, skipPush: true }),
+        });
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          throw new Error(err.description || ('HTTP ' + resp.status));
+        }
+        await loadSecondBrainBrowser();
+      } catch (err) {
+        alert('Could not switch active project: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = 'Set Active';
+      }
+    };
+  });
+  panel.querySelectorAll('.create-github-project').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation(); // don't also trigger the row's data-file "open note" handler
+      const notePath = btn.dataset.notePath;
+      if (!confirm(`Create a new GitHub project seeded from this note?\n\nThis creates a new folder + git repo under your GitHub projects directory, with this note's content as README.md, and links the note to it here.`)) return;
+      btn.disabled = true;
+      btn.textContent = 'Creating...';
+      try {
+        const resp = await fetch('/api/second-brain/create-github-project', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ notePath }),
+        });
+        const result = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
+        await loadSecondBrainBrowser();
+        alert(`Created ${result.projectName} at ${result.repoPath}`);
+      } catch (err) {
+        alert('Could not create GitHub project: ' + err.message);
+        btn.disabled = false;
+        btn.textContent = 'Create GitHub Project';
+      }
+    };
+  });
+  panel.querySelectorAll('[data-file]').forEach((el) => {
+    el.onclick = () => loadSecondBrainFile(el.dataset.file);
+  });
+}
+```
+
+Problem:
+`loadSecondBrainBrowser` spans 142 lines and interleaves four responsibilities with different side-effect profiles: a stateful fetch with stale-path recovery that mutates `brainDumpBrowsePath` and `localStorage`, a pure HTML-string builder (breadcrumb + entry loops with `isDir`/`repoPath`/`.md` branching), and two multi-step async handlers (`.set-active-project`, `.create-github-project`) each carrying confirm → disable → fetch → error-revert logic. A developer fixing the stale-path fallback must scroll past ~80 lines of HTML construction and handler wiring; a developer adding a new entry-type badge must wade through the fetch state-mutation and the async handlers. The two async handlers are each ~20 lines of non-trivial control flow that are independently testable only if extracted.
+
+Solution:
+Extract four named functions from the 142-line body, leaving a ~30-line orchestrator. The concrete shape:
+
+```js
+// 1. Stateful fetch + stale-path recovery
+async function fetchBrowseData(path) {
+  try {
+    return await fetchJson('/api/second-brain/browse?path=' + encodeURIComponent(path));
+  } catch (e) {
+    if (path !== '') {
+      brainDumpBrowsePath = '';
+      localStorage.setItem('agentManagerBrainDumpBrowsePath', '');
+      return await fetchJson('/api/second-brain/browse?path=');
+    }
+    throw e;
+  }
+}
+
+// 2. Pure HTML builder (no I/O, no state mutation)
+function buildBrowserHtml(data, selectedFile) {
+  let html = '';
+  // breadcrumb loop …
+  // entry loop with isDir / repoPath / .md branching …
+  return html;
+}
+
+// 3. Async handlers (one per action)
+async function handleSetActiveProject(btn, repoPath) {
+  // confirm → disable → fetch → error-revert
+}
+async function handleCreateGithubProject(btn, notePath) {
+  // confirm → disable → POST → error-revert
+}
+
+// 4. Thin orchestrator (~30 lines)
+async function loadSecondBrainBrowser() {
+  const panel = document.getElementById('bd-browser');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty">Loading…</div>';
+
+  let data;
+  try {
+    data = await fetchBrowseData(brainDumpBrowsePath);
+  } catch (e) {
+    panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
+    return;
+  }
+  if (!data.configured) { /* … */ return; }
+
+  panel.innerHTML = buildBrowserHtml(data, brainDumpSelectedFile);
+
+  // wire [data-nav], .set-active-project, .create-github-project, [data-file]
+  //   each handler is now a one-liner calling the extracted function
+}
+```
+
+Each extracted piece is scoped to exactly this function's existing logic; no new behavior is introduced.
+
+Benefits:
+The orchestrator drops from 142 to ~30 lines and reads top-to-bottom as a single narrative. `fetchBrowseData` (12 lines) can be unit-tested with a mocked `fetchJson` to verify the stale-path reset and retry without touching the DOM. `buildBrowserHtml` is a pure function of `(data, selectedFile)` and can be tested with fixture data and snapshot assertions. Each async handler is independently testable with a mocked `fetch` and a stubbed button element. Code review of any one concern no longer requires scanning the other three, and the 2026-08-16 "projects" merge incident's stale-path semantics become a 12-line function that is trivially diffable in a PR.
