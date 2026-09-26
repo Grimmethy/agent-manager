@@ -497,7 +497,7 @@ while :; do
 
     # Daily project-graph rebuild (Grimmethy, 2026-08-19: "This should be a daily task so
     # that the review steps keep up with the project" -- graph.json/community-coverage.json
-    # feed arch_discovery's candidate generation, see build_graph.py's own check_due()).
+    # feed arch_discovery's candidate generation, see graph_build.py's own check_due()).
     # Backgrounded, not awaited: check_due() itself returns almost instantly on every tick
     # except the rare one where a rebuild is actually due, and a real rebuild (community
     # detection plus one Ornith naming call per community) can run for MINUTES -- awaiting
@@ -511,7 +511,7 @@ while :; do
       : # a rebuild from an earlier tick is still running -- skip, don't pile up.
     else
       (
-        "${SCRIPT_DIR}/../.venv/bin/python" "${SCRIPT_DIR}/../python/build_graph.py" --check-due >>"${HOME_LOGS}/graph-build.log" 2>&1
+        "${SCRIPT_DIR}/../.venv/bin/python" "${SCRIPT_DIR}/../python/graph_build.py" --check-due >>"${HOME_LOGS}/graph-build.log" 2>&1
         rm -f "$GRAPH_BUILD_LOCK"
       ) &
       echo $! > "$GRAPH_BUILD_LOCK"

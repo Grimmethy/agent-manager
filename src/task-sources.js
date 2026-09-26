@@ -854,7 +854,7 @@ function parseStrongLeadsFromIndex(indexText) {
 }
 
 // Lazy onboarding for one newly-Strong lead: clone it (shallow -- only current history is
-// needed for reading, not the project's own git log) and run build_graph.py against the
+// needed for reading, not the project's own git log) and run graph_build.py against the
 // clone with --no-model-naming (see ADR-0019: naming a community here is a free heuristic,
 // never a spent local-model round-trip) and --target-dir so this repo's own graphify-out/
 // graph.json is never touched. Both the clone and the graph-build are slow/blocking --
@@ -871,9 +871,9 @@ function onboardDeepDiveProject(lead, clonesDir) {
 
   const graphOutPath = path.join(clonePath, '.deep-dive-graph.json');
   if (!fs.existsSync(graphOutPath)) {
-    const buildGraphScript = path.join(__dirname, '..', 'python', 'build_graph.py');
+    const buildGraphScript = path.join(__dirname, '..', 'python', 'graph_build.py');
     // Prefer this package's own .venv interpreter (same one launch.sh uses for the
-    // dashboard: PACKAGE_ROOT/.venv/bin/python) -- that's where build_graph.py's actual
+    // dashboard: PACKAGE_ROOT/.venv/bin/python) -- that's where graph_build.py's actual
     // dependencies (networkx, per python/requirements.txt) are installed. Falls back to a
     // bare python3/python off PATH for a consumer without this exact venv layout. Two
     // stacked bugs found live 2026-08-14, both silent until now (local-worker.sh only

@@ -534,7 +534,7 @@ while :; do                                                                     
   # receive work regardless of how correct the claim logic below was.
   # >>"$LOG_FILE" (not >/dev/null): this call does real side-effecting work on every tick
   # -- generating a new pending/ task AND deep_dive's lazy lead-onboarding (git clone +
-  # build_graph.py against a newly-Strong project_search lead, see task-sources.js's
+  # graph_build.py against a newly-Strong project_search lead, see task-sources.js's
   # onboardLead()) -- and both can fail in ways worth seeing. Confirmed live 2026-08-14: an
   # onboarding clone failed (project_search wrote a lead with url "N/A", not a real repo)
   # and the real `deep_dive: failed to onboard "...": ...` error task-sources.js logs via

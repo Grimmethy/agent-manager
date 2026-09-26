@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Renders graph.json (built by build_graph.py) as an interactive HTML network view,
+"""Renders graph.json (built by graph_build.py) as an interactive HTML network view,
 colored by community, for human review -- open the output file in any browser.
 
 Usage: python visualize_graph.py [output.html]
 Reads the same AGENT_MANAGER_GRAPH_PATH / AGENT_MANAGER_COMMUNITY_COVERAGE_PATH env vars
-as build_graph.py. Default output path: <graph_path's directory>/graph-visualization.html
+as graph_build.py. Default output path: <graph_path's directory>/graph-visualization.html
 """
 
 import json
@@ -449,7 +449,7 @@ def render_html(graph_data: dict, coverage_data: dict | None = None, positions: 
 def main():
     cfg = get_config()
     if not cfg["graph_path"].is_file():
-        raise SystemExit(f"{cfg['graph_path']} does not exist -- run build_graph.py first.")
+        raise SystemExit(f"{cfg['graph_path']} does not exist -- run graph_build.py first.")
 
     graph_data = json.loads(cfg["graph_path"].read_text(encoding="utf-8"))
     coverage_data = None

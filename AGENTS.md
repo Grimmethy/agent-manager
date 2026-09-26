@@ -387,7 +387,7 @@ points it at `/media/wok/model-cache/agent-manager-hygiene/register.js`.
   Core imports nothing from a `src/maintenance/` directory; that directory is gone.
 - `arch-discovery-structcheck.js` and `arch-import-fetch.js` **stay here** (worker
   subprocess by hardcoded path; shared repo-search harness).
-- `python/build_graph.py` **stays here** — it produces `graph.json` / `community-coverage.json`
+- `python/graph_build.py` **stays here** — it produces `graph.json` / `community-coverage.json`
   that the plugin's `arch_discovery` reads read-only. Keep the output shapes stable.
 - The dashboard's Job List / Pipeline Map and `npm run drift-scan` are registry-driven
   (`node src/task-sources.js --dump-topology`), so plugin sources show up automatically and

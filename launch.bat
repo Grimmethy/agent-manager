@@ -43,7 +43,7 @@ if defined AGENT_MANAGER_REPO_ROOT (
 
 where python >nul 2>nul
 if %ERRORLEVEL%==0 (
-    rem app.py imports build_graph.py and visualize_graph.py at module load time (the
+    rem app.py imports graph_build.py and visualize_graph.py at module load time (the
     rem Project tab needs both), so ALL THREE packages must be importable, not just
     rem flask -- checking flask alone gave a false "should work" signal and crashed
     rem app.py instantly on a machine with two Python installs where only one had the

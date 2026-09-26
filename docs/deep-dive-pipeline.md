@@ -6,7 +6,7 @@ update it as the pattern changes, same convention as `docs/arch-discovery-pipeli
 and `docs/project-search-pipeline.md`.
 
 **Status as of 2026-07-20: implemented.** `task-domains.json`, `src/task-sources.js`
-(`nextDeepDiveTask()`), `src/config.js`, `python/build_graph.py`'s Python import support,
+(`nextDeepDiveTask()`), `src/config.js`, `python/graph_build.py`'s (and `graph_edge_resolution.py`'s) Python import support,
 `src/prompts.js`, `src/review-runner.ps1`'s carve-out, and `src/apply-task.js`/
 `src/apply-group-a.js`'s apply path are all in place and exercised end-to-end against a
 local test fixture repo (clone → graph → community selection → context pre-fetch →
@@ -43,7 +43,7 @@ propose-then-fetch shape.
 INDEX.md (read for Strong-rated leads)
         ↓
 nextDeepDiveTask()  [task-sources.js — NEW, priority 82]
-        ↓  first time seeing a Strong lead: clone it, run build_graph.py against the
+        ↓  first time seeing a Strong lead: clone it, run graph_build.py against the
         ↓  clone, populate deep-dive-coverage.json's community list for that project
         ↓  then (every tick): pick the oldest-reviewed/null community across all
         ↓  tracked projects, same "oldest first" convention as community-coverage.json
@@ -98,19 +98,19 @@ the project as a whole — a different lifecycle). Shape:
 `nextDeepDiveTask()`:
 
 1. Read `INDEX.md`, collect every Strong-rated project not yet a key under `projects`.
-   For each: `git clone` into the slug path, run `build_graph.py` against it (see below),
+   For each: `git clone` into the slug path, run `graph_build.py` against it (see below),
    read the resulting community list, seed tracker entries with `lastReviewedAt: null`.
 2. Across all tracked projects' `communities[]`, pick the entry with the oldest/null
    `lastReviewedAt` — same selection rule `nextArchDiscoveryTask()` already uses, just
    flattened across multiple projects instead of one repo.
 
 Re-cloning/re-graphing an already-tracked project is a manual reset (delete its entry
-under `projects` and its clone directory), same convention `build_graph.py`'s own header
+under `projects` and its clone directory), same convention `graph_build.py`'s own header
 comment already documents for `community-coverage.json` — not automatic, since community
 boundaries shifting on every tick would corrupt the rotation the same way it would for
 this repo's own graph.
 
-## `build_graph.py` — Python import support
+## `graph_build.py` — Python import support
 
 Currently JS/TS only (`MATCH_EXTENSIONS = {".js", ".jsx", ".ts", ".tsx"}`, regex over
 `require`/`import`/`export...from`). Add a second extension set (`.py`) and a second
@@ -212,7 +212,7 @@ existing Strong-lead backlog before manufacturing more leads, rather than the re
 Per ADR-0019's rollout gate — do not skip this:
 
 - [ ] Run one clone + graph-build manually against a real Strong lead (CrewAI is the
-      obvious first target) and confirm `build_graph.py`'s new Python pass produces a
+      obvious first target) and confirm `graph_build.py`'s Python pass produces a
       sane community list, not a degenerate single-giant-community or all-singletons
       result.
 - [ ] Run one deep-dive pass manually (call `nextDeepDiveTask()` directly, not through
