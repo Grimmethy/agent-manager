@@ -144,6 +144,13 @@ function findEntry(data, entryId) {
   return data.entries.find((e) => e && e.id === entryId) || null;
 }
 
+// Kept in sync with apply-group-a.js's own MAX_SORT_ATTEMPTS (task-sources.js keeps the
+// same copy) -- all three count the SAME per-entry sort budget, so a literal number in
+// only one of them would let a pass retry past the bound the others enforce. (Not
+// imported from apply-group-a.js: it requires THIS module, and its module.exports
+// assignment runs last, so a circular require could hand us undefined.)
+const MAX_SORT_ATTEMPTS = 3;
+
 function recoverableSortSkip(data, entry, brainDumpPath, reason) {
   entry.sortAttempt = (entry.sortAttempt || 0) + 1;
   try {
@@ -173,22 +180,50 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     return { skipped: true, reason: 'brain-dump entry was suppressed since this task was queued -- not sorting it' };
   }
   if (entry.status !== 'captured' || entry.rawText !== rawText) {
-    // Stale (HUB0050 2/3): this task was drafted against text the entry no longer has,
-    // so re-classifying THIS task's response will NEVER apply -- it is not a
-    // recoverable classification miss. Going through recoverableSortSkip here (the old
-    // path) burned one of the entry's MAX_SORT_ATTEMPTS slots on a condition a fresh
-    // sort under a new id simply supersedes, and its recoverable:true shape let
-    // apply-task.js phrase it as "sort not applied (retrying)" on a done task. Emit a
-    // distinct non-success stale shape instead: no sortAttempt write (the entry is left
-    // exactly as-is, status still 'captured' for the fresh sort), no recoverable flag,
-    // and success:false so the caller's stale check (apply-group-a.js) can route it
-    // away from the done transition.
-    return {
-      skipped: true,
-      stale: true,
-      success: false,
-      reason: 'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text',
-    };
+    if (entry.rawText === rawText) {
+      // Status-only drift (text unchanged, entry already sorted/actioned): re-running
+      // the pass would re-apply work that is already done. Keep HUB0050's distinct
+      // non-success shape -- no sortAttempt write (the entry is left exactly as-is),
+      // no recoverable flag, and success:false so the caller's stale check
+      // (apply-group-a.js) can route it away from the done transition.
+      return {
+        skipped: true,
+        stale: true,
+        success: false,
+        reason: 'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text',
+      };
+    }
+    // Refresh branch (HUB0052 2/3): the entry's text changed after this task was
+    // drafted (the dashboard's PUT resets status to 'captured' on a text change) --
+    // implementResponse was classified against the OLD text, but re-running this SAME
+    // pass against the entry's CURRENT text is still a valid classification of what
+    // the entry actually says now, so apply it instead of dropping it. Substitute
+    // entry.rawText into promptContext (deriveBelongsToProject, the research branch,
+    // and the adhoc branch all read the text from there) and re-run the whole
+    // classify+apply pipeline below. Mirrors the duplicate-gate retry pattern further
+    // down: the budget counter lives on the ENTRY (the object that persists across
+    // repeated classification attempts of the same note), recoverableSortSkip bounds
+    // it (it bumps sortAttempt, and nextBrainDumpSortTask() stops regenerating once
+    // sortAttempt >= MAX_SORT_ATTEMPTS), and the entry is left exactly as-is on the
+    // way out.
+    if ((entry.sortAttempt || 0) >= MAX_SORT_ATTEMPTS) {
+      return recoverableSortSkip(data, entry, brainDumpPath,
+        'brain-dump entry changed since this task was drafted and the sort budget is exhausted -- not re-classifying the current text');
+    }
+    const refreshed = applyBrainDumpSort({
+      implementResponse,
+      task: { ...task, promptContext: { ...task.promptContext, rawText: entry.rawText } },
+      brainDumpPath,
+      secondBrainDir,
+      pipelineDir,
+    });
+    if (!refreshed || refreshed.skipped) {
+      // Re-validation failed (every internal failure path is a recoverableSortSkip,
+      // which already bumped and persisted entry.sortAttempt) or a terminal skip --
+      // return the shape untouched; refreshed:true marks a SUCCESS only.
+      return refreshed;
+    }
+    return { ...refreshed, refreshed: true };
   }
 
   if (!secondBrainDir) {

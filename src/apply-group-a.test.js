@@ -450,20 +450,38 @@ test('applyBrainDumpSort skips cleanly when the entry no longer exists (deleted 
   assert.match(result.reason, /no longer exists/);
 });
 
-test('applyBrainDumpSort refuses to apply a stale classification when the entry was edited since drafting', () => {
+test('applyBrainDumpSort refreshes a stale classification against the entry\'s current text when it was edited since drafting', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
   const secondBrainDir = path.join(dir, 'secondbrain');
   const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'NEW edited text' })]);
 
   // Task was drafted against the OLD text, before the dashboard's edit endpoint changed it.
+  // HUB0052 2/3: instead of refusing, re-run the pass against the entry's CURRENT text.
+  const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'OLD original text' } };
+  const implementResponse = JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
+
+  assert.equal(result.skipped, undefined);
+  assert.equal(result.refreshed, true);
+  assert.equal(result.file, path.join(secondBrainDir, 'Ideas', 'x.md'));
+  assert.match(fs.readFileSync(result.file, 'utf8'), /NEW edited text/);
+  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
+  assert.equal(entries[0].status, 'sorted');
+});
+
+test('applyBrainDumpSort stops refreshing once sortAttempt hits MAX_SORT_ATTEMPTS (3)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-test-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  const brainDumpPath = writeBrainDump(dir, [brainDumpEntry({ rawText: 'NEW edited text', sortAttempt: 3 })]);
+
   const task = { promptContext: { brainDumpEntryId: 'bd-1', rawText: 'OLD original text' } };
   const implementResponse = JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md' });
   const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir });
 
   assert.equal(result.skipped, true);
-  assert.match(result.reason, /changed since this task was drafted/);
-  const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
-  assert.equal(entries[0].status, 'captured');
+  assert.equal(result.recoverable, true);
+  assert.match(result.reason, /sort budget is exhausted/);
+  assert.equal(fs.existsSync(path.join(secondBrainDir, 'Ideas', 'x.md')), false);
 });
 
 test('applyBrainDumpSort skips cleanly when SECOND_BRAIN_DIR is not configured', () => {
