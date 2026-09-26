@@ -565,3 +565,22 @@ test('doc task: an imperative that only has a path somewhere in the sentence is 
   assert.equal(docOnlyBlocks(DOC_TASK_PREFIX + 'Locate the handling of premiumPriority in python/dashboard/routes/chat.py.'), true);
   assert.equal(docOnlyBlocks(DOC_TASK_PREFIX + 'Step 1: Lazy-load the job rows in index.html.'), true);
 });
+
+// --- docs-only gate: a deliverable sentence that also cites code paths as evidence (HUB0033 1/4) ---
+
+const docDiff = (p) => `diff --git a/${p} b/${p}\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/${p}\n@@ -0,0 +1 @@\n+# audit\n`;
+
+test('docs-only: "Create docs/x.md containing ... (routes/chat.py = ...)" is a documentation task, not a code request', () => {
+  const t = adhoc('Create docs/audit/local-provider-dispatch-paths.md containing the 8-row audit table already established in the answer (routes/chat.py and routes/internal_chat.py = known preempt sites; discuss_sessions.py and grill_sessions.py = third paths; app.py _run_build / build_graph.py = background third path).');
+  assert.equal(adhocDiffSubstanceProblem(t, docDiff('docs/audit/local-provider-dispatch-paths.md'), 'created the audit doc'), null);
+});
+
+test('docs-only: a code request in a SEPARATE sentence of the same task still blocks a docs-only diff', () => {
+  const t = adhoc('Create docs/audit/paths.md listing the routes. Then update the timeout handling in src/local-tool-client.js.');
+  assert.equal(adhocDiffSubstanceProblem(t, docDiff('docs/audit/paths.md'), 'wrote the doc').code, 'docs-only');
+});
+
+test('docs-only: a code deliverable is not hidden by a doc deliverable in the same sentence', () => {
+  const t = adhoc('Add a retry loop to src/apply-task.js and document it in docs/apply.md.');
+  assert.equal(adhocDiffSubstanceProblem(t, docDiff('docs/apply.md'), 'documented').code, 'docs-only');
+});

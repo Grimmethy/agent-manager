@@ -117,8 +117,14 @@ function scanForCodeSignals(text) {
   const tripping = [];
   for (const sen of sentences) {
     if (CITATION_CONTEXT_RE.test(sen)) continue;
-    const cleaned = stripNonRequests(sen);
-    if (DOC_DELIVERABLE_RE.test(cleaned)) docDeliverable = true;
+    let cleaned = stripNonRequests(sen);
+    const doc = DOC_DELIVERABLE_RE.exec(cleaned);
+    if (doc) {
+      docDeliverable = true;
+      // The deliverable clause ("Create docs/x.md") is the request itself and its object is a document: its verb must not read as an
+      // edit of the code paths this same sentence goes on to cite as evidence ("... containing the audit table (routes/chat.py = ...)").
+      cleaned = cleaned.replace(doc[0], ' ');
+    }
     if (CODE_SIGNAL_RE.test(cleaned)) tripping.push(cleaned);
   }
   return { docDeliverable, tripping };
