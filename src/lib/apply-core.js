@@ -3,6 +3,7 @@
 // apply-core.js -- extracted from src/apply-task.js ([[hub-task-integration]] node-module decompose).
 
 const { getRegisteredSource, resolveSourceName } = require('../task-source-registry.js');
+const { getCandidateSplitHubFiler } = require('../candidate-split-hub-route.js');
 const { applySecondBrainNote, applyProjectSearchFindings, applyDeepDiveFindings, applyBrainDumpSort, applyPathPrefetchResolve, closeBrainDumpEntryResolved, applyResearchTask, isEffectivelyEmptyResponse, applyArchDiscoveryCandidates } = require('../apply-group-a.js');
 const { applyGroupB, batchContainsDeleteMode } = require('../apply-group-b.js');
 require('../task-sources.js');
@@ -80,9 +81,17 @@ function applyCandidateSplit(task, source) {
 
 function writeArtifact(task, repoRoot, pipelineDir) {
   if (Array.isArray(task.candidateSplitProposals) && task.candidateSplitProposals.length > 0) {
-    // A split the draft routed to the hub system (see apply-adhoc-diff.js's applyCandidateSplitAsHub) becomes real, ordered
-    // sub-tasks under a coordinator instead of more candidate-doc entries.
-    if (task.candidateSplitRoute === 'hub') return require('../apply-adhoc-diff.js').applyCandidateSplitAsHub(task, pipelineDir);
+    // A split the draft routed to the hub system becomes real, ordered sub-tasks under a
+    // coordinator instead of more candidate-doc entries. applyCandidateSplitAsHub itself
+    // lives in the agent-manager-hub-tasks plugin (S4b of the hub-tasks extraction,
+    // 2026-09-25) -- see candidate-split-hub-route.js for the swap point.
+    if (task.candidateSplitRoute === 'hub') {
+      const filer = getCandidateSplitHubFiler();
+      if (!filer) {
+        throw new Error(`task ${task.id}: candidate split routed to a coordinator hub, but no hub-task filer is registered -- load/register the agent-manager-hub-tasks plugin (AGENT_MANAGER_REGISTER_PATH)`);
+      }
+      return filer.applyCandidateSplitAsHub(task, pipelineDir);
+    }
     return applyCandidateSplit(task, getRegisteredSource(resolveSourceName(task)));
   }
   if (!usesGroupB(task)) {

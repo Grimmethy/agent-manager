@@ -1959,25 +1959,53 @@ test('draftTask routes a noCandidateSplit source\'s split (not pre-split) to a c
 
 // The whole path for the incident shape: an over-scoped candidate -> the implement pass proposes a split -> routed to the hub at draft
 // -> apply queues ordered adhoc children and hands back a coordinating parent (nothing blocks for a human at any step).
+// applyCandidateSplitAsHub's real prose-formatting logic moved to the agent-manager-hub-tasks plugin (S4b of the hub-tasks
+// extraction, 2026-09-25; see candidate-split-hub-route.js) -- core never imports it back, so this test registers a local fake
+// filer, exactly the "local fake registration to test THIS file's own dispatch" pattern S4a already used elsewhere in this file
+// for the moved file-decompose kinds. The fake reuses queueSubTasks (the real kernel primitive, still core) so the hub-serial
+// labeling and stacked-branch/dependsOn wiring under test are the real thing, not a mock.
 test('end to end: an oversized candidate is drafted as a hub-routed split and applied as ordered sub-tasks', async () => {
-  await withFixtureRepo(async (draftTask, dir) => {
-    const task = forensicsTask('forensics-fix-e2e-hub-1', {});
-    const result = await draftTask(task, { localCall: splitCall(SPLIT_JSON), withLockFn: async (d, fn) => fn() });
-    assert.notEqual(result.blocked, true);
-    assert.equal(task.status, 'needs-review');
-
-    const { writeArtifact } = require('./lib/apply-core.js');
-    const artifact = writeArtifact(task, dir, dir);
-    assert.equal(artifact.coordinating, true);
-    assert.deepEqual(artifact.subTasks.map((t) => t.title), ['HUB0001 · 1/2 · Extract the tile grid', 'HUB0001 · 2/2 · Extract the boundary projection']);
-
-    const queued = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).map((f) => JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', f), 'utf8')));
-    assert.equal(queued.length, 2);
-    assert.ok(queued.every((k) => k.promptContext.decomposedFrom === 'forensics-fix-e2e-hub-1'));
-    const second = queued.find((k) => k.stacked.seq === 2);
-    assert.match(second.promptContext.rawText, /Part 2 of 2/);
-    assert.ok(second.dependsOn && second.dependsOn.length === 1);
+  const { setCandidateSplitHubFiler } = require('./candidate-split-hub-route.js');
+  const { queueSubTasks } = require('./apply-adhoc-diff.js');
+  setCandidateSplitHubFiler({
+    applyCandidateSplitAsHub(task, pipelineDir) {
+      const proposals = task.candidateSplitProposals || [];
+      const subTasks = proposals.map((c, i) => {
+        const sub = { title: c.title, rawText: `Part ${i + 1} of ${proposals.length}: ${c.title}` };
+        if (i > 0) sub.after = i - 1;
+        return sub;
+      });
+      const queued = queueSubTasks(subTasks, pipelineDir, task.id, task);
+      return {
+        coordinating: true,
+        subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
+        hubSerial: queued.hubSerial,
+        hubLabel: queued.hubLabel,
+      };
+    },
   });
+  try {
+    await withFixtureRepo(async (draftTask, dir) => {
+      const task = forensicsTask('forensics-fix-e2e-hub-1', {});
+      const result = await draftTask(task, { localCall: splitCall(SPLIT_JSON), withLockFn: async (d, fn) => fn() });
+      assert.notEqual(result.blocked, true);
+      assert.equal(task.status, 'needs-review');
+
+      const { writeArtifact } = require('./lib/apply-core.js');
+      const artifact = writeArtifact(task, dir, dir);
+      assert.equal(artifact.coordinating, true);
+      assert.deepEqual(artifact.subTasks.map((t) => t.title), ['HUB0001 · 1/2 · Extract the tile grid', 'HUB0001 · 2/2 · Extract the boundary projection']);
+
+      const queued = fs.readdirSync(path.join(dir, 'queue', 'adhoc')).map((f) => JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', f), 'utf8')));
+      assert.equal(queued.length, 2);
+      assert.ok(queued.every((k) => k.promptContext.decomposedFrom === 'forensics-fix-e2e-hub-1'));
+      const second = queued.find((k) => k.stacked.seq === 2);
+      assert.match(second.promptContext.rawText, /Part 2 of 2/);
+      assert.ok(second.dependsOn && second.dependsOn.length === 1);
+    });
+  } finally {
+    setCandidateSplitHubFiler(null);
+  }
 });
 
 test('draftTask does NOT route to the hub when the split is malformed -- it still blocks with the invalid-split reason', async () => {
