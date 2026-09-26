@@ -204,10 +204,10 @@ companions) onto this mechanism is separate follow-up work, tracked in
 
 ## Cross-repo / cross-language artifacts
 
-- `community-coverage.json` + the graph are produced by **this repo's** `python/build_graph.py`
+- `community-coverage.json` + the graph are produced by **this repo's** `python/graph_build.py`
   (dashboard "Build Graph" button, `queue-watcher.sh --check-due`). The plugin's
   `arch_discovery` consumes them read-only via `getConfig().communityCoveragePath` /
-  `.graphPath`. `build_graph.py` stays here.
+  `.graphPath`. `graph_build.py` stays here.
 - `arch-discovery-structcheck.js` stays in core: the worker invokes it as a subprocess by
   hardcoded path (`scripts/local-worker.*`), and it only depends on `candidate-docs.js`.
 - `arch-import-fetch.js` stays in core: it's a repo-search harness loaded unconditionally

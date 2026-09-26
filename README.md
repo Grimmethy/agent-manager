@@ -123,7 +123,7 @@ edges) and a `community-coverage.json` (rotation state) — see `python/`:
 
 ```
 pip install -r python/requirements.txt
-python python/build_graph.py          # writes graph.json + community-coverage.json
+python python/graph_build.py          # writes graph.json + community-coverage.json
 python python/visualize_graph.py       # writes an interactive HTML view of the graph, for humans
 ```
 
@@ -195,7 +195,7 @@ Bearer token and the Claude OAuth token setter) to the LAN.
 ![Project tab](docs/images/tab-project.png)
 
 Pick and inspect any codebase, independent of whichever project the live pipeline is
-actually pointed at. Browse the filesystem, click **Build Graph** to run `build_graph.py`
+actually pointed at. Browse the filesystem, click **Build Graph** to run `graph_build.py`
 against it, and get the resulting file-level import graph rendered inline (drag nodes,
 toggle **Drag entire community** / **Autosort**). Also shows the live pipeline's own
 running/stopped status and a **Start Pipeline** / **Stop Pipeline** control.
@@ -361,7 +361,7 @@ exactly the kind of thing that silently rots as the registry changes underneath 
 live 2026-07-20: two newly-registered task sources were invisible in the tab for days).
 `npm run drift-scan` is a deterministic, non-LLM set-difference check for exactly that --
 no judgment calls, just "does every registered priority have a matching row." Run it
-manually/periodically, same as `build_graph.py`; findings are written to
+manually/periodically, same as `graph_build.py`; findings are written to
 `<pipelineDir>/queue/drift-flags.json`, non-zero exit on any drift.
 
 ## License
