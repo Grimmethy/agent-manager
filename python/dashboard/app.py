@@ -901,7 +901,8 @@ def read_job_type_counters() -> dict:
     p = job_type_counters_path()
     if not p:
         return {}
-    return read_json_safe(p) or {}
+    result = read_json_safe(p)
+    return result if isinstance(result, dict) else {}
 
 
 def read_json_safe(path: Path):
