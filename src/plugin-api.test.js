@@ -35,6 +35,7 @@ const CONTRACT = {
   './apply-adhoc-diff.js': { functions: ['queueSubTasks', 'applyAdhocDiff'] },
   './candidate-split-hub-route.js': { functions: ['setCandidateSplitHubFiler', 'getCandidateSplitHubFiler'] },
   './decompose-pass-route.js': { functions: ['setDecomposePassRunner', 'getDecomposePassRunner', 'runDecomposePassIfAvailable'] },
+  './apply-branch-prep-route.js': { functions: ['setApplyBranchPrep', 'getApplyBranchPrep', 'prepareApplyBranch'] },
   './agentic-draft-common.js': { functions: ['parseSubTaskProposals'] },
   './local-client.js': { functions: ['call'] },
   './claude-client.js': { functions: ['call'] },
