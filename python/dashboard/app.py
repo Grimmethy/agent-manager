@@ -3852,7 +3852,13 @@ def _resolve_source_name(data: dict) -> str | None:
     (source:'inbox'), and deadcode_triage was renamed to unused_export post-launch. Without
     this, every real adhoc task (a real, common, human-originated task type) would show up
     under an "(unregistered)" bucket labeled "manual" instead of the adhoc node on the map
-    -- confirmed live building this: exactly that happened on the first real test."""
+    -- confirmed live building this: exactly that happened on the first real test.
+
+    A file that parses as JSON but is not an object (a list or scalar -- a partial write, a
+    stray payload) has no fields to read; it resolves to None, which callers bucket under
+    "(unknown)" (change_review AC-77: it used to raise AttributeError and 500 /api/pipeline-map)."""
+    if not isinstance(data, dict):
+        return None
     domain = data.get("domain")
     source = data.get("source")
     if domain == "adhoc" or source == "manual":
