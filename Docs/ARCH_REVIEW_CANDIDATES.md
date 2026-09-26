@@ -784,3 +784,16 @@ Create a test file (location: follow the project's existing test convention; if 
 
 Benefits:
 Catches any future re-introduction of a local constant or value drift between the two files. The test is self-maintaining: it compares values to each other rather than to hard-coded numbers, so a legitimate tuning change (e.g., 1680 → 2400) does not require updating the test.
+
+### AC-82 · Duplicated build-merge-persist sequence in graph_build.py
+Strength: Strong
+Files: python/graph_build.py
+
+Problem:
+Both `check_due()` and the default (non-`--target-dir`) branch of `main()` execute the same five-step pipeline: read the old graph, coverage, and file_cache from disk; call `build_graph_data`; call `merge_coverage` to fold in prior review state; write the three JSON artefacts (graph, coverage, file_cache) with `mkdir(parents=True, exist_ok=True)` guards; and compute/report the carried-forward community count. The only differences between the two call sites are the `progress` sink (a callable in `check_due`, `print` in `main`), the source of `use_model_naming` (hard-coded `True` vs. `not args.no_model_naming`), and whether the schedule file is written afterwards. Because the sequence is copy-pasted rather than shared, any change to the persistence contract—adding atomic writes, changing the JSON schema, emitting an additional output file, or fixing a path-handling bug—must be made in two places with a real risk of divergence.
+
+Solution:
+Extract a single helper, e.g. `_run_build_and_persist(cfg, *, use_model_naming, progress=None)`, that encapsulates the read-old-state → `build_graph_data` → `merge_coverage` → write-three-JSON-files → return `(result, merged_coverage, file_cache, carried_count)` sequence. Both `check_due` and the default branch of `main` call this helper, passing their respective `use_model_naming` value and `progress` sink. The schedule-file write in `check_due` and the human-readable summary lines in `main` remain at their call sites, since they are presentation/scheduling concerns rather than persistence logic.
+
+Benefits:
+A single code path owns the build-and-persist contract, so schema changes, atomicity improvements, or new output artefacts are made once. The two call sites become thin wrappers that only differ in their `use_model_naming` source and post-persist side-effects, making the diff surface for future changes smaller and eliminating the class of "I fixed it in `check_due` but forgot `main`" regressions.
