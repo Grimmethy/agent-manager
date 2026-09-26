@@ -51,170 +51,38 @@ const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api
 // Same repo-root escape guard task-sources.js's nextCandidateFulfillmentTask() already
 // uses for its own fetchedFiles -- reused rather than a second, possibly-inconsistent
 // guard (both this file's own header and that function's comment insist on this).
-function resolveInsideRepo(repoRoot, relPath) {
-  const rootResolved = path.resolve(repoRoot);
-  const full = path.resolve(repoRoot, relPath || '');
-  if (full !== rootResolved && !full.startsWith(rootResolved + path.sep)) return null;
-  return full;
-}
-
 // Multi-root variant (2026-08-31, system-wide Chat panel): the chat assistant is rooted
 // at the agent-manager repo but can also reach every registered plugin/project repo. A
 // RELATIVE path resolves against allowedRoots[0] (the primary root); an ABSOLUTE path is
 // accepted only if it lands inside one of allowedRoots. Returns { full, root } or null.
 // For every non-chat caller allowedRoots is [repoRoot] and this behaves exactly like
 // resolveInsideRepo above.
-function resolveInsideRoots(allowedRoots, p) {
-  const roots = allowedRoots.map((r) => path.resolve(r));
-  if (p && path.isAbsolute(p)) {
-    const full = path.resolve(p);
-    const root = roots.find((r) => full === r || full.startsWith(r + path.sep));
-    return root ? { full, root } : null;
-  }
-  const root = roots[0];
-  const full = path.resolve(root, p || '');
-  if (full !== root && !full.startsWith(root + path.sep)) return null;
-  return { full, root };
-}
-
 // Each file tool below accepts either (allowedRootsArray, argsObj) -- the system-wide
 // Chat path, which threads its own root list -- or just (argsObj), in which case the
 // single configured repoRoot is the only allowed root. The second shape is what every
 // pre-2026-08-31 caller and the standalone unit tests use, unchanged.
-function rootsAndArgs(a, b) {
-  return Array.isArray(a)
-    ? { roots: a, args: b || {} }
-    : { roots: [getConfig().repoRoot], args: a || {} };
-}
-
 // Same cap/truncation-suffix convention as nextCandidateFulfillmentTask()'s own
 // MAX_FETCHED_FILE_CHARS -- one huge file must not blow the model's context or the /api/chat
 // response payload. This is only a hard SAFETY ceiling now: the primary control is the
 // line window below.
-const MAX_READ_FILE_CHARS = 8000;
 // 2026-09-01: a read_file with no way to page is why the local write-tier could never
 // implement a net-new route in python/dashboard/app.py -- the target region is ~130KB into
 // a ~4000-line file, and the old behaviour returned a silent first-8000-char HEAD cut. A
 // line window (offset/limit, 1-indexed, matching the Read tool the operator already knows)
 // + a nextOffset the model can page with fixes that. Defaults chosen so the common
 // "read a function" case is one call and a whole large file is a few deliberate pages.
-const READ_FILE_DEFAULT_LINES = 400;
-const READ_FILE_MAX_LINES = 800;
-
 // Bound a window of lines to MAX_READ_FILE_CHARS WITHOUT lying about what came back. 2026-09-21 (change-review-fix-ac-50, found clearing needs-clarification): the char ceiling used
 // to cut the joined slice mid-line while nextOffset was still endLine + 1, so every line between the cut and endLine was never shown yet the model was told to page PAST them
 // (a comment even said "unknown exact line count when char-truncated"). Now only WHOLE lines that fit are returned, returnedThrough is the last of them, and the caller's
+const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
+const { taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS } = require('./local-tool-task-tools.js');
+
 // nextOffset = returnedThrough + 1, so paging visits every line exactly once. A first line that alone exceeds the ceiling is shown as a prefix and paging continues with the NEXT line.
 // -> { slice, truncated, returnedThrough }
-function boundWindow(lines, off, endLine) {
-  const whole = lines.slice(off - 1, endLine).join('\n');
-  if (whole.length <= MAX_READ_FILE_CHARS) return { slice: whole, truncated: false, returnedThrough: endLine };
-  let used = 0;
-  let kept = 0;
-  for (let i = off - 1; i < endLine; i += 1) {
-    const add = lines[i].length + (kept ? 1 : 0);
-    if (used + add > MAX_READ_FILE_CHARS) break;
-    used += add;
-    kept += 1;
-  }
-  if (kept === 0) {
-    return {
-      slice: `${lines[off - 1].slice(0, MAX_READ_FILE_CHARS)}\n...[truncated: slice exceeded ${MAX_READ_FILE_CHARS} chars, narrow the line window]`,
-      truncated: true,
-      returnedThrough: off,
-    };
-  }
-  const returnedThrough = off + kept - 1;
-  return {
-    slice: `${lines.slice(off - 1, returnedThrough).join('\n')}\n...[truncated: slice exceeded ${MAX_READ_FILE_CHARS} chars after line ${returnedThrough}; continue with offset=${returnedThrough + 1}]`,
-    truncated: true,
-    returnedThrough,
-  };
-}
-
-function readFileTool(a, b) {
-  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
-  const relPath = args.path;
-  if (typeof relPath !== 'string' || !relPath.trim()) {
-    return { error: 'read_file requires a non-empty "path" argument' };
-  }
-  const resolved = resolveInsideRoots(allowedRoots, relPath);
-  if (!resolved) {
-    return { error: `path is not inside any accessible repo, refusing to read: ${relPath}` };
-  }
-  const { full } = resolved;
-  let raw;
-  try {
-    raw = fs.readFileSync(full, 'utf8');
-  } catch (e) {
-    return { error: `could not read ${relPath}: ${e.message}` };
-  }
-
-  const lines = raw.split('\n');
-  const totalLines = lines.length;
-  const windowGiven = args.offset != null || args.limit != null;
-
-  let offset = Number.isFinite(args.offset) ? Math.floor(args.offset) : 1;
-  if (offset < 1) offset = 1;
-  let limit = Number.isFinite(args.limit) ? Math.floor(args.limit) : READ_FILE_DEFAULT_LINES;
-  if (limit < 1) limit = 1;
-  if (limit > READ_FILE_MAX_LINES) limit = READ_FILE_MAX_LINES;
-
-  // offset past EOF -> empty content, but still report totalLines so the model can retry.
-  if (offset > totalLines) {
-    return { path: relPath, content: '', offset, limit, totalLines, nextOffset: null, truncated: false };
-  }
-
-  const endLine = Math.min(totalLines, offset - 1 + limit);
-  // Hard char ceiling still applies to the slice itself (a file with pathological line
-  // lengths must not blow the payload). If it bites, only whole lines that fit are returned.
-  const { slice, truncated, returnedThrough } = boundWindow(lines, offset, endLine);
-  const nextOffset = returnedThrough < totalLines ? returnedThrough + 1 : null;
-
-  const out = { path: relPath, content: slice, offset, limit, totalLines, nextOffset, truncated };
-  if (!windowGiven && nextOffset != null) {
-    out.notice = `file has ${totalLines} lines; showing 1-${returnedThrough}. Re-call read_file with offset=${nextOffset} to page further (and limit=N, up to ${READ_FILE_MAX_LINES}).`;
-  } else if (nextOffset != null) {
-    out.notice = `showing lines ${offset}-${returnedThrough} of ${totalLines}. Re-call with offset=${nextOffset} for the next window.`;
-  }
-  return out;
-}
-
-function listDirectoryTool(a, b) {
-  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
-  const relPath = args.path;
-  const target = typeof relPath === 'string' && relPath.trim() ? relPath : '.';
-  const resolved = resolveInsideRoots(allowedRoots, target);
-  if (!resolved) {
-    return { error: `path is not inside any accessible repo, refusing to list: ${target}` };
-  }
-  const { full } = resolved;
-  let entries;
-  try {
-    entries = fs.readdirSync(full, { withFileTypes: true });
-  } catch (e) {
-    return { error: `could not list ${target}: ${e.message}` };
-  }
-  // Names and kind only -- deliberately not a recursive full-tree dump (see this file's
-  // own header: keep this simple, list_directory is one shallow level per call).
-  return {
-    path: target,
-    entries: entries.map((e) => ({ name: e.name, type: e.isDirectory() ? 'directory' : 'file' })),
-  };
-}
-
 // 2026-08-31 (system-wide Chat panel): the assistant is rooted at the agent-manager repo
 // but can also read/edit every registered plugin/project repo. list_roots tells it which
 // absolute paths those are so it can target a non-primary repo with an absolute path
 // argument (read_file/list_directory/write_file/edit_file) or grep_codebase's `root`.
-function listRootsTool(a) {
-  const roots = Array.isArray(a) ? a : [getConfig().repoRoot];
-  return {
-    primary: roots[0],
-    roots: roots.map((r, i) => ({ path: r, name: path.basename(r), primary: i === 0 })),
-  };
-}
-
 // read_task / search_tasks (2026-09-07, Send to Chat: "what if we limit it to only the
 // task ID... without it being pasted in its entirety" -- see concept-send-to-chat-307f1b's
 // research). Two real gaps made a bare task ID useless on its own: none of the tools
@@ -230,139 +98,9 @@ function listRootsTool(a) {
 // Same field list as python/dashboard/app.py's task_summary() (deliberately excludes
 // planResponse/implementResponse/promptContext -- read_task's `section` param is how a
 // caller pulls one of those on demand instead of eagerly, see below).
-function taskSummary(data, fallbackId) {
-  return {
-    id: data.id || fallbackId,
-    title: data.title,
-    domain: data.domain,
-    source: data.source,
-    status: data.status,
-    blockedReason: data.blockedReason,
-    blockedStage: data.blockedStage,
-    branch: data.branch,
-    compareUrl: data.compareUrl,
-    doneMarker: data.doneMarker,
-    createdAt: data.createdAt,
-    reviewedAt: data.reviewedAt,
-    appliedAt: data.appliedAt,
-    localRejectCount: data.localRejectCount != null ? data.localRejectCount : data.ornithRejectCount,
-    needsClarification: data.needsClarification,
-    stalenessFlag: data.stalenessFlag,
-    contextTrimFlag: data.contextTrimFlag,
-    subTasks: data.subTasks,
-    progress: data.progress,
-    coordinatorBlocked: data.coordinatorBlocked,
-  };
-}
-
-const READ_TASK_SECTIONS = { plan: 'planResponse', implement: 'implementResponse', blockedReason: 'blockedReason', history: 'history' };
-
-function formatTaskHistory(history) {
-  if (!Array.isArray(history)) return '';
-  return history.map((h) => `${h.at || ''} [${h.stage || ''}]${h.detail ? ` -- ${h.detail}` : ''}`).join('\n');
-}
-
 // Standalone line-window helper for read_task's `section` reads, mirroring read_file's
 // own offset/limit paging + MAX_READ_FILE_CHARS truncation convention (see readFileTool
 // above) without touching that already-tested function's own implementation.
-function windowSectionText(text, offset, limit) {
-  const lines = (text || '').split('\n');
-  const totalLines = lines.length;
-  const windowGiven = offset != null || limit != null;
-  let off = Number.isFinite(offset) ? Math.floor(offset) : 1;
-  if (off < 1) off = 1;
-  let lim = Number.isFinite(limit) ? Math.floor(limit) : READ_FILE_DEFAULT_LINES;
-  if (lim < 1) lim = 1;
-  if (lim > READ_FILE_MAX_LINES) lim = READ_FILE_MAX_LINES;
-
-  if (off > totalLines) {
-    return { content: '', offset: off, limit: lim, totalLines, nextOffset: null, truncated: false };
-  }
-  const endLine = Math.min(totalLines, off - 1 + lim);
-  const { slice, truncated, returnedThrough } = boundWindow(lines, off, endLine);
-  const nextOffset = returnedThrough < totalLines ? returnedThrough + 1 : null;
-  const out = { content: slice, offset: off, limit: lim, totalLines, nextOffset, truncated };
-  if (nextOffset != null) {
-    out.notice = windowGiven
-      ? `showing lines ${off}-${returnedThrough} of ${totalLines}. Re-call with offset=${nextOffset} for the next window.`
-      : `showing 1-${returnedThrough} of ${totalLines} lines; re-call with offset=${nextOffset} to page further (limit up to ${READ_FILE_MAX_LINES}).`;
-  }
-  return out;
-}
-
-function readTaskTool(pipelineDir, { taskId, section, offset, limit } = {}) {
-  if (typeof taskId !== 'string' || !taskId.trim()) {
-    return { error: 'read_task requires a non-empty "taskId" argument' };
-  }
-  if (section != null && !Object.prototype.hasOwnProperty.call(READ_TASK_SECTIONS, section)) {
-    return { error: `unknown section '${section}'. Valid sections: ${Object.keys(READ_TASK_SECTIONS).join(', ')}, or omit section for a summary.` };
-  }
-  const found = findTaskAnywhere(pipelineDir, taskId);
-  if (!found) {
-    return { error: `task ${taskId} not found in any queue state` };
-  }
-  const { data, foundState } = found;
-  if (!section) {
-    return { ...taskSummary(data, taskId), foundState };
-  }
-  const field = READ_TASK_SECTIONS[section];
-  const raw = field === 'history' ? formatTaskHistory(data.history) : data[field];
-  if (!raw) {
-    return { error: `task ${taskId} has no ${section} content`, foundState };
-  }
-  return { taskId, foundState, section, ...windowSectionText(raw, offset, limit) };
-}
-
-const MAX_SEARCH_TASK_RESULTS = 15;
-
-function candidateTaskFiles(pipelineDir, state) {
-  const qdir = path.join(pipelineDir, 'queue');
-  const out = []; // [{ fullPath, foundState }]
-  const addDir = (dirPath, foundState) => {
-    let names;
-    try { names = fs.readdirSync(dirPath); } catch { return; }
-    for (const name of names) {
-      if (name.endsWith('.json')) out.push({ fullPath: path.join(dirPath, name), foundState });
-    }
-  };
-  if (state === 'drafting') {
-    const draftingRoot = path.join(qdir, 'drafting');
-    let lanes;
-    try { lanes = fs.readdirSync(draftingRoot, { withFileTypes: true }); } catch { lanes = []; }
-    for (const lane of lanes) {
-      if (lane.isDirectory()) addDir(path.join(draftingRoot, lane.name), `drafting:${lane.name}`);
-    }
-  } else if (state === 'adhoc') {
-    addDir(path.join(qdir, 'adhoc'), 'adhoc');
-  } else if (QUEUE_STATES.includes(state)) {
-    addDir(path.join(qdir, state), state);
-  }
-  return out;
-}
-
-function archivedTaskFiles(pipelineDir) {
-  const qdir = path.join(pipelineDir, 'queue');
-  const out = [];
-  const noActionDir = path.join(qdir, 'done', '_archived_no_action');
-  let names;
-  try { names = fs.readdirSync(noActionDir); } catch { names = []; }
-  for (const name of names) {
-    if (name.endsWith('.json')) out.push({ fullPath: path.join(noActionDir, name), foundState: 'archived' });
-  }
-  const datedRoot = path.join(qdir, 'done', '_archived');
-  let months;
-  try { months = fs.readdirSync(datedRoot, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { months = []; }
-  for (const month of months) {
-    const monthDir = path.join(datedRoot, month);
-    let files;
-    try { files = fs.readdirSync(monthDir); } catch { continue; }
-    for (const name of files) {
-      if (name.endsWith('.json')) out.push({ fullPath: path.join(monthDir, name), foundState: 'archived' });
-    }
-  }
-  return out;
-}
-
 // { query, state?, includeArchived? } -> { results: [taskSummary-shaped, each tagged
 // foundState] }. state, if given, scopes the scan to one location ('drafting' for every
 // lane, 'drafting:<lane>' for one, 'adhoc', or any QUEUE_STATES name); omitted scans
@@ -370,43 +108,6 @@ function archivedTaskFiles(pipelineDir) {
 // precedence order. Archived buckets are excluded by default (scanning every dated
 // month on every call would make this slow for the common case) -- pass
 // includeArchived: true for the rare "what happened with that task last month" search.
-function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
-  if (typeof query !== 'string' || !query.trim()) {
-    return { error: 'search_tasks requires a non-empty "query" argument' };
-  }
-  const validStates = ['drafting', 'adhoc', ...QUEUE_STATES];
-  let candidates = [];
-  if (state != null) {
-    if (state.startsWith('drafting:')) {
-      const lane = state.slice('drafting:'.length);
-      candidates = candidateTaskFiles(pipelineDir, 'drafting').filter((c) => c.foundState === `drafting:${lane}`);
-    } else if (validStates.includes(state)) {
-      candidates = candidateTaskFiles(pipelineDir, state);
-    } else {
-      return { error: `unknown state '${state}'. Valid: ${validStates.join(', ')}, a 'drafting:<lane>' name, or omit to search everywhere live.` };
-    }
-  } else {
-    candidates = [
-      ...candidateTaskFiles(pipelineDir, 'drafting'),
-      ...QUEUE_STATES.flatMap((s) => candidateTaskFiles(pipelineDir, s)),
-      ...candidateTaskFiles(pipelineDir, 'adhoc'),
-    ];
-  }
-  if (includeArchived) candidates = [...candidates, ...archivedTaskFiles(pipelineDir)];
-
-  const results = [];
-  for (const { fullPath, foundState } of candidates) {
-    if (results.length >= MAX_SEARCH_TASK_RESULTS) break;
-    let data;
-    try { data = JSON.parse(fs.readFileSync(fullPath, 'utf8')); } catch { continue; }
-    const fallbackId = path.basename(fullPath, '.json');
-    const haystack = `${data.title || ''} ${data.id || fallbackId}`;
-    if (!lineMatches(haystack, query)) continue;
-    results.push({ ...taskSummary(data, fallbackId), foundState });
-  }
-  return { results };
-}
-
 // 2026-08-24 (Chat panel, Brain Dump #153, Grimmethy: explicitly chose real local-model
 // write access despite the read-only-only design above) -- write_file/edit_file/run_bash
 // are kept SEPARATE from TOOLS/TOOL_HANDLERS below, not merged into them: the existing
@@ -423,8 +124,6 @@ function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
 //     timeout well inside the overall REQUEST_TIMEOUT_MS budget
 //   - maxTurns stays caller-controlled and should be kept tight for Chat callers (see
 //     chat_sessions.py)
-const CHAT_BASH_TIMEOUT_MS = 30_000;
-
 // 2026-09-05, Grimmethy ("is everything going into context or is it conserving tokens"):
 // read_file/grep_codebase both cap their output per call (MAX_READ_FILE_CHARS,
 // grep-codebase-tool.js's MAX_MATCHES), but run_bash's stdout had NO cap on the success
@@ -436,78 +135,6 @@ const CHAT_BASH_TIMEOUT_MS = 30_000;
 // Same cap value and truncation-suffix convention as MAX_READ_FILE_CHARS, applied to
 // stdout on BOTH the success and failure paths (a failing command can still print a huge
 // stdout before erroring).
-const MAX_BASH_OUTPUT_CHARS = 8000;
-
-function capBashOutput(text) {
-  const s = (text || '').toString();
-  if (s.length <= MAX_BASH_OUTPUT_CHARS) return { text: s, truncated: false };
-  return {
-    text: `${s.slice(0, MAX_BASH_OUTPUT_CHARS)}\n...[truncated: output exceeded ${MAX_BASH_OUTPUT_CHARS} chars, narrow the command (e.g. pipe through head/tail/grep) and retry]`,
-    truncated: true,
-  };
-}
-
-function writeFileTool(a, b) {
-  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
-  const { path: relPath, content } = args;
-  if (typeof relPath !== 'string' || !relPath.trim()) {
-    return { error: 'write_file requires a non-empty "path" argument' };
-  }
-  const resolved = resolveInsideRoots(allowedRoots, relPath);
-  if (!resolved) {
-    return { error: `path is not inside any accessible repo, refusing to write: ${relPath}` };
-  }
-  const { full } = resolved;
-  try {
-    fs.mkdirSync(path.dirname(full), { recursive: true });
-    fs.writeFileSync(full, typeof content === 'string' ? content : '');
-  } catch (e) {
-    console.error(`[local-tool-client] write failed ${full}: ${e.message}`, e.stack);
-    return { error: `could not write ${relPath}: ${e.message}` };
-  }
-  return { path: relPath, written: true };
-}
-
-function editFileTool(a, b) {
-  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
-  const { path: relPath, find, replace } = args;
-  if (typeof relPath !== 'string' || !relPath.trim()) {
-    return { error: 'edit_file requires a non-empty "path" argument' };
-  }
-  if (typeof find !== 'string' || find === '') {
-    return { error: 'edit_file requires a non-empty "find" argument' };
-  }
-  const resolved = resolveInsideRoots(allowedRoots, relPath);
-  if (!resolved) {
-    return { error: `path is not inside any accessible repo, refusing to edit: ${relPath}` };
-  }
-  const { full } = resolved;
-  let content;
-  try {
-    content = fs.readFileSync(full, 'utf8');
-  } catch (e) {
-    return { error: `could not read ${relPath}: ${e.message}` };
-  }
-  if (!content.includes(find)) {
-    return { error: `"find" text not found verbatim in ${relPath} -- no change made. Re-read the file and match it exactly.` };
-  }
-  const occurrences = content.split(find).length - 1;
-  if (occurrences > 1) {
-    return { error: `"find" text matches ${occurrences} places in ${relPath} -- make it unique (include more surrounding context) before editing.` };
-  }
-  // Function replacer: a string replacement would interpret `$$`/`$&`/`` $` ``/`$'`/`$<n>`
-  // in `replace` (e.g. a regex literal ending `(.+)$` inside a template string). Substitute
-  // verbatim. Uniqueness already enforced just above.
-  const replacement = replace || '';
-  const updated = content.replace(find, () => replacement);
-  try {
-    fs.writeFileSync(full, updated);
-  } catch (e) {
-    return { error: `could not write ${relPath}: ${e.message}` };
-  }
-  return { path: relPath, edited: true };
-}
-
 // 2026-08-24 -- caught live within minutes of the Chat panel shipping: app.py used to
 // wrap chat_sessions.send_message()'s ENTIRE call in the same git-safety mutex
 // apply-task.sh/api_git_merge_branch use, held for however long the whole turn took
@@ -521,20 +148,6 @@ function editFileTool(a, b) {
 // mechanism proven interoperable all session), acquired via the identical
 // open-fd-then-flock-the-child pattern single-flight-lock.js already uses for its own
 // (different) lock file.
-const APPLY_LOCK_PATH = path.join(os.homedir(), '.local', 'state', 'agent-manager', 'locks', 'apply-task.lock');
-const APPLY_LOCK_CHILD_FD = 3;
-
-function withApplyLock(fn) {
-  fs.mkdirSync(path.dirname(APPLY_LOCK_PATH), { recursive: true });
-  const fd = fs.openSync(APPLY_LOCK_PATH, 'w');
-  try {
-    execFileSync('flock', [String(APPLY_LOCK_CHILD_FD)], { stdio: ['ignore', 'ignore', 'ignore', fd] });
-    return fn();
-  } finally {
-    fs.closeSync(fd);
-  }
-}
-
 // Chat-driven task completion reliability (2026-09-06, Design option A -- see
 // concept-chat-driven-task-completion-reliability-f08ae0's own research): confirmed
 // live that Chat, asked to review 34 unmerged branches, correctly diagnosed the 2 with
@@ -550,69 +163,6 @@ function withApplyLock(fn) {
 // attempting real shell parsing -- a match anywhere in the command string, including
 // inside a compound `&&`/`;` chain, is a deliberate over-block: better to refuse a
 // disguised merge/push than let one slip through a parser gap.
-const RISKY_GIT_COMMAND_RE = /\bgit\s+(merge\b|push\b)/;
-
-function runBashTool(a, b) {
-  const { roots: allowedRoots, args } = rootsAndArgs(a, b);
-  const { command, readOnly } = args;
-  if (typeof command !== 'string' || !command.trim()) {
-    return { error: 'run_bash requires a non-empty "command" argument' };
-  }
-  if (RISKY_GIT_COMMAND_RE.test(command)) {
-    return {
-      error: 'git merge/push is not available via run_bash. The pipeline does not perform git '
-        + 'operations either: it commits and pushes an unmerged branch itself after a draft passes '
-        + 'review, and a human merges it from the dashboard\'s Unmerged Branches tab (which checks '
-        + 'for conflicts first). Investigate and recommend; do not queue a task to merge, push or commit.',
-    };
-  }
-  const realRoots = allowedRoots.map((r) => fs.realpathSync(r));
-  const wrapped = wrapWithSandbox('bash', ['-c', command], {
-    workDir: realRoots[0],
-    // Every accessible repo is still BOUND (must be, or --chdir into it fails and every
-    // command errors, read or write) -- just read-only instead of writable when this is
-    // Chat's own restricted handler (readOnly:true, see buildChatToolHandlers). 2026-09-15
-    // (Grimmethy: "I'd like to see the local chat stick to the task system when making
-    // these fixes... build it in such a way that it honors the task log system and
-    // pushes the fix to unmerged branches for review"): Chat no longer gets write_file/
-    // edit_file at all (see CHAT_TOOLS below) and this read-only mount is the same
-    // guarantee applied to its remaining run_bash access -- a real filesystem-level
-    // block, not a string-matched command-shape guess the way RISKY_GIT_COMMAND_RE above
-    // necessarily is (that check stays too, for a clear error message instead of an
-    // opaque permission-denied one). Every accessible repo stays writable for every
-    // OTHER allowWrite caller (the real agentic-draft implement pass,
-    // local-agentic-write-draft.js) -- unaffected, readOnly is never set there.
-    readOnlyBinds: readOnly
-      ? ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl', ...realRoots]
-      : ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl'],
-    writableBinds: readOnly ? [] : realRoots,
-  });
-  if (!wrapped.available) {
-    // Fails CLOSED here, not open -- unlike the Claude adhoc path (a hardening layer on
-    // top of an already-trusted actor), an unsandboxed local-model Bash call is new,
-    // meaningfully riskier territory this codebase has never granted before. No bwrap,
-    // no local-model shell access, full stop.
-    return { error: 'sandbox (bwrap) is not available on this host -- run_bash is disabled without it' };
-  }
-  try {
-    const rawStdout = withApplyLock(() => execFileSync(wrapped.command, wrapped.args, {
-      encoding: 'utf8', timeout: CHAT_BASH_TIMEOUT_MS, maxBuffer: 1024 * 1024,
-    }));
-    const { text: stdout, truncated } = capBashOutput(rawStdout);
-    return { command, stdout, exitCode: 0, truncated };
-  } catch (e) {
-    const { text: stdout, truncated } = capBashOutput(e.stdout);
-    return {
-      command,
-      stdout,
-      stderr: (e.stderr || e.message || '').toString().slice(0, 2000),
-      exitCode: e.status != null ? e.status : null,
-      timedOut: e.signal === 'SIGTERM' && e.killed === true,
-      truncated,
-    };
-  }
-}
-
 const WRITE_TOOLS = [
   {
     type: 'function',
@@ -987,27 +537,6 @@ function withGrepDirsHint(tools) {
       },
     };
   });
-}
-
-function queueReviewedTaskTool(pipelineDir, { title, description }) {
-  if (typeof title !== 'string' || !title.trim()) return { error: 'queue_reviewed_task requires a non-empty "title" argument' };
-  if (typeof description !== 'string' || !description.trim()) return { error: 'queue_reviewed_task requires a non-empty "description" argument' };
-  if (isGitWriteRequest({ title, description })) return { error: GIT_WRITE_REQUEST_REFUSAL };
-  const { domainsPath } = getConfig();
-  try {
-    // premiumPriority: true (2026-09-16, Grimmethy: "any tasks that chat is working on
-    // directly should be labelled premium priority") -- every task Chat itself queues
-    // is, by construction, something a human is actively watching Chat work on right
-    // now, not a background-priority idea to triage eventually. See
-    // queueAdhocTask()'s own header for what this field does.
-    const { record } = queueAdhocTask(
-      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true },
-      { pipelineDir, domainsPath },
-    );
-    return { queuedTaskId: record.id, message: `Queued as ${record.id} (premium priority) -- it will go through the normal review pipeline (see the Adhoc Tasks tab).` };
-  } catch (e) {
-    return { error: `failed to queue task: ${e.message}` };
-  }
 }
 
 function buildWriteToolHandlers(allowedRoots, pipelineDir) {
