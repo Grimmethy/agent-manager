@@ -725,3 +725,62 @@ At the top of the file add two imports: `const { readJsonSafe } = require('./tas
 
 Benefits:
 The sweep now shares the single canonical safe-JSON-read (no duplicated `readJson`) and writes task files through the shared atomic primitive, gaining the same crash-safety guarantee as the rest of the pipeline. `writeJsonAtomicSync` emits identical JSON bytes to the old `writeJson` (`JSON.stringify(data, null, 2)`), so the on-disk content is unchanged and the only behavioural change is that the write is now atomic; the retained `fs.mkdirSync` keeps the parent-directory creation that the atomic primitive does not perform.
+
+### AC-78 · Create shared heartbeat-thresholds module as single source of truth
+Strength: Strong
+Split-Depth: 1
+Files: src/heartbeat-thresholds.js
+
+Problem:
+uptime-log.js and dead-process-check.js each declare their own copies of STALE_HEARTBEAT_SECONDS and WORKER_ZOMBIE_THRESHOLD_SECONDS. They have already diverged: uptime-log.js holds WORKER_ZOMBIE_THRESHOLD_SECONDS = 1200 while dead-process-check.js (the authoritative owner, per its long rationale comment) holds 1680. The header comment in uptime-log.js claims the values are shared, but they are not. There is no single file that both modules can import from, so any future tuning change must be made in two places and is easy to miss.
+
+Solution:
+Create src/heartbeat-thresholds.js (CommonJS, matching the project's require/module.exports style) that exports exactly two named constants: STALE_HEARTBEAT_SECONDS = 300 and WORKER_ZOMBIE_THRESHOLD_SECONDS = 1680 (the value dead-process-check.js already uses, which is the correct one). Include a brief module-level comment stating this is the single source of truth for stale/zombie thresholds and that both the uptime reporter and the dead-process daemon must read from here. Do not include WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 (that is specific to dead-process-check.js's P40 lane handling) or any logic, helpers, or other constants.
+
+Benefits:
+Establishes one canonical location for the two threshold values. Eliminates the risk of the two files drifting apart again (which has already happened: 1200 vs 1680). Gives both consumers a single import target, making the 'shared semantics' guarantee structural rather than aspirational.
+
+### AC-79 · Point dead-process-check.js at the shared thresholds module
+Strength: Strong
+Split-Depth: 1
+Files: src/dead-process-check.js
+Depends-On: AC-78
+
+Problem:
+dead-process-check.js currently declares its own local const STALE_HEARTBEAT_SECONDS = 300 and const WORKER_ZOMBIE_THRESHOLD_SECONDS = 1680 (with a long rationale comment). These are the authoritative values that uptime-log.js should be reading, but because they are local to this file, uptime-log.js cannot import them and instead re-declares its own (stale) copies.
+
+Solution:
+Remove the two local const declarations (STALE_HEARTBEAT_SECONDS and WORKER_ZOMBIE_THRESHOLD_SECONDS) and the associated rationale comment block. Replace them with a single require: const { STALE_HEARTBEAT_SECONDS, WORKER_ZOMBIE_THRESHOLD_SECONDS } = require('./heartbeat-thresholds.js');. Keep WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 and P40_INSTANCE_IDS as local declarations in this file (they are specific to the P40 lane logic and not shared). All existing internal references (the zombieThreshold ternial, the isZombie comparison) resolve to the same binding names, so no further edits are needed in the decision logic. Do not change any restart-decision code, cooldown logic, orphan-detection code, or exports.
+
+Benefits:
+dead-process-check.js now reads its thresholds from the shared module, making it the canonical consumer. The long rationale comment can be relocated to the shared module (or kept here as a note pointing to it) without changing behaviour. Removes the last local copy of these two constants from this file.
+
+### AC-80 · Point uptime-log.js at the shared thresholds module (fixes the 1200-vs-1680 divergence)
+Strength: Strong
+Split-Depth: 1
+Files: src/uptime-log.js
+Depends-On: AC-78
+
+Problem:
+uptime-log.js declares const STALE_HEARTBEAT_SECONDS = 300 and const WORKER_ZOMBIE_THRESHOLD_SECONDS = 1200 locally, and its header comment asserts these 'reuse dead-process-check.js's own' values. In reality they have diverged: dead-process-check.js uses 1680 (sized to review's 1440s worst-case chain plus slack), while uptime-log.js still holds the old 1200. This means uptime-log.js classifies a worker as 'stale' 480 seconds earlier than the daemon that actually restarts it, producing false-positive 'down' samples in the uptime log for any worker legitimately in a long multi-pass task. The constants are also re-exported via module.exports, so external consumers may depend on them.
+
+Solution:
+Remove the two local const declarations (STALE_HEARTBEAT_SECONDS = 300 and WORKER_ZOMBIE_THRESHOLD_SECONDS = 1200). Add const { STALE_HEARTBEAT_SECONDS, WORKER_ZOMBIE_THRESHOLD_SECONDS } = require('./heartbeat-thresholds.js'); near the top of the file (after the existing require lines). Update the header comment block: replace the sentence claiming the values 'reuse dead-process-check.js's own' constants with a note that the values are imported from ./heartbeat-thresholds.js (the single source of truth). Keep the constants in module.exports (re-export the imported bindings) so any external consumer of require('./uptime-log.js').STALE_HEARTBEAT_SECONDS continues to work. Do not change the stale-computation logic (the > vs >= difference is a separate concern and out of scope here), do not change appendSample, pruneOldSamples, readSamplesInWindow, isProcessAlive, logPath, or the CLI block.
+
+Benefits:
+uptime-log.js now classifies staleness using the same 1680s zombie threshold the daemon uses, eliminating the false-positive 'down' samples for long multi-pass tasks. The 'shared semantics' comment is now factually true. The 1200 value is gone from the codebase; any future tuning change is a one-line edit in heartbeat-thresholds.js.
+
+### AC-81 · Add cross-file threshold-consistency test
+Strength: Strong
+Split-Depth: 1
+Files: test/heartbeat-thresholds.test.js
+Depends-On: AC-80
+
+Problem:
+After the three changes above, both modules import from the same shared module, but nothing in the test suite verifies that they actually agree. A future refactor could re-introduce a local const in one file, or a new consumer could hard-code a value, and the divergence would go undetected until the next live SIGKILL-loop incident.
+
+Solution:
+Create a test file (location: follow the project's existing test convention; if none exists, test/heartbeat-thresholds.test.js) that: (1) requires STALE_HEARTBEAT_SECONDS and WORKER_ZOMBIE_THRESHOLD_SECONDS from src/heartbeat-thresholds.js; (2) requires the same two names from src/uptime-log.js's module.exports and from src/dead-process-check.js (if it exports them) or verifies via a small helper that the values used in its decision path match the shared constants; (3) asserts that all three sources return identical numeric values for both constants. The test must NOT hard-code 300 or 1680 — it should compare the imported values against each other so that a future tuning change is automatically reflected. If dead-process-check.js does not export its constants, the test can instead import the shared module and assert that uptime-log.js's exported constants equal the shared module's, which transitively proves agreement since dead-process-check.js imports from the same module.
+
+Benefits:
+Catches any future re-introduction of a local constant or value drift between the two files. The test is self-maintaining: it compares values to each other rather than to hard-coded numbers, so a legitimate tuning change (e.g., 1680 → 2400) does not require updating the test.
