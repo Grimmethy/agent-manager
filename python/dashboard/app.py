@@ -3972,6 +3972,30 @@ def _write_plugins_manifest(entries: list) -> None:
     PLUGINS_MANIFEST_PATH.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
 
 
+def _resolve_plugin_root(name: str):
+    """Resolve a NAMED, enabled AGENT_MANAGER_REGISTER_PATH plugin's root directory as a
+    Path, or None if not found/not enabled (S5a of the hub-tasks extraction, 2026-09-25) --
+    the Python-side twin of
+    src/resolve-plugin-root.js. Corrects the same real gap that module's own docstring
+    describes: the ORIGINAL resolution this generalizes, `.split(",")[0]`, only ever worked
+    because it assumed whichever plugin needed resolving was the FIRST (or only)
+    comma-separated entry -- true for agent-manager-hygiene when that trick was built,
+    false the moment a second plugin (agent-manager-hub-tasks) needed the same treatment.
+    _read_plugins_manifest() always returns a list (it seeds from
+    AGENT_MANAGER_REGISTER_PATH itself when plugins.json doesn't exist yet), so there is no
+    separate raw-env-var fallback branch needed here the way the JS/bash side has one."""
+    for entry in _read_plugins_manifest():
+        if (
+            isinstance(entry, dict)
+            and entry.get("name") == name
+            and entry.get("enabled") is not False
+            and isinstance(entry.get("registerPath"), str)
+            and entry["registerPath"].strip()
+        ):
+            return Path(entry["registerPath"].strip()).parent
+    return None
+
+
 # --- Manifest-driven dashboard tab (Docs/hub-tasks-extraction-plan.md section 5) --------
 # A plugins.json entry may declare a `tab` object so its own dashboard tab is served from
 # the plugin's repo instead of a hardcoded row in templates/index.html. `_validate_plugin_tab`
@@ -4417,12 +4441,11 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     # whether a project switch happens to trigger it in between.
     try:
         # S4a of the hub-tasks extraction (2026-09-24): proactive-file-decompose-sweep.js
-        # moved to agent-manager-hygiene. Resolved off AGENT_MANAGER_REGISTER_PATH the same
-        # crude "first registered plugin" way scripts/queue-watcher.sh's own equivalent
-        # `_hygiene_src` derivation already does -- skipped (not an error) if the hygiene
-        # plugin isn't installed, same as that script's guard.
-        _register_path = (os.environ.get("AGENT_MANAGER_REGISTER_PATH") or "").split(",")[0].strip()
-        _proactive_sweep = Path(os.path.dirname(_register_path)) / "src" / "proactive-file-decompose-sweep.js" if _register_path else None
+        # moved to agent-manager-hygiene. Resolved BY NAME via _resolve_plugin_root (S5a,
+        # 2026-09-25) -- skipped (not an error) if the hygiene plugin isn't installed, same
+        # as scripts/queue-watcher.sh's own guard.
+        _hygiene_root = _resolve_plugin_root("agent-manager-hygiene")
+        _proactive_sweep = _hygiene_root / "src" / "proactive-file-decompose-sweep.js" if _hygiene_root else None
         if _proactive_sweep and _proactive_sweep.is_file():
             _decompose_log_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
             _decompose_log_dir.mkdir(parents=True, exist_ok=True)

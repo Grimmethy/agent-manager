@@ -77,6 +77,44 @@ class PluginsManifestTest(unittest.TestCase):
         self.assertEqual(app._read_plugins_manifest()[0]["tab"], tab)
 
 
+class ResolvePluginRootTest(unittest.TestCase):
+    """S5a of the hub-tasks extraction (2026-09-25) -- the Python-side twin of
+    src/resolve-plugin-root.js's test coverage. Corrects the same real gap: the ORIGINAL
+    resolution this generalizes, `.split(",")[0]`, could only ever find the FIRST
+    comma-separated AGENT_MANAGER_REGISTER_PATH entry."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        d = Path(self._tmp.name)
+        self._orig_manifest = app.PLUGINS_MANIFEST_PATH
+        app.PLUGINS_MANIFEST_PATH = d / "plugins.json"
+
+    def tearDown(self):
+        app.PLUGINS_MANIFEST_PATH = self._orig_manifest
+        self._tmp.cleanup()
+
+    def test_finds_a_plugin_by_name_regardless_of_position(self):
+        app._write_plugins_manifest([
+            {"name": "agent-manager-hygiene", "registerPath": "/plugins/agent-manager-hygiene/register.js", "enabled": True},
+            {"name": "agent-manager-hub-tasks", "registerPath": "/plugins/agent-manager-hub-tasks/register.js", "enabled": True},
+        ])
+        self.assertEqual(app._resolve_plugin_root("agent-manager-hygiene"), Path("/plugins/agent-manager-hygiene"))
+        # The whole point of S5a: a SECOND, non-first plugin resolves too.
+        self.assertEqual(app._resolve_plugin_root("agent-manager-hub-tasks"), Path("/plugins/agent-manager-hub-tasks"))
+
+    def test_returns_none_for_a_plugin_not_in_the_manifest(self):
+        app._write_plugins_manifest([{"name": "agent-manager-hygiene", "registerPath": "/plugins/agent-manager-hygiene/register.js", "enabled": True}])
+        self.assertIsNone(app._resolve_plugin_root("agent-manager-doesnt-exist"))
+
+    def test_returns_none_for_a_disabled_plugin(self):
+        app._write_plugins_manifest([{"name": "agent-manager-hygiene", "registerPath": "/plugins/agent-manager-hygiene/register.js", "enabled": False}])
+        self.assertIsNone(app._resolve_plugin_root("agent-manager-hygiene"))
+
+    def test_returns_none_for_an_entry_missing_register_path(self):
+        app._write_plugins_manifest([{"name": "agent-manager-hardware-plugin", "slot": "hardware-tab", "enabled": True}])
+        self.assertIsNone(app._resolve_plugin_root("agent-manager-hardware-plugin"))
+
+
 class ValidatePluginTabTest(unittest.TestCase):
     """Docs/hub-tasks-extraction-plan.md section 5: a plugins.json entry may carry
     `tab: {key, label, description?, group?, kind:'script', script:'ui/<file>.js',

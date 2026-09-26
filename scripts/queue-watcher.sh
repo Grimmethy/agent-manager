@@ -39,6 +39,15 @@ echo "[queue-watcher] instance=$INSTANCE_ID waiting ${ORC_TICK_SECS:-60}s for fi
 
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
+# Resolve a NAMED, enabled AGENT_MANAGER_REGISTER_PATH plugin's root directory (S5a of the
+# hub-tasks extraction, 2026-09-25) -- see src/resolve-plugin-root.js for the real logic
+# and its test coverage. Echoes the plugin's root dir (one level above its register.js), or
+# nothing if not found/not enabled -- never errors, so a caller can safely test
+# `[[ -n "$root" ]]` the same way the pre-existing hygiene check below did.
+resolve_plugin_root() {
+  node "${PACKAGE_SRC_DIR}/resolve-plugin-root.js" "$1" 2>/dev/null
+}
+
 # Infinite polling loop — bash while : form identical to PowerShell's while ($true).
 while :; do
     printf '[watchdog] %s tick: checking pending items for staleness\n' "${INSTANCE_ID}" >&2
@@ -340,13 +349,15 @@ while :; do
     printf '[watchdog] product-spec-to-hub: %s\n' "$spec_hub_result" >&2
 
     # The file-decompose family (S4a of the hub-tasks extraction, 2026-09-24) moved to
-    # agent-manager-hygiene -- Docs/hub-tasks-extraction-plan.md. Resolved off
-    # AGENT_MANAGER_REGISTER_PATH the same way file-length-scan.js already was below; every
-    # invocation in this family is skipped (not fatal) if the hygiene plugin isn't
-    # installed, same discipline as that existing check.
+    # agent-manager-hygiene -- Docs/hub-tasks-extraction-plan.md. Resolved by NAME via
+    # resolve_plugin_root (S5a, 2026-09-25) so this keeps working regardless of how many
+    # other plugins are also loaded or in what order; every invocation in this family is
+    # skipped (not fatal) if the hygiene plugin isn't installed, same discipline as the
+    # existing file-length-scan.js check below.
     _hygiene_src=""
-    if [[ -n "${AGENT_MANAGER_REGISTER_PATH:-}" ]]; then
-      _hygiene_src="$(dirname "${AGENT_MANAGER_REGISTER_PATH%%,*}")/src"
+    _hygiene_root="$(resolve_plugin_root "agent-manager-hygiene")"
+    if [[ -n "$_hygiene_root" ]]; then
+      _hygiene_src="${_hygiene_root}/src"
     fi
 
     # file-decompose-to-hub: a human-authored decomposition plan in
