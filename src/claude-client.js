@@ -94,18 +94,25 @@ function buildChildEnv() {
   return env;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+// cwd lets a caller run this against a real project directory instead of the
+// isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
+// dump entry: "Claude in the agent-manager has no access to... the system it's
+// housed inside") pass the active project's repoRoot here alongside a read-only
+// allowedTools list, so Read/Grep/Glob actually resolve real files instead of an
+// empty directory. Falls back to CLAUDE_CWD (the isolated scratch dir) for every
+// caller that doesn't explicitly ask for this -- the existing, safer default.
+function resolveWorkDir(cwd) {
   assertSubscriptionAuthAvailable();
-  // cwd lets a caller run this against a real project directory instead of the
-  // isolated scratch dir -- e.g. the dashboard's Discuss sessions (2026-08-17, brain-
-  // dump entry: "Claude in the agent-manager has no access to... the system it's
-  // housed inside") pass the active project's repoRoot here alongside a read-only
-  // allowedTools list, so Read/Grep/Glob actually resolve real files instead of an
-  // empty directory. Falls back to CLAUDE_CWD (the isolated scratch dir) for every
-  // caller that doesn't explicitly ask for this -- the existing, safer default.
   const workDir = cwd || CLAUDE_CWD;
   fs.mkdirSync(workDir, { recursive: true });
+  return workDir;
+}
 
+// Builds the fully-processed prompt callOnce hands to `claude -p`: the three
+// opt-in instructions injected in their original order, then the date-line
+// prefix with its blank-line separator. Pure -- no I/O -- so it's testable in
+// isolation.
+function buildEffectivePrompt({ prompt, allowSideFindings, allowAmplification, conceptId }) {
   // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header) --
   // same treatment as local-client.js's callOnce(), the sibling chokepoint.
   let effectivePrompt = allowSideFindings ? injectSideFindingInstruction(prompt) : prompt;
@@ -113,7 +120,12 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   // local-client.js's callOnce().
   if (allowAmplification) effectivePrompt = injectAmplificationInstruction(effectivePrompt);
   if (conceptId) effectivePrompt = injectConceptBuildInstruction(effectivePrompt);
-  const datedPrompt = `${currentDateLine()}\n\n${effectivePrompt}`;
+  return `${currentDateLine()}\n\n${effectivePrompt}`;
+}
+
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+  const workDir = resolveWorkDir(cwd);
+  const datedPrompt = buildEffectivePrompt({ prompt, allowSideFindings, allowAmplification, conceptId });
   // Hard ceiling (see DRAFT_MAX_TURNS above, brain-dump bd-1788707820332) -- a
   // caller asking for 61 turns gets 20, a caller asking for 1 keeps 1.
   const effectiveMaxTurns = Math.min(maxTurns, DRAFT_MAX_TURNS);
