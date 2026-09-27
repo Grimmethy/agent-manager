@@ -29,6 +29,13 @@ test('loadConcepts returns an empty store on a corrupt file rather than throwing
   assert.deepEqual(data.concepts, []);
 });
 
+test('loadConcepts returns an empty store when concepts.json is valid JSON that is not an object (e.g. literal null)', () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, 'concepts.json'), 'null');
+  const data = loadConcepts(dir);
+  assert.deepEqual(data.concepts, []);
+});
+
 test('createConcept writes a new row with the expected shape', () => {
   const dir = tmpDir();
   const concept = createConcept({ name: 'Chat context trimming', description: 'Trim old turns.' }, dir, { createdBy: 'organic' });
