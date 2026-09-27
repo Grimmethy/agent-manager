@@ -204,13 +204,38 @@ function buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatt
   return sentences.join(' ');
 }
 
-function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting, queueHealth, selfAuditActivity, blockedPatterns }) {
+function aggregateTaskStats(tasks) {
   const bySource = {};
   const byClassification = { junk: 0, benefit: 0, filtering: 0, housekeeping: 0, unclear: 0 };
   for (const t of tasks) {
     bySource[t.source || 'unknown'] = (bySource[t.source || 'unknown'] || 0) + 1;
     byClassification[t.classification] = (byClassification[t.classification] || 0) + 1;
   }
+  return { bySource, byClassification };
+}
+
+function renderBySource(bySource) {
+  const lines = ['## By Source'];
+  for (const [source, count] of Object.entries(bySource).sort((a, b) => b[1] - a[1])) {
+    lines.push(`- ${source}: ${count}`);
+  }
+  lines.push('');
+  return lines;
+}
+
+function renderByClassification(byClassification) {
+  const lines = ['## Junk vs. Benefit (by task count)'];
+  lines.push(`- Benefit: ${byClassification.benefit}`);
+  lines.push(`- Signal-filtering (correctly dismissed false positives): ${byClassification.filtering}`);
+  lines.push(`- Housekeeping: ${byClassification.housekeeping}`);
+  lines.push(`- Junk (blocked / confirmed-bad): ${byClassification.junk}`);
+  if (byClassification.unclear) lines.push(`- Unclear (not classified): ${byClassification.unclear}`);
+  lines.push('');
+  return lines;
+}
+
+function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting, queueHealth, selfAuditActivity, blockedPatterns }) {
+  const { bySource, byClassification } = aggregateTaskStats(tasks);
 
   const lines = [];
   lines.push(`# ${period[0].toUpperCase()}${period.slice(1)} Report — ${fmtLocal(startIso)} to ${fmtLocal(endIso)}`);
@@ -222,19 +247,8 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
   lines.push(buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatterns, downtime, timeAccounting }));
   lines.push('');
 
-  lines.push('## By Source');
-  for (const [source, count] of Object.entries(bySource).sort((a, b) => b[1] - a[1])) {
-    lines.push(`- ${source}: ${count}`);
-  }
-  lines.push('');
-
-  lines.push('## Junk vs. Benefit (by task count)');
-  lines.push(`- Benefit: ${byClassification.benefit}`);
-  lines.push(`- Signal-filtering (correctly dismissed false positives): ${byClassification.filtering}`);
-  lines.push(`- Housekeeping: ${byClassification.housekeeping}`);
-  lines.push(`- Junk (blocked / confirmed-bad): ${byClassification.junk}`);
-  if (byClassification.unclear) lines.push(`- Unclear (not classified): ${byClassification.unclear}`);
-  lines.push('');
+  lines.push(...renderBySource(bySource));
+  lines.push(...renderByClassification(byClassification));
 
   if (timeAccounting) {
     // Estimated cost folded directly into this table (2026-08-23, Grimmethy: "I'd like
