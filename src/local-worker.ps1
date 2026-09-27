@@ -634,10 +634,41 @@ while ($true) {
     # instruction this model demonstrably won't reliably follow, when the correct answer
     # is already deterministically knowable from the harness result alone, wastes a real
     # GPU call and a real block for an outcome that was never in doubt.
-    $skipImplement = $task.source -eq 'arch_import' -and $task.promptContext.harnessHits.Count -eq 0 -and $task.promptContext.harnessFiles.Count -eq 0
+    # fixedLiterals guard (COMPLETED 1): that task carried a fully-specified literal
+    # edit and STILL burned 5 wasted local qwen/ornith implement calls re-deriving
+    # content the task had already handed over verbatim. Two shapes: (a) the
+    # deterministic one -- promptContext.file and promptContext.find non-empty strings
+    # and exactly one fixedLiterals entry with non-empty string content (the exact
+    # condition src/lib/deterministic-extract.js's tryDeterministicLiteralEdit checks)
+    # -- the {mode:'edit',file,find,replace} response is knowable without a model, so
+    # build it directly and skip the local call; (b) anything else carrying
+    # fixedLiterals -- the local ornith/qwen model is exactly what failed to honor
+    # those literals, so route this one stage to 'claude:adhoc-agentic' instead of
+    # serving it locally. The downstream fixedLiterals compliance gate
+    # (implement-critique.js) still runs after either path, untouched.
+    $hasFixedLiterals = $task.promptContext.PSObject.Properties['fixedLiterals'] -and @($task.promptContext.fixedLiterals).Count -gt 0
+    $fixedLiteralsDetMatch = $false
+    $implModel = $abModel
+    if ($hasFixedLiterals) {
+        $fl = @($task.promptContext.fixedLiterals)
+        $fixedLiteralsDetMatch = ($task.promptContext.PSObject.Properties['file'] -and $task.promptContext.file -is [string] -and $task.promptContext.file -ne '' -and
+                                  $task.promptContext.PSObject.Properties['find'] -and $task.promptContext.find -is [string] -and $task.promptContext.find -ne '' -and
+                                  $fl.Count -eq 1 -and $fl[0].PSObject.Properties['content'] -and $fl[0].content -is [string] -and $fl[0].content -ne '')
+        if (-not $fixedLiteralsDetMatch) {
+            $implModel = 'claude:adhoc-agentic'
+        }
+    }
     if ($skipImplement) {
         Write-Host ('arch_import: harness found nothing groundable, skipping implement call: {0}' -f $task.id) -ForegroundColor DarkGray
         $implResult = [PSCustomObject]@{ response = ''; thinking = ''; degenerate = $null; attempts = 0 }
+    } elseif ($fixedLiteralsDetMatch) {
+        # Path (a): deterministic literal edit -- the exact {mode,file,find,replace}
+        # JSON string tryDeterministicLiteralEdit would have constructed, built
+        # byte-identically here with no local-model call (see COMPLETED 1 above).
+        $flContent = @($task.promptContext.fixedLiterals)[0].content
+        $implResult = [PSCustomObject]@{ response = ('{{"mode":"edit","file":"{0}","find":"{1}","replace":"{2}"}}' -f $task.promptContext.file, $task.promptContext.find, $flContent); thinking = ''; degenerate = $null; attempts = 0 }
+        Write-Host ('fixedLiterals: deterministic literal edit, skipping local model implement call: {0}' -f $task.id) -ForegroundColor DarkGray
+        Invoke-TaskDb 'implement-done' $draftingPath (@{ note = 'fixedLiterals deterministic find/replace: response constructed directly (file, find, and the single fixedLiterals content were all fully specified in the task) instead of calling the local model' } | ConvertTo-Json -Compress)
     } else {
         $implPrompt = Get-PromptText -TaskPath $draftingPath -Pass 'implement' -PlanTextPath $planTextPath
         # brain_dump_sort added here (2026-07-22): its implement pass outputs a single JSON
@@ -655,10 +686,10 @@ while ($true) {
         $implNumPredict = if ($null -ne $abStrategyNumPredict) { $abStrategyNumPredict } else { 1400 }
         if ($task.source -in @('trouble_log', 'arch_review', 'brain_dump_sort') -or $task.domain -eq 'adhoc') {
             $implThink = if ($null -ne $abStrategyThink) { $abStrategyThink } else { $false }
-            $implResult = Invoke-LocalClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -Format 'json' -ModelOverride $abModel
+            $implResult = Invoke-LocalClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -Format 'json' -ModelOverride $implModel
         } else {
             $implThink = if ($null -ne $abStrategyThink) { $abStrategyThink } else { $true }
-            $implResult = Invoke-LocalClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -ModelOverride $abModel
+            $implResult = Invoke-LocalClient -Prompt $implPrompt -Think $implThink -Temperature $implTemperature -NumPredict $implNumPredict -ModelOverride $implModel
         }
     }
     $implSw.Stop()
@@ -674,7 +705,7 @@ while ($true) {
         callId = $abCallId
         taskId = $task.id
         stage = 'implement'
-        model = $(if ($abModel) { $abModel } else { $Model })
+        model = $(if ($implModel) { $implModel } else { $Model })
         candidates = ($AbCandidates -join ',')
         startedAt = (Get-Date).ToString('o')
         latencyMs = $implSw.ElapsedMilliseconds
