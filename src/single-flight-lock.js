@@ -409,14 +409,49 @@ function release(handle) {
 }
 
 // Preferred entry point: acquire, run fn, always release -- even if fn throws. Awaits fn
-// (sync or async) and re-throws whatever it throws, after releasing.
-async function withLock(instancesDir, fn, key) {
-  const handle = acquire(instancesDir, key);
+// (sync or async) and re-throws whatever it throws, after releasing. `opts` forwards to
+// acquire() (e.g. { skipPriorityBackoff: true } -- see withTaskMoveLock below); omitted by
+// every caller that predates this parameter, so existing behavior is unchanged.
+async function withLock(instancesDir, fn, key, opts) {
+  const handle = acquire(instancesDir, key, opts);
   try {
     return await fn();
   } finally {
     release(handle);
   }
+}
+
+// Task-move lock (2026-09-27): a task's file moving between queue/ directories is a
+// plain, unguarded write-then-unlink at every call site (reject-retry-check.js,
+// apply-task.sh) -- no atomic rename, no check for whether a file for this task id
+// already exists elsewhere. Confirmed live: the daemon's own reject-retry sweep
+// independently reprocessing an earlier snapshot of a task id while it was ALSO being
+// moved by hand forked into three files across three queue directories, no error
+// anywhere. This wraps the write+unlink pair in the SAME real flock(2) mutex this module
+// already provides for GPU/model-call exclusion, keyed by task id instead of model name --
+// reuses acquire/release/withLock as-is rather than building a second locking mechanism.
+//
+// skipPriorityBackoff: true always -- the Discuss-priority-yield behavior (backing off
+// while a chat/Discuss turn is active) exists because chat and workers contend for the
+// SAME GPU; a queue-directory move touches no GPU at all and must never wait on chat
+// activity for an unrelated reason.
+//
+// Per-process reentrancy (acquire's own `held` Map, keyed by the resolved lockfile path)
+// applies here for free: if a move cascades into another move for the SAME task id within
+// the same process (e.g. a coordinator rewiring a parent immediately after moving a
+// child), the inner acquire is re-granted immediately rather than deadlocking against
+// itself. A DIFFERENT task id is a different lockfile path and never contends.
+//
+// Cross-language: the bash twin (agent-manager-common.sh's acquire_single_flight_lock)
+// must be called with a key that sanitizes to the IDENTICAL lockfile name (see
+// keySuffix() above) for apply-task.sh's own moves to serialize against this -- verified
+// in single-flight-lock.test.js, not just assumed from the two functions' doc comments.
+function taskMoveLockKey(taskId) {
+  return `move.${taskId}`;
+}
+
+function withTaskMoveLock(instancesDir, taskId, fn) {
+  return withLock(instancesDir, fn, taskMoveLockKey(taskId), { skipPriorityBackoff: true });
 }
 
 // 2026-08-24 (Grimmethy: "add the lock work" for a live Discuss/worker-1 contention bug)
@@ -434,5 +469,5 @@ async function withLock(instancesDir, fn, key) {
 module.exports = {
   acquire, release, withLock, lockFilePath, queueDirPath,
   dropPriorityMarker, refreshPriorityMarker, removePriorityMarker, someoneIsWaiting,
-  DISCUSS_MARKER_FRESH_MS,
+  DISCUSS_MARKER_FRESH_MS, withTaskMoveLock, taskMoveLockKey,
 };

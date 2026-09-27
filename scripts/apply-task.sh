@@ -48,6 +48,39 @@ if [[ -z "${AGENT_MANAGER_REPO_ROOT:-}" ]]; then
   exit 64
 fi
 
+# Task-move lock (2026-09-27): every mv below used to be completely unguarded -- no check
+# for whether another process (reject-retry-check.js's watchdog sweep, or a second
+# apply-task.sh invocation racing this same file) is touching the same task id at the same
+# moment. This script was documented as intentionally NOT sourcing agent-manager-common.sh
+# (see its own original header note) to stay a dependency-free, no-daemon-required
+# one-off -- that tradeoff is deliberately given up here so its moves can join the SAME
+# real flock(2) mutex reject-retry-check.js now uses (src/single-flight-lock.js's
+# taskMoveLockKey, key = "move.<task id>"), matching orc-common.sh's own variable setup
+# exactly so both sides resolve to the identical lockfile path (see
+# single-flight-lock.test.js's cross-language parity test).
+PIPELINE_DIR="${AGENT_MANAGER_PIPELINE_DIR:-$AGENT_MANAGER_REPO_ROOT}"
+INSTANCES_DIR="${AGENT_MANAGER_INSTANCES_DIR:-${PIPELINE_DIR}/instances}"
+PACKAGE_SRC_DIR="${SCRIPT_DIR}/../src"
+TEMP_DIR="${TEMP_DIR:-${TMPDIR:-/tmp}}"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/agent-manager-common.sh"
+
+# Acquire the task-move lock, run the mv, always release -- even if the acquire itself
+# times out (SINGLE_FLIGHT_LOCK_TIMEOUT_SECS, default 600s). Fails OPEN on a lock timeout
+# (logs a warning, still moves the file) rather than silently dropping a task's result --
+# losing a completed apply is a worse outcome than the rare race the lock exists to guard
+# against not being caught on that one tick.
+move_task_file_locked() {
+  local tid="$1" src="$2" dst="$3"
+  if acquire_single_flight_lock "move.${tid}"; then
+    mv "$src" "$dst"
+    release_single_flight_lock
+  else
+    printf '[apply-task] %s: task-move lock timed out -- moving %s -> %s WITHOUT the lock\n' "$tid" "$src" "$dst" >&2
+    mv "$src" "$dst"
+  fi
+}
+
 # Mutex: refuse to run if another apply-task.sh is already mid-apply. Confirmed live
 # 2026-08-17 (investigating a real queue/blocked/ backlog): every single apply-failed task
 # there showed the same symptom -- `git index.lock: File exists`, `fatal: branch 'agent/...'
@@ -164,17 +197,17 @@ if [[ ${#direct_files[@]} -gt 0 ]]; then
       [[ -z "$bpath" ]] && continue
       btid="$(basename "$bpath" .json)"
       if [[ "$bcoordinating" == "1" ]]; then
-        mv "$bpath" "${COORDINATING_DIR}/${btid}.json"
+        move_task_file_locked "$btid" "$bpath" "${COORDINATING_DIR}/${btid}.json"
         printf '[apply-task] %s: coordinating sub-tasks (triage batch) -- %s\n' "$btid" "$bnote"
       elif [[ "$bneedsconfirm" == "1" ]]; then
-        mv "$bpath" "${AWAITING_CONFIRM_DIR}/${btid}.json"
+        move_task_file_locked "$btid" "$bpath" "${AWAITING_CONFIRM_DIR}/${btid}.json"
         printf '[apply-task] %s: awaiting human confirmation (triage batch) -- %s\n' "$btid" "$bnote"
       elif [[ "$bok" == "1" ]]; then
-        mv "$bpath" "${DONE_DIR}/${btid}.json"
+        move_task_file_locked "$btid" "$bpath" "${DONE_DIR}/${btid}.json"
         printf '[apply-task] %s: applied (triage batch) -- %s\n' "$btid" "$bnote"
       else
         ensure_blocked_reason "$bpath" "$bnote"
-        mv "$bpath" "${BLOCKED_DIR}/${btid}.json"
+        move_task_file_locked "$btid" "$bpath" "${BLOCKED_DIR}/${btid}.json"
         printf '[apply-task] %s: FAILED (triage batch) -- %s\n' "$btid" "$bnote" >&2
       fi
     done
@@ -197,17 +230,17 @@ for file in "${other_files[@]}"; do
   coordinating="$(printf '%s' "$result" | node -e 'try{const o=JSON.parse(require("fs").readFileSync(0,"utf8"));console.log(o.coordinating?"true":"false")}catch(e){console.log("false")}')"
 
   if [[ "$coordinating" == "true" ]]; then
-    mv "$file" "${COORDINATING_DIR}/${task_id}.json"
+    move_task_file_locked "$task_id" "$file" "${COORDINATING_DIR}/${task_id}.json"
     printf '[apply-task] %s: coordinating sub-tasks -> %s\n' "$task_id" "$result"
   elif [[ "$needs_confirmation" == "true" ]]; then
-    mv "$file" "${AWAITING_CONFIRM_DIR}/${task_id}.json"
+    move_task_file_locked "$task_id" "$file" "${AWAITING_CONFIRM_DIR}/${task_id}.json"
     printf '[apply-task] %s: awaiting human confirmation (delete in batch) -> %s\n' "$task_id" "$result"
   elif [[ "$succeeded" == "true" ]]; then
-    mv "$file" "${DONE_DIR}/${task_id}.json"
+    move_task_file_locked "$task_id" "$file" "${DONE_DIR}/${task_id}.json"
     printf '[apply-task] %s: applied -> %s\n' "$task_id" "$result"
   else
     ensure_blocked_reason "$file" "$result"
-    mv "$file" "${BLOCKED_DIR}/${task_id}.json"
+    move_task_file_locked "$task_id" "$file" "${BLOCKED_DIR}/${task_id}.json"
     printf '[apply-task] %s: FAILED -> %s\n' "$task_id" "$result" >&2
   fi
 done
