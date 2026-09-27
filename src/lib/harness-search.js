@@ -114,11 +114,17 @@ function parseHarnessQueries(planResponse) {
   return [...(planResponse || '').matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
 }
 
-async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetch, roots }) {
+async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetch, roots, isOnlineFn }) {
   const queries = parseHarnessQueries(task.planResponse);
   if (kind === 'projectSearch') {
     let searchResults = [];
     if (queries.length > 0) {
+      const online = typeof isOnlineFn === 'function' ? isOnlineFn({ forceRefresh: true }) : true;
+      if (!online) {
+        task.networkUnavailable = true;
+        task.promptContext.searchResults = [];
+        return { networkUnavailable: true };
+      }
       try {
         searchResults = await projectSearchFetch(queries);
       } catch (e) {
