@@ -38,6 +38,7 @@ function loadConcepts(pipelineDir) {
     console.error(`[loadConcepts] ${filePath}: ${err.message} -- returning empty store`);
     data = { concepts: [] };
   }
+  if (data === null || typeof data !== 'object') data = { concepts: [] };
   if (!Array.isArray(data.concepts)) data.concepts = [];
   return data;
 }
