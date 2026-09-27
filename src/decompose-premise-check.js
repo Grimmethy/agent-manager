@@ -96,13 +96,15 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
   const rawText = String(pc.rawText || '');
   if (!rawText || !repoRoot) return null;
 
-  const paths = [];
-  const seen = new Set();
+  const pathMap = new Map();
   let pm;
   PATH_RE.lastIndex = 0;
   while ((pm = PATH_RE.exec(rawText))) {
-    if (!seen.has(pm[1])) { seen.add(pm[1]); paths.push({ relPath: pm[1], index: pm.index }); }
+    pathMap.set(pm[1], pm.index);
   }
+  const paths = [...pathMap.entries()]
+    .map(([relPath, index]) => ({ relPath, index }))
+    .sort((a, b) => a.index - b.index);
   if (!paths.length) return null;
 
   const lineRefs = [...maskTimestamps(rawText).matchAll(LINE_REF_RE)].map((m) => ({ line: Number(m[1]), index: m.index }));
