@@ -12,6 +12,8 @@ import time
 # runs, app.py is fully initialised and the import is just a dict lookup. (Same
 # pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)
 
+# Design note: Chat is a human-only layer and queue_reviewed_task tasks carry premiumPriority by design (a future autonomous sweeper must stay on its own non-premium Job List entry) -- see docs/design-notes/chat-vs-autonomous-sweeper.md (decision 2026-09-16).
+
 chat_bp = Blueprint("chat-bp", __name__)
 
 @chat_bp.route("/api/chat/active", methods=["GET"])
