@@ -1379,6 +1379,10 @@ function projectSearchImplementPrompt(task, planText) {
     '',
     resultsText,
     '',
+    // 2026-09-16 incident: when live search was unavailable, the model fabricated findings
+    // to satisfy an implicit "must return results" expectation. This clause makes NO_RESULTS
+    // or an empty findings list a valid terminal output. Do NOT remove -- enforced by
+    // src/test_project_search_zero_findings_prompt.js.
     'If the search tools were unavailable, or a query above shows only failure lines (ENOTFOUND, ' +
       'timeout, "search failed", or "(no results -- the searches returned nothing usable)"), do NOT ' +
       'narrate the failure, apologize, or refuse. Instead, output a structured zero-findings record: ' +
