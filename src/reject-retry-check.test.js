@@ -1495,3 +1495,30 @@ test('hasUnreliableGrounding ignores a context-only file with anchorConfidence:n
   assert.equal(hasUnreliableGrounding(t([{ path: 'src/a.js', anchorConfidence: 'strong' }, { path: 'app.py', context: true, anchorConfidence: 'none' }])), false);
   assert.equal(hasUnreliableGrounding(t([{ path: 'src/a.js', anchorConfidence: 'none' }, { path: 'app.py', context: true, anchorConfidence: 'strong' }])), true);
 });
+
+// 2026-09-22: deterministic (non-stochastic) degenerate-plan block at the SECOND-to-last
+// retry. The cap is localRejectCount 2 (see the exhaustion test above), so a 'plan'-stage
+// degenerate block sitting at localRejectCount 1 still has exactly ONE blind redraft
+// left: it must be requeued and bump the counter to the cap -- not silently treated as
+// already exhausted. Mirrors the existing deterministic-block tests, one counter step later.
+test('rejectRetryCheck requeues a plan-degenerate block at localRejectCount 1 (one retry left), bumping the counter to the cap', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'task-cap-1', {
+    status: 'pending', // local-draft.js's real behavior: never flipped to 'blocked'
+    blockedStage: 'plan',
+    blockedReason: 'Plan pass degenerate: truncated',
+    localRejectCount: 1,
+    planResponse: 'another truncated, unusable plan',
+  });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.equal(summary.exhausted, 0, 'localRejectCount 1 is UNDER the cap of 2: one redraft still available');
+  assert.ok(fs.existsSync(path.join(pendingDir, 'task-cap-1.json')), 'requeued to pending');
+  assert.ok(!fs.existsSync(path.join(blockedDir, 'task-cap-1.json')));
+  const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-cap-1.json'), 'utf8'));
+  assert.equal(requeued.localRejectCount, 2);
+  assert.equal(requeued.planResponse, undefined, 'the stale degenerate plan must not survive the requeue');
+  assert.ok(requeued.priorRejectionFeedback.some((f) => /degenerate/.test(f)), 'the degenerate reason is carried as prior feedback for the next redraft');
+});
