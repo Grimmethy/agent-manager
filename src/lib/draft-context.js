@@ -158,7 +158,10 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
     return gpuArbiter.withGpu(instancesDir, { cls: 'draft', model: key, lockKey: localOllamaLockKey(), taskId: task.id, phase: pass }, run);
   };
 
-  return { resolvedLocalCall, profileSupportsThink, resolvedCallIsLocal, maybeLocked, maybeLockedOn };
+  // profileOverrides is exposed (not just consumed) so callers that want the raw
+  // { model, numCtx, numPredict } decision (or null) can reshape it without
+  // re-running resolveModelProfile -- e.g. local-draft.js's resolveCallOpts.
+  return { resolvedLocalCall, profileOverrides, profileSupportsThink, resolvedCallIsLocal, maybeLocked, maybeLockedOn };
 }
 
 function runStalenessFastpath(task, attempt) {
