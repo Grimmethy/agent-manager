@@ -59,6 +59,19 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
   for (const task of eligible) {
     try {
       const artifact = writeArtifact(task, repoRoot, pipelineDir);
+      // HUB0092 · 2/3: a source.apply that saw its source move past the approved draft
+      // (apply-group-a.js's stale guard: {skipped:true, stale:true, success:false}) used
+      // to be swallowed by the `artifact.skipped` branch below and recorded as
+      // succeeded:true -- the task landed in done/ as if the CURRENT file state had been
+      // reviewed and shipped, when in fact nothing was applied. (Sibling 1/3's guard in
+      // recordApplyOutcome was abandoned, so this inline check is the last gate before
+      // the success branch.) Route every stale artifact to the non-success shape the
+      // single-task path already uses for stale results (apply-group-a.js:51):
+      // succeeded:false, so recordApplyOutcome files it apply-failed, not applied.
+      if (artifact && artifact.stale === true) {
+        results[task.id] = { succeeded: false, stale: true, reason: artifact.reason || 'stale apply result -- source changed after approval, nothing applied' };
+        continue;
+      }
       if (artifact && artifact.skipped) {
         results[task.id] = { succeeded: true, doneMarker: artifact.reason };
         closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
