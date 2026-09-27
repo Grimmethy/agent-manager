@@ -443,6 +443,23 @@ function voteReason(vote, marker) {
   return (m ? m[1] : sample.response).trim().slice(0, 240);
 }
 
+// writeInPlace is module-scoped and exported (HUB0038) so a regression test (or any
+// other sweep) can exercise the same guarded write path. The existsSync guard MUST be
+// the first executable statement: a concurrent /done delete (or a prior bucket's unlink
+// of the same file) can remove the file between the readdirSync at the top of the
+// sweep and this write -- writing it back would resurrect a task that was just
+// intentionally deleted. DRY_RUN is re-read via cfgEnv() per call (same read-at-call
+// discipline as the rest of this file), and `summary` is optional so a caller with no
+// per-run accumulator (e.g. a test) still gets the guard and the write.
+function writeInPlace(file, task, summary) {
+  if (!fs.existsSync(file)) { console.warn('[needs-clarification-triage] writeInPlace: ' + file + ' no longer exists -- skipping (concurrent /done delete)'); return; }
+  if (cfgEnv().DRY_RUN) return;
+  try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch (e) {
+    log(`write failed ${path.basename(file)}: ${e.message}`);
+    if (summary) summary.errors += 1;
+  }
+}
+
 async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote }) {
   const summary = { checked: 0, requeued: 0, archived: 0, flagged: 0, leftForHuman: 0, errors: 0 };
   const { KILL, VOTE_ENABLED, DRY_RUN, MAX_REQUEUES, MAX_VOTES, VOTE_MODEL } = cfgEnv();
@@ -467,13 +484,6 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
 
   const now = new Date().toISOString();
   let votesUsed = 0;
-
-  const writeInPlace = (file, task) => {
-    if (DRY_RUN) return;
-    try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch (e) {
-      log(`write failed ${path.basename(file)}: ${e.message}`); summary.errors += 1;
-    }
-  };
 
   for (const name of names) {
     const file = path.join(ncDir, name);
@@ -695,7 +705,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
         } catch (e) {
           appendHistoryEvent(task, 'advisory',
             `needs-clarification-triage: premise vote could not run (${(e && e.message || 'vote error').slice(0, 140)}) -- will retry`);
-          writeInPlace(file, task);
+          writeInPlace(file, task, summary);
           summary.errors += 1;
           continue;
         }
@@ -719,7 +729,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       task.ncTriageDecision = 'leave-for-human';
       appendHistoryEvent(task, 'advisory',
         'needs-clarification-triage: invalid-premise (deterministic gate), unverified by a resolution signal or vote -- flagged for a human');
-      writeInPlace(file, task);
+      writeInPlace(file, task, summary);
       continue;
     }
 
@@ -737,7 +747,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       task.ncTriageDecision = 'leave-for-human';
       appendHistoryEvent(task, 'advisory',
         'needs-clarification-triage: unreliable-grounding (harness-side; a blind retry reproduces the same anchor-match failure) -- ghost debt filed, left for a human to fix the grounding source or archive');
-      writeInPlace(file, task);
+      writeInPlace(file, task, summary);
       continue;
     }
 
@@ -1142,7 +1152,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
         } catch (e) {
           appendHistoryEvent(task, 'advisory',
             `needs-clarification-triage: premise vote could not run (${(e && e.message || 'vote error').slice(0, 140)}) -- will retry`);
-          writeInPlace(file, task);
+          writeInPlace(file, task, summary);
           summary.errors += 1;
           continue;
         }
@@ -1165,7 +1175,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       }
       appendHistoryEvent(task, 'advisory',
         'needs-clarification-triage: premise looks invalid but unverified -- flagged for a human');
-      writeInPlace(file, task);
+      writeInPlace(file, task, summary);
       continue;
     }
 
@@ -1185,7 +1195,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     appendHistoryEvent(task, 'advisory', hasExhausted
       ? 'needs-clarification-triage: retry-exhausted -- blocked-drain requeues on a fix signature, else a human'
       : 'needs-clarification-triage: genuine design question -- left for a human');
-    writeInPlace(file, task);
+    writeInPlace(file, task, summary);
   }
 
   return summary;
@@ -1193,6 +1203,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
 
 module.exports = {
   needsClarificationTriage,
+  writeInPlace,
   buildInvalidPremisePrompt,
   DEGENERATE_RE,
   INVALID_PREMISE_RE,
