@@ -10035,3 +10035,452 @@ Each extracted piece is scoped to exactly this function's existing logic; no new
 
 Benefits:
 The orchestrator drops from 142 to ~30 lines and reads top-to-bottom as a single narrative. `fetchBrowseData` (12 lines) can be unit-tested with a mocked `fetchJson` to verify the stale-path reset and retry without touching the DOM. `buildBrowserHtml` is a pure function of `(data, selectedFile)` and can be tested with fixture data and snapshot assertions. Each async handler is independently testable with a mocked `fetch` and a stubbed button element. Code review of any one concern no longer requires scanning the other three, and the 2026-08-16 "projects" merge incident's stale-path semantics become a 12-line function that is trivially diffable in a PR.
+
+### AC-189 · Decompose `api_git_merge_branch` into validation, git-sequence, and stamping helpers
+Strength: Strong
+Files: python/dashboard/routes/pipeline_1_more.py
+Snippet:
+```
+
+@pipeline_1_more_bp.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
+def api_git_merge_branch(branch):
+    from app import _acquire_apply_lock, _invalidate_branch_cache, _release_apply_lock, _run_git, _sync_live_checkout, get_active_repo_root, list_unmerged_branches, logger, queue_dir, read_json_safe
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+
+    # Never trust a caller-supplied branch string as a raw git ref beyond what THIS
+    # process already enumerated itself -- re-derive the current list (cheap: cached
+    # unless stale) and require an exact match, the same "only act on what we ourselves
+    # already offered" gate api_task_archive/api_task_requeue's state allowlists use.
+    branches = list_unmerged_branches(force=True)
+    match = next((b for b in branches if b["branch"] == branch), None)
+    if not match:
+        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+
+    # A sibling branch still unmerged in the SAME coordinator hub that this branch would
+    # conflict with (2026-09-16: root-caused live -- 4 sub-tasks of one hub all edited the
+    # same file, each independently branched off main, so each showed willConflict:False
+    # against main alone; merging them one at a time hit a real conflict on the 2nd). The
+    # real merge attempt below would fail the same way (or worse, silently ship whichever
+    # side happened to be merged first without the other's change) -- block and name the
+    # sibling(s) so the caller merges in dependency order (or combines them by hand) rather
+    # than discovering this from an opaque git error. Checked BEFORE the hub-not-finished
+    # gate below: a hub mid-decomposition is ALSO very often the exact shape with an
+    # unmerged sibling still pending, and that gate's own `force` would otherwise mask
+    # this one from ever being seen at all (only one gate's reason is ever returned per
+    # request) -- surfacing the sibling-conflict warning first means a caller who force-
+    # bypasses the hub gate still sees it, instead of being silently exposed to the same
+    # conflict this whole check exists to catch.
+    sibling_conflicts = [s for s in (match.get("hubSiblingConflicts") or [])
+                          if any(b["branch"] == s for b in branches)]
+    if sibling_conflicts and not (request.get_json(silent=True) or {}).get("force"):
+        return jsonify({
+            "succeeded": False,
+            "reason": (
+                f"'{branch}' would conflict with still-unmerged sibling branch(es) in the same "
+                f"coordinator hub: {', '.join(sibling_conflicts)}. Merge the sibling(s) first (in "
+                "dependency order), or resolve the overlap by hand, rather than merging this one "
+                'independently. Re-send with {"force": true} only if you have already verified '
+                "the resolution."
+            ),
+        }), 409
+
+    # A branch owned by a coordinator hub that hasn't finished (a stacked file-decompose
+    # branch still missing its wiring commit + integration-gate pass) is not safe to merge
+    # -- doing so 404s the moved routes. Block it unless the caller explicitly forces.
+    hub = match.get("hub")
+    if hub and not hub.get("readyToMerge") and not (request.get_json(silent=True) or {}).get("force"):
+        prog = hub.get("progress") or {}
+        gate = (hub.get("integrationGate") or {}).get("status")
+        return jsonify({
+            "succeeded": False,
+            "reason": (
+                f"'{branch}' belongs to coordinator hub {hub.get('id')} which is not finished "
+                f"({prog.get('done')}/{prog.get('total')} task(s) done"
+                + (f", integration gate {gate}" if gate else "")
+                + "). Merging now would ship an incomplete decomposition. Re-send with "
+                '{"force": true} only if you have verified the branch is actually complete.'
+            ),
+        }), 409
+
+    lock_fd = _acquire_apply_lock()
+    if lock_fd is None:
+        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+
+    main_branch = match["mainBranch"]
+    try:
+        _run_git(["fetch", "origin"], repo_root)
+        _run_git(["checkout", main_branch], repo_root)
+        _run_git(["reset", "--hard", f"origin/{main_branch}"], repo_root)
+        try:
+            _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {match['title']} (via dashboard)"], repo_root)
+        except RuntimeError as merge_err:
+            subprocess.run(["git", "merge", "--abort"], cwd=str(repo_root), capture_output=True, timeout=15)
+            # match['willConflict']/['conflictFiles'] came from list_unmerged_branches's
+            # own merge-tree preview a moment ago (same request, force-refreshed above) --
+            # if it already predicted this exact outcome, say so plainly instead of
+            # surfacing raw git stderr. Confirmed live 2026-08-18: an add/add conflict
+            # between two independently-drafted candidate docs produced exactly this kind
+            # of opaque failure with no indication of WHICH files or WHY.
+            if match.get("willConflict") and match.get("conflictFiles"):
+                files = ", ".join(match["conflictFiles"])
+                raise RuntimeError(
+                    f"conflicts with {main_branch} on: {files} -- this was flagged before you clicked merge; "
+                    f"resolve by hand (e.g. combine both versions) rather than retrying, retrying will fail the same way"
+                ) from merge_err
+            raise merge_err
+        _run_git(["push", "origin", main_branch], repo_root)
+        try:
+            _run_git(["push", "origin", "--delete", branch], repo_root)
+            from branch_removals import record_branch_removal
+            record_branch_removal(queue_dir(), branch, "merged", task_id=branch.removeprefix("agent/"),
+                                  detail=f"merged into {main_branch} via the dashboard", actor="dashboard-merge")
+        except RuntimeError as e:
+            # Non-fatal -- the merge to main already succeeded and is the part that
+            # matters; a leftover now-fully-merged remote branch is harmless clutter
+            # (next list will filter it out via the ahead==0 check) rather than a real
+            # failure worth reporting as one.
+            logger.warning("Non-fatal: could not delete remote branch %r (repo: %s): %s", branch, repo_root, e)
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+
+    _invalidate_branch_cache()
+    live_sync = _sync_live_checkout(main_branch)
+
+    # Stamp mergedAt on the task record once its branch is actually merged (2026-08-22,
+    # Grimmethy: "some way to prioritize what order adhoc tasks get completed in. Those
+    # with dependencies on new adhoc tasks are absolutely going to need to be done after
+    # the dependency is completed") -- this is the real "is this dependency satisfied"
+    # signal task-sources.js's nextAdhocTask() checks before letting a dependent task
+    # claim. Reaching queue/done/ alone isn't enough: a task there is only pushed to its
+    # OWN branch, not merged, and every adhoc draft's git worktree starts from
+    # origin/<mainBranch> -- a dependency's fix isn't actually visible to a dependent
+    # task's fresh checkout until it's merged, confirmed live by the exact failure this
+    # feature exists to prevent (a dependent task's diff going stale against code the
+    # dependency hadn't landed yet). Best-effort: a task record not found (already
+    # archived, or this merge came from some other source than the normal apply flow)
+    # must never fail the merge itself, which already fully succeeded above.
+    qdir = queue_dir()
+    if qdir:
+        task_id = branch.removeprefix("agent/")
+        for candidate in (qdir / "done" / f"{task_id}.json", qdir / "done" / "_archived_no_action" / f"{task_id}.json"):
+            if candidate.is_file():
+                data = read_json_safe(candidate)
+                if data is not None:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    data["mergedAt"] = now_iso
+                    # Close the task log with a terminal disposition event (see
+                    # src/task-disposition.js) -- `mergedAt` alone is a field the dependency
+                    # gate reads; an update audit reads the history, which used to stop at
+                    # `applied`.
+                    if data.get("terminalDisposition") != "merged":
+                        hist = data.get("history")
+                        if not isinstance(hist, list):
+                            hist = data["history"] = []
+                        hist.append({
+                            "stage": "merged",
+                            "at": now_iso,
+                            "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
+                        })
+                        data["terminalDisposition"] = "merged"
+                    try:
+                        candidate.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                    except OSError as exc:
+                        logger.error("Failed to persist merge-state for branch %r to %s: %s", branch, candidate, exc)
+                        raise
+                break
+
+        # Close out the LOCAL task log too (src/task-log-store.js), not just the queue/
+        # working copy above -- that file is gitignored and gets archived/pruned, while
+        # task-logs/<id>.json is a durable local snapshot that survives it, and this is the
+        # one moment (the task's branch just landed on main) its own log can record that
+        # fact. RE-EVALUATED 2026-09-15 (Grimmethy, .gitignore's own comment on
+        # task-logs/): this repo is public and the log retains a task's rawText/
+        # implementResponse/planResponse verbatim -- for a brain_dump-derived task that is
+        # the user's own free-typed personal/business note content, so this file is no
+        # longer committed/pushed, updated on disk only. Best-effort: a task not authored
+        # through apply-task.js (so it never got a task-logs/ entry in the first place) is
+        # a normal, expected case, not an error.
+        task_log_path = repo_root / "task-logs" / f"{task_id}.json"
+        if task_log_path.is_file():
+            log_data = read_json_safe(task_log_path)
+            if log_data is not None and log_data.get("terminalDisposition") != "merged":
+                merge_iso = datetime.now(timezone.utc).isoformat()
+                hist = log_data.get("history")
+                if not isinstance(hist, list):
+                    hist = log_data["history"] = []
+                hist.append({
+                    "stage": "merged",
+                    "at": merge_iso,
+                    "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
+                })
+                log_data["terminalDisposition"] = "merged"
+                try:
+                    task_log_path.write_text(json.dumps(log_data, indent=2) + "\n", encoding="utf-8")
+                except OSError as exc:
+```
+
+Problem:
+The 182-line handler interleaves four separable concerns—sibling-conflict and hub-readiness validation, the lock-guarded git fetch/checkout/merge/push/delete sequence, and two near-identical ~25-line JSON-stamping blocks for `queue/done/<id>.json` and `task-logs/<id>.json`—all inside a single function body. The stamping blocks are copy-pasted (one already drifts by a trailing-newline quirk), the validation gates are pure dict logic buried between I/O calls, and the conflict-recovery `try/except` sits at four levels of nesting, making it impossible to unit-test any one concern without exercising the others.
+
+Solution:
+Extract three focused helpers and reduce the handler to a thin orchestrator. The shared stamping helper must set `data["mergedAt"]` because `nextAdhocTask()` reads that field to gate downstream ad-hoc work; omitting it silently breaks the dependency. The validation helper returns a `(ok, error_response)` tuple so the handler stays a flat if/return. The git helper owns its own conflict-recovery `try/except` and raises `RuntimeError` on failure, which the handler maps to a 500. The lock remains in the handler's `try/finally` so the helper stays lock-agnostic and testable with a fake lock.
+
+```python
+def _stamp_merged_disposition(path: Path, branch: str, main_branch: str) -> None:
+    """Best-effort: record that *branch* has landed on *main_branch*."""
+    if not path.is_file():
+        return
+    data = read_json_safe(path)
+    if data is None:
+        return
+    now_iso = datetime.now(timezone.utc).isoformat()
+    data["mergedAt"] = now_iso  # dependency gate (nextAdhocTask) reads this field
+    if data.get("terminalDisposition") != "merged":
+        hist = data.get("history")
+        if not isinstance(hist, list):
+            hist = data["history"] = []
+        hist.append({
+            "stage": "merged",
+            "at": now_iso,
+            "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
+        })
+        data["terminalDisposition"] = "merged"
+    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _check_merge_preconditions(branch: str, match: dict, force: bool):
+    """Return (True, None) or (False, (jsonify_body, status_code))."""
+    sibling_conflicts = [
+        s for s in (match.get("hubSiblingConflicts") or [])
+        if any(b["branch"] == s for b in list_unmerged_branches())
+    ]
+    if sibling_conflicts and not force:
+        return False, (jsonify({
+            "succeeded": False,
+            "reason": (f"'{branch}' would conflict with still-unmerged sibling "
+                       f"branch(es) in the same coordinator hub: "
+                       f"{', '.join(sibling_conflicts)}. Merge the sibling(s) first."),
+        }), 409)
+
+    hub = match.get("hub")
+    if hub and not hub.get("readyToMerge") and not force:
+        prog = hub.get("progress") or {}
+        return False, (jsonify({
+            "succeeded": False,
+            "reason": (f"'{branch}' belongs to coordinator hub {hub.get('id')} "
+                       f"which is not finished "
+                       f"({prog.get('done')}/{prog.get('total')})."),
+        }), 409)
+
+    return True, None
+
+
+def _perform_git_merge(repo_root: Path, main_branch: str, branch: str, match: dict) -> None:
+    """Raises RuntimeError on merge conflict or push failure."""
+    _run_git(["fetch", "origin"], repo_root)
+    _run_git(["checkout", main_branch], repo_root)
+    _run_git(["reset", "--hard", f"origin/{main_branch}"], repo_root)
+    try:
+        _run_git(["merge", "--no-ff", f"origin/{branch}",
+                  "-m", f"Merge {match['title']} (via dashboard)"], repo_root)
+    except RuntimeError as merge_err:
+        subprocess.run(["git", "merge", "--abort"], cwd=str(repo_root),
+                       capture_output=True, timeout=15)
+        if match.get("willConflict") and match.get("conflictFiles"):
+            files = ", ".join(match["conflictFiles"])
+            raise RuntimeError(
+                f"conflicts with {main_branch} on: {files} -- this was flagged "
+                f"before you clicked merge; resolve by hand rather than retrying"
+            ) from merge_err
+        raise
+    _run_git(["push", "origin", main_branch], repo_root)
+    try:
+        _run_git(["push", "origin", "--delete", branch], repo_root)
+        from branch_removals import record_branch_removal
+        record_branch_removal(queue_dir(), branch, "merged",
+                              task_id=branch.removeprefix("agent/"),
+                              detail=f"merged into {main_branch} via the dashboard",
+                              actor="dashboard-merge")
+    except RuntimeError as e:
+        logger.warning("Non-fatal: could not delete remote branch %r: %s", branch, e)
+```
+
+The handler body then shrinks to: resolve repo root → find match → call `_check_merge_preconditions` → acquire lock → call `_perform_git_merge` in `try/finally` → release lock → invalidate cache → call `_stamp_merged_disposition` for the two queue paths and the task-log path, each wrapped in its own `try/except OSError`.
+
+Benefits:
+The two stamping blocks collapse into one call-site each, eliminating the trailing-newline drift and guaranteeing `mergedAt` is always written. `_check_merge_preconditions` is pure dict logic with no I/O, so it can be unit-tested with a fake `match` dict and a stubbed `list_unmerged_branches`. `_perform_git_merge` can be integration-tested in a temp repository without the Flask request context or the lock module. The handler drops from ~182 lines to roughly 40, and the lock's `try/finally` scope is now visually adjacent to the single call it guards rather than wrapping 35 inline lines of git plumbing.
+
+### AC-190 · Extract repeated directory-traversal blocks in api_adhoc_tasks
+Strength: Strong
+Files: python/dashboard/routes/shared_misc.py
+Snippet:
+```
+
+@shared_misc_bp.route("/api/adhoc-tasks")
+def api_adhoc_tasks():
+    """Every domain:'adhoc' task across the whole pipeline, in one flat list, with
+    whichever queue state it's currently sitting in -- the cross-cutting view
+    api_task_anywhere already has the right traversal shape for (drafting/ first,
+    per-instance, then every other QUEUE_STATES dir), generalized here from 'find one
+    task by id' to 'collect every adhoc task found along the way'. Also checks
+    queue/adhoc/ itself, the one real state api_task_anywhere never had to check --
+    task-sources.js's own nextAdhocTask() reads directly from there, before a claimed
+    task ever reaches pending/, so a task sitting there unclaimed would otherwise be
+    invisible to this view.
+
+    An 'adhoc' task is identified by domain=='adhoc' OR an id starting with 'adhoc-'
+    (queue-adhoc-task.js's own id convention, also used by the Brain Dump tab's
+    'Process Now' button injection) -- domain alone isn't reliable since a caller can
+    omit --domain (queue-adhoc-task.js then falls back to the first key in
+    task-domains.json, not necessarily 'adhoc').
+
+    done/ is SKIPPED by default (?includeDone=1 opts in) -- confirmed live 2026-08-22
+    this endpoint was timing out (reported "timed out after 8s" from the dashboard
+    itself) once queue/done/ grew to ~3900 files: reading+parsing every one of them on
+    every single poll of this tab, on Flask's single-threaded dev server, starved
+    concurrent requests (nav badge polling, other tabs, the phone app) regardless of
+    how fast any one request actually was in isolation. done/ tasks aren't what this
+    view exists to track anyway -- the whole point is active (in-progress) and stuck
+    (blocked) work, both already excluded from that giant folder."""
+    from app import QUEUE_STATES, _adhoc_task_excerpt, queue_dir, read_json_safe
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"tasks": []})
+    include_done = request.args.get("includeDone") == "1"
+
+    def is_adhoc(data, task_id):
+        return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
+
+    # dependsOn visibility (2026-08-22, Grimmethy: "systematic way to prioritize what
+    # order adhoc tasks get completed in") -- mirrors task-sources.js's own
+    # isDependencySatisfied() exactly (satisfied only once mergedAt is stamped on the
+    # dependency's queue/done/ record, not just done -- see that function's comment for
+    # why reaching done/ alone isn't enough), so a human looking at this list sees the
+    # SAME "is this actually unblocked" answer the claim logic itself uses.
+    def dependency_status(depends_on):
+        if not depends_on:
+            return None
+        out = []
+        for dep_id in depends_on:
+            satisfied = False
+            for candidate in (qdir / "done" / f"{dep_id}.json", qdir / "done" / "_archived_no_action" / f"{dep_id}.json"):
+                dep_data = read_json_safe(candidate)
+                if dep_data and dep_data.get("mergedAt"):
+                    satisfied = True
+                    break
+            out.append({"id": dep_id, "satisfied": satisfied})
+        return out
+
+    def task_row(data, task_id, state):
+        return {
+            "id": task_id,
+            "title": data.get("title") or task_id,
+            "state": state,
+            "createdAt": data.get("createdAt"),
+            "excerpt": _adhoc_task_excerpt(data),
+            "dependsOn": dependency_status(data.get("dependsOn")),
+        }
+
+    tasks = []
+
+    adhoc_dir = qdir / "adhoc"
+    if adhoc_dir.is_dir():
+        for f in adhoc_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if data and is_adhoc(data, f.stem):
+                tasks.append(task_row(data, data.get("id", f.stem), "adhoc"))
+
+    drafting_root = qdir / "drafting"
+    if drafting_root.is_dir():
+        for f in drafting_root.rglob("*.json"):
+            data = read_json_safe(f)
+            if not data:
+                continue
+            task_id = data.get("id", f.stem)
+            if not is_adhoc(data, task_id):
+                continue
+            tasks.append(task_row(data, task_id, f"drafting:{f.parent.name}"))
+
+    for state in QUEUE_STATES:
+        if state == "done" and not include_done:
+            continue
+        state_dir = qdir / state
+        if not state_dir.is_dir():
+            continue
+        for f in state_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if not data:
+                continue
+            task_id = data.get("id", f.stem)
+            if not is_adhoc(data, task_id):
+                continue
+            tasks.append(task_row(data, task_id, state))
+
+    tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
+    return jsonify({"tasks": tasks})
+```
+
+Problem:
+`api_adhoc_tasks` interweaves three responsibilities—filtering (`is_adhoc` + `dependency_status`), traversal (three near-identical loops over `adhoc/`, `drafting/`, and each `QUEUE_STATES` entry), and serialization (`task_row` + sort)—into a single ~60-line body. The traversal section repeats the same glob → `read_json_safe` → `is_adhoc` guard → `task_row` append pattern three times, differing only in the directory, the `glob` vs `rglob` call, and the state label string. Any change to the adhoc predicate or the row shape must be made in three places, and the I/O cost of `dependency_status` (a `read_json_safe` call per dependency) is buried inside the boilerplate, making it easy to miss during review.
+
+Solution:
+Extract a single `_collect_adhoc_rows(dir_path, state_label, recursive)` helper that encapsulates the glob/read/filter/row pattern, and reduce the route body to three one-line calls plus the sort. The helper takes a `label_func` callable so the `drafting` case can still emit `f"drafting:{parent.name}"` while `QUEUE_STATES` entries use the bare state name.
+
+```python
+def _collect_adhoc_rows(
+    dir_path: Path,
+    state_label: str,
+    recursive: bool = False,
+    label_func: Callable[[Path], str] | None = None,
+) -> list[dict]:
+    """Yield adhoc task rows from one state directory."""
+    if not dir_path.is_dir():
+        return []
+    glob_fn = dir_path.rglob if recursive else dir_path.glob
+    rows = []
+    for f in glob_fn("*.json"):
+        data = read_json_safe(f)
+        if not data:
+            continue
+        task_id = data.get("id", f.stem)
+        if not _is_adhoc(data, task_id):
+            continue
+        label = label_func(f) if label_func else state_label
+        rows.append(_task_row(data, task_id, label))
+    return rows
+
+
+@shared_misc_bp.route("/api/adhoc-tasks")
+def api_adhoc_tasks():
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"tasks": []})
+    include_done = request.args.get("includeDone") == "1"
+
+    tasks: list[dict] = []
+    tasks.extend(_collect_adhoc_rows(qdir / "adhoc", "adhoc", recursive=False))
+    tasks.extend(
+        _collect_adhoc_rows(
+            qdir / "drafting",
+            "drafting",
+            recursive=True,
+            label_func=lambda f: f"drafting:{f.parent.name}",
+        )
+    )
+    for state in QUEUE_STATES:
+        if state == "done" and not include_done:
+            continue
+        tasks.extend(_collect_adhoc_rows(qdir / state, state, recursive=False))
+
+    tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
+    return jsonify({"tasks": tasks})
+```
+
+Benefits:
+The route body drops from ~60 lines to ~15, making the control flow (which directories are scanned, in what order, with what filter) scannable at a glance. The single `_collect_adhoc_rows` helper is trivially unit-testable in isolation—feed it a temp directory tree and assert the returned rows—without spinning up the Flask app. Future changes to the adhoc predicate, the row shape, or the glob pattern are made in exactly one place, eliminating the three-site duplication hazard. Reviewers can verify correctness of the traversal logic once rather than diffing three near-identical blocks.
+
