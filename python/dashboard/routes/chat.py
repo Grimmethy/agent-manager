@@ -109,7 +109,7 @@ def api_chat_message(session_id):
     NOT covered by this -- a known, real, narrower gap (git's own index.lock still turns
     a genuine collision into a clean failure to retry, not silent corruption) rather than
     a solved one; revisit if it causes a real incident."""
-    from app import CHAT_STORAGE_DIR, _chat_preempt_enabled, _chat_reservations, _chat_reservations_lock, _preempt_pipeline_for_chat, instances_dir
+    from app import CHAT_STORAGE_DIR, _chat_preempt_enabled, _chat_preempt_gate_state, _chat_reservations, _chat_reservations_lock, _preempt_pipeline_for_chat, instances_dir, log_preempt_gate_off
     body = request.get_json(silent=True) or {}
     message = (body.get("message") or "").strip()
     if not message:
@@ -140,11 +140,22 @@ def api_chat_message(session_id):
     # (chat precludes workers), the reviewer's only if < ~3 min in. Synchronous, before the
     # SSE generator / node child runs. Claude-provider turns don't touch the local model.
     preempted = []
-    if is_local_turn and _chat_preempt_enabled():
-        try:
-            preempted = _preempt_pipeline_for_chat()
-        except Exception as e:  # noqa: BLE001 -- never block a chat turn on this
-            print(f"[chat-preempt] failed (non-fatal): {e}", file=sys.stderr, flush=True)
+    if is_local_turn:
+        # HUB0033 2/4 -- gate state, resolved here (chat_preempt.py's
+        # _chat_preempt_gate_state): env AGENT_MANAGER_CHAT_PREEMPT -> env file ->
+        # default "true"; False only on 0/false/no/off. PRODUCTION STATE on the
+        # worker-1/chat host instance: default ON ("true") -- no disabling value
+        # found anywhere in the repo (the env file is host-local; verify on the live
+        # host). CONFIRMED SILENT BYPASS: with the gate OFF a local-provider (Ollama)
+        # turn proceeds below straight to stream_message() with NO preempt -- now
+        # logged via log_preempt_gate_off so it is no longer silent.
+        if _chat_preempt_enabled():
+            try:
+                preempted = _preempt_pipeline_for_chat()
+            except Exception as e:  # noqa: BLE001 -- never block a chat turn on this
+                print(f"[chat-preempt] failed (non-fatal): {e}", file=sys.stderr, flush=True)
+        else:
+            log_preempt_gate_off(_chat_preempt_gate_state())
 
     def generate():
         # Priority marker held for the WHOLE turn (model call + every tool-loop iteration in
