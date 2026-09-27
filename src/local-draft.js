@@ -61,7 +61,7 @@ const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { parseClarificationOptions } = require('./agentic-draft-common.js');
 const { resolveGroundingRef, readFileAtRef, resolveAtRef } = require('./stacked-grounding.js');
-const { checkDraft } = require('./fact-checker.js');
+const { checkDraft, checkCitationsAgainstHarnessFiles } = require('./fact-checker.js');
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
@@ -1443,6 +1443,28 @@ async function runDraftPasses(task, attempt, {
         };
       }
     }
+
+    // Hard citation gate (2026-09-16): BEFORE critique/revision scores the implement
+    // pass, reject a draft that cites any file path or line number the harness-search
+    // pre-filter never actually listed in task.promptContext.harnessFiles -- the
+    // contrast-confirmed failure mode (citing files/lines the model was never shown)
+    // collapses to a single cheap rejection instead of burning 3 retry cycles.
+    // Keyed on the in-memory checklist, not a disk re-grep; a source with no
+    // harnessFiles (harness-search skipped) passes through untouched.
+    if (typeof task.implementResponse === 'string' && task.implementResponse.length > 0) {
+      const gate = checkCitationsAgainstHarnessFiles(task.implementResponse, (task.promptContext && task.promptContext.harnessFiles) || []);
+      if (!gate.valid) {
+        const desc = gate.failures.map((f) => f.path + (f.line != null ? ':' + f.line : '') + ' (' + f.reason + ')').join('; ');
+        appendHistoryEvent(task, 'blocked', 'harness-citation gate: ' + desc);
+        return {
+          succeeded: true,
+          blocked: true,
+          blockedReason: desc,
+          blockedStage: 'pre-critique',
+        };
+      }
+    }
+    // TODO: strip mode -- remove bad citations and continue instead of rejecting.
 
     await runCritiqueAndRevision(task, {
       maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,

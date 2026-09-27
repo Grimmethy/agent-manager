@@ -607,7 +607,14 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
 // exact string appears in the grounding sourceText (mirrors the literal-substring-match
 // convention checkGroundedValues uses above). Lines carrying at least one unconfirmed
 // citation are the "offending lines" the hard guard strips.
-const FILE_LINE_CITATION_RE = /[A-Za-z0-9_\-./]+\.[A-Za-z0-9]{1,10}:[0-9]+/g;
+// (?<![A-Za-z0-9_.\-/:]) rejects a match preceded by any path-like character or a
+// "/" or ":" -- i.e. it must not be the tail of a longer token. This is what keeps a
+// URL like "https://example.com:8080/docs" from silently matching on its
+// "om:8080" tail (confirmed live: that false hit would otherwise trip the
+// pre-flight citation gate on a perfectly legitimate citation of a real file in the
+// same sentence). Also restricts the extension to real file extensions so generic
+// words ("com", "net", "org") can never read as "a path".
+const FILE_LINE_CITATION_RE = /(?<![A-Za-z0-9_.\-/:])[A-Za-z0-9_\-./]+\.(?:js|jsx|ts|tsx|mjs|cjs|py|json|md|csv|sh|yml|yaml|html|css|toml|txt|lock|cfg|ini|env|xml|sql)\b:[0-9]+/g;
 
 function checkFileLineCitations(draftText, sourceText) {
   if (!sourceText) return { unconfirmedCitations: [] }; // no grounding material -> nothing to strip
@@ -668,6 +675,93 @@ function preValidateCitedPaths(draftText, repoRoot, extraRoots = []) {
     if (seenPaths.has(claimedPath) || createModeTargets.has(claimedPath)) continue;
     const { resolvedPath } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
     if (!resolvedPath) failures.push(`fabricated path: ${claimedPath}`);
+  }
+
+  return { valid: failures.length === 0, failures };
+}
+
+// Hard pre-flight citation gate (2026-09-16): validates every file path a draft
+// cites -- both "path.ext:NN" line citations and bare path tokens, same two shapes
+// preValidateCitedPaths above distinguishes -- against the harnessFiles checklist
+// (task.promptContext.harnessFiles): the exact {path, content, root?} file list the
+// harness-search pre-filter actually handed the implement prompt (runHarnessSearch,
+// src/lib/harness-search.js). A citation of a file the pre-filter never listed is
+// by definition ungrounded -- the model never saw that file -- REGARDLESS of whether
+// the file happens to exist on disk, which is the deliberate difference from both
+// existing gates: missingFileCheck (draft-file-guard.js) asks "does this exist on
+// disk?" (and only for candidateFulfillment sources), preValidateCitedPaths asks the
+// same disk question at REVIEW time (and only for project_search/arch_import). This
+// gate asks the question the contrast task's only repeated, contrast-confirmed
+// failure actually is: "did the model see this file at all?" -- keyed on the
+// in-memory checklist instead of a re-grep of the repo, so it fires for every source
+// whose prompt carried a file list, cheaply, before the implement pass is scored.
+//
+// For "path:NN" citations on a checklist file, the line number is additionally
+// checked against the LINE COUNT OF THE CONTENT THE MODEL WAS GIVEN (entry.content
+// is the budget-windowed slice handed the prompt -- a citation past that window is
+// ungrounded exactly like a file it never listed, since the model only "saw" the
+// window).
+//
+// Shape: (draftText, harnessFiles) -> { valid: boolean,
+//   failures: Array<{path, line?, reason}> } where reason is one of
+//   'not_in_harness_files' | 'line_out_of_range'. Create-mode targets are excluded
+//   via extractCreateModeTargets (a not-yet-real proposed file is the normal,
+//   correct shape of a create claim, same exemption preValidateCitedPaths applies).
+// An empty/missing checklist returns {valid:true, failures:[]} -- no checklist means
+// nothing to gate against (harness-search was skipped, or the source carries no
+// file list), NOT a rejection.
+function checkCitationsAgainstHarnessFiles(draftText, harnessFiles) {
+  if (typeof draftText !== 'string' || draftText.length === 0) return { valid: true, failures: [] };
+  if (!Array.isArray(harnessFiles) || harnessFiles.length === 0) return { valid: true, failures: [] };
+
+  const failures = [];
+  const createModeTargets = extractCreateModeTargets(draftText);
+  const byPath = new Map();
+  for (const f of harnessFiles) {
+    if (f && typeof f.path === 'string' && !byPath.has(f.path)) byPath.set(f.path, f);
+  }
+
+  // Basename fallback (only when the basename is UNIQUE in the checklist): the
+  // model may cite `app.py` for a checklist entry whose path is
+  // `python/dashboard/app.py` -- same imprecise-citation shape resolveAgainstRepo
+  // already tolerates via findByBasename. Ambiguous basenames must not match.
+  const basenames = new Map();
+  for (const p of byPath.keys()) {
+    const base = p.split('/').pop();
+    const list = basenames.get(base) || [];
+    list.push(p);
+    basenames.set(base, list);
+  }
+  function resolveChecklistPath(claimedPath) {
+    if (byPath.has(claimedPath)) return byPath.get(claimedPath);
+    const base = claimedPath.split('/').pop();
+    const cands = basenames.get(base) || [];
+    if (cands.length === 1) return byPath.get(cands[0]);
+    return undefined;
+  }
+
+  const lineCitations = [...new Set((draftText.match(FILE_LINE_CITATION_RE) || []).filter((t) => !t.includes('://')))];
+  const seenPaths = new Set();
+  for (const token of lineCitations) {
+    const lastColon = token.lastIndexOf(':');
+    const claimedPath = token.slice(0, lastColon);
+    const claimedLine = parseInt(token.slice(lastColon + 1), 10);
+    seenPaths.add(claimedPath);
+    if (createModeTargets.has(claimedPath)) continue;
+    const entry = resolveChecklistPath(claimedPath);
+    if (!entry) {
+      failures.push({ path: claimedPath, line: claimedLine, reason: 'not_in_harness_files' });
+      continue;
+    }
+    const lineCount = String(entry.content == null ? '' : entry.content).split('\n').length;
+    if (!Number.isInteger(claimedLine) || claimedLine < 1 || claimedLine > lineCount) {
+      failures.push({ path: claimedPath, line: claimedLine, lineCount, reason: 'line_out_of_range' });
+    }
+  }
+
+  for (const claimedPath of extractFilePaths(draftText)) {
+    if (seenPaths.has(claimedPath) || createModeTargets.has(claimedPath)) continue;
+    if (!resolveChecklistPath(claimedPath)) failures.push({ path: claimedPath, reason: 'not_in_harness_files' });
   }
 
   return { valid: failures.length === 0, failures };
@@ -857,6 +951,7 @@ module.exports = {
   checkGroundedValues,
   checkFileLineCitations,
   preValidateCitedPaths,
+  checkCitationsAgainstHarnessFiles,
   checkCommitClaims,
   checkRevertsAPriorFix,
   checkCompletionClaimsInNote,
