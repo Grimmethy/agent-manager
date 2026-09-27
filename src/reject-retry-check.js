@@ -33,6 +33,27 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { classifyBlockedTask, findClassifier, hasInvalidPremise } = require('./blocked-task-classifiers.js');
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
+const { acquire, release, taskMoveLockKey } = require('./single-flight-lock.js');
+const { sharedInstancesDir } = require('./instances-dir.js');
+
+// Task-move lock (2026-09-27): every requeue/escalation below used to be a plain,
+// unguarded write-then-unlink -- no atomic rename, no check for whether a file for this
+// task id already exists elsewhere in queue/. Confirmed live: this sweep independently
+// reprocessing an earlier snapshot of a task id while it was ALSO being moved by hand
+// forked into three files across three queue directories, no error anywhere. Wraps the
+// write+unlink pair in the same real flock(2) mutex single-flight-lock.js already
+// provides for GPU/model-call exclusion, keyed by task id instead of model name.
+// skipPriorityBackoff is always true here -- a queue-directory move touches no GPU and
+// must never wait on unrelated Discuss/chat activity.
+function writeTaskAndUnlinkOld(instancesDir, task, destPath, srcPath) {
+  const handle = acquire(instancesDir, taskMoveLockKey(task.id), { skipPriorityBackoff: true });
+  try {
+    fs.writeFileSync(destPath, JSON.stringify(task, null, 2));
+    if (path.resolve(srcPath) !== path.resolve(destPath)) fs.unlinkSync(srcPath);
+  } finally {
+    release(handle);
+  }
+}
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { isCandidateFulfillmentSource, isAdvisoryProseSource } = require('./lib/harness-search.js');
 // 2026-09-16: registers this package's built-in sources (side effect of the require) --
@@ -461,6 +482,10 @@ function buildExhaustedReviewVerdictQuestion(task) {
 
 function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
+  // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
+  // only matters for tests that don't bother passing pipelineDir explicitly (it was never
+  // load-bearing before the move-lock existed); a real caller always passes it directly.
+  const instancesDir = sharedInstancesDir(pipelineDir || path.dirname(path.dirname(blockedDir)));
   // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
   // Derive it from needsClarificationDir (<pipelineDir>/queue/needs-clarification) when a
   // caller (older tests) didn't pass it explicitly.
@@ -575,8 +600,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         if (approvedDirResolved) {
           try {
             fs.mkdirSync(approvedDirResolved, { recursive: true });
-            fs.writeFileSync(path.join(approvedDirResolved, name), JSON.stringify(task, null, 2));
-            fs.unlinkSync(filePath);
+            writeTaskAndUnlinkOld(instancesDir, task, path.join(approvedDirResolved, name), filePath);
           } catch (e) {
             console.warn(`[reject-retry-check] deterministic-review-recovery move to approved/ failed for ${task.id || name}:`, e.message);
             summary.errors += 1;
@@ -601,8 +625,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
         fs.mkdirSync(destDir, { recursive: true });
         const newPath = path.join(destDir, name);
-        fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
-        if (path.resolve(filePath) !== path.resolve(newPath)) fs.unlinkSync(filePath);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
         summary.requeued++;
         continue;
       }
@@ -625,8 +648,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
         fs.mkdirSync(destDir, { recursive: true });
         const newPath = path.join(destDir, name);
-        fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
-        if (path.resolve(filePath) !== path.resolve(newPath)) fs.unlinkSync(filePath);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
         summary.requeued++;
         continue;
       }
@@ -648,8 +670,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           appendHistoryEvent(task, 'needs-clarification', 'escalated immediately -- structurally-oversized draft-call failure, a blind retry cannot differ');
           if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'reject-retry-check:structurally-oversized-draft-failure', pipelineDir: ghostRoot });
           fs.mkdirSync(needsClarificationDir, { recursive: true });
-          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
-          fs.unlinkSync(filePath);
+          writeTaskAndUnlinkOld(instancesDir, task, path.join(needsClarificationDir, name), filePath);
           summary.exhausted++;
           continue;
         }
@@ -676,8 +697,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
             // futile and no re-admission signature matched. Record the debt.
             if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason || openQuestions, site: 'reject-retry-check:non-retryable-classification', pipelineDir: ghostRoot });
             fs.mkdirSync(needsClarificationDir, { recursive: true });
-            fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
-            fs.unlinkSync(filePath);
+            writeTaskAndUnlinkOld(instancesDir, task, path.join(needsClarificationDir, name), filePath);
             summary.exhausted++;
             continue;
           }
@@ -764,8 +784,7 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
           // Blind redrafts were spent and nothing re-admitted this class -- ghost debt.
           if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'reject-retry-check:retry-cap-exhausted', pipelineDir: ghostRoot });
           fs.mkdirSync(needsClarificationDir, { recursive: true });
-          fs.writeFileSync(path.join(needsClarificationDir, name), JSON.stringify(task, null, 2));
-          fs.unlinkSync(filePath);
+          writeTaskAndUnlinkOld(instancesDir, task, path.join(needsClarificationDir, name), filePath);
           summary.exhausted++;
           continue;
         }
@@ -1011,11 +1030,10 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
       const newPath = path.join(destDir, name);
       fs.mkdirSync(destDir, { recursive: true });
-      fs.writeFileSync(newPath, JSON.stringify(task, null, 2));
       // A task picked up from queue/adhoc/ requeues back to queue/adhoc/ -- same path.
-      // Only unlink when the source and destination genuinely differ, or we'd delete the
-      // file we just wrote.
-      if (path.resolve(filePath) !== path.resolve(newPath)) fs.unlinkSync(filePath);
+      // writeTaskAndUnlinkOld only unlinks when the source and destination genuinely
+      // differ, or we'd delete the file we just wrote.
+      writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
       summary.requeued++;
     } catch (e) {
       console.warn('[reject-retry-check] requeue failed for', filePath, e.message, e.code);
