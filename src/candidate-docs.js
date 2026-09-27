@@ -146,13 +146,55 @@ function normalizeCandidateFiles(filesLine) {
   }
 }
 
-function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null }) {
-  const candidates = parseArchDiscoveryCandidates(implementResponse);
+// Every doc view a duplicate could already live in: this working tree, the default branch, and each
+// unmerged agent/* branch (candidates awaiting a human merge are invisible to the working tree).
+// Fail-open: any error yields just what was read so far.
+function dedupeDocViews(candidatesPath, workingTreeText) {
+  const views = [{ ref: 'working-tree', text: workingTreeText }];
+  try {
+    const refs = require('./lib/candidate-doc-refs.js').readCandidateDocRefs(candidatesPath);
+    if (refs.main) views.push({ ref: 'master', text: refs.main });
+    for (const b of refs.branches) views.push({ ref: b.ref, text: b.text });
+  } catch { /* git cannot answer -- working tree only */ }
+  return views;
+}
+
+// `dedupe` (opt-in, default off): drop a candidate whose file + function (lib/candidate-dedupe.js) is already in
+// the doc on any view above, or earlier in this same call. Left off for candidate splits (sibling
+// candidates legitimately share Files:) and hand-authored docs. Kill switch: AGENT_MANAGER_CANDIDATE_DEDUPE=false.
+// All candidates dropped -> nothing is written and { skipped, duplicateOf, reason } comes back; the reason contains
+// "skipped" so task-disposition.js's NOOP_RE closes the task as a noop.
+function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null, dedupe = false }) {
+  let candidates = parseArchDiscoveryCandidates(implementResponse);
   if (candidates.length === 0) {
     return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
   }
 
   let text = fs.existsSync(candidatesPath) ? fs.readFileSync(candidatesPath, 'utf8') : `${docTitle}\n`;
+
+  let duplicatesSkipped = [];
+  if (dedupe && process.env.AGENT_MANAGER_CANDIDATE_DEDUPE !== 'false') {
+    try {
+      const { findDuplicateCandidate, candidateKey } = require('./lib/candidate-dedupe.js');
+      const views = dedupeDocViews(candidatesPath, text);
+      const seenKeys = new Set();
+      candidates = candidates.filter((c) => {
+        const key = candidateKey(c);
+        const dup = findDuplicateCandidate(c, views) || (key && seenKeys.has(key) ? { duplicateOf: 'an earlier candidate in this batch', ref: 'this batch' } : null);
+        if (dup) { duplicatesSkipped.push(dup); return false; }
+        if (key) seenKeys.add(key);
+        return true;
+      });
+    } catch { duplicatesSkipped = []; /* fail-open: append as before */ }
+    if (candidates.length === 0 && duplicatesSkipped.length > 0) {
+      const first = duplicatesSkipped[0];
+      return {
+        skipped: true,
+        duplicateOf: first.duplicateOf,
+        reason: `skipped: candidate already exists as ${first.duplicateOf} (${first.ref}) -- not appended again`,
+      };
+    }
+  }
 
   // The working-tree copy is only ONE branch's view of the doc. Ids already used on the default branch or
   // on any unmerged agent/* branch must be skipped too, or two branches each allocate "the next free id"
@@ -191,7 +233,7 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
   writeAtomicSync(candidatesPath, text);
 
-  return { file: candidatesPath, candidateCount: candidates.length, candidateIds };
+  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}) };
 }
 
 module.exports = {

@@ -186,3 +186,91 @@ test('applyArchDiscoveryCandidates normalizes a bare / extension-less Files: ent
     fs.rmSync(repo, { recursive: true, force: true });
   }
 });
+
+// --- dedupe option (2026-09-26: AC-187 re-appended AC-51) ---------------------------------------------------
+const { execFileSync } = require('child_process');
+const dedupeGit = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const dedupeResp = (id, title, files) => `### AC-${id} \u00b7 ${title}\nStrength: Strong\nFiles: ${files}\n\nProblem:\np\n\nSolution:\ns\n\nBenefits:\nb\n`;
+
+function dedupeRepo(mainDocBody) {
+  const T = fs.mkdtempSync(path.join(os.tmpdir(), 'cdd-'));
+  const origin = path.join(T, 'origin.git');
+  const work = path.join(T, 'work');
+  dedupeGit(['init', '--bare', '-q', '-b', 'main', origin], T);
+  dedupeGit(['clone', '-q', origin, work], T);
+  for (const [k, v] of [['user.email', 't@t'], ['user.name', 't']]) dedupeGit(['config', k, v], work);
+  fs.mkdirSync(path.join(work, 'Docs'));
+  const docPath = path.join(work, 'Docs', 'C.md');
+  fs.writeFileSync(docPath, '# Candidates\n\n' + mainDocBody);
+  dedupeGit(['add', '.'], work);
+  dedupeGit(['commit', '-qm', 'main'], work);
+  dedupeGit(['push', '-q', 'origin', 'main'], work);
+  dedupeGit(['remote', 'set-head', 'origin', 'main'], work);
+  return { T, work, docPath };
+}
+
+test('dedupe on: a candidate already on the default branch is skipped, nothing written, duplicateOf reported', () => {
+  const { T, docPath } = dedupeRepo(dedupeResp(51, 'Decompose `api_task_requeue`', 'python/dashboard/routes/task.py'));
+  const before = fs.readFileSync(docPath, 'utf8');
+  const res = applyArchDiscoveryCandidates({ implementResponse: dedupeResp(1, 'Decompose `api_task_requeue` into four helpers', 'python/dashboard/routes/task.py'), candidatesPath: docPath, dedupe: true });
+  assert.equal(res.skipped, true);
+  assert.equal(res.duplicateOf, 'AC-51');
+  assert.match(res.reason, /skipped/i, 'must match task-disposition NOOP_RE so the task closes as noop');
+  assert.equal(fs.readFileSync(docPath, 'utf8'), before);
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
+test('dedupe on: a duplicate that exists only on an unmerged agent/* branch is skipped', () => {
+  const { T, work, docPath } = dedupeRepo(dedupeResp(1, 'Decompose `foo`', 'src/a.js'));
+  dedupeGit(['checkout', '-q', '-b', 'agent/triage-queue', 'main'], work);
+  fs.appendFileSync(docPath, '\n' + dedupeResp(2, 'Decompose `bar`', 'src/b.js'));
+  dedupeGit(['commit', '-qam', 'branch'], work);
+  dedupeGit(['push', '-q', 'origin', 'agent/triage-queue'], work);
+  dedupeGit(['checkout', '-q', 'main'], work);
+  const res = applyArchDiscoveryCandidates({ implementResponse: dedupeResp(1, 'Decompose `bar` again', 'src/b.js'), candidatesPath: docPath, dedupe: true });
+  assert.equal(res.skipped, true);
+  assert.equal(res.duplicateOf, 'AC-2');
+  assert.match(res.reason, /agent\/triage-queue/);
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
+test('dedupe on: a genuinely new function is appended as before, and a duplicate within one batch is dropped', () => {
+  const { T, docPath } = dedupeRepo(dedupeResp(1, 'Decompose `foo`', 'src/a.js'));
+  const res = applyArchDiscoveryCandidates({
+    implementResponse: dedupeResp(1, 'Decompose `baz`', 'src/c.js') + '\n' + dedupeResp(2, 'Decompose `baz` twice', 'src/c.js'),
+    candidatesPath: docPath, dedupe: true,
+  });
+  assert.equal(res.candidateCount, 1);
+  assert.equal(res.duplicatesSkipped, 1);
+  assert.match(fs.readFileSync(docPath, 'utf8'), /Decompose `baz`/);
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
+test('dedupe off (default) appends a same-function candidate exactly as before -- split siblings are never dropped', () => {
+  const { T, docPath } = dedupeRepo(dedupeResp(1, 'Extract `foo` part one', 'src/a.js'));
+  const res = applyArchDiscoveryCandidates({ implementResponse: dedupeResp(1, 'Extract `foo` part one', 'src/a.js'), candidatesPath: docPath });
+  assert.equal(res.candidateCount, 1);
+  assert.equal(res.skipped, undefined);
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
+test('dedupe kill switch AGENT_MANAGER_CANDIDATE_DEDUPE=false restores plain appends', () => {
+  const { T, docPath } = dedupeRepo(dedupeResp(1, 'Decompose `foo`', 'src/a.js'));
+  process.env.AGENT_MANAGER_CANDIDATE_DEDUPE = 'false';
+  try {
+    const res = applyArchDiscoveryCandidates({ implementResponse: dedupeResp(1, 'Decompose `foo`', 'src/a.js'), candidatesPath: docPath, dedupe: true });
+    assert.equal(res.candidateCount, 1);
+  } finally { delete process.env.AGENT_MANAGER_CANDIDATE_DEDUPE; }
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
+test('dedupe on outside a git repo fails open to the working-tree text', () => {
+  const T = fs.mkdtempSync(path.join(os.tmpdir(), 'cdd-nogit-'));
+  const docPath = path.join(T, 'C.md');
+  fs.writeFileSync(docPath, '# C\n\n' + dedupeResp(1, 'Decompose `foo`', 'src/a.js'));
+  const dup = applyArchDiscoveryCandidates({ implementResponse: dedupeResp(1, 'Decompose `foo` again', 'src/a.js'), candidatesPath: docPath, dedupe: true });
+  assert.equal(dup.skipped, true);
+  const fresh = applyArchDiscoveryCandidates({ implementResponse: dedupeResp(1, 'Decompose `qux`', 'src/q.js'), candidatesPath: docPath, dedupe: true });
+  assert.equal(fresh.candidateCount, 1);
+  fs.rmSync(T, { recursive: true, force: true });
+});
