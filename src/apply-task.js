@@ -14,6 +14,7 @@
 const fs = require('fs');
 const { getHubApplyRouting } = require('./hub-apply-routing.js');
 const { getApplyBranchPrep } = require('./apply-branch-prep-route.js');
+const { getWikiContentApply } = require('./wiki-content-apply-route.js');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
@@ -253,6 +254,23 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       if (result.skipped) return { succeeded: true, doneMarker: result.reason };
       closeOriginatingBrainDumpEntry(task, brainDumpPath, `Researched and filed to ${result.file} -- Task: ${task.id}`);
       return { succeeded: true, doneMarker: `research write-up filed to ${result.file}` };
+    }
+
+    // wiki_content's target is a separate WikiForge content-space repo entirely
+    // (propertyforager-wiki, or any other space) -- never repoRoot, same non-git shape as
+    // research/project_search/deep_dive above. Unlike those, the actual write logic is
+    // plugin-owned (which repo, which page format), so this only calls the registered seam
+    // (wiki-content-apply-route.js) -- it never parses or writes anything itself. Throws a
+    // clear error if the wikiforge content-pipeline plugin hasn't registered one, same
+    // "blocked for a human, naming the real fix" discipline as candidate-split-hub-route.js.
+    if (task.domain === 'wiki_content') {
+      const applyWikiContent = getWikiContentApply();
+      if (!applyWikiContent) {
+        throw new Error(`task ${task.id}: domain 'wiki_content' has no apply function registered -- load/register the wikiforge content-pipeline plugin (AGENT_MANAGER_REGISTER_PATH)`);
+      }
+      const result = applyWikiContent({ task });
+      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      return { succeeded: true, doneMarker: `wiki content filed -> ${result.file}` };
     }
 
     // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
