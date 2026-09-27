@@ -813,6 +813,13 @@ function nextProjectSearchTask() {
 // num_predict=1400's response reservation within the 8192 budget.
 const DEEP_DIVE_CONTEXT_BUDGET_CHARS = 24000;
 
+// HUB0019: hard cap on how many files ONE deep_dive task may embed. The char budget above
+// bounds total size, but a single community can still pack in dozens of small files, which
+// dilutes the model's attention (and its item output) across too many of them. Files beyond
+// the cap ride in on successive ticks as sibling tasks (highest-degree first) -- see the
+// slice logic in nextDeepDiveTask below.
+const DEEP_DIVE_MAX_FILES_PER_TASK = 12;
+
 // Cross-references INDEX.md's table rows against its '## Notes' '### Name' subsections --
 // only a Strong-rated finding gets a subsection there (see apply-group-a.js's
 // applyProjectSearchFindings), so a table row with a matching heading is Strong; one
@@ -951,10 +958,11 @@ function nextDeepDiveTask() {
       console.error(`deep_dive: failed to onboard "${lead.name}": ${e.message}`);
     }
   }
-  if (coverageChanged) {
+  const saveCoverage = () => {
     fs.mkdirSync(path.dirname(deepDiveCoveragePath), { recursive: true });
     fs.writeFileSync(deepDiveCoveragePath, JSON.stringify(coverage, null, 2));
-  }
+  };
+  if (coverageChanged) saveCoverage();
 
   // Flatten every tracked project's communities and pick the oldest/null lastReviewedAt
   // first -- same rule nextArchDiscoveryTask() uses, just flattened across multiple
@@ -986,55 +994,93 @@ function nextDeepDiveTask() {
     return at - bt;
   });
 
-  const chosen = candidates.find((c) => !taskIdExistsInQueue(`deep-dive-${c.slug}-${c.community.id}`));
-  if (!chosen) return null; // every known community already has an in-flight or terminal task
-
-  const { slug, proj, community } = chosen;
-  const graphPath = path.join(proj.clonePath, '.deep-dive-graph.json');
-  const graphData = JSON.parse(readIfExists(graphPath) || '{"nodes":[],"links":[]}');
-  const memberNodes = (graphData.nodes || []).filter((n) => n.community === community.id);
-  if (memberNodes.length === 0) return null;
-
-  // Same degree-by-file, budget-capped file selection as nextArchDiscoveryTask() -- see
-  // ARCH_DISCOVERY_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
+  // Collect the degree-sorted, budget-capped file list for one community (null when the
+  // community has no nodes at all in the graph -- same skip rule as the old inline code).
+  // Same degree-by-file, budget-capped selection as nextArchDiscoveryTask() -- see
+  // DEEP_DIVE_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
   // the identical convention rather than inventing a second one.
-  const degreeByNodeId = {};
-  for (const link of graphData.links || []) {
-    degreeByNodeId[link.source] = (degreeByNodeId[link.source] || 0) + 1;
-    degreeByNodeId[link.target] = (degreeByNodeId[link.target] || 0) + 1;
-  }
-  const degreeByFile = {};
-  for (const node of memberNodes) {
-    if (!node.source_file) continue;
-    degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (degreeByNodeId[node.id] || 0);
-  }
-  const rankedFiles = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+  const collectFiles = (proj, community) => {
+    const graphPath = path.join(proj.clonePath, '.deep-dive-graph.json');
+    const graphData = JSON.parse(readIfExists(graphPath) || '{"nodes":[],"links":[]}');
+    const memberNodes = (graphData.nodes || []).filter((n) => n.community === community.id);
+    if (memberNodes.length === 0) return null;
 
-  const files = [];
-  let budgetUsed = 0;
-  for (const [sourceFile, degree] of rankedFiles) {
-    const content = readIfExists(path.join(proj.clonePath, sourceFile));
-    if (content == null) continue;
-    if (budgetUsed + content.length > DEEP_DIVE_CONTEXT_BUDGET_CHARS) break;
-    files.push({ path: sourceFile, degree, content });
-    budgetUsed += content.length;
-  }
+    const degreeByNodeId = {};
+    for (const link of graphData.links || []) {
+      degreeByNodeId[link.source] = (degreeByNodeId[link.source] || 0) + 1;
+      degreeByNodeId[link.target] = (degreeByNodeId[link.target] || 0) + 1;
+    }
+    const degreeByFile = {};
+    for (const node of memberNodes) {
+      if (!node.source_file) continue;
+      degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (degreeByNodeId[node.id] || 0);
+    }
+    const rankedFiles = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
 
-  const lead = strongLeads.find((l) => slugifyForId(l.name) === slug);
-
-  return {
-    id: `deep-dive-${slug}-${community.id}`,
-    domain: 'deep_dive',
-    source: 'deep_dive',
-    title: `Deep dive: ${lead ? lead.name : slug} — ${community.name}`,
-    promptContext: {
-      projectSlug: slug,
-      projectName: lead ? lead.name : slug,
-      communityId: community.id,
-      communityName: community.name,
-      files,
-    },
+    const files = [];
+    let budgetUsed = 0;
+    for (const [sourceFile, degree] of rankedFiles) {
+      const content = readIfExists(path.join(proj.clonePath, sourceFile));
+      if (content == null) continue;
+      if (budgetUsed + content.length > DEEP_DIVE_CONTEXT_BUDGET_CHARS) break;
+      files.push({ path: sourceFile, degree, content });
+      budgetUsed += content.length;
+    }
+    return files;
   };
+
+  // HUB0019: a community whose files exceed DEEP_DIVE_MAX_FILES_PER_TASK is emitted as a
+  // SIBLING SEQUENCE of tasks across successive ticks instead of one oversized task. The
+  // community's coverage entry carries a `consumedSlices` counter: each tick emits the
+  // next chunk (highest-degree first) as its own task with a distinct `-s<N>` ID
+  // (deep-dive-<slug>-<communityId>-s<N>, so taskIdExistsInQueue never collides), then
+  // records the consumed slice so the next tick emits the next one. A community at or
+  // under the cap keeps today's exact behavior: one task, the unsuffixed ID.
+  for (const c of candidates) {
+    const files = collectFiles(c.proj, c.community);
+    if (files === null) continue; // community has no graph nodes -- same skip as before
+
+    const totalSlices = Math.max(1, Math.ceil(files.length / DEEP_DIVE_MAX_FILES_PER_TASK));
+    let id;
+    let taskFiles = files;
+    if (totalSlices > 1) {
+      const consumed = c.community.consumedSlices || 0;
+      if (consumed >= totalSlices) continue; // every slice already emitted for this graph state
+      taskFiles = files.slice(consumed * DEEP_DIVE_MAX_FILES_PER_TASK, (consumed + 1) * DEEP_DIVE_MAX_FILES_PER_TASK);
+      id = `deep-dive-${c.slug}-${c.community.id}-s${consumed}`;
+    } else {
+      // Reset any stale slice counter left from when this community was once over the cap,
+      // so a future regression past the cap starts fresh at s0 rather than mid-sequence.
+      if (c.community.consumedSlices) {
+        c.community.consumedSlices = 0;
+        saveCoverage();
+      }
+      id = `deep-dive-${c.slug}-${c.community.id}`;
+    }
+    if (taskIdExistsInQueue(id)) continue; // this slice already has an in-flight or terminal task
+
+    if (totalSlices > 1) {
+      c.community.consumedSlices = (c.community.consumedSlices || 0) + 1;
+      saveCoverage(); // persist the consumed-slice count so the NEXT tick emits the next slice
+    }
+
+    const lead = strongLeads.find((l) => slugifyForId(l.name) === c.slug);
+
+    return {
+      id,
+      domain: 'deep_dive',
+      source: 'deep_dive',
+      title: `Deep dive: ${lead ? lead.name : c.slug} — ${c.community.name}`,
+      promptContext: {
+        projectSlug: c.slug,
+        projectName: lead ? lead.name : c.slug,
+        communityId: c.community.id,
+        communityName: c.community.name,
+        files: taskFiles,
+      },
+    };
+  }
+  return null; // every known community is fully consumed, or already has a queued task
 }
 
 // --- Source: brain_dump_sort -- classifies one freshly-captured Brain Dump entry
