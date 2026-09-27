@@ -275,7 +275,7 @@ test('captureGroupBDiffInWorktree throws (does not silently reuse) when a non-em
       () => captureGroupBDiffInWorktree({
         repoRoot: repoDir, pipelineDir: repoDir, implementResponse, worktreeSuffix: 'test-linkguard',
       }),
-      /already exists|EEXIST|worktree|test-linkguard/i,
+      /already exists/,
       'a pre-existing non-empty worktree dir must be rejected (a throw), never silently reused',
     );
   } finally {
