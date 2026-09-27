@@ -32,4 +32,16 @@ function validateDecomposeDraft(draftText) {
   return { ok: true, subTasks, reformatted };
 }
 
-module.exports = { validateDecomposeDraft };
+// Thrown (or constructible by callers) when a decompose draft fails schema
+// validation. Carries a stable name and code so other modules can import one
+// canonical error type from this gate module instead of defining their own.
+class DecomposeDraftSchemaError extends Error {
+  constructor(message = 'Decompose draft failed schema validation') {
+    super(message);
+    this.name = 'DecomposeDraftSchemaError';
+    this.code = 'DECOMPOSE_DRAFT_SCHEMA_ERROR';
+    Error.captureStackTrace(this, DecomposeDraftSchemaError);
+  }
+}
+
+module.exports = { validateDecomposeDraft, DecomposeDraftSchemaError };
