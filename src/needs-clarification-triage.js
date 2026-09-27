@@ -177,6 +177,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { classifyVote, clip } = require('./auto-confirm-review.js');
 const { hasResolutionSignal } = require('./staleness-auto-archive.js');
+const { checkCompletionClaimsInNote } = require('./fact-checker.js');
 const { targetOversizedFile, oversizedFiles } = require('./file-length-flags-reader.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { getRegisteredSource } = require('./task-source-registry.js');
