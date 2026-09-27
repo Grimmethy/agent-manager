@@ -10999,3 +10999,172 @@ The handler body then shrinks to: resolve repo root → find match → call `_ch
 
 Benefits:
 The two stamping blocks collapse into one call-site each, eliminating the trailing-newline drift and guaranteeing `mergedAt` is always written. `_check_merge_preconditions` is pure dict logic with no I/O, so it can be unit-tested with a fake `match` dict and a stubbed `list_unmerged_branches`. `_perform_git_merge` can be integration-tested in a temp repository without the Flask request context or the lock module. The handler drops from ~182 lines to roughly 40, and the lock's `try/finally` scope is now visually adjacent to the single call it guards rather than wrapping 35 inline lines of git plumbing.
+
+### AC-190 · Extract repeated directory-traversal blocks in api_adhoc_tasks
+Strength: Strong
+Files: python/dashboard/routes/shared_misc.py
+Snippet:
+```
+
+@shared_misc_bp.route("/api/adhoc-tasks")
+def api_adhoc_tasks():
+    """Every domain:'adhoc' task across the whole pipeline, in one flat list, with
+    whichever queue state it's currently sitting in -- the cross-cutting view
+    api_task_anywhere already has the right traversal shape for (drafting/ first,
+    per-instance, then every other QUEUE_STATES dir), generalized here from 'find one
+    task by id' to 'collect every adhoc task found along the way'. Also checks
+    queue/adhoc/ itself, the one real state api_task_anywhere never had to check --
+    task-sources.js's own nextAdhocTask() reads directly from there, before a claimed
+    task ever reaches pending/, so a task sitting there unclaimed would otherwise be
+    invisible to this view.
+
+    An 'adhoc' task is identified by domain=='adhoc' OR an id starting with 'adhoc-'
+    (queue-adhoc-task.js's own id convention, also used by the Brain Dump tab's
+    'Process Now' button injection) -- domain alone isn't reliable since a caller can
+    omit --domain (queue-adhoc-task.js then falls back to the first key in
+    task-domains.json, not necessarily 'adhoc').
+
+    done/ is SKIPPED by default (?includeDone=1 opts in) -- confirmed live 2026-08-22
+    this endpoint was timing out (reported "timed out after 8s" from the dashboard
+    itself) once queue/done/ grew to ~3900 files: reading+parsing every one of them on
+    every single poll of this tab, on Flask's single-threaded dev server, starved
+    concurrent requests (nav badge polling, other tabs, the phone app) regardless of
+    how fast any one request actually was in isolation. done/ tasks aren't what this
+    view exists to track anyway -- the whole point is active (in-progress) and stuck
+    (blocked) work, both already excluded from that giant folder."""
+    from app import QUEUE_STATES, _adhoc_task_excerpt, queue_dir, read_json_safe
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"tasks": []})
+    include_done = request.args.get("includeDone") == "1"
+
+    def is_adhoc(data, task_id):
+        return data.get("domain") == "adhoc" or task_id.startswith("adhoc-")
+
+    # dependsOn visibility (2026-08-22, Grimmethy: "systematic way to prioritize what
+    # order adhoc tasks get completed in") -- mirrors task-sources.js's own
+    # isDependencySatisfied() exactly (satisfied only once mergedAt is stamped on the
+    # dependency's queue/done/ record, not just done -- see that function's comment for
+    # why reaching done/ alone isn't enough), so a human looking at this list sees the
+    # SAME "is this actually unblocked" answer the claim logic itself uses.
+    def dependency_status(depends_on):
+        if not depends_on:
+            return None
+        out = []
+        for dep_id in depends_on:
+            satisfied = False
+            for candidate in (qdir / "done" / f"{dep_id}.json", qdir / "done" / "_archived_no_action" / f"{dep_id}.json"):
+                dep_data = read_json_safe(candidate)
+                if dep_data and dep_data.get("mergedAt"):
+                    satisfied = True
+                    break
+            out.append({"id": dep_id, "satisfied": satisfied})
+        return out
+
+    def task_row(data, task_id, state):
+        return {
+            "id": task_id,
+            "title": data.get("title") or task_id,
+            "state": state,
+            "createdAt": data.get("createdAt"),
+            "excerpt": _adhoc_task_excerpt(data),
+            "dependsOn": dependency_status(data.get("dependsOn")),
+        }
+
+    tasks = []
+
+    adhoc_dir = qdir / "adhoc"
+    if adhoc_dir.is_dir():
+        for f in adhoc_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if data and is_adhoc(data, f.stem):
+                tasks.append(task_row(data, data.get("id", f.stem), "adhoc"))
+
+    drafting_root = qdir / "drafting"
+    if drafting_root.is_dir():
+        for f in drafting_root.rglob("*.json"):
+            data = read_json_safe(f)
+            if not data:
+                continue
+            task_id = data.get("id", f.stem)
+            if not is_adhoc(data, task_id):
+                continue
+            tasks.append(task_row(data, task_id, f"drafting:{f.parent.name}"))
+
+    for state in QUEUE_STATES:
+        if state == "done" and not include_done:
+            continue
+        state_dir = qdir / state
+        if not state_dir.is_dir():
+            continue
+        for f in state_dir.glob("*.json"):
+            data = read_json_safe(f)
+            if not data:
+                continue
+            task_id = data.get("id", f.stem)
+            if not is_adhoc(data, task_id):
+                continue
+            tasks.append(task_row(data, task_id, state))
+
+    tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
+    return jsonify({"tasks": tasks})
+```
+
+Problem:
+`api_adhoc_tasks` interweaves three responsibilities—filtering (`is_adhoc` + `dependency_status`), traversal (three near-identical loops over `adhoc/`, `drafting/`, and each `QUEUE_STATES` entry), and serialization (`task_row` + sort)—into a single ~60-line body. The traversal section repeats the same glob → `read_json_safe` → `is_adhoc` guard → `task_row` append pattern three times, differing only in the directory, the `glob` vs `rglob` call, and the state label string. Any change to the adhoc predicate or the row shape must be made in three places, and the I/O cost of `dependency_status` (a `read_json_safe` call per dependency) is buried inside the boilerplate, making it easy to miss during review.
+
+Solution:
+Extract a single `_collect_adhoc_rows(dir_path, state_label, recursive)` helper that encapsulates the glob/read/filter/row pattern, and reduce the route body to three one-line calls plus the sort. The helper takes a `label_func` callable so the `drafting` case can still emit `f"drafting:{parent.name}"` while `QUEUE_STATES` entries use the bare state name.
+
+```python
+def _collect_adhoc_rows(
+    dir_path: Path,
+    state_label: str,
+    recursive: bool = False,
+    label_func: Callable[[Path], str] | None = None,
+) -> list[dict]:
+    """Yield adhoc task rows from one state directory."""
+    if not dir_path.is_dir():
+        return []
+    glob_fn = dir_path.rglob if recursive else dir_path.glob
+    rows = []
+    for f in glob_fn("*.json"):
+        data = read_json_safe(f)
+        if not data:
+            continue
+        task_id = data.get("id", f.stem)
+        if not _is_adhoc(data, task_id):
+            continue
+        label = label_func(f) if label_func else state_label
+        rows.append(_task_row(data, task_id, label))
+    return rows
+
+
+@shared_misc_bp.route("/api/adhoc-tasks")
+def api_adhoc_tasks():
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"tasks": []})
+    include_done = request.args.get("includeDone") == "1"
+
+    tasks: list[dict] = []
+    tasks.extend(_collect_adhoc_rows(qdir / "adhoc", "adhoc", recursive=False))
+    tasks.extend(
+        _collect_adhoc_rows(
+            qdir / "drafting",
+            "drafting",
+            recursive=True,
+            label_func=lambda f: f"drafting:{f.parent.name}",
+        )
+    )
+    for state in QUEUE_STATES:
+        if state == "done" and not include_done:
+            continue
+        tasks.extend(_collect_adhoc_rows(qdir / state, state, recursive=False))
+
+    tasks.sort(key=lambda t: t.get("createdAt") or "", reverse=True)
+    return jsonify({"tasks": tasks})
+```
+
+Benefits:
+The route body drops from ~60 lines to ~15, making the control flow (which directories are scanned, in what order, with what filter) scannable at a glance. The single `_collect_adhoc_rows` helper is trivially unit-testable in isolation—feed it a temp directory tree and assert the returned rows—without spinning up the Flask app. Future changes to the adhoc predicate, the row shape, or the glob pattern are made in exactly one place, eliminating the three-site duplication hazard. Reviewers can verify correctness of the traversal logic once rather than diffing three near-identical blocks.
