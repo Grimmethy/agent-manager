@@ -79,6 +79,7 @@ const { getModelProfile } = require('./model-profile-registry.js');
 const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./lib/draft-lifecycle.js');
 const { candidateSplitToHubEnabled } = require('./lib/candidate-split-route.js');
 const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./lib/harness-search.js');
+const { isOnline } = require('./connectivity-check.js');
 const { usesGroupB } = require('./lib/apply-core.js');
 const { canonicalizeEdits } = require('./lib/find-canonicalize.js');
 const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch } = require('./lib/draft-context.js');
@@ -737,7 +738,8 @@ async function runPlanPass(task, {
     // this is additive only (see accessible-roots.js's own header for the incident this
     // closes). 'projectSearch' ignores `roots` entirely (external API, not a repo grep).
     const roots = resolveAccessibleRoots();
-    await runHarnessSearch(harnessKind, task, { projectSearchFetch, archImportFetch, roots });
+    const hs = await runHarnessSearch(harnessKind, task, { projectSearchFetch, archImportFetch, roots, ...(harnessKind === 'projectSearch' ? { isOnlineFn: isOnline } : {}) });
+    if (hs && hs.networkUnavailable) return { blocked: true, blockedReason: 'network_unavailable', networkUnavailable: true };
   }
   return { blocked: false };
 }
@@ -1188,7 +1190,12 @@ async function draftTask(task, deps = {}) {
   // the LAST attempt's planResponse (overwritten every run) and none of the tier detail.
   const attempt = beginDraftAttempt(task);
   const result = await runDraftPasses(task, attempt, deps);
-  finalizeDraftAttempt(task, attempt, result, { emitHistory: appendHistoryEvent });
+  // network_unavailable: the offline gate aborted the draft before it ran at all --
+  // the task never got a real attempt, so requeue WITHOUT stamping task.draftAttempts
+  // (a blocked network_unavailable task must not consume a draft-attempt slot).
+  if (!(result && result.blocked && result.blockedReason === 'network_unavailable')) {
+    finalizeDraftAttempt(task, attempt, result, { emitHistory: appendHistoryEvent });
+  }
   return result;
 }
 
