@@ -125,7 +125,7 @@ function writeCooldowns(cooldownPath, cooldowns) {
   fs.writeFileSync(cooldownPath, JSON.stringify(cooldowns));
 }
 
-function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {
+async function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }) {
   const actions = [];
   let names = [];
   try {
