@@ -11168,3 +11168,237 @@ def api_adhoc_tasks():
 
 Benefits:
 The route body drops from ~60 lines to ~15, making the control flow (which directories are scanned, in what order, with what filter) scannable at a glance. The single `_collect_adhoc_rows` helper is trivially unit-testable in isolation—feed it a temp directory tree and assert the returned rows—without spinning up the Flask app. Future changes to the adhoc predicate, the row shape, or the glob pattern are made in exactly one place, eliminating the three-site duplication hazard. Reviewers can verify correctness of the traversal logic once rather than diffing three near-identical blocks.
+
+### AC-191 · Decompose runIntegrationGate into per-check functions
+Strength: Strong
+Files: src/decompose-integration-gate.js
+Snippet:
+```
+// -- only for a setup failure it genuinely can't proceed past (e.g. cannot create the
+// worktree), which the caller treats as an errored (not failed) gate and retries later.
+function runIntegrationGate({ repoRoot, branch, mainBranch = 'master', sourceFile, routes = [], exec = realExec } = {}) {
+  const checks = [];
+  const srcDir = path.dirname(sourceFile);
+  const srcModule = path.basename(sourceFile).replace(/\.py$/, '');
+  const isPy = /\.py$/.test(sourceFile);
+  const wtBase = fs.mkdtempSync(path.join(os.tmpdir(), 'decompose-gate-'));
+  const branchWt = path.join(wtBase, 'branch');
+  const mainWt = path.join(wtBase, 'main');
+  // The hub branch + main only exist on origin (apply runs in a separate clone since
+  // 2026-09-07 -- see this file's header). Fetch both into throwaway local refs and point
+  // every git op at those instead of the bare names, which no longer resolve here.
+  const branchRef = 'refs/decompose-gate/branch';
+  const mainRef = 'refs/decompose-gate/main';
+  const cleanup = [];
+
+  const record = (name, status, detail) => checks.push({ name, status, detail: String(detail || '').slice(0, 2000) });
+  const done = () => {
+    for (const wt of cleanup) {
+      try { exec('git', ['worktree', 'remove', '--force', wt], { cwd: repoRoot }); } catch { /* best-effort */ }
+    }
+    for (const ref of [branchRef, mainRef]) {
+      try { exec('git', ['update-ref', '-d', ref], { cwd: repoRoot }); } catch { /* best-effort */ }
+    }
+    try { fs.rmSync(wtBase, { recursive: true, force: true }); } catch { /* best-effort */ }
+    const failed = checks.filter((c) => c.status === 'fail');
+    return { ok: failed.length === 0, checks, branch };
+  };
+
+  try {
+    exec('git', ['fetch', '--no-tags', '--force', 'origin',
+      `${branch}:${branchRef}`, `${mainBranch}:${mainRef}`], { cwd: repoRoot });
+  } catch (e) {
+    record('setup', 'fail', `could not fetch ${branch} / ${mainBranch} from origin: ${e.message}`);
+    return { ...done(), errored: true };
+  }
+
+  try {
+    exec('git', ['worktree', 'add', '--detach', branchWt, branchRef], { cwd: repoRoot });
+    cleanup.push(branchWt);
+  } catch (e) {
+    record('setup', 'fail', `could not create worktree for ${branch}: ${e.message}`);
+    return { ...done(), errored: true };
+  }
+
+  if (!isPy) {
+    record('language', 'skip', `integration gate only covers Python decompositions; ${sourceFile} left to review`);
+    return done();
+  }
+
+  // 1. py_compile every changed / new .py file on the branch.
+  let changed = [];
+  try {
+    const out = exec('git', ['diff', '--name-only', `${mainRef}...${branchRef}`], { cwd: repoRoot });
+    changed = out.split('\n').map((s) => s.trim()).filter((s) => s.endsWith('.py'));
+  } catch (e) {
+    record('py_compile', 'skip', `could not list changed files: ${e.message}`);
+  }
+  const toCompile = Array.from(new Set([sourceFile, ...changed])).filter((f) => fs.existsSync(path.join(branchWt, f)));
+  if (toCompile.length) {
+    try {
+      exec('python3', ['-m', 'py_compile', ...toCompile], { cwd: branchWt });
+      record('py_compile', 'pass', `${toCompile.length} file(s): ${toCompile.join(', ')}`);
+    } catch (e) {
+      record('py_compile', 'fail', `${(e.stderr || e.stdout || e.message)}`);
+      return done();
+    }
+  }
+
+  // 2. import the source module -- catches the circular import the isolated compile can't.
+  try {
+    exec('python3', ['-c', `import ${srcModule}`], { cwd: path.join(branchWt, srcDir), timeout: 30_000 });
+    record('import', 'pass', `import ${srcModule} from ${srcDir} exits 0`);
+  } catch (e) {
+    const msg = String(e.stderr || e.stdout || e.message);
+    // A bare ModuleNotFoundError for a third-party dep means this environment can't import
+    // the app at all -- not the branch's fault. A circular import / NameError / ImportError
+    // for a first-party name IS the branch's fault.
+    if (/ModuleNotFoundError: No module named '(flask|werkzeug|jinja2)'/.test(msg) && !/circular|partially initialized/.test(msg)) {
+      record('import', 'skip', `app dependencies not installed here: ${msg.split('\n').pop()}`);
+      return done();
+    }
+    record('import', 'fail', msg);
+    return done();
+  }
+
+  // 2b. entrypoint smoke: exec the source file's body as __main__ (how it is launched).
+  // Catches the circular import that `import <srcModule>` above cannot -- the one that
+  // only fires when sys.modules has no <srcModule> entry during the module body. Kill
+  // switch AGENT_MANAGER_DECOMPOSE_ENTRYPOINT_SMOKE=false.
+  if (process.env.AGENT_MANAGER_DECOMPOSE_ENTRYPOINT_SMOKE !== 'false') {
+    const smokePath = path.join(branchWt, srcDir, '.decompose_entrypoint_smoke.py');
+    try {
+      fs.mkdirSync(path.dirname(smokePath), { recursive: true });
+      fs.writeFileSync(smokePath, ENTRYPOINT_SMOKE);
+    } catch { /* fall through -- exec will just fail to find it and we skip */ }
+    let out = '';
+    let smokeErr = null;
+    try {
+      out = String(exec('python3', ['.decompose_entrypoint_smoke.py', path.basename(sourceFile)],
+        { cwd: path.join(branchWt, srcDir), timeout: 30_000 }) || '');
+    } catch (e) {
+      smokeErr = e;
+      out = String(e.stdout || '');
+    }
+    try { fs.unlinkSync(smokePath); } catch { /* ignore */ }
+    const smokeMsg = smokeErr ? String(smokeErr.stderr || smokeErr.stdout || smokeErr.message) : out;
+    if (/IMPORT_ERROR:|ModuleNotFoundError: No module named '(flask|werkzeug|jinja2)'/.test(smokeMsg)
+        && !/circular|partially initialized/.test(smokeMsg)) {
+      record('entrypoint', 'skip', `app dependencies not installed here: ${smokeMsg.split('\n').filter(Boolean).pop()}`);
+    } else if (smokeErr) {
+      record('entrypoint', 'fail', `${srcModule} fails to execute as an entrypoint (circular import / import-time error):\n${smokeMsg}`);
+      return done();
+    } else {
+      record('entrypoint', 'pass', `${srcModule} module body executes clean with sys.modules[${srcModule}] unset (the __main__ path)`);
+    }
+  }
+
+  // 3. url_map invariant: identical route table on main and on the branch.
+  try {
+    exec('git', ['worktree', 'add', '--detach', mainWt, mainRef], { cwd: repoRoot });
+    cleanup.push(mainWt);
+  } catch (e) {
+    record('url_map', 'skip', `could not create ${mainBranch} worktree: ${e.message}`);
+    return done();
+  }
+  const dump = (wt) => {
+    const p = path.join(wt, srcDir, '.decompose_url_dump.py');
+    fs.writeFileSync(p, URL_MAP_DUMP);
+    try { return exec('python3', ['.decompose_url_dump.py'], { cwd: path.join(wt, srcDir), timeout: 30_000 }); }
+    finally { try { fs.unlinkSync(p); } catch { /* ignore */ } }
+  };
+  let mainRules; let branchRules;
+  try { mainRules = dump(mainWt).trim(); branchRules = dump(branchWt).trim(); } catch (e) {
+    record('url_map', 'skip', `route dump failed: ${String(e.stderr || e.message).split('\n').pop()}`);
+    return done();
+  }
+  if (mainRules.startsWith('IMPORT_ERROR') || branchRules.startsWith('IMPORT_ERROR')) {
+    record('url_map', 'fail', `route dump import error -- main: ${mainRules.slice(0, 300)} | branch: ${branchRules.slice(0, 300)}`);
+    return done();
+  }
+  let cmp;
+  try { cmp = diffRouteTables(mainRules, branchRules); } catch {
+    record('url_map', 'skip', 'route dump was not JSON'); return done();
+  }
+  if (!cmp.ok) {
+    record('url_map', 'fail',
+      `route table changed -- a pure relocation must not. Dropped: ${cmp.droppedRules.join(' | ') || 'none'}. Added: ${cmp.addedRules.join(' | ') || 'none'}.`);
+    return done();
+  }
+  record('url_map', 'pass', `${cmp.count} routes, rule table unchanged (endpoints re-homed as expected)`);
+
+  // 4. boot smoke -- opt-in (needs a runnable app + a free port).
+  if (process.env.AGENT_MANAGER_DECOMPOSE_BOOT_SMOKE === 'true' && routes.length) {
+    record('boot', 'skip', 'boot smoke requested but not implemented in this build -- import + url_map cover the crash modes');
+  }
+
+  return done();
+}
+```
+
+Problem:
+The 158-line body of `runIntegrationGate` interleaves five distinct check phases (py_compile, import, entrypoint-smoke, url_map, boot), each with its own try/catch, skip/pass/fail classification, and domain-specific heuristics (e.g., the regex distinguishing a circular import from a missing third-party dependency). They are sequenced by a shared `checks[]` array and a `done()` closure, which makes every check untestable in isolation without mocking the entire git-worktree lifecycle. The length reflects real branching complexity—eight early-return paths, nested env-var gates, file I/O, process exec, and error classification—not a flat config literal or a single-purpose string builder.
+
+Solution:
+Extract each check phase into its own named function that receives a small shared context object (`ctx`) carrying `repoRoot`, `branch`, `checks`, `cleanup`, `record`, and the worktree paths. The top-level `runIntegrationGate` shrinks to roughly 15 lines of sequencing: build ctx, call `setupWorktrees`, then call each `check*` in order, returning `ctx.done()` on the first failure. Each extracted function is ≤ 30 lines, has a single responsibility, and can be unit-tested by passing a stub ctx (no real git worktrees needed for the url_map comparison or the import-classification regex).
+
+```js
+// src/decompose-integration-gate.js (refactored structure)
+
+function makeGateCtx({ repoRoot, branch, mainBranch, sourceFile, routes, exec }) {
+  const checks = [];
+  const cleanup = [];
+  const branchRef = 'refs/decompose-gate/branch';
+  const mainRef   = 'refs/decompose-gate/main';
+  const wtBase    = fs.mkdtempSync(path.join(os.tmpdir(), 'decompose-gate-'));
+  const branchWt  = path.join(wtBase, 'branch');
+  const mainWt    = path.join(wtBase, 'main');
+  const srcModule = path.basename(sourceFile).replace(/\.py$/, '');
+  const isPy      = /\.py$/.test(sourceFile);
+
+  const record = (name, status, detail) =>
+    checks.push({ name, status, detail: String(detail || '').slice(0, 2000) });
+
+  const done = () => {
+    for (const wt of cleanup) {
+      try { exec('git', ['worktree', 'remove', '--force', wt], { cwd: repoRoot }); } catch {}
+    }
+    for (const ref of [branchRef, mainRef]) {
+      try { exec('git', ['update-ref', '-d', ref], { cwd: repoRoot }); } catch {}
+    }
+    try { fs.rmSync(wtBase, { recursive: true, force: true }); } catch {}
+    const failed = checks.filter((c) => c.status === 'fail');
+    return { ok: failed.length === 0, checks, branch };
+  };
+
+  return { repoRoot, branch, mainBranch, sourceFile, routes, exec,
+           checks, cleanup, branchRef, mainRef, wtBase, branchWt, mainWt,
+           srcModule, isPy, record, done };
+}
+
+function setupWorktrees(ctx) { /* fetch, worktree add, push to ctx.cleanup */ }
+function checkPyCompile(ctx) { /* diff --name-only, python3 -m py_compile */ }
+function checkImport(ctx) { /* python3 -c "import …", dep-missing heuristic */ }
+function checkEntrypointSmoke(ctx) { /* write smoke file, exec, classify */ }
+function checkUrlMap(ctx) { /* main worktree, dump both, diffRouteTables */ }
+function checkBoot(ctx) { /* env gate, record skip */ }
+
+function runIntegrationGate({ repoRoot, branch, mainBranch = 'master',
+                              sourceFile, routes = [], exec = realExec } = {}) {
+  const ctx = makeGateCtx({ repoRoot, branch, mainBranch, sourceFile, routes, exec });
+  if (!setupWorktrees(ctx)) return { ...ctx.done(), errored: true };
+  if (!ctx.isPy) {
+    ctx.record('language', 'skip', `gate covers Python only; ${sourceFile} left to review`);
+    return ctx.done();
+  }
+  if (!checkPyCompile(ctx))       return ctx.done();
+  if (!checkImport(ctx))          return ctx.done();
+  if (!checkEntrypointSmoke(ctx)) return ctx.done();
+  if (!checkUrlMap(ctx))          return ctx.done();
+  checkBoot(ctx);
+  return ctx.done();
+}
+```
+
+Benefits:
+Each extracted `check*` function can be unit-tested in isolation by passing a stub `ctx` object—no real git worktrees, no process spawning—so the url_map diff logic and the circular-import-vs-missing-dep regex become independently verifiable. The "register cleanup before exec" contract becomes explicit in `setupWorktrees` rather than an implicit obligation buried in a 158-line body where a new check author must remember to push into `cleanup` before the first `exec` or the worktree leaks. Reviewers can evaluate each check's classification logic in a 20–30-line function instead of tracking eight early-return paths through a single monolith.
