@@ -805,16 +805,15 @@ test('reviewTask lets a prose-only FALSE POSITIVE verdict for function_length_re
 
 test('reviewTask reaches the vote for a function_length_review draft whose Solution includes a diff hunk', async () => {
   const { repoRoot, domainsPath } = makeFixture();
-  // A diff hunk with no braces/brackets/backticks -- avoids an unrelated, separately-known
-  // issue (pipeline-self-audit-function_length_review-truncated-draft-1788034686181,
-  // 2026-08-29, never fixed): detectTruncatedImplementResponse's CODE_MARKERS check (any
-  // of {}[]`) misfires on legitimate code-bearing prose for a non-JSON advisoryProse
-  // source -- ANY real code snippet with a brace (near-universal in JS) reads as
-  // "unparseable JSON with code markers" -> "truncated." Out of scope for this gate;
-  // filed separately rather than fixed here.
+  // CODE_MARKERS was removed 2026-09-15; the advisoryProse guard in
+  // detectTruncatedImplementResponse now covers the case it used to handle (a
+  // code-bearing advisory-prose draft can never be flagged truncated). The fixture
+  // below intentionally uses a brace-bearing shape to exercise the exact input that
+  // previously tripped the CODE_MARKERS path (pipeline-self-audit-function_length_review
+  // -truncated-draft-1788034686181, 2026-08-29).
   const task = baseTask({
     domain: 'default', source: 'function_length_review',
-    implementResponse: '### AC-9\nProblem: this function is too long.\nSolution:\n@@ -10,3 +10,5 @@\n+const result = computeHelper(x);\n+return result;',
+    implementResponse: '### AC-9\nProblem: this function is too long.\nSolution:\n@@ -10,3 +10,5 @@\n+function foo() { return computeHelper(x); }\n+return foo();',
   });
   const captured = [];
   const result = await reviewTask(task, {
