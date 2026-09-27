@@ -142,6 +142,18 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
         secondBrainDir,
         pipelineDir,
       });
+      // HUB0092 · 3/3 (guard, sibling 1/3's was abandoned): a stale sort result (the
+      // entry was edited / re-captured after this task was drafted) arrives re-stated by
+      // apply-group-a.js as {skipped:true, stale:true, success:false, reason} -- it is a
+      // distinct NON-success, not a recoverable classification miss. Routing it through
+      // the skipped branch below would phrase it as a done/success outcome and land the
+      // task in done/ as if the entry's CURRENT text had been classified, when nothing was
+      // applied. It is terminal for THIS pass (a fresh sort under a new id re-classifies
+      // the current text), so it is non-success: succeeded:false. Mirrors apply-main-batch.js's
+      // own stale guard (sibling 2/3) and apply-group-a.js's non-success stale shape.
+      if (result && result.stale === true) {
+        return { succeeded: false, stale: true, reason: result.reason || 'stale sort result -- entry changed after this task was drafted, nothing applied' };
+      }
       if (result.skipped) {
         // A recoverable skip already bumped the entry's sortAttempt inside applyBrainDumpSort,
         // so nextBrainDumpSortTask regenerates it under a fresh id (…-a1) rather than the
