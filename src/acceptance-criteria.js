@@ -97,6 +97,17 @@ function resolveAcceptanceCriteria(task) {
 //   Acceptance:
 //   1. <criterion> -- <check you ran> -- <PASS/FAIL + output>
 // -> [{ criterion, check, result, pass }]
+// A "0 fail"/"# fail 0"-shaped substring reports ZERO failures -- i.e. not a failure at
+// all -- but the plain \bFAIL\b search below has no way to tell that from a real failure
+// count. Masked out of a COPY of the result before the FAIL check runs, so a genuine
+// non-zero count ("2 fail", "# fail 3") or a bare "FAIL" with no count is untouched and
+// still correctly registers. Two directions, both seen in real production data: prose
+// phrasing puts the count first ("0 fail", "no failures", "zero fail" -- the originally
+// reported incident); Node's own test-runner TAP summary line puts it after ("# fail 0",
+// the dominant real shape, confirmed via a live queue/done/ record that was already
+// mis-marked pass:false despite reporting 0 failures).
+const ZERO_FAIL_RE = /\b(?:(?:0|no|zero)\s+fail\w*|fail\w*\s*[:=]?\s*0\b)/gi;
+
 function parseAcceptanceBlock(summary) {
   const text = String(summary || '');
   const m = text.match(/^\s*Acceptance:\s*$/im);
@@ -112,7 +123,8 @@ function parseAcceptanceBlock(summary) {
     const criterion = segs[0].trim();
     const check = (segs[1] || '').trim();
     const result = segs.slice(2).join(' -- ').trim() || (segs[1] || '').trim();
-    const pass = /\bPASS(?:ED|ES)?\b/i.test(result) && !/\bFAIL(?:ED|S)?\b/i.test(result);
+    const resultForFailCheck = result.replace(ZERO_FAIL_RE, '');
+    const pass = /\bPASS(?:ED|ES)?\b/i.test(result) && !/\bFAIL(?:ED|S)?\b/i.test(resultForFailCheck);
     out.push({ criterion, check, result, pass });
   }
   return out;

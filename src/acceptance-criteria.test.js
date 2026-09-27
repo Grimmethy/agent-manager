@@ -47,6 +47,34 @@ test('parseAcceptanceBlock: absent block -> []', () => {
   assert.deepEqual(parseAcceptanceBlock('RESOLUTION: implemented\ndid the thing'), []);
 });
 
+// Zero-failure phrasing (2026-09-27, brain-dump bd-1790466365857): the plain \bFAIL\b
+// search used to read the literal word "fail" inside an otherwise-passing "0 fail" or
+// "# fail 0" as a real failure signal.
+test('parseAcceptanceBlock: "0 fail" phrasing (the originally reported incident) still registers PASS', () => {
+  const s = 'summary\n\nAcceptance:\n1. tests pass -- ran suite -- PASSED (179 pass, 1 skip, 0 fail, identical to baseline)';
+  const r = parseAcceptanceBlock(s);
+  assert.equal(r[0].pass, true);
+});
+
+test('parseAcceptanceBlock: "# fail 0" phrasing (the dominant real-world shape, Node\'s own TAP summary line) still registers PASS', () => {
+  const s = 'summary\n\nAcceptance:\n1. tests pass -- ran node --test -- PASS: `# pass 24 / # fail 0`, exitCode 0';
+  const r = parseAcceptanceBlock(s);
+  assert.equal(r[0].pass, true);
+});
+
+test('parseAcceptanceBlock: a genuine NON-ZERO failure count is not masked -- proves this is not a blanket "ignore fail near a digit" fix', () => {
+  const withPrefix = 'summary\n\nAcceptance:\n1. tests pass -- ran node --test -- PASS: `# pass 22 / # fail 3`, exitCode 1';
+  assert.equal(parseAcceptanceBlock(withPrefix)[0].pass, false);
+  const proseCount = 'summary\n\nAcceptance:\n1. tests pass -- ran suite -- 5 tests, 2 fail, needs fixing';
+  assert.equal(parseAcceptanceBlock(proseCount)[0].pass, false);
+});
+
+test('parseAcceptanceBlock: real production counter-example, PASS not at the start of the result -- proves a start-anchored fix would have been wrong', () => {
+  const s = 'summary\n\nAcceptance:\n1. code compiles -- py_compile -- COMPILE-OK -- PASS';
+  const r = parseAcceptanceBlock(s);
+  assert.equal(r[0].pass, true);
+});
+
 test('runAcceptanceCommand: empty command -> ok, no checks', () => {
   assert.deepEqual(runAcceptanceCommand({ repoRoot: '/x', command: '  ' }), { ok: true, checks: [] });
 });
