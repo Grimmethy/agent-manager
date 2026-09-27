@@ -181,6 +181,84 @@ function runStalenessFastpath(task, attempt) {
   return { succeeded: true, blocked: false };
 }
 
+// ui_visibility_audit (2026-09-16, "short-circuit detection-only sources that conclude
+// 'no actionable caller' into a fast no-op path that skips the full plan+implement+review
+// cycle"): this is the same short-circuit discipline as runStalenessFastpath above, applied
+// to the ui_visibility_audit detector. That source (see ui-visibility-audit.js) is purely
+// detection-gated: its detector (auditUiVisibility) flags a backend route with NO reference
+// in any scanned frontend surface as a CANDIDATE, and the harness-grounded plan/implement
+// pass exists to clear the candidate (a deliberately non-dashboard endpoint -> empty
+// response) or, only when it is a genuine gap, to build a small dashboard addition. The
+// detector's own "resolved" conclusion -- the route is no longer unreferenced (a real caller
+// was added, or the route was removed) -- is something we can RE-RUN DETERMINISTICALLY
+// against the repo's current content with zero model judgment, exactly as staleness-fastpath
+// re-runs the original scanner rule. When it fires, the finding this task was filed for no
+// longer holds, so there is no UI gap to plan, implement, or review: concluding it here
+// saves a full multi-stage cycle (two model passes + a review vote) that can only ever end
+// in a no-op apply for a source whose only possible outcome for a RESOLVED finding is
+// "nothing to change."
+//
+// Deliberately conservative in the safe direction, matching staleness-fastpath:
+//   - returns null (fall through to the existing harness-grounded model path, unchanged)
+//     whenever the re-audit is INCONCLUSIVE -- app.py absent / no routes parsed (evidence.
+//     routesScanned === 0), no parseable candidate paths on the task, the detector throws,
+//     or ANY of the finding's named routes is STILL an unreferenced candidate (the finding
+//     is live; only the model, reading the route's own docstring, can judge it). A false
+//     "resolved" would skip a real gap; so we only short-circuit when the detector
+//     PROVABLY finds none of the finding's routes still open.
+function runUiVisibilityFastpath(task, attempt) {
+  const { auditUiVisibility } = require('../ui-visibility-audit.js');
+  const repoRoot = getConfig().repoRoot;
+  if (!repoRoot) return null; // no repo to re-audit -- inconclusive, fall through
+  const ctx = task.promptContext;
+  const filedPaths = filedUiVisibilityCandidatePaths(ctx && ctx.evidenceText);
+  if (filedPaths.length === 0) return null; // nothing parseable on the record -- fall through
+  let current;
+  try {
+    current = auditUiVisibility({ repoRoot });
+  } catch {
+    return null; // detector blew up on unexpected content -- inconclusive, fall through
+  }
+  // Inconclusive guard: routesScanned === 0 means the detector found no @app.route at all
+  // (app.py missing in this checkout / unreadable). An empty candidate list for that reason
+  // is NOT "the finding is resolved" -- it means we could not check. Never claim a no-op on
+  // a detector that scanned nothing.
+  if (!current || !current.evidence || current.evidence.routesScanned === 0) return null;
+  const stillOpen = filedPaths.filter((p) => (current.candidates || []).some((c) => c.path === p));
+  if (stillOpen.length > 0) return null; // finding still live -- the model must judge it, unchanged path
+  // Every route this finding named is now referenced (or gone) by the detector's own
+  // re-scan: the "no dashboard caller" concern no longer holds deterministically.
+  task.planResponse = 'Deterministic re-audit: re-running the ui_visibility_audit detector against the repo\u2019s CURRENT content finds none of the backend route(s) this finding named are still unreferenced by any frontend surface -- a real dashboard caller now exists (or the route was removed). There is no UI gap left to plan for.';
+  recordPlan(attempt, { text: task.planResponse, attempts: 0 });
+  appendHistoryEvent(task, 'plan-done', 'deterministic re-audit, no model call');
+  if (ctx) { ctx.harnessHits = []; ctx.harnessFiles = []; }
+  appendHistoryEvent(task, 'harness-search', 'deterministic re-audit, 0 hit(s)');
+  task.implementResponse = `Determination: no actionable caller. Re-running the ui_visibility_audit detector against the current repo finds that none of the ${filedPaths.length} route(s) this finding named are still unreferenced by any scanned frontend source file -- each now has a real dashboard caller (or was removed). This is the detector's own "resolved" conclusion, not a model judgment, so there is no UI addition to make.`;
+  recordImplement(attempt, { text: task.implementResponse, note: 'deterministic re-audit: finding resolved, no diff' });
+  appendHistoryEvent(task, 'implement-done', 'deterministic re-audit: finding resolved, no diff');
+  task.critiqueOutcome = 'no-issues';
+  recordCritique(attempt, { outcome: 'no-issues' });
+  appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic re-audit, nothing for a critique pass to add)');
+  concludeDraft(task);
+  return { succeeded: true, blocked: false };
+}
+
+// Parses the route path(s) a ui_visibility_audit task was FILED for out of
+// promptContext.evidenceText -- nextUiVisibilityAuditTask's own format is one
+// "- <METHODS> <path> (app.py:<line>)" line per candidate. Returns the path tokens
+// (e.g. ['/api/hardware/stats']), or [] when none are present.
+function filedUiVisibilityCandidatePaths(evidenceText) {
+  const text = String(evidenceText || '');
+  const paths = [];
+  const lineRe = /-\s*([A-Z]+(?:\s+[A-Z]+)*)\s+([^\s(]+)\s*\(\s*app\.py:\d+\s*\)/g;
+  let m;
+  while ((m = lineRe.exec(text))) {
+    const p = (m[2] || '').trim();
+    if (p.startsWith('/')) paths.push(p);
+  }
+  return paths;
+}
+
 async function draftAdhocBranch(task, {
   maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
   draftAdhocViaLocalAgenticWriteFn,
@@ -371,4 +449,4 @@ async function draftResearchBranch(task, { recordModelCall, draftResearchImpleme
   return { succeeded: true, blocked: false };
 }
 
-module.exports = { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch };
+module.exports = { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch, runUiVisibilityFastpath };
