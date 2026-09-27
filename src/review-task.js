@@ -558,7 +558,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   // that cuts off mid-string) applies.
   const rawImplementResponse = task.implementResponse || '';
   const truncationCheck = rawImplementResponse.trim()
-    ? detectTruncatedImplementResponse(rawImplementResponse)
+    ? detectTruncatedImplementResponse(rawImplementResponse, resolveSourceName(task))
     : { truncated: false, reason: null };
   if (truncationCheck.truncated) {
     const rawText = rawImplementResponse;

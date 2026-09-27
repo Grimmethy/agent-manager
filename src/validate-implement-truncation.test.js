@@ -101,3 +101,79 @@ test('still flags a genuinely truncated Group A response (cuts off mid-string in
   ].join('\n');
   assert.deepEqual(detectTruncatedImplementResponse(text), { truncated: true, reason: 'truncated output' });
 });
+
+// --- Regression tests for the live false-positive root-caused by the self-audit
+// queue/done/_archived/2026-09/pipeline-self-audit-function_length_review-truncated-draft-1788034686181:
+// function_length_review advisory drafts that merely QUOTE and DISCUSS code (fenced ```js
+// blocks, diff hunks with braces/brackets) were misflagged "truncated". The source-aware
+// advisoryProse carve-out in detectTruncatedImplementResponse (advisoryProse guard on the
+// registered source entry) fixes that; these tests lock it in, and the third test proves
+// the real Topology-incident signal (odd unescaped double-quote in the final token) STILL
+// fires for non-advisory sources. function_length_review is a plugin (agent-manager-hygiene)
+// source, so a bare `node --test` process has not registered it with the task-source
+// registry -- register it here exactly the way apply-task.test.js registers its fixture
+// sources, so the carve-out path is actually exercised rather than vacuously skipped.
+const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+if (!getRegisteredSource('function_length_review')) {
+  registerTaskSource('function_length_review', { priority: 90, next: () => null, advisoryProse: true });
+}
+
+test('function_length_review advisory draft quoting a fenced js block with braces is NOT flagged truncated (ends in an odd unescaped quote, so it WOULD be flagged without the advisoryProse carve-out)', () => {
+  const draft = [
+    '### AC-1: extract the 214-line processTask body into helpers',
+    '',
+    'The current function mixes payload extraction with queue bookkeeping.',
+    '',
+    '```js',
+    'function extractPayload(task) {',
+    '  const body = task.body || {};',
+    '  const meta = task.meta || [];',
+    '  return { body, meta };',
+    '}',
+    '```',
+    '',
+    'That leaves the "outer" loop untouched -- the "loop',
+  ].join('\n');
+  assert.deepEqual(
+    detectTruncatedImplementResponse(draft, 'function_length_review'),
+    { truncated: false, reason: null },
+  );
+});
+
+test('function_length_review advisory draft quoting a diff hunk containing { and [] is NOT flagged truncated (also ends in an odd unescaped quote, so it WOULD be flagged without the advisoryProse carve-out)', () => {
+  const draft = [
+    '### AC-2: split validateInput out of the main loop',
+    '',
+    'Proposed diff:',
+    '',
+    '```diff',
+    '--- a/src/worker.js',
+    '+++ b/src/worker.js',
+    '@@ -12,7 +12,10 @@ function process(batch) {',
+    ' const items = batch.filter(x => x.active);',
+    '+ const valid = items.map(x => ({ ...x, n: x.n + 1 }));',
+    '+ const buckets = valid.reduce((acc, x) => { acc[x.key] = (acc[x.key] || []).concat(x); return acc; }, []);',
+    '+ return { items: valid, buckets };',
+    ' }',
+    '```',
+    '',
+    'Net: process() shrinks by ~40 lines; the "buckets" field keeps the "shape',
+  ].join('\n');
+  assert.deepEqual(
+    detectTruncatedImplementResponse(draft, 'function_length_review'),
+    { truncated: false, reason: null },
+  );
+});
+
+test('non-advisory source whose final token has an odd number of unescaped double-quotes is STILL flagged truncated (the real Topology-incident signal survives the advisoryProse carve-out)', () => {
+  const draft = 'All acceptance criteria verified. Final line: return "Topology';
+  assert.deepEqual(
+    detectTruncatedImplementResponse(draft, 'adhoc'),
+    { truncated: true, reason: 'truncated output' },
+  );
+  // Legacy no-source shape must be equally unaffected by the advisoryProse guard.
+  assert.deepEqual(
+    detectTruncatedImplementResponse(draft),
+    { truncated: true, reason: 'truncated output' },
+  );
+});
