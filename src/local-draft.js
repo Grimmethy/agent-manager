@@ -81,7 +81,7 @@ const { candidateSplitToHubEnabled } = require('./lib/candidate-split-route.js')
 const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./lib/harness-search.js');
 const { usesGroupB } = require('./lib/apply-core.js');
 const { canonicalizeEdits } = require('./lib/find-canonicalize.js');
-const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch } = require('./lib/draft-context.js');
+const { resolveDraftContext, runStalenessFastpath, draftAdhocBranch, draftResearchBranch, runUiVisibilityFastpath } = require('./lib/draft-context.js');
 const { computePlanNumPredict, tryDeterministicScriptExtractEdit, tryDeterministicOnePassDecompose, tryDeterministicNodeModuleDecompose, tryDeterministicBlueprintDecompose, tryDeterministicLiteralEdit } = require('./lib/deterministic-extract.js');
 const { runCritiqueAndRevision, computeImplementBudget, callImplementModel } = require('./lib/implement-critique.js');
 
@@ -1261,6 +1261,15 @@ async function runDraftPasses(task, attempt, {
       // else: not a rule this file knows how to re-run deterministically (adhoc,
       // project_search, arch_review, an unrecognized rule, ...) -- fall through to the
       // existing harness-grounded local-model path below, completely unchanged.
+    }
+
+    // Deterministic ui-visibility re-audit short-circuit -- see runUiVisibilityFastpath().
+    if (task.source === 'ui_visibility_audit') {
+      const uiFastpathResult = runUiVisibilityFastpath(task, attempt);
+      if (uiFastpathResult) return uiFastpathResult;
+      // else: inconclusive (no parseable candidate paths, app.py not re-auditable, or a
+      // named route is STILL unreferenced) -- fall through to the existing
+      // harness-grounded local-model path below, completely unchanged.
     }
 
     // Deterministic script-extract move short-circuit -- see
