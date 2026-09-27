@@ -252,3 +252,33 @@ test('captureGroupBDiffInWorktree throws (not silently applies against the wrong
     repoRoot: repoDir, pipelineDir: repoDir, implementResponse, worktreeSuffix: 'test-wrong-base',
   }), /find string not found/);
 });
+
+// 2026-09-14, pre-existing-dir guard: captureGroupBDiffInWorktree's worktree path is a
+// DETERMINISTIC function of worktreeSuffix (os.tmpdir() + 'agent-manager-groupb-worktree-
+// <suffix>'), not a fresh mkdtempSync, so a caller that retries after a previous failed
+// attempt left a stray non-empty directory at that exact path would hand `git worktree add`
+// a directory git must reject -- and a stale non-empty dir there must never be silently
+// reused as the scratch tree the captured diff is built from. This test proves the call
+// hard-FAILS (throws) rather than reusing it.
+test('captureGroupBDiffInWorktree throws (does not silently reuse) when a non-empty directory already exists at the worktree path', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const guardDir = path.join(os.tmpdir(), 'agent-manager-groupb-worktree-test-linkguard');
+  // Pre-create the exact path the function will target, non-empty, to simulate a
+  // leftover from a previously crashed attempt.
+  fs.mkdirSync(guardDir, { recursive: true });
+  fs.writeFileSync(path.join(guardDir, 'stale.txt'), 'stale\n');
+
+  try {
+    const implementResponse = JSON.stringify({ mode: 'edit', file: 'tracked.txt', find: 'v1', replace: 'v2' });
+    // Broad initial regex -- a sibling pass tightens it to the exact confirmed message.
+    assert.throws(
+      () => captureGroupBDiffInWorktree({
+        repoRoot: repoDir, pipelineDir: repoDir, implementResponse, worktreeSuffix: 'test-linkguard',
+      }),
+      /already exists|EEXIST|worktree|test-linkguard/i,
+      'a pre-existing non-empty worktree dir must be rejected (a throw), never silently reused',
+    );
+  } finally {
+    fs.rmSync(guardDir, { recursive: true, force: true });
+  }
+});
