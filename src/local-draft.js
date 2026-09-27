@@ -1166,6 +1166,22 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   return { done: false };
 }
 
+// HUB0060 part 1/5 -- the profile-resolution + spread-before call-wrapping decision, as
+// an isolated, table-testable unit: given a task and an optional injected localCall,
+// returns { resolvedLocalCall, profileOverrides } where profileOverrides is
+// { model, numCtx, numPredict } (or null when the task's source declares no modelProfile)
+// and resolvedLocalCall is the injected localCall unchanged when one was passed, else the
+// spread-before closure (opts) => baseLocalCall({ ...profileOverrides, ...opts }). This is
+// a thin DELEGATE to lib/draft-context.js's resolveDraftContext -- the single place that
+// actually owns this logic (it bundles the same decision plus the side-findings/lock
+// context the draft passes need) -- so there is exactly one implementation of the
+// profile/spread rule. draftTask's own call path keeps using resolveDraftContext directly
+// (runDraftPasses above); nothing here changes production behavior.
+function resolveCallOpts(task, localCall = null) {
+  const { resolvedLocalCall, profileOverrides } = resolveDraftContext(task, { localCall, withLockFn: defaultWithLock });
+  return { resolvedLocalCall, profileOverrides };
+}
+
 /**
  * The actual draft logic, independent of the CLI/stdout wrapper below -- exported so tests
  * can call it directly with a fake localCall.
@@ -1676,7 +1692,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { draftTask, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
+module.exports = { draftTask, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on
