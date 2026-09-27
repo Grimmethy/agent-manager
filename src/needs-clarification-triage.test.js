@@ -1300,3 +1300,34 @@ test('bucket E: the surfaced decompose design question lands in the sweep\'s own
     assert.equal(fs.existsSync(path.join(elsewhere, 'queue', 'awaiting-confirm')), false, 'nothing written where the env var points');
   } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev; }
 });
+
+// 2026-09-21: idempotency of the bucket-E surfacing. Test 1 (above) proves ONE sweep surfaces
+// exactly one decompose question for te-surface; this proves a SECOND sweep does not create a
+// duplicate. The guard under test is src/decompose-question-surface.js's _dirContainsOriginalTaskId
+// (scans queue/awaiting-confirm/ + queue/approved/ for the same originalTaskId and no-ops), reached
+// from bucket E at src/needs-clarification-triage.js:761. To make the second sweep genuinely
+// re-enter that path -- rather than sweep 1 requeueing the task away into adhoc/ so there is nothing
+// left to re-process -- bucket E is seeded at its MAX_REQUEUES cap: sweep 1 then takes the cap-spent
+// leave-for-human fall-through and the task STAYS in needs-clarification/, so sweep 2 re-calls
+// surfaceDecomposeDesignQuestion and the gate must swallow it.
+test('bucket E: a second sweep is idempotent -- the surfaced question is not duplicated', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('te-surface', {
+    stalenessFlag: { reason: 'decompose-loop', disposition: 're-scope', confidence: 'medium' },
+    history: [{ stage: 'exhausted' }, { stage: 'needs-clarification' }],
+    ncTriageBucketAttempts: { E: 1 }, // E at cap -> sweep 1 leaves the task in place (not requeued), so sweep 2 re-enters the gate
+  }));
+  const countFor = (id) => (fs.existsSync(at(dir, 'awaiting-confirm'))
+    ? fs.readdirSync(at(dir, 'awaiting-confirm'))
+        .filter((f) => f.endsWith('.json'))
+        .map((f) => JSON.parse(fs.readFileSync(at(dir, 'awaiting-confirm', f), 'utf8')))
+        .filter((e) => e && e.originalTaskId === id).length
+    : 0);
+  await needsClarificationTriage(args(dir));
+  assert.equal(countFor('te-surface'), 1, 'first sweep surfaces exactly one question for te-surface');
+  assert.ok(exists(at(dir, 'needs-clarification', 'te-surface.json')), 'cap-spent: task stays in needs-clarification/ so a second sweep re-enters bucket E');
+  const s2 = await needsClarificationTriage(args(dir));
+  assert.equal(countFor('te-surface'), 1, 'second sweep did NOT create a duplicate decompose question');
+  assert.equal(s2.requeued, 0, 'second sweep does not requeue an already-at-cap task');
+  assert.ok(exists(at(dir, 'needs-clarification', 'te-surface.json')), 'task still visible for a human, not consumed');
+});
