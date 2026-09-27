@@ -11948,3 +11948,292 @@ function wireProjectTabEvents() {
 
 Benefits:
 Each extracted helper has zero shared local state with the others, so a reviewer can evaluate a sync-logic change, a layout tweak, or a new button binding in isolation without context-switching across 121 lines. `syncServerState` becomes independently unit-testable: stub `fetchJson`, assert the three module variables and two `localStorage` keys, with no need to mock `document.getElementById` or the template. `wireProjectTabEvents` is the block most likely to grow as new controls are added; isolating it keeps that growth visible and bounded within one function. The orchestrator drops to ~12 lines, well under threshold, leaving headroom for future init steps without re-triggering the length finding.
+
+### AC-194 · Decompose autoConfirmReview into classify / vote / applyOutcome phases
+Strength: Strong
+Files: src/auto-confirm-review.js
+Snippet:
+```
+}
+
+async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote, candidatesPath }) {
+  const summary = { checked: 0, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
+  if (process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW === 'false') return summary;
+
+  const dir = path.join(pipelineDir, 'queue', 'awaiting-confirm');
+  const approvedDir = path.join(pipelineDir, 'queue', 'approved');
+  const archiveDir = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+  const fixCandidatesPath = candidatesPath || (getConfig().pipelineFixCandidatesPath);
+
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+  } catch {
+    return summary; // no awaiting-confirm/ dir -- nothing to do
+  }
+
+  for (const name of names) {
+    const file = path.join(dir, name);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue;
+    }
+    if (task.autoConfirmReviewedAt) continue; // already reviewed once -- left for a human
+
+    summary.checked += 1;
+    const isForensics = task.source === 'pipeline_forensics';
+    const isDebrief = task.source === 'pipeline_debrief';
+    const deleteItems = (isForensics || isDebrief) ? [] : parseDeleteItems(task.implementResponse);
+
+    let prompt;
+    let gateStamp;
+    if (isForensics) {
+      prompt = buildForensicsConfirmPrompt(task, readCandidatesDoc(fixCandidatesPath));
+      gateStamp = 'forensicsReportConfirmedAt';
+    } else if (isDebrief) {
+      prompt = buildDebriefConfirmPrompt(task);
+      gateStamp = 'debriefReportConfirmedAt';
+    } else if (deleteItems.length && batchContainsDeleteMode(task.implementResponse)) {
+      const refMap = gatherDeleteReferences(repoRoot, grepDirs, deleteItems.map((i) => i.file), task);
+      prompt = buildDeleteConfirmPrompt(task, deleteItems, refMap);
+      gateStamp = 'deleteConfirmedAt';
+    } else {
+      // A hold we don't recognise -- don't guess. Leave it for a human, but stamp so we
+      // don't re-check every tick.
+      task.autoConfirmReviewedAt = new Date().toISOString();
+      task.autoConfirmDecision = 'escalate';
+      task.autoConfirmReviewNote = 'auto-confirm review does not recognise this hold type -- left for a human';
+      appendHistoryEvent(task, 'advisory', task.autoConfirmReviewNote);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch (err) {
+        const taskId = task.id || (task.implementResponse ? task.implementResponse.slice(0, 8) : 'unknown');
+        console.error(`[auto-confirm-review] escalate write failed: file=${file} task=${taskId} code=${err.code || ''} message=${err.message}`);
+        summary.errors += 1;
+      }
+      continue;
+    }
+
+    let vote;
+    try {
+      vote = await majorityVote({
+        prompt,
+        classify: classifyVote(['CONFIRM', 'DENY'], 15),
+        n: isDebrief ? DEBRIEF_VOTES : AUTO_CONFIRM_VOTES,
+        minAgreeing: isDebrief ? DEBRIEF_MIN_AGREEING : AUTO_CONFIRM_MIN_AGREEING,
+        temperature: 0.2,
+        source: task.source,
+      });
+    } catch (e) {
+      // Every vote hard-failed (infra). Do NOT stamp -- next tick retries.
+      appendHistoryEvent(task, 'advisory', `auto-confirm review could not run (${(e && e.message || 'vote error').slice(0, 160)}) -- will retry`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch { /* best-effort */ }
+      summary.errors += 1;
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    if (vote.confident && vote.verdict === 'CONFIRM') {
+      const reason = voteReason(vote, 'CONFIRM');
+      task[gateStamp] = now; // 'forensicsReportConfirmedAt' or 'deleteConfirmedAt' -- the field apply-task.js's gate checks
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'confirm';
+      task.autoConfirmReviewNote = reason;
+      task.status = 'approved';
+      appendHistoryEvent(task, 'approved', `auto-confirmed (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
+      try {
+        const result = moveTaskFile(file, approvedDir, name, task);
+        if (result) summary.confirmed += 1;
+        else { console.error(`auto-confirm: moveTaskFile returned falsy for ${name} (${file}): ${result}`); summary.errors += 1; }
+      } catch (err) { console.error(`auto-confirm: moveTaskFile threw for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
+    } else if (vote.confident && vote.verdict === 'DENY') {
+      const reason = voteReason(vote, 'DENY');
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'deny';
+      task.autoConfirmReviewNote = reason;
+      task.status = 'done';
+      task.doneMarker = `auto-denied at confirm gate: ${reason}`;
+      appendHistoryEvent(task, 'archived', `auto-denied (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
+      try {
+        if (moveTaskFile(file, archiveDir, name, task)) summary.denied += 1;
+        else summary.errors += 1;
+      } catch (err) { console.error(`auto-confirm: moveTaskFile threw (DENY) for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
+    } else {
+      // No confident majority -- leave for a human.
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision = 'escalate';
+      task.autoConfirmReviewNote = `no confident CONFIRM/DENY majority (votes: ${vote.realVoteCount}/${vote.requestedVotes})`;
+      appendHistoryEvent(task, 'advisory', `auto-confirm review inconclusive (${task.autoConfirmReviewNote}) -- held for a human`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch { summary.errors += 1; }
+    }
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The 117-line `autoConfirmReview` body interleaves three independently-failable phases—hold-type classification, majority-vote invocation, and result application—into a single sequential block. The result-application phase is the worst offender: three near-identical branches (CONFIRM, DENY, inconclusive) each repeat the same six-step ritual (stamp `autoConfirmReviewedAt`, set `autoConfirmDecision`, set `autoConfirmReviewNote`, call `appendHistoryEvent`, move-or-write the file, bump a summary counter), differing only in directory, status string, history-event type, and counter key. Adding a fourth hold-type or a new outcome (e.g. "park") requires editing three scattered branches inside a function that is already too long to hold in working memory during review.
+
+Solution:
+Extract two pure helpers and one table-driven applier, leaving the main function as a thin orchestration loop. `classifyHold(task, config)` maps `task.source` to `(prompt, gateStamp)` or `null`. `applyOutcome(task, file, pipelineDir, outcomeKey, vote, reason, gateStamp, now, summary)` reads a row from a static `OUTCOMES` table and performs the six-step ritual once. The main body shrinks to the loop skeleton plus the vote `try/catch`, which is the one piece that genuinely belongs inline because it is a single `await` with one error path.
+
+```js
+// ── extracted: classification ──────────────────────────────────────
+function classifyHold(task, { repoRoot, grepDirs, fixCandidatesPath }) {
+  if (task.source === 'pipeline_forensics') {
+    return {
+      prompt:    buildForensicsConfirmPrompt(task, readCandidatesDoc(fixCandidatesPath)),
+      gateStamp: 'forensicsReportConfirmedAt',
+    };
+  }
+  if (task.source === 'pipeline_debrief') {
+    return {
+      prompt:    buildDebriefConfirmPrompt(task),
+      gateStamp: 'debriefReportConfirmedAt',
+    };
+  }
+  const deleteItems = parseDeleteItems(task.implementResponse);
+  if (deleteItems.length && batchContainsDeleteMode(task.implementResponse)) {
+    const refMap = gatherDeleteReferences(repoRoot, grepDirs, deleteItems.map(i => i.file), task);
+    return {
+      prompt:    buildDeleteConfirmPrompt(task, deleteItems, refMap),
+      gateStamp: 'deleteConfirmedAt',
+    };
+  }
+  return null; // unrecognised → caller escalates
+}
+
+// ── extracted: result application (table-driven) ───────────────────
+const OUTCOMES = {
+  confirm: {
+    status:      'approved',
+    decision:    'confirm',
+    moveTo:      (pipelineDir) => path.join(pipelineDir, 'queue', 'approved'),
+    historyType: 'approved',
+    summaryKey:  'confirmed',
+    historyFmt:  (vote, reason) => `auto-confirmed (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`,
+  },
+  deny: {
+    status:      'done',
+    decision:    'deny',
+    moveTo:      (pipelineDir) => path.join(pipelineDir, 'queue', 'done', '_archived_no_action'),
+    historyType: 'archived',
+    summaryKey:  'denied',
+    historyFmt:  (vote, reason) => `auto-denied (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`,
+    extra:       (task, reason) => { task.doneMarker = `auto-denied at confirm gate: ${reason}`; },
+  },
+  escalate: {
+    status:      null,
+    decision:    'escalate',
+    moveTo:      null,
+    historyType: 'advisory',
+    summaryKey:  'escalated',
+    historyFmt:  (vote, reason) => `auto-confirm review inconclusive (${reason}) -- held for a human`,
+  },
+};
+
+function applyOutcome(task, file, pipelineDir, outcomeKey, vote, reason, gateStamp, now, summary) {
+  const o = OUTCOMES[outcomeKey];
+  task[gateStamp] = now;
+  task.autoConfirmReviewedAt = now;
+  task.autoConfirmDecision   = o.decision;
+  task.autoConfirmReviewNote = reason;
+  if (o.status) task.status = o.status;
+  if (o.extra)  o.extra(task, reason);
+  appendHistoryEvent(task, o.historyType, o.historyFmt(vote, reason));
+
+  try {
+    if (o.moveTo) {
+      const dest = o.moveTo(pipelineDir);
+      const name = path.basename(file);
+      if (!moveTaskFile(file, dest, name, task)) {
+        console.error(`auto-confirm: moveTaskFile returned falsy for ${name}`);
+        summary.errors += 1;
+        return;
+      }
+    } else {
+      fs.writeFileSync(file, JSON.stringify(task, null, 2));
+    }
+    summary[o.summaryKey] += 1;
+  } catch (err) {
+    console.error(`auto-confirm: file op failed for ${file}: ${err.message}`);
+    summary.errors += 1;
+  }
+}
+
+// ── refactored main (≈ 55 lines, down from 117) ───────────────────
+async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote, candidatesPath }) {
+  const summary = { checked: 0, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
+  if (process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW === 'false') return summary;
+
+  const dir = path.join(pipelineDir, 'queue', 'awaiting-confirm');
+  const fixCandidatesPath = candidatesPath || getConfig().pipelineFixCandidatesPath;
+
+  let names;
+  try { names = fs.readdirSync(dir).filter(f => f.endsWith('.json')); }
+  catch { return summary; }
+
+  for (const name of names) {
+    const file = path.join(dir, name);
+    let task;
+    try { task = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch { summary.errors += 1; continue; }
+    if (task.autoConfirmReviewedAt) continue;
+
+    summary.checked += 1;
+
+    // 1 ─ classify
+    const cls = classifyHold(task, { repoRoot, grepDirs, fixCandidatesPath });
+    if (!cls) {
+      const now = new Date().toISOString();
+      task.autoConfirmReviewedAt = now;
+      task.autoConfirmDecision   = 'escalate';
+      task.autoConfirmReviewNote = 'auto-confirm review does not recognise this hold type -- left for a human';
+      appendHistoryEvent(task, 'advisory', task.autoConfirmReviewNote);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
+      catch (err) { console.error(`[auto-confirm-review] escalate write failed: ${err.message}`); summary.errors += 1; }
+      continue;
+    }
+
+    // 2 ─ vote
+    let vote;
+    try {
+      vote = await majorityVote({
+        prompt: cls.prompt,
+        classify: classifyVote(['CONFIRM', 'DENY'], 15),
+        n: task.source === 'pipeline_debrief' ? DEBRIEF_VOTES : AUTO_CONFIRM_VOTES,
+        minAgreeing: task.source === 'pipeline_debrief' ? DEBRIEF_MIN_AGREEING : AUTO_CONFIRM_MIN_AGREEING,
+        temperature: 0.2,
+        source: task.source,
+      });
+    } catch (e) {
+      appendHistoryEvent(task, 'advisory',
+        `auto-confirm review could not run (${(e?.message || 'vote error').slice(0, 160)}) -- will retry`);
+      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch { /* best-effort */ }
+      summary.errors += 1;
+      continue;
+    }
+
+    // 3 ─ apply
+    const now = new Date().toISOString();
+    if (vote.confident && vote.verdict === 'CONFIRM') {
+      applyOutcome(task, file, pipelineDir, 'confirm', vote, voteReason(vote, 'CONFIRM'), cls.gateStamp, now, summary);
+    } else if (vote.confident && vote.verdict === 'DENY') {
+      applyOutcome(task, file, pipelineDir, 'deny', vote, voteReason(vote, 'DENY'), cls.gateStamp, now, summary);
+    } else {
+      applyOutcome(task, file, pipelineDir, 'escalate', vote,
+        `no confident CONFIRM/DENY majority (votes: ${vote.realVoteCount}/${vote.requestedVotes})`,
+        cls.gateStamp, now, summary);
+    }
+  }
+
+  return summary;
+}
+```
+
+Benefits:
+`classifyHold` is a pure `(task, config) → (prompt, gateStamp) | null` mapping that can be unit-tested with a fixture task object and no filesystem or network stubs; adding a fifth hold-type is a single `if` branch in one small function instead of a new `else if` buried mid-file. `applyOutcome` plus the `OUTCOMES` table collapses three copy-pasted ~12-line branches into one ~20-line function and a declarative data table, so a new outcome (e.g. "park") is a new table row rather than a new copy-pasted block. The main function drops to roughly 55 lines and reads top-down as *load → classify → vote → apply*, matching the mental model a reviewer actually uses when reading the stage.
