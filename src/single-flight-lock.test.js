@@ -9,6 +9,7 @@ const { spawnSync } = require('child_process');
 const {
   acquire, release, withLock, lockFilePath, queueDirPath,
   someoneIsWaiting, dropPriorityMarker, refreshPriorityMarker, removePriorityMarker,
+  withTaskMoveLock, taskMoveLockKey,
 } = require('./single-flight-lock.js');
 
 function makeInstancesDir() {
@@ -494,4 +495,134 @@ test('cross-language FIFO order: a bash waiter enqueued before a JS waiter is gr
       });
     }, 300);
   });
+});
+
+// Task-move lock (2026-09-27) -- the concurrency test the original incident needed. A
+// mocked single-process test proves nothing about the real failure mode (two SEPARATE
+// processes racing to move the same task id): this spawns two real child processes that
+// both call withTaskMoveLock for the SAME task id at nearly the same instant, each
+// holding it across a real sleep, and asserts their critical sections never overlap in
+// wall-clock time -- not just that the output bytes happen to look clean.
+function childMoveLockScript(dir, taskId, logPath) {
+  return `
+    const { withTaskMoveLock } = require(${JSON.stringify(require.resolve('./single-flight-lock.js'))});
+    const fs = require('fs');
+    withTaskMoveLock(${JSON.stringify(dir)}, ${JSON.stringify(taskId)}, () => {
+      fs.appendFileSync(${JSON.stringify(logPath)}, \`\${process.pid} START \${Date.now()}\\n\`);
+      execFileSyncSleep();
+      fs.appendFileSync(${JSON.stringify(logPath)}, \`\${process.pid} END \${Date.now()}\\n\`);
+    }).then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); });
+    function execFileSyncSleep() {
+      require('child_process').execFileSync('sleep', ['0.4']);
+    }
+  `;
+}
+
+test('withTaskMoveLock: two real concurrent processes racing the SAME task id never overlap in wall-clock time', () => {
+  const dir = makeInstancesDir();
+  const logPath = path.join(dir, 'move-log.txt');
+  const taskId = 'adhoc-concurrency-test-task-id';
+
+  const c1 = require('child_process').spawn('node', ['-e', childMoveLockScript(dir, taskId, logPath)]);
+  const c2 = require('child_process').spawn('node', ['-e', childMoveLockScript(dir, taskId, logPath)]);
+
+  return new Promise((resolve, reject) => {
+    let exited = 0;
+    const onExit = (code) => {
+      exited += 1;
+      if (code !== 0) return reject(new Error(`child exited ${code}`));
+      if (exited < 2) return;
+      const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n').map((l) => {
+        const [pid, kind, ts] = l.split(' ');
+        return { pid, kind, ts: Number(ts) };
+      });
+      assert.equal(lines.length, 4, `expected 4 log lines (2 per process), got ${lines.length}: ${JSON.stringify(lines)}`);
+      const byPid = new Map();
+      for (const l of lines) {
+        if (!byPid.has(l.pid)) byPid.set(l.pid, {});
+        byPid.get(l.pid)[l.kind] = l.ts;
+      }
+      const spans = [...byPid.values()];
+      assert.equal(spans.length, 2, 'expected exactly 2 distinct pids');
+      const [a, b] = spans;
+      // Mutual exclusion, checked in wall-clock time, not byte order: one span's END must
+      // be <= the other's START. If both held the lock "at once" this would fail (a.START
+      // < b.END AND b.START < a.END -- a genuine time overlap), which is exactly the shape
+      // the original incident had no test to catch.
+      const noOverlap = (a.END <= b.START) || (b.END <= a.START);
+      assert.ok(noOverlap, `expected serialized (non-overlapping) critical sections, got ${JSON.stringify({ a, b })}`);
+      resolve();
+    };
+    c1.on('exit', onExit);
+    c2.on('exit', onExit);
+  });
+});
+
+// Same test, run WITHOUT the lock (raw sleep+append, no acquire/release at all) --
+// confirms this test methodology is real: two truly unsynchronized processes DO overlap
+// in wall-clock time, so the assertion above is actually exercising the lock, not just
+// passing regardless of whether it does anything.
+test('sanity check: the SAME two-process race, with no lock at all, DOES overlap (proves the test above is real)', () => {
+  const dir = makeInstancesDir();
+  const logPath = path.join(dir, 'move-log-unlocked.txt');
+  const unlockedScript = `
+    const fs = require('fs');
+    fs.appendFileSync(${JSON.stringify(logPath)}, \`\${process.pid} START \${Date.now()}\\n\`);
+    require('child_process').execFileSync('sleep', ['0.4']);
+    fs.appendFileSync(${JSON.stringify(logPath)}, \`\${process.pid} END \${Date.now()}\\n\`);
+  `;
+  const c1 = require('child_process').spawn('node', ['-e', unlockedScript]);
+  const c2 = require('child_process').spawn('node', ['-e', unlockedScript]);
+
+  return new Promise((resolve, reject) => {
+    let exited = 0;
+    const onExit = (code) => {
+      exited += 1;
+      if (code !== 0) return reject(new Error(`child exited ${code}`));
+      if (exited < 2) return;
+      const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n').map((l) => {
+        const [pid, kind, ts] = l.split(' ');
+        return { pid, kind, ts: Number(ts) };
+      });
+      const byPid = new Map();
+      for (const l of lines) {
+        if (!byPid.has(l.pid)) byPid.set(l.pid, {});
+        byPid.get(l.pid)[l.kind] = l.ts;
+      }
+      const [a, b] = [...byPid.values()];
+      const overlapped = (a.START < b.END) && (b.START < a.END);
+      assert.ok(overlapped, `expected the UNLOCKED race to overlap (both started before either finished) -- if this fails the test methodology itself is unreliable, got ${JSON.stringify({ a, b })}`);
+      resolve();
+    };
+    c1.on('exit', onExit);
+    c2.on('exit', onExit);
+  });
+});
+
+// Cross-language parity for the task-move lock (2026-09-27): apply-task.sh's
+// acquire_single_flight_lock (agent-manager-common.sh) and single-flight-lock.js's
+// taskMoveLockKey MUST resolve to the byte-for-byte identical lockfile path for the same
+// task id, or the two sides serialize against two DIFFERENT lockfiles and provide no
+// mutual exclusion at all -- silently. Computes the JS side via the real lockFilePath/
+// taskMoveLockKey functions and the bash side via the real sed sanitization
+// agent-manager-common.sh's acquire_single_flight_lock actually uses (copied verbatim
+// from that function's own body, not hand-approximated), and asserts they match. This
+// was verified by hand once during implementation and NOT committed as a real test --
+// caught by review, which correctly rejected an earlier draft for claiming this
+// verification existed when it didn't.
+test('taskMoveLockKey resolves to the SAME lockfile path bash\'s acquire_single_flight_lock would compute for the same task id', () => {
+  const dir = makeInstancesDir();
+  const taskId = 'adhoc-some-real-shaped-task-id-1234567890';
+
+  const jsPath = lockFilePath(dir, taskMoveLockKey(taskId));
+
+  const bashResult = spawnSync('bash', ['-c', `
+    INSTANCES_DIR=${JSON.stringify(dir)}
+    key="move.${taskId}"
+    safe_key="$(printf '%s' "$key" | sed -E 's/[^A-Za-z0-9._-]+/_/g')"
+    echo "\${INSTANCES_DIR}/.pipeline-single-flight.\${safe_key}.lock"
+  `]);
+  const bashPath = bashResult.stdout.toString().trim();
+
+  assert.equal(bashPath, jsPath, 'JS and bash must compute the identical lockfile path for the same task id, or the two sides never actually serialize against each other');
 });
