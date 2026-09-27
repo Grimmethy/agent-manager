@@ -10396,3 +10396,327 @@ Extract four module-level helpers above the route — `_resolve_task_source`, `_
 
 Benefits:
 Each extracted helper is a single-purpose, independently-importable unit that can be unit-tested with plain `Path` and `dict` arguments and a `tmp_path` fixture — no Flask app context, no real git repository, no multi-level directory scaffolding. The route body drops to roughly 35 lines of pure orchestration (resolve → guard → cleanup → build → write → record → return), making the control flow scannable at a glance and the diff surface for future changes (e.g., adding a new precondition or a new coordination field) confined to the one helper that owns that concern rather than interleaved with unrelated logic. Reviewers can approve or reject each helper's contract in isolation, and the git-branch side-effect block — the only part with network I/O — is visually and structurally separated from the pure-data transformation.
+
+### AC-188 · Extract model-select and task-assign-select builders from renderWorkers
+Strength: Strong
+Files: python/dashboard/static/js/core-ui.js
+Snippet:
+```
+// === true) is skipped, and only when focus is currently inside one of this tab's own
+// selects, i.e. the operator is actively mid-choice. The next 5s tick tries again.
+async function renderWorkers(isPoll) {
+  if (isPoll) {
+    const active = document.activeElement;
+    if (active && (active.classList.contains('worker-type-select') || active.classList.contains('worker-task-select'))) {
+      return;
+    }
+    // Top up the completed-tasks log with anything newer than what's already loaded --
+    // see refreshNewestCompletedTasks's own header note. Only on the real poll cycle,
+    // not every action-triggered re-render (assign-task, filter click, expand/collapse).
+    await refreshNewestCompletedTasks();
+  }
+  // run-log vs recent-tasks (2026-09-08, Grimmethy: "This looks like it's only showing
+  // fully completed tasks. I want to see a log of every time an agent is run and the
+  // outcome of that run."): a drafting worker's real activity includes attempts that
+  // never reach a terminal task state at all (a hard OLLAMA_TIMEOUT, mid-GPU-contention,
+  // never produces a usable response) -- /api/instances/<id>/run-log surfaces those too,
+  // merged with every model_calls row regardless of outcome. reviewer has no equivalent
+  // call-level data (review-task.js's majorityVote never calls recordCall, see that
+  // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
+  const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
+  const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
+    fetchJson('/api/instances'),
+    fetchJson('/api/worker-models'),
+    fetchJson('/api/models/cost-summary'),
+    // Only fetch for whichever card is currently expanded -- no point loading this for
+    // every instance on every 5s poll when at most one card shows it at a time.
+    expandedWorkerId
+      ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/${expandedIsWorker ? 'run-log' : 'recent-tasks'}`)
+      : Promise.resolve(null),
+  ]);
+  // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
+  // follow-up, Grimmethy after live-testing the override: "the only tasks I have
+  // access to... are pipeline debrief tasks. The task I want, autodecomp, is in
+  // drafting. I need access to the full list of available jobs, they should however be
+  // whats available for that specific worker type"). Per-instance now, not one shared
+  // list: /api/instances/<id>/assignable-tasks tier-filters for THAT lane and also
+  // surfaces tasks already claimed by other lanes (queue/drafting/<lane>/), not just
+  // queue/pending/ -- a plain worker-model-style shared list can't express either of
+  // those. Fetched only for worker-* instances (canAssignTask), in parallel.
+  const assignableByInstance = {};
+  await Promise.all(instances.filter(canAssignTask).map(async (inst) => {
+    try {
+      const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
+      assignableByInstance[inst.instanceId] = r.items || [];
+    } catch (e) {
+      assignableByInstance[inst.instanceId] = [];
+    }
+  }));
+  const overrides = workerModels.overrides || {};
+  // Per-instance cumulative estimated API cost (2026-08-23, "Where else would it make
+  // sense to track it?" -> Workers tab): AGENT_MANAGER_INSTANCE_ID is stamped onto every
+  // real model_calls row now (see model-stats-client.js's own recordCall) -- keyed here
+  // by instanceId so each worker-card can show its own running total, same "estimate,
+  // not a bill" framing as the Models tab's own widget.
+  const costByInstance = Object.fromEntries((costSummary.byInstance || []).map((i) => [i.instanceId, i.totalCost]));
+  const main = document.getElementById('main');
+  const fetchedAt = Date.now();
+  instances.forEach(i => { i._fetchedAtMs = fetchedAt; });
+  instancesForTimers = instances;
+  // Clear the optimistic pending-assign marker the moment real data confirms it --
+  // either the pin took (currentTaskId now matches) or the operator/pipeline moved on
+  // to something else for this instance since (a stale marker pointing at a taskId this
+  // instance is no longer even working toward would be actively misleading, worse than
+  // no marker at all).
+  instances.forEach((inst) => {
+    // Any real currentTaskId -- matching the pin (success) or not (moved on to
+    // something else meanwhile) -- means the "waiting to pick this up" state is over.
+    if (pendingWorkerAssign[inst.instanceId] && inst.currentTaskId) {
+      delete pendingWorkerAssign[inst.instanceId];
+    }
+  });
+  const filterBar = `
+    <div class="worker-filter-bar" style="margin-bottom:10px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px">
+      <div></div>
+      <label style="display:flex; align-items:center; gap:6px; font-size:0.9em; cursor:pointer" title="Stops every automated Claude call pipeline-wide (worker-reasoning's plan pass, adhoc/research's implement calls, review votes) until unchecked -- preserves your subscription's token budget.">
+        <input type="checkbox" id="claude-pause-toggle" ${workerModels.claudePaused ? 'checked' : ''}>
+        Pause Claude (preserve subscription tokens)
+      </label>
+    </div>
+  `;
+  const shown = instances;
+  if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
+  // Preserve scroll position across the full innerHTML replace below -- same isPoll
+  // "don't yank state out from under the operator" reasoning as the dropdown guard
+  // above, needed here because the completed-tasks log (renderCompletedTasksSection)
+  // can push #main well past one screen, and a poll landing mid-scroll would otherwise
+  // silently reset the operator back to the top every 5s.
+  const scrollY = window.scrollY;
+  main.innerHTML = filterBar + (shown.length === 0
+    ? '<div class="empty">No workers match this filter.</div>'
+    : shown.map(inst => `
+    <div class="worker-card clickable" data-instance-id="${escapeAttr(inst.instanceId)}">
+      <div class="row">
+        <span class="id">${inst.instanceId}</span>
+        ${(() => {
+          const kind = modelKindForInstance(inst);
+          if (!kind) return '';
+          const current = overrides[inst.instanceId] || '';
+          const optionsFor = (label, values) => values.length
+            ? `<optgroup label="${escapeAttr(label)}">${values.map(m => `<option value="${escapeAttr(m.value)}" ${m.value === current ? 'selected' : ''}>${m.label}</option>`).join('')}</optgroup>`
+            : '';
+          let body;
+          if (kind === 'mixed') {
+            // Prefixed so local-worker.sh's refresh_active_model can tell which backend
+            // was picked -- see that function's own comment for why this is the fix for
+            // "reasoning only shows subscription models."
+            body = optionsFor('Claude (subscription)', (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))
+              + optionsFor('Local (Ollama)', (workerModels.ollamaModels || []).map(m => ({ value: `ollama:${m}`, label: m })));
+          } else {
+            body = (workerModels.ollamaModels || []).map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`).join('');
+          }
+          return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
+        })()}
+        ${canAssignTask(inst) ? (() => {
+          const items = assignableByInstance[inst.instanceId] || [];
+          // Grouped by source (task TYPE) so the picker shows "pipeline_debrief (7)"
+          // etc first, rather than one flat list where a deep single-type backlog
+          // buries everything else (see selectedWorkerTaskType's own header comment).
+          const bySource = {};
+          items.forEach((t) => {
+            const key = t.source || 'unknown';
+            (bySource[key] = bySource[key] || []).push(t);
+          });
+          const sourceKeys = Object.keys(bySource).sort();
+          const selectedType = selectedWorkerTaskType[inst.instanceId] || '';
+          // Keep the previously-picked type visible even if its bucket happens to be
+          // empty on THIS particular poll (its last task just got claimed elsewhere, or
+          // this instance's own assignable-tasks fetch above hit its catch and fell back
+          // to [] for one cycle) -- 2026-09-07, same complaint as isPoll above: a
+          // transient empty bucket used to collapse the whole drill-down back to the
+          // type-only picker, which looked identical to "your selection got reset" even
+          // though selectedWorkerTaskType was never actually cleared.
+          if (selectedType && !sourceKeys.includes(selectedType)) sourceKeys.push(selectedType);
+          sourceKeys.sort();
+          const typeSelect = `<select class="worker-type-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order -- includes tasks already claimed by other workers, tier-filtered for this worker type">
+            <option value="">(assign a task…)</option>
+            ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${(bySource[k] || []).length})</option>`).join('')}
+          </select>`;
+          if (!selectedType) return typeSelect;
+          const tasksOfSelectedType = bySource[selectedType] || [];
+          // A native <select> sizes itself to its widest <option> text -- an untruncated
+          // task title (adhoc/decompose titles especially routinely run 80-100+ chars)
+          // pushed this whole control off the right edge of the worker card (2026-09-07,
+          // Grimmethy: "when I open the manual task that has long task names it sets the
+          // selector to the size of the largest... names should be truncated"). Truncate
+          // what's SHOWN; the option's own `title` attribute (native hover tooltip) and
+          // `data-title` (read by setWorkerTask's confirm-dialog text) both still carry
+          // the full, untruncated title -- nothing is actually lost, just not rendered
+          // into the control's own width.
+          const OPTION_LABEL_MAX = 70;
+          const truncateLabel = (s) => (s.length > OPTION_LABEL_MAX ? `${s.slice(0, OPTION_LABEL_MAX - 1)}…` : s);
+          const optionLabel = (t) => {
+            // A hub member leads with its HUB#### slot (2026-09-20) so a hub in progress is recognisable in this list.
+            const rawTitle = t.title || t.id;
+            const base = t.hub && !/^HUB\d/.test(rawTitle) ? `${hubTag(t.hub)} · ${rawTitle}` : rawTitle;
+            // pinnedTo (2026-09-07, Grimmethy: "why do the 2 reasoning workers have
+            // different lists? they really should share the same task list") -- a task
+            // pending but already pinned to a SIBLING lane (same tier) now shows here
+            // too instead of being invisible; picking it just re-pins it to this lane
+            // instead (no kill needed, nothing is running on it yet, unlike the
+            // "⚠ running on" case below).
+            let full = base;
+            if (t.location && t.location !== 'pending') full = `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}`;
+            else if (t.pinnedTo) full = `📌 pinned to ${t.pinnedTo} — ${base}`;
+            // premiumPriority (2026-09-07, Grimmethy: "I am getting tired of manually
+            // selecting it for the worker queue every pass") -- surfaces here so the
+            // operator can SEE this task is already set to always-claim-first and
+            // doesn't need to keep re-picking it via this very dropdown.
+            if (t.premiumPriority) full = `★ ${full}`;
+            return truncateLabel(full);
+          };
+          const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Pick a specific ${escapeAttr(selectedType)} task to assign to this worker">
+            <option value="">${tasksOfSelectedType.length ? `(choose a ${escapeHtml(selectedType)} task…)` : `(no ${escapeHtml(selectedType)} tasks right now)`}</option>
+            ${tasksOfSelectedType.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}" title="${escapeAttr(t.title || t.id)}">${escapeHtml(optionLabel(t))}</option>`).join('')}
+          </select>`;
+          return typeSelect + taskSelect;
+        })() : ''}
+        <div class="badge-col">
+          <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
+          ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
+          <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
+        </div>
+      </div>
+      <div class="meta">
+        pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
+        ${inst.currentTaskId && inst.projectLabel ? ' · <span class="badge ' + (inst.borrowed ? 'warn' : 'idle') + '" title="' + (inst.borrowed ? 'Borrowed: this lane is idle in the active project and is working a task of ' + escapeAttr(inst.projectLabel) + ' (idle-pool borrowing)' : 'This task belongs to the active project') + '">📁 ' + escapeHtml(inst.projectLabel) + (inst.borrowed ? ' (borrowed)' : '') + '</span>' : ''}
+        ${inst.currentTaskId && inst.hub ? ' · <span class="badge ok" title="This task belongs to hub ' + escapeAttr(inst.hub.label) + '" style="font-weight:700">🗂 ' + escapeHtml(hubTag(inst.hub)) + '</span>' : ''}
+        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') : ''}
+        ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
+        ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
+      </div>
+      ${expandedWorkerId === inst.instanceId ? `
+      <div class="worker-recent-tasks">
+        <div class="meta" style="margin-top:8px; font-weight:600">${inst.instanceId === 'reviewer' ? 'Last 10 reviewed tasks' : 'Recent runs (every attempt, including failures)'}</div>
+        ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
+      </div>` : ''}
+    </div>
+  `).join('')) + renderCompletedTasksSection();
+  window.scrollTo(0, scrollY);
+  setupCompletedTasksObserver();
+// ... [truncated for review: this function continues for 41 more line(s) not shown]
+```
+
+Problem:
+`renderWorkers` spans roughly 241 lines because it interleaves five distinct responsibilities—poll-guard, parallel data fetch with per-instance fan-out, derived-state bookkeeping, two option-building IIFE closures, and the card/expanded-section template—into a single function body. The two IIFE closures (`(() => { … })()`) inside the `shown.map` template literal each carry non-trivial branching (mixed-vs-ollama model shapes; type→task drill-down with a four-flag label formatter that checks `t.location`, `t.pinnedTo`, `t.premiumPriority`, and `t.hub` in a specific precedence order), yet they are invisible to any line-count or complexity scanner because they live inside a template string. The result is that the highest-cognitive-load logic in the file is the hardest to locate, the hardest to unit-test, and the most likely to regress silently when a new flag or formatting rule is added.
+
+Solution:
+Extract the two IIFE closures into named, pure helper functions that take the relevant data as parameters and return an HTML string. The `renderWorkers` body keeps the filter bar, the `shown.map` skeleton, the empty-state check, scroll preservation, and post-render DOM setup; the option-building logic moves out. Concretely, the model-select IIFE becomes `renderModelSelect(inst, overrides, workerModels)` and the task-assign-select IIFE becomes `renderTaskAssignSelect(inst, assignableByInstance, selectedWorkerTaskType)`. The label formatter inside the second helper preserves the exact precedence from the grounding source: `t.location` (when not `'pending'`) produces the "⚠ running on …" prefix, else `t.pinnedTo` produces the "📌 pinned to …" prefix, and `t.premiumPriority` prepends "★ " to whichever base was built; `t.hub` is folded in via `hubTag(t.hub)` before the location/pinned check. The diff below shows the template-literal call-site and the new function bodies:
+
+```diff
+--- a/python/dashboard/static/js/core-ui.js
++++ b/python/dashboard/static/js/core-ui.js
+@@ renderWorkers — model-select slot @@
+-        ${(() => {
+-          const kind = modelKindForInstance(inst);
+-          if (!kind) return '';
+-          const current = overrides[inst.instanceId] || '';
+-          const optionsFor = (label, values) => values.length
+-            ? `<optgroup label="${escapeAttr(label)}">${values.map(m => `<option value="${escapeAttr(m.value)}" ${m.value === current ? 'selected' : ''}>${m.label}</option>`).join('')}</optgroup>`
+-            : '';
+-          let body;
+-          if (kind === 'mixed') {
+-            body = optionsFor('Claude (subscription)', (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))
+-              + optionsFor('Local (Ollama)', (workerModels.ollamaModels || []).map(m => ({ value: `ollama:${m}`, label: m })));
+-          } else {
+-            body = (workerModels.ollamaModels || []).map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`).join('');
+-          }
+-          return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
+-        })()}
++        ${renderModelSelect(inst, overrides, workerModels)}
+@@ renderWorkers — task-assign-select slot @@
+-        ${canAssignTask(inst) ? (() => {
+-          const items = assignableByInstance[inst.instanceId] || [];
+-          const bySource = {};
+-          items.forEach((t) => { const key = t.source || 'unknown'; (bySource[key] = bySource[key] || []).push(t); });
+-          const sourceKeys = Object.keys(bySource).sort();
+-          const selectedType = selectedWorkerTaskType[inst.instanceId] || '';
+-          if (selectedType && !sourceKeys.includes(selectedType)) sourceKeys.push(selectedType);
+-          sourceKeys.sort();
+-          /* … typeSelect, optionLabel (hub/location/pinnedTo/premiumPriority), taskSelect … */
+-          return typeSelect + taskSelect;
+-        })() : ''}
++        ${canAssignTask(inst) ? renderTaskAssignSelect(inst, assignableByInstance, selectedWorkerTaskType) : ''}
+```
+
+```js
+// NEW — pure, no DOM, independently testable
+function renderModelSelect(inst, overrides, workerModels) {
+  const kind = modelKindForInstance(inst);
+  if (!kind) return '';
+  const current = overrides[inst.instanceId] || '';
+  const optionsFor = (label, values) => values.length
+    ? `<optgroup label="${escapeAttr(label)}">${values.map(m =>
+        `<option value="${escapeAttr(m.value)}" ${m.value === current ? 'selected' : ''}>${m.label}</option>`
+      ).join('')}</optgroup>`
+    : '';
+  let body;
+  if (kind === 'mixed') {
+    body = optionsFor('Claude (subscription)',
+        (workerModels.claudeModels || []).map(m => ({ value: `claude:${m}`, label: m })))
+      + optionsFor('Local (Ollama)',
+        (workerModels.ollamaModels || []).map(m => ({ value: `ollama:${m}`, label: m })));
+  } else {
+    body = (workerModels.ollamaModels || [])
+      .map(m => `<option value="${escapeAttr(m)}" ${m === current ? 'selected' : ''}>${m}</option>`)
+      .join('');
+  }
+  return `<select class="worker-model-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()"><option value="">(default)</option>${body}</select>`;
+}
+
+// NEW — pure, no DOM, independently testable
+function renderTaskAssignSelect(inst, assignableByInstance, selectedWorkerTaskType) {
+  const items = assignableByInstance[inst.instanceId] || [];
+  const bySource = {};
+  items.forEach((t) => {
+    const key = t.source || 'unknown';
+    (bySource[key] = bySource[key] || []).push(t);
+  });
+  const sourceKeys = Object.keys(bySource).sort();
+  const selectedType = selectedWorkerTaskType[inst.instanceId] || '';
+  if (selectedType && !sourceKeys.includes(selectedType)) sourceKeys.push(selectedType);
+  sourceKeys.sort();
+
+  const typeSelect = `<select class="worker-type-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Assign a specific task to this worker, overriding the automated priority/tier claim order">
+    <option value="">(assign a task…)</option>
+    ${sourceKeys.map(k => `<option value="${escapeAttr(k)}" ${k === selectedType ? 'selected' : ''}>${escapeHtml(k)} (${(bySource[k] || []).length})</option>`).join('')}
+  </select>`;
+  if (!selectedType) return typeSelect;
+
+  const tasksOfSelectedType = bySource[selectedType] || [];
+  const OPTION_LABEL_MAX = 70;
+  const truncateLabel = (s) => (s.length > OPTION_LABEL_MAX ? `${s.slice(0, OPTION_LABEL_MAX - 1)}…` : s);
+
+  const optionLabel = (t) => {
+    const rawTitle = t.title || t.id;
+    const base = t.hub && !/^HUB\d/.test(rawTitle) ? `${hubTag(t.hub)} · ${rawTitle}` : rawTitle;
+    let full = base;
+    if (t.location && t.location !== 'pending') {
+      full = `⚠ running on ${t.location.replace(/^drafting:/, '')} — ${base}`;
+    } else if (t.pinnedTo) {
+      full = `📌 pinned to ${t.pinnedTo} — ${base}`;
+    }
+    if (t.premiumPriority) full = `★ ${full}`;
+    return truncateLabel(full);
+  };
+
+  const taskSelect = `<select class="worker-task-select" data-instance-id="${escapeAttr(inst.instanceId)}" onclick="event.stopPropagation()" title="Pick a specific ${escapeAttr(selectedType)} task to assign to this worker">
+    <option value="">${tasksOfSelectedType.length ? `(choose a ${escapeHtml(selectedType)} task…)` : `(no ${escapeHtml(selectedType)} tasks right now)`}</option>
+    ${tasksOfSelectedType.map(t => `<option value="${escapeAttr(t.id)}" data-title="${escapeAttr(t.title || t.id)}" data-source-lane="${escapeAttr(t.location && t.location !== 'pending' ? t.location.replace(/^drafting:/, '') : '')}" title="${escapeAttr(t.title || t.id)}">${escapeHtml(optionLabel(t))}</option>`).join('')}
+  </select>`;
+  return typeSelect + taskSelect;
+}
+```
+
+Benefits:
+Once extracted, `renderWorkers` drops to roughly 90–100 lines and reads as a flat sequence of data-fetch → filter → template → post-render steps, with the two complex option builders referenced by name. More importantly, `optionLabel`—with its four interacting flags (`t.hub`, `t.location`, `t.pinnedTo`, `t.premiumPriority`) and their specific precedence (location outranks pinnedTo; premiumPriority is a prefix on whichever base was built)—becomes a pure string-in/string-out function that can be asserted in a unit test without spinning up a DOM or rendering the full worker page. A reviewer investigating a "label shows the wrong prefix" bug can open `renderTaskAssignSelect` directly instead of hunting through a 241-line function for the IIFE that happens to contain the logic. The model-select helper likewise isolates the mixed-vs-ollama branching, making it straightforward to add a third model family or change the optgroup labels without touching the card template.
