@@ -242,6 +242,69 @@ test('a "false positive" refusal is matched case-insensitively and with a hyphen
   assert.match(result.doneMarker, /false positive/i);
 });
 
+// --- HUB0092 · 3/3: stale brain-dump sort results must be NON-success at the apply-task
+// layer. apply-group-a.js re-states a stale sort (entry edited / re-captured after the
+// task was drafted) as {skipped:true, stale:true, success:false, reason}. Before the guard
+// this pass adds in apply-task.js, the brain_dump_sort branch fell through to its
+// `if (result.skipped)` branch and returned succeeded:true -- routing a stale (never-applied)
+// result into done/ as if the entry's CURRENT text had been classified, when nothing was.
+// The guard (immediately above in apply-task.js) routes every stale result to
+// succeeded:false instead. These tests pin that, and confirm a NON-stale skipped result
+// keeps the old success/skip behaviour (succeeded:true).
+function writeBrainDumpFile(file, entries) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ entries }));
+}
+function brainDumpSortTask(id, rawText) {
+  return {
+    id,
+    domain: 'brain_dump_sort',
+    source: 'brain_dump_sort',
+    title: 'Stale-sort test',
+    implementResponse: 'never parsed -- the stale/skip decision fires before classification',
+    promptContext: { brainDumpEntryId: 'e1', rawText },
+  };
+}
+
+test('HUB0092 3/3: a stale brain_dump_sort result is non-success (succeeded:false), not a done/success skip', () => {
+  const brainDumpPath = path.join(REPO_ROOT, 'bd-stale-1.json');
+  // entry.rawText differs from the task's drafted rawText -> applyBrainDumpSortCore's
+  // staleness guard fires and returns {skipped, stale, success:false}.
+  writeBrainDumpFile(brainDumpPath, [{ id: 'e1', status: 'captured', rawText: 'CHANGED AFTER DRAFT' }]);
+  const result = applyTask(brainDumpSortTask('stale-1', 'the original text this task was drafted against'), {
+    repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, brainDumpPath, gitRunner: createFakeGitRunner(),
+  });
+  assert.equal(result.succeeded, false);
+  assert.equal(result.stale, true);
+  assert.match(result.reason, /changed since this task was drafted/i);
+});
+
+test('HUB0092 3/3: a stale result that ALSO carries skipped:true is still non-success (the stale+skipped case)', () => {
+  const brainDumpPath = path.join(REPO_ROOT, 'bd-stale-2.json');
+  writeBrainDumpFile(brainDumpPath, [{ id: 'e1', status: 'captured', rawText: 'CHANGED AFTER DRAFT' }]);
+  const result = applyTask(brainDumpSortTask('stale-2', 'the original text this task was drafted against'), {
+    repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, brainDumpPath, gitRunner: createFakeGitRunner(),
+  });
+  // The stale re-statement carries BOTH skipped:true and stale:true -- the guard must win over
+  // skipped, so the presence of the skipped flag never flips a stale result back to success.
+  assert.equal(result.succeeded, false, 'a stale result must be non-success even though it also carries skipped:true');
+  assert.equal(result.stale, true);
+});
+
+test('HUB0092 3/3: a NON-stale skipped brain_dump_sort result keeps the old success/skip behaviour (succeeded:true)', () => {
+  const brainDumpPath = path.join(REPO_ROOT, 'bd-nonstale.json');
+  // Entry no longer exists -> the core returns a plain {skipped:true, reason} with NO stale
+  // flag -- a legitimate terminal skip, not a stale one. The new stale guard must leave this
+  // untouched, so it keeps the pre-stale succeeded:true/doneMarker behaviour.
+  writeBrainDumpFile(brainDumpPath, []);
+  const result = applyTask(brainDumpSortTask('nonstale-1', 'the original text'), {
+    repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, brainDumpPath, gitRunner: createFakeGitRunner(),
+  });
+  assert.equal(result.succeeded, true, 'a non-stale skipped result must keep the old success/skip behaviour');
+  assert.equal(result.stale, undefined, 'a non-stale skip must NOT be re-labelled stale');
+  assert.match(result.doneMarker, /no longer exists/i);
+});
+
 test('a real Group B JSON change is never misclassified just because it mentions "false positive" inside a string value', () => {
   const gitRunner = createFakeGitRunner();
   const change = JSON.stringify({
