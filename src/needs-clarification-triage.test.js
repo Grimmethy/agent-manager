@@ -1300,3 +1300,28 @@ test('bucket E: the surfaced decompose design question lands in the sweep\'s own
     assert.equal(fs.existsSync(path.join(elsewhere, 'queue', 'awaiting-confirm')), false, 'nothing written where the env var points');
   } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev; }
 });
+
+// HUB0027 2/2: the bucket-E decompose-loop task's design question must surface as a real
+// decompose_design_question entry in queue/awaiting-confirm/ (idempotent helper, written
+// before the requeue), so a human can answer it through the existing confirm flow.
+test('bucket E: surfacing creates awaiting-confirm entry', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('t-surf-1', {
+    // the exact gate: decompose-loop staleness flag (and NOT an oversized-file target,
+    // so autoroute does not own it) -- same shape the te-surface test above uses.
+    stalenessFlag: { reason: 'decompose-loop', disposition: 're-scope', confidence: 'medium' },
+  }));
+  const s = await needsClarificationTriage(args(dir, voteOf('approve', 'ok')));
+  assert.equal(s.errors, 0, 'no triage errors');
+  // (a) the original is gone from needs-clarification/ (bucket E requeued it to adhoc/):
+  assert.ok(!exists(at(dir, 'needs-clarification', 't-surf-1.json')), 'original gone from needs-clarification/');
+  assert.ok(exists(at(dir, 'adhoc', 't-surf-1.json')), 'bucket E requeued it to adhoc/');
+  // (b) exactly one awaiting-confirm entry for t-surf-1 exists:
+  const acDir = at(dir, 'awaiting-confirm');
+  const entries = fs.readdirSync(acDir).filter((f) => f.includes('t-surf-1'));
+  assert.equal(entries.length, 1, 'exactly one awaiting-confirm entry named after t-surf-1');
+  // (c) ... and it is a decompose_design_question entry pointing at the original task:
+  const entry = read(path.join(acDir, entries[0]));
+  assert.equal(entry.source, 'decompose_design_question');
+  assert.equal(entry.originalTaskId, 't-surf-1');
+});
