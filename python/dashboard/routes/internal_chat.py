@@ -102,8 +102,14 @@ def api_internal_chat_preempt():
     {preempted: [...]} -- an empty list if preemption is disabled
     (AGENT_MANAGER_CHAT_PREEMPT=false) or nothing was in flight."""
     _require_internal_token()
-    from app import _chat_preempt_enabled, _preempt_pipeline_for_chat
+    from app import _chat_preempt_enabled, _chat_preempt_gate_state, _preempt_pipeline_for_chat, log_preempt_gate_off
     if not _chat_preempt_enabled():
+        # HUB0033 2/4 -- gate OFF (see chat_preempt.py's _chat_preempt_gate_state):
+        # production state on the worker-1/chat host is default ON ("true"); no
+        # disabling value found in the repo (env file is host-local). An explicit
+        # operator preempt request hitting the OFF gate is a silent no-op without
+        # this line.
+        log_preempt_gate_off(_chat_preempt_gate_state())
         return jsonify({"preempted": []})
     try:
         preempted = _preempt_pipeline_for_chat()

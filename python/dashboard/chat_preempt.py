@@ -70,11 +70,49 @@ def _is_preemptable_child_pass(pass_name) -> bool:
     return pass_name in _PREEMPT_CHILD_PASSES or pass_name.startswith(_PREEMPT_CHILD_PASS_PREFIXES)
 
 
-def _chat_preempt_enabled() -> bool:
+def _chat_preempt_gate_state() -> tuple:
+    """Resolve the AGENT_MANAGER_CHAT_PREEMPT gate -> (enabled, value, source).
+
+    Resolution precedence (single source of truth -- _chat_preempt_enabled() and any
+    caller that logs/inspects the exact state go through HERE so they can't drift):
+    (a) process env AGENT_MANAGER_CHAT_PREEMPT  -> source "env"
+    (b) ENV_FILE_PATH value                     -> source "env-file"
+    (c) neither set -> "true" (ON)              -> source "default"
+    `enabled` is False only when the resolved value, str().strip().lower(), is in
+    ("0", "false", "no", "off").
+    """
     from app import ENV_FILE_PATH, read_env_file
-    v = (os.environ.get("AGENT_MANAGER_CHAT_PREEMPT")
-         or read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_CHAT_PREEMPT") or "true")
-    return str(v).strip().lower() not in ("0", "false", "no", "off")
+    v = os.environ.get("AGENT_MANAGER_CHAT_PREEMPT")
+    if v:
+        source = "env"
+    else:
+        v = read_env_file(ENV_FILE_PATH).get("AGENT_MANAGER_CHAT_PREEMPT")
+        source = "env-file" if v else "default"
+        if not v:
+            v = "true"
+    enabled = str(v).strip().lower() not in ("0", "false", "no", "off")
+    return enabled, str(v), source
+
+
+def _chat_preempt_enabled() -> bool:
+    return _chat_preempt_gate_state()[0]
+
+
+def log_preempt_gate_off(gate_state: tuple) -> None:
+    """Log ONE line to stderr naming the gate's OFF state -- only when disabled.
+    HUB0033 2/4: the gate being False is a CONFIRMED SILENT BYPASS -- a local-provider
+    (Ollama) turn proceeds to the local model with no preempt and nothing previously
+    said so. This turns that silent skip into a greppable event without changing any
+    dispatch behavior."""
+    enabled, value, source = gate_state
+    if enabled:
+        return
+    print(
+        f"[chat-preempt] GATE OFF: skipping preempt for a local-provider (Ollama) "
+        f"turn -- AGENT_MANAGER_CHAT_PREEMPT={value!r} (source: {source}); the turn "
+        f"proceeds to the local model without freeing it from any in-flight "
+        f"worker/reviewer call.",
+        file=sys.stderr, flush=True)
 
 
 def _chat_preempt_max_age_s() -> int:

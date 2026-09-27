@@ -2556,10 +2556,11 @@ def _chat_roots() -> list:
 # etc.) and every external `from app import _chat_preempt_enabled` (routes/chat.py)
 # keep working unchanged -- pure re-export, zero behavior change.
 from chat_preempt import (  # noqa: E402
-    _arbiter_cancel_below, _chat_preempt_enabled, _chat_preempt_max_age_s,
+    _arbiter_cancel_below, _chat_preempt_enabled, _chat_preempt_gate_state,
+    _chat_preempt_max_age_s,
     _is_preemptable_child_pass, _kill_and_requeue_instance, _preempt_decision,
     _preempt_lane_sets, _preempt_pipeline_for_chat,
-    _read_fresh_model_locks,
+    _read_fresh_model_locks, log_preempt_gate_off,
 )
 
 
