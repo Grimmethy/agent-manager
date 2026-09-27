@@ -174,3 +174,47 @@ test('runSoWhatCitationCheck: an uncited report that flags something (numbered N
   ].join('\n');
   assert.equal(runSoWhatCitationCheck(task(), report).verdict, 'ungrounded');
 });
+
+// --- 2026-09-27: real evidence written in another form is a citation; generic aggregates still are not ---
+// (17 of 21 blocked debriefs cited real evidence as "Task N", "COMPLETED #N", a bd-<digits> token or an id prefix and were rejected.)
+
+const LONG_IDS = [
+  'brain-dump-sort-bd-1788670834315-side-finding-sweep-dedup-can-still-false',
+  'brain-dump-sort-bd-1788671067392-research-claude-agent-sdk-canusetool-sdk',
+  'brain-dump-sort-bd-1788671067392-research-langgraph-persistence-checkpoints',
+];
+const longTask = () => task({ promptContext: { taskIds: LONG_IDS } });
+const report = (soWhat) => ['WHAT', 'x', '', 'SO WHAT', soWhat, '', 'NOW WHAT', '1. Skip the critique pass -- Files: src/a.js. Why: mechanical.'].join('\n');
+const verdict = (soWhat, t = task()) => runSoWhatCitationCheck(t, report(soWhat)).verdict;
+
+test('SO WHAT: "COMPLETED #2", "COMPLETED2" and lowercase "task 3" cite a real block number', () => {
+  assert.equal(verdict('The critique call on COMPLETED #2 re-derived a mechanical parse.'), 'ok');
+  assert.equal(verdict('See COMPLETED2 -- critique stage evalTok=5.'), 'ok');
+  assert.equal(verdict('Flag 1: critique (task 3 row: stage=critique evalTok=5) is mechanical.'), 'ok');
+});
+
+test('SO WHAT: a list "Tasks 1, 3 and 5" counts when any listed number is real', () => {
+  assert.equal(verdict('The plan pass on Tasks 9, 3 and 12 re-derived the classification.'), 'ok');
+});
+
+test('SO WHAT: a real bd-<digits> token or a long real task-id prefix is a citation', () => {
+  assert.equal(verdict('Flag 1 -- critique on bd-1788671067392 is a mechanical parse.', longTask()), 'ok');
+  assert.equal(verdict('Flag 1 -- plan on brain-dump-sort-bd-1788670834315-side-finding re-derived the ask.', longTask()), 'ok');
+});
+
+test('SO WHAT: generic aggregates and things NOT in the evidence are still ungrounded', () => {
+  assert.equal(verdict('Across all 3 shipped tasks the plan stage re-derived work the ask already specified.'), 'ungrounded');
+  assert.equal(verdict('The plan stage of Task 99 re-derived the ask.'), 'ungrounded', 'block 99 is not in the evidence');
+  assert.equal(verdict('COMPLETED 7 spent a redundant call.'), 'ungrounded', 'block 7 is not in the evidence');
+  assert.equal(verdict('Flag 2 -- the plan stage is mechanical.'), 'ungrounded', '"Flag 2" is not a citation');
+  assert.equal(verdict('critique on bd-1999999999999 is mechanical.', longTask()), 'ungrounded', 'a bd token that is in no real task id');
+  assert.equal(verdict('critique on brain-dump-s is mechanical.', longTask()), 'ungrounded', 'a short prefix is not distinctive');
+});
+
+test('the rejection message names the accepted citation forms and still lists real examples', () => {
+  const r = runSoWhatCitationCheck(task(), report('Across all 3 tasks the plan stage is redundant.'));
+  assert.equal(r.verdict, 'ungrounded');
+  assert.match(r.reason, /^SO WHAT does not cite any specific evidence item/);
+  assert.match(r.reason, /Accepted citation forms: "COMPLETED N" or "Task N"/);
+  assert.match(r.reason, /COMPLETED 1, COMPLETED 2, COMPLETED 3/);
+});
