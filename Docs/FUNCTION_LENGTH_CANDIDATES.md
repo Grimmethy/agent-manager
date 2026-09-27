@@ -11751,3 +11751,200 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5,
 
 Benefits:
 `buildRunContext` is ~30 lines and can be unit-tested with a temp directory and a stubbed `getConfig`, isolating the kill-switch, dedup, and header logic from the loop. `applyNudges` is ~25 lines and can be tested in isolation by passing a fake `messages` array and asserting the pushed content and the returned flags, without spinning up a tool loop. The top-level function drops to roughly 60 lines where the `for`-turn is the first substantive code after a 5-line context call, so a reviewer scanning for loop-correctness issues no longer has to wade through setup. Adding a third nudge tier becomes a local edit inside `applyNudges` rather than an insertion into a 200-line function where a misplaced `turnStartLengths` write could corrupt the loop's bookkeeping. The public signature is unchanged, so no caller needs updating.
+
+### AC-193 · Decompose enterProjectTab into sync / render / wire helpers
+Strength: Strong
+Files: python/dashboard/static/js/project-tab.js
+Snippet:
+```
+async function enterProjectTab() {
+  // Sync the path input from the server's actual active project on every tab entry, before
+  // rendering it. Without this, the input only ever reflected localStorage -- if the active
+  // project changed via any OTHER route (hand-editing agent-manager.env, another browser tab,
+  // launch.bat) the input would silently keep showing a stale path while "Last configured
+  // project" below it correctly showed the truth. Since Start Pipeline acts on the input's
+  // value, not on activeRepoRoot, that mismatch could launch a pipeline against the wrong
+  // project with no warning. Only overrides on tab entry, not on the 3s poll thereafter, so a
+  // deliberate browse-a-different-project session isn't fought by this sync mid-use.
+  //
+  // Compares against lastSyncedActiveRepoRoot (the last server value we actually observed),
+  // NOT against projectPath -- comparing against projectPath meant a typed-but-not-yet-started
+  // path (Start Pipeline never ran, so activeRepoRoot on the server never changed) got silently
+  // overwritten back to the server's stale/placeholder activeRepoRoot on every single tab
+  // revisit, since the two never stopped disagreeing. Bug: "Project File Path ... resets to a
+  // non-existent default path each time I navigate to it" (2026-08-18). Only a genuine change
+  // in what the server reports since we last looked now counts as "external".
+  try {
+    const status = await fetchJson('/api/pipeline/status');
+    if (status.activeRepoRoot && status.activeRepoRoot !== lastSyncedActiveRepoRoot) {
+      lastSyncedActiveRepoRoot = status.activeRepoRoot;
+      if (status.activeRepoRoot !== projectPath) setProjectPath(status.activeRepoRoot);
+    }
+    // Same reasoning as the path sync above: reflect whatever's actually configured
+    // server-side (env file / another tab / launch.bat) rather than only ever showing
+    // this browser's last local choice.
+    if (typeof status.includeApply === 'boolean') {
+      includeApply = status.includeApply;
+      localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    }
+    if (typeof status.skipPush === 'boolean') {
+      skipPush = status.skipPush;
+      localStorage.setItem('agentManagerSkipPush', String(skipPush));
+    }
+  } catch (e) { /* dashboard's own status check failed -- fall back to whatever's cached */ }
+
+  const main = document.getElementById('main');
+  main.innerHTML = `
+    <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
+      <div class="path-row">
+        <select id="project-select" style="flex:1;"><option value="">Loading projects...</option></select>
+        <input id="project-path-input" type="text" placeholder="C:\\path\\to\\your\\project" value="${escapeAttr(projectPath)}" list="project-history-list" autocomplete="off" style="display:none;">
+        <datalist id="project-history-list"></datalist>
+        <button class="secondary" id="history-toggle">History...</button>
+        <button class="secondary" id="browse-toggle">Browse...</button>
+        <button class="secondary" id="sync-btn" title="Fetch origin and fast-forward this checkout onto it">Sync with GitHub</button>
+        <button class="action" id="build-btn">Build Graph</button>
+      </div>
+      <div id="history-panel" class="browser-panel" style="display:none"></div>
+      <div class="path-row">
+        <input id="project-grepdirs-input" type="text" placeholder="src, frontend/src, backend/src (optional -- comma-separated, leave blank to scan the whole path)" value="${escapeAttr(grepDirs)}">
+      </div>
+      <div class="path-row" id="pipeline-toggles-row" style="gap:16px;align-items:center;">
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;">
+          <input type="checkbox" id="include-apply-toggle" ${includeApply ? 'checked' : ''}>
+          Enable Apply Runner (writes/commits changes)
+        </label>
+        <label style="display:flex;align-items:center;gap:4px;font-size:0.9em;cursor:pointer;${includeApply ? '' : 'opacity:.5;'}" title="Applied work is always pushed now (2026-08-17) -- an unpushed branch was silently losing real work over time. This only controls whether the local checkout returns to main after each apply, or stays on the applied branch for inspection.">
+          <input type="checkbox" id="skip-push-toggle" ${!includeApply ? 'disabled' : ''} ${!skipPush ? 'checked' : ''}>
+          Return to main after each apply (unchecked: stay on the applied branch)
+        </label>
+        <span class="meta" style="font-size:0.85em;">Which job types run is now controlled from the Job List tab. Applied work is always pushed to the remote for durability, regardless of this toggle.</span>
+      </div>
+      <div id="browser-panel" class="browser-panel" style="display:none"></div>
+      <div id="pipeline-panel" class="worker-card"></div>
+      <div id="project-status-area" style="flex:1;min-height:0;display:flex;flex-direction:column;"></div>
+    </div>
+  `;
+  lastRenderedStatusKey = null;  // fresh tab entry -- force the first poll to actually render
+  document.getElementById('project-path-input').addEventListener('change', (e) => {
+    setProjectPath(e.target.value.trim());
+    lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
+    refreshProjectStatus();
+  });
+  document.getElementById('include-apply-toggle').addEventListener('change', (e) => {
+    includeApply = e.target.checked;
+    localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    const pushToggle = document.getElementById('skip-push-toggle');
+    pushToggle.disabled = !includeApply;
+    pushToggle.closest('label').style.opacity = includeApply ? '' : '.5';
+    if (!includeApply) { pushToggle.checked = false; skipPush = true; localStorage.setItem('agentManagerSkipPush', 'true'); }
+  });
+  document.getElementById('skip-push-toggle').addEventListener('change', (e) => {
+    skipPush = !e.target.checked;
+    localStorage.setItem('agentManagerSkipPush', String(skipPush));
+  });
+  document.getElementById('project-select').addEventListener('change', (e) => {
+    if (!e.target.value) return;
+    setProjectPath(e.target.value);
+    document.getElementById('project-path-input').value = projectPath;
+    lastRenderedStatusKey = null;  // switched projects -- old key would wrongly suppress the new render
+    refreshProjectStatus();
+  });
+  document.getElementById('browse-toggle').onclick = () => {
+    browserOpen = !browserOpen;
+    document.getElementById('browser-panel').style.display = browserOpen ? 'block' : 'none';
+    // Manual path entry only makes sense while actively browsing -- otherwise the
+    // dropdown (populated from Second Brain's referenced projects) is the only way
+    // to pick a project, per the actual ask.
+    document.getElementById('project-select').style.display = browserOpen ? 'none' : '';
+    document.getElementById('project-path-input').style.display = browserOpen ? '' : 'none';
+    if (browserOpen) { browsePath = projectPath || ''; loadBrowsePanel(); }
+  };
+  document.getElementById('history-toggle').onclick = () => {
+    historyOpen = !historyOpen;
+    document.getElementById('history-panel').style.display = historyOpen ? 'block' : 'none';
+    if (historyOpen) renderHistoryPanel();
+  };
+  document.getElementById('project-grepdirs-input').addEventListener('change', (e) => {
+    grepDirs = e.target.value.trim();
+    localStorage.setItem('agentManagerGrepDirs', grepDirs);
+  });
+  document.getElementById('build-btn').onclick = triggerBuild;
+  document.getElementById('sync-btn').onclick = triggerSync;
+
+  await loadProjectHistory();
+  await loadProjectDropdown();
+  await refreshPipelineStatus();
+  await refreshProjectStatus();
+  projectStatusInterval = setInterval(() => { refreshPipelineStatus(); refreshProjectStatus(); }, 3000);
+}
+```
+
+Problem:
+`enterProjectTab` is 121 lines and interleaves four separable responsibilities—server-state sync, DOM skeleton construction, event-listener attachment, and init/polling kickoff—in a single linear body. Changing the `lastSyncedActiveRepoRoot` comparison logic (the guard that fixed the 2026-08-18 reset bug) requires scrolling past ~35 lines of HTML template; changing the layout requires scrolling past the sync logic. The function is already 21 lines over the project's 100-line threshold, so the next feature addition will push it further. The four blocks share no local variables with each other—they communicate only through module-level state and the DOM—making them a clean seam for extraction.
+
+Solution:
+Split the body into three same-file, same-module-scope helpers and leave `enterProjectTab` as a short orchestrator. `syncServerState` owns the `fetchJson` call and the three field syncs (plus the explanatory comments that document *why* the comparison uses `lastSyncedActiveRepoRoot` rather than `projectPath`). `renderProjectTabSkeleton` owns the `main.innerHTML` template string. `wireProjectTabEvents` owns all eight `addEventListener`/`onclick` attachments. The orchestrator calls them in order, then performs the init calls and starts the 3 s polling interval. No new file, no new module, no template-engine indirection.
+
+```js
+// project-tab.js  (refactored)
+
+async function enterProjectTab() {
+  await syncServerState();
+  renderProjectTabSkeleton();
+  wireProjectTabEvents();
+  lastRenderedStatusKey = null;
+  await loadProjectHistory();
+  await loadProjectDropdown();
+  await refreshPipelineStatus();
+  await refreshProjectStatus();
+  projectStatusInterval = setInterval(() => {
+    refreshPipelineStatus();
+    refreshProjectStatus();
+  }, 3000);
+}
+
+async function syncServerState() {
+  // The comparison uses lastSyncedActiveRepoRoot (not projectPath) so that
+  // a server-side repo switch is detected even when the user has not yet
+  // typed a new path.  See 2026-08-18 reset-bug fix.
+  try {
+    const status = await fetchJson('/api/pipeline/status');
+    if (status.activeRepoRoot && status.activeRepoRoot !== lastSyncedActiveRepoRoot) {
+      lastSyncedActiveRepoRoot = status.activeRepoRoot;
+      if (status.activeRepoRoot !== projectPath) setProjectPath(status.activeRepoRoot);
+    }
+    if (typeof status.includeApply === 'boolean') {
+      includeApply = status.includeApply;
+      localStorage.setItem('agentManagerIncludeApply', String(includeApply));
+    }
+    if (typeof status.skipPush === 'boolean') {
+      skipPush = status.skipPush;
+      localStorage.setItem('agentManagerSkipPush', String(skipPush));
+    }
+  } catch (e) { /* fall back to cached values */ }
+}
+
+function renderProjectTabSkeleton() {
+  const main = document.getElementById('main');
+  main.innerHTML = `
+    <div style="display:flex;flex-direction:column;height:calc(100vh - 93px);">
+      … (identical template, unchanged) …
+    </div>
+  `;
+}
+
+function wireProjectTabEvents() {
+  document.getElementById('project-path-input').addEventListener('change', (e) => {
+    setProjectPath(e.target.value.trim());
+    lastRenderedStatusKey = null;
+    refreshProjectStatus();
+  });
+  // … remaining 7 listeners, unchanged …
+  document.getElementById('build-btn').onclick = triggerBuild;
+  document.getElementById('sync-btn').onclick = triggerSync;
+}
+```
+
+Benefits:
+Each extracted helper has zero shared local state with the others, so a reviewer can evaluate a sync-logic change, a layout tweak, or a new button binding in isolation without context-switching across 121 lines. `syncServerState` becomes independently unit-testable: stub `fetchJson`, assert the three module variables and two `localStorage` keys, with no need to mock `document.getElementById` or the template. `wireProjectTabEvents` is the block most likely to grow as new controls are added; isolating it keeps that growth visible and bounded within one function. The orchestrator drops to ~12 lines, well under threshold, leaving headroom for future init steps without re-triggering the length finding.
