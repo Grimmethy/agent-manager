@@ -346,6 +346,18 @@ function renderImplementResponseForReview(implementResponse) {
   return sections.join('\n\n');
 }
 
+// 2026-09-16 (task adhoc-second-brain-opportunities-source-1788382120254-piece1): a data
+// point in the cumulative reviewer-hallucination record (see the 2026-09-13 entry above
+// and the 2026-09-18 entry below). The reviewer falsely rejected that draft, claiming
+// that applySecondBrainOpportunities and secondBrainOpportunitiesCoveragePath were
+// missing from the codebase -- a byte-level grep proves otherwise:
+// applySecondBrainOpportunities is defined at src/apply-group-a.js:376 (exported at
+// line 507) and secondBrainOpportunitiesCoveragePath is defined at src/config.js:256
+// (exported at line 433). Both symbols existed all along; the rejection was a
+// hallucinated "symbol missing" verdict against byte-verified reality. The task was
+// re-filed and resolved -- record it here so the cumulative log of reviewer
+// hallucination data points stays complete and chronologically ordered.
+
 // review-task.js reads each source's own review-gate guidance off the registry
 // (source.reviewGuidance / source.reviewCompletenessQuestion, set in src/task-sources.js
 // or by an AGENT_MANAGER_REGISTER_PATH plugin) instead of an if (task.source === ...) chain.
