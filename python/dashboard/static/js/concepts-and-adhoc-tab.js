@@ -78,6 +78,34 @@ function renderConceptCard(concept) {
   const ghostPanel = concept.id === 'concept-ghost-in-the-machine-0dbeea'
     ? `<div class="ghost-telemetry meta" data-ghost-telemetry-for="${escapeAttr(concept.id)}" style="margin-top:6px">Loading requeue telemetry…</div>`
     : '';
+  // Adhoc Task Lifecycle (2026-09-27, brain-dump bd-1790466365924): same hardcoded-id
+  // special-case shape as ghostPanel above, for a real, static flow chart -- plain
+  // HTML/CSS boxes and arrows, no charting library (confirmed during orient: pyvis/
+  // visualize_assets is wired to a different feature's own data and would be real
+  // overkill for 8 nodes that never change). Each box names the real function that
+  // performs that stage and the real field(s) it persists, so this stays accurate as
+  // long as it's kept in sync by hand alongside those functions -- it is not generated
+  // from the source, just written to match it at the time this was authored.
+  const LIFECYCLE_STAGES = [
+    { label: 'pending / adhoc', detail: 'queue-adhoc-task.js: queueAdhocTask()' },
+    { label: 'drafting / orient', detail: 'orient-pass.js: runOrientPass() → orientNotes, oriented' },
+    { label: 'drafting / plan', detail: 'local-draft.js: runPlanPass() → planResponse, acceptanceCriteria' },
+    { label: 'drafting / implement', detail: 'agentic write pass → rawDiff, implementResponse, acceptanceResults' },
+    { label: 'review', detail: 'review-task.js: reviewTask() → status: approved | blocked' },
+    { label: 'approved', detail: 'queue/approved/ — awaiting apply' },
+    { label: 'applying', detail: 'apply-task.js: applyTask() → real branch/commit' },
+    { label: 'done / blocked', detail: 'status: done (mergedAt set) or blocked (blockedReason set)' },
+  ];
+  const lifecyclePanel = concept.id === 'concept-adhoc-task-lifecycle-64935e'
+    ? `<div class="meta" style="margin-top:6px;display:flex;flex-wrap:wrap;align-items:center;gap:4px">
+        ${LIFECYCLE_STAGES.map((s, i) => `
+          <span style="display:inline-block;border:1px solid var(--muted);border-radius:4px;padding:4px 8px;font-size:11px;line-height:1.3">
+            <strong>${escapeHtml(s.label)}</strong><br>${escapeHtml(s.detail)}
+          </span>
+          ${i < LIFECYCLE_STAGES.length - 1 ? '<span style="color:var(--muted)">→</span>' : ''}
+        `).join('')}
+      </div>`
+    : '';
   return `
     <div class="bd-entry" data-concept-id="${escapeAttr(concept.id)}">
       <div class="row">
@@ -86,6 +114,7 @@ function renderConceptCard(concept) {
       </div>
       ${descriptionHtml}
       ${ghostPanel}
+      ${lifecyclePanel}
       ${shelveNote}
       <div class="row" style="margin-top:8px">
         <span></span>
@@ -236,3 +265,9 @@ async function renderConceptsTab() {
     };
   });
 }
+
+// Mirrors core-ui.js's own precedent (line 1870, "the FIRST test coverage this file has
+// ever had") -- a no-op guard when loaded as a plain browser <script> (module is not
+// defined there), real in Node so renderConceptCard's pure string output is testable in
+// isolation.
+if (typeof module !== 'undefined') module.exports = { renderConceptCard };
