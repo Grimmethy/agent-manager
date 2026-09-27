@@ -10035,3 +10035,364 @@ Each extracted piece is scoped to exactly this function's existing logic; no new
 
 Benefits:
 The orchestrator drops from 142 to ~30 lines and reads top-to-bottom as a single narrative. `fetchBrowseData` (12 lines) can be unit-tested with a mocked `fetchJson` to verify the stale-path reset and retry without touching the DOM. `buildBrowserHtml` is a pure function of `(data, selectedFile)` and can be tested with fixture data and snapshot assertions. Each async handler is independently testable with a mocked `fetch` and a stubbed button element. Code review of any one concern no longer requires scanning the other three, and the 2026-08-16 "projects" merge incident's stale-path semantics become a 12-line function that is trivially diffable in a PR.
+
+### AC-187 · Decompose `api_task_requeue` into four single-purpose helpers
+Strength: Strong
+Files: python/dashboard/routes/task.py
+Snippet:
+```
+
+@task_bp.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
+def api_task_requeue(state, task_id):
+    """Manual requeue (Job Status > Blocked/Needs Clarification/Done tabs, per-row button; also the Brain Dump
+    tab's "Reopen" action on an archived entry's badge): moves the task back to pending/,
+    stripped to the same shape a freshly-generated task has -- every drafting/review/apply
+    artifact (blockedReason, doneMarker, ornithVotes, planResponse, implementResponse, etc.)
+    is dropped, not carried forward. ornithRejectCount resets to 0 deliberately: a manual
+    requeue is a deliberate human do-over, not a continuation of the same automatic retry
+    cycle queue-watchdog.ps1's Invoke-RejectRetryCheck already runs for review-stage
+    rejections (capped at $MaxOrnithRejectRetries=2) -- carrying the old count forward would
+    let a manually-requeued task block again after fewer real attempts than a task hitting
+    that cap for the first time gets.
+
+    2026-09-06, real incident: a stacked file-decompose sub-task (seq 2 of 5, sharing one
+    branch with its 4 siblings -- see file-decompose-to-hub.js) blocked on a sustained
+    Ollama infra outage. Its `stacked` field -- {branch, seq, total}, the ONLY thing that
+    ties it back to the shared branch and its position in the sequence -- is a TOP-LEVEL
+    task field, not part of promptContext, so the "fresh" rebuild below silently dropped it
+    on every requeue: a human clicking Requeue on a stuck stacked sub-task would have
+    detached it from its hub, breaking the coordination with no error and no visible sign
+    anything was wrong until the wiring step later found the branch missing pieces.
+    `dependsOn` (also file-decompose-to-hub.js, and consumed by nextAdhocTask's/
+    coordinator-sweep.js's dependency gate) is the identical shape -- a top-level field a
+    generic reset has no way to know matters.
+
+    2026-09-06, same requeue, second field: `atomic` (also file-decompose-to-hub.js) was
+    STILL being dropped by this same allowlist gap even after the stacked/dependsOn fix
+    above -- confirmed live, the requeued sub-task's own local-draft.js pre-split check
+    (`!task.atomic`, the guard that exists specifically because "a file-decompose child IS
+    the output of a decomposition; re-splitting it loops") saw `atomic: undefined` and let
+    the model try to decompose it AGAIN, producing a malformed 2-piece split and blocking a
+    second time. `noDecompose` (set alongside `atomic` by the same code, currently unread
+    elsewhere but the same coordination-field shape) is preserved too rather than assuming
+    it stays unused forever. All four preserved explicitly now, when present, rather than
+    trusting this allowlist to anticipate every future coordination field one at a time.
+
+    'archived' is a distinct pseudo-state (not a real QUEUE_STATES member) for a task
+    api_task_archive moved to done/_archived_no_action/ -- _task_state_index reports it as
+    'archived', not 'done', so this must be handled as a separate lookup path rather than
+    falling through to state_dir/task_id.json, which would 404 (real gap found 2026-08-17
+    auditing the "always reversible" promise: an archived item couldn't actually be
+    un-archived through the UI before this). 2026-08-24: also checks done-archive.js's own
+    dated month buckets (queue/done/_archived/<YYYY-MM>/) -- a task the AUTOMATIC daily
+    archive pass moved there is just as "archived" and must be just as requeueable as one a
+    human moved to _archived_no_action/ by hand; see done-archive.js's own header on the
+    same "always reversible" promise this endpoint already exists to uphold."""
+    from app import _record_manual_requeue, _repeated_blocker_match, get_active_repo_root, logger, queue_dir, read_json_safe
+    if state not in ("blocked", "needs-clarification", "done", "archived"):
+        abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
+    qdir = queue_dir()
+    if not qdir:
+        abort(404)
+    if state == "archived":
+        src = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+        if not src.is_file():
+            archived_root = qdir / "done" / "_archived"
+            if archived_root.is_dir():
+                for month_dir in archived_root.iterdir():
+                    if not month_dir.is_dir():
+                        continue
+                    candidate = month_dir / f"{task_id}.json"
+                    if candidate.is_file():
+                        src = candidate
+                        break
+    else:
+        src = qdir / state / f"{task_id}.json"
+    data = read_json_safe(src)
+    if not data:
+        abort(404)
+
+    # A needs-clarification task can be sent straight back for a fresh draft -- but only a NON-adhoc one. An adhoc-shaped task lives in
+    # queue/adhoc/ (nextAdhocTask only scans there), and this route writes to pending/, which would silently orphan it; those have their
+    # own /resolve and /answer routes below. (2026-09-20: a candidate-fulfillment task exhausted its retries on failures that were then
+    # fixed, and the only way back was moving its file to blocked/ by hand.)
+    if state == "needs-clarification" and (
+        data.get("domain") == "adhoc" or data.get("source") in ("manual", "derived_task")
+    ):
+        abort(400, description=(
+            "this is an adhoc-shaped task -- send it back with the file-path picker (/resolve) or the answer box (/answer), "
+            "which put it where the adhoc lane claims it; a plain requeue would strand it in pending/"
+        ))
+
+    if state in ("blocked", "needs-clarification") and not (request.get_json(silent=True) or {}).get("force"):
+        repeat = _repeated_blocker_match(data)
+        if repeat:
+            abort(409, description=(
+                "This task's rejection looks like the same underlying problem as an "
+                f"earlier attempt: \"{repeat[:220]}\" -- redrafting alone hasn't fixed "
+                "this before and likely won't now without a real change. Diagnose the "
+                "actual root cause first (or confirm you already have), then requeue "
+                "again to proceed anyway."
+            ))
+
+    # If this task was already applied to a branch that never merged (task-disposition.js's
+    # 'pending-merge' -- an agent/<id> branch exists, ahead of main, unmerged), a requeue is
+    # about to redo the same work from scratch on a FRESH branch, so the old one is now
+    # abandoned, not merely forgotten. Without this, this endpoint silently orphaned the
+    # prior branch: it stayed pushed to GitHub, unmerged, with no PR and no record anywhere
+    # that a later attempt superseded it. Confirmed live 2026-09-13:
+    # adhoc-add-spec-comment-at-call-site-in-src-local-draft-js-1789232601161-1's
+    # forbidden-path-gate-blocked branch sat dangling until a human noticed and deleted it
+    # by hand. Guarded on terminalDisposition != 'merged' so a task record that (rarely)
+    # reached done/ with its branch already merged is never touched.
+    if data.get("terminalDisposition") != "merged":
+        applied_branch = None
+        for ev in reversed(data.get("history") or []):
+            if isinstance(ev, dict) and ev.get("stage") == "applied" and ev.get("detail"):
+                applied_branch = ev["detail"]
+                break
+        if applied_branch:
+            from app import _invalidate_branch_cache, _run_git
+            repo_root = get_active_repo_root()
+            repo_root = Path(repo_root) if repo_root else None
+            if repo_root:
+                try:
+                    _run_git(["push", "origin", "--delete", applied_branch], repo_root)
+                    from branch_removals import record_branch_removal
+                    record_branch_removal(qdir, applied_branch, "superseded-by-requeue", task_id=task_id,
+                                          detail=f"requeued from {state}/", actor="dashboard-requeue")
+                except RuntimeError as e:
+                    # Non-fatal, same reasoning as api_git_merge_branch's own post-merge
+                    # branch delete -- already gone, never actually pushed, or a transient
+                    # network error are all fine; the requeue itself must not fail here.
+                    logger.warning(
+                        "Non-fatal: could not delete superseded branch %r for requeued task %r: %s",
+                        applied_branch, task_id, e,
+                    )
+                _invalidate_branch_cache()
+            abandon_iso = datetime.now(timezone.utc).isoformat()
+            abandon_detail = f"superseded by a manual requeue from {state}/; prior branch {applied_branch} deleted"
+            data.setdefault("history", []).append({
+                "stage": "abandoned", "at": abandon_iso, "detail": abandon_detail,
+            })
+            data["terminalDisposition"] = "abandoned"
+            # NOT closing out task-logs/<id>.json here (contrast api_git_merge_branch's
+            # 'merged' handling): that file is committed only on the task's OWN branch, and
+            # for an unmerged branch it was never on <main> to begin with -- there is
+            # nothing on disk in this checkout to update. task-log-reconcile.js's own
+            # 'abandoned' disposition (see task-disposition.js's header) has the identical
+            # scope: it marks the queue/ record, it does not retroactively rescue a
+            # never-merged branch's task-log onto main.
+
+    pending_dir = qdir / "pending"
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    dest = pending_dir / f"{task_id}.json"
+    if dest.exists():
+        abort(409, description=f"'{task_id}' already has a task in pending/")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    # history must never be replaced -- it's the one append-only, complete log of
+    # everything that happened to this task (see task-history.js and AGENTS.md's task-log
+    # section), and a manual requeue is exactly the kind of step whose OWN reason (plus
+    # whatever blockedReason/priorRejectionFeedback drove it) needs to survive in that log,
+    # not vanish the moment the task starts its next draft cycle. Root-caused live
+    # 2026-09-12: this endpoint used to stamp a brand-new one-entry array here, discarding
+    # every prior event -- including the real blockedReason a `blocked` history event
+    # already carried -- for observability-fix-ac-158 and others, so the ONLY trace left
+    # of why a task ever blocked was this note's bare "manually requeued from blocked/".
+    old_history = data.get("history")
+    history = list(old_history) if isinstance(old_history, list) else []
+    history.append({
+        "stage": "requeued",
+        "at": now_iso,
+        "note": f"manually requeued from {state}/",
+        # The exact fields a fresh rebuild used to drop silently -- carried into the log
+        # entry itself so they're never lost even though the rebuilt task below won't
+        # carry them forward as live working state.
+        "blockedReasonAtRequeue": data.get("blockedReason"),
+        "priorRejectionFeedbackAtRequeue": data.get("priorRejectionFeedback"),
+    })
+    fresh = {
+        "id": data.get("id", task_id),
+        "domain": data.get("domain"),
+        "source": data.get("source"),
+        "title": data.get("title"),
+        "promptContext": data.get("promptContext"),
+        "status": "pending",
+        "createdAt": data.get("createdAt", now_iso),
+        "history": history,
+    }
+    # Coordination fields (see this endpoint's own docstring) -- never part of the
+    # drafting/review/apply history this reset is meant to clear, so always carried over
+    # verbatim when present rather than silently dropped.
+    if "stacked" in data:
+        fresh["stacked"] = data["stacked"]
+    if "dependsOn" in data:
+        fresh["dependsOn"] = data["dependsOn"]
+    if "atomic" in data:
+        fresh["atomic"] = data["atomic"]
+    if "noDecompose" in data:
+        fresh["noDecompose"] = data["noDecompose"]
+    dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
+    src.unlink()
+    _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
+    return jsonify({"id": task_id, "requeued": True})
+```
+
+Problem:
+The ~125 lines of executable code inside `api_task_requeue` (after stripping the ~65-line docstring) interleave four independently-testable responsibilities in a single linear flow: (1) resolving the source `.json` path including the non-trivial archived month-bucket fallback under `done/_archived/<YYYY-MM>/`, (2) precondition guards (state whitelist, adhoc-shape rejection, repeated-blocker 409), (3) an external side-effect block that deletes a superseded git branch, records the removal, mutates history, and invalidates a cache — each with its own `try/except` and deferred import, and (4) the task-state transformation (history preservation, fresh-object rebuild, coordination-field carry-over, write, unlink, record). Exercising any one of those paths in a unit test today requires booting the Flask app, constructing a full queue directory tree, and (for the git path) a real repository, because none of the logic is importable in isolation.
+
+Solution:
+Extract four module-level helpers above the route — `_resolve_task_source`, `_validate_requeue_preconditions`, `_cleanup_superseded_branch`, and `_build_fresh_task` — each taking plain data arguments (a `Path`, a `dict`, a `str`) and returning either a result or an error string, so they are importable and testable without a Flask context. The route body then reduces to a short orchestration sequence: resolve → guard → cleanup → build → write → record → return. The concrete change is:
+
+```diff
++def _resolve_task_source(qdir: Path, state: str, task_id: str) -> Path | None:
++    """Return the source .json path for a task in the given state, or None."""
++    if state == "archived":
++        src = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
++        if src.is_file():
++            return src
++        archived_root = qdir / "done" / "_archived"
++        if archived_root.is_dir():
++            for month_dir in sorted(archived_root.iterdir()):
++                if not month_dir.is_dir():
++                    continue
++                candidate = month_dir / f"{task_id}.json"
++                if candidate.is_file():
++                    return candidate
++        return None
++    return qdir / state / f"{task_id}.json"
++
++
++def _validate_requeue_preconditions(state: str, data: dict, force: bool) -> str | None:
++    """Return an error message string, or None if the requeue is allowed."""
++    if state == "needs-clarification" and (
++        data.get("domain") == "adhoc"
++        or data.get("source") in ("manual", "derived_task")
++    ):
++        return (
++            "this is an adhoc-shaped task -- send it back with the file-path picker "
++            "(/resolve) or the answer box (/answer); a plain requeue would strand it in pending/"
++        )
++    if state in ("blocked", "needs-clarification") and not force:
++        repeat = _repeated_blocker_match(data)
++        if repeat:
++            return (
++                f"This task's rejection looks like the same underlying problem as an "
++                f"earlier attempt: \"{repeat[:220]}\" -- redrafting alone hasn't fixed "
++                f"this before. Diagnose the actual root cause first, then requeue again."
++            )
++    return None
++
++
++def _cleanup_superseded_branch(data: dict, qdir: Path, state: str, task_id: str) -> None:
++    """Delete a superseded unmerged branch and record the abandonment. Non-fatal."""
++    if data.get("terminalDisposition") == "merged":
++        return
++    applied_branch = None
++    for ev in reversed(data.get("history") or []):
++        if isinstance(ev, dict) and ev.get("stage") == "applied" and ev.get("detail"):
++            applied_branch = ev["detail"]
++            break
++    if not applied_branch:
++        return
++    from app import _invalidate_branch_cache, _run_git, get_active_repo_root, logger
++    repo_root = get_active_repo_root()
++    repo_root = Path(repo_root) if repo_root else None
++    if repo_root:
++        try:
++            _run_git(["push", "origin", "--delete", applied_branch], repo_root)
++            from branch_removals import record_branch_removal
++            record_branch_removal(
++                qdir, applied_branch, "superseded-by-requeue",
++                task_id=task_id, detail=f"requeued from {state}/",
++                actor="dashboard-requeue",
++            )
++        except RuntimeError as e:
++            logger.warning(
++                "Non-fatal: could not delete superseded branch %r for task %r: %s",
++                applied_branch, task_id, e,
++            )
++        _invalidate_branch_cache()
++    now_iso = datetime.now(timezone.utc).isoformat()
++    data.setdefault("history", []).append({
++        "stage": "abandoned",
++        "at": now_iso,
++        "detail": f"superseded by requeue from {state}/; prior branch {applied_branch} deleted",
++    })
++    data["terminalDisposition"] = "abandoned"
++
++
++def _build_fresh_task(data: dict, task_id: str, now_iso: str) -> dict:
++    """Rebuild the task to fresh shape, preserving history and coordination fields."""
++    old_history = data.get("history")
++    history = list(old_history) if isinstance(old_history, list) else []
++    history.append({
++        "stage": "requeued",
++        "at": now_iso,
++        "note": f"manually requeued",
++        "blockedReasonAtRequeue": data.get("blockedReason"),
++        "priorRejectionFeedbackAtRequeue": data.get("priorRejectionFeedback"),
++    })
++    fresh = {
++        "id": data.get("id", task_id),
++        "domain": data.get("domain"),
++        "source": data.get("source"),
++        "title": data.get("title"),
++        "promptContext": data.get("promptContext"),
++        "status": "pending",
++        "createdAt": data.get("createdAt", now_iso),
++        "history": history,
++    }
++    for field in ("stacked", "dependsOn", "atomic", "noDecompose"):
++        if field in data:
++            fresh[field] = data[field]
++    return fresh
++
++
+ @task_bp.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
+ def api_task_requeue(state, task_id):
+     """Manual requeue … (docstring unchanged) …"""
+     from app import _record_manual_requeue, get_active_repo_root, queue_dir, read_json_safe
+
+     if state not in ("blocked", "needs-clarification", "done", "archived"):
+         abort(400, description="only a blocked, needs-clarification, done, or archived task can be requeued")
+
+     qdir = queue_dir()
+     if not qdir:
+         abort(404)
+
+-    # --- (removed ~90 lines of inline logic: archived-bucket search, adhoc guard,
+-    #     repeated-blocker check, branch cleanup, fresh-task rebuild, write, unlink) ---
++    src = _resolve_task_source(qdir, state, task_id)
++    if src is None or not src.is_file():
++        abort(404)
+
+     data = read_json_safe(src)
+     if not data:
+         abort(404)
+
+     force = bool((request.get_json(silent=True) or {}).get("force"))
++    err = _validate_requeue_preconditions(state, data, force)
++    if err:
++        status = 409 if "same underlying problem" in err else 400
++        abort(status, description=err)
++
++    _cleanup_superseded_branch(data, qdir, state, task_id)
+
+     pending_dir = qdir / "pending"
+     pending_dir.mkdir(parents=True, exist_ok=True)
+     dest = pending_dir / f"{task_id}.json"
+     if dest.exists():
+         abort(409, description=f"'{task_id}' already has a task in pending/")
+
+     now_iso = datetime.now(timezone.utc).isoformat()
++    fresh = _build_fresh_task(data, task_id, now_iso)
+     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
+     src.unlink()
+     _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
+     return jsonify({"id": task_id, "requeued": True})
+```
+
+Benefits:
+Each extracted helper is a single-purpose, independently-importable unit that can be unit-tested with plain `Path` and `dict` arguments and a `tmp_path` fixture — no Flask app context, no real git repository, no multi-level directory scaffolding. The route body drops to roughly 35 lines of pure orchestration (resolve → guard → cleanup → build → write → record → return), making the control flow scannable at a glance and the diff surface for future changes (e.g., adding a new precondition or a new coordination field) confined to the one helper that owns that concern rather than interleaved with unrelated logic. Reviewers can approve or reject each helper's contract in isolation, and the git-branch side-effect block — the only part with network I/O — is visually and structurally separated from the pure-data transformation.
