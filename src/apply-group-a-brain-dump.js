@@ -5,7 +5,7 @@
 const fs = require('fs');
 const path = require('path');
 const { resolveAnchors, extractKeywords } = require('./path-prefetch.js');
-const { resolveGraphPath } = require('./config.js');
+const { resolveGraphPath, getSecondBrainDir } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
 const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 const {
@@ -191,6 +191,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     };
   }
 
+  if (!secondBrainDir) secondBrainDir = getSecondBrainDir();
   if (!secondBrainDir) {
     // Terminal: no vault configured, no retry will help.
     return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };

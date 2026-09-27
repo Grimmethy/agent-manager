@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
 const { resolveAnchors, extractKeywords } = require('./path-prefetch.js');
-const { resolveGraphPath } = require('./config.js');
+const { resolveGraphPath, getSecondBrainDir } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
 const {
   CANONICAL_TOP_LEVEL,
@@ -452,6 +452,7 @@ function applyResearchTask({ task, secondBrainDir }) {
   if (!secondBrainPath) {
     return { skipped: true, reason: 'task has no promptContext.secondBrainPath -- do not know where to file this research' };
   }
+  if (!secondBrainDir) secondBrainDir = getSecondBrainDir();
   if (!secondBrainDir) {
     return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this research anywhere' };
   }
