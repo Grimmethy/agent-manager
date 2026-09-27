@@ -24,6 +24,55 @@ const { buildCritiquePrompt, buildPlanPrompt, buildImplementPrompt, formatFileCo
   }
 }
 
+// function_length_review / observability_review (HUB0097 · 2/3): their own prompt
+// builders live in the agent-manager-hygiene plugin (like arch_review above), not in
+// this repo, so register minimal sources here whose builders render
+// promptContext.snippet -- the only piece of the function_length_review prompt
+// contract the dispatcher-level test below needs. The VERDICT CONSTRAINT being
+// asserted (HUB0097 · 1/3) is NOT in any source-specific builder: buildImplementPrompt
+// in prompts.js appends it itself, gated on the resolved source name being exactly
+// 'function_length_review', so it structurally cannot leak into observability_review
+// or any other source. If a real plugin registration for either name ever lands first,
+// the guard leaves it in place and the assertions still hold (the constraint is
+// source-name-gated in the dispatcher, not in the builder).
+{
+  const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  const snippetRender = (task) => `Function snippet (from deterministic scan):\n${task.promptContext.snippet}`;
+  for (const name of ['function_length_review', 'observability_review']) {
+    if (!getRegisteredSource(name)) {
+      registerTaskSource(name, { priority: 70, next: () => null, emptyApproval: true, candidateFulfillment: true });
+      updateTaskSource(name, { buildPlanPrompt: snippetRender, buildImplementPrompt: snippetRender });
+    }
+  }
+}
+
+function functionLengthReviewTask() {
+  return {
+    domain: 'default', source: 'function_length_review', title: 'AC-1 · over-long function',
+    promptContext: {
+      file: 'src/foo.js', symbol: 'processThings',
+      snippet: 'function processThings(items) {\n  /* ...400 lines... */\n}',
+    },
+  };
+}
+
+test('buildImplementPrompt for function_length_review includes the snippet and the mandatory verdict constraint', () => {
+  const prompt = buildImplementPrompt(functionLengthReviewTask(), 'PLAN: verdict pending');
+  assert.ok(prompt.includes('function processThings(items)'), 'the known snippet must survive into the implement prompt');
+  assert.match(prompt, /snippet IS provided/i);
+  assert.match(prompt, /GENUINE or FALSE POSITIVE/i);
+});
+
+test('buildImplementPrompt for observability_review does NOT get the function_length_review verdict constraint (scoping check)', () => {
+  const task = {
+    domain: 'default', source: 'observability_review', title: 'AC-1 · silent catch',
+    promptContext: { file: 'src/bar.js', snippet: 'try { doIt(); } catch (e) {}' },
+  };
+  const prompt = buildImplementPrompt(task, 'PLAN: verdict pending');
+  assert.ok(!prompt.includes('snippet IS provided'), 'the function_length_review-specific constraint must not leak into observability_review');
+  assert.doesNotMatch(prompt, /GENUINE or FALSE POSITIVE/i);
+});
+
 // Real failing content, not synthetic: this is the actual blocked task found live
 // 2026-07-21 (deep-dive-autogen-microsoft-20, still sitting in queue/blocked/ at the time
 // this test was written). Its promptContext serializes to ~13.6KB -- comfortably over the
