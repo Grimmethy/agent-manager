@@ -11402,3 +11402,352 @@ function runIntegrationGate({ repoRoot, branch, mainBranch = 'master',
 
 Benefits:
 Each extracted `check*` function can be unit-tested in isolation by passing a stub `ctx` object—no real git worktrees, no process spawning—so the url_map diff logic and the circular-import-vs-missing-dep regex become independently verifiable. The "register cleanup before exec" contract becomes explicit in `setupWorktrees` rather than an implicit obligation buried in a 158-line body where a new check author must remember to push into `cleanup` before the first `exec` or the worktree leaks. Reviewers can evaluate each check's classification logic in a 20–30-line function instead of tracking eight early-return paths through a single monolith.
+
+### AC-192 · Decompose `runPlanWithTools` into context-builder, nudge-policy, and loop
+Strength: Strong
+Files: src/local-tool-client.js
+Snippet:
+```
+}
+
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false }) {
+  const { pipelineDir, repoRoot } = getConfig();
+  // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
+  // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
+  const killSwitchPath = path.join(pipelineDir, 'queue',
+    allowWrite ? '.chat-write-tools-disabled' : '.arch-discovery-tools-disabled');
+  if (fs.existsSync(killSwitchPath)) {
+    return runWithoutToolsFallback(prompt, pipelineDir);
+  }
+
+  // Multi-root (2026-08-31, system-wide Chat panel): the caller may thread its own
+  // primary root + a list of additional accessible repo roots. Every non-chat caller
+  // passes neither, so allowedRoots is just [repoRoot] and every tool behaves exactly
+  // as it did before. Deduped on realpath, primary first.
+  const rawRoots = [primaryRoot || repoRoot, ...(Array.isArray(extraRoots) ? extraRoots : [])];
+  const seen = new Set();
+  const allowedRoots = [];
+  for (const r of rawRoots) {
+    let real;
+    try { real = fs.realpathSync(r); } catch { continue; }
+    if (!seen.has(real)) { seen.add(real); allowedRoots.push(real); }
+  }
+  if (allowedRoots.length === 0) allowedRoots.push(path.resolve(repoRoot));
+
+  const tools = withGrepDirsHint(allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS);
+  const toolHandlers = allowWrite
+    ? { ...buildToolHandlers(allowedRoots), ...buildWriteToolHandlers(allowedRoots) }
+    : buildToolHandlers(allowedRoots);
+  // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
+  // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
+  // resident Ollama model, the exact uncoordinated-contention bug the Discuss-side lock
+  // work earlier tonight was built to fix, just reintroduced through a different call
+  // path. Same instancesDir derivation and withLock() usage local-draft.js's own
+  // maybeLocked() already establishes -- held ONLY around each individual /api/chat call
+  // (in chatTurnWithFlakeRecovery), not the whole multi-turn loop (tool execution between
+  // turns doesn't touch the GPU and shouldn't block other lanes while it runs).
+  const instancesDir = path.join(pipelineDir, 'instances');
+
+  // Same TokenFold session/scope headers local-client.js sends on /api/generate.
+  // Without the session header every /api/chat call hashed into its own one-off
+  // TokenFold session, so the dictionary bootstrap's one-time cost could never
+  // amortize across the tool loop's turns -- the exact traffic shape (one prompt
+  // re-sent with growing history each turn) where session continuity pays most.
+  const tokenFoldHeaders = { 'X-TokenFold-Session': `agent-manager-${process.env.AGENT_MANAGER_INSTANCE_ID || 'default'}` };
+  if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
+
+  // 2026-08-26 (Chat panel, Grimmethy: "vastly improve the chat system... Open WebUI"
+  // investigation) -- callers with real conversation history now pass a proper per-turn
+  // `messages` array (chat_sessions.py builds it with real system/user/assistant roles)
+  // instead of chat_sessions.py's old approach of flattening the whole transcript into
+  // one giant string inside a single {role:'user'} message. Plain single-shot callers
+  // (local-agentic-draft.js) still pass `prompt` and get the old one-message behavior,
+  // unchanged.
+  const messages = Array.isArray(reqMessages) && reqMessages.length
+    ? reqMessages.slice()
+    : [{ role: 'user', content: prompt }];
+  const toolCallLog = [];
+  let turnsUsed = 0;
+  let lastMessage = null;
+
+  // Ollama token accounting, summed across every turn (incl. flake-retried and
+  // forced-summary turns) -- surfaced on the result for model-stats-client.recordCall.
+  const usageAcc = { prompt_eval_count: 0, eval_count: 0, eval_duration: 0 };
+  const addUsage = (u) => {
+    if (!u) return;
+    usageAcc.prompt_eval_count += Number(u.prompt_eval_count) || 0;
+    usageAcc.eval_count += Number(u.eval_count) || 0;
+    usageAcc.eval_duration += Number(u.eval_duration) || 0;
+  };
+  const withUsage = (r) => ({ ...r, ...usageAcc });
+
+  // messages.length / toolCallLog.length as of the START of each turn, in order -- lets a
+  // later turn's unrecoverable flake roll back exactly the PRIOR turn's own additions
+  // (the ones most likely to be the corrupting tool-call-only turn) rather than just the
+  // current turn's, since the corruption always lives in already-stored history, never in
+  // the turn that's actively failing.
+  const turnStartLengths = [];
+  const turnStartLogLengths = [];
+
+  // A final no-tools message that already carries a RESOLUTION: line is a clean finish and
+  // needs no forced-summary turn. Anchored + multiline so it matches the line the
+  // agentic-draft resolvers actually parse, not the word appearing mid-sentence.
+  const HAS_RESOLUTION_RE = /^\s*RESOLUTION:/im;
+
+  // One extra no-tools turn that asks only for the RESOLUTION line, reusing whatever the
+  // model already learned. Shared by the two forceSummaryOnCap paths below (cap hit while
+  // still calling tools; stopped early with no RESOLUTION line). See the header on the
+  // forceSummaryOnCap param and the call sites for why each path needs it.
+  const runForcedSummaryTurn = async () => {
+    turnStartLengths.push(messages.length);
+    turnStartLogLengths.push(toolCallLog.length);
+    messages.push({
+      role: 'user',
+      content: 'You are out of turns and can no longer call tools. Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires. If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).',
+    });
+    turnsUsed += 1;
+    const { message: summaryMsg, usage: summaryUsage, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
+      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+      toolCallLog, turnStartLengths, turnStartLogLengths,
+    });
+    addUsage(summaryUsage);
+    const summaryContent = (!summaryFlake && summaryMsg && summaryMsg.content) ? summaryMsg.content : '';
+    return withUsage({
+      response: summaryContent || (lastMessage && lastMessage.content) || '',
+      toolCallLog, turnsUsed, toolsDisabled: false, forcedSummary: true,
+    });
+  };
+
+  // Edit-by-turn-N forcing function -- fired at most once, see ORIENT_TURN_LIMIT.
+  let editNudgeFired = false;
+  // A second, firmer nudge for a task that is a CONFIRMED-ATOMIC LEAF (leafMustEdit): the
+  // soft nudge above did not always get the 27B off the fence (the /api/chat/inject leaf
+  // took the soft nudge, then still chose decompose instead of editing). A few turns after
+  // the soft one, if there is STILL no edit, one last message: edit now or conclude
+  // needs-human-decision -- decompose is not an option for a leaf.
+  let hardNudgeFired = false;
+  const editToolCallCount = () => toolCallLog.filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    turnsUsed = turn + 1;
+    turnStartLengths.push(messages.length);
+    turnStartLogLengths.push(toolCallLog.length);
+
+    // If this run is meant to produce a diff and has spent its orientation budget without
+    // a single edit, one firm push before the next turn: stop exploring, act now. The
+    // model still has (maxTurns - ORIENT_TURN_LIMIT) turns left to implement or conclude.
+    if (nudgeToEditEarly && !editNudgeFired && turn >= ORIENT_TURN_LIMIT
+        && turn < maxTurns - 1 && editToolCallCount() === 0) {
+      editNudgeFired = true;
+      messages.push({
+        role: 'user',
+        content: `You have used ${turn} turns exploring and have not made a single edit. Stop exploring now -- you have enough information. Your next action MUST be an edit_file or write_file call to start implementing, OR your final message with exactly one RESOLUTION: line (implemented / no-changes-needed / decompose / needs-human-decision). Do not call grep_codebase / read_file / list_directory / run_bash again.`,
+      });
+      // Keep the flake-rollback anchor for THIS turn after the nudge, so a rollback re-does
+      // only the (poisoned) assistant turn and preserves the nudge.
+      turnStartLengths[turnStartLengths.length - 1] = messages.length;
+    }
+
+    // Firmer second push for a confirmed-atomic leaf that STILL has not edited a few turns
+    // after the soft nudge.
+    if (leafMustEdit && !hardNudgeFired && turn >= ORIENT_TURN_LIMIT + 3
+        && turn < maxTurns - 2 && editToolCallCount() === 0) {
+      hardNudgeFired = true;
+      messages.push({
+        role: 'user',
+        content: `Final warning: ${turn} turns used and zero edits on a task that a prior decompose pass already confirmed is implementable in one pass. Your NEXT message MUST be an edit_file or write_file call, OR exactly "RESOLUTION: needs-human-decision" followed by the one concrete fact you are missing. RESOLUTION: decompose is not available for this task.`,
+      });
+      turnStartLengths[turnStartLengths.length - 1] = messages.length;
+    }
+
+    const { message, usage, flakeErr } = await chatTurnWithFlakeRecovery({
+      messages, tools, tokenFoldHeaders, onChunk, instancesDir,
+      toolCallLog, turnStartLengths, turnStartLogLengths,
+    });
+    addUsage(usage);
+    if (flakeErr) {
+      // Rollback exhausted too (or there was no prior turn to roll back -- a first-turn
+      // failure is a genuinely different, unexplained case). Graceful-degrade if the
+      // model already produced real content on an earlier turn; otherwise rethrow.
+      if (lastMessage) return withUsage(flakeDegradeResult(lastMessage, toolCallLog, turnsUsed, onChunk));
+      throw flakeErr;
+    }
+
+    lastMessage = message;
+    const toolCalls = message.tool_calls || [];
+    if (toolCalls.length === 0) {
+      const content = message.content || '';
+      // forceSummaryOnCap, voluntary-stop case (bra-1788142124203 follow-up): the model can
+      // also just END early -- a final no-tools message well before the cap -- without ever
+      // writing a RESOLUTION: line. resolveAgenticDraft reads that exactly as fatally as a
+      // cap-out ("cannot determine outcome -> hard block"), throwing away a run that may
+      // have gotten most of the way there. Confirmed live: a tier-3 write run stopped at
+      // turn 12 of 20 with a plain no-tools message and blocked with zero salvageable
+      // output. Same remedy as the cap path -- one more no-tools turn asking only for the
+      // sentinel -- gated on the caller opting in and the line genuinely being absent (a
+      // clean finish still returns immediately, as before).
+      if (forceSummaryOnCap && !HAS_RESOLUTION_RE.test(content)) {
+        return runForcedSummaryTurn();
+      }
+      return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
+    }
+    executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
+  }
+
+  // maxTurns reached without a final (no-tool-calls) response -- deliberate forced stop,
+  // not a crash, matching how this pipeline already treats an empty/degenerate plan pass.
+  //
+  // forceSummaryOnCap (2026-08-31, bra-1788142124203): the agentic-draft callers need one
+  // more thing here. A run that hits the cap while still calling tools never wrote a
+  // verdict, so `lastMessage.content` is usually empty or a half-thought -- and
+  // resolveAgenticDraft can only read that as "did not end with a RESOLUTION: line ->
+  // hard block", discarding the entire run (a real tier-3 case burned all 20 turns on
+  // read-only exploration and blocked with zero salvageable output). Spend ONE final
+  // no-tools turn asking only for the RESOLUTION line (runForcedSummaryTurn, shared with
+  // the voluntary-stop path above). Off by default so the Chat panel CLI path (which has
+  // its own "ran out of budget" explainer keyed on turnsUsed) is unaffected.
+  if (forceSummaryOnCap) {
+    return runForcedSummaryTurn();
+  }
+
+// ... [truncated for review: this function continues for 2 more line(s) not shown]
+```
+
+Problem:
+`runPlanWithTools` spans roughly 200 lines and interleaves three distinct concerns in a single scope: (1) ~45 lines of context preparation (kill-switch check, multi-root dedup via `fs.realpathSync`, tool/handler assembly, `tokenFoldHeaders` construction, message normalization, usage-accounting scaffolding) that introduce ~12 local variables the loop depends on; (2) two conditional nudge blocks (`editNudgeFired` / `hardNUDGE-fired`) with different trigger thresholds, different inline message strings, and a shared `editToolCallCount()` helper, forming a small state machine that mutates `messages` and `turnStartLengths` in-place; and (3) the core `for`-turn loop with flake recovery, tool execution, early-exit, and the post-loop `forceSummaryOnCap` path. A reader modifying nudge thresholds must scroll past 45 lines of setup; a reader adding a root-dedup edge case must not accidentally clobber the nudge flags. The 10-parameter signature compounds the problem because every parameter feeds a different phase.
+
+Solution:
+Extract two self-contained helpers that use only identifiers already present in the source. `buildRunContext` takes the setup parameters (`prompt`, `reqMessages`, `source`, `allowWrite`, `primaryRoot`, `extraRoots`) and returns a flat context object (`pipelineDir`, `allowedRoots`, `tools`, `toolHandlers`, `instancesDir`, `tokenFoldHeaders`, `messages`, or a `fallback` flag). `applyNudges` receives the loop-local state (`messages`, `turn`, `maxTurns`, `nudgeToEditEarly`, `leafMustEdit`, `editNudgeFired`, `hardNudgeFired`, `editToolCallCount`, `turnStartLengths`), pushes the appropriate inline nudge message string into `messages`, updates `turnStartLengths`, and returns the two fired-flags. The top-level `runPlanWithTools` then shrinks to: call `buildRunContext`, handle the fallback, declare the loop-local variables, and run the `for`-turn with a single call to `applyNudges` per iteration. No new abstractions, no new module exports, no change to the public signature.
+
+```js
+// --- Extracted: context preparation ---
+function buildRunContext({ prompt, messages: reqMessages, source, allowWrite,
+                           primaryRoot, extraRoots }) {
+  const { pipelineDir, repoRoot } = getConfig();
+
+  const killSwitchPath = path.join(pipelineDir, 'queue',
+    allowWrite ? '.chat-write-tools-disabled' : '.arch-discovery-tools-disabled');
+  if (fs.existsSync(killSwitchPath)) return { fallback: true, pipelineDir };
+
+  const rawRoots = [primaryRoot || repoRoot,
+                    ...(Array.isArray(extraRoots) ? extraRoots : [])];
+  const seen = new Set();
+  const allowedRoots = [];
+  for (const r of rawRoots) {
+    let real;
+    try { real = fs.realpathSync(r); } catch { continue; }
+    if (!seen.has(real)) { seen.add(real); allowedRoots.push(real); }
+  }
+  if (allowedRoots.length === 0) allowedRoots.push(path.resolve(repoRoot));
+
+  const tools = withGrepDirsHint(allowWrite ? [...TOOLS, ...WRITE_TOOLS] : TOOLS);
+  const toolHandlers = allowWrite
+    ? { ...buildToolHandlers(allowedRoots), ...buildWriteToolHandlers(allowedRoots) }
+    : buildToolHandlers(allowedRoots);
+
+  const instancesDir = path.join(pipelineDir, 'instances');
+
+  const tokenFoldHeaders = {
+    'X-TokenFold-Session': `agent-manager-${process.env.AGENT_MANAGER_INSTANCE_ID || 'default'}`,
+  };
+  if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
+
+  const messages = Array.isArray(reqMessages) && reqMessages.length
+    ? reqMessages.slice()
+    : [{ role: 'user', content: prompt }];
+
+  return { fallback: false, pipelineDir, allowedRoots, tools, toolHandlers,
+           instancesDir, tokenFoldHeaders, messages };
+}
+
+// --- Extracted: nudge policy ---
+function applyNudges({ messages, turn, maxTurns, nudgeToEditEarly, leafMustEdit,
+                       editNudgeFired, hardNudgeFired, editToolCallCount,
+                       turnStartLengths }) {
+  if (nudgeToEditEarly && !editNudgeFired && turn >= ORIENT_TURN_LIMIT
+      && turn < maxTurns - 1 && editToolCallCount() === 0) {
+    messages.push({
+      role: 'user',
+      content: `You have used ${turn} turns exploring and have not made a single edit. Stop exploring now -- you have enough information. Your next action MUST be an edit_file or write_file call to start implementing, OR your final message with exactly one RESOLUTION: line (implemented / no-changes-needed / decompose / needs-human-decision). Do not call grep_codebase / read_file / list_directory / run_bash again.`,
+    });
+    turnStartLengths[turnStartLengths.length - 1] = messages.length;
+    editNudgeFired = true;
+  }
+  if (leafMustEdit && !hardNudgeFired && turn >= ORIENT_TURN_LIMIT + 3
+      && turn < maxTurns - 2 && editToolCallCount() === 0) {
+    messages.push({
+      role: 'user',
+      content: `Final warning: ${turn} turns used and zero edits on a task that a prior decompose pass already confirmed is implementable in one pass. Your NEXT message MUST be an edit_file or write_file call, OR exactly "RESOLUTION: needs-human-decision" followed by the one concrete fact you are missing. RESOLUTION: decompose is not available for this task.`,
+    });
+    turnStartLengths[turnStartLengths.length - 1] = messages.length;
+    hardNudgeFired = true;
+  }
+  return { editNudgeFired, hardNudgeFired };
+}
+
+// --- Slimmed-down top-level (≈ 60 lines) ---
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5,
+  source, allowWrite = false, onChunk, primaryRoot, extraRoots = [],
+  forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false }) {
+
+  const ctx = buildRunContext({ prompt, messages: reqMessages, source,
+                                allowWrite, primaryRoot, extraRoots });
+  if (ctx.fallback) return runWithoutToolsFallback(prompt, ctx.pipelineDir);
+
+  const { tools, toolHandlers, instancesDir, tokenFoldHeaders, messages } = ctx;
+
+  const toolCallLog = [];
+  let turnsUsed = 0;
+  let lastMessage = null;
+  const usageAcc = { prompt_eval_count: 0, eval_count: 0, eval_duration: 0 };
+  const addUsage = (u) => { /* …unchanged… */ };
+  const withUsage = (r) => ({ ...r, ...usageAcc });
+  const turnStartLengths = [];
+  const turnStartLogLengths = [];
+  const HAS_RESOLUTION_RE = /^\s*RESOLUTION:/im;
+
+  const runForcedSummaryTurn = async () => { /* …unchanged… */ };
+
+  let editNudgeFired = false;
+  let hardNudgeFired = false;
+  const editToolCallCount = () =>
+    toolCallLog.filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
+
+  for (let turn = 0; turn < maxTurns; turn++) {
+    turnsUsed = turn + 1;
+    turnStartLengths.push(messages.length);
+    turnStartLogLengths.push(toolCallLog.length);
+
+    ({ editNudgeFired, hardNudgeFired } = applyNudges({
+      messages, turn, maxTurns, nudgeToEditEarly, leafMustEdit,
+      editNudgeFired, hardNudgeFired, editToolCallCount, turnStartLengths,
+    }));
+
+    const { message, usage, flakeErr } = await chatTurnWithFlakeRecovery({
+      messages, tools, tokenFoldHeaders, onChunk, instancesDir,
+      toolCallLog, turnStartLengths, turnStartLogLengths,
+    });
+    addUsage(usage);
+    if (flakeErr) {
+      if (lastMessage) return withUsage(flakeDegradeResult(lastMessage, toolCallLog, turnsUsed, onChunk));
+      throw flakeErr;
+    }
+    lastMessage = message;
+    const toolCalls = message.tool_calls || [];
+    if (toolCalls.length === 0) {
+      const content = message.content || '';
+      if (forceSummaryOnCap && !HAS_RESOLUTION_RE.test(content))
+        return runForcedSummaryTurn();
+      return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
+    }
+    executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
+  }
+
+  if (forceSummaryOnCap) return runForcedSummaryTurn();
+  return withUsage({ response: (lastMessage && lastMessage.content) || '',
+                     toolCallLog, turnsUsed, toolsDisabled: false });
+}
+```
+
+Benefits:
+`buildRunContext` is ~30 lines and can be unit-tested with a temp directory and a stubbed `getConfig`, isolating the kill-switch, dedup, and header logic from the loop. `applyNudges` is ~25 lines and can be tested in isolation by passing a fake `messages` array and asserting the pushed content and the returned flags, without spinning up a tool loop. The top-level function drops to roughly 60 lines where the `for`-turn is the first substantive code after a 5-line context call, so a reviewer scanning for loop-correctness issues no longer has to wade through setup. Adding a third nudge tier becomes a local edit inside `applyNudges` rather than an insertion into a 200-line function where a misplaced `turnStartLengths` write could corrupt the loop's bookkeeping. The public signature is unchanged, so no caller needs updating.
