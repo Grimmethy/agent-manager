@@ -81,7 +81,17 @@ function isFindStringMiss(task) {
 // redraft + re-review each (and pushed some to the retry cap, i.e. toward a human), only to fail the same way.
 // Such a task is held untouched (no retry burned) while the clone is dirty, then released straight back to
 // approved/ to RE-APPLY its already-approved result, no model call spent.
-const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following files would be overwritten|cannot rebase: you have unstaged changes/i;
+// 2026-09-28: also matches git's "is outside repository at" error -- a candidate-doc
+// path resolved against the WRONG repo root (e.g. the live checkout instead of the
+// dedicated apply clone) so `git add <absolute-path>` fails immediately, before any
+// content is even staged. Root-caused live: a functionLengthCandidatesPath bug hardcoded
+// repoRoot instead of applyRepoRoot (fixed 2026-09-26, hygiene PR #50) hit 20+
+// function_length_review tasks the same day, but this regex didn't recognize the error
+// text, so every one burned a real applyRetryCount slot on a purely mechanical
+// path-config mismatch that had nothing to do with the draft's content -- the exact same
+// "treating infrastructure like a draft failure" mistake this whole check exists to
+// prevent for the three shapes above. Same fix shape, one more real shape covered.
+const INFRA_APPLY_RE = /apply clone is dirty|local changes to the following files would be overwritten|cannot rebase: you have unstaged changes|is outside repository at/i;
 // 2026-09-26: a git subprocess hitting git-runner.js's 60s cap ("spawnSync git ETIMEDOUT", or its annotated form "git <cmd> timed out
 // after <n>ms") is also infrastructure -- the apply clone sits on the same rotational disk as the model files (IO pressure avg300 ~13%),
 // and 23 such timeouts across 3 days hit already-approved drafts (arch_discovery community-12 burned all 2 apply retries on it and was

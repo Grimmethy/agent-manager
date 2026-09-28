@@ -315,6 +315,21 @@ test('applyRetryCheck: the rebase-on-dirty-tree and assertCleanTree messages are
   assert.equal(isInfraApplyFailure({ blockedStage: 'review', blockedReason: DIRTY_REASON }), false);
 });
 
+// 2026-09-28: real incident text (function-length-agent-manager-src-git-runner-js-53) --
+// a candidatesPath bug resolved the doc path against the live checkout instead of the
+// apply clone, so `git add <that absolute path>` failed with git's own "is outside
+// repository at" error before any content was staged. This is infrastructure exactly
+// like the three shapes above, not a draft-quality problem -- 20+ function_length_review
+// tasks burned a real applyRetryCount slot on this before the underlying path bug itself
+// was fixed (hygiene PR #50, 2026-09-26); this regex is what stops it from happening
+// again for any future path-config mismatch of the same shape.
+const OUTSIDE_REPO_REASON = "writeArtifact failed: Command failed: git add /media/wok/model-cache/agent-manager/Docs/FUNCTION_LENGTH_CANDIDATES.md\nfatal: /media/wok/model-cache/agent-manager/Docs/FUNCTION_LENGTH_CANDIDATES.md: '/media/wok/model-cache/agent-manager/Docs/FUNCTION_LENGTH_CANDIDATES.md' is outside repository at '/media/model-cache/github/agent-manager-apply'\n";
+test('applyRetryCheck: a candidate-doc path resolved outside the apply clone ("is outside repository at") is classed as infra, not a draft failure', () => {
+  const { isInfraApplyFailure } = require('./apply-retry-check.js');
+  assert.equal(isInfraApplyFailure({ blockedStage: 'apply', blockedReason: OUTSIDE_REPO_REASON }), true);
+  assert.equal(isInfraApplyFailure({ blockedStage: 'review', blockedReason: OUTSIDE_REPO_REASON }), false);
+});
+
 // 2026-09-26: a git subprocess timeout at apply is infrastructure (arch-discovery-community-12: approved 2/3, then 3 x
 // "spawnSync git ETIMEDOUT" burned both apply retries and escalated as a 'design-decision').
 const TIMEOUT_REASON = 'applyDirectToMainBatch crashed before producing a result: spawnSync git ETIMEDOUT\n    at Object.spawnSync (node:internal/child_process:1120:20)';
