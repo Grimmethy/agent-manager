@@ -123,14 +123,18 @@ function buildEffectivePrompt({ prompt, allowSideFindings, allowAmplification, c
   return `${currentDateLine()}\n\n${effectivePrompt}`;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
-  const workDir = resolveWorkDir(cwd);
-  const datedPrompt = buildEffectivePrompt({ prompt, allowSideFindings, allowAmplification, conceptId });
+// Builds the exact argv callOnce hands to the `claude` CLI -- the -p base flags
+// plus every conditional flag, in the exact order they were inlined in callOnce
+// before (HUB0059 2/3 extracted them here so each flag combination's string[] is
+// assertable in tests with no live CLI process). Pure except for the single
+// process.env.CLAUDE_EFFORT read the inline code already had; MODEL and
+// MAX_BUDGET_USD are the same module-level constants the inline code read.
+function buildCliArgs({ prompt, model, effort, maxTurns, allowedTools, permissionMode, resume, addDirs }) {
   // Hard ceiling (see DRAFT_MAX_TURNS above, brain-dump bd-1788707820332) -- a
   // caller asking for 61 turns gets 20, a caller asking for 1 keeps 1.
   const effectiveMaxTurns = Math.min(maxTurns, DRAFT_MAX_TURNS);
   const args = [
-    '-p', datedPrompt,
+    '-p', prompt,
     '--output-format', 'json',
     '--model', model || MODEL,
     '--max-turns', String(effectiveMaxTurns),
@@ -172,7 +176,6 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   // prior callOnce() (parsed.session_id, already returned below) is what a caller passes
   // back in here for its next message.
   if (resume) args.push('--resume', resume);
-
   // addDirs (2026-08-31, system-wide Chat panel): extra directories the `claude` CLI is
   // allowed to Read/Grep/Glob/Edit/Write in, on top of `cwd`. The dashboard's Chat panel
   // roots `cwd` at the agent-manager repo and passes one entry per registered
@@ -181,6 +184,27 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
   for (const d of Array.isArray(addDirs) ? addDirs : []) {
     if (d) args.push('--add-dir', d);
   }
+  return args;
+}
+
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+  const workDir = resolveWorkDir(cwd);
+  const datedPrompt = buildEffectivePrompt({ prompt, allowSideFindings, allowAmplification, conceptId });
+  // Hard ceiling (see DRAFT_MAX_TURNS above, brain-dump bd-1788707820332) -- a
+  // caller asking for 61 turns gets 20, a caller asking for 1 keeps 1. Recomputed
+  // here for the turn-limit error paths below; buildCliArgs applies the same ceiling
+  // to the --max-turns flag itself.
+  const effectiveMaxTurns = Math.min(maxTurns, DRAFT_MAX_TURNS);
+  const args = buildCliArgs({
+    prompt: datedPrompt,
+    model,
+    effort,
+    maxTurns,
+    allowedTools,
+    permissionMode,
+    resume,
+    addDirs,
+  });
 
   // sandbox (2026-08-24, sandbox.js): only adhoc-agentic-draft.js's agentic call passes
   // this -- the one real Bash-capable, unattended tool-use path in this codebase (see
