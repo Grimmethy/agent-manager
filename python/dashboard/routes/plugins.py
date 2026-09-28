@@ -343,6 +343,40 @@ def api_plugin_ui_asset(name, filename):
     return send_file(path, mimetype=mimetype, max_age=0)
 
 
+@plugins_bp.route("/api/plugins/<name>/ensure-started", methods=["POST"])
+def api_plugin_ensure_started(name):
+    """Starts a plugin's own companion process if it isn't already running -- the real
+    lazy-start a script-kind dashboard tab (PromptForge/AdForge/ScriptForge) calls right
+    before pointing its iframe at the plugin's url, instead of silently embedding an
+    iframe pointed at a port nothing is listening on. Slotted plugins (hardware/chat) have
+    their own explicit start path (api_plugins_select_slot) and don't need this route, but
+    nothing stops them from using it too -- the entry just needs a `process` block.
+
+    Reports `alreadyRunning` (computed BEFORE calling start(), since start() itself is
+    silently idempotent and doesn't say which case happened) separately from `started`,
+    so a caller can tell "was already up" from "we just launched it" -- and only pays the
+    up-to-5s health poll in the second case."""
+    from app import _read_plugins_manifest, _wait_for_plugin_health
+    manifest = _read_plugins_manifest()
+    entry = next((p for p in manifest if p.get("name") == name), None)
+    if entry is None:
+        abort(404, description=f"no plugin named '{name}'")
+    if not entry.get("process"):
+        abort(400, description=f"plugin '{name}' has no process block -- nothing to start")
+
+    key = plugin_process_manager.process_key(entry)
+    already_running = plugin_process_manager.is_running(key)
+    started = plugin_process_manager.start(entry)
+    healthy = already_running or (started and _wait_for_plugin_health(entry))
+    return jsonify({
+        "name": name,
+        "url": entry.get("url"),
+        "alreadyRunning": already_running,
+        "started": started,
+        "healthy": healthy,
+    })
+
+
 @plugins_bp.route("/api/plugins/select-slot", methods=["POST"])
 def api_plugins_select_slot():
     from app import _read_plugins_manifest, _wait_for_plugin_health, _write_plugins_manifest
