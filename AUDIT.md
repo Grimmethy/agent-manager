@@ -58,3 +58,40 @@ every lower-class ticket on the chat's own GPU endpoint only (never P40), while 
 reviewer lane is not on the arbiter yet and keeps the legacy age-gated kill
 (`chat_preempt.py:305-306`). Queued lower-class tickets are killed (their daemon requeues
 the task) rather than chat waiting behind them.
+
+## Open operator decisions (HUB0033 · 4/4)
+
+The two questions below are **open questions for the operator, not code changes** — this
+section surfaces them and records the facts they need to decide; nothing here is an
+instruction to implement either option, and no code file is modified by this entry.
+
+### Decision 1 — Timeout ceiling: close as already-fixed, or is the 300s ceiling itself under review?
+
+Fact on disk: `src/local-client.js:372-375` (constant at `src/local-client.js:375`) —
+`PER_CALL_TIMEOUT_CEILING_MS = 300_000` — was raised from 240s to 300s on **2026-09-18**
+(comment block at `src/local-client.js:352-374`) to match `src/ollama-http.js`'s
+`HARD_TIMEOUT_CEILING_MS`, once `dead-process-check.js`'s
+`WORKER_ZOMBIE_THRESHOLD_SECONDS` moved to 1680s and 4 × 300s = 1200s again left
+deliberate slack. (The P40 endpoint has a separate, explicitly documented 900s exception:
+`P40_PER_CALL_TIMEOUT_CEILING_MS`, `src/local-client.js:397`.)
+
+**Open question for the operator:** given that raise, should the worker-timeout question
+from the incident be closed as **already-fixed**, or is the 300s ceiling itself still
+under review (e.g. does it need to scale per-endpoint the way the P40 exception already
+does)?
+
+### Decision 2 — Retry policy: is retry-then-fail acceptable, or is queue-priority backoff wanted?
+
+Fact on disk: worker retry is **maxRetries=2** — the `call(opts, maxRetries = 2)` default
+(`src/local-client.js:459`) — and the incident observed the task exhaust it at **2/2**.
+The surrounding failure-handling region is the draft-failure branch of
+`scripts/local-worker.sh:239-434` (draftFailureCount / infraRequeueCount requeue-vs-block
+logic, worker-level infra-failure backoff), and the arbiter's existing lever is its
+priority classes (`src/gpu-arbiter.js:1-17`: `interactive > review > draft > audit`).
+
+**Open question for the operator:** is the current **retry-then-fail** behavior
+(maxRetries=2, then the task blocks for a human) acceptable as-is, or does the operator
+want **queue-priority backoff** — a change that would touch
+`scripts/local-worker.sh:239-434` and the `gpu-arbiter` priority classes (e.g. lowering a
+repeatedly-failing lane's class so it yields GPU to healthier work instead of burning
+retries against a contended endpoint)?
