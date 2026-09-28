@@ -1237,6 +1237,67 @@ function tryPreDispatchGate(task) {
   return null;
 }
 
+// selectDraftStrategy -- HUB0060 · 2/5 (function-length-fix-ac-4): the multi-way
+// backend selection that currently sits inline in runDraftPasses, extracted as an
+// isolated, table-testable unit. Pure with respect to the task: it reads only
+// task.domain/task.source (via resolveSourceName) and the task's research-domain
+// marker (isResearchDomainTask), picks one of the three backends that ACTUALLY exist
+// in this codebase (draftResearchBranch / draftAdhocBranch / runImplementPass), and
+// assembles the per-pass parameter object exactly as the inline code does -- no
+// call is executed here, so unit tests can drive it with fixture tasks and zero
+// mocks. (The task description's draftAdhocImplement / draftAdhocViaHarnessSearch /
+// retryState do not exist in this checkout -- draftAdhocImplement was deleted
+// 2026-09 (see local-agentic-write-draft.js's header), and retry-state lives on the
+// task itself (task.localRejectCount, ...), not as a separate flag.)
+//
+// pass-through context: the values runDraftPasses computes per-run (the lock wrapper,
+// the resolved call, the attempt record) are injected here the same way the backend
+// fns are, so this stays a pure function of (task, injectedFns) -- defaults of null
+// keep a bare selectDraftStrategy(task) call (e.g. a fixture test) valid.
+// Returns { draftFn, passParams }; the caller spreads passParams into draftFn(task, ...).
+function selectDraftStrategy(task, injectedFns = {}) {
+  const {
+    recordModelCall = defaultRecordModelCall,
+    draftResearchImplementFn = draftResearchImplement,
+    draftAdhocViaLocalAgenticWriteFn = draftAdhocViaLocalAgenticWrite,
+    isClaudePausedFn = isClaudePaused,
+    attempt,
+    maybeLocked = null,
+    resolvedLocalCall = null,
+    resolvedCallIsLocal = null,
+    profileSupportsThink = null,
+  } = injectedFns;
+
+  const sourceName = resolveSourceName(task);
+
+  // research_task implements via a real agentic Claude (WebSearch/WebFetch) call -- see
+  // draftResearchBranch(). A Research:-titled task routes here no matter what
+  // domain/source it arrived with (isResearchDomainTask), same gate the inline code uses.
+  if (task.domain === 'research' || isResearchDomainTask(task)) {
+    return {
+      draftFn: draftResearchBranch,
+      passParams: { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt },
+    };
+  }
+
+  // adhoc-shaped tasks implement via a single LOCAL write-agentic pass in an isolated
+  // worktree instead of the blind JSON-diff pass -- see draftAdhocBranch().
+  if (sourceName === 'adhoc') {
+    return {
+      draftFn: draftAdhocBranch,
+      passParams: { maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal, draftAdhocViaLocalAgenticWriteFn },
+    };
+  }
+
+  // default: the local JSON-diff plan/implement pass (runImplementPass's second inline
+  // argument { recordModelCall, attempt } is folded into passParams here so the
+  // strategy is ONE object).
+  return {
+    draftFn: runImplementPass,
+    passParams: { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, recordModelCall, attempt },
+  };
+}
+
 async function draftTask(task, deps = {}) {
   // Pre-dispatch gate: a deterministic 'archive' verdict ends the task here, before
   // beginDraftAttempt/resolveDraftContext ever touch the task-source registry.
@@ -1758,7 +1819,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { draftTask, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
+module.exports = { draftTask, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on
