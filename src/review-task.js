@@ -357,6 +357,7 @@ function renderImplementResponseForReview(implementResponse) {
 // hallucinated "symbol missing" verdict against byte-verified reality. The task was
 // re-filed and resolved -- record it here so the cumulative log of reviewer
 // hallucination data points stays complete and chronologically ordered.
+// base-rate: 4 occurrences logged to date; evaluate a detection/prevention mechanism at the 5th.
 
 // review-task.js reads each source's own review-gate guidance off the registry
 // (source.reviewGuidance / source.reviewCompletenessQuestion, set in src/task-sources.js
