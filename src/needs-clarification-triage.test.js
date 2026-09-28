@@ -1356,3 +1356,27 @@ test('bucket E: a second sweep is idempotent -- the surfaced question is not dup
   assert.equal(s2.requeued, 0, 'second sweep does not requeue an already-at-cap task');
   assert.ok(exists(at(dir, 'needs-clarification', 'te-surface.json')), 'task still visible for a human, not consumed');
 });
+
+// Test 3 is orthogonal to the awaiting-confirm surfacing write (Test 1 scope): it verifies that
+// the ORIGINAL triage terminal action for a non-requeued task -- the leave-for-human stamp
+// (src/needs-clarification-triage.js, design-decision + retry-exhausted path) -- is still applied
+// after the sweep, i.e. the surfacing idempotency guard does not swallow the stamp itself.
+test('Test 3: original triage action still applied after sweep', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('t3-orig', {
+    needsClarification: {
+      reason: 'design-decision',
+      openQuestions: 'The automated handler could not get this past review after 3 attempts: never produced a real diff.',
+    },
+    blockedReason: 'never produced a real diff',
+    history: [
+      { stage: 'exhausted', at: '2026-09-01T00:00:00Z' },
+      { stage: 'needs-clarification', at: '2026-09-01T00:01:00Z' },
+    ],
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.equal(s.leftForHuman, 1);
+  assert.ok(exists(at(dir, 'needs-clarification', 't3-orig.json')));
+  assert.equal(read(at(dir, 'needs-clarification', 't3-orig.json')).ncTriageDecision, 'leave-for-human');
+});
