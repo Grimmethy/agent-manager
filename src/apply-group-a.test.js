@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 const os = require('os');
 const path = require('path');
 const fs = require('fs');
-const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport, applyDebriefReport, parseDebriefNowWhatItems, applySecondBrainOpportunities } = require('./apply-group-a.js');
+const { parseArchDiscoveryCandidates, applyArchDiscoveryCandidates, isEffectivelyEmptyResponse, parseBrainDumpSortResult, applyBrainDumpSort, applyVerdictOnly, applyPathPrefetchResolve, parsePathPrefetchResolveResult, closeBrainDumpEntryResolved, applyResearchTask, applyForensicsReport, applyDebriefReport, parseDebriefNowWhatItems, applySecondBrainOpportunities, parseProjectSearchFindings, applyProjectSearchFindings } = require('./apply-group-a.js');
 const { isValidDuplicateMatch } = require('./apply-group-a-brain-dump.js');
 
 function candidateBlock({ id = 'AC-1', title = 'Some Title', strength = 'Strong', source = null, files = 'a.js, b.js', body = 'Problem:\nSomething.\n\nSolution:\nFix it.\n\nBenefits:\nBetter.' } = {}) {
@@ -1652,4 +1652,60 @@ test('applyDebriefReport: a report with no NOW WHAT section (NO CONFIDENT PATTER
     if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
     for (const k of ['./config.js']) delete require.cache[require.resolve(k)];
   }
+});
+
+// --- project_search's index appender zero-results guard (HUB0039 2/2) ---
+// A zero-result run is a VALID terminal outcome (see prompts.js's projectSearchImplementPrompt
+// NO_RESULTS clause, added HUB0039 1/2). The appender must not throw or leave the cross-project
+// index missing/malformed -- instead it files a minimal INDEX.md noting "No results".
+test('applyProjectSearchFindings writes a minimal "No results" INDEX.md for an empty findings array instead of throwing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-project-search-'));
+  const indexPath = path.join(dir, 'UsefulProjectIndex', 'INDEX.md');
+  let result;
+  assert.doesNotThrow(() => { result = applyProjectSearchFindings({ implementResponse: '', indexPath }); });
+  assert.equal(result.skipped, true);
+  assert.equal(result.noResults, true);
+  const text = fs.readFileSync(indexPath, 'utf8');
+  assert.match(text, /No results/, 'minimal index must note that there were no results');
+  assert.match(text, /^# Index/m, 'minimal index must be a properly titled markdown doc');
+  assert.doesNotMatch(text, /\| \[[^\]]*\]\([^)]*\) \|/, 'no malformed table rows in the minimal index');
+});
+
+test('applyProjectSearchFindings treats the NO_RESULTS marker as a zero-findings terminal output', () => {
+  // parseProjectSearchFindings: the marker alone, and the marker plus its own note line
+  // (the shape prompts.js's zero-findings clause asks the model for), both yield zero findings.
+  assert.deepEqual(parseProjectSearchFindings('NO_RESULTS'), []);
+  assert.deepEqual(parseProjectSearchFindings('NO_RESULTS\nsearches could not be completed (ENOTFOUND)'), []);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-project-search-'));
+  const indexPath = path.join(dir, 'UsefulProjectIndex', 'INDEX.md');
+  let result;
+  assert.doesNotThrow(() => { result = applyProjectSearchFindings({ implementResponse: 'NO_RESULTS', indexPath }); });
+  assert.equal(result.noResults, true);
+  assert.match(fs.readFileSync(indexPath, 'utf8'), /No results/);
+});
+
+test('applyProjectSearchFindings does not clobber an existing INDEX.md when a run finds nothing', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-project-search-'));
+  const indexPath = path.join(dir, 'INDEX.md');
+  const original = '# Index\n\n| Project | Source | Description | Relevant to | Status |\n|---|---|---|---|---|\n| [real-lead](https://example.com) | github | x | y | lead |\n';
+  fs.writeFileSync(indexPath, original);
+
+  const result = applyProjectSearchFindings({ implementResponse: 'NO_RESULTS', indexPath });
+  assert.equal(result.noResults, true);
+  assert.equal(fs.readFileSync(indexPath, 'utf8'), original, 'existing index with prior leads must stay untouched');
+});
+
+test('applyProjectSearchFindings still appends real findings to a pre-existing index (no regression)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-project-search-'));
+  const indexPath = path.join(dir, 'INDEX.md');
+  const original = '# Index\n\n| Project | Source | Description | Relevant to | Status |\n|---|---|---|---|---|\n\n## Notes\n';
+  fs.writeFileSync(indexPath, original);
+
+  const finding = '### PROJECT: example-repo\nSource: github\nURL: https://example.com\nDescription: a tool\nRelevant to: us\nStrength: Weak\n';
+  const result = applyProjectSearchFindings({ implementResponse: finding, indexPath });
+  assert.equal(result.findingCount, 1);
+  const text = fs.readFileSync(indexPath, 'utf8');
+  assert.match(text, /\[example-repo\]\(https:\/\/example\.com\)/);
+  assert.doesNotMatch(text, /No results/);
 });
