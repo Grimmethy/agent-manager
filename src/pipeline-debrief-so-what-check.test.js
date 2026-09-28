@@ -218,3 +218,48 @@ test('the rejection message names the accepted citation forms and still lists re
   assert.match(r.reason, /Accepted citation forms: "COMPLETED N" or "Task N"/);
   assert.match(r.reason, /COMPLETED 1, COMPLETED 2, COMPLETED 3/);
 });
+
+// --- 2026-09-28: two more real forms found on the 12-task blocked cluster after the
+// 2026-09-27 widening -- a real contrastId (still-stuck comparison evidence, shown to the
+// drafter but never in the citable set) and a real, distinctive mid-string slug fragment
+// ("nul-bytes" out of a much longer id) that isn't a full id, a bd-token, or a 24-char
+// prefix. Both root-caused live: 9 of 12 blocked debriefs (2 of those 9 via contrastIds
+// specifically) were rejected despite citing 100% real evidence in one of these two forms.
+
+test('realTaskIds also pulls contrastIds, not just taskIds', () => {
+  const t = task({ promptContext: { taskIds: ['a'], contrastIds: ['change-review-53b8f52'] } });
+  assert.deepEqual(realTaskIds(t), ['a', 'change-review-53b8f52']);
+});
+
+test('SO WHAT: citing a real CONTRAST (still-stuck) task counts -- it is real evidence the drafter was shown, not a fabrication', () => {
+  const t = task({ promptContext: { contrastIds: ['change-review-53b8f52'] } });
+  assert.equal(verdict('Flag 2 -- change-review-53b8f52 is still stuck at the same review-vote stage the shipped tasks burned calls on.', t), 'ok');
+});
+
+test('SO WHAT: a distinctive mid-string slug fragment of a real id counts as a citation', () => {
+  const t = task({
+    promptContext: {
+      taskIds: ['adhoc-fix-corrupted-nul-bytes-in-src-lib-implement-critique-js-dedup-key-1789521505895'],
+    },
+  });
+  // real, live example: the model cited "nul-bytes" (a fragment) rather than the full id.
+  assert.equal(verdict('The nul-bytes fix burned 9 plan calls before a deterministic check would have routed it correctly.', t), 'ok');
+});
+
+test('SO WHAT: a short hash-like fragment (e.g. a git-short-sha task label) of a real contrast id counts', () => {
+  const t = task({ promptContext: { contrastIds: ['change-review-05a140a'] } });
+  assert.equal(verdict('change-review-05a140a is contrasted here: same critique-stage waste, still blocked.', t), 'ok');
+});
+
+test('SO WHAT: a generic shared-prefix fragment across many ids (naming the task TYPE, not one item) is still ungrounded', () => {
+  const t = task({
+    promptContext: {
+      taskIds: [
+        'brain-dump-sort-bd-1111-alpha', 'brain-dump-sort-bd-2222-beta', 'brain-dump-sort-bd-3333-gamma',
+      ],
+    },
+  });
+  // "brain-dump-sort" is a shared prefix of all three real ids -- it names the SOURCE, not
+  // a specific evidence item, and must not satisfy the citation requirement on its own.
+  assert.equal(verdict('For the brain-dump-sort tasks, the critique stage is redundant.', t), 'ungrounded');
+});

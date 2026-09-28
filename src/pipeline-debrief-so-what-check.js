@@ -47,9 +47,21 @@ function realCompletedNumbers(task) {
   return numbers;
 }
 
+// 2026-09-28: also includes contrastIds -- debrief-bundle.js's evidence text carries a
+// "### CONTRAST N (STILL STUCK, same source)" block for each still-stuck sibling task
+// alongside the "### COMPLETED N" shipped ones (both real, both shown to the drafter,
+// both named in the prompt: prompts.js's "Contrast (still-stuck, same source) tasks:"
+// line), and task-sources.js already stores contrastIds on the task record right next to
+// taskIds -- but this function only ever read taskIds, so a SO WHAT flag that legitimately
+// cites a contrast task as comparative evidence (a real, common pattern: "did the stuck
+// ones burn out at the same stage" is literally what the prompt asks the drafter to
+// check) was rejected as ungrounded even though the citation was 100% real. Root-caused
+// live from 2 of 12 currently-blocked debriefs both citing a real contrastId with no
+// other match.
 function realTaskIds(task) {
-  const ids = (task.promptContext && task.promptContext.taskIds) || [];
-  return Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && id) : [];
+  const ctx = task.promptContext || {};
+  const ids = [...(ctx.taskIds || []), ...(ctx.contrastIds || [])];
+  return ids.filter((id) => typeof id === 'string' && id);
 }
 
 // Isolates the SO WHAT section (between its own heading and the next section heading) --
@@ -72,6 +84,57 @@ function extractSoWhatSection(text) {
 // that is not in the evidence never satisfies any form below.
 const MIN_ID_PREFIX_CHARS = 24;
 
+// 2026-09-28: task ids/contrastIds in this pipeline are long, auto-generated, hyphen-
+// joined slugs (e.g. `adhoc-fix-corrupted-nul-bytes-in-src-lib-implement-critique-js-
+// dedup-k...`) or `change-review-<7-char-hash>` labels. Measured live on 9 of 12
+// currently-blocked debriefs: the drafter routinely cites a real, meaningful FRAGMENT
+// pulled from the middle of one of these ids ("nul-bytes", "guard-review-gate",
+// "53b8f52") rather than the exact "COMPLETED N" form, a full id, a bd-<digits> token, or
+// the 24-char PREFIX form (b)/(c) already accept -- none of which cover a mid-string
+// fragment. Extracts every hyphen-joined multi-word run (>=2 segments, >=8 chars
+// combined) and every short hash-like token (6-8 alnum chars containing at least one
+// digit) from the real ids, once per check call -- same "real evidence, closed set"
+// discipline as every other form here: a fragment that is not a substring of some real
+// id can never match, so this cannot fabricate grounding, only recognize a real citation
+// written in a shorter shape. A fragment shared by MULTIPLE real ids (e.g. "brain-dump-
+// sort", a common source-name prefix) names the task TYPE, not one item, and is excluded
+// -- only a fragment that uniquely identifies exactly one real id counts.
+const HASH_TOKEN_RE = /^(?=.*[0-9])[a-z0-9]{6,8}$/;
+
+// Counts which real ids each candidate fragment appears in -- a fragment shared by many
+// ids (e.g. "brain-dump-sort", a shared SOURCE prefix on every brain_dump_sort id) names
+// the task TYPE, not a specific evidence item, and must not satisfy the citation
+// requirement on its own (same reasoning as "across all N tasks" already failing). Only a
+// fragment that uniquely identifies exactly ONE real id counts.
+function uniqueSlugFragments(ids) {
+  const owners = new Map(); // frag -> Set of ids it appears in
+  for (const id of ids) {
+    const parts = id.toLowerCase().split(/[-_]/).filter(Boolean);
+    const seen = new Set();
+    for (let i = 0; i < parts.length; i++) {
+      if (HASH_TOKEN_RE.test(parts[i])) seen.add(parts[i]);
+      for (let j = i + 2; j <= parts.length; j++) {
+        const frag = parts.slice(i, j).join('-');
+        if (frag.length >= 8) seen.add(frag);
+      }
+    }
+    for (const frag of seen) {
+      if (!owners.has(frag)) owners.set(frag, new Set());
+      owners.get(frag).add(id);
+    }
+  }
+  const unique = new Set();
+  for (const [frag, idSet] of owners) if (idSet.size === 1) unique.add(frag);
+  return unique;
+}
+
+function citesFragment(soWhatLower, ids) {
+  for (const frag of uniqueSlugFragments(ids)) {
+    if (new RegExp(`(?<![a-z0-9-])${frag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9-])`).test(soWhatLower)) return true;
+  }
+  return false;
+}
+
 function citesEvidence(soWhat, completedNumbers, taskIds) {
   const real = new Set(completedNumbers.map(String));
   // (d) the original exact forms
@@ -87,7 +150,9 @@ function citesEvidence(soWhat, completedNumbers, taskIds) {
   const realBd = new Set(taskIds.flatMap((id) => id.match(/bd-\d{10,}/g) || []));
   if ((soWhat.match(/bd-\d{10,}/g) || []).some((t) => realBd.has(t))) return true;
   // (c) a long, distinctive prefix of a real task id
-  return taskIds.some((id) => id.length >= MIN_ID_PREFIX_CHARS && soWhat.includes(id.slice(0, MIN_ID_PREFIX_CHARS)));
+  if (taskIds.some((id) => id.length >= MIN_ID_PREFIX_CHARS && soWhat.includes(id.slice(0, MIN_ID_PREFIX_CHARS)))) return true;
+  // (e) a real, distinctive mid-string slug fragment (see slugFragments above)
+  return citesFragment(soWhat.toLowerCase(), taskIds);
 }
 
 // task, implementResponse -> { verdict: 'ok'|'ungrounded', reason? }
@@ -108,7 +173,7 @@ function runSoWhatCitationCheck(task, implementResponse) {
   const sample = completedNumbers.slice(0, 5).map((n) => `COMPLETED ${n}`).join(', ');
   return {
     verdict: 'ungrounded',
-    reason: `SO WHAT does not cite any specific evidence item (a "COMPLETED N" reference or a real task id) for its flagged inefficiency -- it must cite at least one, e.g.: ${sample || '(see evidence)'}. A generic aggregate claim ("across all N tasks...") with no citation is not grounded, even if the underlying observation is correct. Accepted citation forms: "COMPLETED N" or "Task N" (N a real block number), a real task id, or its bd-<digits> token.`,
+    reason: `SO WHAT does not cite any specific evidence item (a "COMPLETED N" reference or a real task id) for its flagged inefficiency -- it must cite at least one, e.g.: ${sample || '(see evidence)'}. A generic aggregate claim ("across all N tasks...") with no citation is not grounded, even if the underlying observation is correct. Accepted citation forms: "COMPLETED N" or "Task N" (N a real block number), a real task id (including a still-stuck CONTRAST task), its bd-<digits> token, or a distinctive fragment of a real id (e.g. "nul-bytes" from a longer id, or a short hash like "53b8f52").`,
   };
 }
 
