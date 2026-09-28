@@ -419,7 +419,7 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(`Before producing the draft above, an independent critique call flagged real problems, and a revision was attempted. The draft above is the REVISED version. Verify the issues below were actually addressed -- if the draft above still has any of these same problems, reject it; do not assume a revision attempt means the issues are fixed.`);
     lines.push(task.critiqueText.length > 4000 ? `${task.critiqueText.slice(0, 4000)}\n...[truncated]` : task.critiqueText);
     // 2026-09-18 (brain-dump bd-1789602450613, "reviewer-hallucination pattern extends to
-    // a 3rd task family"): a real, correct fix (performance-fix-ac-6) was rejected TWICE,
+    // a 4th task family"): a real, correct fix (performance-fix-ac-6) was rejected TWICE,
     // both votes quoting the CRITIQUE's description of the pre-revision draft ("the draft
     // is a refusal") as if it described the current one -- the critique text above ends
     // up being the LAST thing read before the draft, and the model conflated "what was
