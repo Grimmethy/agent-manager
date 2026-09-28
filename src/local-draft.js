@@ -65,6 +65,7 @@ const { checkDraft, checkCitationsAgainstHarnessFiles } = require('./fact-checke
 const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.js');
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
+const { getPreDispatchGate } = require('./deterministic-recheck-registry.js');
 const { selectAbModel } = require('./ab-model-select.js');
 const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
@@ -1196,7 +1197,56 @@ function resolveCallOpts(task, localCall = null) {
  *   Tests can inject a no-op ((dir, fn) => fn()) to skip touching a real lockfile.
  * @returns {Promise<{succeeded: boolean, blocked?: boolean, blockedReason?: string, blockedStage?: string, needsClarification?: boolean, reason?: string}>}
  */
+// 2026-09 (HUB0016 2/2): pre-dispatch gate (HUB0030's await-in-loop detector, keyed in
+// src/deterministic-recheck-registry.js's registerPreDispatchGate/getPreDispatchGate)
+// consulted BEFORE draftTask() enters the plan/implement cycle. The payload names the
+// flagged rule id and the flagged code (promptContext.ruleId/flaggedCode, with the
+// producer-side alias fields and a finding.* fallback); when a registered gate decides
+// the rule with verdict 'archive' the whole multi-agent cycle is skipped (zero model
+// calls) and the task is recorded archived with the detector's own reason. Any miss --
+// no rule id, unregistered rule, empty code, a detector throw, or an 'investigate'
+// verdict -- falls through to the normal path, completely unchanged. No
+// task-source-registry read/write happens here, so a source not in task-sources.js's
+// base set (performance_review is one) cannot crash this path with "Cannot update
+// unregistered task source" -- the exact failure the prior attempt hit.
+function tryPreDispatchGate(task) {
+  try {
+    const pc = (task && typeof task.promptContext === 'object' && task.promptContext) || {};
+    const finding = (pc && typeof pc.finding === 'object' && pc.finding)
+      || (task && typeof task.finding === 'object' && task.finding)
+      || {};
+    const ruleId = pc.ruleId || pc.rule || pc.originalRule || finding.ruleId || finding.rule;
+    if (typeof ruleId !== 'string' || !ruleId) return null;
+    const flaggedCode = pc.flaggedCode || pc.code || pc.ruleCode || pc.snippet
+      || finding.flaggedCode || finding.code || finding.snippet;
+    if (typeof flaggedCode !== 'string' || !flaggedCode) return null;
+    let detector;
+    try {
+      detector = getPreDispatchGate(ruleId);
+    } catch {
+      return null; // a malformed lookup must never crash the draft
+    }
+    if (typeof detector !== 'function') return null; // unregistered rule -- normal path
+    const gateResult = detector(flaggedCode);
+    if (gateResult && gateResult.verdict === 'archive') {
+      return { ruleId, status: 'archived', reason: gateResult.reason || 'pre-dispatch gate verdict' };
+    }
+  } catch {
+    return null; // any detector error means "fall through to the normal path", never a crash
+  }
+  return null;
+}
+
 async function draftTask(task, deps = {}) {
+  // Pre-dispatch gate: a deterministic 'archive' verdict ends the task here, before
+  // beginDraftAttempt/resolveDraftContext ever touch the task-source registry.
+  const gateHit = tryPreDispatchGate(task);
+  if (gateHit) {
+    task.status = 'archived';
+    task.preDispatchGate = { ruleId: gateHit.ruleId, verdict: 'archive', reason: gateHit.reason };
+    appendHistoryEvent(task, 'pre-dispatch-gate', `rule "${gateHit.ruleId}" verdict 'archive' -- ${gateHit.reason}`);
+    return { status: 'archived', reason: gateHit.reason, succeeded: true, ruleId: gateHit.ruleId };
+  }
   // One append-only record per draftTask() run (draft-attempt-record.js). runDraftPasses
   // threads `attempt` through every pass and records into it as output is produced;
   // finalizeDraftAttempt stamps the terminal verdict, pushes it onto task.draftAttempts,
