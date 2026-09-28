@@ -89,6 +89,46 @@ function realLineCount(repoRoot, relPath) {
   }
 }
 
+// Given a raw path string that may or may not include an allowed root prefix (src/, python/,
+// scripts/, lib/, docs/), build a deduplicated list of candidate repo-relative paths and
+// return the first one that actually exists on disk (per lineCountFn), or the raw form if
+// none do. Used to normalize relative paths by existence before a line-count check.
+function resolveExistingPath(raw, repoRoot, lineCountFn) {
+  const ROOTS = ['src', 'python', 'scripts', 'lib', 'docs'];
+  const probe = lineCountFn || realLineCount;
+
+  // Strip any leading allowed root to get the bare path (e.g. "src/foo/bar.js" -> "foo/bar.js").
+  let bare = raw;
+  for (const root of ROOTS) {
+    if (bare.startsWith(root + '/')) {
+      bare = bare.slice(root.length + 1);
+      break;
+    }
+  }
+
+  // Build the candidate list: raw first, then bare prefixed with each root.
+  const candidates = [raw];
+  for (const root of ROOTS) {
+    const c = root + '/' + bare;
+    if (!candidates.includes(c)) candidates.push(c);
+  }
+  // Deduplicate preserving first-seen order.
+  const seen = new Set();
+  const deduped = candidates.filter((c) => {
+    if (seen.has(c)) return false;
+    seen.add(c);
+    return true;
+  });
+
+  // Probe each candidate; return the first that yields a non-null positive line count.
+  for (const c of deduped) {
+    const n = probe(repoRoot, c);
+    if (n !== null && n > 0) return c;
+  }
+  // None existed -- fall back to the raw form.
+  return raw;
+}
+
 function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCount } = {}) {
   if (!isEnabled()) return null;
   const pc = (task && task.promptContext) || {};
@@ -157,4 +197,4 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
   };
 }
 
-module.exports = { detectStaleDecomposePremise, PATH_RE, LINE_REF_RE, LINE_OVERSHOOT_SLACK, maskTimestamps };
+module.exports = { detectStaleDecomposePremise, PATH_RE, LINE_REF_RE, LINE_OVERSHOOT_SLACK, maskTimestamps, resolveExistingPath };
