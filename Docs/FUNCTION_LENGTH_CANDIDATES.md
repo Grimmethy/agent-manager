@@ -10484,3 +10484,1347 @@ def api_adhoc_tasks():
 Benefits:
 The route body drops from ~60 lines to ~15, making the control flow (which directories are scanned, in what order, with what filter) scannable at a glance. The single `_collect_adhoc_rows` helper is trivially unit-testable in isolation—feed it a temp directory tree and assert the returned rows—without spinning up the Flask app. Future changes to the adhoc predicate, the row shape, or the glob pattern are made in exactly one place, eliminating the three-site duplication hazard. Reviewers can verify correctness of the traversal logic once rather than diffing three near-identical blocks.
 
+
+### AC-193 · Decompose renderModelsTab into single-purpose builders
+Strength: Strong
+Files: python/dashboard/static/js/analytics-and-discovery.js
+Snippet:
+```
+async function renderModelsTab() {
+  // Every fetch this tab needs -- including the benchmark panel's -- happens up front, in
+  // parallel, BEFORE any DOM write (2026-08-19, Grimmethy: "I refreshed and my screen
+  // still flashes"). The previous version wrote an EMPTY '<div id="benchmark-panel">'
+  // placeholder first and only populated it after its own separate await chain resolved
+  // (which itself wrote an empty '#benchmark-results' placeholder, populated by a THIRD
+  // await) -- a real collapse-then-expand on every single 5s background refresh, not just
+  // a scroll-offset problem (the earlier scrollY save/restore fix only corrected the
+  // FINAL position after that flash had already been visible). Fetching everything first
+  // and writing main.innerHTML exactly once eliminates the intermediate empty states
+  // entirely, so there is nothing left to flash.
+  const [models, usageRows, costSummary, settingsPanel, usagePanel, benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
+    fetchJson('/api/models'),
+    fetchJson('/api/models/usage'),
+    fetchJson('/api/models/cost-summary'),
+    renderClaudeSettingsPanel(),
+    renderClaudeUsagePanel(),
+    benchmarkModelsCache || fetchJson('/api/benchmark/models').then(r => { benchmarkModelsCache = r.ollamaModels || []; return benchmarkModelsCache; }),
+    benchmarkCasesCache || fetchJson('/api/benchmark/cases').then(r => { benchmarkCasesCache = r; return r; }),
+    fetchJson('/api/benchmark/status'),
+    fetchJson('/api/benchmark/runs'),
+  ]);
+  if (benchmarkSelectedModels.size === 0 && benchmarkSelectedCases.size === 0) {
+    benchModels.forEach(m => benchmarkSelectedModels.add(m));
+    benchCases.forEach(c => benchmarkSelectedCases.add(c.id));
+  }
+  // Default to the combined view across every saved run (2026-08-24, Grimmethy: "results
+  // should default to All Runs (combined)") -- was defaulting to just the single most
+  // recent run, which is also why the radar chart (aggregate-only per the same request
+  // earlier today) wasn't visible without a manual dropdown click.
+  const viewingRunId = benchmarkViewingRunId || (benchRuns.length > 0 ? BENCHMARK_ALL_RUNS_ID : null);
+  const benchResultsHtml = await buildBenchmarkResultsHtml(viewingRunId, benchRuns);
+  const benchmarkPanelHtml = buildBenchmarkPanelHtml(benchModels, benchCases, benchStatus, benchRuns, viewingRunId, benchResultsHtml);
+
+  const main = document.getElementById('main');
+
+  const sorted = models.slice().sort((a, b) => {
+    const av = a[modelsSortKey], bv = b[modelsSortKey];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;   // nulls last regardless of direction
+    if (bv == null) return -1;
+    if (av < bv) return modelsSortDir === 'asc' ? -1 : 1;
+    if (av > bv) return modelsSortDir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0), 0);
+  const maxTokS = Math.max(...models.map(m => m.avgTokensPerSec ?? 0), 0);
+
+  const headCells = MODELS_COLUMNS.map(col => {
+    if (!col.sortable) return `<th>${col.label}</th>`;
+    const arrow = modelsSortKey === col.key ? (modelsSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="sortable" data-key="${col.key}">${col.label}${arrow}</th>`;
+  }).join('');
+
+  const rows = sorted.map((m, i) => `
+    <tr class="${i === 0 ? 'top-row' : ''}">
+      <td>${m.model}</td>
+      <td>${m.callCount}</td>
+      <td>${renderBarCell(m.approveRate, maxApprove, 'ok', fmtPct)}</td>
+      <td>${renderBarCell(m.avgTokensPerSec, maxTokS, 'accent', (v) => fmtNum(v, 1))}</td>
+      <td>${fmtNum(m.minTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.maxTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.avgLatencyMs, 0)}</td>
+      <td>${m.degenerateCount}</td>
+      <td>${m.errorCount}</td>
+      <td>${fmtUsd(m.totalCostUsd)}</td>
+    </tr>
+  `).join('');
+
+  const implementTable = models.length === 0
+    ? '<div class="empty">No implement-pass stats yet -- set AGENT_MANAGER_CLAUDE_SOURCES or ORNITH_AB_MODELS to compare candidates.</div>'
+    : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+
+  // Estimated Anthropic API Cost (2026-08-23, Grimmethy: "Do we have any way of knowing
+  // how much these tasks would cost using anthropic API?") -- claude-client.js's call()
+  // has always computed a real per-call cost estimate (Claude Code CLI's own
+  // total_cost_usd, against real Anthropic API pricing) but nothing stored or surfaced
+  // it until now. Explicitly labeled "estimate, not a bill" -- every real call here runs
+  // under a Claude subscription, never pay-per-token, so this is what the SAME work
+  // would have cost on the API, not what was actually charged.
+  const mostRecentDay = costSummary.byDay && costSummary.byDay[0] ? costSummary.byDay[0] : null;
+  // hypothetical (2026-08-23, Grimmethy: "Clarification on the anthropic costs. I'd like
+  // estimates for if we had used the API. Even if we used the local models.") -- unlike
+  // totalCostUsd above (real spend, only real Claude calls contribute), this covers
+  // EVERY call, local ones included (a token-based estimate via anthropic-pricing.js for
+  // those) -- see api_models_cost_summary's own docstring.
+  const hyp = costSummary.hypothetical || { totalCostUsd: 0, totalCalls: 0 };
+  const costWidget = `
+    <div class="grill-session" style="margin-bottom:16px">
+      <div class="field-label">Estimated Anthropic API Cost</div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What every recorded Claude call would have cost on real Anthropic API pricing -- these calls actually ran under a subscription, never billed per-token. An estimate of avoided/equivalent cost, not a bill."><strong>${fmtUsd(costSummary.totalCostUsd)}</strong>real spend (all time)</div>
+        <div class="stat"><strong>${costSummary.callsWithCost}</strong>Claude calls</div>
+        <div class="stat" title="Local Ollama calls -- genuinely free, not just unbilled."><strong>${costSummary.freeCalls}</strong>free (local) calls</div>
+        ${mostRecentDay ? `<div class="stat"><strong>${fmtUsd(mostRecentDay.totalCost)}</strong>${escapeHtml(mostRecentDay.day)} (${mostRecentDay.calls} call(s))</div>` : ''}
+      </div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What EVERY call this pipeline has ever made -- including the ones that ran locally, free -- would have cost had it gone through the Anthropic API instead. Real Claude calls use their real cost; local calls are a token-based estimate."><strong>${fmtUsd(hyp.totalCostUsd)}</strong>if every call had used the API (${hyp.totalCalls} call(s))</div>
+      </div>
+    </div>`;
+
+  const usageTableRows = usageRows.map(r => `
+    <tr>
+      <td>${escapeHtml(r.model)}</td>
+      <td>${escapeHtml(r.stage)}</td>
+      <td>${r.callCount}</td>
+      <td>${fmtNum(r.avgLatencyMs, 0)}</td>
+      <td>${r.lastUsedAt ? new Date(r.lastUsedAt).toLocaleString() : ''}</td>
+    </tr>
+  `).join('');
+  const usageTable = usageRows.length === 0 ? '' : `
+    <div class="field-label" style="margin-top:20px">All Calls (every stage, both providers)</div>
+    <table><thead><tr><th>Model</th><th>Stage</th><th>Calls</th><th>Avg Latency (ms)</th><th>Last Used</th></tr></thead>
+    <tbody>${usageTableRows}</tbody></table>`;
+
+  // Scroll-position preservation on top of the single-write fix above: the generic 5s
+  // refresh() cycle (see its own comment near setInterval(refresh, 5000)) still re-renders
+  // this whole tab on a timer regardless of what the user is doing on it, so restoring
+  // window.scrollY keeps their reading position stable across a background refresh they
+  // didn't ask for, even though the write itself no longer has an empty intermediate state.
+  const scrollY = window.scrollY;
+  main.innerHTML = settingsPanel + usagePanel + costWidget + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable
+    + benchmarkPanelHtml;
+  wireClaudeSettingsPanel();
+  main.querySelectorAll('th.sortable').forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      modelsSortDir = (modelsSortKey === key && modelsSortDir === 'desc') ? 'asc' : 'desc';
+      modelsSortKey = key;
+      renderModelsTab();
+    };
+  });
+  wireBenchmarkPanel(benchModels, benchCases);
+  window.scrollTo(0, scrollY);
+}
+```
+
+Problem:
+The 136-line renderModelsTab interleaves five distinct responsibilities—parallel fetch with default-selection, model-table construction (null-aware sort comparator + column-driven header loop + row rendering + empty-state), a two-concept cost widget (real-spend vs. hypothetical-API with independent null-guards), an independent usage table with its own data shape and empty-state branch, and DOM write with click-handler wiring that mutates module-level sort state. Each block has its own internal branching and edge cases, so a change to the cost widget's `mostRecentDay` guard or the comparator's tie-breaker forces a reader to re-scan the entire function to confirm no other block was disturbed, and none of the five concerns can be unit-tested in isolation without mocking the other four.
+
+Solution:
+Extract four single-purpose pure builders (`sortModels`, `buildModelsTable`, `buildCostWidget`, `buildUsageTable`) and one side-effect isolator (`wireModelsTabEvents`), leaving `renderModelsTab` as a ~30-line linear "fetch → assemble → write → wire" orchestrator with no internal branching of its own. The concrete shape of the extracted code:
+
+```js
+function sortModels(models) {
+  const key = modelsSortKey, dir = modelsSortDir;
+  return models.slice().sort((a, b) => {
+    const av = a[key], bv = b[key];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    if (av < bv) return dir === 'asc' ? -1 : 1;
+    if (av > bv) return dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+}
+
+function buildModelsTable(models) {
+  const sorted = sortModels(models);
+  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0), 0);
+  const maxTokS    = Math.max(...models.map(m => m.avgTokensPerSec ?? 0), 0);
+  const headCells = MODELS_COLUMNS.map(col => {
+    if (!col.sortable) return `<th>${col.label}</th>`;
+    const arrow = modelsSortKey === col.key
+      ? (modelsSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="sortable" data-key="${col.key}">${col.label}${arrow}</th>`;
+  }).join('');
+  const rows = sorted.map((m, i) => `
+    <tr class="${i === 0 ? 'top-row' : ''}">
+      <td>${m.model}</td><td>${m.callCount}</td>
+      <td>${renderBarCell(m.approveRate, maxApprove, 'ok', fmtPct)}</td>
+      <td>${renderBarCell(m.avgTokensPerSec, maxTokS, 'accent', v => fmtNum(v, 1))}</td>
+      <td>${fmtNum(m.minTokensPerSec, 1)}</td><td>${fmtNum(m.maxTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.avgLatencyMs, 0)}</td><td>${m.degenerateCount}</td>
+      <td>${m.errorCount}</td><td>${fmtUsd(m.totalCostUsd)}</td>
+    </tr>`).join('');
+  return models.length === 0
+    ? '<div class="empty">No implement-pass stats yet.</div>'
+    : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function buildCostWidget(cs) {
+  const day = cs.byDay?.[0] ?? null;
+  const hyp = cs.hypothetical || { totalCostUsd: 0, totalCalls: 0 };
+  return `<div class="grill-session" style="margin-bottom:16px">
+    <div class="field-label">Estimated Anthropic API Cost</div>
+    <div class="row" style="gap:24px;margin-top:6px">
+      <div class="stat"><strong>${fmtUsd(cs.totalCostUsd)}</strong>real spend</div>
+      <div class="stat"><strong>${cs.callsWithCost}</strong>Claude calls</div>
+      <div class="stat"><strong>${cs.freeCalls}</strong>free (local)</div>
+      ${day ? `<div class="stat"><strong>${fmtUsd(day.totalCost)}</strong>${escapeHtml(day.day)} (${day.calls})</div>` : ''}
+    </div>
+    <div class="row" style="gap:24px;margin-top:6px">
+      <div class="stat"><strong>${fmtUsd(hyp.totalCostUsd)}</strong>if all via API (${hyp.totalCalls})</div>
+    </div>
+  </div>`;
+}
+
+function buildUsageTable(rows) {
+  if (!rows.length) return '';
+  const body = rows.map(r => `<tr><td>${escapeHtml(r.model)}</td><td>${escapeHtml(r.stage)}</td>
+    <td>${r.callCount}</td><td>${fmtNum(r.avgLatencyMs, 0)}</td>
+    <td>${r.lastUsedAt ? new Date(r.lastUsedAt).toLocaleString() : ''}</td></tr>`).join('');
+  return `<div class="field-label" style="margin-top:20px">All Calls</div>
+    <table><thead><tr><th>Model</th><th>Stage</th><th>Calls</th><th>Avg ms</th><th>Last</th></tr></thead>
+    <tbody>${body}</tbody></table>`;
+}
+
+function wireModelsTabEvents(main) {
+  wireClaudeSettingsPanel();
+  main.querySelectorAll('th.sortable').forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      modelsSortDir = (modelsSortKey === key && modelsSortDir === 'desc') ? 'asc' : 'desc';
+      modelsSortKey = key;
+      renderModelsTab();
+    };
+  });
+}
+
+// ── slimmed orchestrator ──────────────────────────────────────────────
+async function renderModelsTab() {
+  const [models, usageRows, costSummary, settingsPanel, usagePanel,
+       benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
+    fetchJson('/api/models'),
+    fetchJson('/api/models/usage'),
+    fetchJson('/api/models/cost-summary'),
+    renderClaudeSettingsPanel(),
+    renderClaudeUsagePanel(),
+    benchmarkModelsCache || fetchJson('/api/benchmark/models').then(r => { benchmarkModelsCache = r.ollamaModels || []; return benchmarkModelsCache; }),
+    benchmarkCasesCache  || fetchJson('/api/benchmark/cases').then(r => { benchmarkCasesCache = r; return r; }),
+    fetchJson('/api/benchmark/status'),
+    fetchJson('/api/benchmark/runs'),
+  ]);
+  if (benchmarkSelectedModels.size === 0 && benchmarkSelectedCases.size === 0) {
+    benchModels.forEach(m => benchmarkSelectedModels.add(m));
+    benchCases.forEach(c => benchmarkSelectedCases.add(c.id));
+  }
+  const viewingRunId = benchmarkViewingRunId || (benchRuns.length > 0 ? BENCHMARK_ALL_RUNS_ID : null);
+  const benchResultsHtml = await buildBenchmarkResultsHtml(viewingRunId, benchRuns);
+  const benchmarkPanelHtml = buildBenchmarkPanelHtml(benchModels, benchCases, benchStatus, benchRuns, viewingRunId, benchResultsHtml);
+  const main = document.getElementById('main');
+  const scrollY = window.scrollY;
+  main.innerHTML = settingsPanel + usagePanel
+    + buildCostWidget(costSummary)
+    + '<div class="field-label">Implement-Pass Quality</div>'
+    + buildModelsTable(models)
+    + buildUsageTable(usageRows)
+    + benchmarkPanelHtml;
+  wireModelsTabEvents(main);
+  wireBenchmarkPanel(benchModels, benchCases);
+  window.scrollTo(0, scrollY);
+}
+```
+
+Benefits:
+Each extracted helper is 10–30 lines, single-purpose, and independently unit-testable: the sort comparator against fixture arrays, the cost-widget HTML against a mock `costSummary` object, the usage-table empty-state branch in isolation. The orchestrator drops to ~30 lines of linear pipeline with no internal branching, so a reviewer can verify the fetch/assemble/write sequence in one pass without tracking interleaved template literals. Future changes to pricing fields, sort columns, or event wiring touch only the relevant helper without risking accidental breakage in an unrelated block, and the mechanical cut-and-paste nature of the refactor keeps review risk low.
+
+### AC-194 · Decompose `renderJobListTab` (411 lines) into five responsibility-scoped functions
+Strength: Strong
+Files: python/dashboard/static/js/branches-joblist-hardware-tabs.js
+Snippet:
+```
+}
+
+async function renderJobListTab() {
+  const main = document.getElementById('main');
+  let jobTypes;
+  try {
+    jobTypes = await fetchJson('/api/job-types');
+  } catch (e) {
+    jobTypes = null;
+  }
+  // 2026-08-26, Grimmethy: "After looking at pipeline map I've realized that it really
+  // should just be an extension of Job List instead of a new tab entirely" -- folded in
+  // here rather than kept as its own tab. Row list is /api/pipeline-map's sources (straight
+  // off the real registry via --dump-topology); /api/job-types carries the per-row
+  // description/domain/priority/worker-type (also registry-driven, load_topology()) and the
+  // editable state. Both include AGENT_MANAGER_REGISTER_PATH plugin sources, so neither
+  // can drift the way the old client-side JOB_TYPES const did.
+  let pipelineMap;
+  try {
+    pipelineMap = await fetchJson('/api/pipeline-map');
+  } catch (e) {
+    pipelineMap = null;
+  }
+  const activeByName = {};
+  const alwaysActiveByName = {};
+  const priorityByName = {};
+  const approvalModeByName = {};
+  const workerTypeByName = {};
+  const timesPerformedByName = {};
+  const availableByName = {};
+  const familyByName = {};
+  const familyLabelByName = {};
+  (jobTypes || []).forEach((j) => {
+    activeByName[j.name] = j.active;
+    alwaysActiveByName[j.name] = j.alwaysActive;
+    priorityByName[j.name] = j.priority;
+    approvalModeByName[j.name] = j.approvalMode;
+    workerTypeByName[j.name] = j.workerType;
+    timesPerformedByName[j.name] = j.timesPerformed;
+    availableByName[j.name] = j.available;
+    familyByName[j.name] = j.family || null;
+    familyLabelByName[j.name] = j.familyLabel || null;
+  });
+  const descByName = {};
+  const domainByName = {};
+  (jobTypes || []).forEach((j) => { descByName[j.name] = j.description; domainByName[j.name] = j.domain; });
+
+  const mapAvailable = !!(pipelineMap && pipelineMap.available);
+  // Fall back to /api/job-types' own rows when /api/pipeline-map itself is unavailable
+  // (node not on PATH, script error, etc.) -- /api/job-types has a committed topology
+  // snapshot fallback so it stays populated; same "degrade, don't blank the tab" treatment.
+  const sourceList = mapAvailable
+    ? pipelineMap.sources
+    : (jobTypes || []).map((j) => ({ name: j.name, priority: j.priority, liveCounts: {} }));
+
+  // Backbone strip: total live count per stage, summed across every source at once.
+  const stageTotals = {};
+  for (const stage of PIPELINE_STAGE_ORDER) stageTotals[stage] = 0;
+  for (const s of sourceList) {
+    for (const [stage, count] of Object.entries(s.liveCounts || {})) {
+      stageTotals[stage] = (stageTotals[stage] || 0) + count;
+    }
+  }
+  const backboneHtml = mapAvailable ? `
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
+      ${PIPELINE_STAGE_ORDER.map((stage) => `
+        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; text-align:center;">
+          <div style="font-size:22px; font-weight:700; color:${stageTotals[stage] > 0 ? 'var(--accent)' : 'var(--muted)'};">${stageTotals[stage]}</div>
+          <div class="meta">${PIPELINE_STAGE_LABELS[stage]}</div>
+        </div>
+      `).join('<div style="align-self:center; color:var(--muted); font-size:18px;">→</div>')}
+    </div>
+  ` : '';
+
+  // Sort by the EFFECTIVE priority (server override if any, else the registry/JOB_TYPES
+  // static default) -- not the bare static default -- so an edit actually reorders the
+  // table.
+  const buildRow = (j, opts = {}) => {
+    const alwaysActive = !!alwaysActiveByName[j.name];
+    const isActive = jobTypes ? (activeByName[j.name] ?? true) : true;
+    const checkbox = jobTypes
+      ? `<input type="checkbox" class="job-type-toggle" data-source="${escapeAttr(j.name)}" ${isActive ? 'checked' : ''} ${alwaysActive ? 'disabled title="Always active -- cannot be turned off"' : ''}>`
+      : `<span class="meta">?</span>`;
+    // Priority cell: click-to-type input, relying on the browser's own native number-input
+    // spinner for the "up1/down1" arrows the Brain Dump request asked for -- a separate
+    // pair of custom buttons above/below the input (the original implementation) was
+    // redundant with that native control and looked like a duplicate widget. Disabled
+    // entirely when /api/job-types failed to load, same convention the checkbox already
+    // uses for that case.
+    const priorityCell = jobTypes
+      ? `<input type="number" class="priority-input" data-source="${escapeAttr(j.name)}" value="${j.priority}">`
+      : `<span class="meta">${j.priority}</span>`;
+    // Approval mode (three-tier approval mode, 2026-07-26): a plain native <select> --
+    // there's no custom-dropdown component anywhere in this dashboard, and a 3-option
+    // enum is exactly what a native select is for. 'auto' applies automatically once
+    // Ornith approves; 'approve'/'prompt' both wait for a manual Apply click on the
+    // Approved tab -- 'prompt' only differs in getting an active badge there instead of
+    // a plain count, never in whether this automatic loop touches it.
+    const approvalMode = approvalModeByName[j.name] ?? 'auto';
+    const approvalModeCell = jobTypes
+      ? `<select class="approval-mode-select" data-source="${escapeAttr(j.name)}">
+          ${['auto', 'prompt', 'approve'].map((m) => `<option value="${m}" ${m === approvalMode ? 'selected' : ''}>${m}</option>`).join('')}
+        </select>`
+      : `<span class="meta">${approvalMode}</span>`;
+    // Worker Type: which worker actually claims this source's tasks -- 'ornith' (the
+    // local, low-reasoning worker) or 'reasoning' (the Claude-backed high-reasoning
+    // worker). Note for adhoc/research_task specifically: their actual draft call is
+    // hardcoded to Claude regardless of this setting (see model-provider.js's
+    // reasoningTierFor() comment), so overriding those two rows to 'ornith' only changes
+    // which worker's claim filter picks the task up, not what drafts it.
+    const workerType = workerTypeByName[j.name] ?? 'ornith';
+    const workerTypeCell = jobTypes
+      ? `<select class="worker-type-select" data-source="${escapeAttr(j.name)}">
+          ${['ornith', 'reasoning'].map((w) => `<option value="${w}" ${w === workerType ? 'selected' : ''}>${w}</option>`).join('')}
+        </select>`
+      : `<span class="meta">${workerType}</span>`;
+    // Times Performed: cumulative, all-time count of how many tasks this job type has
+    // ever generated (Brain Dump, 2026-08-23) -- independent of the Active/Priority/
+    // Approval Mode columns above, which only affect FUTURE tasks. Read-only here; the
+    // one way to change it is the "Reset counts" button below, which zeroes every row at
+    // once (see /api/job-types/reset-counts's own comment for why never a single row).
+    const timesPerformed = timesPerformedByName[j.name] ?? 0;
+    // Available: how many Strong-rated candidates this source's own backlog doc (e.g.
+    // ARCH_REVIEW_CANDIDATES.md) still has waiting, not yet claimed by any in-queue
+    // fulfillment task (app.py's available_candidate_counts()). Only a handful of sources
+    // have an enumerable backlog doc at all (arch_review, arch_import_review,
+    // observability_fix, performance_fix) -- null for everything else, shown as a blank
+    // cell rather than a misleading 0 for a source whose real backlog size just isn't
+    // tracked anywhere (an inbox folder, a flags file, external scanner output, ...).
+    const available = jobTypes ? availableByName[j.name] : null;
+    const availableCell = available == null ? '' : String(available);
+    const behaviorCell = mapAvailable ? pipelineFlagBadges(j) : '<span class="meta">?</span>';
+    const liveCell = mapAvailable
+      ? (Object.entries(j.liveCounts || {}).filter(([, c]) => c > 0)
+          .map(([stage, c]) => `<span class="badge warn" title="${PIPELINE_STAGE_LABELS[stage] || stage}">${PIPELINE_STAGE_LABELS[stage] || stage}: ${c}</span>`)
+          .join(' ') || '<span class="meta">idle</span>')
+      : '<span class="meta">?</span>';
+    // Turns (min/avg/max) (2026-08-26, Grimmethy: "add turnsUsed recording... a data
+    // point we track for each job type in the Job List itself (min/max/average)" --
+    // prompted by the Chat-panel turn-budget investigation finding zero telemetry for
+    // whether ANY runPlanWithTools()-backed source's turn cap is actually enough). Only
+    // populated for sources that have gone through a real recorded call at least once
+    // (model-stats.db's turns_used column, model-stats-db.js's own turns-summary event)
+    // -- a blank cell means "not instrumented yet or never called," not "uses 0 turns."
+    const turnsCell = j.turnsStats
+      ? `${j.turnsStats.minTurns} / ${Math.round(j.turnsStats.avgTurns * 10) / 10} / ${j.turnsStats.maxTurns}<span class="meta"> (n=${j.turnsStats.calls})</span>`
+      : '<span class="meta">—</span>';
+    const nameCellStyle = opts.inFamily ? ' style="padding-left:24px"' : '';
+    const trAttrs = opts.inFamily ? ` class="fam-member" data-fam-row="${escapeAttr(opts.inFamily)}"${opts.hidden ? ' style="display:none"' : ''}` : '';
+    return `
+    <tr${trAttrs}>
+      <td>${checkbox}</td>
+      <td>${priorityCell}</td>
+      <td>${approvalModeCell}</td>
+      <td>${workerTypeCell}</td>
+      <td${nameCellStyle}><a href="#" class="job-log-link" data-job-log="${escapeAttr(j.name)}" title="Recent runs of this job type">${escapeHtml(j.name)}</a></td>
+      <td>${domainByName[j.name] ?? '—'}</td>
+      <td>${behaviorCell}</td>
+      <td>${liveCell}</td>
+      <td>${turnsCell}</td>
+      <td>${timesPerformed}</td>
+      <td>${availableCell}</td>
+      <td>${escapeHtml(descByName[j.name] ?? '')}</td>
+    </tr>
+  `;
+  };
+
+  // Group family members (arch_discovery/arch_import/arch_review/arch_import_review, ...)
+  // out of the flat priority sort: a family renders as one collapsible block positioned
+  // at its lowest-priority member, with a group-level Priority input that shifts every
+  // member together (POST /api/job-types/priority-family). Members are NOT guaranteed
+  // contiguous in a global priority sort, so pulling them into a block means a family's
+  // higher-priority members can appear ahead of a singleton that outranks them -- an
+  // accepted trade for the grouping. Per-source overrides still work: expand and edit a
+  // member row. Collapse state persists per family in localStorage.
+  let collapsedFamilies;
+  try {
+    collapsedFamilies = new Set(JSON.parse(localStorage.getItem('joblist-collapsed-families') || '[]'));
+  } catch (e) {
+    collapsedFamilies = new Set();
+  }
+
+  const sorted = sourceList.slice()
+    .map((j) => ({ ...j, priority: priorityByName[j.name] ?? j.priority }))
+    .sort((a, b) => a.priority - b.priority);
+
+  const familyMembers = {};
+  for (const j of sorted) {
+    const fam = familyByName[j.name];
+    if (fam) (familyMembers[fam] = familyMembers[fam] || []).push(j);
+  }
+
+  const renderItems = [];
+  const seenFamilies = new Set();
+  for (const j of sorted) {
+    const fam = familyByName[j.name];
+    if (!fam) { renderItems.push({ sortKey: j.priority, kind: 'single', row: j }); continue; }
+    if (seenFamilies.has(fam)) continue;
+    seenFamilies.add(fam);
+    const members = familyMembers[fam];
+    const lo = Math.min(...members.map((m) => m.priority));
+    const hi = Math.max(...members.map((m) => m.priority));
+// ... [truncated for review: this function continues for 211 more line(s) not shown]
+```
+
+Problem:
+`renderJobListTab` interleaves five independently-changeable responsibilities—API fetch and 12-lookup-map hydration, backbone-strip aggregation, a ~90-line `buildRow` closure that captures ten outer-scope variables, priority sort with family grouping and localStorage persistence, and DOM assembly with event binding—into a single 411-line function. A one-line change to the backbone strip forces a reviewer to scroll past the entire row-template block; a change to the family-grouping rule forces re-reading the fetch/normalization preamble. The `buildRow` closure is the sharpest symptom: it captures `activeByName`, `priorityByName`, `approvalModeByName`, `workerTypeByName`, `timesPerformedByName`, `availableByName`, `descByName`, `domainByName`, `mapAvailable`, and `jobTypes` from the outer scope, making it impossible to unit-test "does the approval-mode cell render the correct `<select>` when `jobTypes` is null" without executing the fetch, map-building, and backbone code first.
+
+Solution:
+Extract each responsibility into a named, pure (or near-pure) function that takes explicit parameters and returns a value, leaving a thin ~35-line orchestrator. The concrete shape of the decomposition is:
+
+```js
+// ── 1. Data acquisition + normalization (pure, no DOM) ────────────
+async function fetchJobListData() {
+  const [jobTypesRes, pipelineRes] = await Promise.allSettled([
+    fetchJson('/api/job-types'),
+    fetchJson('/api/pipeline-map'),
+  ]);
+  return {
+    jobTypes: jobTypesRes.status === 'fulfilled' ? jobTypesRes.value : null,
+    pipelineMap: pipelineRes.status === 'fulfilled' ? pipelineRes.value : null,
+  };
+}
+
+function buildLookupMaps(jobTypes) {
+  const activeByName = new Map(), priorityByName = new Map(),
+        approvalModeByName = new Map(), workerTypeByName = new Map(),
+        timesPerformedByName = new Map(), availableByName = new Map(),
+        familyByName = new Map(), familyLabelByName = new Map(),
+        descByName = new Map(), domainByName = new Map(),
+        alwaysActiveByName = new Map();
+  (jobTypes || []).forEach(j => {
+    activeByName.set(j.name, j.active);
+    priorityByName.set(j.name, j.priority);
+    approvalModeByName.set(j.name, j.approvalMode);
+    workerTypeByName.set(j.name, j.workerType);
+    timesPerformedByName.set(j.name, j.timesPerformed);
+    availableByName.set(j.name, j.available);
+    familyByName.set(j.name, j.family);
+    familyLabelByName.set(j.name, j.familyLabel);
+    descByName.set(j.name, j.description);
+    domainByName.set(j.name, j.domain);
+    alwaysActiveByName.set(j.name, j.alwaysActive);
+  });
+  return { activeByName, priorityByName, approvalModeByName, workerTypeByName,
+           timesPerformedByName, availableByName, familyByName, familyLabelByName,
+           descByName, domainByName, alwaysActiveByName };
+}
+
+function computeSourceList(jobTypes, pipelineMap) {
+  const mapAvailable = !!(pipelineMap && pipelineMap.available);
+  return mapAvailable
+    ? pipelineMap.sources
+    : (jobTypes || []).map(j => ({ name: j.name, priority: j.priority, liveCounts: {} }));
+}
+
+// ── 2. Backbone strip (pure HTML string) ──────────────────────────
+function renderBackboneStrip(sourceList, mapAvailable) {
+  if (!mapAvailable) return '';
+  const stageTotals = {};
+  sourceList.forEach(s => {
+    Object.entries(s.liveCounts || {}).forEach(([stage, n]) => {
+      stageTotals[stage] = (stageTotals[stage] || 0) + n;
+    });
+  });
+  const cards = Object.entries(stageTotals)
+    .map(([stage, count]) => `<div class="bb-card"><span>${stage}</span><b>${count}</b></div>`)
+    .join('');
+  return `<div class="backbone-strip">${cards}</div>`;
+}
+
+// ── 3. Row template (pure, explicit context) ──────────────────────
+function buildRow(j, ctx) {
+  const { jobTypes, mapAvailable, activeByName, priorityByName,
+          approvalModeByName, workerTypeByName, timesPerformedByName,
+          availableByName, descByName, domainByName, alwaysActiveByName } = ctx;
+  const active = activeByName.get(j.name);
+  const priority = priorityByName.get(j.name);
+  const approvalMode = approvalModeByName.get(j.name);
+  const workerType = workerTypeByName.get(j.name);
+  const times = timesPerformedByName.get(j.name);
+  const available = availableByName.get(j.name);
+  const desc = descByName.get(j.name);
+  const domain = domainByName.get(j.name);
+  const alwaysActive = alwaysActiveByName.get(j.name);
+
+  const approvalCell = (approvalMode && jobTypes)
+    ? `<select data-job="${j.name}" class="approval-select">
+         ${jobTypes.map(t => `<option value="${t}" ${t === approvalMode ? 'selected' : ''}>${t}</option>`).join('')}
+       </select>`
+    : `<span>${approvalMode || '—'}</span>`;
+
+  return `<tr data-name="${j.name}" class="${active ? '' : 'inactive'}">
+    <td><input type="checkbox" ${active ? 'checked' : ''} data-toggle="${j.name}"></td>
+    <td>${j.name}</td>
+    <td>${priority ?? '—'}</td>
+    <td>${approvalCell}</td>
+    <td>${workerType ?? '—'}</td>
+    <td>${times ?? '—'}</td>
+    <td>${available ? '✓' : '✗'}</td>
+    <td>${desc || ''}</td>
+    <td>${domain || ''}</td>
+    <td>${alwaysActive ? 'always' : ''}</td>
+  </tr>`;
+}
+
+// ── 4. Sort + family grouping (pure) ──────────────────────────────
+function sortAndGroup(sourceList, lookups) {
+  const sorted = [...sourceList].sort((a, b) =>
+    (lookups.priorityByName.get(a.name) ?? 99) - (lookups.priorityByName.get(b.name) ?? 99)
+  );
+  const familyMembers = {};
+  sorted.forEach(j => {
+    const fam = lookups.familyByName.get(j.name) || '__none__';
+    (familyMembers[fam] = familyMembers[fam] || []).push(j);
+  });
+  const renderItems = [];
+  const collapsedFamilies = new Set(JSON.parse(localStorage.getItem('collapsedFamilies') || '[]'));
+  Object.entries(familyMembers).forEach(([fam, members]) => {
+    if (fam === '__none__') {
+      members.forEach(j => renderItems.push({ type: 'row', job: j }));
+    } else {
+      renderItems.push({ type: 'family-header', fam, label: lookups.familyLabelByName.get(members[0].name) || fam, count: members.length, collapsed: collapsedFamilies.has(fam) });
+      if (!collapsedFamilies.has(fam)) {
+        members.forEach(j => renderItems.push({ type: 'row', job: j }));
+      }
+    }
+  });
+  return { renderItems, collapsedFamilies };
+}
+
+// ── 5. Orchestration (thin, ~35 lines) ────────────────────────────
+async function renderJobListTab() {
+  const main = document.getElementById('main');
+  const { jobTypes, pipelineMap } = await fetchJobListData();
+  const lookups = buildLookupMaps(jobTypes);
+  const sourceList = computeSourceList(jobTypes, pipelineMap);
+  const mapAvailable = !!(pipelineMap && pipelineMap.available);
+  const backboneHtml = renderBackboneStrip(sourceList, mapAvailable);
+  const { renderItems, collapsedFamilies } = sortAndGroup(sourceList, lookups);
+
+  const ctx = { jobTypes, mapAvailable, ...lookups };
+  const rowsHtml = renderItems
+    .filter(it => it.type === 'row')
+    .map(it => buildRow(it.job, ctx))
+    .join('');
+
+  const headersHtml = renderItems
+    .filter(it => it.type === 'family-header')
+    .map(it => `<tr class="family-header" data-fam="${it.fam}">
+      <td colspan="10">▾ ${it.label} (${it.count})</td>
+    </tr>`)
+    .join('');
+
+  main.innerHTML = `${backboneHtml}
+    <table class="joblist"><thead>…</thead><tbody>${headersHtml}${rowsHtml}</tbody></table>`;
+
+  // event binding (checkbox toggle, approval select, family collapse)
+  main.querySelectorAll('input[data-toggle]').forEach(cb =>
+    cb.addEventListener('change', e => toggleJob(e.target.dataset.toggle)));
+  main.querySelectorAll('.approval-select').forEach(sel =>
+    sel.addEventListener('change', e => updateApproval(e.target.dataset.job, e.target.value)));
+  main.querySelectorAll('.family-header').forEach(h =>
+    h.addEventListener('click', e => toggleFamily(e.currentTarget.dataset.fam, collapsedFamilies)));
+}
+```
+
+Each extracted function is independently callable with fixture inputs and returns a string or array, so a change to the backbone strip, a new column in `buildRow`, or a new family rule no longer requires re-reading the other four blocks.
+
+Benefits:
+The orchestrator shrinks from 411 lines to roughly 35, and each extracted function has a single, nameable contract. `buildRow` becomes a pure function of `(job, ctx)` that can be snapshot-tested in Node without a browser, a fetch, or the backbone code. A reviewer changing the family-grouping rule reads only `sortAndGroup` (~25 lines) instead of scrolling through the fetch block and the row template. A new backbone stage touches only `renderBackboneStrip`. The 12 `xxxByName` maps stay in one cohesive `buildLookupMaps` call—no ceremony of twelve one-liner functions—while the responsibility seams between fetch, aggregate, render, sort, and bind become the unit boundaries for both code review and automated testing.
+
+### AC-195 · Extract `main` in `decompose-blueprint-extract.py` into a thin orchestrator plus named helpers
+Strength: Strong
+Files: scripts/decompose-blueprint-extract.py
+Snippet:
+```
+
+
+def main(argv):
+    if len(argv) < 5:
+        fail(["usage: decompose-blueprint-extract.py <source.py> <bp_var> <bp_slug> <sym>..."])
+        return 2
+    path, bp_var, bp_slug, symbols = argv[1], argv[2], argv[3], argv[4:]
+    try:
+        src = open(path, "r", encoding="utf-8").read()
+        tree = ast.parse(src, filename=path)
+    except (OSError, SyntaxError, ValueError) as exc:
+        fail([f"{type(exc).__name__}: {exc}"])
+        return 2
+    lines = src.split("\n")
+
+    module_funcs, module_names = {}, set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            module_funcs.setdefault(node.name, node)
+            module_names.add(node.name)
+        elif isinstance(node, ast.ClassDef):
+            module_names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    module_names.add(t.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            module_names.add(node.target.id)
+
+    problems, moved = [], []
+    for s in symbols:
+        n = module_funcs.get(s)
+        if n is None:
+            problems.append(f"{s}: not a module-level function")
+        else:
+            moved.append(n)
+    if problems:
+        fail(problems)
+        return 0
+    # A blueprint move must carry at least one actual route (helpers may ride along, but a
+    # blueprint with zero @app.route views is a nonsense split).
+    if not any(any(decorator_is_app_route(d) for d in n.decorator_list) for n in moved):
+        fail([f"none of {', '.join(symbols)} is an @app.route view -- not a blueprint move"])
+        return 0
+
+    moved_names = {n.name for n in moved}
+    moved_lines = set()
+    for n in moved:
+        lo, hi = span(n)
+        moved_lines.update(range(lo, hi + 1))
+
+    strays = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in moved_names and node.lineno not in moved_lines:
+            strays.setdefault(node.id, []).append(node.lineno)
+    if strays:
+        fail([f"{s} is still referenced at line(s) {sorted(set(v))} outside the moved routes"
+              for s, v in strays.items()])
+        return 0
+
+    import_line_for = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            line = "\n".join(lines[node.lineno - 1:node.end_lineno])
+            for a in node.names:
+                bound = a.asname or a.name
+                if isinstance(node, ast.Import):
+                    bound = bound.split(".")[0]
+                import_line_for[bound] = line
+
+    shared_deps = {}
+    needed_import_lines, seen = [], set()
+    flask_used = set()
+    for n in moved:
+        local_bound, read = set(), set()
+        # Walk the BODY only, not decorator_list -- `@app.route` is rewritten to
+        # `@<bp>.route`, so `app` from the decorator must not count as a body dependency.
+        for stmt in n.body:
+            for sub in ast.walk(stmt):
+                if isinstance(sub, ast.Name):
+                    (local_bound if isinstance(sub.ctx, ast.Store) else read).add(sub.id)
+                elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    local_bound.add(sub.name)
+                elif isinstance(sub, ast.arg):
+                    local_bound.add(sub.arg)
+        # Real incident, 2026-09-13: a return/param type annotation (`-> Path`, `x: dict`)
+        # is NOT part of n.body -- it lives on n.returns / arg.annotation -- so a name used
+        # ONLY in an annotation was invisible here, carried no import, and crashed at
+        # def-time (`NameError: name 'Path' is not defined`) the moment app.py imported the
+        # new module. Annotations can't assign (Store), so every Name found here is a read.
+        annotation_nodes = [n.returns] if n.returns else []
+        for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs + ([n.args.vararg] if n.args.vararg else []) + ([n.args.kwarg] if n.args.kwarg else []):
+            if a.annotation:
+                annotation_nodes.append(a.annotation)
+        for ann in annotation_nodes:
+            for sub in ast.walk(ann):
+                if isinstance(sub, ast.Name):
+                    read.add(sub.id)
+        for a in n.args.args + n.args.posonlyargs + n.args.kwonlyargs:
+            local_bound.add(a.arg)
+        if n.args.vararg:
+            local_bound.add(n.args.vararg.arg)
+        if n.args.kwarg:
+            local_bound.add(n.args.kwarg.arg)
+        shared_deps[n.name] = sorted(
+            x for x in read
+            if x in module_names and x not in moved_names
+            and x not in local_bound and x not in BUILTIN_NAMES and x != "app")
+        for x in sorted(read):
+            if x in FLASK_NAMES:
+                flask_used.add(x)
+            elif x in import_line_for and x not in local_bound and x not in BUILTIN_NAMES:
+                il = import_line_for[x]
+                if il not in seen:
+                    seen.add(il)
+                    needed_import_lines.append(il)
+
+    all_deps = sorted({d for ds in shared_deps.values() for d in ds})
+    flask_import = "from flask import Blueprint"
+    if flask_used:
+        flask_import += ", " + ", ".join(sorted(flask_used))
+
+    header = [flask_import]
+    if needed_import_lines:
+        header.append("")
+        header.extend(needed_import_lines)
+    header += [
+        "",
+        f"# The app.py helpers these views call ({', '.join(all_deps) or 'none'}) are",
+        "# imported lazily inside each view: app.py imports THIS module to register the",
+        "# blueprint, so a top-level `from app import ...` is a circular import that only",
+        "# fails when app.py is the entrypoint (how the dashboard runs). By the time a view",
+        "# runs, app.py is fully initialised and the import is just a dict lookup. (Same",
+        "# pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)",
+        "",
+        f'{bp_var} = Blueprint("{bp_slug}", __name__)',
+        "",
+        "",
+    ]
+
+    fn_texts = []
+    for n in moved:
+        lo, hi = span(n)
+        body = lines[lo - 1:hi]
+        out = []
+        for bl in body:
+            stripped = bl.lstrip()
+            if is_route_decorator_line(stripped):
+                indent = bl[:len(bl) - len(stripped)]
+                bl = indent + "@" + bp_var + stripped[len("@app"):]
+            out.append(bl)
+        def_idx = next(i for i, x in enumerate(out)
+                       if x.lstrip().startswith(("def ", "async def ")))
+        insert_at = def_idx + 1
+        fb = n.body[0] if n.body else None
+        if (isinstance(fb, ast.Expr) and isinstance(getattr(fb, "value", None), ast.Constant)
+                and isinstance(fb.value.value, str)):
+            insert_at = (fb.end_lineno - lo) + 1
+        deps = shared_deps[n.name]
+        if deps:
+            out = out[:insert_at] + [f"    from app import {', '.join(deps)}"] + out[insert_at:]
+        fn_texts.append("\n".join(out))
+
+    new_content = "\n".join(header) + "\n\n\n".join(fn_texts) + "\n"
+
+    spans = sorted((span(n) for n in moved), reverse=True)
+    red = lines[:]
+    for lo, hi in spans:
+        end = hi
+        while end < len(red) and red[end].strip() == "":
+            end += 1
+        del red[lo - 1:end]
+    reduced = "\n".join(red)
+    while "\n\n\n\n" in reduced:
+        reduced = reduced.replace("\n\n\n\n", "\n\n\n")
+
+    print(json.dumps({
+        "ok": True,
+        "newFileContent": new_content,
+        "reducedSource": reduced,
+        "sharedDeps": shared_deps,
+        "movedCount": len(moved),
+    }))
+    return 0
+```
+
+Problem:
+The 182-line `main` interleaves five distinct responsibilities—CLI/file I/O, module inventory, symbol validation, shared-dependency analysis (including the annotation-aware walk added after the 2026-09-13 `NameError` incident), and code generation with source reduction—each with its own input/output contract. Because the dependency-analysis block and the string-building block are fused into one function, the annotation-walk logic cannot be unit-tested in isolation: the only way to exercise it is to run the entire script against a real file, which is exactly how the `Path` annotation bug escaped to production. The code-generation phase (rewriting `@app` → `@bp`, inserting lazy imports, building the header) is a pure string transform that depends only on the analysis results, yet it is entangled with the AST traversal, making golden-file tests on generated output require re-executing the full analysis path.
+
+Solution:
+Split `main` into a ~25-line orchestrator that calls six extracted helpers, each a straight-line cut of existing code with no reordering. The extracted functions are: `load_and_parse`, `inventory_module`, `validate_and_select`, `check_no_strays`, `collect_import_lines`, `analyse_shared_deps`, `build_new_file`, and `remove_moved_spans`. The dependency walk (body + annotation) stays as one function because it shares `local_bound`/`read` sets; it is not split further.
+
+```python
+# scripts/decompose-blueprint-extract.py  (post-refactor shape)
+
+def main(argv):
+    """Thin orchestrator: parse args, run pipeline, emit JSON."""
+    if len(argv) < 5:
+        fail(["usage: decompose-blueprint-extract.py <source.py> <bp_var> <bp_slug> <sym>..."])
+        return 2
+    path, bp_var, bp_slug, symbols = argv[1], argv[2], argv[3], argv[4:]
+
+    src, tree, lines = load_and_parse(path)
+    module_funcs, module_names = inventory_module(tree)
+    moved = validate_and_select(symbols, module_funcs)
+    check_no_strays(tree, moved, lines)
+
+    import_line_for = collect_import_lines(tree, lines)
+    shared_deps, flask_used, needed_import_lines = (
+        analyse_shared_deps(moved, module_names, import_line_for)
+    )
+
+    new_content = build_new_file(
+        moved, bp_var, bp_slug,
+        shared_deps, flask_used, needed_import_lines, lines,
+    )
+    reduced = remove_moved_spans(lines, moved)
+
+    print(json.dumps({
+        "ok": True,
+        "newFileContent": new_content,
+        "reducedSource": reduced,
+        "sharedDeps": shared_deps,
+        "movedCount": len(moved),
+    }))
+    return 0
+
+
+def load_and_parse(path):
+    """Read file, ast.parse; return (src, tree, lines). Raises OSError/SyntaxError."""
+    ...  # existing lines, moved verbatim
+
+
+def inventory_module(tree):
+    """Single pass over tree.body → (module_funcs: dict, module_names: set)."""
+    ...  # existing lines, moved verbatim
+
+
+def validate_and_select(symbols, module_funcs):
+    """Return list of moved FunctionDef nodes or call fail(). Enforces ≥1 @app.route."""
+    ...  # existing lines, moved verbatim
+
+
+def check_no_strays(tree, moved, lines):
+    """ast.walk for Name refs outside moved spans; fail() if any found."""
+    ...  # existing lines, moved verbatim
+
+
+def collect_import_lines(tree, lines):
+    """Map bound-name → source-line string for every top-level import."""
+    ...  # existing lines, moved verbatim
+
+
+def analyse_shared_deps(moved, module_names, import_line_for):
+    """Body + annotation walk (2026-09-13 fix).
+    Returns (shared_deps: dict[str, list[str]], flask_used: set, needed_import_lines: list[str])."""
+    ...  # existing lines, moved verbatim
+
+
+def build_new_file(moved, bp_var, bp_slug,
+                   shared_deps, flask_used, needed_import_lines, lines):
+    """Rewrite @app→@bp, insert lazy `from app import …`, prepend header.
+    Returns the full new-file string."""
+    ...  # existing lines, moved verbatim
+
+
+def remove_moved_spans(lines, moved):
+    """Delete moved function spans (plus trailing blank lines) from original source."""
+    ...  # existing lines, moved verbatim
+```
+
+Benefits:
+`analyse_shared_deps` becomes independently testable: a synthetic `FunctionDef` with a `-> Path` annotation can be fed directly and the assertion that `Path` appears in `shared_deps` or `needed_import_lines` runs without touching the file-I/O or code-generation paths. `build_new_file` and `remove_moved_spans` are pure string transforms, so a golden-file test on the generated output no longer re-executes the AST analysis. `main` drops to roughly 25 lines of orchestration and early-return, which is the shape a CLI entry-point should have, and the `json.dumps` output remains byte-identical because every extracted body is a verbatim move with no reordering.
+
+### AC-196 · Decompose coordinatorSweep into named per-step helpers
+Strength: Strong
+Files: src/coordinator-sweep.js
+Snippet:
+```
+}
+
+function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, runWiring = runStackedWiring, runAutoMerge = autoMergeVerifiedMoveChild } = {}) {
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  let resolvedRepoRoot = repoRoot;
+  if (resolvedRepoRoot === undefined) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
+  const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
+
+  // Label every hub that has no HUB#### yet (oldest first), before the loop below reads them.
+  try { const labelled = assignMissingHubSerials(pipelineDir); if (labelled) summary.hubsLabelled = labelled; } catch (e) { console.warn(`[coordinator-sweep] hub serial backfill failed (advisory): ${e.message}`); }
+
+  let names;
+  try {
+    names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    if (err.code === 'ENOENT') { console.warn(`[coordinator-sweep] ${coordDir} does not exist yet -- nothing to sweep`); return summary; }
+    summary.errors += 1;
+    console.error(`[coordinator-sweep] readdirSync failed for ${coordDir}: ${err.code || 'UNKNOWN'} -- ${err.message}`);
+    return summary;
+  }
+
+  for (const name of names) {
+    const file = path.join(coordDir, name);
+    let parent;
+    try {
+      parent = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue; // a malformed coordinating file is not this sweep's problem to fix
+    }
+    if (!Array.isArray(parent.subTasks) || parent.subTasks.length === 0) {
+      // A coordinating parent with no checklist is a bug upstream -- complete it out so it
+      // does not sit here forever.
+      //
+      // 2026-09-14, screaminggoatclubmt: "fix the mislabeling" -- a hub that carries
+      // `coordinatorBlocked` from the moment it was filed (file-decompose-to-hub.js's
+      // fileBlockedHub(): validatePlan() found a hard problem, subTasks was `[]` from
+      // creation, ZERO children were ever attempted) was being routed through
+      // stampHubMerged() exactly like a hub whose children ALL genuinely shipped, so its
+      // history read "created -> merged -> done" and the dashboard reported it as a
+      // successful merge. Confirmed live: 33 `Decompose <file> -- plan needs revision`
+      // records in queue/done/ carry this exact false "merged" disposition. Route the
+      // rejected-at-creation case through `noop` instead (task-disposition.js's own
+      // definition: "the apply produced no change... no code change") -- still stamps
+      // mergedAt so any (unlikely, since no children ever existed) dependsOn sibling isn't
+      // blocked forever, per stampHubMerged's own reasoning, just without the false
+      // "merged" label.
+      const rejectedAtCreation = !!parent.coordinatorBlocked;
+      parent.status = 'done';
+      parent.doneMarker = rejectedAtCreation
+        ? 'coordinator hub rejected at creation -- no sub-tasks were ever filed'
+        : 'coordinator had no sub-tasks -- completed';
+      stampHubMerged(parent, rejectedAtCreation ? {
+        disposition: 'noop',
+        detail: 'coordinator hub: plan rejected at creation, no sub-tasks were ever filed',
+      } : undefined);
+      appendHistoryEvent(parent, 'done', parent.doneMarker);
+      // 2026-09-14, screaminggoatclubmt: "fold it into the watchdog sweep" -- file
+      // straight into done/_archived_no_action/ instead of done/'s top level for the
+      // rejected-at-creation case: it produced zero real work, so there is nothing for a
+      // human to review or a dependent to wait on, the exact "no action" meaning this
+      // folder already carries elsewhere (staleness-auto-archive.js's own DENY-vote and
+      // archive-recommendation paths file directly here the same way, with no human
+      // click in between -- established precedent for an automated sweep to use this
+      // folder, not only the dashboard's own Archive button). Otherwise these hubs would
+      // just sit in done/'s top level for up to done-archive.js's 30-day retention window
+      // before its generic time-based pass finally moved them. The genuine
+      // all-children-succeeded case is unaffected -- it still lands in done/ normally.
+      const destDir = rejectedAtCreation ? path.join(doneDir, '_archived_no_action') : doneDir;
+      if (rejectedAtCreation) {
+        appendHistoryEvent(parent, 'archived', 'Auto-archived: coordinator hub rejected at creation, no sub-tasks were ever filed -- nothing to review or wait on');
+      }
+      moveToDone(file, destDir, name, parent);
+      summary.checked += 1;
+      summary.completed += 1;
+      continue;
+    }
+
+    summary.checked += 1;
+    const recById = new Map();
+    for (const st of parent.subTasks) {
+      const rec = st && st.id ? findTaskRecordById(pipelineDir, st.id) : null;
+      recById.set(st && st.id, rec);
+      st.status = classifyChildStatus(rec);
+    }
+    // A hub built before "one hub = one stacked chain" may be mixed (some pieces stacked, some independent and stuck behind a merge):
+    // put its not-yet-started pieces onto the chain (hub-restack.js). Before the held-marker below, which reads the fresh fields.
+    try {
+      const restacked = restackHubChain(parent, recById);
+      if (restacked.length) { summary.restacked = (summary.restacked || 0) + restacked.length; appendHistoryEvent(parent, 'advisory', `restacked ${restacked.length} piece(s) onto the hub's shared branch`); }
+    } catch { /* repair is best-effort */ }
+    // Members lead with their hub's label (hub-serial.js): queueSubTasks does it for the hubs it builds, this covers older hubs and the
+    // producers that mint their own child ids. The checklist titles always follow; a member's record is only rewritten while it is idle.
+    try { const n = retitleHubMembers(parent, recById); if (n) summary.membersRetitled = (summary.membersRetitled || 0) + n; } catch { /* cosmetic */ }
+    // A hub renamed to its HUB#### id (hub-rename.js) may have a member a worker was mid-way through: point its decomposedFrom at the new id once idle.
+    try { const n = repairStaleHubRefs(parent, recById); if (n) summary.staleHubRefsRepaired = (summary.staleHubRefsRepaired || 0) + n; } catch { /* cosmetic */ }
+    // A piece that is only waiting for an earlier sibling to land (hub-priority.js hubHasUnmergedEarlierSibling) reads 'in-progress' and
+    // looks stuck; say what it is waiting for so the checklist is honest. Computed after every status above is fresh (the check reads
+    // sibling statuses off `parent`), and cleared as soon as the piece is released.
+    for (const st of parent.subTasks) {
+      const rec = st && st.id ? recById.get(st.id) : null;
+      let held = null;
+      if (st && st.status === 'in-progress' && rec && rec.task) {
+        try { const h = hubHasUnmergedEarlierSibling(pipelineDir, rec.task, parent); if (h.blocked) held = { id: h.blockingSiblingId, status: h.blockingSiblingStatus }; } catch { /* advisory */ }
+      }
+      if (st && held) st.heldFor = held; else if (st) delete st.heldFor;
+    }
+
+    // A non-stacked decompose hub: its move children carry no dependsOn, so nothing else
+    // reconciles their merge. Confirm each `done` child against origin/<main>'s commit
+    // trailer and flip it to `merged` -- then the hub only completes on all-MERGED, so its
+    // mergedAt stamp is honest and dependents don't unblock against a pre-split main.
+    const strictMergeHub = parent.decomposeHub === true && parent.mode !== 'stacked';
+    if (strictMergeHub) {
+      reconcileDecomposeChildMerges(pipelineDir, resolvedRepoRoot, parent.subTasks, recById, parent, runAutoMerge);
+    }
+
+    let doneCount = 0;
+    let builtCount = 0;
+    for (const st of parent.subTasks) {
+      st.phase = childPhase(st.status, strictMergeHub); // bare `done` is NOT enough to complete a strict-merge hub
+      if (st.phase === 'merged') { doneCount += 1; builtCount += 1; } else if (st.phase === 'built') builtCount += 1;
+    }
+    // done = merged/closed (completion, unchanged); built = done + finished-but-awaiting-merge (what the UI shows as progress).
+    parent.progress = { done: doneCount, built: builtCount, total: parent.subTasks.length };
+    parent.lastReconciledAt = new Date().toISOString();
+
+    // Stuck-chain detection: surface a hub that can never complete on its own instead of
+    // leaving it frozen at partial progress. The hub STAYS in coordinating/ so the sweep
+    // keeps reconciling it (and auto-clears / auto-completes if the children get unstuck);
+    // what changes is a `coordinatorBlocked` marker + a `blockedReason` the dashboard
+    // renders, and after a grace period an `escalated` flag + a louder history event.
+    if (doneCount < parent.subTasks.length) {
+      const stuck = findStuckChildren(parent.subTasks, recById);
+      const now = new Date().toISOString();
+      if (stuck.length > 0) {
+        const signature = stuck.map((s) => `${s.id}:${s.why}`).sort().join(' | ');
+        if (!parent.coordinatorBlocked || parent.coordinatorBlocked.signature !== signature) {
+          parent.coordinatorBlocked = { signature, since: now, children: stuck, escalated: false };
+          appendHistoryEvent(parent, 'blocked', `coordinator stuck: ${stuck.map((s) => `${s.id} -- ${s.why}`).join('; ')}`.slice(0, 500));
+          summary.blocked = (summary.blocked || 0) + 1;
+        }
+        parent.blockedReason = `${stuck.length} sub-task(s) can't proceed: ${stuck.map((s) => `${s.id.replace(/^adhoc-/, '')} (${s.why})`).join('; ')}`.slice(0, 400);
+        const escalateMs = stuckEscalateMs();
+        const stuckForMs = Date.now() - Date.parse(parent.coordinatorBlocked.since || now);
+        if (escalateMs > 0 && stuckForMs >= escalateMs && !parent.coordinatorBlocked.escalated) {
+          parent.coordinatorBlocked.escalated = true;
+          parent.coordinatorBlocked.escalatedAt = now;
+          appendHistoryEvent(parent, 'advisory',
+            `coordinator hub stuck ${Math.floor(stuckForMs / 86400000)}d -- needs a human: resolve/requeue/archive ${stuck.map((s) => s.id).join(', ')}, or archive this hub`);
+          summary.escalated = (summary.escalated || 0) + 1;
+        }
+      } else if (parent.coordinatorBlocked) {
+        delete parent.coordinatorBlocked;
+        delete parent.blockedReason;
+        appendHistoryEvent(parent, 'advisory', 'coordinator unblocked -- sub-tasks progressing again');
+        summary.unblocked = (summary.unblocked || 0) + 1;
+      }
+    }
+
+    const allChildrenDone = doneCount === parent.subTasks.length;
+
+    // A child went back to work (e.g. a human requeued the wiring step after a gate
+    // failure) -- re-arm the gate so the next all-done transition re-checks the branch.
+    if (!allChildrenDone && parent.integrationGate
+        && ['failed', 'errored'].includes(parent.integrationGate.status)) {
+      parent.integrationGate = { status: 'pending', reArmedAt: new Date().toISOString() };
+      delete parent.blockedReason;
+      delete parent.coordinatorBlocked;
+    }
+
+    // Stacked all-blueprint decompose hub: every move child committed its Blueprint module
+    // to the branch, but nothing registered them yet. Do the `register_blueprint` splice
+    // deterministically now, before the gate. On failure the hub stays in coordinating/
+    // with a blockedReason; on success wiringPending clears and the next tick runs the gate
+    // against the wired branch.
+    if (allChildrenDone && parent.mode === 'stacked' && parent.wiringPending
+        && (!parent.integrationGate || parent.integrationGate.status === 'pending')) {
+      const res = runWiring(parent, resolvedRepoRoot);
+      const now = new Date().toISOString();
+      if (res && res.ok) {
+        parent.wiringPending = false;
+        appendHistoryEvent(parent, 'advisory', res.skipped
+          ? `blueprint wiring already present on ${parent.branch}`
+          : `wired ${res.registered} blueprint(s) onto ${parent.branch}${res.sha ? ` @ ${res.sha.slice(0, 10)}` : ''}`);
+        summary.wired = (summary.wired || 0) + 1;
+      } else {
+        parent.blockedReason = `deterministic blueprint wiring failed on ${parent.branch}: ${res && res.detail ? res.detail : 'unknown'}`.slice(0, 600);
+        parent.coordinatorBlocked = {
+          signature: 'blueprint-wiring:failed', since: now, escalated: false,
+          children: [{ id: parent.subTasks[parent.subTasks.length - 1].id, why: (res && res.detail) || 'wiring failed' }],
+        };
+        appendHistoryEvent(parent, 'blocked', parent.blockedReason);
+        summary.wiringFailed = (summary.wiringFailed || 0) + 1;
+      }
+      try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); summary.updated += 1; }
+      catch (err) { console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`); summary.errors += 1; }
+      continue;
+    }
+
+    // Stacked decompose hub: children done is necessary but not sufficient -- the shared
+// ... [truncated for review: this function continues for 54 more line(s) not shown]
+```
+
+Problem:
+`coordinatorSweep` is a ~254-line orchestration loop that has accreted at least ten independently-testable responsibilities (serial backfill, empty-subtask edge, status classify + restack + retitle + stale-ref repair, held-for computation, strict-merge reconcile, progress tally, stuck-detection/escalation/unblock, gate re-arm, blueprint wiring, and the all-done completion path). Each responsibility has its own branching, its own `try/catch` boundary, and its own `summary` mutations, yet they all share one function scope. The ordering invariant (classify → repair → held-for → reconcile → tally → stuck → gate → wiring → complete) is documented only by inline comments, making the function fragile to reordering and impossible to unit-test any single step in isolation without exercising the entire 250-line body.
+
+Solution:
+Extract each numbered responsibility into a small, clearly-named helper that receives `parent`, the shared `recById` map, and `summary` as explicit parameters. The main loop body becomes a readable top-to-bottom pipeline of named calls. The concrete shape is:
+
+```js
+// ── extracted helpers (same file or sibling module) ──────────────
+
+function handleEmptySubTasks(parent, file, doneDir, name, summary) {
+  const rejectedAtCreation = !!parent.coordinatorBlocked;
+  parent.status = 'done';
+  parent.doneMarker = rejectedAtCreation
+    ? 'coordinator hub rejected at creation -- no sub-tasks were ever filed'
+    : 'coordinator had no sub-tasks -- completed';
+  stampHubMerged(parent, rejectedAtCreation ? {
+    disposition: 'noop',
+    detail: 'coordinator hub: plan rejected at creation, no sub-tasks were ever filed',
+  } : undefined);
+  appendHistoryEvent(parent, 'done', parent.doneMarker);
+  const destDir = rejectedAtCreation ? path.join(doneDir, '_archived_no_action') : doneDir;
+  if (rejectedAtCreation) {
+    appendHistoryEvent(parent, 'archived',
+      'Auto-archived: coordinator hub rejected at creation, no sub-tasks were ever filed');
+  }
+  moveToDone(file, destDir, name, parent);
+  summary.checked += 1;
+  summary.completed += 1;
+}
+
+function classifyAndRepair(parent, pipelineDir, recById, summary) {
+  for (const st of parent.subTasks) {
+    const rec = st && st.id ? findTaskRecordById(pipelineDir, st.id) : null;
+    recById.set(st && st.id, rec);
+    st.status = classifyChildStatus(rec);
+  }
+  try {
+    const restacked = restackHubChain(parent, recById);
+    if (restacked.length) {
+      summary.restacked = (summary.restacked || 0) + restacked.length;
+      appendHistoryEvent(parent, 'advisory', `restacked ${restacked.length} piece(s) onto the hub's shared branch`);
+    }
+  } catch { /* best-effort */ }
+  try {
+    const n = retitleHubMembers(parent, recById);
+    if (n) summary.membersRetitled = (summary.membersRetitled || 0) + n;
+  } catch { /* cosmetic */ }
+  try {
+    const n = repairStaleHubRefs(parent, recById);
+    if (n) summary.staleHubRefsRepaired = (summary.staleHubRefsRepaired || 0) + n;
+  } catch { /* cosmetic */ }
+}
+
+function computeHeldFor(parent, recById, pipelineDir) {
+  for (const st of parent.subTasks) {
+    const rec = st && st.id ? recById.get(st.id) : null;
+    let held = null;
+    if (st && st.status === 'in-progress' && rec && rec.task) {
+      try {
+        const h = hubHasUnmergedEarlierSibling(pipelineDir, rec.task, parent);
+        if (h.blocked) held = { id: h.blockingSiblingId, status: h.blockingSiblingStatus };
+      } catch { /* advisory */ }
+    }
+    if (st && held) st.heldFor = held;
+    else if (st) delete st.heldFor;
+  }
+}
+
+function detectStuckAndEscalate(parent, recById, summary) {
+  const doneCount = parent.subTasks.filter(st => st.phase === 'merged').length;
+  if (doneCount >= parent.subTasks.length) return;
+  const stuck = findStuckChildren(parent.subTasks, recById);
+  const now = new Date().toISOString();
+  if (stuck.length > 0) {
+    const signature = stuck.map((s) => `${s.id}:${s.why}`).sort().join(' | ');
+    if (!parent.coordinatorBlocked || parent.coordinatorBlocked.signature !== signature) {
+      parent.coordinatorBlocked = { signature, since: now, children: stuck, escalated: false };
+      appendHistoryEvent(parent, 'blocked',
+        `coordinator stuck: ${stuck.map((s) => `${s.id} -- ${s.why}`).join('; ')}`.slice(0, 500));
+      summary.blocked = (summary.blocked || 0) + 1;
+    }
+    parent.blockedReason = `${stuck.length} sub-task(s) can't proceed: ${stuck.map((s) => `${s.id.replace(/^adhoc-/, '')} (${s.why})`).join('; ')}`.slice(0, 400);
+    const escalateMs = stuckEscalateMs();
+    const stuckForMs = Date.now() - Date.parse(parent.coordinatorBlocked.since || now);
+    if (escalateMs > 0 && stuckForMs >= escalateMs && !parent.coordinatorBlocked.escalated) {
+      parent.coordinatorBlocked.escalated = true;
+      parent.coordinatorBlocked.escalatedAt = now;
+      appendHistoryEvent(parent, 'advisory',
+        `coordinator hub stuck ${Math.floor(stuckForMs / 86400000)}d -- needs a human`);
+      summary.escalated = (summary.escalated || 0) + 1;
+    }
+  } else if (parent.coordinatorBlocked) {
+    delete parent.coordinatorBlocked;
+    delete parent.blockedReason;
+    appendHistoryEvent(parent, 'advisory', 'coordinator unblocked -- sub-tasks progressing again');
+    summary.unblocked = (summary.unblocked || 0) + 1;
+  }
+}
+
+function handleBlueprintWiring(parent, resolvedRepoRoot, runWiring, file, summary) {
+  const res = runWiring(parent, resolvedRepoRoot);
+  const now = new Date().toISOString();
+  if (res && res.ok) {
+    parent.wiringPending = false;
+    appendHistoryEvent(parent, 'advisory', res.skipped
+      ? `blueprint wiring already present on ${parent.branch}`
+      : `wired ${res.registered} blueprint(s) onto ${parent.branch}`);
+    summary.wired = (summary.wired || 0) + 1;
+  } else {
+    parent.blockedReason = `deterministic blueprint wiring failed on ${parent.branch}: ${res && res.detail ? res.detail : 'unknown'}`.slice(0, 600);
+    parent.coordinatorBlocked = {
+      signature: 'blueprint-wiring:failed', since: now, escalated: false,
+      children: [{ id: parent.subTasks[parent.subTasks.length - 1].id, why: (res && res.detail) || 'wiring failed' }],
+    };
+    appendHistoryEvent(parent, 'blocked', parent.blockedReason);
+    summary.wiringFailed = (summary.wiringFailed || 0) + 1;
+  }
+  try { fs.writeFileSync(file, JSON.stringify(parent, null, 2)); summary.updated += 1; }
+  catch (err) { console.error(`coordinator-sweep: failed to write ${file}: ${err.message}`); summary.errors += 1; }
+}
+
+function completeHub(parent, file, pipelineDir, resolvedRepoRoot, runGate, summary) {
+  // Body: the existing ~54-line all-done gate-run + completion + write tail,
+  // moved verbatim. Signature shown for the extraction boundary.
+  const gateResult = runGate(parent, resolvedRepoRoot);
+  // … (existing lines: gate status handling, parent.status = 'done',
+  //     doneMarker, stampHubMerged, appendHistoryEvent, moveToDone,
+  //     fs.writeFileSync, summary increments) …
+}
+
+// ── refactored main loop ──────────────────────────────────────────
+
+function coordinatorSweep({ pipelineDir, repoRoot, runGate = runStackedGate, runWiring = runStackedWiring, runAutoMerge = autoMergeVerifiedMoveChild } = {}) {
+  const coordDir = path.join(pipelineDir, 'queue', 'coordinating');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  let resolvedRepoRoot = repoRoot;
+  if (resolvedRepoRoot === undefined) { try { ({ repoRoot: resolvedRepoRoot } = getConfig()); } catch { resolvedRepoRoot = null; } }
+  const summary = { checked: 0, updated: 0, completed: 0, errors: 0 };
+
+  try { const labelled = assignMissingHubSerials(pipelineDir); if (labelled) summary.hubsLabelled = labelled; }
+  catch (e) { console.warn(`[coordinator-sweep] hub serial backfill failed (advisory): ${e.message}`); }
+
+  let names;
+  try {
+    names = fs.readdirSync(coordDir).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    if (err.code === 'ENOENT') { console.warn(`[coordinator-sweep] ${coordDir} does not exist yet -- nothing to sweep`); return summary; }
+    summary.errors += 1;
+    console.error(`[coordinator-sweep] readdirSync failed for ${coordDir}: ${err.code || 'UNKNOWN'} -- ${err.message}`);
+    return summary;
+  }
+
+  for (const name of names) {
+    const file = path.join(coordDir, name);
+    let parent;
+    try { parent = JSON.parse(fs.readFileSync(file, 'utf8')); }
+    catch { summary.errors += 1; continue; }
+
+    if (!Array.isArray(parent.subTasks) || parent.subTasks.length === 0) {
+      handleEmptySubTasks(parent, file, doneDir, name, summary);
+      continue;
+    }
+
+    summary.checked += 1;
+
+    const recById = new Map();
+    classifyAndRepair(parent, pipelineDir, recById, summary);
+    computeHeldFor(parent, recById, pipelineDir);
+
+    const strictMergeHub = parent.decomposeHub === true && parent.mode !== 'stacked';
+    if (strictMergeHub) {
+      reconcileDecomposeChildMerges(pipelineDir, resolvedRepoRoot, parent.subTasks, recById, parent, runAutoMerge);
+    }
+
+    let doneCount = 0, builtCount = 0;
+    for (const st of parent.subTasks) {
+      st.phase = childPhase(st.status, strictMergeHub);
+      if (st.phase === 'merged') { doneCount += 1; builtCount += 1; }
+      else if (st.phase === 'built') builtCount += 1;
+    }
+    parent.progress = { done: doneCount, built: builtCount, total: parent.subTasks.length };
+    parent.lastReconciledAt = new Date().toISOString();
+
+    detectStuckAndEscalate(parent, recById, summary);
+
+    const allChildrenDone = doneCount === parent.subTasks.length;
+
+    if (!allChildrenDone && parent.integrationGate
+        && ['failed', 'errored'].includes(parent.integrationGate.status)) {
+      parent.integrationGate = { status: 'pending', reArmedAt: new Date().toISOString() };
+      delete parent.blockedReason;
+      delete parent.coordinatorBlocked;
+    }
+
+    if (allChildrenDone && parent.mode === 'stacked' && parent.wiringPending
+        && (!parent.integrationGate || parent.integrationGate.status === 'pending')) {
+      handleBlueprintWiring(parent, resolvedRepoRoot, runWiring, file, summary);
+      continue;
+    }
+
+    if (allChildrenDone) {
+      completeHub(parent, file, pipelineDir, resolvedRepoRoot, runGate, summary);
+    }
+  }
+
+  return summary;
+}
+```
+
+No behavioural change: every `try/catch` boundary, every `continue`, every `summary` increment stays in the same relative position. This is a pure extraction refactor.
+
+Benefits:
+Each helper is unit-testable in isolation (feed a synthetic `parent` with a stuck child and assert the `coordinatorBlocked` shape without touching the filesystem or the full loop). The main loop reads top-to-bottom as a numbered pipeline, so the ordering invariant is visible at a glance rather than buried in 254 lines of interleaved `try/catch` blocks. New responsibilities get their own numbered step and helper instead of another 20-line block spliced into the middle of the loop. The `summary` object is passed explicitly, making data flow auditable in code review.
