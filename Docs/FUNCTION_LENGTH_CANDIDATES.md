@@ -10748,3 +10748,380 @@ async function renderModelsTab() {
 
 Benefits:
 Each extracted helper is 10–30 lines, single-purpose, and independently unit-testable: the sort comparator against fixture arrays, the cost-widget HTML against a mock `costSummary` object, the usage-table empty-state branch in isolation. The orchestrator drops to ~30 lines of linear pipeline with no internal branching, so a reviewer can verify the fetch/assemble/write sequence in one pass without tracking interleaved template literals. Future changes to pricing fields, sort columns, or event wiring touch only the relevant helper without risking accidental breakage in an unrelated block, and the mechanical cut-and-paste nature of the refactor keeps review risk low.
+
+### AC-194 · Decompose `renderJobListTab` (411 lines) into five responsibility-scoped functions
+Strength: Strong
+Files: python/dashboard/static/js/branches-joblist-hardware-tabs.js
+Snippet:
+```
+}
+
+async function renderJobListTab() {
+  const main = document.getElementById('main');
+  let jobTypes;
+  try {
+    jobTypes = await fetchJson('/api/job-types');
+  } catch (e) {
+    jobTypes = null;
+  }
+  // 2026-08-26, Grimmethy: "After looking at pipeline map I've realized that it really
+  // should just be an extension of Job List instead of a new tab entirely" -- folded in
+  // here rather than kept as its own tab. Row list is /api/pipeline-map's sources (straight
+  // off the real registry via --dump-topology); /api/job-types carries the per-row
+  // description/domain/priority/worker-type (also registry-driven, load_topology()) and the
+  // editable state. Both include AGENT_MANAGER_REGISTER_PATH plugin sources, so neither
+  // can drift the way the old client-side JOB_TYPES const did.
+  let pipelineMap;
+  try {
+    pipelineMap = await fetchJson('/api/pipeline-map');
+  } catch (e) {
+    pipelineMap = null;
+  }
+  const activeByName = {};
+  const alwaysActiveByName = {};
+  const priorityByName = {};
+  const approvalModeByName = {};
+  const workerTypeByName = {};
+  const timesPerformedByName = {};
+  const availableByName = {};
+  const familyByName = {};
+  const familyLabelByName = {};
+  (jobTypes || []).forEach((j) => {
+    activeByName[j.name] = j.active;
+    alwaysActiveByName[j.name] = j.alwaysActive;
+    priorityByName[j.name] = j.priority;
+    approvalModeByName[j.name] = j.approvalMode;
+    workerTypeByName[j.name] = j.workerType;
+    timesPerformedByName[j.name] = j.timesPerformed;
+    availableByName[j.name] = j.available;
+    familyByName[j.name] = j.family || null;
+    familyLabelByName[j.name] = j.familyLabel || null;
+  });
+  const descByName = {};
+  const domainByName = {};
+  (jobTypes || []).forEach((j) => { descByName[j.name] = j.description; domainByName[j.name] = j.domain; });
+
+  const mapAvailable = !!(pipelineMap && pipelineMap.available);
+  // Fall back to /api/job-types' own rows when /api/pipeline-map itself is unavailable
+  // (node not on PATH, script error, etc.) -- /api/job-types has a committed topology
+  // snapshot fallback so it stays populated; same "degrade, don't blank the tab" treatment.
+  const sourceList = mapAvailable
+    ? pipelineMap.sources
+    : (jobTypes || []).map((j) => ({ name: j.name, priority: j.priority, liveCounts: {} }));
+
+  // Backbone strip: total live count per stage, summed across every source at once.
+  const stageTotals = {};
+  for (const stage of PIPELINE_STAGE_ORDER) stageTotals[stage] = 0;
+  for (const s of sourceList) {
+    for (const [stage, count] of Object.entries(s.liveCounts || {})) {
+      stageTotals[stage] = (stageTotals[stage] || 0) + count;
+    }
+  }
+  const backboneHtml = mapAvailable ? `
+    <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px;">
+      ${PIPELINE_STAGE_ORDER.map((stage) => `
+        <div style="flex:1; min-width:110px; background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 12px; text-align:center;">
+          <div style="font-size:22px; font-weight:700; color:${stageTotals[stage] > 0 ? 'var(--accent)' : 'var(--muted)'};">${stageTotals[stage]}</div>
+          <div class="meta">${PIPELINE_STAGE_LABELS[stage]}</div>
+        </div>
+      `).join('<div style="align-self:center; color:var(--muted); font-size:18px;">→</div>')}
+    </div>
+  ` : '';
+
+  // Sort by the EFFECTIVE priority (server override if any, else the registry/JOB_TYPES
+  // static default) -- not the bare static default -- so an edit actually reorders the
+  // table.
+  const buildRow = (j, opts = {}) => {
+    const alwaysActive = !!alwaysActiveByName[j.name];
+    const isActive = jobTypes ? (activeByName[j.name] ?? true) : true;
+    const checkbox = jobTypes
+      ? `<input type="checkbox" class="job-type-toggle" data-source="${escapeAttr(j.name)}" ${isActive ? 'checked' : ''} ${alwaysActive ? 'disabled title="Always active -- cannot be turned off"' : ''}>`
+      : `<span class="meta">?</span>`;
+    // Priority cell: click-to-type input, relying on the browser's own native number-input
+    // spinner for the "up1/down1" arrows the Brain Dump request asked for -- a separate
+    // pair of custom buttons above/below the input (the original implementation) was
+    // redundant with that native control and looked like a duplicate widget. Disabled
+    // entirely when /api/job-types failed to load, same convention the checkbox already
+    // uses for that case.
+    const priorityCell = jobTypes
+      ? `<input type="number" class="priority-input" data-source="${escapeAttr(j.name)}" value="${j.priority}">`
+      : `<span class="meta">${j.priority}</span>`;
+    // Approval mode (three-tier approval mode, 2026-07-26): a plain native <select> --
+    // there's no custom-dropdown component anywhere in this dashboard, and a 3-option
+    // enum is exactly what a native select is for. 'auto' applies automatically once
+    // Ornith approves; 'approve'/'prompt' both wait for a manual Apply click on the
+    // Approved tab -- 'prompt' only differs in getting an active badge there instead of
+    // a plain count, never in whether this automatic loop touches it.
+    const approvalMode = approvalModeByName[j.name] ?? 'auto';
+    const approvalModeCell = jobTypes
+      ? `<select class="approval-mode-select" data-source="${escapeAttr(j.name)}">
+          ${['auto', 'prompt', 'approve'].map((m) => `<option value="${m}" ${m === approvalMode ? 'selected' : ''}>${m}</option>`).join('')}
+        </select>`
+      : `<span class="meta">${approvalMode}</span>`;
+    // Worker Type: which worker actually claims this source's tasks -- 'ornith' (the
+    // local, low-reasoning worker) or 'reasoning' (the Claude-backed high-reasoning
+    // worker). Note for adhoc/research_task specifically: their actual draft call is
+    // hardcoded to Claude regardless of this setting (see model-provider.js's
+    // reasoningTierFor() comment), so overriding those two rows to 'ornith' only changes
+    // which worker's claim filter picks the task up, not what drafts it.
+    const workerType = workerTypeByName[j.name] ?? 'ornith';
+    const workerTypeCell = jobTypes
+      ? `<select class="worker-type-select" data-source="${escapeAttr(j.name)}">
+          ${['ornith', 'reasoning'].map((w) => `<option value="${w}" ${w === workerType ? 'selected' : ''}>${w}</option>`).join('')}
+        </select>`
+      : `<span class="meta">${workerType}</span>`;
+    // Times Performed: cumulative, all-time count of how many tasks this job type has
+    // ever generated (Brain Dump, 2026-08-23) -- independent of the Active/Priority/
+    // Approval Mode columns above, which only affect FUTURE tasks. Read-only here; the
+    // one way to change it is the "Reset counts" button below, which zeroes every row at
+    // once (see /api/job-types/reset-counts's own comment for why never a single row).
+    const timesPerformed = timesPerformedByName[j.name] ?? 0;
+    // Available: how many Strong-rated candidates this source's own backlog doc (e.g.
+    // ARCH_REVIEW_CANDIDATES.md) still has waiting, not yet claimed by any in-queue
+    // fulfillment task (app.py's available_candidate_counts()). Only a handful of sources
+    // have an enumerable backlog doc at all (arch_review, arch_import_review,
+    // observability_fix, performance_fix) -- null for everything else, shown as a blank
+    // cell rather than a misleading 0 for a source whose real backlog size just isn't
+    // tracked anywhere (an inbox folder, a flags file, external scanner output, ...).
+    const available = jobTypes ? availableByName[j.name] : null;
+    const availableCell = available == null ? '' : String(available);
+    const behaviorCell = mapAvailable ? pipelineFlagBadges(j) : '<span class="meta">?</span>';
+    const liveCell = mapAvailable
+      ? (Object.entries(j.liveCounts || {}).filter(([, c]) => c > 0)
+          .map(([stage, c]) => `<span class="badge warn" title="${PIPELINE_STAGE_LABELS[stage] || stage}">${PIPELINE_STAGE_LABELS[stage] || stage}: ${c}</span>`)
+          .join(' ') || '<span class="meta">idle</span>')
+      : '<span class="meta">?</span>';
+    // Turns (min/avg/max) (2026-08-26, Grimmethy: "add turnsUsed recording... a data
+    // point we track for each job type in the Job List itself (min/max/average)" --
+    // prompted by the Chat-panel turn-budget investigation finding zero telemetry for
+    // whether ANY runPlanWithTools()-backed source's turn cap is actually enough). Only
+    // populated for sources that have gone through a real recorded call at least once
+    // (model-stats.db's turns_used column, model-stats-db.js's own turns-summary event)
+    // -- a blank cell means "not instrumented yet or never called," not "uses 0 turns."
+    const turnsCell = j.turnsStats
+      ? `${j.turnsStats.minTurns} / ${Math.round(j.turnsStats.avgTurns * 10) / 10} / ${j.turnsStats.maxTurns}<span class="meta"> (n=${j.turnsStats.calls})</span>`
+      : '<span class="meta">—</span>';
+    const nameCellStyle = opts.inFamily ? ' style="padding-left:24px"' : '';
+    const trAttrs = opts.inFamily ? ` class="fam-member" data-fam-row="${escapeAttr(opts.inFamily)}"${opts.hidden ? ' style="display:none"' : ''}` : '';
+    return `
+    <tr${trAttrs}>
+      <td>${checkbox}</td>
+      <td>${priorityCell}</td>
+      <td>${approvalModeCell}</td>
+      <td>${workerTypeCell}</td>
+      <td${nameCellStyle}><a href="#" class="job-log-link" data-job-log="${escapeAttr(j.name)}" title="Recent runs of this job type">${escapeHtml(j.name)}</a></td>
+      <td>${domainByName[j.name] ?? '—'}</td>
+      <td>${behaviorCell}</td>
+      <td>${liveCell}</td>
+      <td>${turnsCell}</td>
+      <td>${timesPerformed}</td>
+      <td>${availableCell}</td>
+      <td>${escapeHtml(descByName[j.name] ?? '')}</td>
+    </tr>
+  `;
+  };
+
+  // Group family members (arch_discovery/arch_import/arch_review/arch_import_review, ...)
+  // out of the flat priority sort: a family renders as one collapsible block positioned
+  // at its lowest-priority member, with a group-level Priority input that shifts every
+  // member together (POST /api/job-types/priority-family). Members are NOT guaranteed
+  // contiguous in a global priority sort, so pulling them into a block means a family's
+  // higher-priority members can appear ahead of a singleton that outranks them -- an
+  // accepted trade for the grouping. Per-source overrides still work: expand and edit a
+  // member row. Collapse state persists per family in localStorage.
+  let collapsedFamilies;
+  try {
+    collapsedFamilies = new Set(JSON.parse(localStorage.getItem('joblist-collapsed-families') || '[]'));
+  } catch (e) {
+    collapsedFamilies = new Set();
+  }
+
+  const sorted = sourceList.slice()
+    .map((j) => ({ ...j, priority: priorityByName[j.name] ?? j.priority }))
+    .sort((a, b) => a.priority - b.priority);
+
+  const familyMembers = {};
+  for (const j of sorted) {
+    const fam = familyByName[j.name];
+    if (fam) (familyMembers[fam] = familyMembers[fam] || []).push(j);
+  }
+
+  const renderItems = [];
+  const seenFamilies = new Set();
+  for (const j of sorted) {
+    const fam = familyByName[j.name];
+    if (!fam) { renderItems.push({ sortKey: j.priority, kind: 'single', row: j }); continue; }
+    if (seenFamilies.has(fam)) continue;
+    seenFamilies.add(fam);
+    const members = familyMembers[fam];
+    const lo = Math.min(...members.map((m) => m.priority));
+    const hi = Math.max(...members.map((m) => m.priority));
+// ... [truncated for review: this function continues for 211 more line(s) not shown]
+```
+
+Problem:
+`renderJobListTab` interleaves five independently-changeable responsibilities—API fetch and 12-lookup-map hydration, backbone-strip aggregation, a ~90-line `buildRow` closure that captures ten outer-scope variables, priority sort with family grouping and localStorage persistence, and DOM assembly with event binding—into a single 411-line function. A one-line change to the backbone strip forces a reviewer to scroll past the entire row-template block; a change to the family-grouping rule forces re-reading the fetch/normalization preamble. The `buildRow` closure is the sharpest symptom: it captures `activeByName`, `priorityByName`, `approvalModeByName`, `workerTypeByName`, `timesPerformedByName`, `availableByName`, `descByName`, `domainByName`, `mapAvailable`, and `jobTypes` from the outer scope, making it impossible to unit-test "does the approval-mode cell render the correct `<select>` when `jobTypes` is null" without executing the fetch, map-building, and backbone code first.
+
+Solution:
+Extract each responsibility into a named, pure (or near-pure) function that takes explicit parameters and returns a value, leaving a thin ~35-line orchestrator. The concrete shape of the decomposition is:
+
+```js
+// ── 1. Data acquisition + normalization (pure, no DOM) ────────────
+async function fetchJobListData() {
+  const [jobTypesRes, pipelineRes] = await Promise.allSettled([
+    fetchJson('/api/job-types'),
+    fetchJson('/api/pipeline-map'),
+  ]);
+  return {
+    jobTypes: jobTypesRes.status === 'fulfilled' ? jobTypesRes.value : null,
+    pipelineMap: pipelineRes.status === 'fulfilled' ? pipelineRes.value : null,
+  };
+}
+
+function buildLookupMaps(jobTypes) {
+  const activeByName = new Map(), priorityByName = new Map(),
+        approvalModeByName = new Map(), workerTypeByName = new Map(),
+        timesPerformedByName = new Map(), availableByName = new Map(),
+        familyByName = new Map(), familyLabelByName = new Map(),
+        descByName = new Map(), domainByName = new Map(),
+        alwaysActiveByName = new Map();
+  (jobTypes || []).forEach(j => {
+    activeByName.set(j.name, j.active);
+    priorityByName.set(j.name, j.priority);
+    approvalModeByName.set(j.name, j.approvalMode);
+    workerTypeByName.set(j.name, j.workerType);
+    timesPerformedByName.set(j.name, j.timesPerformed);
+    availableByName.set(j.name, j.available);
+    familyByName.set(j.name, j.family);
+    familyLabelByName.set(j.name, j.familyLabel);
+    descByName.set(j.name, j.description);
+    domainByName.set(j.name, j.domain);
+    alwaysActiveByName.set(j.name, j.alwaysActive);
+  });
+  return { activeByName, priorityByName, approvalModeByName, workerTypeByName,
+           timesPerformedByName, availableByName, familyByName, familyLabelByName,
+           descByName, domainByName, alwaysActiveByName };
+}
+
+function computeSourceList(jobTypes, pipelineMap) {
+  const mapAvailable = !!(pipelineMap && pipelineMap.available);
+  return mapAvailable
+    ? pipelineMap.sources
+    : (jobTypes || []).map(j => ({ name: j.name, priority: j.priority, liveCounts: {} }));
+}
+
+// ── 2. Backbone strip (pure HTML string) ──────────────────────────
+function renderBackboneStrip(sourceList, mapAvailable) {
+  if (!mapAvailable) return '';
+  const stageTotals = {};
+  sourceList.forEach(s => {
+    Object.entries(s.liveCounts || {}).forEach(([stage, n]) => {
+      stageTotals[stage] = (stageTotals[stage] || 0) + n;
+    });
+  });
+  const cards = Object.entries(stageTotals)
+    .map(([stage, count]) => `<div class="bb-card"><span>${stage}</span><b>${count}</b></div>`)
+    .join('');
+  return `<div class="backbone-strip">${cards}</div>`;
+}
+
+// ── 3. Row template (pure, explicit context) ──────────────────────
+function buildRow(j, ctx) {
+  const { jobTypes, mapAvailable, activeByName, priorityByName,
+          approvalModeByName, workerTypeByName, timesPerformedByName,
+          availableByName, descByName, domainByName, alwaysActiveByName } = ctx;
+  const active = activeByName.get(j.name);
+  const priority = priorityByName.get(j.name);
+  const approvalMode = approvalModeByName.get(j.name);
+  const workerType = workerTypeByName.get(j.name);
+  const times = timesPerformedByName.get(j.name);
+  const available = availableByName.get(j.name);
+  const desc = descByName.get(j.name);
+  const domain = domainByName.get(j.name);
+  const alwaysActive = alwaysActiveByName.get(j.name);
+
+  const approvalCell = (approvalMode && jobTypes)
+    ? `<select data-job="${j.name}" class="approval-select">
+         ${jobTypes.map(t => `<option value="${t}" ${t === approvalMode ? 'selected' : ''}>${t}</option>`).join('')}
+       </select>`
+    : `<span>${approvalMode || '—'}</span>`;
+
+  return `<tr data-name="${j.name}" class="${active ? '' : 'inactive'}">
+    <td><input type="checkbox" ${active ? 'checked' : ''} data-toggle="${j.name}"></td>
+    <td>${j.name}</td>
+    <td>${priority ?? '—'}</td>
+    <td>${approvalCell}</td>
+    <td>${workerType ?? '—'}</td>
+    <td>${times ?? '—'}</td>
+    <td>${available ? '✓' : '✗'}</td>
+    <td>${desc || ''}</td>
+    <td>${domain || ''}</td>
+    <td>${alwaysActive ? 'always' : ''}</td>
+  </tr>`;
+}
+
+// ── 4. Sort + family grouping (pure) ──────────────────────────────
+function sortAndGroup(sourceList, lookups) {
+  const sorted = [...sourceList].sort((a, b) =>
+    (lookups.priorityByName.get(a.name) ?? 99) - (lookups.priorityByName.get(b.name) ?? 99)
+  );
+  const familyMembers = {};
+  sorted.forEach(j => {
+    const fam = lookups.familyByName.get(j.name) || '__none__';
+    (familyMembers[fam] = familyMembers[fam] || []).push(j);
+  });
+  const renderItems = [];
+  const collapsedFamilies = new Set(JSON.parse(localStorage.getItem('collapsedFamilies') || '[]'));
+  Object.entries(familyMembers).forEach(([fam, members]) => {
+    if (fam === '__none__') {
+      members.forEach(j => renderItems.push({ type: 'row', job: j }));
+    } else {
+      renderItems.push({ type: 'family-header', fam, label: lookups.familyLabelByName.get(members[0].name) || fam, count: members.length, collapsed: collapsedFamilies.has(fam) });
+      if (!collapsedFamilies.has(fam)) {
+        members.forEach(j => renderItems.push({ type: 'row', job: j }));
+      }
+    }
+  });
+  return { renderItems, collapsedFamilies };
+}
+
+// ── 5. Orchestration (thin, ~35 lines) ────────────────────────────
+async function renderJobListTab() {
+  const main = document.getElementById('main');
+  const { jobTypes, pipelineMap } = await fetchJobListData();
+  const lookups = buildLookupMaps(jobTypes);
+  const sourceList = computeSourceList(jobTypes, pipelineMap);
+  const mapAvailable = !!(pipelineMap && pipelineMap.available);
+  const backboneHtml = renderBackboneStrip(sourceList, mapAvailable);
+  const { renderItems, collapsedFamilies } = sortAndGroup(sourceList, lookups);
+
+  const ctx = { jobTypes, mapAvailable, ...lookups };
+  const rowsHtml = renderItems
+    .filter(it => it.type === 'row')
+    .map(it => buildRow(it.job, ctx))
+    .join('');
+
+  const headersHtml = renderItems
+    .filter(it => it.type === 'family-header')
+    .map(it => `<tr class="family-header" data-fam="${it.fam}">
+      <td colspan="10">▾ ${it.label} (${it.count})</td>
+    </tr>`)
+    .join('');
+
+  main.innerHTML = `${backboneHtml}
+    <table class="joblist"><thead>…</thead><tbody>${headersHtml}${rowsHtml}</tbody></table>`;
+
+  // event binding (checkbox toggle, approval select, family collapse)
+  main.querySelectorAll('input[data-toggle]').forEach(cb =>
+    cb.addEventListener('change', e => toggleJob(e.target.dataset.toggle)));
+  main.querySelectorAll('.approval-select').forEach(sel =>
+    sel.addEventListener('change', e => updateApproval(e.target.dataset.job, e.target.value)));
+  main.querySelectorAll('.family-header').forEach(h =>
+    h.addEventListener('click', e => toggleFamily(e.currentTarget.dataset.fam, collapsedFamilies)));
+}
+```
+
+Each extracted function is independently callable with fixture inputs and returns a string or array, so a change to the backbone strip, a new column in `buildRow`, or a new family rule no longer requires re-reading the other four blocks.
+
+Benefits:
+The orchestrator shrinks from 411 lines to roughly 35, and each extracted function has a single, nameable contract. `buildRow` becomes a pure function of `(job, ctx)` that can be snapshot-tested in Node without a browser, a fetch, or the backbone code. A reviewer changing the family-grouping rule reads only `sortAndGroup` (~25 lines) instead of scrolling through the fetch block and the row template. A new backbone stage touches only `renderBackboneStrip`. The 12 `xxxByName` maps stay in one cohesive `buildLookupMaps` call—no ceremony of twelve one-liner functions—while the responsibility seams between fetch, aggregate, render, sort, and bind become the unit boundaries for both code review and automated testing.
