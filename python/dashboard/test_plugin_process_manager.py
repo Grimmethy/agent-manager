@@ -113,6 +113,56 @@ class StartPortGuardTest(TmpStateDirTest):
             ppm.stop("test-plugin")
 
 
+class StartEnvPassthroughTest(TmpStateDirTest):
+    def test_start_passes_the_entry_own_process_env_to_the_child(self):
+        """Real live bug (2026-09-28): the child's env was built purely from the
+        dashboard's own inherited os.environ -- an entry's own process.env block
+        (e.g. wikiforge-*'s WIKIFORGE_SECOND_BRAIN_ROOT) never actually reached the
+        child process at all. Confirmed live: starting wikiforge this way registered
+        zero spaces despite a fully correct process.env block."""
+        outfile = self.tmp / "env-out.txt"
+        port = free_port()
+        entry = {
+            "name": "test-plugin", "url": f"http://localhost:{port}",
+            "process": {
+                "command": "/bin/sh",
+                "args": ["-c", f'echo "$WIKIFORGE_TEST_ROOT" > {outfile}'],
+                "env": {"WIKIFORGE_TEST_ROOT": "/some/real/path"},
+            },
+        }
+        try:
+            self.assertTrue(ppm.start(entry))
+            for _ in range(20):
+                if outfile.exists() and outfile.read_text().strip():
+                    break
+                time.sleep(0.1)
+            self.assertEqual(outfile.read_text().strip(), "/some/real/path")
+        finally:
+            ppm.stop("test-plugin")
+
+    def test_start_entry_env_overrides_an_inherited_value_of_the_same_name(self):
+        outfile = self.tmp / "env-override-out.txt"
+        port = free_port()
+        entry = {
+            "name": "test-plugin", "url": f"http://localhost:{port}",
+            "process": {
+                "command": "/bin/sh",
+                "args": ["-c", f'echo "$WIKIFORGE_TEST_OVERRIDE" > {outfile}'],
+                "env": {"WIKIFORGE_TEST_OVERRIDE": "entry-value"},
+            },
+        }
+        try:
+            with mock.patch.dict("os.environ", {"WIKIFORGE_TEST_OVERRIDE": "inherited-value"}):
+                self.assertTrue(ppm.start(entry))
+            for _ in range(20):
+                if outfile.exists() and outfile.read_text().strip():
+                    break
+                time.sleep(0.1)
+            self.assertEqual(outfile.read_text().strip(), "entry-value", "the entry's own value must win over an inherited one")
+        finally:
+            ppm.stop("test-plugin")
+
+
 class StopTest(TmpStateDirTest):
     def test_stop_kills_a_real_process_and_removes_the_pidfile(self):
         port = free_port()

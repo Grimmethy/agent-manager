@@ -131,8 +131,20 @@ def start(entry: dict) -> bool:
         # meaningless in the new process (Popen's close_fds=True default has already
         # closed it), so this crashed every plugin child with "OSError: [Errno 9] Bad
         # file descriptor" before this fix. Confirmed live 2026-09-05.
+        # 2026-09-28, real live bug: this only ever built the child's env from the
+        # dashboard's own inherited os.environ -- an entry's own process.env block
+        # (e.g. wikiforge-*'s WIKIFORGE_SECOND_BRAIN_ROOT/WIKIFORGE_AM_WIKI_ROOT/...)
+        # was read into plugins.json but never actually reached the child process at
+        # all. Confirmed live: starting wikiforge this way registered zero spaces
+        # (GET /api/spaces came back []) despite a fully correct process.env block.
+        # The entry's own vars are merged in LAST so they can override an inherited
+        # value of the same name (they're the plugin's explicit config, not a
+        # fallback) -- inherited env still flows through for anything the entry
+        # doesn't set itself (matching AGENT_MANAGER_CORE_REPO_ROOT's own documented
+        # "flows through via env passthrough" assumption for agent-manager-chat-plugin).
         child_env = {k: v for k, v in os.environ.items()
                      if not k.startswith("WERKZEUG_")}
+        child_env.update({k: str(v) for k, v in (process.get("env") or {}).items()})
         with open(_logfile(name), "ab") as logfile:
             proc = subprocess.Popen(
                 [command, *args],
