@@ -538,6 +538,18 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       const task = JSON.parse(raw);
       summary.checked++;
 
+      // A source can opt out of blind-redraft-and-retry entirely
+      // (registerTaskSource(name, { noAutoRetry: true })) -- e.g. wikiforge's
+      // wiki_transcript_extract/wiki_page_promote, where a full redraft costs a genuine
+      // 15-40min plan+implement+critique cycle and, running a large batch overnight, the
+      // operator would rather move on to the next item than spend that time re-attempting
+      // one that already failed once ("one attempt and done"). Checked before any of the
+      // eligibility classifiers below so it applies uniformly regardless of WHY the task
+      // blocked; the task is simply left as-is in blocked/ for a human to look at later,
+      // same as any task this sweep was never eligible to touch at all.
+      const noAutoRetryEntry = getRegisteredSource(resolveSourceName(task));
+      if (noAutoRetryEntry && noAutoRetryEntry.noAutoRetry === true) continue;
+
       // Only a genuine review-stage rejection is eligible -- never an apply-stage failure
       // that happens to still carry localVotes from an earlier, unrelated successful
       // review (redrafting can't fix that; see agent-manager-common.sh's
