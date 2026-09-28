@@ -42,7 +42,7 @@ function writeHeartbeat(dir, instanceId, overrides = {}) {
   fs.writeFileSync(path.join(dir, `${instanceId}.json`), JSON.stringify(hb));
 }
 
-test('a dot-prefixed state file (.active-local-model.json shape) is never mistaken for a dead worker', () => {
+test('a dot-prefixed state file (.active-local-model.json shape) is never mistaken for a dead worker', async () => {
   const dir = tempInstancesDir();
   // Real, healthy heartbeat for worker-p40.
   writeHeartbeat(dir, 'worker-p40');
@@ -54,28 +54,28 @@ test('a dot-prefixed state file (.active-local-model.json shape) is never mistak
   }));
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.deepEqual(actions, []);
 });
 
-test('the watchdog cooldown file itself (keyed by instanceId, no top-level instanceId field) is silently skipped, not flagged', () => {
+test('the watchdog cooldown file itself (keyed by instanceId, no top-level instanceId field) is silently skipped, not flagged', async () => {
   const dir = tempInstancesDir();
   writeHeartbeat(dir, 'worker-3090');
   fs.writeFileSync(path.join(dir, '.watchdog-restart-cooldown.json'), JSON.stringify({ 'worker-3090': Date.now() }));
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.deepEqual(actions, []);
 });
 
-test('a genuinely dead worker (pid gone, stale heartbeat) still produces a restart action', () => {
+test('a genuinely dead worker (pid gone, stale heartbeat) still produces a restart action', async () => {
   const dir = tempInstancesDir();
   const longDeadPid = 999999; // astronomically unlikely to be a real live pid in the test sandbox
   const staleTime = new Date(Date.now() - 400_000).toISOString(); // > 300s STALE_HEARTBEAT_SECONDS
   writeHeartbeat(dir, 'worker-3090', { pid: longDeadPid, lastHeartbeat: staleTime });
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.equal(actions.length, 1);
   assert.equal(actions[0].instanceId, 'worker-3090');
   assert.equal(actions[0].action, 'restart');
@@ -90,14 +90,14 @@ test('a genuinely dead worker (pid gone, stale heartbeat) still produces a resta
 // a fresh heartbeat. Liveness must be judged against daemonPid when present, or this
 // fires a needless 'restart' that queue-watcher.sh spawns with no recheck, producing a
 // second live daemon under the same instanceId.
-test('a stale heartbeat whose pid (a since-exited call child) looks dead is NOT restarted when daemonPid is still alive', () => {
+test('a stale heartbeat whose pid (a since-exited call child) looks dead is NOT restarted when daemonPid is still alive', async () => {
   const dir = tempInstancesDir();
   const longDeadChildPid = 999999; // the exited local-draft.js child -- astronomically unlikely to be live.
   const staleTime = new Date(Date.now() - 400_000).toISOString(); // > 300s STALE_HEARTBEAT_SECONDS
   writeHeartbeat(dir, 'worker-3090', { pid: longDeadChildPid, daemonPid: process.pid, lastHeartbeat: staleTime });
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.deepEqual(actions, []);
 });
 
@@ -175,7 +175,7 @@ test('restartTargetFor: an ordinary worker (worker-3090, worker-p40) never carri
   }
 });
 
-test('deadProcessCheck: a dead worker-p40\'s emitted restart action includes the P40 env end-to-end', () => {
+test('deadProcessCheck: a dead worker-p40\'s emitted restart action includes the P40 env end-to-end', async () => {
   const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
   const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
   process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
@@ -186,7 +186,7 @@ test('deadProcessCheck: a dead worker-p40\'s emitted restart action includes the
     writeHeartbeat(dir, 'worker-p40', { pid: 999999, lastHeartbeat: staleTime });
     const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-    const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+    const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
     assert.equal(actions.length, 1);
     assert.equal(actions[0].instanceId, 'worker-p40');
     assert.deepEqual(actions[0].env, {
@@ -208,13 +208,13 @@ test('deadProcessCheck: a dead worker-p40\'s emitted restart action includes the
 // comment documents happening to draft's worst case in 2026-08-16 before that value was
 // last raised. A reviewer instance whose pid is alive and stuck on the SAME task for
 // 1440s must NOT be flagged as a zombie.
-test('a reviewer stuck "working" the SAME task for review\'s real worst-case duration (~1440s, 6 sequential majorityVote attempts) is NOT flagged as a zombie', () => {
+test('a reviewer stuck "working" the SAME task for review\'s real worst-case duration (~1440s, 6 sequential majorityVote attempts) is NOT flagged as a zombie', async () => {
   const dir = tempInstancesDir();
   const stuckTime = new Date(Date.now() - 1440_000).toISOString(); // 24 min -- review's real worst case
   writeHeartbeat(dir, 'reviewer', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: stuckTime, stateSince: stuckTime });
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.deepEqual(actions, [], 'still comfortably within the real worst-case chain -- must not be treated as a hung/zombie process');
 });
 
@@ -224,17 +224,17 @@ test('a reviewer stuck "working" the SAME task for review\'s real worst-case dur
 // 1680s threshold. Same failure mode this file's own header documents for the 240s/1200s
 // case: raising a lane's per-call ceiling without raising its zombie threshold in
 // lockstep means the watchdog SIGKILLs a legitimately still-generating worker mid-call.
-test('a worker-p40 stuck "working" the SAME task for the P40 lane\'s real worst-case duration (~3600s, 4 sequential 900s calls) is NOT flagged as a zombie', () => {
+test('a worker-p40 stuck "working" the SAME task for the P40 lane\'s real worst-case duration (~3600s, 4 sequential 900s calls) is NOT flagged as a zombie', async () => {
   const dir = tempInstancesDir();
   const stuckTime = new Date(Date.now() - 3600_000).toISOString(); // 60 min -- the P40 lane's real worst case
   writeHeartbeat(dir, 'worker-p40', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: stuckTime, stateSince: stuckTime });
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.deepEqual(actions, [], 'still within the P40 lane\'s real worst-case chain -- must not be treated as a hung/zombie process');
 });
 
-test('a worker-p40 past the P40 lane\'s scaled threshold (3840s) IS flagged as a zombie -- the exception is not unlimited', () => {
+test('a worker-p40 past the P40 lane\'s scaled threshold (3840s) IS flagged as a zombie -- the exception is not unlimited', async () => {
   const prevUrl = process.env.AGENT_MANAGER_P40_OLLAMA_URL;
   const prevModel = process.env.AGENT_MANAGER_P40_MODEL;
   process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.168.122.29:11434';
@@ -245,7 +245,7 @@ test('a worker-p40 past the P40 lane\'s scaled threshold (3840s) IS flagged as a
     writeHeartbeat(dir, 'worker-p40', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: staleTime, stateSince: staleTime, pid: process.pid });
     const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-    const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+    const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
     assert.equal(actions.length, 1);
     assert.equal(actions[0].instanceId, 'worker-p40');
     assert.equal(actions[0].action, 'restart-after-kill');
@@ -258,24 +258,24 @@ test('a worker-p40 past the P40 lane\'s scaled threshold (3840s) IS flagged as a
 // A non-P40 worker at the SAME 3600s age it takes to clear the P40's own longer threshold
 // must still be flagged -- confirms the exception is scoped to the two P40 instanceIds,
 // not a global change to WORKER_ZOMBIE_THRESHOLD_SECONDS.
-test('a worker-3090 stuck for the P40 lane\'s worst-case duration (3600s) IS still flagged as a zombie -- the exception does not leak to other lanes', () => {
+test('a worker-3090 stuck for the P40 lane\'s worst-case duration (3600s) IS still flagged as a zombie -- the exception does not leak to other lanes', async () => {
   const dir = tempInstancesDir();
   const stuckTime = new Date(Date.now() - 3600_000).toISOString();
   writeHeartbeat(dir, 'worker-3090', { status: 'working', currentTaskId: 'some-task', lastHeartbeat: stuckTime, stateSince: stuckTime, pid: process.pid });
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.equal(actions.length, 1);
   assert.equal(actions[0].instanceId, 'worker-3090');
   assert.equal(actions[0].action, 'restart-after-kill');
 });
 
-test('a healthy, recently-updated worker heartbeat produces no action', () => {
+test('a healthy, recently-updated worker heartbeat produces no action', async () => {
   const dir = tempInstancesDir();
   writeHeartbeat(dir, 'reviewer');
   const cooldownPath = path.join(dir, '.watchdog-restart-cooldown.json');
 
-  const actions = deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
+  const actions = await deadProcessCheck({ instancesDir: dir, cooldownPath, now: Date.now() });
   assert.deepEqual(actions, []);
 });
 
@@ -423,7 +423,7 @@ test('flags multiple real orphans in one pass, leaving the one real live worker 
 // the actual, correct-by-design implementation; rewritten to pin the real contract,
 // and to spawn NO real process so no real pidfile is held by a live pid in the test
 // process's view.)
-test('deadProcessCheck: a stale heartbeat with a dead pid emits one restart decision carrying the pidfileName the bash-side pidfile gate keys off', () => {
+test('deadProcessCheck: a stale heartbeat with a dead pid emits one restart decision carrying the pidfileName the bash-side pidfile gate keys off', async () => {
   const instancesDir = tempInstancesDir();
   const pidDir = tempPidDir(); // the shared pids dir, as the bash side would see it -- the module must decide without reading it.
   const cooldownPath = path.join(instancesDir, '.watchdog-restart-cooldown.json');
@@ -436,7 +436,7 @@ test('deadProcessCheck: a stale heartbeat with a dead pid emits one restart deci
     const staleTime = new Date(Date.now() - 400_000).toISOString();
     writeHeartbeat(instancesDir, 'worker-3090', { pid: 9999999, lastHeartbeat: staleTime });
 
-    const actions = deadProcessCheck({ instancesDir, cooldownPath, now: Date.now() });
+    const actions = await deadProcessCheck({ instancesDir, cooldownPath, now: Date.now() });
     assert.equal(actions.length, 1);
     assert.equal(actions[0].instanceId, 'worker-3090');
     assert.equal(actions[0].action, 'restart');

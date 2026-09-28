@@ -154,9 +154,22 @@ async function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }
   const cooldowns = readCooldowns(cooldownPath);
   let cooldownsChanged = false;
 
-  for (const name of names) {
+  // AC-12: all heartbeat reads issue concurrently instead of serially (sweep wall-time
+  // sum-of-latencies -> max-latency). Per-file failure isolation preserved: a bad/mid-
+  // write file resolves to null here and is skipped below with the same warn it used to
+  // get inline, rather than one slow/broken file blocking every read behind it.
+  const heartbeats = await Promise.all(names.map((name) => fs.promises.readFile(path.join(instancesDir, name), 'utf8')
+    .then((raw) => JSON.parse(raw))
+    .catch((e) => {
+      console.warn(`[dead-process-check] skipping unreadable heartbeat: ${name} -- ${e.message}`);
+      return null;
+    })));
+
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    const hb = heartbeats[i];
+    if (hb === null) continue; // already warned above.
     try {
-      const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, name), 'utf8'));
       if (hb.instanceId === 'queue-watchdog') continue; // never watch ourselves.
 
       const ageSeconds = (now - new Date(hb.lastHeartbeat).getTime()) / 1000;
@@ -210,9 +223,10 @@ async function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }
       cooldowns[hb.instanceId] = now;
       cooldownsChanged = true;
     } catch (e) {
-      console.warn(`[dead-process-check] skipping unreadable heartbeat: ${name} -- ${e.message}`);
-      // Unreadable/mid-write heartbeat file -- skip it this pass, same "don't let one bad
-      // file stop the rest" treatment the reference gives this per-item try/catch.
+      console.warn(`[dead-process-check] skipping heartbeat ${name} after a processing error: ${e.message}`);
+      // Malformed heartbeat contents (e.g. an unparseable lastHeartbeat) hit here --
+      // read/parse failures are already caught above and skipped before this loop, same
+      // "don't let one bad file stop the rest" treatment either way.
     }
   }
 
@@ -358,12 +372,15 @@ function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid,
     && !hasLiveWorkerAncestor(p.ppid, pidToPpid, liveWorkerPids));
 }
 
-function main() {
+async function main() {
   const { pipelineDir } = getConfig();
   const instancesDir = sharedInstancesDir(pipelineDir);
   const cooldownPath = path.join(instancesDir, '.watchdog-restart-cooldown.json');
 
-  const actions = deadProcessCheck({ instancesDir, cooldownPath });
+  // AC-13: deadProcessCheck is now async (AC-12) -- awaited here so `actions` is the
+  // resolved array, not a Promise (a bare Promise is not iterable, which would have
+  // thrown on the very next line).
+  const actions = await deadProcessCheck({ instancesDir, cooldownPath });
   for (const action of actions) process.stdout.write(`${JSON.stringify(action)}\n`);
 
   const orphans = findOrphanedModelCallProcesses({ instancesDir });
@@ -383,5 +400,7 @@ module.exports = {
 };
 
 if (require.main === module) {
-  main();
+  // main() is async (AC-13) -- catch here so a rejected promise surfaces on stderr with a
+  // non-zero exit instead of becoming an unhandled rejection warning.
+  main().catch((e) => { console.error('[dead-process-check]', (e && e.stack) || e); process.exit(1); });
 }
