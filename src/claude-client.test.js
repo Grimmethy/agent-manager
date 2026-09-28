@@ -204,6 +204,97 @@ test('callOnce passes --allowedTools instead of --tools when a caller explicitly
   });
 });
 
+// HUB0059 2/3: buildCliArgs -- the exact string[] for each flag combination, asserted
+// end-to-end through callOnce with a mocked execFileSync (this file's own convention;
+// buildCliArgs is module-private, so callOnce is the seam). allowSideFindings: false
+// keeps args[1] the deterministic `${currentDateLine()}\n\n<prompt>`, and the withEnv
+// overrides pin MODEL/CLAUDE_EFFORT/CLAUDE_MAX_BUDGET_USD/DRAFT_MAX_TURNS exactly as
+// expectedArgs() below encodes them (defaults: model "sonnet", DRAFT_MAX_TURNS 20).
+const { currentDateLine: currentDateLineForArgsTests } = require('./current-date-line.js');
+
+function expectedArgs({ prompt, model, maxTurns = 1, permissionMode = 'dontAsk', effort, allowedTools, resume, addDirs }) {
+  const args = [
+    '-p', `${currentDateLineForArgsTests()}\n\n${prompt}`,
+    '--output-format', 'json',
+    '--model', model || process.env.CLAUDE_MODEL || 'sonnet',
+    '--max-turns', String(Math.min(maxTurns, 20)),
+    '--permission-mode', permissionMode,
+  ];
+  const effortLevel = effort || process.env.CLAUDE_EFFORT;
+  if (effortLevel) args.push('--effort', effortLevel);
+  if (allowedTools) {
+    args.push('--allowedTools', allowedTools);
+  } else {
+    args.push('--tools', '');
+  }
+  if (process.env.CLAUDE_MAX_BUDGET_USD) args.push('--max-budget-usd', process.env.CLAUDE_MAX_BUDGET_USD);
+  if (resume) args.push('--resume', resume);
+  for (const d of Array.isArray(addDirs) ? addDirs : []) {
+    if (d) args.push('--add-dir', d);
+  }
+  return args;
+}
+
+const buildCliArgsCases = [
+  {
+    name: 'minimal call -- base flags only, --tools "" and no opt-in flags at all',
+    env: {},
+    input: { prompt: 'hello', model: 'sonnet', maxTurns: 1 },
+  },
+  {
+    name: 'all opt-in flags present in the exact order, including --max-budget-usd',
+    env: { CLAUDE_MAX_BUDGET_USD: '9.99' },
+    input: {
+      prompt: 'hello', model: 'opus', effort: 'high', maxTurns: 5,
+      allowedTools: 'Read,Bash', permissionMode: 'acceptEdits',
+      resume: 'sess-abc', addDirs: ['/tmp/a', '/tmp/b'],
+    },
+  },
+  {
+    name: 'effort falls back to CLAUDE_EFFORT when the call site does not set one',
+    env: { CLAUDE_EFFORT: 'xhigh' },
+    input: { prompt: 'hello', model: 'sonnet', maxTurns: 1 },
+  },
+  {
+    name: 'resume --resume <sessionId> passed exactly, nothing else opt-in',
+    env: {},
+    input: { prompt: 'follow-up message', model: 'sonnet', maxTurns: 1, resume: 'sess-abc123' },
+  },
+  {
+    name: 'addDirs -- one --add-dir per entry, in order, empty entries filtered',
+    env: {},
+    input: { prompt: 'hello', model: 'sonnet', maxTurns: 1, addDirs: ['', '/tmp/a', '/tmp/b'] },
+  },
+  {
+    name: 'maxTurns above DRAFT_MAX_TURNS is clamped to 20 in --max-turns',
+    env: {},
+    input: { prompt: 'hello', model: 'sonnet', maxTurns: 50 },
+  },
+];
+
+for (const { name, env, input } of buildCliArgsCases) {
+  test(`buildCliArgs (via callOnce): ${name}`, async () => {
+    await withEnv(
+      {
+        CLAUDE_CODE_OAUTH_TOKEN: 'fake-token',
+        CLAUDE_MODEL: 'sonnet',
+        CLAUDE_EFFORT: undefined,
+        CLAUDE_MAX_BUDGET_USD: undefined,
+        DRAFT_MAX_TURNS: undefined,
+        ...env,
+      },
+      async () => {
+        let capturedArgs = null;
+        await withMockedClient(
+          (bin, args) => { capturedArgs = args; return JSON.stringify({ result: 'ok' }); },
+          async ({ callOnce }) => { await callOnce({ allowSideFindings: false, ...input }); },
+        );
+        assert.deepEqual(capturedArgs, expectedArgs(input));
+      },
+    );
+  });
+}
+
 // 2026-08-24 (sandbox.js): the mock here has to handle TWO distinct execFileSync shapes --
 // sandbox.js's own `which bwrap` lookup, and the real `bwrap ... -- claude ...` invocation
 // this call site produces once available -- so a fake `which` command is passed via PATH
