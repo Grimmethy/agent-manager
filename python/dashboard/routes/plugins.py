@@ -18,8 +18,12 @@ def api_plugins():
     from app import PLUGINS_MANIFEST_PATH, _manifest_tabs_enabled, _read_plugins_manifest
     manifest = _read_plugins_manifest()
     for p in manifest:
-        if p.get("slot"):
-            p["running"] = plugin_process_manager.is_running(p["name"])
+        # A processName-bearing entry (e.g. the 4 wikiforge-* tabs sharing one real
+        # node server.js) needs live status just as much as a slotted one -- process_key()
+        # resolves to whichever identity that shared process is actually tracked
+        # under, not necessarily this entry's own name (2026-09-28).
+        if p.get("slot") or p.get("processName"):
+            p["running"] = plugin_process_manager.is_running(plugin_process_manager.process_key(p))
     return jsonify({
         "plugins": manifest,
         "manifestPath": str(PLUGINS_MANIFEST_PATH),
@@ -352,7 +356,7 @@ def api_plugins_select_slot():
     manifest = _read_plugins_manifest()
     for p in manifest:
         if p.get("slot") == slot and p.get("active") and p.get("name") != name:
-            plugin_process_manager.stop(p["name"])
+            plugin_process_manager.stop(plugin_process_manager.process_key(p))
             p["active"] = False
     started = healthy = False
     if name:

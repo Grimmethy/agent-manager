@@ -163,6 +163,63 @@ class StartEnvPassthroughTest(TmpStateDirTest):
             ppm.stop("test-plugin")
 
 
+class ProcessKeyTest(unittest.TestCase):
+    def test_process_key_returns_processName_when_present(self):
+        self.assertEqual(ppm.process_key({"name": "wikiforge-secondbrain", "processName": "wikiforge"}), "wikiforge")
+
+    def test_process_key_falls_back_to_name_when_processName_absent(self):
+        self.assertEqual(ppm.process_key({"name": "promptforge"}), "promptforge")
+
+
+class SharedProcessKeyTest(TmpStateDirTest):
+    def test_starting_a_second_entry_sharing_processName_recognizes_the_first_as_already_running(self):
+        """The exact live incident (2026-09-28): 4 real plugins.json entries
+        (wikiforge-secondbrain/wikiforge-agent-manager/wikiforge-wikiforge/
+        wikiforge-propertyforager) all declare processName: "wikiforge" and share one
+        real node server.js on one port -- starting the SECOND one while the first is
+        still running used to hit the port-guard and refuse, because is_running()
+        checked a pidfile keyed by the second entry's own name, which never existed."""
+        port = free_port()
+        entry_a = {
+            "name": "wikiforge-secondbrain", "processName": "wikiforge", "url": f"http://localhost:{port}",
+            "process": {"command": "/bin/sleep", "args": ["30"]},
+        }
+        entry_b = {
+            "name": "wikiforge-propertyforager", "processName": "wikiforge", "url": f"http://localhost:{port}",
+            "process": {"command": "/bin/sleep", "args": ["30"]},
+        }
+        try:
+            self.assertTrue(ppm.start(entry_a), "starting the first entry must succeed")
+            self.assertTrue(ppm.is_running(ppm.process_key(entry_a)))
+            # The real bug: starting a DIFFERENT entry sharing the same processName,
+            # while the first is still alive, used to return False (port-guard refusal).
+            self.assertTrue(ppm.start(entry_b), "starting the second entry must recognize the shared process, not refuse")
+            self.assertTrue(ppm.is_running(ppm.process_key(entry_b)))
+            # Exactly one pidfile exists -- under the shared key, not two separate ones.
+            self.assertTrue(ppm._pidfile("wikiforge").exists())
+            self.assertFalse(ppm._pidfile("wikiforge-secondbrain").exists())
+            self.assertFalse(ppm._pidfile("wikiforge-propertyforager").exists())
+        finally:
+            ppm.stop(ppm.process_key(entry_a))
+
+    def test_api_plugins_live_status_logic_reflects_a_processName_entry_not_just_slotted(self):
+        """Direct check of the exact logic routes/plugins.py's api_plugins() now runs
+        (process_key + is_running) -- no existing Flask-route test file covers this
+        endpoint to extend, so this reproduces its updated condition/call directly."""
+        port = free_port()
+        entry = {
+            "name": "wikiforge-secondbrain", "processName": "wikiforge", "url": f"http://localhost:{port}",
+            "process": {"command": "/bin/sleep", "args": ["30"]},
+        }
+        try:
+            ppm.start(entry)
+            # This is the exact updated api_plugins() condition + call:
+            self.assertTrue(entry.get("slot") or entry.get("processName"))
+            self.assertTrue(ppm.is_running(ppm.process_key(entry)))
+        finally:
+            ppm.stop(ppm.process_key(entry))
+
+
 class StopTest(TmpStateDirTest):
     def test_stop_kills_a_real_process_and_removes_the_pidfile(self):
         port = free_port()

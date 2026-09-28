@@ -76,6 +76,25 @@ def _port_in_use(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bo
         return False
 
 
+def process_key(entry: dict) -> str:
+    """The identity a plugin's pidfile/logfile is actually tracked under -- an
+    entry's own `processName` when set (several real entries share one underlying
+    process this way, e.g. wikiforge-secondbrain/wikiforge-agent-manager/
+    wikiforge-wikiforge/wikiforge-propertyforager all declare processName:
+    "wikiforge", one real node server.js on one port shared by four dashboard tabs),
+    else the entry's own `name`.
+
+    Real live incident (2026-09-28): every caller here used to key pidfile/logfile
+    identity by entry["name"] directly, so a SECOND manifest entry sharing the same
+    real process as an already-running first one had no way to recognize it --
+    is_running() checked a pidfile that never existed for that second entry's own
+    name, and start() then hit its own port-guard ("port already answering but our
+    own pidfile has no live pid for it") and refused, even though the process it was
+    being asked to ensure was already correctly running under a sibling entry's
+    pidfile."""
+    return entry.get("processName") or entry["name"]
+
+
 def start(entry: dict) -> bool:
     """Idempotent: already running -> log + return True, matching start_bg()'s
     "already running (pid N) -- skipping" behavior. Returns False (never raises) if
@@ -98,8 +117,9 @@ def start(entry: dict) -> bool:
     is already answering and our own pidfile doesn't know why -- a clear, loud
     failure instead of a silent double-bind."""
     name = entry.get("name")
-    if is_running(name):
-        log.info("plugin '%s' already running -- skipping start", name)
+    key = process_key(entry)
+    if is_running(key):
+        log.info("plugin '%s' already running (shared process key '%s') -- skipping start", name, key)
         return True
     process = entry.get("process") or {}
     command, args = process.get("command"), process.get("args") or []
@@ -116,7 +136,7 @@ def start(entry: dict) -> bool:
             "its pidfile) -- find and stop it by hand (e.g. `ss -ltnp | grep :%s`) "
             "before starting this plugin again, or the new child will silently fail "
             "to bind while the old one keeps answering health checks.",
-            name, port, _pidfile(name), port,
+            name, port, _pidfile(key), port,
         )
         return False
     try:
@@ -145,7 +165,7 @@ def start(entry: dict) -> bool:
         child_env = {k: v for k, v in os.environ.items()
                      if not k.startswith("WERKZEUG_")}
         child_env.update({k: str(v) for k, v in (process.get("env") or {}).items()})
-        with open(_logfile(name), "ab") as logfile:
+        with open(_logfile(key), "ab") as logfile:
             proc = subprocess.Popen(
                 [command, *args],
                 cwd=cwd,
@@ -154,8 +174,8 @@ def start(entry: dict) -> bool:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,  # detach, same intent as launch.sh's `nohup ... &`
             )
-        _pidfile(name).write_text(str(proc.pid))
-        log.info("started plugin '%s' (pid %s), logging to %s", name, proc.pid, _logfile(name))
+        _pidfile(key).write_text(str(proc.pid))
+        log.info("started plugin '%s' (pid %s, shared process key '%s'), logging to %s", name, proc.pid, key, _logfile(key))
         return True
     except Exception:
         log.exception("failed to start plugin '%s'", name)
