@@ -1132,6 +1132,24 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
         }
       };
 
+      // --- claim-verification gate (bucket-B prose path) -------------------------
+      // If the openQuestions prose asserts something checkable about the repo and the
+      // fact-check says it is NOT there, the premise is false -- do not archive on its
+      // own words; leave the task for a human (idempotent: safe if the gate re-fires).
+      let claimResults = null;
+      try { claimResults = checkCompletionClaimsInNote(task.needsClarification.openQuestions, repoRoot); }
+      catch (e) { log(`${id}: checkCompletionClaimsInNote threw: ${e.message} -- skipping gate`); claimResults = null; }
+      if (claimResults && claimResults.some((r) => r.found === false)) {
+        log(`${id}: bucket B but unverified claim -> leave for human (gate)`);
+        if (DRY_RUN) continue;
+        if (!task.ncClaimUnverified) task.ncClaimUnverified = true;
+        task.ncTriageDecision = 'leave-for-human';
+        appendHistoryEvent(task, 'advisory',
+          `needs-clarification-triage: completion claim in openQuestions could not be verified (${claimResults.filter((r) => r.found === false).map((r) => (r.evidence || '').slice(0, 120)).join(' | ').slice(0, 300)}) -- left for a human`);
+        writeInPlace(file, task);
+        continue;
+      }
+
       let resolved = false;
       try { resolved = hasResolutionSignal(task, oq); } catch (e) { log(`${id}: hasResolutionSignal threw: ${e.message} -- treating as unresolved`); resolved = false; }
       if (resolved) { archive('verified resolution signal'); continue; }
