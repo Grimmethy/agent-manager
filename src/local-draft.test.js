@@ -2952,6 +2952,38 @@ test('a task with NO model profile still defaults to think:true, unaffected by t
 // almost never mattered). staleness_audit is also advisoryProse:true and, unlike
 // observability_review/performance_review, is already registered in task-sources.js's own
 // base set this fixture loads -- no custom source registration needed.
+// 2026-09 (HUB0016 2/2): the pre-dispatch gate (deterministic-recheck-registry.js's
+// sequential-await-in-loop detector, fan-out = 'archive') is wired into draftTask BEFORE
+// the plan/implement cycle starts -- an 'archive' verdict must skip every model call.
+// Uses staleness_audit (already in task-sources.js's base set this fixture loads) rather
+// than performance_review, so no "Cannot update unregistered task source" crash at
+// task-source-registry.js:114 (the prior attempt's failure).
+test('draftTask returns the archived shape with zero draft calls when the pre-dispatch gate archives the flagged rule', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      return { response: 'must never be called', degenerate: null, attempts: 1 };
+    };
+    const task = {
+      id: 'pre-dispatch-gate-test', domain: 'default', source: 'staleness_audit', title: 'test',
+      promptContext: {
+        ruleId: 'sequential-await-in-loop',
+        flaggedCode: 'const results = await Promise.all(items.map(async (item) => process(item)));',
+      },
+    };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(result.status, 'archived', 'the gate archive verdict must produce the archived shape');
+    assert.match(result.reason, /fan-out \(parallel\)/, "the reason must be the detector's own");
+    assert.equal(result.succeeded, true);
+    assert.equal(callCount, 0, 'an archive verdict must skip the entire plan/implement/critique cycle -- zero model calls');
+    assert.equal(task.status, 'archived');
+    assert.ok(task.history.some((h) => h.stage === 'pre-dispatch-gate'), 'a pre-dispatch-gate history event must be recorded');
+  });
+});
+
 test('draftTask skips the critique+revision pass entirely for an advisoryProse source', async () => {
   await withFixtureRepo(async (draftTask) => {
     let callCount = 0;
