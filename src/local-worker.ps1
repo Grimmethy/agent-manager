@@ -636,16 +636,25 @@ while ($true) {
     # GPU call and a real block for an outcome that was never in doubt.
     # fixedLiterals guard (COMPLETED 1): that task carried a fully-specified literal
     # edit and STILL burned 5 wasted local qwen/ornith implement calls re-deriving
-    # content the task had already handed over verbatim. Two shapes: (a) the
-    # deterministic one -- promptContext.file and promptContext.find non-empty strings
-    # and exactly one fixedLiterals entry with non-empty string content (the exact
-    # condition src/lib/deterministic-extract.js's tryDeterministicLiteralEdit checks)
-    # -- the {mode:'edit',file,find,replace} response is knowable without a model, so
-    # build it directly and skip the local call; (b) anything else carrying
-    # fixedLiterals -- the local ornith/qwen model is exactly what failed to honor
-    # those literals, so route this one stage to 'claude:adhoc-agentic' instead of
-    # serving it locally. The downstream fixedLiterals compliance gate
-    # (implement-critique.js) still runs after either path, untouched.
+    # content the task had already handed over verbatim. Deterministic shape:
+    # promptContext.file and promptContext.find non-empty strings and exactly one
+    # fixedLiterals entry with non-empty string content (the exact condition
+    # src/lib/deterministic-extract.js's tryDeterministicLiteralEdit checks) -- the
+    # {mode:'edit',file,find,replace} response is knowable without a model, so build
+    # it directly and skip the local call. The downstream fixedLiterals compliance
+    # gate (implement-critique.js) still runs after, untouched.
+    #
+    # 2026-09-28, corrected: an earlier version of this guard routed the non-
+    # deterministic shape to a model override 'claude:adhoc-agentic'. That tier does
+    # not exist -- the Claude-only adhoc-agentic-draft.js it referred to was deleted
+    # 2026-09-01 (see agentic-draft-common.js's own header), replaced by the LOCAL
+    # local-agentic-write-draft.js, and Invoke-LocalClient/local-client.js have no
+    # "claude:" prefix handling at all -- the override just got sent to Ollama as a
+    # literal nonexistent model tag ("model not found"). Escalating to Claude here
+    # would also contradict the standing policy of never switching provider when the
+    # local model struggles (split into narrower turns instead). So the non-
+    # deterministic shape now falls through to the normal local-model path
+    # unchanged, same as before this guard existed.
     $hasFixedLiterals = $task.promptContext.PSObject.Properties['fixedLiterals'] -and @($task.promptContext.fixedLiterals).Count -gt 0
     $fixedLiteralsDetMatch = $false
     $implModel = $abModel
@@ -654,9 +663,6 @@ while ($true) {
         $fixedLiteralsDetMatch = ($task.promptContext.PSObject.Properties['file'] -and $task.promptContext.file -is [string] -and $task.promptContext.file -ne '' -and
                                   $task.promptContext.PSObject.Properties['find'] -and $task.promptContext.find -is [string] -and $task.promptContext.find -ne '' -and
                                   $fl.Count -eq 1 -and $fl[0].PSObject.Properties['content'] -and $fl[0].content -is [string] -and $fl[0].content -ne '')
-        if (-not $fixedLiteralsDetMatch) {
-            $implModel = 'claude:adhoc-agentic'
-        }
     }
     if ($skipImplement) {
         Write-Host ('arch_import: harness found nothing groundable, skipping implement call: {0}' -f $task.id) -ForegroundColor DarkGray
