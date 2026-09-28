@@ -16,6 +16,11 @@ const {
 function parseProjectSearchFindings(implementResponse) {
   const text = (implementResponse || '').trim();
   if (!text) return [];
+  // HUB0039 2/2: an explicit NO_RESULTS marker (see prompts.js's projectSearchImplementPrompt
+  // zero-findings clause) is a valid terminal output -- treat it as zero findings rather
+  // than letting the block parser stumble over it. Only the FIRST line is checked: a real
+  // finding whose Rationale happens to mention the token must not be dropped wholesale.
+  if (text === 'NO_RESULTS' || /^NO_RESULTS\b/.test(text)) return [];
   const blocks = text.split(/(?=^### PROJECT: )/m).map((b) => b.trim()).filter(Boolean);
   const field = (block, name) => {
     const m = block.match(new RegExp(`^${name}:\\s*(.+)$`, 'mi'));
@@ -41,7 +46,19 @@ function parseProjectSearchFindings(implementResponse) {
 
 function applyProjectSearchFindings({ implementResponse, indexPath }) {
   const findings = parseProjectSearchFindings(implementResponse);
-  if (findings.length === 0) return { skipped: true, reason: 'no findings in implement response -- nothing to apply' };
+  if (findings.length === 0) {
+    // HUB0039 2/2: a zero-result project_search run is a valid terminal outcome (the
+    // prompt's NO_RESULTS clause), not a failure. If the cross-project index does not
+    // exist yet, write a minimal one noting "No results" -- an honest, auditable artifact
+    // for downstream readers instead of a silently missing file. An EXISTING index is
+    // left untouched: zero findings for one query is no reason to wipe prior leads.
+    if (!fs.existsSync(indexPath)) {
+      fs.mkdirSync(path.dirname(indexPath), { recursive: true });
+      writeAtomicSync(indexPath, '# Index\n\nNo results -- the most recent project_search run found nothing usable to add.\n');
+      return { skipped: true, noResults: true, file: indexPath, reason: `No results -- wrote minimal index at ${indexPath}` };
+    }
+    return { skipped: true, noResults: true, reason: 'No results -- index already exists, nothing to add' };
+  }
 
   let indexText = fs.existsSync(indexPath) ? fs.readFileSync(indexPath, 'utf8') : '# Index\n\n| Project | Source | Description | Relevant to | Status |\n|---|---|---|---|---|\n\n## Notes\n';
 
