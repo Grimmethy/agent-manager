@@ -57,6 +57,7 @@ Registration fields added for the last holdouts (each opts a source into one cor
 | `preValidateCitedPaths: true` | `review-task.js` | Prose drafts that cite files/lines as evidence: block a fabricated cited path before any review call (`project_search`, `arch_import`). |
 | `requireCodeShapeInCandidate: true` | `review-task.js` | A draft that is an `### AC-NNN` candidate must show a fenced code block or diff hunk; prose-only verdicts (false positive / uncertain) still pass (`function_length_review`). |
 | `groundedPromptFiles: true` | `needs-clarification-triage.js` bucket L | `promptContext.files` is a verified list of real grounded paths, so a fabricated-file-path near-miss can be auto-repaired against it (`arch_discovery`). |
+| `noAutoRetry: true` | `reject-retry-check.js` | Opts a source out of the blind-redraft-and-retry sweep entirely (2026-09-28) -- a blocked task from this source is left exactly as-is (never auto-requeued for a fresh draft-started cycle, never counted toward `MAX_LOCAL_REJECT_RETRIES`/`exhausted`). For a source whose redraft is a genuine multi-minute plan+implement+critique cycle run at batch scale (`wiki_transcript_extract`/`wiki_page_promote`), the operator may prefer "one attempt and done, move to the next item" over spending that time re-attempting one that already failed. |
 
 Known, deliberate exceptions:
 

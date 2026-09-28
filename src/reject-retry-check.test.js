@@ -356,6 +356,38 @@ test('a candidateFulfillment source exhaustion escalation is idempotent across t
   clearRegistry();
 });
 
+test('a noAutoRetry source\'s review-rejected task is left exactly as-is, never requeued', () => {
+  clearRegistry();
+  registerTaskSource('fixture_wiki_transcript_extract', { priority: 90, next: () => null, noAutoRetry: true });
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'wiki-task-1', { source: 'fixture_wiki_transcript_extract', localRejectCount: 0 });
+
+  const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(fs.existsSync(path.join(blockedDir, 'wiki-task-1.json')), 'left in blocked/, not requeued');
+  assert.ok(!fs.existsSync(path.join(pendingDir, 'wiki-task-1.json')));
+  const untouched = JSON.parse(fs.readFileSync(path.join(blockedDir, 'wiki-task-1.json'), 'utf8'));
+  assert.equal(untouched.localRejectCount, 0, 'not even the reject count is bumped -- this sweep never touched it');
+  clearRegistry();
+});
+
+test('a noAutoRetry source at the retry cap is still just left in blocked/, never escalated to needs-clarification either', () => {
+  clearRegistry();
+  registerTaskSource('fixture_wiki_transcript_extract', { priority: 90, next: () => null, noAutoRetry: true });
+  const d = setupAdhocDirs();
+  writeBlockedTask(d.blockedDir, 'wiki-task-2', { source: 'fixture_wiki_transcript_extract', localRejectCount: 2 });
+
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.equal(summary.exhausted, 0);
+  assert.ok(fs.existsSync(path.join(d.blockedDir, 'wiki-task-2.json')));
+  assert.ok(!fs.existsSync(path.join(d.needsClarificationDir, 'wiki-task-2.json')));
+  clearRegistry();
+});
+
 // 2026-09-19 (ghost-in-the-machine retroactive audit, sibling finding to bd-1789702787675
 // above): the advisoryProse "_review" TRIAGE-stage siblings of the "_fix" family
 // (performance_review, function_length_review, observability_review(_digest),
