@@ -10484,3 +10484,267 @@ def api_adhoc_tasks():
 Benefits:
 The route body drops from ~60 lines to ~15, making the control flow (which directories are scanned, in what order, with what filter) scannable at a glance. The single `_collect_adhoc_rows` helper is trivially unit-testable in isolation—feed it a temp directory tree and assert the returned rows—without spinning up the Flask app. Future changes to the adhoc predicate, the row shape, or the glob pattern are made in exactly one place, eliminating the three-site duplication hazard. Reviewers can verify correctness of the traversal logic once rather than diffing three near-identical blocks.
 
+
+### AC-193 · Decompose renderModelsTab into single-purpose builders
+Strength: Strong
+Files: python/dashboard/static/js/analytics-and-discovery.js
+Snippet:
+```
+async function renderModelsTab() {
+  // Every fetch this tab needs -- including the benchmark panel's -- happens up front, in
+  // parallel, BEFORE any DOM write (2026-08-19, Grimmethy: "I refreshed and my screen
+  // still flashes"). The previous version wrote an EMPTY '<div id="benchmark-panel">'
+  // placeholder first and only populated it after its own separate await chain resolved
+  // (which itself wrote an empty '#benchmark-results' placeholder, populated by a THIRD
+  // await) -- a real collapse-then-expand on every single 5s background refresh, not just
+  // a scroll-offset problem (the earlier scrollY save/restore fix only corrected the
+  // FINAL position after that flash had already been visible). Fetching everything first
+  // and writing main.innerHTML exactly once eliminates the intermediate empty states
+  // entirely, so there is nothing left to flash.
+  const [models, usageRows, costSummary, settingsPanel, usagePanel, benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
+    fetchJson('/api/models'),
+    fetchJson('/api/models/usage'),
+    fetchJson('/api/models/cost-summary'),
+    renderClaudeSettingsPanel(),
+    renderClaudeUsagePanel(),
+    benchmarkModelsCache || fetchJson('/api/benchmark/models').then(r => { benchmarkModelsCache = r.ollamaModels || []; return benchmarkModelsCache; }),
+    benchmarkCasesCache || fetchJson('/api/benchmark/cases').then(r => { benchmarkCasesCache = r; return r; }),
+    fetchJson('/api/benchmark/status'),
+    fetchJson('/api/benchmark/runs'),
+  ]);
+  if (benchmarkSelectedModels.size === 0 && benchmarkSelectedCases.size === 0) {
+    benchModels.forEach(m => benchmarkSelectedModels.add(m));
+    benchCases.forEach(c => benchmarkSelectedCases.add(c.id));
+  }
+  // Default to the combined view across every saved run (2026-08-24, Grimmethy: "results
+  // should default to All Runs (combined)") -- was defaulting to just the single most
+  // recent run, which is also why the radar chart (aggregate-only per the same request
+  // earlier today) wasn't visible without a manual dropdown click.
+  const viewingRunId = benchmarkViewingRunId || (benchRuns.length > 0 ? BENCHMARK_ALL_RUNS_ID : null);
+  const benchResultsHtml = await buildBenchmarkResultsHtml(viewingRunId, benchRuns);
+  const benchmarkPanelHtml = buildBenchmarkPanelHtml(benchModels, benchCases, benchStatus, benchRuns, viewingRunId, benchResultsHtml);
+
+  const main = document.getElementById('main');
+
+  const sorted = models.slice().sort((a, b) => {
+    const av = a[modelsSortKey], bv = b[modelsSortKey];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;   // nulls last regardless of direction
+    if (bv == null) return -1;
+    if (av < bv) return modelsSortDir === 'asc' ? -1 : 1;
+    if (av > bv) return modelsSortDir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0), 0);
+  const maxTokS = Math.max(...models.map(m => m.avgTokensPerSec ?? 0), 0);
+
+  const headCells = MODELS_COLUMNS.map(col => {
+    if (!col.sortable) return `<th>${col.label}</th>`;
+    const arrow = modelsSortKey === col.key ? (modelsSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="sortable" data-key="${col.key}">${col.label}${arrow}</th>`;
+  }).join('');
+
+  const rows = sorted.map((m, i) => `
+    <tr class="${i === 0 ? 'top-row' : ''}">
+      <td>${m.model}</td>
+      <td>${m.callCount}</td>
+      <td>${renderBarCell(m.approveRate, maxApprove, 'ok', fmtPct)}</td>
+      <td>${renderBarCell(m.avgTokensPerSec, maxTokS, 'accent', (v) => fmtNum(v, 1))}</td>
+      <td>${fmtNum(m.minTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.maxTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.avgLatencyMs, 0)}</td>
+      <td>${m.degenerateCount}</td>
+      <td>${m.errorCount}</td>
+      <td>${fmtUsd(m.totalCostUsd)}</td>
+    </tr>
+  `).join('');
+
+  const implementTable = models.length === 0
+    ? '<div class="empty">No implement-pass stats yet -- set AGENT_MANAGER_CLAUDE_SOURCES or ORNITH_AB_MODELS to compare candidates.</div>'
+    : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+
+  // Estimated Anthropic API Cost (2026-08-23, Grimmethy: "Do we have any way of knowing
+  // how much these tasks would cost using anthropic API?") -- claude-client.js's call()
+  // has always computed a real per-call cost estimate (Claude Code CLI's own
+  // total_cost_usd, against real Anthropic API pricing) but nothing stored or surfaced
+  // it until now. Explicitly labeled "estimate, not a bill" -- every real call here runs
+  // under a Claude subscription, never pay-per-token, so this is what the SAME work
+  // would have cost on the API, not what was actually charged.
+  const mostRecentDay = costSummary.byDay && costSummary.byDay[0] ? costSummary.byDay[0] : null;
+  // hypothetical (2026-08-23, Grimmethy: "Clarification on the anthropic costs. I'd like
+  // estimates for if we had used the API. Even if we used the local models.") -- unlike
+  // totalCostUsd above (real spend, only real Claude calls contribute), this covers
+  // EVERY call, local ones included (a token-based estimate via anthropic-pricing.js for
+  // those) -- see api_models_cost_summary's own docstring.
+  const hyp = costSummary.hypothetical || { totalCostUsd: 0, totalCalls: 0 };
+  const costWidget = `
+    <div class="grill-session" style="margin-bottom:16px">
+      <div class="field-label">Estimated Anthropic API Cost</div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What every recorded Claude call would have cost on real Anthropic API pricing -- these calls actually ran under a subscription, never billed per-token. An estimate of avoided/equivalent cost, not a bill."><strong>${fmtUsd(costSummary.totalCostUsd)}</strong>real spend (all time)</div>
+        <div class="stat"><strong>${costSummary.callsWithCost}</strong>Claude calls</div>
+        <div class="stat" title="Local Ollama calls -- genuinely free, not just unbilled."><strong>${costSummary.freeCalls}</strong>free (local) calls</div>
+        ${mostRecentDay ? `<div class="stat"><strong>${fmtUsd(mostRecentDay.totalCost)}</strong>${escapeHtml(mostRecentDay.day)} (${mostRecentDay.calls} call(s))</div>` : ''}
+      </div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What EVERY call this pipeline has ever made -- including the ones that ran locally, free -- would have cost had it gone through the Anthropic API instead. Real Claude calls use their real cost; local calls are a token-based estimate."><strong>${fmtUsd(hyp.totalCostUsd)}</strong>if every call had used the API (${hyp.totalCalls} call(s))</div>
+      </div>
+    </div>`;
+
+  const usageTableRows = usageRows.map(r => `
+    <tr>
+      <td>${escapeHtml(r.model)}</td>
+      <td>${escapeHtml(r.stage)}</td>
+      <td>${r.callCount}</td>
+      <td>${fmtNum(r.avgLatencyMs, 0)}</td>
+      <td>${r.lastUsedAt ? new Date(r.lastUsedAt).toLocaleString() : ''}</td>
+    </tr>
+  `).join('');
+  const usageTable = usageRows.length === 0 ? '' : `
+    <div class="field-label" style="margin-top:20px">All Calls (every stage, both providers)</div>
+    <table><thead><tr><th>Model</th><th>Stage</th><th>Calls</th><th>Avg Latency (ms)</th><th>Last Used</th></tr></thead>
+    <tbody>${usageTableRows}</tbody></table>`;
+
+  // Scroll-position preservation on top of the single-write fix above: the generic 5s
+  // refresh() cycle (see its own comment near setInterval(refresh, 5000)) still re-renders
+  // this whole tab on a timer regardless of what the user is doing on it, so restoring
+  // window.scrollY keeps their reading position stable across a background refresh they
+  // didn't ask for, even though the write itself no longer has an empty intermediate state.
+  const scrollY = window.scrollY;
+  main.innerHTML = settingsPanel + usagePanel + costWidget + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable
+    + benchmarkPanelHtml;
+  wireClaudeSettingsPanel();
+  main.querySelectorAll('th.sortable').forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      modelsSortDir = (modelsSortKey === key && modelsSortDir === 'desc') ? 'asc' : 'desc';
+      modelsSortKey = key;
+      renderModelsTab();
+    };
+  });
+  wireBenchmarkPanel(benchModels, benchCases);
+  window.scrollTo(0, scrollY);
+}
+```
+
+Problem:
+The 136-line renderModelsTab interleaves five distinct responsibilities—parallel fetch with default-selection, model-table construction (null-aware sort comparator + column-driven header loop + row rendering + empty-state), a two-concept cost widget (real-spend vs. hypothetical-API with independent null-guards), an independent usage table with its own data shape and empty-state branch, and DOM write with click-handler wiring that mutates module-level sort state. Each block has its own internal branching and edge cases, so a change to the cost widget's `mostRecentDay` guard or the comparator's tie-breaker forces a reader to re-scan the entire function to confirm no other block was disturbed, and none of the five concerns can be unit-tested in isolation without mocking the other four.
+
+Solution:
+Extract four single-purpose pure builders (`sortModels`, `buildModelsTable`, `buildCostWidget`, `buildUsageTable`) and one side-effect isolator (`wireModelsTabEvents`), leaving `renderModelsTab` as a ~30-line linear "fetch → assemble → write → wire" orchestrator with no internal branching of its own. The concrete shape of the extracted code:
+
+```js
+function sortModels(models) {
+  const key = modelsSortKey, dir = modelsSortDir;
+  return models.slice().sort((a, b) => {
+    const av = a[key], bv = b[key];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    if (av < bv) return dir === 'asc' ? -1 : 1;
+    if (av > bv) return dir === 'asc' ? 1 : -1;
+    return 0;
+  });
+}
+
+function buildModelsTable(models) {
+  const sorted = sortModels(models);
+  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0), 0);
+  const maxTokS    = Math.max(...models.map(m => m.avgTokensPerSec ?? 0), 0);
+  const headCells = MODELS_COLUMNS.map(col => {
+    if (!col.sortable) return `<th>${col.label}</th>`;
+    const arrow = modelsSortKey === col.key
+      ? (modelsSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="sortable" data-key="${col.key}">${col.label}${arrow}</th>`;
+  }).join('');
+  const rows = sorted.map((m, i) => `
+    <tr class="${i === 0 ? 'top-row' : ''}">
+      <td>${m.model}</td><td>${m.callCount}</td>
+      <td>${renderBarCell(m.approveRate, maxApprove, 'ok', fmtPct)}</td>
+      <td>${renderBarCell(m.avgTokensPerSec, maxTokS, 'accent', v => fmtNum(v, 1))}</td>
+      <td>${fmtNum(m.minTokensPerSec, 1)}</td><td>${fmtNum(m.maxTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.avgLatencyMs, 0)}</td><td>${m.degenerateCount}</td>
+      <td>${m.errorCount}</td><td>${fmtUsd(m.totalCostUsd)}</td>
+    </tr>`).join('');
+  return models.length === 0
+    ? '<div class="empty">No implement-pass stats yet.</div>'
+    : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function buildCostWidget(cs) {
+  const day = cs.byDay?.[0] ?? null;
+  const hyp = cs.hypothetical || { totalCostUsd: 0, totalCalls: 0 };
+  return `<div class="grill-session" style="margin-bottom:16px">
+    <div class="field-label">Estimated Anthropic API Cost</div>
+    <div class="row" style="gap:24px;margin-top:6px">
+      <div class="stat"><strong>${fmtUsd(cs.totalCostUsd)}</strong>real spend</div>
+      <div class="stat"><strong>${cs.callsWithCost}</strong>Claude calls</div>
+      <div class="stat"><strong>${cs.freeCalls}</strong>free (local)</div>
+      ${day ? `<div class="stat"><strong>${fmtUsd(day.totalCost)}</strong>${escapeHtml(day.day)} (${day.calls})</div>` : ''}
+    </div>
+    <div class="row" style="gap:24px;margin-top:6px">
+      <div class="stat"><strong>${fmtUsd(hyp.totalCostUsd)}</strong>if all via API (${hyp.totalCalls})</div>
+    </div>
+  </div>`;
+}
+
+function buildUsageTable(rows) {
+  if (!rows.length) return '';
+  const body = rows.map(r => `<tr><td>${escapeHtml(r.model)}</td><td>${escapeHtml(r.stage)}</td>
+    <td>${r.callCount}</td><td>${fmtNum(r.avgLatencyMs, 0)}</td>
+    <td>${r.lastUsedAt ? new Date(r.lastUsedAt).toLocaleString() : ''}</td></tr>`).join('');
+  return `<div class="field-label" style="margin-top:20px">All Calls</div>
+    <table><thead><tr><th>Model</th><th>Stage</th><th>Calls</th><th>Avg ms</th><th>Last</th></tr></thead>
+    <tbody>${body}</tbody></table>`;
+}
+
+function wireModelsTabEvents(main) {
+  wireClaudeSettingsPanel();
+  main.querySelectorAll('th.sortable').forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      modelsSortDir = (modelsSortKey === key && modelsSortDir === 'desc') ? 'asc' : 'desc';
+      modelsSortKey = key;
+      renderModelsTab();
+    };
+  });
+}
+
+// ── slimmed orchestrator ──────────────────────────────────────────────
+async function renderModelsTab() {
+  const [models, usageRows, costSummary, settingsPanel, usagePanel,
+       benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
+    fetchJson('/api/models'),
+    fetchJson('/api/models/usage'),
+    fetchJson('/api/models/cost-summary'),
+    renderClaudeSettingsPanel(),
+    renderClaudeUsagePanel(),
+    benchmarkModelsCache || fetchJson('/api/benchmark/models').then(r => { benchmarkModelsCache = r.ollamaModels || []; return benchmarkModelsCache; }),
+    benchmarkCasesCache  || fetchJson('/api/benchmark/cases').then(r => { benchmarkCasesCache = r; return r; }),
+    fetchJson('/api/benchmark/status'),
+    fetchJson('/api/benchmark/runs'),
+  ]);
+  if (benchmarkSelectedModels.size === 0 && benchmarkSelectedCases.size === 0) {
+    benchModels.forEach(m => benchmarkSelectedModels.add(m));
+    benchCases.forEach(c => benchmarkSelectedCases.add(c.id));
+  }
+  const viewingRunId = benchmarkViewingRunId || (benchRuns.length > 0 ? BENCHMARK_ALL_RUNS_ID : null);
+  const benchResultsHtml = await buildBenchmarkResultsHtml(viewingRunId, benchRuns);
+  const benchmarkPanelHtml = buildBenchmarkPanelHtml(benchModels, benchCases, benchStatus, benchRuns, viewingRunId, benchResultsHtml);
+  const main = document.getElementById('main');
+  const scrollY = window.scrollY;
+  main.innerHTML = settingsPanel + usagePanel
+    + buildCostWidget(costSummary)
+    + '<div class="field-label">Implement-Pass Quality</div>'
+    + buildModelsTable(models)
+    + buildUsageTable(usageRows)
+    + benchmarkPanelHtml;
+  wireModelsTabEvents(main);
+  wireBenchmarkPanel(benchModels, benchCases);
+  window.scrollTo(0, scrollY);
+}
+```
+
+Benefits:
+Each extracted helper is 10–30 lines, single-purpose, and independently unit-testable: the sort comparator against fixture arrays, the cost-widget HTML against a mock `costSummary` object, the usage-table empty-state branch in isolation. The orchestrator drops to ~30 lines of linear pipeline with no internal branching, so a reviewer can verify the fetch/assemble/write sequence in one pass without tracking interleaved template literals. Future changes to pricing fields, sort columns, or event wiring touch only the relevant helper without risking accidental breakage in an unrelated block, and the mechanical cut-and-paste nature of the refactor keeps review risk low.
