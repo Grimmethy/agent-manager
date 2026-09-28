@@ -225,6 +225,17 @@ while :; do
     fabricated_path_result="$(node "${PACKAGE_SRC_DIR}/fabricated-path-recheck-sweep.js" 2>>"${HOME_LOGS}/fabricated-path-recheck-sweep.log")"
     printf '[watchdog] fabricated-path-recheck-sweep: %s\n' "$fabricated_path_result" >&2
 
+    # Grounding recheck (2026-09-28): every registered postImplementCheck grounding gate (deep_dive, pipeline_debrief,
+    # function_length_review) stamps reviewInconclusive:true on a block, meant as "a re-roll-worthy gate flake, not a
+    # genuine reviewer REJECT" -- but reject-retry-check.js's own entry gate excludes every reviewInconclusive task, and
+    # fabricated-path-recheck-sweep.js above only covers ONE specific gate. This sweep is source-agnostic: re-runs
+    # whatever postImplementCheck IS registered for a task's own source against its EXISTING implementResponse, releases
+    # straight to approved/ if it now passes, grants one real redraft chance if it does not, and escalates (or, for
+    # pipeline_debrief/pipeline_forensics, marks exhausted in place) on a second failure. Kill switch
+    # AGENT_MANAGER_GROUNDING_RECHECK=false. See grounding-recheck-sweep.js.
+    grounding_recheck_result="$(node "${PACKAGE_SRC_DIR}/grounding-recheck-sweep.js" 2>>"${HOME_LOGS}/grounding-recheck-sweep.log")"
+    printf '[watchdog] grounding-recheck-sweep: %s\n' "$grounding_recheck_result" >&2
+
     # Expiry sweep (2026-09-24, change_review flood): retires a QUEUED task whose subject went stale while it waited, for any source that
     # declares an `expiry` hook on its registration (change_review: a review of a commit older than its recency window). Source-agnostic --
     # core names no plugin source. archive -> done/_archived_no_action/ stamped terminalDisposition 'aged-out'; a task already holding an
