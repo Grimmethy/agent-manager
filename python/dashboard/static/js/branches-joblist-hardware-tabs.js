@@ -348,6 +348,7 @@ async function renderBranchDetailModal(b) {
 
 async function renderJobListTab() {
   const main = document.getElementById('main');
+  const isStale = renderStaleCheck();
   let jobTypes;
   try {
     jobTypes = await fetchJson('/api/job-types');
@@ -601,6 +602,7 @@ async function renderJobListTab() {
     </div>
   ` : '';
 
+  if (isStale()) return;
   main.innerHTML = `<div style="margin-bottom:10px"><button id="reset-job-type-counts" class="secondary">Reset counts</button></div>`
     + backboneHtml
     + `<table><thead><tr><th>Active</th><th>Priority</th><th>Approval Mode</th><th>Worker Type</th><th>Source</th><th>Domain</th><th>Behavior</th><th>Live (in-flight)</th><th title="Min / Avg / Max turnsUsed across every recorded runPlanWithTools() call for this source">Turns (min/avg/max)</th><th>Times Performed</th><th>Available</th><th>Description</th></tr></thead><tbody>${rows}</tbody></table>`
@@ -855,10 +857,12 @@ function renderWatchConfigChecklist(watchConfig) {
 
 async function renderHardwareTab() {
   const main = document.getElementById('main');
+  const isStale = renderStaleCheck();
   const [data, watchConfig] = await Promise.all([
     fetchJson('/api/hardware/stats'),
     fetchJson('/api/hardware/watch-config').catch(() => ({})),
   ]);
+  if (isStale()) return;
   // Hardware is a swappable plugin slot (2026-09-05) -- "available: false" means no
   // plugin is currently active/running for it, distinct from a plugin running but
   // still warming up its first sample (which instead shows normally with nulls/no
@@ -989,6 +993,7 @@ async function renderHardwareTab() {
 }
 
 async function renderMain() {
+  bumpRenderGeneration(); // supersedes any older in-flight render; renderers check renderStaleCheck() before writing
   try {
     // Plugin-owned tab dispatch runs FIRST, ahead of every hardcoded branch below --
     // including the 'promptforge' one. Without this, a plugin's `tab.replaces` never
@@ -1029,7 +1034,14 @@ async function renderMain() {
   }
 }
 
-async function refresh() {
+// 5s poll entry point: skipped while the previous cycle is still running (see
+// runRefreshGuarded in core-ui.js) so a slow server can't stack concurrent cycles. The cycle
+// AWAITS its renderMain() on purpose: if it didn't, the guard would only span the fetches, the
+// next poll's renderMain() would bump the render generation before this one finished, and a
+// tab whose render takes longer than 5s would be superseded every time and never paint.
+function refresh() { return runRefreshGuarded(refreshCycle); }
+
+async function refreshCycle() {
   try {
     counts = await fetchJson('/api/summary');
     document.getElementById('pipeline-status').textContent = 'connected';
@@ -1065,7 +1077,7 @@ async function refresh() {
   // request before the last one had even resolved, and replacing the whole list with a
   // "timed out" error on every miss. enterBranchesTab()/leaveBranchesTab() now run
   // their own 15s poll that diffs in new/removed branches instead of rebuilding.
-  if (!['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'].includes(activeTab)) renderMain();
+  if (!['project', 'brain-dump', 'filed', 'hygiene', 'promptforge', 'adforge', 'scriptforge', 'concepts', 'branches'].includes(activeTab)) await renderMain();
 }
 
 function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
