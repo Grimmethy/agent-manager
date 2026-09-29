@@ -35,6 +35,7 @@ const CONTRACT = {
   './apply-adhoc-diff.js': { functions: ['queueSubTasks', 'applyAdhocDiff'] },
   './candidate-split-hub-route.js': { functions: ['setCandidateSplitHubFiler', 'getCandidateSplitHubFiler'] },
   './wiki-content-apply-route.js': { functions: ['setWikiContentApply', 'getWikiContentApply'] },
+  './domain-apply-route.js': { functions: ['registerDomainApply', 'getDomainApply', 'clearDomainApplyRegistry'] },
   './decompose-pass-route.js': { functions: ['setDecomposePassRunner', 'getDecomposePassRunner', 'runDecomposePassIfAvailable'] },
   './apply-branch-prep-route.js': { functions: ['setApplyBranchPrep', 'getApplyBranchPrep', 'prepareApplyBranch'] },
   './split-coverage-judging-route.js': { functions: ['setSplitCoverageJudging', 'getSplitCoverageJudging', 'originalAskInjectionLines', 'coverageGuidanceOverride', 'completenessQuestionOverride'] },
