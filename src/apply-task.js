@@ -15,6 +15,7 @@ const fs = require('fs');
 const { getHubApplyRouting } = require('./hub-apply-routing.js');
 const { getApplyBranchPrep } = require('./apply-branch-prep-route.js');
 const { getWikiContentApply } = require('./wiki-content-apply-route.js');
+const { getDomainApply } = require('./domain-apply-route.js');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
@@ -271,6 +272,17 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       const result = applyWikiContent({ task });
       if (result.skipped) return { succeeded: true, doneMarker: result.reason };
       return { succeeded: true, doneMarker: `wiki content filed -> ${result.file}` };
+    }
+
+    // Any other plugin-owned non-git domain registers its apply through the generic seam
+    // (domain-apply-route.js) instead of needing its own block here. Same reason as every
+    // non-git domain above: falling through would run the git-branch-diff flow, which
+    // fetches/resets/branches the tracked repo for a task that never touches it.
+    const pluginDomainApply = getDomainApply(task.domain);
+    if (pluginDomainApply) {
+      const result = pluginDomainApply({ task }) || {};
+      if (result.skipped) return { succeeded: true, doneMarker: result.reason };
+      return { succeeded: true, doneMarker: result.doneMarker || `${task.domain} applied -> ${result.file}` };
     }
 
     // Non-secondbrain: git-branch-diff flow. Order matters -- fetch/reset/branch FIRST,
