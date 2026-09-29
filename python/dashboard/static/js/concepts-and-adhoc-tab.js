@@ -1,13 +1,16 @@
 async function renderAdhocTasksTab() {
   const main = document.getElementById('main');
+  const isStale = renderStaleCheck();
   let tasks;
   try {
     const resp = await fetchJson('/api/adhoc-tasks');
     tasks = resp.tasks;
   } catch (e) {
+    if (isStale()) return;
     main.innerHTML = `<div class="empty">Error loading adhoc tasks: ${e.message}</div>`;
     return;
   }
+  if (isStale()) return;
   if (tasks.length === 0) {
     main.innerHTML = '<div class="empty">No adhoc tasks right now.</div>';
     return;

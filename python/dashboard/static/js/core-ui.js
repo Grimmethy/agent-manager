@@ -85,6 +85,38 @@ async function fetchJson(url, { timeoutMs = 8000 } = {}) {
   return r.json();
 }
 
+// Stale-render guard (2026-09-29, "display stutters and switches to the wrong tab"): every
+// tab renderer awaits a fetch and THEN writes #main, and nothing tied that late write to
+// the tab active when it lands -- with server calls taking 8-28s under disk contention, a
+// poll-triggered render for tab A routinely finished after the user had clicked tab B and
+// painted A over it. renderGeneration is bumped whenever a newer render supersedes older
+// ones (renderMain entry, switchToTab); a renderer takes renderStaleCheck() at entry and
+// returns instead of writing if the generation has moved on. Capture-only (no bump) on
+// purpose: renderMain already bumped for THIS render, and a renderer bumping again would
+// invalidate its own caller.
+let renderGeneration = 0;
+function bumpRenderGeneration() { renderGeneration += 1; }
+function renderStaleCheck() {
+  const gen = renderGeneration;
+  return () => gen !== renderGeneration;
+}
+
+// In-flight guard for the 5s refresh() poll: setInterval fires regardless of whether the
+// last cycle finished, so a slow server stacked N concurrent cycles, each rebuilding #main.
+// A cycle older than maxMs no longer blocks, so one hung request can't wedge polling forever
+// (fetchJson's own 8s timeout bounds each request; a cycle is a few of them).
+let refreshRunningSince = 0;
+async function runRefreshGuarded(fn, { now = Date.now, maxMs = 30000 } = {}) {
+  if (refreshRunningSince && now() - refreshRunningSince < maxMs) return;
+  refreshRunningSince = now();
+  try {
+    await fn();
+  } finally {
+    refreshRunningSince = 0;
+  }
+}
+function _resetRenderStateForTest() { renderGeneration = 0; refreshRunningSince = 0; }
+
 function severityForTab(tabKey, count) {
   const thresholds = TAB_COUNT_SEVERITY_THRESHOLDS[tabKey];
   if (!thresholds || typeof count !== 'number') return null;
@@ -104,6 +136,7 @@ function switchToTab(key) {
   if (activeTab === 'brain-dump' && key !== 'brain-dump') leaveBrainDumpTab();
   if (activeTab === 'branches' && key !== 'branches') leaveBranchesTab();
   if (activeTab === 'hygiene' && key !== 'hygiene') leaveHygieneTab();
+  bumpRenderGeneration(); // any in-flight render for the tab being left is now stale
   activeTab = key;
   renderNav();
   if (key === 'project') enterProjectTab();
@@ -576,6 +609,7 @@ async function refreshNewestCompletedTasks() {
 // === true) is skipped, and only when focus is currently inside one of this tab's own
 // selects, i.e. the operator is actively mid-choice. The next 5s tick tries again.
 async function renderWorkers(isPoll) {
+  const isStale = renderStaleCheck();
   if (isPoll) {
     const active = document.activeElement;
     if (active && (active.classList.contains('worker-type-select') || active.classList.contains('worker-task-select'))) {
@@ -656,6 +690,7 @@ async function renderWorkers(isPoll) {
     </div>
   `;
   const shown = instances;
+  if (isStale()) return;
   if (instances.length === 0) { main.innerHTML = '<div class="empty">No instances found -- is the pipeline running?</div>'; return; }
   // Preserve scroll position across the full innerHTML replace below -- same isPoll
   // "don't yank state out from under the operator" reasoning as the dropdown guard
@@ -1292,6 +1327,7 @@ function hubProgressChip(t) {
 }
 
 async function renderQueueTab(state) {
+  const isStale = renderStaleCheck();
   if (!queueLoadedCount[state]) queueLoadedCount[state] = QUEUE_PAGE_SIZE;
   queueLoadInFlight = true;
   const sourceFilter = queueSourceFilter[state] || '';
@@ -1326,6 +1362,7 @@ async function renderQueueTab(state) {
     : '';
   const filterHtml = `<div class="row" style="margin-bottom:10px"><label class="meta">Task type: <select id="queue-source-filter">${filterOptionsHtml}</select></label>${hubSortHtml}</div>`;
 
+  if (isStale()) return;
   if (tasks.length === 0) {
     main.innerHTML = filterHtml + `<div class="empty">${sourceFilter ? `No "${escapeHtml(sourceFilter)}" tasks here.` : 'Nothing here.'}</div>`;
     wireQueueSourceFilter(state);
@@ -1485,6 +1522,7 @@ async function renderQueueTab(state) {
   const actionHeader = (showArchiveRequeue || showArchiveOnly || showConfirmDeny || showApply) ? '<th>Actions</th>' : '';
   const footer = `<div class="meta" style="padding:10px 4px">Showing ${tasks.length} of ${total}${queueHasMore[state] ? ' -- scroll for more' : ''}</div>`
     + (state === 'needs-clarification' ? '<div class="meta" style="padding:0 4px">Click a row to pick a file path, answer an open design question, or Discuss -- then send it back to drafting.</div>' : '');
+  if (isStale()) return;
   main.innerHTML = filterHtml + `<table><thead><tr><th>ID</th><th>Title</th><th>Domain/Source</th><th>Detail</th>${actionHeader}</tr></thead><tbody>${rows}</tbody></table>${footer}`;
   wireQueueSourceFilter(state);
   wireHubSort(state);
@@ -1867,4 +1905,4 @@ function pipelineFlagBadges(s) {
 // (`module` is undefined there, so this is a no-op in production) -- the guard exists
 // solely so safeSourceNames is requireable from a Node test, the first test coverage
 // this file has ever had.
-if (typeof module !== 'undefined') module.exports = { safeSourceNames };
+if (typeof module !== 'undefined') module.exports = { safeSourceNames, bumpRenderGeneration, renderStaleCheck, runRefreshGuarded, _resetRenderStateForTest };
