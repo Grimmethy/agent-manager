@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import os
 import string
+import threading
+import time
 
 # The app.py helpers these views call (BRAIN_DUMP_NEEDS_ATTENTION_STATES, QUEUE_STATES, _NEEDS_CLARIFICATION_REASON_TEXT, _adhoc_task_excerpt, _brain_dump_entries_with_task_status, _brain_dump_needs_attention_count, _fire_alert_webhook, _is_real_ship, _scan_recently_completed_tasks, alerts_path, list_unmerged_branches, logger, queue_dir, read_json_safe, read_project_history, task_summary) are
 # imported lazily inside each view: app.py imports THIS module to register the
@@ -393,10 +395,39 @@ def api_adhoc_tasks():
     return jsonify({"tasks": tasks})
 
 
-@shared_misc_bp.route("/api/summary")
-def api_summary():
-    from app import QUEUE_STATES, _brain_dump_entries_with_task_status, _brain_dump_needs_attention_count, _is_real_ship, list_unmerged_branches, queue_dir, read_json_safe
-    qdir = queue_dir()
+# /api/summary is polled every 5s per open browser tab and used to json-parse every record in
+# queue/done/ (~2,400 files, ~180KB each) plus every adhoc-candidate record on EVERY poll,
+# just to split doneShipped from doneNoop and count adhoc tasks. On the spinning media
+# drive, with ollama reloading a model from it, that took 28s live (2026-09-29): polls piled
+# up and the header read "disconnected". Three layers fix it: a per-record verdict cache
+# keyed by (path, mtime_ns, size) so a poll stats files instead of re-parsing them, a short
+# TTL cache of the whole payload, and single-flight -- one recompute at a time, with any
+# overlapping caller served the last good payload flagged "stale": true instead of stacking.
+_SUMMARY_TTL_S = 3.0
+_summary_state = {"entry": None}  # (qdir key, monotonic time, counts) -- one atomic assignment
+_summary_lock = threading.Lock()
+_verdict_cache = {}
+
+
+def _cached_verdict(kind, path, compute, seen):
+    """compute(record-or-None) memoized per (kind, path, mtime_ns, size). A file that vanished
+    between listing and stat yields None. Only ever called under _summary_lock, so pruning
+    via `seen` in _compute_summary_counts cannot race another pass."""
+    from app import read_json_safe
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (kind, str(path), st.st_mtime_ns, st.st_size)
+    seen.add(key)
+    if key not in _verdict_cache:
+        _verdict_cache[key] = bool(compute(read_json_safe(path)))
+    return _verdict_cache[key]
+
+
+def _compute_summary_counts(qdir):
+    from app import QUEUE_STATES, _brain_dump_entries_with_task_status, _brain_dump_needs_attention_count, _is_real_ship, list_unmerged_branches
+    seen = set()
     counts = {s: 0 for s in QUEUE_STATES}
     counts["drafting"] = 0
     # Suppressed entries are hidden from every list view (routes/brain_dump.py) and must not
@@ -427,7 +458,7 @@ def api_summary():
     # (used when the tab is actually open) always forces a fresh fetch instead.
     counts["branches"] = len(list_unmerged_branches(force=False))
     if not qdir:
-        return jsonify(counts)
+        return counts
 
     for state in QUEUE_STATES:
         state_dir = qdir / state
@@ -442,8 +473,7 @@ def api_summary():
     shipped = noop = 0
     if done_dir.is_dir():
         for f in done_dir.glob("*.json"):
-            rec = read_json_safe(f)
-            if isinstance(rec, dict) and _is_real_ship(rec):
+            if _cached_verdict("ship", f, _is_real_ship, seen):
                 shipped += 1
             else:
                 noop += 1
@@ -471,8 +501,7 @@ def api_summary():
             return 0
         n = 0
         for f in dir_path.glob("*.json"):
-            data = read_json_safe(f)
-            if data and is_adhoc_record(data, data.get("id", f.stem)):
+            if _cached_verdict("adhoc", f, lambda data, f=f: data and is_adhoc_record(data, data.get("id", f.stem)), seen):
                 n += 1
         return n
 
@@ -481,12 +510,52 @@ def api_summary():
         + count_adhoc_in(qdir / "adhoc")
     if drafting_root.is_dir():
         for f in drafting_root.rglob("*.json"):
-            data = read_json_safe(f)
-            if data and is_adhoc_record(data, data.get("id", f.stem)):
+            if _cached_verdict("adhoc", f, lambda data, f=f: data and is_adhoc_record(data, data.get("id", f.stem)), seen):
                 adhoc_in_progress += 1
     counts["adhocBlocked"] = adhoc_blocked
     counts["adhocInProgress"] = adhoc_in_progress
-    return jsonify(counts)
+    for k in [k for k in _verdict_cache if k not in seen]:
+        del _verdict_cache[k]
+    return counts
+
+
+@shared_misc_bp.route("/api/summary")
+def api_summary():
+    from app import queue_dir
+    qdir = queue_dir()
+    key = str(qdir) if qdir else None
+
+    def fresh_value():
+        entry = _summary_state["entry"]
+        if entry and entry[0] == key and time.monotonic() - entry[1] < _SUMMARY_TTL_S:
+            return entry[2]
+        return None
+
+    def recompute():
+        value = _compute_summary_counts(qdir)
+        _summary_state["entry"] = (key, time.monotonic(), value)
+        return value
+
+    value = fresh_value()
+    if value is not None:
+        return jsonify(dict(value))
+    if _summary_lock.acquire(blocking=False):
+        try:
+            value = fresh_value()
+            if value is None:
+                value = recompute()
+        finally:
+            _summary_lock.release()
+        return jsonify(dict(value))
+    # Another poll is already recomputing: serve the last good payload for this project
+    # (flagged stale) rather than stacking behind it; only a caller with nothing to serve waits.
+    entry = _summary_state["entry"]
+    if entry and entry[0] == key:
+        return jsonify({**entry[2], "stale": True})
+    with _summary_lock:
+        entry = _summary_state["entry"]
+        value = entry[2] if entry and entry[0] == key else recompute()
+    return jsonify(dict(value))
 
 
 @shared_misc_bp.route("/api/browse")
