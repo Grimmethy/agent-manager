@@ -3798,6 +3798,9 @@ SOURCE_DESCRIPTIONS = {
     "product_spec_section": "BROWNFIELD lane, step 2: drafts one PRODUCT_SPEC_OUTLINE.md section at a time (candidate-fulfillment) into its placeholder block in PRODUCT_SPEC.md, on the local model, grounded by that section's files plus its own harness grep.",
     "backlog_decomposition": "Breaks a product-spec backlog item into AC-NNN candidates in BACKLOG_CANDIDATES.md.",
     "backlog_fulfillment": "Consumes a Strong BACKLOG_CANDIDATES.md entry into a real diff -- same fulfillment logic as arch_review.",
+    "character_interview": "LOW-priority (95) local-model draft for the CharacterForge interview: answers to one blank questionnaire section, or a keyword block / backstory, requested from the CharacterForge tab. Deterministic review (no majority vote); result goes to CharacterForge's jobs/results/. (characterforge plugin; domain character_content.)",
+    "character_interview_premium": "The same CharacterForge interview draft, for a request the user filed with \"premium priority\" (priority 12, just under adhoc). (characterforge plugin; domain character_content.)",
+    "character_autofill": "LOW-priority (95) AUTO mode: fills the blank sections / keywords / backstory of CharacterForge characters flagged autofill, one narrow chained step per task. Output is a proposal in CharacterForge's drafts/ that a human accepts or dismisses; never writes to a character or the vault. (characterforge plugin; domain character_content.)",
 }
 
 
