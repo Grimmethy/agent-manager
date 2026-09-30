@@ -3464,6 +3464,8 @@ def _list_unmerged_branches_uncached():
         })
 
     _annotate_hub_sibling_conflicts(repo_root, branches)
+    import branch_verdicts  # lazy: keeps app.py's import block untouched
+    branch_verdicts.enrich_branches_with_verdicts(queue_dir(), repo_root, branches, _run_git)
     branches.sort(key=lambda b: b["pushedAt"])
     return branches
 
@@ -4569,6 +4571,7 @@ from routes.plugin_proxy import plugin_proxy_bp  # noqa: E402
 from routes.project import project_bp  # noqa: E402
 from routes.task_anywhere_1_more import task_anywhere_1_more_bp  # noqa: E402
 from routes.pipeline_1_more import pipeline_1_more_bp  # noqa: E402
+from routes.branch_verdicts import branch_verdicts_bp  # noqa: E402
 from routes.plugins import plugins_bp  # noqa: E402
 from routes.task import task_bp  # noqa: E402
 from routes.shared_misc import shared_misc_bp  # noqa: E402
@@ -4593,6 +4596,7 @@ app.register_blueprint(plugin_proxy_bp)
 app.register_blueprint(project_bp)
 app.register_blueprint(task_anywhere_1_more_bp)
 app.register_blueprint(pipeline_1_more_bp)
+app.register_blueprint(branch_verdicts_bp)
 app.register_blueprint(plugins_bp)
 app.register_blueprint(task_bp)
 app.register_blueprint(shared_misc_bp)
