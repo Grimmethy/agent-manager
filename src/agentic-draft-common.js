@@ -379,6 +379,75 @@ async function runAgenticDraftInWorktree(task, { runInWorktree, modelLabel, repo
   }
 }
 
+// Early-exit helpers for resolveAgenticDraft's three inline early-exit branches (extracted
+// from its body so each path is independently testable). Each takes the shared context
+// object resolveAgenticDraft builds -- { task, result, worktreeDir, modelLabel,
+// retriedForTurnBudget, summary, meta, bestEffortDiff } -- performs exactly the task
+// mutations the inline code used to, and returns exactly the same verdict shape. Pure
+// mechanical extraction; no behavior change.
+
+/** Early-exit: the result is degenerate (empty/invalid response). */
+function resolveDegenerate(ctx) {
+  const { result, retriedForTurnBudget, meta, bestEffortDiff } = ctx;
+  return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass degenerate: ${result.degenerate}${retriedForTurnBudget ? ' (retried once at a larger turn budget)' : ''}`, ...meta, capturedDiff: bestEffortDiff() };
+}
+
+/** Early-exit: no RESOLUTION line, but runPlanWithTools' forced final no-tools turn produced a forced summary. */
+function resolveNoResolutionForced(ctx) {
+  const { task, result, summary, meta, bestEffortDiff } = ctx;
+  const capturedDiff = bestEffortDiff();
+  const edits = ((result && result.toolCallLog) || [])
+    .filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
+  // The failure class this whole grounding change targets: the model spent its entire
+  // turn budget exploring and never edited a single file (no edit/write calls, empty
+  // worktree). A hardcoded "needs-human-decision" placeholder is neither a real
+  // question nor a retryable state -- record a clean, honest block that
+  // reject-retry-check.js can requeue once with the plan + prior-investigation map.
+  if (edits === 0 && !capturedDiff) {
+    task.turnBudgetExhausted = true;
+    task.retryableDraftBlock = true;
+    // Sticky (survives reject-retry-check's reset of turnBudgetExhausted): a leaf that
+    // has demonstrably blown a full budget with zero edits is NOT confirmed-atomic --
+    // local-agentic-write-draft.js's leafDecomposeLocked() reads this to let it
+    // choose RESOLUTION: decompose on the next pass.
+    task.turnBudgetExhaustedBefore = true;
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: 'Agentic implement pass exhausted its turn budget without making any edits -- likely needs grounding or a smaller scope',
+      ...meta,
+      capturedDiff: undefined,
+    };
+  }
+  // Otherwise the model got somewhere (partial work in the worktree, or the forced
+  // summary produced real content) -- keep the existing human-clarification path.
+  task.adhocResolution = 'needs-human-decision';
+  task.rawDiff = '';
+  task.implementResponse = summary
+    || '(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity for what it had investigated)';
+  // 2026-09-16, pipeline hardening: result.forcedSummaryNonCompliant means the model
+  // ignored runPlanWithTools' own explicit, bounded, twice-repeated demand for a
+  // RESOLUTION: line -- a mechanical gate/model-compliance failure, NOT the same kind
+  // of thing as a genuine RESOLUTION: needs-human-decision the model actually chose.
+  // Confirmed live: this exact shape stranded a task with a fully correct diff already
+  // sitting in its own history behind a human-only queue, twice in a row, because
+  // nothing distinguished "the model declined to decide" from "the model never even
+  // tried to answer the question this turn asked." Stamped here so a future triage
+  // pass (or a human reading the task) can tell the two apart without re-deriving it
+  // from the raw transcript.
+  if (result && result.forcedSummaryNonCompliant) task.forcedSummaryNonCompliant = true;
+  return { succeeded: true, blocked: false, needsClarification: true, ...meta, capturedDiff };
+}
+
+/** Early-exit: no RESOLUTION line and no forced summary -- cannot determine outcome. */
+function resolveNoResolutionUnforced(ctx) {
+  const { retriedForTurnBudget, meta, bestEffortDiff } = ctx;
+  const budgetNote = retriedForTurnBudget
+    ? ' -- ran out of turns twice in a row; a larger budget alone will not fix this'
+    : '';
+  return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}`, ...meta, capturedDiff: bestEffortDiff() };
+}
+
 // Maps a finished agentic result onto `task` (implementResponse, rawDiff, adhocResolution,
 // subTaskProposals, needsClarification) and returns a draftTask-shaped verdict. Provider-
 // neutral: reads only `result.response` / `result.degenerate` and stages the worktree's
@@ -426,8 +495,13 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     }
   };
 
+  // Shared context for the three early-exit helpers (degenerate first, then the two
+  // no-resolution paths) -- see resolveDegenerate / resolveNoResolutionForced /
+  // resolveNoResolutionUnforced above.
+  const ctx = { task, result, worktreeDir, modelLabel, retriedForTurnBudget, summary, meta, bestEffortDiff };
+
   if (result && result.degenerate) {
-    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass degenerate: ${result.degenerate}${retriedForTurnBudget ? ' (retried once at a larger turn budget)' : ''}`, ...meta, capturedDiff: bestEffortDiff() };
+    return resolveDegenerate(ctx);
   }
 
   const resolutionMatch = summary.match(RESOLUTION_RE);
@@ -443,53 +517,9 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     // transcript and whatever partial work landed in the worktree -- the same terminal
     // shape a real RESOLUTION: needs-human-decision produces.
     if (result && result.forcedSummary) {
-      const capturedDiff = bestEffortDiff();
-      const edits = ((result && result.toolCallLog) || [])
-        .filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
-      // The failure class this whole grounding change targets: the model spent its entire
-      // turn budget exploring and never edited a single file (no edit/write calls, empty
-      // worktree). A hardcoded "needs-human-decision" placeholder is neither a real
-      // question nor a retryable state -- record a clean, honest block that
-      // reject-retry-check.js can requeue once with the plan + prior-investigation map.
-      if (edits === 0 && !capturedDiff) {
-        task.turnBudgetExhausted = true;
-        task.retryableDraftBlock = true;
-        // Sticky (survives reject-retry-check's reset of turnBudgetExhausted): a leaf that
-        // has demonstrably blown a full budget with zero edits is NOT confirmed-atomic --
-        // local-agentic-write-draft.js's leafDecomposeLocked() reads this to let it
-        // choose RESOLUTION: decompose on the next pass.
-        task.turnBudgetExhaustedBefore = true;
-        return {
-          succeeded: true,
-          blocked: true,
-          blockedReason: 'Agentic implement pass exhausted its turn budget without making any edits -- likely needs grounding or a smaller scope',
-          ...meta,
-          capturedDiff: undefined,
-        };
-      }
-      // Otherwise the model got somewhere (partial work in the worktree, or the forced
-      // summary produced real content) -- keep the existing human-clarification path.
-      task.adhocResolution = 'needs-human-decision';
-      task.rawDiff = '';
-      task.implementResponse = summary
-        || '(the agentic implement pass ran out of turns before reaching a conclusion; see its recorded tool activity for what it had investigated)';
-      // 2026-09-16, pipeline hardening: result.forcedSummaryNonCompliant means the model
-      // ignored runPlanWithTools' own explicit, bounded, twice-repeated demand for a
-      // RESOLUTION: line -- a mechanical gate/model-compliance failure, NOT the same kind
-      // of thing as a genuine RESOLUTION: needs-human-decision the model actually chose.
-      // Confirmed live: this exact shape stranded a task with a fully correct diff already
-      // sitting in its own history behind a human-only queue, twice in a row, because
-      // nothing distinguished "the model declined to decide" from "the model never even
-      // tried to answer the question this turn asked." Stamped here so a future triage
-      // pass (or a human reading the task) can tell the two apart without re-deriving it
-      // from the raw transcript.
-      if (result && result.forcedSummaryNonCompliant) task.forcedSummaryNonCompliant = true;
-      return { succeeded: true, blocked: false, needsClarification: true, ...meta, capturedDiff };
+      return resolveNoResolutionForced(ctx);
     }
-    const budgetNote = retriedForTurnBudget
-      ? ' -- ran out of turns twice in a row; a larger budget alone will not fix this'
-      : '';
-    return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}`, ...meta, capturedDiff: bestEffortDiff() };
+    return resolveNoResolutionUnforced(ctx);
   }
 
   if (resolution === 'decompose') {
