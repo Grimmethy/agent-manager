@@ -8,7 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths } = require('./review-verify.js');
+const { verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback } = require('./review-verify.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 
 const DIFF = 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/src/a.test.js b/src/a.test.js\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.test.js\n@@ -0,0 +1 @@\n+z\n';
@@ -232,5 +232,98 @@ test('integration: the sandbox contains the diff\'s own tests -- a test that wri
       acceptanceResults: AR('`node --test src/add.test.js`') });
     assert.equal(fs.existsSync(target), false, 'the main checkout must not be writable from inside the sandbox');
     assert.ok(['passed', 'failed', 'inconclusive'].includes(r.status));
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// --- covering tests by changed symbol (python/dashboard has no <name>.test.js / test_<name>.py convention) ---------
+test('extractChangedSymbols reads added/removed declarations and the function named in a hunk header', () => {
+  const diff = [
+    'diff --git a/python/dashboard/app.py b/python/dashboard/app.py', '--- a/python/dashboard/app.py', '+++ b/python/dashboard/app.py',
+    '@@ -10,3 +10,4 @@ def _existing_helper(x):', ' unchanged', '+    y = 1',
+    '@@ -40,2 +41,9 @@', '+def _build_pipeline_env(raw_path):', '+    return {}', '-async function oldJsThing(a) {',
+    '+const arrowHelper = async (a, b) => a + b;', '+class WidgetRegistry:', '+def run():', '+function main() {',
+    '+def _build_pipeline_env(again):',
+    '@@ -90,2 +99,2 @@', ' def context_only_function():', '-    return 1', '+    return 2',
+  ].join('\n');
+  assert.deepEqual(extractChangedSymbols(diff).sort(), ['WidgetRegistry', '_build_pipeline_env', '_existing_helper', 'arrowHelper', 'context_only_function', 'oldJsThing'].sort());
+  assert.deepEqual(extractChangedSymbols(''), []);
+  assert.deepEqual(extractChangedSymbols('+++ b/x.py\n--- a/x.py\n'), []);
+});
+
+function makeDashTree() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-verify-sym-'));
+  const w = (rel, text) => { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), text); };
+  w('python/dashboard/app.py', 'def _build_pipeline_env():\n    return 1\n');
+  w('python/dashboard/routes/x.py', 'def api_thing():\n    return 1\n');
+  w('python/dashboard/test_alpha.py', 'from app import _build_pipeline_env\n_build_pipeline_env()\n');
+  w('python/dashboard/test_beta.py', '_build_pipeline_env_extra()\nxx_build_pipeline_env()\n');   // only look-alikes: must NOT match
+  w('python/dashboard/test_gamma.py', 'unrelated()\n');
+  w('python/dashboard/test_delta.py', '_build_pipeline_env()\n');
+  w('python/dashboard/test_zeta.py', '_build_pipeline_env()\napi_thing()\n');   // mentions BOTH symbols but sorts last alphabetically
+  return root;
+}
+
+test('findSymbolCoveringTests matches whole identifiers only, ranks by distinct symbols, and looks in the file\'s directory and its parent', () => {
+  const root = makeDashTree();
+  try {
+    let r = findSymbolCoveringTests(root, ['python/dashboard/app.py'], ['_build_pipeline_env']);
+    assert.deepEqual(r.py, ['python/dashboard/test_alpha.py', 'python/dashboard/test_delta.py', 'python/dashboard/test_zeta.py']);
+    assert.deepEqual(r.js, []);
+    r = findSymbolCoveringTests(root, ['python/dashboard/routes/x.py'], ['_build_pipeline_env', 'api_thing']);
+    assert.equal(r.py[0], 'python/dashboard/test_zeta.py', 'the file mentioning both symbols ranks first even though it sorts last alphabetically');   // parent dir searched
+    // a test file the diff itself changes is left to the primary finder, never listed again here
+    r = findSymbolCoveringTests(root, ['python/dashboard/app.py', 'python/dashboard/test_alpha.py'], ['_build_pipeline_env']);
+    assert.ok(!r.py.includes('python/dashboard/test_alpha.py'));
+    assert.deepEqual(findSymbolCoveringTests(root, ['python/dashboard/app.py'], []), { js: [], py: [] });
+    assert.deepEqual(findSymbolCoveringTests(root, ['python/dashboard/app.py'], ['nothing_mentions_this']), { js: [], py: [] });
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('findTestsWithSymbolFallback prefers the file-name based finder and only falls back when it finds nothing', () => {
+  const root = makeDashTree();
+  try {
+    const diff = '@@ -1,2 +1,2 @@ def _build_pipeline_env():\n-    return 1\n+    return 2\n';
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_alpha.py', 'python/dashboard/test_delta.py', 'python/dashboard/test_zeta.py']);
+    fs.writeFileSync(path.join(root, 'python/dashboard/test_app.py'), 'pass\n');     // now a co-located test exists
+    assert.deepEqual(findTestsWithSymbolFallback(root, ['python/dashboard/app.py'], diff).py, ['python/dashboard/test_app.py']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+const PY3 = ['/usr/bin/python3', '/usr/local/bin/python3'].find((p) => fs.existsSync(p));
+
+function makePyRepo() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-verify-py-'));
+  const origin = path.join(root, 'origin.git');
+  const work = path.join(root, 'work');
+  const git = (args, cwd) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  git(['init', '--bare', '-b', 'master', origin], root);
+  git(['clone', origin, work], root);
+  git(['checkout', '-b', 'master'], work);
+  fs.mkdirSync(path.join(work, 'dash'), { recursive: true });
+  fs.writeFileSync(path.join(work, 'dash', 'app.py'), 'def compute_total():\n    return 1\n');
+  fs.writeFileSync(path.join(work, 'dash', 'test_feature.py'), 'import unittest\nfrom dash.app import compute_total\n\n\nclass T(unittest.TestCase):\n    def test_total(self):\n        self.assertEqual(compute_total(), 1)\n');
+  fs.writeFileSync(path.join(work, 'dash', '__init__.py'), '');
+  git(['add', '-A'], work);
+  git(['commit', '-m', 'base'], work);
+  git(['push', 'origin', 'master'], work);
+  const changeTo = (v) => {
+    fs.writeFileSync(path.join(work, 'dash', 'app.py'), `def compute_total():\n    return ${v}\n`);
+    const d = git(['diff', '--full-index', '--binary'], work);
+    git(['checkout', '--', '.'], work);
+    return d;
+  };
+  return { root, work, changeTo };
+}
+
+test('integration: a dashboard-style Python change with no co-located test is verified by the test that mentions its function', { skip: !HAVE_BWRAP || !PY3 }, () => {
+  const { root, work, changeTo } = makePyRepo();
+  try {
+    const bad = verifyDiff({ taskId: 'int-sym-fail', rawDiff: changeTo(2), repoRoot: work, mainBranch: 'master', pythonBin: PY3 });
+    assert.equal(bad.status, 'failed', JSON.stringify(bad));
+    assert.deepEqual(bad.tests.ran, ['dash/test_feature.py']);
+    assert.equal(bad.tests.passed, false);
+    const good = verifyDiff({ taskId: 'int-sym-pass', rawDiff: changeTo('1  # same value, new comment'), repoRoot: work, mainBranch: 'master', pythonBin: PY3 });
+    assert.equal(good.status, 'passed', JSON.stringify(good));
+    assert.deepEqual(good.tests.ran, ['dash/test_feature.py']);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

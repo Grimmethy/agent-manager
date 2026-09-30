@@ -167,10 +167,82 @@ function worktreePaths(taskId) {
   return { worktreeDir: path.join(os.tmpdir(), `agent-manager-review-worktree-${safe}`), branchName: `throwaway/review-${safe}` };
 }
 
+// --- covering tests by changed symbol -------------------------------------------------------------------
+// scoped-test-runner finds covering tests by file NAME (foo.js -> foo.test.js, foo.py -> test_foo.py). That convention holds for
+// ~94% of src/*.js but not for python/dashboard/, where app.py and routes/*.py are covered by tests named for the feature
+// (test_git_discard_branch.py, test_hub_data_route.py), so most dashboard diffs came back with "no covering tests". Fallback: find
+// the test files in the changed file's own directory (or its parent) that mention a function/class the diff adds or changes.
+const SYMBOL_STOPLIST = new Set(['main', 'test', 'setUp', 'tearDown', 'run', 'get', 'set', 'init', 'constructor', 'render', 'handler', 'wrapper', 'helper', 'callback']);
+const MAX_SYMBOLS = 20;
+const MAX_SYMBOL_TEST_FILES = 12;
+
+function extractChangedSymbols(diff) {
+  const found = [];
+  const add = (name) => {
+    if (name && name.length >= 5 && !SYMBOL_STOPLIST.has(name) && !found.includes(name)) found.push(name);
+  };
+  const declRe = /^(?:async\s+)?(?:function\*?\s+|def\s+|class\s+)([A-Za-z_$][\w$]*)|^(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/;
+  for (const line of String(diff || '').split('\n')) {
+    let body = null;
+    if (line.startsWith('@@')) body = (line.match(/^@@[^@]*@@\s*(.*)$/) || [])[1];      // hunk header: the function the hunk sits in
+    else if ((line[0] === '+' || line[0] === '-' || line[0] === ' ') && !/^(?:\+\+\+|---)/.test(line)) body = line.slice(1).trimStart();   // changed OR context: an edit inside a function shows its def as context
+    if (!body) continue;
+    const m = body.match(declRe);
+    if (m) add(m[1] || m[2]);
+    if (found.length >= MAX_SYMBOLS) break;
+  }
+  return found;
+}
+
+function symbolTestCandidates(repoRoot, changedFiles) {
+  const dirs = new Set();
+  for (const f of changedFiles || []) {
+    if (!/\.(?:py|[jt]sx?)$/i.test(f)) continue;
+    const dir = path.dirname(f);
+    dirs.add(dir);
+    dirs.add(path.dirname(dir));
+  }
+  const out = [];
+  for (const d of dirs) {
+    let names;
+    try { names = fs.readdirSync(path.join(repoRoot, d)); } catch { continue; }
+    for (const n of names) {
+      if (/^test_[^/]+\.py$/i.test(n) || /\.test\.[jt]sx?$/i.test(n)) out.push(path.join(d, n).replace(/\\/g, '/'));
+    }
+  }
+  return out;
+}
+
+// { js: [...], py: [...] } like findAffectedTestFiles, ranked by how many distinct changed symbols each test file mentions.
+function findSymbolCoveringTests(repoRoot, changedFiles, symbols) {
+  const res = { js: [], py: [] };
+  if (!symbols || !symbols.length) return res;
+  const escaped = symbols.map((sy) => sy.replace(/[.*+?^${}()|[\]\\$]/g, '\\$&'));
+  const scored = [];
+  for (const rel of symbolTestCandidates(repoRoot, changedFiles)) {
+    if ((changedFiles || []).includes(rel)) continue; // a test file the diff itself changes is handled by the primary finder
+    let text;
+    try { text = fs.readFileSync(path.join(repoRoot, rel), 'utf8'); } catch { continue; }
+    let hits = 0;
+    for (const sy of escaped) if (new RegExp(`(?<![\\w$])${sy}(?![\\w$])`).test(text)) hits += 1;
+    if (hits) scored.push({ rel, hits });
+  }
+  scored.sort((a, b) => b.hits - a.hits || a.rel.localeCompare(b.rel));
+  for (const { rel } of scored.slice(0, MAX_SYMBOL_TEST_FILES)) (/\.py$/i.test(rel) ? res.py : res.js).push(rel);
+  return res;
+}
+
+// The primary (file-name based) finder first; only when it finds NOTHING, fall back to tests that mention the changed symbols.
+function findTestsWithSymbolFallback(repoRoot, changedFiles, diff) {
+  const primary = findAffectedTestFiles(repoRoot, changedFiles);
+  if (primary.js.length || primary.py.length) return primary;
+  return findSymbolCoveringTests(repoRoot, changedFiles, extractChangedSymbols(diff));
+}
+
 function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, deps = {} }) {
   const d = {
     prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
-    findTests: findAffectedTestFiles, ...deps,
+    findTests: findTestsWithSymbolFallback, ...deps,
   };
   const result = { status: 'inconclusive', reasons: [], apply: null, tests: null, commands: [] };
   const inconclusive = (reason) => { result.reasons.push(reason); return result; };
@@ -203,7 +275,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 
     // 1. The tests that cover the changed files.
     const changed = extractChangedFiles(rawDiff);
-    const affected = d.findTests(worktreeDir, changed);
+    const affected = d.findTests(worktreeDir, changed, rawDiff);
     const suites = [];
     if (affected.js.length) suites.push({ label: 'js', bin: 'node', args: ['--test', ...affected.js], files: affected.js, parse: parseNodeTestFailures });
     if (affected.py.length) suites.push({ label: 'py', bin: 'python', args: ['-m', 'unittest', ...affected.py.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'))], files: affected.py, parse: parsePyTestFailures });
@@ -248,6 +320,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 }
 
 module.exports = {
+  extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS,
 };
