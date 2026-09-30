@@ -1971,3 +1971,85 @@ test('summariseExecutedVerification carries the failures that already exist on t
   const without = summariseExecutedVerification({ status: 'passed', reasons: [], tests: { ran: ['a.test.js'], passed: true, failures: [] }, commands: [] });
   assert.equal('preexisting' in without.tests, false);
 });
+
+
+// --- the voters see the executed-verification result (brain dump #1647 step 2) --------------------------------------------------------------
+const EV_PASSED = {
+  status: 'passed', reasons: [],
+  tests: { ran: ['python/dashboard/test_thing.py', 'src/a.test.js'], passed: true, failures: [] },
+  commands: [{ criterion: 'c', command: 'python3 -m unittest python.dashboard.test_thing', claimedPass: true, outcome: 'confirmed', exitCode: 0 },
+    { criterion: 'd', command: 'python3 -m unittest test_x', claimedPass: true, outcome: 'skipped' }],
+};
+
+test('the voter prompt carries the executed-verification section, right after the fact-check JSON and before the judging instructions', () => {
+  const { buildVerdictPrompt, formatExecutedVerificationSection } = require('./review-task.js');
+  const prompt = buildVerdictPrompt({ ...baseTask(), executedVerification: EV_PASSED }, { flags: [], marker: 'FACTCHECK-JSON' }, 'GROUNDING-SOURCE');
+  const section = formatExecutedVerificationSection(EV_PASSED);
+  assert.match(prompt, /--- Executed verification \(GROUND TRUTH: the review harness ran this itself; the drafter did not\) ---/);
+  assert.match(prompt, /Result: PASSED\./);
+  assert.match(prompt, /Covering test files run \(2\): python\/dashboard\/test_thing\.py, src\/a\.test\.js -- all PASSED\./);
+  assert.match(prompt, /re-ran and CONFIRMED \(they exited 0\): `python3 -m unittest python\.dashboard\.test_thing`/);
+  assert.match(prompt, /1 claimed check\(s\) could not be re-run from the repo root/);
+  assert.ok(prompt.indexOf('FACTCHECK-JSON') < prompt.indexOf(section), 'after the fact-check JSON');
+  assert.ok(prompt.indexOf(section) < prompt.indexOf('GROUNDING-SOURCE'), 'before the grounding source');
+  assert.ok(prompt.indexOf(section) < prompt.indexOf('Judge whether this draft is correct'), 'before the judging instructions');
+});
+
+test('the executed-verification rules limit what a pass proves and say what INCONCLUSIVE is, and tell voters a diff-created file is not missing', () => {
+  const { formatExecutedVerificationSection } = require('./review-task.js');
+  const section = formatExecutedVerificationSection(EV_PASSED);
+  assert.match(section, /PASSED means ONLY that the listed tests passed and the listed commands exited 0/);
+  assert.match(section, /says nothing about whether the diff does what the TASK asked, stays in scope, or meets every requirement/);
+  assert.match(section, /INCONCLUSIVE is neither a pass nor a failure/);
+  assert.match(section, /do not reject a draft because a file IT CREATES is missing from the live repo/);
+  assert.match(section, /Do not re-litigate a confirmed check or call its reported result fabricated/);
+});
+
+test('an inconclusive result names why and lists the tests that already fail on the base, without calling anything passed', () => {
+  const { formatExecutedVerificationSection } = require('./review-task.js');
+  const section = formatExecutedVerificationSection({
+    status: 'inconclusive', reasons: ['covering py tests already fail on master in the review sandbox, so the failure is not caused by the diff', 'second reason', 'third reason'],
+    tests: { ran: ['python/dashboard/test_start_pipeline_apply_root.py'], passed: null, failures: [], preexisting: ['test_registry_upsert_preserves_apply_root'] }, commands: [],
+  });
+  assert.match(section, /Result: INCONCLUSIVE\./);
+  assert.match(section, /-- no clean result\./);
+  assert.match(section, /ALREADY fail on the base branch in this sandbox \(not caused by the diff, so not counted against it\): test_registry_upsert_preserves_apply_root/);
+  assert.match(section, /Why it is inconclusive: covering py tests already fail on master.*, second reason \(\+1 more\)\./);
+  assert.doesNotMatch(section, /third reason/, 'at most two reasons are quoted; the rest is counted');
+  assert.doesNotMatch(section, /all PASSED/);
+});
+
+test('with no executed-verification result the prompt is exactly what it was before: no section, no rules', () => {
+  const { buildVerdictPrompt, formatExecutedVerificationSection } = require('./review-task.js');
+  const plain = buildVerdictPrompt(baseTask(), { flags: [] }, 'G');
+  assert.doesNotMatch(plain, /Executed verification/);
+  const withEv = buildVerdictPrompt({ ...baseTask(), executedVerification: EV_PASSED }, { flags: [] }, 'G');
+  assert.equal(withEv.replace(`${formatExecutedVerificationSection(EV_PASSED)}\n\n`, ''), plain, 'the section is the ONLY difference');
+  for (const junk of [undefined, null, {}, { status: 'weird' }, 'passed', 42]) assert.equal(formatExecutedVerificationSection(junk), '', String(junk));
+});
+
+test('the section stays small: file, test-name and reason lists are capped', () => {
+  const { formatExecutedVerificationSection } = require('./review-task.js');
+  const section = formatExecutedVerificationSection({
+    status: 'failed', reasons: [], commands: [],
+    tests: { ran: Array.from({ length: 20 }, (_, i) => `t${i}.test.js`), passed: false, failures: Array.from({ length: 12 }, (_, i) => `failing test ${i}`), preexisting: [] },
+  });
+  assert.match(section, /Covering test files run \(20\): t0\.test\.js.*t7\.test\.js \(\+12 more\) -- FAILED\./);
+  assert.match(section, /Failing tests the diff introduced: failing test 0.*failing test 5 \(\+6 more\)\./);
+  assert.ok(section.length < 2200, `section is ${section.length} chars`);
+});
+
+test('end to end: a recorded executed-verification result reaches the prompt the voters are actually given, and the kill switch removes it', async () => {
+  for (const [env, expectSection] of [['true', true], ['false', false]]) {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: `ev-prompt-${env}` });
+    const captured = [];
+    process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = env;
+    try {
+      await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, verifyDiffFn: () => ({ status: 'passed', reasons: [], tests: { ran: ['src/a.test.js'], passed: true, failures: [] }, commands: [] }) });
+    } finally { process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false'; }
+    assert.equal(captured.length, 1);
+    assert.equal(/--- Executed verification \(GROUND TRUTH/.test(captured[0]), expectSection, `env=${env}`);
+    if (expectSection) assert.match(captured[0], /Covering test files run \(1\): src\/a\.test\.js -- all PASSED\./);
+  }
+});

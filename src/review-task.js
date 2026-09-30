@@ -370,6 +370,45 @@ function resolveDynamicReviewField(field, task) {
   return typeof value === 'string' && value ? value : null;
 }
 
+// --- executed verification, as the voters see it (brain dump #1647 step 2) -----------------------------------------------------------------------
+// The gate in runReview runs the diff in a scratch worktree and records the outcome on task.executedVerification; until now it only decided block-or-continue
+// and the voters never saw it, so they kept judging the draft's NARRATED "Acceptance:" results and rejecting good drafts as "fabricated" or "claims a test
+// that does not exist" (the file is created by the diff, absent from the live repo). This renders the recorded result as ground truth, with the limits of
+// what it proves stated up front so a clean run is not mistaken for "the change is correct". Empty string when there is no result (gate off / not run).
+const EV_MAX_FILES = 8;
+const EV_MAX_ITEMS = 6;
+function evList(items, max) {
+  const shown = items.slice(0, max).join(', ');
+  return items.length > max ? `${shown} (+${items.length - max} more)` : shown;
+}
+function formatExecutedVerificationSection(ev) {
+  if (!ev || typeof ev !== 'object' || !['passed', 'inconclusive', 'failed'].includes(ev.status)) return '';
+  const out = [];
+  out.push('--- Executed verification (GROUND TRUTH: the review harness ran this itself; the drafter did not) ---');
+  out.push(`The draft's diff was applied in an isolated scratch worktree of its base branch and checked inside a sandbox. Result: ${ev.status.toUpperCase()}.`);
+  const tests = ev.tests || {};
+  if (Array.isArray(tests.ran) && tests.ran.length) {
+    const verdict = tests.passed === true ? 'all PASSED' : tests.passed === false ? 'FAILED' : 'no clean result';
+    out.push(`- Covering test files run (${tests.ran.length}): ${evList(tests.ran, EV_MAX_FILES)} -- ${verdict}.`);
+  } else {
+    out.push('- No covering test file could be found for the changed files.');
+  }
+  if (Array.isArray(tests.failures) && tests.failures.length) out.push(`- Failing tests the diff introduced: ${evList(tests.failures.map((f) => String(f).slice(0, 120)), EV_MAX_ITEMS)}.`);
+  if (Array.isArray(tests.preexisting) && tests.preexisting.length) {
+    out.push(`- Tests that ALREADY fail on the base branch in this sandbox (not caused by the diff, so not counted against it): ${evList(tests.preexisting.map((f) => String(f).slice(0, 120)), EV_MAX_ITEMS)}.`);
+  }
+  const cmds = Array.isArray(ev.commands) ? ev.commands : [];
+  const confirmed = cmds.filter((c) => c.outcome === 'confirmed').map((c) => `\`${String(c.command).slice(0, 100)}\``);
+  const contradicted = cmds.filter((c) => c.outcome === 'contradicted').map((c) => `\`${String(c.command).slice(0, 100)}\``);
+  const skipped = cmds.filter((c) => c.outcome === 'skipped').length;
+  if (confirmed.length) out.push(`- Claimed checks the harness re-ran and CONFIRMED (they exited 0): ${evList(confirmed, EV_MAX_ITEMS)}.`);
+  if (contradicted.length) out.push(`- Claimed checks that FAILED when re-run: ${evList(contradicted, EV_MAX_ITEMS)}.`);
+  if (skipped) out.push(`- ${skipped} claimed check(s) could not be re-run from the repo root (not runnable as written); they are neither confirmed nor contradicted.`);
+  if (ev.status === 'inconclusive' && Array.isArray(ev.reasons) && ev.reasons.length) out.push(`- Why it is inconclusive: ${evList(ev.reasons.map((r) => String(r).slice(0, 200)), 2)}.`);
+  out.push('How to use this: PASSED means ONLY that the listed tests passed and the listed commands exited 0 against the diff applied to its base. It says nothing about whether the diff does what the TASK asked, stays in scope, or meets every requirement -- keep judging those yourself. INCONCLUSIVE is neither a pass nor a failure: the harness could not decide, so judge the draft on the rest of the evidence and do not count it either way. Do not re-litigate a confirmed check or call its reported result fabricated, and do not reject a draft because a file IT CREATES is missing from the live repo -- that file is added by the diff.');
+  return out.join('\n');
+}
+
 function buildVerdictPrompt(task, factCheck, groundingText) {
   const lines = [];
   lines.push('You are a review gate in an unattended pipeline. You are producing a VERDICT ONLY -- you have no ability to run commands, write files, or touch git. Do not attempt to.');
@@ -434,6 +473,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   lines.push('--- Deterministic fact-check pre-filter (necessary, NOT sufficient) ---');
   lines.push(JSON.stringify(factCheck));
   lines.push('');
+  const executedSection = formatExecutedVerificationSection(task.executedVerification);
+  if (executedSection) {
+    lines.push(executedSection);
+    lines.push('');
+  }
   // Advisory only (see local-draft.js's postImplementCheck handling): a literal-text check that
   // could not verify something. NOT proof of a defect, so it informs the votes, never blocks.
   if (Array.isArray(task.groundingWarnings) && task.groundingWarnings.length) {
@@ -1210,7 +1254,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, summariseExecutedVerification, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
