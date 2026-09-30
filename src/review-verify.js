@@ -30,7 +30,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
-const { prepareAdhocWorktree, applyPartialDiff, cleanupAdhocWorktree } = require('./agentic-draft-common.js');
+const { prepareAdhocWorktree, applyPartialDiff, cleanupAdhocWorktree, runGit } = require('./agentic-draft-common.js');
 const { findAffectedTestFiles, parseNodeTestFailures, parsePyTestFailures } = require('./scoped-test-runner.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 
@@ -133,6 +133,9 @@ function sandboxEnv(tmpDir, sandboxRoot) {
     // Same reason as scoped-test-runner.childEnv: tests must never see the live pipeline's write targets.
     AGENT_MANAGER_REPO_ROOT: sandboxRoot,
     AGENT_MANAGER_APPLY_REPO_ROOT: sandboxRoot,
+    // The differential check reverses the diff in this same worktree and re-runs. Python's .pyc cache is keyed on source mtime (whole seconds) and size, so a
+    // file rewritten within the same second to a same-size variant would keep serving the DIFF's bytecode on the "base" run and blame the base for the diff's failure.
+    PYTHONDONTWRITEBYTECODE: '1',
   };
 }
 
@@ -239,9 +242,44 @@ function findTestsWithSymbolFallback(repoRoot, changedFiles, diff) {
   return findSymbolCoveringTests(repoRoot, changedFiles, extractChangedSymbols(diff));
 }
 
+// The repo files a classified command targets (node --test/--check paths, python -m py_compile paths, python -m unittest module names), so the
+// differential check can tell "fails on the base too" from "cannot be run on the base at all" (the target only exists in the diff).
+function commandTargets(c) {
+  const out = [];
+  const args = c.args || [];
+  if (c.bin === 'node') return args.filter((a) => !a.startsWith('-'));
+  const mod = args[1];
+  if (mod === 'py_compile') return args.slice(2).filter((a) => !a.startsWith('-'));
+  if (mod === 'unittest') {
+    for (let i = 2; i < args.length; i += 1) {
+      const a = args[i];
+      if (a === 'discover') break;
+      if (/^[A-Za-z_][\w.]*$/.test(a)) out.push(`${a.replace(/\./g, '/')}.py`);
+    }
+  }
+  return out;
+}
+
+// Reverses applyPartialDiff in the same throwaway worktree (the diff was applied as uncommitted changes), returning the tree to the exact base state.
+// Never throws: { applied: true } on success, { applied: false, reason } otherwise.
+function unapplyPartialDiff(worktreeDir, diff) {
+  const text = typeof diff === 'string' ? diff : '';
+  if (!text.trim()) return { applied: false, reason: 'empty' };
+  const file = path.join(os.tmpdir(), `agent-manager-unapply-${process.pid}-${Date.now()}.patch`);
+  try {
+    fs.writeFileSync(file, text.endsWith('\n') ? text : `${text}\n`);
+    runGit(['apply', '-R', '--binary', '--whitespace=nowarn', file], worktreeDir);
+    return { applied: true };
+  } catch (e) {
+    return { applied: false, reason: String((e && e.message) || e).slice(0, 300) };
+  } finally {
+    try { fs.unlinkSync(file); } catch { /* best-effort */ }
+  }
+}
+
 function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, deps = {} }) {
   const d = {
-    prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
+    prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
     findTests: findTestsWithSymbolFallback, ...deps,
   };
   const result = { status: 'inconclusive', reasons: [], apply: null, tests: null, commands: [] };
@@ -263,6 +301,8 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     let sandboxMissing = false;
     let anyExecuted = false;
     const failures = [];
+    const failedSuites = [];       // suites that failed WITH the diff, pending attribution against the base
+    const contradictedCmds = [];   // claimed-PASS commands that exited non-zero WITH the diff, pending attribution
     const runOne = (bin, args, timeoutMs) => {
       const remaining = deadline - Date.now();
       if (remaining <= 1000) { anyTimeout = true; return { ran: true, timedOut: true, exitCode: null, output: '' }; }
@@ -277,16 +317,18 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     const changed = extractChangedFiles(rawDiff);
     const affected = d.findTests(worktreeDir, changed, rawDiff);
     const suites = [];
-    if (affected.js.length) suites.push({ label: 'js', bin: 'node', args: ['--test', ...affected.js], files: affected.js, parse: parseNodeTestFailures });
-    if (affected.py.length) suites.push({ label: 'py', bin: 'python', args: ['-m', 'unittest', ...affected.py.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'))], files: affected.py, parse: parsePyTestFailures });
+    const jsArgs = (files) => ['--test', ...files];
+    const pyArgs = (files) => ['-m', 'unittest', ...files.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'))];
+    if (affected.js.length) suites.push({ label: 'js', bin: 'node', buildArgs: jsArgs, files: affected.js, parse: parseNodeTestFailures });
+    if (affected.py.length) suites.push({ label: 'py', bin: 'python', buildArgs: pyArgs, files: affected.py, parse: parsePyTestFailures });
     if (suites.length) {
       result.tests = { ran: [], passed: true, failures: [], timedOut: false };
       for (const s of suites) {
-        const r = runOne(s.bin, s.args, TEST_TIMEOUT_MS);
+        const r = runOne(s.bin, s.buildArgs(s.files), TEST_TIMEOUT_MS);
         if (!r.ran) { result.tests = null; break; }
         result.tests.ran.push(...s.files);
         if (r.timedOut) { result.tests.timedOut = true; result.tests.passed = null; continue; }
-        if (r.exitCode !== 0) { result.tests.passed = false; result.tests.failures.push(...s.parse(r.output)); result.tests.raw = r.output; failures.push(`covering ${s.label} tests failed`); }
+        if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s, names: s.parse(r.output), raw: r.output }); }
       }
     }
 
@@ -300,12 +342,58 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
         if (r.timedOut) outcome = 'inconclusive';
         else if (r.exitCode === 0) outcome = 'confirmed';
         else outcome = ar.pass ? 'contradicted' : 'confirmed-fail';
-        if (outcome === 'contradicted') failures.push(`\`${c.text}\` exited ${r.exitCode} but the draft claimed PASS`);
-        result.commands.push({ criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome, exitCode: r.exitCode, detail: outcome === 'contradicted' ? r.output.slice(-800) : '' });
+        const entry = { criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome, exitCode: r.exitCode, detail: outcome === 'contradicted' ? r.output.slice(-800) : '' };
+        result.commands.push(entry);
+        if (outcome === 'contradicted') contradictedCmds.push({ entry, c });
       }
     }
 
+    // 3. Differential check: a failure only counts against the diff if the SAME check passes on the base. Tests that already fail on the base inside
+    // this sandbox (a throwaway HOME with no ~/.local/state/..., no network, ...) say nothing about the diff -- confirmed live 2026-09-30, HUB0068-02: a
+    // good draft was blocked because python/dashboard/test_start_pipeline_apply_root.py fails on the untouched base in the review sandbox. The diff is
+    // reversed in this throwaway worktree and each failing check re-run; anything that also fails on the base is reported inconclusive, never a block.
+    const unattributable = [];
+    if (failedSuites.length || contradictedCmds.length) {
+      const back = d.unapplyDiff(worktreeDir, rawDiff);
+      if (!back || !back.applied) {
+        for (const f of failedSuites) unattributable.push(`covering ${f.s.label} tests failed, but the diff could not be reversed to check them against the base`);
+        for (const x of contradictedCmds) { x.entry.outcome = 'inconclusive'; unattributable.push(`\`${x.c.text}\` failed, but the diff could not be reversed to check it against the base`); }
+        if (result.tests) result.tests.passed = null;
+      } else {
+        for (const f of failedSuites) {
+          const baseFiles = f.s.files.filter((file) => fs.existsSync(path.join(worktreeDir, file)));
+          let attributable = f.names;
+          if (baseFiles.length) {
+            const b = runOne(f.s.bin, f.s.buildArgs(baseFiles), TEST_TIMEOUT_MS);
+            if (!b.ran || b.timedOut) attributable = null;                       // cannot tell -- do not block
+            else if (b.exitCode !== 0) {
+              const baseNames = f.s.parse(b.output);
+              const fresh = f.names.filter((n) => !baseNames.includes(n));
+              result.tests.preexisting = [...(result.tests.preexisting || []), ...f.names.filter((n) => baseNames.includes(n))];
+              attributable = (baseNames.length && fresh.length) ? fresh : null;   // base fails with no nameable test = a whole-suite/env failure: not the diff's doing
+            }
+          }
+          if (attributable && (attributable.length || !baseFiles.length)) {
+            result.tests.failures.push(...attributable);
+            result.tests.raw = f.raw;
+            failures.push(`covering ${f.s.label} tests failed`);
+          } else {
+            unattributable.push(`covering ${f.s.label} tests (${f.s.files.join(', ')}) already fail on ${mainBranch} in the review sandbox, so the failure is not caused by the diff`);
+          }
+        }
+        for (const x of contradictedCmds) {
+          // A command whose target does not exist on the base (a test file the diff itself adds) cannot fail there: the failure is the diff's.
+          const targets = commandTargets(x.c);
+          if (targets.some((t) => !fs.existsSync(path.join(worktreeDir, t)))) { failures.push(`\`${x.c.text}\` exited ${x.entry.exitCode} but the draft claimed PASS`); continue; }
+          const b = runOne(x.c.bin, x.c.args, COMMAND_TIMEOUT_MS);
+          if (b.ran && !b.timedOut && b.exitCode === 0) failures.push(`\`${x.c.text}\` exited ${x.entry.exitCode} but the draft claimed PASS`);
+          else { x.entry.outcome = 'inconclusive'; x.entry.detail = ''; unattributable.push(`\`${x.c.text}\` also fails on ${mainBranch} in the review sandbox, so it says nothing about the diff`); }
+        }
+        if (result.tests && result.tests.passed === false && !result.tests.failures.length) result.tests.passed = null;   // every failing suite was already failing on the base
+      }
+    }
     if (failures.length) { result.status = 'failed'; result.reasons.push(...failures); return result; }
+    if (unattributable.length) return inconclusive(unattributable.join('; '));
     if (sandboxMissing && !anyExecuted) return inconclusive('the bwrap sandbox is unavailable, so nothing was executed');
     if (anyTimeout) return inconclusive('a check timed out, which is not a failure');
     const confirmed = (result.tests && result.tests.passed === true) || result.commands.some((c) => c.outcome === 'confirmed');
@@ -321,6 +409,6 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 
 module.exports = {
   extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
-  verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
+  verifyDiff, unapplyPartialDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS,
 };
