@@ -214,7 +214,7 @@ test('lockKey: two different models do NOT serialize when each keeps its own def
   assert.ok(waited < 500, `model-b should NOT have waited for model-a's separate lock, waited ${waited}ms (child err: ${orr.err})`);
 });
 
-// ---- waitForTurn isolation tests (HUB0065 1/2) ------------------------------------------
+// ---- waitForSlot isolation tests (HUB0071 2/3) ------------------------------------------
 // Each path is exercised directly against a mock ticket dir, never touching flock or the
 // compat-marker code. `pid: 1` gives liveTickets a guaranteed-live, different pid.
 
@@ -225,14 +225,11 @@ function rawTicket(dir, name, data) {
   return fp;
 }
 
-test('waitForTurn: path 1 -- holdsPlace breaks immediately, even past the deadline', () => {
-  const inst = tmpInst();
-  const dir = arb.ticketsDir(inst, 'm');
-  // deadline in the past -- the holdsPlace break must fire BEFORE the timeout check.
-  arb.waitForTurn(inst, 'm', 'ignored', path.join(dir, '0000000000000001.x.json'), 2, 1, 0, true, 'draft', 't', null, 'm');
-});
+function makeTicket(dir, name, fp, myRank, mySeqNum, cls, key, taskId, phase, model) {
+  return { fp, name, myRank, mySeqNum, dir, key, cls, taskId, phase, model };
+}
 
-test('waitForTurn: path 2 -- deadline passed -> safeUnlink(fp) + timeout Error', () => {
+test('waitForSlot: timeout -- deadline passed -> safeUnlink(fp) + timeout Error', () => {
   const inst = tmpInst();
   const dir = arb.ticketsDir(inst, 'm');
   const high = rawTicket(dir, '0000000000000000.1.aaaa.json',
@@ -240,11 +237,12 @@ test('waitForTurn: path 2 -- deadline passed -> safeUnlink(fp) + timeout Error',
   const myName = '0000000000000009.' + process.pid + '.bbbb.json';
   const fp = rawTicket(dir, myName,
     { pid: process.pid, cls: 'draft', taskId: 't', phase: 'p', model: 'm', startedAt: 'x', holding: false, cancelRequested: false });
+  const ticket = makeTicket(dir, myName, fp, 2, 900, 'draft', 'm', 't', 'p', 'm');
   const realNow = Date.now;
   Date.now = () => 2_000_000; // controlled clock: past the deadline below
   try {
     assert.throws(
-      () => arb.waitForTurn(inst, 'm', myName, fp, 2, 900, 1_999_999, false, 'draft', 't', 'p', 'm'),
+      () => arb.waitForSlot(ticket, inst, { deadline: 1_999_999 }),
       (err) => /timed out waiting to reach the head of the queue/.test(err.message),
     );
   } finally {
@@ -254,13 +252,14 @@ test('waitForTurn: path 2 -- deadline passed -> safeUnlink(fp) + timeout Error',
   fs.unlinkSync(high);
 });
 
-test('waitForTurn: path 3 -- swept ticket is re-written (same fields) and the loop continues to a break', () => {
+test('waitForSlot: sweep-recovery -- swept ticket is re-written (same fields) and the loop continues to a break', () => {
   const inst = tmpInst();
   const dir = arb.ticketsDir(inst, 'm');
   const myName = '0000000000000010.' + process.pid + '.cccc.json';
   fs.mkdirSync(dir, { recursive: true });
   const fp = path.join(dir, myName); // absent: liveTickets will not find us -> re-write -> continue
-  arb.waitForTurn(inst, 'm', myName, fp, 2, 100, Date.now() + 60_000, false, 'draft', 't9', 'phase9', 'm9');
+  const ticket = makeTicket(dir, myName, fp, 2, 100, 'draft', 'm', 't9', 'phase9', 'm9');
+  arb.waitForSlot(ticket, inst, { deadline: Date.now() + 60_000 });
   const t = JSON.parse(fs.readFileSync(fp, 'utf8'));
   assert.equal(t.pid, process.pid);
   assert.equal(t.cls, 'draft');
@@ -272,20 +271,21 @@ test('waitForTurn: path 3 -- swept ticket is re-written (same fields) and the lo
   assert.ok(t.startedAt, 're-write carries a startedAt');
 });
 
-test('waitForTurn: path 4 -- cancelRequested on our ticket -> cleanup + gpuArbiterCancelled throw', () => {
+test('waitForSlot: cancellation -- cancelRequested on our ticket -> cleanup + gpuArbiterCancelled throw', () => {
   const inst = tmpInst();
   const dir = arb.ticketsDir(inst, 'm');
   const myName = '0000000000000011.' + process.pid + '.dddd.json';
   const fp = rawTicket(dir, myName,
     { pid: process.pid, cls: 'draft', taskId: 't', phase: null, model: 'm', startedAt: new Date().toISOString(), holding: false, cancelRequested: true });
+  const ticket = makeTicket(dir, myName, fp, 2, 110, 'draft', 'm', 't', null, 'm');
   assert.throws(
-    () => arb.waitForTurn(inst, 'm', myName, fp, 2, 110, Date.now() + 60_000, false, 'draft', 't', null, 'm'),
+    () => arb.waitForSlot(ticket, inst, { deadline: Date.now() + 60_000 }),
     (err) => err.gpuArbiterCancelled === true && /cancelled while waiting/.test(err.message),
   );
   assert.equal(fs.existsSync(fp), false, 'cleanup must have unlinked our ticket');
 });
 
-test('waitForTurn: path 5 -- no higher-rank ticket and no earlier same-rank peer -> break (later peer does not block)', () => {
+test('waitForSlot: higher-priority / earlier-peer -- no higher-rank ticket and no earlier same-rank peer -> break (later peer does not block)', () => {
   const inst = tmpInst();
   const dir = arb.ticketsDir(inst, 'm');
   const myName = '0000000000000200.' + process.pid + '.eeee.json';
@@ -293,7 +293,8 @@ test('waitForTurn: path 5 -- no higher-rank ticket and no earlier same-rank peer
     { pid: process.pid, cls: 'draft', taskId: 't', phase: null, model: 'm', startedAt: new Date().toISOString(), holding: false, cancelRequested: false });
   const peer = rawTicket(dir, '0000000000000300.1.ffff.json',
     { pid: 1, cls: 'draft', taskId: 'p', phase: null, model: 'm', startedAt: new Date().toISOString(), holding: false, cancelRequested: false });
-  arb.waitForTurn(inst, 'm', myName, fp, 2, 200, Date.now() + 60_000, false, 'draft', 't', null, 'm');
+  const ticket = makeTicket(dir, myName, fp, 2, 200, 'draft', 'm', 't', null, 'm');
+  arb.waitForSlot(ticket, inst, { deadline: Date.now() + 60_000 });
   fs.unlinkSync(peer);
 });
 
