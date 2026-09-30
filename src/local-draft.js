@@ -568,6 +568,81 @@ function computeSubstanceGate(task) {
   return { substanceGated, seedPlan };
 }
 
+// Content-length of a plan roll: -1 when the roll is missing or degenerate, so any real
+// response beats a degenerate one in the "keep whichever roll carries more content"
+// comparison below. (HUB0079 1/3: hoisted out of runPlanPass so attemptSeedReroll can
+// use it at module scope -- behavior identical to the inline arrow it replaced.)
+const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
+
+// Extracted from runPlanPass (2026-09-xx, HUB0079 1/3): the thin-plan re-roll + seed
+// fallback sequence. runPlanPass used to inline all of this -- the one-shot re-roll of a
+// thin (but not degenerate) adhoc plan, the stillThin calculation, and the
+// seed-vs-thin dispatch that decides whether the implement tiers get the seed (a real
+// plan from a prior attempt) or this roll's (possibly thin) response. Same behavior as
+// before; pulled out so the re-roll/seed policy is unit-testable with a synthetic
+// planResult and a stub callPlan without exercising the full plan-pass pipeline, and so
+// future re-roll-policy changes (e.g. allowing two re-rolls) live in one place.
+//
+// Contract: mutates task.planResponse (and task.lastGoodPlan unless the roll is still
+// thin), records the plan via recordPlan, and appends the 'plan-done' history event --
+// exactly what the inline code did. The degenerate path is owned inline by runPlanPass,
+// which guards `if (planResult.degenerate)` and returns blocked BEFORE calling this, so a
+// degenerate planResult never reaches here -- the `!planResult.degenerate` in the re-roll
+// condition below stays as the unit-test contract that a degenerate input simply skips
+// the re-roll.
+async function attemptSeedReroll({
+  planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+}) {
+  let totalAttempts = planResult.attempts || 1;
+  let reRolled = false;
+  if (substanceGated && !planResult.degenerate && planIsThin(planResult.response)) {
+    // One thin (but not degenerate) roll -- give it exactly one more, then keep whichever
+    // of the two rolls carries more content.
+    reRolled = true;
+    const startedAt = new Date().toISOString();
+    const startMs = Date.now();
+    const reRoll = await callPlan(RETRY_TEMPERATURE);
+    if (recordModelCall) {
+      recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reRoll, source: task.source, stage: 'plan' });
+    }
+    totalAttempts += reRoll.attempts || 1;
+    if (planLen(reRoll) > planLen(planResult)) planResult = reRoll;
+  }
+
+  const stillThin = substanceGated && planIsThin(planResult.response);
+
+  if (stillThin && seedPlan) {
+    // Thin rolls, but a real plan from a prior attempt exists -- reuse it verbatim rather
+    // than hand the implement tiers a stub with no map.
+    task.planResponse = seedPlan;
+    task.lastGoodPlan = seedPlan;
+    recordPlan(attempt, { text: seedPlan, attempts: totalAttempts, reRolled, seededFromPrior: true });
+    appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), reused a prior attempt's plan (${seedPlan.length} chars) after ${reRolled ? 'two thin rolls' : 'a thin roll'}`);
+    return { planResult, totalAttempts, reRolled, stillThin, seededFromPrior: true };
+  }
+
+  task.planResponse = planResult.response;
+  // Fix 2b: keep the last good plan outside draftAttempts (so record collapse can't drop
+  // it -- it is the seed source for any later retry). Never store a thin one.
+  if (!stillThin) task.lastGoodPlan = planResult.response;
+  recordPlan(attempt, {
+    text: planResult.response,
+    attempts: totalAttempts,
+    ...(reRolled ? { reRolled: true } : {}),
+    ...(seedPlan ? { seededFromPrior: true } : {}),
+    ...(stillThin ? { thin: true } : {}),
+    ...(grounding ? { grounded: true, groundingChars: grounding.text.length, anchorPaths: grounding.anchorPaths } : {}),
+  });
+  const notes = [
+    seedPlan ? 'seeded from a prior plan' : null,
+    reRolled ? 're-rolled once' : null,
+    stillThin ? 'still thin, no prior plan to fall back on' : null,
+  ].filter(Boolean);
+  appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), ${task.planResponse.length} chars${notes.length ? `, ${notes.join(', ')}` : ''}`);
+
+  return { planResult, totalAttempts, reRolled, stillThin, seededFromPrior: false };
+}
+
 // The plan pass plus its harness-search grounding step. Mutates task.planResponse (and,
 // for a harnessSearch source, task.promptContext.harnessHits/searchResults) and emits the
 // plan-done / harness-search history events. Returns { blocked: true, blockedReason } --
@@ -666,7 +741,6 @@ async function runPlanPass(task, {
 
   const planNumPredict = computePlanNumPredict(task);
   const callPlan = (temperature = 0.4) => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', isDraft: true, ...researchPlanTools }), 'plan');
-  const planLen = (r) => (r && !r.degenerate ? ((r.response || '').trim().length) : -1);
 
   // Records the plan pass into model-stats.db, same as callImplementModel's own
   // recordModelCall below in this file -- previously the ONLY stage ever recorded there
@@ -681,25 +755,9 @@ async function runPlanPass(task, {
   if (recordModelCall) {
     recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: planResult, source: task.source, stage: 'plan' });
   }
-  let totalAttempts = planResult.attempts || 1;
-  let reRolled = false;
-  if (substanceGated && !planResult.degenerate && planIsThin(planResult.response)) {
-    // One thin (but not degenerate) roll -- give it exactly one more, then keep whichever
-    // of the two rolls carries more content.
-    reRolled = true;
-    startedAt = new Date().toISOString();
-    startMs = Date.now();
-    const reRoll = await callPlan(RETRY_TEMPERATURE);
-    if (recordModelCall) {
-      recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reRoll, source: task.source, stage: 'plan' });
-    }
-    totalAttempts += reRoll.attempts || 1;
-    if (planLen(reRoll) > planLen(planResult)) planResult = reRoll;
-  }
-
   if (planResult.degenerate) {
     const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
-    recordPlan(attempt, { degenerate: planResult.degenerate, attempts: totalAttempts });
+    recordPlan(attempt, { degenerate: planResult.degenerate, attempts: planResult.attempts || 1 });
     appendHistoryEvent(task, 'blocked', blockedReason);
     // 2026-09-17: this used to set no blockedStage at all -- invisible to reject-retry-
     // check.js's entry gate (isReviewRejection/retryableDraftBlock/isPreCritiqueBlock/
@@ -711,35 +769,20 @@ async function runPlanPass(task, {
     return { blocked: true, blockedReason, blockedStage: 'plan' };
   }
 
-  const stillThin = substanceGated && planIsThin(planResult.response);
-
-  if (stillThin && seedPlan) {
-    // Thin rolls, but a real plan from a prior attempt exists -- reuse it verbatim rather
-    // than hand the implement tiers a stub with no map.
-    task.planResponse = seedPlan;
-    task.lastGoodPlan = seedPlan;
-    recordPlan(attempt, { text: seedPlan, attempts: totalAttempts, reRolled, seededFromPrior: true });
-    appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), reused a prior attempt's plan (${seedPlan.length} chars) after ${reRolled ? 'two thin rolls' : 'a thin roll'}`);
-  } else {
-    task.planResponse = planResult.response;
-    // Fix 2b: keep the last good plan outside draftAttempts (so record collapse can't drop
-    // it -- it is the seed source for any later retry). Never store a thin one.
-    if (!stillThin) task.lastGoodPlan = planResult.response;
-    recordPlan(attempt, {
-      text: planResult.response,
-      attempts: totalAttempts,
-      ...(reRolled ? { reRolled: true } : {}),
-      ...(seedPlan ? { seededFromPrior: true } : {}),
-      ...(stillThin ? { thin: true } : {}),
-      ...(grounding ? { grounded: true, groundingChars: grounding.text.length, anchorPaths: grounding.anchorPaths } : {}),
-    });
-    const notes = [
-      seedPlan ? 'seeded from a prior plan' : null,
-      reRolled ? 're-rolled once' : null,
-      stillThin ? 'still thin, no prior plan to fall back on' : null,
-    ].filter(Boolean);
-    appendHistoryEvent(task, 'plan-done', `${totalAttempts} attempt(s), ${task.planResponse.length} chars${notes.length ? `, ${notes.join(', ')}` : ''}`);
-  }
+  // Thin-plan re-roll + seed fallback (HUB0079 1/3): extracted from this function into
+  // attemptSeedReroll above -- same behavior, now unit-testable in isolation. The call
+  // mutates task.planResponse/lastGoodPlan, calls recordPlan (with the reRolled /
+  // seededFromPrior / thin / grounding flags) and emits the 'plan-done' event; its return
+  // value keeps the bookkeeping locals (totalAttempts, reRolled, stillThin,
+  // seededFromPrior) available below.
+  const seedReroll = await attemptSeedReroll({
+    planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+  });
+  planResult = seedReroll.planResult;
+  const totalAttempts = seedReroll.totalAttempts;
+  const reRolled = seedReroll.reRolled;
+  const stillThin = seedReroll.stillThin;
+  const seededFromPrior = seedReroll.seededFromPrior;
 
   // Acceptance criteria (2026-09-04): a "definition of done" the implement + review are
   // held to. From promptContext.acceptanceCriteria if the caller gave one, else the
