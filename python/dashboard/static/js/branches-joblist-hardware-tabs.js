@@ -38,7 +38,7 @@ function branchCardHtml(b) {
       : `<span class="badge ok" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Coordinator hub complete -- click to open the hub">✓ hub complete</span>`)
     : '';
   return `
-    <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}" data-open-branch="${escapeAttr(b.branch)}" style="cursor:pointer">
+    <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}" data-open-branch="${escapeAttr(b.branch)}" data-verdict-key="${branchVerdictKey(b)}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
       <div class="row">
         <span class="id">${escapeHtmlBright(b.title)}</span>
         <div class="badge-col">
@@ -48,6 +48,7 @@ function branchCardHtml(b) {
           ${behindBadge}
         </div>
       </div>
+      ${branchVerdictBadgeHtml(b)}
       <div class="meta">
         ${b.domain ? `domain <strong>${escapeHtml(b.domain)}</strong>${b.source ? ' · source <strong>' + escapeHtml(b.source) + '</strong>' : ''} · ` : ''}
         pushed ${fmtAge((Date.now() - new Date(b.pushedAt).getTime()) / 1000)} ago
@@ -178,8 +179,7 @@ async function renderBranchesTab() {
     main.innerHTML = '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
     return;
   }
-  main.innerHTML = branches.map(branchCardHtml).join('');
-  main.querySelectorAll('[data-branch-row]').forEach(wireBranchCard);
+  renderBranchListInto(main, branches);
 }
 
 // Entered from the nav click handler (core-ui.js), same "own render lifecycle, not the
@@ -224,10 +224,8 @@ async function refreshBranchesTab() {
   // isn't there.
   if (!main.querySelector('[data-branch-row]')) {
     currentBranches = branches;
-    main.innerHTML = branches.length
-      ? branches.map(branchCardHtml).join('')
-      : '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
-    main.querySelectorAll('[data-branch-row]').forEach(wireBranchCard);
+    if (branches.length) renderBranchListInto(main, branches);
+    else main.innerHTML = '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
     return;
   }
   if (branches.length === 0) {
@@ -237,9 +235,12 @@ async function refreshBranchesTab() {
   }
 
   const seen = new Set();
-  for (const b of branches) {
+  for (const b of filterBranchesByVerdict(branches, branchVerdictFilter)) {
     seen.add(b.branch);
-    if (main.querySelector(`[data-branch-row="${CSS.escape(b.branch)}"]`)) continue; // already on screen -- leave it, see header comment
+    const existing = main.querySelector(`[data-branch-row="${CSS.escape(b.branch)}"]`);
+    // Already on screen -- leave it (see header comment), unless its verdict bucket changed: then swap the card so the border/badge update.
+    if (existing && existing.dataset.verdictKey === branchVerdictKey(b)) continue;
+    if (existing) existing.remove();
     const wrapper = document.createElement('div');
     wrapper.innerHTML = branchCardHtml(b);
     const card = wrapper.firstElementChild;
@@ -250,6 +251,7 @@ async function refreshBranchesTab() {
     if (!seen.has(card.dataset.branchRow)) card.remove();
   });
   currentBranches = branches;
+  refreshBranchVerdictFilterBar(main, branches);
 }
 
 async function renderBranchDetailModal(b) {
@@ -271,6 +273,7 @@ async function renderBranchDetailModal(b) {
   html += `<div class="meta" style="font-family:monospace;font-size:11px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
   if (b.domain) html += `<div class="field-label">Domain / Source</div><div>${escapeHtml(b.domain)} / ${escapeHtml(b.source || '')}</div>`;
   if (b.description) html += `<div class="field-label">What this changes</div><div>${escapeHtml(b.description)}</div>`;
+  html += branchVerdictDetailHtml(b);
 
   // Coordinator hub status -- a stacked file-decompose branch is a slice of a multi-task
   // hub, not a finished unit. Show where the hub stands and whether it's safe to merge.
