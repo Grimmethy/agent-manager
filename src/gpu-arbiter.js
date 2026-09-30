@@ -257,6 +257,23 @@ function shouldSkipWait(instancesDir, key, myRank) {
   );
 }
 
+// Take the real mutex after winning the ticket queue: create the compat marker FIRST,
+// then acquire the flock; if the flock fails, undo the marker and unlink the ticket
+// before rethrowing. On success, mark the ticket as holding and hand back both handles.
+function acquireFlockWithCompat(instancesDir, key, cls, fp) {
+  const compat = interactiveCompatMarker(instancesDir, cls);
+  let flockHandle;
+  try {
+    flockHandle = sfl.acquire(instancesDir, key, { skipPriorityBackoff: true });
+  } catch (err) {
+    compat.remove();
+    safeUnlink(fp);
+    throw err;
+  }
+  patchTicket(fp, { holding: true });
+  return { flockHandle, compat };
+}
+
 function acquire(instancesDir, { cls = DEFAULT_CLASS, model, lockKey, taskId = null, phase = null, onCancel = null } = {}) {
   // lockKey overrides model as the actual serialization key when a caller passes one
   // (see this file's own header) -- model is still carried on the ticket as metadata.
@@ -280,19 +297,9 @@ function acquire(instancesDir, { cls = DEFAULT_CLASS, model, lockKey, taskId = n
     throw err;
   }
 
-  // At the head -- take the real mutex. skipPriorityBackoff: the ARBITER is the priority
-  // mechanism now; sfl's own .discuss-waiting backoff would just make us wait on the
-  // compat marker the arbiter itself drops for interactive tickets.
-  const compat = interactiveCompatMarker(instancesDir, cls);
-  let flockHandle;
-  try {
-    flockHandle = sfl.acquire(instancesDir, key, { skipPriorityBackoff: true });
-  } catch (err) {
-    compat.remove();
-    safeUnlink(fp);
-    throw err;
-  }
-  patchTicket(fp, { holding: true });
+  // At the head -- take the real mutex (compat marker + flock + ticket patch, with the
+  // failure invariant, encapsulated in acquireFlockWithCompat).
+  const { flockHandle, compat } = acquireFlockWithCompat(instancesDir, key, cls, fp);
 
   let cancelled = false;
   let released = false;
