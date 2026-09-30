@@ -302,6 +302,30 @@ function handleConfirmOutcome(record, ctx) {
   } catch (err) { console.error(`auto-confirm: moveTaskFile threw for ${ctx.name} (${ctx.file}): ${err && err.message || err}`); ctx.summary.errors += 1; }
 }
 
+function handleDenyOutcome(record, ctx) {
+  const reason = voteReason(ctx.vote, 'DENY');
+  record.autoConfirmReviewedAt = ctx.now;
+  record.autoConfirmDecision = 'deny';
+  record.autoConfirmReviewNote = reason;
+  record.status = 'done';
+  record.doneMarker = `auto-denied at confirm gate: ${reason}`;
+  appendHistoryEvent(record, 'archived', `auto-denied (votes: ${ctx.vote.realVoteCount}/${ctx.vote.requestedVotes}): ${reason}`);
+  try {
+    if (moveTaskFile(ctx.file, ctx.archiveDir, ctx.name, record)) ctx.summary.denied += 1;
+    else ctx.summary.errors += 1;
+  } catch (err) { console.error(`auto-confirm: moveTaskFile threw (DENY) for ${ctx.name} (${ctx.file}): ${err && err.message || err}`); ctx.summary.errors += 1; }
+}
+
+function handleInconclusiveOutcome(record, ctx) {
+  const reason = `no confident CONFIRM/DENY majority (votes: ${ctx.vote.realVoteCount}/${ctx.vote.requestedVotes})`;
+  record.autoConfirmReviewedAt = ctx.now;
+  record.autoConfirmDecision = 'escalate';
+  record.autoConfirmReviewNote = reason;
+  appendHistoryEvent(record, 'advisory', `auto-confirm review inconclusive (${reason}) -- held for a human`);
+  try { fs.writeFileSync(ctx.file, JSON.stringify(record, null, 2)); ctx.summary.escalated += 1; }
+  catch { ctx.summary.errors += 1; }
+}
+
 async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote, candidatesPath }) {
   const summary = { checked: 0, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
   if (process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW === 'false') return summary;
@@ -384,25 +408,10 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
     if (vote.confident && vote.verdict === 'CONFIRM') {
       handleConfirmOutcome(task, { file, name, summary, approvedDir, vote, now, gateStamp });
     } else if (vote.confident && vote.verdict === 'DENY') {
-      const reason = voteReason(vote, 'DENY');
-      task.autoConfirmReviewedAt = now;
-      task.autoConfirmDecision = 'deny';
-      task.autoConfirmReviewNote = reason;
-      task.status = 'done';
-      task.doneMarker = `auto-denied at confirm gate: ${reason}`;
-      appendHistoryEvent(task, 'archived', `auto-denied (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
-      try {
-        if (moveTaskFile(file, archiveDir, name, task)) summary.denied += 1;
-        else summary.errors += 1;
-      } catch (err) { console.error(`auto-confirm: moveTaskFile threw (DENY) for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
+      handleDenyOutcome(task, { file, name, summary, archiveDir, vote, now, gateStamp });
     } else {
       // No confident majority -- leave for a human.
-      task.autoConfirmReviewedAt = now;
-      task.autoConfirmDecision = 'escalate';
-      task.autoConfirmReviewNote = `no confident CONFIRM/DENY majority (votes: ${vote.realVoteCount}/${vote.requestedVotes})`;
-      appendHistoryEvent(task, 'advisory', `auto-confirm review inconclusive (${task.autoConfirmReviewNote}) -- held for a human`);
-      try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); summary.escalated += 1; }
-      catch { summary.errors += 1; }
+      handleInconclusiveOutcome(task, { file, name, summary, vote, now, gateStamp });
     }
   }
 
@@ -411,6 +420,8 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
 
 module.exports = {
   autoConfirmReview,
+  handleDenyOutcome,
+  handleInconclusiveOutcome,
   classifyVote,
   clip,
   buildForensicsConfirmPrompt,

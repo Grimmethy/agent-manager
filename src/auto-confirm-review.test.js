@@ -9,7 +9,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const {
   autoConfirmReview, classifyVote, parseDeleteItems, buildForensicsConfirmPrompt, buildDebriefConfirmPrompt,
-  gatherDeleteReferences,
+  gatherDeleteReferences, handleDenyOutcome, handleInconclusiveOutcome,
 } = require('./auto-confirm-review.js');
 
 function makePipeline() {
@@ -287,4 +287,65 @@ test('gatherDeleteReferences reports no references for a NON-stacked task (the s
   const repoRoot = makeGitRepoWithStackedBranch();
   const refs = gatherDeleteReferences(repoRoot, ['src'], ['src/old-module.js']);
   assert.match(refs['src/old-module.js'], /no references found/);
+});
+
+test('handleDenyOutcome stamps deny/done, appends an archived event, and moves the file to archiveDir', () => {
+  const dir = makePipeline();
+  const file = path.join(dir, 'queue', 'awaiting-confirm', 't-deny.json');
+  fs.writeFileSync(file, JSON.stringify({ id: 't-deny', history: [] }, null, 2));
+  const record = { id: 't-deny', history: [] };
+  const summary = { checked: 1, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
+  const now = '2026-09-06T00:00:00.000Z';
+  handleDenyOutcome(record, {
+    file, name: 't-deny.json', summary,
+    archiveDir: path.join(dir, 'queue', 'done', '_archived_no_action'),
+    vote: { verdict: 'DENY', confident: true, votes: [{ verdict: 'DENY', response: 'DENY: dupe of AC-4' }], realVoteCount: 2, requestedVotes: 3 },
+    now, gateStamp: 'forensicsReportConfirmedAt',
+  });
+  assert.equal(record.autoConfirmReviewedAt, now);
+  assert.equal(record.autoConfirmDecision, 'deny');
+  assert.match(record.autoConfirmReviewNote, /dupe of AC-4/);
+  assert.equal(record.status, 'done');
+  assert.match(record.doneMarker, /auto-denied/);
+  assert.ok(record.history.some((h) => h.stage === 'archived' && /auto-denied/.test(h.detail)));
+  assert.equal(summary.denied, 1);
+  assert.equal(summary.errors, 0);
+  assert.ok(!exists(file), 'source file removed');
+  const moved = read(path.join(dir, 'queue', 'done', '_archived_no_action', 't-deny.json'));
+  assert.equal(moved.autoConfirmDecision, 'deny');
+});
+
+test('handleInconclusiveOutcome stamps escalate and writes the record back to the same file', () => {
+  const dir = makePipeline();
+  const file = path.join(dir, 'queue', 'awaiting-confirm', 't-inc.json');
+  const record = { id: 't-inc', history: [] };
+  const summary = { checked: 1, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
+  const now = '2026-09-06T00:00:00.000Z';
+  handleInconclusiveOutcome(record, {
+    file, name: 't-inc.json', summary,
+    vote: { verdict: null, confident: false, votes: [], realVoteCount: 2, requestedVotes: 3 },
+    now, gateStamp: 'forensicsReportConfirmedAt',
+  });
+  assert.equal(record.autoConfirmReviewedAt, now);
+  assert.equal(record.autoConfirmDecision, 'escalate');
+  assert.match(record.autoConfirmReviewNote, /2\/3/);
+  assert.ok(record.history.some((h) => h.stage === 'advisory' && /inconclusive/.test(h.detail)));
+  assert.equal(summary.escalated, 1);
+  assert.equal(summary.errors, 0);
+  const written = read(file);
+  assert.equal(written.autoConfirmDecision, 'escalate');
+});
+
+test('handleInconclusiveOutcome counts a write failure as an error and does not throw', () => {
+  const record = { id: 't-bad', history: [] };
+  const summary = { checked: 1, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
+  handleInconclusiveOutcome(record, {
+    file: path.join(os.tmpdir(), 'definitely-not-a-dir-x', 't-bad.json'),
+    name: 't-bad.json', summary,
+    vote: { verdict: null, confident: false, votes: [], realVoteCount: 1, requestedVotes: 3 },
+    now: '2026-09-06T00:00:00.000Z', gateStamp: 'forensicsReportConfirmedAt',
+  });
+  assert.equal(record.autoConfirmDecision, 'escalate');
+  assert.equal(summary.escalated, 0);
+  assert.equal(summary.errors, 1);
 });
