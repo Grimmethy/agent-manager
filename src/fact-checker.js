@@ -29,6 +29,28 @@ function extractFilePaths(text) {
   return [...new Set(matches)];
 }
 
+// Paths a unified diff CREATES: a `diff --git a/X b/X` header followed (before the next header) by `new file mode`, or a `--- /dev/null` + `+++ b/X` pair
+// (with or without a diff --git header). Modified, deleted (`deleted file mode` / `+++ /dev/null`) and renamed files are not create targets. Prose that merely
+// mentions "new file mode" without a diff header yields nothing.
+function extractDiffCreateTargets(text) {
+  const targets = new Set();
+  const lines = String(text || '').split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const header = lines[i].match(/^diff --git a\/(\S+) b\/(\S+)\s*$/);
+    if (header) {
+      for (let j = i + 1; j < Math.min(i + 6, lines.length); j += 1) {
+        if (/^diff --git /.test(lines[j])) break;
+        if (/^new file mode /.test(lines[j])) { targets.add(header[2]); break; }
+      }
+    }
+    if (/^--- \/dev\/null\s*$/.test(lines[i]) && i + 1 < lines.length) {
+      const plus = lines[i + 1].match(/^\+\+\+ b\/(\S+)\s*$/);
+      if (plus) targets.add(plus[1]);
+    }
+  }
+  return targets;
+}
+
 // Confirmed live 2026-08-20 (first real product_spec bootstrap run against a brand-new
 // crm-plugin repo): a Group B `{"mode":"create", "file":"Docs/PRODUCT_SPEC.md", ...}`
 // draft got auto-rejected in review because checkFilePaths flagged its OWN create target
@@ -56,13 +78,17 @@ function extractFilePaths(text) {
 // reviewer model as JSON evidence -- confirmed live via the done-task backlog: 7 of 8
 // brain_dump_sort tasks were rejected on the first review pass for exactly this, each
 // costing an extra draft+review cycle.
+//
+// 2026-09-30: an adhoc implement draft is NOT that shape -- it is a summary plus a plain unified diff (`=== DIFF ===`), so JSON.parse always failed
+// here (every review printed the warning) and a file the diff itself CREATES was listed exists:false with no isCreateTarget. The reviewer prompt then
+// told the voters "exists:false WITHOUT isCreateTarget is evidence toward fabrication", and they rejected good drafts for "claiming a test file that does
+// not exist" (brain dump #1647; HUB0068-02 was exhausted to a human this way). For non-JSON text the creation markers are read from the diff headers.
 function extractCreateModeTargets(text) {
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch (err) {
-    console.warn('[fact-checker] failed to parse targets input', err);
-    return new Set();
+    return extractDiffCreateTargets(text);
   }
   const items = Array.isArray(parsed) ? parsed : [parsed];
   const targets = new Set();
@@ -957,6 +983,7 @@ module.exports = {
   checkCompletionClaimsInNote,
   extractFilePaths,
   extractCreateModeTargets,
+  extractDiffCreateTargets,
   extractClaimedRelationships,
   extractClaimedCommits,
   resolveAgainstRepo,
