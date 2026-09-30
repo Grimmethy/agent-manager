@@ -2053,3 +2053,102 @@ test('end to end: a recorded executed-verification result reaches the prompt the
     if (expectSection) assert.match(captured[0], /Covering test files run \(1\): src\/a\.test\.js -- all PASSED\./);
   }
 });
+
+
+// --- replay of the session's false rejections through the REAL engines (brain dump #1647 step 3) -----------------------------------------
+// Everything above stubs verifyDiffFn or the fact-checker. These tests stub only the vote: the real fact-checker, the real
+// executed-verification engine (bwrap sandbox, scratch worktree of a real git remote) and the real prompt builder all run, so a break in the
+// wiring between them -- which is exactly what produced HUB0068-02's false rejection -- fails here instead of in production.
+const HAS_BWRAP = (() => { try { execFileSync('bwrap', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
+
+function withReplayRepo(files, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-replay-'));
+  const git = (args, cwd) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    const origin = path.join(dir, 'origin.git');
+    const work = path.join(dir, 'repo');
+    git(['init', '--bare', '-b', 'main', origin], dir);
+    git(['clone', origin, work], dir);
+    git(['checkout', '-b', 'main'], work);
+    for (const [rel, body] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(path.join(work, rel)), { recursive: true });
+      fs.writeFileSync(path.join(work, rel), body);
+    }
+    git(['add', '-A'], work); git(['commit', '-m', 'base'], work); git(['push', 'origin', 'main'], work);
+    const domainsPath = path.join(dir, 'task-domains.json');
+    fs.writeFileSync(domainsPath, JSON.stringify({ default: { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' } }));
+    return fn({ work, domainsPath });
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}
+
+const REPLAY_TEST_SRC = "const test = require('node:test');\nconst assert = require('node:assert/strict');\nconst { add } = require('./a.js');\ntest('add', () => { assert.equal(add(1, 2), 3); });\n";
+
+function newFileDiff(rel, content) {
+  const lines = content.split('\n').slice(0, -1);
+  return `diff --git a/${rel} b/${rel}\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/${rel}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join('\n')}\n`;
+}
+
+function replayTask(id, rawDiff, check) {
+  return adhocImplementedTask({
+    id, title: 'replay', rawDiff,
+    acceptanceResults: [{ criterion: 'the new test passes', check: `\`${check}\``, result: 'PASS', pass: true }],
+    implementResponse: `Added the change.\n\nAcceptance:\n1. the new test passes -- \`${check}\` -- PASS\n\n=== DIFF ===\n${rawDiff}`,
+  });
+}
+
+async function runReplay(task, work, domainsPath) {
+  const captured = [];
+  process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'true';
+  try {
+    await reviewTask(task, { repoRoot: work, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  } finally { process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false'; }
+  return captured;
+}
+
+// Replay of HUB0068-02: a diff whose only content is a NEW test file. The voters called the new path fabricated ("does not exist") and
+// doubted the acceptance result, because nothing told them the file is created by the diff or that the harness had run it.
+test('replay: a diff that creates a new passing test file is seen by the voters as a create target whose claimed command the harness CONFIRMED', { skip: !HAS_BWRAP && 'bwrap unavailable' }, async () => {
+  await withReplayRepo({ 'src/a.js': 'module.exports = { add: (x, y) => x + y };\n' }, async ({ work, domainsPath }) => {
+    const task = replayTask('replay-create', newFileDiff('src/a.test.js', REPLAY_TEST_SRC), 'node --test src/a.test.js');
+    const captured = await runReplay(task, work, domainsPath);
+    assert.equal(captured.length, 1, 'a passing change must reach the vote');
+    assert.equal(task.executedVerification.status, 'passed');
+    const prompt = captured[0];
+    assert.match(prompt, /"claimedPath":"src\/a\.test\.js","exists":false,"resolvedPath":null,"resolvedVia":null,"isCreateTarget":true/);
+    assert.match(prompt, /Result: PASSED\./);
+    assert.match(prompt, /Covering test files run \(1\): src\/a\.test\.js -- all PASSED\./);
+    assert.match(prompt, /re-ran and CONFIRMED \(they exited 0\): `node --test src\/a\.test\.js`/);
+    assert.ok(!task.executedVerification.commands.some((c) => c.outcome !== 'confirmed'));
+  });
+});
+
+// A path the diff only MODIFIES (never creates) and that is not on the base is still flagged: the create-target fix must not turn
+// every missing path into a pass.
+test('replay: a path the diff modifies but the base does not contain is still flagged missing-file, and nothing is called PASSED', { skip: !HAS_BWRAP && 'bwrap unavailable' }, async () => {
+  await withReplayRepo({ 'src/a.js': 'module.exports = { add: (x, y) => x + y };\n' }, async ({ work, domainsPath }) => {
+    const diff = 'diff --git a/src/ghost.js b/src/ghost.js\n--- a/src/ghost.js\n+++ b/src/ghost.js\n@@ -1 +1 @@\n-old\n+new\n';
+    const task = replayTask('replay-ghost', diff, 'node --test src/ghost.test.js');
+    const captured = await runReplay(task, work, domainsPath);
+    assert.equal(captured.length, 1);
+    const prompt = captured[0];
+    assert.match(prompt, /"type":"missing-file","detail":"src\/ghost\.test\.js"/, 'the test file the draft claims to run does not exist anywhere');
+    assert.doesNotMatch(prompt, /"claimedPath":"[^"]*ghost[^"]*","exists":false,"resolvedPath":null,"resolvedVia":null,"isCreateTarget":true/, 'nothing here is a create target');
+    assert.notEqual(task.executedVerification.status, 'passed');
+    assert.doesNotMatch(prompt, /Result: PASSED\./);
+  });
+});
+
+// Replay of the dependent-slice rejection: slice 2 edits a file only slice 1 (unmerged) creates. The diff cannot apply to the base,
+// which is "cannot tell", never "failed" -- the review must reach the vote instead of hard-blocking.
+test('replay: a slice that depends on an unmerged sibling is INCONCLUSIVE -- it is not blocked, and the voters are told not to count it either way', { skip: !HAS_BWRAP && 'bwrap unavailable' }, async () => {
+  await withReplayRepo({ 'src/a.js': 'module.exports = { add: (x, y) => x + y };\n' }, async ({ work, domainsPath }) => {
+    const diff = 'diff --git a/src/sibling.js b/src/sibling.js\n--- a/src/sibling.js\n+++ b/src/sibling.js\n@@ -1,2 +1,3 @@\n keep\n-old\n+new\n+more\n';
+    const task = replayTask('replay-dependent', diff, 'node --test src/a.test.js');
+    const captured = await runReplay(task, work, domainsPath);
+    assert.equal(captured.length, 1, 'inconclusive must not block');
+    assert.equal(task.executedVerification.status, 'inconclusive');
+    assert.notEqual(task.status, 'blocked');
+    assert.match(captured[0], /Result: INCONCLUSIVE\./);
+    assert.match(captured[0], /INCONCLUSIVE is neither a pass nor a failure/);
+  });
+});
