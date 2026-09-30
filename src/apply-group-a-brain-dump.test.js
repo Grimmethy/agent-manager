@@ -27,6 +27,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { applyBrainDumpSort } = require('./apply-group-a.js');
+const { isValidDuplicateMatch } = require('./apply-group-a-brain-dump.js');
 
 function brainDumpEntry(overrides = {}) {
   return { id: 'bd-1', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'original', status: 'captured', ...overrides };
@@ -96,4 +97,51 @@ test('applyBrainDumpSort stale no-op: status moved off captured since drafting -
   const entries = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries;
   assert.equal(entries[0].status, 'sorted'); // untouched -- the guard writes nothing
   assert.equal(entries[0].sortAttempt, undefined);
+});
+
+// 2026-09-16, pipeline hardening (brain_dump_sort possibleDuplicateOf false matches):
+// applyBrainDumpSort's guard (apply-group-a-brain-dump.js) nulls result.possibleDuplicateOf
+// BEFORE the duplicate-gate routing whenever the classifier's claimed title matches NOTHING
+// in the real candidate list it was shown (task.promptContext.existingQueuedTitles) -- see
+// isValidDuplicateMatch's own header for the two confirmed hallucination shapes (a quoted
+// phrase echoed from the note's own body; an invented slug). isValidDuplicateMatch is
+// exported precisely so this decision is unit-testable in isolation; the apply-level
+// end-to-end case (hallucinated flag must not hold for a human, must proceed to adhoc/)
+// lives in src/apply-group-a.test.js ('discards a possibleDuplicateOf that matches nothing
+// in the real candidate list'). These tests pin the guard itself so a future change to
+// the match bar cannot silently re-route hallucinated duplicates to needs-clarification.
+//
+// (Sweep note for the original `.verdict === 'approved'` question: the only strict
+// consumer in src/ is src/review-task.js reviewTask() (`result.verdict === 'approved' ||
+// result.verdict === 'blocked'`), and every verdict producer in runReview returns exactly
+// 'approved' or 'blocked' -- the string 'noop-approved' does not exist anywhere in this
+// tree, so that check is self-consistent and out of scope for this pipeline.)
+test('possibleDuplicateOf guard: a hallucinated claimed title matching no real candidate is rejected (nulls the match)', () => {
+  const realTitles = [
+    'Add authentication to the Agent Manager dashboard',
+    'Rebalance the worker-1 lane split between draft and review',
+  ];
+  // Shape (b): a plausible-sounding invented slug that is not a real task title at all.
+  assert.equal(isValidDuplicateMatch('agent-manager-apply-target', realTitles), false,
+    'invented slug matching no real title must be rejected -- the apply guard nulls result.possibleDuplicateOf for this');
+  // Shape (a): a quoted phrase echoed from the note's own body, not an external queued title.
+  assert.equal(isValidDuplicateMatch('Design option: a shared constrained action-interface layer, replacing per-task-type ad hoc tool access', realTitles), false,
+    'a phrase echoed from the note\'s own body must be rejected -- not routed to needs-clarification');
+});
+
+test('possibleDuplicateOf guard: an empty or missing candidate list never validates (nulls the match)', () => {
+  // No list shown to the classifier at all -- nothing can be a "duplicate of" what it saw.
+  assert.equal(isValidDuplicateMatch('anything at all', []), false);
+  assert.equal(isValidDuplicateMatch('anything at all', undefined), false);
+});
+
+test('possibleDuplicateOf guard: a claimed title that IS in the real candidate list still passes (no false negative)', () => {
+  const realTitles = [
+    'Add authentication to the Agent Manager dashboard',
+    'Rebalance the worker-1 lane split between draft and review',
+  ];
+  assert.equal(isValidDuplicateMatch('Add authentication to the Agent Manager dashboard', realTitles), true,
+    'a genuine exact match must NOT be discarded -- a real duplicate flag still reaches the duplicate gate');
+  assert.equal(isValidDuplicateMatch('Add authentication to the Agent Manager dashboard session persistence', realTitles), true,
+    'a truncated/extended form of a real title still matches, so a real duplicate is not lost to the guard');
 });
