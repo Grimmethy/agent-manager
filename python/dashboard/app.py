@@ -4405,11 +4405,13 @@ def _acquire_gpu_lease() -> None:
         logger.debug("ComfyUI lease unlink failed: %s", exc, exc_info=True)
 
 
-def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
-    """Writes the chosen path/toggles into agent-manager.env (creating the file if it
-    doesn't exist yet) and spawns the relevant loops as real, visible console windows,
-    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
-    /api/pipeline/start and _restart_pipeline()."""
+def _build_pipeline_env(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
+    """Builds the child-process env for a pipeline start: records the project in the
+    history, persists the launch toggles, resolves this project's per-project keys
+    (AGENT_MANAGER_PIPELINE_DIR/DOMAINS_PATH, AGENT_MANAGER_APPLY_REPO_ROOT, and
+    AGENT_MANAGER_GREP_DIRS) to the registered project's values or clears stale ones,
+    then merges agent-manager.env over os.environ. Extracted verbatim from
+    _start_pipeline so the env setup is testable in isolation; behavior is unchanged."""
     record_project_used(raw_path)
     _persist_launch_env(raw_path, include_apply, skip_push)
 
@@ -4469,17 +4471,30 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
 
     env_overrides = read_env_file(ENV_FILE_PATH)
     env_overrides["AGENT_MANAGER_REPO_ROOT"] = raw_path
-    child_env = {**os.environ, **env_overrides}
+    return {**os.environ, **env_overrides}
 
-    _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
 
-    # Same pipelineDir/domainsPath resolution _ensure_task_domains just used above --
-    # recorded here so a later brain-dump routing decision can locate THIS project's
-    # queue even after a different project becomes active (project-history.json alone
-    # only ever stored the bare repoRoot).
+def _ensure_registry_entry(child_env: dict, raw_path: str) -> None:
+    """Records this project's registry entry (repoRoot -> pipelineDir/domainsPath) so a
+    later brain-dump routing decision can locate THIS project's queue even after a
+    different project becomes active (project-history.json alone only ever stored the
+    bare repoRoot). Same pipelineDir/domainsPath resolution _build_pipeline_env used,
+    ending in the same record_project_registry_entry upsert _start_pipeline did inline."""
     pipeline_dir_for_registry = child_env.get("AGENT_MANAGER_PIPELINE_DIR") or raw_path
     domains_path_for_registry = child_env.get("AGENT_MANAGER_DOMAINS_PATH") or str(Path(pipeline_dir_for_registry) / "task-domains.json")
     record_project_registry_entry(raw_path, pipeline_dir_for_registry, domains_path_for_registry)
+
+
+def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
+    """Writes the chosen path/toggles into agent-manager.env (creating the file if it
+    doesn't exist yet) and spawns the relevant loops as real, visible console windows,
+    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
+    /api/pipeline/start and _restart_pipeline()."""
+    child_env = _build_pipeline_env(raw_path, include_apply, skip_push)
+
+    _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
+
+    _ensure_registry_entry(child_env, raw_path)
 
     # Explicit pipeline start is a "GPU work now" signal -- stomp any ComfyUI GPU lease
     # PromptForge left behind (see _acquire_gpu_lease).
