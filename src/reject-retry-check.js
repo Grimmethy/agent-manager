@@ -480,25 +480,12 @@ function buildExhaustedReviewVerdictQuestion(task) {
   ].join('\n');
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
-  const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
-  // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
-  // only matters for tests that don't bother passing pipelineDir explicitly (it was never
-  // load-bearing before the move-lock existed); a real caller always passes it directly.
-  const instancesDir = sharedInstancesDir(pipelineDir || path.dirname(path.dirname(blockedDir)));
-  // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
-  // Derive it from needsClarificationDir (<pipelineDir>/queue/needs-clarification) when a
-  // caller (older tests) didn't pass it explicitly.
-  const ghostRoot = pipelineDir
-    || (needsClarificationDir ? path.dirname(path.dirname(needsClarificationDir)) : null);
-  // Lazy, best-effort (deterministicReviewRecoveryCheck below tolerates undefined) -- same
-  // "read env inside the sweep, never at module load, never let a missing config block a
-  // sweep tick" discipline every other watchdog sweep in this codebase already follows.
-  // Callers that pass approvedDir explicitly (tests) skip this derivation entirely.
-  const approvedDirResolved = approvedDir
-    || (ghostRoot ? path.join(ghostRoot, 'queue', 'approved') : null);
-  let recoveryConfig = {};
-  try { recoveryConfig = getConfig(); } catch { /* no live config (e.g. a unit test) -- recovery check just no-ops */ }
+// The directory-discovery half of rejectRetryCheck, extracted so the "which
+// directories do we scan, and what entries do they yield" policy is a named,
+// independently unit-testable unit (mock fs.readdirSync, assert the shape of the
+// returned array) rather than inlined in the ~200-line orchestrator. No behavioral
+// change: same three scans, same missing-dir swallowing, same status filter.
+function discoverBlockedEntries({ blockedDir, adhocDir, derivedDir }) {
   const entries = [];
   try {
     for (const n of fs.readdirSync(blockedDir).filter((f) => f.endsWith('.json'))) {
@@ -527,6 +514,29 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       }
     } catch { /* dir absent -- fine */ }
   }
+  return entries;
+}
+
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
+  const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
+  // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
+  // only matters for tests that don't bother passing pipelineDir explicitly (it was never
+  // load-bearing before the move-lock existed); a real caller always passes it directly.
+  const instancesDir = sharedInstancesDir(pipelineDir || path.dirname(path.dirname(blockedDir)));
+  // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
+  // Derive it from needsClarificationDir (<pipelineDir>/queue/needs-clarification) when a
+  // caller (older tests) didn't pass it explicitly.
+  const ghostRoot = pipelineDir
+    || (needsClarificationDir ? path.dirname(path.dirname(needsClarificationDir)) : null);
+  // Lazy, best-effort (deterministicReviewRecoveryCheck below tolerates undefined) -- same
+  // "read env inside the sweep, never at module load, never let a missing config block a
+  // sweep tick" discipline every other watchdog sweep in this codebase already follows.
+  // Callers that pass approvedDir explicitly (tests) skip this derivation entirely.
+  const approvedDirResolved = approvedDir
+    || (ghostRoot ? path.join(ghostRoot, 'queue', 'approved') : null);
+  let recoveryConfig = {};
+  try { recoveryConfig = getConfig(); } catch { /* no live config (e.g. a unit test) -- recovery check just no-ops */ }
+  const entries = discoverBlockedEntries({ blockedDir, adhocDir, derivedDir });
 
   if (entries.length === 0) return summary;
 
