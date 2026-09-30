@@ -4485,17 +4485,13 @@ def _ensure_registry_entry(child_env: dict, raw_path: str) -> None:
     record_project_registry_entry(raw_path, pipeline_dir_for_registry, domains_path_for_registry)
 
 
-def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
-    """Writes the chosen path/toggles into agent-manager.env (creating the file if it
-    doesn't exist yet) and spawns the relevant loops as real, visible console windows,
-    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
-    /api/pipeline/start and _restart_pipeline()."""
-    child_env = _build_pipeline_env(raw_path, include_apply, skip_push)
-
-    _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
-
-    _ensure_registry_entry(child_env, raw_path)
-
+def _launch_pipeline_subprocess(child_env: dict, raw_path: str, include_apply: bool, skip_push: bool) -> dict:
+    """Spawns the actual pipeline daemons for this project, platform-specific: stomps
+    any ComfyUI GPU lease PromptForge left behind (an explicit start is a "GPU work now"
+    signal), fires the proactive file-decompose sweep, then launches either
+    scripts/launch.sh (Linux) or the PowerShell console-window daemons (Windows).
+    Extracted verbatim from _start_pipeline so the launch step is testable in
+    isolation; behavior is unchanged."""
     # Explicit pipeline start is a "GPU work now" signal -- stomp any ComfyUI GPU lease
     # PromptForge left behind (see _acquire_gpu_lease).
     _acquire_gpu_lease()
@@ -4559,6 +4555,20 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
         subprocess.Popen(args, env=child_env, creationflags=creationflags, cwd=str(PACKAGE_ROOT))
 
     return {"started": True, "repoRoot": raw_path, "includeApply": include_apply, "skipPush": skip_push}
+
+
+def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
+    """Writes the chosen path/toggles into agent-manager.env (creating the file if it
+    doesn't exist yet) and spawns the relevant loops as real, visible console windows,
+    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
+    /api/pipeline/start and _restart_pipeline()."""
+    child_env = _build_pipeline_env(raw_path, include_apply, skip_push)
+
+    _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
+
+    _ensure_registry_entry(child_env, raw_path)
+
+    return _launch_pipeline_subprocess(child_env, raw_path, include_apply, skip_push)
 
 
 def _restart_pipeline():
