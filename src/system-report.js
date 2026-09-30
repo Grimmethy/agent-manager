@@ -234,22 +234,20 @@ function renderByClassification(byClassification) {
   return lines;
 }
 
-function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting, queueHealth, selfAuditActivity, blockedPatterns }) {
-  const { bySource, byClassification } = aggregateTaskStats(tasks);
-
+function renderSummarySection({ period, tasks, byClassification, blockedPatterns, downtime, timeAccounting }) {
   const lines = [];
-  lines.push(`# ${period[0].toUpperCase()}${period.slice(1)} Report — ${fmtLocal(startIso)} to ${fmtLocal(endIso)}`);
-  lines.push('');
-  lines.push(`**Tasks completed:** ${tasks.length}`);
-  lines.push('');
-
   lines.push('## Summary');
   lines.push(buildPlainEnglishSummary({ period, tasks, byClassification, blockedPatterns, downtime, timeAccounting }));
   lines.push('');
+  return lines;
+}
 
-  lines.push(...renderBySource(bySource));
-  lines.push(...renderByClassification(byClassification));
+function renderJunkVsBenefitSection(byClassification) {
+  return renderByClassification(byClassification);
+}
 
+function renderTimeAccountingSection(timeAccounting) {
+  const lines = [];
   if (timeAccounting) {
     // Estimated cost folded directly into this table (2026-08-23, Grimmethy: "I'd like
     // the main time tracking data frame to also include an estimated token cost for
@@ -283,7 +281,11 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
     lines.push('_model-stats.db was unavailable for this period -- see task-count breakdown above instead._');
     lines.push('');
   }
+  return lines;
+}
 
+function renderApiCostSection(timeAccounting) {
+  const lines = [];
   // Estimated Anthropic API Cost by SOURCE (2026-08-23, Grimmethy: "We should track it
   // in the hourly/daily/weekly logs" / "Where else would it make sense to track it?" /
   // "Even if we used the local models.") -- the by-outcome-bucket breakdown now lives
@@ -302,7 +304,11 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
     lines.push('_No model calls with a usable token/cost estimate this period._');
     lines.push('');
   }
+  return lines;
+}
 
+function renderBlockedPatternsSection(blockedPatterns) {
+  const lines = [];
   if (blockedPatterns && blockedPatterns.totalJunk > 0) {
     lines.push('## Failure Patterns (within junk/blocked)');
     if (blockedPatterns.patterns.length === 0) {
@@ -316,7 +322,11 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
     }
     lines.push('');
   }
+  return lines;
+}
 
+function renderQueueHealthSection(queueHealth) {
+  const lines = [];
   lines.push('## Queue Health (live snapshot, not windowed to this period)');
   if (queueHealth) {
     const c = queueHealth.counts;
@@ -327,13 +337,21 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
     lines.push('_queue state unavailable._');
   }
   lines.push('');
+  return lines;
+}
 
+function renderSelfAuditSection(selfAuditActivity) {
+  const lines = [];
   if (selfAuditActivity && selfAuditActivity.length > 0) {
     lines.push('## Self-Audit Activity (pipeline_self_audit)');
     for (const a of selfAuditActivity) lines.push(`- \`${a.signature}\` reported at ${fmtLocal(a.reportedAt)} → ${a.taskId}`);
     lines.push('');
   }
+  return lines;
+}
 
+function renderDowntimeSection(downtime, { startIso, endIso }) {
+  const lines = [];
   lines.push('## Downtime');
   lines.push(`- Total pipeline downtime: ${fmtDuration(downtime.pipelineDownSec)} (out of ${fmtDuration((new Date(endIso) - new Date(startIso)) / 1000)} in this period)`);
   if (downtime.pipelineDownIntervals.length) {
@@ -346,12 +364,38 @@ function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccount
     for (const [id, sec] of perInstance) lines.push(`  - ${id}: ${fmtDuration(sec)}`);
   }
   lines.push('');
+  return lines;
+}
 
-  lines.push('## Methodology & Limitations');
-  lines.push('- "Junk vs. benefit" classification is a heuristic based on task source and verdict text, not a manual audit -- treat it as a strong first pass, not ground truth (the same review pipeline that classifies these has approved at least one fabricated candidate 3/3 votes).');
-  lines.push('- Downtime is inferred from gaps in per-tick heartbeat sampling; the pipeline cannot observe its own downtime any more precisely than "no samples were recorded."');
-  lines.push('- Wall-clock time accounting only covers calls recorded in model-stats.db for this window -- see the task-count breakdown as the always-available fallback.');
+function renderMethodologySection() {
+  return [
+    '## Methodology & Limitations',
+    '- "Junk vs. benefit" classification is a heuristic based on task source and verdict text, not a manual audit -- treat it as a strong first pass, not ground truth (the same review pipeline that classifies these has approved at least one fabricated candidate 3/3 votes).',
+    '- Downtime is inferred from gaps in per-tick heartbeat sampling; the pipeline cannot observe its own downtime any more precisely than "no samples were recorded."',
+    '- Wall-clock time accounting only covers calls recorded in model-stats.db for this window -- see the task-count breakdown as the always-available fallback.',
+    '',
+  ];
+}
+
+function renderMarkdown({ period, startIso, endIso, tasks, downtime, timeAccounting, queueHealth, selfAuditActivity, blockedPatterns }) {
+  const { bySource, byClassification } = aggregateTaskStats(tasks);
+
+  const lines = [];
+  lines.push(`# ${period[0].toUpperCase()}${period.slice(1)} Report — ${fmtLocal(startIso)} to ${fmtLocal(endIso)}`);
   lines.push('');
+  lines.push(`**Tasks completed:** ${tasks.length}`);
+  lines.push('');
+
+  lines.push(...renderSummarySection({ period, tasks, byClassification, blockedPatterns, downtime, timeAccounting }));
+  lines.push(...renderBySource(bySource));
+  lines.push(...renderJunkVsBenefitSection(byClassification));
+  lines.push(...renderTimeAccountingSection(timeAccounting));
+  lines.push(...renderApiCostSection(timeAccounting));
+  lines.push(...renderBlockedPatternsSection(blockedPatterns));
+  lines.push(...renderQueueHealthSection(queueHealth));
+  lines.push(...renderSelfAuditSection(selfAuditActivity));
+  lines.push(...renderDowntimeSection(downtime, { startIso, endIso }));
+  lines.push(...renderMethodologySection());
 
   return lines.join('\n');
 }
