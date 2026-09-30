@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote } = require('./fact-checker.js');
+const { extractDiffCreateTargets, checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
 // against a hash that genuinely exists, not just one that doesn't.
@@ -855,4 +855,72 @@ test('checkCompletionClaimsInNote returns [] for empty or undefined noteText', (
   const repoRoot = makeRepo();
   assert.deepEqual(checkCompletionClaimsInNote('', repoRoot), []);
   assert.deepEqual(checkCompletionClaimsInNote(undefined, repoRoot), []);
+});
+
+
+// --- create targets read from a unified diff (adhoc implement drafts are a summary + a plain diff, never JSON) -- brain dump #1647 --------
+const NEW_FILE_DIFF = [
+  'diff --git a/python/dashboard/test_thing.py b/python/dashboard/test_thing.py',
+  'new file mode 100644', 'index 0000000..abc1234',
+  '--- /dev/null', '+++ b/python/dashboard/test_thing.py', '@@ -0,0 +1,3 @@', '+import unittest', '+class T(unittest.TestCase): pass', '+',
+  'diff --git a/src/existing.js b/src/existing.js', 'index 111..222 100644', '--- a/src/existing.js', '+++ b/src/existing.js', '@@ -1 +1 @@', '-a', '+b',
+].join('\n');
+
+test('extractDiffCreateTargets reads only the files a diff CREATES: new file mode / --- /dev/null, not modified, deleted or merely mentioned ones', () => {
+  assert.deepEqual([...extractDiffCreateTargets(NEW_FILE_DIFF)], ['python/dashboard/test_thing.py']);
+  assert.deepEqual([...extractDiffCreateTargets('--- /dev/null\n+++ b/docs/plain.md\n@@ -0,0 +1 @@\n+hi')], ['docs/plain.md'], 'a bare /dev/null pair without a diff --git header');
+  const deleted = 'diff --git a/src/old.js b/src/old.js\ndeleted file mode 100644\nindex 1..0\n--- a/src/old.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-x';
+  assert.deepEqual([...extractDiffCreateTargets(deleted)], []);
+  assert.deepEqual([...extractDiffCreateTargets('the draft adds a new file mode for src/ghost.js and --- /dev/null style thinking')], [], 'prose is not a diff');
+  assert.deepEqual([...extractDiffCreateTargets('')], []);
+  const two = NEW_FILE_DIFF + '\ndiff --git a/src/b.js b/src/b.js\nnew file mode 100644\n--- /dev/null\n+++ b/src/b.js\n@@ -0,0 +1 @@\n+x';
+  assert.deepEqual([...extractDiffCreateTargets(two)].sort(), ['python/dashboard/test_thing.py', 'src/b.js']);
+});
+
+test('extractCreateModeTargets falls back to the diff headers for non-JSON text, and no longer prints a parse warning for it', () => {
+  const warned = [];
+  const orig = console.warn; console.warn = (...a) => warned.push(a);
+  try {
+    assert.deepEqual([...extractCreateModeTargets('Summary of the change.\n\n=== DIFF ===\n' + NEW_FILE_DIFF)], ['python/dashboard/test_thing.py']);
+    assert.deepEqual([...extractCreateModeTargets('plain prose, no diff')], []);
+  } finally { console.warn = orig; }
+  assert.deepEqual(warned, []);
+  // the JSON Group B path is unchanged
+  assert.deepEqual([...extractCreateModeTargets(JSON.stringify([{ mode: 'create', file: 'src/n.js', content: 'x' }]))], ['src/n.js']);
+});
+
+test('checkDraft treats a file the diff creates as a create target (no missing-file flag), but still flags a path the draft invents and never creates', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'existing.js'), 'a\n');
+  const draft = 'Added python/dashboard/test_thing.py (3 tests) and updated src/existing.js; also see src/invented-module.js.\n\nRESOLUTION: implemented\n\n=== DIFF ===\n' + NEW_FILE_DIFF;
+  const result = checkDraft(draft, dir);
+  const created = result.fileChecks.find((c) => c.claimedPath === 'python/dashboard/test_thing.py');
+  assert.equal(created.exists, false, 'the file really is absent from the repo before the diff is applied');
+  assert.equal(created.isCreateTarget, true, 'the explanation travels with the raw fileChecks entry the reviewer model reads');
+  const missing = result.flags.filter((f) => f.type === 'missing-file').map((f) => f.detail);
+  assert.ok(!missing.includes('python/dashboard/test_thing.py'));
+  assert.ok(missing.includes('src/invented-module.js'), 'a path the draft invents and the diff never creates is still evidence of fabrication');
+  const existing = result.fileChecks.find((c) => c.claimedPath === 'src/existing.js');
+  assert.equal(existing.exists, true);
+  assert.equal(existing.isCreateTarget, undefined, 'a file the diff only MODIFIES is not a create target');
+});
+
+test('checkDraft does not treat a path as created just because the prose says so: no diff header, no create target', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fact-checker-test-'));
+  const result = checkDraft('I created python/dashboard/test_thing.py which contains three tests.', dir);
+  assert.deepEqual(result.flags.filter((f) => f.type === 'missing-file').map((f) => f.detail), ['python/dashboard/test_thing.py']);
+});
+
+test('extractDiffCreateTargets attributes a /dev/null marker to its OWN file header, never to a modified file listed just before it', () => {
+  const modifiedFirst = [
+    'diff --git a/src/modified.js b/src/modified.js', 'index 1..2 100644', '--- a/src/modified.js', '+++ b/src/modified.js',
+    'diff --git a/src/created.js b/src/created.js', 'new file mode 100644', '--- /dev/null', '+++ b/src/created.js', '@@ -0,0 +1 @@', '+x',
+  ].join('\n');
+  assert.deepEqual([...extractDiffCreateTargets(modifiedFirst)], ['src/created.js']);
+});
+
+test('extractDiffCreateTargets finds a newly created BINARY file, which has a new file mode header but no ---/+++ lines', () => {
+  const binary = ['diff --git a/assets/logo.png b/assets/logo.png', 'new file mode 100644', 'index 0000000..abc1234', 'GIT binary patch', 'literal 12', 'zcmZ?wbhEHb'].join('\n');
+  assert.deepEqual([...extractDiffCreateTargets(binary)], ['assets/logo.png']);
 });
