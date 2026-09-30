@@ -93,3 +93,54 @@ test('an unreadable file in queue/adhoc/ does not crash generation and does not 
   });
   clearRegistry();
 });
+
+// --- hub tier (2026-09-30): a live-hub child generates ahead of the source walk, one band below premium ---
+
+test('hub-tier: a live-hub child in queue/adhoc generates ahead of a priority-1 source', () => {
+  withRepo(os.tmpdir(), (pipelineDir) => {
+    registerFakes();
+    writeTask(pipelineDir, 'coordinating', 'hub-x.json', { id: 'hub-x', status: 'coordinating', createdAt: '2026-09-01T00:00:00Z' });
+    writeTask(pipelineDir, 'adhoc', 'hub-child.json', { id: 'hub-child', title: 'hub child', parentHub: 'hub-x' });
+    const task = getNextTask();
+    assert.equal(task.id, 'hub-child', 'a hub child must be generated ahead of the priority-1 source');
+  });
+  clearRegistry();
+});
+
+test('hub-tier: premiumPriority still generates ahead of a hub child', () => {
+  withRepo(os.tmpdir(), (pipelineDir) => {
+    registerFakes();
+    writeTask(pipelineDir, 'coordinating', 'hub-x.json', { id: 'hub-x', status: 'coordinating', createdAt: '2026-09-01T00:00:00Z' });
+    writeTask(pipelineDir, 'adhoc', 'hub-child.json', { id: 'hub-child', title: 'hub child', parentHub: 'hub-x' });
+    writeTask(pipelineDir, 'adhoc', 'premium-adhoc.json', { id: 'premium-adhoc', title: 'premium', premiumPriority: true });
+    assert.equal(getNextTask().id, 'premium-adhoc');
+  });
+  clearRegistry();
+});
+
+test('hub-tier: a hub child held by an unresolved earlier sibling does not preempt, and does not let a plain adhoc task preempt either', () => {
+  withRepo(os.tmpdir(), (pipelineDir) => {
+    registerFakes();
+    writeTask(pipelineDir, 'coordinating', 'hub-x.json', {
+      id: 'hub-x', status: 'coordinating', createdAt: '2026-09-01T00:00:00Z',
+      subTasks: [{ id: 'sib0', status: 'pending-merge' }, { id: 'hub-child', status: 'queued' }],
+    });
+    writeTask(pipelineDir, 'adhoc', 'hub-child.json', { id: 'hub-child', title: 'hub child', parentHub: 'hub-x' });
+    writeTask(pipelineDir, 'adhoc', 'plain-adhoc.json', { id: 'plain-adhoc', title: 'plain adhoc' });
+    const task = getNextTask();
+    assert.equal(task.id, 'probe-hygiene', 'the held hub child falls through, and the plain adhoc fallback the loader returns must not preempt the walk');
+  });
+  clearRegistry();
+});
+
+test('hub-tier: a hub child with an unmet dependsOn or softDependsOn does not preempt the walk', () => {
+  for (const field of ['dependsOn', 'softDependsOn']) {
+    withRepo(os.tmpdir(), (pipelineDir) => {
+      registerFakes();
+      writeTask(pipelineDir, 'coordinating', 'hub-x.json', { id: 'hub-x', status: 'coordinating', createdAt: '2026-09-01T00:00:00Z' });
+      writeTask(pipelineDir, 'adhoc', 'hub-child.json', { id: 'hub-child', title: 'hub child', parentHub: 'hub-x', [field]: ['never-finished-dep'] });
+      assert.equal(getNextTask().id, 'probe-hygiene', `${field} unmet must hold the hub child back`);
+    });
+    clearRegistry();
+  }
+});

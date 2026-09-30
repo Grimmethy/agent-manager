@@ -328,3 +328,30 @@ test('hubHasUnmergedEarlierSibling: in a 3-piece chain, a stacked piece 3 is rel
   fs.writeFileSync(path.join(dir, 'queue', 'done', 'p2.json'), JSON.stringify({ id: 'p2', stacked: { branch, seq: 2, total: 3 } }));
   assert.equal(hubHasUnmergedEarlierSibling(dir, p3).blocked, false);
 });
+
+// --- hub claim tier (2026-09-30) ---
+
+const { HUB_TIER_PRIORITY, isHubTierTask } = require('./hub-priority.js');
+
+test('HUB_TIER_PRIORITY is -1000: below every registered source priority, above premiumPriority (-Infinity)', () => {
+  assert.equal(HUB_TIER_PRIORITY, -1000);
+  assert.ok(HUB_TIER_PRIORITY > -Infinity && HUB_TIER_PRIORITY < 1);
+});
+
+test('isHubTierTask: a child of a live coordinating hub is in the tier (parentHub or promptContext.decomposedFrom)', () => {
+  const dir = makePipeline();
+  writeHub(dir, { id: 'hub-a', createdAt: '2026-09-01T00:00:00Z' });
+  assert.equal(isHubTierTask(dir, { id: 'c1', parentHub: 'hub-a' }), true);
+  assert.equal(isHubTierTask(dir, { id: 'c2', promptContext: { decomposedFrom: 'hub-a' } }), true);
+});
+
+test('isHubTierTask: a child whose hub already left coordinating/, and a plain task, are not', () => {
+  const dir = makePipeline();
+  assert.equal(isHubTierTask(dir, { id: 'c3', parentHub: 'gone-hub' }), false);
+  assert.equal(isHubTierTask(dir, { id: 'plain' }), false);
+});
+
+test('isHubTierTask: an atomic decompose child is in the tier even when its hub record is missing', () => {
+  const dir = makePipeline();
+  assert.equal(isHubTierTask(dir, { id: 'atom', atomic: true }), true);
+});

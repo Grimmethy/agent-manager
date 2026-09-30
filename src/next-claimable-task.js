@@ -3,6 +3,7 @@
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
 const path = require('path');
+const { HUB_TIER_PRIORITY, isHubTierTask, hubIdForTask } = require('./hub-priority.js');
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
@@ -71,9 +72,16 @@ const path = require('path');
 // same discipline as the rest of this file, and the exact class of bug the "ghost in the machine" concept's own
 // standing-mechanism-vs-one-time-check lesson (AGENTS.md) warns to watch for: a rule that
 // only ever gets applied in ONE of two places that are supposed to agree.
+//
+// Hub-work tier (2026-09-30, Grimmethy: hub sub-tasks handled ahead of ordinary work but below a human-pinned premium task):
+// `hubTier` is true for an `atomic` decompose child or a child of a LIVE coordinating hub (hub-priority.js isHubTierTask, resolved
+// through the source's hubOrder hook so an override is honored). Ranks HUB_TIER_PRIORITY (-1000): after premiumPriority
+// (-Infinity), before every registered source priority. Derived from live hub membership at rank time -- never stamped on the task
+// -- so it cannot drift. Within the tier the existing hub key (hubPriority, hub createdAt) and mtime decide.
 const BOT_ADHOC_PRIORITY_PENALTY = 30; // 10 -> 40, landing alongside brain_dump_sort (42) / secondbrain (40) -- thematically apt, since most bot-adhoc IS brain_dump_sort's own continued output
-function effectivePriority(task, basePriority, resolveSourceNameFn) {
+function effectivePriority(task, basePriority, resolveSourceNameFn, hubTier = false) {
   if (task && task.premiumPriority) return -Infinity;
+  if (hubTier) return HUB_TIER_PRIORITY;
   if (task && resolveSourceNameFn(task) === 'adhoc' && !task.humanQueued) return basePriority + BOT_ADHOC_PRIORITY_PENALTY;
   return basePriority;
 }
@@ -105,9 +113,22 @@ function readTaskSafe(fullPath) {
 // bot-adhoc penalty / premium override applied. Infinity when unresolvable (sorts last, still listed). Shared by
 // pickClaimableTasks (claim ranking) and task-sources.js's generation throttle, so "how important is this
 // in-flight task" can never disagree between the two.
-function rankPriorityOfTask(task) {
+//
+// `opts.hubTier` (boolean) is supplied by pickClaimableTasks, which already resolved it through the task's source hubOrder hook;
+// when absent (the generation throttle) it is derived from the live coordinating/ records under `opts.pipelineDir` (default: the
+// configured pipeline dir). The hub tier is applied BEFORE the derived_task early return below so a derived hub child gets it too;
+// a premiumPriority task still ranks -Infinity.
+function rankPriorityOfTask(task, opts = {}) {
   if (!task) return Infinity;
   loadSourceRegistry();
+  let hubTier = opts.hubTier;
+  if (hubTier === undefined) {
+    try {
+      const pipelineDir = opts.pipelineDir || require('./config.js').getConfig().pipelineDir;
+      hubTier = isHubTierTask(pipelineDir, task, opts.hubKeyCache);
+    } catch (_) { hubTier = false; /* no config / unreadable hub records -- ordinary ranking */ }
+  }
+  if (hubTier) return task.premiumPriority ? -Infinity : HUB_TIER_PRIORITY;
   const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
   try {
     // A derived_task carries domain:'adhoc' (so every draft/apply path treats it exactly like adhoc --
@@ -153,6 +174,31 @@ function preferredLaneIsIdle({ instanceId, instancesDir, lanes, now = Date.now()
   } catch (_) {
     return false; // no heartbeat / unreadable -- the preferred lane isn't provably available, don't hold anything for it
   }
+}
+
+// Audit trail for the hub tier (AGENTS.md "build for after-the-fact audit"): when the head-of-queue task is in the hub tier and a
+// non-hub candidate would have outranked it by its natural priority, append one JSON line to <instances>/hub-tier-audit.log naming
+// both. Written from the claim path, so a line identical (task + displaced task) to the previous one is skipped -- an idle-tick
+// re-evaluation of the same queue must not grow the log. Best-effort: never affects claiming, and stdout (names only) is untouched.
+function recordHubTierAudit(rankable, instancesDir) {
+  try {
+    const head = rankable[0];
+    if (!head || !head.hubTier || head.priority !== HUB_TIER_PRIORITY) return;
+    const displaced = rankable.slice(1).find((r) => !r.hubTier && r.naturalPriority < head.naturalPriority);
+    if (!displaced) return;
+    const file = path.join(instancesDir, 'hub-tier-audit.log');
+    const entry = {
+      ts: new Date().toISOString(), taskId: head.id, hubId: head.hubId, hubRank: head.hubKey.rank,
+      naturalRank: head.naturalPriority, displacedTaskId: displaced.id, displacedRank: displaced.naturalPriority,
+    };
+    try {
+      const lines = fs.readFileSync(file, 'utf8').trimEnd().split('\n');
+      const last = JSON.parse(lines[lines.length - 1]);
+      if (last.taskId === entry.taskId && last.displacedTaskId === entry.displacedTaskId) return;
+    } catch (_) { /* no log yet / unreadable last line -- write */ }
+    fs.mkdirSync(instancesDir, { recursive: true });
+    fs.appendFileSync(file, JSON.stringify(entry) + '\n');
+  } catch (_) { /* audit is best-effort */ }
 }
 
 // Returns every filename in pendingDir this instance may claim, in claim-attempt order:
@@ -202,7 +248,6 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
       if (task && !sourceEligibleHere(getRegisteredSource(resolveSourceName(task)), coreActive)) continue;
     } catch (_) { /* unresolvable source -- not gated */ }
 
-    const priority = rankPriorityOfTask(task);
     // Within one source-priority band, order a live hub's children by their owning hub's
     // key (explicit hubPriority asc, then hub createdAt asc) so this path can't contradict
     // nextAdhocTask()'s hub ordering -- same "the two must never disagree" discipline this
@@ -216,9 +261,13 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     const registeredName = task && task.source === 'derived_task' ? 'derived_task' : (task ? resolveSourceName(task) : null);
     const registered = registeredName ? getRegisteredSource(registeredName) : null;
     const hubOrder = (registered && registered.hubOrder) || DEFAULT_HUB_ORDER;
-    const hk = task ? hubOrder.orderCandidate(pipelineDir, task, hubKeyCache).hubKey : { isHubChild: false };
+    const oc = task ? hubOrder.orderCandidate(pipelineDir, task, hubKeyCache) : null;
+    const hk = oc ? oc.hubKey : { isHubChild: false };
     const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt } : noHubKey;
-    rankable.push({ name, priority, mtimeMs, hubKey });
+    const hubTier = !!(oc && oc.isHubWork);
+    const priority = rankPriorityOfTask(task, { hubTier });
+    const naturalPriority = hubTier ? rankPriorityOfTask(task, { hubTier: false }) : priority;
+    rankable.push({ name, id: (task && task.id) || name.replace(/\.json$/, ''), hubId: hubIdForTask(task), priority, naturalPriority, hubTier, mtimeMs, hubKey });
   }
 
   pinned.sort((a, b) => a.mtimeMs - b.mtimeMs);
@@ -229,13 +278,14 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   // compareKeys override would only make sense once a hub-tasks plugin can register a
   // genuinely different record shape -- not needed by S1.
   rankable.sort((a, b) => (a.priority - b.priority) || DEFAULT_HUB_ORDER.compareKeys(a.hubKey, b.hubKey) || (a.mtimeMs - b.mtimeMs));
+  const instancesDir = opts.instancesDir || sharedInstancesDir(pipelineDir);
+  recordHubTierAudit(rankable, instancesDir);
   // Leave the top-ranked task for an idle preferred lane (see lanePreferenceGraceMs above), while it is still fresh.
   const now = opts.now !== undefined ? opts.now : Date.now();
   const graceMs = opts.graceMs !== undefined ? opts.graceMs : lanePreferenceGraceMs();
   if (graceMs > 0 && rankable.length > 0 && (now - rankable[0].mtimeMs) < graceMs) {
     let lanes = opts.lanes;
     if (!lanes) { try { lanes = require('./lanes.js').getLanes(); } catch (_) { lanes = []; } }
-    const instancesDir = opts.instancesDir || sharedInstancesDir(pipelineDir);
     if (preferredLaneIsIdle({ instanceId, instancesDir, lanes, now })) rankable.shift();
   }
   return [...pinned.map((r) => r.name), ...rankable.map((r) => r.name)];
@@ -337,9 +387,13 @@ function listAssignableTasks(queueDir, instanceId) {
     adhocNames = fs.readdirSync(adhocDir).filter((f) => f.endsWith('.json'));
   } catch (_) { /* no adhoc/ dir yet */ }
   const adhocRows = [];
+  const pipelineDir = path.join(queueDir, '..');
+  const hubKeyCache = new Map();
+  const hubTierIds = new Set(); // kept off the row itself: the row shape is the assign-task dropdown's API
   for (const name of adhocNames) {
     const { task } = readTaskSafe(path.join(adhocDir, name));
     if (!task) continue;
+    if (isHubTierTask(pipelineDir, task, hubKeyCache)) hubTierIds.add(task.id || name.replace(/\.json$/, ''));
     adhocRows.push({
       id: task.id || name.replace(/\.json$/, ''),
       title: task.title || null,
@@ -349,7 +403,9 @@ function listAssignableTasks(queueDir, instanceId) {
       premiumPriority: !!task.premiumPriority,
     });
   }
-  adhocRows.sort((a, b) => (a.premiumPriority === b.premiumPriority ? 0 : (a.premiumPriority ? -1 : 1)));
+  // premium, then hub tier, then the rest (Array#sort is stable, so the directory order survives within each band).
+  const bandOf = (r) => (r.premiumPriority ? 0 : (hubTierIds.has(r.id) ? 1 : 2));
+  adhocRows.sort((a, b) => bandOf(a) - bandOf(b));
   out.push(...adhocRows);
 
   return out;
