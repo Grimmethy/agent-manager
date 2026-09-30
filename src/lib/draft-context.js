@@ -262,10 +262,57 @@ function filedUiVisibilityCandidatePaths(evidenceText) {
   return paths;
 }
 
+// Module-private (not exported): the preliminary decompose gate for draftAdhocBranch.
+// Returns true if the gate fired (the caller must stop -- the draft is already
+// concluded with a decompose verdict) or false to proceed to the next tier.
+//
+// PRELIMINARY DECOMPOSE CHECK (2026-09-02): one cheap model call, no tool loop, run
+// BEFORE the write-agentic pass. A task that is genuinely 5 endpoints + a UI + tests
+// wastes a full 35-turn agentic pass (and 2 retries) discovering that; catch it here
+// instead. Only on a FRESH task -- a retry / re-scoped / already-decomposed task has
+// specific feedback to act on and skips this. The decompose verdict flows straight to
+// review -> coordinator exactly like a RESOLUTION: decompose from the agentic pass.
+async function runPreliminaryDecomposeGate(task, ctx) {
+  const preliminaryDecomposeEnabled = process.env.AGENT_MANAGER_PRELIMINARY_DECOMPOSE !== 'false';
+  const isFreshAdhoc = !task.localRejectCount
+    && !(Array.isArray(task.priorRejectionFeedback) && task.priorRejectionFeedback.length)
+    && !task.rescopedFromDecompose
+    && !task.autoDecomposeCount
+    && !task.atomic // a file-decompose child IS the output of a decomposition -- re-splitting it loops
+    && task.adhocResolution !== 'decompose';
+  if (preliminaryDecomposeEnabled && isFreshAdhoc) {
+    const split = await ctx.maybeLocked(ctx.resolvedCallIsLocal !== false, () => runDecomposePassIfAvailable(task, { mode: 'preliminary', call: ctx.resolvedLocalCall }), 'decompose-check');
+    delete task._decomposeHint; // transient -- consumed by preliminaryPrompt above; never persist
+    if (split && split.subTasks.length >= 2) {
+      appendHistoryEvent(task, 'implement-started', `adhoc: preliminary size check -> decompose (${split.subTasks.length} pieces)`);
+      task.adhocResolution = 'decompose';
+      task.subTaskProposals = split.subTasks;
+      task.rawDiff = '';
+      task.implementResponse = `Preliminary size check: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
+      concludeDraft(task);
+      return true;
+    }
+  }
+  return false;
+}
+
 async function draftAdhocBranch(task, {
   maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
   draftAdhocViaLocalAgenticWriteFn,
 }) {
+  // Shared per-call context for the module-private tier helpers above -- assembled
+  // once so each extracted tier runs against the same lock wrapper / resolved call
+  // (and, when the later tiers are extracted too, the same injected tier fns).
+  const ctx = {
+    maybeLocked, recordModelCall, attempt, resolvedLocalCall, resolvedCallIsLocal,
+    draftAdhocViaLocalAgenticWriteFn,
+  };
+  // Preliminary decompose gate: if it fired the draft is already concluded and
+  // returned as a decompose verdict -- stop here.
+  if (await runPreliminaryDecomposeGate(task, ctx)) {
+    return { succeeded: true, blocked: false };
+  }
+
   // Single LOCAL pass: local-agentic-write, multi-turn with real edit/write/run_bash in
   // an isolated worktree (this is what the deleted Claude adhoc-agentic-draft.js used to
   // do). Returns a terminal draftTask-shaped verdict (implemented / blocked /
@@ -294,33 +341,6 @@ async function draftAdhocBranch(task, {
   // persist hook this lands on disk the moment it fires, so the log shows exactly how
   // far the draft got. (2026-08-31, Grimmethy: "the task log gets cut short" -- observed
   // on a stubborn brain-dump adhoc looping in this pass.)
-
-  // PRELIMINARY DECOMPOSE CHECK (2026-09-02): one cheap model call, no tool loop, run
-  // BEFORE the write-agentic pass. A task that is genuinely 5 endpoints + a UI + tests
-  // wastes a full 35-turn agentic pass (and 2 retries) discovering that; catch it here
-  // instead. Only on a FRESH task -- a retry / re-scoped / already-decomposed task has
-  // specific feedback to act on and skips this. The decompose verdict flows straight to
-  // review -> coordinator exactly like a RESOLUTION: decompose from the agentic pass.
-  const preliminaryDecomposeEnabled = process.env.AGENT_MANAGER_PRELIMINARY_DECOMPOSE !== 'false';
-  const isFreshAdhoc = !task.localRejectCount
-    && !(Array.isArray(task.priorRejectionFeedback) && task.priorRejectionFeedback.length)
-    && !task.rescopedFromDecompose
-    && !task.autoDecomposeCount
-    && !task.atomic // a file-decompose child IS the output of a decomposition -- re-splitting it loops
-    && task.adhocResolution !== 'decompose';
-  if (preliminaryDecomposeEnabled && isFreshAdhoc) {
-    const split = await maybeLocked(resolvedCallIsLocal !== false, () => runDecomposePassIfAvailable(task, { mode: 'preliminary', call: resolvedLocalCall }), 'decompose-check');
-    delete task._decomposeHint; // transient -- consumed by preliminaryPrompt above; never persist
-    if (split && split.subTasks.length >= 2) {
-      appendHistoryEvent(task, 'implement-started', `adhoc: preliminary size check -> decompose (${split.subTasks.length} pieces)`);
-      task.adhocResolution = 'decompose';
-      task.subTaskProposals = split.subTasks;
-      task.rawDiff = '';
-      task.implementResponse = `Preliminary size check: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
-      concludeDraft(task);
-      return { succeeded: true, blocked: false };
-    }
-  }
 
   // Local write-agentic. Returns the same verdict shape the Claude tier did
   // (succeeded/blocked/blockedReason/needsClarification); a non-succeeded result is a
