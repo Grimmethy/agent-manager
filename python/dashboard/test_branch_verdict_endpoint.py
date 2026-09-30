@@ -3,6 +3,7 @@ with the git-backed lookups stubbed. Store/check behavior is covered in test_bra
 
 Run: python -m unittest python.dashboard.test_branch_verdict_endpoint -v   (from the repo root)
 """
+import json
 import sys
 import tempfile
 import unittest
@@ -61,18 +62,39 @@ class Endpoint(unittest.TestCase):
         self.assertEqual(bv.load_verdicts(self.q), {})
 
     def test_endpoint_only_records_it_never_merges_or_discards(self):
-        with mock.patch.object(self.app, "_run_git") as run_git_mock:
+        with mock.patch.object(self.app, "_run_git", return_value="") as run_git_mock:
             self.post({"verdict": "discard", "reasons": ["x"], "source": "manual"})
-        run_git_mock.assert_not_called()
+        # The only git it may run is the read-only `git log` that finds the owning task's `Task:` trailer.
+        self.assertTrue(run_git_mock.call_args_list)
+        for call in run_git_mock.call_args_list:
+            self.assertEqual(call.args[0][0], "log", call.args)
 
-    def test_without_a_cached_head_sha_the_only_git_call_is_a_read_only_rev_parse(self):
+    def test_without_a_cached_head_sha_the_only_git_calls_are_read_only_rev_parse_and_log(self):
         no_sha = {"branch": "agent/t2", "taskId": "t2", "hub": None}
         with mock.patch.object(self.app, "list_unmerged_branches", return_value=[no_sha]), \
                 mock.patch.object(self.app, "_run_git", return_value="sha-B\n") as run_git_mock:
             r = self.post({"verdict": "needs-work", "reasons": ["x"], "source": "manual"}, branch="agent/t2")
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.get_json()["headSha"], "sha-B")
-        self.assertEqual([c.args[0] for c in run_git_mock.call_args_list], [["rev-parse", "origin/agent/t2"]])
+        self.assertEqual([c.args[0][0] for c in run_git_mock.call_args_list], ["rev-parse", "log"])  # both read-only
+
+    def test_verdict_is_logged_on_the_trailer_task_and_its_hub_when_the_branch_name_is_not_the_task_id(self):
+        # The real shape: branch agent/decompose-function-length-fix-ac-12 carries task HUB0063-02-..., owned by hub function-length-fix-ac-12.
+        for d in ("done", "coordinating"):
+            (self.q / d).mkdir(exist_ok=True)
+        (self.q / "done" / "HUB0063-02-render.json").write_text(json.dumps({"id": "HUB0063-02-render", "history": []}))
+        (self.q / "coordinating" / "function-length-fix-ac-12.json").write_text(json.dumps(
+            {"id": "function-length-fix-ac-12", "title": "hub", "subTasks": [{"id": "HUB0063-02-render", "status": "done"}]}))
+        branch = {"branch": "agent/decompose-function-length-fix-ac-12", "taskId": "decompose-function-length-fix-ac-12",
+                  "headSha": "sha-C", "hub": None, "mainBranch": "master"}
+        with mock.patch.object(self.app, "list_unmerged_branches", return_value=[branch]), \
+                mock.patch.object(self.app, "_run_git", return_value="body\n\nTask: HUB0063-02-render (adhoc/manual)\n"):
+            r = self.post({"verdict": "merge", "reasons": ["tests pass"], "source": "chat"}, branch=branch["branch"])
+        self.assertEqual(r.status_code, 200)
+        for f in (self.q / "done" / "HUB0063-02-render.json", self.q / "coordinating" / "function-length-fix-ac-12.json"):
+            events = [h for h in json.loads(f.read_text())["history"] if h["stage"] == "branch-verdict"]
+            self.assertEqual(len(events), 1, f.name)
+            self.assertIn("merge", events[0]["detail"])
 
 
 if __name__ == "__main__":

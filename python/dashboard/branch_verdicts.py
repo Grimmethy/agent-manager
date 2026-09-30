@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,8 @@ STALE_NOTE = "verdict is for an older commit"
 _KEEP_SHAS = 5
 # The queue dirs a task record can sit in and still be worth logging onto (same list as app.py QUEUE_STATES).
 _TASK_DIRS = ("pending", "review", "approved", "blocked", "done", "needs-clarification", "awaiting-confirm", "coordinating", "adhoc")
+# Same trailer app.py's _TASK_TRAILER_RE reads: apply-task.js stamps "Task: <id> (...)" on every commit it makes.
+_TASK_TRAILER_RE = re.compile(r"^Task:\s*(\S+)", re.MULTILINE)
 _CONFLICT_RE = re.compile(r"^CONFLICT \([^)]+\):.*\bin (.+)$", re.MULTILINE)
 
 
@@ -144,7 +147,7 @@ def _git_out(run_git, args, cwd):
     """(ok, stdout). run_git is app.py's _run_git, which raises RuntimeError on a nonzero exit."""
     try:
         return True, run_git(args, cwd)
-    except RuntimeError as exc:
+    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
 
 
@@ -166,7 +169,6 @@ def _check_already_on_main(run_git, repo_root, main_branch, branch):
 
 def _reverse_applies(run_git, repo_root, main_branch, diff_text):
     """Reverse-apply the branch's diff in a temporary detached worktree of origin/<main>. (ok, first line of git's complaint)."""
-    import subprocess
     with tempfile.TemporaryDirectory() as tmp:
         wt = str(Path(tmp) / "wt")
         try:
@@ -249,15 +251,48 @@ def _task_file(queue_dir, task_id):
     return None
 
 
-def write_task_log(queue_dir, task_id, hub_id, branch, verdict, reasons, source):
-    """Append a history event to the owning task (and its hub), shaped like src/task-history.js's
-    appendHistoryEvent ({stage, at, detail}). Silent no-op when no task file is found. Returns the count of
-    records written."""
+def resolve_owner(repo_root, main_branch, branch, run_git, queue_dir=None, hub_lookup=None, fallback_task_id=None):
+    """(task_ids, hub_id) for the task(s) and coordinator hub that own this branch.
+
+    The join the branch detail view uses (routes/pipeline_1_more.py api_git_branch_commits): the `Task: <id>`
+    trailer on each of the branch's commits names the owning task, and hub_lookup(queue_dir, branch, task_ids)
+    (app.py's hub_for_branch, via get_hub_data_provider) names the hub. The branch NAME is not that id for
+    hub sub-task branches (agent/decompose-function-length-fix-ac-12 carries task HUB0063-02-...), so it is
+    only the last-resort fallback. Best-effort: any failure yields fewer ids, never an exception.
+    """
+    task_ids = []
+    ok, out = _git_out(run_git, ["log", f"origin/{main_branch}..origin/{branch}", "--format=%b"], repo_root)
+    if ok:
+        for tid in _TASK_TRAILER_RE.findall(out):
+            if tid not in task_ids:
+                task_ids.append(tid)
+    if fallback_task_id and fallback_task_id not in task_ids:
+        task_ids.append(fallback_task_id)
+    hub_id = None
+    if hub_lookup:
+        try:
+            hub = hub_lookup(Path(queue_dir) if queue_dir else None, branch, task_ids)
+            hub_id = (hub or {}).get("id")
+        except Exception as exc:  # a hub-provider failure must never block recording a verdict
+            logger.warning("Hub lookup failed for %s (non-fatal): %s", branch, exc)
+    return task_ids, hub_id
+
+
+def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source):
+    """Append a history event to each owning task and to its hub, shaped like src/task-history.js's
+    appendHistoryEvent ({stage, at, detail}). `task_ids` is one id or a list (see resolve_owner). Silent
+    no-op for an id with no task file. Returns the count of records written."""
     if not queue_dir:
         return 0
+    if isinstance(task_ids, str):
+        task_ids = [task_ids]
     detail = f"branch verdict: {verdict} ({source}) -- " + "; ".join(reasons)[:400]
     written = 0
-    for tid in [t for t in (task_id, hub_id) if t]:
+    seen = set()
+    for tid in [t for t in list(task_ids or []) + [hub_id] if t]:
+        if tid in seen:
+            continue
+        seen.add(tid)
         path = _task_file(queue_dir, tid)
         if not path:
             continue
@@ -275,7 +310,7 @@ def write_task_log(queue_dir, task_id, hub_id, branch, verdict, reasons, source)
     return written
 
 
-def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, rev_parse=None):
+def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_lookup=None):
     """Mutates `branches` in place: adds verdict/reasons/source/verifiedAt/stale/headSha to each.
 
     Runs the deterministic checks only when this head SHA has no verdict yet (a chat/manual one is never
@@ -307,7 +342,9 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, rev_p
                     if not unchanged:
                         record, written = record_verdict(queue_dir, branch, sha, verdict, reasons, "deterministic")
                         if written:
-                            write_task_log(queue_dir, b.get("taskId"), (b.get("hub") or {}).get("id"), branch, verdict, reasons, "deterministic")
+                            task_ids, hub_id = resolve_owner(repo_root, b.get("mainBranch") or "master", branch, run_git,
+                                                             queue_dir, hub_lookup, b.get("taskId"))
+                            write_task_log(queue_dir, task_ids, hub_id or (b.get("hub") or {}).get("id"), branch, verdict, reasons, "deterministic")
                         verdicts = load_verdicts(queue_dir)
                 elif existing is not None:
                     clear_verdict(queue_dir, branch, sha)

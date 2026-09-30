@@ -228,6 +228,52 @@ class TaskLog(unittest.TestCase):
         self.assertEqual(bv.write_task_log(self.q, "ghost", None, "agent/ghost", "merge", [], "manual"), 0)
 
 
+class ResolveOwner(unittest.TestCase):
+    def setUp(self):
+        self.fx = Fixture()
+        self.addCleanup(self.fx.cleanup)
+
+    def _branch_with_trailer(self, name, *trailers):
+        self.fx.branch_from_master(name)
+        self.fx.write("f.txt", "f\n")
+        git(["add", "-A"], self.fx.work)
+        msg = "work\n\n" + "\n".join(trailers)
+        git(["commit", "-m", msg], self.fx.work)
+        self.fx.push(name)
+        git(["fetch", "origin", "--prune"], self.fx.work)
+
+    def test_trailer_task_ids_are_read_from_the_branch_commits(self):
+        self._branch_with_trailer("agent/decompose-x", "Task: HUB0001-02-real-id (adhoc/manual)")
+        ids, hub = bv.resolve_owner(self.fx.work, "master", "agent/decompose-x", run_git, self.fx.queue, None, "decompose-x")
+        self.assertEqual(ids, ["HUB0001-02-real-id", "decompose-x"])  # trailer first, branch-name fallback last
+        self.assertIsNone(hub)
+
+    def test_hub_comes_from_the_lookup_called_with_the_trailer_ids(self):
+        self._branch_with_trailer("agent/decompose-x", "Task: HUB0001-02-real-id (adhoc/manual)")
+        seen = {}
+
+        def lookup(qdir, branch, ids):
+            seen.update(qdir=qdir, branch=branch, ids=ids)
+            return {"id": "the-hub"}
+        ids, hub = bv.resolve_owner(self.fx.work, "master", "agent/decompose-x", run_git, self.fx.queue, lookup, "decompose-x")
+        self.assertEqual(hub, "the-hub")
+        self.assertEqual((seen["branch"], seen["ids"]), ("agent/decompose-x", ["HUB0001-02-real-id", "decompose-x"]))
+
+    def test_a_failing_hub_lookup_or_git_log_yields_fewer_ids_never_an_exception(self):
+        def boom(*a):
+            raise RuntimeError("provider down")
+        ids, hub = bv.resolve_owner(self.fx.work, "master", "agent/does-not-exist", run_git, self.fx.queue, boom, "fallback")
+        self.assertEqual((ids, hub), (["fallback"], None))
+
+    def test_write_task_log_accepts_a_list_dedupes_and_skips_missing(self):
+        q = self.fx.queue
+        (q / "done").mkdir()
+        (q / "done" / "a.json").write_text(json.dumps({"id": "a"}))
+        n = bv.write_task_log(q, ["a", "a", "missing"], "a", "agent/x", "merge", ["r"], "chat")
+        self.assertEqual(n, 1)
+        self.assertEqual(len(json.loads((q / "done" / "a.json").read_text())["history"]), 1)
+
+
 class Enrich(unittest.TestCase):
     def setUp(self):
         self.fx = Fixture()
@@ -258,6 +304,28 @@ class Enrich(unittest.TestCase):
         bv.enrich_branches_with_verdicts(fx.queue, fx.work, branches, run_git)  # second build: unchanged -> not re-logged
         history = json.loads((fx.queue / "done" / "dup.json").read_text())["history"]
         self.assertEqual(len(history), 1)
+
+    def test_enrich_logs_on_the_trailer_task_and_hub_when_branch_name_differs_from_the_record(self):
+        fx = self.fx
+        fx.branch_from_master("agent/dup")
+        fx.write("f.txt", "f\n")
+        git(["add", "-A"], fx.work)
+        git(["commit", "-m", "f\n\nTask: HUB0009-01-the-real-task (adhoc/manual)"], fx.work)
+        fx.push("agent/dup")
+        git(["cherry-pick", "origin/agent/dup"], fx.work)
+        git(["commit", "--amend", "-m", "by hand"], fx.work)
+        git(["push", "origin", "master"], fx.work)
+        git(["fetch", "origin", "--prune"], fx.work)
+        (fx.queue / "done").mkdir()
+        (fx.queue / "coordinating").mkdir()
+        (fx.queue / "done" / "HUB0009-01-the-real-task.json").write_text(json.dumps({"id": "HUB0009-01-the-real-task"}))
+        (fx.queue / "coordinating" / "the-hub.json").write_text(json.dumps({"id": "the-hub"}))
+        branches = [{"branch": "agent/dup", "taskId": "dup", "mainBranch": "master", "behind": 1}]
+        bv.enrich_branches_with_verdicts(fx.queue, fx.work, branches, run_git, hub_lookup=lambda q, b, ids: {"id": "the-hub"})
+        self.assertEqual(branches[0]["verdict"], "discard")
+        for f in ("done/HUB0009-01-the-real-task.json", "coordinating/the-hub.json"):
+            events = [h for h in json.loads((fx.queue / f).read_text()).get("history", []) if h["stage"] == "branch-verdict"]
+            self.assertEqual(len(events), 1, f)
 
     def test_enrich_respects_a_manual_verdict_for_the_same_head(self):
         fx = self.fx
