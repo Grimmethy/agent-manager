@@ -224,11 +224,15 @@ function wireBrainDumpCardHandlers(el) {
     btn.onclick = () => {
       const entry = brainDumpEntryById.get(btn.dataset.bdSendToChat);
       if (!entry) { showToast('Could not send to chat: that brain-dump entry is no longer in the list.'); return; }
-      const block =
-        `Brain Dump entry #${entry.serial} -- id: ${entry.id}\n\n` +
+      // Cap like task-detail-modal.js's Send to Chat (2026-09-07): sendTextToChat must
+      // never receive >200 chars. The entry has no lookup tool to fetch the full text on
+      // demand, so keep the bounded excerpt (first 200 chars) plus the id/serial for an
+      // out-of-band reference instead of pasting the unbounded rawText into the chat.
+      let text = `Brain Dump entry #${entry.serial} -- id: ${entry.id}\n\n` +
         `${entry.rawText}\n` +
         `Discuss this brain-dump entry. Its id is ${entry.id}.`;
-      sendTextToChat(block)
+      if (text.length > 200) text = text.slice(0, 199) + '…';
+      sendTextToChat(text)
         .catch((e) => showToast(`Could not send to chat: ${e.message}`));
     };
   });
