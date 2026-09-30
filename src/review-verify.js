@@ -336,6 +336,14 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     for (const ar of (acceptanceResults || []).slice(0, MAX_COMMANDS)) {
       const cmds = extractRunnableCommands(ar.check);
       for (const c of cmds) {
+        // A claimed command is re-run from the repo root. If its target does not exist there EVEN WITH the diff applied, the draft ran it from somewhere else
+        // (e.g. `python3 -m unittest test_x` from python/dashboard/) and the exit code from here says nothing about the diff -- confirmed live 2026-09-30, HUB0068-02's
+        // redraft. Skip it: neither a confirmation nor a contradiction.
+        const missing = commandTargets(c).filter((t) => !fs.existsSync(path.join(worktreeDir, t)));
+        if (missing.length) {
+          result.commands.push({ criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome: 'skipped', detail: `target not found from the repo root even with the diff applied (${missing.join(', ')}); the draft probably ran it from another directory` });
+          continue;
+        }
         const r = runOne(c.bin, c.args, COMMAND_TIMEOUT_MS);
         if (!r.ran) { result.commands.push({ criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome: 'skipped', detail: r.reason }); continue; }
         let outcome;
