@@ -192,10 +192,7 @@ function sleepSync(ms) {
 // The caller MUST call handle.release() (use withGpu() to make that automatic). While
 // holding, a background interval re-touches the ticket and, if cancelRequested lands,
 // invokes onCancel() exactly once -- the caller wires that to abort its model call.
-function acquire(instancesDir, { cls = DEFAULT_CLASS, model, lockKey, taskId = null, phase = null, onCancel = null } = {}) {
-  // lockKey overrides model as the actual serialization key when a caller passes one
-  // (see this file's own header) -- model is still carried on the ticket as metadata.
-  const key = lockKey || model;
+function createTicket(instancesDir, { cls, key, model, taskId, phase }) {
   const dir = ticketsDir(instancesDir, key);
   fs.mkdirSync(dir, { recursive: true });
 
@@ -210,14 +207,28 @@ function acquire(instancesDir, { cls = DEFAULT_CLASS, model, lockKey, taskId = n
     startedAt: nowIso(), holding: false, cancelRequested: false,
   });
 
+  return { fp, name, myRank, mySeqNum, dir };
+}
+
+function shouldSkipWait(instancesDir, key, myRank) {
+  return liveTickets(instancesDir, key).some(
+    (t) => t.pid === process.pid && t.place && classRank(t.cls) <= myRank,
+  );
+}
+
+function acquire(instancesDir, { cls = DEFAULT_CLASS, model, lockKey, taskId = null, phase = null, onCancel = null } = {}) {
+  // lockKey overrides model as the actual serialization key when a caller passes one
+  // (see this file's own header) -- model is still carried on the ticket as metadata.
+  const key = lockKey || model;
+  const ticket = createTicket(instancesDir, { cls, key, model, taskId, phase });
+  const { fp, name, myRank, mySeqNum } = ticket;
+
   // If this pid already holds a place ticket (holdPlace) of equal-or-higher priority for
   // this key, FIFO position is already reserved -- an inner per-turn acquire must not
   // re-queue behind peers that arrived AFTER the place (that would deadlock: the place
   // blocks those peers, and those peers would block this turn). Skip the wait loop; the
   // real flock still serialises the actual model call.
-  const holdsPlace = liveTickets(instancesDir, key).some(
-    (t) => t.pid === process.pid && t.place && classRank(t.cls) <= myRank,
-  );
+  const holdsPlace = shouldSkipWait(instancesDir, key, myRank);
 
   const deadline = Date.now() + overallTimeoutMs();
 
