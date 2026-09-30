@@ -59,10 +59,10 @@ function fakeDeps(over = {}) {
   return {
     calls,
     deps: {
-      prepare: () => ({ ok: true }),
+      prepare: baseTree(['src/a.js', 'src/a.test.js']),
       applyDiff: () => ({ applied: true }),
       unapplyDiff: () => ({ applied: true }),
-      cleanup: () => { calls.cleanup += 1; },
+      cleanup: () => { calls.cleanup += 1; fs.rmSync(worktreePaths('t1').worktreeDir, { recursive: true, force: true }); },
       findTests: () => ({ js: [], py: [] }),
       run: (a) => { calls.run.push(a); return { ran: true, exitCode: 0, timedOut: false, output: '' }; },
       ...over,
@@ -93,7 +93,7 @@ test('a diff that does not apply (unmet dependency slice) is inconclusive, not f
 });
 
 test('a claimed-PASS command that really exits non-zero is contradicted and the result is failed', () => {
-  const f = fakeDeps({ run: () => ({ ran: true, exitCode: 1, timedOut: false, output: 'AssertionError' }) });
+  const f = fakeDeps({ run: scriptedRun([{ exitCode: 1, output: 'AssertionError' }, passing]) });   // fails with the diff, passes on the base
   const r = verifyDiff({ ...base, acceptanceResults: AR('`node --test src/a.test.js`'), deps: f.deps });
   assert.equal(r.status, 'failed');
   assert.equal(r.commands[0].outcome, 'contradicted');
@@ -124,7 +124,7 @@ test('a timeout is inconclusive even when the draft claimed PASS (PR #454 rule)'
 test('covering tests that fail make the result failed and carry the parsed failure names', () => {
   const f = fakeDeps({
     findTests: () => ({ js: ['src/a.test.js'], py: [] }),
-    run: () => ({ ran: true, exitCode: 1, timedOut: false, output: 'not ok 1 - the thing breaks\n' }),
+    run: scriptedRun([{ exitCode: 1, output: 'not ok 1 - the thing breaks\n' }, passing]),   // fails with the diff, passes on the base
   });
   const r = verifyDiff({ ...base, deps: f.deps });
   assert.equal(r.status, 'failed');
@@ -408,7 +408,10 @@ test('differential: a contradicted claim is a failure only if the same command p
   assert.equal(r.commands[0].outcome, 'inconclusive');
   assert.match(r.reasons[0], /also fails on master in the review sandbox/);
   const run = scriptedRun([{ exitCode: 1 }]);
-  f = diffDeps({ findTests: () => ({ js: [], py: [] }), prepare: baseTree(['src/a.js']), run });   // the claimed test file only exists in the diff
+  const tree = () => worktreePaths('t1').worktreeDir;
+  f = diffDeps({ findTests: () => ({ js: [], py: [] }), prepare: baseTree(['src/a.js']), run,
+    applyDiff: () => { fs.writeFileSync(path.join(tree(), 'src/a.test.js'), '// added by the diff\n'); return { applied: true }; },
+    unapplyDiff: () => { fs.rmSync(path.join(tree(), 'src/a.test.js'), { force: true }); return { applied: true }; } });   // the claimed test file only exists in the diff
   r = verifyDiff({ ...base, acceptanceResults: claim, deps: f.deps });
   assert.equal(r.status, 'failed');
   assert.equal(run.calls.length, 1, 'no control run for a command whose target the base does not have');
@@ -477,5 +480,43 @@ test('integration: a test that already fails on the base inside the sandbox does
     assert.deepEqual(bad.tests.failures, ['adds']);
     assert.deepEqual(bad.tests.preexisting, ['needs the real HOME state dir']);
     assert.equal(fs.existsSync(worktreePaths('int-diff-reg').worktreeDir), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// --- a claimed command whose target is not found from the repo root is skipped, not contradicted (HUB0068-02's redraft, 2026-09-30) -------------
+test('a claimed command whose target does not exist from the repo root even WITH the diff is skipped: no run, no contradiction, no block', () => {
+  const run = scriptedRun([{ exitCode: 1 }]);
+  const f = fakeDeps({ run });
+  const r = verifyDiff({ ...base, acceptanceResults: AR('`node --test src/elsewhere.test.js`'), deps: f.deps });
+  assert.equal(run.calls.length, 0, 'never executed');
+  assert.equal(r.commands[0].outcome, 'skipped');
+  assert.match(r.commands[0].detail, /target not found from the repo root even with the diff applied \(src\/elsewhere\.test\.js\)/);
+  assert.notEqual(r.status, 'failed');
+});
+
+test('a bare python module name claimed from another directory (python3 -m unittest test_x, file at dash/test_x.py) is skipped, while the dotted path from the root still runs', () => {
+  const tree = () => worktreePaths('t1').worktreeDir;
+  const run = scriptedRun([passing]);
+  const f = fakeDeps({ prepare: baseTree(['dash/test_x.py']), run });
+  let r = verifyDiff({ ...base, acceptanceResults: AR('`python3 -m unittest test_x -v`'), deps: f.deps });
+  assert.equal(r.commands[0].outcome, 'skipped');
+  assert.equal(run.calls.length, 0);
+  const run2 = scriptedRun([passing]);
+  const f2 = fakeDeps({ prepare: baseTree(['dash/test_x.py']), run: run2 });
+  r = verifyDiff({ ...base, acceptanceResults: AR('`python3 -m unittest dash.test_x`'), deps: f2.deps });
+  assert.equal(r.commands[0].outcome, 'confirmed');
+  assert.equal(run2.calls.length, 1);
+  void tree;
+});
+
+test('integration: the HUB0068-02 shape -- a real passing draft that claims a cwd-relative python command is not contradicted', { skip: !HAVE_BWRAP || !PY3 }, () => {
+  const { root, work, changeTo } = makePyRepo();
+  try {
+    const r = verifyDiff({ taskId: 'int-cwd', rawDiff: changeTo('1  # same value, new comment'), repoRoot: work, mainBranch: 'master', pythonBin: PY3,
+      acceptanceResults: [{ criterion: 'tests pass', check: '`python3 -m unittest test_feature -v` -> Ran 1 test OK (run from dash/)', result: 'PASS', pass: true }] });
+    assert.notEqual(r.status, 'failed', JSON.stringify(r));
+    assert.equal(r.commands[0].outcome, 'skipped');
+    assert.equal(r.tests.passed, true, 'the covering test was still found by symbol and passed');
+    assert.equal(r.status, 'passed');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
