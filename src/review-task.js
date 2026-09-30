@@ -503,11 +503,46 @@ function classifyVote(markers, minReasoningChars) {
   };
 }
 
+// --- executed verification (2026-09-30) ---------------------------------------------------------
+// The reviewer votes on the draft's own NARRATED "Acceptance:" results and never reproduces any of them. review-verify.js applies the diff in a
+// private scratch worktree, runs the tests that cover it and re-runs the commands the draft claims PASS on (sandboxed), and returns failed /
+// passed / inconclusive. Only a genuine `failed` blocks; `inconclusive` (diff will not apply -- often a stacked slice that depends on an unmerged
+// one --, sandbox missing, timeout, nothing runnable) goes on to the vote exactly as before. Kill switch: AGENT_MANAGER_REVIEW_EXECUTED_VERIFY=false.
+const EXECUTED_VERIFY_BUDGET_MS = 240000;
+
+// A compact, record-safe view of a review-verify result for task.executedVerification (no raw output beyond what a redraft needs).
+function summariseExecutedVerification(ev) {
+  return {
+    status: ev.status,
+    at: new Date().toISOString(),
+    reasons: (ev.reasons || []).slice(0, 6).map((r) => String(r).slice(0, 300)),
+    tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10) } : null,
+    commands: (ev.commands || []).map((c) => ({
+      criterion: String(c.criterion || '').slice(0, 160), command: c.command, claimedPass: !!c.claimedPass, outcome: c.outcome, exitCode: c.exitCode,
+    })),
+  };
+}
+
+// The block reason doubles as the redraft feedback (reject-retry-check hands blockedReason back to the drafter), so it names what failed.
+function executedVerificationBlockReason(ev) {
+  const bits = [];
+  if (ev.tests && ev.tests.passed === false) {
+    const names = (ev.tests.failures || []).slice(0, 5).join('; ');
+    bits.push(`the tests covering it (${(ev.tests.ran || []).join(', ')}) FAIL${names ? `: ${names}` : ''}`);
+  }
+  for (const c of (ev.commands || []).filter((x) => x.outcome === 'contradicted')) {
+    bits.push(`the draft claimed PASS for \`${c.command}\` but it exits ${c.exitCode}`);
+  }
+  const tail = (ev.tests && ev.tests.passed === false && ev.tests.raw)
+    || ((ev.commands || []).find((c) => c.outcome === 'contradicted') || {}).detail || '';
+  return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).join('; ')}.${tail ? ` Output tail: ${String(tail).trim().slice(-700)}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
+}
+
 /**
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported (via
  * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
  */
-async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome } = {}) {
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
@@ -993,6 +1028,37 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
+  // Executed verification: see the block comment above summariseExecutedVerification. Adhoc implement drafts only (they carry a real rawDiff plus
+  // the acceptance results the draft claims); every other source keeps its own gates.
+  if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    let ev = null;
+    try {
+      const verify = verifyDiffFn || require('./review-verify.js').verifyDiff;
+      // A stacked hub sub-task builds on its shared branch, not on master -- verify against the same base the draft used.
+      const baseBranch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
+      const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
+      ev = verify({ taskId: task.id, rawDiff: task.rawDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS });
+    } catch (e) {
+      console.error(`[review] executed verification errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+    if (ev && ev.status) {
+      task.executedVerification = summariseExecutedVerification(ev);
+      const ranTests = ev.tests && ev.tests.ran ? ev.tests.ran.length : 0;
+      const confirmed = (ev.commands || []).filter((c) => c.outcome === 'confirmed').length;
+      appendHistoryEvent(task, 'advisory', `executed verification: ${ev.status} (${ranTests} covering test file(s), ${confirmed} claimed check(s) re-run and confirmed${ev.status === 'inconclusive' && ev.reasons && ev.reasons[0] ? `; ${String(ev.reasons[0]).slice(0, 160)}` : ''})`);
+      if (ev.status === 'failed') {
+        const reason = executedVerificationBlockReason(ev);
+        task.reviewProvider = 'deterministic-executed-verification';
+        recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+        appendHistoryEvent(task, 'blocked', reason);
+        return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+      }
+    }
+  }
+
   await waitForLocalAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
@@ -1144,7 +1210,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { reviewTask, buildVerdictPrompt, summariseExecutedVerification, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
