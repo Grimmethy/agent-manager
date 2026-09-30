@@ -187,25 +187,16 @@ function buildCliArgs({ prompt, model, effort, maxTurns, allowedTools, permissio
   return args;
 }
 
-async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
-  const workDir = resolveWorkDir(cwd);
-  const datedPrompt = buildEffectivePrompt({ prompt, allowSideFindings, allowAmplification, conceptId });
-  // Hard ceiling (see DRAFT_MAX_TURNS above, brain-dump bd-1788707820332) -- a
-  // caller asking for 61 turns gets 20, a caller asking for 1 keeps 1. Recomputed
-  // here for the turn-limit error paths below; buildCliArgs applies the same ceiling
-  // to the --max-turns flag itself.
-  const effectiveMaxTurns = Math.min(maxTurns, DRAFT_MAX_TURNS);
-  const args = buildCliArgs({
-    prompt: datedPrompt,
-    model,
-    effort,
-    maxTurns,
-    allowedTools,
-    permissionMode,
-    resume,
-    addDirs,
-  });
-
+// Spawns the `claude -p` process and collects its stdout -- the I/O boundary of
+// callOnce extracted so it's mockable in tests (stub execFileSync) without a real
+// CLI: wraps the command via wrapWithSandbox when `sandbox` is truthy (failing OPEN
+// with a flagged sandboxUnavailable return field, matching the prior inline
+// behavior), and calls execFileSync with the caller's timeoutMs or the
+// REQUEST_TIMEOUT_MS default and the buildChildEnv() env (stripping
+// ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN to force subscription billing). Throws
+// exactly as the prior inline code did, including the DRAFT_TURN_LIMIT_EXCEEDED
+// remapping for a non-zero exit whose output mentions the turn limit.
+function spawnAndCollect(workDir, args, { timeoutMs, sandbox, effectiveMaxTurns }) {
   // sandbox (2026-08-24, sandbox.js): only adhoc-agentic-draft.js's agentic call passes
   // this -- the one real Bash-capable, unattended tool-use path in this codebase (see
   // sandbox.js's own header). Every other caller omits it and this branch never runs,
@@ -256,7 +247,17 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
     }
     throw new Error(`claude -p failed: ${detail}`);
   }
+  return { stdout, sandboxUnavailable };
+}
 
+// Parses the `--output-format json` envelope and builds callOnce's final result
+// object -- extracted from callOnce so it's a pure function testable with canned
+// JSON fixtures (happy-path, empty-text, tool-use, malformed-JSON). The
+// side-finding / amplification / concept-build extraction chain stays in call()
+// (this pass does NOT move it); parseAndExtract only parses the envelope, applies
+// the JSON-path turn-limit check, and returns the EXACT result object callOnce used
+// to return inline, with sandboxUnavailable threaded in from spawnAndCollect.
+function parseAndExtract(stdout, { effectiveMaxTurns, sandboxUnavailable }) {
   let parsed;
   try {
     parsed = JSON.parse(stdout);
@@ -295,7 +296,7 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
     // stopReason/numTurns (2026-08-23, Grimmethy: "Fix: Claude agentic adhoc drafts that
     // exhaust their turn budget get blindly retried at the same budget, wasting real
     // spend") -- previously discarded entirely, even though the raw CLI JSON always
-    // carries them (confirmed live in a real failure: stop_reason":"tool_use",
+    // carries them (confirmed live in a real failure: stop_reason:"tool_use",
     // "num_turns":31). Without these, a caller has no way to tell "ran out of turns
     // mid-investigation" apart from any other incomplete response -- see
     // adhoc-agentic-draft.js's own turn-exhaustion retry, the first real consumer.
@@ -303,6 +304,34 @@ async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, per
     numTurns: parsed.num_turns != null ? parsed.num_turns : null,
     sandboxUnavailable,
   };
+}
+
+async function callOnce({ prompt, model, effort, maxTurns = 1, allowedTools, permissionMode = 'dontAsk', cwd, timeoutMs, sandbox, resume, addDirs, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+  const workDir = resolveWorkDir(cwd);
+  const datedPrompt = buildEffectivePrompt({ prompt, allowSideFindings, allowAmplification, conceptId });
+  // Hard ceiling (see DRAFT_MAX_TURNS above, brain-dump bd-1788707820332) -- a
+  // caller asking for 61 turns gets 20, a caller asking for 1 keeps 1. Recomputed
+  // here for the turn-limit error paths below; buildCliArgs applies the same ceiling
+  // to the --max-turns flag itself.
+  const effectiveMaxTurns = Math.min(maxTurns, DRAFT_MAX_TURNS);
+  const args = buildCliArgs({
+    prompt: datedPrompt,
+    model,
+    effort,
+    maxTurns,
+    allowedTools,
+    permissionMode,
+    resume,
+    addDirs,
+  });
+
+  // The I/O boundary (sandbox wrap, env-strip, execFileSync + the DRAFT_TURN_LIMIT_
+  // EXCEEDED remapping) lives in spawnAndCollect; the JSON parse, the JSON-path
+  // turn-limit check, and the exact result object (sandboxUnavailable threaded
+  // through) live in parseAndExtract. The side-finding / amplification / concept-build
+  // extraction chain stays in call() below -- see HUB0059 3/3.
+  const { stdout, sandboxUnavailable } = spawnAndCollect(workDir, args, { timeoutMs, sandbox, effectiveMaxTurns });
+  return parseAndExtract(stdout, { effectiveMaxTurns, sandboxUnavailable });
 }
 
 // Same retry-on-degenerate shape as local-client.js's call() -- reuses that module's
