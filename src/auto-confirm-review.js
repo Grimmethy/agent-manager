@@ -287,6 +287,21 @@ function voteReason(vote, marker) {
   return (m ? m[1] : sample.response).trim().slice(0, 300);
 }
 
+function handleConfirmOutcome(record, ctx) {
+  const reason = voteReason(ctx.vote, 'CONFIRM');
+  record[ctx.gateStamp] = ctx.now; // 'forensicsReportConfirmedAt' or 'deleteConfirmedAt' -- the field apply-task.js's gate checks
+  record.autoConfirmReviewedAt = ctx.now;
+  record.autoConfirmDecision = 'confirm';
+  record.autoConfirmReviewNote = reason;
+  record.status = 'approved';
+  appendHistoryEvent(record, 'approved', `auto-confirmed (votes: ${ctx.vote.realVoteCount}/${ctx.vote.requestedVotes}): ${reason}`);
+  try {
+    const result = moveTaskFile(ctx.file, ctx.approvedDir, ctx.name, record);
+    if (result) ctx.summary.confirmed += 1;
+    else { console.error(`auto-confirm: moveTaskFile returned falsy for ${ctx.name} (${ctx.file}): ${result}`); ctx.summary.errors += 1; }
+  } catch (err) { console.error(`auto-confirm: moveTaskFile threw for ${ctx.name} (${ctx.file}): ${err && err.message || err}`); ctx.summary.errors += 1; }
+}
+
 async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote, candidatesPath }) {
   const summary = { checked: 0, confirmed: 0, denied: 0, escalated: 0, errors: 0 };
   if (process.env.AGENT_MANAGER_AUTO_CONFIRM_REVIEW === 'false') return summary;
@@ -367,18 +382,7 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
 
     const now = new Date().toISOString();
     if (vote.confident && vote.verdict === 'CONFIRM') {
-      const reason = voteReason(vote, 'CONFIRM');
-      task[gateStamp] = now; // 'forensicsReportConfirmedAt' or 'deleteConfirmedAt' -- the field apply-task.js's gate checks
-      task.autoConfirmReviewedAt = now;
-      task.autoConfirmDecision = 'confirm';
-      task.autoConfirmReviewNote = reason;
-      task.status = 'approved';
-      appendHistoryEvent(task, 'approved', `auto-confirmed (votes: ${vote.realVoteCount}/${vote.requestedVotes}): ${reason}`);
-      try {
-        const result = moveTaskFile(file, approvedDir, name, task);
-        if (result) summary.confirmed += 1;
-        else { console.error(`auto-confirm: moveTaskFile returned falsy for ${name} (${file}): ${result}`); summary.errors += 1; }
-      } catch (err) { console.error(`auto-confirm: moveTaskFile threw for ${name} (${file}): ${err && err.message || err}`); summary.errors += 1; }
+      handleConfirmOutcome(task, { file, name, summary, approvedDir, vote, now, gateStamp });
     } else if (vote.confident && vote.verdict === 'DENY') {
       const reason = voteReason(vote, 'DENY');
       task.autoConfirmReviewedAt = now;
