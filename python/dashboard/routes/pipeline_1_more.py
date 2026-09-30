@@ -151,13 +151,29 @@ def api_git_branch_commits(branch):
     return jsonify({"branch": branch, "mainBranch": main_branch, "commits": commits, "hub": hub})
 
 
-@pipeline_1_more_bp.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
-def api_git_merge_branch(branch):
-    from app import _acquire_apply_lock, _invalidate_branch_cache, _release_apply_lock, _run_git, _sync_live_checkout, get_active_repo_root, list_unmerged_branches, logger, queue_dir, read_json_safe
-    repo_root = get_active_repo_root()
-    if not repo_root:
-        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
-    repo_root = Path(repo_root)
+class MergeLockBusy(Exception):
+    """The shared apply lock is held by another process (a pipeline apply mid-flight).
+
+    Deliberately NOT a RuntimeError: api_git_merge_branch maps a RuntimeError from the git
+    sequence to a 500, but lock contention has always been a retryable 409 ("try again in
+    a few seconds"). A first split of this endpoint (AC-26b, 2026-09-30) let it fall
+    through as a RuntimeError and silently turned that 409 into a 500."""
+
+
+# --- AC-26: api_git_merge_branch is an orchestrator over the single-responsibility
+# helpers below. Same lazy-import convention as every view in this file: app.py imports
+# THIS module to register the blueprint, so a top-level `from app import ...` is a circular
+# import; by the time a helper runs, app.py is fully initialised and the import is a dict
+# lookup (and tests patch these names on `app`). ---
+
+def _validate_and_authorize_merge(repo_root, branch, force):
+    """Step 1: prove this branch is one THIS process itself offered, then run the two
+    409 gates (unmerged hub sibling that would conflict, then a hub that is not finished).
+
+    Returns the context dict the later helpers consume: {"match", "main_branch", "repo_root"}.
+    Raises LookupError if the branch is not in a fresh list, PermissionError (the endpoint
+    answers 409) if a gate blocks and the caller did not force."""
+    from app import list_unmerged_branches
 
     # Never trust a caller-supplied branch string as a raw git ref beyond what THIS
     # process already enumerated itself -- re-derive the current list (cheap: cached
@@ -166,60 +182,64 @@ def api_git_merge_branch(branch):
     branches = list_unmerged_branches(force=True)
     match = next((b for b in branches if b["branch"] == branch), None)
     if not match:
-        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+        raise LookupError(f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 
     # A sibling branch still unmerged in the SAME coordinator hub that this branch would
     # conflict with (2026-09-16: root-caused live -- 4 sub-tasks of one hub all edited the
     # same file, each independently branched off main, so each showed willConflict:False
-    # against main alone; merging them one at a time hit a real conflict on the 2nd). The
-    # real merge attempt below would fail the same way (or worse, silently ship whichever
-    # side happened to be merged first without the other's change) -- block and name the
-    # sibling(s) so the caller merges in dependency order (or combines them by hand) rather
-    # than discovering this from an opaque git error. Checked BEFORE the hub-not-finished
-    # gate below: a hub mid-decomposition is ALSO very often the exact shape with an
-    # unmerged sibling still pending, and that gate's own `force` would otherwise mask
-    # this one from ever being seen at all (only one gate's reason is ever returned per
-    # request) -- surfacing the sibling-conflict warning first means a caller who force-
-    # bypasses the hub gate still sees it, instead of being silently exposed to the same
-    # conflict this whole check exists to catch.
+    # against main alone; merging them one at a time hit a real conflict on the 2nd). Block
+    # and name the sibling(s) so the caller merges in dependency order (or combines them by
+    # hand) rather than discovering this from an opaque git error. Checked BEFORE the
+    # hub-not-finished gate below: a hub mid-decomposition is also very often the shape with
+    # an unmerged sibling still pending, and that gate's own `force` would otherwise mask
+    # this one (only one gate's reason is ever returned per request).
     sibling_conflicts = [s for s in (match.get("hubSiblingConflicts") or [])
-                          if any(b["branch"] == s for b in branches)]
-    if sibling_conflicts and not (request.get_json(silent=True) or {}).get("force"):
-        return jsonify({
-            "succeeded": False,
-            "reason": (
-                f"'{branch}' would conflict with still-unmerged sibling branch(es) in the same "
-                f"coordinator hub: {', '.join(sibling_conflicts)}. Merge the sibling(s) first (in "
-                "dependency order), or resolve the overlap by hand, rather than merging this one "
-                'independently. Re-send with {"force": true} only if you have already verified '
-                "the resolution."
-            ),
-        }), 409
+                         if any(b["branch"] == s for b in branches)]
+    if sibling_conflicts and not force:
+        raise PermissionError(
+            f"'{branch}' would conflict with still-unmerged sibling branch(es) in the same "
+            f"coordinator hub: {', '.join(sibling_conflicts)}. Merge the sibling(s) first (in "
+            "dependency order), or resolve the overlap by hand, rather than merging this one "
+            'independently. Re-send with {"force": true} only if you have already verified '
+            "the resolution."
+        )
 
     # A branch owned by a coordinator hub that hasn't finished (a stacked file-decompose
     # branch still missing its wiring commit + integration-gate pass) is not safe to merge
     # -- doing so 404s the moved routes. Block it unless the caller explicitly forces.
     hub = match.get("hub")
-    if hub and not hub.get("readyToMerge") and not (request.get_json(silent=True) or {}).get("force"):
+    if hub and not hub.get("readyToMerge") and not force:
         prog = hub.get("progress") or {}
         gate = (hub.get("integrationGate") or {}).get("status")
-        return jsonify({
-            "succeeded": False,
-            "reason": (
-                f"'{branch}' belongs to coordinator hub {hub.get('id')} which is not finished "
-                f"({prog.get('done')}/{prog.get('total')} task(s) done"
-                + (f", integration gate {gate}" if gate else "")
-                + "). Merging now would ship an incomplete decomposition. Re-send with "
-                '{"force": true} only if you have verified the branch is actually complete.'
-            ),
-        }), 409
+        raise PermissionError(
+            f"'{branch}' belongs to coordinator hub {hub.get('id')} which is not finished "
+            f"({prog.get('done')}/{prog.get('total')} task(s) done"
+            + (f", integration gate {gate}" if gate else "")
+            + "). Merging now would ship an incomplete decomposition. Re-send with "
+            '{"force": true} only if you have verified the branch is actually complete.'
+        )
+
+    return {"match": match, "main_branch": match["mainBranch"], "repo_root": repo_root}
+
+
+def _execute_git_merge(context):
+    """Step 2: the git merge under the shared apply lock -- fetch, checkout main, reset
+    --hard, merge --no-ff, push, then a best-effort remote-branch delete.
+
+    Raises MergeLockBusy if the apply lock is held (the endpoint answers 409) and
+    RuntimeError on any merge/push failure (the endpoint answers 500). The lock is released
+    in `finally` on every path."""
+    from app import _acquire_apply_lock, _release_apply_lock, _run_git, logger, queue_dir
+
+    repo_root = context["repo_root"]
+    match = context["match"]
+    main_branch = context["main_branch"]
+    branch = match["branch"]
 
     try:
         lock_fd = _acquire_apply_lock()
-    except RuntimeError:
-        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
-
-    main_branch = match["mainBranch"]
+    except RuntimeError as exc:
+        raise MergeLockBusy(str(exc)) from exc
     try:
         _run_git(["fetch", "origin"], repo_root)
         _run_git(["checkout", main_branch], repo_root)
@@ -253,13 +273,26 @@ def api_git_merge_branch(branch):
             # (next list will filter it out via the ahead==0 check) rather than a real
             # failure worth reporting as one.
             logger.warning("Non-fatal: could not delete remote branch %r (repo: %s): %s", branch, repo_root, e)
-    except RuntimeError as e:
-        return jsonify({"succeeded": False, "reason": str(e)}), 500
     finally:
         _release_apply_lock(lock_fd)
 
+
+def _apply_post_merge_side_effects(context):
+    """Step 3: drop the now-stale unmerged-branch list cache and fast-forward the
+    dashboard's own checkout to the new main tip (see app.py's _sync_live_checkout for
+    the safety rules around a dirty PACKAGE_ROOT). Returns the live-sync result."""
+    from app import _invalidate_branch_cache, _sync_live_checkout
+
     _invalidate_branch_cache()
-    live_sync = _sync_live_checkout(main_branch)
+    return _sync_live_checkout(context["main_branch"])
+
+
+def _record_merge_in_task_file(branch, main_branch):
+    """Step 4a: stamp mergedAt + a terminal `merged` history/disposition on the task's
+    queue record, in whichever done/ location it sits. No-op without a queue dir or a
+    record; re-raises OSError if the write-back fails (the merge itself already succeeded,
+    but losing the record is a real, reportable failure)."""
+    from app import logger, queue_dir, read_json_safe
 
     # Stamp mergedAt on the task record once its branch is actually merged (2026-08-22,
     # Grimmethy: "some way to prioritize what order adhoc tasks get completed in. Those
@@ -268,73 +301,106 @@ def api_git_merge_branch(branch):
     # signal task-sources.js's nextAdhocTask() checks before letting a dependent task
     # claim. Reaching queue/done/ alone isn't enough: a task there is only pushed to its
     # OWN branch, not merged, and every adhoc draft's git worktree starts from
-    # origin/<mainBranch> -- a dependency's fix isn't actually visible to a dependent
-    # task's fresh checkout until it's merged, confirmed live by the exact failure this
-    # feature exists to prevent (a dependent task's diff going stale against code the
-    # dependency hadn't landed yet). Best-effort: a task record not found (already
-    # archived, or this merge came from some other source than the normal apply flow)
-    # must never fail the merge itself, which already fully succeeded above.
+    # origin/<mainBranch>. Best-effort when no record exists (already archived, or this
+    # merge came from some source other than the normal apply flow).
     qdir = queue_dir()
-    if qdir:
-        task_id = branch.removeprefix("agent/")
-        for candidate in (qdir / "done" / f"{task_id}.json", qdir / "done" / "_archived_no_action" / f"{task_id}.json"):
-            if candidate.is_file():
-                data = read_json_safe(candidate)
-                if data is not None:
-                    now_iso = datetime.now(timezone.utc).isoformat()
-                    data["mergedAt"] = now_iso
-                    # Close the task log with a terminal disposition event (see
-                    # src/task-disposition.js) -- `mergedAt` alone is a field the dependency
-                    # gate reads; an update audit reads the history, which used to stop at
-                    # `applied`.
-                    if data.get("terminalDisposition") != "merged":
-                        hist = data.get("history")
-                        if not isinstance(hist, list):
-                            hist = data["history"] = []
-                        hist.append({
-                            "stage": "merged",
-                            "at": now_iso,
-                            "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
-                        })
-                        data["terminalDisposition"] = "merged"
-                    try:
-                        candidate.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                    except OSError as exc:
-                        logger.error("Failed to persist merge-state for branch %r to %s: %s", branch, candidate, exc)
-                        raise
-                break
-
-        # Close out the LOCAL task log too (src/task-log-store.js), not just the queue/
-        # working copy above -- that file is gitignored and gets archived/pruned, while
-        # task-logs/<id>.json is a durable local snapshot that survives it, and this is the
-        # one moment (the task's branch just landed on main) its own log can record that
-        # fact. RE-EVALUATED 2026-09-15 (Grimmethy, .gitignore's own comment on
-        # task-logs/): this repo is public and the log retains a task's rawText/
-        # implementResponse/planResponse verbatim -- for a brain_dump-derived task that is
-        # the user's own free-typed personal/business note content, so this file is no
-        # longer committed/pushed, updated on disk only. Best-effort: a task not authored
-        # through apply-task.js (so it never got a task-logs/ entry in the first place) is
-        # a normal, expected case, not an error.
-        task_log_path = repo_root / "task-logs" / f"{task_id}.json"
-        if task_log_path.is_file():
-            log_data = read_json_safe(task_log_path)
-            if log_data is not None and log_data.get("terminalDisposition") != "merged":
-                merge_iso = datetime.now(timezone.utc).isoformat()
-                hist = log_data.get("history")
-                if not isinstance(hist, list):
-                    hist = log_data["history"] = []
-                hist.append({
-                    "stage": "merged",
-                    "at": merge_iso,
-                    "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
-                })
-                log_data["terminalDisposition"] = "merged"
+    if not qdir:
+        return
+    task_id = branch.removeprefix("agent/")
+    for candidate in (qdir / "done" / f"{task_id}.json", qdir / "done" / "_archived_no_action" / f"{task_id}.json"):
+        if candidate.is_file():
+            data = read_json_safe(candidate)
+            if data is not None:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                data["mergedAt"] = now_iso
+                # Close the task log with a terminal disposition event (see
+                # src/task-disposition.js) -- `mergedAt` alone is a field the dependency
+                # gate reads; an update audit reads the history, which used to stop at
+                # `applied`.
+                if data.get("terminalDisposition") != "merged":
+                    hist = data.get("history")
+                    if not isinstance(hist, list):
+                        hist = data["history"] = []
+                    hist.append({
+                        "stage": "merged",
+                        "at": now_iso,
+                        "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
+                    })
+                    data["terminalDisposition"] = "merged"
                 try:
-                    task_log_path.write_text(json.dumps(log_data, indent=2) + "\n", encoding="utf-8")
+                    candidate.write_text(json.dumps(data, indent=2), encoding="utf-8")
                 except OSError as exc:
-                    logger.warning("Non-fatal: could not record merge disposition in task-logs/%s.json: %s", task_id, exc)
+                    logger.error("Failed to persist merge-state for branch %r to %s: %s", branch, candidate, exc)
+                    raise
+            break
 
-    return jsonify({"succeeded": True, "branch": branch, "mainBranch": main_branch, "liveSync": live_sync})
+
+def _record_merge_in_task_log(repo_root, branch, main_branch):
+    """Step 4b: close out the LOCAL task-logs/<id>.json snapshot (src/task-log-store.js),
+    not just the queue/ working copy -- that file is gitignored and gets archived/pruned,
+    while task-logs/<id>.json is a durable local snapshot that survives it, and this is the
+    one moment (the task's branch just landed on main) its own log can record that fact.
+    RE-EVALUATED 2026-09-15 (Grimmethy, .gitignore's own comment on task-logs/): this repo
+    is public and the log retains a task's rawText/implementResponse/planResponse verbatim
+    -- for a brain_dump-derived task that is the user's own free-typed note content, so this
+    file is no longer committed/pushed, updated on disk only. Best-effort: a task not
+    authored through apply-task.js (so it never got a task-logs/ entry) is a normal case.
+    Skipped, like step 4a, when there is no queue dir."""
+    from app import logger, queue_dir, read_json_safe
+
+    if not queue_dir():
+        return
+    task_id = branch.removeprefix("agent/")
+    task_log_path = repo_root / "task-logs" / f"{task_id}.json"
+    if not task_log_path.is_file():
+        return
+    log_data = read_json_safe(task_log_path)
+    if log_data is None or log_data.get("terminalDisposition") == "merged":
+        return
+    merge_iso = datetime.now(timezone.utc).isoformat()
+    hist = log_data.get("history")
+    if not isinstance(hist, list):
+        hist = log_data["history"] = []
+    hist.append({
+        "stage": "merged",
+        "at": merge_iso,
+        "detail": f"merged into {main_branch} via the dashboard Unmerged Branches tab",
+    })
+    log_data["terminalDisposition"] = "merged"
+    try:
+        task_log_path.write_text(json.dumps(log_data, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Non-fatal: could not record merge disposition in task-logs/%s.json: %s", task_id, exc)
+
+
+@pipeline_1_more_bp.route("/api/git/branches/<path:branch>/merge", methods=["POST"])
+def api_git_merge_branch(branch):
+    from app import get_active_repo_root
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+    force = bool((request.get_json(silent=True) or {}).get("force"))
+
+    try:
+        context = _validate_and_authorize_merge(repo_root, branch, force)
+    except LookupError as e:
+        abort(404, description=str(e))
+    except PermissionError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 409
+
+    try:
+        _execute_git_merge(context)
+    except MergeLockBusy:
+        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+
+    live_sync = _apply_post_merge_side_effects(context)
+    _record_merge_in_task_file(branch, context["main_branch"])
+    _record_merge_in_task_log(repo_root, branch, context["main_branch"])
+
+    return jsonify({"succeeded": True, "branch": branch, "mainBranch": context["main_branch"], "liveSync": live_sync})
 
 
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/discard", methods=["POST"])
