@@ -1962,3 +1962,12 @@ test('executed verification: a stacked hub sub-task is verified against its shar
     assert.equal(seen.plain, 'main');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }));
+
+test('summariseExecutedVerification carries the failures that already exist on the base ("preexisting"), capped, and omits the key when there are none', () => {
+  const { summariseExecutedVerification } = require('./review-task.js');
+  const withPre = summariseExecutedVerification({ status: 'inconclusive', reasons: ['x'], tests: { ran: ['a.test.js'], passed: null, failures: [], preexisting: Array.from({ length: 14 }, (_, i) => `p${i}`) }, commands: [] });
+  assert.equal(withPre.tests.preexisting.length, 10);
+  assert.equal(withPre.tests.passed, null);
+  const without = summariseExecutedVerification({ status: 'passed', reasons: [], tests: { ran: ['a.test.js'], passed: true, failures: [] }, commands: [] });
+  assert.equal('preexisting' in without.tests, false);
+});

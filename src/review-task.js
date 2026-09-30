@@ -516,7 +516,7 @@ function summariseExecutedVerification(ev) {
     status: ev.status,
     at: new Date().toISOString(),
     reasons: (ev.reasons || []).slice(0, 6).map((r) => String(r).slice(0, 300)),
-    tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10) } : null,
+    tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10), ...(ev.tests.preexisting && ev.tests.preexisting.length ? { preexisting: ev.tests.preexisting.slice(0, 10) } : {}) } : null,
     commands: (ev.commands || []).map((c) => ({
       criterion: String(c.criterion || '').slice(0, 160), command: c.command, claimedPass: !!c.claimedPass, outcome: c.outcome, exitCode: c.exitCode,
     })),

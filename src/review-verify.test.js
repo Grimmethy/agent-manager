@@ -61,6 +61,7 @@ function fakeDeps(over = {}) {
     deps: {
       prepare: () => ({ ok: true }),
       applyDiff: () => ({ applied: true }),
+      unapplyDiff: () => ({ applied: true }),
       cleanup: () => { calls.cleanup += 1; },
       findTests: () => ({ js: [], py: [] }),
       run: (a) => { calls.run.push(a); return { ran: true, exitCode: 0, timedOut: false, output: '' }; },
@@ -325,5 +326,156 @@ test('integration: a dashboard-style Python change with no co-located test is ve
     const good = verifyDiff({ taskId: 'int-sym-pass', rawDiff: changeTo('1  # same value, new comment'), repoRoot: work, mainBranch: 'master', pythonBin: PY3 });
     assert.equal(good.status, 'passed', JSON.stringify(good));
     assert.deepEqual(good.tests.ran, ['dash/test_feature.py']);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// --- differential check: a failure counts against the diff only if the same check passes on the base ----------------------------------------
+// fake `prepare` builds a real (temp) worktree dir holding the BASE tree, so the engine's "does this test file exist on the base" check is real.
+function baseTree(files) {
+  return () => {
+    const dir = worktreePaths('t1').worktreeDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+    for (const f of files) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), '// base\n'); }
+    return { ok: true };
+  };
+}
+function scriptedRun(results) {   // returns the next scripted result per call, in order
+  const calls = [];
+  const fn = (a) => { calls.push(a); const r = results[Math.min(calls.length - 1, results.length - 1)]; return { ran: true, timedOut: false, output: '', ...r }; };
+  fn.calls = calls;
+  return fn;
+}
+const failing = (...names) => ({ exitCode: 1, output: names.map((n, i) => `not ok ${i + 1} - ${n}\n`).join('') });
+const passing = { exitCode: 0 };
+function diffDeps(over) {
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js'], py: [] }), prepare: baseTree(['src/a.test.js', 'src/a.js']), ...over });
+  const inner = f.deps.cleanup;
+  f.deps.cleanup = (...a) => { inner(...a); fs.rmSync(worktreePaths('t1').worktreeDir, { recursive: true, force: true }); };
+  return f;
+}
+
+test('differential: a suite that fails with the diff but passes on the base is a real failure, and only then', () => {
+  const run = scriptedRun([failing('the helper adds'), passing]);
+  const f = diffDeps({ run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(r.tests.failures, ['the helper adds']);
+  assert.equal(run.calls.length, 2, 'one run with the diff, one control run on the base');
+});
+
+test('differential: tests that ALSO fail on the base (same names) are inconclusive, never a block', () => {
+  const f = diffDeps({ run: scriptedRun([failing('needs a writable HOME', 'needs the log dir'), failing('needs a writable HOME', 'needs the log dir')]) });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.preexisting, ['needs a writable HOME', 'needs the log dir']);
+  assert.equal(r.tests.passed, null);
+  assert.match(r.reasons[0], /already fail on master in the review sandbox, so the failure is not caused by the diff/);
+});
+
+test('differential: only the failures the diff ADDS count; ones already failing on the base are listed as preexisting', () => {
+  const f = diffDeps({ run: scriptedRun([failing('old env failure', 'new regression'), failing('old env failure')]) });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(r.tests.failures, ['new regression']);
+  assert.deepEqual(r.tests.preexisting, ['old env failure']);
+});
+
+test('differential: a base run that fails with no nameable test (import or environment error) or times out is inconclusive', () => {
+  for (const baseRun of [{ exitCode: 1, output: 'Traceback (most recent call last): ... ImportError' }, { exitCode: null, timedOut: true }]) {
+    const f = diffDeps({ run: scriptedRun([failing('x'), baseRun]) });
+    const r = verifyDiff({ ...base, deps: f.deps });
+    assert.equal(r.status, 'inconclusive', JSON.stringify(baseRun));
+  }
+});
+
+test('differential: a failing test file that exists only in the diff has no base to compare with, so the failure stands without a control run', () => {
+  const run = scriptedRun([failing('brand new test fails')]);
+  const f = diffDeps({ prepare: baseTree(['src/a.js']), run });   // src/a.test.js is NOT on the base
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(run.calls.length, 1);
+});
+
+test('differential: a contradicted claim is a failure only if the same command passes on the base', () => {
+  const claim = AR('`node --test src/a.test.js`');
+  let f = diffDeps({ findTests: () => ({ js: [], py: [] }), run: scriptedRun([{ exitCode: 1 }, passing]) });
+  let r = verifyDiff({ ...base, acceptanceResults: claim, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.commands[0].outcome, 'contradicted');
+  f = diffDeps({ findTests: () => ({ js: [], py: [] }), run: scriptedRun([{ exitCode: 1 }, { exitCode: 1 }]) });
+  r = verifyDiff({ ...base, acceptanceResults: claim, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.equal(r.commands[0].outcome, 'inconclusive');
+  assert.match(r.reasons[0], /also fails on master in the review sandbox/);
+  const run = scriptedRun([{ exitCode: 1 }]);
+  f = diffDeps({ findTests: () => ({ js: [], py: [] }), prepare: baseTree(['src/a.js']), run });   // the claimed test file only exists in the diff
+  r = verifyDiff({ ...base, acceptanceResults: claim, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(run.calls.length, 1, 'no control run for a command whose target the base does not have');
+});
+
+test('differential: when the diff cannot be reversed the failure cannot be attributed, so it is inconclusive', () => {
+  const f = diffDeps({ run: scriptedRun([failing('x')]), unapplyDiff: () => ({ applied: false, reason: 'patch does not reverse' }) });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons[0], /could not be reversed/);
+});
+
+test('differential: an all-green run never reverses the diff or runs a control', () => {
+  let reversed = 0;
+  const run = scriptedRun([passing]);
+  const f = diffDeps({ run, unapplyDiff: () => { reversed += 1; return { applied: true }; } });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.equal(reversed, 0);
+  assert.equal(run.calls.length, 1);
+});
+
+test('unapplyPartialDiff restores the exact base state and refuses an empty diff', () => {
+  const { unapplyPartialDiff } = require('./review-verify.js');
+  const { applyPartialDiff } = require('./agentic-draft-common.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-verify-unapply-'));
+  try {
+    execFileSync('git', ['init', '-q', '-b', 'main', dir]);
+    fs.writeFileSync(path.join(dir, 'f.txt'), 'one\ntwo\n');
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '-A'], { cwd: dir });
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'base'], { cwd: dir });
+    fs.writeFileSync(path.join(dir, 'f.txt'), 'one\nTWO\nthree\n');
+    fs.writeFileSync(path.join(dir, 'new.txt'), 'brand new\n');
+    execFileSync('git', ['add', '-A'], { cwd: dir });
+    const diff = execFileSync('git', ['diff', '--cached', '--full-index', '--binary'], { cwd: dir, encoding: 'utf8' });
+    execFileSync('git', ['reset', '-q', '--hard'], { cwd: dir });
+    assert.equal(applyPartialDiff(dir, diff).applied, true);
+    assert.equal(fs.readFileSync(path.join(dir, 'f.txt'), 'utf8'), 'one\nTWO\nthree\n');
+    assert.deepEqual(unapplyPartialDiff(dir, diff), { applied: true });
+    assert.equal(fs.readFileSync(path.join(dir, 'f.txt'), 'utf8'), 'one\ntwo\n');
+    assert.equal(fs.existsSync(path.join(dir, 'new.txt')), false);
+    assert.equal(unapplyPartialDiff(dir, '  ').applied, false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+// real bwrap: the HUB0068-02 incident. A base test that needs the real HOME fails in the sandbox with or without the diff.
+test('integration: a test that already fails on the base inside the sandbox does not block a harmless diff, but a regression the diff adds still does', { skip: !HAVE_BWRAP }, () => {
+  const { root, work, git } = makeRepo();
+  try {
+    const envTest = "const test = require('node:test'); const assert = require('node:assert/strict'); const fs = require('fs'); const path = require('path');\n" +
+      "test('needs the real HOME state dir', () => assert.ok(fs.existsSync(path.join(process.env.HOME, '.local', 'state', 'agent-manager'))));\n" +
+      "test('adds', () => assert.equal(require('./add.js')(1, 2), 3));\n";
+    fs.writeFileSync(path.join(work, 'src', 'add.test.js'), envTest);
+    git(['add', '-A'], work); git(['commit', '-m', 'add tests'], work); git(['push', 'origin', 'master'], work);
+    // harmless diff: a comment; the env test still fails, but it fails on the base too
+    fs.writeFileSync(path.join(work, 'src', 'add.js'), 'module.exports = (a, b) => a + b; // harmless\n');
+    const harmless = git(['diff', '--full-index', '--binary'], work); git(['checkout', '--', '.'], work);
+    const ok = verifyDiff({ taskId: 'int-diff-env', rawDiff: harmless, repoRoot: work, mainBranch: 'master' });
+    assert.equal(ok.status, 'inconclusive', JSON.stringify(ok));
+    assert.deepEqual(ok.tests.preexisting, ['needs the real HOME state dir']);
+    // regression diff: breaks add(); the env test fails on the base too, but 'adds' is NEW
+    fs.writeFileSync(path.join(work, 'src', 'add.js'), 'module.exports = (a, b) => a - b;\n');
+    const broken = git(['diff', '--full-index', '--binary'], work); git(['checkout', '--', '.'], work);
+    const bad = verifyDiff({ taskId: 'int-diff-reg', rawDiff: broken, repoRoot: work, mainBranch: 'master' });
+    assert.equal(bad.status, 'failed', JSON.stringify(bad));
+    assert.deepEqual(bad.tests.failures, ['adds']);
+    assert.deepEqual(bad.tests.preexisting, ['needs the real HOME state dir']);
+    assert.equal(fs.existsSync(worktreePaths('int-diff-reg').worktreeDir), false);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
