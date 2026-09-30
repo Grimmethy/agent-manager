@@ -233,7 +233,11 @@ def run_deterministic_checks(repo_root, main_branch, branch, run_git, extra_reas
         hit = check(run_git, repo_root, main_branch, branch)
         if hit:
             return hit
-    reasons = []
+    import branch_redundancy  # lazy: standalone sibling module, same convention as app.py's own lazy imports
+    dupes = branch_redundancy.check_duplicate_candidates(run_git, repo_root, main_branch, branch)
+    if dupes and dupes[0] == "discard":
+        return dupes  # every candidate is a recurring duplicate: nothing here is worth keeping
+    reasons = list(dupes[1]) if dupes else []
     conflict = _check_conflicts(run_git, repo_root, main_branch, branch)
     if conflict:
         reasons.extend(conflict[1])
@@ -320,6 +324,13 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
     if not queue_dir:
         return branches
     verdicts = load_verdicts(queue_dir)
+    # Cross-branch pass (needs the whole list): open rivals from different hubs that cannot both merge.
+    import branch_redundancy
+    try:
+        alternatives = branch_redundancy.find_alternatives(branches, repo_root, (branches[0].get("mainBranch") if branches else None) or "master", run_git)
+    except Exception as exc:  # noqa: BLE001 -- best-effort; a failure here must never break the branch list
+        logger.warning("Alternative-branch check failed (non-fatal): %s", exc)
+        alternatives = {}
     for b in branches:
         branch = b["branch"]
         ok, sha = _git_out(run_git, ["rev-parse", f"origin/{branch}"], repo_root)
@@ -336,7 +347,8 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
                     extra.append("would conflict with unmerged hub sibling(s): " + ", ".join(b["hubSiblingConflicts"]))
                 if isinstance(b.get("behind"), int) and b["behind"] > 50:
                     extra.append(f"stale vs {b.get('mainBranch', 'master')}: {b['behind']} commits behind")
-                verdict, reasons = run_deterministic_checks(repo_root, b.get("mainBranch") or "master", branch, run_git, extra)
+                verdict, reasons = branch_redundancy.merge_results(
+                    run_deterministic_checks(repo_root, b.get("mainBranch") or "master", branch, run_git, extra), alternatives.get(branch))
                 if verdict:
                     unchanged = existing and existing.get("verdict") == verdict and existing.get("reasons") == reasons
                     if not unchanged:
