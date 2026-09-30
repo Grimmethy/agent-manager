@@ -9,7 +9,7 @@ branch_verdicts_bp = Blueprint("branch-verdicts-bp", __name__)
 
 @branch_verdicts_bp.route("/api/git/branches/<path:branch>/verdict", methods=["POST"])
 def api_git_record_branch_verdict(branch):
-    from app import _invalidate_branch_cache, _run_git, get_active_repo_root, list_unmerged_branches, queue_dir
+    from app import _invalidate_branch_cache, _run_git, get_active_repo_root, get_hub_data_provider, list_unmerged_branches, queue_dir
     import branch_verdicts as bv
 
     repo_root = get_active_repo_root()
@@ -39,6 +39,8 @@ def api_git_record_branch_verdict(branch):
 
     record, written = bv.record_verdict(qdir, branch, head_sha, verdict, reasons, source)
     if written:
-        bv.write_task_log(qdir, match.get("taskId"), (match.get("hub") or {}).get("id"), branch, verdict, reasons, source)
+        task_ids, hub_id = bv.resolve_owner(repo_root, match.get("mainBranch") or "master", branch, _run_git, qdir,
+                                            get_hub_data_provider().hub_for_branch, match.get("taskId"))
+        bv.write_task_log(qdir, task_ids, hub_id or (match.get("hub") or {}).get("id"), branch, verdict, reasons, source)
     _invalidate_branch_cache()
     return jsonify({"succeeded": True, "written": written, "headSha": head_sha, **bv.get_verdict(qdir, branch, head_sha)})

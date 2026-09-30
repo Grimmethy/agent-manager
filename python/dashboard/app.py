@@ -3465,7 +3465,7 @@ def _list_unmerged_branches_uncached():
 
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
-    branch_verdicts.enrich_branches_with_verdicts(queue_dir(), repo_root, branches, _run_git)
+    branch_verdicts.enrich_branches_with_verdicts(queue_dir(), repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
     branches.sort(key=lambda b: b["pushedAt"])
     return branches
 
