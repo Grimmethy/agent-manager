@@ -517,6 +517,89 @@ function discoverBlockedEntries({ blockedDir, adhocDir, derivedDir }) {
   return entries;
 }
 
+// The exhaustion half of rejectRetryCheck, extracted so the "what happens when the
+// blind-redraft cap is spent" policy (escalate adhoc/fulfillment/review-verdict to a
+// human, otherwise stamp-and-stay in blocked/) is a named, independently unit-testable
+// unit -- idempotency guards, ghost-debt filing, file move, and history appends all
+// atomic within one function -- rather than a ~55-line block buried mid-orchestrator.
+// Mutates task (and the on-disk artifacts) in place and returns 'escalated' (a
+// needs-clarification escalation ran), 'skipped' (an idempotency guard -- already
+// escalated/stamped since the last readmission -- bailed it out), or 'stamped' (the
+// stamp-and-stay path ran). Does NOT touch summary: the caller increments
+// summary.exhausted exactly once per call regardless of outcome, so the total is
+// identical to the block it replaced. No behavioral change: same guard order, same
+// side-effect order, same payloads, same file moves.
+function handleExhaustion({ task, name, sourceDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, ghostRoot, retryCount }) {
+  const filePath = path.join(sourceDir, name);
+  // writeTaskAndUnlinkOld needs the per-instance lock dir; rejectRetryCheck derives it
+  // from pipelineDir (or, for tests that omit that, from blockedDir). Every per-entry
+  // source dir (blocked/ or adhoc-/derived/ in-place) sits under <root>/queue/, so the
+  // same root is derivable here from ghostRoot (rejectRetryCheck's own pipelineDir) or
+  // sourceDir for callers that pass neither.
+  const instancesDir = sharedInstancesDir(ghostRoot || path.dirname(path.dirname(sourceDir)));
+  const isFulfillment = isCandidateFulfillmentSource(task.source);
+  const isReviewVerdict = isReviewVerdictAdvisoryProseSource(task.source);
+  if ((isAdhocTask(task) || isFulfillment || isReviewVerdict) && needsClarificationDir) {
+    const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
+    if (alreadyEscalated) return 'skipped';
+    // A task that exhausted its retries on a tagged tool/environment failure lands
+    // with an honest reason:'infra-error' -- not design-decision -- so forensics and
+    // the triage sweep see it for what it is. (nc.reason already carries non-
+    // design-decision values elsewhere: external-dependency, unreliable-grounding.)
+    //
+    // 2026-09-22 (needs-clarification bucket review): every OTHER exhausted
+    // candidate-fulfillment/review-verdict/adhoc task got blanket-labeled
+    // 'design-decision' regardless of what actually blocked it -- classifyBlockedTask
+    // already ran above (line ~650) and, since it's retryable:true here (a
+    // non-retryable verdict would have escalated immediately and never reached this
+    // branch), its category is a precise, real cause: a stale/fabricated citation
+    // (fabricated-ungrounded-claim), a refusal instead of a diff
+    // (refusal-no-changes-needed), a degenerate plan/implement, a JSON parse
+    // failure, or an inconclusive-review flake that happened three times running.
+    // Confirmed live: 9+ of the real 26-task needs-clarification bucket were exactly
+    // this -- a stale citation or a refusal, not a product/architecture question --
+    // yet every one read 'design-decision', indistinguishable from a genuine one.
+    // 'uncategorized' still falls back to 'design-decision' (unchanged behavior for
+    // the majority that really are open questions). needs-clarification-triage.js's
+    // own reason allowlist is extended in the same PR to keep every one of these
+    // categories triage-eligible -- exactly the class of gap its own comments
+    // describe fixing for 'infra-error' (see this file's own header there).
+    // Re-classified here (identical deterministic classifier, same task object) since
+    // the call site's `classification` local is not part of this helper's signature.
+    const exhaustedCategory = classifyBlockedTask(task).category !== 'uncategorized' ? classifyBlockedTask(task).category : 'design-decision';
+    task.needsClarification = {
+      reason: task.infraErrorBefore ? 'infra-error' : exhaustedCategory,
+      openQuestions: isFulfillment ? buildExhaustedFulfillmentQuestion(task)
+        : isReviewVerdict ? buildExhaustedReviewVerdictQuestion(task)
+          : buildExhaustedAdhocQuestion(task),
+    };
+    appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
+    appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting redraft retries');
+    // Blind redrafts were spent and nothing re-admitted this class -- ghost debt.
+    if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'reject-retry-check:retry-cap-exhausted', pipelineDir: ghostRoot });
+    fs.mkdirSync(needsClarificationDir, { recursive: true });
+    writeTaskAndUnlinkOld(instancesDir, task, path.join(needsClarificationDir, name), filePath);
+    return 'escalated';
+  }
+  // Already stamped on a prior tick -- an exhausted task stays in blocked/
+  // permanently (nothing here ever moves or deletes it), so without this guard this
+  // whole branch re-fires every single tick forever. Confirmed live 2026-08-17: one
+  // real exhausted task accumulated 20+ duplicate 'exhausted' history entries (one
+  // per ~30s tick) over about 12 minutes before this was caught, unbounded growth
+  // for as long as the task sits there -- which, being exhausted, is indefinitely.
+  const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
+  if (alreadyStamped) return 'skipped';
+  stampDeepDiveExhausted(task, deepDiveCoveragePath);
+  stampBrainDumpSortExhausted(task, brainDumpPath);
+  // Persist the exhaustion itself onto the task -- previously this branch never
+  // wrote the file back at all, so a task permanently stuck in queue/blocked/ after
+  // hitting the retry cap carried no record that retries were ever attempted or
+  // exhausted; only localRejectCount (no timestamp) hinted at it.
+  appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
+  fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+  return 'stamped';
+}
+
 function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
@@ -742,90 +825,14 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       }
       if (blockSig !== null) task._prevBlockSignature = blockSig;
       if (retryCount >= MAX_LOCAL_REJECT_RETRIES && !isContinuation) {
-        // An exhausted ADHOC rejection is very often a real disagreement about scope
-        // ("is this already done, or a request to extend it?") that no amount of blind
-        // redraft will resolve -- send it to a human instead of leaving it to rot in
-        // blocked/ forever.
-        //
-        // 2026-09-18 (brain-dump bd-1789702787675): candidate-fulfillment sources
-        // (observability_fix, performance_fix, pipeline_forensics_fix, function_length_fix,
-        // arch_review, arch_import_review, change_review_fix, backlog_fulfillment) used to
-        // fall through to the "non-adhoc keeps stamp once, stay in blocked" branch below
-        // instead -- permanently, since nothing else in the pipeline ever reads them back
-        // out. context-trim-sweep.js's own contextTrimFlag (disposition:
-        // 'needs-human-regrounding') LOOKS like an escalation but has no consumer anywhere;
-        // confirmed live via 10 real blocked _fix tasks, 9 of which sat re-flagged every 3
-        // days for up to 12 days with zero resolution. These sources get the exact same
-        // real escalation adhoc already had, just with fulfillment-shaped question text
-        // (buildExhaustedFulfillmentQuestion) since their own failure vocabulary --
-        // stale/fabricated find-string citations, not "extend vs already done" -- differs
-        // from adhoc's. Every OTHER non-adhoc source (deep_dive, brain_dump_sort, etc.,
-        // each with its own cursor-advance recovery below) keeps the original behaviour.
-        //
-        // 2026-09-18: the advisoryProse "_review" triage siblings (performance_review,
-        // function_length_review, observability_review(_digest), change_review,
-        // staleness_audit, second_brain_opportunities) get the same real escalation here
-        // too -- see isReviewVerdictAdvisoryProseSource's own header for the full
-        // incident this closes (the sibling gap to bd-1789702787675 above).
-        const isFulfillment = isCandidateFulfillmentSource(task.source);
-        const isReviewVerdict = isReviewVerdictAdvisoryProseSource(task.source);
-        if ((isAdhocTask(task) || isFulfillment || isReviewVerdict) && needsClarificationDir) {
-          const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
-          if (alreadyEscalated) { summary.exhausted++; continue; }
-          // A task that exhausted its retries on a tagged tool/environment failure lands
-          // with an honest reason:'infra-error' -- not design-decision -- so forensics and
-          // the triage sweep see it for what it is. (nc.reason already carries non-
-          // design-decision values elsewhere: external-dependency, unreliable-grounding.)
-          //
-          // 2026-09-22 (needs-clarification bucket review): every OTHER exhausted
-          // candidate-fulfillment/review-verdict/adhoc task got blanket-labeled
-          // 'design-decision' regardless of what actually blocked it -- classifyBlockedTask
-          // already ran above (line ~650) and, since it's retryable:true here (a
-          // non-retryable verdict would have escalated immediately and never reached this
-          // branch), its category is a precise, real cause: a stale/fabricated citation
-          // (fabricated-ungrounded-claim), a refusal instead of a diff
-          // (refusal-no-changes-needed), a degenerate plan/implement, a JSON parse
-          // failure, or an inconclusive-review flake that happened three times running.
-          // Confirmed live: 9+ of the real 26-task needs-clarification bucket were exactly
-          // this -- a stale citation or a refusal, not a product/architecture question --
-          // yet every one read 'design-decision', indistinguishable from a genuine one.
-          // 'uncategorized' still falls back to 'design-decision' (unchanged behavior for
-          // the majority that really are open questions). needs-clarification-triage.js's
-          // own reason allowlist is extended in the same PR to keep every one of these
-          // categories triage-eligible -- exactly the class of gap its own comments
-          // describe fixing for 'infra-error' (see this file's own header there).
-          const exhaustedCategory = classification.category !== 'uncategorized' ? classification.category : 'design-decision';
-          task.needsClarification = {
-            reason: task.infraErrorBefore ? 'infra-error' : exhaustedCategory,
-            openQuestions: isFulfillment ? buildExhaustedFulfillmentQuestion(task)
-              : isReviewVerdict ? buildExhaustedReviewVerdictQuestion(task)
-                : buildExhaustedAdhocQuestion(task),
-          };
-          appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
-          appendHistoryEvent(task, 'needs-clarification', 'escalated to a human after exhausting redraft retries');
-          // Blind redrafts were spent and nothing re-admitted this class -- ghost debt.
-          if (ghostRoot) fileGhostDebt({ task, reasonText: task.blockedReason, site: 'reject-retry-check:retry-cap-exhausted', pipelineDir: ghostRoot });
-          fs.mkdirSync(needsClarificationDir, { recursive: true });
-          writeTaskAndUnlinkOld(instancesDir, task, path.join(needsClarificationDir, name), filePath);
-          summary.exhausted++;
-          continue;
-        }
-        // Already stamped on a prior tick -- an exhausted task stays in blocked/
-        // permanently (nothing here ever moves or deletes it), so without this guard this
-        // whole branch re-fires every single tick forever. Confirmed live 2026-08-17: one
-        // real exhausted task accumulated 20+ duplicate 'exhausted' history entries (one
-        // per ~30s tick) over about 12 minutes before this was caught, unbounded growth
-        // for as long as the task sits there -- which, being exhausted, is indefinitely.
-        const alreadyStamped = Array.isArray(task.history) && task.history.some((h) => h.stage === 'exhausted');
-        if (alreadyStamped) { summary.exhausted++; continue; }
-        stampDeepDiveExhausted(task, deepDiveCoveragePath);
-        stampBrainDumpSortExhausted(task, brainDumpPath);
-        // Persist the exhaustion itself onto the task -- previously this branch never
-        // wrote the file back at all, so a task permanently stuck in queue/blocked/ after
-        // hitting the retry cap carried no record that retries were ever attempted or
-        // exhausted; only localRejectCount (no timestamp) hinted at it.
-        appendHistoryEvent(task, 'exhausted', `${retryCount}/${MAX_LOCAL_REJECT_RETRIES} retries used`);
-        fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+        // Exhaustion policy (which sources escalate to a human vs stamp-and-stay, the
+        // idempotency guards, ghost-debt filing, file move) extracted to the standalone
+        // helper defined above -- its header carries the source-by-source rationale.
+        // summary.exhausted++
+        // stays here, exactly once per call for every outcome, matching the old block's
+        // count; 'skipped' means an idempotency guard bailed the helper out with no
+        // side effects.
+        handleExhaustion({ task, name, sourceDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, ghostRoot, retryCount });
         summary.exhausted++;
         continue;
       }
