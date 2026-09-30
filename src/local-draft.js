@@ -535,6 +535,39 @@ function bestPriorPlan(task) {
 // 7170-21381 chars; the smallest observed failure was 7170, so 6000 leaves real margin
 // without needing to hardcode these source names (a future large-context source gets
 // this for free, same discipline as the evidenceText check already established here).
+
+// Plan-pass pre-computation policies (HUB0094 · 1/2, function-length-fix-ac-44),
+// extracted from runPlanPass so each is a single named, independently unit-testable
+// unit. All three are pure -- no side effects, no I/O -- and preserve the exact
+// expressions and evaluation order they had inline in runPlanPass. Deliberately NOT
+// added to module.exports: they are module-private, same as bestPriorPlan's internals.
+
+// Research-only tool grant: WebSearch/WebFetch for the research_task plan pass so its
+// fact-like claims are looked up, not guessed; null for every other source (which
+// keeps its plain no-tool completion exactly as before).
+function buildResearchPlanTools(task) {
+  return task.domain === 'research' ? { allowedTools: 'WebSearch,WebFetch', maxTurns: 8 } : null;
+}
+
+// Allow-empty-plan policy: emptyApproval-generator sources (minus candidate-
+// fulfillment sources, which have a specific candidate to implement) and
+// advisory-prose sources (whose plan output is supplementary grounding, never a
+// required artifact) may legitimately produce an empty plan.
+function computeAllowEmptyPlan(task) {
+  return (isEmptyApprovalSource(task.source) && !isCandidateFulfillmentSource(task.source))
+    || isAdvisoryProseSource(resolveSourceName(task));
+}
+
+// Adhoc substance gate: gate the plan on real substance for adhoc tasks only, and --
+// for adhoc only -- seed the pass with the best prior plan on this task (bestPriorPlan
+// above) rather than cold-rolling every retry. Never blocks on its own: a thin plan
+// with no prior plan to fall back on still proceeds (with a note), exactly as before.
+function computeSubstanceGate(task) {
+  const substanceGated = resolveSourceName(task) === 'adhoc';
+  const seedPlan = substanceGated ? bestPriorPlan(task) : null;
+  return { substanceGated, seedPlan };
+}
+
 // The plan pass plus its harness-search grounding step. Mutates task.planResponse (and,
 // for a harnessSearch source, task.promptContext.harnessHits/searchResults) and emits the
 // plan-done / harness-search history events. Returns { blocked: true, blockedReason } --
@@ -557,7 +590,7 @@ async function runPlanPass(task, {
   // ID, a date, a site) has actually been looked up, not guessed. Scoped narrowly to
   // task.domain === 'research' -- every other source's plan pass is unaffected, kept as
   // a plain no-tool completion exactly as before.
-  const researchPlanTools = task.domain === 'research' ? { allowedTools: 'WebSearch,WebFetch', maxTurns: 8 } : null;
+  const researchPlanTools = buildResearchPlanTools(task);
   // arch_discovery / arch_import are GENERATORS registered emptyApproval:true -- their
   // own plan prompt explicitly invites "found nothing" as the correct answer, and an
   // empty implement already auto-approves as "no candidates -- nothing to apply". An
@@ -579,16 +612,14 @@ async function runPlanPass(task, {
   // the think trace against a 26KB evidence prompt -- so the report pass (which PR #64 gave
   // a real 16K budget) never ran at all. Let it fall through to implement, same as the
   // emptyApproval generators below.
-  const allowEmptyPlan = (isEmptyApprovalSource(task.source) && !isCandidateFulfillmentSource(task.source))
-    || isAdvisoryProseSource(resolveSourceName(task));
+  const allowEmptyPlan = computeAllowEmptyPlan(task);
   // Fix 1/2 (2026-08-31, bra-1788142124203): for adhoc tasks, gate the plan on real
   // substance and, when a prior attempt on this same task already produced a good plan,
   // seed the pass with it rather than cold-roll every retry. Scoped to adhoc -- the
   // domain the incident lives in; other sources' plan passes are unchanged. Never blocks
   // on its own: a thin plan with no prior plan to fall back on still proceeds (with a
   // note), exactly as before -- the implement tiers, not this gate, decide feasibility.
-  const substanceGated = resolveSourceName(task) === 'adhoc';
-  const seedPlan = substanceGated ? bestPriorPlan(task) : null;
+  const { substanceGated, seedPlan } = computeSubstanceGate(task);
 
   // Grounded plan (2026-09-04): give the adhoc plan pass real repo content -- the files the
   // task names + a grep on its identifiers -- so it stops inventing paths/symbols.
