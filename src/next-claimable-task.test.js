@@ -532,3 +532,140 @@ test('preferredLaneIsIdle / lanePreferenceGraceMs: the primitives', () => {
   assert.equal(lanePreferenceGraceMs({ AGENT_MANAGER_LANE_PREFERENCE_GRACE_SECS: '0' }), 0);
   assert.equal(lanePreferenceGraceMs({ AGENT_MANAGER_LANE_PREFERENCE_GRACE_SECS: '30' }), 30000);
 });
+
+// --- hub claim tier (2026-09-30, Grimmethy: hub sub-tasks below premiumPriority but ahead of ordinary work) ---
+
+const { HUB_TIER_PRIORITY } = require('./hub-priority.js');
+const { rankPriorityOfTask } = require('./next-claimable-task.js');
+
+function writeHubRecord(pendingDir, hub) {
+  const coordDir = path.join(pendingDir, '..', 'coordinating');
+  fs.mkdirSync(coordDir, { recursive: true });
+  fs.writeFileSync(path.join(coordDir, `${hub.id}.json`), JSON.stringify({ status: 'coordinating', ...hub }));
+}
+
+test('hub tier: a live-hub child is claimed ahead of a better-priority ordinary task (trouble_log 20 vs bot adhoc 40)', () => {
+  const pendingDir = setupPending();
+  writeHubRecord(pendingDir, { id: 'hub-x', createdAt: '2026-09-01T00:00:00Z' });
+  writeTask(pendingDir, 'hygiene', { source: 'trouble_log' });
+  writeTask(pendingDir, 'hub-child', { source: 'adhoc', parentHub: 'hub-x' });
+
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0 }), ['hub-child.json', 'hygiene.json']);
+});
+
+test('hub tier: premiumPriority still outranks a hub child, and a non-hub bot adhoc keeps its old rank behind hygiene', () => {
+  const pendingDir = setupPending();
+  writeHubRecord(pendingDir, { id: 'hub-x', createdAt: '2026-09-01T00:00:00Z' });
+  writeTask(pendingDir, 'plain-bot-adhoc', { source: 'adhoc' });
+  writeTask(pendingDir, 'hub-child', { source: 'adhoc', parentHub: 'hub-x' });
+  writeTask(pendingDir, 'premium', { source: 'trouble_log', premiumPriority: true });
+  writeTask(pendingDir, 'hygiene', { source: 'trouble_log' });
+
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0 }),
+    ['premium.json', 'hub-child.json', 'hygiene.json', 'plain-bot-adhoc.json']);
+});
+
+test('hub tier: within the tier, hubPriority ascending then hub createdAt then mtime decide', () => {
+  const pendingDir = setupPending();
+  writeHubRecord(pendingDir, { id: 'hub-late', hubPriority: 5, createdAt: '2026-09-09T00:00:00Z' });
+  writeHubRecord(pendingDir, { id: 'hub-early-unranked', createdAt: '2026-08-01T00:00:00Z' });
+  writeHubRecord(pendingDir, { id: 'hub-first', hubPriority: 1, createdAt: '2026-09-20T00:00:00Z' });
+  writeTask(pendingDir, 'c-unranked', { source: 'adhoc', parentHub: 'hub-early-unranked' });
+  writeTask(pendingDir, 'c-late', { source: 'adhoc', parentHub: 'hub-late' });
+  writeTask(pendingDir, 'c-first-b', { source: 'adhoc', parentHub: 'hub-first' });
+  writeTask(pendingDir, 'c-first-a', { source: 'adhoc', parentHub: 'hub-first' }); // written after c-first-b -> FIFO within the hub
+  writeTask(pendingDir, 'hygiene', { source: 'trouble_log' });
+
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0 }),
+    ['c-first-b.json', 'c-first-a.json', 'c-late.json', 'c-unranked.json', 'hygiene.json']);
+});
+
+test('hub tier: a derived_task hub child gets the tier (before the derived 48 early return); a non-hub derived task stays 48', () => {
+  const pendingDir = setupPending();
+  writeHubRecord(pendingDir, { id: 'hub-x', createdAt: '2026-09-01T00:00:00Z' });
+  writeTask(pendingDir, 'hygiene', { source: 'trouble_log' });
+  writeTask(pendingDir, 'derived-plain', { source: 'derived_task', domain: 'adhoc', promptContext: { rawText: 'x' } });
+  writeTask(pendingDir, 'derived-hub-child', { source: 'derived_task', domain: 'adhoc', parentHub: 'hub-x', promptContext: { rawText: 'x' } });
+
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0 }),
+    ['derived-hub-child.json', 'hygiene.json', 'derived-plain.json']);
+});
+
+test('hub tier: an atomic decompose child is in the tier even when its hub record is missing; a child of a completed hub is not', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'hygiene', { source: 'trouble_log' });
+  writeTask(pendingDir, 'orphaned-hub-child', { source: 'adhoc', parentHub: 'hub-gone' });
+  writeTask(pendingDir, 'atomic-child', { source: 'adhoc', atomic: true });
+
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0 }),
+    ['atomic-child.json', 'hygiene.json', 'orphaned-hub-child.json']);
+});
+
+test('hub tier: rankPriorityOfTask and effectivePriority', () => {
+  assert.equal(effectivePriority({ source: 'adhoc' }, 10, resolveSourceName), 10 + BOT_ADHOC_PRIORITY_PENALTY, '3-arg form is unchanged');
+  assert.equal(effectivePriority({ source: 'adhoc' }, 10, resolveSourceName, true), HUB_TIER_PRIORITY);
+  assert.equal(effectivePriority({ source: 'adhoc', premiumPriority: true }, 10, resolveSourceName, true), -Infinity, 'premium beats the tier');
+  assert.equal(rankPriorityOfTask({ source: 'adhoc' }, { hubTier: true }), HUB_TIER_PRIORITY);
+  assert.equal(rankPriorityOfTask({ source: 'derived_task', domain: 'adhoc' }, { hubTier: true }), HUB_TIER_PRIORITY);
+  assert.equal(rankPriorityOfTask({ source: 'derived_task', domain: 'adhoc', premiumPriority: true }, { hubTier: true }), -Infinity);
+  assert.equal(rankPriorityOfTask({ source: 'trouble_log' }, { hubTier: false }), 20);
+  const pendingDir = setupPending();
+  writeHubRecord(pendingDir, { id: 'hub-x', createdAt: '2026-09-01T00:00:00Z' });
+  assert.equal(rankPriorityOfTask({ source: 'adhoc', parentHub: 'hub-x' }, { pipelineDir: path.join(pendingDir, '..', '..') }), HUB_TIER_PRIORITY,
+    'with no explicit hubTier the tier is derived from the live coordinating/ record (the generation throttle path)');
+});
+
+test('hub tier audit: one line when the tier outranks a better-natural-priority task, none otherwise, stdout list unchanged, no repeat lines', () => {
+  const pendingDir = setupPending();
+  const instancesDir = path.join(pendingDir, '..', '..', 'instances');
+  const auditFile = path.join(instancesDir, 'hub-tier-audit.log');
+  writeHubRecord(pendingDir, { id: 'hub-x', hubPriority: 3, createdAt: '2026-09-01T00:00:00Z' });
+  writeTask(pendingDir, 'hub-child', { source: 'adhoc', parentHub: 'hub-x' });
+
+  pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0, instancesDir });
+  assert.equal(fs.existsSync(auditFile), false, 'nothing was displaced -> no audit line');
+
+  writeTask(pendingDir, 'hygiene', { source: 'trouble_log' });
+  const first = pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0, instancesDir });
+  pickClaimableTasks(pendingDir, 'worker-2', { graceMs: 0, instancesDir });
+  assert.deepEqual(first, ['hub-child.json', 'hygiene.json'], 'the returned list is still names only');
+  const lines = fs.readFileSync(auditFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(lines.length, 1, 'an identical re-evaluation must not append a second line');
+  assert.equal(lines[0].taskId, 'hub-child');
+  assert.equal(lines[0].hubId, 'hub-x');
+  assert.equal(lines[0].hubRank, 3);
+  assert.equal(lines[0].displacedTaskId, 'hygiene');
+  assert.equal(lines[0].displacedRank, 20);
+  assert.equal(lines[0].naturalRank, 10 + BOT_ADHOC_PRIORITY_PENALTY);
+});
+
+test('hub tier: a hubOrder override that reports no hub work disables the tier (the override is honored)', () => {
+  const pendingDir = setupPending();
+  writeHubRecord(pendingDir, { id: 'hub-x', createdAt: '2026-09-01T00:00:00Z' });
+  writeTask(pendingDir, 'hygiene', { source: 'trouble_log' });
+  writeTask(pendingDir, 'hub-child', { source: 'adhoc', parentHub: 'hub-x' });
+  const { updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+  const original = getRegisteredSource('adhoc').hubOrder;
+  updateTaskSource('adhoc', {
+    hubOrder: { orderCandidate: () => ({ isHubWork: false, hubKey: { isHubChild: false } }), compareKeys: () => 0, siblingHolds: () => false },
+  });
+  try {
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-1', { graceMs: 0 }), ['hygiene.json', 'hub-child.json']);
+  } finally {
+    updateTaskSource('adhoc', { hubOrder: original });
+  }
+});
+
+test('hub tier: listAssignableTasks orders adhoc/ rows premium, then hub tier, then the rest, without adding fields to the rows', () => {
+  const queueDir = setupQueue();
+  const adhocDir = path.join(queueDir, 'adhoc');
+  fs.mkdirSync(adhocDir, { recursive: true });
+  writeHubRecord(path.join(queueDir, 'pending'), { id: 'hub-x', createdAt: '2026-09-01T00:00:00Z' });
+  writeTask(adhocDir, 'a-plain', { source: 'adhoc' });
+  writeTask(adhocDir, 'z-hub-child', { source: 'adhoc', parentHub: 'hub-x' });
+  writeTask(adhocDir, 'm-premium', { source: 'adhoc', premiumPriority: true });
+
+  const rows = listAssignableTasks(queueDir, 'worker-1').filter((r) => r.location === 'adhoc');
+  assert.deepEqual(rows.map((r) => r.id), ['m-premium', 'z-hub-child', 'a-plain']);
+  assert.deepEqual(Object.keys(rows[0]).sort(), ['id', 'location', 'pinnedTo', 'premiumPriority', 'source', 'title']);
+});

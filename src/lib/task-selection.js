@@ -52,6 +52,41 @@ function hasPremiumPriorityInQueue(queueDir) {
   return false;
 }
 
+// Hub-tier generation preemption (2026-09-30): a hub sub-task ranks HUB_TIER_PRIORITY at claim time (next-claimable-task.js) but,
+// like premium before 2026-09-25, would still wait behind the hygiene family's source-priority walk to be GENERATED. Same peek,
+// same immediate generation, one band below premium. The loader still applies dependsOn / softDependsOn / siblingHolds, and it can
+// return a plain (non-hub) task when every hub child is held -- that result must NOT preempt the walk, so only a premium or hub-tier
+// result is accepted here; anything else falls through to the normal priority walk.
+function hasHubTierInQueue(queueDir, pipelineDir) {
+  const { isHubTierTask } = require('../hub-priority.js');
+  const cache = new Map();
+  let entries;
+  try {
+    entries = fs.readdirSync(queueDir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const e of entries) {
+    if (!e.isFile() || !e.name.endsWith('.json')) continue;
+    try {
+      if (isHubTierTask(pipelineDir, JSON.parse(fs.readFileSync(path.join(queueDir, e.name), 'utf8')), cache)) return true;
+    } catch {
+      continue; // corrupt/partial write -- the normal walk still sees it
+    }
+  }
+  return false;
+}
+
+function hubTierPreemptedTask(queueDir, pipelineDir) {
+  const { isHubTierTask } = require('../hub-priority.js');
+  for (const [dir, load] of [['adhoc', 'nextAdhocTask'], ['derived', 'nextDerivedTask']]) {
+    if (!hasHubTierInQueue(path.join(queueDir, dir), pipelineDir)) continue;
+    const task = require('../task-sources.js')[load]();
+    if (task && (task.premiumPriority === true || isHubTierTask(pipelineDir, task))) return task;
+  }
+  return null;
+}
+
 function premiumPreemptedTask() {
   const { pipelineDir } = getConfig();
   const queueDir = path.join(pipelineDir, 'queue');
@@ -63,7 +98,7 @@ function premiumPreemptedTask() {
     const task = require('../task-sources.js').nextDerivedTask();
     if (task) return task;
   }
-  return null;
+  return hubTierPreemptedTask(queueDir, pipelineDir);
 }
 
 function getNextTask({ blocked } = {}) {

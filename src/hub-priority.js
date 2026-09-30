@@ -31,6 +31,14 @@ const path = require('path');
 // callers can do plain arithmetic sorts without special-casing Infinity.
 const UNRANKED_HUB_PRIORITY = 1e9;
 
+// Hub-work claim tier (2026-09-30, Grimmethy: hub sub-tasks need a slot below premiumPriority -- which resolves to
+// -Infinity and beats everything -- but ahead of ordinary work). A task that is hub work (an `atomic` decompose child, or a
+// child of a LIVE coordinating hub) ranks here in next-claimable-task.js, so it outranks every registered source priority
+// (all >= 1) without a per-task stamp that could drift from hub membership. Within the tier the existing hub key
+// (hubPriority asc, hub createdAt asc) then mtime still decide. Priority ordering only -- sequencing between siblings stays
+// the generation-time siblingHolds gate.
+const HUB_TIER_PRIORITY = -1000;
+
 // Accepts whatever the dashboard route was handed; returns an integer, or null to mean
 // "clear it / unranked". Non-finite, non-numeric -> null.
 function normalizeHubPriority(value) {
@@ -206,6 +214,11 @@ function siblingHolds(pipelineDir, task, hubRecord) {
   return hubHasUnmergedEarlierSibling(pipelineDir, task, hubRecord).blocked;
 }
 
+// True when `task` belongs in the hub claim tier: atomic decompose child OR child of a live coordinating hub.
+function isHubTierTask(pipelineDir, task, cache) {
+  return !!orderCandidate(pipelineDir, task, cache).isHubWork;
+}
+
 const DEFAULT_HUB_ORDER = {
   orderCandidate,
   compareKeys: compareHubKeys,
@@ -214,6 +227,8 @@ const DEFAULT_HUB_ORDER = {
 
 module.exports = {
   UNRANKED_HUB_PRIORITY,
+  HUB_TIER_PRIORITY,
+  isHubTierTask,
   normalizeHubPriority,
   hubIdForTask,
   readHubOrderKey,
