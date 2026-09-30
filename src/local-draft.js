@@ -643,6 +643,28 @@ async function attemptSeedReroll({
   return { planResult, totalAttempts, reRolled, stillThin, seededFromPrior: false };
 }
 
+// Extracted from runPlanPass (HUB0079 2/3): the harness-search grounding step -- running the
+// plan pass's proposed QUERY: lines against the real search harness the task's source declares
+// (via `harnessSearch` on its registration in task-source-registry.js) and handing the hits to
+// the implement pass. Which harness (if any) applies is a per-source dispatch concern, so this
+// now owns it: resolve the source name, look up that source's harnessSearch kind, and only then
+// invoke the shared harness runner (lib/harness-search.js) with the caller's fetchers. Same
+// behavior as the inline block this replaced: a no-op (returns null) for every source without a
+// `harnessSearch` registration, and -- when one is registered -- the runner's result is returned
+// so runPlanPass can honor its networkUnavailable short-circuit. Pulled out so "which sources
+// trigger a harness search" is unit-testable in isolation without driving the whole plan pass.
+async function resolveHarnessSearch(task, projectSearchFetch, archImportFetch) {
+  const sourceName = resolveSourceName(task);
+  const harnessKind = getRegisteredSource(sourceName)?.harnessSearch;
+  if (!harnessKind) return null;
+  // Cross-repo (2026-09-04): every 'archImport'-kind source is fundamentally "what does
+  // this pipeline's own code do" -- collapses to [repoRoot] with zero plugins loaded, so
+  // this is additive only (see accessible-roots.js's own header for the incident this
+  // closes). 'projectSearch' ignores `roots` entirely (external API, not a repo grep).
+  const roots = resolveAccessibleRoots();
+  return await runHarnessSearch(harnessKind, task, { projectSearchFetch, archImportFetch, roots, ...(harnessKind === 'projectSearch' ? { isOnlineFn: isOnline } : {}) });
+}
+
 // The plan pass plus its harness-search grounding step. Mutates task.planResponse (and,
 // for a harnessSearch source, task.promptContext.harnessHits/searchResults) and emits the
 // plan-done / harness-search history events. Returns { blocked: true, blockedReason } --
@@ -800,22 +822,15 @@ async function runPlanPass(task, {
     task.acceptanceCriteriaSource = ac.source;
   }
 
-  // Harness-search grounding step: run the plan pass's proposed QUERY: lines against a
-  // real search harness and hand the hits to implement. Which harness (if any) is
-  // declared per source via `harnessSearch` on its registration -- see runHarnessSearch
-  // above. Replaces the per-source branches this used to be (project_search,
-  // arch_import, pipeline_self_audit, pipeline_health_audit, ui_visibility_audit,
-  // staleness_audit).
-  const harnessKind = getRegisteredSource(resolveSourceName(task))?.harnessSearch;
-  if (harnessKind) {
-    // Cross-repo (2026-09-04): every 'archImport'-kind source is fundamentally "what does
-    // this pipeline's own code do" -- collapses to [repoRoot] with zero plugins loaded, so
-    // this is additive only (see accessible-roots.js's own header for the incident this
-    // closes). 'projectSearch' ignores `roots` entirely (external API, not a repo grep).
-    const roots = resolveAccessibleRoots();
-    const hs = await runHarnessSearch(harnessKind, task, { projectSearchFetch, archImportFetch, roots, ...(harnessKind === 'projectSearch' ? { isOnlineFn: isOnline } : {}) });
-    if (hs && hs.networkUnavailable) return { blocked: true, blockedReason: 'network_unavailable', networkUnavailable: true };
-  }
+  // Harness-search grounding step (HUB0079 2/3): extracted from this function into
+  // resolveHarnessSearch above -- same behavior, now unit-testable in isolation (which
+  // sources trigger a harness search is decided entirely in there). Replaces the
+  // per-source branches this used to be (project_search, arch_import,
+  // pipeline_self_audit, pipeline_health_audit, ui_visibility_audit, staleness_audit).
+  // Its return value carries the runner's networkUnavailable short-circuit when the
+  // harness could not be reached; null when no harness applies to this source.
+  const hs = await resolveHarnessSearch(task, projectSearchFetch, archImportFetch);
+  if (hs && hs.networkUnavailable) return { blocked: true, blockedReason: 'network_unavailable', networkUnavailable: true };
   return { blocked: false };
 }
 
