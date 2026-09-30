@@ -31,6 +31,9 @@ const { execFileSync } = require('child_process');
 // into getConfig() and pollute the real repo's own Docs/*_CANDIDATES.md files -- the same
 // risk applies here even though this file's own tests don't touch that path today.
 process.env.AGENT_MANAGER_REPO_ROOT = require('os').tmpdir();
+// Executed verification (review-verify.js) creates a real scratch worktree and runs tests, so it is OFF for this file's many fixture-based adhoc
+// tasks (fake rawDiffs, non-git repoRoot). The tests at the end of this file that exercise the gate switch it on and inject a fake verifier.
+process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false';
 process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
 // 2026-08-23: review-task.js's own isEmptyApprovalSource/isAdvisoryProseSource now read
@@ -1803,3 +1806,159 @@ test('reviewTask puts a deterministic SCOPE CHECK in the vote prompt when the di
   assert.match(prompt, /package-lock\.json/);
   assert.doesNotMatch(prompt.replace(/diff --git[^"]*/g, ''), /file\(s\) that NEITHER[^.]*App\.tsx/, 'a mentioned file is not listed as unnamed');
 });
+
+
+// --- executed verification gate (review-verify.js wired into runReview, slice 2b) -------------------------------------------------------
+function withExecutedVerify(fn) {
+  return async () => {
+    process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'true';
+    try { await fn(); } finally { process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false'; }
+  };
+}
+
+function adhocImplementedTask(overrides = {}) {
+  return baseTask({
+    domain: 'default', source: 'manual', adhocResolution: 'implemented',
+    acceptanceCriteria: ['the helper works'],
+    acceptanceResults: [{ criterion: 'the helper works', check: '`node --test src/a.test.js`', result: 'PASS', pass: true }],
+    rawDiff: 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n-a\n+b\n',
+    ...overrides,
+  });
+}
+
+test('executed verification: a genuinely failed check blocks before any vote, names what failed, and is recorded on the task', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask();
+  const captured = [];
+  const fake = () => ({
+    status: 'failed', reasons: ['covering js tests failed'],
+    tests: { ran: ['src/a.test.js'], passed: false, failures: ['the helper adds', 'the helper subtracts'], raw: 'not ok 1 - the helper adds\nAssertionError: 3 !== 4' },
+    commands: [{ criterion: 'the helper works', command: 'node --test src/a.test.js', claimedPass: true, outcome: 'contradicted', exitCode: 1, detail: 'AssertionError' }],
+  });
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, verifyDiffFn: fake });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.equal(task.reviewProvider, 'deterministic-executed-verification');
+  assert.match(result.blockedReason, /executed verification failed/);
+  assert.match(result.blockedReason, /src\/a\.test\.js/);
+  assert.match(result.blockedReason, /the helper adds; the helper subtracts/);
+  assert.match(result.blockedReason, /claimed PASS for `node --test src\/a\.test\.js` but it exits 1/);
+  assert.equal(captured.length, 0, 'no vote is spent on a draft whose own tests fail');
+  assert.equal(task.executedVerification.status, 'failed');
+  assert.deepEqual(task.executedVerification.tests.failures, ['the helper adds', 'the helper subtracts']);
+  assert.equal(task.executedVerification.commands[0].outcome, 'contradicted');
+  const stages = task.history.map((h) => h.stage);
+  assert.ok(stages.includes('advisory') && stages.includes('blocked'));
+}));
+
+test('executed verification: passed and inconclusive both go on to the vote, with the result recorded', withExecutedVerify(async () => {
+  for (const [status, reasons] of [['passed', []], ['inconclusive', ['the diff does not apply to main (often a slice that depends on an unmerged earlier one): x']]]) {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: `ev-${status}` });
+    const captured = [];
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+      verifyDiffFn: () => ({ status, reasons, tests: status === 'passed' ? { ran: ['src/a.test.js'], passed: true, failures: [] } : null, commands: [] }) });
+    assert.notEqual(task.reviewProvider, 'deterministic-executed-verification', status);
+    assert.equal(captured.length, 1, `${status} must reach the vote`);
+    assert.equal(task.executedVerification.status, status);
+    const note = task.history.find((h) => h.stage === 'advisory' && /executed verification/.test(h.detail || ''));
+    assert.ok(note, `${status} leaves an advisory history event`);
+    if (status === 'inconclusive') assert.match(note.detail, /does not apply/);
+  }
+}));
+
+test('executed verification: a verifier that throws never blocks and never breaks the review', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask();
+  const captured = [];
+  const origErr = console.error; console.error = () => {};
+  try {
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, verifyDiffFn: () => { throw new Error('bwrap exploded'); } });
+  } finally { console.error = origErr; }
+  assert.notEqual(task.reviewProvider, 'deterministic-executed-verification');
+  assert.equal(captured.length, 1);
+  assert.equal(task.executedVerification, undefined);
+}));
+
+test('executed verification: the kill switch, a non-adhoc source, an unimplemented draft and a missing rawDiff each skip the verifier entirely', async () => {
+  const cases = [
+    ['kill switch', { env: 'false', task: {} }],
+    ['not adhoc', { env: 'true', task: { domain: 'default', source: 'trouble_log' } }],
+    ['not implemented', { env: 'true', task: { adhocResolution: 'needs-human-decision' } }],
+    ['no rawDiff', { env: 'true', task: { rawDiff: '' } }],
+  ];
+  for (const [label, { env, task: overrides }] of cases) {
+    const { repoRoot, domainsPath } = makeFixture();
+    const calls = [];
+    process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = env;
+    try {
+      await reviewTask(adhocImplementedTask({ id: `skip-${label.replace(/ /g, '-')}`, ...overrides }), {
+        repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, verifyDiffFn: (a) => { calls.push(a); return { status: 'passed', reasons: [], tests: null, commands: [] }; } });
+    } finally { process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false'; }
+    assert.equal(calls.length, 0, `${label}: the verifier must not run`);
+  }
+});
+
+test('executed verification: the verifier is handed the task id, raw diff, claimed results, repo root, base branch and budget', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'ev-args' });
+  let seen = null;
+  process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS = '12345';
+  try {
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {},
+      verifyDiffFn: (a) => { seen = a; return { status: 'passed', reasons: [], tests: null, commands: [] }; } });
+  } finally { delete process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS; }
+  assert.equal(seen.taskId, 'ev-args');
+  assert.equal(seen.rawDiff, task.rawDiff);
+  assert.equal(seen.acceptanceResults, task.acceptanceResults);
+  assert.equal(seen.repoRoot, repoRoot);
+  assert.equal(seen.mainBranch, 'main', 'a non-git fixture falls back to the literal main, the same way the apply stage does');
+  assert.equal(seen.budgetMs, 12345);
+}));
+
+test('summariseExecutedVerification keeps the record small and executedVerificationBlockReason ends with the output tail', () => {
+  const { summariseExecutedVerification, executedVerificationBlockReason } = require('./review-task.js');
+  const ev = {
+    status: 'failed', reasons: Array.from({ length: 9 }, (_, i) => `r${i}`),
+    tests: { ran: ['a.test.js'], passed: false, failures: Array.from({ length: 15 }, (_, i) => `t${i}`), raw: 'x'.repeat(5000) + 'THE-END' },
+    commands: [{ criterion: 'c'.repeat(400), command: 'node --test a.test.js', claimedPass: true, outcome: 'contradicted', exitCode: 1, detail: 'd'.repeat(3000) }],
+  };
+  const s = summariseExecutedVerification(ev);
+  assert.equal(s.reasons.length, 6);
+  assert.equal(s.tests.failures.length, 10);
+  assert.equal(s.commands[0].criterion.length, 160);
+  assert.equal('raw' in s.tests, false);
+  assert.equal('detail' in s.commands[0], false);
+  const reason = executedVerificationBlockReason(ev);
+  assert.match(reason, /THE-END/);
+  assert.ok(reason.length < 1600);
+});
+
+test('executed verification: a stacked hub sub-task is verified against its shared branch, not master (real git remote)', withExecutedVerify(async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-task-stacked-'));
+  const git = (args, cwd) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  try {
+    const origin = path.join(dir, 'origin.git');
+    const work = path.join(dir, 'repo');
+    git(['init', '--bare', '-b', 'main', origin], dir);
+    git(['clone', origin, work], dir);
+    git(['checkout', '-b', 'main'], work);
+    fs.writeFileSync(path.join(work, 'f.txt'), 'base\n');
+    git(['add', '-A'], work); git(['commit', '-m', 'base'], work); git(['push', 'origin', 'main'], work);
+    git(['checkout', '-b', 'agent/decompose-hub-x'], work);
+    fs.writeFileSync(path.join(work, 'g.txt'), 'sibling work\n');
+    git(['add', '-A'], work); git(['commit', '-m', 'sibling'], work); git(['push', 'origin', 'agent/decompose-hub-x'], work);
+    git(['checkout', 'main'], work);
+    const domainsPath = path.join(dir, 'task-domains.json');
+    fs.writeFileSync(domainsPath, JSON.stringify({ default: { workDirKind: 'repoRoot', successCheck: 'git-branch-diff' } }));
+    const stacked = adhocImplementedTask({ id: 'ev-stacked', stacked: { branch: 'agent/decompose-hub-x', seq: 2, total: 2 } });
+    const plain = adhocImplementedTask({ id: 'ev-plain' });
+    const seen = {};
+    for (const [key, t] of [['stacked', stacked], ['plain', plain]]) {
+      await reviewTask(t, { repoRoot: work, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {},
+        verifyDiffFn: (a) => { seen[key] = a.mainBranch; return { status: 'passed', reasons: [], tests: null, commands: [] }; } });
+    }
+    assert.equal(seen.stacked, 'agent/decompose-hub-x');
+    assert.equal(seen.plain, 'main');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}));
