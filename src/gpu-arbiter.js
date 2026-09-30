@@ -184,6 +184,47 @@ function sleepSync(ms) {
 
 // ---- the primary API --------------------------------------------------------------------
 
+// The wait-for-our-turn loop, extracted from acquire so its five exit/continue paths can
+// be unit-tested in isolation (mock ticket dir + controlled Date.now/pidAlive) without
+// exercising the flock/compat lifecycle that follows. Body is verbatim from the old
+// inline loop: (1) holdsPlace break, (2) deadline -> safeUnlink + timeout throw,
+// (3) sweep re-write + continue, (4) cancelRequested -> cleanup + marked throw,
+// (5) no higher-rank ticket and no earlier same-rank peer -> break. Returns void on
+// success; throws on timeout or cancellation. (cls/taskId/phase/model are passed in
+// because the sweep re-write must rebuild a byte-identical ticket.)
+function waitForTurn(instancesDir, key, name, fp, myRank, mySeqNum, deadline, holdsPlace,
+                     cls, taskId, phase, model) {
+  while (true) {
+    if (holdsPlace) break;
+    if (Date.now() >= deadline) {
+      safeUnlink(fp);
+      throw new Error(`gpu-arbiter: '${cls}' ticket for '${key || '(default)'}' timed out waiting to reach the head of the queue`);
+    }
+    touch(fp);
+    const tickets = liveTickets(instancesDir, key);
+    const mine = tickets.find((t) => t._name === name);
+    if (!mine) {
+      // our ticket was swept (we were too slow to re-touch, or a clock jump) -- re-add.
+      writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, model, startedAt: nowIso(), holding: false, cancelRequested: false });
+      continue;
+    }
+    if (mine.cancelRequested) {
+      safeUnlink(fp);
+      const err = new Error('gpu-arbiter: cancelled while waiting');
+      err.gpuArbiterCancelled = true;
+      throw err;
+    }
+    const higherExists = tickets.some((t) => t._name !== name && t.pid !== process.pid && classRank(t.cls) < myRank);
+    // A ticket owned by THIS pid at our own class (typically a holdPlace() place-holder
+    // for a chat tool loop, or a re-added ticket after a sweep) is not a competitor --
+    // this process already has its spot.
+    const earlierPeer = tickets.some((t) => t._name !== name && t.pid !== process.pid
+      && classRank(t.cls) === myRank && t._seq < mySeqNum);
+    if (!higherExists && !earlierPeer) break;
+    sleepSync(POLL_MS);
+  }
+}
+
 // Register a ticket and block (busy-wait with sleeps, like single-flight-lock.js -- this
 // whole module blocks the calling process by design) until this ticket may proceed:
 // no higher-priority-class ticket exists, and this is the earliest ticket of its own
@@ -222,35 +263,7 @@ function acquire(instancesDir, { cls = DEFAULT_CLASS, model, lockKey, taskId = n
   const deadline = Date.now() + overallTimeoutMs();
 
   try {
-    for (;;) {
-      if (holdsPlace) break;
-      if (Date.now() >= deadline) {
-        safeUnlink(fp);
-        throw new Error(`gpu-arbiter: '${cls}' ticket for '${key || '(default)'}' timed out waiting to reach the head of the queue`);
-      }
-      touch(fp);
-      const tickets = liveTickets(instancesDir, key);
-      const mine = tickets.find((t) => t._name === name);
-      if (!mine) {
-        // our ticket was swept (we were too slow to re-touch, or a clock jump) -- re-add.
-        writeTicketAtomic(fp, { pid: process.pid, cls, taskId, phase, model, startedAt: nowIso(), holding: false, cancelRequested: false });
-        continue;
-      }
-      if (mine.cancelRequested) {
-        safeUnlink(fp);
-        const err = new Error('gpu-arbiter: cancelled while waiting');
-        err.gpuArbiterCancelled = true;
-        throw err;
-      }
-      const higherExists = tickets.some((t) => t._name !== name && t.pid !== process.pid && classRank(t.cls) < myRank);
-      // A ticket owned by THIS pid at our own class (typically a holdPlace() place-holder
-      // for a chat tool loop, or a re-added ticket after a sweep) is not a competitor --
-      // this process already has its spot.
-      const earlierPeer = tickets.some((t) => t._name !== name && t.pid !== process.pid
-        && classRank(t.cls) === myRank && t._seq < mySeqNum);
-      if (!higherExists && !earlierPeer) break;
-      sleepSync(POLL_MS);
-    }
+    waitForTurn(instancesDir, key, name, fp, myRank, mySeqNum, deadline, holdsPlace, cls, taskId, phase, model);
   } catch (err) {
     safeUnlink(fp);
     throw err;
@@ -377,6 +390,7 @@ function status(instancesDir, model) {
 
 module.exports = {
   acquire, withGpu, holdPlace, cancelBelow, status,
+  waitForTurn,
   liveTickets, ticketsDir,
   CLASS_RANK, classRank,
 };
