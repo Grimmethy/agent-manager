@@ -4361,12 +4361,10 @@ def _stop_pipeline(force: bool = False) -> list:
     return stopped
 
 
-def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
-    """Writes the chosen path/toggles into agent-manager.env (creating the file if it
-    doesn't exist yet) and spawns the relevant loops as real, visible console windows,
-    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
-    /api/pipeline/start and _restart_pipeline()."""
-    record_project_used(raw_path)
+def _persist_launch_env(raw_path: str, include_apply: bool, skip_push: bool) -> None:
+    """Write the launch toggles (REPO_ROOT/INCLUDE_APPLY/SKIP_PUSH) to ENV_FILE_PATH and
+    mirror AGENT_MANAGER_REPO_ROOT into os.environ so the running dashboard process sees
+    the new value immediately."""
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_REPO_ROOT", raw_path)
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_INCLUDE_APPLY", "true" if include_apply else "false")
     write_env_value(ENV_FILE_PATH, "AGENT_MANAGER_APPLY_SKIP_PUSH", "true" if skip_push else "false")
@@ -4385,6 +4383,33 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     # in-dashboard project switch actually take effect and persist for the rest of this
     # process's lifetime, matching what the Project tab visibly promises.
     os.environ["AGENT_MANAGER_REPO_ROOT"] = raw_path
+
+
+def _acquire_gpu_lease() -> None:
+    """Stomp (unlink) any ComfyUI GPU lease PromptForge left behind; failures are logged
+    at debug level. Called on explicit pipeline start: an explicit start is a
+    "GPU work now" signal, so the local-model daemons shouldn't yield their ticks to a
+    generation that isn't the priority anymore (see comfyui_lease_held in
+    agent-manager-common.sh). scripts/launch.sh does the same on the Linux path; this
+    also covers the Windows .ps1 path."""
+    _comfy_lease = Path(
+        os.environ.get("AGENT_MANAGER_COMFY_LEASE_PATH")
+        or (Path(os.environ.get("HOME") or "~").expanduser()
+            / ".local/state/agent-manager/comfyui-lease.json")
+    )
+    try:
+        _comfy_lease.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("ComfyUI lease unlink failed: %s", exc, exc_info=True)
+
+
+def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict:
+    """Writes the chosen path/toggles into agent-manager.env (creating the file if it
+    doesn't exist yet) and spawns the relevant loops as real, visible console windows,
+    same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
+    /api/pipeline/start and _restart_pipeline()."""
+    record_project_used(raw_path)
+    _persist_launch_env(raw_path, include_apply, skip_push)
 
     # Fix, 2026-08-20 (Grimmethy: "I'm still only seeing the agent manager and it's clone
     # [in the Project tab] -- we should be able to select from any of the projects"):
@@ -4455,19 +4480,8 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     record_project_registry_entry(raw_path, pipeline_dir_for_registry, domains_path_for_registry)
 
     # Explicit pipeline start is a "GPU work now" signal -- stomp any ComfyUI GPU lease
-    # PromptForge left behind so the local-model daemons don't yield their ticks to a
-    # generation that isn't the priority anymore (see comfyui_lease_held in
-    # agent-manager-common.sh). scripts/launch.sh does the same on the Linux path; this
-    # also covers the Windows .ps1 path below.
-    _comfy_lease = Path(
-        os.environ.get("AGENT_MANAGER_COMFY_LEASE_PATH")
-        or (Path(os.environ.get("HOME") or "~").expanduser()
-            / ".local/state/agent-manager/comfyui-lease.json")
-    )
-    try:
-        _comfy_lease.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.debug("ComfyUI lease unlink failed: %s", exc, exc_info=True)
+    # PromptForge left behind (see _acquire_gpu_lease).
+    _acquire_gpu_lease()
 
     # Proactive file-decompose sweep (2026-09-14): "when the project is selected as the
     # target of agent manager" is exactly this event -- a project becoming the active
