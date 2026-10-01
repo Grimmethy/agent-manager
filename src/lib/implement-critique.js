@@ -18,6 +18,7 @@ const { resolveStrategy } = require('../model-strategies.js');
 const { PINNED_NUM_CTX } = require('../gpu-capacity.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('../local-client.js');
 const { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor } = require('./harness-search.js');
+const { fileGhostDebt } = require('../ghost-debt.js');
 const fs = require('fs');
 const path = require('path');
 
@@ -160,7 +161,27 @@ async function runCritiqueAndRevision(task, {
     // recordCritique() / 'critique-done' tail made it look like a pass signal downstream.
     // Mirror the advisory-prose early-return above: mark the outcome, log the skip, and
     // stop before the shared recordCritique / 'critique-done' tail.
+    //
+    // 2026-09-16 (degenerate-as-block, supersedes skip): skipping only stopped the
+    // pass SIGNAL -- the draft still flowed on to the review vote un-critiqued, i.e. a
+    // rubber-stamp (the flagged COMPLETED 5/6/8/11/12/14/20/22 cohort). So like the
+    // grounding-failed branch above, this stamps blockedStage/blockedReason (which
+    // local-draft.js's post-critique `if (task.blockedStage)` disposal turns into
+    // `{ succeeded: true, blocked: true }` BEFORE concludeDraft, so it never reaches
+    // the review queue) and files the recurring "degenerate draft" failure class via
+    // ghost-debt.js -- deduped by failure signature on the concept timeline instead of
+    // silently shipping. fileGhostDebt is best-effort and never throws (see its header:
+    // a telemetry write must never break a draft), so it is safe to call inline.
+    task.blockedStage = 'critique';
+    task.blockedReason = `Critique call degenerate (${String(critiqueResult.degenerate || 'unspecified')}) -- the draft never received a real critique pass; blocking rather than rubber-stamping it into review`.slice(0, 500);
     appendHistoryEvent(task, 'critique-skipped', 'degenerate model response -- not a pass signal');
+    appendHistoryEvent(task, 'blocked', task.blockedReason);
+    try {
+      const { pipelineDir } = getConfig();
+      if (pipelineDir) {
+        fileGhostDebt({ task, reasonText: task.blockedReason, site: 'implement-critique:critique-degenerate', pipelineDir });
+      }
+    } catch { /* best-effort -- a ghost-debt filing must never break the draft block path */ }
     return;
   }
   if (critiqueResult.response.trim() === 'NO ISSUES FOUND') {

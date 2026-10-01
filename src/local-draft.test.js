@@ -3211,6 +3211,95 @@ test('draftTask skips (not passes) the critique pass when the critique call is d
   });
 });
 
+// 2026-09-16 (degenerate-as-block, supersedes the skip test above): a degenerate
+// critique response used to be SKIPPED -- the draft then reached the review vote
+// un-critiqued, a rubber-stamp (the flagged COMPLETED 5/6/8/11/12/14/20/22 cohort).
+// runCritiqueAndRevision (src/lib/implement-critique.js) must instead stamp
+// blockedStage/blockedReason (same contract as the grounding-failed branch), so
+// local-draft.js's post-critique blockedStage disposal returns blocked:true BEFORE
+// concludeDraft and the draft never enters the review vote.
+test('draftTask BLOCKS (not rubber-stamps) the draft when the critique call is degenerate', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'function real() {\n  return 1;\n}\n');
+    const task = {
+      id: 'obs-fix-critique-degenerate-block', domain: 'default', source: 'observability_fix', title: 'test',
+      promptContext: {
+        candidateId: 'AC-3', title: 'x', files: ['src/x.js'],
+        fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }],
+        body: 'Files: src/x.js',
+      },
+    };
+
+    let callCount = 0;
+    const localCall = async () => {
+      callCount += 1;
+      if (callCount === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      if (callCount === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 };
+      return { response: '', degenerate: 'truncated', attempts: 1 }; // 3rd call = degenerate critique
+    };
+
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+
+    assert.equal(task.critiqueOutcome, 'critique-degenerate');
+    assert.ok(task.blockedStage, 'a degenerate critique must set a truthy blockedStage so the draft cannot reach the review vote');
+    assert.equal(typeof task.blockedReason, 'string');
+    assert.ok(task.blockedReason.length > 0, 'blockedReason must be a non-empty human-readable string');
+    assert.ok(result && result.blocked === true, 'draftTask must dispose the task as blocked, not a review-ready success');
+    assert.ok(!(task.history || []).some((h) => h.stage === 'critique-done'), 'no critique-done entry for a degenerate critique');
+    assert.ok((task.history || []).some((h) => h.stage === 'blocked'), 'a blocked history entry must be recorded');
+    assert.ok(!task.revisionApplied, 'no revision may be applied after a degenerate critique');
+  });
+});
+
+// The loop closes (2026-10-01): a draft blocked because its critique came back degenerate is re-admitted by reject-retry-check.js and, once the critique works, goes on to
+// review. Without the re-admission the new block would strand the task in queue/blocked/ for good.
+test('a draft blocked on a degenerate critique is requeued by reject-retry-check and then drafts through to review', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    const { rejectRetryCheck } = require('./reject-retry-check.js');
+    fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'function real() {\n  return 1;\n}\n');
+    const mkTask = () => ({
+      id: 'obs-fix-critique-roundtrip', domain: 'default', source: 'observability_fix', title: 'test', localRejectCount: 0, history: [],
+      promptContext: { candidateId: 'AC-3', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }], body: 'Files: src/x.js' },
+    });
+    const script = (critique) => {
+      let n = 0;
+      return async () => {
+        n += 1;
+        if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+        if (n === 2) return { response: JSON.stringify({ mode: 'edit', file: 'src/x.js', find: 'return 1;', replace: 'return 2;' }), degenerate: null, attempts: 1 };
+        return critique;
+      };
+    };
+
+    // attempt 1: the critique call is degenerate -> blocked at the critique stage
+    const task = mkTask();
+    const first = await draftTask(task, { localCall: script({ response: '', degenerate: 'truncated', attempts: 1 }), withLockFn: async (d, fn) => fn() });
+    assert.equal(first.blocked, true);
+    assert.equal(task.blockedStage, 'critique');
+
+    // the worker would move it to blocked/; the sweep must take it back
+    const blockedDir = path.join(dir, 'queue', 'blocked');
+    const pendingDir = path.join(dir, 'queue', 'pending');
+    fs.mkdirSync(blockedDir, { recursive: true });
+    fs.mkdirSync(pendingDir, { recursive: true });
+    task.status = 'blocked';
+    fs.writeFileSync(path.join(blockedDir, `${task.id}.json`), JSON.stringify(task));
+    const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+    assert.equal(summary.requeued, 1, 'a critique-degenerate block is not a dead end');
+    const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, `${task.id}.json`), 'utf8'));
+    assert.equal(requeued.localRejectCount, 1);
+
+    // attempt 2: same task, the critique now works -> no stale block, on to review
+    const second = await draftTask(requeued, { localCall: script({ response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 }), withLockFn: async (d, fn) => fn() });
+    assert.ok(!second.blocked, 'the retry must not be re-blocked by the stale critique stage');
+    assert.equal(requeued.blockedStage, undefined);
+    assert.equal(requeued.critiqueOutcome, 'no-issues');
+    assert.equal(requeued.status, 'needs-review');
+  });
+});
+
 // Plan-grounding fix, 2026-08-25: research_task's plan pass now gets real WebSearch/
 // WebFetch tool access (see prompts.js's researchPlanPrompt for the incident this
 // fixes -- an ungrounded plan pass fabricated a fake clinical trial registry ID/site,
