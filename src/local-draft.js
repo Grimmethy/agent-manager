@@ -49,6 +49,7 @@ const { fetchForQueries: archImportFetch } = require('./arch-import-fetch.js');
 const { resolveAccessibleRoots } = require('./accessible-roots.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
+const { detectSerialIntent } = require('./serial-intent.js');
 const {
   beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordOrient, recordPlanCritique, recordTier, finalizeDraftAttempt,
 } = require('./draft-attempt-record.js');
@@ -1320,10 +1321,35 @@ function tryPreDispatchGate(task) {
     if (gateResult && gateResult.verdict === 'archive') {
       return { ruleId, status: 'archived', reason: gateResult.reason || 'pre-dispatch gate verdict' };
     }
+    // Serial-intent check (brain dump #1661). The detector said 'investigate', so a model would normally spend a full plan -> implement -> critique -> review cycle
+    // on it; but 218 of the 253 findings for this rule ended 'dismissed', mostly because the serial order is REQUIRED (a retry or poll loop, a pagination cursor, an
+    // early exit on the result, a comment saying so). detectSerialIntent reads that evidence from the snippet. Mode (AGENT_MANAGER_SEQ_AWAIT_INTENT_GATE):
+    //   'shadow' (default) -- record what it WOULD archive as a history event and carry on drafting, so its decisions can be audited before it is trusted;
+    //   'on'               -- archive, with the signals in the reason (draftTask writes the audit line and task.preDispatchGate);
+    //   'off'              -- skip the check.
+    if (ruleId === SEQUENTIAL_AWAIT_RULE_ID && gateResult && gateResult.verdict === 'investigate') {
+      const mode = seqAwaitIntentMode();
+      if (mode !== 'off') {
+        const intent = detectSerialIntent(flaggedCode);
+        if (intent.intentional) {
+          const why = intent.signals.join(', ');
+          if (mode === 'on') return { ruleId, status: 'archived', reason: `the await in this loop is serial by design (${why})` };
+          appendHistoryEvent(task, 'pre-dispatch-gate-shadow', `rule "${ruleId}" would be archived: the await in this loop is serial by design (${why}) -- shadow mode, drafting continues`);
+        }
+      }
+    }
   } catch {
     return null; // any detector error means "fall through to the normal path", never a crash
   }
   return null;
+}
+
+const SEQUENTIAL_AWAIT_RULE_ID = 'sequential-await-in-loop';
+function seqAwaitIntentMode() {
+  const v = String(process.env.AGENT_MANAGER_SEQ_AWAIT_INTENT_GATE || '').trim().toLowerCase();
+  if (v === 'on') return 'on';
+  if (v === 'off' || v === 'false') return 'off';
+  return 'shadow';
 }
 
 // selectDraftStrategy -- HUB0060 · 2/5 (function-length-fix-ac-4): the multi-way
@@ -1917,7 +1943,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { draftTask, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
+module.exports = { draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on
