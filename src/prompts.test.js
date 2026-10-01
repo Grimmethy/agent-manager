@@ -787,3 +787,59 @@ test('adhoc plan prompt and the agentic write prompt both carry the git-ownershi
   const { buildWriteAgenticPrompt } = require('./local-agentic-write-draft.js');
   assert.ok(buildWriteAgenticPrompt({ ...task, id: 't' }).includes(GIT_OWNERSHIP_RULE), 'agentic implement prompt');
 });
+
+
+// --- drafter guidance for tasks that add a skip / dismiss / early-exit path (brain dump #1667, slice B) ---------------------------------------------
+const SKIP_TASK = (rawText, title = 't') => ({ domain: 'adhoc', source: 'manual', title, promptContext: { rawText } });
+
+test('skipPathDirective fires for a task about dismissing, archiving, short-circuiting, suppressing or skipping work, and for nothing else', () => {
+  const { skipPathDirective } = require('./prompts.js');
+  for (const text of ['Dismiss findings whose snippet has no loop', 'archive the low-confidence ones', 'short-circuit the cycle', 'add an early exit when three runs return nothing', 'early-exit on zero results',
+    'suppress duplicate candidates', 'bypass the plan stage', 'the 24/25 false positives burn a full cycle', 'Skip the plan stage for brain_dump_sort tasks', 'skip tasks that are identical', 'dismissal path for stale tasks']) {
+    assert.equal(skipPathDirective(SKIP_TASK(text), 'plan').length > 0, true, text);
+  }
+  assert.equal(skipPathDirective({ title: 'Dismiss stale tasks', promptContext: { rawText: 'x' } }, 'plan').length > 0, true, 'the title alone triggers it');
+  for (const text of ['fix the bug in foo.js', 'Add a helper that formats dates', 'rename the config key', 'update the zip docs and the readme']) {
+    assert.deepEqual(skipPathDirective(SKIP_TASK(text), 'plan'), [], text);
+  }
+  for (const bad of [null, undefined, {}, { promptContext: null }]) assert.deepEqual(skipPathDirective(bad, 'plan'), []);
+});
+
+test('the plan prompt for such a task asks for the three things before the standard PLAN instruction, and an ordinary task\'s prompt does not mention them', () => {
+  const prompt = buildPlanPrompt(SKIP_TASK('Dismiss findings with no loop in the snippet'));
+  assert.match(prompt, /adds or changes a path that skips, dismisses, archives or short-circuits work/);
+  assert.match(prompt, /\(1\) name a real case the path could wrongly drop/);
+  assert.match(prompt, /check the case you most want to protect FIRST/);
+  assert.match(prompt, /\(2\) include a test where that case still goes through, and list that test in CRITERIA/);
+  assert.match(prompt, /\(3\) say how every dismissal is recorded \(a history event or a counter\) so a wrongly dismissed case can be found/);
+  assert.ok(prompt.indexOf('adds or changes a path that skips') < prompt.indexOf('Write a numbered, actionable PLAN'), 'before the PLAN instruction');
+  assert.ok(prompt.indexOf('Dismiss findings with no loop') < prompt.indexOf('adds or changes a path that skips'), 'after the request itself');
+  const ordinary = buildPlanPrompt(SKIP_TASK('fix the bug in foo.js'));
+  assert.doesNotMatch(ordinary, /skips, dismisses, archives or short-circuits/);
+  assert.doesNotMatch(ordinary, /wrongly drop/);
+});
+
+test('the implement prompt gets a one-paragraph reminder only for such a task, and the rest of it is unchanged', () => {
+  const plain = buildImplementPrompt(SKIP_TASK('fix the bug in foo.js'), 'PLAN TEXT');
+  const skip = buildImplementPrompt(SKIP_TASK('Dismiss findings with no loop'), 'PLAN TEXT');
+  assert.doesNotMatch(plain, /skips, dismisses or short-circuits work/);
+  assert.match(skip, /The diff must include the test from your PLAN where the real case that path could wrongly drop still goes through, and every dismissal must leave a history line or a counter/);
+  assert.ok(skip.indexOf('PLAN TEXT') < skip.indexOf('adds or changes a path that skips'), 'the reminder follows the plan');
+  assert.equal(skip.replace(/This task adds or changes a path that skips, dismisses or short-circuits work\.[^\n]*\n\n/, ''), plain, 'removing the reminder gives exactly the ordinary prompt');
+});
+
+test('AGENT_MANAGER_SKIPPATH_DRAFT_GUIDANCE=false turns the guidance off for both prompts', () => {
+  process.env.AGENT_MANAGER_SKIPPATH_DRAFT_GUIDANCE = 'false';
+  try {
+    assert.doesNotMatch(buildPlanPrompt(SKIP_TASK('Dismiss findings with no loop')), /wrongly drop/);
+    assert.doesNotMatch(buildImplementPrompt(SKIP_TASK('Dismiss findings with no loop'), 'P'), /wrongly drop/);
+  } finally { delete process.env.AGENT_MANAGER_SKIPPATH_DRAFT_GUIDANCE; }
+  assert.match(buildPlanPrompt(SKIP_TASK('Dismiss findings with no loop')), /wrongly drop/);
+});
+
+test('the guidance sits alongside the brain-dump directive without displacing it', () => {
+  const prompt = buildPlanPrompt({ domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'design option: archive duplicates', brainDumpEntryId: 'bd-1' } });
+  assert.match(prompt, /captured research finding or design recommendation/);
+  assert.match(prompt, /wrongly drop/);
+  assert.ok(prompt.indexOf('captured research finding') < prompt.indexOf('adds or changes a path that skips'));
+});
