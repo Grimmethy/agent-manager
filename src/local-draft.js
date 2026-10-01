@@ -654,7 +654,7 @@ async function attemptSeedReroll({
 // `harnessSearch` registration, and -- when one is registered -- the runner's result is returned
 // so runPlanPass can honor its networkUnavailable short-circuit. Pulled out so "which sources
 // trigger a harness search" is unit-testable in isolation without driving the whole plan pass.
-async function resolveHarnessSearch(task, projectSearchFetch, archImportFetch) {
+async function runHarnessSearchStep(task, projectSearchFetch, archImportFetch) {
   const sourceName = resolveSourceName(task);
   const harnessKind = getRegisteredSource(sourceName)?.harnessSearch;
   if (!harnessKind) return null;
@@ -671,6 +671,82 @@ async function resolveHarnessSearch(task, projectSearchFetch, archImportFetch) {
 // plan-done / harness-search history events. Returns { blocked: true, blockedReason } --
 // after emitting the 'blocked' event -- when the plan pass produced no usable plan (and no
 // prior plan to fall back on), else { blocked: false }.
+// Extracted from runPlanPass (HUB0094 · 2/2, function-length-fix-ac-44): the model-
+// invocation unit -- the callPlan closure runPlanPass used to assemble inline, plus the
+// planLen length helper the re-roll "keep whichever roll carries more content" comparison
+// uses. planLen is the module-level const hoisted out earlier (HUB0079 1/3, see its header
+// above) -- it is defined in this module's scope, so returning it here is a plain in-scope
+// reference, not a call to an undefined name. Same behavior as the inline closure it
+// replaced: identical payload, same maybeLocked('plan') wrapping, planLen semantics
+// unchanged. Pulled out so "how the plan is called" is one named unit.
+function buildCallPlan(task, {
+  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, planPrompt, planNumPredict, researchPlanTools, allowEmptyPlan,
+}) {
+  const callPlan = (temperature = 0.4) => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', isDraft: true, ...researchPlanTools }), 'plan');
+  return { callPlan, planLen };
+}
+
+// Extracted from runPlanPass (HUB0094 · 2/2): the initial plan roll + its recordModelCall
+// bookkeeping, which runPlanPass used to inline right before the degenerate guard. Same
+// optional-call convention as before (recordModelCall may be omitted by a test double),
+// same argument object. planLen is accepted as the comparison helper the re-roll policy
+// consumes (owned by attemptSeedReroll, HUB0079 1/3) -- it is NOT referenced by this
+// function and is threaded through purely so the caller can pass it onward.
+async function executePlanRolls(callPlan, planLen, { substanceGated, recordModelCall, task }) {
+  // Records the plan pass into model-stats.db, same as callImplementModel's own
+  // recordModelCall below in this file -- previously the ONLY stage ever recorded there
+  // at all, leaving the plan stage (and any re-roll -- a second, genuinely separate call)
+  // entirely invisible to every cost/degenerate-rate/token-efficiency stat this pipeline
+  // computes (2026-09-06, Grimmethy: "We need to fix cost tracking before we can even
+  // begin to properly work on this problem"). recordModelCall may be omitted by a test
+  // double, same optional-call convention callImplementModel's callers already rely on.
+  let startedAt = new Date().toISOString();
+  let startMs = Date.now();
+  const planResult = await callPlan();
+  if (recordModelCall) {
+    recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: planResult, source: task.source, stage: 'plan' });
+  }
+  // The optional RETRY_TEMPERATURE re-roll + its own recordModelCall around the second
+  // call are owned by attemptSeedReroll (HUB0079 1/3), which runPlanPass invokes right
+  // after this via handlePlanResult -- the call order is unchanged.
+  return { planResult, totalAttempts: planResult.attempts || 1, reRolled: false, planLen };
+}
+
+// Extracted from runPlanPass (HUB0094 · 2/2): the result-handling branches -- the
+// degenerate guard (recordPlan -> appendHistoryEvent('blocked') -> return blocked) that
+// used to sit inline after the initial roll, followed by the non-degenerate dispatch to
+// attemptSeedReroll (HUB0079 1/3), which owns the task.planResponse/lastGoodPlan writes,
+// its own recordPlan and appendHistoryEvent('plan-done') calls, and the bookkeeping
+// locals. Call order, arguments, and side effects are exactly what the inline code did;
+// returns { blocked: true, blockedReason, blockedStage: 'plan' } on a degenerate roll,
+// else undefined after handing the (possibly re-rolled) plan to attemptSeedReroll.
+async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding }) {
+  if (planResult.degenerate) {
+    const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
+    recordPlan(attempt, { degenerate: planResult.degenerate, attempts: planResult.attempts || 1 });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    // 2026-09-17: this used to set no blockedStage at all -- invisible to reject-retry-
+    // check.js's entry gate (isReviewRejection/retryableDraftBlock/isPreCritiqueBlock/
+    // isDraftFailureBlock all miss it), so a task landing here via 'blocked' with
+    // status left at 'pending' (never even flipped to 'blocked') just sat in queue/
+    // blocked/ forever with zero automated retry -- confirmed live: 2 of 4 stuck-child
+    // hubs in Hub Tasks were gated on exactly this shape. 'plan' is deliberately not
+    // 'review'/'apply'/'pre-critique'/'draft' so none of those checks accidentally match it.
+    return { blocked: true, blockedReason, blockedStage: 'plan' };
+  }
+
+  // Thin-plan re-roll + seed fallback (HUB0079 1/3): extracted from this function into
+  // attemptSeedReroll above -- same behavior, now unit-testable in isolation. The call
+  // mutates task.planResponse/lastGoodPlan, calls recordPlan (with the reRolled /
+  // seededFromPrior / thin / grounding flags) and emits the 'plan-done' event; its return
+  // value keeps the bookkeeping locals (totalAttempts, reRolled, stillThin,
+  // seededFromPrior) available below.
+  const seedReroll = await attemptSeedReroll({
+    planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+  });
+  return { planResult: seedReroll.planResult, totalAttempts: seedReroll.totalAttempts, reRolled: seedReroll.reRolled, stillThin: seedReroll.stillThin, seededFromPrior: seedReroll.seededFromPrior };
+}
+
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
   runOrientPassFn = runOrientPass, recordModelCall,
@@ -763,49 +839,27 @@ async function runPlanPass(task, {
   delete task._hubStatusGrounding; // transient -- baked into planPrompt
 
   const planNumPredict = computePlanNumPredict(task);
-  const callPlan = (temperature = 0.4) => maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: planPrompt, think: profileSupportsThink, temperature, numPredict: planNumPredict, allowEmpty: allowEmptyPlan, source: task.source, taskId: task.id, stage: 'plan', isDraft: true, ...researchPlanTools }), 'plan');
+  // callPlan closure + planLen (HUB0094 · 2/2): extracted from this function into
+  // buildCallPlan above -- same behavior, now a single named unit.
+  const { callPlan, planLen } = buildCallPlan(task, { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, planPrompt, planNumPredict, researchPlanTools, allowEmptyPlan });
 
-  // Records the plan pass into model-stats.db, same as callImplementModel's own
-  // recordModelCall below in this file -- previously the ONLY stage ever recorded there
-  // at all, leaving the plan stage (and any re-roll -- a second, genuinely separate call)
-  // entirely invisible to every cost/degenerate-rate/token-efficiency stat this pipeline
-  // computes (2026-09-06, Grimmethy: "We need to fix cost tracking before we can even
-  // begin to properly work on this problem"). recordModelCall may be omitted by a test
-  // double, same optional-call convention callImplementModel's callers already rely on.
-  let startedAt = new Date().toISOString();
-  let startMs = Date.now();
-  let planResult = await callPlan();
-  if (recordModelCall) {
-    recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: planResult, source: task.source, stage: 'plan' });
-  }
-  if (planResult.degenerate) {
-    const blockedReason = `Plan pass degenerate: ${planResult.degenerate}`;
-    recordPlan(attempt, { degenerate: planResult.degenerate, attempts: planResult.attempts || 1 });
-    appendHistoryEvent(task, 'blocked', blockedReason);
-    // 2026-09-17: this used to set no blockedStage at all -- invisible to reject-retry-
-    // check.js's entry gate (isReviewRejection/retryableDraftBlock/isPreCritiqueBlock/
-    // isDraftFailureBlock all miss it), so a task landing here via 'blocked' with
-    // status left at 'pending' (never even flipped to 'blocked') just sat in queue/
-    // blocked/ forever with zero automated retry -- confirmed live: 2 of 4 stuck-child
-    // hubs in Hub Tasks were gated on exactly this shape. 'plan' is deliberately not
-    // 'review'/'apply'/'pre-critique'/'draft' so none of those checks accidentally match it.
-    return { blocked: true, blockedReason, blockedStage: 'plan' };
-  }
+  // Initial roll + recordModelCall bookkeeping (HUB0094 · 2/2): extracted into
+  // executePlanRolls above -- same behavior, now a single named unit.
+  const rolls = await executePlanRolls(callPlan, planLen, { substanceGated, recordModelCall, task });
+  let planResult = rolls.planResult;
+  const totalAttempts = rolls.totalAttempts;
+  const reRolled = rolls.reRolled;
 
-  // Thin-plan re-roll + seed fallback (HUB0079 1/3): extracted from this function into
-  // attemptSeedReroll above -- same behavior, now unit-testable in isolation. The call
-  // mutates task.planResponse/lastGoodPlan, calls recordPlan (with the reRolled /
-  // seededFromPrior / thin / grounding flags) and emits the 'plan-done' event; its return
-  // value keeps the bookkeeping locals (totalAttempts, reRolled, stillThin,
-  // seededFromPrior) available below.
-  const seedReroll = await attemptSeedReroll({
-    planResult, substanceGated, seedPlan, callPlan, recordModelCall, recordPlan, appendHistoryEvent, attempt, grounding, task,
+  // Degenerate guard + thin re-roll/seed-fallback dispatch (HUB0094 · 2/2): extracted
+  // into handlePlanResult above -- same behavior, same recordPlan/appendHistoryEvent
+  // order, now a single named unit. Returns { blocked: ... } on a degenerate roll.
+  const handled = await handlePlanResult(task, attempt, {
+    planResult, totalAttempts, reRolled, seedPlan, substanceGated, callPlan, recordModelCall, grounding,
   });
-  planResult = seedReroll.planResult;
-  const totalAttempts = seedReroll.totalAttempts;
-  const reRolled = seedReroll.reRolled;
-  const stillThin = seedReroll.stillThin;
-  const seededFromPrior = seedReroll.seededFromPrior;
+  if (handled && handled.blocked) return handled;
+  planResult = handled.planResult;
+  const stillThin = handled.stillThin;
+  const seededFromPrior = handled.seededFromPrior;
 
   // Acceptance criteria (2026-09-04): a "definition of done" the implement + review are
   // held to. From promptContext.acceptanceCriteria if the caller gave one, else the
@@ -824,13 +878,13 @@ async function runPlanPass(task, {
   }
 
   // Harness-search grounding step (HUB0079 2/3): extracted from this function into
-  // resolveHarnessSearch above -- same behavior, now unit-testable in isolation (which
+  // runHarnessSearchStep above -- same behavior, now unit-testable in isolation (which
   // sources trigger a harness search is decided entirely in there). Replaces the
   // per-source branches this used to be (project_search, arch_import,
   // pipeline_self_audit, pipeline_health_audit, ui_visibility_audit, staleness_audit).
   // Its return value carries the runner's networkUnavailable short-circuit when the
   // harness could not be reached; null when no harness applies to this source.
-  const hs = await resolveHarnessSearch(task, projectSearchFetch, archImportFetch);
+  const hs = await runHarnessSearchStep(task, projectSearchFetch, archImportFetch);
   if (hs && hs.networkUnavailable) return { blocked: true, blockedReason: 'network_unavailable', networkUnavailable: true };
   return { blocked: false };
 }
