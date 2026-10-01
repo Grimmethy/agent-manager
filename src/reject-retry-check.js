@@ -333,6 +333,14 @@ function isImplementDegenerateBlock(task) {
   return task.blockedStage === 'implement';
 }
 
+// 2026-10-01: blockedStage:'critique' -- implement-critique.js's runCritiqueAndRevision now BLOCKS a draft whose critique call came back degenerate (empty / truncated) instead of
+// letting it flow on to the review vote un-critiqued (a rubber-stamp; roughly 6% of critiqued tasks). Wired into this entry gate in the SAME change that introduces the stage, because
+// every earlier stage that shipped without it sat in queue/blocked/ forever (see the plan / implement / pre-critique notes above). The draft itself was fine and the critique model
+// had a bad moment, so a bounded blind retry is right: the attempt re-runs from the top (draftTask clears the stale blockedStage first) and is capped like every other retry.
+function isCritiqueDegenerateBlock(task) {
+  return task.blockedStage === 'critique';
+}
+
 // Same reasoning as queue-watchdog.ps1's arch_discovery/arch_import stamping (not ported
 // here, see header) -- deep_dive's own coverage tracker: without this, a community whose
 // task exhausts its retries stays eligible for nextDeepDiveTask() to re-select FOREVER
@@ -757,11 +765,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       const draftFailureBlock = isDraftFailureBlock(task);
       const planDegenerateBlock = isPlanDegenerateBlock(task);
       const implementDegenerateBlock = isImplementDegenerateBlock(task);
+      const critiqueDegenerateBlock = isCritiqueDegenerateBlock(task);
       // An "Invalid premise:" verdict is recognized whatever its blockedStage (or lack of
       // one) -- see invalidPremiseBeforeCheckExisted / hasInvalidPremise: it is either
       // re-admitted once or escalated by the classifier below, never left invisible.
       const invalidPremiseBlock = hasInvalidPremise(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !invalidPremiseBlock) continue;
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -1091,6 +1100,9 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         // The plan completed and is kept; only the unusable (empty / truncated) implement output is dropped.
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'implement-pass degenerate -- cleared stale implement state for a fresh implement pass');
+      } else if (critiqueDegenerateBlock) {
+        // Nothing to clear: the draft was fine, only its critique call failed, and the next attempt regenerates plan / implement / critique from the top anyway.
+        appendHistoryEvent(task, 'requeued', 'critique-pass degenerate -- the draft was never critiqued; redrafting from the top');
       }
 
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: task.blockedReason || null });
@@ -1129,7 +1141,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { selectFeedbackBranch, buildFeedbackString, rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
+module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
 
 if (require.main === module) {
   main();
