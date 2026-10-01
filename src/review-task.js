@@ -483,6 +483,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(executedSection);
     lines.push('');
   }
+  const inertSection = formatInertAdditionsSection(task.inertAdditions);
+  if (inertSection) {
+    lines.push(inertSection);
+    lines.push('');
+  }
   // Advisory only (see local-draft.js's postImplementCheck handling): a literal-text check that
   // could not verify something. NOT proof of a defect, so it informs the votes, never blocks.
   if (Array.isArray(task.groundingWarnings) && task.groundingWarnings.length) {
@@ -598,11 +603,61 @@ function executedVerificationBlockReason(ev) {
   return `Deterministic gate: executed verification failed -- the diff was applied in a scratch worktree and ${bits.join('; ') || (ev.reasons || []).join('; ')}.${tail ? ` Output tail: ${String(tail).trim().slice(-700)}` : ''} No local-model review call spent on a draft whose own tests or claimed checks demonstrably fail.`;
 }
 
+// --- inert additions, as the voters see them (brain dump #1665) -------------------------------------------------------------------------------------
+// review-inert.js lists NEW functions/classes/files in the diff that nothing else references (not another added line, not code already on the base; a use only in
+// a test, an export list or a comment does not count). Four of ten needs-work branches examined on 2026-09-30 were half a feature of exactly this kind. It is
+// advisory: a hub slice may be wired by a later sibling, and a library helper may be what the task asked for, so it goes to the voters as evidence and never blocks.
+const INERT_MAX_ITEMS = 8;
+
+// A slice of a hub (stacked branch, dependency, parent hub) can legitimately add something a later sibling wires up.
+function isHubChildTask(task) {
+  if (!task || typeof task !== 'object') return false;
+  return !!(task.stacked || task.parentHub
+    || (Array.isArray(task.dependsOn) && task.dependsOn.length) || (Array.isArray(task.softDependsOn) && task.softDependsOn.length)
+    || /^HUB\d+\b/.test(String(task.title || '')) || /^HUB\d+-/.test(String(task.id || '')));
+}
+
+// A ref `git grep` can search: the remote-tracking branch the draft was based on, else the local one, else null (not a git checkout).
+function resolveInertBaseRef(repoRoot, branch) {
+  const { execFileSync } = require('child_process');
+  for (const ref of [`origin/${branch}`, branch]) {
+    try {
+      execFileSync('git', ['-C', repoRoot, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { stdio: 'ignore', timeout: 10000 });
+      return ref;
+    } catch { /* try the next */ }
+  }
+  return null;
+}
+
+function summariseInertAdditions(r, hubChild) {
+  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  const inert = Array.isArray(r && r.inert) ? r.inert : [];
+  return {
+    at: new Date().toISOString(), considered: n(r && r.considered), unknown: n(r && r.unknown), hubChild: !!hubChild, total: inert.length,
+    inert: inert.slice(0, INERT_MAX_ITEMS).map((i) => ({
+      kind: ['function', 'class', 'file'].includes(i && i.kind) ? i.kind : 'function', name: String((i && i.name) || '').slice(0, 120), file: String((i && i.file) || '').slice(0, 160), line: n(i && i.line),
+    })),
+  };
+}
+
+function formatInertAdditionsSection(ia) {
+  if (!ia || typeof ia !== 'object' || !Array.isArray(ia.inert) || !ia.inert.length) return '';
+  const where = ia.inert.map((i) => (i.kind === 'file' ? `file ${i.name} (${i.file})` : `${i.kind} ${i.name} (${i.file}:${i.line})`));
+  const more = ia.total > ia.inert.length ? ` (+${ia.total - ia.inert.length} more)` : '';
+  const out = [];
+  out.push('--- Unreferenced additions (deterministic check; advisory) ---');
+  out.push(`The harness compared the diff with its base branch. These NEW definitions are not referenced by anything else the diff adds, nor by code already on the base (a use only in a test, an export list or a comment does not count): ${where.join('; ')}${more}.`);
+  out.push(ia.hubChild
+    ? 'This task is one slice of a hub, so a later sibling may legitimately wire these up. Check whether the task text or the plan says which slice does; if it does, this is expected and not a reason to reject.'
+    : 'Nothing in this task wires them in. Unless the task asked only for a reusable helper or module to be used later, ask whether the draft is half a feature: a field nothing reads, a file nothing loads, a function nothing calls. This is evidence to weigh, not a verdict.');
+  return out.join('\n');
+}
+
 /**
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported (via
  * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
  */
-async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null } = {}) {
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
@@ -1119,6 +1174,29 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
   }
 
+  // Inert additions (see formatInertAdditionsSection): a cheap diff + git-grep check, independent of the executed-verification switch. Advisory only.
+  if (process.env.AGENT_MANAGER_REVIEW_INERT_CHECK !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    try {
+      const find = findInertFn || require('./review-inert.js').findInertAdditions;
+      const branch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
+      const baseRef = resolveInertBaseRef(repoRoot, branch) || (findInertFn ? branch : null);
+      if (baseRef) {
+        const r = find({ rawDiff: task.rawDiff, repoRoot, baseRef });
+        if (r && Array.isArray(r.inert)) {
+          task.inertAdditions = summariseInertAdditions(r, isHubChildTask(task));
+          if (r.inert.length) {
+            appendHistoryEvent(task, 'advisory', `inert-addition check: ${r.inert.length} unreferenced addition(s) (${r.inert.slice(0, 4).map((i) => i.name).join(', ')}${r.inert.length > 4 ? ', ...' : ''})${task.inertAdditions.hubChild ? ' -- hub slice, a sibling may wire it' : ''}`);
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`[review] inert-addition check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+  }
+
   await waitForLocalAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
@@ -1270,7 +1348,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();

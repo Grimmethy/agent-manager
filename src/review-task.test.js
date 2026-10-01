@@ -34,6 +34,7 @@ process.env.AGENT_MANAGER_REPO_ROOT = require('os').tmpdir();
 // Executed verification (review-verify.js) creates a real scratch worktree and runs tests, so it is OFF for this file's many fixture-based adhoc
 // tasks (fake rawDiffs, non-git repoRoot). The tests at the end of this file that exercise the gate switch it on and inject a fake verifier.
 process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false';
+process.env.AGENT_MANAGER_REVIEW_INERT_CHECK = 'false';
 process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
 // 2026-08-23: review-task.js's own isEmptyApprovalSource/isAdvisoryProseSource now read
@@ -2233,3 +2234,123 @@ test('replay: the real verification engine reports the hunk the new test does no
     assert.match(captured[0], /Changed code NOT pinned by any test \(1 of 2 hunk\(s\) checked\): src\/add\.js:\d+\./);
   });
 });
+
+
+
+// --- the voters see additions nothing references (brain dump #1665 slice 2) -----------------------------------------------------------------------
+function withInertCheck(fn) {
+  return async () => {
+    process.env.AGENT_MANAGER_REVIEW_INERT_CHECK = 'true';
+    try { await fn(); } finally { process.env.AGENT_MANAGER_REVIEW_INERT_CHECK = 'false'; }
+  };
+}
+const INERT_FOUND = { considered: 3, unknown: 0, inert: [{ kind: 'function', name: 'orphanHelper', file: 'src/a.js', line: 21 }, { kind: 'file', name: 'new-lib.js', file: 'src/new-lib.js', line: 1 }] };
+
+test('isHubChildTask recognises a slice of a hub by its coordination fields, title or id, and nothing else', () => {
+  const { isHubChildTask } = require('./review-task.js');
+  for (const t of [{ stacked: { branch: 'agent/x', seq: 2, total: 3 } }, { parentHub: 'h1' }, { dependsOn: ['HUB0001-01-a'] }, { softDependsOn: ['x'] }, { title: 'HUB0068 · 2/3 · Extract it' }, { id: 'HUB0068-02-extract' }]) assert.equal(isHubChildTask(t), true, JSON.stringify(t));
+  for (const t of [{}, { dependsOn: [] }, { title: 'Add a helper' }, { id: 'adhoc-thing-17' }, null, undefined, 'x']) assert.equal(isHubChildTask(t), false, JSON.stringify(t));
+});
+
+test('summariseInertAdditions clamps junk, caps the list and remembers the real total', () => {
+  const { summariseInertAdditions } = require('./review-task.js');
+  const s = summariseInertAdditions(INERT_FOUND, true);
+  assert.deepEqual([s.considered, s.unknown, s.hubChild, s.total, s.inert.length], [3, 0, true, 2, 2]);
+  const many = summariseInertAdditions({ considered: -5, unknown: 'x', inert: Array.from({ length: 12 }, (_, i) => ({ kind: 'weird', name: `n${i}`.padEnd(300, 'x'), file: 'f', line: NaN })) }, false);
+  assert.deepEqual([many.considered, many.unknown, many.total, many.inert.length], [0, 0, 12, 8]);
+  assert.equal(many.inert[0].kind, 'function');
+  assert.equal(many.inert[0].name.length, 120);
+  assert.equal(many.inert[0].line, 0);
+  assert.deepEqual(summariseInertAdditions(null, false).inert, []);
+});
+
+test('the inert section names each addition, differs for a hub slice, shows how many more there are, and is empty when there is nothing', () => {
+  const { formatInertAdditionsSection, summariseInertAdditions } = require('./review-task.js');
+  const plain = formatInertAdditionsSection(summariseInertAdditions(INERT_FOUND, false));
+  assert.match(plain, /--- Unreferenced additions \(deterministic check; advisory\) ---/);
+  assert.match(plain, /function orphanHelper \(src\/a\.js:21\); file new-lib\.js \(src\/new-lib\.js\)/);
+  assert.match(plain, /Nothing in this task wires them in/);
+  assert.doesNotMatch(plain, /one slice of a hub/);
+  const hub = formatInertAdditionsSection(summariseInertAdditions(INERT_FOUND, true));
+  assert.match(hub, /one slice of a hub, so a later sibling may legitimately wire these up/);
+  assert.doesNotMatch(hub, /Nothing in this task wires them in/);
+  const more = formatInertAdditionsSection(summariseInertAdditions({ inert: Array.from({ length: 11 }, (_, i) => ({ kind: 'function', name: `fn${i}`, file: 'f.js', line: i })) }, false));
+  assert.match(more, /\(\+3 more\)/);
+  for (const none of [undefined, null, {}, 'x', summariseInertAdditions({ considered: 4, inert: [] }, false)]) assert.equal(formatInertAdditionsSection(none), '');
+});
+
+test('the inert finder is not called while its switch is off, or for a task that is not an implemented adhoc diff', async () => {
+  let calls = 0;
+  const finder = () => { calls += 1; return INERT_FOUND; };
+  const run = async (task) => {
+    const { repoRoot, domainsPath } = makeFixture();
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findInertFn: finder });
+  };
+  await run(adhocImplementedTask({ id: 'inert-off' }));                                   // switch is 'false' here (set at the top of the file)
+  assert.equal(calls, 0);
+  await withInertCheck(async () => {
+    await run(adhocImplementedTask({ id: 'inert-no-diff', rawDiff: '' }));
+    await run(adhocImplementedTask({ id: 'inert-not-implemented', adhocResolution: 'no-changes-needed' }));
+    assert.equal(calls, 0);
+    await run(adhocImplementedTask({ id: 'inert-on' }));
+    assert.equal(calls, 1);
+  })();
+});
+
+test('end to end: an inert finding is recorded, noted in the history and shown to the voters, and it never blocks', withInertCheck(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'inert-e2e' });
+  const captured = [];
+  let seen = null;
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: (a) => { seen = a; return INERT_FOUND; } });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1, 'advisory: the vote still happens');
+  assert.equal(seen.rawDiff, task.rawDiff);
+  assert.equal(seen.repoRoot, repoRoot);
+  assert.equal(task.inertAdditions.total, 2);
+  assert.equal(task.inertAdditions.hubChild, false);
+  assert.match(task.history.find((h) => h.stage === 'advisory' && /inert-addition check/.test(h.detail)).detail, /2 unreferenced addition\(s\) \(orphanHelper, new-lib\.js\)$/);
+  assert.match(captured[0], /Unreferenced additions \(deterministic check; advisory\)/);
+  assert.match(captured[0], /Nothing in this task wires them in/);
+}));
+
+test('a hub slice gets the hub wording and a history note saying a sibling may wire it', withInertCheck(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'inert-hub', dependsOn: ['HUB0001-01-a'], stacked: { branch: 'agent/decompose-hub-x', seq: 2, total: 2 } });
+  const captured = [];
+  await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: () => INERT_FOUND });
+  assert.equal(task.inertAdditions.hubChild, true);
+  assert.match(captured[0], /one slice of a hub/);
+  assert.match(task.history.find((h) => /inert-addition check/.test(h.detail || '')).detail, /hub slice, a sibling may wire it/);
+}));
+
+test('nothing inert means no section and no history note, and a finder that throws or returns junk cannot break the review', withInertCheck(async () => {
+  for (const [label, finder] of [['clean', () => ({ considered: 2, unknown: 0, inert: [] })], ['throws', () => { throw new Error('git exploded'); }], ['junk', () => 'nope']]) {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: `inert-${label}` });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findInertFn: finder });
+    assert.equal(result.verdict, 'approved', label);
+    assert.equal(captured.length, 1, label);
+    assert.doesNotMatch(captured[0], /Unreferenced additions/, label);
+    assert.equal(task.history.some((h) => /inert-addition check/.test(h.detail || '')), false, label);
+  }
+}));
+
+// Real engine, real git: a diff that adds a function nothing calls (and one the base already calls).
+test('replay: the real inert check, against a real git remote, tells the voters about the orphan helper and not about the one the base already calls', withInertCheck(async () => {
+  await withReplayRepo({ 'src/lib.js': 'const keep = 1;\nmodule.exports = { keep };\n', 'src/caller.js': 'const x = waitedForHelper();\n' }, async ({ work, domainsPath }) => {
+    const git = (args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: work, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    fs.writeFileSync(path.join(work, 'src/lib.js'), 'const keep = 1;\nfunction orphanHelper() { return 1; }\nfunction waitedForHelper() { return 2; }\nmodule.exports = { keep };\n');
+    git(['add', '-A']);
+    const diff = git(['diff', '--cached', '--full-index', '--binary']);
+    git(['reset', '-q', '--hard']);
+    const task = replayTask('replay-inert', diff, 'node --check src/lib.js');
+    const captured = [];
+    await reviewTask(task, { repoRoot: work, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+    assert.equal(captured.length, 1);
+    assert.deepEqual(task.inertAdditions.inert.map((i) => i.name), ['orphanHelper']);
+    assert.match(captured[0], /function orphanHelper \(src\/lib\.js:\d+\)/);
+    assert.doesNotMatch(captured[0], /waitedForHelper \(/, 'the base already calls it');
+  });
+}));
