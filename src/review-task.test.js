@@ -2152,3 +2152,84 @@ test('replay: a slice that depends on an unmerged sibling is INCONCLUSIVE -- it 
     assert.match(captured[0], /INCONCLUSIVE is neither a pass nor a failure/);
   });
 });
+
+
+// --- the voters see changed code no test pins (brain dump #1664 slice 2) ---------------------------------------------------------------------
+const EV_UNPINNED = {
+  status: 'passed', reasons: [],
+  tests: { ran: ['src/a.test.js'], passed: true, failures: [] },
+  commands: [],
+  unpinned: { total: 3, checked: 3, skipped: 0, hunks: [{ file: 'src/local-draft.js', start: 1367, end: 1384 }, { file: 'src/a.js', start: 12, end: 12 }] },
+};
+
+test('summariseExecutedVerification carries the unpinned result (counts clamped, hunks capped and trimmed) and omits the key when there is none', () => {
+  const { summariseExecutedVerification } = require('./review-task.js');
+  const s = summariseExecutedVerification(EV_UNPINNED);
+  assert.deepEqual(s.unpinned, EV_UNPINNED.unpinned);
+  const junk = summariseExecutedVerification({ ...EV_UNPINNED, unpinned: { total: -4, checked: 'x', skipped: 2.9, hunks: Array.from({ length: 9 }, (_, i) => ({ file: `f${i}.js`.padEnd(300, 'x'), start: i, end: NaN })) } });
+  assert.deepEqual([junk.unpinned.total, junk.unpinned.checked, junk.unpinned.skipped], [0, 0, 2]);
+  assert.equal(junk.unpinned.hunks.length, 6);
+  assert.equal(junk.unpinned.hunks[0].file.length, 160);
+  assert.equal(junk.unpinned.hunks[3].end, 0);
+  assert.equal('unpinned' in summariseExecutedVerification({ ...EV_UNPINNED, unpinned: undefined }), false);
+  assert.equal('unpinned' in summariseExecutedVerification({ ...EV_UNPINNED, unpinned: 'junk' }), false);
+});
+
+test('the section names each unpinned hunk as file:start-end (file:line for one line), says what that does and does not prove, and is unchanged when there are none', () => {
+  const { formatExecutedVerificationSection } = require('./review-task.js');
+  const section = formatExecutedVerificationSection(EV_UNPINNED);
+  assert.match(section, /- Changed code NOT pinned by any test \(2 of 3 hunk\(s\) checked\): src\/local-draft\.js:1367-1384, src\/a\.js:12\./);
+  assert.match(section, /every covering test still passed/);
+  assert.match(section, /may be a pure refactor, so this alone is not a reason to reject/);
+  const without = formatExecutedVerificationSection({ ...EV_UNPINNED, unpinned: undefined });
+  const emptyHunks = formatExecutedVerificationSection({ ...EV_UNPINNED, unpinned: { total: 2, checked: 2, skipped: 0, hunks: [] } });
+  assert.doesNotMatch(without, /NOT pinned/);
+  assert.equal(emptyHunks, without, 'every checked hunk pinned: nothing extra for the voters');
+  assert.equal(section.split('\n').filter((l) => !l.startsWith('- Changed code NOT pinned')).join('\n'), without);
+});
+
+test('the verifier is asked for the unpinned check by default, and AGENT_MANAGER_REVIEW_UNPINNED_CHECK=false turns only that off', withExecutedVerify(async () => {
+  const seen = {};
+  for (const [label, env] of [['default', undefined], ['off', 'false'], ['on', 'true']]) {
+    const { repoRoot, domainsPath } = makeFixture();
+    if (env === undefined) delete process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK; else process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK = env;
+    try {
+      await reviewTask(adhocImplementedTask({ id: `ev-unpinned-${label}` }), { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {},
+        verifyDiffFn: (a) => { seen[label] = a.checkUnpinned; return { status: 'passed', reasons: [], tests: null, commands: [] }; } });
+    } finally { delete process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK; }
+  }
+  assert.deepEqual(seen, { default: true, off: false, on: true });
+}));
+
+test('end to end: an unpinned result from the verifier is recorded on the task, noted in its history and shown in the prompt the voters get', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'ev-unpinned-e2e' });
+  const captured = [];
+  await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, verifyDiffFn: () => EV_UNPINNED });
+  assert.equal(captured.length, 1, 'advisory: it never blocks');
+  assert.deepEqual(task.executedVerification.unpinned.hunks.map((h) => h.file), ['src/local-draft.js', 'src/a.js']);
+  assert.match(task.history.find((h) => h.stage === 'advisory' && /executed verification/.test(h.detail)).detail, /2 unpinned hunk\(s\)/);
+  assert.match(captured[0], /Changed code NOT pinned by any test \(2 of 3 hunk\(s\) checked\): src\/local-draft\.js:1367-1384, src\/a\.js:12\./);
+}));
+
+// Real engines end to end: a diff that changes two functions but adds a test for only one of them.
+test('replay: the real verification engine reports the hunk the new test does not exercise, and the voters are shown it', { skip: !HAS_BWRAP && 'bwrap unavailable' }, async () => {
+  const filler = Array.from({ length: 12 }, (_, i) => `// filler ${i}`).join('\n');
+  const base = `function add(a, b) { return a + b; }\n${filler}\nfunction twice(a) { return a * 2; }\nmodule.exports = add;\nmodule.exports.twice = twice;\n`;
+  await withReplayRepo({ 'src/add.js': base }, async ({ work, domainsPath }) => {
+    const git = (args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: work, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    fs.writeFileSync(path.join(work, 'src/add.js'), base.replace('return a + b;', 'return Number(a) + Number(b);').replace('return a * 2;', 'return a * 3;'));
+    fs.writeFileSync(path.join(work, 'src/add.test.js'), "const test = require('node:test'); const assert = require('node:assert/strict'); const add = require('./add.js');\ntest('coerces', () => assert.equal(add('1', 2), 3));\n");
+    git(['add', '-A']);
+    const diff = git(['diff', '--cached', '--full-index', '--binary']);
+    git(['reset', '-q', '--hard']);
+    const task = replayTask('replay-unpinned', diff, 'node --test src/add.test.js');
+    const captured = await runReplay(task, work, domainsPath);
+    assert.equal(captured.length, 1);
+    assert.equal(task.executedVerification.status, 'passed');
+    assert.equal(task.executedVerification.unpinned.hunks.length, 1);
+    assert.equal(task.executedVerification.unpinned.hunks[0].file, 'src/add.js');
+    assert.ok(task.executedVerification.unpinned.hunks[0].start > 10, 'the twice() hunk, not the add() hunk');
+    assert.match(captured[0], /Changed code NOT pinned by any test \(1 of 2 hunk\(s\) checked\): src\/add\.js:\d+\./);
+  });
+});

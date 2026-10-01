@@ -404,6 +404,11 @@ function formatExecutedVerificationSection(ev) {
   if (confirmed.length) out.push(`- Claimed checks the harness re-ran and CONFIRMED (they exited 0): ${evList(confirmed, EV_MAX_ITEMS)}.`);
   if (contradicted.length) out.push(`- Claimed checks that FAILED when re-run: ${evList(contradicted, EV_MAX_ITEMS)}.`);
   if (skipped) out.push(`- ${skipped} claimed check(s) could not be re-run from the repo root (not runnable as written); they are neither confirmed nor contradicted.`);
+  const unpinned = ev.unpinned && typeof ev.unpinned === 'object' ? ev.unpinned : null;
+  if (unpinned && Array.isArray(unpinned.hunks) && unpinned.hunks.length) {
+    const where = unpinned.hunks.map((h) => `${String(h.file).slice(0, 120)}:${h.start}${h.end > h.start ? `-${h.end}` : ''}`);
+    out.push(`- Changed code NOT pinned by any test (${unpinned.hunks.length} of ${unpinned.checked} hunk(s) checked): ${evList(where, EV_MAX_ITEMS)}. The harness reverted each of these hunks on its own and every covering test still passed, so no test demonstrates that this code does what the draft claims. It may be a pure refactor, so this alone is not a reason to reject; but do not accept the draft's claims about the behavior of these lines as demonstrated, and check that its Acceptance block does not rest on them.`);
+  }
   if (ev.status === 'inconclusive' && Array.isArray(ev.reasons) && ev.reasons.length) out.push(`- Why it is inconclusive: ${evList(ev.reasons.map((r) => String(r).slice(0, 200)), 2)}.`);
   out.push('How to use this: PASSED means ONLY that the listed tests passed and the listed commands exited 0 against the diff applied to its base. It says nothing about whether the diff does what the TASK asked, stays in scope, or meets every requirement -- keep judging those yourself. INCONCLUSIVE is neither a pass nor a failure: the harness could not decide, so judge the draft on the rest of the evidence and do not count it either way. Do not re-litigate a confirmed check or call its reported result fabricated, and do not reject a draft because a file IT CREATES is missing from the live repo -- that file is added by the diff.');
   return out.join('\n');
@@ -564,6 +569,17 @@ function summariseExecutedVerification(ev) {
     commands: (ev.commands || []).map((c) => ({
       criterion: String(c.criterion || '').slice(0, 160), command: c.command, claimedPass: !!c.claimedPass, outcome: c.outcome, exitCode: c.exitCode,
     })),
+    ...(ev.unpinned && typeof ev.unpinned === 'object' ? { unpinned: summariseUnpinned(ev.unpinned) } : {}),
+  };
+}
+
+// Unpinned-change result (review-verify checkUnpinned, brain dump #1664): hunks the covering tests do not pin. Counts are clamped to numbers and the hunk list is capped.
+function summariseUnpinned(u) {
+  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  return {
+    total: n(u.total), checked: n(u.checked), skipped: n(u.skipped),
+    hunks: (Array.isArray(u.hunks) ? u.hunks : []).slice(0, EV_MAX_ITEMS)
+      .map((h) => ({ file: String((h && h.file) || '').slice(0, 160), start: n(h && h.start), end: n(h && h.end) })),
   };
 }
 
@@ -1084,7 +1100,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       // A stacked hub sub-task builds on its shared branch, not on master -- verify against the same base the draft used.
       const baseBranch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
       const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
-      ev = verify({ taskId: task.id, rawDiff: task.rawDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS });
+      ev = verify({ taskId: task.id, rawDiff: task.rawDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false' });
     } catch (e) {
       console.error(`[review] executed verification errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
     }
@@ -1092,7 +1108,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       task.executedVerification = summariseExecutedVerification(ev);
       const ranTests = ev.tests && ev.tests.ran ? ev.tests.ran.length : 0;
       const confirmed = (ev.commands || []).filter((c) => c.outcome === 'confirmed').length;
-      appendHistoryEvent(task, 'advisory', `executed verification: ${ev.status} (${ranTests} covering test file(s), ${confirmed} claimed check(s) re-run and confirmed${ev.status === 'inconclusive' && ev.reasons && ev.reasons[0] ? `; ${String(ev.reasons[0]).slice(0, 160)}` : ''})`);
+      appendHistoryEvent(task, 'advisory', `executed verification: ${ev.status} (${ranTests} covering test file(s), ${confirmed} claimed check(s) re-run and confirmed${ev.unpinned && Array.isArray(ev.unpinned.hunks) && ev.unpinned.hunks.length ? `, ${ev.unpinned.hunks.length} unpinned hunk(s)` : ''}${ev.status === 'inconclusive' && ev.reasons && ev.reasons[0] ? `; ${String(ev.reasons[0]).slice(0, 160)}` : ''})`);
       if (ev.status === 'failed') {
         const reason = executedVerificationBlockReason(ev);
         task.reviewProvider = 'deterministic-executed-verification';
