@@ -520,3 +520,145 @@ test('integration: the HUB0068-02 shape -- a real passing draft that claims a cw
     assert.equal(r.status, 'passed');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+
+// --- unpinned changes: a hunk the covering tests do not pin (brain dump #1664, slice 1) ---------------------------------------------------
+const { parseModifiedHunks, isTrivialHunk, isTestFile, MAX_UNPINNED_HUNKS } = require('./review-verify.js');
+
+const TWO_HUNKS = [
+  'diff --git a/src/a.js b/src/a.js', '--- a/src/a.js', '+++ b/src/a.js',
+  '@@ -1,2 +1,2 @@', '-const one = 1;', '+const one = 11;', ' keep',
+  '@@ -20,2 +20,2 @@', '-const two = 2;', '+const two = 22;', ' keep',
+  'diff --git a/src/new.js b/src/new.js', 'new file mode 100644', '--- /dev/null', '+++ b/src/new.js', '@@ -0,0 +1 @@', '+x',
+  'diff --git a/src/a.test.js b/src/a.test.js', '--- a/src/a.test.js', '+++ b/src/a.test.js', '@@ -1 +1 @@', '-t', '+u',
+  'diff --git a/src/old.js b/src/new2.js', 'similarity index 90%', 'rename from src/old.js', 'rename to src/new2.js', '@@ -1 +1 @@', '-q', '+r',
+  '',
+].join('\n');
+
+test('parseModifiedHunks returns each hunk of a MODIFIED source file as a standalone patch, and skips new, renamed and test files', () => {
+  const hunks = parseModifiedHunks(TWO_HUNKS);
+  assert.deepEqual(hunks.map((h) => [h.file, h.start, h.end]), [['src/a.js', 1, 1], ['src/a.js', 20, 20]]);
+  for (const h of hunks) {
+    assert.match(h.patch, /^diff --git a\/src\/a\.js b\/src\/a\.js\n--- a\/src\/a\.js\n\+\+\+ b\/src\/a\.js\n@@ /);
+    assert.equal((h.patch.match(/^@@ /gm) || []).length, 1, 'exactly one hunk per patch');
+    assert.ok(h.patch.endsWith('\n'));
+  }
+  assert.deepEqual(hunks[1].changed, ['-const two = 2;', '+const two = 22;']);
+  assert.deepEqual(parseModifiedHunks(''), []);
+});
+
+test('isTestFile and isTrivialHunk: tests, comments, imports and exports cannot be mutated into a behavior change', () => {
+  for (const f of ['src/a.test.js', 'src/a.spec.mjs', 'python/dashboard/test_x.py', 'pkg/x_test.py', 'tests/helper.py', 'src/__tests__/a.js']) assert.equal(isTestFile(f), true, f);
+  for (const f of ['src/a.js', 'python/dashboard/app.py', 'src/testing.js']) assert.equal(isTestFile(f), false, f);
+  assert.equal(isTrivialHunk(['+// note', '-  ', "+const x = require('./x.js');", '+import os', '+from a import b', '+module.exports = { a };', '+# py comment', '+ * doc']), true);
+  assert.equal(isTrivialHunk(['+// note', '+const y = 2;']), false);
+  assert.equal(isTrivialHunk(['+if (a) return null;']), false);
+});
+
+// Scripted order for TWO_HUNKS with one covering js suite: [main suite, h1 syntax, h1 suite, h2 syntax, h2 suite]
+const unpinnedBase = { ...base, rawDiff: TWO_HUNKS, checkUnpinned: true };
+
+test('unpinned: a hunk whose revert leaves every covering test green is reported, a hunk whose revert fails a test is not, and every hunk is put back', () => {
+  const restored = [];
+  const reverted = [];
+  const run = scriptedRun([passing, passing, passing, passing, { exitCode: 1, output: 'not ok 1 - pins two\n' }]);
+  const f = diffDeps({ run, unapplyDiff: (_d, patch) => { reverted.push(patch); return { applied: true }; }, applyDiff: (_d, patch) => { restored.push(patch); return { applied: true }; } });
+  const r = verifyDiff({ ...unpinnedBase, deps: f.deps });
+  assert.equal(r.status, 'passed', 'advisory only: the verdict is unchanged');
+  assert.deepEqual(r.unpinned, { total: 2, checked: 2, skipped: 0, hunks: [{ file: 'src/a.js', start: 1, end: 1 }] });
+  assert.equal(reverted.length, 2);
+  assert.deepEqual(restored.slice(1), reverted, 'each reverted hunk is re-applied (restored[0] is the initial diff apply)');
+  assert.deepEqual(run.calls[1].args, ['--check', 'src/a.js'], 'the reverted file is syntax-checked before the tests are trusted');
+  assert.equal(run.calls.length, 5);
+});
+
+test('unpinned: off by default -- a plain verifyDiff never reverses a hunk', () => {
+  let reversed = 0;
+  const f = diffDeps({ run: scriptedRun([passing]), unapplyDiff: () => { reversed += 1; return { applied: true }; } });
+  const r = verifyDiff({ ...base, rawDiff: TWO_HUNKS, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.equal(r.unpinned, undefined);
+  assert.equal(reversed, 0);
+});
+
+test('unpinned: a diff whose only source hunks are comments or imports reports nothing', () => {
+  const trivial = 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1,2 @@\n+// explain\n keep\n';
+  const f = diffDeps({ run: scriptedRun([passing]) });
+  const r = verifyDiff({ ...unpinnedBase, rawDiff: trivial, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.equal(r.unpinned, undefined);
+});
+
+test('unpinned: a revert that leaves the file unparseable is skipped, not counted as pinned; a suite timeout is skipped too', () => {
+  const run = scriptedRun([passing, { exitCode: 1, output: 'SyntaxError' }, passing, { exitCode: null, timedOut: true }]);
+  const f = diffDeps({ run });
+  const r = verifyDiff({ ...unpinnedBase, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.deepEqual(r.unpinned, { total: 2, checked: 0, skipped: 2, hunks: [] });
+});
+
+test('unpinned: a hunk that cannot be reverted on its own is skipped and the rest are still checked', () => {
+  let n = 0;
+  const f = diffDeps({ run: scriptedRun([passing]), unapplyDiff: () => { n += 1; return n === 1 ? { applied: false, reason: 'overlap' } : { applied: true }; } });
+  const r = verifyDiff({ ...unpinnedBase, deps: f.deps });
+  assert.equal(r.unpinned.skipped, 1);
+  assert.equal(r.unpinned.checked, 1);
+  assert.deepEqual(r.unpinned.hunks.map((h) => h.start), [20]);
+});
+
+test('unpinned: if a hunk cannot be put back nothing is concluded, and the settled verdict is untouched', () => {
+  let applies = 0;
+  const f = diffDeps({ run: scriptedRun([passing]), applyDiff: () => { applies += 1; return applies === 1 ? { applied: true } : { applied: false, reason: 'restore failed' }; } });
+  const r = verifyDiff({ ...unpinnedBase, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.equal(r.unpinned, undefined);
+});
+
+test('unpinned: it does not run when the covering tests failed, and a thrown error in it cannot change the verdict', () => {
+  let reversed = 0;
+  let f = diffDeps({ run: scriptedRun([failing('x'), passing]), unapplyDiff: () => { reversed += 1; return { applied: true }; } });
+  const failed = verifyDiff({ ...unpinnedBase, deps: f.deps });
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.unpinned, undefined);
+  f = diffDeps({ run: scriptedRun([passing]), unapplyDiff: (_d, patch) => { if (patch.includes('@@ -1,2')) throw new Error('boom'); return { applied: true }; } });
+  const r = verifyDiff({ ...unpinnedBase, deps: f.deps });
+  assert.equal(r.status, 'passed');
+});
+
+test('unpinned: at most MAX_UNPINNED_HUNKS hunks are tried, the rest are counted as skipped; a nearly-spent budget tries none', () => {
+  const many = ['diff --git a/src/a.js b/src/a.js', '--- a/src/a.js', '+++ b/src/a.js'];
+  for (let i = 0; i < 9; i += 1) many.push(`@@ -${i * 20 + 1},2 +${i * 20 + 1},2 @@`, `-const v${i} = 1;`, `+const v${i} = 2;`, ' keep');
+  const bigDiff = `${many.join('\n')}\n`;
+  const run = scriptedRun([passing]);
+  const f = diffDeps({ run });
+  const r = verifyDiff({ ...unpinnedBase, rawDiff: bigDiff, deps: f.deps });
+  assert.equal(r.unpinned.total, 9);
+  assert.equal(r.unpinned.checked, MAX_UNPINNED_HUNKS);
+  assert.equal(r.unpinned.skipped, 9 - MAX_UNPINNED_HUNKS);
+  const f2 = diffDeps({ run: scriptedRun([passing]) });
+  const r2 = verifyDiff({ ...unpinnedBase, rawDiff: bigDiff, budgetMs: 15000, deps: f2.deps });
+  assert.equal(r2.status, 'passed');
+  assert.equal(r2.unpinned.checked, 0, 'under 20s left: no hunk is attempted');
+});
+
+test('integration: in a real worktree and sandbox, the hunk the new test does not exercise is reported unpinned and the covered one is not', { skip: !HAVE_BWRAP }, () => {
+  const { root, work, git } = makeRepo();
+  try {
+    const filler = Array.from({ length: 12 }, (_, i) => `// filler ${i}`).join('\n');
+    fs.writeFileSync(path.join(work, 'src', 'add.js'), `function add(a, b) { return a + b; }\n${filler}\nfunction twice(a) { return a * 2; }\nmodule.exports = add;\nmodule.exports.twice = twice;\n`);
+    git(['add', '-A'], work); git(['commit', '-m', 'two functions'], work); git(['push', 'origin', 'master'], work);
+    // The diff coerces add()'s inputs (pinned by the new test) and changes twice() (which no test exercises).
+    const src = fs.readFileSync(path.join(work, 'src', 'add.js'), 'utf8');
+    fs.writeFileSync(path.join(work, 'src', 'add.js'), src.replace('return a + b;', 'return Number(a) + Number(b);').replace('return a * 2;', 'return a * 3;'));
+    fs.writeFileSync(path.join(work, 'src', 'add.test.js'), "const test = require('node:test'); const assert = require('node:assert/strict'); const add = require('./add.js');\ntest('coerces', () => assert.equal(add('1', 2), 3));\n");
+    git(['add', '-A'], work);
+    const diff = git(['diff', '--cached', '--full-index', '--binary'], work);
+    git(['reset', '-q', '--hard'], work);
+    const r = verifyDiff({ taskId: 'unpinned-int', rawDiff: diff, repoRoot: work, mainBranch: 'master', checkUnpinned: true });
+    assert.equal(r.status, 'passed', JSON.stringify(r.reasons));
+    assert.equal(r.unpinned.total, 2);
+    assert.equal(r.unpinned.checked, 2);
+    assert.deepEqual(r.unpinned.hunks.map((h) => h.file), ['src/add.js']);
+    assert.ok(r.unpinned.hunks[0].start > 10, 'it is the twice() hunk, not the add() hunk');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
