@@ -201,8 +201,32 @@ function resolveAgainstRepo(repoRoot, candidatePath, extraRoots = []) {
   return resolveAgainstRepoDetailed(repoRoot, candidatePath, extraRoots).resolvedPath;
 }
 
-function checkFilePaths(text, repoRoot, extraRoots = []) {
+function checkFilePaths(text, repoRoot, extraRoots = [], ref) {
   return extractFilePaths(text).map((claimedPath) => {
+    // 2026-09-16, PF HUB0109-1/3: `ref` (from resolveGroundingRef -- null for any non-stacked
+    // task, so this whole branch is inert there and the check below runs exactly as before)
+    // resolves existence against the stacked branch's real TIP via the git object database
+    // instead of the shared working tree. A file a sibling task committed to the shared
+    // stacked branch does not exist in the working-tree checkout (usually main), so a
+    // working-tree-only check would flag the sibling's real file as fabricated. Mirrors the
+    // ref treatment existsLiterallyInRepo already uses, and resolveAtRef's own tiers
+    // (exact / extraRoot-prefix / unique basename): it returns the resolved repo-relative
+    // path or null, never throws, and its null result does NOT void the working-tree
+    // verdict below -- an unreadable ref degrades to exactly the pre-ref behavior.
+    if (ref) {
+      try {
+        const { resolveAtRef } = require('./stacked-grounding.js');
+        const hit = resolveAtRef(repoRoot, ref, claimedPath, extraRoots);
+        if (hit) {
+          const normalized = String(claimedPath).replace(/\\/g, '/').replace(/^\.?\//, '');
+          const roots = (extraRoots || []).map((r) => String(r).replace(/\\/g, '/').replace(/\/$/, '') + '/');
+          const resolvedVia = hit === normalized ? 'exact' : (roots.some((r) => hit.startsWith(r)) ? 'prefix' : 'basename');
+          return { claimedPath, exists: true, resolvedPath: path.join(repoRoot, hit), resolvedVia };
+        }
+      } catch (e) {
+        // could not confirm against the stacked ref -- fall through to the working-tree check below.
+      }
+    }
     const { resolvedPath, resolvedVia } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
     return { claimedPath, exists: !!resolvedPath, resolvedPath, resolvedVia };
   });
