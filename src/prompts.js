@@ -250,6 +250,26 @@ function planCritiqueFeedbackBlock(task) {
   ];
 }
 
+// 2026-10-01 (brain dump #1667): a task that adds or changes a path that skips, dismisses, archives or short-circuits work gets a guidance block. Three of ten
+// needs-work branches examined on 2026-09-30 added such a path and wrongly dropped real cases while their tests passed (a startup exemption checked ahead of a
+// hot-path check; a gate that archived a genuine finding because its snippet lacked the loop header; a zero-result early exit whose streak key was the project tag,
+// so it hit every project). The reviewer is told the same thing when the DIFF adds such a path (review-skip-paths.js); this is the drafter's half, shown BEFORE it
+// writes. Triggered by the task's own title and request text, so an ordinary task's prompt is unchanged. Switch: AGENT_MANAGER_SKIPPATH_DRAFT_GUIDANCE=false.
+const SKIP_PATH_TASK_RE = /\b(dismiss(?:al|ed|es|ing)?|archiv(?:e|ed|es|ing)|short-?circuit(?:s|ed|ing)?|early[- ]?exit(?:s|ed|ing)?|suppress(?:es|ed|ing)?|bypass(?:es|ed|ing)?)\b|\bfalse[- ]positives?\b|\bskip(?:s|ped|ping)? (?:the |any |all |it |them |tasks?|findings?|candidates?|work|cycle|review|draft)/i;
+function skipPathDirective(task, stage) {
+  if (process.env.AGENT_MANAGER_SKIPPATH_DRAFT_GUIDANCE === 'false') return [];
+  const ctx = task && task.promptContext;
+  const text = `${(task && task.title) || ''}\n${String((ctx && ctx.rawText) || '').slice(0, 3000)}`;
+  if (!SKIP_PATH_TASK_RE.test(text)) return [];
+  if (stage === 'implement') {
+    return ['This task adds or changes a path that skips, dismisses or short-circuits work. The diff must include the test from your PLAN where the real case that path could wrongly drop still goes through, and every dismissal must leave a history line or a counter.', ''];
+  }
+  return [
+    'This task adds or changes a path that skips, dismisses, archives or short-circuits work. Such paths have repeatedly dropped REAL cases in this pipeline while their tests passed: a startup exemption checked ahead of a hot-path check, a genuine finding dismissed because its snippet lacked the loop header, one project\'s zero-result streak early-exiting every project. Your PLAN must therefore: (1) name a real case the path could wrongly drop and say how the ordering or the key makes that case still go through (check the case you most want to protect FIRST; key any streak or dedup on what actually distinguishes cases); (2) include a test where that case still goes through, and list that test in CRITERIA; (3) say how every dismissal is recorded (a history event or a counter) so a wrongly dismissed case can be found.',
+    '',
+  ];
+}
+
 function adhocPlanPrompt(task) {
   const ctx = task.promptContext;
   // 2026-09-06: a brain_dump_sort-spawned task (promptContext.brainDumpEntryId) is
@@ -291,6 +311,7 @@ function adhocPlanPrompt(task) {
     '',
     ...brainDumpDirective,
     ...decomposeMoveDirective,
+    ...skipPathDirective(task, 'plan'),
     'Write a numbered, actionable PLAN.',
     GIT_OWNERSHIP_RULE,
     'IMPORTANT: This promptContext\'s shape is NOT standardized. Treat anything not explicitly stated in it as unknown — do not assume a field exists just because a similar-sounding one appeared in another kind of task.',
@@ -1448,6 +1469,7 @@ function adhocImplementPrompt(task, planText) {
     '',
     planText,
     '',
+    ...skipPathDirective(task, 'implement'),
     ...fixedLiteralsBlock(task),
     groupBJsonInstructions,
   ].join('\n');
@@ -1638,7 +1660,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 
 module.exports = {
   buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents, priorRejectionBlock,
-  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, seedPlanBlock, planGroundingBlock, hubStatusGroundingBlock, planCritiqueFeedbackBlock,
+  adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, skipPathDirective, seedPlanBlock, planGroundingBlock, hubStatusGroundingBlock, planCritiqueFeedbackBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
   secondBrainOpportunitiesPlanPrompt, secondBrainOpportunitiesImplementPrompt,
   pipelineDebriefPlanPrompt, pipelineDebriefImplementPrompt,
