@@ -448,6 +448,117 @@ function resolveNoResolutionUnforced(ctx) {
   return { succeeded: true, blocked: true, blockedReason: `Agentic implement pass did not end with a RESOLUTION: line -- cannot determine outcome${budgetNote}`, ...meta, capturedDiff: bestEffortDiff() };
 }
 
+// The three RESOLUTION: decompose sub-branches, extracted from resolveAgenticDraft
+// (HUB0080 2/3) so each case is independently testable. Each takes the same shared
+// `ctx` object the early-exit helpers above receive, plus `subTasks` (and `resolution`
+// for the many case) which the dispatch in resolveAgenticDraft adds. The bodies are
+// the moved inline code verbatim -- no behavior change.
+
+/** Decompose, n === 0: said "split it" but produced no usable sub-task JSON. */
+function resolveDecomposeZero(ctx) {
+  const { task, summary, meta, bestEffortDiff } = ctx;
+  // The model reached a conclusion ("this is too big, split it") but produced no
+  // usable sub-task JSON at all.
+  //
+  // If it made REAL edits first, that is "I did part of it then ran low on turns/
+  // confidence" -- redirect to a CONTINUATION (finish what you started) exactly like
+  // the n >= 2 case does, rather than blocking and throwing
+  // the partial work away.
+  // Confirmed live 2026-09-02 (second-brain note-graph task): two passes each made
+  // several successful edit_file calls, then answered RESOLUTION: decompose with
+  // malformed JSON -- every retry restarted from origin/master.
+  const partialDiff = bestEffortDiff();
+  const priorContinuations = Number(task.agenticContinuationCount) || 0;
+  if (partialDiff && priorContinuations < MAX_AGENTIC_CONTINUATIONS) {
+    task.agenticContinuationCount = priorContinuations + 1;
+    task.agenticContinuationNote = summary;
+    task.priorPartialDiff = partialDiff;
+    task.retryableDraftBlock = true;
+    task.isAgenticContinuation = true;
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose with no usable pieces -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish`,
+      ...meta,
+      capturedDiff: partialDiff,
+    };
+  }
+  // No partial work (or continuation budget spent): redraft-eligible with a format
+  // reminder. Sticky count of "said decompose, gave nothing usable" passes: local-
+  // agentic-write-draft.js's repeated-decompose backstop fires once this reaches 2 (do
+  // the split in a single clean call rather than requeue toward escalation).
+  // reject-retry-check.js does not reset it.
+  task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
+  task.retryableDraftBlock = true;
+  return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it', ...meta, capturedDiff: bestEffortDiff() };
+}
+
+/** Decompose, n === 1: "decompose" into one sub-task means "this is atomic" -- re-scope once, else escalate. */
+function resolveDecomposeOne(ctx) {
+  const { task, summary, meta, bestEffortDiff, subTasks } = ctx;
+  // A "decompose" into exactly ONE sub-task is the model saying "this is atomic" --
+  // usually it just could not commit to editing. Treat the single sub-task as a
+  // sharper re-scope of THIS task and requeue once (reject-retry-check.js swaps in the
+  // sharper rawText). If it decomposes-to-one AGAIN after being re-scoped, that is a
+  // real signal it needs a human -- escalate instead of looping.
+  if (task.rescopedFromDecompose === true) {
+    task.adhocResolution = 'needs-human-decision';
+    task.rawDiff = '';
+    task.implementResponse = `${summary}\n\n(decomposed to a single atomic sub-task twice without implementing it -- needs a human)`;
+    return { succeeded: true, blocked: false, needsClarification: true, ...meta };
+  }
+  task.rescopedFromDecompose = true;
+  task.rescopedRawText = subTasks[0].rawText;
+  // Also a "said decompose, not implementable as given" pass -- counts toward the
+  // repeated-decompose backstop (see the zero-sub-task case above).
+  task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
+  task.retryableDraftBlock = true;
+  return { succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass', ...meta, capturedDiff: bestEffortDiff() };
+}
+
+/** Decompose, n >= 2: redirect partial work to a continuation first, else accept the split. */
+function resolveDecomposeMany(ctx) {
+  const { task, summary, meta, bestEffortDiff, resolution, subTasks } = ctx;
+  // A pass that made REAL edits and then answered RESOLUTION: decompose is not "this
+  // can't be one change" -- it is "I did part of it and ran low on turns/confidence."
+  // Accepting the split here discards that partial work (rawDiff = '') AND routinely
+  // drops whatever the model already finished from the sub-task list (root-caused live
+  // 2026-09-02 via the plugins-marketplace endpoint task: tier 3 wrote the catalog
+  // validators in app.py, then split into "seed file" + "test file" and the endpoint
+  // itself -- the actual deliverable -- silently vanished). Redirect it to a CONTINUATION
+  // (finish what you started), same mechanism the needs-human-decision branch uses,
+  // bounded by MAX_AGENTIC_CONTINUATIONS. Only once that budget is spent and it STILL
+  // wants to split do we accept the decompose.
+  const decomposeDiff = bestEffortDiff();
+  const continuations = Number(task.agenticContinuationCount) || 0;
+  if (decomposeDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+    task.agenticContinuationCount = continuations + 1;
+    task.agenticContinuationNote = summary;
+    task.priorPartialDiff = decomposeDiff;
+    task.retryableDraftBlock = true;
+    task.isAgenticContinuation = true;
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish before any split`,
+      ...meta,
+      capturedDiff: decomposeDiff,
+    };
+  }
+
+  task.adhocResolution = resolution;
+  task.subTaskProposals = subTasks;
+  task.rawDiff = '';
+  // The pieces were written by a pass whose worktree ALREADY HAD the partial edits, so they describe what REMAINS. Dropping the diff left
+  // pieces that assume imports/calls no branch contains (PropertyForager HUB0003, 2026-09-20). The diff rides on the task as
+  // carriedPartialDiff; queueSubTasks (apply-adhoc-diff.js) hands it to the first piece, whose worktree starts from it.
+  if (decomposeDiff) task.carriedPartialDiff = decomposeDiff;
+  task.implementResponse = decomposeDiff
+    ? `${summary}\n\n(NOTE: an earlier pass made partial edits before this split; they are CARRIED into the first sub-task's worktree, so the sub-tasks describe what REMAINS to be done on top of them, not the whole change.)`
+    : summary;
+  return { succeeded: true, blocked: false, ...meta };
+}
+
 // Maps a finished agentic result onto `task` (implementResponse, rawDiff, adhocResolution,
 // subTaskProposals, needsClarification) and returns a draftTask-shaped verdict. Provider-
 // neutral: reads only `result.response` / `result.degenerate` and stages the worktree's
@@ -526,102 +637,16 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
     const afterResolution = summary.slice(resolutionMatch.index + resolutionMatch[0].length);
     const subTasks = parseSubTaskProposals(afterResolution);
     const n = subTasks ? subTasks.length : 0;
-
-    if (n === 0) {
-      // The model reached a conclusion ("this is too big, split it") but produced no
-      // usable sub-task JSON at all.
-      //
-      // If it made REAL edits first, that is "I did part of it then ran low on turns/
-      // confidence" -- redirect to a CONTINUATION (finish what you started) exactly like
-      // the n >= 2 branch below, rather than blocking and throwing the partial work away.
-      // Confirmed live 2026-09-02 (second-brain note-graph task): two passes each made
-      // several successful edit_file calls, then answered RESOLUTION: decompose with
-      // malformed JSON -- every retry restarted from origin/master.
-      const partialDiff = bestEffortDiff();
-      const priorContinuations = Number(task.agenticContinuationCount) || 0;
-      if (partialDiff && priorContinuations < MAX_AGENTIC_CONTINUATIONS) {
-        task.agenticContinuationCount = priorContinuations + 1;
-        task.agenticContinuationNote = summary;
-        task.priorPartialDiff = partialDiff;
-        task.retryableDraftBlock = true;
-        task.isAgenticContinuation = true;
-        return {
-          succeeded: true,
-          blocked: true,
-          blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose with no usable pieces -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish`,
-          ...meta,
-          capturedDiff: partialDiff,
-        };
-      }
-      // No partial work (or continuation budget spent): redraft-eligible with a format
-      // reminder. Sticky count of "said decompose, gave nothing usable" passes: local-
-      // agentic-write-draft.js's repeated-decompose backstop fires once this reaches 2 (do
-      // the split in a single clean call rather than requeue toward escalation).
-      // reject-retry-check.js does not reset it.
-      task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
-      task.retryableDraftBlock = true;
-      return { succeeded: true, blocked: true, blockedReason: 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it', ...meta, capturedDiff: bestEffortDiff() };
+    // Three sub-branches, extracted verbatim into their own per-case helpers
+    // (declared above this function; HUB0080 2/3) so each case is independently
+    // testable. `dctx` extends the shared `ctx` with the two values
+    // only this branch needs (the zero/one cases never read them).
+    const dctx = { ...ctx, subTasks, resolution };
+    switch (n) {
+      case 0: return resolveDecomposeZero(dctx);
+      case 1: return resolveDecomposeOne(dctx);
+      default: return resolveDecomposeMany(dctx); // n >= 2
     }
-
-    if (n === 1) {
-      // A "decompose" into exactly ONE sub-task is the model saying "this is atomic" --
-      // usually it just could not commit to editing. Treat the single sub-task as a
-      // sharper re-scope of THIS task and requeue once (reject-retry-check.js swaps in the
-      // sharper rawText). If it decomposes-to-one AGAIN after being re-scoped, that is a
-      // real signal it needs a human -- escalate instead of looping.
-      if (task.rescopedFromDecompose === true) {
-        task.adhocResolution = 'needs-human-decision';
-        task.rawDiff = '';
-        task.implementResponse = `${summary}\n\n(decomposed to a single atomic sub-task twice without implementing it -- needs a human)`;
-        return { succeeded: true, blocked: false, needsClarification: true, ...meta };
-      }
-      task.rescopedFromDecompose = true;
-      task.rescopedRawText = subTasks[0].rawText;
-      // Also a "said decompose, not implementable as given" pass -- counts toward the
-      // repeated-decompose backstop (see the n === 0 branch).
-      task.decomposeBlockCount = (Number(task.decomposeBlockCount) || 0) + 1;
-      task.retryableDraftBlock = true;
-      return { succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass', ...meta, capturedDiff: bestEffortDiff() };
-    }
-
-    // A pass that made REAL edits and then answered RESOLUTION: decompose is not "this
-    // can't be one change" -- it is "I did part of it and ran low on turns/confidence."
-    // Accepting the split here discards that partial work (rawDiff = '') AND routinely
-    // drops whatever the model already finished from the sub-task list (root-caused live
-    // 2026-09-02 via the plugins-marketplace endpoint task: tier 3 wrote the catalog
-    // validators in app.py, then split into "seed file" + "test file" and the endpoint
-    // itself -- the actual deliverable -- silently vanished). Redirect it to a CONTINUATION
-    // (finish what you started), same mechanism the needs-human-decision branch uses,
-    // bounded by MAX_AGENTIC_CONTINUATIONS. Only once that budget is spent and it STILL
-    // wants to split do we accept the decompose.
-    const decomposeDiff = bestEffortDiff();
-    const continuations = Number(task.agenticContinuationCount) || 0;
-    if (decomposeDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
-      task.agenticContinuationCount = continuations + 1;
-      task.agenticContinuationNote = summary;
-      task.priorPartialDiff = decomposeDiff;
-      task.retryableDraftBlock = true;
-      task.isAgenticContinuation = true;
-      return {
-        succeeded: true,
-        blocked: true,
-        blockedReason: `Agentic implement pass made partial edits then chose RESOLUTION: decompose -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS} to finish before any split`,
-        ...meta,
-        capturedDiff: decomposeDiff,
-      };
-    }
-
-    task.adhocResolution = resolution;
-    task.subTaskProposals = subTasks;
-    task.rawDiff = '';
-    // The pieces were written by a pass whose worktree ALREADY HAD the partial edits, so they describe what REMAINS. Dropping the diff left
-    // pieces that assume imports/calls no branch contains (PropertyForager HUB0003, 2026-09-20). The diff rides on the task as
-    // carriedPartialDiff; queueSubTasks (apply-adhoc-diff.js) hands it to the first piece, whose worktree starts from it.
-    if (decomposeDiff) task.carriedPartialDiff = decomposeDiff;
-    task.implementResponse = decomposeDiff
-      ? `${summary}\n\n(NOTE: an earlier pass made partial edits before this split; they are CARRIED into the first sub-task's worktree, so the sub-tasks describe what REMAINS to be done on top of them, not the whole change.)`
-      : summary;
-    return { succeeded: true, blocked: false, ...meta };
   }
 
   if (resolution === 'needs-human-decision') {
