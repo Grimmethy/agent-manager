@@ -699,7 +699,7 @@ async function renderDiscoveryTab() {
   const candidateRows = d.candidates.map(c => `
     <tr class="clickable" data-candidate-id="${c.id}" title="Click to read the full write-up">
       <td><span class="bd-serial">AC-${String(c.id).padStart(3, '0')}</span></td>
-      <td>${escapeHtmlBright(c.title)}</td>
+      <td>${escapeHtmlBright(c.title)} <button class="secondary" data-discovery-send-to-chat="${c.id}" title="Send this candidate's title and write-up to the System Chat panel as a message -- no AI call, works even while the local model is busy">Send to Chat</button></td>
       <td>${c.strength ? `<span class="badge ${c.strength === 'Strong' ? 'ok' : 'idle'}">${escapeHtml(c.strength)}</span>` : ''}</td>
       <td class="meta">${c.files.slice(0, 3).map(escapeHtml).join(', ')}${c.files.length > 3 ? ` +${c.files.length - 3} more` : ''}</td>
     </tr>`).join('');
@@ -730,6 +730,33 @@ async function renderDiscoveryTab() {
   });
   main.querySelectorAll('tr[data-candidate-id]').forEach(row => {
     row.onclick = () => openDiscoveryCandidate(parseInt(row.dataset.candidateId, 10));
+  });
+
+  // "Send to Chat": dumps this arch_discovery candidate's title + write-up into the
+  // System Chat panel as a user message (via sendTextToChat -> POST /api/chat/inject,
+  // no model call) so a follow-up can be had about it. Same pattern as
+  // concepts-and-adhoc-tab.js's concept cards: wired here (not inlined in an onclick)
+  // so the payload isn't quote-escaping trouble, and hard-capped at <=200 chars
+  // before sendTextToChat.
+  main.querySelectorAll('[data-discovery-send-to-chat]').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation(); // keep the row's own click (open the full write-up) from firing too
+      btn.disabled = true;
+      try {
+        const candidate = discoveryCandidatesCache.find((x) => x.id === parseInt(btn.dataset.discoverySendToChat, 10));
+        if (!candidate) { showToast('Could not send to chat: that candidate is no longer in the list.'); return; }
+        const parts = [`AC-${String(candidate.id).padStart(3, '0')}: ${candidate.title}`];
+        if (candidate.content) parts.push(candidate.content);
+        let text = parts.join('\n\n');
+        if (text.length > 200) text = text.slice(0, 199) + '…'; // hard cap: sendTextToChat must never receive >200 chars
+        await sendTextToChat(text); // POSTs { text } to /api/chat/inject, no model call
+        showToast('Sent to chat', 'info');
+      } catch (err) {
+        showToast('Could not send to chat: ' + err.message);
+      } finally {
+        btn.disabled = false;
+      }
+    };
   });
   const toggleBtn = document.getElementById('discovery-show-all');
   if (toggleBtn) toggleBtn.onclick = () => {
