@@ -488,6 +488,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(inertSection);
     lines.push('');
   }
+  const skipPathSection = formatSkipPathSection(task.skipPaths);
+  if (skipPathSection) {
+    lines.push(skipPathSection);
+    lines.push('');
+  }
   // Advisory only (see local-draft.js's postImplementCheck handling): a literal-text check that
   // could not verify something. NOT proof of a defect, so it informs the votes, never blocks.
   if (Array.isArray(task.groundingWarnings) && task.groundingWarnings.length) {
@@ -653,11 +658,41 @@ function formatInertAdditionsSection(ia) {
   return out.join('\n');
 }
 
+// --- skip / dismiss / early-exit paths, as the voters see them (brain dump #1667) --------------------------------------------------------------------
+// review-skip-paths.js lists the places a diff ADDS code that can archive, dismiss, skip or short-circuit work. Three of ten needs-work branches examined on
+// 2026-09-30 did that and wrongly dropped real cases while their tests passed (a startup exemption ahead of a hot-path check, a gate that archived a genuine finding
+// whose snippet lacked the loop header, a zero-result early exit shared by every project). Advisory: the voters are told what the draft must then show.
+const SKIP_PATH_MAX_ITEMS = 8;
+
+function summariseSkipPaths(r) {
+  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  const paths = Array.isArray(r && r.paths) ? r.paths : [];
+  return {
+    at: new Date().toISOString(), total: Math.max(n(r && r.total), paths.length),
+    paths: paths.slice(0, SKIP_PATH_MAX_ITEMS).map((p) => ({
+      kind: ['status-label', 'skip-flag', 'early-exit', 'gate-function'].includes(p && p.kind) ? p.kind : 'status-label',
+      file: String((p && p.file) || '').slice(0, 160), line: n(p && p.line), text: String((p && p.text) || '').slice(0, 120),
+    })),
+  };
+}
+
+function formatSkipPathSection(sp) {
+  if (!sp || typeof sp !== 'object' || !Array.isArray(sp.paths) || !sp.paths.length) return '';
+  const where = sp.paths.map((p) => `${p.file}:${p.line} (${p.kind}: ${p.text})`);
+  const more = sp.total > sp.paths.length ? ` (+${sp.total - sp.paths.length} more)` : '';
+  return [
+    '--- Skip / dismiss paths in this diff (deterministic check; advisory) ---',
+    `The diff adds code that can archive, dismiss, skip or short-circuit work: ${where.join('; ')}${more}.`,
+    'Paths like this have repeatedly dropped REAL cases in this pipeline while their tests passed: a startup exemption checked ahead of a hot-path check, a genuine finding dismissed because its snippet lacked the loop header, one project\'s zero-result streak early-exiting every project.',
+    'If a listed path really does drop or defer work (a status label or a helper name alone is not enough), the draft must show all three: (1) it names a real case the path could wrongly drop; (2) a test shows that case still goes through; (3) every dismissal leaves an audit/history line or a counter. If a path drops work and any of the three is missing, that is a concrete reason to REJECT: say which one is missing. A path that only skips what the task explicitly asked to skip, with a test, is fine.',
+  ].join('\n');
+}
+
 /**
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported (via
  * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
  */
-async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null } = {}) {
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
@@ -1197,6 +1232,25 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
   }
 
+  // Skip / dismiss paths (see formatSkipPathSection): a pure diff scan, independent of the other checks' switches. Advisory only.
+  if (process.env.AGENT_MANAGER_REVIEW_SKIPPATH_RULE !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    try {
+      const find = findSkipPathsFn || require('./review-skip-paths.js').findSkipPaths;
+      const r = find({ rawDiff: task.rawDiff });
+      if (r && Array.isArray(r.paths)) {
+        task.skipPaths = summariseSkipPaths(r);
+        if (r.paths.length) {
+          appendHistoryEvent(task, 'advisory', `skip-path rule: ${task.skipPaths.total} dismiss/skip path(s) in the diff (${[...new Set(r.paths.map((p) => p.kind))].join(', ')})`);
+        }
+      }
+    } catch (e) {
+      console.error(`[review] skip-path check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+  }
+
   await waitForLocalAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
@@ -1348,7 +1402,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();

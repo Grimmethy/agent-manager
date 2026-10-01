@@ -35,6 +35,7 @@ process.env.AGENT_MANAGER_REPO_ROOT = require('os').tmpdir();
 // tasks (fake rawDiffs, non-git repoRoot). The tests at the end of this file that exercise the gate switch it on and inject a fake verifier.
 process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false';
 process.env.AGENT_MANAGER_REVIEW_INERT_CHECK = 'false';
+process.env.AGENT_MANAGER_REVIEW_SKIPPATH_RULE = 'false';
 process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
 // 2026-08-23: review-task.js's own isEmptyApprovalSource/isAdvisoryProseSource now read
@@ -2353,4 +2354,114 @@ test('replay: the real inert check, against a real git remote, tells the voters 
     assert.match(captured[0], /function orphanHelper \(src\/lib\.js:\d+\)/);
     assert.doesNotMatch(captured[0], /waitedForHelper \(/, 'the base already calls it');
   });
+}));
+
+
+
+// --- the voters are told when a diff adds a skip / dismiss / early-exit path (brain dump #1667) ---------------------------------------------------------
+function withSkipPathRule(fn) {
+  return async () => {
+    process.env.AGENT_MANAGER_REVIEW_SKIPPATH_RULE = 'true';
+    try { await fn(); } finally { process.env.AGENT_MANAGER_REVIEW_SKIPPATH_RULE = 'false'; }
+  };
+}
+const SKIP_FOUND = { total: 3, paths: [{ kind: 'gate-function', file: 'src/gate.js', line: 12, text: 'gateThing' }, { kind: 'status-label', file: 'src/gate.js', line: 15, text: "status: 'archived'" }] };
+const GATE_DIFF = "diff --git a/src/gate.js b/src/gate.js\n--- a/src/gate.js\n+++ b/src/gate.js\n@@ -10,0 +11,4 @@\n+function gateThing(snippet) {\n+  if (!/loop/.test(snippet)) return { ruleId: 'x', status: 'archived', reason: 'no loop' };\n+  return null;\n+}\n";
+
+test('summariseSkipPaths clamps junk, caps the list and never reports fewer than it lists', () => {
+  const { summariseSkipPaths } = require('./review-task.js');
+  const s = summariseSkipPaths(SKIP_FOUND);
+  assert.deepEqual([s.total, s.paths.length, s.paths[0].kind], [3, 2, 'gate-function']);
+  const junk = summariseSkipPaths({ total: -9, paths: Array.from({ length: 12 }, (_, i) => ({ kind: 'weird', file: `f${i}`.padEnd(300, 'x'), line: NaN, text: 't'.repeat(400) })) });
+  assert.deepEqual([junk.total, junk.paths.length], [12, 8]);
+  assert.equal(junk.paths[0].kind, 'status-label');
+  assert.equal(junk.paths[0].file.length, 160);
+  assert.equal(junk.paths[0].text.length, 120);
+  assert.equal(junk.paths[0].line, 0);
+  assert.deepEqual(summariseSkipPaths(null).paths, []);
+});
+
+test('the skip-path section lists each path, states the three things the draft must show and when to reject, and is empty when there are none', () => {
+  const { formatSkipPathSection, summariseSkipPaths } = require('./review-task.js');
+  const section = formatSkipPathSection(summariseSkipPaths(SKIP_FOUND));
+  assert.match(section, /--- Skip \/ dismiss paths in this diff \(deterministic check; advisory\) ---/);
+  assert.match(section, /src\/gate\.js:12 \(gate-function: gateThing\); src\/gate\.js:15 \(status-label: status: 'archived'\) \(\+1 more\)/);
+  assert.match(section, /\(1\) it names a real case the path could wrongly drop; \(2\) a test shows that case still goes through; \(3\) every dismissal leaves an audit\/history line or a counter/);
+  assert.match(section, /a status label or a helper name alone is not enough/);
+  assert.match(section, /concrete reason to REJECT: say which one is missing/);
+  assert.match(section, /only skips what the task explicitly asked to skip, with a test, is fine/);
+  for (const none of [undefined, null, {}, 'x', { total: 0, paths: [] }]) assert.equal(formatSkipPathSection(none), '');
+});
+
+test('a prompt for a task with no skip paths is byte-identical to one that never ran the check', () => {
+  const { buildVerdictPrompt } = require('./review-task.js');
+  const task = adhocImplementedTask({ id: 'skip-identical' });
+  const before = buildVerdictPrompt(task, { flags: [] }, 'GROUNDING');
+  const after = buildVerdictPrompt({ ...task, skipPaths: { total: 0, paths: [] } }, { flags: [] }, 'GROUNDING');
+  assert.equal(after, before);
+  assert.doesNotMatch(before, /Skip \/ dismiss paths/);
+  assert.match(buildVerdictPrompt({ ...task, skipPaths: SKIP_FOUND }, { flags: [] }, 'GROUNDING'), /Skip \/ dismiss paths in this diff/);
+});
+
+test('the skip-path finder is not called while its switch is off, or for a task that is not an implemented adhoc diff', async () => {
+  let calls = 0;
+  const finder = () => { calls += 1; return SKIP_FOUND; };
+  const run = async (task) => {
+    const { repoRoot, domainsPath } = makeFixture();
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findSkipPathsFn: finder });
+  };
+  await run(adhocImplementedTask({ id: 'skip-off' }));
+  assert.equal(calls, 0);
+  await withSkipPathRule(async () => {
+    await run(adhocImplementedTask({ id: 'skip-no-diff', rawDiff: '' }));
+    await run(adhocImplementedTask({ id: 'skip-not-implemented', adhocResolution: 'no-changes-needed' }));
+    assert.equal(calls, 0);
+    await run(adhocImplementedTask({ id: 'skip-on' }));
+    assert.equal(calls, 1);
+  })();
+});
+
+test('end to end: the finding is recorded, noted in the history and shown to the voters, and it never blocks', withSkipPathRule(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'skip-e2e' });
+  const captured = [];
+  let seen = null;
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findSkipPathsFn: (a) => { seen = a; return SKIP_FOUND; } });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1, 'advisory: the vote still happens');
+  assert.equal(seen.rawDiff, task.rawDiff);
+  assert.equal(task.skipPaths.total, 3);
+  assert.match(task.history.find((h) => /skip-path rule/.test(h.detail || '')).detail, /3 dismiss\/skip path\(s\) in the diff \(gate-function, status-label\)$/);
+  assert.match(captured[0], /Skip \/ dismiss paths in this diff/);
+  assert.match(captured[0], /\(3\) every dismissal leaves an audit\/history line or a counter/);
+}));
+
+test('a clean result, a throwing finder and a junk result all leave the review untouched', withSkipPathRule(async () => {
+  for (const [label, finder] of [['clean', () => ({ total: 0, paths: [] })], ['throws', () => { throw new Error('boom'); }], ['junk', () => 'nope']]) {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: `skip-${label}` });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findSkipPathsFn: finder });
+    assert.equal(result.verdict, 'approved', label);
+    assert.equal(captured.length, 1, label);
+    assert.doesNotMatch(captured[0], /Skip \/ dismiss paths/, label);
+    assert.equal(task.history.some((h) => /skip-path rule/.test(h.detail || '')), false, label);
+  }
+}));
+
+test('replay: the real detector flags a diff that adds a gate returning an archived status, and says nothing about an ordinary diff', withSkipPathRule(async () => {
+  const run = async (id, rawDiff) => {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id, rawDiff });
+    const captured = [];
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+    return { task, prompt: captured[0] };
+  };
+  const gate = await run('skip-real-gate', GATE_DIFF);
+  assert.deepEqual(gate.task.skipPaths.paths.map((p) => p.kind), ['gate-function', 'status-label']);
+  assert.match(gate.prompt, /src\/gate\.js:11 \(gate-function: gateThing\)/);
+  assert.match(gate.prompt, /src\/gate\.js:12 \(status-label: /);
+  const plain = await run('skip-real-plain', adhocImplementedTask().rawDiff);
+  assert.equal(plain.task.skipPaths.paths.length, 0);
+  assert.doesNotMatch(plain.prompt, /Skip \/ dismiss paths/);
 }));
