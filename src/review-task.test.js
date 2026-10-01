@@ -1887,6 +1887,76 @@ test('executed verification: passed and inconclusive both go on to the vote, wit
   }
 }));
 
+const OVER_LIMIT_REPLAY = {
+  candidates: [{ name: 'checkDraftQuality', file: 'src/draft-quality-gate.js', family: 'draft-text', blocking: true, total: 2385, mergedTotal: 335,
+    before: null, after: { n: 2385, flagged: 144, flaggedMerged: 93, errors: 0 }, rateMerged: 93 / 335, newlyFlaggedMergedCount: 93,
+    newlyFlaggedMerged: [{ id: 'HUB0060-01', detail: 'fabricated-path lib/draft-context.js' }] }],
+  skipped: [{ name: 'checkOdd', file: 'src/odd.js', reason: 'no corpus for the signature (checkOdd(task, ctx))' }],
+};
+const withReplayVerify = (replay) => () => ({ status: 'passed', reasons: [], tests: { ran: ['src/a.test.js'], passed: true, failures: [] }, commands: [], replay });
+
+test('gate replay: the numbers reach the voters and the task record, and by default an over-limit gate does NOT block', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'gr-advisory' });
+  const captured = [];
+  await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, verifyDiffFn: withReplayVerify(OVER_LIMIT_REPLAY) });
+  assert.equal(captured.length, 1, 'advisory: the vote still runs');
+  assert.notEqual(task.reviewProvider, 'deterministic-gate-replay');
+  assert.equal(task.gateReplay.block, true);
+  assert.equal(task.gateReplay.candidates[0].afterFlaggedMerged, 93);
+  assert.equal(task.gateReplay.candidates[0].mergedTotal, 335);
+  const prompt = String(captured[0].prompt || captured[0]);
+  assert.match(prompt, /Gate replay over tasks that already ran/);
+  assert.match(prompt, /checkDraftQuality .*flags 93 merged task\(s\) = 27\.8%/);
+  assert.match(prompt, /THIS GATE IS OVER THE LIMIT/);
+  assert.match(prompt, /No real-data replay was possible for checkOdd/);
+  assert.ok(task.history.some((h) => h.stage === 'advisory' && /gate replay: checkDraftQuality flags 93\/335/.test(h.detail || '')));
+}));
+
+test('gate replay: with AGENT_MANAGER_GATE_REPLAY_BLOCK=true an over-limit gate is a deterministic block before any vote, naming the tasks', withExecutedVerify(async () => {
+  process.env.AGENT_MANAGER_GATE_REPLAY_BLOCK = 'true';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'gr-block' });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, verifyDiffFn: withReplayVerify(OVER_LIMIT_REPLAY) });
+    assert.equal(result.verdict, 'blocked');
+    assert.equal(result.blockedStage, 'review');
+    assert.equal(task.reviewProvider, 'deterministic-gate-replay');
+    assert.match(result.blockedReason, /would flag 93 of 335 already-merged tasks \(27\.8%, limit 2\.0%\)/);
+    assert.match(result.blockedReason, /HUB0060-01|already-merged/);
+    assert.equal(captured.length, 0, 'no vote is spent');
+    // a within-limit gate is never blocked, switch on or not
+    const ok = adhocImplementedTask({ id: 'gr-ok' });
+    const within = { candidates: [{ ...OVER_LIMIT_REPLAY.candidates[0], rateMerged: 0.005, newlyFlaggedMergedCount: 0, after: { flaggedMerged: 2 } }], skipped: [] };
+    const cap2 = [];
+    await reviewTask(ok, { repoRoot, domainsPath, localMajorityVote: fakeApprove(cap2), recordModelOutcome: () => {}, verifyDiffFn: withReplayVerify(within) });
+    assert.equal(cap2.length, 1);
+    assert.equal(ok.gateReplay.block, false);
+  } finally { delete process.env.AGENT_MANAGER_GATE_REPLAY_BLOCK; }
+}));
+
+test('gate replay: a malformed replay result never breaks the review -- it still reaches the vote', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'gr-malformed' });
+  const captured = [];
+  const origErr = console.error; console.error = () => {};
+  try {
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+      verifyDiffFn: withReplayVerify({ candidates: [{ name: 'checkX', blocking: true, mergedTotal: 50, rateMerged: 0.5, newlyFlaggedMergedCount: 5 }], skipped: [] }) });
+  } finally { console.error = origErr; }
+  assert.equal(captured.length, 1, 'the vote still runs');
+  assert.notEqual(task.reviewProvider, 'deterministic-gate-replay');
+}));
+
+test('gate replay: nothing to report (no gate in the diff) leaves no record and no prompt section', () => {
+  const { summariseGateReplay, formatGateReplaySection } = require('./review-task.js');
+  assert.equal(summariseGateReplay({ candidates: [], skipped: [] }), null);
+  assert.equal(summariseGateReplay(null), null);
+  assert.equal(formatGateReplaySection(null), '');
+  assert.equal(formatGateReplaySection({ candidates: [], skipped: [] }), '');
+});
+
 test('executed verification: a verifier that throws never blocks and never breaks the review', withExecutedVerify(async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = adhocImplementedTask();

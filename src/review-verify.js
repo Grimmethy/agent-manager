@@ -39,6 +39,8 @@ const TEST_TIMEOUT_MS = 90000;
 const TOTAL_BUDGET_MS = 300000;
 const MAX_COMMANDS = 8;
 const MAX_OUTPUT_CHARS = 4000;
+const REPLAY_MIN_REMAINING_MS = 8000;
+const REPLAY_TIMEOUT_MS = 90000;
 
 function extractChangedFiles(diff) {
   const files = [];
@@ -365,10 +367,10 @@ function checkUnpinnedHunks({ worktreeDir, rawDiff, suites, run, d, deadline, py
   return res;
 }
 
-function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, deps = {} }) {
+function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, deps = {} }) {
   const d = {
     prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
-    findTests: findTestsWithSymbolFallback, ...deps,
+    findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args), ...deps,
   };
   const result = { status: 'inconclusive', reasons: [], apply: null, tests: null, commands: [] };
   const inconclusive = (reason) => { result.reasons.push(reason); return result; };
@@ -442,6 +444,17 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
         result.commands.push(entry);
         if (outcome === 'contradicted') contradictedCmds.push({ entry, c });
       }
+    }
+
+    // 2b. Gate replay (src/gate-replay.js, brain dump 7/8): while the diff is still applied (step 3 reverses it), replay any gate/guard/detector the diff adds or changes
+    // over tasks that already ran. Advisory data on the result; it never changes the status, and any failure here is swallowed.
+    if (checkReplay && pipelineDir && deadline - Date.now() > REPLAY_MIN_REMAINING_MS) {
+      try {
+        result.replay = d.replay({
+          rawDiff, worktreeDir, pipelineDir, mainBranch,
+          run: (a) => d.run({ ...a, pythonBin: py, mainRepoRoot: repoRoot, timeoutMs: Math.min(a.timeoutMs || REPLAY_TIMEOUT_MS, Math.max(1000, deadline - Date.now())) }),
+        });
+      } catch { /* advisory */ }
     }
 
     // 3. Differential check: a failure only counts against the diff if the SAME check passes on the base. Tests that already fail on the base inside

@@ -488,6 +488,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(inertSection);
     lines.push('');
   }
+  const gateReplaySection = formatGateReplaySection(task.gateReplay);
+  if (gateReplaySection) {
+    lines.push(gateReplaySection);
+    lines.push('');
+  }
   const skipPathSection = formatSkipPathSection(task.skipPaths);
   if (skipPathSection) {
     lines.push(skipPathSection);
@@ -655,6 +660,45 @@ function formatInertAdditionsSection(ia) {
   out.push(ia.hubChild
     ? 'This task is one slice of a hub, so a later sibling may legitimately wire these up. Check whether the task text or the plan says which slice does; if it does, this is expected and not a reason to reject.'
     : 'Nothing in this task wires them in. Unless the task asked only for a reusable helper or module to be used later, ask whether the draft is half a feature: a field nothing reads, a file nothing loads, a function nothing calls. This is evidence to weigh, not a verdict.');
+  return out.join('\n');
+}
+
+// --- gate replay, as the voters see it (brain dump "Pipeline yellow hardening 7/8") -----------------------------------------------------------------------
+// gate-replay.js replays every gate/guard/detector the diff adds or changes over tasks that already ran. On 2026-10-01 three such drafts passed their own tests and three
+// unanimous approve votes while flagging 5.7% of finished tasks, 21% of merged edit drafts, and changing every source's evidence set. The numbers below are what the votes lacked.
+const GATE_REPLAY_MAX_ITEMS = 3;
+
+function summariseGateReplay(replay) {
+  if (!replay || typeof replay !== 'object') return null;
+  const { replayVerdict, gateReplayMaxRate } = require('./gate-replay.js');
+  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  const cands = Array.isArray(replay.candidates) ? replay.candidates : [];
+  const skipped = Array.isArray(replay.skipped) ? replay.skipped : [];
+  if (!cands.length && !skipped.length) return null;
+  const verdict = replayVerdict(replay, { maxRate: gateReplayMaxRate() });
+  return {
+    at: new Date().toISOString(), block: verdict.block, blockReasons: verdict.reasons.map((r) => String(r).slice(0, 300)), maxRate: gateReplayMaxRate(),
+    candidates: cands.slice(0, GATE_REPLAY_MAX_ITEMS).map((c) => ({
+      name: String(c.name || '').slice(0, 80), file: String(c.file || '').slice(0, 120), family: String(c.family || '').slice(0, 20), blocking: !!c.blocking, total: n(c.total), mergedTotal: n(c.mergedTotal),
+      beforeFlaggedMerged: c.before ? n(c.before.flaggedMerged) : null, afterFlaggedMerged: c.after ? n(c.after.flaggedMerged) : 0, afterFlagged: c.after ? n(c.after.flagged) : 0,
+      rateMerged: Number.isFinite(c.rateMerged) ? c.rateMerged : null, newCount: n(c.newlyFlaggedMergedCount),
+      examples: (Array.isArray(c.newlyFlaggedMerged) ? c.newlyFlaggedMerged : []).slice(0, 3).map((x) => ({ id: String((x && x.id) || '').slice(0, 70), detail: String((x && x.detail) || '').slice(0, 100) })),
+    })),
+    skipped: skipped.slice(0, GATE_REPLAY_MAX_ITEMS).map((x) => ({ name: String((x && x.name) || '').slice(0, 80), reason: String((x && x.reason) || '').slice(0, 160) })),
+  };
+}
+
+function formatGateReplaySection(gr) {
+  if (!gr || typeof gr !== 'object' || (!Array.isArray(gr.candidates) || !gr.candidates.length) && (!Array.isArray(gr.skipped) || !gr.skipped.length)) return '';
+  const out = ['--- Gate replay over tasks that already ran (deterministic check; advisory) ---'];
+  for (const c of gr.candidates || []) {
+    const pct = c.rateMerged == null ? 'n/a' : `${(c.rateMerged * 100).toFixed(1)}%`;
+    out.push(`The diff adds or changes the gate ${c.name} (${c.file}). Run over the real corpus (${c.total} finished tasks, ${c.mergedTotal} of them merged), it flags ${c.afterFlaggedMerged} merged task(s) = ${pct}`
+      + `${c.beforeFlaggedMerged == null ? ' (it is a new gate)' : `; the base version flags ${c.beforeFlaggedMerged}`}; ${c.newCount} merged task(s) are newly flagged${c.examples.length ? `, e.g. ${c.examples.map((x) => `${x.id}${x.detail ? ` (${x.detail})` : ''}`).join('; ')}` : ''}.`);
+    if (c.blocking) out.push(`Work that already merged should not be flagged by a new gate; the limit here is ${(gr.maxRate * 100).toFixed(1)}%. ${gr.block ? 'THIS GATE IS OVER THE LIMIT: treat it as a false-positive defect unless the task text says the merged tasks listed were wrong to merge.' : 'This gate is within the limit.'}`);
+    else out.push('This corpus has no "must not flag" population, so the count is reported for information only.');
+  }
+  for (const x of gr.skipped || []) out.push(`No real-data replay was possible for ${x.name}: ${x.reason}. Ask what real inputs the draft tested it against.`);
   return out.join('\n');
 }
 
@@ -1190,7 +1234,7 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       // A stacked hub sub-task builds on its shared branch, not on master -- verify against the same base the draft used.
       const baseBranch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
       const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
-      ev = verify({ taskId: task.id, rawDiff: task.rawDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false' });
+      ev = verify({ taskId: task.id, rawDiff: task.rawDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false', pipelineDir, checkReplay: process.env.AGENT_MANAGER_REVIEW_GATE_REPLAY !== 'false' });
     } catch (e) {
       console.error(`[review] executed verification errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
     }
@@ -1199,6 +1243,24 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       const ranTests = ev.tests && ev.tests.ran ? ev.tests.ran.length : 0;
       const confirmed = (ev.commands || []).filter((c) => c.outcome === 'confirmed').length;
       appendHistoryEvent(task, 'advisory', `executed verification: ${ev.status} (${ranTests} covering test file(s), ${confirmed} claimed check(s) re-run and confirmed${ev.unpinned && Array.isArray(ev.unpinned.hunks) && ev.unpinned.hunks.length ? `, ${ev.unpinned.hunks.length} unpinned hunk(s)` : ''}${ev.status === 'inconclusive' && ev.reasons && ev.reasons[0] ? `; ${String(ev.reasons[0]).slice(0, 160)}` : ''})`);
+      if (ev.replay) {
+        let gr = null;
+        try { gr = summariseGateReplay(ev.replay); } catch (e) { console.error(`[review] gate replay summary errored for ${task.id} (non-fatal, continuing): ${e && e.message}`); }
+        if (gr) {
+          task.gateReplay = gr;
+          if (gr.candidates.length) {
+            appendHistoryEvent(task, 'advisory', `gate replay: ${gr.candidates.map((c) => `${c.name} flags ${c.afterFlaggedMerged}/${c.mergedTotal} merged tasks (base ${c.beforeFlaggedMerged == null ? 'n/a' : c.beforeFlaggedMerged})`).join('; ')}${gr.block ? ' -- over the limit' : ''}`.slice(0, 480));
+          }
+          // Advisory by default (the numbers go to the voters); AGENT_MANAGER_GATE_REPLAY_BLOCK=true turns an over-limit result into a deterministic block, like a failing test.
+          if (gr.block && process.env.AGENT_MANAGER_GATE_REPLAY_BLOCK === 'true') {
+            const reason = `Deterministic gate: replaying the new/changed gate over tasks that already ran -- ${gr.blockReasons.join('; ')}. A gate that flags already-merged work is a false-positive defect; narrow it (exclude what the draft itself creates, fixtures, prose) and add a regression test built from these tasks.`.slice(0, 900);
+            task.reviewProvider = 'deterministic-gate-replay';
+            recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+            appendHistoryEvent(task, 'blocked', reason);
+            return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+          }
+        }
+      }
       if (ev.status === 'failed') {
         const reason = executedVerificationBlockReason(ev);
         task.reviewProvider = 'deterministic-executed-verification';
@@ -1402,7 +1464,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
