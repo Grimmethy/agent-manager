@@ -123,6 +123,107 @@ function gateSequentialAwaitInLoop(flaggedCode) {
 registerPreDispatchGate('sequential-await-in-loop', gateSequentialAwaitInLoop);
 registerPreDispatchGate('sequential await in loop', gateSequentialAwaitInLoop);
 
+// ─── Detector: sync-io-in-loop ───
+//
+// 2026-09-30: startup bounded-loop exemption (brain-dump bd-1788781713129) -- a 2026-09-16
+// triage window ended 25/25 "false-positive dismissal": the sync-io-in-loop rule flagged
+// startup-time bounded loops (hardcoded arrays, 3-10 directory walks) identically to
+// request-hot-path loops, and every one of them burned a full plan+implement+review cycle
+// to be dismissed. Finding's own recommendation: the rule itself (or a suppression list
+// keyed on "startup"/"bounded"/"hardcoded") should be the first thing a human looks at.
+// Before this gate existed, getPreDispatchGate('sync-io-in-loop') was undefined, so EVERY
+// such flag fell through to the multi-agent cycle -- that fall-through is the 100%
+// false-positive window.
+//
+// Pure function. Given a snippet of flagged code, decides whether the sync I/O is in a
+// startup-time bounded loop (safe to archive -- runs once at process start, bounded, no
+// event-loop contention) or in a hot-path / unbounded loop (investigate).
+//
+// Heuristic rules (checked in order):
+//   1. No loop construct at all -> 'investigate' (nothing to exempt; fail-safe).
+//   2. Bounded + startup: the loop bound is a numeric literal <= 10 (or the loop is
+//      over a small literal array) AND the enclosing scope names a startup initializer
+//      (init/main/bootstrap/setup/load/start) -> 'archive'.
+//   3. Hot-path scope (request handler / listener / socket / connection path) ->
+//      'investigate' regardless of bound.
+//   4. Default: bound above 10, or startup context not confirmable -> 'investigate'
+//      (fail-safe, exactly like the await-in-loop detector's ambiguous branch).
+
+const SYNC_IO_BOUND_THRESHOLD = 10;
+
+const SYNC_IO_LOOP_PATTERN = /\b(?:for|while)\s*[\({]|do\s*\{|\.map\s*\(/;
+// Comparison operators only (< / <=): `i = 0` loop initializers must NOT count as a bound.
+const SYNC_IO_BOUND_PATTERN = /\bi\s*<=?\s*(\d+)|\blength\s*<=?\s*(\d+)/;
+const SYNC_IO_ARRAY_BOUND_PATTERN = /for\s*\(.*\bof\s+(\[[^\]]*\])/;
+const SYNC_IO_ARRAY_ELEMENT_RE = /'[^']*'|"[^"]*"|`[^`]*`|\b[A-Za-z_$][\w$]*\b/g;
+// Startup scope is a function DEFINED with a startup name (function main() / def setup() / const bootstrapAll = () =>), never merely a call to one: a request
+// handler or a per-item helper that happens to call loadConfig() or init() is not startup code, and treating the call as proof of startup archived real findings.
+const SYNC_IO_STARTUP_NAME = '(?:init|initialize|main|bootstrap|setup|load|start)[\\w]*';
+const SYNC_IO_STARTUP_SCOPE_PATTERN = new RegExp(`\\b(?:function\\*?|def)\\s+${SYNC_IO_STARTUP_NAME}\\s*\\(|\\b(?:const|let|var)\\s+${SYNC_IO_STARTUP_NAME}\\s*=\\s*(?:async\\s*)?(?:function\\b|\\([^)]*\\)\\s*=>|[A-Za-z_$][\\w$]*\\s*=>)`);
+const SYNC_IO_HOT_PATH_PATTERN = /\b(?:req|request|res|response|socket|client)\b|\bapp\.(?:get|post|put|delete|use|listen)\s*\(|\bon\w*\s*\(/;
+// Quoted text is removed before the hot-path test: a startup list that names a directory 'client' is not a request path.
+const SYNC_IO_QUOTED_RE = /'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g;
+
+function syncIoBoundedBound(flaggedCode) {
+  const boundMatch = flaggedCode.match(SYNC_IO_BOUND_PATTERN);
+  if (boundMatch) {
+    const n = Number(boundMatch[1] !== undefined ? boundMatch[1] : boundMatch[2]);
+    if (Number.isFinite(n) && n <= SYNC_IO_BOUND_THRESHOLD) return true;
+    return false; // bound present but above the threshold -> not a bounded-startup loop
+  }
+  const arrayMatch = flaggedCode.match(SYNC_IO_ARRAY_BOUND_PATTERN);
+  if (arrayMatch) {
+    const elements = (arrayMatch[1].match(SYNC_IO_ARRAY_ELEMENT_RE) || []).length;
+    return Number.isFinite(elements) && elements > 0 && elements <= SYNC_IO_BOUND_THRESHOLD;
+  }
+  return false; // no literal bound at all (while(true), unbounded iterator) -> not bounded
+}
+
+function gateSyncIoInLoop(flaggedCode) {
+  if (typeof flaggedCode !== 'string' || flaggedCode.length === 0) {
+    throw new TypeError('gateSyncIoInLoop: flaggedCode must be a non-empty string');
+  }
+
+  if (!SYNC_IO_LOOP_PATTERN.test(flaggedCode)) {
+    return {
+      verdict: 'investigate',
+      reason: 'No loop construct found in flagged snippet; sync I/O outside a loop cannot be exempted',
+    };
+  }
+
+  // Hot path FIRST (rule 3 above: hot-path scope is 'investigate' regardless of bound). The first version ran the startup exemption ahead of this test, so a
+  // request handler that also called loadConfig() or init() was archived (verified 2026-09-30).
+  if (SYNC_IO_HOT_PATH_PATTERN.test(flaggedCode.replace(SYNC_IO_QUOTED_RE, "''"))) {
+    return {
+      verdict: 'investigate',
+      reason: 'Sync I/O inside a loop in request/socket hot-path scope',
+    };
+  }
+
+  // 2026-09-30: startup bounded-loop exemption (brain-dump bd-1788781713129) --
+  // a loop whose bound is a numeric literal <= 10 (or a small hardcoded array) inside a
+  // function DEFINED as startup/initialization code runs once at process start and does
+  // not block the event loop under request load: dismiss the flag instead of spending a
+  // full plan+implement+review cycle on it.
+  if (syncIoBoundedBound(flaggedCode) && SYNC_IO_STARTUP_SCOPE_PATTERN.test(flaggedCode)) {
+    return {
+      verdict: 'archive',
+      reason: 'Bounded (<=10) loop in startup/initialization scope: one-time bounded work, not a hot-path violation',
+    };
+  }
+
+  // Fail-safe: unbounded loop, or startup context not confirmable from the snippet.
+  return {
+    verdict: 'investigate',
+    reason: 'Sync I/O inside a loop; startup bounded-loop exemption not confirmed (bound > 10, unbounded, or no startup scope)',
+  };
+}
+
+// Register the detector under both the canonical machine-readable key and the
+// human-readable alias.
+registerPreDispatchGate('sync-io-in-loop', gateSyncIoInLoop);
+registerPreDispatchGate('sync io in loop', gateSyncIoInLoop);
+
 // ─── End pre-dispatch gate registry ───
 
 function registerDeterministicRecheck(sourceName, config) {
@@ -159,4 +260,6 @@ module.exports = {
   getPreDispatchGate,
   clearPreDispatchGateRegistry,
   gateSequentialAwaitInLoop,
+  gateSyncIoInLoop,
+  SYNC_IO_BOUND_THRESHOLD,
 };
