@@ -122,6 +122,7 @@ function renderConceptCard(concept) {
       <div class="row" style="margin-top:8px">
         <span></span>
         <span>
+          <button class="secondary" data-send-concept-to-chat="${escapeAttr(concept.id)}" title="Send this concept's title and body to the System Chat panel as a message -- no AI call, works even while the local model is busy">Send to Chat</button>
           <button class="secondary" data-view-timeline="${escapeAttr(concept.id)}">View timeline</button>
           ${lifecycleButtons}
         </span>
@@ -265,6 +266,31 @@ async function renderConceptsTab() {
     btn.onclick = async () => {
       await fetch(`/api/concepts/${encodeURIComponent(btn.dataset.reopenConcept)}/reopen`, { method: 'POST' });
       renderConceptsTab();
+    };
+  });
+
+  // "Send to Chat": dumps this concept's name + description into the System Chat panel
+  // as a user message (via sendTextToChat -> POST /api/chat/inject, no model call) so a
+  // follow-up can be had about it. Same pattern as task-detail-modal.js's Send to Chat:
+  // wired here (not inlined in an onclick) so the payload isn't quote-escaping trouble,
+  // and hard-capped at <=200 chars before sendTextToChat.
+  main.querySelectorAll('[data-send-concept-to-chat]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const concept = concepts.find((c) => c.id === btn.dataset.sendConceptToChat);
+        if (!concept) { showToast('Could not send to chat: that concept is no longer in the list.'); return; }
+        const parts = [`# ${concept.name}`];
+        if (concept.description) parts.push(concept.description);
+        let text = parts.join('\n\n');
+        if (text.length > 200) text = text.slice(0, 199) + '…'; // hard cap: sendTextToChat must never receive >200 chars
+        await sendTextToChat(text); // POSTs { text } to /api/chat/inject, no model call
+        showToast('Sent to chat', 'info');
+      } catch (e) {
+        showToast('Could not send to chat: ' + e.message);
+      } finally {
+        btn.disabled = false;
+      }
     };
   });
 }
