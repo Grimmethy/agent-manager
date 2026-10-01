@@ -1630,6 +1630,15 @@ async function runDraftPasses(task, attempt, {
         return await draftResearchBranch(task, { recordModelCall, draftResearchImplementFn, isClaudePausedFn, attempt });
       }
 
+      // BOUNDARY: This is the plan→implement seam. DSPy's ChainOfThought achieves
+      // a comparable "reason before answer" effect with a single call (one extra
+      // prepended `reasoning` field, see docs/research/dspy-chain-of-thought.md).
+      // We deliberately keep two separate calls here because:
+      //   (a) the single-flight lock (src/single-flight-lock.js) must be released
+      //       between plan and implement so other lanes are not starved during
+      //       multi-turn agentic work (2026-08-22 fix);
+      //   (b) runPlanCritique (src/plan-critique.js) needs the gap between calls;
+      //   (c) bestPriorPlan enables partial retry (keep plan, redo implement only).
       const implementOutcome = await runImplementPass(task, {
         maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
       }, { recordModelCall, attempt });
