@@ -1751,6 +1751,19 @@ test('renderImplementResponseForReview: a lone edit op (no array wrapper) still 
   assert.match(rendered, /REPLACE:\ny/);
 });
 
+test('renderImplementResponseForReview: an edit draft wrapped in a code fence renders identically to the unfenced form', () => {
+  const op = { mode: 'edit', file: 'a.js', find: 'x', replace: 'y' };
+  const fenced = '```json\n' + JSON.stringify(op) + '\n```';
+  const rendered = renderImplementResponseForReview(fenced);
+  assert.match(rendered, /--- EDIT: a\.js ---/);
+  assert.match(rendered, /FIND:\nx/);
+  assert.match(rendered, /REPLACE:\ny/);
+  assert.ok(rendered.includes('\n'));
+  assert.ok(!rendered.includes('\\n'));
+  // Fenced and unfenced drafts must produce the same readable text for the reviewer.
+  assert.equal(rendered, renderImplementResponseForReview(JSON.stringify(op)));
+});
+
 test('renderImplementResponseForReview: a lone create op (no array wrapper) still gets a legible label', () => {
   const implementResponse = JSON.stringify({ mode: 'create', file: 'new.js', content: 'module.exports = {};' });
   const rendered = renderImplementResponseForReview(implementResponse);
@@ -1760,6 +1773,11 @@ test('renderImplementResponseForReview: a lone create op (no array wrapper) stil
 
 test('renderImplementResponseForReview: non-Group-B free text (e.g. a local-agentic-write transcript) passes through unchanged', () => {
   const implementResponse = 'Investigated and the real bug was in bar.js, not foo.js.\n\n=== DIFF ===\ndiff --git a/bar.js b/bar.js\nRESOLUTION: implemented';
+  assert.equal(renderImplementResponseForReview(implementResponse), implementResponse);
+});
+
+test('renderImplementResponseForReview: a mode other than edit/create (e.g. a read op) passes through unchanged', () => {
+  const implementResponse = JSON.stringify({ mode: 'read', file: 'a.js' });
   assert.equal(renderImplementResponseForReview(implementResponse), implementResponse);
 });
 
