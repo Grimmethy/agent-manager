@@ -277,7 +277,95 @@ function unapplyPartialDiff(worktreeDir, diff) {
   }
 }
 
-function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, deps = {} }) {
+// --- unpinned changes (brain dump #1664) -----------------------------------------------------------------
+// Passing covering tests prove the tests pass, not that they test the change: a diff can add a gate or a branch that no test fails without
+// (2026-09-30: a confidence gate shipped with 4 tests that all still passed with the gate disabled). After the covering tests pass, each non-trivial
+// hunk of a modified SOURCE file is reverted on its own in the scratch worktree and the covering tests re-run; a hunk whose revert leaves every test
+// green is "unpinned". Advisory only: an equivalent mutant (a refactor that changes no behavior) looks the same, so this never changes the status.
+const MAX_UNPINNED_HUNKS = 6;
+const UNPINNED_MIN_REMAINING_MS = 20000;
+
+function isTestFile(file) {
+  return /(^|\/)test_[^/]*\.py$|_test\.py$|\.(?:test|spec)\.[cm]?js$|(^|\/)(?:tests?|__tests__)\//.test(String(file || ''));
+}
+
+// Hunks of files the diff only MODIFIES (not new, deleted, renamed or binary) in a checkable language, as standalone patches.
+// [{ file, patch, start, end, changed: ['+line', '-line', ...] }], start/end being the new-file lines the hunk touches.
+function parseModifiedHunks(diff) {
+  const out = [];
+  for (const chunk of String(diff || '').split(/^(?=diff --git )/m)) {
+    const head = chunk.match(/^diff --git a\/(\S+) b\/(\S+)/);
+    if (!head || head[1] !== head[2]) continue;
+    const file = head[2];
+    if (!/\.(?:[cm]?js|py)$/.test(file) || isTestFile(file)) continue;
+    const firstHunk = chunk.search(/^@@ /m);
+    if (firstHunk < 0) continue;
+    const header = chunk.slice(0, firstHunk);
+    if (/^(?:new file mode|deleted file mode|rename from|rename to|old mode|Binary files|GIT binary patch)/m.test(header)) continue;
+    for (const hunk of chunk.slice(firstHunk).split(/^(?=@@ )/m)) {
+      const hh = hunk.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (!hh) continue;
+      let n = Number(hh[1]);
+      const changed = [];
+      const touched = [];
+      for (const line of hunk.split('\n').slice(1)) {
+        if (line.startsWith('\\')) continue;
+        if (line.startsWith('+')) { changed.push(line); touched.push(n); n += 1; }
+        else if (line.startsWith('-')) { changed.push(line); touched.push(n); }
+        else if (line.startsWith(' ')) n += 1;
+      }
+      if (!changed.length) continue;
+      out.push({ file, patch: `${header}${hunk.endsWith('\n') ? hunk : `${hunk}\n`}`, start: Math.min(...touched), end: Math.max(...touched), changed });
+    }
+  }
+  return out;
+}
+
+// A hunk whose changed lines are all blank, comments, imports/requires or module.exports lines cannot change behavior a test could observe.
+function isTrivialHunk(changed) {
+  return (changed || []).every((line) => {
+    const t = String(line).slice(1).trim();
+    return t === '' || /^(?:\/\/|\/\*|\*|#)/.test(t) || /^(?:const|let|var)\b[^=]*=\s*require\(/.test(t)
+      || /^import\b/.test(t) || /^from\s+\S+\s+import\b/.test(t) || /^module\.exports\b/.test(t);
+  });
+}
+
+// Reverts up to MAX_UNPINNED_HUNKS non-trivial hunks one at a time, re-running the covering suites each time, and puts every hunk back.
+// Returns { total, checked, skipped, hunks: [{ file, start, end }] } (hunks = the unpinned ones), or null if the worktree could not be restored
+// (nothing may be concluded from a tree in an unknown state). Never throws.
+function checkUnpinnedHunks({ worktreeDir, rawDiff, suites, run, d, deadline, py, repoRoot }) {
+  const candidates = parseModifiedHunks(rawDiff).filter((h) => !isTrivialHunk(h.changed));
+  const res = { total: candidates.length, checked: 0, skipped: 0, hunks: [] };
+  const exec = (bin, args, timeoutMs) => run({ worktreeDir, bin, args, timeoutMs: Math.min(timeoutMs, deadline - Date.now()), pythonBin: py, mainRepoRoot: repoRoot });
+  for (const h of candidates.slice(0, MAX_UNPINNED_HUNKS)) {
+    if (deadline - Date.now() < UNPINNED_MIN_REMAINING_MS) break;
+    const reverted = d.unapplyDiff(worktreeDir, h.patch);
+    if (!reverted || !reverted.applied) { res.skipped += 1; continue; }
+    let verdict = 'skipped';
+    try {
+      // A revert that leaves the file unparseable fails every test trivially, which would read as "pinned".
+      const syntax = h.file.endsWith('.py') ? exec('python', ['-m', 'py_compile', h.file], COMMAND_TIMEOUT_MS) : exec('node', ['--check', h.file], COMMAND_TIMEOUT_MS);
+      if (syntax && syntax.ran && !syntax.timedOut && syntax.exitCode === 0) {
+        verdict = 'unpinned';
+        for (const s of suites) {
+          const r = exec(s.bin, s.buildArgs(s.files), TEST_TIMEOUT_MS);
+          if (!r || !r.ran || r.timedOut) { verdict = 'skipped'; break; }
+          if (r.exitCode !== 0) { verdict = 'pinned'; break; }
+        }
+      }
+    } finally {
+      const back = d.applyDiff(worktreeDir, h.patch);
+      if (!back || !back.applied) return null;
+    }
+    if (verdict === 'skipped') { res.skipped += 1; continue; }
+    res.checked += 1;
+    if (verdict === 'unpinned') res.hunks.push({ file: h.file, start: h.start, end: h.end });
+  }
+  res.skipped += Math.max(0, candidates.length - MAX_UNPINNED_HUNKS);
+  return res;
+}
+
+function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, deps = {} }) {
   const d = {
     prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
     findTests: findTestsWithSymbolFallback, ...deps,
@@ -407,6 +495,13 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     const confirmed = (result.tests && result.tests.passed === true) || result.commands.some((c) => c.outcome === 'confirmed');
     if (!confirmed) return inconclusive('no covering tests and no runnable acceptance commands were found');
     result.status = 'passed';
+    // Advisory, after the verdict is settled: never changes the status.
+    if (checkUnpinned && result.tests && result.tests.passed === true && suites.length) {
+      try {
+        const unpinned = checkUnpinnedHunks({ worktreeDir, rawDiff, suites, run: d.run, d, deadline, py, repoRoot });
+        if (unpinned && unpinned.total > 0) result.unpinned = unpinned;
+      } catch { /* advisory: a failure here must never disturb the settled verdict */ }
+    }
     return result;
   } catch (e) {
     return inconclusive(`verification errored (${String((e && e.message) || e).slice(0, 200)})`);
@@ -417,6 +512,6 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 
 module.exports = {
   extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
-  verifyDiff, unapplyPartialDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
+  verifyDiff, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS,
 };
