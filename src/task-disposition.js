@@ -321,7 +321,8 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
 
   // 5. The apply was an explicit no-op verdict.
   if (NOOP_RE.test(detail)) {
-    return { stage: 'noop', detail: `no-op apply: ${detail}`.slice(0, 200) };
+    // "verdict", not "apply": noop is a triage/verdict outcome, not a change application. Records written before 2026-10-01 say "no-op apply"; nothing matches on the text.
+    return { stage: 'noop', detail: `no-op verdict: ${detail}`.slice(0, 200) };
   }
 
   // 6. The apply detail names an agent/<id> branch, but it is gone AND not on <main>:

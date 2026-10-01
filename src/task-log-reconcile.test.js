@@ -90,12 +90,13 @@ test('reconcile: a review with reviewDisposition:"dismissed" closes as dismissed
   assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).terminalDisposition, 'dismissed');
 });
 
-test('reconcile --reclassify: flips a historical FALSE-POSITIVE noop record to dismissed; a plain run does not', () => {
+// Persisted records carry either wording ('no-op apply' before 2026-10-01, 'no-op verdict' after); reclassification must not care which.
+for (const wording of ['no-op apply', 'no-op verdict']) test(`reconcile --reclassify: flips a historical FALSE-POSITIVE noop record to dismissed; a plain run does not (persisted wording "${wording}")`, () => {
   const dir = tmpPipeline();
   const hist = [
     { stage: 'created' },
     { stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' },
-    { stage: 'noop', detail: 'no-op apply: no candidates in implement response -- nothing to apply' },
+    { stage: 'noop', detail: `${wording}: no candidates in implement response -- nothing to apply` },
   ];
   const f = writeRec(dir, '', 'obs-hist', hist, {
     source: 'observability_review', terminalDisposition: 'noop',
