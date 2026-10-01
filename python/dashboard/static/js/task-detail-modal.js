@@ -542,13 +542,15 @@ function clarifyDiscussRenderPanel(taskId, session) {
   const el = document.getElementById('clarify-discuss-panel');
   if (!el) return;
   const transcriptHtml = grillRenderTranscript(session.transcript, session);
+  const sendDiscussToChatBtn = (label) =>
+    `<button type="button" class="secondary" data-send-discuss-to-chat="${escapeHtml(session.id)}">${label}</button>`;
   if (session.status === 'ended') {
     const actionHtml = session.summary
       ? `<div class="grill-enriched-badge">Added to task ✓ -- re-queued for another resolution attempt with this context.</div>`
       : `<div class="meta" style="margin-top:8px">Ended with nothing said -- task unchanged.</div>`;
-    el.innerHTML = `<div class="grill-session"><div class="field-label">Discussion ended</div>${transcriptHtml}${actionHtml}</div>`;
+    el.innerHTML = `<div class="grill-session"><div class="field-label">Discussion ended</div>${transcriptHtml}${actionHtml}<div style="margin-top:8px">${sendDiscussToChatBtn('Send to Chat')}</div>`;
   } else {
-    el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Say more... (Enter to send, Shift+Enter for a new line)"></textarea><div class="row" style="margin-top:8px"><button type="button" class="secondary" id="clarify-discuss-end">End Discussion</button><button type="button" class="action" id="clarify-discuss-send">Send</button></div></div>`;
+    el.innerHTML = `<div class="grill-session">${transcriptHtml}<textarea class="grill-answer" rows="3" placeholder="Say more... (Enter to send, Shift+Enter for a new line)"></textarea><div class="row" style="margin-top:8px"><button type="button" class="secondary" id="clarify-discuss-end">End Discussion</button><button type="button" class="action" id="clarify-discuss-send">Send</button> ${sendDiscussToChatBtn('Send to Chat')}</div></div>`;
     const answerEl = el.querySelector('.grill-answer');
     const sendBtn = el.querySelector('#clarify-discuss-send');
     const endBtn = el.querySelector('#clarify-discuss-end');
@@ -560,6 +562,37 @@ function clarifyDiscussRenderPanel(taskId, session) {
     };
     answerEl.focus();
   }
+  // "Send to Chat": dumps this Discuss session's transcript into the System Chat panel
+  // as a user message (via sendTextToChat -> POST /api/chat/inject, no model call), same
+  // convention as this file's task header button above: wired here (not inlined in an
+  // onclick) so the payload isn't quote-escaping trouble, and hard-capped at <=200 chars.
+  el.querySelectorAll('[data-send-discuss-to-chat]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        // session may be undefined on the rare re-render paths; fall back to the DOM
+        let text = '';
+        if (session && Array.isArray(session.transcript) && session.transcript.length) {
+          const lines = session.transcript.map((t) => {
+            const role = t.role === 'assistant' ? (session.provider === 'claude' ? 'Claude' : 'Local') : 'You';
+            return `${role}: ${String(t.text || '')}`;
+          });
+          text = lines.join('\n\n');
+        } else {
+          const node = el.querySelector('.grill-transcript');
+          if (node) text = (node.innerText || node.textContent || '').trim();
+        }
+        if (!text) { showToast('Nothing to send -- the session transcript is empty.'); return; }
+        if (text.length > 200) text = text.slice(0, 199) + '…'; // hard cap: sendTextToChat must never receive >200 chars
+        await sendTextToChat(text); // POSTs { text } to /api/chat/inject, no model call
+        showToast('Sent to chat', 'info');
+      } catch (e) {
+        showToast('Could not send to chat: ' + e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  });
   const scrollEl = el.querySelector('.grill-transcript');
   if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
 }
