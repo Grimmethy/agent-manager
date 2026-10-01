@@ -29,6 +29,13 @@ const { windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
 const { isCandidateFulfillmentSource } = require('./local-draft.js');
 const { resolveGroundingRef, readFileAtRef } = require('./stacked-grounding.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
+const { snippetMissingFrom, relocateStaleAnchor } = require('./sdk/lib/file-grounding.js');
+// Repo-wide "find the one file this snippet actually moved to" primitive. HUB0112's plan text
+// pointed at fabricated-path-recheck-sweep.js, but that module only exports
+// sweepFabricatedPathRecheck/ENTRY -- its actual repo search (resolveCitedFileAtMain) is a
+// git origin/<main> probe, not a snippet search. The snippet-search primitive that file
+// depends on is relocateStaleAnchor in sdk/lib/file-grounding.js (the same one
+// known-fixed-failures.js#citedCodeMovedAndRelocatable follows), imported from there.
 
 const FLAG_TTL_MS = Number(process.env.AGENT_MANAGER_CONTEXT_TRIM_SWEEP_FLAG_TTL_DAYS || 3) * 24 * 60 * 60 * 1000;
 const KEEP_COOLDOWN_MS = Number(process.env.AGENT_MANAGER_CONTEXT_TRIM_SWEEP_KEEP_COOLDOWN_DAYS || 21) * 24 * 60 * 60 * 1000;
@@ -196,6 +203,48 @@ async function sweep({ pipelineDir, repoRoot, dryRun = false, now = Date.now() }
         newFetchedByPath.set(entry.path, windowed);
         const improvement = describeImprovement(entry, windowed);
         if (improvement) improvements.push(improvement);
+      }
+
+      // 2026-09-23, HUB0112 (1/3): before declaring a task stale-grounding-unrecoverable,
+      // check whether its cited code simply MOVED: snippetMissingFrom says the Snippet is
+      // genuinely gone from a cited file (not a low-confidence window -- a file can window
+      // "strong" through symbols that merely occur elsewhere in it), and relocateStaleAnchor
+      // finds the ONE file the snippet moved to. A confirmed hit re-points the Files:
+      // citation in-place so the re-anchor pass below re-windows against the new home; only
+      // when the snippet is found nowhere does the flag fall through to the original path.
+      // Mirrors known-fixed-failures.js#citedCodeMovedAndRelocatable (same two primitives).
+      if (improvements.length === 0 && !dryRun && body) {
+        for (const entry of declared) {
+          if (!entry.path) continue;
+          let liveText = null;
+          try {
+            liveText = fs.readFileSync(path.resolve(repoRoot, entry.path), 'utf8');
+          } catch { liveText = ''; } // a deleted/renamed cited file counts as "the snippet is not there"
+          if (!snippetMissingFrom(liveText, body)) continue;
+          const hit = relocateStaleAnchor(repoRoot, entry.path, body);
+          if (!hit || hit.path === entry.path) continue;
+          // In-place mutation of the SAME fetchedFiles object (not a copy): downstream
+          // readers of task.promptContext.fetchedFiles see the corrected citation, and the
+          // re-anchor pass just above this loop already ran -- re-run it for this entry now
+          // so improvements/newFetchedByPath reflect the corrected path before the flag
+          // decision below.
+          entry.path = hit.path;
+          entry.content = hit.content;
+          entry.anchorConfidence = null;
+          const result = reAnchorFile(repoRoot, entry, body, task);
+          if (result) {
+            const { windowed } = result;
+            if (windowed.confidence === 'strong') anyStrong = true;
+            newFetchedByPath.set(entry.path, windowed);
+            entry.anchorConfidence = windowed.confidence;
+            const improvement = describeImprovement({ path: entry.path, usedSnippetFuzzyMatch: false, anchorConfidence: 'none', content: '' }, windowed);
+            if (improvement) improvements.push(improvement);
+            else improvements.push(`cited Files: path corrected to ${entry.path} (snippet absent from old citation)`);
+          }
+          appendHistoryEvent(task, 'advisory',
+            `context-trim citation auto-correction: Snippet absent from cited path; relocated to ${hit.path}`.slice(0, 400));
+          break; // one correction per task per tick; the requeue path below will carry it
+        }
       }
 
       const attempts = Number(task.contextTrimAttempts || 0);
