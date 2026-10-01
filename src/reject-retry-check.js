@@ -600,6 +600,99 @@ function handleExhaustion({ task, name, sourceDir, needsClarificationDir, deepDi
   return 'stamped';
 }
 
+// selectFeedbackBranch / buildFeedbackString: the "what does the next pass see" policy for a requeued blocked task, extracted from rejectRetryCheck's
+// inline 12-branch `if / else if` feedback chain. The chain was EXCLUSIVE -- only the first matching branch ran, and only that branch's field deletion --
+// so the choice is made ONCE, here, in precedence order, and both the feedback text (buildFeedbackString) and the field cleanup in rejectRetryCheck follow
+// that single decision. (The first extraction re-wrapped each branch's deletion in its own independent `if`, so a task matching several conditions had
+// several cleanups run, e.g. a continuation that also carried a rescoped scope overwrote promptContext.rawText, and a pointed feedback field was
+// deleted without ever being shown.) Both functions are pure: no mutation, no I/O.
+//   continuation > rescoped-from-decompose > turn-budget-exhausted > adhoc-diff-substance > adhoc-no-changes-claim > infra-error-note >
+//   malformed-decompose JSON > pre-critique block > pre-implement block > draft-call failure > plan-degenerate > default
+function selectFeedbackBranch({ task, isContinuation, retryableDraftBlock, preCritiqueBlock, preImplementBlock, draftFailureBlock, planDegenerateBlock }) {
+  if (isContinuation) return 'continuation';
+  if (retryableDraftBlock && task.rescopedFromDecompose === true && typeof task.rescopedRawText === 'string' && task.rescopedRawText.trim()) return 'rescoped';
+  if (retryableDraftBlock && task.turnBudgetExhausted === true) return 'turn-budget';
+  if (retryableDraftBlock && typeof task.adhocDiffSubstanceFeedback === 'string' && task.adhocDiffSubstanceFeedback.trim()) return 'diff-substance';
+  if (retryableDraftBlock && typeof task.adhocNoChangesClaimFeedback === 'string' && task.adhocNoChangesClaimFeedback.trim()) return 'no-changes-claim';
+  if (retryableDraftBlock && typeof task.infraErrorNote === 'string' && task.infraErrorNote.trim()) return 'infra-error';
+  if (retryableDraftBlock) return 'malformed-decompose';
+  if (preCritiqueBlock) return 'pre-critique';
+  if (preImplementBlock) return 'pre-implement';
+  if (draftFailureBlock) return 'draft-failure';
+  if (planDegenerateBlock) return 'plan-degenerate';
+  return 'default';
+}
+
+function buildFeedbackString(ctx) {
+  const { task } = ctx;
+  const branch = ctx.branch || selectFeedbackBranch(ctx);
+  switch (branch) {
+    case 'continuation':
+    return [
+      'This is a CONTINUATION, not a fresh start. A prior pass got partway through and ran out of turns. It reported this remaining work:',
+      '',
+      String(task.agenticContinuationNote || '').slice(0, 4000),
+      task.priorPartialDiff
+        ? '\nThe edits it already made are ALREADY APPLIED to your worktree as uncommitted changes (agentic-draft-common.js applies the carried diff before you start). Run git diff / read the files to confirm what is there; do NOT redo those edits -- build on them.'
+        : '',
+      '',
+      'Start editing with edit_file/write_file within your first 1-2 turns from where it left off. Finish the remaining work and end with RESOLUTION: implemented.',
+    ].filter(Boolean).join('\n');
+    case 'rescoped':
+    return `A prior pass decided this task's real scope is exactly: ${task.rescopedRawText}\nThat is the task now. Implement THAT with edit_file/write_file in this pass. Do not decompose again.`;
+    case 'turn-budget':
+    return 'A prior attempt spent its whole turn budget exploring and made ZERO edits. Do not re-explore from scratch: the PLAN and PRIOR INVESTIGATION are already in your prompt -- use them, get to a concrete edit_file within the first few turns, and answer RESOLUTION: decompose if the task is genuinely too large to finish in one pass.';
+    case 'diff-substance':
+    return task.adhocDiffSubstanceFeedback;
+    case 'no-changes-claim':
+    return task.adhocNoChangesClaimFeedback;
+    case 'infra-error':
+    return [
+      'A prior attempt hit a tool/environment failure (not a design question):',
+      '',
+      String(task.infraErrorNote).slice(0, 3000),
+      '',
+      'Retry the operation from a clean pass. If a command genuinely fails identically again, end with RESOLUTION: needs-human-decision and BLOCKER-TYPE: infra-error, quoting the exact command and its full error output.',
+    ].join('\n');
+    case 'malformed-decompose':
+    return 'A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.';
+    case 'pre-critique':
+    return [
+      'A prior implementation was blocked before review because it cited a file that does not actually exist in the repo:',
+      '',
+      String(task.blockedReason || ''),
+      '',
+      'Only reference files that are actually present in the repo (verify with a tool call before citing one). If this task genuinely requires a brand-new file, create it with write_file/edit_file in create mode -- do not just describe or reference it as if it already exists.',
+    ].join('\n');
+    case 'pre-implement':
+    return [
+      'A prior plan was blocked before implementation because it named an edit target that does not actually exist in the repo:',
+      '',
+      String(task.blockedReason || ''),
+      '',
+      'Only declare edit targets that are actually present in the repo (verify with a tool call before naming one). If this task genuinely requires a brand-new file, say so explicitly (e.g. "create `path`") so it is recognized as a create target, not a citation of an existing file.',
+    ].join('\n');
+    case 'draft-failure':
+    return [
+      'A prior draft attempt failed outright (not a content rejection or a design question) after repeated tries:',
+      '',
+      String(task.blockedReason || ''),
+      '',
+      'Try again from a clean pass.',
+    ].join('\n');
+    case 'plan-degenerate':
+    return [
+      'A prior plan pass produced a degenerate (truncated or empty) plan even after an internal higher-temperature reroll:',
+      '',
+      String(task.blockedReason || ''),
+      '',
+      'Try a fresh plan pass. Keep the plan concrete and complete -- do not truncate mid-thought.',
+    ].join('\n');
+    default:
+    return String(task.blockedReason || '');
+  }
+}
+
 function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
@@ -838,103 +931,53 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       }
 
       const priorFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
-      if (isContinuation) {
-        priorFeedback.push([
-          'This is a CONTINUATION, not a fresh start. A prior pass got partway through and ran out of turns. It reported this remaining work:',
-          '',
-          String(task.agenticContinuationNote || '').slice(0, 4000),
-          task.priorPartialDiff
-            ? '\nThe edits it already made are ALREADY APPLIED to your worktree as uncommitted changes (agentic-draft-common.js applies the carried diff before you start). Run git diff / read the files to confirm what is there; do NOT redo those edits -- build on them.'
-            : '',
-          '',
-          'Start editing with edit_file/write_file within your first 1-2 turns from where it left off. Finish the remaining work and end with RESOLUTION: implemented.',
-        ].filter(Boolean).join('\n'));
-        delete task.agenticContinuationNote;
-        // task.priorPartialDiff is KEPT: the next pass applies it to its fresh worktree (agentic-draft-common.js applyPartialDiff) and clears it
-        // once that pass's captured diff (which then includes it) is accepted.
-        // keep task.isAgenticContinuation + task.agenticContinuationCount for the cap in
-        // agentic-draft-common.js's resolveAgenticDraft on the next pass.
-      } else if (retryableDraftBlock && task.rescopedFromDecompose === true && typeof task.rescopedRawText === 'string' && task.rescopedRawText.trim()) {
-        // resolveAgenticDraft decided this task's real scope is exactly one sub-task the
-        // model proposed. Make that the task now, and tell the next pass to implement it
-        // (not decompose again).
-        task.promptContext = task.promptContext || {};
-        task.promptContext.rawText = task.rescopedRawText;
-        priorFeedback.push(`A prior pass decided this task's real scope is exactly: ${task.rescopedRawText}\nThat is the task now. Implement THAT with edit_file/write_file in this pass. Do not decompose again.`);
-        delete task.rescopedRawText; // keep rescopedFromDecompose set for the escalation cap in resolveAgenticDraft
-      } else if (retryableDraftBlock && task.turnBudgetExhausted === true) {
-        priorFeedback.push('A prior attempt spent its whole turn budget exploring and made ZERO edits. Do not re-explore from scratch: the PLAN and PRIOR INVESTIGATION are already in your prompt -- use them, get to a concrete edit_file within the first few turns, and answer RESOLUTION: decompose if the task is genuinely too large to finish in one pass.');
-      } else if (retryableDraftBlock && typeof task.adhocDiffSubstanceFeedback === 'string' && task.adhocDiffSubstanceFeedback.trim()) {
-        // resolveAgenticDraft (agentic-draft-common.js) found the produced diff was a token
-        // gesture -- an ADR/doc instead of the code, an unrequested delete, or a file the
-        // task explicitly forbids. The feedback names the real target(s).
-        priorFeedback.push(task.adhocDiffSubstanceFeedback);
-        delete task.adhocDiffSubstanceFeedback;
-      } else if (retryableDraftBlock && typeof task.adhocNoChangesClaimFeedback === 'string' && task.adhocNoChangesClaimFeedback.trim()) {
-        // Sibling of the above, for a `no-changes-needed` resolution: no "Already covered:"
-        // citation block, or a named object cited nowhere and grep-findable nowhere. The
-        // feedback names the exact gap. See adhoc-diff-sanity.js.
-        priorFeedback.push(task.adhocNoChangesClaimFeedback);
-        delete task.adhocNoChangesClaimFeedback;
-        // GUARD (coordination-field survival): do NOT add a blanket
-        // `delete task.<coordinationField>` in this requeue branch. Coordination flags
-        // -- e.g. task.decomposeDirective, set by the decompose/rescope path in
-        // agentic-draft-common.js (resolveAgenticDraft) -- must survive here and reach
-        // buildWriteAgenticPrompt (src/local-agentic-write-draft.js) intact. Only the
-        // fields explicitly listed in READMIT_CLEAN_SLATE_FIELDS (line 42 above) are
-        // safe to clear in this branch; decomposeDirective is deliberately not among them.
-      } else if (retryableDraftBlock && typeof task.infraErrorNote === 'string' && task.infraErrorNote.trim()) {
-        // resolveAgenticDraft (agentic-draft-common.js): the model tagged BLOCKER-TYPE:
-        // infra-error -- a tool/command/file-op that should have worked failed, unrelated
-        // to any design decision. A transient fault usually clears on a fresh pass; tell
-        // it what broke and how to escalate if it genuinely reproduces.
-        priorFeedback.push([
-          'A prior attempt hit a tool/environment failure (not a design question):',
-          '',
-          String(task.infraErrorNote).slice(0, 3000),
-          '',
-          'Retry the operation from a clean pass. If a command genuinely fails identically again, end with RESOLUTION: needs-human-decision and BLOCKER-TYPE: infra-error, quoting the exact command and its full error output.',
-        ].join('\n'));
-        delete task.infraErrorNote;
-      } else if (retryableDraftBlock) {
-        priorFeedback.push('A prior attempt chose RESOLUTION: decompose but the sub-task JSON was malformed. If this task is doable in one pass, just implement it. If it genuinely needs splitting, end with EXACTLY "RESOLUTION: decompose" then, on the next lines, a single valid JSON array of 2+ objects each shaped {"title": "...", "rawText": "..."} and nothing else.');
-      } else if (preCritiqueBlock) {
-        priorFeedback.push([
-          'A prior implementation was blocked before review because it cited a file that does not actually exist in the repo:',
-          '',
-          String(task.blockedReason || ''),
-          '',
-          'Only reference files that are actually present in the repo (verify with a tool call before citing one). If this task genuinely requires a brand-new file, create it with write_file/edit_file in create mode -- do not just describe or reference it as if it already exists.',
-        ].join('\n'));
-      } else if (preImplementBlock) {
-        priorFeedback.push([
-          'A prior plan was blocked before implementation because it named an edit target that does not actually exist in the repo:',
-          '',
-          String(task.blockedReason || ''),
-          '',
-          'Only declare edit targets that are actually present in the repo (verify with a tool call before naming one). If this task genuinely requires a brand-new file, say so explicitly (e.g. "create `path`") so it is recognized as a create target, not a citation of an existing file.',
-        ].join('\n'));
-      } else if (draftFailureBlock) {
-        // Reaching here means NOT structurally-oversized (that shape escalated straight to
-        // needs-clarification above, before this point) -- an ordinary content/model-
-        // variance draft-CALL failure, which plausibly differs on a fresh attempt.
-        priorFeedback.push([
-          'A prior draft attempt failed outright (not a content rejection or a design question) after repeated tries:',
-          '',
-          String(task.blockedReason || ''),
-          '',
-          'Try again from a clean pass.',
-        ].join('\n'));
-      } else if (planDegenerateBlock) {
-        priorFeedback.push([
-          'A prior plan pass produced a degenerate (truncated or empty) plan even after an internal higher-temperature reroll:',
-          '',
-          String(task.blockedReason || ''),
-          '',
-          'Try a fresh plan pass. Keep the plan concrete and complete -- do not truncate mid-thought.',
-        ].join('\n'));
-      } else {
-        priorFeedback.push(String(task.blockedReason || ''));
+      // The 12-branch feedback-construction chain (isContinuation, rescoped, turn-budget,
+      // diff-substance, no-changes-claim, infra-error, malformed-JSON, pre-critique,
+      // pre-implement, draft-failure, plan-degenerate, default) and its interleaved
+      // field deletions were extracted to the standalone PURE helper buildFeedbackString
+      // (defined above) -- same 12-branch policy, now unit-testable without asserting
+      // side effects. The string it returns is pushed below; every mutation that used to
+      // be interleaved inside the chain lives in the single cleanup block right after it.
+      const feedbackBranch = selectFeedbackBranch({ task, isContinuation, retryableDraftBlock, preCritiqueBlock, preImplementBlock, draftFailureBlock, planDegenerateBlock });
+      priorFeedback.push(buildFeedbackString({ task, branch: feedbackBranch }));
+      // Cleanup (was interleaved inside the per-branch feedback construction). It follows the SAME single branch decision as the text above, so -- as in the
+      // original `if / else if` chain -- only the branch that actually supplied the feedback clears its own fields; nothing else is touched.
+      switch (feedbackBranch) {
+        case 'continuation':
+          delete task.agenticContinuationNote;
+          // task.priorPartialDiff is KEPT: the next pass applies it to its fresh worktree (agentic-draft-common.js applyPartialDiff) and clears it
+          // once that pass's captured diff (which then includes it) is accepted.
+          // keep task.isAgenticContinuation + task.agenticContinuationCount for the cap in
+          // agentic-draft-common.js's resolveAgenticDraft on the next pass.
+          break;
+        case 'rescoped':
+          // resolveAgenticDraft decided this task's real scope is exactly one sub-task the model proposed. Make that the task now, and tell the next
+          // pass to implement it (not decompose again).
+          task.promptContext = task.promptContext || {};
+          task.promptContext.rawText = task.rescopedRawText;
+          delete task.rescopedRawText; // keep rescopedFromDecompose set for the escalation cap in resolveAgenticDraft
+          break;
+        case 'diff-substance':
+          // resolveAgenticDraft (agentic-draft-common.js) found the produced diff was a token gesture -- an ADR/doc instead of the code, an unrequested
+          // delete, or a file the task explicitly forbids. The feedback names the real target(s).
+          delete task.adhocDiffSubstanceFeedback;
+          break;
+        case 'no-changes-claim':
+          // Sibling of the above, for a `no-changes-needed` resolution: no "Already covered:" citation block, or a named object cited nowhere and
+          // grep-findable nowhere. The feedback names the exact gap. See adhoc-diff-sanity.js.
+          delete task.adhocNoChangesClaimFeedback;
+          // GUARD (coordination-field survival): do NOT add a blanket `delete task.<coordinationField>` in this requeue branch. Coordination flags
+          // (stacked / dependsOn / atomic / noDecompose / decomposeDirective ...) must survive so buildWriteAgenticPrompt
+          // (src/local-agentic-write-draft.js) stays intact. Only the fields explicitly listed in READMIT_CLEAN_SLATE_FIELDS (line 42 above) are
+          // safe to clear in this branch; decomposeDirective is deliberately not among them.
+          break;
+        case 'infra-error':
+          // resolveAgenticDraft (agentic-draft-common.js): the model tagged BLOCKER-TYPE: infra-error -- a tool/command/file-op that should have
+          // worked failed, unrelated to any design decision. A transient fault usually clears on a fresh pass.
+          delete task.infraErrorNote;
+          break;
+        default:
+          break;
       }
       delete task.turnBudgetExhausted;
       delete task.infraErrorRetry;
@@ -1086,7 +1129,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
+module.exports = { selectFeedbackBranch, buildFeedbackString, rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
 
 if (require.main === module) {
   main();
