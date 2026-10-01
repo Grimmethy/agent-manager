@@ -1723,6 +1723,23 @@ async function runDraftPasses(task, attempt, {
         maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
       }, { recordModelCall, attempt });
       if (implementOutcome.done) return implementOutcome.result;
+
+      // Terminal no-op stub (2026-09-17): archImportImplementPrompt (prompts.js) now
+      // instructs the model to respond with exactly "no real file to adapt" when no file
+      // in the harness Real matches list is a valid adaptation target -- the replacement
+      // for the old "output the empty string" instruction the model routinely ignored
+      // while fabricating a plausible-looking file instead (every arch_import requeue in
+      // the window). Treat that exact stub the same way as the deterministic zero-hit
+      // skip just above (skipImplementWhenNoHarnessHits block): resolve it as a terminal,
+      // successful no-op and return BEFORE critique/revision/requeue can touch it -- the
+      // stub is a compliant response, never a fabrication signal.
+      if (typeof task.implementResponse === 'string' && task.implementResponse.trim() === 'no real file to adapt') {
+        task.implementResponse = 'no real file to adapt';
+        recordImplement(attempt, { note: 'no real file to adapt (model stub)' });
+        appendHistoryEvent(task, 'implement-done', 'no real file to adapt -- terminal no-op, no requeue');
+        concludeDraft(task);
+        return { done: true, result: { succeeded: true, blocked: false } };
+      }
     }
 
     // Hard pre-critique guard (2026-09-16, recovering a real approved-but-lost fix --

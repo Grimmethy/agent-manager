@@ -147,5 +147,82 @@ class RequeuePreservesCoordinationFieldsTest(unittest.TestCase):
         self.assertNotIn("noDecompose", requeued, "a task that never carried noDecompose must not gain one")
 
 
+    # 2026-09-17, arch_import requeue burn: archImportImplementPrompt (src/prompts.js)
+    # now forbids naming any file outside the fact-check Real-matches list and tells the
+    # model to respond with exactly "no real file to adapt" when no listed file fits.
+    # src/local-draft.js must treat that stub as a TERMINAL SUCCESSFUL no-op (same shape
+    # as the skipImplementWhenNoHarnessHits zero-hit block) so it never reaches
+    # critique/requeue/re-draft -- the single largest avoidable cost in this window.
+    # A stub that got flagged blocked/requeued would re-enter the exact requeue loop
+    # this change exists to stop.
+    def test_no_real_file_to_adapt_stub_is_terminal_noop_not_requeued(self):
+        import re
+
+        draft_js = (self.pipeline_dir.parent.parent / "src" / "local-draft.js").resolve()
+        # The draft path may legitimately live one directory above this repo in an
+        # in-place checkout; fall back to the file's own repo root either way.
+        if not draft_js.is_file():
+            draft_js = (Path(__file__).parent.parent.parent / "src" / "local-draft.js")
+        text = draft_js.read_text(encoding="utf-8")
+
+        # (a) The stub guard exists in the draft path.
+        self.assertIn(
+            "implementResponse.trim() === 'no real file to adapt'",
+            text,
+            "local-draft.js must special-case the 'no real file to adapt' stub",
+        )
+        # (b) It is a TERMINAL no-op: resolved successful/unblocked, exactly like the
+        #     zero-hit skip, with no blockedReason attached.
+        self.assertRegex(
+            text,
+            r"no real file to adapt.*?\{ succeeded: true, blocked: false \}",
+            "the stub must resolve as { succeeded: true, blocked: false }, a terminal no-op",
+        )
+        self.assertNotRegex(
+            text,
+            r"no real file to adapt[^;]*blockedReason",
+            "the stub must never be stamped with a blockedReason (that would feed the requeue loop)",
+        )
+        # (c) It short-circuits BEFORE critique/requeue: the guard's concludeDraft +
+        #     return sit between the implement pass and runCritiqueAndRevision.
+        guard_idx = text.find("no real file to adapt")
+        critique_idx = text.find("runCritiqueAndRevision(task, {")
+        self.assertGreater(guard_idx, -1, "stub guard present")
+        self.assertGreater(critique_idx, guard_idx,
+                           "the stub guard must fire before critique/requeue")
+        # (d) The prompt itself carries both halves: the file-naming prohibition and
+        #     the stub instruction (no more "output the empty string" escape).
+        prompts_js = draft_js.parent / "prompts.js"
+        ptext = prompts_js.read_text(encoding="utf-8")
+        fn_start = ptext.find("function archImportImplementPrompt(")
+        self.assertGreater(fn_start, -1)
+        fn = ptext[fn_start: ptext.find("\n// ", fn_start)]
+        self.assertIn("MUST NOT name", fn)
+        self.assertIn("no real file to adapt", fn)
+        self.assertNotIn("output the empty string", fn,
+                         "the old empty-string escape must be gone from archImportImplementPrompt")
+        # (e) The zero-hit skip the guard mirrors is untouched.
+        self.assertIn("skipImplementOnNoHits", text)
+        self.assertRegex(text, r"skipImplementOnNoHits && Array\.isArray\(task\.promptContext\.harnessHits\)\s*&& task\.promptContext\.harnessHits\.length === 0")
+        # (f) The stub must NOT ride the requeue endpoint: a task parked blocked for
+        #     any other reason requeues as before (existing behavior), and the requeued
+        #     copy still carries blockedReason -- i.e. the requeue path is not what
+        #     disposes the stub, the draft path above is.
+        task_id = "adhoc-arch-import-stub-1"
+        self._write_blocked(task_id, {
+            "id": task_id, "domain": "arch", "source": "arch_import", "title": "import finding",
+            "promptContext": {"harnessHits": [{"file": "src/prompts.js", "line": 581}]},
+            "implementResponse": "no real file to adapt",
+            "blockedReason": "unrelated blocked reason, not the stub",
+        })
+        resp = self.client.post(f"/api/task/blocked/{task_id}/requeue")
+        self.assertEqual(resp.status_code, 200)
+        requeued = json.loads((self.pipeline_dir / "queue" / "pending" / f"{task_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual(requeued.get("implementResponse"), "no real file to adapt",
+                         "the stub text must survive an incidental requeue of an otherwise-blocked task")
+        self.assertEqual(requeued.get("blockedReason"), "unrelated blocked reason, not the stub",
+                         "requeue semantics are unchanged -- the stub's terminal handling lives in the draft path, not here")
+
+
 if __name__ == "__main__":
     unittest.main()
