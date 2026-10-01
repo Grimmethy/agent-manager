@@ -57,3 +57,5 @@ The prior passes concluded the Q1/Q2/Q3 field-level evidence was reachable only 
 ## State of the field-level gap
 
 Q1/Q2/Q3 remain honestly marked **undetermined** (not fabricated) — verbatim field-level evidence (timeline-entry actor/creator enums, Slack↔timeline cross-link fields) was **not extractable in this pass** because the static-mirror paths above are leads, not yet-confirmed URLs. The blocker is now a *bounded fetch task* (one confirmed file from each of the two public repos), not a JS-execution infra constraint.
+
+> **Follow-up:** See `dspy-chain-of-thought.md` (this directory) for the DSPy ChainOfThought comparison and the three structural reasons agent-manager's two-call shape is the correct fit for this codebase's constraints.
