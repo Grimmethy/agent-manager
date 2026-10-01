@@ -131,6 +131,17 @@ test('resolveDisposition: a no-op verdict apply -> noop', () => {
   }
 });
 
+test('resolveDisposition: the noop detail it writes says "no-op verdict", never "no-op apply"', () => {
+  const out = resolveDisposition({ id: 'x', ...applied('no candidates in implement response -- nothing to apply') }, { ctx: ctx() });
+  assert.equal(out.stage, 'noop');
+  assert.match(out.detail, /^no-op verdict: no candidates in implement response/);
+  assert.doesNotMatch(out.detail, /no-op apply/);
+  const long = resolveDisposition({ id: 'x', ...applied(`no candidates in implement response -- nothing to apply ${'x'.repeat(400)}`) }, { ctx: ctx() });
+  assert.equal(long.stage, 'noop');
+  assert.equal(long.detail.length, 200, 'a long applied detail is cut to 200 characters');
+  assert.match(long.detail, /^no-op verdict: /);
+});
+
 test('resolveDisposition: an unclassifiable non-branch apply detail -> noop, never abandoned', () => {
   const out = resolveDisposition({ id: 'weird', ...applied('suggested 0 path(s) for adhoc-brain-dump-x') }, { ctx: ctx() });
   assert.equal(out.stage, 'noop');
@@ -178,20 +189,23 @@ test('resolveDisposition: the FALSE POSITIVE fallback is gated to *_review sourc
   assert.equal(resolveDisposition(r, { ctx: ctx() }).stage, 'noop');
 });
 
-test('resolveDisposition: allowReopenFrom re-resolves a noop tail to dismissed, only when passed', () => {
-  const r = {
-    id: 'obs-r-3', source: 'observability_review',
-    history: [
-      { stage: 'created' },
-      { stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' },
-      { stage: 'noop', detail: 'no-op apply' },
-    ],
-    implementResponse: 'FALSE POSITIVE — the except binds e and the documented contract returns None.',
-  };
-  assert.equal(resolveDisposition(r, { ctx: ctx() }), null, 'noop tail is stable without the opt-in');
-  const out = resolveDisposition(r, { ctx: ctx(), allowReopenFrom: new Set(['noop']) });
-  assert.equal(out.stage, 'dismissed');
-});
+// Records written before 2026-10-01 say 'no-op apply'; new ones say 'no-op verdict'. Nothing may depend on which.
+for (const wording of ['no-op apply', 'no-op verdict']) {
+  test(`resolveDisposition: allowReopenFrom re-resolves a noop tail to dismissed, only when passed (persisted wording "${wording}")`, () => {
+    const r = {
+      id: 'obs-r-3', source: 'observability_review',
+      history: [
+        { stage: 'created' },
+        { stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' },
+        { stage: 'noop', detail: wording },
+      ],
+      implementResponse: 'FALSE POSITIVE — the except binds e and the documented contract returns None.',
+    };
+    assert.equal(resolveDisposition(r, { ctx: ctx() }), null, 'noop tail is stable without the opt-in');
+    const out = resolveDisposition(r, { ctx: ctx(), allowReopenFrom: new Set(['noop']) });
+    assert.equal(out.stage, 'dismissed');
+  });
+}
 
 test('resolveDisposition: allowReopenFrom does not re-open merged/filed/etc', () => {
   const r = { id: 't', source: 'observability_review', history: [{ stage: 'applied', detail: 'x' }, { stage: 'merged', detail: 'y' }] };

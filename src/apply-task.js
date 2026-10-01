@@ -566,7 +566,9 @@ function recordApplyOutcome(task, result) {
     const isReviewSource = /_review(_digest)?$/.test(String(resolveSourceName(task) || ''));
     if (!isReviewSource) {
       task.terminalDisposition = 'noop';
-      appendHistoryEvent(task, 'noop', `no-op apply: ${String(marker || '').slice(0, 200)}`);
+      // Says "verdict", not "apply": noop is a triage/verdict outcome, not a change application (brain dump: 18 of 25 triage tasks read 'noop: no-op apply').
+      // Records written before 2026-10-01 carry the old wording; nothing matches on this text, so both read the same.
+      appendHistoryEvent(task, 'noop', `no-op verdict: ${String(marker || '').slice(0, 200)}`);
     }
   }
   return applyStage;

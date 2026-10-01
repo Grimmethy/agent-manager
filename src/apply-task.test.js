@@ -1124,7 +1124,15 @@ test('recordApplyOutcome stamps a terminal noop event + terminalDisposition for 
   assert.equal(task.terminalDisposition, 'noop');
   const stages = task.history.map((h) => h.stage);
   assert.deepEqual(stages, ['applied', 'noop']);
-  assert.match(task.history[1].detail, /no-op apply: no candidates/);
+  assert.match(task.history[1].detail, /^no-op verdict: no candidates/);
+  assert.doesNotMatch(task.history[1].detail, /no-op apply/, 'the writer no longer calls a triage outcome an apply');
+});
+
+test('recordApplyOutcome cuts the marker it copies into the noop event to 200 characters', () => {
+  const task = { id: 'noop-long', source: 'adhoc', history: [] };
+  recordApplyOutcome(task, { succeeded: true, doneMarker: `no candidates in implement response -- nothing to apply ${'y'.repeat(500)}` });
+  const detail = task.history.find((h) => h.stage === 'noop').detail;
+  assert.equal(detail.length, 'no-op verdict: '.length + 200);
 });
 
 test('recordApplyOutcome does NOT stamp noop for a real branch apply', () => {
