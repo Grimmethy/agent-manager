@@ -559,6 +559,140 @@ function resolveDecomposeMany(ctx) {
   return { succeeded: true, blocked: false, ...meta };
 }
 
+// The RESOLUTION: needs-human-decision branch -- authoritative BLOCKER-TYPE handling,
+// re-run-pattern check, continuation-budget logic, and the clarification fallback --
+// extracted verbatim from resolveAgenticDraft (HUB0080 3/3) so every branch is a named,
+// independently testable helper. `resolution` is fixed here: the dispatch above only
+// routes into this function for that exact verb.
+function resolveNeedsHuman(ctx) {
+  const { task, result, summary, meta, bestEffortDiff } = ctx;
+  const resolution = 'needs-human-decision';
+  const capturedDiff = bestEffortDiff();
+  const continuations = Number(task.agenticContinuationCount) || 0;
+  const blockerTypeMatch = BLOCKER_TYPE_RE.exec(summary);
+  const blockerType = blockerTypeMatch ? blockerTypeMatch[1].toLowerCase() : null;
+
+  // Authoritative: the model explicitly tagged this BLOCKER-TYPE: budget-exhausted --
+  // skip the phrase/structure heuristics below entirely (they exist only as a fallback
+  // for a response that, for whatever reason, doesn't carry the tag) and route it as a
+  // retryable block regardless of whether partial work landed, since neither of those
+  // heuristics' own structural gates (forcedSummary, capturedDiff) are reliable
+  // predictors of "did the model mean budget exhaustion" -- the tag itself already says.
+  if (blockerType === 'budget-exhausted') {
+    if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+      task.agenticContinuationCount = continuations + 1;
+      task.agenticContinuationNote = summary;
+      task.priorPartialDiff = capturedDiff;
+      task.retryableDraftBlock = true;
+      task.isAgenticContinuation = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass tagged BLOCKER-TYPE: budget-exhausted with partial work landed -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
+        ...meta,
+        capturedDiff,
+      };
+    }
+    task.turnBudgetExhausted = true;
+    task.retryableDraftBlock = true;
+    task.turnBudgetExhaustedBefore = true;
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: 'Agentic implement pass tagged BLOCKER-TYPE: budget-exhausted -- explicit, not a real design question, requeued for a clean retry',
+      ...meta,
+      capturedDiff: undefined,
+    };
+  }
+
+  // Authoritative, exactly like budget-exhausted above: the model explicitly tagged a
+  // tool/environment failure (a command that should have worked did not, a file op
+  // failed) unrelated to any decision. A transient infra fault is worth a bounded retry,
+  // NOT a human hold -- without this it fell through to the needsClarification return
+  // below and local-draft.js stamped reason:'design-decision' on it, dead-ending it in
+  // queue/needs-clarification/ where nothing retries it (the same pre-fix dead-end
+  // budget-exhausted had). Deliberately does NOT set turnBudgetExhausted -- that flag
+  // carries "over-explored, edit sooner" grounding + unlocks decompose for a leaf, wrong
+  // for an infra fault. reject-retry-check.js bounds it by MAX_LOCAL_REJECT_RETRIES and,
+  // on exhaustion, escalates with reason:'infra-error' (not design-decision).
+  if (blockerType === 'infra-error') {
+    if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
+      task.agenticContinuationCount = continuations + 1;
+      task.agenticContinuationNote = summary;
+      task.priorPartialDiff = capturedDiff;
+      task.retryableDraftBlock = true;
+      task.isAgenticContinuation = true;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass tagged BLOCKER-TYPE: infra-error with partial work landed -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
+        ...meta,
+        capturedDiff,
+      };
+    }
+    task.infraErrorRetry = true;
+    task.infraErrorBefore = true;
+    task.infraErrorNote = summary;
+    task.retryableDraftBlock = true;
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: 'Agentic implement pass tagged BLOCKER-TYPE: infra-error -- a tool/environment failure, not a design question, requeued for a clean retry',
+      ...meta,
+      capturedDiff: undefined,
+    };
+  }
+
+  // Zero edits, empty worktree, forced final turn, and the summary itself says "re-run
+  // me / ran out of turns / no design question": this is turn-budget exhaustion on
+  // orientation dressed up as a clarification, NOT a real open question. The `!resolution`
+  // branch above already treats the identical state (forcedSummary + edits===0 +
+  // !capturedDiff) as a clean retryable block; a polite `RESOLUTION: needs-human-decision`
+  // on the forced turn must not route it to a human instead. Same three flags, so
+  // reject-retry-check.js requeues it (bounded by MAX_LOCAL_REJECT_RETRIES) with the
+  // "use the plan, get to edit_file fast, decompose if genuinely too big" grounding,
+  // and turnBudgetExhaustedBefore unlocks RESOLUTION: decompose for a leaf that keeps
+  // stalling -- instead of dead-ending in needs-clarification/ where nothing retries a
+  // reason:'design-decision' hold. Root-caused live via the POST /api/plugins/install
+  // task (7137-line app.py, 0 edits across attempts, "No design decisions remain").
+  const editCalls = ((result && result.toolCallLog) || [])
+    .filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
+  if (result && result.forcedSummary && editCalls === 0 && !capturedDiff
+      && RERUN_NOT_A_QUESTION_RE.test(summary)) {
+    task.turnBudgetExhausted = true;
+    task.retryableDraftBlock = true;
+    task.turnBudgetExhaustedBefore = true;
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: 'Agentic implement pass ended RESOLUTION: needs-human-decision with zero edits and a re-run request -- exhausted its turn budget on orientation, not a real design question',
+      ...meta,
+      capturedDiff: undefined,
+    };
+  }
+
+  // "Re-run me", not a real question -- see MAX_AGENTIC_CONTINUATIONS. Only when real
+  // partial work landed (an empty worktree here is a genuine "I could not even start").
+  if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS && RERUN_NOT_A_QUESTION_RE.test(summary)) {
+    task.agenticContinuationCount = continuations + 1;
+    task.agenticContinuationNote = summary;
+    task.priorPartialDiff = capturedDiff;
+    task.retryableDraftBlock = true;
+    task.isAgenticContinuation = true;
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `Agentic implement pass ran out of turns mid-implementation with partial work landed and no real design question -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
+      ...meta,
+      capturedDiff,
+    };
+  }
+  task.adhocResolution = resolution;
+  task.rawDiff = '';
+  task.implementResponse = summary;
+  return { succeeded: true, blocked: false, needsClarification: true, ...meta };
+}
+
 // Maps a finished agentic result onto `task` (implementResponse, rawDiff, adhocResolution,
 // subTaskProposals, needsClarification) and returns a draftTask-shaped verdict. Provider-
 // neutral: reads only `result.response` / `result.degenerate` and stages the worktree's
@@ -650,130 +784,7 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   }
 
   if (resolution === 'needs-human-decision') {
-    const capturedDiff = bestEffortDiff();
-    const continuations = Number(task.agenticContinuationCount) || 0;
-    const blockerTypeMatch = BLOCKER_TYPE_RE.exec(summary);
-    const blockerType = blockerTypeMatch ? blockerTypeMatch[1].toLowerCase() : null;
-
-    // Authoritative: the model explicitly tagged this BLOCKER-TYPE: budget-exhausted --
-    // skip the phrase/structure heuristics below entirely (they exist only as a fallback
-    // for a response that, for whatever reason, doesn't carry the tag) and route it as a
-    // retryable block regardless of whether partial work landed, since neither of those
-    // heuristics' own structural gates (forcedSummary, capturedDiff) are reliable
-    // predictors of "did the model mean budget exhaustion" -- the tag itself already says.
-    if (blockerType === 'budget-exhausted') {
-      if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
-        task.agenticContinuationCount = continuations + 1;
-        task.agenticContinuationNote = summary;
-        task.priorPartialDiff = capturedDiff;
-        task.retryableDraftBlock = true;
-        task.isAgenticContinuation = true;
-        return {
-          succeeded: true,
-          blocked: true,
-          blockedReason: `Agentic implement pass tagged BLOCKER-TYPE: budget-exhausted with partial work landed -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
-          ...meta,
-          capturedDiff,
-        };
-      }
-      task.turnBudgetExhausted = true;
-      task.retryableDraftBlock = true;
-      task.turnBudgetExhaustedBefore = true;
-      return {
-        succeeded: true,
-        blocked: true,
-        blockedReason: 'Agentic implement pass tagged BLOCKER-TYPE: budget-exhausted -- explicit, not a real design question, requeued for a clean retry',
-        ...meta,
-        capturedDiff: undefined,
-      };
-    }
-
-    // Authoritative, exactly like budget-exhausted above: the model explicitly tagged a
-    // tool/environment failure (a command that should have worked did not, a file op
-    // failed) unrelated to any decision. A transient infra fault is worth a bounded retry,
-    // NOT a human hold -- without this it fell through to the needsClarification return
-    // below and local-draft.js stamped reason:'design-decision' on it, dead-ending it in
-    // queue/needs-clarification/ where nothing retries it (the same pre-fix dead-end
-    // budget-exhausted had). Deliberately does NOT set turnBudgetExhausted -- that flag
-    // carries "over-explored, edit sooner" grounding + unlocks decompose for a leaf, wrong
-    // for an infra fault. reject-retry-check.js bounds it by MAX_LOCAL_REJECT_RETRIES and,
-    // on exhaustion, escalates with reason:'infra-error' (not design-decision).
-    if (blockerType === 'infra-error') {
-      if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS) {
-        task.agenticContinuationCount = continuations + 1;
-        task.agenticContinuationNote = summary;
-        task.priorPartialDiff = capturedDiff;
-        task.retryableDraftBlock = true;
-        task.isAgenticContinuation = true;
-        return {
-          succeeded: true,
-          blocked: true,
-          blockedReason: `Agentic implement pass tagged BLOCKER-TYPE: infra-error with partial work landed -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
-          ...meta,
-          capturedDiff,
-        };
-      }
-      task.infraErrorRetry = true;
-      task.infraErrorBefore = true;
-      task.infraErrorNote = summary;
-      task.retryableDraftBlock = true;
-      return {
-        succeeded: true,
-        blocked: true,
-        blockedReason: 'Agentic implement pass tagged BLOCKER-TYPE: infra-error -- a tool/environment failure, not a design question, requeued for a clean retry',
-        ...meta,
-        capturedDiff: undefined,
-      };
-    }
-
-    // Zero edits, empty worktree, forced final turn, and the summary itself says "re-run
-    // me / ran out of turns / no design question": this is turn-budget exhaustion on
-    // orientation dressed up as a clarification, NOT a real open question. The `!resolution`
-    // branch above already treats the identical state (forcedSummary + edits===0 +
-    // !capturedDiff) as a clean retryable block; a polite `RESOLUTION: needs-human-decision`
-    // on the forced turn must not route it to a human instead. Same three flags, so
-    // reject-retry-check.js requeues it (bounded by MAX_LOCAL_REJECT_RETRIES) with the
-    // "use the plan, get to edit_file fast, decompose if genuinely too big" grounding,
-    // and turnBudgetExhaustedBefore unlocks RESOLUTION: decompose for a leaf that keeps
-    // stalling -- instead of dead-ending in needs-clarification/ where nothing retries a
-    // reason:'design-decision' hold. Root-caused live via the POST /api/plugins/install
-    // task (7137-line app.py, 0 edits across attempts, "No design decisions remain").
-    const editCalls = ((result && result.toolCallLog) || [])
-      .filter((c) => c && /^(edit_file|write_file)$/.test(c.tool)).length;
-    if (result && result.forcedSummary && editCalls === 0 && !capturedDiff
-        && RERUN_NOT_A_QUESTION_RE.test(summary)) {
-      task.turnBudgetExhausted = true;
-      task.retryableDraftBlock = true;
-      task.turnBudgetExhaustedBefore = true;
-      return {
-        succeeded: true,
-        blocked: true,
-        blockedReason: 'Agentic implement pass ended RESOLUTION: needs-human-decision with zero edits and a re-run request -- exhausted its turn budget on orientation, not a real design question',
-        ...meta,
-        capturedDiff: undefined,
-      };
-    }
-
-    // "Re-run me", not a real question -- see MAX_AGENTIC_CONTINUATIONS. Only when real
-    // partial work landed (an empty worktree here is a genuine "I could not even start").
-    if (capturedDiff && continuations < MAX_AGENTIC_CONTINUATIONS && RERUN_NOT_A_QUESTION_RE.test(summary)) {
-      task.agenticContinuationCount = continuations + 1;
-      task.agenticContinuationNote = summary;
-      task.priorPartialDiff = capturedDiff;
-      task.retryableDraftBlock = true;
-      task.isAgenticContinuation = true;
-      return {
-        succeeded: true,
-        blocked: true,
-        blockedReason: `Agentic implement pass ran out of turns mid-implementation with partial work landed and no real design question -- requeued as continuation ${task.agenticContinuationCount}/${MAX_AGENTIC_CONTINUATIONS}`,
-        ...meta,
-        capturedDiff,
-      };
-    }
-    task.adhocResolution = resolution;
-    task.rawDiff = '';
-    task.implementResponse = summary;
-    return { succeeded: true, blocked: false, needsClarification: true, ...meta };
+    return resolveNeedsHuman(ctx);
   }
 
   // implemented | no-changes-needed -- capture whatever actually landed in the worktree.
