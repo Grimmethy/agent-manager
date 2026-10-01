@@ -1227,6 +1227,34 @@ test('draftTask runs harness search iff the source declares harnessSearch, and p
   });
 });
 
+// Brain dump #1663: a project search where EVERY query errored with a transient failure (DNS down, timeouts) did not run. It must stop as network_unavailable --
+// no implement/critique/review spent on a fake "0 results", and no draft attempt consumed -- not carry on. (runHarnessSearch's offline gate uses the real connectivity
+// probe, so this skips on a machine with no network, like the harness-search test above relies on one.)
+const { isOnline: __isOnlineForSearchTest } = require('./connectivity-check.js');
+test('draftTask: a project search where every query errored is blocked as network_unavailable, never implemented, and uses no draft attempt', { skip: !__isOnlineForSearchTest({ forceRefresh: true }) && 'no network for the connectivity probe' }, async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    registerTaskSource('psearch_down_probe', { priority: 80, next: () => null, emptyApproval: true, harnessSearch: 'projectSearch' });
+    updateTaskSource('psearch_down_probe', { buildPlanPrompt: p.archImportPlanPrompt, buildImplementPrompt: p.archImportImplementPrompt });
+    const projectSearchFetch = async () => [{ query: 'a', source: 'github', error: 'getaddrinfo ENOTFOUND api.github.com' }, { query: 'a', source: 'huggingface', error: 'request timed out' }];
+    let calls = 0;
+    const localCall = async () => {
+      calls += 1;
+      if (calls > 1) throw new Error('implement must never run when the search did not run');
+      return { response: 'QUERY: some query\nQUERY: another', degenerate: null, attempts: 1 };
+    };
+    const task = { id: 'psearch-down', domain: 'default', source: 'psearch_down_probe', title: 't', promptContext: {} };
+    const result = await draftTask(task, { localCall, projectSearchFetch, withLockFn: async (d, fn) => fn() });
+    assert.equal(result.blocked, true);
+    assert.equal(result.blockedReason, 'network_unavailable');
+    assert.equal(calls, 1, 'only the plan call happened');
+    assert.equal(task.draftAttempts, undefined, 'a network_unavailable block does not consume a draft attempt');
+    assert.deepEqual(task.promptContext.searchResults, []);
+    assert.match((task.history || []).find((e) => e.stage === 'harness-search').detail, /the search did not run \(2 of 2 results errored/);
+  });
+});
+
 // Cross-repo (2026-09-04): an 'archImport'-kind source's harness search must ALSO reach a
 // loaded plugin repo -- root-caused via a stuck adhoc task whose real fix site lived
 // entirely in agent-manager-hygiene. Real fetch (not faked, unlike projectSearchFetch

@@ -114,6 +114,28 @@ function parseHarnessQueries(planResponse) {
   return [...(planResponse || '').matchAll(/^QUERY:\s*(.+)$/gm)].map((m) => m[1].trim()).filter(Boolean);
 }
 
+// A project search where EVERY query result is a transient error did not run: nothing was searched, so there is nothing to implement from and "0 results" would be
+// a lie. Brain dump #1663: of 102 recorded project_search runs, 66 had zero real results and six errors each -- getaddrinfo ENOTFOUND api.github.com (126 errors) and
+// huggingface.co (64), request timed out (206) -- yet the connectivity probe had passed, so each one went on through implement, critique and review and finished as a
+// no-op "0 results". Only genuinely transient classes count (DNS, connection, timeout, HTTP 403/429/5xx rate limit or outage): a permanent error such as a rejected
+// query (HTTP 422) keeps the old behaviour, otherwise it would be requeued forever.
+const TRANSIENT_SEARCH_ERROR_RE = /ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|socket hang up|timed out|HTTP (?:403|429|5\d\d)\b/i;
+
+// Returns a short description of the dominant error when the search did not run, else null (some result is real, the list is empty, or an error is not transient).
+function searchDidNotRun(results) {
+  if (!Array.isArray(results) || results.length === 0) return null;
+  const errors = [];
+  for (const r of results) {
+    if (!r || typeof r !== 'object' || typeof r.error !== 'string' || !r.error) return null;
+    if (!TRANSIENT_SEARCH_ERROR_RE.test(r.error)) return null;
+    errors.push(r.error);
+  }
+  const counts = new Map();
+  for (const e of errors) { const k = e.replace(/\d+/g, 'N').slice(0, 60); counts.set(k, (counts.get(k) || 0) + 1); }
+  const [top] = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  return `${errors.length} of ${results.length} results errored, mostly "${top[0]}"`;
+}
+
 async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetch, roots, isOnlineFn }) {
   const queries = parseHarnessQueries(task.planResponse);
   if (kind === 'projectSearch') {
@@ -132,6 +154,14 @@ async function runHarnessSearch(kind, task, { projectSearchFetch, archImportFetc
         // Non-fatal -- implement proceeds with no results (its own prompt handles an empty
         // list: "(no results -- the searches returned nothing usable)").
       }
+    }
+    const failure = searchDidNotRun(searchResults);
+    if (failure) {
+      // Same outcome as the offline gate above: draftTask requeues a network_unavailable block WITHOUT using a draft attempt, so it is retried later.
+      task.networkUnavailable = true;
+      task.promptContext.searchResults = [];
+      appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies): the search did not run (${failure}) -- treated as network unavailable, requeued without using an attempt`);
+      return { networkUnavailable: true };
     }
     task.promptContext.searchResults = searchResults;
     appendHistoryEvent(task, 'harness-search', `${queries.length} quer(y/ies), ${searchResults.length} result(s)`);
@@ -197,4 +227,4 @@ function findEditFarFromAnchor(find, content, anchorSnippet) {
   return Math.abs(findIdx - anchorIdx) > WRONG_BLOCK_MARGIN_CHARS; // ~15 lines away = a different block
 }
 
-module.exports = { isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor };
+module.exports = { searchDidNotRun, TRANSIENT_SEARCH_ERROR_RE, isCandidateFulfillmentSource, refreshCandidateFetchedFiles, isEmptyApprovalSource, isAdvisoryProseSource, parseHarnessQueries, runHarnessSearch, extractCandidateSnippet, distinctiveLine, findEditFarFromAnchor };
