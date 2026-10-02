@@ -831,7 +831,13 @@ test('runPlanWithTools reports an unknown tool as an error string result and kee
   ], async (mod) => {
     const result = await mod.runPlanWithTools({ prompt: 'go' });
     assert.equal(result.response, 'recovered');
-    assert.deepEqual(result.toolCallLog[0].result, { error: 'unknown tool: nonexistent_tool' });
+    // 2026-09-22: the error string must now enumerate the actually-registered tools so
+    // the model can self-correct on its next turn (a bare "unknown tool: X" let one
+    // tier-3 run conclude it was stuck after a single hallucinated `list_files` call).
+    // Assert the FORMAT (name + comma-separated available list), not the exact tool
+    // list, so this stays correct as the read-only tool set grows.
+    assert.match(result.toolCallLog[0].result.error,
+      /^unknown tool: nonexistent_tool\. Available tools: \w+(, \w+)+\.$/);
   });
 });
 
