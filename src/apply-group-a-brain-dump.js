@@ -75,6 +75,38 @@ function isValidDuplicateMatch(candidate, existingTitles) {
   });
 }
 
+// HUB0115 1/3 -- phrase-echo rejection for the duplicate gate. The classifier's
+// confirmed hallucination shape (a) is echoing a quoted/bracketed phrase from INSIDE
+// the note's own rawText as if it were an external task-title match. This helper
+// detects exactly that grounding: a possibleDuplicateOf string that is (after
+// normalizing -- lowercase, collapse whitespace, and stripping one pair of enclosing
+// quotes/brackets the classifier may have dropped or kept) a substring of the note's
+// own rawText is a phrase-echo, not a real duplicate the classifier found. It is the
+// (b) branch of the gate's decision order and is only consulted for candidates that
+// FAIL isValidDuplicateMatch, so a genuine candidate-list match can never be
+// overridden by it. Pure function -- safe to unit-test directly.
+function isGroundedInInput(candidate, rawText) {
+  const raw = String(rawText || '');
+  if (!raw.trim()) return false;
+  const plain = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  // Reuse text-similarity.js's normalizeTokens (already imported above) as a second,
+  // punctuation/case/stopword-insensitive containment signal: the candidate's normalized
+  // token stream must appear, in order, inside rawText's normalized token stream.
+  const tokenStream = (s) => [...normalizeTokens(s)].join(' ');
+  const variants = [
+    candidate,
+    String(candidate || '').replace(/^['"[\(`]+|['"\]\)`]+$/g, ''),
+  ];
+  const tPlain = plain(raw);
+  const tTokens = tokenStream(raw);
+  return variants.some((v) => {
+    const cPlain = plain(v);
+    if (cPlain && tPlain.includes(cPlain)) return true;
+    const cTok = tokenStream(v);
+    return cTok.length > 0 && tTokens.includes(cTok);
+  });
+}
+
 function allNoteBasenames(secondBrainDir) {
   const names = new Set();
   const walk = (abs, depth) => {
@@ -429,9 +461,22 @@ function applyDuplicateGate(ctx, matchedProject, built) {
   // Validate BEFORE trusting it -- see isValidDuplicateMatch's own header for the
   // incident this closes. A classifier answer that matches nothing in the real
   // candidate list it was shown is treated as no match at all, not a duplicate flag.
-  if (result.possibleDuplicateOf && !isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles)) {
-    console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier -- discarding as a hallucinated match, not routing to needs-clarification`);
-    result.possibleDuplicateOf = null;
+  // HUB0115 1/3 -- enforce the decision order explicitly: (a) a valid match against
+  // the REAL candidate list the classifier was shown is trusted (falls through to
+  // the duplicate handling below); (b) else a string grounded in the note's own
+  // rawText is null'd as a phrase-echo; (c) else null'd as ungrounded. (b) and (c)
+  // both null -- they differ only in WHY, which the log and the sibling 2/3
+  // dismissal-recording keep distinct for the human reviewing the queue.
+  if (result.possibleDuplicateOf) {
+    if (isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles)) {
+      // (a) valid candidate-list match -- trust it.
+    } else if (isGroundedInInput(result.possibleDuplicateOf, rawText)) {
+      console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that is a phrase grounded in the note's own rawText (phrase-echo) -- discarding, not routing to needs-clarification`);
+      result.possibleDuplicateOf = null;
+    } else {
+      console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier and is not grounded in the note's own rawText -- discarding as ungrounded, not routing to needs-clarification`);
+      result.possibleDuplicateOf = null;
+    }
   }
   if (result.possibleDuplicateOf) {
     // Bounded one-retry gate (2026-09-15, brain-dump bd-1788900769368: "All three
@@ -593,4 +638,4 @@ function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) 
   return { closed: true, entryId: brainDumpEntryId };
 }
 
-module.exports = { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort, closeBrainDumpEntryResolved, readProjectRegistry, isValidDuplicateMatch, originProjectFor };
+module.exports = { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort, closeBrainDumpEntryResolved, readProjectRegistry, isValidDuplicateMatch, isGroundedInInput, originProjectFor };
