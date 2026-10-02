@@ -43,6 +43,12 @@ const PINNED_NUM_CTX = 49152;
 // Kept so existing callers keep working: there is no longer a separate, larger tier.
 const EXTENDED_NUM_CTX = PINNED_NUM_CTX;
 
+// OLLAMA_KV_CACHE_TYPE (e.g. a lower-precision KV cache dtype) is an additional VRAM
+// lever that is not yet enabled in this deployment. Do not raise NUM_CTX (PINNED_NUM_CTX
+// / EXTENDED_NUM_CTX above) until a quality regression check has been run against the
+// resulting output on this model -- a larger context or a quantized KV cache that
+// degrades quality would only show up in the actual answers, not in the VRAM math here.
+
 // ollama-http.js documents a hard-won 5-minute ceiling (docs/pipeline-incident-2026-07-19.md):
 // a call legitimately needing longer than this is a signal to change the workload, not to
 // raise the number. A computed timeout must respect that ceiling, never exceed it.
