@@ -19,7 +19,24 @@ const config = require('./config.js');
 let anchor = { status: 'greenfield', paths: [] };
 pathPrefetch.resolveAnchors = () => anchor;
 config.resolveGraphPath = () => '/nonexistent/graph.json';
-const { applyBrainDumpSort } = require('./apply-group-a-brain-dump.js');
+const { applyBrainDumpSort, duplicateGateDismissals } = require('./apply-group-a-brain-dump.js');
+
+// Reason keys the duplicate gate's dismissal-recording helper (recordDuplicateGateDismissal)
+// knows about -- the module-level reason-keyed counter is shared across the whole process, so a
+// test measures a DELTA against a snapshot taken immediately before its own run, never an absolute.
+const DISMISSAL_REASONS = ['phrase-echo', 'ungrounded', 'invalid-candidate'];
+// Snapshot the counter and run fn with console.warn captured; returns { before, after, warnLines, run }.
+function withDismissalCapture(fn) {
+  const before = {}; for (const k of DISMISSAL_REASONS) before[k] = duplicateGateDismissals[k];
+  const warnLines = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => { warnLines.push(a.join(' ')); };
+  let run;
+  try { run = fn(); } finally { console.warn = origWarn; }
+  return { before, warnLines, run };
+}
+const dismissalLine = (warnLines) => warnLines.find((l) => l.includes('duplicateGateDismissal'));
+const hasFourFields = (line) => /noteId=/.test(line) && /rejectedCandidate=/.test(line) && /reason=/.test(line) && /candidatesChecked=/.test(line);
 
 const TITLES = ['Add a retry cap to the sweep'];
 
@@ -176,4 +193,48 @@ test('origin routing overrides the classifier for a machine-raised finding, and 
   assert.ok(n.file && n.file.startsWith(inv.vault), 'filed as a vault note');
   assert.equal(inv.entryNow().status, 'sorted');
   assert.equal(inv.entryNow().sort.actionable, false);
+});
+
+test('a possibleDuplicateOf naming a DISTINCT existing note is either retained (flag trusted) or dismissed WITH a recorded dismissal -- never silently dropped', () => {
+  const w = world();
+  // TITLES[0] is a genuinely distinct, already-queued task title (not a hallucination of this
+  // entry's own text) -- the "distinct existing note" the gate must either trust or record.
+  const candidate = TITLES[0];
+  const { before, warnLines, run: r } = withDismissalCapture(() => w.run({ belongsToProject: 'agent-manager', possibleDuplicateOf: candidate }));
+  const delta = (k) => duplicateGateDismissals[k] - before[k];
+  const dismissedKey = DISMISSAL_REASONS.find((k) => delta(k) > 0);
+  if (dismissedKey) {
+    // Dismissed: EXACTLY one reason-keyed counter moves, by exactly 1, and the greppable warn
+    // line carries all four audit fields -- this is what makes a wrongly-dismissed note recoverable.
+    assert.equal(delta(dismissedKey), 1, `the '${dismissedKey}' reason-keyed counter increments by exactly 1`);
+    for (const k of DISMISSAL_REASONS) if (k !== dismissedKey) assert.equal(delta(k), 0, `'${k}' counter must not move`);
+    const line = dismissalLine(warnLines);
+    assert.ok(line, 'a dismissal emits a greppable duplicateGateDismissal warn line');
+    assert.ok(hasFourFields(line), `warn line carries all four fields: ${line}`);
+  } else {
+    // Retained: the distinct-note flag was trusted, so the note is held for a human (recoverable
+    // skip on the first flag), NOT silently dropped and NOT quietly queued as a real adhoc task.
+    assert.equal(r.skipped, true, 'a trusted distinct-note flag on the first hold is a recoverable skip');
+    assert.equal(w.entryNow().status, 'captured', 'the note is never dropped -- it stays captured for a fresh pass');
+    assert.equal(w.queued(path.join(w.base, 'pipeA', 'queue', 'adhoc')).length, 0, 'no adhoc task is silently written for a trusted distinct note');
+  }
+});
+
+test('a genuine (invented) duplicate flag is dismissed: the reason-keyed counter increments by exactly 1 and the warn line carries all four fields', () => {
+  const w = world();
+  // 'Totally invented slug' matches no real queued title and is grounded in neither the candidate
+  // list nor this entry's own rawText -- a genuine ungrounded dismissal, the case the counter must
+  // NOT stay zero for.
+  const { before, warnLines, run: r } = withDismissalCapture(() => w.run({ belongsToProject: 'agent-manager', possibleDuplicateOf: 'Totally invented slug' }));
+  const delta = (k) => duplicateGateDismissals[k] - before[k];
+  assert.equal(delta('ungrounded'), 1, "the 'ungrounded' reason-keyed counter increments by exactly 1 for a genuine dismissal");
+  for (const k of DISMISSAL_REASONS) if (k !== 'ungrounded') assert.equal(delta(k), 0, `'${k}' counter must not move`);
+  const line = dismissalLine(warnLines);
+  assert.ok(line, 'a genuine dismissal emits a greppable duplicateGateDismissal warn line');
+  assert.match(line, /noteId=/, 'warn line carries noteId');
+  assert.match(line, /rejectedCandidate=/, 'warn line carries rejectedCandidate');
+  assert.match(line, /reason=ungrounded/, 'warn line carries the reason key');
+  assert.match(line, /candidatesChecked=/, 'warn line carries candidatesChecked');
+  // Dismissing the FLAG is not the same as dropping the NOTE -- the note itself still files to its project.
+  assert.equal(r.queuedProject, 'agent-manager', 'a dismissed duplicate flag still lets the note queue as an adhoc task');
 });
