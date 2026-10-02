@@ -539,13 +539,22 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     // that (pre-PR-#230) never mentioned it. Regenerate implementResponse from the real
     // sub-tasks and file straight to queue/review/ for a real vote -- see the top-of-file
     // header comment for the full incident.
+    //
+    // TERMINAL SALVAGE PATH (widened gate): Bucket K no longer requires
+    // task.adhocResolution === 'decompose' -- a viable subTaskProposals list (>= 2
+    // well-formed entries, none already echoed in implementResponse) is the only
+    // viability signal. It now fires only AFTER the generic requeue budget is
+    // exhausted (task.ncTriageAttempts >= MAX_REQUEUES) and stays bounded by its own
+    // per-bucket counter: a task that burned its one generic requeue shot on an
+    // unrelated signature gets exactly one last in-place repair attempt here before
+    // falling back to the normal leave-for-human path.
     {
       const id0 = task.id || name.replace(/\.json$/, '');
       const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
-      const isDecompose = task.adhocResolution === 'decompose' && subTasks.length >= 2;
+      const isDecompose = Array.isArray(task.subTaskProposals) && subTasks.length >= 2 && subTasks.every((s) => s && typeof s === 'object');
       const hasEvidence = isDecompose && subTasks.some((s) => s && s.title
         && String(task.implementResponse || '').includes(String(s.title).slice(0, 30)));
-      if (isDecompose && !hasEvidence && bucketAttempts(task, 'K') < MAX_REQUEUES) {
+      if (isDecompose && !hasEvidence && (Number(task.ncTriageAttempts || 0) >= MAX_REQUEUES) && bucketAttempts(task, 'K') < MAX_REQUEUES) {
         const reviewDir = path.join(pipelineDir, 'queue', 'review');
         const reviewPath = path.join(reviewDir, `${id0}.json`);
         if (fs.existsSync(reviewPath)) {
