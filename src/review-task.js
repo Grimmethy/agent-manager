@@ -38,6 +38,17 @@
 // NAME (see python/build_graph.py:378, python/dashboard/app.py:6207, scripts/provision-plugin-
 // repo.sh:57) -- NOT a file or module in this repo. Those tasks target THIS file
 // (src/review-task.js, the REVIEW step); the APPLY step is a separate file, src/apply-task.js.
+//
+// brain_dump_sort skip (2026-10-02, HUB0128 1/2): classification tasks from the
+// brain_dump_sort source are auto-approved at review without the critique/verdict
+// model call. The skip branch sits AFTER checkDraft/preValidateCitedPaths (so
+// structural validation of the draft still runs and can block) and BEFORE the
+// critique/verdict model call (so no LLM tokens are spent on a task that needs no
+// semantic review). Recording is dual: appendHistoryEvent (task-level audit
+// trail, an 'advisory' event) and logPipelineEvent (pipeline-level event log,
+// stage 'critique', reason 'brain_dump_sort skip'). The branch returns
+// { succeeded: true, verdict: 'approved' } immediately, so the caller
+// (review-runner.sh) moves the task to queue/approved/ as usual.
 
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
@@ -1042,6 +1053,23 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
     appendHistoryEvent(task, 'blocked', reason);
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+  }
+
+  // brain_dump_sort skip (HUB0128 · 1/2): classification tasks are auto-approved here --
+  // AFTER the checkDraft/preValidateCitedPaths pass-handling (structural validation of
+  // the draft still runs above and can block) and BEFORE the critique/verdict model
+  // call (no LLM tokens spent on a task that needs no semantic review). Dual recording:
+  // appendHistoryEvent (task-level audit trail) + logPipelineEvent (pipeline-level
+  // event log, stage 'critique', reason 'brain_dump_sort skip'), both fired before the
+  // early return. The caller (review-runner.sh) then moves the task to queue/approved/
+  // as for any other approved verdict.
+  if (resolveSourceName(task) === 'brain_dump_sort') {
+    appendHistoryEvent(task, 'advisory', 'brain_dump_sort skip: auto-approved post-validator, no critique needed');
+    logPipelineEvent(pipelineDir, 'critique', {
+      reason: 'brain_dump_sort skip',
+      instanceId: process.env.AGENT_MANAGER_INSTANCE_ID || null,
+    });
+    return { succeeded: true, verdict: 'approved' };
   }
 
   const onePassVerdict = verifyDeterministicOnePassDecomposeDraft(task, repoRootForCheck);
