@@ -511,7 +511,6 @@ function applyDuplicateGate(ctx, matchedProject, built) {
         reason: 'phrase-echo',
         candidatesChecked: Array.isArray(existingQueuedTitles) ? existingQueuedTitles.length : 0,
       });
-      console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that is a phrase grounded in the note's own rawText (phrase-echo) -- discarding, not routing to needs-clarification`);
       result.possibleDuplicateOf = null;
     } else {
       // HUB0115 1/3 -- record the dismissal (pure side effect, after the decision).
@@ -521,7 +520,6 @@ function applyDuplicateGate(ctx, matchedProject, built) {
         reason: 'ungrounded',
         candidatesChecked: Array.isArray(existingQueuedTitles) ? existingQueuedTitles.length : 0,
       });
-      console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier and is not grounded in the note's own rawText -- discarding as ungrounded, not routing to needs-clarification`);
       result.possibleDuplicateOf = null;
     }
   }
