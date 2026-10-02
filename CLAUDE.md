@@ -41,6 +41,20 @@ have the answer — but it's the cheapest lookup and the whole point is to check
 falling back to a slower search. If it doesn't have what you need, add a row once you
 find it — that's the whole maintenance model; nothing else keeps it fresh.
 
+This check is **injected, not just advised**: `python/dashboard/codebase_map_digest.py`
+builds a compact digest (the lookup rule, every table's row labels, the "Recurring work
+processes" table). The in-app Chat panel puts it in the local system prompt and the Claude
+provider's first-turn preamble (`chat_sessions.py`). For Claude Code sessions run in this
+repo, register it as a SessionStart hook in `~/.claude/settings.json` (`.claude/` is
+gitignored here, so it can't ship in-repo):
+
+```json
+"hooks": {"SessionStart": [{"matcher": "startup|clear|compact", "hooks": [{
+  "type": "command", "command": "python3 /media/model-cache/github/agent-manager/python/dashboard/codebase_map_digest.py"}]}]}
+```
+
+It no-ops silently when the cwd isn't inside a repo that has the map.
+
 ### Reviewing an unmerged branch
 
 Before judging any unmerged/`agent/<id>` branch for value or completeness, check whether

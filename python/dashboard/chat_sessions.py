@@ -34,6 +34,7 @@ import uuid
 from pathlib import Path
 
 import claude_client
+import codebase_map_digest
 import local_tool_client
 import model_stats_client
 import ollama_client
@@ -195,6 +196,14 @@ def _agents_md_blurb(agents_md: str) -> str:
     )
 
 
+def _codebase_map_digest(session: dict) -> str:
+    """Digest of the primary repo's docs/agents/codebase-map.md ("" if it has none) --
+    same injection the Claude Code SessionStart hook does, so the in-app chat checks the
+    map before grepping too. See codebase_map_digest.py."""
+    roots = session.get("roots") or [session["repoRoot"]]
+    return codebase_map_digest.build_digest(roots[0])
+
+
 def _send_claude(session: dict, message: str) -> str:
     started = time.time()
     roots = session.get("roots") or [session["repoRoot"]]
@@ -212,6 +221,9 @@ def _send_claude(session: dict, message: str) -> str:
         agents_md = _read_agents_md(session)
         if agents_md:
             preamble_parts.append(_agents_md_blurb(agents_md))
+        map_digest = _codebase_map_digest(session)
+        if map_digest:
+            preamble_parts.append(map_digest)
         if preamble_parts:
             message = "\n\n---\n\n".join(preamble_parts) + "\n\n---\n\n" + message
     result = claude_client.generate(
@@ -287,6 +299,9 @@ def _local_system_prompt(session: dict) -> str:
     agents_md = _read_agents_md(session)
     if agents_md:
         prompt += "\n\n---\n\n" + _agents_md_blurb(agents_md)
+    map_digest = _codebase_map_digest(session)
+    if map_digest:
+        prompt += "\n\n---\n\n" + map_digest
     return prompt
 
 
