@@ -19,7 +19,7 @@ const config = require('./config.js');
 let anchor = { status: 'greenfield', paths: [] };
 pathPrefetch.resolveAnchors = () => anchor;
 config.resolveGraphPath = () => '/nonexistent/graph.json';
-const { applyBrainDumpSort } = require('./apply-group-a-brain-dump.js');
+const { applyBrainDumpSort, duplicateGateDismissals } = require('./apply-group-a-brain-dump.js');
 
 const TITLES = ['Add a retry cap to the sweep'];
 
@@ -176,4 +176,69 @@ test('origin routing overrides the classifier for a machine-raised finding, and 
   assert.ok(n.file && n.file.startsWith(inv.vault), 'filed as a vault note');
   assert.equal(inv.entryNow().status, 'sorted');
   assert.equal(inv.entryNow().sort.actionable, false);
+});
+
+// HUB0118 3/3 -- dismissal-recording tests. The 1/3 helper (recordDuplicateGateDismissal) keeps a
+// module-level reason-keyed counter (duplicateGateDismissals: 'phrase-echo' / 'ungrounded' /
+// 'invalid-candidate') that accumulates across every test in this file's process, so both tests
+// below measure the DELTA against a snapshot taken immediately before their run, and capture
+// console.warn around the run to inspect the single greppable line the helper emits.
+const DISMISSAL_FIELDS = ['noteId=', 'rejectedCandidate=', 'reason=', 'candidatesChecked='];
+
+function withDismissalCapture(fn) {
+  const before = { ...duplicateGateDismissals };
+  const warns = [];
+  const origWarn = console.warn;
+  console.warn = (...a) => { warns.push(a.join(' ')); };
+  try {
+    return { result: fn(), before, warns };
+  } finally {
+    console.warn = origWarn;
+  }
+}
+
+function counterDelta(before) {
+  return Object.fromEntries(Object.keys(duplicateGateDismissals).map((k) => [k, duplicateGateDismissals[k] - before[k]]));
+}
+
+function dismissalWarnLine(warns) {
+  const line = warns.find((l) => l.includes('duplicateGateDismissal'));
+  return line && DISMISSAL_FIELDS.every((f) => line.includes(f)) ? line : null;
+}
+
+test('a possibleDuplicateOf naming a DISTINCT existing note is either retained (trusted duplicate flag) or dismissed WITH a recorded dismissal -- never silently dropped', () => {
+  const w = world();
+  const cap = withDismissalCapture(() => w.run({ belongsToProject: 'agent-manager', possibleDuplicateOf: TITLES[0] }));
+  const { result: r, before, warns } = cap;
+  const delta = counterDelta(before);
+  const totalDismissed = Object.values(delta).reduce((a, b) => a + b, 0);
+  const line = dismissalWarnLine(warns);
+  // Retained evidence: the gate trusted the real queued-title match, so the first flag is a
+  // recoverable skip (entry untouched, nothing quietly written to any queue).
+  const retained = r.skipped === true
+    && r.recoverable === true
+    && /possible duplicate of .* on the first flag/.test(r.reason)
+    && w.entryNow().status === 'captured'
+    && w.queued(path.join(w.base, 'pipeA', 'queue', 'adhoc')).length === 0
+    && w.queued(path.join(w.base, 'pipeA', 'queue', 'needs-clarification')).length === 0;
+  // Dismissed evidence: exactly one reason key moved by 1 AND the warn line carries all four fields.
+  const dismissed = totalDismissed === 1 && line !== null;
+  assert.ok(
+    retained || dismissed,
+    `a distinct existing note must survive as a recoverable skip or leave an audit record, but got reason=${JSON.stringify(r.reason)} counterDelta=${JSON.stringify(delta)} dismissalLine=${line === null ? null : JSON.stringify(line)}`
+  );
+});
+
+test('a genuine dismissal (an invented candidate) increments the reason-keyed counter by exactly 1 and the warn line carries all four fields', () => {
+  const w = world();
+  const cap = withDismissalCapture(() => w.run({ belongsToProject: 'agent-manager', possibleDuplicateOf: 'Totally invented slug' }));
+  const { result: r, before, warns } = cap;
+  const delta = counterDelta(before);
+  assert.equal(delta['ungrounded'], 1, `the invented candidate must be recorded under 'ungrounded' (delta=${JSON.stringify(delta)})`);
+  assert.equal(delta['phrase-echo'], 0, 'no other reason key may move for an ungrounded dismissal');
+  assert.equal(delta['invalid-candidate'], 0, 'no other reason key may move for an ungrounded dismissal');
+  const line = warns.find((l) => l.includes('duplicateGateDismissal'));
+  assert.ok(line, 'the dismissal must emit its greppable warn line');
+  assert.match(line, /duplicateGateDismissal noteId=bd-1 rejectedCandidate=Totally invented slug reason=ungrounded candidatesChecked=\d+/);
+  assert.equal(r.queuedProject, 'agent-manager', 'with the bogus flag dismissed, the note still routes on its own merits');
 });
