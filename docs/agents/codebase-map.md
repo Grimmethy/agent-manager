@@ -50,7 +50,8 @@ prefix(es) the tab's own JS calls, plus the `app.py` line range those handlers l
 
 `analytics-and-discovery.js` covers 6 tabs total (Scouted Repos, Discovery, Time
 Tracking, TokenFold Savings, PromptForge, AdForge, ScriptForge) — by far the most
-shared file. `task-detail-modal.js` (742 lines) is shared UI invoked from several tabs
+shared file. The Models tab (`renderModelsTab()`, the model/stage configuration and the benchmark runner) moved
+out of it into `models-tab.js` on 2026-10-02. `task-detail-modal.js` (742 lines) is shared UI invoked from several tabs
 (Workers, Job List, Discovery, ...), not tied to any one tab itself —
 `renderTaskDetailModal()` (L201).
 
