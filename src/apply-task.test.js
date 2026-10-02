@@ -1108,6 +1108,41 @@ test('safeApplyCall composed with recordApplyOutcome: a crash still produces a r
   assert.match(task.blockedReason, /Cannot read properties of undefined/);
 });
 
+// HUB0116 2/2 -- the invariant this whole pair (silent-catch fix + this test) protects:
+// EVERY write to queue/blocked/ must carry a non-empty blockedReason. apply-task.sh is
+// what physically moves the task file into queue/blocked/, so "everything that ends up in
+// blocked/" is exactly "everything whose apply result was recorded here" -- pin the
+// invariant at its source with a stubbed apply that throws a known error, instead of
+// needing a real git repo to observe the same thing from the directory afterward.
+test('every write to queue/blocked/ carries a non-empty blockedReason', () => {
+  // (1) A minimal approved-state task -- review already passed, apply is the next step;
+  // this is exactly the state a task is in when it can end up in queue/blocked/.
+  const task = { id: 'blocked-reason-task', status: 'approved', history: [] };
+
+  // (2) Invoke the apply path with a stubbed apply function that throws a known error.
+  // safeApplyCall is the seam that turns that throw into a real result instead of a
+  // process death; recordApplyOutcome is what stamps the fields apply-task.sh then
+  // carries with the file into queue/blocked/.
+  const result = safeApplyCall(() => { throw new Error('simulated disk full'); }, 'applyTask');
+  const stage = recordApplyOutcome(task, result);
+
+  assert.equal(stage, 'apply-failed');
+  // (3) The task ends in blocked state (matching the queue/blocked/ directory).
+  assert.equal(task.status, 'blocked');
+  // (4) blockedReason is a non-empty string containing the error message.
+  assert.equal(typeof task.blockedReason, 'string');
+  assert.ok(task.blockedReason.length > 0, 'blockedReason must be non-empty');
+  assert.ok(task.blockedReason.includes('simulated disk full'), 'blockedReason must name the apply error');
+  // (5) blockedStage is set.
+  assert.ok(task.blockedStage, 'a blocked task must carry a blockedStage');
+  // (6) The history array ends with a 'blocked' event carrying a non-empty message
+  // (task-history.js's appendHistoryEvent carries the message in `detail`).
+  const last = task.history[task.history.length - 1];
+  assert.equal(last.stage, 'blocked');
+  assert.equal(typeof last.detail, 'string');
+  assert.ok(last.detail.length > 0, 'the blocking history event must carry a non-empty message');
+});
+
 test('safeApplyCall: the crash message is capped, not an unbounded full stack dump', () => {
   const r = safeApplyCall(() => { throw new Error('boom'); }, 'applyDirectToMainBatch');
   // message + up to 3 stack frames -- generous but bounded, never the whole raw stack.
