@@ -284,3 +284,22 @@ test('the older "empty AND zero harness hits" block is NOT swept into the new no
   assert.notEqual(classifyBlockedTask(task).classifierName, 'no-context-files');
   assert.equal(classifyBlockedTask(task).classifierName, 'empty-degenerate-draft'); // unchanged from before
 });
+
+test('harness-side variant of the malformed-JSON apply failure is NOT mislabeled faultSide:model', () => {
+  // Same apply-time "Invalid JSON in Group B implementResponse" text a model content
+  // mistake produces, but with a harness-side structural signal (broken grounding) also
+  // present on the task: the structural harness-side classifier is checked FIRST in
+  // CLASSIFIERS order, so the task resolves harness-side instead of dropping into the
+  // retryable json-parse-failure/model bucket. A deterministic harness bug must surface
+  // as harness-side and be escalated -- not masked behind blind model-side retries
+  // (pins the guarantee the invalid-premise archival bd-1789684602621 relies on).
+  const task = {
+    blockedReason: 'Invalid JSON in Group B implementResponse: Unexpected end of JSON input',
+    promptContext: { fetchedFiles: [{ path: 'src/foo.js', anchorConfidence: 'none' }] },
+  };
+  const result = classifyBlockedTask(task);
+  assert.notEqual(result.faultSide, 'model');
+  assert.equal(result.category, 'unreliable-grounding');
+  assert.equal(result.faultSide, 'harness');
+  assert.equal(result.retryable, false);
+});
