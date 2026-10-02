@@ -863,6 +863,7 @@ test('bucket K: decompose-review-blind signature -> implementResponse regenerate
   fs.mkdirSync(at(dir, 'review'), { recursive: true });
   held(dir, baseTask('tk1', {
     adhocResolution: 'decompose',
+    ncTriageAttempts: 1,
     subTaskProposals: REAL_SUB_TASKS,
     implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).\n\nAgentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it',
     needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
@@ -902,6 +903,7 @@ test('bucket K: still fires even when the task is ALSO decompose-loop-flagged wi
   held(dir, baseTask('tk6', {
     promptContext: { rawText: 'In src/local-draft.js, add a short-circuit for critique-degenerate.' },
     adhocResolution: 'decompose',
+    ncTriageAttempts: 1,
     subTaskProposals: REAL_SUB_TASKS,
     implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).',
     stalenessFlag: { reason: 'decompose-loop', disposition: 're-scope', confidence: 'medium' },
@@ -925,6 +927,7 @@ test('bucket K: still fires when needsClarification.reason is NOT design-decisio
   fs.mkdirSync(at(dir, 'review'), { recursive: true });
   held(dir, baseTask('tk7', {
     adhocResolution: 'decompose',
+    ncTriageAttempts: 1,
     subTaskProposals: REAL_SUB_TASKS,
     implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).',
     needsClarification: { reason: 'infra-error', openQuestions: 'Agentic implement pass tagged BLOCKER-TYPE: infra-error -- requeued for a clean retry' },
@@ -978,6 +981,7 @@ test('bucket K: already at MAX_REQUEUES -> falls through to leave-for-human, not
   // needsClarification override -- same reasoning as bucket D's own MAX_REQUEUES test above.
   held(dir, baseTask('tk5', {
     adhocResolution: 'decompose',
+    ncTriageAttempts: 1,
     subTaskProposals: REAL_SUB_TASKS,
     implementResponse: 'Auto-decomposed after two implement passes (2 pieces).',
     needsClarification: { reason: 'design-decision', openQuestions: 'This is unrelated to any known signature.' },
@@ -1000,6 +1004,7 @@ test('bucket D being exhausted does NOT block bucket K from firing on the same t
   fs.mkdirSync(at(dir, 'review'), { recursive: true });
   held(dir, baseTask('tdk1', {
     adhocResolution: 'decompose',
+    ncTriageAttempts: 1,
     subTaskProposals: REAL_SUB_TASKS,
     implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).\n\nAgentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it',
     needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
@@ -1014,6 +1019,34 @@ test('bucket D being exhausted does NOT block bucket K from firing on the same t
   assert.equal(moved.status, 'needs-review');
   assert.equal(moved.ncTriageBucketAttempts.K, 1, 'bucket K got its OWN fresh attempt, unaffected by D already being at its cap');
   assert.equal(moved.ncTriageBucketAttempts.D, 1, 'bucket D\'s own prior count is preserved, not reset by K firing');
+  assert.match(moved.implementResponse, /Add the allowlist constant/);
+});
+
+// 2026-09-16, widened-gate coverage: Bucket K no longer requires
+// adhocResolution === 'decompose' -- the viable subTaskProposals list (>= 2 well-formed
+// entries, none echoed in implementResponse) is the only viability signal, per the
+// terminal-salvage path in needs-clarification-triage.js. A task whose resolution is
+// merely 'draft' (or anything else) still has a real decomposition riding on it and has
+// already burned the one generic requeue shot -- it must be rescued here, not left for
+// a human, exactly like the adhocResolution:'decompose' cases above.
+test('bucket K: fires even when adhocResolution is only "draft" (widened gate does not require adhocResolution:decompose)', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, baseTask('tk8', {
+    adhocResolution: 'draft',
+    subTaskProposals: REAL_SUB_TASKS,
+    implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).',
+    needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
+    // The one generic requeue shot is already spent -- this is precisely the state the
+    // widened salvage path targets (ncTriageAttempts >= MAX_REQUEUES, K's own budget free).
+    ncTriageAttempts: 1,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tk8.json')));
+  const moved = read(at(dir, 'review', 'tk8.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.equal(moved.ncTriageBucketAttempts.K, 1, 'bucket K consumed its own budget for the salvage repair');
   assert.match(moved.implementResponse, /Add the allowlist constant/);
 });
 
