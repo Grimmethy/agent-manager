@@ -1605,6 +1605,29 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // It now takes the one pinned context (gpu-capacity.js PINNED_NUM_CTX) like everything else.
 registerModelProfile('brain-dump-cheap-local', { backend: 'local', think: false });
 registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping', strictOutputOnly: true });
+// brain_dump_disposition (2026-09-16, HUB0119 1/4): the domain for the structured
+// disposition decision on a brain-dump entry that must NOT become code work -- the
+// counterpart of brain_dump_sort's requiresCode/requiresResearch routing. Registered here
+// so this file is the single source of truth for the domain string (same
+// domain===source convention brain_dump_sort uses above, which is what
+// resolveSourceName()/_ensure_task_domains key off). strictOutputOnly:true mirrors
+// brain_dump_sort exactly (structured decision output, no rawDiff); requiresWorktree:false
+// is consumed by the apply-task.js branch (sibling HUB0119 3/4) so a disposition never
+// spins up a git worktree. No auto-generator: next() returns null because tasks in this
+// domain are produced by the apply-adhoc-diff.js routing (sibling 2/4), not by a source
+// scanner. deterministicReviewValidate is intentionally null for now -- its consumers
+// (review-task.js, reject-retry-check.js) guard with `typeof === 'function'` and safely
+// fall through to the ordinary review path until sibling 2/4 supplies the real validator.
+registerTaskSource('brain_dump_disposition', {
+  priority: taskPriority('brain_dump_disposition', 43),
+  next: () => null,
+  modelProfile: 'brain-dump-cheap-local',
+  deterministicReview: true,
+  deterministicReviewValidate: null,
+  reportClass: 'housekeeping',
+  strictOutputOnly: true,
+  requiresWorktree: false,
+});
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
 // drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
