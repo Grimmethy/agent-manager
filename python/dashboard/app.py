@@ -183,6 +183,8 @@ from app_branch_helpers import (  # noqa: F401
     _norm_path,
     _summarize_hub,
     _summarize_task_record,
+    branch_task_ids,
+    partition_held_hub_branches,
 )
 
 # Moved verbatim into app_source_plugin_helpers.py (2026-10-01 breakdown); re-exported so every importer of app.X is unchanged.
@@ -2047,7 +2049,7 @@ def _list_unmerged_branches_uncached():
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
         qdir = (pipeline_dir / "queue") if pipeline_dir else None
-        hub = get_hub_data_provider().hub_for_branch(qdir, branch, [task_id])
+        hub = get_hub_data_provider().hub_for_branch(qdir, branch, branch_task_ids(_run_git, repo_root, main_branch, full_ref, task_id))
         branches.append({
             "branch": branch,
             "taskId": task_id,
@@ -2070,6 +2072,9 @@ def _list_unmerged_branches_uncached():
             "hub": hub,
         })
 
+    branches, held = partition_held_hub_branches(branches)
+    with _branch_cache_lock:
+        _branch_cache["held"] = held
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
     branch_verdicts.enrich_branches_with_verdicts(queue_dir(), repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
@@ -2095,6 +2100,13 @@ def list_unmerged_branches(force=False):
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
     return branches
+
+
+def list_held_hub_groups():
+    """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches)."""
+    list_unmerged_branches(force=False)
+    with _branch_cache_lock:
+        return list(_branch_cache.get("held") or [])
 
 
 def _invalidate_branch_cache():

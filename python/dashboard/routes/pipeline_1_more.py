@@ -79,6 +79,13 @@ def api_git_unmerged_branches():
     return jsonify(list_unmerged_branches(force=True))
 
 
+@pipeline_1_more_bp.route("/api/git/held-hub-branches")
+def api_git_held_hub_branches():
+    """Hubs with built-but-unlisted children, so the tab can say what each is waiting on."""
+    from app import list_held_hub_groups
+    return jsonify(list_held_hub_groups())
+
+
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/commits")
 def api_git_branch_commits(branch):
     """Full commit history for one pushed-but-unmerged branch, ahead of mainBranch --
