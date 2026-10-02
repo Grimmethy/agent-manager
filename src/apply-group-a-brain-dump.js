@@ -107,6 +107,39 @@ function isGroundedInInput(candidate, rawText) {
   });
 }
 
+// HUB0115 1/3 -- reason-keyed dismissal recording for the possible-duplicate gate.
+// Every path that nulls result.possibleDuplicateOf (i.e. DISMISSES the classifier's
+// duplicate claim) calls recordDuplicateGateDismissal BEFORE nulling it, so the exact
+// rejected string is captured. The record is a pure side effect -- counter increments
+// plus one stable, greppable console.warn line -- and runs AFTER the gate has already
+// decided to dismiss, so it cannot flip a would-be-kept candidate into a dropped one:
+// the keep/decide branches above are untouched by this. Keys:
+//   'phrase-echo'       -- candidate grounded in the note's own rawText (gate branch (b))
+//   'ungrounded'        -- candidate matching neither a real queued title nor the note (branch (c))
+//   'invalid-candidate' -- a claimed duplicate that isn't even a usable string (reserved
+//                          for the sibling 2/3 dismissal paths outside this gate)
+const duplicateGateDismissals = {
+  'phrase-echo': 0,
+  'ungrounded': 0,
+  'invalid-candidate': 0,
+};
+
+// entry is the brain-dump entry object (or null/omitted on paths that have no entry):
+// the existing entry.duplicateGateAttempts retry counter lives on the entry because the
+// entry is the object that persists across repeated classification attempts of the same
+// note. Emits exactly one greppable line (token: duplicateGateDismissal) carrying all
+// four audit fields.
+function recordDuplicateGateDismissal(entry, { noteId, rejectedCandidate, reason, candidatesChecked }) {
+  if (entry && typeof entry === 'object') {
+    entry.duplicateGateAttempts = (Number(entry.duplicateGateAttempts) || 0) + 1;
+  }
+  if (Object.prototype.hasOwnProperty.call(duplicateGateDismissals, reason)) {
+    duplicateGateDismissals[reason] += 1;
+  }
+  console.warn(`[apply-group-a-brain-dump] duplicateGateDismissal noteId=${noteId} rejectedCandidate=${rejectedCandidate} reason=${reason} candidatesChecked=${candidatesChecked}`);
+  return reason;
+}
+
 function allNoteBasenames(secondBrainDir) {
   const names = new Set();
   const walk = (abs, depth) => {
@@ -471,9 +504,23 @@ function applyDuplicateGate(ctx, matchedProject, built) {
     if (isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles)) {
       // (a) valid candidate-list match -- trust it.
     } else if (isGroundedInInput(result.possibleDuplicateOf, rawText)) {
+      // HUB0115 1/3 -- record the dismissal (pure side effect, after the decision).
+      recordDuplicateGateDismissal(entry, {
+        noteId: brainDumpEntryId,
+        rejectedCandidate: result.possibleDuplicateOf,
+        reason: 'phrase-echo',
+        candidatesChecked: Array.isArray(existingQueuedTitles) ? existingQueuedTitles.length : 0,
+      });
       console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that is a phrase grounded in the note's own rawText (phrase-echo) -- discarding, not routing to needs-clarification`);
       result.possibleDuplicateOf = null;
     } else {
+      // HUB0115 1/3 -- record the dismissal (pure side effect, after the decision).
+      recordDuplicateGateDismissal(entry, {
+        noteId: brainDumpEntryId,
+        rejectedCandidate: result.possibleDuplicateOf,
+        reason: 'ungrounded',
+        candidatesChecked: Array.isArray(existingQueuedTitles) ? existingQueuedTitles.length : 0,
+      });
       console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier and is not grounded in the note's own rawText -- discarding as ungrounded, not routing to needs-clarification`);
       result.possibleDuplicateOf = null;
     }
@@ -638,4 +685,4 @@ function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) 
   return { closed: true, entryId: brainDumpEntryId };
 }
 
-module.exports = { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort, closeBrainDumpEntryResolved, readProjectRegistry, isValidDuplicateMatch, isGroundedInInput, originProjectFor };
+module.exports = { allNoteBasenames, resolveNoteLinks, appendMarkdownLineAtomic, loadBrainDump, findEntry, recoverableSortSkip, applyBrainDumpSort, closeBrainDumpEntryResolved, readProjectRegistry, isValidDuplicateMatch, isGroundedInInput, duplicateGateDismissals, recordDuplicateGateDismissal, originProjectFor };
