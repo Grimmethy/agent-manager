@@ -867,6 +867,7 @@ test('bucket K: decompose-review-blind signature -> implementResponse regenerate
     implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).\n\nAgentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it',
     needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
     blockedReason: 'The IMPLEMENT draft is a degenerate meta-commentary...',
+    ncTriageAttempts: 1,
   }));
   const s = await needsClarificationTriage(args(dir));
   assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
@@ -906,6 +907,7 @@ test('bucket K: still fires even when the task is ALSO decompose-loop-flagged wi
     implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).',
     stalenessFlag: { reason: 'decompose-loop', disposition: 're-scope', confidence: 'medium' },
     needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
+    ncTriageAttempts: 1,
   }));
   const s = await needsClarificationTriage(args(dir));
   assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
@@ -928,6 +930,7 @@ test('bucket K: still fires when needsClarification.reason is NOT design-decisio
     subTaskProposals: REAL_SUB_TASKS,
     implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).',
     needsClarification: { reason: 'infra-error', openQuestions: 'Agentic implement pass tagged BLOCKER-TYPE: infra-error -- requeued for a clean retry' },
+    ncTriageAttempts: 1,
   }));
   const s = await needsClarificationTriage(args(dir));
   assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
@@ -982,6 +985,7 @@ test('bucket K: already at MAX_REQUEUES -> falls through to leave-for-human, not
     implementResponse: 'Auto-decomposed after two implement passes (2 pieces).',
     needsClarification: { reason: 'design-decision', openQuestions: 'This is unrelated to any known signature.' },
     ncTriageBucketAttempts: { K: 1 },
+    ncTriageAttempts: 1,
   }));
   const s = await needsClarificationTriage(args(dir));
   assert.equal(s.requeued, 0);
@@ -1004,6 +1008,9 @@ test('bucket D being exhausted does NOT block bucket K from firing on the same t
     implementResponse: 'Auto-decomposed after two implement passes that both chose RESOLUTION: decompose without usable pieces (2 pieces).\n\nAgentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it',
     needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
     blockedReason: 'The IMPLEMENT draft is a degenerate meta-commentary...',
+    // The flat, pre-2026-09-16 generic requeue counter is ALSO already at its cap --
+    // bucket K must be gated by its OWN ncTriageBucketAttempts.K, not this shared one.
+    ncTriageAttempts: 1,
     // Bucket D's own budget is already spent -- simulates a task an earlier, unrelated
     // requeue bucket already touched once, exactly the production incident this closes.
     ncTriageBucketAttempts: { D: 1 },
@@ -1015,6 +1022,33 @@ test('bucket D being exhausted does NOT block bucket K from firing on the same t
   assert.equal(moved.ncTriageBucketAttempts.K, 1, 'bucket K got its OWN fresh attempt, unaffected by D already being at its cap');
   assert.equal(moved.ncTriageBucketAttempts.D, 1, 'bucket D\'s own prior count is preserved, not reset by K firing');
   assert.match(moved.implementResponse, /Add the allowlist constant/);
+});
+
+// 2026-09-16, widened gate (sibling piece 1/2): a task whose adhocResolution is only
+// 'draft' (never promoted to 'decompose') but which ALREADY carries a real, valid
+// subTaskProposals decomposition -- with the generic requeue budget spent and an
+// implementResponse that names none of the sub-task titles -- must still be rescued by
+// bucket K. Same signature as tk1, one gate-step earlier in the adhoc lifecycle.
+test('bucket K: fires for adhocResolution "draft" with a real decomposition sitting unused (widened gate)', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, baseTask('tk8', {
+    adhocResolution: 'draft',
+    subTaskProposals: REAL_SUB_TASKS,
+    // Deliberately names NO sub-task title (contrast tk2, which shows the real titles
+    // and is left alone) -- the blind signature this bucket repairs.
+    implementResponse: 'Implement pass drafted a fix for the widget but the response body is otherwise generic.',
+    needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
+    ncTriageAttempts: 1,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tk8.json')));
+  const moved = read(at(dir, 'review', 'tk8.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.equal(moved.ncTriageBucketAttempts.K, 1, 'bucket K consumed its OWN budget, not the flat ncTriageAttempts');
+  assert.match(moved.implementResponse, /Add the allowlist constant/);
+  assert.match(moved.implementResponse, /Wire the allowlist into the check/);
 });
 
 // --- Ghost-in-the-Machine: bucket C retry-exhausted -> ghost debt (2026-09-09) ---------
