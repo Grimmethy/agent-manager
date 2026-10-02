@@ -261,6 +261,53 @@ function buildExhaustedReviewVerdictQuestion(task) {
   ].join('\n');
 }
 
+// HUB0114 · 1/3: a pure "is this candidate's feature ACTUALLY already in the target
+// file?" check. A candidate's premise can be genuinely stale -- someone else already
+// fixed it after the candidate was created (see buildExhaustedFulfillmentQuestion
+// above: 9 of 10 live blocked _fix tasks were exactly this) -- so before redrafting,
+// read the REAL target file and look for the candidate's stated feature title. Pure
+// and self-contained on purpose: (candidate, targetFile) in, a verdict out; no queue/
+// writes, no registry lookups, no task JSON, so the 2/3 wiring pass can call it from
+// any branch and unit-test it in isolation (3/3).
+//
+// Matching rules (deliberately simple, no parser):
+//   - case-insensitive substring of the candidate's feature title (candidate.title,
+//     falling back to featureTitle/feature) against each line of the target file;
+//   - the line must be a code comment (//, /*, * , #) or a quote-free identifier
+//     context -- a hit inside a string literal is data, not a feature reference;
+//   - a line whose ONLY occurrence of the feature title is a bare AC-id token
+//     (HUB0114 / AC-123 / HUB-0114 / AC123 -- a TODO or doc-comment id reference) is
+//     explicitly rejected: referencing an acceptance-criteria id is not evidence the
+//     feature is implemented, even when the title textually is that id.
+function alreadyImplementedInTarget(candidate, targetFile) {
+  const none = { implemented: false, matchedLine: null };
+  const featureTitle = candidate && String(candidate.title || candidate.featureTitle || candidate.feature || '').trim();
+  if (!featureTitle || !targetFile) return none;
+  const feature = featureTitle.toLowerCase();
+  let content;
+  try {
+    content = fs.readFileSync(targetFile, 'utf8');
+  } catch {
+    // Unreadable/missing target file is "not implemented", not an exception: the
+    // caller owns error reporting, and a moved/deleted file is exactly the stale
+    // citation case this check exists to catch.
+    return none;
+  }
+  // Bare AC-id tokens: 2-8 uppercase letters (an acronym) + optional dash + 1-8 digits.
+  // Uppercase-only on the letters so a lowercase word like "retry2" is never stripped.
+  const acIdToken = /\b[A-Z]{2,8}-?\d{1,8}\b/g;
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || !line.toLowerCase().includes(feature)) continue;
+    const inComment = /^(\/\/|\/\*|\*|#)/.test(line);
+    const inIdentifierContext = !/["'`]/.test(line);
+    if (!inComment && !inIdentifierContext) continue;
+    if (!line.replace(acIdToken, ' ').toLowerCase().includes(feature)) continue;
+    return { implemented: true, matchedLine: line };
+  }
+  return none;
+}
+
 // The directory-discovery half of rejectRetryCheck, extracted so the "which
 // directories do we scan, and what entries do they yield" policy is a named,
 // independently unit-testable unit (mock fs.readdirSync, assert the shape of the
@@ -914,7 +961,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
+module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion, alreadyImplementedInTarget };
 
 if (require.main === module) {
   main();
