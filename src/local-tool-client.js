@@ -906,7 +906,14 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
     const handler = toolHandlers[name];
     let result;
     if (!handler) {
-      result = { error: `unknown tool: ${name}` };
+      // 2026-09-22 (pipeline hardening, 2nd repro): the bare "unknown tool: X" gave the
+      // model no way to self-correct -- a tier-3 run called one hallucinated name
+      // (`list_files`), got back nothing but the rejection, then spent its remaining
+      // turns refusing to proceed and answered RESOLUTION: needs-human-decision without
+      // ever trying `list_directory` (a real tool, one typo away). Enumerating the
+      // actually-registered handlers in the error string is cheap and deterministic:
+      // the model gets exactly what it needs to pick a real tool on its very next turn.
+      result = { error: `unknown tool: ${name}. Available tools: ${Object.keys(toolHandlers).join(', ')}.` };
     } else {
       try {
         result = await handler(args);
