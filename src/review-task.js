@@ -493,6 +493,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(gateReplaySection);
     lines.push('');
   }
+  const policySection = formatPolicyChangeSection(task.policyChange);
+  if (policySection) {
+    lines.push(policySection);
+    lines.push('');
+  }
   const skipPathSection = formatSkipPathSection(task.skipPaths);
   if (skipPathSection) {
     lines.push(skipPathSection);
@@ -700,6 +705,19 @@ function formatGateReplaySection(gr) {
   }
   for (const x of gr.skipped || []) out.push(`No real-data replay was possible for ${x.name}: ${x.reason}. Ask what real inputs the draft tested it against.`);
   return out.join('\n');
+}
+
+// --- policy change, as the voters see it (brain dump "Pipeline yellow hardening 5/8, revised") ----------------------------------------------------------------
+function formatPolicyChangeSection(pc) {
+  if (!pc || typeof pc !== 'object' || !pc.policy || !Array.isArray(pc.kinds) || !pc.kinds.length) return '';
+  const where = (pc.signals || []).slice(0, 3).map((x) => `${x.file}:${x.line} (${x.kind})`).join('; ');
+  return [
+    '--- Policy-affecting diff (deterministic check; advisory) ---',
+    `This diff changes how the pipeline itself behaves (${pc.kinds.join(', ')}): ${where}.`,
+    pc.route === 'replay-settled'
+      ? 'A replay over finished work decides the gate part of it -- read the replay line above.'
+      : 'Nothing replays this over finished work, so the draft must show it was checked against real inputs, not only hand-made examples. Ask which real tasks, prompts or timings it was exercised on, and who or what still calls what changed.',
+  ].join('\n');
 }
 
 // --- skip / dismiss / early-exit paths, as the voters see them (brain dump #1667) --------------------------------------------------------------------
@@ -1313,6 +1331,41 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
   }
 
+  // Policy-change classification (src/policy-change.js; brain dump "Pipeline yellow hardening 5/8, revised"): is this diff a change to how the pipeline itself behaves, and can a
+  // replay over finished work settle it? Recorded on the task either way so the escalation rate can be measured; it only BLOCKS (escalating to a human) when
+  // AGENT_MANAGER_POLICY_CHANGE_ROUTING=true. Never throws.
+  if (process.env.AGENT_MANAGER_POLICY_CHANGE_CLASSIFY !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    try {
+      const pc = require('./policy-change.js');
+      const rawText = (task.promptContext && task.promptContext.rawText) || '';
+      const classification = pc.classifyPolicyChange({ rawDiff: task.rawDiff, text: rawText, title: task.title });
+      const decision = pc.decidePolicyRouting({ classification, gateReplay: task.gateReplay, task });
+      task.policyChange = {
+        at: new Date().toISOString(), policy: !!classification.policy, kinds: classification.kinds, pureMove: !!classification.pureMove, hint: !!classification.hint,
+        route: decision.route, reason: decision.reason,
+        signals: classification.signals.slice(0, 4).map((x) => ({ kind: x.kind, file: x.file, line: x.line, text: String(x.text || '').slice(0, 120) })),
+      };
+      if (classification.policy) {
+        appendHistoryEvent(task, 'advisory', `policy change: ${classification.kinds.join(', ')} -> ${decision.route}${pc.policyRoutingEnabled() ? '' : ' (shadow: escalation is off)'}`);
+      }
+      if (decision.route === 'escalate') {
+        task.policyChange.brief = pc.buildPolicyBrief({ classification, gateReplay: task.gateReplay, taskTitle: task.title });
+        if (pc.policyRoutingEnabled()) {
+          const reason = `Policy change: ${classification.kinds.join(', ')} -- ${decision.reason}. Escalated to a human instead of a vote.`.slice(0, 400);
+          task.reviewProvider = 'deterministic-policy-change';
+          recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+          appendHistoryEvent(task, 'blocked', reason);
+          return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+        }
+      }
+    } catch (e) {
+      console.error(`[review] policy-change classification errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+  }
+
   await waitForLocalAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
@@ -1464,7 +1517,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();

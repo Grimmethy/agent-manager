@@ -101,6 +101,17 @@ function buildInvalidPremiseQuestion(task) {
   ].join('\n');
 }
 
+// Policy-change escalation (brain dump "Pipeline yellow hardening 5/8, revised"): review-task.js blocks with "Policy change: ..." when a draft changes how the pipeline itself
+// behaves (src/policy-change.js) and no replay over finished work can settle it. DESIGN-side, not retryable: a redraft cannot decide whether the behaviour should ship.
+function hasPolicyChangeEscalation(task) {
+  return /^policy change:/i.test(String(task.blockedReason || '').trim());
+}
+
+function buildPolicyChangeQuestion(task) {
+  const brief = task.policyChange && typeof task.policyChange.brief === 'string' ? task.policyChange.brief : '';
+  return brief || `${String(task.blockedReason || '').replace(/^policy change:\s*/i, '')}\n\nThis draft changes how the pipeline itself behaves and no replay can settle it: ship it as drafted, ship it with constraints (say which), or Archive the task.`;
+}
+
 // concept-candidate-grounding-gate-3e9bec: the candidate-generator grounding checks
 // (arch_import / arch_discovery / deep_dive) emit this exact "fabricated file path(s)"
 // prefix via the shared deterministic Check 0 (candidate-path-grounding.js) when the
@@ -239,6 +250,15 @@ const CLASSIFIERS = [
     },
   },
   {
+    // Ordered first among the escalations: the reason text can mention gates and thresholds that the keyword classifiers below would otherwise claim.
+    name: 'policy-change',
+    classify(task) {
+      if (hasPolicyChangeEscalation(task)) return { category: 'policy-change', faultSide: 'design', retryable: false };
+      return null;
+    },
+    buildQuestion: buildPolicyChangeQuestion,
+  },
+  {
     name: 'unreliable-grounding',
     classify(task) {
       if (hasUnreliableGrounding(task)) {
@@ -357,6 +377,7 @@ module.exports = {
   hasZeroHitHarnessSearch,
   hasUnreliableGrounding,
   hasInvalidPremise,
+  hasPolicyChangeEscalation,
   hasFabricatedFilePath,
   hasFabricatedSymbolCitation,
   hasNoContextFiles,

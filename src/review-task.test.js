@@ -1936,6 +1936,65 @@ test('gate replay: with AGENT_MANAGER_GATE_REPLAY_BLOCK=true an over-limit gate 
   } finally { delete process.env.AGENT_MANAGER_GATE_REPLAY_BLOCK; }
 }));
 
+const POLICY_DIFF = 'diff --git a/src/single-flight-lock.js b/src/single-flight-lock.js\n--- a/src/single-flight-lock.js\n+++ b/src/single-flight-lock.js\n@@ -1 +1 @@\n-const DISCUSS_PRIORITY_MAX_WAIT_MS = 120000;\n+const DISCUSS_PRIORITY_SAFETY_VALVE_MS = 900000;\n';
+const withPolicyEnv = (routing, fn) => async () => {
+  if (routing) process.env.AGENT_MANAGER_POLICY_CHANGE_ROUTING = 'true'; else delete process.env.AGENT_MANAGER_POLICY_CHANGE_ROUTING;
+  try { await fn(); } finally { delete process.env.AGENT_MANAGER_POLICY_CHANGE_ROUTING; }
+};
+
+test('policy change: in shadow mode (the default) a policy-affecting draft is recorded and shown to the voters but still gets its vote', withPolicyEnv(false, async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'pc-shadow', rawDiff: POLICY_DIFF, title: 'Raise the chat backoff ceiling' });
+  const captured = [];
+  await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  assert.equal(captured.length, 1, 'shadow mode never blocks');
+  assert.equal(task.policyChange.policy, true);
+  assert.deepEqual(task.policyChange.kinds, ['threshold']);
+  assert.equal(task.policyChange.route, 'escalate');
+  assert.match(task.policyChange.brief, /alters how the pipeline itself behaves/);
+  assert.match(String(captured[0].prompt || captured[0]), /Policy-affecting diff/);
+  assert.ok(task.history.some((h) => h.stage === 'advisory' && /policy change: threshold -> escalate \(shadow: escalation is off\)/.test(h.detail || '')));
+}));
+
+test('policy change: with AGENT_MANAGER_POLICY_CHANGE_ROUTING=true an unsettled policy change is blocked before any vote for a human', withPolicyEnv(true, async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'pc-on', rawDiff: POLICY_DIFF, title: 'Raise the chat backoff ceiling' });
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.match(result.blockedReason, /^Policy change: threshold -- policy-affecting and no replay can settle it/);
+  assert.equal(task.reviewProvider, 'deterministic-policy-change');
+  assert.equal(captured.length, 0, 'no vote is spent');
+}));
+
+test('policy change: a task a human already answered, a non-policy draft and a replay-settled gate are never escalated, routing on or not', withPolicyEnv(true, async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const decided = adhocImplementedTask({ id: 'pc-decided', rawDiff: POLICY_DIFF, promptContext: { rawText: 'raise it\n\nHUMAN DESIGN DECISION (answered directly from the Needs Clarification picker, 2026-10-01T00:00:00Z):\nship it' } });
+  const c1 = [];
+  await reviewTask(decided, { repoRoot, domainsPath, localMajorityVote: fakeApprove(c1), recordModelOutcome: () => {} });
+  assert.equal(c1.length, 1, 'already decided: goes to the vote');
+  assert.equal(decided.policyChange.route, 'decided');
+  const plain = adhocImplementedTask({ id: 'pc-plain' });
+  const c2 = [];
+  await reviewTask(plain, { repoRoot, domainsPath, localMajorityVote: fakeApprove(c2), recordModelOutcome: () => {} });
+  assert.equal(c2.length, 1);
+  assert.equal(plain.policyChange.policy, false);
+  assert.equal(plain.policyChange.route, 'none');
+}));
+
+test('policy change: AGENT_MANAGER_POLICY_CHANGE_CLASSIFY=false skips the classification entirely', withPolicyEnv(true, async () => {
+  process.env.AGENT_MANAGER_POLICY_CHANGE_CLASSIFY = 'false';
+  try {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = adhocImplementedTask({ id: 'pc-off', rawDiff: POLICY_DIFF });
+    const captured = [];
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+    assert.equal(task.policyChange, undefined);
+    assert.equal(captured.length, 1);
+  } finally { delete process.env.AGENT_MANAGER_POLICY_CHANGE_CLASSIFY; }
+}));
+
 test('gate replay: a malformed replay result never breaks the review -- it still reaches the vote', withExecutedVerify(async () => {
   const { repoRoot, domainsPath } = makeFixture();
   const task = adhocImplementedTask({ id: 'gr-malformed' });
