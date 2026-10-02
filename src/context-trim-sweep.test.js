@@ -223,3 +223,69 @@ test('reAnchorFile falls back to null (unreadable) for a NON-stacked task when t
   const result = reAnchorFile(repoRoot, { path: 'realTarget.js', anchorConfidence: 'none' }, 'Problem:\nThe `realTarget` function has a bug.', { id: 't-plain' });
   assert.equal(result, null, 'a non-stacked task must not see a file that only exists on some other branch');
 });
+
+// --- HUB0112 (3/3): AC-111 citation auto-correction ------------------------------------
+// observability-fix-ac-111's real shape: the report handler's code (its Snippet) moved out
+// of python/dashboard/app.py into python/dashboard/routes/reports.py, so re-anchoring
+// against the cited file can show no measurable improvement and the sweep would otherwise
+// flag the task stale-grounding-unrecoverable. The auto-correction pass (2026-09-23,
+// sibling 1/3) must instead re-point the candidate's Files: citation at the file that now
+// owns the snippet, and the task must be requeued -- not flagged.
+test('AC-111 citation correction: a candidate citing app.py whose Snippet only exists at routes/reports.py gets its Files: citation re-pointed and is NOT flagged stale-grounding-unrecoverable', async () => {
+  const dir = tmpPipeline();
+  const repo = path.join(dir, 'repo');
+
+  // Synthetic stand-ins for the two REAL files (the test must not depend on their actual
+  // on-disk contents). app.py: the report-detail handler is GONE (its code lived here
+  // when the candidate was written) -- the snippet is genuinely absent from the cited
+  // file. reports.py: the Snippet exists ONLY here, and nowhere else in the repo (so
+  // relocateStaleAnchor's "exactly one file matches" tier acceptance can fire).
+  fs.mkdirSync(path.join(repo, 'python', 'dashboard', 'routes'), { recursive: true });
+  const appContent =
+    'try:\n    payload = open(path)\nexcept OSError:\n    logger.warning("could not read %r", path)\n    return None\n';
+  const handlerBlock =
+    'def api_report_detail(period, filename):\n' +
+    '    try:\n' +
+    '        content = path.read_text(encoding="utf-8")\n' +
+    '    except OSError:\n' +
+    '        logger.exception("Failed to serve report file %r", path)\n' +
+    '        abort(404)\n';
+  fs.writeFileSync(path.join(repo, 'python', 'dashboard', 'app.py'), appContent);
+  fs.writeFileSync(path.join(repo, 'python', 'dashboard', 'routes', 'reports.py'), handlerBlock);
+
+  // The Snippet is the handler block itself -- comfortably past relocateStaleAnchor's
+  // 120 whitespace-stripped-char floor (a snippet shorter than that is never followed,
+  // as it would be ambiguous to a neighbour).
+  const body =
+    'Problem:\nThe `api_report_detail` error handler needs a cleaner failure path.\n\n' +
+    'Snippet:\n' +
+    '```\n' + handlerBlock + '\n```\n\n' +
+    'Solution:\nReturn a JSON body instead of aborting.';
+
+  // Stale snapshot taken at candidate-creation time: points at app.py (where the code
+  // USED to live). Its frozen window is byte-identical to what's on disk and was
+  // already anchored 'strong', so re-anchoring app.py shows NO measurable improvement
+  // -- the branch under test is exactly the one where the sweep must fall through to
+  // the citation auto-correction path instead of flagging.
+  writeTask(dir, 'blocked', baseTask('t-ac111', {
+    title: 'AC-111 · report handler moved out of app.py',
+    promptContext: {
+      body,
+      fetchedFiles: [
+        { path: 'python/dashboard/app.py', content: appContent, anchorConfidence: 'strong' },
+      ],
+    },
+  }));
+
+  const s = await sweep({ pipelineDir: dir, repoRoot: repo, now: Date.now() });
+
+  assert.equal(s.requeued, 1, 'a relocatable citation is a measurable improvement -> requeue');
+  assert.equal(s.flagged, 0);
+  assert.equal(exists(dir, 'blocked', 't-ac111'), false, 'must be moved out of blocked');
+  const fresh = readTask(dir, 'pending', 't-ac111');
+  assert.equal(fresh.promptContext.fetchedFiles[0].path, 'python/dashboard/routes/reports.py',
+    "the candidate's Files: citation must now point at the file that owns the Snippet");
+  assert.ok(!fresh.contextTrimFlag, "'stale-grounding-unrecoverable' flag must NOT be set");
+  assert.ok(JSON.stringify(fresh).indexOf('stale-grounding-unrecoverable') === -1,
+    'no trace of the unrecoverable flag anywhere on the requeued task');
+});
