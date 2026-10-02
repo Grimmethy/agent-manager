@@ -25,8 +25,8 @@ const { signatureForClarificationTask } = require('../pipeline-forensics.js');
 const { appendHistoryEvent } = require('../task-history.js');
 const { readIfExists, quotedSymbolsFromSection, snippetFromSection } = require('./lib/candidate-doc-parsing.js');
 const { findFuzzyMatch, windowAroundIndex } = require('./lib/fuzzy-matching.js');
-const { collectAnchorHits, windowFetchedFileContent } = require('./lib/file-grounding.js');
-const { extractCandidateSignatures, liveSignatureCount, staleSignatureReason, archiveStaleCandidate, nextCandidateFulfillmentTask, SIGNATURE_RE, MAX_ARCH_REVIEW_TASK_CHARS } = require('./lib/candidate-lifecycle.js');
+const { collectAnchorHits, windowFetchedFileContent, snippetMissingFrom, relocateStaleAnchor } = require('./lib/file-grounding.js');
+const { extractCandidateSignatures, liveSignatureCount, staleSignatureReason, archiveStaleCandidate, nextCandidateFulfillmentTask: rawNextCandidateFulfillmentTask, SIGNATURE_RE, MAX_ARCH_REVIEW_TASK_CHARS } = require('./lib/candidate-lifecycle.js');
 
 const MAX_FETCHED_FILE_CHARS = 8000;
 
@@ -192,6 +192,89 @@ const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable an
 // determined (no needs-clarification/ dir), is never flagged by this check -- it has
 // nothing to disprove, same "no real claim, no verdict" discipline computePremiseEvidence
 // applies to citations.
+
+// Pre-filing citation validation (HUB0112 · 2/3, 2026-09-20): observability_fix and
+// performance_fix candidates are the ONLY sources whose Snippet: field is a verbatim copy
+// of real code the scanner read at review time -- which means that citation can be
+// CHECKED deterministically against the repo before the candidate is filed, instead of
+// only being discovered, hours later, as a grounding miss (windowFetchedFileContent's own
+// rank-0 miss + LOW-CONFIDENCE GROUNDING marker) or a full blocked cycle (the
+// observability-fix-ac-111 incident in this file's header). Three outcomes:
+//
+//   PASS        -- the snippet is still at one of the candidate's cited Files: paths
+//                  (snippetMissingFrom, the exact same primitive context-trim-sweep.js
+//                  and known-fixed-failures.js re-check per retry, says "not missing"):
+//                  the candidate is filed unmodified, its Files: line untouched.
+//   CORRECTED   -- the snippet is absent from every cited path but relocateStaleAnchor
+//                  (the existing repo-wide search primitive: siblings of the cited file
+//                  first, then its top-level directory subtree, unique WHOLE-snippet
+//                  match only, never a guess) finds exactly one home for it: the corrected
+//                  path is written into the candidate's Files: field BEFORE persistence,
+//                  so the task that gets filed declares the real edit target.
+//   REJECTED    -- the snippet is found NOWHERE: the candidate is archived straight to
+//                  queue/done/_archived_no_action/ (archiveStaleCandidate, the same
+//                  pre-draft-reject precedent the signature/premise checks above use) with
+//                  a diagnostic naming the expected snippet substring, and the loop moves
+//                  on to the next candidate in the doc instead of filing a task doomed to
+//                  the no-real-code degenerate cycle.
+//
+// Deliberately conservative: only the two sources above are gated (their Snippet is
+// scanner-written verbatim -- arch_review / pipeline_forensics_fix candidates carry
+// model-authored or diff-shaped snippets this check was not built for, and diff snippets
+// are passed through by snippetMissingFrom's own looksLikeDiff guard anyway). Best-effort
+// throughout: any unexpected error degrades to PASS, never to a crash of the filing loop.
+const CITATION_GATE_SOURCES = new Set(['observability_fix', 'performance_fix']);
+
+// ctx: { sourceName, section, files, repoRoot } (the loop variables at the filing point,
+// see candidate-lifecycle.js's preFilingGate hook). Returns:
+//   null                        -> PASS, file the candidate unmodified;
+//   { files, correctedFrom, correctedTo } -> PASS with the corrected Files: line;
+//   { archiveReason }           -> REJECTED, archive with this diagnostic.
+function validateCitationBeforeFiling(ctx) {
+  const { sourceName, section, files, repoRoot } = ctx || {};
+  try {
+    if (!CITATION_GATE_SOURCES.has(sourceName)) return null;
+    // snippetFromSection is SNIPPET_FIELD_RE (defined above) applied -- the same parse
+    // snippetMissingFrom itself uses, so the check and the preview can't disagree.
+    const snippet = snippetFromSection(section);
+    if (!snippet || !Array.isArray(files) || files.length === 0) return null;
+    const snippetPreview = snippet.replace(/\s+/g, ' ').trim().slice(0, 40);
+
+    // PASS if the snippet is still where the candidate says it is.
+    for (const relPath of files) {
+      let content = null;
+      try { content = fs.readFileSync(path.resolve(repoRoot, relPath), 'utf8'); } catch { continue; }
+      if (content && !snippetMissingFrom(content, section)) return null;
+    }
+
+    // CORRECTED: the code moved after the candidate was written -- follow it, but only
+    // where relocateStaleAnchor can prove it uniquely (never the ambiguous case).
+    const hit = relocateStaleAnchor(repoRoot, files[0], section);
+    if (hit && hit.path) {
+      return { files: [hit.path, ...files.slice(1)], correctedFrom: files[0], correctedTo: hit.path };
+    }
+
+    // REJECTED: unresolvable citation -- say exactly which snippet was expected where.
+    return {
+      archiveReason: `pre-filing citation validation: the candidate's Snippet `
+        + `(expected at ${files[0]}: "${snippetPreview}"${snippetPreview.length >= 40 ? '...' : ''}) `
+        + 'is not at the cited path and no unique match was found anywhere else in the repo '
+        + '-- the citation is unresolvable, candidate rejected before filing',
+    };
+  } catch {
+    return null; // a gate bug must never wedge the filing loop -- degrade to PASS
+  }
+}
+
+// The public filing entry point consumers require (task-sources.js, the hygiene plugin's
+// observability_fix/performance_fix sources): runs the pre-filing citation gate above
+// immediately before the candidate-fulfillment task object is handed to the filer. The
+// raw loop (rawNextCandidateFulfillmentTask, lib/candidate-lifecycle.js) is unchanged for
+// any caller that doesn't inject a gate.
+function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
+  return rawNextCandidateFulfillmentTask(candidatesPath, sourceName, { preFilingGate: validateCitationBeforeFiling });
+}
+
 module.exports = {
   ...candidateDocs,
   nextCandidateFulfillmentTask,
@@ -202,6 +285,8 @@ module.exports = {
   collectAnchorHits,
   snippetFromSection,
   quotedSymbolsFromSection,
+  validateCitationBeforeFiling,
+  snippetMissingFrom,
   MAX_FETCHED_FILE_CHARS,
   MAX_ARCH_REVIEW_TASK_CHARS,
 };

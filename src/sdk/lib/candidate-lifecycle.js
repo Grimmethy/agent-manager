@@ -76,7 +76,14 @@ function archiveStaleCandidate({ pipelineDir, taskId, domain, sourceName, titleT
   fs.writeFileSync(path.join(dir, `${taskId}.json`), JSON.stringify(record, null, 2));
 }
 
-function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
+// opts.preFilingGate (2026-09-20, HUB0112 · 2/3): optional last-moment gate, run
+// per-candidate immediately BEFORE the task object is handed to the filer (see
+// candidate-fulfillment.js's validateCitationBeforeFiling for the gate that ships with
+// it). Contract: gate({ sourceName, section, files, repoRoot }) returns null (pass
+// unchanged), { files, ... } (pass with a corrected Files: line), or { archiveReason }
+// (reject: archived via archiveStaleCandidate, loop moves to the next candidate).
+// Absent/undefined opts keeps the original behavior exactly for direct callers.
+function nextCandidateFulfillmentTask(candidatesPath, sourceName, opts = {}) {
   // lazy (see module header) -- task-sources.js is fully loaded by the time any
   // next() poll calls this.
   const { taskIdExistsInQueue, isDependencySatisfied } = require('../../task-sources.js');
@@ -284,6 +291,33 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
       ? 'none'
       : null;
 
+    // Pre-filing gate hook (HUB0112 · 2/3): the LAST deterministic check before this
+    // candidate becomes a real task. candidate-fulfillment.js's
+    // validateCitationBeforeFiling ships through here for every source it is injected
+    // for (today: observability_fix / performance_fix) -- a REJECT archives the
+    // candidate with its diagnostic (same archiveStaleCandidate path the
+    // staleSignatureReason/premise checks above already use) and the loop continues to
+    // the next candidate in the doc; a CORRECTED verdict rewrites filesArray (+
+    // re-reads the corrected file for grounding) so what the filer persists carries the
+    // real edit target.
+    let gateVerdict = null;
+    if (opts.preFilingGate) {
+      try {
+        gateVerdict = opts.preFilingGate({ sourceName, section, files: filesArray, repoRoot });
+      } catch { gateVerdict = null; } // a gate crash is never allowed to wedge the filing loop
+    }
+    if (gateVerdict && gateVerdict.archiveReason) {
+      archiveStaleCandidate({
+        pipelineDir, taskId, domain: defaultDomain, sourceName, titleText, candidateId, section,
+        reason: gateVerdict.archiveReason,
+      });
+      continue;
+    }
+    const finalFiles = (gateVerdict && gateVerdict.files) || filesArray;
+    const finalFetchedFiles = finalFiles === filesArray
+      ? fetchedFiles
+      : [...finalFiles.map((p) => readWindowed(p, false)).filter(Boolean), ...contextFetched];
+
     return {
       id: taskId,
       domain: defaultDomain,
@@ -292,8 +326,8 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
       promptContext: {
         candidateId,
         title: titleText,
-        files: filesArray,
-        fetchedFiles,
+        files: finalFiles,
+        fetchedFiles: finalFetchedFiles,
         body: section,
         splitDepth,
         mustPreSplit,
