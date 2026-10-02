@@ -1366,6 +1366,30 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
   }
 
+  // Deterministic hit-count gate (2026-09-13, pipeline-debrief Task 2 / Flag 2): when an
+  // acceptance criterion asserts a SPECIFIC grep hit count (`grep -n <symbol> <file>` ...
+  // "exactly N hits" / "returns N hits"), the count is mechanically determinable via
+  // `grep -c <symbol> <file>` -- block the draft with the actual count BEFORE any
+  // model-reviewer call, instead of spending a vote re-discovering the same systematic
+  // mismatch (the model repeats the symbol in comment + code). No-op when no criterion
+  // matches the pattern; never throws (a gate error falls through to the normal vote,
+  // same non-fatal discipline as the skip-path / policy-change checks above).
+  if (process.env.AGENT_MANAGER_HIT_COUNT_GATE !== 'false'
+      && Array.isArray(task.acceptanceCriteria) && task.acceptanceCriteria.length) {
+    try {
+      const { checkHitCountGate } = require('./hit-count-gate.js');
+      const gate = checkHitCountGate({ repoRoot: repoRootForCheck, criteria: task.acceptanceCriteria });
+      if (gate && gate.verdict === 'blocked') {
+        task.reviewProvider = 'deterministic-hit-count';
+        recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: gate.blockedReason });
+        appendHistoryEvent(task, 'blocked', gate.blockedReason);
+        return { succeeded: true, verdict: 'blocked', blockedReason: gate.blockedReason, blockedStage: 'review', factCheckVerdict };
+      }
+    } catch (e) {
+      console.error(`[review] hit-count gate errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+  }
+
   await waitForLocalAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
