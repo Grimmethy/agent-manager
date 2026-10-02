@@ -80,10 +80,25 @@ function branchVerdictFilterBarHtml(branches, activeKey) {
 
 // Browser-only: (re)build the filter bar + filtered card list into `main`. Uses the globals
 // branchCardHtml / wireBranchCard from branches-joblist-hardware-tabs.js at CALL time.
+// Hubs whose built pieces are pushed but held out of the list until every piece is built (server: partition_held_hub_branches).
+function heldHubsHtml(groups) {
+  const list = Array.isArray(groups) ? groups : [];
+  if (!list.length) return '<div data-held-hubs></div>';
+  const rows = list.map((g) => {
+    const p = g.progress || {};
+    const waiting = (g.waitingOn || []).map(_bvEscape).join(', ');
+    return `<div class="meta" style="margin:2px 0">${_bvEscape(String(g.title || g.hubId).slice(0, 70))}: ${p.built || 0} of ${p.total || 0} built, `
+      + `${(g.branches || []).length} held${waiting ? ', waiting on ' + waiting : ''}</div>`;
+  }).join('');
+  return '<div data-held-hubs style="margin-top:14px;padding:8px 10px;border:1px dashed #888;border-radius:6px">'
+    + `<div class="meta"><b>Waiting on siblings (${list.length})</b> -- pushed, but not listed until every piece of the hub is built</div>${rows}</div>`;
+}
+
 function renderBranchListInto(main, branches) {
   const shown = filterBranchesByVerdict(branches, branchVerdictFilter);
   main.innerHTML = branchVerdictFilterBarHtml(branches, branchVerdictFilter)
-    + (shown.length ? shown.map(branchCardHtml).join('') : '<div class="empty">No branches match this filter.</div>');
+    + (shown.length ? shown.map(branchCardHtml).join('') : `<div class="empty">${branches.length ? 'No branches match this filter.' : 'Nothing is ready to verify yet.'}</div>`)
+    + heldHubsHtml(typeof currentHeldHubs === 'undefined' ? [] : currentHeldHubs);
   main.querySelectorAll('[data-branch-row]').forEach(wireBranchCard);
   wireBranchVerdictFilterBar(main);
 }
@@ -102,4 +117,4 @@ function refreshBranchVerdictFilterBar(main, branches) {
   wireBranchVerdictFilterBar(main);
 }
 
-if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS };
+if (typeof module !== 'undefined') module.exports = { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, branchVerdictDetailHtml, filterBranchesByVerdict, branchVerdictFilterBarHtml, BRANCH_VERDICT_FILTERS, heldHubsHtml };
