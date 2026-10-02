@@ -662,3 +662,43 @@ test('integration: in a real worktree and sandbox, the hunk the new test does no
     assert.ok(r.unpinned.hunks[0].start > 10, 'it is the twice() hunk, not the add() hunk');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+// --- gate replay hook (brain dump 7/8) ----------------------------------------------------------------
+const REPLAY_RESULT = { candidates: [{ name: 'checkX', file: 'src/a.js', family: 'draft-text' }], skipped: [] };
+
+test('verifyDiff attaches the gate replay result while the diff is applied, and the replay never changes the status', () => {
+  let seen = null;
+  const f = fakeDeps({ replay: (a) => { seen = a; return REPLAY_RESULT; } });
+  const r = verifyDiff({ ...base, pipelineDir: '/pipe', checkReplay: true, deps: f.deps });
+  assert.deepEqual(r.replay, REPLAY_RESULT);
+  assert.equal(seen.rawDiff, DIFF);
+  assert.equal(seen.pipelineDir, '/pipe');
+  assert.equal(seen.mainBranch, 'master');
+  assert.equal(typeof seen.run, 'function');
+  assert.equal(r.status, 'inconclusive', 'no covering tests found: the replay does not turn that into a pass or a fail');
+  const g = verifyDiff({ ...base, pipelineDir: '/pipe', checkReplay: true, deps: fakeDeps({ replay: () => REPLAY_RESULT, findTests: () => ({ js: ['src/a.test.js'], py: [] }) }).deps });
+  assert.equal(g.status, 'passed');
+  assert.deepEqual(g.replay, REPLAY_RESULT);
+});
+
+test('verifyDiff does not replay without the flag or a pipeline dir, and a replay that throws is swallowed', () => {
+  let calls = 0;
+  const counting = fakeDeps({ replay: () => { calls += 1; return REPLAY_RESULT; } });
+  assert.equal(verifyDiff({ ...base, pipelineDir: '/pipe', deps: counting.deps }).replay, undefined, 'checkReplay defaults off');
+  assert.equal(verifyDiff({ ...base, checkReplay: true, deps: counting.deps }).replay, undefined, 'no pipeline dir -> no corpus');
+  assert.equal(calls, 0);
+  const boom = fakeDeps({ replay: () => { throw new Error('replay exploded'); }, findTests: () => ({ js: ['src/a.test.js'], py: [] }) });
+  const r = verifyDiff({ ...base, pipelineDir: '/pipe', checkReplay: true, deps: boom.deps });
+  assert.equal(r.status, 'passed', 'the verdict is untouched');
+  assert.equal(r.replay, undefined);
+});
+
+test('the replay runs inside the sandbox runner with the remaining budget, never past the deadline', () => {
+  const f = fakeDeps({ replay: (a) => { a.run({ worktreeDir: '/w', bin: 'node', args: ['x'], timeoutMs: 999999 }); return REPLAY_RESULT; } });
+  verifyDiff({ ...base, pipelineDir: '/pipe', checkReplay: true, budgetMs: 60000, deps: f.deps });
+  const call = f.calls.run.find((c) => c.args && c.args[0] === 'x');
+  assert.ok(call, 'the replay went through deps.run (the bwrap runner)');
+  assert.ok(call.timeoutMs <= 60000, `timeout ${call.timeoutMs} is capped by the total budget`);
+  const starved = fakeDeps({ replay: () => { throw new Error('must not run with <8s left'); } });
+  assert.doesNotThrow(() => verifyDiff({ ...base, pipelineDir: '/pipe', checkReplay: true, budgetMs: 5000, deps: starved.deps }));
+});
