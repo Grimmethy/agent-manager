@@ -153,7 +153,11 @@ function recoverableSortSkip(data, entry, brainDumpPath, reason) {
   return { skipped: true, recoverable: true, reason };
 }
 
-function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
+// applyBrainDumpSort is the entry point (HUB0085): load + classify the entry, then dispatch to exactly one of four outcomes -- queue a research task, queue an adhoc
+// task in the matched project, report a recoverable skip, or file a passive vault note. Each stage below is the original code moved verbatim; only the plumbing
+// (ctx in, the original return objects out) is new. loadAndClassifyEntry returns { done: <the original early-return value> } or { ctx }.
+// Stage 1: load the entry, refuse anything stale / suppressed / unconfigured, parse the classifier's JSON.
+function loadAndValidateEntry({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
   const { brainDumpEntryId, rawText, existingQueuedTitles } = task.promptContext;
 
   const data = loadBrainDump(brainDumpPath);
@@ -161,7 +165,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   const entry = findEntry(data, brainDumpEntryId);
   if (!entry) {
     // Terminal: the entry is gone, there is nothing to regenerate.
-    return { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` };
+    return { done: { skipped: true, reason: `brain-dump entry "${brainDumpEntryId}" no longer exists (deleted since this task was drafted)` } };
   }
   // The entry may have been edited (the dashboard's PUT resets status back to 'captured' on
   // a text change) or otherwise changed since this task was drafted -- classifying stale
@@ -170,7 +174,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   if (entry.suppressed) {
     // A human retired this finding after its sort task was queued -- sorting it now would
     // still file a note or queue a task for something they already dismissed.
-    return { skipped: true, reason: 'brain-dump entry was suppressed since this task was queued -- not sorting it' };
+    return { done: { skipped: true, reason: 'brain-dump entry was suppressed since this task was queued -- not sorting it' } };
   }
   if (entry.status !== 'captured' || entry.rawText !== rawText) {
     // Stale (HUB0050 2/3): this task was drafted against text the entry no longer has,
@@ -183,26 +187,33 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     // exactly as-is, status still 'captured' for the fresh sort), no recoverable flag,
     // and success:false so the caller's stale check (apply-group-a.js) can route it
     // away from the done transition.
-    return {
+    return { done: {
       skipped: true,
       stale: true,
       success: false,
       reason: 'brain-dump entry changed since this task was drafted -- a fresh sort will classify the current text',
-    };
+    } };
   }
 
   if (!secondBrainDir) secondBrainDir = getSecondBrainDir();
   if (!secondBrainDir) {
     // Terminal: no vault configured, no retry will help.
-    return { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' };
+    return { done: { skipped: true, reason: 'SECOND_BRAIN_DIR is not configured -- cannot file this entry anywhere' } };
   }
 
   const result = parseBrainDumpSortResult(implementResponse);
   if (!result) {
-    return recoverableSortSkip(data, entry, brainDumpPath,
-      'implement pass did not return a valid classification JSON');
+    return { done: recoverableSortSkip(data, entry, brainDumpPath,
+      'implement pass did not return a valid classification JSON') };
   }
 
+
+  return { ctx: { data, entry, result, secondBrainDir, pipelineDir, brainDumpEntryId, rawText, existingQueuedTitles, brainDumpPath, promptContext: task.promptContext } };
+}
+
+// Stage 2: normalise and validate the vault path, then recover the owning project (derive, origin routing, investigation-shaped findings).
+function classifySortResult(ctx) {
+  const { data, entry, result, secondBrainDir, rawText, brainDumpPath, promptContext } = ctx;
   const trackedLabels = readProjectRegistry().map((p) => p.label).filter(Boolean);
   result.secondBrainPath = normalizeSecondBrainPathCase(result.secondBrainPath, trackedLabels);
   result.secondBrainPath = path.normalize(result.secondBrainPath);
@@ -236,15 +247,15 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   }
   const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir, trackedLabels);
   if (namingError) {
-    return recoverableSortSkip(data, entry, brainDumpPath,
-      `rejected secondBrainPath "${result.secondBrainPath}": ${namingError}`);
+    return { done: recoverableSortSkip(data, entry, brainDumpPath,
+      `rejected secondBrainPath "${result.secondBrainPath}": ${namingError}`) };
   }
 
   // Deterministic belongsToProject recovery -- the classifier routinely leaves this null
   // for a note that is plainly a concrete change to this pipeline's own code (the dominant
   // failure of the blocked backlog). May also flip actionable true.
   {
-    const derived = deriveBelongsToProject(result, task.promptContext);
+    const derived = deriveBelongsToProject(result, promptContext);
     result.belongsToProject = derived.belongsToProject;
     result.actionable = derived.actionable;
   }
@@ -274,212 +285,234 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     result.actionable = false;
   }
 
-  // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
-  // change -- "investigate X, document findings" needs real web research, not a diff
-  // against any tracked project. Only when NO tracked project was named/recovered -- a
-  // note tied to a project routes to that project's queue below, never to research.
-  if (result.requiresResearch && !result.belongsToProject) {
-    if (!pipelineDir) {
-      return { skipped: true, reason: 'no pipelineDir available -- cannot queue a research task' };
+  return { ctx };
+}
+
+// loadAndClassifyEntry returns { done: <the original early-return value> } or { ctx }.
+function loadAndClassifyEntry(args) {
+  const loaded = loadAndValidateEntry(args);
+  if (loaded.done) return loaded;
+  return classifySortResult(loaded.ctx);
+}
+
+// Stage: a requeue-free research note (no tracked project named) becomes a research task plus a vault cross-reference.
+function queueResearchTask(ctx) {
+  const { data, entry, result, secondBrainDir, pipelineDir, brainDumpEntryId, rawText, brainDumpPath } = ctx;
+  if (!pipelineDir) {
+    return { skipped: true, reason: 'no pipelineDir available -- cannot queue a research task' };
+  }
+  const queuedId = `research-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+  const researchTask = {
+    id: queuedId,
+    domain: 'research',
+    source: 'research_task',
+    title: rawText.slice(0, 120),
+    promptContext: { rawText, brainDumpEntryId, secondBrainPath: result.secondBrainPath, tags: result.tags },
+  };
+  const researchDir = path.join(pipelineDir, 'queue', 'research');
+  fs.mkdirSync(researchDir, { recursive: true });
+  writeJsonAtomicSync(path.join(researchDir, `${queuedId}.json`), researchTask);
+
+  // Same audit-trail cross-reference convention the adhoc branch below already uses --
+  // an entry findable in the note it will eventually gain real content in, not the
+  // record of truth (brain-dump.json's queuedTaskId/queuedAt is that).
+  const fullPath = path.join(secondBrainDir, result.secondBrainPath);
+  fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+  const stamp = new Date().toISOString().slice(0, 10);
+  appendMarkdownLineAtomic(fullPath, `\n- **${stamp}** Queued as research task \`${queuedId}\` -- ${rawText}\n`);
+
+  entry.status = 'actioned';
+  entry.queuedTaskId = queuedId;
+  entry.queuedAt = new Date().toISOString();
+  fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+  writeJsonAtomicSync(brainDumpPath, data);
+
+  return { file: fullPath, queuedTaskId: queuedId, researchQueued: true };
+}
+
+// Stage: the matched project's registered domains (an unreadable domains file is logged and treated as none).
+function readProjectDomains(matchedProject) {
+  return (() => {
+    try {
+      return Object.keys(JSON.parse(fs.readFileSync(matchedProject.domainsPath, 'utf8')));
+    } catch (err) {
+      const reason = err && err.message ? err.message : String(err);
+      process.stderr.write(`[apply-group-a] failed to read domains from ${matchedProject.domainsPath}: ${reason}\n`);
+      return [];
     }
-    const queuedId = `research-brain-dump-${brainDumpEntryId}-${Date.now()}`;
-    const researchTask = {
-      id: queuedId,
-      domain: 'research',
-      source: 'research_task',
-      title: rawText.slice(0, 120),
-      promptContext: { rawText, brainDumpEntryId, secondBrainPath: result.secondBrainPath, tags: result.tags },
+  })();
+}
+
+// Stage: build the adhoc/derived task for the entry and resolve its path prefetch (queue dir + needs-clarification for no-match / ambiguous).
+function buildAdhocTaskForEntry(ctx, matchedProject) {
+  const { entry, brainDumpEntryId, rawText } = ctx;
+  const queuedId = `adhoc-brain-dump-${brainDumpEntryId}-${Date.now()}`;
+  // A brain-dump entry with a `raisedBy` was machine-filed (side-finding-sweep.js:
+  // a pipeline_debrief Now-What item, or any pass's writeSideFindingInbox side
+  // finding) -- NOT a human handing the pipeline a task. Route it to queue/derived/
+  // (source: derived_task, priority 48) instead of queue/adhoc/ (priority 10, preempts
+  // every deterministic source), so this whole class is its own throttleable Job List
+  // lane. A human-typed entry has no raisedBy and stays genuine adhoc. If it still
+  // needs clarification (below), it goes to needs-clarification either way -- a human
+  // resolving it there re-files it as real adhoc, which is correct (they vouched for it).
+  const isDerived = !!(entry && entry.raisedBy);
+  const adhocTask = {
+    id: queuedId,
+    domain: 'adhoc',
+    source: isDerived ? 'derived_task' : 'brain_dump',
+    title: rawText.slice(0, 120),
+    promptContext: isDerived
+      ? { rawText, brainDumpEntryId, derivedFrom: entry.raisedBy }
+      : { rawText, brainDumpEntryId },
+  };
+
+  // Path-prefetch (context-aware-file-path-prefetch-job.md, 2026-08-16): resolve
+  // anchor keywords from this task's title/rawText against the target project's own
+  // dependency graph BEFORE it's ever claimed for drafting, so the plan/implement
+  // passes already have real, validated file paths in promptContext instead of the
+  // model searching for them (or worse, inventing them) from scratch on every call.
+  // 'greenfield' (no graph built yet for this project) is explicitly NOT an error --
+  // per the Discuss session's own note, that's just "nothing to prefetch," and the
+  // task queues normally. 'no-match'/'ambiguous' are the two cases the Grill Me/
+  // Discuss sessions asked to be held for a human rather than silently guessed at:
+  // written to queue/needs-clarification/ instead of queue/adhoc/, invisible to
+  // nextAdhocTask() (which only ever scans queue/adhoc/) until a human resolves it
+  // via the dashboard.
+  // graphPathOverride via config.js's resolveGraphPath() (not path-prefetch.js's own
+  // graphify-out/graph.json default) -- confirmed live 2026-08-16: the dashboard's
+  // Build Graph button writes to .agent-manager-cache/, not graphify-out/, so without
+  // this override every real project's graph looked absent ('greenfield') even after
+  // a real build, and this fast path silently never matched anything.
+  const anchorResult = resolveAnchors({
+    repoRoot: matchedProject.repoRoot,
+    title: adhocTask.title,
+    rawText,
+    graphPathOverride: resolveGraphPath(matchedProject.repoRoot),
+    // uiVocabHubFiles (2026-08-20, see path-prefetch.js's UI_VOCAB header): opt-in
+    // per project in projects.json -- a project with no UI hub file(s) declared here
+    // simply never triggers the fallback, same behavior as before this existed.
+    uiVocabHubFiles: matchedProject.uiVocabHubFiles || [],
+  });
+  let adhocDir = path.join(matchedProject.pipelineDir, 'queue', isDerived ? 'derived' : 'adhoc');
+  if (anchorResult.status === 'matched') {
+    adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+  } else if (anchorResult.status === 'no-match') {
+    adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+    adhocTask.needsClarification = { reason: 'no-match' };
+  } else if (anchorResult.status === 'ambiguous') {
+    adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+    adhocTask.needsClarification = { reason: 'ambiguous', candidates: anchorResult.candidates };
+    if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
+  }
+  // 'greenfield': adhocTask left exactly as constructed above, queues normally with
+  // no prefetchedPaths field at all -- there is nothing to prefetch from yet.
+
+  return { queuedId, adhocTask, adhocDir };
+}
+
+// Stage: the possible-duplicate gate. Returns { skip } (a recoverable skip on the first flag) or { adhocDir } (possibly redirected to needs-clarification).
+function applyDuplicateGate(ctx, matchedProject, built) {
+  const { data, entry, result, rawText, brainDumpEntryId, existingQueuedTitles, brainDumpPath } = ctx;
+  const { adhocTask } = built;
+  let { adhocDir } = built;
+  // 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before
+  // filing") -- brainDumpSortPlanPrompt/ImplementPrompt already showed the classifier
+  // every currently-queued task title and asked it to flag a real match. Overrides
+  // whatever the anchor-resolution logic above decided (even a confident path match
+  // isn't worth drafting if the whole task is a duplicate) -- held for a human via the
+  // SAME multiple-choice/free-text picker the "needs a human decision" adhoc path
+  // already uses (adhoc-agentic-draft.js's RESOLUTION: needs-human-decision), not a
+  // new UI: no structured options here since this is really a binary "is this real"
+  // call the existing generic Archive button on every needs-clarification row (for
+  // "yes, duplicate") plus the free-text Other box (for "no, here's why not") already
+  // fully cover.
+  // Validate BEFORE trusting it -- see isValidDuplicateMatch's own header for the
+  // incident this closes. A classifier answer that matches nothing in the real
+  // candidate list it was shown is treated as no match at all, not a duplicate flag.
+  if (result.possibleDuplicateOf && !isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles)) {
+    console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier -- discarding as a hallucinated match, not routing to needs-clarification`);
+    result.possibleDuplicateOf = null;
+  }
+  if (result.possibleDuplicateOf) {
+    // Bounded one-retry gate (2026-09-15, brain-dump bd-1788900769368: "All three
+    // 'failing' tasks share identical death signature... with zero model_calls" --
+    // root-caused live: a fuzzy title-match false positive here used to route
+    // straight to needs-clarification every time, with no way back -- this decision
+    // happens at APPLY time for the brain_dump_sort CLASSIFICATION task, before the
+    // downstream adhoc task this block builds ever exists, so reject-retry-check.js's
+    // retry machinery (which only ever sees adhoc/research tasks, not this one) can
+    // never reach it. Mirrors needs-clarification-triage.js's own ncTriageAttempts/
+    // MAX_REQUEUES pattern -- and reuses recoverableSortSkip, the SAME mechanism this
+    // file already relies on for every other "give it one more classification pass"
+    // case just above -- by leaving entry.status as 'captured' (not writing the
+    // downstream adhoc task, not marking the entry actioned), nextBrainDumpSortTask()
+    // naturally re-drafts a fresh classification of this same note later, which may
+    // well not repeat the same fuzzy match on a differently-worded pass. The counter
+    // lives on the brain-dump ENTRY (not the classification task or the not-yet-built
+    // adhocTask) since the entry is the one object that genuinely persists across
+    // repeated classification attempts of the same logical note.
+    const duplicateGateAttempts = Number(entry.duplicateGateAttempts) || 0;
+    if (duplicateGateAttempts < 1) {
+      entry.duplicateGateAttempts = duplicateGateAttempts + 1;
+      console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" (duplicateGateAttempts=${entry.duplicateGateAttempts}) -- retrying with a fresh classification pass instead of routing to needs-clarification`);
+      return { skip: recoverableSortSkip(data, entry, brainDumpPath,
+        `possible duplicate of "${result.possibleDuplicateOf}" on the first flag -- retrying with a fresh classification pass`) };
+    }
+    console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" again (duplicateGateAttempts=${duplicateGateAttempts}) -- routing to needs-clarification`);
+    adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
+    adhocTask.needsClarification = {
+      reason: 'design-decision',
+      openQuestions: (
+        `This brain-dump note was flagged as a possible duplicate of an already-` +
+        `queued task:\n\n  "${result.possibleDuplicateOf}"\n\n` +
+        `NOTE (this task's own text): ${rawText}\n\n` +
+        'If this genuinely is the same underlying feature/fix, use the Archive ' +
+        'button on this row instead of answering below. If it is NOT actually a ' +
+        'duplicate (different scope, different project, coincidental overlap), ' +
+        'explain why in the box below and submit to send it to drafting.'
+      ),
     };
-    const researchDir = path.join(pipelineDir, 'queue', 'research');
-    fs.mkdirSync(researchDir, { recursive: true });
-    writeJsonAtomicSync(path.join(researchDir, `${queuedId}.json`), researchTask);
-
-    // Same audit-trail cross-reference convention the adhoc branch below already uses --
-    // an entry findable in the note it will eventually gain real content in, not the
-    // record of truth (brain-dump.json's queuedTaskId/queuedAt is that).
-    const fullPath = path.join(secondBrainDir, result.secondBrainPath);
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    const stamp = new Date().toISOString().slice(0, 10);
-    appendMarkdownLineAtomic(fullPath, `\n- **${stamp}** Queued as research task \`${queuedId}\` -- ${rawText}\n`);
-
-    entry.status = 'actioned';
-    entry.queuedTaskId = queuedId;
-    entry.queuedAt = new Date().toISOString();
-    fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
-    writeJsonAtomicSync(brainDumpPath, data);
-
-    return { file: fullPath, queuedTaskId: queuedId, researchQueued: true };
   }
 
-  // A note naming a tracked project IS work -- queue a real adhoc task in that project's
-  // own queue. The old `result.actionable &&` precondition is dropped (2026-09-03, user:
-  // "a note describing a concrete change to a tracked project always becomes a work task"):
-  // a project-labelled note the classifier forgot to mark actionable is still a task, and
-  // deriveBelongsToProject already forces actionable when it recovers a self-project label.
-  const matchedProject = result.belongsToProject
-    ? readProjectRegistry().find((p) => p.label === result.belongsToProject)
-    : null;
+  return { adhocDir };
+}
 
-  if (result.belongsToProject && !matchedProject) {
-    // reviewBrainDumpSort should have blocked a non-tracked label; if one slipped through,
-    // don't silently downgrade it to a passive note -- that masks the misclassification.
-    return recoverableSortSkip(data, entry, brainDumpPath,
-      `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`);
+// Stage: write the adhoc task into its queue dir and mark the brain-dump entry actioned.
+function writeAdhocTask(ctx, matchedProject, built, adhocDir) {
+  const { data, entry, brainDumpPath } = ctx;
+  const { queuedId, adhocTask } = built;
+  adhocTask.generatedForRepoRoot = matchedProject.repoRoot;
+
+  fs.mkdirSync(adhocDir, { recursive: true });
+  writeJsonAtomicSync(path.join(adhocDir, `${queuedId}.json`), adhocTask);
+
+  entry.status = 'actioned';
+  entry.queuedTaskId = queuedId;
+  entry.queuedAt = new Date().toISOString();
+  fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+  writeJsonAtomicSync(brainDumpPath, data);
+
+  return { file: path.join(adhocDir, `${queuedId}.json`), queuedTaskId: queuedId, queuedProject: matchedProject.label };
+}
+
+// Stage: a result naming a registered project becomes an adhoc task in that project (or a recoverable skip when the project cannot take one).
+function queueProjectTask(ctx, matchedProject) {
+  const { data, entry, brainDumpPath } = ctx;
+  if (readProjectDomains(matchedProject).includes('adhoc')) {
+    const built = buildAdhocTaskForEntry(ctx, matchedProject);
+    const gate = applyDuplicateGate(ctx, matchedProject, built);
+    if (gate.skip) return gate.skip;
+    return writeAdhocTask(ctx, matchedProject, built, gate.adhocDir);
   }
+  // Matched a real project but it has no 'adhoc' domain -- a config gap that needs a
+  // human, not a silent downgrade to a passive note.
+  return recoverableSortSkip(data, entry, brainDumpPath,
+    `matched project "${matchedProject.label}" has no 'adhoc' domain registered -- cannot queue work there`);
+}
 
-  if (matchedProject) {
-    const validDomains = (() => {
-      try {
-        return Object.keys(JSON.parse(fs.readFileSync(matchedProject.domainsPath, 'utf8')));
-      } catch (err) {
-        const reason = err && err.message ? err.message : String(err);
-        process.stderr.write(`[apply-group-a] failed to read domains from ${matchedProject.domainsPath}: ${reason}\n`);
-        return [];
-      }
-    })();
-
-    if (validDomains.includes('adhoc')) {
-      const queuedId = `adhoc-brain-dump-${brainDumpEntryId}-${Date.now()}`;
-      // A brain-dump entry with a `raisedBy` was machine-filed (side-finding-sweep.js:
-      // a pipeline_debrief Now-What item, or any pass's writeSideFindingInbox side
-      // finding) -- NOT a human handing the pipeline a task. Route it to queue/derived/
-      // (source: derived_task, priority 48) instead of queue/adhoc/ (priority 10, preempts
-      // every deterministic source), so this whole class is its own throttleable Job List
-      // lane. A human-typed entry has no raisedBy and stays genuine adhoc. If it still
-      // needs clarification (below), it goes to needs-clarification either way -- a human
-      // resolving it there re-files it as real adhoc, which is correct (they vouched for it).
-      const isDerived = !!(entry && entry.raisedBy);
-      const adhocTask = {
-        id: queuedId,
-        domain: 'adhoc',
-        source: isDerived ? 'derived_task' : 'brain_dump',
-        title: rawText.slice(0, 120),
-        promptContext: isDerived
-          ? { rawText, brainDumpEntryId, derivedFrom: entry.raisedBy }
-          : { rawText, brainDumpEntryId },
-      };
-
-      // Path-prefetch (context-aware-file-path-prefetch-job.md, 2026-08-16): resolve
-      // anchor keywords from this task's title/rawText against the target project's own
-      // dependency graph BEFORE it's ever claimed for drafting, so the plan/implement
-      // passes already have real, validated file paths in promptContext instead of the
-      // model searching for them (or worse, inventing them) from scratch on every call.
-      // 'greenfield' (no graph built yet for this project) is explicitly NOT an error --
-      // per the Discuss session's own note, that's just "nothing to prefetch," and the
-      // task queues normally. 'no-match'/'ambiguous' are the two cases the Grill Me/
-      // Discuss sessions asked to be held for a human rather than silently guessed at:
-      // written to queue/needs-clarification/ instead of queue/adhoc/, invisible to
-      // nextAdhocTask() (which only ever scans queue/adhoc/) until a human resolves it
-      // via the dashboard.
-      // graphPathOverride via config.js's resolveGraphPath() (not path-prefetch.js's own
-      // graphify-out/graph.json default) -- confirmed live 2026-08-16: the dashboard's
-      // Build Graph button writes to .agent-manager-cache/, not graphify-out/, so without
-      // this override every real project's graph looked absent ('greenfield') even after
-      // a real build, and this fast path silently never matched anything.
-      const anchorResult = resolveAnchors({
-        repoRoot: matchedProject.repoRoot,
-        title: adhocTask.title,
-        rawText,
-        graphPathOverride: resolveGraphPath(matchedProject.repoRoot),
-        // uiVocabHubFiles (2026-08-20, see path-prefetch.js's UI_VOCAB header): opt-in
-        // per project in projects.json -- a project with no UI hub file(s) declared here
-        // simply never triggers the fallback, same behavior as before this existed.
-        uiVocabHubFiles: matchedProject.uiVocabHubFiles || [],
-      });
-      let adhocDir = path.join(matchedProject.pipelineDir, 'queue', isDerived ? 'derived' : 'adhoc');
-      if (anchorResult.status === 'matched') {
-        adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
-      } else if (anchorResult.status === 'no-match') {
-        adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
-        adhocTask.needsClarification = { reason: 'no-match' };
-      } else if (anchorResult.status === 'ambiguous') {
-        adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
-        adhocTask.needsClarification = { reason: 'ambiguous', candidates: anchorResult.candidates };
-        if (anchorResult.paths.length > 0) adhocTask.promptContext.prefetchedPaths = anchorResult.paths;
-      }
-      // 'greenfield': adhocTask left exactly as constructed above, queues normally with
-      // no prefetchedPaths field at all -- there is nothing to prefetch from yet.
-
-      // 2026-08-24 (pipeline hardening, Grimmethy: "duplicate-task detection before
-      // filing") -- brainDumpSortPlanPrompt/ImplementPrompt already showed the classifier
-      // every currently-queued task title and asked it to flag a real match. Overrides
-      // whatever the anchor-resolution logic above decided (even a confident path match
-      // isn't worth drafting if the whole task is a duplicate) -- held for a human via the
-      // SAME multiple-choice/free-text picker the "needs a human decision" adhoc path
-      // already uses (adhoc-agentic-draft.js's RESOLUTION: needs-human-decision), not a
-      // new UI: no structured options here since this is really a binary "is this real"
-      // call the existing generic Archive button on every needs-clarification row (for
-      // "yes, duplicate") plus the free-text Other box (for "no, here's why not") already
-      // fully cover.
-      // Validate BEFORE trusting it -- see isValidDuplicateMatch's own header for the
-      // incident this closes. A classifier answer that matches nothing in the real
-      // candidate list it was shown is treated as no match at all, not a duplicate flag.
-      if (result.possibleDuplicateOf && !isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles)) {
-        console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier -- discarding as a hallucinated match, not routing to needs-clarification`);
-        result.possibleDuplicateOf = null;
-      }
-      if (result.possibleDuplicateOf) {
-        // Bounded one-retry gate (2026-09-15, brain-dump bd-1788900769368: "All three
-        // 'failing' tasks share identical death signature... with zero model_calls" --
-        // root-caused live: a fuzzy title-match false positive here used to route
-        // straight to needs-clarification every time, with no way back -- this decision
-        // happens at APPLY time for the brain_dump_sort CLASSIFICATION task, before the
-        // downstream adhoc task this block builds ever exists, so reject-retry-check.js's
-        // retry machinery (which only ever sees adhoc/research tasks, not this one) can
-        // never reach it. Mirrors needs-clarification-triage.js's own ncTriageAttempts/
-        // MAX_REQUEUES pattern -- and reuses recoverableSortSkip, the SAME mechanism this
-        // file already relies on for every other "give it one more classification pass"
-        // case just above -- by leaving entry.status as 'captured' (not writing the
-        // downstream adhoc task, not marking the entry actioned), nextBrainDumpSortTask()
-        // naturally re-drafts a fresh classification of this same note later, which may
-        // well not repeat the same fuzzy match on a differently-worded pass. The counter
-        // lives on the brain-dump ENTRY (not the classification task or the not-yet-built
-        // adhocTask) since the entry is the one object that genuinely persists across
-        // repeated classification attempts of the same logical note.
-        const duplicateGateAttempts = Number(entry.duplicateGateAttempts) || 0;
-        if (duplicateGateAttempts < 1) {
-          entry.duplicateGateAttempts = duplicateGateAttempts + 1;
-          console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" (duplicateGateAttempts=${entry.duplicateGateAttempts}) -- retrying with a fresh classification pass instead of routing to needs-clarification`);
-          return recoverableSortSkip(data, entry, brainDumpPath,
-            `possible duplicate of "${result.possibleDuplicateOf}" on the first flag -- retrying with a fresh classification pass`);
-        }
-        console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" again (duplicateGateAttempts=${duplicateGateAttempts}) -- routing to needs-clarification`);
-        adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
-        adhocTask.needsClarification = {
-          reason: 'design-decision',
-          openQuestions: (
-            `This brain-dump note was flagged as a possible duplicate of an already-` +
-            `queued task:\n\n  "${result.possibleDuplicateOf}"\n\n` +
-            `NOTE (this task's own text): ${rawText}\n\n` +
-            'If this genuinely is the same underlying feature/fix, use the Archive ' +
-            'button on this row instead of answering below. If it is NOT actually a ' +
-            'duplicate (different scope, different project, coincidental overlap), ' +
-            'explain why in the box below and submit to send it to drafting.'
-          ),
-        };
-      }
-
-      adhocTask.generatedForRepoRoot = matchedProject.repoRoot;
-
-      fs.mkdirSync(adhocDir, { recursive: true });
-      writeJsonAtomicSync(path.join(adhocDir, `${queuedId}.json`), adhocTask);
-
-      entry.status = 'actioned';
-      entry.queuedTaskId = queuedId;
-      entry.queuedAt = new Date().toISOString();
-      fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
-      writeJsonAtomicSync(brainDumpPath, data);
-
-      return { file: path.join(adhocDir, `${queuedId}.json`), queuedTaskId: queuedId, queuedProject: matchedProject.label };
-    }
-    // Matched a real project but it has no 'adhoc' domain -- a config gap that needs a
-    // human, not a silent downgrade to a passive note.
-    return recoverableSortSkip(data, entry, brainDumpPath,
-      `matched project "${matchedProject.label}" has no 'adhoc' domain registered -- cannot queue work there`);
-  }
-
-  // Passive vault note -- the fallback for a genuine observation / journal / reference
-  // entry not tied to any tracked project.
+// Stage: the passive vault-note fallback for an entry not tied to any tracked project.
+function filePassiveNote(ctx) {
+  const { data, entry, result, secondBrainDir, rawText, brainDumpPath } = ctx;
   const fullPath = path.join(secondBrainDir, result.secondBrainPath);
   fs.mkdirSync(path.dirname(fullPath), { recursive: true });
   const stamp = new Date().toISOString().slice(0, 10);
@@ -502,6 +535,41 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
   writeJsonAtomicSync(brainDumpPath, data);
 
   return { file: fullPath };
+}
+
+function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
+  const loaded = loadAndClassifyEntry({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
+  if (loaded.done) return loaded.done;
+  const { ctx } = loaded;
+  const { result, data, entry } = ctx;
+
+  // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
+  // change -- "investigate X, document findings" needs real web research, not a diff
+  // against any tracked project. Only when NO tracked project was named/recovered -- a
+  // note tied to a project routes to that project's queue below, never to research.
+  if (result.requiresResearch && !result.belongsToProject) {
+    return queueResearchTask(ctx);
+  }
+
+  // A note naming a tracked project IS work -- queue a real adhoc task in that project's
+  // own queue. The old `result.actionable &&` precondition is dropped (2026-09-03, user:
+  // "a note describing a concrete change to a tracked project always becomes a work task"):
+  // a project-labelled note the classifier forgot to mark actionable is still a task, and
+  // deriveBelongsToProject already forces actionable when it recovers a self-project label.
+  const matchedProject = result.belongsToProject
+    ? readProjectRegistry().find((p) => p.label === result.belongsToProject)
+    : null;
+
+  if (result.belongsToProject && !matchedProject) {
+    // reviewBrainDumpSort should have blocked a non-tracked label; if one slipped through,
+    // don't silently downgrade it to a passive note -- that masks the misclassification.
+    return recoverableSortSkip(data, entry, brainDumpPath,
+      `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`);
+  }
+
+  if (matchedProject) return queueProjectTask(ctx, matchedProject);
+
+  return filePassiveNote(ctx);
 }
 
 function closeBrainDumpEntryResolved({ brainDumpPath, brainDumpEntryId, note }) {
