@@ -40,6 +40,12 @@ function revisionKeepsAnswerShape(task, revised) {
 async function runCritiqueAndRevision(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
 }) {
+  // Deliberate 2026-08-25 data-driven skip, NOT dead weight: advisory-prose sources
+  // (observability_review / performance_review et al.) produce short prose verdicts, not
+  // code diffs, and critique was a measurable no-op 90.9%/94.9% of the time across
+  // 1341+453 real runs (12.2 combined hours) while the same verdict already goes through
+  // the full independent majority-vote review immediately after. Full rationale with the
+  // measured data: src/local-draft.js:956-974 (this file's pre-extraction home).
   if (isAdvisoryProseSource(resolveSourceName(task))) {
     return;
   }
