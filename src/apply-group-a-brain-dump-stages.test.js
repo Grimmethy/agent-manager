@@ -19,7 +19,7 @@ const config = require('./config.js');
 let anchor = { status: 'greenfield', paths: [] };
 pathPrefetch.resolveAnchors = () => anchor;
 config.resolveGraphPath = () => '/nonexistent/graph.json';
-const { applyBrainDumpSort } = require('./apply-group-a-brain-dump.js');
+const { applyBrainDumpSort, duplicateGateDismissals } = require('./apply-group-a-brain-dump.js');
 
 const TITLES = ['Add a retry cap to the sweep'];
 
@@ -162,6 +162,41 @@ test('the possible-duplicate gate: an invented title is dropped, a real one retr
     const held = second.queued(path.join(second.base, 'pipeA', 'queue', 'needs-clarification'))[0];
     assert.equal(held.needsClarification.reason, 'design-decision');
     assert.match(held.needsClarification.openQuestions, /possible duplicate of an already-queued task/);
+  } finally { console.warn = origWarn; }
+});
+
+test('the possible-duplicate gate: a candidate whose title matches a real queued task is KEPT even when the note snippet is empty / lacks a loop header, and a dismissed one is recorded with its reason', () => {
+  const origWarn = console.warn; const warns = []; console.warn = (...a) => warns.push(a.join(' '));
+  try {
+    // HUB0118 2/3 protected case: the candidate string IS a real queued title (a canonical
+    // group member) while the note's own text is empty / loop-header-less. The
+    // title-match short-circuit (isValidDuplicateMatch) runs BEFORE the
+    // snippet-grounding check, so result.possibleDuplicateOf is NOT nulled here -- the
+    // observable proof is the gate's own "first flag" retry skip, whose reason carries
+    // the surviving candidate title verbatim.
+    const kept = world({ rawText: '   ' });
+    const k = kept.run({ belongsToProject: 'agent-manager', possibleDuplicateOf: TITLES[0] });
+    assert.equal(k.skipped, true);
+    assert.equal(k.recoverable, true);
+    assert.match(k.reason, /possible duplicate of "Add a retry cap to the sweep" on the first flag/);
+    assert.equal(kept.entryNow().status, 'captured');
+    assert.equal(kept.queued(path.join(kept.base, 'pipeA', 'queue', 'adhoc')).length, 0, 'a kept candidate must not queue an adhoc task');
+
+    // HUB0118 2/3 dismissal recording: an ungrounded candidate (matches no queued title,
+    // and empty rawText cannot ground it) is dismissed through recordDuplicateGateDismissal
+    // with reason 'ungrounded' and the true count of candidate titles checked.
+    const before = duplicateGateDismissals['ungrounded'];
+    const warningsBefore = warns.length;
+    const dismissed = world({ rawText: '   ' });
+    const d = dismissed.run({ belongsToProject: 'agent-manager', possibleDuplicateOf: 'Totally invented slug' });
+    assert.equal(d.queuedProject, 'agent-manager', 'a dismissed candidate falls through to the adhoc path');
+    assert.equal(dismissed.entryNow().duplicateGateAttempts, 1, 'the dismissal bumps the entry retry counter');
+    assert.equal(duplicateGateDismissals['ungrounded'], before + 1, 'the reason-keyed counter increments exactly once');
+    const audit = warns.slice(warningsBefore).find((w) => /duplicateGateDismissal/.test(w));
+    assert.ok(audit, 'the helper emits its greppable audit line');
+    assert.match(audit, /reason=ungrounded/);
+    assert.match(audit, /candidatesChecked=1/);
+    assert.match(audit, /rejectedCandidate=Totally invented slug/);
   } finally { console.warn = origWarn; }
 });
 

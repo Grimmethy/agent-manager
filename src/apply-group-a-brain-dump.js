@@ -498,30 +498,31 @@ function applyDuplicateGate(ctx, matchedProject, built) {
   // the REAL candidate list the classifier was shown is trusted (falls through to
   // the duplicate handling below); (b) else a string grounded in the note's own
   // rawText is null'd as a phrase-echo; (c) else null'd as ungrounded. (b) and (c)
-  // both null -- they differ only in WHY, which the log and the sibling 2/3
-  // dismissal-recording keep distinct for the human reviewing the queue.
+  // both null -- they differ only in WHY, which recordDuplicateGateDismissal's
+  // reason-keyed counter and single greppable audit line keep distinct for the
+  // human reviewing the queue (HUB0118 2/3: both paths route through it).
   if (result.possibleDuplicateOf) {
     if (isValidDuplicateMatch(result.possibleDuplicateOf, existingQueuedTitles)) {
       // (a) valid candidate-list match -- trust it.
     } else if (isGroundedInInput(result.possibleDuplicateOf, rawText)) {
-      // HUB0115 1/3 -- record the dismissal (pure side effect, after the decision).
+      // HUB0118 2/3 -- the helper call IS the dismissal record (reason-keyed counter +
+      // entry.duplicateGateAttempts + the single greppable audit line); no separate
+      // console.warn / raw counter increment here anymore.
       recordDuplicateGateDismissal(entry, {
         noteId: brainDumpEntryId,
         rejectedCandidate: result.possibleDuplicateOf,
         reason: 'phrase-echo',
         candidatesChecked: Array.isArray(existingQueuedTitles) ? existingQueuedTitles.length : 0,
       });
-      console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that is a phrase grounded in the note's own rawText (phrase-echo) -- discarding, not routing to needs-clarification`);
       result.possibleDuplicateOf = null;
     } else {
-      // HUB0115 1/3 -- record the dismissal (pure side effect, after the decision).
+      // HUB0118 2/3 -- same: the helper call is the one and only dismissal record.
       recordDuplicateGateDismissal(entry, {
         noteId: brainDumpEntryId,
         rejectedCandidate: result.possibleDuplicateOf,
         reason: 'ungrounded',
         candidatesChecked: Array.isArray(existingQueuedTitles) ? existingQueuedTitles.length : 0,
       });
-      console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} claimed a duplicate of "${result.possibleDuplicateOf}" but that does not match any real candidate title shown to the classifier and is not grounded in the note's own rawText -- discarding as ungrounded, not routing to needs-clarification`);
       result.possibleDuplicateOf = null;
     }
   }
