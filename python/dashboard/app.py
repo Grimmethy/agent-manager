@@ -1978,6 +1978,26 @@ def _label_for_branch(task_id, pipeline_dir, subject, repo_root=None):
     return {"title": subject or task_id, "domain": None, "source": None, "matchedTaskState": None, "description": None}
 
 
+# The rolling triage branch has no task record, so its card/detail title falls back to the TIP commit's subject, and every commit says "Triage batch: 1
+# candidate-doc update(s)" (one task per apply tick) -- a per-commit count shown as if it described the branch. For a branch in that state the title
+# becomes the branch total: the number of `### AC-` candidates it adds against the default branch (brain-dump #1755). The raw subject and the per-commit
+# rows are untouched. None = leave today's title (not a triage-style fallback, zero candidates, git failed, or AGENT_MANAGER_BRANCH_TITLE_COUNT=false).
+_TRIAGE_SUBJECT_RE = re.compile(r"^Triage batch: \d+ candidate-doc update\(s\)$")
+
+
+def _triage_candidate_count(repo_root, main_branch, full_ref, subject, label):
+    if os.environ.get("AGENT_MANAGER_BRANCH_TITLE_COUNT", "").strip().lower() == "false":
+        return None
+    if label.get("matchedTaskState") is not None or not _TRIAGE_SUBJECT_RE.match((subject or "").strip()):
+        return None
+    try:
+        import branch_removals  # lazy: keeps app.py's import block untouched
+        n = branch_removals.count_added_candidates(_run_git, repo_root, main_branch, full_ref)
+    except Exception:  # noqa: BLE001 -- a title decoration must never break the listing
+        return None
+    return n if isinstance(n, int) and n >= 1 else None
+
+
 def _branch_content_already_on_main(repo_root, main_branch, full_ref):
     """True when every file this branch changed (vs. where it forked from main) is byte-identical on origin/<main>: there is nothing left to merge.
 
@@ -2048,17 +2068,19 @@ def _list_unmerged_branches_uncached():
         conflict = _check_merge_conflict(repo_root, main_branch, branch)
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
+        candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
         qdir = (pipeline_dir / "queue") if pipeline_dir else None
         hub = get_hub_data_provider().hub_for_branch(qdir, branch, branch_task_ids(_run_git, repo_root, main_branch, full_ref, task_id))
         branches.append({
             "branch": branch,
             "taskId": task_id,
-            "title": label["title"],
+            "title": f"Triage batch: {candidate_count} candidate-doc update(s)" if candidate_count else label["title"],
             "domain": label["domain"],
             "source": label["source"],
             "matchedTaskState": label["matchedTaskState"],
             "description": label["description"],
             "subject": subject.strip(),
+            **({"candidateCount": candidate_count} if candidate_count else {}),
             "pushedAt": pushed_at,
             "ahead": ahead,
             "behind": behind,

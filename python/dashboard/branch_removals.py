@@ -132,6 +132,36 @@ def _git(run_git, args, cwd):
         return False, ""
 
 
+def parse_added_candidates(diff_text):
+    """The `### AC-N <title>` candidates a unified diff ADDS ('+' lines only), each with the first `Files:` line that follows it in the same file.
+    Pure. Shared by snapshot_branch (the removal ledger) and count_added_candidates (the Unmerged Branches title)."""
+    candidates, current = [], None
+    for line in str(diff_text or "").splitlines():
+        if line.startswith("+++"):
+            current = None  # a new file: a Files: line must not attach across files
+            continue
+        if not line.startswith("+"):
+            continue
+        body = line[1:]
+        m = _HEADING_RE.match(body)
+        if m:
+            current = {"id": m.group(1), "title": m.group(2), "files": ""}
+            candidates.append(current)
+        elif current is not None and not current["files"] and body.startswith("Files:"):
+            current["files"] = body[len("Files:"):].strip()
+    return candidates
+
+
+def count_added_candidates(run_git, repo_root, main_branch, head):
+    """How many candidates the branch tip `head` adds against origin/<main_branch> (the same range snapshot_branch and the card's `ahead` use).
+    One `git diff`; None when git fails. Never raises."""
+    try:
+        out = str(run_git(["diff", "--unified=0", f"origin/{main_branch}...{head}", "--", "*.md"], repo_root))
+        return len(parse_added_candidates(out))
+    except Exception:  # noqa: BLE001 -- a title decoration must never break the branch listing
+        return None
+
+
 def snapshot_branch(run_git, repo_root, main_branch, branch, head_sha, queue_dir, keep_ref=False):
     """What a branch holds, for the removal ledger. NEVER raises; returns whatever it managed to collect.
 
@@ -167,20 +197,7 @@ def snapshot_branch(run_git, repo_root, main_branch, branch, head_sha, queue_dir
 
         ok, out = _git(run_git, ["diff", "--unified=0", f"{base}...{head}", "--", "*.md"], repo_root)
         if ok:
-            candidates, current = [], None
-            for line in out.splitlines():
-                if line.startswith("+++"):
-                    current = None  # a new file: a Files: line must not attach across files
-                    continue
-                if not line.startswith("+"):
-                    continue
-                body = line[1:]
-                m = _HEADING_RE.match(body)
-                if m:
-                    current = {"id": m.group(1), "title": m.group(2), "files": ""}
-                    candidates.append(current)
-                elif current is not None and not current["files"] and body.startswith("Files:"):
-                    current["files"] = body[len("Files:"):].strip()
+            candidates = parse_added_candidates(out)
             snap["candidatesTotal"] = len(candidates)
             snap["candidates"] = candidates[:MAX_CANDIDATES]
 
