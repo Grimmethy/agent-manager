@@ -254,6 +254,19 @@ test('dedupe off (default) appends a same-function candidate exactly as before -
   fs.rmSync(T, { recursive: true, force: true });
 });
 
+test('dedupe on + symbol: a Symbol: line is written right after Files:, and a repeat with an identifier-free title is skipped as a duplicate', () => {
+  const { T, docPath } = dedupeRepo('');
+  const first = applyArchDiscoveryCandidates({ implementResponse: dedupeResp(1, 'Decompose someHelperFn into parts', 'src/a.js'), candidatesPath: docPath, dedupe: true, symbol: 'someHelperFn' });
+  assert.equal(first.candidateCount, 1);
+  assert.match(fs.readFileSync(docPath, 'utf8'), /Files: src\/a\.js\nSymbol: someHelperFn\n/);
+  const before = fs.readFileSync(docPath, 'utf8');
+  const second = applyArchDiscoveryCandidates({ implementResponse: dedupeResp(1, 'Tidy the retry logic', 'src/a.js'), candidatesPath: docPath, dedupe: true, symbol: 'someHelperFn' });
+  assert.equal(second.skipped, true);
+  assert.equal(second.duplicateOf, 'AC-1');
+  assert.equal(fs.readFileSync(docPath, 'utf8'), before, 'a skipped duplicate must not touch the doc');
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
 test('dedupe kill switch AGENT_MANAGER_CANDIDATE_DEDUPE=false restores plain appends', () => {
   const { T, docPath } = dedupeRepo(dedupeResp(1, 'Decompose `foo`', 'src/a.js'));
   process.env.AGENT_MANAGER_CANDIDATE_DEDUPE = 'false';
