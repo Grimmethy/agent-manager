@@ -249,6 +249,14 @@ def _execute_git_merge(context):
         raise MergeLockBusy(str(exc)) from exc
     try:
         _run_git(["fetch", "origin"], repo_root)
+        # Brain-dump #1740: what this merged branch held (commits + candidate headings + the verdict on its card), recorded with the merged row
+        # below. No ref is pinned -- the commits land on the main branch. Best-effort: never stops the merge.
+        snapshot = {}
+        try:
+            from branch_removals import snapshot_branch
+            snapshot = snapshot_branch(_run_git, repo_root, main_branch, branch, None, queue_dir(), keep_ref=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Non-fatal: could not snapshot %r before merging it: %s", branch, exc)
         _run_git(["checkout", main_branch], repo_root)
         _run_git(["reset", "--hard", f"origin/{main_branch}"], repo_root)
         try:
@@ -273,7 +281,8 @@ def _execute_git_merge(context):
             _run_git(["push", "origin", "--delete", branch], repo_root)
             from branch_removals import record_branch_removal
             record_branch_removal(queue_dir(), branch, "merged", task_id=branch.removeprefix("agent/"),
-                                  detail=f"merged into {main_branch} via the dashboard", actor="dashboard-merge")
+                                  detail=f"merged into {main_branch} via the dashboard", actor="dashboard-merge",
+                                  snapshot=snapshot or None)
         except RuntimeError as e:
             # Non-fatal -- the merge to main already succeeded and is the part that
             # matters; a leftover now-fully-merged remote branch is harmless clutter
@@ -444,6 +453,22 @@ def api_git_discard_branch(branch):
         abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
 
     local_branch = {"deleted": False, "reason": "not attempted"}
+
+    # Brain-dump #1740: capture WHAT this branch holds (commits, the candidate headings it added, the verdict recorded on its card) and
+    # pin its head under refs/discarded/ BEFORE the remote delete below, so a discarded batch is no longer just "discarded via the
+    # dashboard" and stays recoverable once both the remote and local branch are gone. Best-effort: nothing in this block may stop the discard.
+    snapshot, reason = {}, ""
+    try:
+        from branch_removals import snapshot_branch
+        snapshot = snapshot_branch(_run_git, repo_root, match.get("mainBranch") or "main", branch, match.get("headSha"), queue_dir(), keep_ref=True)
+        body = request.get_json(silent=True)
+        reason = str(body.get("reason") or "").strip() if isinstance(body, dict) else ""
+        if not reason:
+            default_reasons = (snapshot.get("verdict") or {}).get("reasons") or []
+            reason = str(default_reasons[0]) if default_reasons else ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Non-fatal: could not snapshot %r before discarding it: %s", branch, exc)
+
     try:
         try:
             _run_git(["push", "origin", "--delete", branch], repo_root)
@@ -457,7 +482,8 @@ def api_git_discard_branch(branch):
                 raise
         from branch_removals import record_branch_removal
         record_branch_removal(queue_dir(), branch, "discarded", task_id=branch.removeprefix("agent/"),
-                              detail="discarded via the dashboard Unmerged Branches tab", actor="dashboard-discard")
+                              detail="discarded via the dashboard Unmerged Branches tab", actor="dashboard-discard",
+                              reason=reason or None, snapshot=snapshot or None)
         # Also drop the LOCAL copy (only reached when the remote delete succeeded or the ref was
         # already gone) -- see _delete_local_branch for why leaving it is a real hazard.
         local_branch = _delete_local_branch(repo_root, branch)
@@ -505,4 +531,5 @@ def api_git_discard_branch(branch):
             task_archived = True  # already archived (e.g. by hand) -- nothing more to do
 
     _invalidate_branch_cache()
-    return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch})
+    return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch,
+                    "snapshotRef": (snapshot or {}).get("snapshotRef")})

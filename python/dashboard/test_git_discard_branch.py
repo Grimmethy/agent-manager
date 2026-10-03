@@ -254,6 +254,238 @@ class TestDiscardBranch(unittest.TestCase):
                 p.stop()
 
 
+
+# --- brain-dump #1740 (2026-10-03): a removal row says WHAT the branch held and WHY, and the commits stay reachable ----------------------------
+
+def _git_out(args, cwd):
+    return subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _git_succeeds(args, cwd):
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True).returncode == 0
+
+
+def _last_row(repo):
+    return json.loads((repo / "queue" / "branch-removals.jsonl").read_text().splitlines()[-1])
+
+
+def add_candidate_doc_commit(repo, branch_name):
+    """One more commit on an already-pushed branch: a candidates doc with two headings (each with a Files: line) plus a NON-markdown file
+    that also contains a heading-shaped line, which must not be counted."""
+    _git(["checkout", branch_name], cwd=repo)
+    (repo / "Docs").mkdir(exist_ok=True)
+    (repo / "Docs" / "X_CANDIDATES.md").write_text(
+        "# Candidates\n\n### AC-1 \u00b7 Decompose foo\nStrength: Strong\nFiles: src/a.js\n\nProblem:\np\n\n"
+        "### AC-2 \u00b7 Decompose bar\nStrength: Strong\nFiles: src/b.js, src/c.js\n\nProblem:\np\n")
+    (repo / "notes.txt").write_text("### AC-9 \u00b7 not a markdown doc\nFiles: nope.js\n")
+    _git(["add", "Docs", "notes.txt"], cwd=repo)
+    _git(["commit", "-q", "-m", "add candidates"], cwd=repo)
+    _git(["push", "origin", branch_name], cwd=repo)
+    _git(["checkout", "main"], cwd=repo)
+
+
+class TestRemovalSnapshot(unittest.TestCase):
+    """The discard/merge endpoints record a snapshot of the branch in queue/branch-removals.jsonl (brain-dump #1740)."""
+
+    def setUp(self):
+        app._invalidate_branch_cache()
+        self.client = app.app.test_client()
+        # The real apply lock is ~/.local/state/agent-manager/locks/apply-task.lock, the SAME file the live apply-task.sh loop holds every tick.
+        # An endpoint test that takes it for real gets a 409 whenever the live pipeline happens to be mid-apply (seen under load: the older
+        # tests in this file are exposed to that flake). These tests are about the ledger row, not the lock, so they do not touch it.
+        self._patches_started = [
+            mock.patch.object(app, "_sync_live_checkout", return_value={"synced": False}),
+            mock.patch.object(app, "_acquire_apply_lock", return_value=object()),
+            mock.patch.object(app, "_release_apply_lock", return_value=None),
+        ]
+        for p in self._patches_started:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches_started:
+            p.stop()
+        app._invalidate_branch_cache()
+
+    def _discard(self, repo, branch, body=None):
+        patches = TestDiscardBranch._patches(self, repo)
+        for p in patches:
+            p.start()
+        try:
+            kwargs = {"json": body} if body is not None else {}
+            return self.client.post(f"/api/git/branches/{branch.replace('/', '%2F')}/discard", **kwargs)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_discard_row_carries_the_branch_snapshot(self):
+        repo = make_repo_with_pushed_branch("agent/snap-1")
+        head = _git_out(["rev-parse", "refs/remotes/origin/agent/snap-1"], repo)
+        self.assertTrue(self._discard(repo, "agent/snap-1").get_json()["succeeded"])
+        row = _last_row(repo)
+        self.assertEqual(row["headSha"], head)
+        self.assertEqual(row["base"], "origin/main")
+        self.assertEqual(row["commitCount"], 1)
+        self.assertEqual(row["commits"], [{"sha": head[:12], "subject": "a real feature commit"}])
+        # the original keys are all still there, unchanged
+        self.assertEqual((row["branch"], row["cause"], row["taskId"], row["actor"]), ("agent/snap-1", "discarded", "snap-1", "dashboard-discard"))
+
+    def test_snapshot_ref_still_resolves_after_the_remote_and_local_branch_are_gone(self):
+        repo = make_repo_with_pushed_branch("agent/snap-2")
+        head = _git_out(["rev-parse", "refs/remotes/origin/agent/snap-2"], repo)
+        res = self._discard(repo, "agent/snap-2").get_json()
+        row = _last_row(repo)
+        self.assertTrue(row["snapshotRef"].startswith("refs/discarded/agent/snap-2/"), row.get("snapshotRef"))
+        self.assertEqual(res["snapshotRef"], row["snapshotRef"])
+        self.assertEqual(_git_out(["rev-parse", row["snapshotRef"]], repo), head)
+        self.assertFalse(_git_succeeds(["rev-parse", "--verify", "--quiet", "refs/remotes/origin/agent/snap-2"], repo), "remote-tracking ref is gone")
+        self.assertEqual(_git_out(["branch", "--list", "agent/snap-2"], repo), "", "local branch is gone")
+
+    def test_candidates_added_by_the_branch_are_recorded_with_their_files(self):
+        repo = make_repo_with_pushed_branch("agent/snap-3")
+        add_candidate_doc_commit(repo, "agent/snap-3")
+        self._discard(repo, "agent/snap-3")
+        row = _last_row(repo)
+        self.assertEqual(row["commitCount"], 2)
+        self.assertEqual(row["candidates"], [
+            {"id": "AC-1", "title": "Decompose foo", "files": "src/a.js"},
+            {"id": "AC-2", "title": "Decompose bar", "files": "src/b.js, src/c.js"},
+        ])
+        self.assertEqual(row["candidatesTotal"], 2)
+
+    def test_a_recorded_verdict_is_copied_and_becomes_the_default_reason(self):
+        import branch_verdicts as bv
+        repo = make_repo_with_pushed_branch("agent/snap-4")
+        head = _git_out(["rev-parse", "refs/remotes/origin/agent/snap-4"], repo)
+        bv.record_verdict(repo / "queue", "agent/snap-4", head, "discard", ["first reason", "second reason"], "chat")
+        self._discard(repo, "agent/snap-4")
+        row = _last_row(repo)
+        self.assertEqual(row["reason"], "first reason")
+        self.assertEqual(row["verdict"], {"verdict": "discard", "reasons": ["first reason", "second reason"], "source": "chat", "sha": head[:12]})
+
+    def test_an_explicit_reason_in_the_request_body_wins_over_the_verdict_default(self):
+        import branch_verdicts as bv
+        repo = make_repo_with_pushed_branch("agent/snap-5")
+        head = _git_out(["rev-parse", "refs/remotes/origin/agent/snap-5"], repo)
+        bv.record_verdict(repo / "queue", "agent/snap-5", head, "discard", ["verdict reason"], "chat")
+        self._discard(repo, "agent/snap-5", body={"reason": "dead end, duplicates AC-10"})
+        row = _last_row(repo)
+        self.assertEqual(row["reason"], "dead end, duplicates AC-10")
+        self.assertEqual(row["verdict"]["reasons"], ["verdict reason"])
+
+    def test_a_verdict_for_an_older_commit_is_not_copied_and_gives_no_reason(self):
+        import branch_verdicts as bv
+        repo = make_repo_with_pushed_branch("agent/snap-6")
+        bv.record_verdict(repo / "queue", "agent/snap-6", "a" * 40, "discard", ["about some OLDER commit"], "chat")
+        self._discard(repo, "agent/snap-6")
+        row = _last_row(repo)
+        self.assertNotIn("verdict", row)
+        self.assertNotIn("reason", row)
+
+    def test_a_failing_snapshot_still_discards_and_writes_the_original_minimal_row(self):
+        repo = make_repo_with_pushed_branch("agent/snap-7")
+        with mock.patch("branch_removals.snapshot_branch", side_effect=RuntimeError("boom")):
+            res = self._discard(repo, "agent/snap-7")
+        self.assertTrue(res.get_json()["succeeded"])
+        self.assertIsNone(res.get_json()["snapshotRef"])
+        self.assertEqual(set(_last_row(repo)), {"branch", "taskId", "cause", "detail", "actor", "at"})
+        self.assertFalse(_git_succeeds(["rev-parse", "--verify", "--quiet", "refs/remotes/origin/agent/snap-7"], repo), "the branch really was deleted")
+
+    def test_merge_row_carries_the_snapshot_and_pins_no_ref(self):
+        repo = make_repo_with_pushed_branch("agent/snap-8")
+        head = _git_out(["rev-parse", "refs/remotes/origin/agent/snap-8"], repo)
+        patches = TestDiscardBranch._patches(self, repo)
+        for p in patches:
+            p.start()
+        try:
+            res = self.client.post("/api/git/branches/agent%2Fsnap-8/merge")
+            self.assertEqual(res.status_code, 200, res.get_json())
+        finally:
+            for p in patches:
+                p.stop()
+        row = _last_row(repo)
+        self.assertEqual((row["cause"], row["actor"]), ("merged", "dashboard-merge"))
+        self.assertEqual(row["headSha"], head)
+        self.assertEqual(row["commits"][0]["subject"], "a real feature commit")
+        self.assertNotIn("snapshotRef", row)
+
+
+class TestRemovalRowFields(unittest.TestCase):
+    """record_branch_removal's optional fields and snapshot_branch, directly."""
+
+    def test_the_legacy_call_shape_writes_exactly_the_original_keys(self):
+        from branch_removals import record_branch_removal
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(record_branch_removal(d, "origin/agent/x", "merged", task_id="x", detail="d", actor="a"))
+            row = json.loads((Path(d) / "branch-removals.jsonl").read_text())
+            self.assertEqual(set(row), {"branch", "taskId", "cause", "detail", "actor", "at"})
+
+    def test_oversized_lists_are_capped_and_unknown_snapshot_keys_are_ignored(self):
+        from branch_removals import record_branch_removal
+        snap = {
+            "headSha": "a" * 40, "base": "origin/master", "commitCount": 99,
+            "commits": [{"sha": "b" * 40, "subject": "s" * 500}] * 50,
+            "candidates": [{"id": "AC-%d" % i, "title": "t" * 400, "files": "f" * 400} for i in range(60)], "candidatesTotal": 60,
+            "verdict": {"verdict": "discard", "reasons": ["r" * 500] * 9, "source": "chat", "sha": "c" * 40},
+            "bogus": "drop me",
+        }
+        with tempfile.TemporaryDirectory() as d:
+            record_branch_removal(d, "agent/y", "discarded", reason="r" * 900, snapshot=snap)
+            row = json.loads((Path(d) / "branch-removals.jsonl").read_text())
+        self.assertNotIn("bogus", row)
+        self.assertEqual(len(row["reason"]), 300)
+        self.assertLessEqual(len(row["commits"]), 20)
+        self.assertEqual(len(row["commits"][0]["sha"]), 12)
+        self.assertLessEqual(len(row["candidates"]), 25)
+        self.assertEqual(row["candidatesTotal"], 60)
+        self.assertEqual(len(row["verdict"]["reasons"]), 5)
+        self.assertLessEqual(len(row["verdict"]["reasons"][0]), 200)
+
+    def test_a_malformed_snapshot_is_ignored_and_the_row_is_still_written(self):
+        from branch_removals import record_branch_removal
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(record_branch_removal(d, "agent/z", "discarded", snapshot="not a dict"))
+            self.assertTrue(record_branch_removal(d, "agent/w", "discarded", snapshot={"commits": "x", "candidates": 5, "commitCount": True, "verdict": "no"}))
+            for line in (Path(d) / "branch-removals.jsonl").read_text().splitlines():
+                self.assertEqual(set(json.loads(line)), {"branch", "taskId", "cause", "detail", "actor", "at"})
+
+    def test_a_row_over_the_size_limit_trims_commits_first_and_keeps_the_candidates(self):
+        import branch_removals as br
+        snap = {"commits": [{"sha": "b" * 12, "subject": "s" * 120}] * 20,
+                "candidates": [{"id": "AC-%d" % i, "title": "t" * 140, "files": "f" * 160} for i in range(25)], "candidatesTotal": 25}
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(br, "MAX_ROW_CHARS", 9000):
+                br.record_branch_removal(d, "agent/q", "discarded", snapshot=snap)
+            row = json.loads((Path(d) / "branch-removals.jsonl").read_text())
+        self.assertLess(len(row["commits"]), 20, "commits are trimmed first")
+        self.assertEqual(len(row["candidates"]), 25, "candidates survive while trimming commits is enough")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(br, "MAX_ROW_CHARS", 3000):
+                br.record_branch_removal(d, "agent/q", "discarded", snapshot=snap)
+            row = json.loads((Path(d) / "branch-removals.jsonl").read_text())
+        self.assertEqual(row["commits"], [])
+        self.assertLess(len(row["candidates"]), 25)
+        self.assertEqual(row["candidatesOmitted"], 25 - len(row["candidates"]), "the cut is stated, never silent")
+
+    def test_snapshot_branch_never_raises_even_when_git_fails_everywhere(self):
+        from branch_removals import snapshot_branch
+        def boom(args, cwd):
+            raise RuntimeError("git exploded")
+        self.assertEqual(snapshot_branch(boom, "/nonexistent", "main", "agent/x", None, None), {})
+        partial = snapshot_branch(boom, "/nonexistent", "main", "agent/x", "d" * 40, None, keep_ref=True)
+        self.assertEqual(partial["headSha"], "d" * 40)
+        self.assertNotIn("snapshotRef", partial)
+
+    def test_snapshot_branch_on_a_real_repo_without_a_verdict_file(self):
+        from branch_removals import snapshot_branch
+        repo = make_repo_with_pushed_branch("agent/snap-u")
+        snap = snapshot_branch(app._run_git, str(repo), "main", "agent/snap-u", None, repo / "queue")
+        self.assertEqual(snap["headSha"], _git_out(["rev-parse", "refs/remotes/origin/agent/snap-u"], repo))
+        self.assertEqual((snap["base"], snap["commitCount"]), ("origin/main", 1))
+        self.assertNotIn("verdict", snap)
+        self.assertNotIn("snapshotRef", snap, "no ref unless keep_ref=True")
+        with_ref = snapshot_branch(app._run_git, str(repo), "main", "agent/snap-u", None, repo / "queue", keep_ref=True)
+        self.assertEqual(_git_out(["rev-parse", with_ref["snapshotRef"]], repo), snap["headSha"])
+
 if __name__ == "__main__":
     unittest.main()
 
