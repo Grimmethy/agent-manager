@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const { planNodeModules, sandboxHasToolchain, copyNodeModules, dropToolchainCriteria, filterCriteriaForSandbox } = require('./draft-sandbox.js');
+const { planNodeModules, sandboxHasToolchain, copyNodeModules, dropToolchainCriteria, filterCriteriaForSandbox, externalDependencyLinks, codeBindPaths } = require('./draft-sandbox.js');
 const { prepareAdhocWorktree, cleanupAdhocWorktree } = require('../agentic-draft-common.js');
 
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
@@ -163,4 +163,44 @@ test('prepareAdhocWorktree writes NOTHING to stdout, for a copy and for the "no 
     assert.match(err.join('\n'), /\[draft-sandbox\]/, `installed=${installed}: the note is on stderr`);
     cleanupAdhocWorktree(repo, wt, `throwaway/adhoc-stdout-${installed}`);
   }
+});
+
+// --- brain-dump #1745: dependency links to a sibling checkout (agent-manager-hygiene -> ../agent-manager) -----------------------
+
+test('externalDependencyLinks: finds a relative link to a sibling dir and a scoped one; skips links inside node_modules, dangling links and plain dirs', () => {
+  const root = tmp('sbx-links-');
+  const repo = path.join(root, 'repo'); const nm = path.join(repo, 'node_modules');
+  fs.mkdirSync(nm, { recursive: true });
+  fs.mkdirSync(path.join(root, 'sibling')); fs.mkdirSync(path.join(root, 'scoped-sibling'));
+  fs.symlinkSync('../../sibling', path.join(nm, 'dep'));                       // relative link out of the repo
+  fs.mkdirSync(path.join(nm, '@scope'));
+  fs.symlinkSync('../../../scoped-sibling', path.join(nm, '@scope', 'pkg'));    // scoped
+  fs.mkdirSync(path.join(nm, 'real')); fs.symlinkSync('./real', path.join(nm, 'alias'));      // inside node_modules: not external
+  fs.symlinkSync('../../nowhere', path.join(nm, 'dangling'));                  // dangling
+  fs.mkdirSync(path.join(nm, 'plain'));                                        // plain dir
+  fs.mkdirSync(path.join(nm, '.bin')); fs.symlinkSync('../real', path.join(nm, '.bin', 'x'));
+  const found = externalDependencyLinks(repo);
+  assert.deepEqual(found.map((l) => l.name).sort(), ['@scope/pkg', 'dep']);
+  assert.equal(found.find((l) => l.name === 'dep').target, fs.realpathSync(path.join(root, 'sibling')));
+  assert.deepEqual(externalDependencyLinks(path.join(root, 'no-such-repo')), []);
+  assert.deepEqual(externalDependencyLinks(root), [], 'a repo with no node_modules');
+});
+
+test('codeBindPaths: returns only allowlisted CODE entries of the target, never an env file, queue data, brain dump or .git', () => {
+  const t = tmp('sbx-target-');
+  for (const d of ['src', 'lib', 'queue', '.git', 'node_modules', 'docs']) fs.mkdirSync(path.join(t, d));
+  for (const f of ['package.json', 'agent-manager.env', '.env', 'brain-dump.json', 'index.js', 'notes.md']) fs.writeFileSync(path.join(t, f), 'x');
+  const real = fs.realpathSync(t);
+  const got = codeBindPaths(t).map((p) => path.relative(real, p)).sort();
+  assert.deepEqual(got, ['index.js', 'lib', 'node_modules', 'package.json', 'src']);
+  for (const never of ['agent-manager.env', '.env', 'queue', 'brain-dump.json', '.git', 'docs', 'notes.md']) assert.ok(!got.includes(never), never);
+  assert.deepEqual(codeBindPaths(path.join(t, 'missing')), []);
+});
+
+test('codeBindPaths: an allowlisted entry that is a symlink OUT of the target is dropped', () => {
+  const t = tmp('sbx-target-link-'); const outside = tmp('sbx-outside-');
+  fs.writeFileSync(path.join(outside, 'secret.txt'), 's');
+  fs.symlinkSync(outside, path.join(t, 'src'));
+  fs.mkdirSync(path.join(t, 'lib'));
+  assert.deepEqual(codeBindPaths(t).map((p) => path.basename(p)), ['lib']);
 });

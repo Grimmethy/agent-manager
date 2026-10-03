@@ -8,7 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback } = require('./review-verify.js');
+const { verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 
 const DIFF = 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/src/a.test.js b/src/a.test.js\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.test.js\n@@ -0,0 +1 @@\n+z\n';
@@ -701,4 +701,114 @@ test('the replay runs inside the sandbox runner with the remaining budget, never
   assert.ok(call.timeoutMs <= 60000, `timeout ${call.timeoutMs} is capped by the total budget`);
   const starved = fakeDeps({ replay: () => { throw new Error('must not run with <8s left'); } });
   assert.doesNotThrow(() => verifyDiff({ ...base, pipelineDir: '/pipe', checkReplay: true, budgetMs: 5000, deps: starved.deps }));
+});
+
+// --- brain-dump #1745: a dependency that is a link to a sibling checkout (agent-manager-hygiene -> ../agent-manager) ------------
+
+// <root>/work (a git repo with an installed node_modules whose `dep` is a RELATIVE link to <root>/sibling-dep) and the sibling itself: code (src/x.js,
+// package.json) plus things a test must never see (dep.env, queue/data.txt).
+function makeRepoWithSiblingDep() {
+  const r = makeRepo();
+  const sibling = path.join(r.root, 'sibling-dep');
+  fs.mkdirSync(path.join(sibling, 'src'), { recursive: true }); fs.mkdirSync(path.join(sibling, 'queue'));
+  fs.writeFileSync(path.join(sibling, 'package.json'), '{"name":"dep","version":"1.0.0"}\n');
+  fs.writeFileSync(path.join(sibling, 'src', 'x.js'), "module.exports = { answer: 42 };\n");
+  fs.writeFileSync(path.join(sibling, 'dep.env'), 'TOKEN=super-secret\n');
+  fs.writeFileSync(path.join(sibling, 'queue', 'data.txt'), 'task data\n');
+  fs.writeFileSync(path.join(r.work, 'package.json'), '{"name":"host"}\n');
+  fs.mkdirSync(path.join(r.work, 'node_modules'));
+  fs.symlinkSync('../../sibling-dep', path.join(r.work, 'node_modules', 'dep'));   // relative, like hygiene's agent-manager link
+  r.git(['add', '-A'], r.work); r.git(['commit', '-m', 'package.json'], r.work); r.git(['push', 'origin', 'master'], r.work);
+  return { ...r, sibling };
+}
+
+test('relinkExternalDependencies: a dangling relative link in the worktree COPY becomes an absolute link that resolves; the host and plain dirs are untouched', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relink-'));
+  const host = path.join(root, 'host'); const sibling = path.join(root, 'sib');
+  for (const d of [path.join(host, 'node_modules'), sibling]) fs.mkdirSync(d, { recursive: true });
+  fs.symlinkSync('../../sib', path.join(host, 'node_modules', 'dep'));
+  fs.writeFileSync(path.join(sibling, 'f.txt'), 'hello');
+  const copyParent = fs.mkdtempSync(path.join(os.tmpdir(), 'relink-wt-'));
+  const copyWt = path.join(copyParent, 'wt'); fs.mkdirSync(path.join(copyWt, 'node_modules'), { recursive: true });
+  fs.symlinkSync('../../sib', path.join(copyWt, 'node_modules', 'dep'));  // dangling: <copyParent>/sib does not exist
+  fs.mkdirSync(path.join(copyWt, 'node_modules', 'plain'));
+  assert.equal(fs.existsSync(path.join(copyWt, 'node_modules', 'dep', 'f.txt')), false, 'dangling before');
+  assert.deepEqual(relinkExternalDependencies(host, copyWt), ['dep']);
+  assert.equal(fs.readFileSync(path.join(copyWt, 'node_modules', 'dep', 'f.txt'), 'utf8'), 'hello', 'resolves after');
+  assert.equal(path.isAbsolute(fs.readlinkSync(path.join(copyWt, 'node_modules', 'dep'))), true);
+  assert.equal(fs.readlinkSync(path.join(host, 'node_modules', 'dep')), '../../sib', 'the host link is untouched');
+  assert.equal(fs.lstatSync(path.join(copyWt, 'node_modules', 'plain')).isDirectory(), true);
+});
+
+test('relinkExternalDependencies: never touches anything when the worktree\'s node_modules is itself a link out of the worktree', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relink-out-'));
+  const host = path.join(root, 'host'); const sibling = path.join(root, 'sib'); const wt = path.join(root, 'wt');
+  fs.mkdirSync(path.join(host, 'node_modules'), { recursive: true }); fs.mkdirSync(sibling); fs.mkdirSync(wt);
+  fs.symlinkSync('../../sib', path.join(host, 'node_modules', 'dep'));
+  fs.symlinkSync(path.join(host, 'node_modules'), path.join(wt, 'node_modules'));   // shared tree: unlinking inside it would damage the host
+  assert.deepEqual(relinkExternalDependencies(host, wt), []);
+  assert.equal(fs.readlinkSync(path.join(host, 'node_modules', 'dep')), '../../sib');
+  assert.deepEqual(relinkExternalDependencies(path.join(root, 'none'), path.join(root, 'none-wt')), [], 'advisory: errors are swallowed');
+});
+
+test('sandboxUnresolvedDependency: only a bare specifier that RESOLVES on the host counts as the sandbox\'s fault', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'unresolved-'));
+  fs.mkdirSync(path.join(root, 'node_modules', 'dep', 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"host"}');
+  fs.writeFileSync(path.join(root, 'node_modules', 'dep', 'package.json'), '{"name":"dep","main":"src/x.js"}');
+  fs.writeFileSync(path.join(root, 'node_modules', 'dep', 'src', 'x.js'), 'module.exports = 1;');
+  assert.equal(sandboxUnresolvedDependency(['dep/src/x.js'], root), 'dep/src/x.js');
+  assert.equal(sandboxUnresolvedDependency(['./local.js', 'dep/src/x.js'], root), 'dep/src/x.js', 'relative ones are skipped');
+  assert.equal(sandboxUnresolvedDependency(['not-installed-anywhere'], root), null, 'missing on the host too: the diff\'s fault');
+  assert.equal(sandboxUnresolvedDependency(['dep/src/nope.js'], root), null, 'the package exists but this file does not: the diff\'s fault');
+  assert.equal(sandboxUnresolvedDependency(['./x', '../y', '/abs/z', 'node:fs'], root), null);
+  assert.equal(sandboxUnresolvedDependency([], root), null);
+});
+
+function missingModuleRun(spec) {
+  return scriptedRun([{ exitCode: 1, output: `not ok 1 - needs the dep\nError: Cannot find module '${spec}'\n`, missingModules: [spec] }, { exitCode: 1, output: 'not ok 1 - other old failure\n' }]);
+}
+
+test('classification: a suite that died on a host-resolvable module is inconclusive and names the dependency, never a block', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cls-'));
+  fs.mkdirSync(path.join(root, 'node_modules', 'dep'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"h"}'); fs.writeFileSync(path.join(root, 'node_modules', 'dep', 'package.json'), '{"name":"dep","main":"i.js"}'); fs.writeFileSync(path.join(root, 'node_modules', 'dep', 'i.js'), '');
+  const f = diffDeps({ prepare: baseTree(['src/a.js']), run: missingModuleRun('dep') });   // a.test.js only in the diff: without this rule the failure would stand
+  const r = verifyDiff({ ...base, repoRoot: root, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons.join(' '), /sandbox cannot resolve dep \(present on the host, missing in the review sandbox\)/);
+});
+
+test('classification: a module missing on the host as well, and a relative-path module-not-found, are still failures', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cls2-'));
+  fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true }); fs.writeFileSync(path.join(root, 'package.json'), '{"name":"h"}');
+  for (const spec of ['uninstalled-package', './not-there.js']) {
+    const f = diffDeps({ prepare: baseTree(['src/a.js']), run: missingModuleRun(spec) });
+    const r = verifyDiff({ ...base, repoRoot: root, deps: f.deps });
+    assert.equal(r.status, 'failed', spec);
+  }
+});
+
+test('integration: a hygiene-style repo (node_modules/dep is a RELATIVE link to a sibling checkout) verifies as passed inside the real sandbox', { skip: !HAVE_BWRAP }, () => {
+  const { root, work, git } = makeRepoWithSiblingDep();
+  try {
+    const body = "const test = require('node:test'); const assert = require('node:assert/strict');\ntest('loads the sibling dependency', () => assert.equal(require('dep/src/x.js').answer, 42));\n";
+    const r = verifyDiff({ taskId: 'int-dep', rawDiff: diffAddingTest(work, git, body), repoRoot: work, mainBranch: 'master', acceptanceResults: AR('`node --test src/add.test.js`') });
+    assert.equal(r.status, 'passed', JSON.stringify(r));
+    assert.equal(r.tests.passed, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('integration: the sibling\'s secret-looking file and queue data are NOT readable from inside the sandbox, though its code is', { skip: !HAVE_BWRAP }, () => {
+  const { root, work, git, sibling } = makeRepoWithSiblingDep();
+  try {
+    const secret = JSON.stringify(path.join(fs.realpathSync(sibling), 'dep.env')); const queued = JSON.stringify(path.join(fs.realpathSync(sibling), 'queue', 'data.txt'));
+    const body = "const test = require('node:test'); const assert = require('node:assert/strict'); const fs = require('fs');\n"
+      + "test('code is loadable', () => assert.equal(require('dep/src/x.js').answer, 42));\n"
+      + `test('env file is invisible', () => assert.throws(() => fs.readFileSync(${secret}, 'utf8'), { code: 'ENOENT' }));\n`
+      + `test('queue data is invisible', () => assert.throws(() => fs.readFileSync(${queued}, 'utf8'), { code: 'ENOENT' }));\n`;
+    const r = verifyDiff({ taskId: 'int-dep-secret', rawDiff: diffAddingTest(work, git, body), repoRoot: work, mainBranch: 'master', acceptanceResults: AR('`node --test src/add.test.js`') });
+    assert.equal(r.status, 'passed', JSON.stringify(r));
+    assert.equal(r.tests.passed, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
