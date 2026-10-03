@@ -790,6 +790,35 @@ test('checkDraft wires revertChecks into its own flags/return shape', () => {
   assert.equal(fc.revertChecks.length, 1);
 });
 
+// --- Symbol-presence warning (HUB0136 1/3): a backtick-quoted identifier cited on the
+// same line as a file:line citation should actually appear in the cited file's content.
+// WARNING-ONLY by design -- the gate still passes and nothing is stripped; the miss just
+// surfaces as a severity:'warning' entry in the result. ---
+
+test('checkFileLineCitations passes the gate AND emits a symbol-not-found-in-cited-file warning when the backtick-quoted symbol is absent from the cited real file', () => {
+  const repoRoot = makeRepo(); // src/real-file.js containing only `// real` -- no symbol in it
+  const draftText = 'The `ghostSymbol` helper lives at src/real-file.js:1';
+  const sourceText = 'grounding: src/real-file.js:1';
+
+  const { unconfirmedCitations, warnings } = checkFileLineCitations(draftText, sourceText, repoRoot, ['src']);
+  assert.deepEqual(unconfirmedCitations, [], 'the citation is grounded in sourceText, so the gate passes and nothing is stripped');
+  assert.equal(warnings.length, 1);
+  assert.equal(warnings[0].type, 'symbol-not-found-in-cited-file');
+  assert.equal(warnings[0].identifier, 'ghostSymbol');
+  assert.equal(warnings[0].citedFile, 'src/real-file.js');
+  assert.equal(warnings[0].severity, 'warning');
+});
+
+test('checkFileLineCitations does NOT emit a symbol-not-found-in-cited-file warning when the backtick-quoted symbol is actually present in the cited real file', () => {
+  const repoRoot = path.join(__dirname, '..'); // this repo: src/fact-checker.js really defines checkFileLineCitations
+  const draftText = 'The `checkFileLineCitations` gate sits at src/fact-checker.js:645';
+  const sourceText = 'grounding: src/fact-checker.js:645';
+
+  const { unconfirmedCitations, warnings } = checkFileLineCitations(draftText, sourceText, repoRoot, ['src']);
+  assert.deepEqual(unconfirmedCitations, []);
+  assert.deepEqual(warnings.filter((w) => w.type === 'symbol-not-found-in-cited-file'), [], 'symbol exists in the file, so no warning');
+});
+
 test('checkFileLineCitations strips a line citing scripts/local-worker.sh:414 when sourceText lacks it', () => {
   const draftText = 'The INFRA_FAILURE_PATTERN regex lives at scripts/local-worker.sh:414.';
   const sourceText = 'unrelated grounding material';
