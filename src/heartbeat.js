@@ -19,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { writeAtomicSync } = require('./atomic-write.js');
 
 function writeHeartbeatFile(instancesDir, instanceId, status, model, taskId, pass, startedAt) {
   const hbPath = path.join(instancesDir, `${instanceId}.json`);
@@ -63,7 +64,10 @@ function writeHeartbeatFile(instancesDir, instanceId, status, model, taskId, pas
   if (daemonPid != null) hb.daemonPid = daemonPid;
   // Set while this lane is running a borrowed project's task (docs/idle-pool-borrowing.md), so the Workers tab can say whose work it is.
   if (process.env.AGENT_MANAGER_BORROWING_FROM) hb.project = process.env.AGENT_MANAGER_BORROWING_FROM;
-  fs.writeFileSync(hbPath, JSON.stringify(hb, null, 2));
+  // Atomic (temp + fsync + rename): this file is the pipeline's only liveness source of
+  // truth, and the liveness guard treats an unreadable heartbeat as an abandoned instance,
+  // so a torn write (crash, or a reader landing mid-write) could let a duplicate start.
+  writeAtomicSync(hbPath, JSON.stringify(hb, null, 2));
 }
 
 module.exports = { writeHeartbeatFile };
