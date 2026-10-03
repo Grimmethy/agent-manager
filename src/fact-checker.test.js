@@ -817,6 +817,46 @@ test('checkFileLineCitations is a no-op for a bare path with no :NNN suffix', ()
   );
 });
 
+test('checkFileLineCitations warns (but still passes the gate) when a backtick-quoted symbol is absent from the cited real file', () => {
+  // makeRepo()'s src/real-file.js contains only "// real" -- no such identifier.
+  const repoRoot = makeRepo();
+  const draftText = 'The `ghostSymbol` helper lives at src/real-file.js:2.';
+  // sourceText grounds the file:line token so the citation is CONFIRMED (gate passes).
+  const sourceText = 'The `ghostSymbol` helper lives at src/real-file.js:2.';
+
+  let result;
+  assert.doesNotThrow(() => {
+    result = checkFileLineCitations(draftText, sourceText, repoRoot);
+  });
+  // Gate still passes: the confirmed citation is NOT stripped.
+  assert.deepEqual(result.unconfirmedCitations, []);
+  // ...and the missing symbol is surfaced as a warning-only entry (never a failure).
+  const warning = result.warnings.find((w) => w.type === 'symbol-not-found-in-cited-file');
+  assert.ok(warning, 'expected a symbol-not-found-in-cited-file warning');
+  assert.equal(warning.identifier, 'ghostSymbol');
+  assert.equal(warning.citedFile, 'src/real-file.js');
+  assert.equal(warning.severity, 'warning');
+});
+
+test('checkFileLineCitations does NOT warn when the backtick-quoted symbol is actually present in the cited real file', () => {
+  // Cite the real source file of checkFileLineCitations itself and name a symbol that
+  // genuinely exists in it, so the warning path must stay silent.
+  const repoRoot = path.resolve(__dirname, '..');
+  const draftText = 'The `checkFileLineCitations` function is defined at src/fact-checker.js:645.';
+  const sourceText = 'The `checkFileLineCitations` function is defined at src/fact-checker.js:645.';
+
+  let result;
+  assert.doesNotThrow(() => {
+    result = checkFileLineCitations(draftText, sourceText, repoRoot);
+  });
+  assert.deepEqual(result.unconfirmedCitations, []);
+  assert.equal(
+    result.warnings.filter((w) => w.type === 'symbol-not-found-in-cited-file').length,
+    0,
+    'checkFileLineCitations exists in src/fact-checker.js, so no symbol-not-found warning is expected',
+  );
+});
+
 // --- checkCompletionClaimsInNote: "already in place / already inserted" claims in a
 // note are verified against the LIVE repo (file exists, named function exists in it),
 // fail-open on read errors, and return one candidate object per claim ---
