@@ -33,6 +33,7 @@ const { spawnSync } = require('child_process');
 const { prepareAdhocWorktree, applyPartialDiff, cleanupAdhocWorktree, runGit } = require('./agentic-draft-common.js');
 const { findAffectedTestFiles, parseNodeTestFailures, parsePyTestFailures } = require('./scoped-test-runner.js');
 const { wrapWithSandbox } = require('./sandbox.js');
+const { externalDependencyLinks, codeBindPaths } = require('./lib/draft-sandbox.js');
 
 const COMMAND_TIMEOUT_MS = 120000;
 const TEST_TIMEOUT_MS = 90000;
@@ -150,6 +151,8 @@ function runSandboxed({ worktreeDir, bin, args, timeoutMs, pythonBin, mainRepoRo
     const readOnlyBinds = ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/etc', '/opt', path.dirname(path.dirname(process.execPath))];
     if (mainRepoRoot) readOnlyBinds.push(path.join(mainRepoRoot, '.venv'));
     try { readOnlyBinds.push(path.dirname(path.dirname(fs.realpathSync(realBin)))); } catch { /* keep going */ }
+    // A dependency that is a link to a sibling checkout (agent-manager-hygiene -> ../agent-manager): bind its CODE only, read-only. Never the whole target.
+    if (mainRepoRoot) for (const link of externalDependencyLinks(mainRepoRoot)) readOnlyBinds.push(...codeBindPaths(link.target));
     const wrapped = wrapWithSandbox(realBin, args, {
       workDir: worktreeDir,
       readOnlyBinds,
@@ -160,10 +163,48 @@ function runSandboxed({ worktreeDir, bin, args, timeoutMs, pythonBin, mainRepoRo
     const r = spawnSync(wrapped.command, wrapped.args, { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
     const timedOut = (r.error && r.error.code === 'ETIMEDOUT') || r.signal === 'SIGTERM';
     const output = `${r.stdout || ''}${r.stderr || ''}`;
-    return { ran: true, exitCode: timedOut ? null : (typeof r.status === 'number' ? r.status : 1), timedOut: !!timedOut, output: output.slice(-MAX_OUTPUT_CHARS) };
+    // Read from the FULL output: the 4000-char tail can cut the one line that names the missing module.
+    const missingModules = [...new Set([...output.matchAll(/Cannot find (?:module|package) '([^']+)'/g)].map((m) => m[1]))];
+    return { ran: true, exitCode: timedOut ? null : (typeof r.status === 'number' ? r.status : 1), timedOut: !!timedOut, output: output.slice(-MAX_OUTPUT_CHARS), missingModules };
   } finally {
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
   }
+}
+
+// The worktree's node_modules is a PRIVATE COPY (copyNodeModules), so a relative link to a sibling checkout dangles there. Point each such link at its real
+// target (absolute). Only symlinks inside the worktree copy are touched -- never the host's node_modules -- and the copy is skipped unless it really lives
+// inside the worktree. Advisory: any error leaves verification exactly as it was. Returns the names relinked.
+function relinkExternalDependencies(repoRoot, worktreeDir) {
+  const relinked = [];
+  try {
+    const copyRoot = path.join(worktreeDir, 'node_modules');
+    const realCopy = fs.realpathSync(copyRoot);
+    const realWorktree = fs.realpathSync(worktreeDir);
+    if (!realCopy.startsWith(realWorktree + path.sep)) return relinked; // node_modules is itself a link out of the worktree: never touch it
+    for (const { name, target } of externalDependencyLinks(repoRoot)) {
+      const copy = path.join(copyRoot, name);
+      let st;
+      try { st = fs.lstatSync(copy); } catch { continue; }
+      if (!st.isSymbolicLink()) continue;
+      fs.unlinkSync(copy);
+      fs.symlinkSync(target, copy, 'dir');
+      relinked.push(name);
+    }
+  } catch { /* advisory */ }
+  return relinked;
+}
+
+// A failing suite that died on `Cannot find module '<spec>'` is the SANDBOX's doing, not the diff's, when <spec> is a bare specifier that RESOLVES on the
+// host (from the repo root) -- the module exists, the sandbox just cannot see it. A relative path, a node: builtin, or a specifier that does not resolve on
+// the host either is the diff's own mistake and stays a failure. Returns the first such specifier, or null.
+function sandboxUnresolvedDependency(missingModules, repoRoot) {
+  let resolveFromRepo;
+  try { resolveFromRepo = require('module').createRequire(path.join(repoRoot, 'package.json')); } catch { return null; }
+  for (const spec of missingModules || []) {
+    if (!spec || spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('node:')) continue;
+    try { resolveFromRepo.resolve(spec); return spec; } catch { /* missing on the host too: the diff's fault */ }
+  }
+  return null;
 }
 
 function worktreePaths(taskId) {
@@ -370,7 +411,7 @@ function checkUnpinnedHunks({ worktreeDir, rawDiff, suites, run, d, deadline, py
 function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, deps = {} }) {
   const d = {
     prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
-    findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args), ...deps,
+    relink: relinkExternalDependencies, findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args), ...deps,
   };
   const result = { status: 'inconclusive', reasons: [], apply: null, tests: null, commands: [] };
   const inconclusive = (reason) => { result.reasons.push(reason); return result; };
@@ -383,6 +424,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     const prep = d.prepare(repoRoot, mainBranch, worktreeDir, branchName);
     prepared = true;
     if (!prep || !prep.ok) return inconclusive(`could not create a scratch worktree: ${(prep && prep.reason) || 'unknown'}`);
+    d.relink(repoRoot, worktreeDir);
     const applied = d.applyDiff(worktreeDir, rawDiff);
     result.apply = { applied: !!applied.applied, reason: applied.reason || null };
     if (!applied.applied) return inconclusive(`the diff does not apply to ${mainBranch} (often a slice that depends on an unmerged earlier one): ${applied.reason || 'unknown'}`);
@@ -418,7 +460,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
         if (!r.ran) { result.tests = null; break; }
         result.tests.ran.push(...s.files);
         if (r.timedOut) { result.tests.timedOut = true; result.tests.passed = null; continue; }
-        if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s, names: s.parse(r.output), raw: r.output }); }
+        if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] }); }
       }
     }
 
@@ -470,6 +512,11 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
         if (result.tests) result.tests.passed = null;
       } else {
         for (const f of failedSuites) {
+          const unresolved = f.s.label === 'js' ? sandboxUnresolvedDependency(f.missing, repoRoot) : null;
+          if (unresolved) {
+            unattributable.push(`covering ${f.s.label} tests (${f.s.files.join(', ')}) could not run: sandbox cannot resolve ${unresolved} (present on the host, missing in the review sandbox), so the failure says nothing about the diff`);
+            continue;
+          }
           const baseFiles = f.s.files.filter((file) => fs.existsSync(path.join(worktreeDir, file)));
           let attributable = f.names;
           if (baseFiles.length) {
@@ -525,6 +572,6 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 
 module.exports = {
   extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
-  verifyDiff, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
+  verifyDiff, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS,
 };

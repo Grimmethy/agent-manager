@@ -86,6 +86,60 @@ function copyNodeModules(repoRoot, worktreeDir, { run = execFileSync, env = proc
   }
 }
 
+// ---- dependency links to a sibling checkout (brain-dump #1745) -------------------------------------------------------------
+// agent-manager-hygiene's node_modules holds ONE relative symlink, `agent-manager -> ../../agent-manager` (package.json "file:../agent-manager").
+// `cp -a` of that directory leaves the link dangling in a worktree, and the review sandbox (bwrap) binds only system paths, so a hygiene test that
+// requires 'agent-manager/src/...' threw before running. These two helpers let review-verify.js relink the COPY and bind the target read-only.
+//
+// Only CODE of the target is ever exposed: the target is usually a live checkout whose root holds agent-manager.env (dashboard and internal
+// tokens), the pipeline queue and brain-dump.json, none of which a test needs.
+const CODE_ENTRIES = ['package.json', 'src', 'lib', 'dist', 'index.js', 'index.cjs', 'index.mjs', 'node_modules'];
+
+// repoRoot -> [{ name, linkPath, target }]: the symlinks directly inside <repoRoot>/node_modules (and one level inside @scope dirs) whose real path is a
+// directory OUTSIDE the real node_modules tree. A link into node_modules itself (.bin, workspace-style) and a dangling link are skipped. Never throws.
+function externalDependencyLinks(repoRoot) {
+  const out = [];
+  try {
+    const nm = path.join(repoRoot, 'node_modules');
+    const realNm = fs.realpathSync(nm);
+    const consider = (linkPath, name) => {
+      try {
+        if (!fs.lstatSync(linkPath).isSymbolicLink()) return;
+        const target = fs.realpathSync(linkPath); // throws for a dangling link
+        if (!fs.statSync(target).isDirectory()) return;
+        if (target === realNm || target.startsWith(realNm + path.sep)) return;
+        out.push({ name, linkPath, target });
+      } catch { /* dangling or unreadable: skip */ }
+    };
+    for (const entry of fs.readdirSync(nm)) {
+      if (entry.startsWith('.')) continue;
+      const entryPath = path.join(nm, entry);
+      if (entry.startsWith('@')) {
+        try { for (const sub of fs.readdirSync(entryPath)) consider(path.join(entryPath, sub), `${entry}/${sub}`); } catch { /* not a dir */ }
+        continue;
+      }
+      consider(entryPath, entry);
+    }
+  } catch { return []; }
+  return out;
+}
+
+// targetDir -> the existing paths among an ALLOWLIST of code entries (CODE_ENTRIES), each required to really live inside the target (an entry that is
+// a symlink out of it is dropped). Nothing else is ever returned, so an env file, queue data, brain-dump.json or .git of the target stay invisible.
+function codeBindPaths(targetDir) {
+  const out = [];
+  let realTarget;
+  try { realTarget = fs.realpathSync(targetDir); } catch { return out; }
+  for (const entry of CODE_ENTRIES) {
+    const p = path.join(realTarget, entry);
+    try {
+      const real = fs.realpathSync(p);
+      if (real === realTarget || real.startsWith(realTarget + path.sep)) out.push(p);
+    } catch { /* absent */ }
+  }
+  return out;
+}
+
 // A criterion that can only be met by RUNNING the project's JS toolchain: a typecheck, build, lint, test run, or an npx/npm/yarn/pnpm command.
 const TOOLCHAIN_CRITERION_RE = /\b(?:npx|npm\s+(?:run|test|ci|install|i)\b|yarn\s+[\w-]+|pnpm\s+[\w-]+|tsc\b|vitest\b|vite\b|jest\b|eslint\b|mocha\b|playwright\b|cypress\b)|\btype[- ]?check|\bnpm\s+t\b/i;
 
@@ -105,4 +159,4 @@ function filterCriteriaForSandbox({ criteria, source, repoRoot, env = process.en
   return dropToolchainCriteria(list);
 }
 
-module.exports = { planNodeModules, sandboxHasToolchain, copyNodeModules, dropToolchainCriteria, filterCriteriaForSandbox, isJsProject, TOOLCHAIN_CRITERION_RE };
+module.exports = { planNodeModules, sandboxHasToolchain, copyNodeModules, dropToolchainCriteria, filterCriteriaForSandbox, isJsProject, externalDependencyLinks, codeBindPaths, CODE_ENTRIES, TOOLCHAIN_CRITERION_RE };
