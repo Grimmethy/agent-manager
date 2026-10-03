@@ -1243,6 +1243,26 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   // "the CANDIDATE itself rests on a false premise" (retrying redrafts against the exact
   // same false premise every time -- structurally futile, not stochastically unlucky).
   const postImplementEntry = getRegisteredSource(resolveSourceName(task));
+  // Write-time size gate (ADR-0023 S1): a directToMain candidate write-up over the fulfillment limit would be appended and then skipped
+  // forever, so it is bounced here with its measured size. Unlike the grounding gate below, this does NOT set reviewInconclusive: the
+  // violation is deterministic, so it goes through the normal reject-retry loop (feedback injected, MAX_LOCAL_REJECT_RETRIES, then
+  // needs-clarification). A throwing gate is advisory and never blocks a draft.
+  let sizeGate = null;
+  try {
+    sizeGate = require('./candidate-size-gate.js').checkCandidateSize(task, task.implementResponse, { entry: postImplementEntry });
+  } catch (e) {
+    sizeGate = null;
+  }
+  if (sizeGate && sizeGate.verdict === 'oversized') {
+    const blockedReason = `Oversized candidate: ${String(sizeGate.reason || '(no detail)')}`.slice(0, 500);
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(blockedReason);
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+  }
   if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
     let grounding;
     try {
