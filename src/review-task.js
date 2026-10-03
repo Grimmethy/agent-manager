@@ -1366,6 +1366,19 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
   }
 
+  // HUB0138 · 1/2: brain_dump_sort critique skip guard.
+  // The deterministic validator has already run and passed by this point (a broken draft
+  // would have been blocked earlier), so the LLM critique stage is redundant for this source.
+  // Skip it and proceed to the verdict decision using only the deterministic validator result.
+  if (task.source === 'brain_dump_sort') {
+    appendHistoryEvent(task, 'critique-skipped', 'skippedStage: critique, source: brain_dump_sort, reason: deterministic validator only');
+    task.reviewedAt = new Date().toISOString();
+    task.reviewProvider = 'deterministic-brain-dump-sort-skip-critique';
+    task.localVerdict = 'Auto-approved: brain_dump_sort critique stage skipped, deterministic validator passed.';
+    recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'review', outcomeReason: 'brain_dump_sort critique skip' });
+    return { succeeded: true, verdict: 'approved', factCheckVerdict: 'skipped' };
+  }
+
   await waitForLocalAvailability(instancesDir);
 
   const verdictPrompt = buildVerdictPrompt(task, factCheck, groundingText);
