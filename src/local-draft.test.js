@@ -3961,3 +3961,65 @@ test('installStdoutEpipeGuard: a non-EPIPE stdout error is still surfaced to std
     process.exitCode = originalExitCode;
   }
 });
+
+// --- write-time candidate size gate (ADR-0023 S1; src/candidate-size-gate.js) --
+// A directToMain source's oversized candidate write-up is bounced through the NORMAL reject-retry path: blockedStage 'review',
+// reviewInconclusive NOT set (a size violation is deterministic, not a stochastic gate flake).
+const sizeGateBlock = (problem) => `### AC-1 · A candidate\nStrength: Strong\nFiles: src/x.js\n\nProblem:\n${problem}\n\nSolution:\nS\n\nBenefits:\nB\n`;
+
+async function runSizeGateDraft(sourceName, entryExtras, response, taskId) {
+  let task;
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource(sourceName)) {
+      registerTaskSource(sourceName, { priority: 80, next: () => null, ...entryExtras });
+      updateTaskSource(sourceName, { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    task = {
+      id: taskId, domain: 'default', source: sourceName, title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response, degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+  });
+  return task;
+}
+
+test('draftTask blocks an oversized candidate from a directToMain source as a genuine review rejection (reviewInconclusive unset)', async () => {
+  const { isReviewRejection } = require('./reject-retry-check.js');
+  const task = await runSizeGateDraft('size_gate_oversized_source', { directToMain: true }, sizeGateBlock('x'.repeat(4300)), 'size-gate-oversized-1');
+  assert.equal(task.blockedStage, 'review');
+  assert.equal(task.reviewInconclusive, undefined);
+  assert.match(task.blockedReason, /Oversized candidate/);
+  assert.match(task.blockedReason, /"A candidate" is \d+ chars/);
+  assert.deepEqual(task.priorRejectionFeedback, [task.blockedReason]);
+  assert.match(task.history.find((h) => h.stage === 'blocked').detail, /Oversized candidate/);
+  assert.equal(isReviewRejection(task), true);
+});
+
+test('draftTask does not block a short candidate from a directToMain source on size', async () => {
+  const task = await runSizeGateDraft('size_gate_short_source', { directToMain: true }, sizeGateBlock('tiny'), 'size-gate-short-1');
+  assert.doesNotMatch(String(task.blockedReason || ''), /Oversized candidate/);
+});
+
+test('draftTask does not apply the size gate to a source that is not directToMain', async () => {
+  const task = await runSizeGateDraft('size_gate_not_direct_source', {}, sizeGateBlock('x'.repeat(4300)), 'size-gate-not-direct-1');
+  assert.doesNotMatch(String(task.blockedReason || ''), /Oversized candidate/);
+});
+
+test('draftTask leaves an oversized draft unblocked when AGENT_MANAGER_CANDIDATE_SIZE_GATE=false', async () => {
+  const prev = process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE;
+  process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE = 'false';
+  try {
+    const task = await runSizeGateDraft('size_gate_killswitch_source', { directToMain: true }, sizeGateBlock('x'.repeat(4300)), 'size-gate-killswitch-1');
+    assert.doesNotMatch(String(task.blockedReason || ''), /Oversized candidate/);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE; else process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE = prev;
+  }
+});

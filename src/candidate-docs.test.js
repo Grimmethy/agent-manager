@@ -287,3 +287,38 @@ test('dedupe on outside a git repo fails open to the working-tree text', () => {
   assert.equal(fresh.candidateCount, 1);
   fs.rmSync(T, { recursive: true, force: true });
 });
+
+// renderCandidateSection (extracted 2026-10-03 for candidate-size-gate.js): the gate must measure exactly what
+// applyArchDiscoveryCandidates writes, so the section it renders is pinned against the real written doc.
+test('renderCandidateSection output is exactly the section applyArchDiscoveryCandidates writes', () => {
+  const { renderCandidateSection } = candidateDocs;
+  const blk = (id, title, meta, body) => `### AC-${id} · ${title}\nStrength: Strong\n${meta}\n\nProblem:\n${body}\n\nSolution:\nS\n\nBenefits:\nB\n`;
+  const shapes = [
+    { resp: blk(1, 'Plain', 'Files: src/a.js', 'p'), opts: {} },
+    { resp: blk(1, 'Split', 'Split-Depth: 1\nFiles: src/a.js', 'p'), opts: {} },
+    { resp: blk(1, 'Sourced', 'Source: function_length_review\nFiles: src/a.js', 'p'), opts: {} },
+    { resp: blk(1, 'Bare', 'Files: SearchView, ./src/b.js:12-40', 'p'), opts: {} },
+    { resp: blk(1, 'Decompose someFn', 'Files: src/a.js', 'p'), opts: { symbol: 'someFn' } },
+    { resp: blk(1, 'Snip', 'Files: src/b.js', 'p'), opts: { snippet: 'function bar() {\n  return `x`;\n}' } },
+  ];
+  for (const s of shapes) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'render-parity-'));
+    const p = path.join(dir, 'DOC.md');
+    const res = applyArchDiscoveryCandidates({ implementResponse: s.resp, candidatesPath: p, docTitle: '# T', ...s.opts });
+    const c = parseArchDiscoveryCandidates(s.resp)[0];
+    if (s.opts.symbol) c.symbol = s.opts.symbol;
+    const section = renderCandidateSection(c, res.candidateIds[0], { snippet: s.opts.snippet || null, dependsOnId: null });
+    assert.equal(fs.readFileSync(p, 'utf8'), `# T\n\n${section}`);
+    // Pin the literal lines too: the render and the writer share one function now, so equality alone cannot see a line both drop.
+    if (s.opts.symbol) assert.match(section, new RegExp(`\\nSymbol: ${s.opts.symbol}\\n`));
+    if (s.opts.snippet) assert.match(section, /\nSnippet:\n```\n/);
+    assert.match(section, /^### AC-\d+ · .+\nStrength: Strong\n/);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('renderCandidateSection writes a Depends-On line only when a dependsOnId is passed', () => {
+  const c = { title: 'T', strength: 'Strong', files: 'src/a.js', body: 'b' };
+  assert.doesNotMatch(candidateDocs.renderCandidateSection(c, 'AC-2'), /Depends-On/);
+  assert.match(candidateDocs.renderCandidateSection(c, 'AC-2', { dependsOnId: 'AC-1' }), /\nDepends-On: AC-1\n/);
+});

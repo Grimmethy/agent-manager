@@ -159,6 +159,31 @@ function dedupeDocViews(candidatesPath, workingTreeText) {
   return views;
 }
 
+// The text one candidate occupies in a Docs/*_CANDIDATES.md doc, minus the leading blank-line separator. Pure: the
+// caller allocates `id` and resolves `dependsOnId` (the id of an EARLIER candidate in the same batch, or null).
+// Shared by applyArchDiscoveryCandidates and candidate-size-gate.js so the gate measures exactly what gets written.
+function renderCandidateSection(c, id, { snippet = null, dependsOnId = null } = {}) {
+  const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
+  // Split-Depth: N -- a one-level pre-split marker; nextCandidateFulfillmentTask (SDK)
+  // refuses to pre-split a candidate at depth >= 1 (hard recursion stop).
+  if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
+  if (c.source) lines.push(`Source: ${c.source}`);
+  if (c.files) lines.push(`Files: ${normalizeCandidateFiles(c.files)}`);
+  if (c.symbol) lines.push(`Symbol: ${c.symbol}`);
+  // dependsOnIndex -> a real Depends-On: AC-NNN line (2026-09-05, see
+  // prompts.js's candidateSplitInstructions for the incident): only resolvable once ids are
+  // actually being assigned in the same pass, so the caller passes the resolved id in. Only valid
+  // within a single split batch -- parseCandidateSplit's own remapping guarantees the index
+  // refers to an EARLIER candidate in THIS SAME call.
+  if (dependsOnId) lines.push(`Depends-On: ${dependsOnId}`);
+  // Fenced, not backtick-inline -- the real snippet is often multi-line and may itself
+  // contain backticks (template literals are common in this codebase), so a fence is
+  // the only delimiter that can't collide with the content it's wrapping.
+  if (snippet) lines.push('Snippet:', '```', snippet, '```');
+  lines.push('', c.body);
+  return lines.join('\n') + '\n';
+}
+
 // `symbol` (optional): see the comment at the top of the function body. `dedupe` (opt-in, default off): drop a candidate whose file + function (lib/candidate-dedupe.js) is already in
 // the doc on any view above, or earlier in this same call. Left off for candidate splits (sibling
 // candidates legitimately share Files:) and hand-authored docs. Kill switch: AGENT_MANAGER_CANDIDATE_DEDUPE=false.
@@ -210,29 +235,9 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   const candidateIds = [];
   candidates.forEach((c) => {
     const id = `AC-${Math.max(nextAvailableCandidateId(text), idFloor + 1)}`;
-    const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
-    // Split-Depth: N -- a one-level pre-split marker; nextCandidateFulfillmentTask (SDK)
-    // refuses to pre-split a candidate at depth >= 1 (hard recursion stop).
-    if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
-    if (c.source) lines.push(`Source: ${c.source}`);
-    if (c.files) lines.push(`Files: ${normalizeCandidateFiles(c.files)}`);
-    if (c.symbol) lines.push(`Symbol: ${c.symbol}`);
-    // dependsOnIndex -> a real Depends-On: AC-NNN line (2026-09-05, see
-    // prompts.js's candidateSplitInstructions for the incident): only resolvable NOW,
-    // once ids are actually being assigned in this same pass. Only valid within a single
-    // split batch (candidates all arrive together, in original order, from
-    // apply-task.js's applyCandidateSplit) -- candidateIds[c.dependsOnIndex] is only
-    // populated when that index refers to an EARLIER candidate in THIS SAME call, which
-    // parseCandidateSplit's own remapping already guarantees.
-    if (Number.isInteger(c.dependsOnIndex) && candidateIds[c.dependsOnIndex]) {
-      lines.push(`Depends-On: ${candidateIds[c.dependsOnIndex]}`);
-    }
-    // Fenced, not backtick-inline -- the real snippet is often multi-line and may itself
-    // contain backticks (template literals are common in this codebase), so a fence is
-    // the only delimiter that can't collide with the content it's wrapping.
-    if (snippet) lines.push('Snippet:', '```', snippet, '```');
-    lines.push('', c.body);
-    text += '\n' + lines.join('\n') + '\n';
+    const dependsOnId = Number.isInteger(c.dependsOnIndex) ? candidateIds[c.dependsOnIndex] : null;
+    const section = renderCandidateSection(c, id, { snippet, dependsOnId });
+    text += '\n' + section;
     candidateIds.push(id);
   });
 
@@ -247,4 +252,5 @@ module.exports = {
   parseArchDiscoveryCandidates,
   nextAvailableCandidateId,
   applyArchDiscoveryCandidates,
+  renderCandidateSection,
 };
