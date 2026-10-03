@@ -159,16 +159,21 @@ function dedupeDocViews(candidatesPath, workingTreeText) {
   return views;
 }
 
-// `dedupe` (opt-in, default off): drop a candidate whose file + function (lib/candidate-dedupe.js) is already in
+// `symbol` (optional): see the comment at the top of the function body. `dedupe` (opt-in, default off): drop a candidate whose file + function (lib/candidate-dedupe.js) is already in
 // the doc on any view above, or earlier in this same call. Left off for candidate splits (sibling
 // candidates legitimately share Files:) and hand-authored docs. Kill switch: AGENT_MANAGER_CANDIDATE_DEDUPE=false.
 // All candidates dropped -> nothing is written and { skipped, duplicateOf, reason } comes back; the reason contains
 // "skipped" so task-disposition.js's NOOP_RE closes the task as a noop.
-function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null, dedupe = false }) {
+function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null, dedupe = false, symbol = null }) {
   let candidates = parseArchDiscoveryCandidates(implementResponse);
   if (candidates.length === 0) {
     return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
   }
+  // `symbol` (2026-10-03): the function/identifier the SOURCE knows the candidate is about (e.g. function_length_review
+  // reads it off its scanner finding), written as a deterministic `Symbol:` line and used as the dedupe key ahead of any
+  // title parsing -- the model's title formatting (backticks or not) no longer decides whether a duplicate is caught.
+  // Only applied to a single-candidate batch: with several candidates one symbol cannot be attributed to any one of them.
+  if (symbol && candidates.length === 1) candidates[0].symbol = String(symbol).trim();
 
   let text = fs.existsSync(candidatesPath) ? fs.readFileSync(candidatesPath, 'utf8') : `${docTitle}\n`;
 
@@ -211,6 +216,7 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
     if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
     if (c.source) lines.push(`Source: ${c.source}`);
     if (c.files) lines.push(`Files: ${normalizeCandidateFiles(c.files)}`);
+    if (c.symbol) lines.push(`Symbol: ${c.symbol}`);
     // dependsOnIndex -> a real Depends-On: AC-NNN line (2026-09-05, see
     // prompts.js's candidateSplitInstructions for the incident): only resolvable NOW,
     // once ids are actually being assigned in this same pass. Only valid within a single
