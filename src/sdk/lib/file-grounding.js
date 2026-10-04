@@ -137,6 +137,36 @@ function collectAnchorHits(content, section) {
   return hits.sort((a, b) => a.rank - b.rank || a.index - b.index);
 }
 
+// Which anchors get a region (2026-10-04, arch-review-ac-52): the cap used to be `hits.slice(0, MAX_ANCHOR_REGIONS)` on hits sorted by (rank, index), i.e. the FIVE EARLIEST hits, so anchors packed
+// into the top of a 20k-char file used up every slot and the real edit sites further down were never shown (203 of 408 candidate section/file pairs had more than five anchors, and in 158 one lay
+// outside the window). Each pick shows the file from `half` before it to `half` after it, so with more than MAX_ANCHOR_REGIONS hits this chooses, greedily, the hit whose window covers the most
+// remaining anchors (a protected rank-0 / rank-0.5 hit counts PROTECTED_HIT_WEIGHT, a quoted symbol 1, a cited line 0.5), removes what that window covers, and repeats. Ties keep the (rank, index)
+// order, so when no two hits are within a window of each other the picks equal the old first five; with the cap or fewer hits the array is returned untouched. The picks come back sorted by
+// (rank, index) so hits[0] still means "the best hit". (Clustering hits by distance first was tried and rejected: hits a little under a window apart chain into ONE cluster, and picking inside it
+// by position is the old bug again.)
+const PROTECTED_HIT_WEIGHT = 1000;
+function selectAnchorHits(hits, maxChars, contentLength) {
+  if (hits.length <= MAX_ANCHOR_REGIONS) return hits;
+  const totalBudget = Math.min(MAX_FETCHED_FILE_TOTAL_CHARS, Math.max(maxChars, contentLength));
+  const half = Math.floor(Math.max(MIN_REGION_CHARS, Math.min(maxChars, Math.floor(totalBudget / MAX_ANCHOR_REGIONS))) / 2);
+  const byRankIndex = (a, b) => a.rank - b.rank || a.index - b.index;
+  const weight = (h) => (h.rank < 1 ? PROTECTED_HIT_WEIGHT : h.rank === 1 ? 1 : 0.5);
+  let remaining = [...hits].sort(byRankIndex);
+  const picks = [];
+  while (picks.length < MAX_ANCHOR_REGIONS && remaining.length > 0) {
+    let best = null;
+    let bestWeight = -1;
+    for (const c of remaining) {
+      let w = 0;
+      for (const h of remaining) if (Math.abs(h.index - c.index) <= half) w += weight(h);
+      if (w > bestWeight) { best = c; bestWeight = w; }
+    }
+    picks.push(best);
+    remaining = remaining.filter((h) => Math.abs(h.index - best.index) > half);
+  }
+  return picks.sort(byRankIndex);
+}
+
 function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_CHARS) {
   if (content.length <= maxChars) {
     return { text: content, confidence: 'strong', anchorCount: 0, usedSnippetFuzzyMatch: false };
@@ -147,7 +177,7 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
   // 'weak' into 'strong' (known-fixed-failures, blocked-task-classifiers and reject-retry-check all key on the confidence).
   const allHits = collected.some((h) => h.rank < 3 && !h.tailCue) ? collected : collected.filter((h) => !h.tailCue);
   const usedSnippetFuzzyMatch = allHits.some((h) => h.rank === 0);
-  const strongHits = allHits.filter((h) => h.rank < 3).slice(0, MAX_ANCHOR_REGIONS);
+  const strongHits = selectAnchorHits(allHits.filter((h) => h.rank < 3), maxChars, content.length);
   const realStrongHits = strongHits.filter((h) => !h.tailCue);
 
   if (strongHits.length === 0) {
@@ -300,4 +330,4 @@ function relocateStaleAnchor(repoRoot, relPath, section) {
   } catch { return null; }
 }
 
-module.exports = { collectAnchorHits, windowFetchedFileContent, relocateStaleAnchor, snippetMissingFrom };
+module.exports = { collectAnchorHits, windowFetchedFileContent, relocateStaleAnchor, snippetMissingFrom, selectAnchorHits };

@@ -11,6 +11,7 @@
 const assert = require('assert/strict');
 const { test } = require('node:test');
 const { windowFetchedFileContent, collectAnchorHits } = require('./candidate-fulfillment.js');
+const { selectAnchorHits } = require('./lib/file-grounding.js');
 
 test('windowFetchedFileContent: content under the cap is returned unchanged with strong confidence', () => {
   const content = 'small content, well under the cap';
@@ -225,4 +226,74 @@ test('windowFetchedFileContent: a weak partial Snippet match plus a tail cue sta
   assert.equal(withCue.anchorCount, 1);
   assert.deepEqual(withCue, withoutCue, 'the tail cue must change nothing next to a weak partial guess');
   assert.doesNotMatch(withCue.text, /finalCall/);
+});
+
+
+// ---- the region cap picks the anchors that cover the most others, not the five earliest (2026-10-04, arch-review-ac-52) -----------------------------------------------------
+// With more than five anchors the window kept the five EARLIEST ones, so five symbols packed into the top of a 20k-char file used every slot and the real edit sites further down were never
+// shown. selectAnchorHits now picks, greedily, the hit whose window (+/- half a region) covers the most remaining anchors, protected ranks first.
+const hit = (index, rank = 1) => ({ index, length: 10, rank });
+const idx = (hits) => hits.map((h) => h.index);
+
+test('selectAnchorHits: five or fewer hits are returned untouched, in the order they came', () => {
+  const hits = [hit(900), hit(0), hit(5000), hit(100), hit(7000)];
+  const result = selectAnchorHits(hits, 8000, 40000);
+  assert.equal(result, hits);
+  assert.deepEqual(idx(result), [900, 0, 5000, 100, 7000]);
+});
+
+test('selectAnchorHits: more than five hits that are all farther apart than a window give exactly the first five by (rank, index), as before', () => {
+  const hits = [0, 5000, 10000, 15000, 20000, 25000, 30000].map((i) => hit(i));
+  assert.deepEqual(idx(selectAnchorHits(hits, 8000, 40000)), [0, 5000, 10000, 15000, 20000]);
+});
+
+test('selectAnchorHits: a dense group of anchors gets ONE pick, leaving slots for the others, and the picks come back sorted by (rank, index)', () => {
+  const hits = [0, 5000, 12000, 12300, 12600, 12900, 20000, 25000, 30000].map((i) => hit(i));
+  const picks = selectAnchorHits(hits, 8000, 40000);
+  assert.deepEqual(idx(picks), [0, 5000, 12000, 20000, 25000]);
+});
+
+test('selectAnchorHits: a chain of anchors a little under a window apart is covered by a few picks and does not use every slot (the AC-31 shape)', () => {
+  const hits = [0, 1500, 3000, 4500, 6000, 7500, 9000, 20000].map((i) => hit(i));
+  const picks = selectAnchorHits(hits, 8000, 40000);
+  assert.deepEqual(idx(picks), [1500, 6000, 9000, 20000]);
+  assert.ok(idx(selectAnchorHits(hits, 8000, 40000)).includes(20000), 'the far anchor is shown');
+  assert.ok(!idx(hits.slice().sort((a, b) => a.rank - b.rank || a.index - b.index).slice(0, 5)).includes(20000), 'sanity: the old first-five rule would have dropped it');
+});
+
+test('selectAnchorHits: a protected (rank 0.5) lone hit outweighs six pairs of ordinary anchors, because a protected hit must never be the one the cap drops', () => {
+  const pairs = [0, 5000, 10000, 15000, 20000, 25000].flatMap((i) => [hit(i), hit(i + 300)]);
+  const picks = selectAnchorHits([...pairs, hit(33000, 0.5)], 8000, 60000);
+  assert.deepEqual(idx(picks), [33000, 0, 5000, 10000, 15000]);
+  assert.equal(picks[0].rank, 0.5);
+  // however dense the ordinary groups are: five groups of six anchors each still leave the protected hit a slot
+  const groups = [0, 5000, 10000, 15000, 20000].flatMap((i) => [0, 100, 200, 300, 400, 500].map((d) => hit(i + d)));
+  assert.ok(idx(selectAnchorHits([...groups, hit(33000, 0.5)], 8000, 60000)).includes(33000));
+});
+
+// The AC-52 shape: five symbols packed into the top of the file, two edit sites far below.
+const TOP5 = SYMBOLS.map((s) => `${pad(250)}\nfunction ${s}() {}\n`).join('');
+const EDIT_FILE = `${TOP5}${pad(7000)}\nfunction editSiteOne() {}\n${pad(1500)}\nfunction editSiteTwo() {}\n${pad(3000)}\nfinalCall();\n`;
+const EDIT_SECTION = `Problem:\nThe file uses ${[...SYMBOLS, 'editSiteOne', 'editSiteTwo'].map((s) => `\`${s}\``).join(', ')}.`;
+
+test('windowFetchedFileContent: five anchors packed at the top no longer crowd out the two edit sites further down (the AC-52 shape)', () => {
+  const result = windowFetchedFileContent(EDIT_FILE, EDIT_SECTION, 3000);
+  assert.equal(result.confidence, 'strong');
+  assert.match(result.text, /function editSiteOne/);
+  assert.match(result.text, /function editSiteTwo/);
+  assert.match(result.text, /function alphaOne/, 'the top region must still be shown');
+  const oldPicks = collectAnchorHits(EDIT_FILE, EDIT_SECTION).filter((h) => h.rank < 3).slice(0, 5);
+  assert.ok(oldPicks.every((h) => h.index < 3000), 'sanity: the old first-five-by-position rule would have kept only the top group');
+});
+
+test('windowFetchedFileContent: a crowded section keeps confidence strong and usedSnippetFuzzyMatch false, anchorCount is the number of real picks, and a tail cue still adds the file end', () => {
+  const plain = windowFetchedFileContent(EDIT_FILE, EDIT_SECTION, 3000);
+  assert.equal(plain.usedSnippetFuzzyMatch, false);
+  assert.equal(plain.anchorCount, 3, 'one pick for the dense top group plus one per edit site');
+  const withCue = windowFetchedFileContent(EDIT_FILE, `${EDIT_SECTION}\nThe file ends with an unconditional call.`, 3000);
+  assert.equal(withCue.confidence, 'strong');
+  assert.equal(withCue.anchorCount, 3, 'the tail hit takes a pick but is not counted as a real anchor');
+  assert.match(withCue.text, /finalCall\(\);/);
+  assert.match(withCue.text, /function editSiteOne/);
+  assert.match(withCue.text, /function editSiteTwo/);
 });
