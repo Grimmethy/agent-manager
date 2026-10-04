@@ -106,6 +106,22 @@ test('extractFilePaths still extracts a bare path with no line suffix', () => {
   assert.deepEqual(extractFilePaths('see src/real-file.js for detail'), ['src/real-file.js']);
 });
 
+// A method call that happens to end in a file extension (res.json(...), r.json(), resp.json()) is code, not a cited file.
+test('extractFilePaths does not read a method call like res.json({...}), r.json() or resp.json() as a file path', () => {
+  assert.deepEqual(extractFilePaths('await res.json({ ok: 1 }) then r.json() and resp.json()'), []);
+});
+
+test('extractFilePaths still extracts real, backticked and quoted paths and a path followed by prose in parentheses', () => {
+  assert.deepEqual(
+    extractFilePaths("see foo.js (the helper) and src/data.json and `config.json` and require('./lib/x.js')"),
+    ['foo.js', 'src/data.json', 'config.json', './lib/x.js'],
+  );
+});
+
+test('extractFilePaths returns only the real path when a call and a path share one text', () => {
+  assert.deepEqual(extractFilePaths('const d = await r.json(); // reads src/real-file.js'), ['src/real-file.js']);
+});
+
 test('checkFilePaths does not leak a :NNN-suffixed token as an existing file', () => {
   const repoRoot = makeRepo();
   assert.deepEqual(checkFilePaths('see src/real-file.js:310 for detail', repoRoot, ['src']), []);
