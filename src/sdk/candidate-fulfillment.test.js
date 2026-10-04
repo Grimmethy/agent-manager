@@ -122,3 +122,107 @@ test('collectAnchorHits: a too-common symbol is still returned (rank 3), not dro
   assert.ok(theOneThingHit);
   assert.equal(theOneThingHit.rank, 1);
 });
+
+// ---- long quoted code + file tail anchors (2026-10-04, arch-review-ac-42) ----------------------------------------------------------------------------------------------
+// The drafter was shown 6943 of 15614 chars (confidence 'strong') and never the file's last statement, which the candidate quoted flattened onto one line and which the file
+// lays out over several. A backtick span > 80 chars is now an anchor (rank 0.5, whitespace-insensitive), and a tail cue adds an end-of-file anchor that only ever sits NEXT TO a real anchor.
+const pad = (n) => 'x'.repeat(n);
+const SYMBOLS = ['alphaOne', 'betaTwo', 'gammaThree', 'deltaFour', 'epsilonFive'];
+const EARLY = SYMBOLS.map((s) => `${pad(600)}\nfunction ${s}() {}\n`).join('');
+const TAIL_STMT = "run()\n  .catch((e) => { console.error('FAILED:', e); process.exitCode = 1; })\n  .finally(async () => { await db.close(); });\n";
+const TAIL_QUOTE = "`run().catch((e) => { console.error('FAILED:', e); process.exitCode = 1; }).finally(async () => { await db.close(); })`";
+const LONG_FILE = EARLY + pad(9000) + '\n' + TAIL_STMT;
+
+test('windowFetchedFileContent: a long quoted statement near the END of the file is inside the window next to five early symbol anchors (the AC-42 shape)', () => {
+  const section = `Problem:\nThe file uses ${SYMBOLS.map((s) => `\`${s}\``).join(', ')} and calls ${TAIL_QUOTE} unconditionally.`;
+  const result = windowFetchedFileContent(LONG_FILE, section, 3000);
+  assert.equal(result.confidence, 'strong');
+  assert.match(result.text, /\.finally\(async \(\) => \{ await db\.close\(\); \}\);/, 'the quoted statement, laid out over several lines in the file, must be in the window');
+  assert.match(result.text, /function alphaOne/, 'the earlier regions must still be shown');
+  const without = windowFetchedFileContent(LONG_FILE, `Problem:\nThe file uses ${SYMBOLS.map((s) => `\`${s}\``).join(', ')}.`, 3000);
+  assert.doesNotMatch(without.text, /await db\.close/, 'sanity: without the quoted statement the window misses the tail (the bug)');
+});
+
+test('windowFetchedFileContent: a tail cue with a real anchor also shows the last lines of the file', () => {
+  const content = `${pad(600)}\nfunction alphaOne() {}\n${pad(9000)}\nfinalCall();\n`;
+  const result = windowFetchedFileContent(content, 'Problem:\nThe file ends with an unconditional call. The `alphaOne` helper is wrong.', 3000);
+  assert.equal(result.confidence, 'strong');
+  assert.match(result.text, /finalCall\(\);/);
+  assert.match(result.text, /function alphaOne/);
+  const noCue = windowFetchedFileContent(content, 'Problem:\nThe `alphaOne` helper is wrong.', 3000);
+  assert.doesNotMatch(noCue.text, /finalCall/, 'sanity: without the cue the tail is not shown');
+});
+
+test('windowFetchedFileContent: a tail cue with NO real anchor creates no confidence -- still the flat truncation, confidence none, with the low-confidence marker', () => {
+  const content = `${pad(9000)}\nfinalCall();\n${pad(500)}`;
+  const result = windowFetchedFileContent(content, 'Problem:\nThe file ends with an unconditional call.', 2000);
+  assert.equal(result.confidence, 'none');
+  assert.equal(result.anchorCount, 0);
+  assert.match(result.text, /^\[LOW-CONFIDENCE GROUNDING/);
+  assert.doesNotMatch(result.text, /finalCall/);
+});
+
+test('windowFetchedFileContent: a section with neither a long quoted span nor a tail cue gets exactly the single window it always did', () => {
+  const content = `${pad(9000)}\nfunction realTarget() {}\n${pad(9000)}\nfinalCall();\n`;
+  const result = windowFetchedFileContent(content, 'Problem:\nThe `realTarget` function has a bug.', 2000);
+  const idx = content.indexOf('realTarget');
+  const expected = `...[truncated]...\n${content.slice(Math.max(0, idx - 1000), idx + 'realTarget'.length + 1000)}\n...[truncated]`;
+  assert.equal(result.text, expected);
+  assert.equal(result.confidence, 'strong');
+  assert.equal(result.anchorCount, 1);
+});
+
+test('windowFetchedFileContent: a long quoted span whose prefix occurs more than MAX_ANCHOR_OCCURRENCES times is ignored, not used as a fallback', () => {
+  const content = `${EARLY}${(`${pad(700)}\n${TAIL_STMT}`).repeat(7)}`;
+  const base = `Problem:\nThe file uses \`alphaOne\` and \`betaTwo\``;
+  const withSpan = windowFetchedFileContent(content, `${base} and calls ${TAIL_QUOTE}.`, 3000);
+  const withoutSpan = windowFetchedFileContent(content, `${base}.`, 3000);
+  assert.deepEqual(withSpan, withoutSpan);
+});
+
+test('windowFetchedFileContent: a long-span anchor is rank 0.5 and never sets usedSnippetFuzzyMatch, while a real Snippet match still does', () => {
+  const section = `Problem:\nThe file calls ${TAIL_QUOTE} unconditionally.`;
+  const hits = collectAnchorHits(LONG_FILE, section);
+  const spanHit = hits.find((h) => LONG_FILE.slice(h.index).replace(/\s+/g, '').startsWith('run().catch('));
+  assert.ok(spanHit, 'the quoted statement must produce a hit');
+  assert.equal(spanHit.rank, 0.5);
+  assert.equal(windowFetchedFileContent(LONG_FILE, section, 3000).usedSnippetFuzzyMatch, false);
+
+  const withSnippet = `Files: x.js\nSnippet:\n\`\`\`\nfunction alphaOne() {}\n\`\`\`\n\n${section}`;
+  assert.equal(windowFetchedFileContent(LONG_FILE, withSnippet, 3000).usedSnippetFuzzyMatch, true);
+});
+
+test('windowFetchedFileContent: a tail cue next to FIVE symbol anchors still shows the file end (the tail hit is not the one the region cap drops)', () => {
+  const content = EARLY + pad(9000) + '\nfinalCall();\n';
+  const section = `Problem:\nThe file uses ${SYMBOLS.map((s) => `\`${s}\``).join(', ')} and the file ends with an unconditional call.`;
+  const result = windowFetchedFileContent(content, section, 3000);
+  assert.equal(result.confidence, 'strong');
+  assert.match(result.text, /finalCall\(\);/);
+  assert.match(result.text, /function alphaOne/);
+});
+
+test('windowFetchedFileContent: ordinary prose ("last line read", "ends with", "trailing") is NOT a tail cue', () => {
+  const content = EARLY + pad(9000) + '\nfinalCall();\n';
+  const syms = SYMBOLS.map((s) => `\`${s}\``).join(', ');
+  const plain = windowFetchedFileContent(content, `Problem:\nThe file uses ${syms}.`, 3000);
+  for (const prose of ['bounds the gap between last line read and process reaped', 'a string that ends with a slash', 'remove the trailing quote on line 208']) {
+    const result = windowFetchedFileContent(content, `Problem:\nThe file uses ${syms}; it ${prose}.`, 3000);
+    assert.deepEqual(result, plain, `"${prose}" must not add an end-of-file region`);
+  }
+});
+
+// The 'weak partial' branch (a Snippet whose only match is under 30% of it) must ignore a tail hit: a cue next to a guess is still a guess. Pins strongHits -> realStrongHits.
+test('windowFetchedFileContent: a weak partial Snippet match plus a tail cue stays weak -- the cue neither upgrades it nor adds a region', () => {
+  const head = 'function distinctiveHeadOne(alpha, beta) { const gammaValue = alpha * beta + computeSomethingUnusual(alpha); return gammaValue; }\n'
+    + 'function distinctiveHeadTwo(delta) { return delta.map((x) => x * transformFactorOne).filter(Boolean).reduce((a, b) => a + b, 0); }\n';
+  const staleTail = Array.from({ length: 24 }, (_, i) => `const staleLine${i} = deprecatedHelper${i}(argumentValue${i}, secondArgument${i});`).join('\n');
+  const content = `${pad(9000)}\n${head}${pad(9000)}\nfinalCall();\n`;
+  const section = `Files: x.js\nSnippet:\n\`\`\`\n${head}${staleTail}\n\`\`\`\n\nProblem:\nThe file ends with an unconditional call.`;
+  const withCue = windowFetchedFileContent(content, section, 3000);
+  const withoutCue = windowFetchedFileContent(content, section.replace('The file ends with an unconditional call.', 'Nothing about position.'), 3000);
+  assert.equal(withoutCue.confidence, 'weak', 'sanity: this Snippet is only a weak partial match');
+  assert.equal(withCue.confidence, 'weak');
+  assert.equal(withCue.anchorCount, 1);
+  assert.deepEqual(withCue, withoutCue, 'the tail cue must change nothing next to a weak partial guess');
+  assert.doesNotMatch(withCue.text, /finalCall/);
+});

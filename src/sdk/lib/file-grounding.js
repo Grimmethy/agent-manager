@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { snippetFromSection, quotedSymbolsFromSection } = require('./candidate-doc-parsing.js');
+const { snippetFromSection, quotedSymbolsFromSection, stripWhitespace, realIndexForStrippedIndex } = require('./candidate-doc-parsing.js');
 const { findFuzzyMatch, windowAroundIndex, MIN_PARTIAL_CHARS } = require('./fuzzy-matching.js');
 
 // Same literals as src/sdk/candidate-fulfillment.js (the source these were moved out of)
@@ -13,6 +13,20 @@ const MAX_ANCHOR_OCCURRENCES = 5;
 const LINE_CITATION_RE = /\blines?\s+(\d+)/i;
 const MAX_FETCHED_FILE_CHARS = 8000;
 const MAX_ANCHOR_REGIONS = 5;
+// Anchors for code the candidate QUOTES at length (2026-10-04, arch-review-ac-42): a backtick span of more than QUOTED_SYMBOL's 80 chars is a code statement, not a
+// symbol, so quotedSymbolsFromSection never anchored on it and the window missed the very statement the candidate edits (the file's last line). Its first
+// LONG_SPAN_PREFIX_CHARS chars locate it. Rank 0.5 sorts it ahead of the quoted symbols (rank 1) so the MAX_ANCHOR_REGIONS cap cannot drop it, and it is not rank 0,
+// which usedSnippetFuzzyMatch tests.
+const LONG_SPAN_MIN_CHARS = 81;
+const LONG_SPAN_MAX_CHARS = 400;
+const LONG_SPAN_PREFIX_CHARS = 60;
+const LONG_SPAN_MIN_STRIPPED_CHARS = 30; // the prefix without whitespace must still be distinctive
+const LONG_SPAN_RANK = 0.5;
+// A section that says where in the file the change goes ("ends with", "at the end of the file") but quotes nothing locatable. Narrower than task-anchor-files.js's
+// WINDOW_TAIL_CUES on purpose: that one also matches a bare "append", and a bare "ends with" / "last line" ("the gap between last line read and ...") is ordinary prose, so only phrases that
+// name a position in the FILE count.
+const TAIL_CUE_RE = /\b(?:(?:at|to|near) the (?:very )?(?:bottom|end) of (?:the )?file|(?:end|bottom) of (?:the )?file|file(?:'s)? (?:last|final) (?:line|statement)|(?:last|final) (?:line|statement) of (?:the )?file|file ends with)\b/i;
+const TAIL_ANCHOR_CHARS = 200;
 const MIN_CONFIDENT_PARTIAL_FRACTION = 0.3; // findPartialMatch tries 0.75, 0.5, 0.35, 0.25, 0.15 of the snippet: the two smallest tiers are the weak guesses
 const MAX_FETCHED_FILE_TOTAL_CHARS = 22000;
 const MIN_REGION_CHARS = 1400;
@@ -20,6 +34,21 @@ const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable an
   + "for this candidate's cited code -- this window is a best-effort guess and may not "
   + 'contain the real target. If you cannot find the described code here, respond with a '
   + 'clarification request rather than guessing.]\n';
+
+// Backtick spans of LONG_SPAN_MIN_CHARS..LONG_SPAN_MAX_CHARS, paired line by line (1st with 2nd backtick, 3rd with 4th, ...), so the closing backtick of one short
+// span and the opening backtick of the next cannot pair up and turn the prose between them into a fake "span".
+function longQuotedSpans(prose) {
+  const spans = [];
+  for (const line of String(prose || '').split('\n')) {
+    const ticks = [];
+    for (let i = line.indexOf('`'); i !== -1; i = line.indexOf('`', i + 1)) ticks.push(i);
+    for (let k = 0; k + 1 < ticks.length; k += 2) {
+      const span = line.slice(ticks[k] + 1, ticks[k + 1]).trim();
+      if (span.length >= LONG_SPAN_MIN_CHARS && span.length <= LONG_SPAN_MAX_CHARS) spans.push(span);
+    }
+  }
+  return spans;
+}
 
 function collectAnchorHits(content, section) {
   const hits = [];
@@ -50,6 +79,24 @@ function collectAnchorHits(content, section) {
   // The fenced Snippet: block's own triple backticks otherwise confuse QUOTED_SYMBOL_RE's
   // single-backtick pairing (a real bug, caught by direct test) -- strip it first.
   const prose = (section || '').replace(SNIPPET_FIELD_RE, '');
+
+  // Whitespace-insensitive, like the Snippet match: a candidate quotes a statement flattened onto one line (`main().catch(...)`) that the file lays out over several.
+  let strippedContent = null;
+  for (const span of longQuotedSpans(prose)) {
+    const needle = stripWhitespace(span.slice(0, LONG_SPAN_PREFIX_CHARS));
+    if (needle.length < LONG_SPAN_MIN_STRIPPED_CHARS) continue;
+    if (strippedContent === null) strippedContent = stripWhitespace(content);
+    const occ = [];
+    for (let from = 0; ;) {
+      const i = strippedContent.indexOf(needle, from);
+      if (i === -1 || occ.length > MAX_ANCHOR_OCCURRENCES) break;
+      occ.push(i);
+      from = i + needle.length;
+    }
+    // Nowhere in the file, or too generic to place anything: ignore it (never the rank-3 single-window fallback quoted symbols get).
+    if (occ.length === 0 || occ.length > MAX_ANCHOR_OCCURRENCES) continue;
+    for (const i of occ) push(realIndexForStrippedIndex(content, i), span.length, LONG_SPAN_RANK);
+  }
 
   for (const symbol of quotedSymbolsFromSection(prose)) {
     if (symbol.length < MIN_ANCHOR_SYMBOL_CHARS) continue;
@@ -83,6 +130,10 @@ function collectAnchorHits(content, section) {
     }
   }
 
+  // Pushed LAST so a real anchor near the end of the file keeps its own bucket. A tail hit only positions a window next to real anchors (see windowFetchedFileContent):
+  // it is never evidence that the cited code was found.
+  if (TAIL_CUE_RE.test(prose) && content.length > TAIL_ANCHOR_CHARS) push(content.length - TAIL_ANCHOR_CHARS, TAIL_ANCHOR_CHARS, LONG_SPAN_RANK, { tailCue: true });
+
   return hits.sort((a, b) => a.rank - b.rank || a.index - b.index);
 }
 
@@ -91,9 +142,13 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
     return { text: content, confidence: 'strong', anchorCount: 0, usedSnippetFuzzyMatch: false };
   }
 
-  const allHits = collectAnchorHits(content, section);
+  const collected = collectAnchorHits(content, section);
+  // A tail-cue hit only places a region NEXT TO a real anchor; with none it is dropped and today's weak/none paths run unchanged, so a cue can never turn 'none' or
+  // 'weak' into 'strong' (known-fixed-failures, blocked-task-classifiers and reject-retry-check all key on the confidence).
+  const allHits = collected.some((h) => h.rank < 3 && !h.tailCue) ? collected : collected.filter((h) => !h.tailCue);
   const usedSnippetFuzzyMatch = allHits.some((h) => h.rank === 0);
   const strongHits = allHits.filter((h) => h.rank < 3).slice(0, MAX_ANCHOR_REGIONS);
+  const realStrongHits = strongHits.filter((h) => !h.tailCue);
 
   if (strongHits.length === 0) {
     const weakHit = allHits.find((h) => h.rank === 3);
@@ -114,9 +169,9 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
   }
   // Every anchor is a small-fraction partial guess and nothing else corroborates it: use it to place the window, but say so (weak tier + the low-confidence note) rather than
   // reporting a confident anchor. 'weak' is not 'none', so a task is not parked for it (blocked-task-classifiers / reject-retry-check key on 'none').
-  if (strongHits.every((h) => h.weakPartial)) {
+  if (realStrongHits.every((h) => h.weakPartial)) {
     return {
-      text: LOW_CONFIDENCE_GROUNDING_NOTE + windowAroundIndex(content, strongHits[0].index, strongHits[0].length, maxChars),
+      text: LOW_CONFIDENCE_GROUNDING_NOTE + windowAroundIndex(content, realStrongHits[0].index, realStrongHits[0].length, maxChars),
       confidence: 'weak',
       anchorCount: 1,
       usedSnippetFuzzyMatch,
@@ -155,7 +210,7 @@ function windowFetchedFileContent(content, section, maxChars = MAX_FETCHED_FILE_
     if (i < merged.length - 1) out.push('...[gap]...');
     else if (r.to < content.length) out.push('...[truncated]');
   });
-  return { text: out.join('\n'), confidence: 'strong', anchorCount: strongHits.length, usedSnippetFuzzyMatch };
+  return { text: out.join('\n'), confidence: 'strong', anchorCount: realStrongHits.length, usedSnippetFuzzyMatch };
 }
 
 // The candidate HAS a Snippet and it is nowhere in this file (whole, or via findFuzzyMatch's prefix/suffix fallback). This, not a low window confidence, is what says the cited
