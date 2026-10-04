@@ -189,10 +189,26 @@ function renderCandidateSection(c, id, { snippet = null, dependsOnId = null } = 
 // candidates legitimately share Files:) and hand-authored docs. Kill switch: AGENT_MANAGER_CANDIDATE_DEDUPE=false.
 // All candidates dropped -> nothing is written and { skipped, duplicateOf, reason } comes back; the reason contains
 // "skipped" so task-disposition.js's NOOP_RE closes the task as a noop.
-function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null, dedupe = false, symbol = null }) {
+// `requireStrength` (2026-10-04): opt-in, default null = every candidate is accepted as before. A verdict-style source whose prompt
+// only ever asks for a Strong block (dead-code triage: a FALSE POSITIVE / UNCERTAIN verdict must write NO block) passes 'Strong'
+// so a block the model wrote anyway ("Strength: Not actionable (false positive)", deadcode-getparser) is not filed as a candidate.
+// Exact trimmed match, because fulfillment (sdk/lib/candidate-lifecycle.js) acts only on exactly 'Strong'. Not enforced in
+// parseArchDiscoveryCandidates: arch_import/arch_review legitimately file 'Worth exploring' and 'Speculative'.
+function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null, dedupe = false, symbol = null, requireStrength = null }) {
   let candidates = parseArchDiscoveryCandidates(implementResponse);
   if (candidates.length === 0) {
     return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
+  }
+  let droppedNonStrong = 0;
+  if (typeof requireStrength === 'string' && requireStrength.trim()) {
+    const required = requireStrength.trim();
+    const kept = candidates.filter((c) => String(c.strength).trim() === required);
+    droppedNonStrong = candidates.length - kept.length;
+    if (kept.length === 0) {
+      const found = [...new Set(candidates.map((c) => String(c.strength).trim()))].join(', ');
+      return { skipped: true, reason: `skipped: ${droppedNonStrong} candidate(s) not Strength: ${required} (${found}) -- nothing appended` };
+    }
+    candidates = kept;
   }
   // `symbol` (2026-10-03): the function/identifier the SOURCE knows the candidate is about (e.g. function_length_review
   // reads it off its scanner finding), written as a deterministic `Symbol:` line and used as the dedupe key ahead of any
@@ -244,7 +260,7 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
   writeAtomicSync(candidatesPath, text);
 
-  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}) };
+  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}), ...(droppedNonStrong ? { droppedNonStrong } : {}) };
 }
 
 module.exports = {

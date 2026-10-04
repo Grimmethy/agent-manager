@@ -322,3 +322,61 @@ test('renderCandidateSection writes a Depends-On line only when a dependsOnId is
   assert.doesNotMatch(candidateDocs.renderCandidateSection(c, 'AC-2'), /Depends-On/);
   assert.match(candidateDocs.renderCandidateSection(c, 'AC-2', { dependsOnId: 'AC-1' }), /\nDepends-On: AC-1\n/);
 });
+
+// requireStrength (2026-10-04): opt-in filter for verdict-style sources (dead-code triage) whose prompt only asks for a Strong block.
+// deadcode-getparser answered FALSE POSITIVE but still wrote "Strength: Not actionable (false positive)" and it was filed as a candidate.
+function strengthBlock(id, strength, file) {
+  const line = strength === null ? '' : `Strength: ${strength}\n`;
+  return `### AC-${id} · Remove ${file}\n${line}Files: ${file}\n\nProblem:\np\n\nSolution:\ns\n\nBenefits:\nb\n`;
+}
+function strengthDoc() {
+  const T = fs.mkdtempSync(path.join(os.tmpdir(), 'cdd-strength-'));
+  const docPath = path.join(T, 'C.md');
+  fs.writeFileSync(docPath, '# C\n');
+  return { T, docPath, text: () => fs.readFileSync(docPath, 'utf8') };
+}
+
+test('requireStrength Strong drops a "Not actionable (false positive)" block: skipped with a reason, file untouched', () => {
+  const { T, docPath, text } = strengthDoc();
+  const res = applyArchDiscoveryCandidates({ implementResponse: strengthBlock(9, 'Not actionable (false positive)', 'src/a.js'), candidatesPath: docPath, requireStrength: 'Strong' });
+  assert.equal(res.skipped, true);
+  assert.match(res.reason, /skipped: 1 candidate\(s\) not Strength: Strong \(Not actionable \(false positive\)\)/);
+  assert.equal(text(), '# C\n');
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
+test('requireStrength Strong keeps the Strong block of a mixed response and reports droppedNonStrong', () => {
+  const { T, docPath, text } = strengthDoc();
+  const resp = strengthBlock(1, 'Strong', 'src/a.js') + '\n' + strengthBlock(2, 'Worth exploring', 'src/b.js');
+  const res = applyArchDiscoveryCandidates({ implementResponse: resp, candidatesPath: docPath, requireStrength: 'Strong' });
+  assert.equal(res.candidateCount, 1);
+  assert.equal(res.droppedNonStrong, 1);
+  assert.match(text(), /Files: src\/a\.js/);
+  assert.doesNotMatch(text(), /src\/b\.js/);
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
+test('requireStrength is an exact trimmed match, like fulfillment: "Strong " is kept and "strong" is dropped', () => {
+  const { T, docPath } = strengthDoc();
+  const kept = applyArchDiscoveryCandidates({ implementResponse: strengthBlock(1, 'Strong ', 'src/a.js'), candidatesPath: docPath, requireStrength: 'Strong' });
+  assert.equal(kept.candidateCount, 1);
+  const dropped = applyArchDiscoveryCandidates({ implementResponse: strengthBlock(2, 'strong', 'src/b.js'), candidatesPath: docPath, requireStrength: 'Strong' });
+  assert.equal(dropped.skipped, true);
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
+test('requireStrength omitted: a "Worth exploring" block is appended exactly as before', () => {
+  const { T, docPath, text } = strengthDoc();
+  const res = applyArchDiscoveryCandidates({ implementResponse: strengthBlock(1, 'Worth exploring', 'src/a.js'), candidatesPath: docPath });
+  assert.equal(res.candidateCount, 1);
+  assert.equal(res.droppedNonStrong, undefined);
+  assert.match(text(), /Strength: Worth exploring/);
+  fs.rmSync(T, { recursive: true, force: true });
+});
+
+test('requireStrength Strong keeps a block with no Strength line (the parser default is Strong)', () => {
+  const { T, docPath } = strengthDoc();
+  const res = applyArchDiscoveryCandidates({ implementResponse: strengthBlock(1, null, 'src/a.js'), candidatesPath: docPath, requireStrength: 'Strong' });
+  assert.equal(res.candidateCount, 1);
+  fs.rmSync(T, { recursive: true, force: true });
+});
