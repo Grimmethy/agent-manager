@@ -21,7 +21,11 @@ const { extractDomainRoot } = require('./lib/fact-checker-url-utils.js');
 
 // (?!\s*:\s*\d) rejects a match where a ":NNN" line-number suffix follows, so
 // "foo.js:310" is not silently truncated to the bare path "foo.js".
-const PATH_EXT_RE = /[A-Za-z0-9_.\-/\\]+\.(?:js|jsx|ts|tsx|py|json|md|csv)\b(?!\s*:\s*\d)/g;
+// (?!\() rejects a match immediately followed by "(": that is a method call, not a file --
+// `res.json({ ok: true })`, `r.json()`, `resp.json()` in the code a draft quotes in its `find` text were read as a cited
+// file "res.json" that does not exist and blocked the draft pre-critique. No whitespace is allowed before the paren, so
+// prose like "see foo.js (the helper)" still matches.
+const PATH_EXT_RE = /[A-Za-z0-9_.\-/\\]+\.(?:js|jsx|ts|tsx|py|json|md|csv)\b(?!\s*:\s*\d)(?!\()/g;
 const RELATIONSHIP_RE = /`([^`]+)`\s+(?:imports?|calls?|reads?\s+from|uses?)\s+`?([A-Za-z0-9_.]+)`?/gi;
 
 function extractFilePaths(text) {
