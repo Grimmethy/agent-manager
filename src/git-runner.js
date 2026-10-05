@@ -350,7 +350,7 @@ function createRealGitRunner(repoRoot) {
             return;
           }
         }
-        // A ROLLING branch (e.g. TRIAGE_BRANCH) is never explicitly rebased on its own --
+        // A ROLLING branch (e.g. TRIAGE_BRANCH) is never explicitly rebased on its own (it is brought up to main by the MERGE below) --
         // apply-main-batch.js's own header says so plainly ("based on whatever main was
         // when it was first created and is never rebased"). Every branch of the logic
         // above only ever compares LOCAL to REMOTE; none of it ever asks whether the
@@ -364,16 +364,33 @@ function createRealGitRunner(repoRoot) {
         // explicitly retracted as a false positive after the fact.
         try { run(['fetch', 'origin', mainBranch]); } catch { /* best-effort, matches fetchMain elsewhere */ }
         if (!isAncestor(`origin/${mainBranch}`, remote)) {
+          // MERGE main in first; the rebase is only the fallback (brain dump bd-1791228522460, 2026-10-05). The rebase this used to do EVERY time rewrote only the LOCAL branch and nothing pushed the
+          // rewrite, so origin never contained main and this block re-fired on EVERY tick: a tick with a batch had its plain push rejected (non-fast-forward) and
+          // retryPushAfterRebase rebased the commits back onto the old origin tip; a tick with nothing to commit left the rewrite unpushed and the next tick saw
+          // two-sided divergence (the `-rescued-` branches, 18 in ~11 h on TaxHarvest; the reflog of the local branch shows the pattern). A merge only ADVANCES the
+          // branch: the push is a fast-forward, no SHA is rewritten, and main is an ancestor of origin after the first tick. Local ends strictly ahead of origin by one
+          // merge commit, which the 'trust local' path above already handles on the next call.
           run(['checkout', '-B', name, remote]);
           try {
-            run(['rebase', `origin/${mainBranch}`]);
-          } catch (e) {
-            try { run(['rebase', '--abort']); } catch { /* best-effort */ }
-            throw new Error(
-              `prepareStackedBranch: ${remote} is based on a stale point of ${mainBranch} (main has moved on since this rolling branch was last built) and rebasing its still-unmerged commits onto the current tip failed -- needs a human to reconcile, not an automatic sync: ${e.message}`,
-            );
+            run(['merge', '--no-edit', `origin/${mainBranch}`]);
+            return;
+          } catch (mergeErr) {
+            try { run(['merge', '--abort']); } catch { /* best-effort */ }
+            // A single three-way merge can conflict where the commit-by-commit rebase would not: the rolling branch may already carry changes that main later received
+            // under other SHAs (the rebase drops those as already applied; replayed on real TaxHarvest refs the merge conflicted on adjacent removals in
+            // frontend/src/api/properties.ts where the rebase succeeded). Falling back to the rebase keeps that case working exactly as it did before; only a conflict
+            // BOTH ways needs a human. (The rebase path still rewrites only the local branch -- the old loop -- but is now the rare path, not every tick.)
+            try {
+              run(['rebase', `origin/${mainBranch}`]);
+              console.error(`[git-runner] prepareStackedBranch: merging ${mainBranch} into ${name} conflicted; rebased onto ${mainBranch} instead (the rebase drops commits main already carries): ${String(mergeErr && mergeErr.message).split('\n')[0].slice(0, 160)}`);
+              return;
+            } catch (e) {
+              try { run(['rebase', '--abort']); } catch { /* best-effort */ }
+              throw new Error(
+                `prepareStackedBranch: ${remote} is based on a stale point of ${mainBranch} (main has moved on since this rolling branch was last built) and neither merging the current ${mainBranch} into it nor rebasing its still-unmerged commits onto it worked -- needs a human to reconcile, not an automatic sync: ${e.message}`,
+              );
+            }
           }
-          return;
         }
         run(['checkout', '-B', name, remote]); // local missing, or ⊆ origin (stale/behind/identical); remote itself is current
         return;

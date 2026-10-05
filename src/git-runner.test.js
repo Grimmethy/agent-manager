@@ -429,7 +429,7 @@ test('prepareStackedBranch: no remote copy and no local branch at all -> creates
 // commits that had ALREADY separately landed on main (one of which was a finding a human
 // had explicitly retracted as a false positive after the fact).
 
-test('prepareStackedBranch: remote exists but is based on a stale point of main -> rebases its commits onto current main', () => {
+test('prepareStackedBranch: remote exists but is based on a stale point of main -> merges current main into it (the branch only advances)', () => {
   const { bareDir, repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);
   git(['checkout', '-b', 'agent/triage-queue'], repoDir);
@@ -454,7 +454,7 @@ test('prepareStackedBranch: remote exists but is based on a stale point of main 
   assert.equal(fs.readFileSync(path.join(repoDir, 'unrelated.txt'), 'utf8'), 'main moved on\n', 'current main\'s content is now included too');
 });
 
-test('prepareStackedBranch: remote exists, stale relative to main, AND main already carries an equivalent (re-authored) version of the same change -> rebase auto-drops the now-empty duplicate, no human needed', () => {
+test('prepareStackedBranch: remote exists, stale relative to main, AND main already carries an equivalent (re-authored) version of the same change -> the merge leaves no duplicate content', () => {
   const { bareDir, repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);
   git(['checkout', '-b', 'agent/triage-queue'], repoDir);
@@ -476,7 +476,7 @@ test('prepareStackedBranch: remote exists, stale relative to main, AND main alre
   assert.equal(fs.readFileSync(path.join(repoDir, 'candidate.md'), 'utf8'), 'base\nappend X\n', 'no duplicate content -- the already-landed change is not reapplied a second time');
 });
 
-test('prepareStackedBranch: remote exists, stale relative to main, and rebasing its commits onto main hits a REAL conflict -> throws for a human, discards nothing', () => {
+test('prepareStackedBranch: remote exists, stale relative to main, and merging main into it AND rebasing onto it both hit a REAL conflict -> throws for a human, aborts both, discards nothing', () => {
   const { bareDir, repoDir } = makeRepoWithOrigin();
   const runner = createRealGitRunner(repoDir);
   git(['checkout', '-b', 'agent/triage-queue'], repoDir);
@@ -494,9 +494,11 @@ test('prepareStackedBranch: remote exists, stale relative to main, and rebasing 
   git(['push', 'origin', 'main'], repoDir);
 
   assert.throws(() => runner.prepareStackedBranch('agent/triage-queue'), /stale point of main/);
-  // No rebase left in progress, and the remote-tracking branch's own commit is untouched.
-  assert.equal(fs.existsSync(path.join(repoDir, '.git', 'rebase-merge')), false, 'a failed rebase must be aborted, not left in progress');
-  assert.equal(git(['rev-parse', 'origin/agent/triage-queue'], repoDir).trim(), branchTip, 'the remote copy itself is never touched by a failed local rebase');
+  // Neither the merge nor the fallback rebase is left in progress (no MERGE_HEAD, no rebase-merge, no conflicted files), and the remote-tracking branch's own commit is untouched.
+  assert.equal(fs.existsSync(path.join(repoDir, '.git', 'MERGE_HEAD')), false, 'a failed merge must be aborted, not left in progress');
+  assert.equal(fs.existsSync(path.join(repoDir, '.git', 'rebase-merge')), false, 'a failed fallback rebase must be aborted, not left in progress');
+  assert.equal(git(['status', '--porcelain'], repoDir).trim(), '', 'no conflicted or modified files are left in the tree');
+  assert.equal(git(['rev-parse', 'origin/agent/triage-queue'], repoDir).trim(), branchTip, 'the remote copy itself is never touched by a failed local merge');
 });
 
 test('remoteBranchExists reflects the real remote-tracking ref, independent of a same-named local branch', () => {
@@ -911,5 +913,103 @@ test('prepareStackedBranch: a local merge commit with its own edit is still resc
   git(['fetch', 'origin'], f.repoDir);
   f.prepare();
   assert.equal(f.rescueBranches().length, 1, 'the merge-only edit is unique work: rescued');
+});
+
+// --- the rewrite loop (brain dump bd-1791228522460, 2026-10-05) ---------------------------------------------------------------------------------------------
+// The old stale-main REBASE rewrote only the local branch: origin never contained main, the block re-fired every tick, a batch tick had its plain push rejected and
+// retryPushAfterRebase rebased back onto the old origin tip, and a tick with nothing to commit left the rewrite unpushed so the next tick saw two-sided divergence
+// (a `-rescued-` branch each time). A merge only advances the branch.
+function loopFixture() {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  const NAME = 'agent/triage-queue';
+  git(['checkout', '-b', NAME], repoDir);
+  commitFile(repoDir, 'candidate.md', 'entry A\n', 'append entry A');
+  git(['push', '-u', 'origin', NAME], repoDir);
+  git(['checkout', 'main'], repoDir);
+  const moveMain = (file, text) => { git(['checkout', 'main'], repoDir); commitFile(repoDir, file, text, `main moves: ${file}`); git(['push', 'origin', 'main'], repoDir); };
+  const sh = (args) => git(args, repoDir).trim();
+  const ancestor = (a, b) => { try { execFileSync('git', ['merge-base', '--is-ancestor', a, b], { cwd: repoDir, stdio: 'pipe' }); return true; } catch { return false; } };
+  const rescues = () => ({
+    local: git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/agent/triage-queue-rescued-*'], repoDir).trim().split('\n').filter(Boolean),
+    remote: git(['ls-remote', '--heads', bareDir, 'agent/triage-queue-rescued-*'], repoDir).trim().split('\n').filter(Boolean),
+  });
+  // one apply tick, shaped like lib/apply-main-batch.js: prepare, (maybe) commit + push, push rejection -> retryPushAfterRebase, then back to main
+  const tick = ({ batch }) => {
+    const before = sh(['rev-parse', `refs/heads/${NAME}`]);
+    runner.prepareStackedBranch(NAME);
+    if (batch) {
+      fs.appendFileSync(path.join(repoDir, 'candidate.md'), `${batch}\n`);
+      git(['add', 'candidate.md'], repoDir);
+      git(['commit', '-m', 'Triage batch: 1 candidate-doc update(s)'], repoDir);
+      try { runner.push(NAME); } catch { runner.retryPushAfterRebase(NAME); }
+    }
+    runner.checkoutMain();
+    git(['fetch', 'origin'], repoDir);
+    return { before, after: sh(['rev-parse', `refs/heads/${NAME}`]), origin: sh(['rev-parse', `origin/${NAME}`]) };
+  };
+  return { repoDir, runner, NAME, moveMain, sh, ancestor, rescues, tick };
+}
+
+test('prepareStackedBranch: after the merge a second call is a no-op, and local is strictly ahead of origin by the merge', () => {
+  const f = loopFixture();
+  f.moveMain('unrelated.txt', 'main moved on\n');
+  git(['fetch', 'origin'], f.repoDir);
+  f.runner.prepareStackedBranch(f.NAME);
+  const afterFirst = f.sh(['rev-parse', `refs/heads/${f.NAME}`]);
+  assert.ok(f.ancestor('origin/main', afterFirst), 'main is merged in');
+  assert.ok(f.ancestor(`origin/${f.NAME}`, afterFirst), 'origin\'s tip is an ancestor of local (the merge only advanced the branch)');
+  assert.notEqual(afterFirst, f.sh(['rev-parse', `origin/${f.NAME}`]), 'local is ahead of origin');
+  assert.equal(f.sh(['rev-list', '--count', `origin/${f.NAME}..${afterFirst}`]) >= '1', true);
+  f.runner.checkoutMain();
+  f.runner.prepareStackedBranch(f.NAME);                                     // second call: the 'trust local, strictly ahead' path
+  assert.equal(f.sh(['rev-parse', `refs/heads/${f.NAME}`]), afterFirst, 'a second prepare changes nothing');
+  assert.deepEqual(f.rescues(), { local: [], remote: [] });
+});
+
+test('apply ticks against a rolling branch whose remote lacks main: no tip is ever rewritten, origin contains main after the first tick, no rescue branch appears (batch / nothing / main moves / batch / nothing)', () => {
+  const f = loopFixture();
+  f.moveMain('unrelated.txt', 'main moved on\n');
+  const t1 = f.tick({ batch: 'entry B' });                                    // batch tick: merge, commit, push (fast-forward)
+  assert.ok(f.ancestor('origin/main', `origin/${f.NAME}`), 'after tick 1 origin contains main');
+  assert.equal(t1.after, t1.origin, 'tick 1: local and origin agree after the push');
+  const t2 = f.tick({ batch: null });                                         // nothing to commit: nothing rewritten, nothing diverges
+  assert.equal(t2.after, t1.after, 'tick 2 changed nothing');
+  f.moveMain('unrelated2.txt', 'main moves again\n');
+  const t3 = f.tick({ batch: 'entry C' });                                    // main moved again: merged once more, then the batch is pushed ff
+  assert.ok(f.ancestor('origin/main', `origin/${f.NAME}`), 'after tick 3 origin contains the new main too');
+  assert.ok(f.ancestor(t1.after, t3.after), 'tick 3\'s tip descends from tick 1\'s tip: no history was rewritten');
+  assert.equal(t3.after, t3.origin, 'tick 3: local and origin agree after the push');
+  const t4 = f.tick({ batch: null });
+  assert.equal(t4.after, t3.after, 'tick 4 changed nothing');
+  assert.deepEqual(f.rescues(), { local: [], remote: [] }, 'no rescue branch was ever created, locally or on the remote');
+  assert.equal(f.sh(['rev-parse', '--abbrev-ref', 'HEAD']), 'main', 'the checkout is back on main after every tick');
+  assert.equal(git(['show', `origin/${f.NAME}:candidate.md`], f.repoDir), 'entry A\nentry B\nentry C\n', 'both batches are on the branch, once each');
+});
+
+test('prepareStackedBranch: when the merge conflicts but the rebase would not (main carries the same change under another SHA plus an adjacent edit), it falls back to the rebase instead of throwing', () => {
+  const { repoDir } = makeRepoWithOrigin();
+  const runner = createRealGitRunner(repoDir);
+  fs.writeFileSync(path.join(repoDir, 'f.txt'), 'l1\nl2\n');
+  git(['add', 'f.txt'], repoDir); git(['commit', '-m', 'f base'], repoDir); git(['push', 'origin', 'main'], repoDir);
+  git(['checkout', '-b', 'agent/triage-queue'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'f.txt'), 'l1\na1\nl2\n');
+  git(['commit', '-am', 'rolling: insert a1'], repoDir);
+  git(['push', '-u', 'origin', 'agent/triage-queue'], repoDir);
+  git(['checkout', 'main'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'f.txt'), 'l1\na1\nl2\n');                      // main lands the SAME change under its own SHA ...
+  git(['commit', '-am', 'main: insert a1 (same patch, other sha)'], repoDir);
+  fs.writeFileSync(path.join(repoDir, 'f.txt'), 'l1\na1\nb\n');                       // ... then edits the adjacent line, which makes a three-way merge conflict
+  git(['commit', '-am', 'main: change l2'], repoDir);
+  git(['push', 'origin', 'main'], repoDir);
+  const newMain = git(['rev-parse', 'main'], repoDir).trim();
+  const logged = [];
+  const orig = console.error; console.error = (...a) => { logged.push(a.join(' ')); };
+  try { runner.prepareStackedBranch('agent/triage-queue'); } finally { console.error = orig; }
+  assert.equal(git(['rev-parse', '--abbrev-ref', 'HEAD'], repoDir).trim(), 'agent/triage-queue');
+  assert.doesNotThrow(() => execFileSync('git', ['merge-base', '--is-ancestor', newMain, 'agent/triage-queue'], { cwd: repoDir, stdio: 'pipe' }), 'current main is an ancestor after the fallback');
+  assert.equal(fs.readFileSync(path.join(repoDir, 'f.txt'), 'utf8'), 'l1\na1\nb\n', 'the content is main\'s (the duplicate was dropped by the rebase)');
+  assert.equal(fs.existsSync(path.join(repoDir, '.git', 'MERGE_HEAD')), false, 'no merge left in progress');
+  assert.ok(logged.some((l) => /conflicted; rebased onto main instead/.test(l)), 'the fallback is logged');
 });
 
