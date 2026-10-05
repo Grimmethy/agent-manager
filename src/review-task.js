@@ -488,6 +488,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(inertSection);
     lines.push('');
   }
+  const undefinedSection = formatUndefinedRemovalSection(task.undefinedAfterRemoval);
+  if (undefinedSection) {
+    lines.push(undefinedSection);
+    lines.push('');
+  }
   const gateReplaySection = formatGateReplaySection(task.gateReplay);
   if (gateReplaySection) {
     lines.push(gateReplaySection);
@@ -644,6 +649,50 @@ function resolveInertBaseRef(repoRoot, branch) {
   return null;
 }
 
+// Undefined-identifier-after-removal (src/review-undefined-after-removal.js, brain dump #1768): a change that deletes a declaration but leaves a use of the name in the
+// post-change file. The draft is read from whichever shape it has: an adhoc rawDiff, or a Group B edit array (the arch_review / *_fix lanes carry no rawDiff).
+// AGENT_MANAGER_REVIEW_UNDEFINED_CHECK: 'false' = off, 'advisory' = evidence for the voters only, anything else (default) = block.
+function editsOfImplementResponse(task) {
+  try {
+    const parsed = parseJsonMaybeFenced(task && task.implementResponse);
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    const isOp = (i) => i && typeof i === 'object' && typeof i.file === 'string'
+      && ((i.mode === 'edit' && typeof i.find === 'string' && typeof i.replace === 'string') || (i.mode === 'create' && typeof i.content === 'string') || i.mode === 'delete');
+    return items.length && items.every(isOp) ? items : null;
+  } catch { return null; }
+}
+
+function summariseUndefinedRemoval(r) {
+  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  const uses = Array.isArray(r && r.uses) ? r.uses : [];
+  return {
+    at: new Date().toISOString(), considered: n(r && r.considered), unknown: n(r && r.unknown), total: uses.length,
+    uses: uses.slice(0, 8).map((u) => ({
+      file: String((u && u.file) || '').slice(0, 160), name: String((u && u.name) || '').slice(0, 120),
+      lines: (Array.isArray(u && u.lines) ? u.lines : []).slice(0, 5).map((l) => ({ line: n(l && l.line), text: String((l && l.text) || '').slice(0, 140) })),
+    })),
+  };
+}
+
+function undefinedRemovalWhere(u) {
+  return `\`${u.name}\` in ${u.file} (${u.lines.map((l) => `line ${l.line}: ${l.text}`).join(' | ')})`;
+}
+
+function undefinedRemovalBlockReason(summary) {
+  const items = (summary && summary.uses) || [];
+  return `Deterministic gate: undefined identifier after removal -- the change deletes the declaration of ${items.length} name(s) that the file still uses, so the code would throw a ReferenceError when that line runs: ${items.map(undefinedRemovalWhere).join('; ')}. Either keep the declaration, or replace every remaining use with the new form.`;
+}
+
+function formatUndefinedRemovalSection(ua) {
+  if (!ua || typeof ua !== 'object' || !Array.isArray(ua.uses) || !ua.uses.length) return '';
+  return [
+    '--- Removed declarations that are still used (deterministic check; advisory) ---',
+    'The harness rebuilt each changed file as it would be after the change. These names lose their declaration in the change, are not declared again anywhere in the change or the file, and are still used (a use outside the edited lines is easy to miss): '
+      + ua.uses.map(undefinedRemovalWhere).join('; ') + '.',
+    'Unless a remaining use is unreachable or the name is a global, this draft throws a ReferenceError at that line: it should be rejected.',
+  ].join('\n');
+}
+
 function summariseInertAdditions(r, hubChild) {
   const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
   const inert = Array.isArray(r && r.inert) ? r.inert : [];
@@ -754,7 +803,7 @@ function formatSkipPathSection(sp) {
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported (via
  * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
  */
-async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null } = {}) {
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null, findUndefinedFn = null } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
@@ -1312,6 +1361,40 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
   }
 
+  // Undefined identifier after removal (see undefinedRemovalBlockReason): a declaration the change deletes whose name the file still uses. Covers an adhoc rawDiff and a
+  // Group B edit array. Blocks by default; AGENT_MANAGER_REVIEW_UNDEFINED_CHECK=advisory only shows the voters; =false skips it. Never throws.
+  const undefinedMode = process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK;
+  if (undefinedMode !== 'false') {
+    const rawDiffOk = resolveSourceName(task) === 'adhoc' && task.adhocResolution === 'implemented' && typeof task.rawDiff === 'string' && task.rawDiff.trim();
+    const edits = rawDiffOk ? null : editsOfImplementResponse(task);
+    if (rawDiffOk || edits) {
+      try {
+        const find = findUndefinedFn || require('./review-undefined-after-removal.js').findUndefinedAfterRemoval;
+        const branch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
+        const baseRef = resolveInertBaseRef(repoRoot, branch) || (findUndefinedFn ? branch : null);
+        if (baseRef) {
+          const r = find({ rawDiff: rawDiffOk ? task.rawDiff : undefined, edits: edits || undefined, repoRoot, baseRef });
+          if (r && Array.isArray(r.uses)) {
+            task.undefinedAfterRemoval = summariseUndefinedRemoval(r);
+            if (r.uses.length) {
+              if (undefinedMode === 'advisory') {
+                appendHistoryEvent(task, 'advisory', `undefined-after-removal check: ${r.uses.length} removed declaration(s) still used (${r.uses.slice(0, 4).map((u) => u.name).join(', ')})`);
+              } else {
+                const reason = undefinedRemovalBlockReason(task.undefinedAfterRemoval);
+                task.reviewProvider = 'deterministic-undefined-after-removal';
+                recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+                appendHistoryEvent(task, 'blocked', reason);
+                return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[review] undefined-after-removal check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+      }
+    }
+  }
+
   // Skip / dismiss paths (see formatSkipPathSection): a pure diff scan, independent of the other checks' switches. Advisory only.
   if (process.env.AGENT_MANAGER_REVIEW_SKIPPATH_RULE !== 'false'
       && resolveSourceName(task) === 'adhoc'
@@ -1517,7 +1600,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
