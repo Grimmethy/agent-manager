@@ -297,3 +297,48 @@ test('windowFetchedFileContent: a crowded section keeps confidence strong and us
   assert.match(withCue.text, /function editSiteOne/);
   assert.match(withCue.text, /function editSiteTwo/);
 });
+
+// (these two live here, not in sdk/lib/fuzzy-matching.test.js: npm test's globs do not reach src/sdk/lib/*.test.js)
+// 2026-10-05 (brain dump bd-1791177888894): a task created before citedContextFiles existed (or requeued from its stored snapshot) keeps a fetchedFiles list without the modules its prose names.
+function withRefreshRepo(files, fn) {
+  const fs = require('fs'); const os = require('os'); const path = require('path');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'refresh-ctx-'));
+  for (const [rel, body] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), body); }
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = root;
+  delete require.cache[require.resolve('../config.js')];
+  try { return fn(root, require('../local-draft.js').refreshCandidateFetchedFiles); } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+    delete require.cache[require.resolve('../config.js')];
+  }
+}
+const CTX_BODY = "### AC-47 · Replace it\nStrength: Strong\nFiles: app/db-v2.js\n\nProblem:\nBad.\n\nSolution:\nUse `const { STATUS } = require('./statuses');` and the helper in app/util/extra.js.\n";
+const ctxTask = () => ({ source: 'arch_review', history: [], promptContext: { body: CTX_BODY, files: ['app/db-v2.js'], fetchedFiles: [{ path: 'app/db-v2.js', content: 'old', anchorConfidence: 'strong' }] } });
+
+test('refreshCandidateFetchedFiles adds the context files the prose names to a task created without them, once (idempotent), and never turns a declared file into context', () => {
+  withRefreshRepo({ 'app/db-v2.js': 'const x = 1;\n', 'app/statuses.js': 'module.exports = { STATUS: {} };\n', 'app/util/extra.js': 'exports.a = 1;\n' }, (root, refresh) => {
+    const task = ctxTask();
+    refresh(task);
+    const byPath = Object.fromEntries(task.promptContext.fetchedFiles.map((f) => [f.path, f]));
+    assert.deepEqual(Object.keys(byPath).sort(), ['app/db-v2.js', 'app/statuses.js', 'app/util/extra.js']);
+    assert.equal(byPath['app/statuses.js'].context, true);
+    assert.equal(byPath['app/util/extra.js'].context, true);
+    assert.equal(byPath['app/db-v2.js'].context, undefined, 'the declared file stays a normal entry');
+    assert.match(byPath['app/statuses.js'].content, /STATUS/);
+    assert.equal(task.history.filter((h) => h.stage === 'context-refreshed' && /app\/statuses\.js/.test(h.detail)).length, 1);
+    const snapshot = JSON.stringify(task.promptContext.fetchedFiles);
+    const histLen = task.history.length;
+    refresh(task);
+    assert.equal(JSON.stringify(task.promptContext.fetchedFiles), snapshot, 'a second refresh changes nothing');
+    assert.equal(task.history.length, histLen, 'and adds no history line');
+  });
+});
+
+test('refreshCandidateFetchedFiles respects the cap of three context files in total, counting those already on the task', () => {
+  const body = "### AC-1 · X\nFiles: app/m.js\n\nSolution:\nrequire('./a') require('./b') require('./c') require('./d')\n";
+  withRefreshRepo({ 'app/m.js': 'm', 'app/a.js': 'a', 'app/b.js': 'b', 'app/c.js': 'c', 'app/d.js': 'd' }, (root, refresh) => {
+    const task = { source: 'arch_review', history: [], promptContext: { body, files: ['app/m.js'], fetchedFiles: [{ path: 'app/m.js', content: 'm', anchorConfidence: 'strong' }, { path: 'app/a.js', content: 'a', context: true, anchorConfidence: 'strong' }] } };
+    refresh(task);
+    assert.deepEqual(task.promptContext.fetchedFiles.filter((f) => f.context).map((f) => f.path), ['app/a.js', 'app/b.js', 'app/c.js']);
+  });
+});
