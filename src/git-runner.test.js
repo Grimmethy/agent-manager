@@ -786,3 +786,130 @@ test('annotateGitTimeout: non-timeout errors are left untouched', () => {
   const err = Object.assign(new Error('fatal: not a git repository'), { status: 128 });
   assert.equal(annotateGitTimeout(err, ['status'], 60000).message, 'fatal: not a git repository');
 });
+
+// --- prepareStackedBranch: no rescue branch for a diverged local that only duplicates origin's content (brain dump bd-1791187136669, 2026-10-05) -----------------------
+// TaxHarvest made 12 `agent/triage-queue-rescued-*` branches in ~6 h, each a near-copy of the live rolling branch: the stale-main rebase gives the same commits new SHAs,
+// so local and origin look two-sided divergent although local adds nothing origin lacks. Anything that might be unique work must still be rescued.
+function rollingFixture() {
+  const { bareDir, repoDir } = makeRepoWithOrigin();
+  fs.writeFileSync(path.join(repoDir, 'doc.md'), 'a\nb\nc\nd\n');
+  git(['add', 'doc.md'], repoDir);
+  git(['commit', '-m', 'doc base'], repoDir);
+  git(['push', 'origin', 'main'], repoDir);
+  const runner = createRealGitRunner(repoDir);
+  runner.createBranch('agent/rolling');
+  fs.writeFileSync(path.join(repoDir, 'seed.txt'), 'seed\n');
+  git(['add', 'seed.txt'], repoDir);
+  git(['commit', '-m', 'rolling seed'], repoDir);
+  git(['push', '-u', 'origin', 'agent/rolling'], repoDir);
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), 'git-runner-test-other-clone-'));
+  git(['clone', bareDir, other]);
+  git(['config', 'user.email', 'test@example.com'], other);
+  git(['config', 'user.name', 'Test'], other);
+  git(['config', 'core.autocrlf', 'false'], other);
+  git(['checkout', 'agent/rolling'], other);
+  const localCommit = (edit, msg = 'local change') => { edit(repoDir); git(['add', '-A'], repoDir); git(['commit', '-m', msg], repoDir); };
+  const otherPush = (edit, msg = 'origin change') => { edit(other); git(['add', '-A'], other); git(['commit', '-m', msg, '--date', '2020-01-01T00:00:00'], other); git(['push', 'origin', 'agent/rolling'], other); };
+  const rescueBranches = () => git(['for-each-ref', '--format=%(refname:short)', 'refs/heads/agent/rolling-rescued-*'], repoDir).trim().split('\n').filter(Boolean);
+  const remoteRescues = () => git(['ls-remote', '--heads', bareDir, 'agent/rolling-rescued-*'], repoDir).trim().split('\n').filter(Boolean);
+  const prepare = () => {
+    runner.checkoutMain();
+    const logged = [];
+    const orig = console.error;
+    console.error = (...a) => { logged.push(a.join(' ')); };
+    try { runner.prepareStackedBranch('agent/rolling'); } finally { console.error = orig; }
+    return logged;
+  };
+  return { bareDir, repoDir, other, runner, localCommit, otherPush, rescueBranches, remoteRescues, prepare };
+}
+const appendLines = (...lines) => (dir) => fs.appendFileSync(path.join(dir, 'doc.md'), lines.map((l) => `${l}\n`).join(''));
+const writeDoc = (text) => (dir) => fs.writeFileSync(path.join(dir, 'doc.md'), text);
+
+test('prepareStackedBranch: a diverged local that holds the SAME content as origin under a different SHA is reset without a rescue branch, and says so', () => {
+  const f = rollingFixture();
+  f.localCommit(appendLines('e', 'f'));
+  f.otherPush(appendLines('e', 'f'));                                       // same added content, different commit (the stale-main rebase shape)
+  git(['fetch', 'origin'], f.repoDir);
+  const localTip = git(['rev-parse', 'agent/rolling'], f.repoDir).trim();
+  assert.notEqual(localTip, git(['rev-parse', 'origin/agent/rolling'], f.repoDir).trim(), 'the two sides really are different commits');
+  const logged = f.prepare();
+  assert.deepEqual(f.rescueBranches(), [], 'no local rescue branch');
+  assert.deepEqual(f.remoteRescues(), [], 'no pushed rescue branch');
+  assert.equal(git(['rev-parse', 'agent/rolling'], f.repoDir).trim(), git(['rev-parse', 'origin/agent/rolling'], f.repoDir).trim(), 'local is reset to origin\'s tip');
+  assert.ok(logged.some((l) => /adds nothing origin lacks \(a duplicate of origin's content\) -- resetting without a rescue branch/.test(l)), 'the skipped rescue is logged');
+});
+
+test('prepareStackedBranch: a patch-equivalent deletion-only copy (only the cherry signal holds) is reset without a rescue branch', () => {
+  const f = rollingFixture();
+  f.localCommit(writeDoc('a\nb\nc\n'));                                    // deletes line d
+  f.otherPush(writeDoc('a\nb\nc\n'));                                      // the same deletion, different commit
+  git(['fetch', 'origin'], f.repoDir);
+  f.prepare();
+  assert.deepEqual(f.rescueBranches(), []);
+  assert.deepEqual(f.remoteRescues(), []);
+});
+
+test('prepareStackedBranch: a local that adds a SUBSET of the lines origin added (not patch-equivalent) is reset without a rescue branch', () => {
+  const f = rollingFixture();
+  f.localCommit(appendLines('e'));
+  f.otherPush(appendLines('e', 'f'));
+  git(['fetch', 'origin'], f.repoDir);
+  f.prepare();
+  assert.deepEqual(f.rescueBranches(), []);
+  assert.deepEqual(f.remoteRescues(), []);
+});
+
+test('prepareStackedBranch: local content that is partly duplicate and partly unique is still rescued', () => {
+  const f = rollingFixture();
+  f.localCommit(appendLines('e', 'unique-local-line'));
+  f.otherPush(appendLines('e', 'f'));
+  git(['fetch', 'origin'], f.repoDir);
+  const localTip = git(['rev-parse', 'agent/rolling'], f.repoDir).trim();
+  f.prepare();
+  assert.equal(f.rescueBranches().length, 1, 'exactly one rescue branch');
+  assert.equal(git(['rev-parse', f.rescueBranches()[0]], f.repoDir).trim(), localTip, 'it preserves local\'s tip');
+  assert.equal(f.remoteRescues().length, 1, 'and it was pushed');
+});
+
+test('prepareStackedBranch: a local commit that only DELETES lines origin lacks the deletion of is still rescued', () => {
+  const f = rollingFixture();
+  f.localCommit(writeDoc('a\nb\nc\n'));                                    // deletes d (origin keeps it)
+  f.otherPush(appendLines('e'));
+  git(['fetch', 'origin'], f.repoDir);
+  f.prepare();
+  assert.equal(f.rescueBranches().length, 1, 'a deletions-only change is never treated as a duplicate');
+});
+
+test('prepareStackedBranch: histories with no common ancestor cannot be compared and are still rescued', () => {
+  const f = rollingFixture();
+  git(['checkout', '--orphan', 'unrelated-tmp'], f.repoDir);
+  git(['rm', '-rf', '.'], f.repoDir);
+  fs.writeFileSync(path.join(f.repoDir, 'orphan.txt'), 'orphan content\n');   // content origin does not have, and no shared history to compare from
+  git(['add', '-A'], f.repoDir);
+  git(['commit', '-m', 'unrelated root'], f.repoDir);
+  git(['branch', '-f', 'agent/rolling', 'unrelated-tmp'], f.repoDir);
+  git(['checkout', 'main'], f.repoDir);
+  git(['branch', '-D', 'unrelated-tmp'], f.repoDir);
+  git(['fetch', 'origin'], f.repoDir);
+  f.prepare();
+  assert.equal(f.rescueBranches().length, 1, 'no merge-base: any doubt falls through to the old rescue');
+});
+
+test('prepareStackedBranch: a local merge commit with its own edit is still rescued even though git cherry cannot see merge commits', () => {
+  const f = rollingFixture();
+  git(['checkout', '-b', 'side', 'agent/rolling'], f.repoDir);
+  fs.appendFileSync(path.join(f.repoDir, 'doc.md'), 'side\n');
+  git(['add', '-A'], f.repoDir);
+  git(['commit', '-m', 'side commit'], f.repoDir);
+  git(['checkout', 'agent/rolling'], f.repoDir);
+  git(['merge', '--no-ff', '--no-commit', 'side'], f.repoDir);
+  fs.appendFileSync(path.join(f.repoDir, 'doc.md'), 'merge-only-edit\n');   // an edit that exists only in the merge commit
+  git(['add', '-A'], f.repoDir);
+  git(['commit', '-m', 'merge side with an extra edit'], f.repoDir);
+  // origin gets a patch-equivalent copy of the side commit (different SHA), so cherry sees nothing unique among the non-merge commits
+  f.otherPush(appendLines('side'), 'same change as the side commit');
+  git(['fetch', 'origin'], f.repoDir);
+  f.prepare();
+  assert.equal(f.rescueBranches().length, 1, 'the merge-only edit is unique work: rescued');
+});
+

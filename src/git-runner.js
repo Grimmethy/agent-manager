@@ -78,6 +78,32 @@ function createRealGitRunner(repoRoot) {
   function isAncestor(a, b) {
     try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
   }
+  // True only when a diverged local branch adds NOTHING its remote counterpart lacks -- it is a duplicate of origin's content (typically the same commits under
+  // different SHAs after the stale-main rebase rewrote one side), so a rescue branch would only be a stale snapshot of the rolling branch. Seen 2026-10-04/05 on
+  // TaxHarvest: 12 rescue branches in ~6 h, every one a near-copy of agent/triage-queue. Two signals, either suffices: (a) `git cherry <remote> <name>` lists no '+'
+  // line AND lists every local-unique commit (each has a patch-equivalent upstream; merges are invisible to cherry, so a count mismatch falls through to (b)), or (b) measured from the two branches' FORK POINT (merge-base, so shared history is not
+  // counted), the lines local ADDS are a NON-EMPTY subset of the lines the remote branch adds (the rule python/dashboard/branch_verdicts.py
+  // _check_redundant_snapshot applies to these branches, there measured from main). Any doubt -- a git failure, no common ancestor -- returns false and the caller
+  // rescues exactly as before: a wrong 'redundant' drops work, a wrong 'not redundant' costs one extra branch. Known limit: the line-set test looks only at added
+  // lines, so a local commit that duplicates added lines AND deletes lines origin kept would be judged redundant; the rolling candidate-doc branches this exists
+  // for only append.
+  function localAddsNothingOver(remote, name) {
+    try {
+      // `git cherry` skips merge commits, so "no '+' line" only proves a duplicate when it accounts for EVERY local-unique commit (a merge with its own edits would otherwise pass).
+      const cherry = run(['cherry', remote, name]).split('\n').filter(Boolean);
+      const uniqueCommits = Number(run(['rev-list', '--count', `${remote}..${name}`]).trim());
+      if (cherry.length === uniqueCommits && !cherry.some((l) => l.startsWith('+'))) return true;
+      const fork = run(['merge-base', name, remote]).trim();
+      if (!fork) return false;
+      const added = (ref) => new Set(run(['diff', '--unified=0', fork, ref]).split('\n')
+        .filter((l) => l.startsWith('+') && !l.startsWith('+++') && l.slice(1).trim()).map((l) => l.slice(1)));
+      const mine = added(name);
+      if (mine.size === 0) return false;                                  // nothing added since the fork: a deletions-only change is never "a duplicate"
+      const theirs = added(remote);
+      for (const line of mine) if (!theirs.has(line)) return false;
+      return true;
+    } catch { return false; }
+  }
   // A DEDICATED apply clone is the one AGENT_MANAGER_APPLY_REPO_ROOT names (never the shared
   // interactive checkout, never any other repo). Nothing legitimate is ever left uncommitted in it, so
   // uncommitted content there is always stray -- and must NOT be carried forward (see quarantineStash).
@@ -311,6 +337,11 @@ function createRealGitRunner(repoRoot) {
             // tip and let the pipeline continue. A human can still recover the rescue
             // branch's content later; nothing downstream has to wait on them noticing
             // first.
+            if (localAddsNothingOver(remote, name)) {
+              console.error(`[git-runner] prepareStackedBranch: local ${name} had diverged from ${remote} but adds nothing origin lacks (a duplicate of origin's content) -- resetting without a rescue branch`);
+              run(['checkout', '-B', name, remote]);
+              return;
+            }
             const rescue = `${name}-rescued-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
             try { run(['branch', rescue, name]); } catch { /* best-effort: proceed even if the rescue branch itself couldn't be created */ }
             try { run(['push', '-u', 'origin', rescue]); } catch { /* best-effort: the local rescue branch still exists even if the push fails */ }
