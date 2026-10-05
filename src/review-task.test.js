@@ -36,6 +36,7 @@ process.env.AGENT_MANAGER_REPO_ROOT = require('os').tmpdir();
 process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false';
 process.env.AGENT_MANAGER_REVIEW_INERT_CHECK = 'false';
 process.env.AGENT_MANAGER_REVIEW_SKIPPATH_RULE = 'false';
+process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK = 'false';
 process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
 // 2026-08-23: review-task.js's own isEmptyApprovalSource/isAdvisoryProseSource now read
@@ -2611,4 +2612,131 @@ test('replay: the real detector flags a diff that adds a gate returning an archi
   const plain = await run('skip-real-plain', adhocImplementedTask().rawDiff);
   assert.equal(plain.task.skipPaths.paths.length, 0);
   assert.doesNotMatch(plain.prompt, /Skip \/ dismiss paths/);
+}));
+
+
+// --- undefined identifier after removal (brain dump #1768): a change that deletes a declaration whose name the file still uses -----------------------------
+function withUndefinedCheck(mode, fn) {
+  return async () => {
+    const prev = process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK;
+    if (mode === undefined) delete process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK; else process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK = mode;
+    try { await fn(); } finally { process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK = prev; }
+  };
+}
+const UNDEF_EDITS = JSON.stringify([{ mode: 'edit', file: 'src/db.js', find: 'const [STATUS_PENDING, STATUS_DRAFTING] = AGENT_TASK_STATUSES;', replace: "const { STATUS } = require('./statuses');" }]);
+const UNDEF_FOUND = { considered: 2, unknown: 0, uses: [{ file: 'src/db.js', name: 'STATUS_PENDING', lines: [{ line: 121, text: 'if (prev.status !== STATUS_PENDING) {' }] }] };
+const candidateEditTask = (id, extra = {}) => baseTask({ id, source: 'arch_review', implementResponse: UNDEF_EDITS, ...extra });
+
+test('undefined-after-removal, default mode: the review is blocked before any vote, and the reason names the identifier, the file and the line', withUndefinedCheck(undefined, async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = candidateEditTask('undef-block');
+  const captured = [];
+  const outcomes = [];
+  let seen = null;
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: (o) => outcomes.push(o), findUndefinedFn: (a) => { seen = a; return UNDEF_FOUND; } });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.match(result.blockedReason, /Deterministic gate: undefined identifier after removal/);
+  assert.match(result.blockedReason, /`STATUS_PENDING` in src\/db\.js \(line 121: if \(prev\.status !== STATUS_PENDING\) \{\)/);
+  assert.equal(captured.length, 0, 'no vote is spent');
+  assert.equal(task.reviewProvider, 'deterministic-undefined-after-removal');
+  assert.equal(outcomes[0].outcome, 'rejected');
+  assert.equal(Array.isArray(seen.edits) && seen.edits[0].file, 'src/db.js');
+  assert.equal(seen.rawDiff, undefined, 'an edit-array draft is passed as edits, not as a diff');
+  assert.equal(task.undefinedAfterRemoval.total, 1);
+  assert.ok(task.history.some((h) => h.stage === 'blocked' && /undefined identifier after removal/.test(h.detail)));
+}));
+
+test('undefined-after-removal covers an implemented adhoc rawDiff too', withUndefinedCheck(undefined, async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'undef-adhoc-diff' });
+  let seen = null;
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findUndefinedFn: (a) => { seen = a; return UNDEF_FOUND; } });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(seen.rawDiff, task.rawDiff);
+  assert.equal(seen.edits, undefined);
+}));
+
+test('undefined-after-removal, advisory mode: the voters see the finding, the history notes it, and the vote still happens', withUndefinedCheck('advisory', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = candidateEditTask('undef-advisory');
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findUndefinedFn: () => UNDEF_FOUND });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1);
+  assert.match(captured[0], /Removed declarations that are still used \(deterministic check; advisory\)/);
+  assert.match(captured[0], /`STATUS_PENDING` in src\/db\.js \(line 121/);
+  assert.match(task.history.find((h) => h.stage === 'advisory' && /undefined-after-removal check/.test(h.detail)).detail, /1 removed declaration\(s\) still used \(STATUS_PENDING\)/);
+}));
+
+test('undefined-after-removal: nothing found means no section and no note; a throwing or junk finder cannot break the review', withUndefinedCheck(undefined, async () => {
+  for (const [label, finder] of [['clean', () => ({ considered: 3, unknown: 0, uses: [] })], ['throws', () => { throw new Error('git exploded'); }], ['junk', () => 'nope']]) {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = candidateEditTask(`undef-${label}`);
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findUndefinedFn: finder });
+    assert.equal(result.verdict, 'approved', label);
+    assert.equal(captured.length, 1, label);
+    assert.doesNotMatch(captured[0], /Removed declarations that are still used/, label);
+    assert.equal(task.history.some((h) => /undefined-after-removal|undefined identifier/.test(h.detail || '')), false, label);
+  }
+}));
+
+test('undefined-after-removal: the finder is not called when the switch is off, or for a draft that is neither an implemented adhoc diff nor an edit array', async () => {
+  let calls = 0;
+  const finder = () => { calls += 1; return UNDEF_FOUND; };
+  const run = async (task) => {
+    const { repoRoot, domainsPath } = makeFixture();
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findUndefinedFn: finder });
+  };
+  await run(candidateEditTask('undef-off'));                                               // switch is 'false' here (set at the top of the file)
+  assert.equal(calls, 0);
+  await withUndefinedCheck(undefined, async () => {
+    await run(baseTask({ id: 'undef-prose', source: 'arch_review', implementResponse: 'Plain prose: rename the constants everywhere.' }));
+    await run(baseTask({ id: 'undef-not-ops', source: 'arch_review', implementResponse: JSON.stringify([{ title: 'a sub-task proposal' }]) }));
+    await run(adhocImplementedTask({ id: 'undef-no-diff', rawDiff: '', implementResponse: 'prose only' }));
+    assert.equal(calls, 0);
+    await run(candidateEditTask('undef-on'));
+    assert.equal(calls, 1);
+  })();
+});
+
+test('undefined-after-removal helpers: the summary clamps junk, the section is empty when nothing was found', () => {
+  const { summariseUndefinedRemoval, formatUndefinedRemovalSection, undefinedRemovalBlockReason, editsOfImplementResponse } = require('./review-task.js');
+  const s = summariseUndefinedRemoval({ considered: -1, unknown: 'x', uses: Array.from({ length: 12 }, (_, i) => ({ file: 'f.js', name: `n${i}`.padEnd(300, 'x'), lines: Array.from({ length: 9 }, (_, k) => ({ line: k, text: 'y'.repeat(400) })) })) });
+  assert.deepEqual([s.considered, s.unknown, s.total, s.uses.length, s.uses[0].lines.length, s.uses[0].name.length, s.uses[0].lines[0].text.length], [0, 0, 12, 8, 5, 120, 140]);
+  for (const none of [undefined, null, {}, { uses: [] }]) assert.equal(formatUndefinedRemovalSection(none), '');
+  assert.match(undefinedRemovalBlockReason(summariseUndefinedRemoval(UNDEF_FOUND)), /1 name\(s\) that the file still uses/);
+  assert.equal(editsOfImplementResponse({ implementResponse: 'prose' }), null);
+  assert.equal(editsOfImplementResponse({ implementResponse: '{"mode":"edit","file":"a.js","find":"x","replace":"y"}' }).length, 1);
+  assert.equal(editsOfImplementResponse({ implementResponse: '[{"mode":"edit","file":"a.js","find":"x","replace":"y"},{"nope":1}]' }), null);
+});
+
+// Real engine, real git: the AC-46 shape against a real remote -- the destructuring is replaced, one use survives on an untouched line.
+// (withReplayRepo removes its temp dir as soon as the callback first yields, so each review gets its own repo.)
+const UNDEF_REPLAY_BASE = "const { AGENT_TASK_STATUSES } = require('./s');\nconst [STATUS_PENDING, STATUS_DRAFTING] = AGENT_TASK_STATUSES;\nfunction a() { return { status: STATUS_PENDING }; }\nfunction b(prev) { return prev.status !== STATUS_PENDING; }\n";
+const UNDEF_REPLAY_PARTIAL = [
+  { mode: 'edit', file: 'src/db.js', find: 'const [STATUS_PENDING, STATUS_DRAFTING] = AGENT_TASK_STATUSES;', replace: "const { STATUS } = require('./s');" },
+  { mode: 'edit', file: 'src/db.js', find: 'status: STATUS_PENDING', replace: 'status: STATUS.pending' },
+];
+
+test('replay: the real check, against a real git remote, blocks the AC-46 shape', withUndefinedCheck(undefined, async () => {
+  await withReplayRepo({ 'src/db.js': UNDEF_REPLAY_BASE }, async ({ work, domainsPath }) => {
+    const bad = baseTask({ id: 'replay-undef-bad', source: 'arch_review', implementResponse: JSON.stringify(UNDEF_REPLAY_PARTIAL) });
+    const r = await reviewTask(bad, { repoRoot: work, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {} });
+    assert.equal(r.verdict, 'blocked');
+    assert.match(r.blockedReason, /`STATUS_PENDING` in src\/db\.js \(line 4: function b\(prev\) \{ return prev\.status !== STATUS_PENDING; \}\)/);
+  });
+}));
+
+test('replay: the real check, against a real git remote, passes the complete rename and lets the vote happen', withUndefinedCheck(undefined, async () => {
+  await withReplayRepo({ 'src/db.js': UNDEF_REPLAY_BASE }, async ({ work, domainsPath }) => {
+    const complete = [...UNDEF_REPLAY_PARTIAL, { mode: 'edit', file: 'src/db.js', find: 'prev.status !== STATUS_PENDING', replace: 'prev.status !== STATUS.pending' }];
+    const good = baseTask({ id: 'replay-undef-good', source: 'arch_review', implementResponse: JSON.stringify(complete) });
+    const captured = [];
+    const r = await reviewTask(good, { repoRoot: work, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+    assert.equal(r.verdict, 'approved');
+    assert.equal(captured.length, 1);
+    assert.equal(good.undefinedAfterRemoval.total, 0);
+  });
 }));
