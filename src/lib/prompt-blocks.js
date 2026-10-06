@@ -50,6 +50,39 @@ function priorRejectionBlock(task) {
   return lines.join('\n');
 }
 
+// A chat/manual needs-work verdict on the task's previous branch is stamped onto promptContext.priorVerdict by
+// python/dashboard/branch_verdicts.py (apply_prior_verdict) and survives both requeue paths with the rest of
+// promptContext. Without this, a redraft was a blind re-roll of the change the reviewer had just rejected
+// (arch-review-ac-50 repeated the same six-error change after its verdict named the fix).
+const PRIOR_VERDICT_MAX_CHARS = 1500;
+
+function priorVerdictBlock(task) {
+  const ctx = task && task.promptContext;
+  const pv = ctx && typeof ctx === 'object' ? ctx.priorVerdict : null;
+  if (!pv || typeof pv !== 'object' || pv.verdict !== 'needs-work') return '';
+  const reasons = (Array.isArray(pv.reasons) ? pv.reasons : [])
+    .map((r) => (typeof r === 'string' ? r.trim() : ''))
+    .filter(Boolean);
+  if (reasons.length === 0) return '';
+  const kept = [];
+  let used = 0;
+  for (const reason of reasons) {
+    const room = PRIOR_VERDICT_MAX_CHARS - used;
+    if (room <= 0) break;
+    const text = reason.length > room ? `${reason.slice(0, Math.max(0, room - 3))}...` : reason;
+    kept.push(text);
+    used += text.length;
+  }
+  const lines = [
+    '',
+    'A reviewer examined your previous attempt for this task and judged it needs-work. Do not repeat that change; the reasons below say what is wrong and what to do instead:',
+    '',
+  ];
+  kept.forEach((reason, i) => lines.push(`${i + 1}. ${reason}`));
+  lines.push('');
+  return lines.join('\n');
+}
+
 function strictCiteConstraintBlock(task) {
   const files = Array.isArray(task.verifiedFiles) ? task.verifiedFiles : [];
   const lines = [
@@ -68,4 +101,4 @@ function strictCiteConstraintBlock(task) {
   return lines.join('\n');
 }
 
-module.exports = { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, strictCiteConstraintBlock };
+module.exports = { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, priorVerdictBlock, strictCiteConstraintBlock };

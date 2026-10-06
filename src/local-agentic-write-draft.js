@@ -30,6 +30,7 @@ const { getConfig } = require('./config.js');
 const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
+const { priorVerdictBlock } = require('./lib/prompt-blocks.js');
 const { detectContradictoryLiteralAcceptance } = require('./acceptance-criteria.js');
 const { detectStaleDecomposePremise } = require('./decompose-premise-check.js');
 const { runDecomposePassIfAvailable } = require('./decompose-pass-route.js');
@@ -384,6 +385,7 @@ function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } =
     anchorFilesPromptBlock(task),
     hubStatusGroundingBlock(task),
     priorRejectionBlock(task),
+    priorVerdictBlock(task),
     blindPlanBlock(task),
     priorInvestigationBlock(task),
     acceptanceCriteriaBlock(task),
