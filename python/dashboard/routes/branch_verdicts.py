@@ -41,6 +41,6 @@ def api_git_record_branch_verdict(branch):
     if written:
         task_ids, hub_id = bv.resolve_owner(repo_root, match.get("mainBranch") or "master", branch, _run_git, qdir,
                                             get_hub_data_provider().hub_for_branch, match.get("taskId"))
-        bv.write_task_log(qdir, task_ids, hub_id or (match.get("hub") or {}).get("id"), branch, verdict, reasons, source)
+        bv.write_task_log(qdir, task_ids, hub_id or (match.get("hub") or {}).get("id"), branch, verdict, reasons, source, head_sha)
     _invalidate_branch_cache()
     return jsonify({"succeeded": True, "written": written, "headSha": head_sha, **bv.get_verdict(qdir, branch, head_sha)})

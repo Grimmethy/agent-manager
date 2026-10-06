@@ -20,7 +20,7 @@ const { pendingBlock, filledBlock } = require('./product-spec-assembly.js');
 const { anchorFilesPromptBlock, backtickIdentifiers } = require('./task-anchor-files.js');
 const { CANONICAL_TOP_LEVEL } = require('./brain-dump-sort-classify.js');
 require('./task-sources.js');
-const { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, strictCiteConstraintBlock } = require('./lib/prompt-blocks.js');
+const { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, priorVerdictBlock, strictCiteConstraintBlock } = require('./lib/prompt-blocks.js');
 const { assemblePrompt } = require('./lib/prompt-assembly.js');
 const { troubleLogPlanPrompt, secondbrainPlanPrompt, brainDumpSortPlanPrompt, pathPrefetchResolvePlanPrompt, researchPlanPrompt, pipelineSelfAuditPlanPrompt, pipelineHealthAuditPlanPrompt, uiVisibilityAuditPlanPrompt, stalenessAuditPlanPrompt, productSpecPlanPrompt, backlogDecompositionPlanPrompt } = require('./lib/prompt-planning.js');
 const { pathPrefetchResolveImplementPrompt, deepDiveImplementPrompt, backlogDecompositionImplementPrompt, brainDumpSortImplementPrompt } = require('./lib/prompt-implementation.js');
@@ -1565,7 +1565,7 @@ updateTaskSource('pipeline_forensics_fix', { buildPlanPrompt: archReviewPlanProm
 function buildPlanPrompt(task) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
-  const prior = priorRejectionBlock(task);
+  const prior = priorRejectionBlock(task) + priorVerdictBlock(task);
   const base = source && typeof source.buildPlanPrompt === 'function'
     ? source.buildPlanPrompt(task)
     : genericFallbackPlanPrompt(task);
@@ -1575,7 +1575,7 @@ function buildPlanPrompt(task) {
 function buildImplementPrompt(task, planText, options) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
-  const prior = priorRejectionBlock(task);
+  const prior = priorRejectionBlock(task) + priorVerdictBlock(task);
   const base = source && typeof source.buildImplementPrompt === 'function'
     ? source.buildImplementPrompt(task, planText)
     : genericFallbackImplementPrompt(task, planText);
@@ -1659,7 +1659,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 }
 
 module.exports = {
-  buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents, priorRejectionBlock,
+  buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents, priorRejectionBlock, priorVerdictBlock,
   adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, skipPathDirective, seedPlanBlock, planGroundingBlock, hubStatusGroundingBlock, planCritiqueFeedbackBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
   secondBrainOpportunitiesPlanPrompt, secondBrainOpportunitiesImplementPrompt,

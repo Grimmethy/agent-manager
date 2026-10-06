@@ -186,6 +186,17 @@ test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks 
   });
 });
 
+test('write tier: buildWriteAgenticPrompt includes a prior needs-work verdict when promptContext.priorVerdict is set, and not otherwise', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const base = { title: 'T', promptContext: { rawText: 'the ask' } };
+    const withV = { title: 'T', promptContext: { rawText: 'the ask', priorVerdict: { verdict: 'needs-work', reasons: ['keep the return type `any`'], source: 'chat' } } };
+    assert.ok(buildWriteAgenticPrompt(withV).includes('A reviewer examined your previous attempt'));
+    assert.ok(buildWriteAgenticPrompt(withV).includes('keep the return type `any`'));
+    assert.ok(!buildWriteAgenticPrompt(base).includes('A reviewer examined your previous attempt'));
+  });
+});
+
 // 2026-09-15 (brain-dump bd-1789433484128, "pipeline hardening 1/5"): orientTurnLimit is
 // now an explicit override, threaded through to BOTH sentences that cite it in the
 // prompt -- the model's own instructions must always match whatever limit is actually
