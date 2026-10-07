@@ -390,7 +390,7 @@ function parseCandidateSplit(implementResponse) {
   });
 
   if (valid.length < 2) {
-    return { invalid: true, reason: `Implement pass said mode "split" but only ${valid.length} of ${raw.length} proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required` };
+    return { invalid: true, tooFew: true, usable: valid.length, proposed: raw.length, reason: `Implement pass said mode "split" but only ${valid.length} of ${raw.length} proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required` };
   }
 
   valid.forEach((c, finalIndex) => {
@@ -1001,7 +1001,23 @@ function canonicalizeImplementFinds(task) {
 async function finalizeCandidateFulfillment(task, {
   maybeLocked, maybeLockedOn, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
 }, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
-  const split = parseCandidateSplit(task.implementResponse);
+  let split = parseCandidateSplit(task.implementResponse);
+  // Too-few-sub-candidates retry (class C, arch-review-ac-180): the model said mode "split" but gave ONE child that restated the whole
+  // single-file candidate (and itself spanned two files, against the prompt's own one-file-per-piece rule). That is a fixable answer, not
+  // a dead end -- ask once, naming the rule, before blocking for a human. Any later failure blocks exactly as before. The flag is not a
+  // clean-slate field, so a re-admitted task is not retried forever.
+  if (split && split.invalid && split.tooFew && !task.splitTooFewRetried) {
+    task.splitTooFewRetried = true;
+    const correction = `Your previous answer was mode "split" but only ${split.usable} of ${split.proposed} sub-candidate(s) were usable. A split needs AT LEAST 2 sub-candidates, each with a title, problem and solution, each touching exactly ONE file, listed in the order they must be applied (use dependsOn when a later piece needs an earlier one). For example: (1) create the new module, then (2) rewire the original file to use it. Do not put the whole job in a single sub-candidate.`;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(correction);
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: `${implPrompt}\n\n${correction}`, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      split = parseCandidateSplit(task.implementResponse);
+    }
+    appendHistoryEvent(task, 'implement-retry', `split had ${split && split.tooFew ? split.usable : 'too few'} usable sub-candidate(s) -- retried once asking for at least 2, one file each${retryResult.degenerate ? ' (retry degenerate, original answer kept)' : ''}`);
+  }
   if (split) {
     const pc = task.promptContext || {};
     const atSplitCap = (pc.splitDepth || 0) >= 1;

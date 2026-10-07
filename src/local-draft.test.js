@@ -2649,6 +2649,68 @@ test('draftTask blocks a candidate-fulfillment source that says mode "split" but
   });
 });
 
+test('parseCandidateSplit tags a too-few split with tooFew and the counts, but not a truncated-JSON one', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const one = parseCandidateSplit(JSON.stringify({ mode: 'split', candidates: [{ title: 'Only one', problem: 'p', solution: 's' }] }));
+  assert.equal(one.tooFew, true);
+  assert.equal(one.usable, 1);
+  assert.equal(one.proposed, 1);
+  const none = parseCandidateSplit(JSON.stringify({ mode: 'split', candidates: [{ title: 'a' }, { title: 'b' }] }));
+  assert.equal(none.tooFew, true);
+  assert.equal(none.usable, 0);
+  assert.equal(none.proposed, 2);
+  const truncated = parseCandidateSplit('{"mode": "split", "candidates": [{"title": "cut off');
+  assert.equal(truncated.invalid, true);
+  assert.equal(truncated.tooFew, undefined, 'a truncated split is a different failure and keeps its own reason');
+});
+
+function splitTooFewTask(id, extra = {}) {
+  return {
+    id, domain: 'default', source: 'arch_review', title: 'test',
+    promptContext: { candidateId: 'AC-180', title: 'x', files: ['src/apply-task.js'], fetchedFiles: [{ path: 'src/apply-task.js', content: 'function applyTask() {}\n' }], body: 'Files: src/apply-task.js' },
+    ...extra,
+  };
+}
+const ONE_CHILD = JSON.stringify({ mode: 'split', candidates: [{ title: 'Only one', files: 'a.js, b.js', problem: 'p', solution: 's' }] });
+const TWO_CHILDREN = JSON.stringify({ mode: 'split', candidates: [
+  { title: 'Create the module', files: 'src/new.js', problem: 'p1', solution: 's1' },
+  { title: 'Rewire the original', files: 'src/apply-task.js', problem: 'p2', solution: 's2', dependsOn: 0 },
+] });
+
+test('draftTask retries a one-child candidate split once with the one-file-per-piece rule and accepts a real 2-piece answer', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = splitTooFewTask('split-too-few-1');
+    const prompts = [];
+    let n = 0;
+    const localCall = async ({ prompt } = {}) => { n += 1; prompts.push(String(prompt)); return n === 1 ? { response: 'plan text', degenerate: null, attempts: 1 } : { response: n === 2 ? ONE_CHILD : TWO_CHILDREN, degenerate: null, attempts: 1 }; };
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.notEqual(result.blocked, true);
+    assert.equal(task.candidateSplitProposals.length, 2);
+    assert.equal(task.splitTooFewRetried, true);
+    assert.equal(task.history.filter((h) => h.stage === 'implement-retry').length, 1);
+    assert.match(prompts[prompts.length - 1], /AT LEAST 2 sub-candidates.*exactly ONE file/s);
+    assert.ok(task.priorRejectionFeedback.some((f) => /only 1 of 1 sub-candidate/.test(f)));
+  });
+});
+
+test('draftTask retries the too-few split only ONCE and then blocks as before; an already-retried task is not retried again', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = splitTooFewTask('split-too-few-2');
+    let n = 0;
+    const localCall = async () => { n += 1; return n === 1 ? { response: 'plan text', degenerate: null, attempts: 1 } : { response: ONE_CHILD, degenerate: null, attempts: 1 }; };
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(result.blocked, true);
+    assert.match(result.blockedReason, /at least 2/);
+    assert.equal(task.history.filter((h) => h.stage === 'implement-retry').length, 1, 'exactly one retry');
+    const again = splitTooFewTask('split-too-few-3', { splitTooFewRetried: true });
+    let m = 0;
+    const localCall2 = async () => { m += 1; return m === 1 ? { response: 'plan text', degenerate: null, attempts: 1 } : { response: ONE_CHILD, degenerate: null, attempts: 1 }; };
+    const r2 = await draftTask(again, { localCall: localCall2, withLockFn: async (dir, fn) => fn() });
+    assert.equal(r2.blocked, true);
+    assert.equal((again.history || []).filter((h) => h.stage === 'implement-retry').length, 0, 'the flag stops a second retry');
+  });
+});
+
 test('draftTask retries the implement call once when a candidate-fulfillment source writes an unverifiable find, and accepts the corrected retry', async () => {
   await withFixtureRepo(async (draftTask, dir) => {
     fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
