@@ -1554,3 +1554,93 @@ test('rejectRetryCheck requeues a plan-degenerate block at localRejectCount 1 (o
   assert.equal(requeued.planResponse, undefined, 'the stale degenerate plan must not survive the requeue');
   assert.ok(requeued.priorRejectionFeedback.some((f) => /degenerate/.test(f)), 'the degenerate reason is carried as prior feedback for the next redraft');
 });
+
+// --- stale-premise gate false positive (2026-10-07): "sub-task premise may be stale" blocked
+// hub sub-tasks whose cited file exists under a monorepo sub-root (HUB0007-02, HUB0008-01,
+// HUB0012-02 on TaxHarvest). Nothing re-admitted them: no blockedStage, no needsClarification, so
+// every gate here skipped them. Re-admitted clean-slate exactly once when the gate no longer fires. ---
+
+const STALE_PREMISE_REASON = "sub-task premise may be stale: This sub-task's premise may be stale (filed by an internal decompose, then the codebase moved on): cites `src/routes/x.js`, but that file does not exist in the repo.";
+
+function staleMonorepo(files) {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'stale-premise-repo-'));
+  for (const [rel, lines] of Object.entries(files)) {
+    const abs = path.join(repo, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, Array.from({ length: lines }, (_, i) => `// ${i + 1}`).join('\n'));
+  }
+  return repo;
+}
+
+function stalePremiseTask(extra = {}) {
+  return {
+    id: 'HUB0007-02-reduce-handler', domain: 'adhoc', source: 'manual', status: 'pending',
+    title: 'HUB0007 · 2/2 · Reduce handler',
+    promptContext: { decomposedFrom: 'parent-1', rawText: 'In src/routes/x.js near line 120, reduce the handler.' },
+    blockedReason: STALE_PREMISE_REASON,
+    localRejectCount: 1, priorRejectionFeedback: ['an earlier note'],
+    history: [{ stage: 'blocked', at: '2026-10-05T01:31:00Z', detail: STALE_PREMISE_REASON }],
+    ...extra,
+  };
+}
+
+test('a stale-premise block whose cited file really exists under a sub-root is re-admitted once, clean slate', () => {
+  const d = setupAdhocDirs();
+  const repoRoot = staleMonorepo({ 'sub/backend/src/routes/x.js': 400 });
+  fs.writeFileSync(path.join(d.blockedDir, 'stale-1.json'), JSON.stringify(stalePremiseTask()));
+
+  const summary = rejectRetryCheck({ ...d, repoRoot, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(d.adhocDir, 'stale-1.json')), 'back in queue/adhoc/');
+  assert.ok(!fs.existsSync(path.join(d.blockedDir, 'stale-1.json')));
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'stale-1.json'), 'utf8'));
+  assert.equal(out.blockedReason, undefined, 'the gate\'s false verdict is cleared');
+  assert.equal(out.localRejectCount, undefined, 'retry budget reset');
+  assert.equal(out.priorRejectionFeedback, undefined);
+  assert.equal(out.stalePremiseReadmitted, true, 'stamped so it happens at most once');
+  assert.equal(out.status, 'pending');
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /stale-premise verdict/.test(h.detail)));
+});
+
+test('a stale-premise block that STILL holds (the file really is missing) is left alone', () => {
+  const d = setupAdhocDirs();
+  const repoRoot = staleMonorepo({ 'sub/backend/src/routes/other.js': 400 });
+  fs.writeFileSync(path.join(d.blockedDir, 'stale-2.json'), JSON.stringify(stalePremiseTask({ id: 'stale-2' })));
+
+  const summary = rejectRetryCheck({ ...d, repoRoot, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(d.blockedDir, 'stale-2.json')), 'still parked in blocked/');
+  assert.ok(!fs.existsSync(path.join(d.adhocDir, 'stale-2.json')));
+});
+
+test('the stale-premise re-admission fires at most once (stalePremiseReadmitted stamp)', () => {
+  const d = setupAdhocDirs();
+  const repoRoot = staleMonorepo({ 'sub/backend/src/routes/x.js': 400 });
+  fs.writeFileSync(path.join(d.blockedDir, 'stale-3.json'), JSON.stringify(stalePremiseTask({ id: 'stale-3', stalePremiseReadmitted: true })));
+
+  const summary = rejectRetryCheck({ ...d, repoRoot, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0, 'not re-admitted a second time');
+  assert.ok(!fs.existsSync(path.join(d.adhocDir, 'stale-3.json')));
+});
+
+test('a block with any OTHER reason is never treated as a stale-premise re-admission', () => {
+  const d = setupAdhocDirs();
+  const repoRoot = staleMonorepo({ 'sub/backend/src/routes/x.js': 400 });
+  fs.writeFileSync(path.join(d.blockedDir, 'stale-4.json'), JSON.stringify(stalePremiseTask({ id: 'stale-4', blockedReason: 'task requires something else entirely' })));
+
+  const summary = rejectRetryCheck({ ...d, repoRoot, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(d.blockedDir, 'stale-4.json')));
+});
+
+test('stalePremiseGateNoLongerFires answers false without a repoRoot or when detection throws', () => {
+  const { stalePremiseGateNoLongerFires } = require('./lib/reject-retry-check.js');
+  assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), {}), false, 'no repoRoot -> never re-admit on doubt');
+  assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), { repoRoot: '/r', detectFn: () => { throw new Error('boom'); } }), false);
+  assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), { repoRoot: '/r', detectFn: () => null }), true);
+  assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), { repoRoot: '/r', detectFn: () => ({ stale: true }) }), false);
+});

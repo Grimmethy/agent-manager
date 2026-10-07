@@ -56,7 +56,7 @@ function writeTaskAndUnlinkOld(instancesDir, task, destPath, srcPath) {
 }
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { isCandidateFulfillmentSource, isAdvisoryProseSource } = require('./lib/harness-search.js');
-const { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock } = require('./lib/reject-retry-check.js');
+const { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock } = require('./lib/reject-retry-check.js');
 // 2026-09-16: registers this package's built-in sources (side effect of the require) --
 // deterministicReviewRecoveryCheck below looks a task's source up in this SAME registry
 // (getRegisteredSource), but this file itself never required task-sources.js, so a
@@ -474,7 +474,7 @@ function buildFeedbackString(ctx) {
   }
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, repoRoot: repoRootOverride, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
   // only matters for tests that don't bother passing pipelineDir explicitly (it was never
@@ -493,6 +493,8 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
     || (ghostRoot ? path.join(ghostRoot, 'queue', 'approved') : null);
   let recoveryConfig = {};
   try { recoveryConfig = getConfig(); } catch { /* no live config (e.g. a unit test) -- recovery check just no-ops */ }
+  // repoRoot: an explicit caller/test override wins over the live config (the stale-premise re-admission below checks files against it).
+  const sweepRepoRoot = repoRootOverride || recoveryConfig.repoRoot;
   const entries = discoverBlockedEntries({ blockedDir, adhocDir, derivedDir });
 
   if (entries.length === 0) return summary;
@@ -543,7 +545,10 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // one) -- see invalidPremiseBeforeCheckExisted / hasInvalidPremise: it is either
       // re-admitted once or escalated by the classifier below, never left invisible.
       const invalidPremiseBlock = hasInvalidPremise(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock) continue;
+      // A "sub-task premise may be stale" block whose gate no longer fires (it used to call a monorepo
+      // sub-root file missing) is recognized whatever its stage -- re-admitted once below.
+      const stalePremiseFalsePositive = stalePremiseGateNoLongerFires(task, { repoRoot: sweepRepoRoot });
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock && !stalePremiseFalsePositive) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -602,6 +607,26 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         appendHistoryEvent(task, 'requeued',
           "reject-retry-check: prior forbidden-path block named one of the task's own declared edit targets (adhoc-diff-sanity gate bug, since fixed) -- re-admitted with a clean slate, retry budget reset");
         recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'forbidden-path-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) stale-premise gate wrongly blocked: it cited a file that
+      // exists under a monorepo sub-root and the gate called it missing. The re-check above already
+      // proved the gate no longer fires, so no blind retry is involved -- clean slate, exactly once
+      // (the stalePremiseReadmitted stamp is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS, so a
+      // later clean-slate pass keeps the bound).
+      if (stalePremiseFalsePositive) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.stalePremiseReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was a stale-premise verdict from decompose-premise-check that called a cited file missing (it exists under a monorepo sub-root; resolved by path suffix since) -- re-admitted with a clean slate, exactly once");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'stale-premise-false-positive-readmit' });
         const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
         fs.mkdirSync(destDir, { recursive: true });
         const newPath = path.join(destDir, name);
