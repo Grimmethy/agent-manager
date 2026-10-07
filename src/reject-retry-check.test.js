@@ -1711,3 +1711,33 @@ test('a soft-marker external-dependency block is re-admitted in the default advi
     if (prev === undefined) delete process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE; else process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE = prev;
   }
 });
+
+// --- one-child candidate split (2026-10-07, class C): blocked BEFORE the in-draft retry existed -> re-admitted once so the retry runs ---
+const SPLIT_REASON = 'Implement pass said mode "split" but only 1 of 1 proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required';
+function splitTask(extra = {}) {
+  return { id: 'sp-1', domain: 'default', source: 'arch_review', status: 'pending', title: 'AC-180', promptContext: { candidateId: 'AC-180' }, blockedReason: SPLIT_REASON, localRejectCount: 1, history: [{ stage: 'blocked', at: '2026-10-06T22:07:27Z', detail: SPLIT_REASON }], ...extra };
+}
+
+test('a too-few-sub-candidates split block from before the retry existed is re-admitted once, clean slate', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'sp-1.json'), JSON.stringify(splitTask()));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 1);
+  const dest = ['pendingDir', 'adhocDir'].map((k) => path.join(d[k], 'sp-1.json')).find((f) => fs.existsSync(f));
+  assert.ok(dest, 'back in a live queue dir');
+  const out = JSON.parse(fs.readFileSync(dest, 'utf8'));
+  assert.equal(out.blockedReason, undefined);
+  assert.equal(out.localRejectCount, undefined);
+  assert.equal(out.splitTooFewReadmitted, true);
+  assert.equal(out.splitTooFewRetried, undefined, 'the draft retry flag is left unset so the draft gets its retry');
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /fewer than 2 usable sub-candidates/.test(h.detail)));
+});
+
+test('a too-few split block is NOT re-admitted when the draft retry already ran, or when it was already re-admitted once', () => {
+  for (const [id, extra] of [['sp-2', { splitTooFewRetried: true }], ['sp-3', { splitTooFewReadmitted: true }]]) {
+    const d = setupAdhocDirs();
+    fs.writeFileSync(path.join(d.blockedDir, `${id}.json`), JSON.stringify(splitTask({ id, ...extra })));
+    assert.equal(rejectRetryCheck({ ...d, recordModelOutcome: () => {} }).requeued, 0, id);
+    assert.ok(fs.existsSync(path.join(d.blockedDir, `${id}.json`)));
+  }
+});

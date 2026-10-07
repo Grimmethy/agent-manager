@@ -177,6 +177,16 @@ function externalDepGateNoLongerBlocks(task, { detectFn } = {}) {
   }
 }
 
+// 2026-10-07 (blocked class C, arch-review-ac-180): a candidate split with fewer than 2 usable sub-candidates is now retried once inside the
+// draft (local-draft.js finalizeCandidateFulfillment, flag splitTooFewRetried). A task blocked that way BEFORE the retry existed carries no
+// such flag, so it is re-admitted clean-slate exactly once and gets the retry; a task that already had it (the retry also failed) stays
+// blocked, and splitTooFewReadmitted (deliberately NOT in READMIT_CLEAN_SLATE_FIELDS) bounds the re-admission itself.
+const SPLIT_TOO_FEW_REASON_RE = /only \d+ of \d+ proposed sub-candidate\(s\) had a real title\/problem\/solution/i;
+function splitTooFewStillRetryable(task) {
+  if (!task || task.splitTooFewRetried || task.splitTooFewReadmitted) return false;
+  return SPLIT_TOO_FEW_REASON_RE.test(String(task.blockedReason || ''));
+}
+
 // 2026-09-17: every escalation site in this file used to check "has this task EVER, in
 // its whole lifetime, carried a needs-clarification history stage" -- correct the FIRST
 // time a task exhausts, but permanently wrong afterward: a task legitimately re-admitted
@@ -285,4 +295,4 @@ function isImplementDegenerateBlock(task) {
   return task.blockedStage === 'implement';
 }
 
-module.exports = { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, externalDepGateNoLongerBlocks, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock };
+module.exports = { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, externalDepGateNoLongerBlocks, splitTooFewStillRetryable, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock };

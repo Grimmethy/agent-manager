@@ -56,7 +56,7 @@ function writeTaskAndUnlinkOld(instancesDir, task, destPath, srcPath) {
 }
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { isCandidateFulfillmentSource, isAdvisoryProseSource } = require('./lib/harness-search.js');
-const { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, externalDepGateNoLongerBlocks, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock } = require('./lib/reject-retry-check.js');
+const { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, externalDepGateNoLongerBlocks, splitTooFewStillRetryable, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock } = require('./lib/reject-retry-check.js');
 // 2026-09-16: registers this package's built-in sources (side effect of the require) --
 // deterministicReviewRecoveryCheck below looks a task's source up in this SAME registry
 // (getRegisteredSource), but this file itself never required task-sources.js, so a
@@ -549,7 +549,8 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // sub-root file missing) is recognized whatever its stage -- re-admitted once below.
       const stalePremiseFalsePositive = stalePremiseGateNoLongerFires(task, { repoRoot: sweepRepoRoot });
       const externalDepFalsePositive = externalDepGateNoLongerBlocks(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock && !stalePremiseFalsePositive && !externalDepFalsePositive) continue;
+      const splitTooFewReadmit = splitTooFewStillRetryable(task);
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock && !stalePremiseFalsePositive && !externalDepFalsePositive && !splitTooFewReadmit) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -647,6 +648,23 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         appendHistoryEvent(task, 'requeued',
           "reject-retry-check: prior block was the external-dependency gate matching credential/network vocabulary in prose, a code span, or the plan echo (code spans and the plan are no longer scanned, and soft markers only advise by default) -- re-admitted with a clean slate, exactly once");
         recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'external-dep-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a candidate whose split was rejected for having fewer than 2 usable sub-candidates before the in-draft retry existed
+      // (class C): clean slate, exactly once, so the draft's one corrective retry gets to run on it.
+      if (splitTooFewReadmit) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.splitTooFewReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          'reject-retry-check: prior block was a candidate split with fewer than 2 usable sub-candidates; the draft now retries that once with the one-file-per-piece rule spelled out -- re-admitted with a clean slate, exactly once');
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'split-too-few-readmit' });
         const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
         fs.mkdirSync(destDir, { recursive: true });
         const newPath = path.join(destDir, name);
