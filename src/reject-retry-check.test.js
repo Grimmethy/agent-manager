@@ -1693,3 +1693,21 @@ test('the external-dependency re-admission fires at most once (externalDepReadmi
   const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
   assert.equal(summary.requeued, 0);
 });
+
+test('a soft-marker external-dependency block is re-admitted in the default advisory mode but NOT while block mode still blocks it', () => {
+  const soft = (id) => extDepTask({ id, title: 'Add the API key to config', promptContext: { rawText: 'add the API key to config' } });
+  const prev = process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE;
+  try {
+    process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE = 'block';
+    let d = setupAdhocDirs();
+    fs.writeFileSync(path.join(d.blockedDir, 'ext-4.json'), JSON.stringify(soft('ext-4')));
+    assert.equal(rejectRetryCheck({ ...d, recordModelOutcome: () => {} }).requeued, 0, 'block mode still blocks a soft marker: not re-admitted');
+    assert.ok(fs.existsSync(path.join(d.blockedDir, 'ext-4.json')));
+    delete process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE;
+    d = setupAdhocDirs();
+    fs.writeFileSync(path.join(d.blockedDir, 'ext-5.json'), JSON.stringify(soft('ext-5')));
+    assert.equal(rejectRetryCheck({ ...d, recordModelOutcome: () => {} }).requeued, 1, 'advisory mode no longer blocks it: re-admitted once');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE; else process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE = prev;
+  }
+});
