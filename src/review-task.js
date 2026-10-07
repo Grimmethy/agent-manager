@@ -1603,7 +1603,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
