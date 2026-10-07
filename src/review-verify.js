@@ -36,7 +36,16 @@ const { wrapWithSandbox } = require('./sandbox.js');
 const { externalDependencyLinks, codeBindPaths } = require('./lib/draft-sandbox.js');
 
 const COMMAND_TIMEOUT_MS = 120000;
-const TEST_TIMEOUT_MS = 90000;
+// 2026-10-07: a single `node --test` call over the covering files must be able to fit the slowest
+// covering suite (src/local-draft.test.js alone needs ~3 min), or every change that pulls it in is
+// inconclusive and the voters reject it. 90s could never finish; override with
+// AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS.
+const DEFAULT_TEST_TIMEOUT_MS = 210000;
+function resolveTestTimeoutMs(env = process.env) {
+  const v = parseInt(env.AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS, 10);
+  return v > 0 ? v : DEFAULT_TEST_TIMEOUT_MS;
+}
+const TEST_TIMEOUT_MS = resolveTestTimeoutMs();
 const TOTAL_BUDGET_MS = 300000;
 const MAX_COMMANDS = 8;
 const MAX_OUTPUT_CHARS = 4000;
@@ -459,7 +468,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
         const r = runOne(s.bin, s.buildArgs(s.files), TEST_TIMEOUT_MS);
         if (!r.ran) { result.tests = null; break; }
         result.tests.ran.push(...s.files);
-        if (r.timedOut) { result.tests.timedOut = true; result.tests.passed = null; continue; }
+        if (r.timedOut) { result.tests.timedOut = true; result.tests.passed = null; (result.tests.timedOutFiles = result.tests.timedOutFiles || []).push(...s.files); continue; }
         if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] }); }
       }
     }
@@ -551,7 +560,12 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     if (failures.length) { result.status = 'failed'; result.reasons.push(...failures); return result; }
     if (unattributable.length) return inconclusive(unattributable.join('; '));
     if (sandboxMissing && !anyExecuted) return inconclusive('the bwrap sandbox is unavailable, so nothing was executed');
-    if (anyTimeout) return inconclusive('a check timed out, which is not a failure');
+    if (anyTimeout) {
+      const unverified = (result.tests && result.tests.timedOutFiles) || [];
+      return inconclusive(unverified.length
+        ? `covering tests timed out after ${Math.round(TEST_TIMEOUT_MS / 1000)}s or the review budget (${unverified.length} file(s) unverified, not a failure: ${unverified.join(', ')})`
+        : 'a check timed out, which is not a failure');
+    }
     const confirmed = (result.tests && result.tests.passed === true) || result.commands.some((c) => c.outcome === 'confirmed');
     if (!confirmed) return inconclusive('no covering tests and no runnable acceptance commands were found');
     result.status = 'passed';
@@ -573,5 +587,5 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 module.exports = {
   extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
-  COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS,
+  COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
 };
