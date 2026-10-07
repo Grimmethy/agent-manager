@@ -67,6 +67,7 @@ const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
 const { getPreDispatchGate } = require('./deterministic-recheck-registry.js');
+const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
 const { selectAbModel } = require('./ab-model-select.js');
 const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
@@ -1504,14 +1505,27 @@ function selectDraftStrategy(task, injectedFns = {}) {
 }
 
 async function draftTask(task, deps = {}) {
-  // Pre-dispatch gate: a deterministic 'archive' verdict ends the task here, before
-  // beginDraftAttempt/resolveDraftContext ever touch the task-source registry.
+  // Pre-dispatch gate: a deterministic 'archive' verdict ends the drafting here, before
+  // beginDraftAttempt/resolveDraftContext ever touch the task-source registry. It is expressed as a model-free
+  // FALSE POSITIVE draft (lib/gate-verdict.js) and concluded like any other draft, so the task goes to review and
+  // the source's own apply() records the scanner suppression and the dismissed disposition. It used to return
+  // {status:'archived'}, which nothing routed: the task reached review with an empty draft (39 stranded tasks).
   const gateHit = tryPreDispatchGate(task);
   if (gateHit) {
-    task.status = 'archived';
+    delete task.blockedStage;
+    delete task.blockedReason;
     task.preDispatchGate = { ruleId: gateHit.ruleId, verdict: 'archive', reason: gateHit.reason };
     appendHistoryEvent(task, 'pre-dispatch-gate', `rule "${gateHit.ruleId}" verdict 'archive' -- ${gateHit.reason}`);
-    return { status: 'archived', reason: gateHit.reason, succeeded: true, ruleId: gateHit.ruleId };
+    const draft = buildGateFalsePositiveDraft(gateHit, task);
+    task.planResponse = draft.plan;
+    task.lastGoodPlan = draft.plan;
+    task.implementResponse = draft.implementResponse;
+    task.critiqueOutcome = 'no-issues';
+    appendHistoryEvent(task, 'plan-done', 'pre-dispatch gate verdict, no model call');
+    appendHistoryEvent(task, 'implement-done', 'FALSE POSITIVE from the deterministic gate, no model call');
+    appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic verdict, nothing for a critique pass to add)');
+    concludeDraft(task);
+    return { succeeded: true, blocked: false, gateVerdict: 'false-positive', ruleId: gateHit.ruleId, reason: gateHit.reason };
   }
   // One append-only record per draftTask() run (draft-attempt-record.js). runDraftPasses
   // threads `attempt` through every pass and records into it as output is produced;
