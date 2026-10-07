@@ -1644,3 +1644,52 @@ test('stalePremiseGateNoLongerFires answers false without a repoRoot or when det
   assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), { repoRoot: '/r', detectFn: () => null }), true);
   assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), { repoRoot: '/r', detectFn: () => ({ stale: true }) }), false);
 });
+
+
+// --- external-dependency gate false positive (2026-10-07, class B): "task requires external-state
+// operation" blocked ordinary code edits on credential/network words in prose or code spans. No
+// blockedStage / needsClarification, so nothing re-admitted them. One clean-slate re-admit when the
+// gate no longer blocks; a genuine hard-marker block is left alone. ---
+
+const EXT_REASON = (label) => `task requires external-state operation (${label}) that the local sandbox cannot perform -- needs a human to provision the resource first.`;
+
+function extDepTask(extra = {}) {
+  return {
+    id: 'ext-1', domain: 'adhoc', source: 'manual', status: 'blocked',
+    title: 'Fix ensureDriveToken',
+    promptContext: { rawText: 'In `credential.idToken` handling the `access_token` variable is stale.' },
+    blockedReason: EXT_REASON('credentials/API keys/tokens/secrets'),
+    localRejectCount: 1, priorRejectionFeedback: ['an earlier note'],
+    history: [{ stage: 'blocked', at: '2026-10-07T01:00:00Z', detail: 'external-state' }],
+    ...extra,
+  };
+}
+
+test('an external-dependency block the fixed gate no longer produces is re-admitted once, clean slate', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'ext-1.json'), JSON.stringify(extDepTask()));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(d.adhocDir, 'ext-1.json')));
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'ext-1.json'), 'utf8'));
+  assert.equal(out.blockedReason, undefined);
+  assert.equal(out.localRejectCount, undefined);
+  assert.equal(out.externalDepReadmitted, true);
+  assert.equal(out.status, 'pending');
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /external-dependency gate/.test(h.detail)));
+});
+
+test('a genuine hard-marker external-dependency block is NOT re-admitted', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'ext-2.json'), JSON.stringify(extDepTask({ id: 'ext-2', title: 'Create a new repo for the plugin', promptContext: { rawText: 'we need a fresh repo' }, blockedReason: EXT_REASON('creating a new repo') })));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(d.blockedDir, 'ext-2.json')));
+});
+
+test('the external-dependency re-admission fires at most once (externalDepReadmitted stamp)', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'ext-3.json'), JSON.stringify(extDepTask({ id: 'ext-3', externalDepReadmitted: true })));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 0);
+});

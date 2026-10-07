@@ -84,9 +84,9 @@ test('detectExternalDependency matches each real marker category via title/rawTe
   const { detectExternalDependency } = freshModule();
   assert.equal(detectExternalDependency({ title: 'Create a new repo for this' }), 'creating a new repo');
   assert.equal(detectExternalDependency({ promptContext: { rawText: 'deploy to production' } }), 'hosting/deploying/publishing');
-  assert.equal(detectExternalDependency({ planResponse: 'run git push origin main' }), 'a git remote operation');
-  assert.equal(detectExternalDependency({ title: 'add the API key to config' }), 'credentials/API keys/tokens/secrets');
-  assert.equal(detectExternalDependency({ lastGoodPlan: 'call a third-party service for weather data' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'run git push origin main' } }), 'a git remote operation');
+  assert.equal(detectExternalDependency({ title: 'add the API key to config' }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'call a third-party service for weather data' } }, { mode: 'block' }), 'a network/third-party service call');
 });
 
 test('detectExternalDependency returns null for an ordinary local code task', () => {
@@ -103,17 +103,17 @@ test('detectExternalDependency returns null for an ordinary local code task', ()
 // matches, the same discipline "api[\s_-]?keys?" already used (never a bare "key").
 test('detectExternalDependency does NOT false-positive on "token counts" / LLM-metrics token vocabulary', () => {
   const { detectExternalDependency } = freshModule();
-  assert.equal(detectExternalDependency({ planResponse: 'they read/report model_calls and token counts but do not make the pass/reject decision' }), null);
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'they read/report model_calls and token counts but do not make the pass/reject decision' } }), null);
   assert.equal(detectExternalDependency({ title: 'Reduce the promptTok/evalTok climb in 3-call tasks' }), null);
   assert.equal(detectExternalDependency({ promptContext: { rawText: 'tighten the tokens used per implement pass' } }), null);
 });
 
 test('detectExternalDependency still matches a real auth/API token reference', () => {
   const { detectExternalDependency } = freshModule();
-  assert.equal(detectExternalDependency({ title: 'Store the API token in a secrets manager' }), 'credentials/API keys/tokens/secrets');
-  assert.equal(detectExternalDependency({ promptContext: { rawText: 'you will need an OAuth token to call this' } }), 'credentials/API keys/tokens/secrets');
-  assert.equal(detectExternalDependency({ planResponse: 'generate a personal access token from GitHub settings' }), 'credentials/API keys/tokens/secrets');
-  assert.equal(detectExternalDependency({ title: 'Set the bearer token on every request' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ title: 'Store the API token in a secrets manager' }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'you will need an OAuth token to call this' } }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'generate a personal access token from GitHub settings' } }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ title: 'Set the bearer token on every request' }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
 });
 
 // 2026-09-11, root-caused live from two real blocked hub-children: the bare "network"/
@@ -125,18 +125,18 @@ test('detectExternalDependency still matches a real auth/API token reference', (
 test('detectExternalDependency does NOT false-positive on a negated or merely-mentioned "network"', () => {
   const { detectExternalDependency } = freshModule();
   assert.equal(detectExternalDependency({
-    planResponse: 'The test does not depend on network access, external services, or mutable global state; it is fully deterministic.',
+    promptContext: { rawText: 'The test does not depend on network access, external services, or mutable global state; it is fully deterministic.' },
   }), null);
   assert.equal(detectExternalDependency({
-    planResponse: 'The existing retry path for other errors (network, timeout, `detectDegenerate`) must remain untouched.',
+    promptContext: { rawText: 'The existing retry path for other errors (network, timeout, `detectDegenerate`) must remain untouched.' },
   }), null);
 });
 
 test('detectExternalDependency still matches a real network/third-party dependency', () => {
   const { detectExternalDependency } = freshModule();
-  assert.equal(detectExternalDependency({ lastGoodPlan: 'call a third-party service for weather data' }), 'a network/third-party service call');
-  assert.equal(detectExternalDependency({ title: 'Requires network access to fetch the remote schema' }), 'a network/third-party service call');
-  assert.equal(detectExternalDependency({ planResponse: 'make a network call to the upstream pricing API' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'call a third-party service for weather data' } }, { mode: 'block' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ title: 'Requires network access to fetch the remote schema' }, { mode: 'block' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'make a network call to the upstream pricing API' } }, { mode: 'block' }), 'a network/third-party service call');
 });
 
 test('write tier: a task requiring an external resource is blocked with needsClarification BEFORE any model call', async () => {
@@ -154,19 +154,53 @@ test('write tier: a task requiring an external resource is blocked with needsCla
   });
 });
 
-test('write tier: a task whose PLAN (not the original ask) reveals an external dependency is still caught', async () => {
+test('detectExternalDependency ignores the plan echo and code spans/fences (class B false positives)', () => {
+  const { detectExternalDependency, classifyExternalDependency } = freshModule();
+  const block = { mode: 'block' };
+  assert.equal(detectExternalDependency({ title: 'Wire notifications', promptContext: { rawText: 'add notifications' }, planResponse: 'call an external API (Twilio) to send the SMS' }, block), null);
+  assert.equal(detectExternalDependency({ lastGoodPlan: 'make a network call to the pricing API' }, block), null);
+  assert.equal(detectExternalDependency({ title: 'Fix ensureDriveToken', promptContext: { rawText: 'In `credential.idToken` handling, the `access_token` variable is stale.' } }, block), null);
+  assert.equal(detectExternalDependency({ title: 'Fix updateItem', promptContext: { rawText: 'See:\n```js\nconst h = { Authorization: bearer_token, secret: api_key };\n```\nthe loop never exits.' } }, block), null);
+  assert.equal(classifyExternalDependency({ title: 'Create a new repo' }).severity, 'hard');
+  assert.equal(classifyExternalDependency({ title: 'add the API key to config' }).severity, 'soft');
+});
+
+test('detectExternalDependency modes: hard markers block unless off; soft markers block only in block mode', () => {
+  const { detectExternalDependency, externalDependencyAdvisory } = freshModule();
+  const hard = { title: 'Create a new repo for the plugin' };
+  const soft = { title: 'add the API key to config' };
+  assert.equal(detectExternalDependency(hard, { mode: 'advisory' }), 'creating a new repo');
+  assert.equal(detectExternalDependency(hard, { mode: 'block' }), 'creating a new repo');
+  assert.equal(detectExternalDependency(hard, { mode: 'off' }), null);
+  assert.equal(detectExternalDependency(soft, { mode: 'advisory' }), null);
+  assert.equal(detectExternalDependency(soft, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency(soft, { mode: 'off' }), null);
+  assert.equal(externalDependencyAdvisory(soft, { mode: 'advisory' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(externalDependencyAdvisory(soft, { mode: 'block' }), null);
+  assert.equal(externalDependencyAdvisory(hard, { mode: 'advisory' }), null);
+});
+
+test('write tier: the default advisory mode does not block a soft-marker task and adds a prompt hint; block mode blocks it', async () => {
   await withRepo(async () => {
-    const { draftAdhocViaLocalAgenticWrite } = freshModule();
-    const task = {
-      id: 'w-ext-plan', source: 'manual', title: 'Wire up the notification feature',
-      promptContext: { rawText: 'add notifications when a task completes' },
-      planResponse: 'Plan: call an external API (Twilio) to send the SMS notification.',
-    };
-    const res = await draftAdhocViaLocalAgenticWrite(task, {
-      runInWorktree: async () => { throw new Error('must not run once the plan reveals an external dependency'); },
-    });
-    assert.equal(res.blocked, true);
-    assert.equal(res.needsClarification.reason, 'external-dependency');
+    const { draftAdhocViaLocalAgenticWrite, buildWriteAgenticPrompt } = freshModule();
+    const task = { id: 'w-soft', source: 'manual', title: 'Rename the auth token variable', promptContext: { rawText: 'rename the auth token variable in getHeaders' } };
+    assert.match(buildWriteAgenticPrompt(task), /mentions credentials\/API keys\/tokens\/secrets/);
+    assert.ok(!buildWriteAgenticPrompt({ id: 'x', title: 'Fix countPending', promptContext: { rawText: 'narrow the catch' } }).includes('Confirm this is an ordinary code edit'));
+    // Advisory mode lets the task past the gate: it reaches worktree prep (which fails cleanly
+    // here -- no origin) instead of returning the blocked external-dependency shape.
+    const through = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+    assert.notEqual(through.blocked, true);
+    assert.equal(through.needsClarification, undefined);
+    assert.equal(through.succeeded, false);
+    assert.match(through.reason, /worktree|fetch|origin/i);
+    process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE = 'block';
+    try {
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => { throw new Error('must not run in block mode'); } });
+      assert.equal(res.blocked, true);
+      assert.equal(res.needsClarification.reason, 'external-dependency');
+    } finally {
+      delete process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE;
+    }
   });
 });
 

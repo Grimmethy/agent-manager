@@ -93,10 +93,10 @@ function isEnabled() {
 // exactly the ambiguous case a Literal type would forbid, so it's now qualified the same
 // way "api[\s_-]?keys?" already was (never a bare "key").
 const EXTERNAL_DEP_MARKERS = [
-  { label: 'creating a new repo', re: /\b(create|init)\s+(a\s+)?(new\s+)?(git\s+)?repo(sitory)?\b/i },
-  { label: 'hosting/deploying/publishing', re: /\b(host|deploy|publish)\s+(at|to)\s+\S/i },
-  { label: 'a git remote operation', re: /\bgit\s+(remote|push|clone)\b/i },
-  { label: 'credentials/API keys/tokens/secrets', re: /\b(credentials?|api[\s_-]?keys?|secrets?|(?:api|auth(?:entication)?|access|bearer|session|oauth|personal[\s_-]access)[\s_-]?tokens?)\b/i },
+  { label: 'creating a new repo', severity: 'hard', re: /\b(create|init)\s+(a\s+)?(new\s+)?(git\s+)?repo(sitory)?\b/i },
+  { label: 'hosting/deploying/publishing', severity: 'hard', re: /\b(host|deploy|publish)\s+(at|to)\s+\S/i },
+  { label: 'a git remote operation', severity: 'hard', re: /\bgit\s+(remote|push|clone)\b/i },
+  { label: 'credentials/API keys/tokens/secrets', severity: 'soft', re: /\b(credentials?|api[\s_-]?keys?|secrets?|(?:api|auth(?:entication)?|access|bearer|session|oauth|personal[\s_-]access)[\s_-]?tokens?)\b/i },
   // 2026-09-11 (screaminggoatclubmt, from two real blocked hub-children -- adhoc-add-
   // node-test-coverage-for-scopecomplexitygate-1789097760618-2 and adhoc-exclude-turn-
   // limit-exhaustion-from-the-retry-loop-1788877276899-1): the bare `\bnetwork\b`/
@@ -116,7 +116,7 @@ const EXTERNAL_DEP_MARKERS = [
   // no longer matches. The negation guard is applied to every marker, not just this one,
   // since a task text saying "this does NOT need git push" or "no credentials required"
   // would be the identical false-positive shape for any of them.
-  { label: 'a network/third-party service call', re: /\b(network|internet)\s+(access|call|request|connectivity|connection|outage|dependency)\b|\bexternal\s+api\b|\bthird[\s_-]?party\s+service\b/i },
+  { label: 'a network/third-party service call', severity: 'soft', re: /\b(network|internet)\s+(access|call|request|connectivity|connection|outage|dependency)\b|\bexternal\s+api\b|\bthird[\s_-]?party\s+service\b/i },
 ];
 
 // Negation cues that, appearing shortly before a marker match, mean the surrounding text
@@ -137,15 +137,52 @@ function isNegatedMatch(text, matchIndex) {
 // task.promptContext.rawText are the real "ask" text (see buildWriteAgenticPrompt's own
 // `Title: ${task.title}` / `ctx.rawText` usage just below), task.planResponse /
 // task.lastGoodPlan is the real plan-pass output (see local-draft.js's draftPlan()).
-function detectExternalDependency(task) {
+// 2026-10-07 (blocked class B: HUB0018-01, bd-1791098464493 updateItem, bd-1791128943154
+// Promise.allSettled, bd-1791200686856 ensureDriveToken -- all ordinary code edits, third
+// patch of this same heuristic): the regexes match WORDS, so identifiers and prose that
+// merely mention a credential (credential.idToken, an existing "auth token" variable, "the
+// network call itself failed", access_token inside a pasted snippet) blocked real code
+// tasks before any model call. Three changes: (1) code fences/inline code spans are stripped
+// before matching -- an identifier in code is a reference to existing code, not a request;
+// (2) the plan echo is no longer scanned, only the task's own ask (title + rawText) -- the
+// plan just repeats whatever the ask said, so it could only add false positives; (3) markers
+// carry a severity: 'hard' ones (new repo, hosting, git remote) describe an operation the
+// sandbox truly cannot perform and always block; 'soft' ones (credentials, network) are
+// ambiguous vocabulary and only ADVISE by default. AGENT_MANAGER_EXTERNAL_DEP_MODE =
+// block (hard+soft block) | advisory (default) | off.
+function externalDepMode() {
+  const m = String(process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE || 'advisory').trim().toLowerCase();
+  return m === 'block' || m === 'off' ? m : 'advisory';
+}
+
+function stripCodeForGate(text) {
+  return String(text || '').replace(/```[\s\S]*?(?:```|$)/g, ' ').replace(/`[^`\n]*`/g, ' ');
+}
+
+// Pure classifier: the first non-negated marker hit in the task's own ask, or null.
+function classifyExternalDependency(task) {
   const ctx = (task && task.promptContext) || {};
-  const text = [task && task.title, ctx.rawText, task && (task.planResponse || task.lastGoodPlan)]
-    .filter(Boolean).join(' ');
+  const text = stripCodeForGate([task && task.title, ctx.rawText].filter(Boolean).join(' '));
   for (const marker of EXTERNAL_DEP_MARKERS) {
     const match = marker.re.exec(text);
-    if (match && !isNegatedMatch(text, match.index)) return marker.label;
+    if (match && !isNegatedMatch(text, match.index)) return { label: marker.label, severity: marker.severity };
   }
   return null;
+}
+
+// The BLOCKING decision under the current mode: a label, or null (nothing to block on).
+function detectExternalDependency(task, { mode = externalDepMode() } = {}) {
+  if (mode === 'off') return null;
+  const hit = classifyExternalDependency(task);
+  if (!hit) return null;
+  return hit.severity === 'hard' || mode === 'block' ? hit.label : null;
+}
+
+// The advisory label: a soft hit that did not block (advisory mode only).
+function externalDependencyAdvisory(task, { mode = externalDepMode() } = {}) {
+  if (mode !== 'advisory') return null;
+  const hit = classifyExternalDependency(task);
+  return hit && hit.severity === 'soft' ? hit.label : null;
 }
 
 // A task whose target is a file the file-length-scan watchdog already flagged as
@@ -348,6 +385,11 @@ function preFilterFlagsBlock(task) {
 // number is ACTUALLY enforced this pass (runPlanWithTools' nudge timing uses the same
 // value, passed by the caller below), not always the cold-start default, or the model's
 // own instructions would contradict when the nudge really fires.
+function externalDepAdvisoryBlock(task) {
+  const label = externalDependencyAdvisory(task);
+  return label ? `Note: the task text mentions ${label}. Confirm this is an ordinary code edit before treating it as an external operation; if it truly needs a resource the sandbox cannot reach, answer RESOLUTION: needs-human-decision and name it.` : '';
+}
+
 function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } = {}) {
   const ctx = task.promptContext || {};
   const leaf = leafDecomposeLocked(task);
@@ -386,6 +428,7 @@ function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } =
     hubStatusGroundingBlock(task),
     priorRejectionBlock(task),
     priorVerdictBlock(task),
+    externalDepAdvisoryBlock(task),
     blindPlanBlock(task),
     priorInvestigationBlock(task),
     acceptanceCriteriaBlock(task),
@@ -689,5 +732,5 @@ function modelStatsSafe(fn, args) {
 module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
   isLeafTask, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
-  detectExternalDependency, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
+  detectExternalDependency, classifyExternalDependency, externalDependencyAdvisory, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
 };
