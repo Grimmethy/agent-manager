@@ -2815,3 +2815,33 @@ test('formatExecutedVerificationSection tells reviewers unverified dependent tes
   assert.match(out, /Dependent test files .* did NOT finish .*unverified -- NOT a failure.*src\/dep\.test\.js/);
   assert.ok(!formatExecutedVerificationSection({ status: 'passed', tests: { ran: ['src/a.test.js'], passed: true, failures: [] }, commands: [] }).includes('Dependent test files'));
 });
+
+// --- changed-file syntax gate: what the reviewers and the record see (2026-10-07) ---
+test('executed verification: the compact summary carries the syntax result, and a failed syntax result becomes the deterministic block text', () => {
+  const { summariseExecutedVerification, executedVerificationBlockReason } = require('./review-task.js');
+  const ev = {
+    status: 'failed', reasons: ['syntax error in a file the diff changes -- cadastral_image.py:12 SyntaxError: invalid syntax (the base version parses; fix the syntax before anything else)'],
+    tests: null, commands: [],
+    syntax: { checked: ['a.js'], skipped: [{ file: 'web/App.tsx', reason: 'no syntax checker for this file type' }], failed: ['cadastral_image.py'], preexisting: [] },
+  };
+  const sum = summariseExecutedVerification(ev);
+  assert.equal(sum.status, 'failed');
+  assert.deepEqual(sum.syntax, { checked: 1, failed: ['cadastral_image.py'], preexisting: [], skipped: [{ file: 'web/App.tsx', reason: 'no syntax checker for this file type' }] });
+  const reason = executedVerificationBlockReason(ev);
+  assert.match(reason, /^Deterministic gate: executed verification failed/);
+  assert.match(reason, /cadastral_image\.py:12 SyntaxError: invalid syntax/, 'the drafter is told the file and line');
+  assert.equal(summariseExecutedVerification({ status: 'passed', reasons: [], tests: null, commands: [] }).syntax, undefined, 'absent when the harness did not report one');
+});
+
+test('executed verification: reviewers are told which files were NOT syntax-checked (TypeScript) and which already fail on the base', () => {
+  const { formatExecutedVerificationSection } = require('./review-task.js');
+  const out = formatExecutedVerificationSection({
+    status: 'passed', reasons: [], commands: [], tests: { ran: ['a.test.js'], passed: true, failures: [] },
+    syntax: { checked: ['a.js'], failed: [], preexisting: ['old.py'], skipped: [{ file: 'web/App.tsx', reason: 'no syntax checker for this file type' }, { file: 'svc/x.py', reason: 'no python interpreter available' }, { file: 'gone.js', reason: 'absent (removed or renamed by the diff)' }] },
+  });
+  assert.match(out, /NOT syntax-checked \(no checker for the file type[^)]*\): web\/App\.tsx/);
+  assert.match(out, /NOT syntax-checked \(no Python interpreter was available\): svc\/x\.py/);
+  assert.match(out, /already fail to parse on the base branch[^:]*: old\.py/);
+  assert.ok(!/gone\.js/.test(out), 'a removed file is not a coverage gap worth telling the reviewers about');
+  assert.ok(!/NOT syntax-checked/.test(formatExecutedVerificationSection({ status: 'passed', reasons: [], commands: [], tests: { ran: ['a.test.js'], passed: true, failures: [] }, syntax: { checked: ['a.js'], failed: [], preexisting: [], skipped: [] } })));
+});

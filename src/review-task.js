@@ -407,6 +407,14 @@ function formatExecutedVerificationSection(ev) {
   if (confirmed.length) out.push(`- Claimed checks the harness re-ran and CONFIRMED (they exited 0): ${evList(confirmed, EV_MAX_ITEMS)}.`);
   if (contradicted.length) out.push(`- Claimed checks that FAILED when re-run: ${evList(contradicted, EV_MAX_ITEMS)}.`);
   if (skipped) out.push(`- ${skipped} claimed check(s) could not be re-run from the repo root (not runnable as written); they are neither confirmed nor contradicted.`);
+  const syn = ev.syntax && typeof ev.syntax === 'object' ? ev.syntax : null;
+  if (syn && Array.isArray(syn.skipped)) {
+    const noChecker = syn.skipped.filter((x) => x && /no syntax checker/.test(String(x.reason))).map((x) => String(x.file));
+    if (noChecker.length) out.push(`- NOT syntax-checked (no checker for the file type, e.g. TypeScript): ${evList(noChecker, EV_MAX_ITEMS)}. A syntax error there would not have been caught by the harness -- read those files for it.`);
+    const noPython = syn.skipped.filter((x) => x && /no python interpreter/.test(String(x.reason))).map((x) => String(x.file));
+    if (noPython.length) out.push(`- NOT syntax-checked (no Python interpreter was available): ${evList(noPython, EV_MAX_ITEMS)}.`);
+  }
+  if (syn && Array.isArray(syn.preexisting) && syn.preexisting.length) out.push(`- Files that already fail to parse on the base branch (not caused by the diff): ${evList(syn.preexisting.map(String), EV_MAX_ITEMS)}.`);
   const unpinned = ev.unpinned && typeof ev.unpinned === 'object' ? ev.unpinned : null;
   if (unpinned && Array.isArray(unpinned.hunks) && unpinned.hunks.length) {
     const where = unpinned.hunks.map((h) => `${String(h.file).slice(0, 120)}:${h.start}${h.end > h.start ? `-${h.end}` : ''}`);
@@ -590,6 +598,18 @@ function classifyVote(markers, minReasoningChars) {
 // AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS.
 const EXECUTED_VERIFY_BUDGET_MS = 360000;
 
+// Changed-file syntax gate result (review-verify checkChangedFilesSyntax): counts, plus the skipped files with the reason, capped.
+function summariseSyntax(s) {
+  const list = (a) => (Array.isArray(a) ? a : []).slice(0, EV_MAX_ITEMS).map((x) => String(x).slice(0, 160));
+  return {
+    checked: Array.isArray(s.checked) ? s.checked.length : 0,
+    failed: list(s.failed),
+    preexisting: list(s.preexisting),
+    skipped: (Array.isArray(s.skipped) ? s.skipped : []).slice(0, EV_MAX_ITEMS)
+      .map((x) => ({ file: String((x && x.file) || '').slice(0, 160), reason: String((x && x.reason) || '').slice(0, 120) })),
+  };
+}
+
 // A compact, record-safe view of a review-verify result for task.executedVerification (no raw output beyond what a redraft needs).
 function summariseExecutedVerification(ev) {
   return {
@@ -601,6 +621,7 @@ function summariseExecutedVerification(ev) {
       criterion: String(c.criterion || '').slice(0, 160), command: c.command, claimedPass: !!c.claimedPass, outcome: c.outcome, exitCode: c.exitCode,
     })),
     ...(ev.unpinned && typeof ev.unpinned === 'object' ? { unpinned: summariseUnpinned(ev.unpinned) } : {}),
+    ...(ev.syntax && typeof ev.syntax === 'object' ? { syntax: summariseSyntax(ev.syntax) } : {}),
   };
 }
 
