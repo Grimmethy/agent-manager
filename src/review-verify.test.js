@@ -8,7 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS, TEST_TIMEOUT_MS } = require('./review-verify.js');
+const { splitCoveringTiers, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS, TEST_TIMEOUT_MS } = require('./review-verify.js');
 const { verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 
@@ -133,13 +133,14 @@ test('the covering-test timeout fits a ~3 min suite by default and AGENT_MANAGER
 
 test('a covering-suite timeout is inconclusive and names the unverified files', () => {
   const f = fakeDeps({
-    findTests: () => ({ js: ['src/a.test.js', 'src/slow.test.js'], py: [] }),
+    findTests: () => ({ js: ['src/a.test.js', 'src/b.test.js'], py: [] }),   // neither is changed/co-located by the diff, so both stay primary
     run: () => ({ ran: true, exitCode: null, timedOut: true, output: '' }),
+    prepare: baseTree(['src/a.js', 'src/a.test.js', 'src/b.test.js']),
   });
-  const r = verifyDiff({ ...base, deps: f.deps });
+  const r = verifyDiff({ ...base, rawDiff: 'diff --git a/src/other.js b/src/other.js\n--- a/src/other.js\n+++ b/src/other.js\n@@ -1 +1 @@\n-x\n+y\n', deps: f.deps });
   assert.equal(r.status, 'inconclusive');
-  assert.deepEqual(r.tests.timedOutFiles, ['src/a.test.js', 'src/slow.test.js']);
-  assert.match(r.reasons.join(' '), /2 file\(s\) unverified.*src\/a\.test\.js, src\/slow\.test\.js/);
+  assert.deepEqual(r.tests.timedOutFiles, ['src/a.test.js', 'src/b.test.js']);
+  assert.match(r.reasons.join(' '), /2 file\(s\) unverified.*src\/a\.test\.js, src\/b\.test\.js/);
 });
 
 test('covering tests that fail make the result failed and carry the parsed failure names', () => {
@@ -832,4 +833,61 @@ test('integration: the sibling\'s secret-looking file and queue data are NOT rea
     assert.equal(r.status, 'passed', JSON.stringify(r));
     assert.equal(r.tests.passed, true);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// --- two evidence tiers: primary (changed + co-located tests) gate the verdict; dependents (mere importers) only report -------------------
+test('splitCoveringTiers: changed and co-located tests are primary, mere importers are dependents; no primary keeps everything primary', () => {
+  const affected = { js: ['src/x.test.js', 'src/y.test.js', 'src/z.test.js'], py: ['python/d/test_m.py', 'python/d/test_other.py'] };
+  let t = splitCoveringTiers(['src/x.js', 'src/x.test.js', 'python/d/m.py'], affected);
+  assert.deepEqual(t.primary, { js: ['src/x.test.js'], py: ['python/d/test_m.py'] });
+  assert.deepEqual(t.dependents, { js: ['src/y.test.js', 'src/z.test.js'], py: ['python/d/test_other.py'] });
+  t = splitCoveringTiers(['src/x.js'], affected);                       // co-located x.test.js, no changed test file
+  assert.deepEqual(t.primary.js, ['src/x.test.js']);
+  t = splitCoveringTiers(['src/lib/util.js'], { js: ['src/a.test.js', 'src/b.test.js'], py: [] });   // no name-matched test: all stay primary
+  assert.deepEqual(t.primary.js, ['src/a.test.js', 'src/b.test.js']);
+  assert.deepEqual(t.dependents.js, []);
+});
+
+const TIER_FILES = ['src/a.js', 'src/a.test.js', 'src/dep.test.js'];
+test('a dependent test file that times out is reported unverified and does NOT make the result inconclusive', () => {
+  const run = scriptedRun([passing, { exitCode: null, timedOut: true }]);   // primary passes, dependents time out
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.equal(r.tests.passed, true);
+  assert.deepEqual(r.tests.dependentsUnverified, ['src/dep.test.js']);
+  assert.deepEqual(run.calls.map((c) => c.args.filter((a) => a.endsWith('.test.js'))), [['src/a.test.js'], ['src/dep.test.js']], 'primary and dependents run as separate suites');
+});
+
+test('a dependent test file that FAILS with the diff but passes on the base still fails the result', () => {
+  const run = scriptedRun([passing, failing('dep breaks'), passing]);   // primary ok, dependent fails, dependent passes on the base
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.tests.passed, false);
+  assert.deepEqual(r.tests.failures, ['dep breaks']);
+});
+
+test('a PRIMARY timeout is still inconclusive even when the dependents pass', () => {
+  const run = scriptedRun([{ exitCode: null, timedOut: true }, passing]);
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.timedOutFiles, ['src/a.test.js']);
+});
+
+test('a dependent file that also fails on the base in the sandbox is unverified, not a reason to void a passing primary tier', () => {
+  const run = scriptedRun([passing, failing('env only'), failing('env only')]);   // primary ok; dependent fails with the diff AND on the base
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.equal(r.tests.passed, true);
+  assert.deepEqual(r.tests.dependentsUnverified, ['src/dep.test.js']);
+});
+
+test('a primary file that also fails on the base in the sandbox still makes the result inconclusive', () => {
+  const run = scriptedRun([failing('env only'), failing('env only')]);
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
 });

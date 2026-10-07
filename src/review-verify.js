@@ -417,6 +417,33 @@ function checkUnpinnedHunks({ worktreeDir, rawDiff, suites, run, d, deadline, py
   return res;
 }
 
+// Two evidence tiers for the covering tests. PRIMARY = the test files the diff itself changes plus the co-located test of each changed
+// source file (foo.js -> foo.test.js, foo.py -> test_foo.py): they gate the verdict. DEPENDENTS = every other test that merely imports a
+// changed module (scoped-test-runner's reverse dependents): a module many tests import has a large, legitimate covering set, and one slow
+// importer (src/local-draft.test.js, minutes) must not make the whole result inconclusive. A dependent that FAILS still counts (against the
+// base); one that times out or never gets budget is reported unverified. When a language has no primary file, all of it stays primary.
+function splitCoveringTiers(changedFiles, affected) {
+  const changedSet = new Set(changedFiles || []);
+  const colocated = new Set();
+  for (const f of changedFiles || []) {
+    if (/\.py$/i.test(f)) {
+      const name = path.basename(f, '.py');
+      if (!name.startsWith('test_')) colocated.add(path.join(path.dirname(f), `test_${name}.py`).replace(/\\/g, '/'));
+    } else if (/\.[jt]sx?$/i.test(f) && !isTestFile(f)) {
+      const ext = path.extname(f);
+      colocated.add(`${f.slice(0, -ext.length)}.test${ext}`);
+    }
+  }
+  const split = (files) => {
+    const primary = (files || []).filter((f) => changedSet.has(f) || colocated.has(f));
+    if (!primary.length) return { primary: files || [], dependents: [] };
+    return { primary, dependents: (files || []).filter((f) => !primary.includes(f)) };
+  };
+  const js = split(affected && affected.js);
+  const py = split(affected && affected.py);
+  return { primary: { js: js.primary, py: py.primary }, dependents: { js: js.dependents, py: py.dependents } };
+}
+
 function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, deps = {} }) {
   const d = {
     prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
@@ -444,24 +471,29 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     const failures = [];
     const failedSuites = [];       // suites that failed WITH the diff, pending attribution against the base
     const contradictedCmds = [];   // claimed-PASS commands that exited non-zero WITH the diff, pending attribution
-    const runOne = (bin, args, timeoutMs) => {
+    const runOne = (bin, args, timeoutMs, { tolerateTimeout = false } = {}) => {
       const remaining = deadline - Date.now();
-      if (remaining <= 1000) { anyTimeout = true; return { ran: true, timedOut: true, exitCode: null, output: '' }; }
+      if (remaining <= 1000) { if (!tolerateTimeout) anyTimeout = true; return { ran: true, timedOut: true, exitCode: null, output: '' }; }
       const r = d.run({ worktreeDir, bin, args, timeoutMs: Math.min(timeoutMs, remaining), pythonBin: py, mainRepoRoot: repoRoot });
       if (!r.ran) { sandboxMissing = true; return r; }
       anyExecuted = true;
-      if (r.timedOut) anyTimeout = true;
+      if (r.timedOut && !tolerateTimeout) anyTimeout = true;
       return r;
     };
 
     // 1. The tests that cover the changed files.
     const changed = extractChangedFiles(rawDiff);
-    const affected = d.findTests(worktreeDir, changed, rawDiff);
+    const found = d.findTests(worktreeDir, changed, rawDiff);
+    const tiers = splitCoveringTiers(changed, found);
+    const affected = tiers.primary;
     const suites = [];
+    const depSuites = [];
     const jsArgs = (files) => ['--test', ...files];
     const pyArgs = (files) => ['-m', 'unittest', ...files.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'))];
     if (affected.js.length) suites.push({ label: 'js', bin: 'node', buildArgs: jsArgs, files: affected.js, parse: parseNodeTestFailures });
     if (affected.py.length) suites.push({ label: 'py', bin: 'python', buildArgs: pyArgs, files: affected.py, parse: parsePyTestFailures });
+    if (tiers.dependents.js.length) depSuites.push({ label: 'js', bin: 'node', buildArgs: jsArgs, files: tiers.dependents.js, parse: parseNodeTestFailures });
+    if (tiers.dependents.py.length) depSuites.push({ label: 'py', bin: 'python', buildArgs: pyArgs, files: tiers.dependents.py, parse: parsePyTestFailures });
     if (suites.length) {
       result.tests = { ran: [], passed: true, failures: [], timedOut: false };
       for (const s of suites) {
@@ -497,6 +529,18 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
       }
     }
 
+    // 2a. Dependent tier: tests that only import a changed module. Run with whatever budget is left; a timeout or exhausted budget is
+    // reported (result.tests.dependentsUnverified), never a reason for inconclusive. A real failure goes through the same base attribution.
+    if (result.tests && depSuites.length) {
+      for (const s of depSuites) {
+        const r = runOne(s.bin, s.buildArgs(s.files), TEST_TIMEOUT_MS, { tolerateTimeout: true });
+        if (!r.ran) continue;
+        result.tests.dependents = [...(result.tests.dependents || []), ...s.files];
+        if (r.timedOut) { result.tests.dependentsUnverified = [...(result.tests.dependentsUnverified || []), ...s.files]; continue; }
+        if (r.exitCode !== 0) failedSuites.push({ s, dependent: true, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] });   // result.tests.passed is only touched once the failure is attributed to the diff
+      }
+    }
+
     // 2b. Gate replay (src/gate-replay.js, brain dump 7/8): while the diff is still applied (step 3 reverses it), replay any gate/guard/detector the diff adds or changes
     // over tasks that already ran. Advisory data on the result; it never changes the status, and any failure here is swallowed.
     if (checkReplay && pipelineDir && deadline - Date.now() > REPLAY_MIN_REMAINING_MS) {
@@ -513,23 +557,30 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     // good draft was blocked because python/dashboard/test_start_pipeline_apply_root.py fails on the untouched base in the review sandbox. The diff is
     // reversed in this throwaway worktree and each failing check re-run; anything that also fails on the base is reported inconclusive, never a block.
     const unattributable = [];
+    // A dependent-tier failure that cannot be pinned on the diff (it also fails on the base in this sandbox, cannot run, or cannot be re-checked)
+    // is reported unverified; only a primary-tier one makes the whole result inconclusive.
+    const unverifiedOrUnattributable = (f, msg) => {
+      if (!f.dependent) { unattributable.push(msg); return; }
+      const have = (result.tests && result.tests.dependentsUnverified) || [];
+      result.tests.dependentsUnverified = [...have, ...f.s.files.filter((x) => !have.includes(x))];
+    };
     if (failedSuites.length || contradictedCmds.length) {
       const back = d.unapplyDiff(worktreeDir, rawDiff);
       if (!back || !back.applied) {
-        for (const f of failedSuites) unattributable.push(`covering ${f.s.label} tests failed, but the diff could not be reversed to check them against the base`);
+        for (const f of failedSuites) unverifiedOrUnattributable(f, `covering ${f.s.label} tests failed, but the diff could not be reversed to check them against the base`);
         for (const x of contradictedCmds) { x.entry.outcome = 'inconclusive'; unattributable.push(`\`${x.c.text}\` failed, but the diff could not be reversed to check it against the base`); }
-        if (result.tests) result.tests.passed = null;
+        if (result.tests && failedSuites.some((f) => !f.dependent)) result.tests.passed = null;
       } else {
         for (const f of failedSuites) {
           const unresolved = f.s.label === 'js' ? sandboxUnresolvedDependency(f.missing, repoRoot) : null;
           if (unresolved) {
-            unattributable.push(`covering ${f.s.label} tests (${f.s.files.join(', ')}) could not run: sandbox cannot resolve ${unresolved} (present on the host, missing in the review sandbox), so the failure says nothing about the diff`);
+            unverifiedOrUnattributable(f, `covering ${f.s.label} tests (${f.s.files.join(', ')}) could not run: sandbox cannot resolve ${unresolved} (present on the host, missing in the review sandbox), so the failure says nothing about the diff`);
             continue;
           }
           const baseFiles = f.s.files.filter((file) => fs.existsSync(path.join(worktreeDir, file)));
           let attributable = f.names;
           if (baseFiles.length) {
-            const b = runOne(f.s.bin, f.s.buildArgs(baseFiles), TEST_TIMEOUT_MS);
+            const b = runOne(f.s.bin, f.s.buildArgs(baseFiles), TEST_TIMEOUT_MS, { tolerateTimeout: !!f.dependent });
             if (!b.ran || b.timedOut) attributable = null;                       // cannot tell -- do not block
             else if (b.exitCode !== 0) {
               const baseNames = f.s.parse(b.output);
@@ -540,10 +591,11 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
           }
           if (attributable && (attributable.length || !baseFiles.length)) {
             result.tests.failures.push(...attributable);
+            if (f.dependent) result.tests.passed = false;
             result.tests.raw = f.raw;
             failures.push(`covering ${f.s.label} tests failed`);
           } else {
-            unattributable.push(`covering ${f.s.label} tests (${f.s.files.join(', ')}) already fail on ${mainBranch} in the review sandbox, so the failure is not caused by the diff`);
+            unverifiedOrUnattributable(f, `covering ${f.s.label} tests (${f.s.files.join(', ')}) already fail on ${mainBranch} in the review sandbox, so the failure is not caused by the diff`);
           }
         }
         for (const x of contradictedCmds) {
@@ -585,7 +637,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 }
 
 module.exports = {
-  extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
+  splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
 };

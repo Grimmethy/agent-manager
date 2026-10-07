@@ -2746,3 +2746,10 @@ test('the executed-verification budget exceeds the covering-test timeout so a sl
   const { DEFAULT_TEST_TIMEOUT_MS } = require('./review-verify.js');
   assert.ok(EXECUTED_VERIFY_BUDGET_MS >= DEFAULT_TEST_TIMEOUT_MS + 120000, `budget ${EXECUTED_VERIFY_BUDGET_MS} must leave room for the syntax/command checks after a full-length test run (${DEFAULT_TEST_TIMEOUT_MS})`);
 });
+
+test('formatExecutedVerificationSection tells reviewers unverified dependent test files are not a failure', () => {
+  const { formatExecutedVerificationSection } = require('./review-task.js');
+  const out = formatExecutedVerificationSection({ status: 'passed', tests: { ran: ['src/a.test.js', 'src/dep.test.js'], passed: true, failures: [], dependentsUnverified: ['src/dep.test.js'] }, commands: [] });
+  assert.match(out, /Dependent test files .* did NOT finish .*unverified -- NOT a failure.*src\/dep\.test\.js/);
+  assert.ok(!formatExecutedVerificationSection({ status: 'passed', tests: { ran: ['src/a.test.js'], passed: true, failures: [] }, commands: [] }).includes('Dependent test files'));
+});
