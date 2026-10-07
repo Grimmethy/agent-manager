@@ -34,6 +34,7 @@ const { prepareAdhocWorktree, applyPartialDiff, cleanupAdhocWorktree, runGit } =
 const { findAffectedTestFiles, parseNodeTestFailures, parsePyTestFailures } = require('./scoped-test-runner.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { externalDependencyLinks, codeBindPaths } = require('./lib/draft-sandbox.js');
+const { checkerFor, isModuleFormatAmbiguity, summarizeSyntaxError, resolvePython } = require('./lib/syntax-check.js');
 
 const COMMAND_TIMEOUT_MS = 120000;
 // 2026-10-07: a single `node --test` call over the covering files must be able to fit the slowest
@@ -49,6 +50,7 @@ const TEST_TIMEOUT_MS = resolveTestTimeoutMs();
 const TOTAL_BUDGET_MS = 300000;
 const MAX_COMMANDS = 8;
 const MAX_OUTPUT_CHARS = 4000;
+const SYNTAX_TIMEOUT_MS = 20000;
 const REPLAY_MIN_REMAINING_MS = 8000;
 const REPLAY_TIMEOUT_MS = 90000;
 
@@ -444,17 +446,77 @@ function splitCoveringTiers(changedFiles, affected) {
   return { primary: { js: js.primary, py: py.primary }, dependents: { js: js.dependents, py: py.dependents } };
 }
 
+// --- changed-file syntax gate ------------------------------------------------------------------------------------------------------
+// Runs the language's own parser over every file the diff changed (lib/syntax-check.js), BEFORE any test: a file that does not parse makes
+// every test below it meaningless, and the local reviewers have approved such edits (AC-271's split import, twice). A failure only counts
+// against the diff if the same file parsed on the BASE: the diff is un-applied, the failing files re-checked, and the diff re-applied
+// (restoreFailed reports a tree that could not be put back, which the caller treats as inconclusive). Files with no checker (TypeScript,
+// markdown, ...), files the diff removed, python files with no interpreter and runs that cannot happen are SKIPPED with a reason; skipped
+// files never fail the result.
+function checkChangedFilesSyntax({ worktreeDir, files, rawDiff, run, py, repoRoot, d, deadline }) {
+  const out = { checked: [], skipped: [], failed: [], preexisting: [], restoreFailed: false, unattributable: [] };
+  const checkOne = (file) => {
+    const checker = checkerFor(file);
+    if (!checker) return { skip: 'no syntax checker for this file type' };
+    const full = path.join(worktreeDir, file);
+    let stat;
+    try { stat = fs.statSync(full); } catch { return { skip: 'absent (removed or renamed by the diff)' }; }
+    if (!stat.isFile()) return { skip: 'not a regular file' };
+    if (checker.kind === 'json') {
+      try { JSON.parse(fs.readFileSync(full, 'utf8')); return { ok: true }; } catch (e) { return { error: `${file} ${String((e && e.message) || e).slice(0, 200)}` }; }
+    }
+    if (checker.kind === 'python' && !py) return { skip: 'no python interpreter available' };
+    const remaining = deadline - Date.now();
+    if (remaining <= 1000) return { skip: 'review time budget exhausted' };
+    const r = run({ worktreeDir, bin: checker.bin, args: checker.args, timeoutMs: Math.min(SYNTAX_TIMEOUT_MS, remaining), pythonBin: py, mainRepoRoot: repoRoot });
+    if (!r || !r.ran) return { skip: (r && r.reason) || 'checker could not run' };
+    if (r.timedOut) return { skip: 'syntax check timed out' };
+    if (r.exitCode === 0) return { ok: true };
+    if (isModuleFormatAmbiguity(r.output)) return { skip: 'module-format ambiguity (not a syntax error)' };
+    return { error: summarizeSyntaxError(r.output, file) };
+  };
+
+  const withDiff = new Map();
+  for (const file of files) {
+    const res = checkOne(file);
+    withDiff.set(file, res);
+    if (res.ok) out.checked.push(file);
+    else if (res.skip) out.skipped.push({ file, reason: res.skip });
+  }
+  const failing = files.filter((f) => withDiff.get(f).error);
+  if (!failing.length) return out;
+
+  const un = d.unapplyDiff(worktreeDir, rawDiff);
+  if (!un || !un.applied) {
+    out.unattributable = failing.map((f) => ({ file: f, error: withDiff.get(f).error }));
+    return out;
+  }
+  try {
+    for (const file of failing) {
+      const onBase = fs.existsSync(path.join(worktreeDir, file));
+      if (!onBase) { out.failed.push({ file, error: withDiff.get(file).error }); continue; }   // a NEW file cannot be "already broken"
+      const base = checkOne(file);
+      if (base.error) out.preexisting.push({ file, error: base.error });
+      else out.failed.push({ file, error: withDiff.get(file).error });
+    }
+  } finally {
+    const back = d.applyDiff(worktreeDir, rawDiff);
+    if (!back || !back.applied) out.restoreFailed = true;
+  }
+  return out;
+}
+
 function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, deps = {} }) {
   const d = {
     prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
-    relink: relinkExternalDependencies, findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args), ...deps,
+    relink: relinkExternalDependencies, resolvePy: resolvePython, findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args), ...deps,
   };
   const result = { status: 'inconclusive', reasons: [], apply: null, tests: null, commands: [] };
   const inconclusive = (reason) => { result.reasons.push(reason); return result; };
   if (!String(rawDiff || '').trim()) return inconclusive('no diff to verify');
   const { worktreeDir, branchName } = worktreePaths(taskId);
   const deadline = Date.now() + budgetMs;
-  const py = pythonBin || (repoRoot && fs.existsSync(path.join(repoRoot, '.venv', 'bin', 'python')) ? path.join(repoRoot, '.venv', 'bin', 'python') : null);
+  const py = d.resolvePy({ explicit: pythonBin, repoRoot });
   let prepared = false;
   try {
     const prep = d.prepare(repoRoot, mainBranch, worktreeDir, branchName);
@@ -465,8 +527,20 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     result.apply = { applied: !!applied.applied, reason: applied.reason || null };
     if (!applied.applied) return inconclusive(`the diff does not apply to ${mainBranch} (often a slice that depends on an unmerged earlier one): ${applied.reason || 'unknown'}`);
 
+    // 0. Do the changed files still parse? Decided before any test is spent on them.
+    const syn = checkChangedFilesSyntax({ worktreeDir, files: extractChangedFiles(rawDiff), rawDiff, run: d.syntaxRun || d.run, py, repoRoot, d, deadline });
+    result.syntax = { checked: syn.checked, skipped: syn.skipped, failed: syn.failed.map((f) => f.file), preexisting: syn.preexisting.map((f) => f.file) };
+    if (syn.restoreFailed) return inconclusive('the diff could not be re-applied after the syntax base check, so nothing further was run');
+    if (syn.unattributable.length) return inconclusive(`a changed file does not parse with the diff, but the diff could not be un-applied to tell whether the base already failed: ${syn.unattributable.map((f) => f.error).join('; ')}`);
+    if (syn.failed.length) {
+      result.status = 'failed';
+      result.reasons.push(...syn.failed.map((f) => `syntax error in a file the diff changes -- ${f.error} (the base version parses; fix the syntax before anything else)`));
+      return result;
+    }
+
     let anyTimeout = false;
     let sandboxMissing = false;
+    const notRunReasons = new Set();
     let anyExecuted = false;
     const failures = [];
     const failedSuites = [];       // suites that failed WITH the diff, pending attribution against the base
@@ -475,7 +549,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
       const remaining = deadline - Date.now();
       if (remaining <= 1000) { if (!tolerateTimeout) anyTimeout = true; return { ran: true, timedOut: true, exitCode: null, output: '' }; }
       const r = d.run({ worktreeDir, bin, args, timeoutMs: Math.min(timeoutMs, remaining), pythonBin: py, mainRepoRoot: repoRoot });
-      if (!r.ran) { sandboxMissing = true; return r; }
+      if (!r.ran) { sandboxMissing = true; notRunReasons.add(r.reason || 'bwrap sandbox unavailable'); return r; }
       anyExecuted = true;
       if (r.timedOut && !tolerateTimeout) anyTimeout = true;
       return r;
@@ -611,7 +685,11 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     }
     if (failures.length) { result.status = 'failed'; result.reasons.push(...failures); return result; }
     if (unattributable.length) return inconclusive(unattributable.join('; '));
-    if (sandboxMissing && !anyExecuted) return inconclusive('the bwrap sandbox is unavailable, so nothing was executed');
+    if (sandboxMissing && !anyExecuted) {
+      const reasons = [...notRunReasons];
+      const onlySandbox = !reasons.length || reasons.every((x) => /bwrap/i.test(x));
+      return inconclusive(onlySandbox ? 'the bwrap sandbox is unavailable, so nothing was executed' : `nothing was executed: ${reasons.join('; ')}`);
+    }
     if (anyTimeout) {
       const unverified = (result.tests && result.tests.timedOutFiles) || [];
       return inconclusive(unverified.length
@@ -637,7 +715,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 }
 
 module.exports = {
-  splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
+  checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
 };

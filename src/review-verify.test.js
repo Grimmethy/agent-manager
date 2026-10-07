@@ -66,6 +66,8 @@ function fakeDeps(over = {}) {
       cleanup: () => { calls.cleanup += 1; fs.rmSync(worktreePaths('t1').worktreeDir, { recursive: true, force: true }); },
       findTests: () => ({ js: [], py: [] }),
       run: (a) => { calls.run.push(a); return { ran: true, exitCode: 0, timedOut: false, output: '' }; },
+      // The changed-file syntax step has its own runner so these legacy cases (which script and count `run` calls for the tests) stay unaffected.
+      syntaxRun: () => ({ ran: true, exitCode: 0, timedOut: false, output: '' }),
       ...over,
     },
   };
@@ -890,4 +892,143 @@ test('a primary file that also fails on the base in the sandbox still makes the 
   const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
   const r = verifyDiff({ ...base, deps: f.deps });
   assert.equal(r.status, 'inconclusive');
+});
+
+// --- changed-file syntax gate (2026-10-07: AC-271's split import reached pending-merge, then the redraft repeated it) ----------------------
+// A stateful stub: `applied` follows applyDiff/unapplyDiff so a check can behave differently with the diff and on the base. Files named in
+// `newFiles` exist only while the diff is applied; the others exist throughout.
+function synDeps({ tree = ['src/a.js', 'src/a.test.js'], contents = {}, appliedContents = {}, newFiles = [], failWith = () => false, unapplyOk = true, reapplyOk = true, over = {} } = {}) {
+  const st = { applied: false, applyCalls: 0, unapplyCalls: 0, synRuns: [] };
+  const dir = () => worktreePaths('t1').worktreeDir;
+  const f = fakeDeps({
+    prepare: () => {
+      fs.rmSync(dir(), { recursive: true, force: true });
+      for (const t of tree) { fs.mkdirSync(path.dirname(path.join(dir(), t)), { recursive: true }); fs.writeFileSync(path.join(dir(), t), contents[t] != null ? contents[t] : '// base\n'); }
+      return { ok: true };
+    },
+    applyDiff: () => {
+      st.applyCalls += 1;
+      if (st.applyCalls > 1 && !reapplyOk) return { applied: false, reason: 'conflict' };
+      st.applied = true;
+      for (const n of newFiles) { fs.mkdirSync(path.dirname(path.join(dir(), n)), { recursive: true }); fs.writeFileSync(path.join(dir(), n), '// new\n'); }
+      for (const [n, c] of Object.entries(appliedContents)) fs.writeFileSync(path.join(dir(), n), c);
+      return { applied: true };
+    },
+    unapplyDiff: () => {
+      st.unapplyCalls += 1;
+      if (!unapplyOk) return { applied: false, reason: 'cannot reverse' };
+      st.applied = false;
+      for (const n of newFiles) fs.rmSync(path.join(dir(), n), { force: true });
+      for (const n of Object.keys(appliedContents)) fs.writeFileSync(path.join(dir(), n), contents[n] != null ? contents[n] : '// base\n');
+      return { applied: true };
+    },
+    syntaxRun: (a) => {
+      st.synRuns.push({ bin: a.bin, file: a.args[a.args.length - 1], applied: st.applied });
+      const file = a.args[a.args.length - 1];
+      const fail = failWith({ file, applied: st.applied });
+      return fail ? { ran: true, exitCode: 1, timedOut: false, output: typeof fail === 'string' ? fail : `${file}:12\n  x = ;\n\nSyntaxError: Unexpected token ';'` } : { ran: true, exitCode: 0, timedOut: false, output: '' };
+    },
+    findTests: () => ({ js: ['src/a.test.js'], py: [] }),
+    ...over,
+  });
+  return { f, st };
+}
+
+test('syntax gate: a changed file that parses on the base but not with the diff FAILS the result before any test is run, naming the file and line', () => {
+  const { f, st } = synDeps({ failWith: ({ file, applied }) => applied && file === 'src/a.js' });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.match(r.reasons[0], /syntax error in a file the diff changes -- src\/a\.js:12 SyntaxError: Unexpected token/);
+  assert.deepEqual(r.syntax.failed, ['src/a.js']);
+  assert.equal(f.calls.run.length, 0, 'no covering test is spent on a file that does not parse');
+  assert.equal(r.tests, null);
+  assert.equal(st.unapplyCalls, 1);
+  assert.equal(st.applied, true, 'the diff was put back');
+  assert.equal(f.calls.cleanup, 1);
+});
+
+test('syntax gate: a file that already fails on the base is pre-existing and does not fail the result', () => {
+  const { f } = synDeps({ failWith: ({ file }) => file === 'src/a.js' });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.notEqual(r.status, 'failed');
+  assert.deepEqual(r.syntax.preexisting, ['src/a.js']);
+  assert.deepEqual(r.syntax.failed, []);
+  assert.ok(f.calls.run.length > 0, 'the tests still ran');
+});
+
+test('syntax gate: a NEW file that does not parse has no base to compare with, so the failure stands', () => {
+  const { f } = synDeps({ tree: ['src/a.test.js'], newFiles: ['src/a.js'], failWith: ({ file, applied }) => applied && file === 'src/a.js' });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(r.syntax.failed, ['src/a.js']);
+});
+
+test('syntax gate: a file the diff removed, a TypeScript file and an unknown extension are skipped with a reason and never fail the result', () => {
+  const diff = DIFF + 'diff --git a/src/gone.js b/src/gone.js\n--- a/src/gone.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\ndiff --git a/web/App.tsx b/web/App.tsx\n--- a/web/App.tsx\n+++ b/web/App.tsx\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/run.sh b/run.sh\n--- a/run.sh\n+++ b/run.sh\n@@ -1 +1 @@\n-a\n+b\n';
+  const { f } = synDeps({ tree: ['src/a.js', 'src/a.test.js', 'web/App.tsx', 'run.sh'] });
+  const r = verifyDiff({ ...base, rawDiff: diff, deps: f.deps });
+  assert.notEqual(r.status, 'failed');
+  const why = Object.fromEntries(r.syntax.skipped.map((x) => [x.file, x.reason]));
+  assert.match(why['src/gone.js'], /absent/);
+  assert.match(why['web/App.tsx'], /no syntax checker/);
+  assert.match(why['run.sh'], /no syntax checker/);
+  assert.deepEqual(r.syntax.checked.sort(), ['src/a.js', 'src/a.test.js']);
+});
+
+test('syntax gate: python files are skipped (not failed) when no interpreter can be found, and checked with the resolved one otherwise', () => {
+  const diff = 'diff --git a/svc/x.py b/svc/x.py\n--- a/svc/x.py\n+++ b/svc/x.py\n@@ -1 +1 @@\n-a\n+b\n';
+  let a = synDeps({ tree: ['svc/x.py'], over: { resolvePy: () => null, findTests: () => ({ js: [], py: [] }) } });
+  let r = verifyDiff({ ...base, rawDiff: diff, deps: a.f.deps });
+  assert.notEqual(r.status, 'failed');
+  assert.match(r.syntax.skipped[0].reason, /no python interpreter/);
+  assert.equal(a.st.synRuns.length, 0);
+  a = synDeps({ tree: ['svc/x.py'], failWith: ({ applied }) => applied && 'File "svc/x.py", line 3\nSyntaxError: invalid syntax', over: { resolvePy: () => '/usr/bin/python3', findTests: () => ({ js: [], py: [] }) } });
+  r = verifyDiff({ ...base, rawDiff: diff, deps: a.f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(a.st.synRuns[0].bin, 'python');
+  assert.match(r.reasons[0], /svc\/x\.py:3 SyntaxError: invalid syntax/);
+});
+
+test('syntax gate: node module-format messages are skipped, not failures', () => {
+  const { f } = synDeps({ failWith: ({ applied }) => applied && 'SyntaxError: Cannot use import statement outside a module' });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.notEqual(r.status, 'failed');
+  assert.ok(r.syntax.skipped.some((x) => /module-format/.test(x.reason)));
+});
+
+test('syntax gate: when the diff cannot be reversed, or cannot be put back, the result is inconclusive and nothing else runs', () => {
+  let x = synDeps({ failWith: ({ applied }) => applied, unapplyOk: false });
+  let r = verifyDiff({ ...base, deps: x.f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons[0], /could not be un-applied/);
+  assert.equal(x.f.calls.run.length, 0);
+  x = synDeps({ failWith: ({ file, applied }) => applied && file === 'src/a.js', reapplyOk: false });
+  r = verifyDiff({ ...base, deps: x.f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons[0], /could not be re-applied/);
+  assert.equal(x.f.calls.run.length, 0);
+});
+
+test('syntax gate: a clean diff never reverses the diff, and a .json file is parsed in process', () => {
+  const diff = DIFF + 'diff --git a/cfg/x.json b/cfg/x.json\n--- a/cfg/x.json\n+++ b/cfg/x.json\n@@ -1 +1 @@\n-{}\n+{"a":1}\n';
+  const tree = ['src/a.js', 'src/a.test.js', 'cfg/x.json'];
+  let x = synDeps({ tree, contents: { 'cfg/x.json': '{"a":1}' } });
+  let r = verifyDiff({ ...base, rawDiff: diff, deps: x.f.deps });
+  assert.notEqual(r.status, 'failed');
+  assert.equal(x.st.unapplyCalls, 0, 'an all-clean run never touches the worktree');
+  assert.ok(r.syntax.checked.includes('cfg/x.json'));
+  x = synDeps({ tree, contents: { 'cfg/x.json': '{"a":1}' }, appliedContents: { 'cfg/x.json': '{"a":' } });
+  r = verifyDiff({ ...base, rawDiff: diff, deps: x.f.deps });
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(r.syntax.failed, ['cfg/x.json']);
+  assert.match(r.reasons[0], /cfg\/x\.json/);
+});
+
+test('an unresolved python interpreter is reported as such, not as an unavailable sandbox', () => {
+  const diff = 'diff --git a/svc/x.py b/svc/x.py\n--- a/svc/x.py\n+++ b/svc/x.py\n@@ -1 +1 @@\n-a\n+b\n';
+  const f = fakeDeps({ prepare: baseTree(['svc/x.py', 'svc/test_x.py']), resolvePy: () => null, findTests: () => ({ js: [], py: ['svc/test_x.py'] }), run: () => ({ ran: false, reason: 'no python interpreter available' }) });
+  const r = verifyDiff({ ...base, rawDiff: diff, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons.join(' '), /no python interpreter available/);
+  assert.doesNotMatch(r.reasons.join(' '), /bwrap/);
 });
