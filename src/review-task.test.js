@@ -600,6 +600,15 @@ test('NON_IMPL gate: a short mode "read" request, short prose, an item without a
   }
 });
 
+test('NON_IMPL gate: a long implementResponse (summary plus diff) that merely MENTIONS "mode": "read" is NOT rejected as a tool call', async () => {
+  const body = `Added gate tests.\n\n=== DIFF ===\n${'diff --git a/src/x.test.js b/src/x.test.js\n+  const resp = \'{"mode": "read", "file": "a.js"}\';\n+  assert.equal(blocked(resp), true);\n'.repeat(8)}`;
+  assert.ok(body.length > 300);
+  const { task, result, votes } = await gateOutcomeFor(body);
+  assert.notEqual(task.reviewProvider, 'deterministic-non-implementation');
+  assert.equal(result.verdict, 'approved');
+  assert.equal(votes, 1);
+});
+
 // Regression, 2026-08-23: caught live -- observabilityReviewImplementPrompt/
 // performanceReviewImplementPrompt (prompts.js) explicitly ask for a short 2-4 sentence
 // prose paragraph on a FALSE POSITIVE/UNCERTAIN verdict, but neither source was in

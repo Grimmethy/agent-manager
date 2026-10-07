@@ -50,4 +50,27 @@ function isStructuredGroupBChange(implementResponse) {
   }
 }
 
-module.exports = { isStructuredGroupBChange, isValidChangeItem, isRepoRelativePath };
+// A "read" tool-call request: the model asking to look at a file instead of implementing (`{"mode": "read", "file": "..."}`).
+// review-task.js's NON_IMPL_PATTERNS used a bare /"mode"\s*:\s*"read"/ against the WHOLE implementResponse, so any diff or
+// summary that merely MENTIONED the string (a test fixture, this very file) was rejected as "a bare tool-call request"
+// (found 2026-10-07 when the review of the length-gate fix itself blocked on its own tests). A request is only a request
+// when the response IS one: it parses as JSON whose items include mode "read", or it is a short fragment (under
+// SHORT_FRAGMENT_CHARS) containing the marker. Never throws.
+const SHORT_FRAGMENT_CHARS = 200;
+const READ_MODE_RE = /"mode"\s*:\s*"read"/;
+
+function looksLikeReadToolCall(implementResponse) {
+  try {
+    if (typeof implementResponse !== 'string') return false;
+    const text = stripSingleFence(implementResponse.trim()).trim();
+    if (!READ_MODE_RE.test(text)) return false;
+    if (text.length < SHORT_FRAGMENT_CHARS) return true;
+    if (text[0] !== '{' && text[0] !== '[') return false;
+    const parsed = JSON.parse(text);
+    return (Array.isArray(parsed) ? parsed : [parsed]).some((item) => item && typeof item === 'object' && item.mode === 'read');
+  } catch {
+    return false;
+  }
+}
+
+module.exports = { isStructuredGroupBChange, looksLikeReadToolCall, isValidChangeItem, isRepoRelativePath };
