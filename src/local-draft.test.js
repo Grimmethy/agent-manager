@@ -3048,30 +3048,69 @@ test('a task with NO model profile still defaults to think:true, unaffected by t
 // Uses staleness_audit (already in task-sources.js's base set this fixture loads) rather
 // than performance_review, so no "Cannot update unregistered task source" crash at
 // task-source-registry.js:114 (the prior attempt's failure).
-test('draftTask returns the archived shape with zero draft calls when the pre-dispatch gate archives the flagged rule', async () => {
+// 2026-10-07: the gate's archive verdict used to return {status:'archived'}, which scripts/local-worker.sh does not route, so the
+// task reached review/ with an EMPTY draft and looped to needs-clarification (39 TaxHarvest tasks). It is now a model-free FALSE
+// POSITIVE draft concluded like any other, so it flows to review and the source's own apply() records the suppression.
+const GATE_FANOUT_CODE = 'const results = await Promise.all(items.map(async (item) => process(item)));';
+const GATE_NO_AWAIT_CODE = 'for (const row of rows) {\n  total += row.amount;\n}';
+const GATE_SYNC_IO_CODE = 'function init() {\n  for (let i = 0; i < 3; i++) {\n    const t = fs.readFileSync(paths[i]);\n  }\n}';
+
+test('draftTask turns a pre-dispatch gate archive verdict into a model-free FALSE POSITIVE draft ready for review', async () => {
   await withFixtureRepo(async (draftTask) => {
     let callCount = 0;
-    const localCall = async () => {
-      callCount += 1;
-      return { response: 'must never be called', degenerate: null, attempts: 1 };
-    };
+    const localCall = async () => { callCount += 1; return { response: 'must never be called', degenerate: null, attempts: 1 }; };
     const task = {
       id: 'pre-dispatch-gate-test', domain: 'default', source: 'staleness_audit', title: 'test',
-      promptContext: {
-        ruleId: 'sequential-await-in-loop',
-        flaggedCode: 'const results = await Promise.all(items.map(async (item) => process(item)));',
-      },
+      promptContext: { ruleId: 'sequential-await-in-loop', flaggedCode: GATE_FANOUT_CODE },
     };
 
     const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
 
-    assert.equal(result.status, 'archived', 'the gate archive verdict must produce the archived shape');
-    assert.match(result.reason, /fan-out \(parallel\)/, "the reason must be the detector's own");
     assert.equal(result.succeeded, true);
-    assert.equal(callCount, 0, 'an archive verdict must skip the entire plan/implement/critique cycle -- zero model calls');
-    assert.equal(task.status, 'archived');
-    assert.ok(task.history.some((h) => h.stage === 'pre-dispatch-gate'), 'a pre-dispatch-gate history event must be recorded');
+    assert.notEqual(result.blocked, true);
+    assert.equal(result.gateVerdict, 'false-positive');
+    assert.match(result.reason, /fan-out \(parallel\)/, "the reason must be the detector's own");
+    assert.equal(callCount, 0, 'a gate verdict must skip the entire plan/implement/critique cycle -- zero model calls');
+    assert.equal(task.status, 'needs-review', 'concluded like any draft so the worker files it to review/');
+    assert.match(task.implementResponse, /^FALSE POSITIVE\n\n/);
+    assert.match(task.implementResponse, /sequential-await-in-loop/);
+    assert.match(task.implementResponse, /fan-out \(parallel\)/);
+    assert.match(task.implementResponse, /Promise\.all/, 'quotes the flagged code it examined');
+    assert.equal(task.critiqueOutcome, 'no-issues');
+    assert.equal(task.preDispatchGate.verdict, 'archive');
+    for (const stage of ['pre-dispatch-gate', 'plan-done', 'implement-done', 'critique-done', 'draft-done', 'needs-review']) {
+      assert.ok(task.history.some((h) => h.stage === stage), `${stage} history event`);
+    }
   });
+});
+
+test('the gate draft covers a snippet with no await, the sync-io-in-loop gate, and a task with no snippet text', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const cases = [
+      ['sequential-await-in-loop', GATE_NO_AWAIT_CODE, /No await expression found/],
+      ['sync-io-in-loop', GATE_SYNC_IO_CODE, /Bounded \(<=10\) loop in startup/],
+    ];
+    for (const [ruleId, code, reasonRe] of cases) {
+      const task = { id: `gate-${ruleId}`, domain: 'default', source: 'staleness_audit', title: 't', promptContext: { ruleId, flaggedCode: code } };
+      const result = await draftTask(task, { localCall: async () => { throw new Error('no model call expected'); }, withLockFn: async (dir, fn) => fn() });
+      assert.equal(result.gateVerdict, 'false-positive', ruleId);
+      assert.match(task.implementResponse, reasonRe, ruleId);
+      assert.ok(!/\n\s*\n\s*\n/.test(task.implementResponse), 'one short paragraph after the verdict line');
+    }
+  });
+});
+
+test('gate-verdict: the draft is built only from the detector reason and the snippet, flattened and bounded', () => {
+  const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
+  const long = `for (const a of b) {\n${'  x += 1; // a very long line to test excerpt bounds\n'.repeat(40)}}`;
+  const d = buildGateFalsePositiveDraft({ ruleId: 'r-1', reason: 'No await expression found in flagged snippet.' }, { promptContext: { snippet: long } });
+  assert.match(d.implementResponse, /^FALSE POSITIVE\n\nThe deterministic pre-dispatch check for rule "r-1" found no real instance/);
+  assert.ok(!/found in flagged snippet\.\./.test(d.implementResponse), 'a trailing period on the reason is not doubled');
+  assert.ok(!d.implementResponse.slice(d.implementResponse.indexOf('\n\n') + 2).includes('\n'), 'a single paragraph, no newlines');
+  assert.ok(d.implementResponse.length < 700, `bounded (${d.implementResponse.length})`);
+  const bare = buildGateFalsePositiveDraft({ ruleId: 'r-2', reason: 'why' }, { promptContext: {} });
+  assert.ok(!/flagged code window/.test(bare.implementResponse), 'no quote when there is no snippet');
+  assert.match(bare.plan, /Rule: r-2\nDetector reason: why\nVerdict: FALSE POSITIVE\./);
 });
 
 test('draftTask skips the critique+revision pass entirely for an advisoryProse source', async () => {

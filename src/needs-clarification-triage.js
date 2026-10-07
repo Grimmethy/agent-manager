@@ -180,6 +180,7 @@ const { hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { checkCompletionClaimsInNote } = require('./fact-checker.js');
 const { targetOversizedFile, oversizedFiles } = require('./file-length-flags-reader.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
+const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
 const { getRegisteredSource } = require('./task-source-registry.js');
 const { REASON_CATEGORIES } = require('./blocked-task-classifiers.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
@@ -580,6 +581,56 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
               fs.unlinkSync(file);
             } catch (e) {
               log(`${id0}: repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket N: stranded pre-dispatch-gate archive verdicts -> repair in place, send to review ---
+    // Checked BEFORE the nc.reason allowlist, like K: the escalation reason of these tasks is
+    // 'empty-degenerate-draft' (not in that allowlist) and the signal here is the preDispatchGate stamp, not the reason.
+    // Before 2026-10-07 draftTask returned {status:'archived'} for a gate hit, which nothing routed, so the task reached
+    // review with an empty draft, was rejected three times and escalated (39 TaxHarvest performance_review tasks). The
+    // gate's verdict is already known and deterministic, so nothing needs redrafting: regenerate the FALSE POSITIVE
+    // draft the fixed draftTask now writes (lib/gate-verdict.js) and file the task to review/ for a real vote.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const gate = task.preDispatchGate;
+      if (gate && gate.verdict === 'archive' && gate.ruleId && bucketAttempts(task, 'N') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket N but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'N') + 1;
+          log(`${id0}: bucket N (stranded pre-dispatch gate archive, rule "${gate.ruleId}") -> FALSE POSITIVE draft rebuilt, sent to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            for (const f of ['localVotes', 'voteErrors', 'reviewProvider', 'ncTriageDecision', 'ncTriageReviewedAt', 'critiqueOutcome']) delete task[f];
+            bumpBucketAttempts(task, 'N');
+            const draft = buildGateFalsePositiveDraft(gate, task);
+            task.planResponse = draft.plan;
+            task.lastGoodPlan = draft.plan;
+            task.implementResponse = draft.implementResponse;
+            task.critiqueOutcome = 'no-issues';
+            task.status = 'needs-review';
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: stranded pre-dispatch gate archive verdict (rule "${gate.ruleId}": ${String(gate.reason || '').slice(0, 120)}) -- the gate's deterministic false positive was never executed and the empty draft looped through review; FALSE POSITIVE draft rebuilt and filed to review for a real vote`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-N: stranded pre-dispatch gate archive', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: gate-archive repair-and-review move failed: ${e.message}`);
               summary.requeued -= 1;
               summary.errors += 1;
             }

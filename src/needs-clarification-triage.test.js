@@ -1380,3 +1380,62 @@ test('Test 3: original triage action still applied after sweep', async () => {
   assert.ok(exists(at(dir, 'needs-clarification', 't3-orig.json')));
   assert.equal(read(at(dir, 'needs-clarification', 't3-orig.json')).ncTriageDecision, 'leave-for-human');
 });
+
+// --- Bucket N: stranded pre-dispatch gate archive verdicts (2026-10-07; 39 TaxHarvest performance_review tasks) ---
+
+function gateStranded(id, over = {}) {
+  return {
+    id, domain: 'default', source: 'performance_review', status: 'blocked',
+    promptContext: { rule: 'sequential-await-in-loop', file: 'backend/x.js', snippet: 'for (const r of rows) {\n  total += r.amount;\n}' },
+    preDispatchGate: { ruleId: 'sequential-await-in-loop', verdict: 'archive', reason: 'No await expression found in flagged snippet' },
+    blockedStage: 'review', blockedReason: 'The draft is empty (zero characters)',
+    localRejectCount: 2, priorRejectionFeedback: ['The draft is empty'], localVotes: [{ verdict: 'REJECT' }], reviewProvider: 'local',
+    needsClarification: { reason: 'empty-degenerate-draft', openQuestions: 'The automated handler could not render a verdict that passed review after 3 attempts' },
+    ncTriageDecision: 'leave-for-human', ncTriageReviewedAt: '2026-10-04T16:09:53Z',
+    history: [{ stage: 'exhausted', at: '2026-10-04T16:09:48Z' }, { stage: 'needs-clarification', at: '2026-10-04T16:09:48Z' }],
+    ...over,
+  };
+}
+
+test('bucket N: a stranded gate-archive task gets its FALSE POSITIVE draft rebuilt and is filed to review/, whatever its escalation reason', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, gateStranded('gate-1'));
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'gate-1.json')));
+  const out = read(at(dir, 'review', 'gate-1.json'));
+  assert.equal(out.status, 'needs-review');
+  assert.match(out.implementResponse, /^FALSE POSITIVE\n\n/);
+  assert.match(out.implementResponse, /No await expression found/);
+  assert.equal(out.critiqueOutcome, 'no-issues');
+  for (const f of ['needsClarification', 'blockedReason', 'blockedStage', 'localRejectCount', 'priorRejectionFeedback', 'localVotes', 'reviewProvider', 'ncTriageDecision', 'ncTriageReviewedAt']) {
+    assert.equal(out[f], undefined, `${f} cleared`);
+  }
+  assert.equal(out.ncTriageBucketAttempts.N, 1);
+  assert.equal(out.preDispatchGate.verdict, 'archive', 'the stamp stays as the audit trail');
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /stranded pre-dispatch gate archive verdict/.test(h.detail)));
+});
+
+test('bucket N: bounded to one attempt, a task without an archive stamp is untouched, dry-run writes nothing, already-in-review is skipped', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, gateStranded('gate-capped', { ncTriageBucketAttempts: { N: 1 } }));
+  held(dir, gateStranded('gate-nostamp', { preDispatchGate: undefined }));
+  held(dir, gateStranded('gate-investigate', { preDispatchGate: { ruleId: 'sequential-await-in-loop', verdict: 'investigate', reason: 'Sequential await inside a loop-bound iteration' } }));
+  held(dir, gateStranded('gate-inreview'));
+  fs.writeFileSync(at(dir, 'review', 'gate-inreview.json'), '{}');
+  let summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 0);
+  for (const id of ['gate-capped', 'gate-nostamp', 'gate-investigate', 'gate-inreview']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), id);
+  assert.ok(!exists(at(dir, 'review', 'gate-capped.json')) && !exists(at(dir, 'review', 'gate-nostamp.json')) && !exists(at(dir, 'review', 'gate-investigate.json')));
+
+  const dry = makePipeline();
+  fs.mkdirSync(at(dry, 'review'), { recursive: true });
+  held(dry, gateStranded('gate-dry'));
+  const prev = process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN;
+  process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = '1';
+  try { summary = await needsClarificationTriage(args(dry, throwingVote)); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; else process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = prev; }
+  assert.equal(summary.dryRun, true);
+  assert.ok(exists(at(dry, 'needs-clarification', 'gate-dry.json')) && !exists(at(dry, 'review', 'gate-dry.json')));
+});
