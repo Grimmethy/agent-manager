@@ -1439,3 +1439,62 @@ test('bucket N: bounded to one attempt, a task without an archive stamp is untou
   assert.equal(summary.dryRun, true);
   assert.ok(exists(at(dry, 'needs-clarification', 'gate-dry.json')) && !exists(at(dry, 'review', 'gate-dry.json')));
 });
+
+// --- Bucket O: valid short change sets blocked by the deterministic non-implementation length gate (2026-10-07; 9 deadcode_fix tasks) ---
+
+const DELETE_RESP = '{"mode": "delete", "file": "TaxHarvest/frontend/src/components/ui/form.tsx"}';
+function gateBlocked(id, over = {}) {
+  return {
+    id, domain: 'default', source: 'deadcode_fix', status: 'blocked',
+    promptContext: { candidateId: 'AC-101', files: ['TaxHarvest/frontend/src/components/ui/form.tsx'] },
+    implementResponse: DELETE_RESP, rawDiff: 'keep-me', adhocResolution: undefined,
+    reviewProvider: 'deterministic-non-implementation', blockedStage: 'review',
+    blockedReason: 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt',
+    localRejectCount: 2, priorRejectionFeedback: ['Deterministic gate: bare tool-call request'],
+    needsClarification: { reason: 'design-decision', openQuestions: 'The automated handler could not get this candidate past review/apply after 3 attempts' },
+    ncTriageDecision: 'leave-for-human', ncTriageReviewedAt: '2026-10-07T01:00:00Z',
+    history: [{ stage: 'exhausted', at: '2026-10-07T00:59:00Z' }, { stage: 'needs-clarification', at: '2026-10-07T00:59:30Z' }],
+    ...over,
+  };
+}
+
+test('bucket O: a stranded valid change set blocked by the length gate is filed to review/ with its draft kept exactly as written', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, gateBlocked('chg-1'));
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'chg-1.json')));
+  const out = read(at(dir, 'review', 'chg-1.json'));
+  assert.equal(out.status, 'needs-review');
+  assert.equal(out.implementResponse, DELETE_RESP, 'the draft is untouched');
+  assert.equal(out.rawDiff, 'keep-me');
+  for (const f of ['needsClarification', 'blockedReason', 'blockedStage', 'localRejectCount', 'priorRejectionFeedback', 'reviewProvider', 'ncTriageDecision', 'ncTriageReviewedAt']) {
+    assert.equal(out[f], undefined, `${f} cleared`);
+  }
+  assert.equal(out.ncTriageBucketAttempts.O, 1);
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /structurally valid change set/.test(h.detail)));
+});
+
+test('bucket O: bounded to one attempt; a non-structured response, another reviewProvider, already-in-review and dry-run are all left alone', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, gateBlocked('chg-capped', { ncTriageBucketAttempts: { O: 1 } }));
+  held(dir, gateBlocked('chg-prose', { implementResponse: 'Let me check the file first.' }));
+  held(dir, gateBlocked('chg-read', { implementResponse: '{"mode": "read", "file": "a.js"}' }));
+  held(dir, gateBlocked('chg-otherprovider', { reviewProvider: 'local' }));
+  held(dir, gateBlocked('chg-inreview'));
+  fs.writeFileSync(at(dir, 'review', 'chg-inreview.json'), '{}');
+  let summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 0);
+  for (const id of ['chg-capped', 'chg-prose', 'chg-read', 'chg-otherprovider', 'chg-inreview']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), id);
+
+  const dry = makePipeline();
+  fs.mkdirSync(at(dry, 'review'), { recursive: true });
+  held(dry, gateBlocked('chg-dry'));
+  const prev = process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN;
+  process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = '1';
+  try { summary = await needsClarificationTriage(args(dry, throwingVote)); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; else process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = prev; }
+  assert.equal(summary.dryRun, true);
+  assert.ok(exists(at(dry, 'needs-clarification', 'chg-dry.json')) && !exists(at(dry, 'review', 'chg-dry.json')));
+});

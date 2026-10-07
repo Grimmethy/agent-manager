@@ -556,6 +556,50 @@ test('NON_IMPL gate: non-exempt source short prose IS flagged', async () => {
   assert.equal(captured.length, 0, 'no reviewer vote spent on a mechanically-decidable rejection');
 });
 
+// 2026-10-07: the <80-char rule blocked the model's CORRECT whole-file delete directive (71-79 chars) on length alone (9 stranded
+// deadcode_fix tasks; every delete of 80+ chars had merged). A structurally valid change set now skips the length heuristic.
+async function gateOutcomeFor(implementResponse, source = 'trouble_log') {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({ source, planResponse: '1. Remove the unused file.', implementResponse });
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  return { task, result, votes: captured.length };
+}
+
+test('NON_IMPL gate: a short valid delete directive reaches the real vote instead of the deterministic block', async () => {
+  const resp = '{"mode": "delete", "file": "TaxHarvest/frontend/src/components/ui/form.tsx"}';
+  assert.ok(resp.length < 80, `fixture must be under the heuristic length (${resp.length})`);
+  const { task, result, votes } = await gateOutcomeFor(resp);
+  assert.notEqual(task.reviewProvider, 'deterministic-non-implementation');
+  assert.equal(result.verdict, 'approved');
+  assert.equal(votes, 1, 'the delete must be judged by the real reviewer vote');
+});
+
+test('NON_IMPL gate: a short valid edit and a short valid create also reach the vote', async () => {
+  for (const resp of ['{"mode":"edit","file":"a.js","find":"x","replace":"y"}', '{"mode":"create","file":"a.js","content":"z"}', '[{"mode":"delete","file":"a.js"},{"mode":"delete","file":"b.js"}]']) {
+    assert.ok(resp.length < 80, resp);
+    const { task, votes } = await gateOutcomeFor(resp);
+    assert.notEqual(task.reviewProvider, 'deterministic-non-implementation', resp);
+    assert.equal(votes, 1, resp);
+  }
+});
+
+test('NON_IMPL gate: a short mode "read" request, short prose, an item without a file, and malformed JSON are STILL blocked', async () => {
+  for (const resp of [
+    '{"mode": "read", "file": "TaxHarvest/frontend/src/App.tsx"}',
+    'This is a false positive; no action needed.',
+    '{"mode": "delete"}',
+    '{"mode": "delete", "file": "../../etc/passwd"}',
+    '{"mode": "delete", "file": "a.js"',
+    '[]',
+  ]) {
+    const { task, result, votes } = await gateOutcomeFor(resp);
+    assert.equal(task.reviewProvider, 'deterministic-non-implementation', resp);
+    assert.equal(result.verdict, 'blocked', resp);
+    assert.equal(votes, 0, resp);
+  }
+});
+
 // Regression, 2026-08-23: caught live -- observabilityReviewImplementPrompt/
 // performanceReviewImplementPrompt (prompts.js) explicitly ask for a short 2-4 sentence
 // prose paragraph on a FALSE POSITIVE/UNCERTAIN verdict, but neither source was in

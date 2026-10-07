@@ -181,6 +181,7 @@ const { checkCompletionClaimsInNote } = require('./fact-checker.js');
 const { targetOversizedFile, oversizedFiles } = require('./file-length-flags-reader.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
+const { isStructuredGroupBChange } = require('./lib/structured-change.js');
 const { getRegisteredSource } = require('./task-source-registry.js');
 const { REASON_CATEGORIES } = require('./blocked-task-classifiers.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
@@ -581,6 +582,52 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
               fs.unlinkSync(file);
             } catch (e) {
               log(`${id0}: repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket O: valid short change sets blocked by the deterministic non-implementation gate -> file to review ---
+    // Checked BEFORE the nc.reason allowlist, like K and N: these tasks escalate as 'design-decision' (deadcode_fix) but the
+    // signal here is the persisted reviewProvider stamp plus the response itself. review-task.js rejected any fence-free
+    // response under 80 characters as "a bare tool-call request or meta-commentary", which blocked the model's CORRECT
+    // `{"mode": "delete", "file": "<path>"}` (71-79 characters) three times with no model vote (9 TaxHarvest deadcode_fix
+    // tasks). The gate now exempts structurally valid change sets (lib/structured-change.js), so nothing needs redrafting:
+    // the draft was fine. Keep implementResponse exactly as written, clear the rejection state, and file it to review/.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (task.reviewProvider === 'deterministic-non-implementation'
+        && isStructuredGroupBChange(String(task.implementResponse || '').trim())
+        && bucketAttempts(task, 'O') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket O but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'O') + 1;
+          log(`${id0}: bucket O (valid short change set blocked by the non-implementation length gate) -> filed to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of ['needsClarification', 'localRejectCount', 'retryableDraftBlock', 'priorRejectionFeedback', 'blockedReason',
+              'blockedStage', 'claimedAt', 'reviewProvider', 'reviewInconclusive', 'localVotes', 'voteErrors', 'ncTriageDecision', 'ncTriageReviewedAt']) delete task[f];
+            bumpBucketAttempts(task, 'O');
+            task.status = 'needs-review';
+            appendHistoryEvent(task, 'requeued',
+              'needs-clarification-triage: the draft is a structurally valid change set (the deterministic non-implementation gate rejected it on length alone, since fixed) -- implementResponse kept as written, rejection state cleared, filed to review for a real vote');
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-O: valid short change set blocked by the non-implementation length gate', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: change-set repair-and-review move failed: ${e.message}`);
               summary.requeued -= 1;
               summary.errors += 1;
             }

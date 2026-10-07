@@ -51,6 +51,7 @@ const { resolveModelProfile } = require('./model-provider.js');
 const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
+const { isStructuredGroupBChange } = require('./lib/structured-change.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
 const { unnamedChangedFiles, changedFilesOfDiff } = require('./lib/draft-side-effects.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
@@ -1195,7 +1196,12 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   let isNonImplementation = false;
   if (!effectivelyEmpty) {
     isNonImplementation = NON_IMPL_PATTERNS.some((pat) => pat.test(trimmedImplResponse));
-    if (!isNonImplementation && trimmedImplResponse.length < 80 && !trimmedImplResponse.includes('```')) {
+    // A short fence-free response is presumed to be meta-commentary -- unless it IS a structurally valid change set
+    // (lib/structured-change.js): `{"mode": "delete", "file": "<path>"}` is 71-79 characters for this repo's short paths and
+    // was blocked on length alone (deadcode_fix, 9 stranded tasks). NON_IMPL_PATTERNS above still win, so a short
+    // mode:"read" request is rejected exactly as before, and the delete-specific safeguards downstream are untouched.
+    if (!isNonImplementation && trimmedImplResponse.length < 80 && !trimmedImplResponse.includes('```')
+      && !isStructuredGroupBChange(trimmedImplResponse)) {
       isNonImplementation = true;
     }
   }
