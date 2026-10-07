@@ -8,6 +8,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS, TEST_TIMEOUT_MS } = require('./review-verify.js');
 const { verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 
@@ -119,6 +120,26 @@ test('a timeout is inconclusive even when the draft claimed PASS (PR #454 rule)'
   const r = verifyDiff({ ...base, acceptanceResults: AR('`node --test src/a.test.js`'), deps: f.deps });
   assert.equal(r.status, 'inconclusive');
   assert.equal(r.commands[0].outcome, 'inconclusive');
+});
+
+test('the covering-test timeout fits a ~3 min suite by default and AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS overrides it', () => {
+  assert.ok(DEFAULT_TEST_TIMEOUT_MS >= 200000, 'default must exceed the slowest covering suite (local-draft.test.js ~3 min)');
+  assert.equal(TEST_TIMEOUT_MS, resolveTestTimeoutMs({}));
+  assert.equal(resolveTestTimeoutMs({}), DEFAULT_TEST_TIMEOUT_MS);
+  assert.equal(resolveTestTimeoutMs({ AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS: '45000' }), 45000);
+  assert.equal(resolveTestTimeoutMs({ AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS: 'junk' }), DEFAULT_TEST_TIMEOUT_MS);
+  assert.equal(resolveTestTimeoutMs({ AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS: '0' }), DEFAULT_TEST_TIMEOUT_MS);
+});
+
+test('a covering-suite timeout is inconclusive and names the unverified files', () => {
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/a.test.js', 'src/slow.test.js'], py: [] }),
+    run: () => ({ ran: true, exitCode: null, timedOut: true, output: '' }),
+  });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.timedOutFiles, ['src/a.test.js', 'src/slow.test.js']);
+  assert.match(r.reasons.join(' '), /2 file\(s\) unverified.*src\/a\.test\.js, src\/slow\.test\.js/);
 });
 
 test('covering tests that fail make the result failed and carry the parsed failure names', () => {

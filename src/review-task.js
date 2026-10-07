@@ -582,7 +582,10 @@ function classifyVote(markers, minReasoningChars) {
 // private scratch worktree, runs the tests that cover it and re-runs the commands the draft claims PASS on (sandboxed), and returns failed /
 // passed / inconclusive. Only a genuine `failed` blocks; `inconclusive` (diff will not apply -- often a stacked slice that depends on an unmerged
 // one --, sandbox missing, timeout, nothing runnable) goes on to the vote exactly as before. Kill switch: AGENT_MANAGER_REVIEW_EXECUTED_VERIFY=false.
-const EXECUTED_VERIFY_BUDGET_MS = 240000;
+// 2026-10-07: must exceed review-verify.js's test timeout (210s) plus the syntax/command checks, or the
+// budget clamp turns a slow-but-passing covering suite into a timeout. Override with
+// AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS.
+const EXECUTED_VERIFY_BUDGET_MS = 360000;
 
 // A compact, record-safe view of a review-verify result for task.executedVerification (no raw output beyond what a redraft needs).
 function summariseExecutedVerification(ev) {
@@ -1600,7 +1603,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();

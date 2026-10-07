@@ -2740,3 +2740,9 @@ test('replay: the real check, against a real git remote, passes the complete ren
     assert.equal(good.undefinedAfterRemoval.total, 0);
   });
 }));
+
+test('the executed-verification budget exceeds the covering-test timeout so a slow passing suite is not clamped into a timeout', () => {
+  const { EXECUTED_VERIFY_BUDGET_MS } = require('./review-task.js');
+  const { DEFAULT_TEST_TIMEOUT_MS } = require('./review-verify.js');
+  assert.ok(EXECUTED_VERIFY_BUDGET_MS >= DEFAULT_TEST_TIMEOUT_MS + 120000, `budget ${EXECUTED_VERIFY_BUDGET_MS} must leave room for the syntax/command checks after a full-length test run (${DEFAULT_TEST_TIMEOUT_MS})`);
+});
