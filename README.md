@@ -35,6 +35,8 @@ files / touches git) is **off by default** -- set `AGENT_MANAGER_INCLUDE_APPLY=t
 tab, or `scripts/register-project.sh <name> <repo_dir> <pipeline_dir>` /
 `scripts/adopt-existing-project.sh <name> <clone-url>`.
 
+For contributors: read `CONTEXT.md`, `AGENTS.md`, `CLAUDE.md` and `docs/agents/codebase-map.md` first, and run `scripts/install-skills.sh` to get the `act-as-local-agent` and `verify-unmerged-branches` Claude Code skills (see `docs/agents/skills/`).
+
 Plugins and companion apps (extra task sources, dashboard tabs) are listed under
 [Plugins and companion repos](#plugins-and-companion-repos). Windows users: see
 [Launching on Windows](#launching-on-windows).
