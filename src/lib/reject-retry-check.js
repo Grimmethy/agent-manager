@@ -157,6 +157,26 @@ function stalePremiseGateNoLongerFires(task, { repoRoot, detectFn } = {}) {
   }
 }
 
+// 2026-10-07 (blocked class B): local-agentic-write-draft.js's external-dependency gate blocked
+// ordinary code edits on prose/identifier words (credential.idToken, "auth token", access_token in
+// a snippet) before any model call. The block carries no persisted needsClarification and no
+// blockedStage, so the entry gate never admitted it. Re-evaluate the gate now (code spans and the
+// plan echo are no longer scanned; soft markers only advise by default): when it no longer blocks,
+// the block was the gate's false positive and the task is re-admitted clean-slate exactly once.
+// A genuine hard-marker block (new repo, hosting, git remote) still reproduces and is never
+// re-admitted; externalDepReadmitted is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS.
+const EXTERNAL_DEP_REASON_RE = /^task requires external-state operation/i;
+function externalDepGateNoLongerBlocks(task, { detectFn } = {}) {
+  if (!task || task.externalDepReadmitted) return false;
+  if (!EXTERNAL_DEP_REASON_RE.test(String(task.blockedReason || '').trim())) return false;
+  try {
+    const detect = detectFn || require('../local-agentic-write-draft.js').detectExternalDependency;
+    return detect(task) === null;
+  } catch {
+    return false;
+  }
+}
+
 // 2026-09-17: every escalation site in this file used to check "has this task EVER, in
 // its whole lifetime, carried a needs-clarification history stage" -- correct the FIRST
 // time a task exhausts, but permanently wrong afterward: a task legitimately re-admitted
@@ -265,4 +285,4 @@ function isImplementDegenerateBlock(task) {
   return task.blockedStage === 'implement';
 }
 
-module.exports = { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock };
+module.exports = { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, externalDepGateNoLongerBlocks, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock };
