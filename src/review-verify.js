@@ -54,6 +54,22 @@ const SYNTAX_TIMEOUT_MS = 20000;
 const REPLAY_MIN_REMAINING_MS = 8000;
 const REPLAY_TIMEOUT_MS = 90000;
 
+// Names of the node:test cases the diff ADDS to `file` (test( / it( / describe( opened on a `+` line). Used to run just those first in a covering file that is
+// too slow to run whole (src/local-draft.test.js is ~9 minutes, past the review's per-run cap). Empty when the diff adds none there.
+function addedTestNames(rawDiff, file) {
+  const names = [];
+  let inFile = false;
+  for (const line of String(rawDiff || '').split('\n')) {
+    const h = line.match(/^diff --git a\/(\S+) b\/(\S+)$/);
+    if (h) { inFile = h[2] === file; continue; }
+    if (!inFile) continue;
+    const m = line.match(/^\+\s*(?:test|it|describe)(?:\.\w+)?\(\s*(['"`])((?:\\.|(?!\1).)+)\1/);
+    if (m) names.push(m[2].replace(/\\(['"`])/g, '$1'));
+  }
+  return [...new Set(names)];
+}
+const escapeRegex = (t) => String(t).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 function extractChangedFiles(diff) {
   const files = [];
   const re = /^diff --git a\/(\S+) b\/(\S+)$/gm;
@@ -570,12 +586,36 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     if (tiers.dependents.py.length) depSuites.push({ label: 'py', bin: 'python', buildArgs: pyArgs, files: tiers.dependents.py, parse: parsePyTestFailures });
     if (suites.length) {
       result.tests = { ran: [], passed: true, failures: [], timedOut: false };
+      // 2026-10-08: every covering file runs in its OWN process (cheapest first) instead of one `node --test a b c d`. TaxHarvest-style incident: the four
+      // files covering the test-framework gate included src/local-draft.test.js, which alone takes ~9 minutes; in one process its timeout discarded the
+      // three fast files' passes too, and the reviewers rejected on "unverified". Now a slow file leaves only ITSELF unverified. For a file the diff adds
+      // named tests to, those tests run FIRST (seconds) and are recorded as partial evidence, so even a file that cannot finish whole says what ran.
+      const sizeOf = (f) => { try { return fs.statSync(path.join(worktreeDir, f)).size; } catch { return 0; } };
       for (const s of suites) {
-        const r = runOne(s.bin, s.buildArgs(s.files), TEST_TIMEOUT_MS);
-        if (!r.ran) { result.tests = null; break; }
-        result.tests.ran.push(...s.files);
-        if (r.timedOut) { result.tests.timedOut = true; result.tests.passed = null; (result.tests.timedOutFiles = result.tests.timedOutFiles || []).push(...s.files); continue; }
-        if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] }); }
+        for (const file of [...s.files].sort((a, b) => sizeOf(a) - sizeOf(b))) {
+          const one = { ...s, files: [file] };
+          const added = s.label === 'js' ? addedTestNames(rawDiff, file) : [];
+          if (added.length) {
+            const pattern = added.map(escapeRegex).join('|');
+            const narrowed = { ...s, files: [file], buildArgs: (files) => ['--test', '--test-name-pattern', pattern, ...files] };
+            const n = runOne(s.bin, narrowed.buildArgs([file]), TEST_TIMEOUT_MS, { tolerateTimeout: true });
+            if (n.ran && !n.timedOut) {
+              (result.tests.partial = result.tests.partial || []).push({ file, tests: added.slice(0, 12), count: added.length, passed: n.exitCode === 0 });
+              if (n.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: narrowed, names: s.parse(n.output), raw: n.output, missing: n.missingModules || [] }); }
+            }
+          }
+          const r = runOne(s.bin, one.buildArgs(one.files), TEST_TIMEOUT_MS);
+          if (!r.ran) { result.tests = null; break; }
+          result.tests.ran.push(file);
+          if (r.timedOut) { result.tests.timedOut = true; if (result.tests.passed !== false) result.tests.passed = null; (result.tests.timedOutFiles = result.tests.timedOutFiles || []).push(file); continue; }
+          if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: one, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] }); }
+        }
+        if (!result.tests) break;
+      }
+      // Files that ran to completion and passed (the evidence the reviewers can lean on even when another file could not finish).
+      if (result.tests) {
+        const bad = new Set([...(result.tests.timedOutFiles || []), ...failedSuites.map((f) => f.s.files[0])]);
+        result.tests.passedFiles = result.tests.ran.filter((f) => !bad.has(f));
       }
     }
 
@@ -653,14 +693,21 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
           }
           const baseFiles = f.s.files.filter((file) => fs.existsSync(path.join(worktreeDir, file)));
           let attributable = f.names;
+          let baseTimedOut = false;
+          let allPreexisting = false;
           if (baseFiles.length) {
             const b = runOne(f.s.bin, f.s.buildArgs(baseFiles), TEST_TIMEOUT_MS, { tolerateTimeout: !!f.dependent });
+            if (b.ran && b.timedOut) baseTimedOut = true;
             if (!b.ran || b.timedOut) attributable = null;                       // cannot tell -- do not block
             else if (b.exitCode !== 0) {
               const baseNames = f.s.parse(b.output);
               const fresh = f.names.filter((n) => !baseNames.includes(n));
               result.tests.preexisting = [...(result.tests.preexisting || []), ...f.names.filter((n) => baseNames.includes(n))];
               attributable = (baseNames.length && fresh.length) ? fresh : null;   // base fails with no nameable test = a whole-suite/env failure: not the diff's doing
+              // Every test that fails WITH the diff is named and fails identically on the base: the diff introduced nothing. The rest of that file ran and passed,
+              // so this is NOT unattributable -- it is a clean result with listed pre-existing failures (2026-10-08: agentic-draft-common.test.js has one test that
+              // greps the live repo, fails in the sandbox's empty repo on base AND diff, and used to make the whole file "inconclusive").
+              if (!attributable && f.names.length > 0 && baseNames.length > 0 && fresh.length === 0) allPreexisting = true;
             }
           }
           if (attributable && (attributable.length || !baseFiles.length)) {
@@ -669,7 +716,12 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
             result.tests.raw = f.raw;
             failures.push(`covering ${f.s.label} tests failed`);
           } else {
-            unverifiedOrUnattributable(f, `covering ${f.s.label} tests (${f.s.files.join(', ')}) already fail on ${mainBranch} in the review sandbox, so the failure is not caused by the diff`);
+            // Status stays inconclusive (the earlier, deliberately conservative contract), but a file whose ONLY failures also fail on the base is reported
+            // as exactly that, so the reviewers see "the diff introduced nothing here" instead of an unexplained non-pass.
+            if (allPreexisting) (result.tests.preexistingOnlyFiles = result.tests.preexistingOnlyFiles || []).push(...f.s.files);
+            unverifiedOrUnattributable(f, baseTimedOut
+              ? `covering ${f.s.label} tests (${f.s.files.join(', ')}) failed with the diff, but the same tests could not finish on ${mainBranch} either (timed out), so the failure could not be attributed to the diff`
+              : `covering ${f.s.label} tests (${f.s.files.join(', ')}) already fail on ${mainBranch} in the review sandbox, so the failure is not caused by the diff`);
           }
         }
         for (const x of contradictedCmds) {
@@ -716,6 +768,6 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 
 module.exports = {
   checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
-  verifyDiff, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
+  verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
 };
