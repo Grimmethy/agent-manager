@@ -257,3 +257,57 @@ test('INERT TARGET: a held task is held by isHeld, within the hold cap only', ()
   assert.equal(gate.isHeld({ ...stamped, humanQueued: true }, [], { now: NOW }).held, false);
   assert.equal(gate.isHeld({ ...stamped, inertTarget: { ...stamped.inertTarget, held: false } }, [], { now: NOW }).held, false);
 });
+
+// --- inert leftovers (2026-10-08): a derived/ record whose id already exists elsewhere is a stale copy, moved aside ------------------------------------------------------
+// 144 of 146 records in TaxHarvest's derived/ were copies of tasks that had moved on (done / archived); they were never drafted, but they made a retired area look like 23 live tasks.
+const aged = (dir, state, id, hoursOld = 2) => { const f = path.join(dir, 'queue', state, `${id}.json`); const t = new Date(NOW - hoursOld * 3600 * 1000); fs.utimesSync(f, t, t); };
+const supersededCopy = (dir, id) => JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'derived', '_superseded', `${id}.json`), 'utf8'));
+
+test('LEFTOVERS: a derived/ copy of a task that already exists in done/, the archive, a queue dir or a lane is moved to derived/_superseded/ with a stamp; the real record is untouched', () => {
+  const dir = pipeline();
+  const spots = [['done', 'in-done'], ['done/_archived_no_action', 'in-archive'], ['pending', 'in-pending'], ['blocked', 'in-blocked'], ['needs-clarification', 'in-nc'], ['drafting/worker-1', 'in-lane']];
+  for (const [state, id] of spots) {
+    put(dir, 'derived', dt(id, 'Problem in `src/exists.ts`')); aged(dir, 'derived', id);
+    fs.writeFileSync(path.join(dir, 'queue', ...state.split('/'), `${id}.json`), JSON.stringify({ id, source: 'derived_task', marker: 'real' }));
+  }
+  const s = run(dir);
+  assert.deepEqual(s.leftoversSuperseded.map((x) => x.id).sort(), spots.map(([, id]) => id).sort());
+  for (const [state, id] of spots) {
+    assert.equal(has(dir, 'derived', id), false, `${id} left derived/`);
+    const rec = supersededCopy(dir, id);
+    assert.equal(rec.supersededBy.state, state);
+    assert.equal(rec.history.at(-1).stage, 'superseded');
+    assert.match(rec.history.at(-1).detail, /already exists in /);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'queue', ...state.split('/'), `${id}.json`), 'utf8')).marker, 'real', 'the real record is untouched');
+  }
+});
+
+test('LEFTOVERS: a genuinely unclaimed derived task, a young copy (promotion may still be in progress) and an existing superseded copy are all left alone', () => {
+  const dir = pipeline();
+  put(dir, 'derived', dt('unclaimed', 'Problem in `src/exists.ts`')); aged(dir, 'derived', 'unclaimed');
+  put(dir, 'derived', dt('young', 'Problem in `src/exists.ts`')); put(dir, 'done', { id: 'young', source: 'derived_task' });   // mtime is "now" (real clock) -> younger than 10 min
+  put(dir, 'derived', dt('dupe', 'Problem in `src/exists.ts`')); aged(dir, 'derived', 'dupe'); put(dir, 'done', { id: 'dupe', source: 'derived_task' });
+  fs.mkdirSync(path.join(dir, 'queue', 'derived', '_superseded'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'derived', '_superseded', 'dupe.json'), JSON.stringify({ id: 'dupe', marker: 'older superseded copy' }));
+  const s = run(dir);
+  assert.deepEqual(s.leftoversSuperseded, []);
+  for (const id of ['unclaimed', 'young', 'dupe']) assert.equal(has(dir, 'derived', id), true, id);
+  assert.equal(supersededCopy(dir, 'dupe').marker, 'older superseded copy', 'never overwritten');
+});
+
+test('LEFTOVERS: dry-run reports without moving; AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP=off disables it; the _superseded dir is invisible to the sweep itself', () => {
+  const dir = pipeline();
+  put(dir, 'derived', dt('l1', 'Problem in `src/exists.ts`')); aged(dir, 'derived', 'l1'); put(dir, 'done', { id: 'l1', source: 'derived_task' });
+  const dry = run(dir, { dryRun: true });
+  assert.deepEqual(dry.leftoversSuperseded.map((x) => x.id), ['l1']);
+  assert.equal(has(dir, 'derived', 'l1'), true, 'dry run moves nothing');
+  const prev = process.env.AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP;
+  process.env.AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP = 'off';
+  try {
+    assert.deepEqual(run(dir).leftoversSuperseded, []);
+    assert.equal(has(dir, 'derived', 'l1'), true);
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP; else process.env.AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP = prev; }
+  const real = run(dir);
+  assert.deepEqual(real.leftoversSuperseded.map((x) => x.id), ['l1']);
+  assert.equal(run(dir).leftoversSuperseded.length, 0, 'a second sweep finds nothing: the moved copy is not re-scanned');
+});
