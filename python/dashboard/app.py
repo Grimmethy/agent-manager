@@ -1703,15 +1703,33 @@ def _pipeline_running() -> bool:
             if last_hb:
                 age = (datetime.now(timezone.utc) - last_hb).total_seconds()
                 threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
-                if age <= threshold:
+                # A fresh heartbeat only proves "running" while the process that wrote it
+                # still exists. A stop (or a crash) leaves the last heartbeat on disk, and a
+                # "working" one stays fresh for WORKING_STALE_SECONDS (20 min) -- so the old
+                # check kept reporting a pipeline that was already gone, and /api/pipeline/start
+                # refused ("a pipeline is already running") for ~20 min after every stop
+                # (2026-10-08, hit live twice). Liveness is judged against daemonPid when the
+                # heartbeat has one -- `pid` is the per-call child and is legitimately gone
+                # between calls (same rule as src/dead-process-check.js). No recorded pid at
+                # all (legacy heartbeat) keeps the old trust-the-timestamp behavior.
+                if age <= threshold and _heartbeat_owner_alive(data):
                     return True
 
-    # Stale or unparseable heartbeat -- believe a live process over a stale timestamp.
+    # Stale, unparseable, or ownerless heartbeat -- believe a live process over a timestamp.
     for name in (*lane_ids, "reviewer"):
         d = read_json_safe(inst_dir / f"{name}.json")
-        if d and d.get("pid") and _pid_alive(d["pid"]):
+        if d and any(d.get(k) and _pid_alive(d[k]) for k in ("daemonPid", "pid")):
             return True
     return bool(_pipeline_daemon_pids())
+
+
+def _heartbeat_owner_alive(data: dict) -> bool:
+    """Is the process that owns this heartbeat still alive? Owner = `daemonPid` (the lane's
+    bash loop) when recorded, else `pid`. True when the heartbeat records no pid at all."""
+    owner = data.get("daemonPid") if data.get("daemonPid") is not None else data.get("pid")
+    if owner is None:
+        return True
+    return _pid_alive(owner)
 
 
 # --- Unmerged branches (the "sandbox" visibility gap) -----------------------------------
