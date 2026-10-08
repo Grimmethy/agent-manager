@@ -182,6 +182,7 @@ const { targetOversizedFile, oversizedFiles } = require('./file-length-flags-rea
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
 const { isStructuredGroupBChange } = require('./lib/structured-change.js');
+const { planTargetNoLongerBlocks, ungroundedUrlsAreTestFixtures } = require('./lib/gate-readmit.js');
 const { getRegisteredSource } = require('./task-source-registry.js');
 const { REASON_CATEGORIES } = require('./blocked-task-classifiers.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
@@ -628,6 +629,88 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
               fs.unlinkSync(file);
             } catch (e) {
               log(`${id0}: change-set repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket P: plan-target guard misfire (a call like `res.json()` read as a file, a create target called "absent") -> clean-state requeue ---
+    // Checked BEFORE the nc.reason allowlist, like K/N/O: the signal is the persisted guard reason plus a RE-RUN of the fixed guard on the task's own plan.
+    // adhoc-diff-sanity.js no longer reads a title call expression as a path, and plan-target-guard.js now honours the task's own "Create <file>" and an
+    // "is absent" acknowledgement. Only a task the CURRENT guard would let through is requeued; a genuinely fabricated target still blocks and stays here.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (planTargetNoLongerBlocks(task, repoRoot) && bucketAttempts(task, 'P') < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket P but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'P') + 1;
+          log(`${id0}: bucket P (plan-target guard misfire, since fixed) -> requeue ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            bumpBucketAttempts(task, 'P');
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: the plan-target guard blocked this on an illustrative token (a call expression read as a file, or a create target called absent); the fixed guard no longer blocks the stored plan -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-P: plan-target guard misfire', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket Q: ungrounded-url gate misfire (fixture URLs in a test file the draft adds) -> file to review ---
+    // The draft was fine: every flagged value is a URL that exists only in an added test file (fact-checker.js urlsOnlyInAddedTestFiles). Keep
+    // implementResponse exactly as written, clear the rejection state and file it to review/ for a real vote (Bucket O's shape). A task flagged for ANY
+    // field, or for a URL that also appears in non-test code, is not matched.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (ungroundedUrlsAreTestFixtures(task) && bucketAttempts(task, 'Q') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket Q but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'Q') + 1;
+          log(`${id0}: bucket Q (ungrounded-url flags are test fixtures) -> filed to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of ['needsClarification', 'localRejectCount', 'retryableDraftBlock', 'priorRejectionFeedback', 'blockedReason',
+              'blockedStage', 'claimedAt', 'reviewProvider', 'reviewInconclusive', 'localVotes', 'voteErrors', 'ncTriageDecision', 'ncTriageReviewedAt']) delete task[f];
+            bumpBucketAttempts(task, 'Q');
+            task.status = 'needs-review';
+            appendHistoryEvent(task, 'requeued',
+              'needs-clarification-triage: every ungrounded-url flag is a fixture URL in a test file the draft itself adds (the gate now exempts those) -- implementResponse kept as written, rejection state cleared, sent to review');
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-Q: ungrounded-url flags are test fixtures', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: fixture-url repair-and-review move failed: ${e.message}`);
               summary.requeued -= 1;
               summary.errors += 1;
             }

@@ -940,3 +940,36 @@ test('extractDiffCreateTargets finds a newly created BINARY file, which has a ne
   const binary = ['diff --git a/assets/logo.png b/assets/logo.png', 'new file mode 100644', 'index 0000000..abc1234', 'GIT binary patch', 'literal 12', 'zcmZ?wbhEHb'].join('\n');
   assert.deepEqual([...extractDiffCreateTargets(binary)], ['assets/logo.png']);
 });
+
+// 2026-10-08: fixture URLs the draft itself adds in a TEST file are its own test data, not claims about the repo (TaxHarvest http_get_bytes cache task).
+const { urlsOnlyInAddedTestFiles } = require('./fact-checker.js');
+const diffOf = (...files) => files.map(([f, lines]) => `diff --git a/${f} b/${f}\nnew file mode 100644\n--- /dev/null\n+++ b/${f}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join('\n')}`).join('\n');
+const SRC = 'unrelated grounding text with nothing in it';
+
+test('checkGroundedValues: a URL that exists only in added TEST files is exempt; the same URL in a production file, in both, or only in prose is still flagged', () => {
+  const testOnly = diffOf(['pkg/tests/test_cache.py', ['url = "http://ex.com/report/a.pdf"']]);
+  assert.deepEqual(checkGroundedValues(testOnly, SRC, null, null), []);
+  assert.deepEqual([...urlsOnlyInAddedTestFiles(testOnly)], ['http://ex.com/report/a.pdf']);
+
+  const prod = diffOf(['pkg/cache.py', ['URL = "http://ex.com/report/a.pdf"']]);
+  assert.deepEqual(checkGroundedValues(prod, SRC, null, null).map((f) => f.detail), ['http://ex.com/report/a.pdf']);
+
+  const both = diffOf(['pkg/cache.py', ['URL = "http://ex.com/report/a.pdf"']], ['pkg/tests/test_cache.py', ['url = "http://ex.com/report/a.pdf"']]);
+  assert.deepEqual(checkGroundedValues(both, SRC, null, null).map((f) => f.detail), ['http://ex.com/report/a.pdf'], 'a production file relies on it too');
+
+  assert.deepEqual(checkGroundedValues('The fix fetches http://ex.com/report/a.pdf from the portal.', SRC, null, null).map((f) => f.detail), ['http://ex.com/report/a.pdf'], 'prose only');
+
+  const proseAndTest = `Tests use http://ex.com/page.html.\n${diffOf(['src/foo.test.js', ['const u = "http://ex.com/page.html";']])}`;
+  assert.deepEqual(checkGroundedValues(proseAndTest, SRC, null, null), [], 'prose describing the fixture does not veto it');
+});
+
+test('test-file recognition covers tests/ dirs, *.test.js/ts, *.spec.*, test_*.py and *_test.py, and nothing else', () => {
+  const urlIn = (f) => [...urlsOnlyInAddedTestFiles(diffOf([f, ['x = "http://t.example.org/a"']]))].length;
+  for (const f of ['a/tests/x.py', 'a/test/x.js', 'a/__tests__/x.ts', 'a/x.test.js', 'a/x.spec.tsx', 'a/test_x.py', 'a/x_test.py']) assert.equal(urlIn(f), 1, f);
+  for (const f of ['a/contest.py', 'a/latest/x.py', 'a/attest.js', 'a/x.js', 'a/testing_notes.md']) assert.equal(urlIn(f), 0, f);
+});
+
+test('an ungrounded ALLCAPS field in a test file is still flagged (only URLs are exempt)', () => {
+  const d = diffOf(['pkg/tests/test_cache.py', ['x = INVENTED_FIELD_NAME']]);
+  assert.deepEqual(checkGroundedValues(d, SRC, null, null).map((f) => f.type), ['ungrounded-field']);
+});

@@ -294,7 +294,9 @@ function extractDeclaredTargets(task, planText = '') {
   for (const frag of String((task && task.title) || '').split(/(?<=[.!?:;])\s+|\s+[—-]\s+/)) {
     if (RESTRICTION_SENTENCE_RE.test(frag)) continue;
     for (const m of frag.matchAll(/\b(?:src|python|scripts|lib|tests?|docs|node_modules)\/[\w./@-]*[\w]/gi)) add(m[0]);
-    for (const m of frag.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b/gi)) add(m[0]);
+    // `(?!\()`: a CALL such as `res.json()` / `fs.readFile()` in a title is code, not a file path (2026-10-08: two TaxHarvest tasks whose title is the whole
+    // brain-dump text, "`res.json()` on a non-JSON 200 ...", were blocked by the plan-target guard as "cites missing-file target(s): res.json"; same shape as #514).
+    for (const m of frag.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b(?!\()/gi)) add(m[0]);
   }
   // 3. Explicit edit-target mentions in the plan body.
   const plan = String(planText || '');
@@ -349,7 +351,7 @@ function leadingInClauseTargets(text) {
   for (const frag of String(text || '').split(/(?<=[.!?:;])\s+|\n+/)) {
     const sentence = frag.trim();
     if (RESTRICTION_SENTENCE_RE.test(sentence)) continue;
-    const leading = /^(?:In|At)\s+[`'"]?([\w./@-]+\.\w+)[`'"]?\s*(?:\([^)]*\)\s*)?,/i.exec(sentence);
+    const leading = /^(?:In|At)\s+[`'"]?([\w./@-]+\.\w+)(?!\()[`'"]?\s*(?:\([^)]*\)\s*)?,/i.exec(sentence);
     if (leading && EDIT_VERB_RE.test(sentence)) out.push(leading[1]);
   }
   return out;

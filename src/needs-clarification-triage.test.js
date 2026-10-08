@@ -1498,3 +1498,86 @@ test('bucket O: bounded to one attempt; a non-structured response, another revie
   assert.equal(summary.dryRun, true);
   assert.ok(exists(at(dry, 'needs-clarification', 'chg-dry.json')) && !exists(at(dry, 'review', 'chg-dry.json')));
 });
+
+// --- Buckets P and Q: deterministic gates that read an illustrative token as a claim (2026-10-08; 4 TaxHarvest tasks) ---
+
+function planGuardBlocked(id, over = {}) {
+  return {
+    id, domain: 'adhoc', source: 'derived_task', status: 'blocked',
+    title: '`res.json()` on a non-JSON 200 response throws inside the try', promptContext: { rawText: 'In `real.js` line 3 the body may be HTML.' },
+    planResponse: 'Edit `src/real.js` to wrap `await res.json()` in a try.', implementResponse: 'stale',
+    blockedStage: 'pre-implement', blockedReason: 'plan cites missing-file target(s): res.json', localRejectCount: 1,
+    needsClarification: { reason: 'fabricated-file-path', openQuestions: 'plan cites missing-file target(s): res.json' },
+    history: [{ stage: 'exhausted', at: '2026-10-07T00:59:00Z' }], ...over,
+  };
+}
+
+test('bucket P: a task the plan-target guard blocked on an illustrative token (res.json()) is requeued to adhoc/ clean; one capped attempt', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'adhoc'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'real.js'), '//\n'); // the sweep's repoRoot is this dir: the plan's real target must exist
+  held(dir, planGuardBlocked('plan-1'));
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'plan-1.json')));
+  const out = read(at(dir, 'adhoc', 'plan-1.json'));
+  assert.equal(out.ncTriageBucketAttempts.P, 1);
+  assert.equal(out.blockedReason, undefined);
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /plan-target guard blocked this on an illustrative token/.test(h.detail)));
+});
+
+test('bucket P: a genuinely fabricated target, a capped task and an already-in-adhoc task are left alone', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'adhoc'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'real.js'), '//\n'); // so the capped / in-adhoc tasks WOULD be re-admitted but for their guard
+  held(dir, planGuardBlocked('plan-fab', { title: 'Edit src/invented.js to add a guard', planResponse: 'Edit `src/invented.js` to add a guard.', blockedReason: 'plan cites missing-file target(s): src/invented.js', needsClarification: { reason: 'fabricated-file-path', openQuestions: 'plan cites missing-file target(s): src/invented.js' } }));
+  held(dir, planGuardBlocked('plan-capped', { ncTriageBucketAttempts: { P: 1 } }));
+  held(dir, planGuardBlocked('plan-inadhoc'));
+  fs.writeFileSync(at(dir, 'adhoc', 'plan-inadhoc.json'), '{}');
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  for (const id of ['plan-fab', 'plan-capped', 'plan-inadhoc']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), `${id} stays`);
+  assert.ok(!exists(at(dir, 'adhoc', 'plan-fab.json')));
+  assert.equal(summary.requeued, 0);
+});
+
+const FIXTURE_DIFF = 'diff --git a/pkg/tests/test_x.py b/pkg/tests/test_x.py\nnew file mode 100644\n--- /dev/null\n+++ b/pkg/tests/test_x.py\n@@ -0,0 +1 @@\n+url = "http://ex.com/a.pdf"';
+function urlGateBlocked(id, over = {}) {
+  return {
+    id, domain: 'adhoc', source: 'derived_task', status: 'blocked', promptContext: { rawText: 'x' },
+    implementResponse: FIXTURE_DIFF, rawDiff: 'keep-me', blockedStage: 'review', reviewProvider: 'deterministic-ungrounded',
+    blockedReason: 'Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ungrounded-url: http://ex.com/a.pdf. This fact-check flag is high-precision.',
+    localRejectCount: 3, priorRejectionFeedback: ['older: ungrounded-field: OLD_FLAG'],
+    needsClarification: { reason: 'fabricated-ungrounded-claim', openQuestions: '1. ungrounded-field: OLD_FLAG' },
+    history: [{ stage: 'exhausted', at: '2026-10-07T00:59:00Z' }], ...over,
+  };
+}
+
+test('bucket Q: ungrounded-url flags that are fixture URLs in an added test file -> filed to review/ with the draft kept exactly as written', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, urlGateBlocked('url-1'));
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'url-1.json')));
+  const out = read(at(dir, 'review', 'url-1.json'));
+  assert.equal(out.status, 'needs-review');
+  assert.equal(out.implementResponse, FIXTURE_DIFF);
+  assert.equal(out.rawDiff, 'keep-me');
+  for (const f of ['needsClarification', 'blockedReason', 'blockedStage', 'localRejectCount', 'priorRejectionFeedback', 'reviewProvider']) assert.equal(out[f], undefined, `${f} cleared`);
+  assert.equal(out.ncTriageBucketAttempts.Q, 1);
+});
+
+test('bucket Q: a field flag, a URL in production code, a capped task and an already-in-review task stay', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, urlGateBlocked('url-field', { blockedReason: 'Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ungrounded-url: http://ex.com/a.pdf; ungrounded-field: SOME_FIELD. x' }));
+  held(dir, urlGateBlocked('url-prod', { implementResponse: FIXTURE_DIFF.replace('pkg/tests/test_x.py', 'pkg/cache.py').replace('pkg/tests/test_x.py', 'pkg/cache.py') }));
+  held(dir, urlGateBlocked('url-capped', { ncTriageBucketAttempts: { Q: 1 } }));
+  held(dir, urlGateBlocked('url-inreview'));
+  fs.writeFileSync(at(dir, 'review', 'url-inreview.json'), '{}');
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  for (const id of ['url-field', 'url-prod', 'url-capped', 'url-inreview']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), `${id} stays`);
+  assert.equal(summary.requeued, 0);
+});
