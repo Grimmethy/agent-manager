@@ -18,6 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const { lineRangeOf, extractChangedSpan, normalizeCode } = require('./lib/fact-checker-text-utils.js');
 const { extractDomainRoot } = require('./lib/fact-checker-url-utils.js');
+const { isArchivedDirName } = require('./lib/archived-dirs.js');
 
 // (?!\s*:\s*\d) rejects a match where a ":NNN" line-number suffix follows, so
 // "foo.js:310" is not silently truncated to the bare path "foo.js".
@@ -143,7 +144,7 @@ function findByBasename(root, basename, maxResults = 10) {
     for (const entry of entries) {
       if (found.length >= maxResults) return;
       if (entry.isDirectory()) {
-        if (WALK_SKIP_DIRS.has(entry.name)) continue;
+        if (WALK_SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
         walk(path.join(dir, entry.name));
       } else if (entry.isFile() && entry.name === basename) {
         found.push(path.join(dir, entry.name));

@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { snippetFromSection, quotedSymbolsFromSection, stripWhitespace, realIndexForStrippedIndex } = require('./candidate-doc-parsing.js');
 const { findFuzzyMatch, windowAroundIndex, MIN_PARTIAL_CHARS } = require('./fuzzy-matching.js');
+const { isArchivedDirName } = require('../../lib/archived-dirs.js');
 
 // Same literals as src/sdk/candidate-fulfillment.js (the source these were moved out of)
 // -- duplicated here rather than required back, so this module stays self-contained.
@@ -274,7 +275,7 @@ function listCandidateFiles(dir, ext, recursive, budget) {
     try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       if (budget.left <= 0) return;
-      if (e.isDirectory()) { if (recursive && !RELOCATE_SKIP_DIRS.has(e.name)) walk(path.join(d, e.name)); continue; }
+      if (e.isDirectory()) { if (recursive && !RELOCATE_SKIP_DIRS.has(e.name) && !isArchivedDirName(e.name)) walk(path.join(d, e.name)); continue; }
       if (!e.isFile() || path.extname(e.name) !== ext || e.name.includes('.test.')) continue;
       budget.left -= 1;
       out.push(path.join(d, e.name));
