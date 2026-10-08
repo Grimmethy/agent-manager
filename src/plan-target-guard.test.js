@@ -127,3 +127,45 @@ test('existsAtRef is not consulted for a target that exists in the working tree'
   assert.equal(r.blocked, false);
   assert.equal(called, 0);
 });
+
+// 2026-10-08 (HUB0011-02 "Create test_or_columbia_value.py"): the task's own create verb and an "is absent" acknowledgement both declare a create target.
+test('a task titled "Create <file>" makes that file a create target even when the plan only calls the full path "absent"', () => {
+  const repo = tmpRepo();
+  const task = { title: 'HUB0011 · 2/2 · Create test_or_columbia_value.py', promptContext: { rawText: 'Create or extend enrichers/test_or_columbia_value.py with a test that mocks the Playwright instance.' } };
+  const plan = 'A grep for the name returned zero hits, confirming `enrichers/test_or_columbia_value.py` is absent. This step writes the test.';
+  assert.equal(planTargetGuard(task, plan, repo, ['src']).blocked, false);
+  assert.equal(isDeclaredCreateTarget(plan, 'test_or_columbia_value.py', task.title), true);
+});
+
+test('the TASK\'s own "Create <file>" exempts the target even when the plan says nothing about creating or absence (isolates the task-level signal)', () => {
+  const repo = tmpRepo();
+  const task = { title: 'HUB0011 · 2/2 · Create brand_new_check.test.js', promptContext: { rawText: 'Write the first test.' } };
+  const plan = 'Add the tests to `brand_new_check.test.js` covering the reset path.';
+  assert.equal(isDeclaredCreateTarget(plan, 'brand_new_check.test.js'), false, 'the plan alone gives no signal');
+  assert.equal(isDeclaredCreateTarget(plan, 'brand_new_check.test.js', task.title), true, 'the task title does');
+  assert.equal(planTargetGuard(task, plan, repo, ['src']).blocked, false);
+  assert.equal(planTargetGuard({ title: 'Update brand_new_check.test.js' }, plan, repo, ['src']).blocked, true, 'without the create verb it is a missing target');
+});
+
+test('"is absent", "not present", "not found" and "no such file" next to the path are existence acknowledgements', () => {
+  for (const phrase of ['`new.js` is absent', '`new.js` is not present', '`new.js` is not found', '`new.js`: no such file', 'the file `new.js` was absent']) {
+    assert.equal(isDeclaredCreateTarget(`Note: ${phrase} in the tree.`, 'new.js'), true, phrase);
+  }
+  assert.equal(isDeclaredCreateTarget('The helper in `new.js` is present and used widely.', 'new.js'), false);
+});
+
+test('a fabricated path with no create signal anywhere is STILL blocked, and a create verb about a different file does not exempt it', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Edit src/invented.js to add a guard', promptContext: { rawText: 'Create a summary of the problem first, then edit src/invented.js.' } };
+  const r = planTargetGuard(task, 'Edit `src/invented.js` to add a guard.', repo, ['src']);
+  assert.equal(r.blocked, true);
+  assert.deepEqual(r.missing, ['src/invented.js']);
+  const far = { title: 'Create the docs/overview.md page and then, once a long and detailed description of everything that happens on that page has been written out in full, fix src/invented.js' };
+  assert.equal(isDeclaredCreateTarget('Edit `src/invented.js`.', 'src/invented.js', far.title), false, 'the create verb is about another file, > 80 chars away');
+});
+
+test('planTargetGuard no longer blocks a title that is a call expression (res.json())', () => {
+  const repo = tmpRepo();
+  const task = { title: '`res.json()` on a non-JSON 200 response throws inside the try', promptContext: { rawText: 'In `real.js` line 3 the body may be HTML.' } };
+  assert.equal(planTargetGuard(task, 'Edit `src/real.js` to wrap `await res.json()` in a try.', repo, ['src']).blocked, false);
+});
