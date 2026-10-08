@@ -222,8 +222,71 @@ async function runCritiqueAndRevision(task, {
     // Revision came back degenerate: bounded to one attempt, leave original draft
     // intact rather than lose a working draft to a bad revision call.
   }
+  if (await recheckFinalEdits(task, { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall })) return;
   recordCritique(attempt, { outcome: task.critiqueOutcome, revised: !!task.revisionApplied });
   appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
+}
+
+// Hard find-string re-check of the FINAL edit set (lib/find-recheck.js, 2026-10-08, TaxHarvest AC-271): the pre-critique check is advisory and the
+// critique's revision replaces the edit set unchecked, so an edit whose `find` matches nothing used to reach review and fail at apply. Replays the
+// edits in apply order; on a failure makes ONE bounded fix call that shows the real nearby lines, and if that still fails blocks the draft with the same
+// feedback for the redraft. The same failure twice in a row, and advisory mode, record an advisory instead. Returns true when the draft was blocked.
+async function recheckFinalEdits(task, { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall }) {
+  try {
+    if (!usesGroupB(task)) return false;
+    const fr = require('./find-recheck.js');
+    const mode = fr.recheckMode();
+    if (mode === 'off') return false;
+    const parse = (text) => { try { const v = parseJsonMaybeFenced(text || ''); return v ? (Array.isArray(v) ? v : [v]) : null; } catch { return null; } };
+    const items = parse(task.implementResponse);
+    if (!items) return false;
+    const repoRoot = getConfig().repoRoot;
+    let flags = fr.simulateEdits(items, repoRoot);
+    if (!flags.length) return false;
+    const sig = fr.signatureOf(flags);
+    const repeat = task.findRecheckBlocked === sig;
+    if (mode === 'advisory' || repeat) {
+      appendHistoryEvent(task, 'advisory', `find-string recheck (${repeat ? 'same failure blocked before, not blocking again' : 'advisory mode'}): ${fr.feedbackFor(flags)}`.slice(0, 600));
+      delete task.findRecheckBlocked;
+      return false;
+    }
+    if (typeof resolvedLocalCall === 'function') {
+      const prompt = [
+        'The edit set below CANNOT be applied: apply requires every `find` to match the real file EXACTLY ONCE, in order.',
+        '', 'ORIGINAL TASK PLAN:', String(task.planResponse || '').slice(0, 3000),
+        '', 'CURRENT EDIT SET:', String(task.implementResponse || '').slice(0, 9000),
+        '', 'WHAT WILL FAIL (with the real nearby lines):', fr.feedbackFor(flags),
+        '', 'Return the corrected edit set ONLY, as the same JSON array, with every `find` copied character for character from the real lines above. Do not add commentary.',
+      ].join('\n');
+      const startedAt = new Date().toISOString();
+      const startMs = Date.now();
+      const fixResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt, think: profileSupportsThink, temperature: 0.2, numPredict: 1400, source: task.source, taskId: task.id, stage: 'revise' }), 'revise');
+      if (recordModelCall) recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: fixResult, source: task.source, stage: 'revise' });
+      const fixed = fixResult && !fixResult.degenerate ? fixResult.response : null;
+      if (fixed && revisionKeepsAnswerShape(task, fixed)) {
+        const fixedItems = parse(fixed);
+        if (fixedItems && fr.simulateEdits(fixedItems, repoRoot).length === 0) {
+          task.implementResponse = fixed;
+          task.revisionApplied = true;
+          delete task.findRecheckBlocked;
+          appendHistoryEvent(task, 'advisory', `find-string recheck: ${flags.length} failing edit(s) corrected by one bounded fix call`);
+          return false;
+        }
+      }
+    }
+    const blockedReason = `Edit set would not apply: ${fr.feedbackFor(flags)}`.slice(0, 900);
+    task.findRecheckBlocked = sig;
+    task.critiqueOutcome = 'find-recheck-failed';
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = [...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), blockedReason];
+    try { recordCritique(attempt, { outcome: 'find-recheck-failed' }); } catch { /* telemetry must not turn a block into a pass */ }
+    appendHistoryEvent(task, 'critique-done', blockedReason);
+    return true;
+  } catch (err) {
+    console.warn('[local-draft] find-string recheck failed (advisory):', (err && err.message) || err);
+    return false;
+  }
 }
 
 function computeImplementBudget(task, implPrompt) {
@@ -509,4 +572,4 @@ function checkFindStrings(implementResponse, repoRoot) {
   return flags;
 }
 
-module.exports = { revisionKeepsAnswerShape, runCritiqueAndRevision, computeImplementBudget, callImplementModel, checkFindStrings };
+module.exports = { recheckFinalEdits, revisionKeepsAnswerShape, runCritiqueAndRevision, computeImplementBudget, callImplementModel, checkFindStrings };

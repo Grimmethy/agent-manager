@@ -286,6 +286,21 @@ function applyRetryCheck({ blockedDir, pendingDir, needsClarificationDir, approv
 
       task.applyRetryCount = retryCount + 1;
 
+      // A find-string miss redrafts with the REAL nearby lines (lib/find-recheck.js), not just "find string not found": the redraft that failed this way
+      // (TaxHarvest AC-271) invented its `find`, and the bare reason gave it nothing to copy. Best-effort; a task with no parseable edit set is unchanged.
+      if (isFindStringMiss(task)) {
+        try {
+          const fr = require('./lib/find-recheck.js');
+          const parsed = require('./json-fence.js').parseJsonMaybeFenced(String(task.implementResponse || ''));
+          const flags = parsed ? fr.simulateEdits(Array.isArray(parsed) ? parsed : [parsed], repoRoot) : [];
+          if (flags.length) {
+            const note = `Last attempt's edit set could not apply: ${fr.feedbackFor(flags)}`.slice(0, 900);
+            const prior = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+            if (!prior.includes(note)) task.priorRejectionFeedback = [...prior, note];
+          }
+        } catch { /* best-effort: the bare blockedReason is still in history */ }
+      }
+
       step = 'record';
       recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'apply-watchdog', outcomeReason: task.blockedReason || null });
       appendHistoryEvent(task, 'requeued', task.blockedReason || undefined);
