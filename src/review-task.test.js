@@ -2845,3 +2845,13 @@ test('executed verification: reviewers are told which files were NOT syntax-chec
   assert.ok(!/gone\.js/.test(out), 'a removed file is not a coverage gap worth telling the reviewers about');
   assert.ok(!/NOT syntax-checked/.test(formatExecutedVerificationSection({ status: 'passed', reasons: [], commands: [], tests: { ran: ['a.test.js'], passed: true, failures: [] }, syntax: { checked: ['a.js'], failed: [], preexisting: [], skipped: [] } })));
 });
+
+// 2026-10-08: a task carrying an inert-target stamp (derived-premise-sweep.js) shows the reviewer an advisory line; one without it does not.
+test('buildVerdictPrompt: the inert-target advisory appears only for a task stamped with one', () => {
+  const { buildVerdictPrompt } = require('./review-task.js');
+  const base = { id: 't', title: 'x', domain: 'adhoc', source: 'derived_task', planResponse: 'p', implementResponse: 'i', promptContext: { rawText: 'r' } };
+  const stamped = buildVerdictPrompt({ ...base, inertTarget: { symbol: '_patchRun', definedIn: 'TaxHarvest/backend/src/services/runStore.js', held: true } }, { verdict: 'pass' }, '');
+  assert.match(stamped, /Inert target \(deterministic, advisory\)/);
+  assert.match(stamped, /`_patchRun`.*runStore\.js.*NO call sites/s);
+  assert.doesNotMatch(buildVerdictPrompt(base, { verdict: 'pass' }, ''), /Inert target/);
+});
