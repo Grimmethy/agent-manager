@@ -21,6 +21,7 @@ const { normalizeDiffOutput } = require('./group-b-worktree-diff.js');
 const { stageDraftChanges } = require('./lib/draft-side-effects.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
+const { checkLeftoverReferences, makeGrepBase } = require('./lib/leftover-references.js');
 const { writeSideFindingInbox } = require('./side-finding.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
@@ -811,6 +812,29 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   // -- root-caused via three needs-clarification tasks that each burned their retry budget
   // getting a doc / stub / off-limits diff rejected in review.
   if (resolution === 'implemented' && trimmedDiff) {
+    // Did the diff remove / rename a name the tree still uses? Runs before the substance gate: it is the cheaper, more specific
+    // finding (it names the file and line of the missed use). A second block on the SAME names downgrades to an advisory so a
+    // false positive can never strand the task. See src/lib/leftover-references.js.
+    const leftover = checkLeftoverReferences({
+      diff: trimmedDiff,
+      grepBase: makeGrepBase(runGit, worktreeDir),
+      priorNames: task.leftoverRefBlocked,
+    });
+    if (leftover.action === 'advisory') {
+      appendHistoryEvent(task, 'advisory', leftover.advisoryText);
+      delete task.leftoverRefBlocked;
+    } else if (leftover.action === 'block') {
+      task.retryableDraftBlock = true;
+      task.leftoverRefBlocked = leftover.names;
+      task.adhocDiffSubstanceFeedback = leftover.retryFeedback;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass produced a diff that is not a real implementation -- ${leftover.reason}`,
+        ...meta,
+        capturedDiff: trimmedDiff,
+      };
+    }
     const substance = adhocDiffSubstanceProblem(task, trimmedDiff, summary);
     if (substance) {
       task.retryableDraftBlock = true;

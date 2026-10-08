@@ -177,6 +177,55 @@ test('resolveAgenticDraft(implemented): a lockfile rewritten by a sandbox npm in
   });
 });
 
+// 2026-10-07 (leftover-references.js): a draft that removes a name but leaves a use behind is blocked at draft time with the file
+// and line named; the SAME names blocked twice in a row downgrade to an advisory so a false positive can never strand the task.
+function leftoverDraft(wt) {
+  const g = (args) => execFileSync('git', args, { cwd: wt, encoding: 'utf8' });
+  fs.mkdirSync(path.join(wt, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(wt, 'src', 'db.js'), 'const [STATUS_PENDING] = LIST;\nfunction claim(p) { return p !== STATUS_PENDING; }\n');
+  g(['add', '-A']); g(['commit', '-qm', 'files']);
+  fs.writeFileSync(path.join(wt, 'src', 'db.js'), 'const [STATUS] = LIST;\nfunction claim(p) { return p !== STATUS_PENDING; }\n');
+  return { id: 'tleft', source: 'manual', domain: 'adhoc', promptContext: { rawText: 'Rename the STATUS constants in src/db.js.' } };
+}
+const leftoverResult = { response: 'Renamed the constants in src/db.js.\n\nRESOLUTION: implemented\n\ndone' };
+
+test('resolveAgenticDraft(implemented): a removed name still referenced -> retryable block naming the file and line', () => {
+  withRealRepo((wt) => {
+    const task = leftoverDraft(wt);
+    const out = resolveAgenticDraft(task, { result: leftoverResult, worktreeDir: wt });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /still referenced.*STATUS_PENDING/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.deepEqual(task.leftoverRefBlocked, ['STATUS_PENDING']);
+    assert.match(task.adhocDiffSubstanceFeedback, /src\/db\.js:2/);
+    assert.ok(!task.adhocResolution, 'not stamped as implemented');
+  });
+});
+
+test('resolveAgenticDraft(implemented): the same leftover names blocked twice -> advisory, the draft goes through', () => {
+  withRealRepo((wt) => {
+    const task = leftoverDraft(wt);
+    task.leftoverRefBlocked = ['STATUS_PENDING'];
+    const out = resolveAgenticDraft(task, { result: leftoverResult, worktreeDir: wt });
+    assert.notEqual(out.blocked, true, JSON.stringify(out).slice(0, 300));
+    assert.equal(task.adhocResolution, 'implemented');
+    assert.equal(task.leftoverRefBlocked, undefined, 'the marker is cleared once it has been waved through');
+    assert.ok(task.history.some((e) => e.stage === 'advisory' && /leftover-reference gate.*not blocking again/.test(e.detail || '')));
+  });
+});
+
+test('resolveAgenticDraft(implemented): AGENT_MANAGER_LEFTOVER_REF_MODE=off disables the gate', () => {
+  const prev = process.env.AGENT_MANAGER_LEFTOVER_REF_MODE;
+  process.env.AGENT_MANAGER_LEFTOVER_REF_MODE = 'off';
+  try {
+    withRealRepo((wt) => {
+      const task = leftoverDraft(wt);
+      const out = resolveAgenticDraft(task, { result: leftoverResult, worktreeDir: wt });
+      assert.notEqual(out.blocked, true);
+    });
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_LEFTOVER_REF_MODE; else process.env.AGENT_MANAGER_LEFTOVER_REF_MODE = prev; }
+});
+
 // --- resolveAgenticDraft(no-changes-needed) -- adhocNoChangesClaimProblem (2026-09-04) ---
 
 test('resolveAgenticDraft(no-changes-needed): no "Already covered:" block -> retryable block with pointed feedback', () => {
