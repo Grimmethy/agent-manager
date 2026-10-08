@@ -9,7 +9,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { splitCoveringTiers, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS, TEST_TIMEOUT_MS } = require('./review-verify.js');
-const { verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
+const { addedTestNames, verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 
 const DIFF = 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/src/a.test.js b/src/a.test.js\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.test.js\n@@ -0,0 +1 @@\n+z\n';
@@ -1031,4 +1031,137 @@ test('an unresolved python interpreter is reported as such, not as an unavailabl
   assert.equal(r.status, 'inconclusive');
   assert.match(r.reasons.join(' '), /no python interpreter available/);
   assert.doesNotMatch(r.reasons.join(' '), /bwrap/);
+});
+
+// --- per-file covering runs (2026-10-08) ------------------------------------------------------------------------------------------------
+// src/local-draft.test.js alone takes ~9 minutes, past the review's 210s cap. All covering files used to run in ONE `node --test a b c d`, so its timeout
+// discarded the three fast files' passes too and the reviewers rejected on "unverified". Each file now runs in its own process.
+
+const OTHER = 'diff --git a/src/other.js b/src/other.js\n--- a/src/other.js\n+++ b/src/other.js\n@@ -1 +1 @@\n-x\n+y\n';
+const filesOf = (a) => a.args.filter((x) => /\.test\.js$/.test(x));
+
+test('per-file: a slow file times out ALONE -- the other covering file still reports a real pass, and each run gets exactly one file', () => {
+  const calls = [];
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/a.test.js', 'src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/a.js', 'src/a.test.js', 'src/b.test.js']),
+    run: (a) => { calls.push(a); return /b\.test\.js/.test(a.args.join(' ')) ? { ran: true, exitCode: null, timedOut: true, output: '' } : { ran: true, exitCode: 0, timedOut: false, output: '' }; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: OTHER, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.passedFiles, ['src/a.test.js']);
+  assert.deepEqual(r.tests.timedOutFiles, ['src/b.test.js']);
+  assert.ok(calls.every((c) => filesOf(c).length === 1), 'one file per process');
+  assert.match(r.reasons.join(' '), /1 file\(s\) unverified.*src\/b\.test\.js/);
+});
+
+test('per-file: the cheapest (smallest) covering file runs first, so a huge one cannot starve the rest of the budget', () => {
+  const order = [];
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/huge.test.js', 'src/tiny.test.js'], py: [] }),
+    prepare: () => {
+      const dir = worktreePaths('t1').worktreeDir;
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src/huge.test.js'), '// big\n'.repeat(500));
+      fs.writeFileSync(path.join(dir, 'src/tiny.test.js'), '// t\n');
+      return { ok: true };
+    },
+    run: (a) => { order.push(filesOf(a)[0]); return { ran: true, exitCode: 0, timedOut: false, output: '' }; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: OTHER, deps: f.deps });
+  assert.deepEqual(order, ['src/tiny.test.js', 'src/huge.test.js']);
+  assert.equal(r.status, 'passed');
+  assert.deepEqual(r.tests.passedFiles, ['src/tiny.test.js', 'src/huge.test.js']);
+});
+
+test('addedTestNames: the test()/it()/describe() cases a diff adds to ONE file, unescaped and de-duplicated', () => {
+  const diff = [
+    'diff --git a/src/x.test.js b/src/x.test.js', '--- a/src/x.test.js', '+++ b/src/x.test.js', '@@ -1 +1,4 @@',
+    "+test('first one: it\\'s fine', () => {});", '+  it("second", () => {});', '+test(`third`, () => {});', "+test('first one: it\\'s fine', () => {});",
+    " test('untouched context', () => {});",
+    'diff --git a/src/y.test.js b/src/y.test.js', '--- a/src/y.test.js', '+++ b/src/y.test.js', '@@ -1 +1 @@', "+test('belongs to y', () => {});",
+  ].join('\n');
+  assert.deepEqual(addedTestNames(diff, 'src/x.test.js'), ["first one: it's fine", 'second', 'third']);
+  assert.deepEqual(addedTestNames(diff, 'src/y.test.js'), ['belongs to y']);
+  assert.deepEqual(addedTestNames(diff, 'src/none.test.js'), []);
+});
+
+const ADDS = 'diff --git a/src/b.js b/src/b.js\n--- a/src/b.js\n+++ b/src/b.js\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/src/b.test.js b/src/b.test.js\n--- a/src/b.test.js\n+++ b/src/b.test.js\n@@ -1 +1,2 @@\n+test(\'the gate blocks (a.b)\', () => {});\n';
+
+test('narrowed-first: the tests a diff adds to a file run on their own first; if the whole file then cannot finish, they remain as PARTIAL evidence', () => {
+  const calls = [];
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/b.js', 'src/b.test.js']),
+    run: (a) => { calls.push(a); return a.args.includes('--test-name-pattern') ? { ran: true, exitCode: 0, timedOut: false, output: '' } : { ran: true, exitCode: null, timedOut: true, output: '' }; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: ADDS, deps: f.deps });
+  const narrowed = calls.find((c) => c.args.includes('--test-name-pattern'));
+  assert.ok(narrowed, 'a narrowed run happened');
+  assert.equal(narrowed.args[narrowed.args.indexOf('--test-name-pattern') + 1], 'the gate blocks \\(a\\.b\\)', 'the pattern is regex-escaped');
+  assert.equal(calls.indexOf(narrowed), 0, 'and it ran BEFORE the whole file');
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.timedOutFiles, ['src/b.test.js']);
+  assert.deepEqual(r.tests.partial, [{ file: 'src/b.test.js', tests: ['the gate blocks (a.b)'], count: 1, passed: true }]);
+  assert.deepEqual(r.tests.passedFiles, []);
+});
+
+test('narrowed-first: a diff-added test that FAILS is a real failure (the base has no such test, so the control run cannot excuse it)', () => {
+  let onBase = false;   // the control run happens after the diff is reversed; there the added test does not exist, so the pattern matches nothing and exits 0
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/b.js', 'src/b.test.js']),
+    unapplyDiff: () => { onBase = true; return { applied: true }; },
+    run: (a) => (a.args.includes('--test-name-pattern') && !onBase ? { ran: true, exitCode: 1, timedOut: false, output: 'not ok 1 - the gate blocks (a.b)\n' } : { ran: true, exitCode: 0, timedOut: false, output: '' }),
+  });
+  const r = verifyDiff({ ...base, rawDiff: ADDS, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.tests.partial[0].passed, false);
+});
+
+test('differential: a failure whose base run TIMED OUT says so -- it is not reported as "already fails on master"', () => {
+  const f = diffDeps({ run: scriptedRun([failing('x'), { exitCode: null, timedOut: true }]) });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  const text = r.reasons.join(' ');
+  assert.match(text, /could not finish on master either \(timed out\)/);
+  assert.doesNotMatch(text, /already fail on/);
+});
+
+test('differential: a failure that really also fails on the base keeps the "already fail" wording', () => {
+  const f = diffDeps({ run: scriptedRun([failing('x'), failing('x')]) });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.match(r.reasons.join(' '), /already fail on master in the review sandbox/);
+});
+
+test('differential: a file whose only failures also fail on the base is reported as such (status stays inconclusive), while a clean sibling file still reports its pass', () => {
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/a.test.js', 'src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/a.js', 'src/a.test.js', 'src/b.test.js']),
+    run: (a) => (/b\.test\.js/.test(a.args.join(' ')) ? { ran: true, exitCode: 1, timedOut: false, output: 'not ok 1 - greps the live repo\n' } : { ran: true, exitCode: 0, timedOut: false, output: '' }),
+  });
+  const r = verifyDiff({ ...base, rawDiff: OTHER, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.preexistingOnlyFiles, ['src/b.test.js']);
+  assert.deepEqual(r.tests.passedFiles, ['src/a.test.js']);
+  assert.deepEqual(r.tests.preexisting, ['greps the live repo']);
+});
+
+test('per-file: a real failure in one file is not erased by another file timing out -- the result is failed and tests.passed stays false', () => {
+  let onBase = false;
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/a.test.js', 'src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/a.js', 'src/a.test.js', 'src/b.test.js']),
+    unapplyDiff: () => { onBase = true; return { applied: true }; },
+    run: (a) => {
+      const text = a.args.join(' ');
+      if (/b\.test\.js/.test(text)) return { ran: true, exitCode: null, timedOut: true, output: '' };
+      return onBase ? { ran: true, exitCode: 0, timedOut: false, output: '' } : { ran: true, exitCode: 1, timedOut: false, output: 'not ok 1 - the new regression\n' };
+    },
+  });
+  const r = verifyDiff({ ...base, rawDiff: OTHER, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.tests.passed, false);
+  assert.deepEqual(r.tests.timedOutFiles, ['src/b.test.js']);
 });

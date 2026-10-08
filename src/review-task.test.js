@@ -2855,3 +2855,18 @@ test('buildVerdictPrompt: the inert-target advisory appears only for a task stam
   assert.match(stamped, /`_patchRun`.*runStore\.js.*NO call sites/s);
   assert.doesNotMatch(buildVerdictPrompt(base, { verdict: 'pass' }, ''), /Inert target/);
 });
+
+test('formatExecutedVerificationSection separates files that finished and passed from files that could not finish, and shows the diff-added tests that ran', () => {
+  const { formatExecutedVerificationSection, summariseExecutedVerification } = require('./review-task.js');
+  const out = formatExecutedVerificationSection({
+    status: 'inconclusive',
+    tests: { ran: ['a.test.js', 'b.test.js'], passed: null, passedFiles: ['a.test.js'], timedOutFiles: ['b.test.js'], partial: [{ file: 'b.test.js', count: 2, passed: true, tests: ['x one', 'x two'] }] },
+    commands: [], reasons: [],
+  });
+  assert.match(out, /ran to completion and PASSED \(1\): a\.test\.js/);
+  assert.match(out, /In b\.test\.js the 2 test\(s\) THIS DIFF ADDS were run on their own: PASSED \(x one, x two\)/);
+  assert.match(out, /did NOT finish within the review's per-run cap.*not a failure and not a reason to reject by itself: b\.test\.js/);
+  const sum = summariseExecutedVerification({ status: 'inconclusive', reasons: [], tests: { ran: ['b.test.js'], passed: null, passedFiles: [], timedOutFiles: ['b.test.js'], partial: [{ file: 'b.test.js', count: 1, passed: true, tests: ['t'] }] }, commands: [] });
+  assert.deepEqual(sum.tests.timedOutFiles, ['b.test.js']);
+  assert.deepEqual(sum.tests.partial, [{ file: 'b.test.js', count: 1, passed: true, tests: ['t'] }]);
+});

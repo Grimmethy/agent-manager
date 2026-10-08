@@ -395,6 +395,14 @@ function formatExecutedVerificationSection(ev) {
   } else {
     out.push('- No covering test file could be found for the changed files.');
   }
+  // Per-file evidence (review-verify runs each covering file in its own process): what FINISHED and passed is separated from what could not finish, so one
+  // slow file no longer reads as "nothing was verified".
+  if (Array.isArray(tests.passedFiles) && tests.passedFiles.length) out.push(`- Covering test files that ran to completion and PASSED (${tests.passedFiles.length}): ${evList(tests.passedFiles, EV_MAX_FILES)}.`);
+  if (Array.isArray(tests.preexistingOnlyFiles) && tests.preexistingOnlyFiles.length) out.push(`- Covering test files whose ONLY failures are tests that fail identically on the base branch in this sandbox -- the diff introduced no failure there, and every other test in them passed: ${evList(tests.preexistingOnlyFiles, EV_MAX_FILES)}.`);
+  if (Array.isArray(tests.partial) && tests.partial.length) {
+    for (const x of tests.partial) out.push(`- In ${x.file} the ${x.count} test(s) THIS DIFF ADDS were run on their own: ${x.passed ? 'PASSED' : 'FAILED'} (${evList(x.tests || [], EV_MAX_ITEMS)}).`);
+  }
+  if (Array.isArray(tests.timedOutFiles) && tests.timedOutFiles.length) out.push(`- Covering test files that did NOT finish within the review's per-run cap, so the REST of their tests are unverified -- not a failure and not a reason to reject by itself: ${evList(tests.timedOutFiles, EV_MAX_FILES)}.`);
   if (Array.isArray(tests.dependentsUnverified) && tests.dependentsUnverified.length) out.push(`- Dependent test files (they only import a changed module) that did NOT finish in the review budget, so they are unverified -- NOT a failure and not a reason to reject on their own: ${evList(tests.dependentsUnverified, EV_MAX_FILES)}.`);
   if (Array.isArray(tests.failures) && tests.failures.length) out.push(`- Failing tests the diff introduced: ${evList(tests.failures.map((f) => String(f).slice(0, 120)), EV_MAX_ITEMS)}.`);
   if (Array.isArray(tests.preexisting) && tests.preexisting.length) {
@@ -621,7 +629,7 @@ function summariseExecutedVerification(ev) {
     status: ev.status,
     at: new Date().toISOString(),
     reasons: (ev.reasons || []).slice(0, 6).map((r) => String(r).slice(0, 300)),
-    tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10), ...(ev.tests.preexisting && ev.tests.preexisting.length ? { preexisting: ev.tests.preexisting.slice(0, 10) } : {}), ...(ev.tests.dependentsUnverified && ev.tests.dependentsUnverified.length ? { dependentsUnverified: ev.tests.dependentsUnverified.slice(0, 10) } : {}) } : null,
+    tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10), ...(ev.tests.preexisting && ev.tests.preexisting.length ? { preexisting: ev.tests.preexisting.slice(0, 10) } : {}), ...(ev.tests.dependentsUnverified && ev.tests.dependentsUnverified.length ? { dependentsUnverified: ev.tests.dependentsUnverified.slice(0, 10) } : {}), ...(ev.tests.passedFiles && ev.tests.passedFiles.length ? { passedFiles: ev.tests.passedFiles.slice(0, 10) } : {}), ...(ev.tests.timedOutFiles && ev.tests.timedOutFiles.length ? { timedOutFiles: ev.tests.timedOutFiles.slice(0, 10) } : {}), ...(ev.tests.preexistingOnlyFiles && ev.tests.preexistingOnlyFiles.length ? { preexistingOnlyFiles: ev.tests.preexistingOnlyFiles.slice(0, 10) } : {}), ...(ev.tests.partial && ev.tests.partial.length ? { partial: ev.tests.partial.slice(0, 6).map((x) => ({ file: x.file, count: x.count, passed: x.passed, tests: (x.tests || []).slice(0, 6).map((t) => String(t).slice(0, 100)) })) } : {}) } : null,
     commands: (ev.commands || []).map((c) => ({
       criterion: String(c.criterion || '').slice(0, 160), command: c.command, claimedPass: !!c.claimedPass, outcome: c.outcome, exitCode: c.exitCode,
     })),
