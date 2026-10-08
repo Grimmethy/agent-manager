@@ -4124,3 +4124,103 @@ test('draftTask leaves an oversized draft unblocked when AGENT_MANAGER_CANDIDATE
     if (prev === undefined) delete process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE; else process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE = prev;
   }
 });
+
+// ---- test-framework gate (lib/test-framework.js), 2026-10-08 --------------------------------------------------------------------------------------
+// A Group B draft that CREATES a test file for a framework its package cannot run is blocked before the critique call, with the fix in the feedback.
+function tfScript(createdFile, content) {
+  let n = 0;
+  const calls = [];
+  const fn = async (opts) => {
+    n += 1; calls.push(n);
+    if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+    if (n === 2) return { response: JSON.stringify([{ mode: 'create', file: createdFile, content }]), degenerate: null, attempts: 1 };
+    return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+  };
+  fn.calls = calls;
+  return fn;
+}
+function tfTask(id, over = {}) {
+  return {
+    id, domain: 'default', source: 'observability_fix', title: 'Add a test for x', localRejectCount: 0, history: [],
+    promptContext: { candidateId: 'AC-3', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }], body: 'Files: src/x.js' }, ...over,
+  };
+}
+function tfSeed(dir) {
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'pkg', dependencies: {} }));
+  fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'function real() {\n  return 1;\n}\n');
+  fs.writeFileSync(path.join(dir, 'src', 'sibling.test.js'), "const test = require('node:test');\ntest('s', () => {});\n");
+}
+const JESTY = "describe('x', () => { it('y', () => { const f = jest.fn(); expect(f).toBeDefined(); }); });\n";
+
+test('test-framework gate: a created jest test in a node:test package blocks the draft BEFORE the critique call, naming the sibling test as the example', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    tfSeed(dir);
+    const task = tfTask('tf-block-1');
+    const localCall = tfScript('src/new.test.js', JESTY);
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+    assert.equal(task.critiqueOutcome, 'test-framework-failed');
+    assert.ok(task.blockedStage);
+    assert.match(task.blockedReason, /Test framework not usable/);
+    assert.match(task.blockedReason, /src\/new\.test\.js.*written for jest/);
+    assert.match(task.blockedReason, /sibling\.test\.js/, 'an existing test is named as the example to follow');
+    assert.ok(task.priorRejectionFeedback.some((f) => /Test framework not usable/.test(f)), 'the redraft sees the feedback');
+    assert.deepEqual(task.testFrameworkBlocked, ['src/new.test.js']);
+    assert.ok(result && result.blocked === true);
+    assert.deepEqual(localCall.calls, [1, 2], 'plan and implement only: the critique model was never called');
+  });
+});
+
+test('test-framework gate: a node:test file in the same package passes through to the critique; so does a framework the same change adds', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    tfSeed(dir);
+    const ok = tfTask('tf-ok-1');
+    const call = tfScript('src/new.test.js', "const test = require('node:test');\ntest('n', () => {});\n");
+    await draftTask(ok, { localCall: call, withLockFn: async (d, fn) => fn() });
+    assert.notEqual(ok.critiqueOutcome, 'test-framework-failed');
+    assert.ok(call.calls.length >= 3, 'the critique call happened');
+  });
+});
+
+test('test-framework gate: the same files blocked a second time are waved through as an advisory, so a false positive cannot strand the task', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    tfSeed(dir);
+    const task = tfTask('tf-repeat-1', { testFrameworkBlocked: ['src/new.test.js'] });
+    const call = tfScript('src/new.test.js', JESTY);
+    await draftTask(task, { localCall: call, withLockFn: async (d, fn) => fn() });
+    assert.notEqual(task.critiqueOutcome, 'test-framework-failed');
+    assert.equal(task.testFrameworkBlocked, undefined);
+    assert.ok(task.history.some((h) => h.stage === 'advisory' && /not blocking again/.test(h.detail || '')));
+    assert.ok(call.calls.length >= 3);
+  });
+});
+
+test('test-framework gate: AGENT_MANAGER_TEST_FRAMEWORK_GATE=off disables it', async () => {
+  const prev = process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE;
+  process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = 'off';
+  try {
+    await withFixtureRepo(async (draftTask, dir) => {
+      tfSeed(dir);
+      const task = tfTask('tf-off-1');
+      await draftTask(task, { localCall: tfScript('src/new.test.js', JESTY), withLockFn: async (d, fn) => fn() });
+      assert.notEqual(task.critiqueOutcome, 'test-framework-failed');
+    });
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE; else process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = prev; }
+});
+
+test('test-framework prompt line: a task that concerns tests gets the repo\'s real conventions appended to the implement prompt; an unrelated task does not', () => {
+  const { withTestConventions } = require('./lib/implement-critique.js');
+  const tf = require('./lib/test-framework.js');
+  tf.clearCache();
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'tfp-'));
+  fs.mkdirSync(path.join(d, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(d, 'package.json'), '{}');
+  fs.writeFileSync(path.join(d, 'src', 'a.test.js'), "const test = require('node:test');\n");
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = d;
+  try {
+    const testy = { title: 'Add unit tests for a', planResponse: '', promptContext: { rawText: 'Write a test.', files: ['src/a.js'] } };
+    assert.match(withTestConventions(testy, 'BASE PROMPT'), /^BASE PROMPT\n\nTEST CONVENTIONS[\s\S]*tests use node:test/);
+    assert.equal(withTestConventions({ title: 'Rename a helper', promptContext: { rawText: 'no relation', files: ['src/a.js'] } }, 'BASE PROMPT'), 'BASE PROMPT');
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev; tf.clearCache(); }
+});

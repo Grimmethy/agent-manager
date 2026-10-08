@@ -390,7 +390,13 @@ function externalDepAdvisoryBlock(task) {
   return label ? `Note: the task text mentions ${label}. Confirm this is an ordinary code edit before treating it as an external operation; if it truly needs a resource the sandbox cannot reach, answer RESOLUTION: needs-human-decision and name it.` : '';
 }
 
-function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } = {}) {
+// The project's real test conventions (lib/test-framework.js) ride along on every write prompt for a task that concerns tests. Never throws.
+function buildWriteAgenticPrompt(task, opts = {}) {
+  const prompt = buildWriteAgenticPromptBase(task, opts);
+  try { return require('./lib/implement-critique.js').withTestConventions(task, prompt); } catch { return prompt; }
+}
+
+function buildWriteAgenticPromptBase(task, { orientTurnLimit = ORIENT_TURN_LIMIT } = {}) {
   const ctx = task.promptContext || {};
   const leaf = leafDecomposeLocked(task);
   // decomposeDirective (2026-09-10, agentic-draft-common.js's resolveAgenticDraft): the

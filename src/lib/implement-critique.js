@@ -93,6 +93,44 @@ async function runCritiqueAndRevision(task, {
     console.warn('[local-draft] pre-critique find-string check failed (advisory):', (err && err.message) || err);
   }
 
+  // Test-framework gate (lib/test-framework.js, 2026-10-08): a test file this change CREATES must be written for a framework its package can run. Three
+  // TaxHarvest drafts created jest / @testing-library tests in packages that have neither (the frontend has no runner at all); each was dead code that only a
+  // hand check caught. Deterministic and precise, so unlike the advisory pre-filters above it blocks the draft BEFORE the critique call, with the exact
+  // fix in the feedback the redraft sees. The same files blocked twice in a row downgrade to an advisory, so a false positive can never strand a task.
+  // AGENT_MANAGER_TEST_FRAMEWORK_GATE=block|advisory|off.
+  try {
+    const tfw = require('./test-framework.js');
+    const mode = tfw.gateMode();
+    if (mode !== 'off') {
+      let items = null;
+      try { items = parseJsonMaybeFenced(task.implementResponse || ''); } catch { items = null; }
+      if (items && !Array.isArray(items)) items = [items];
+      const { files, packageText } = tfw.inspectChangeSet(items || []);
+      const tfFlags = files.length ? tfw.checkNewTestFiles({ repoRoot: getConfig().repoRoot, files, packageText }) : [];
+      if (tfFlags.length) {
+        const names = tfFlags.map((f) => f.file).sort();
+        const repeat = Array.isArray(task.testFrameworkBlocked) && task.testFrameworkBlocked.join('|') === names.join('|');
+        const feedback = tfw.feedbackFor(tfFlags);
+        if (mode === 'advisory' || repeat) {
+          appendHistoryEvent(task, 'advisory', `test-framework gate (${repeat ? 'same files blocked before, not blocking again' : 'advisory mode'}): ${feedback}`.slice(0, 600));
+          delete task.testFrameworkBlocked;
+        } else {
+          const blockedReason = `Test framework not usable: ${feedback}`.slice(0, 700);
+          task.testFrameworkBlocked = names;
+          task.critiqueOutcome = 'test-framework-failed';
+          task.blockedStage = 'review';
+          task.blockedReason = blockedReason;
+          task.priorRejectionFeedback = [...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), blockedReason];
+          recordCritique(attempt, { outcome: 'test-framework-failed' });
+          appendHistoryEvent(task, 'critique-done', blockedReason);
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[local-draft] test-framework gate failed (advisory):', (err && err.message) || err);
+  }
+
   const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
   let startedAt = new Date().toISOString();
   let startMs = Date.now();
@@ -456,7 +494,21 @@ function computeImplementBudget(task, implPrompt) {
   };
 }
 
-async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget }) {
+// The project's real test conventions (lib/test-framework.js), appended to an implement prompt when the task concerns tests. Never throws.
+function withTestConventions(task, prompt) {
+  try {
+    const { extractDeclaredTargets } = require('../adhoc-diff-sanity.js');
+    const tfw = require('./test-framework.js');
+    const files = new Set(extractDeclaredTargets(task, task.planResponse || ''));
+    const pf = task.promptContext && task.promptContext.files;
+    if (Array.isArray(pf)) for (const f of pf) { const p = typeof f === 'string' ? f : f && f.path; if (p) files.add(p); }
+    const block = tfw.testConventionsBlock(getConfig().repoRoot, task, [...files]);
+    return block ? `${prompt}\n\n${block}` : prompt;
+  } catch { return prompt; }
+}
+
+async function callImplementModel(task, ctx, { recordModelCall, implPrompt: baseImplPrompt, budget }) {
+  const implPrompt = withTestConventions(task, baseImplPrompt);
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
   const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
   const implStartedAt = new Date().toISOString();
@@ -572,4 +624,4 @@ function checkFindStrings(implementResponse, repoRoot) {
   return flags;
 }
 
-module.exports = { recheckFinalEdits, revisionKeepsAnswerShape, runCritiqueAndRevision, computeImplementBudget, callImplementModel, checkFindStrings };
+module.exports = { withTestConventions, recheckFinalEdits, revisionKeepsAnswerShape, runCritiqueAndRevision, computeImplementBudget, callImplementModel, checkFindStrings };
