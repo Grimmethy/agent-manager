@@ -68,9 +68,9 @@ function annotateGitTimeout(err, args, timeoutMs) {
  */
 function createRealGitRunner(repoRoot) {
   const mainBranch = detectDefaultBranch(repoRoot);
-  function run(args) {
+  function run(args, extra = {}) {
     try {
-      return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+      return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, ...extra });
     } catch (e) {
       throw annotateGitTimeout(e, args, GIT_TIMEOUT_MS);
     }
@@ -415,6 +415,9 @@ function createRealGitRunner(repoRoot) {
       try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}`]); } catch { return false; }
       return !isAncestor(remote, `origin/${mainBranch}`);
     },
+    // Drops candidate blocks main already retracted from the CURRENT branch's Docs/*_CANDIDATES.md and commits the removal (its own commit, pushed
+    // with the next batch). Paired repair for the merge driver's old ignore-deletions bug -- see src/lib/prune-retracted-candidates.js. Never throws.
+    pruneRetractedCandidates: () => require('./lib/prune-retracted-candidates.js').pruneRetractedCandidates({ repoRoot, git: run, mainRef: `origin/${mainBranch}` }),
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
     push: (branchName) => run(['push', '-u', 'origin', branchName]),
@@ -548,6 +551,7 @@ function createFakeGitRunner(opts = {}) {
       const isAncestor = opts.isAncestorFn || (() => false);
       return !isAncestor(`origin/${name}`, `origin/${opts.mainBranch || 'main'}`);
     },
+    pruneRetractedCandidates: () => { record('pruneRetractedCandidates'); return { pruned: [], committed: false }; },
     add: (files) => record('add', files),
     commit: (messageFilePath) => record('commit', messageFilePath),
     push: (branchName) => record('push', branchName),

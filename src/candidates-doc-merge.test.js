@@ -101,3 +101,57 @@ test('output stays parseable by the same AC-N heading convention apply-group-a.j
   const headings = merged.match(/^### AC-\d+ · .+$/gm);
   assert.equal(headings.length, 3);
 });
+
+// 2026-10-07 (TaxHarvest): the driver ignored DELETIONS, so a candidate retracted on main (AC-262..265) survived every merge of main into the rolling
+// triage branch. A block the ancestor had, theirs removed and ours never touched is now dropped.
+test('a block theirs deleted and ours left alone is dropped (the retraction propagates)', () => {
+  const ancestor = doc(block(1, 'keep me'), block(2, 'retract me'), block(3, 'also keep'));
+  const ours = doc(block(1, 'keep me'), block(2, 'retract me'), block(3, 'also keep'), block(10, 'branch-only new candidate'));
+  const theirs = doc(block(1, 'keep me'), block(3, 'also keep'));
+
+  const merged = mergeCandidatesDoc({ ancestorText: ancestor, oursText: ours, theirsText: theirs });
+
+  assert.doesNotMatch(merged, /AC-2 ·/, 'the retracted block is gone');
+  assert.match(merged, /### AC-1 · keep me/);
+  assert.match(merged, /### AC-3 · also keep/);
+  assert.match(merged, /### AC-10 · branch-only new candidate/, 'a block only the branch has is untouched');
+  assert.doesNotMatch(merged, /undefined/);
+  assert.equal(merged, doc(block(1, 'keep me'), block(3, 'also keep'), block(10, 'branch-only new candidate')), 'exactly the surviving blocks, no stray gap where the retracted one was');
+});
+
+test('a block ours EDITED is kept even though theirs deleted it (never silently drop changed content)', () => {
+  const ancestor = doc(block(1, 'seed'), block(2, 'retract me'));
+  const ours = doc(block(1, 'seed'), block(2, 'retract me', 'Strength: Strong\nFiles: x.js\n\nProblem: ours reworked this'));
+  const theirs = doc(block(1, 'seed'));
+  const merged = mergeCandidatesDoc({ ancestorText: ancestor, oursText: ours, theirsText: theirs });
+  assert.match(merged, /### AC-2 · retract me/);
+  assert.match(merged, /ours reworked this/);
+});
+
+test('a block both sides deleted stays deleted, and a block only ours deleted is not resurrected', () => {
+  const ancestor = doc(block(1, 'seed'), block(2, 'both delete'), block(3, 'ours deletes'));
+  const ours = doc(block(1, 'seed'));
+  const theirs = doc(block(1, 'seed'), block(3, 'ours deletes'));
+  const merged = mergeCandidatesDoc({ ancestorText: ancestor, oursText: ours, theirsText: theirs });
+  assert.doesNotMatch(merged, /AC-2 ·/);
+  assert.doesNotMatch(merged, /AC-3 ·/, 'theirs did not touch AC-3, so ours deleting it stands');
+});
+
+test('an empty or non-candidate theirs is NOT read as "everything was retracted"', () => {
+  const ancestor = doc(block(1, 'seed'), block(2, 'second'));
+  const ours = doc(block(1, 'seed'), block(2, 'second'), block(3, 'new'));
+  const merged = mergeCandidatesDoc({ ancestorText: ancestor, oursText: ours, theirsText: '# Candidates\n\nnothing here\n' });
+  assert.match(merged, /### AC-1 · seed/);
+  assert.match(merged, /### AC-2 · second/);
+  assert.match(merged, /### AC-3 · new/);
+});
+
+test('a deletion on theirs does not disturb a same-slot collision elsewhere in the same merge', () => {
+  const ancestor = doc(block(1, 'seed'), block(2, 'retract me'), block(9, 'stale slot'));
+  const ours = doc(block(1, 'seed'), block(2, 'retract me'), block(9, 'ours new fix'));
+  const theirs = doc(block(1, 'seed'), block(9, 'theirs new fix'));
+  const merged = mergeCandidatesDoc({ ancestorText: ancestor, oursText: ours, theirsText: theirs });
+  assert.doesNotMatch(merged, /AC-2 ·/);
+  assert.match(merged, /### AC-9 · ours new fix/);
+  assert.match(merged, /### AC-\d+ · theirs new fix/);
+});

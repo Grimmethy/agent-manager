@@ -53,6 +53,14 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
     if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
     state.enteredTriageBranch = true;
     gitRunner.prepareStackedBranch(TRIAGE_BRANCH);
+    // Drop candidate blocks main already retracted that this branch still carries (the merge driver used to keep them; see
+    // src/lib/prune-retracted-candidates.js). Best-effort and never fatal: a failure here must not block the batch.
+    if (typeof gitRunner.pruneRetractedCandidates === 'function') {
+      try {
+        const pruned = gitRunner.pruneRetractedCandidates();
+        if (pruned && pruned.committed) console.error(`[apply-main-batch] pruned retracted candidate(s) from ${TRIAGE_BRANCH}: ${pruned.pruned.map((p) => `${p.doc} ${p.ids.map((i) => `AC-${i}`).join(',')}`).join('; ')}`);
+      } catch (e) { console.error(`[apply-main-batch] pruneRetractedCandidates failed (ignored): ${String(e && e.message).split('\n')[0].slice(0, 200)}`); }
+    }
   } else gitRunner.resetToMain();
 
   const staged = [];
