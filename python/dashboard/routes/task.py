@@ -371,6 +371,24 @@ def api_task_confirm_delete(task_id):
     return jsonify({"id": task_id, "confirmed": True})
 
 
+def _shared_branch_siblings(qdir, branch, task_id):
+    """Live tasks (other than task_id) with work applied to `branch` -- see src/lib/shared-branch.js, the single implementation, run through its CLI.
+
+    Returns {"siblings": [...]} or {"siblings": [], "error": "..."}; the caller keeps the branch on any error (fail safe)."""
+    try:
+        cli = Path(__file__).resolve().parents[3] / "src" / "shared-branch-siblings.js"
+        out = subprocess.run(
+            ["node", str(cli), "--pipeline", str(Path(qdir).parent), "--branch", str(branch), "--task", str(task_id)],
+            capture_output=True, text=True, timeout=20,
+        )
+        data = json.loads(out.stdout or "{}")
+        if out.returncode != 0 or not isinstance(data, dict):
+            return {"siblings": [], "error": data.get("error") if isinstance(data, dict) and data.get("error") else f"exit {out.returncode}"}
+        return data
+    except Exception as e:  # noqa: BLE001 -- anything unexpected means "unknown", which keeps the branch
+        return {"siblings": [], "error": str(e)[:120]}
+
+
 @task_bp.route("/api/task/<state>/<task_id>/requeue", methods=["POST"])
 def api_task_requeue(state, task_id):
     """Manual requeue (Job Status > Blocked/Needs Clarification/Done tabs, per-row button; also the Brain Dump
@@ -480,7 +498,18 @@ def api_task_requeue(state, task_id):
             if isinstance(ev, dict) and ev.get("stage") == "applied" and ev.get("detail"):
                 applied_branch = ev["detail"]
                 break
-        if applied_branch:
+        # A branch other live work sits on (a hub's shared branch) is KEPT: deleting it destroyed the siblings' approved, unmerged commits (HUB0018-01,
+        # 2026-10-07; src/lib/shared-branch.js is the single implementation, reached through its CLI). A failing check also keeps the branch -- a stale
+        # pushed branch is the cheap mistake, a deleted shared one the expensive one. The redraft stacks on top of the kept branch.
+        shared = _shared_branch_siblings(qdir, applied_branch, task_id) if applied_branch else {"siblings": []}
+        if applied_branch and (shared.get("error") or shared.get("siblings")):
+            why = (f"sibling check failed ({shared['error']})" if shared.get("error")
+                   else "shared with " + ", ".join(s["id"] for s in shared["siblings"]))
+            data.setdefault("history", []).append({
+                "stage": "branch-kept", "at": datetime.now(timezone.utc).isoformat(),
+                "detail": f"requeue kept {applied_branch}: {why}; the redraft stacks on it",
+            })
+        elif applied_branch:
             from app import _invalidate_branch_cache, _run_git
             repo_root = get_active_repo_root()
             repo_root = Path(repo_root) if repo_root else None
