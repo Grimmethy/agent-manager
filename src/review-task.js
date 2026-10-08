@@ -499,6 +499,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(inertSection);
     lines.push('');
   }
+  const inertTargetSection = require('./lib/inert-target.js').formatInertTargetSection(task.inertTarget);
+  if (inertTargetSection) {
+    lines.push(inertTargetSection);
+    lines.push('');
+  }
   const undefinedSection = formatUndefinedRemovalSection(task.undefinedAfterRemoval);
   if (undefinedSection) {
     lines.push(undefinedSection);
