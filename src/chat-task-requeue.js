@@ -27,6 +27,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { recordBranchRemoval } = require('./branch-removal-ledger.js');
+const { liveSiblingsOnBranch } = require('./lib/shared-branch.js');
 
 function readJsonSafe(fullPath) {
   try {
@@ -279,7 +280,16 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
     for (const ev of [...(data.history || [])].reverse()) {
       if (ev && ev.stage === 'applied' && ev.detail) { appliedBranch = ev.detail; break; }
     }
-    if (appliedBranch && repoRoot) {
+    // A branch other live work sits on (a hub's shared branch) is KEPT: deleting it destroyed the siblings' approved, unmerged commits (HUB0018-01,
+    // 2026-10-07; see lib/shared-branch.js). A failing sibling check also keeps it -- a stale pushed branch is the cheap mistake. The redraft stacks on top.
+    const shared = appliedBranch ? liveSiblingsOnBranch({ pipelineDir, branch: appliedBranch, selfId: data.id }) : { siblings: [] };
+    if (appliedBranch && (shared.error || shared.siblings.length)) {
+      data.history = data.history || [];
+      data.history.push({
+        stage: 'branch-kept', at: nowIso(),
+        detail: `requeue (via Chat) kept ${appliedBranch}: ${shared.error ? `sibling check failed (${shared.error})` : `shared with ${shared.siblings.map((x) => x.id).join(', ')}`}; the redraft stacks on it`,
+      });
+    } else if (appliedBranch && repoRoot) {
       try {
         execFileSync('git', ['push', 'origin', '--delete', appliedBranch], { cwd: repoRoot, stdio: 'pipe' });
         recordBranchRemoval(pipelineDir, { branch: appliedBranch, taskId: data.id, cause: 'superseded-by-requeue', detail: `requeued from ${state}/`, actor: 'chat-requeue' });
