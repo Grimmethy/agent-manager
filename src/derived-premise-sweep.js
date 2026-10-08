@@ -11,6 +11,10 @@
 // triage reached a GENUINE verdict for that symbol it auto-retires; without one the task is stamped `inertTarget` and HELD (derived/ only; capped like any hold),
 // and a later scan that finds a caller releases/restores it. AGENT_MANAGER_DERIVED_INERT_TARGET=off|hold|retire (default retire).
 // It also REPORTS which derived tasks are currently held by an overlapping open task (the hold itself is in task-sources.js, via derived-gate.js).
+// A fourth, housekeeping step (supersedeInertLeftovers): a derived/ record whose id ALREADY exists in another state (done/, the archive, a lane, a blocked/needs-clarification/
+// coordinating dir ...) is a stale copy of work that moved on -- never drafted, just clutter that looked like live backlog (2026-10-08: 144 of 146 records in TaxHarvest's
+// derived/ were such copies, which made a retired area look like 23 live tasks). It is moved, stamped, to derived/_superseded/ (reversible, invisible to every scan of
+// derived/), only when it is at least 10 minutes old. AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP=off disables it.
 // Kill switch: AGENT_MANAGER_DERIVED_PREMISE_SWEEP=false. CLI: node derived-premise-sweep.js [--dry-run]
 
 const fs = require('fs');
@@ -81,12 +85,54 @@ function readmitInertTargets({ queueDir, flags, nowIso, dryRun }) {
 }
 
 // existsOnDisk / existsAtRef / fetch are injectable so the tests need no real repo or network.
+const LEFTOVER_MIN_AGE_MS = 10 * 60 * 1000;
+const LEFTOVER_LOCATIONS = ['adhoc', 'pending', 'review', 'approved', 'awaiting-confirm', 'blocked', 'needs-clarification', 'coordinating', 'done', 'done/_archived_no_action'];
+const leftoverCleanupEnabled = () => String(process.env.AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP || '').trim().toLowerCase() !== 'off';
+
+// Where else a derived/ record's id lives (first match), or null. A drafting lane counts too.
+function whereElse(queueDir, id) {
+  for (const loc of LEFTOVER_LOCATIONS) if (fs.existsSync(path.join(queueDir, ...loc.split('/'), `${id}.json`))) return loc;
+  try {
+    for (const lane of fs.readdirSync(path.join(queueDir, 'drafting'))) if (fs.existsSync(path.join(queueDir, 'drafting', lane, `${id}.json`))) return `drafting/${lane}`;
+  } catch { /* no drafting dir */ }
+  return null;
+}
+
+// Moves each stale derived/ copy to derived/_superseded/<id>.json with a `supersededBy` stamp and a history event. Never overwrites an existing superseded copy;
+// never touches a record younger than LEFTOVER_MIN_AGE_MS (a promotion that copies before it deletes must not race this). Returns [{ id, where }].
+function supersedeInertLeftovers({ queueDir, nowMs, nowIso, dryRun }) {
+  const moved = [];
+  if (!leftoverCleanupEnabled()) return moved;
+  const dir = path.join(queueDir, 'derived');
+  for (const id of gate.names(dir)) {
+    const filePath = path.join(dir, `${id}.json`);
+    let mtime = 0;
+    try { mtime = fs.statSync(filePath).mtimeMs; } catch { continue; }
+    if (nowMs - mtime < LEFTOVER_MIN_AGE_MS) continue;
+    const where = whereElse(queueDir, id);
+    if (!where) continue;
+    const dest = path.join(dir, '_superseded', `${id}.json`);
+    if (fs.existsSync(dest)) continue;
+    moved.push({ id, where });
+    if (dryRun) continue;
+    const task = gate.readJson(filePath);
+    if (!task || typeof task !== 'object') { moved.pop(); continue; }
+    task.history = Array.isArray(task.history) ? task.history : [];
+    task.history.push({ stage: 'superseded', at: nowIso, detail: `inert leftover: this id already exists in ${where}/, so this derived/ copy was moved aside (restore by moving it back)` });
+    task.supersededBy = { state: where, at: nowIso };
+    writeJson(dest, task);
+    fs.unlinkSync(filePath);
+  }
+  return moved;
+}
+
 function sweepDerivedPremise({ pipelineDir, repoRoot, mainBranch = 'main', extraRoots = [], brainDumpPath = null, now = Date.now(), dryRun = false, existsOnDisk, existsAtRef, fetch = true } = {}) {
-  const summary = { checked: 0, archived: [], held: [], skipped: 0, inertHeld: [], inertReleased: [], inertReadmitted: [] };
+  const summary = { checked: 0, archived: [], held: [], skipped: 0, inertHeld: [], inertReleased: [], inertReadmitted: [], leftoversSuperseded: [] };
   if (!gate.sweepEnabled() || !pipelineDir) return summary;
   const queueDir = path.join(pipelineDir, 'queue');
   const nowIso = new Date(now).toISOString();
   if (fetch && repoRoot) refreshMain(repoRoot, mainBranch, path.join(queueDir, '.derived-premise-fetch'), now);
+  summary.leftoversSuperseded = supersedeInertLeftovers({ queueDir, nowMs: now, nowIso, dryRun });
   const elsewhere = gate.otherIds(queueDir);
   const index = gate.openTaskIndex(pipelineDir);
   const inertMode = inertTarget.inertTargetMode();
@@ -158,7 +204,7 @@ function sweepDerivedPremise({ pipelineDir, repoRoot, mainBranch = 'main', extra
   return summary;
 }
 
-module.exports = { sweepDerivedPremise, readmitInertTargets, refreshMain, CASCADE_STATES, PREMISE_STATES };
+module.exports = { sweepDerivedPremise, supersedeInertLeftovers, readmitInertTargets, refreshMain, CASCADE_STATES, PREMISE_STATES };
 
 if (require.main === module) {
   const { getConfig } = require('./config.js');
@@ -171,5 +217,5 @@ if (require.main === module) {
   });
   const arch = s.archived.map((a) => `${a.id}<-${a.rule}`).join(', ');
   const inert = `inert(held=${s.inertHeld.length} released=${s.inertReleased.length} readmitted=${s.inertReadmitted.length})`;
-  process.stdout.write(`checked=${s.checked} ${inert} archived=${s.archived.length}${arch ? ` [${arch}]` : ''} held=${s.held.length}${s.held.length ? ` [${s.held.map((h) => `${h.id}<-${h.by.join('+')}`).join(', ')}]` : ''} skipped=${s.skipped}${dryRun ? ' (dry run)' : ''}\n`);
+  process.stdout.write(`checked=${s.checked} ${inert} leftovers=${s.leftoversSuperseded.length} archived=${s.archived.length}${arch ? ` [${arch}]` : ''} held=${s.held.length}${s.held.length ? ` [${s.held.map((h) => `${h.id}<-${h.by.join('+')}`).join(', ')}]` : ''} skipped=${s.skipped}${dryRun ? ' (dry run)' : ''}\n`);
 }
