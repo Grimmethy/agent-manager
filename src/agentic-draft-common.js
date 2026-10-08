@@ -835,6 +835,37 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
         capturedDiff: trimmedDiff,
       };
     }
+    // Test-framework gate (lib/test-framework.js): a NEW test file must use a framework its package can run. Same shape and safety net as the leftover-
+    // reference gate above: a retryable block with the exact fix, and the same files blocked twice downgrade to an advisory.
+    try {
+      const tfw = require('./lib/test-framework.js');
+      const tfMode = tfw.gateMode();
+      if (tfMode !== 'off') {
+        const { files, packageText } = tfw.inspectDiff(trimmedDiff);
+        const tfFlags = files.length ? tfw.checkNewTestFiles({ repoRoot: worktreeDir, files, packageText }) : [];
+        if (tfFlags.length) {
+          const names = tfFlags.map((f) => f.file).sort();
+          const repeat = Array.isArray(task.testFrameworkBlocked) && task.testFrameworkBlocked.join('|') === names.join('|');
+          const feedback = tfw.feedbackFor(tfFlags);
+          if (tfMode === 'advisory' || repeat) {
+            appendHistoryEvent(task, 'advisory', `test-framework gate (${repeat ? 'same files blocked before, not blocking again' : 'advisory mode'}): ${feedback}`.slice(0, 600));
+            delete task.testFrameworkBlocked;
+          } else {
+            task.retryableDraftBlock = true;
+            task.testFrameworkBlocked = names;
+            task.adhocDiffSubstanceFeedback = `Your diff adds a test file that can never run. ${feedback}`;
+            return {
+              succeeded: true,
+              blocked: true,
+              blockedReason: `Agentic implement pass produced a diff that is not a real implementation -- test framework not usable: ${feedback}`.slice(0, 700),
+              ...meta,
+              capturedDiff: trimmedDiff,
+            };
+          }
+        }
+      }
+    } catch (err) { console.warn('[agentic-draft] test-framework gate failed (advisory):', (err && err.message) || err); }
+
     const substance = adhocDiffSubstanceProblem(task, trimmedDiff, summary);
     if (substance) {
       task.retryableDraftBlock = true;

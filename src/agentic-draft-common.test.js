@@ -226,6 +226,86 @@ test('resolveAgenticDraft(implemented): AGENT_MANAGER_LEFTOVER_REF_MODE=off disa
   } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_LEFTOVER_REF_MODE; else process.env.AGENT_MANAGER_LEFTOVER_REF_MODE = prev; }
 });
 
+// 2026-10-08 (lib/test-framework.js): a diff that adds a test file for a framework its package cannot run is a retryable block with the fix in the feedback;
+// the same files blocked twice are waved through as an advisory.
+function tfAgenticSeed(wt) {
+  const g = (args) => execFileSync('git', args, { cwd: wt, encoding: 'utf8' });
+  fs.mkdirSync(path.join(wt, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(wt, 'package.json'), JSON.stringify({ name: 'pkg' }));
+  fs.writeFileSync(path.join(wt, 'src', 'sibling.test.js'), "const test = require('node:test');\ntest('s', () => {});\n");
+  fs.writeFileSync(path.join(wt, 'src', 'x.js'), 'let a = 1;\n');
+  g(['add', '-A']); g(['commit', '-qm', 'seed']);
+}
+const tfResult = { response: 'Added a test.\n\nRESOLUTION: implemented\n\ndone' };
+const tfTaskFor = (id, over = {}) => ({ id, source: 'manual', domain: 'adhoc', promptContext: { rawText: 'Add a test for src/x.js.' }, ...over });
+
+test('resolveAgenticDraft(implemented): a NEW jest test in a node:test package -> retryable block naming the sibling test; the same files twice -> advisory', () => {
+  withRealRepo((wt) => {
+    tfAgenticSeed(wt);
+    fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "describe('x', () => { it('y', () => { const f = jest.fn(); expect(f).toBeDefined(); }); });\n");
+    const task = tfTaskFor('tf-agentic-1');
+    const out = resolveAgenticDraft(task, { result: tfResult, worktreeDir: wt });
+    assert.equal(out.blocked, true);
+    assert.match(out.blockedReason, /test framework not usable/);
+    assert.equal(task.retryableDraftBlock, true);
+    assert.deepEqual(task.testFrameworkBlocked, ['src/new.test.js']);
+    assert.match(task.adhocDiffSubstanceFeedback, /sibling\.test\.js/);
+    assert.ok(!task.adhocResolution);
+    // the retry produces the same files: not blocked again
+    const again = tfTaskFor('tf-agentic-2', { testFrameworkBlocked: ['src/new.test.js'] });
+    const out2 = resolveAgenticDraft(again, { result: tfResult, worktreeDir: wt });
+    assert.notEqual(out2.blocked, true, JSON.stringify(out2).slice(0, 200));
+    assert.equal(again.adhocResolution, 'implemented');
+    assert.ok(again.history.some((h) => h.stage === 'advisory' && /not blocking again/.test(h.detail || '')));
+  });
+});
+
+test('resolveAgenticDraft(implemented): a node:test file passes; a modified (not new) test file and a change that adds the dependency are not checked', () => {
+  withRealRepo((wt) => {
+    tfAgenticSeed(wt);
+    fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "const test = require('node:test');\ntest('n', () => {});\n");
+    const ok = tfTaskFor('tf-agentic-ok');
+    assert.notEqual(resolveAgenticDraft(ok, { result: tfResult, worktreeDir: wt }).blocked, true);
+  });
+  withRealRepo((wt) => {
+    tfAgenticSeed(wt);
+    fs.appendFileSync(path.join(wt, 'src', 'sibling.test.js'), "describe('x', () => { jest.fn(); });\n"); // an EDIT to an existing test: not a new file
+    assert.notEqual(resolveAgenticDraft(tfTaskFor('tf-agentic-edit'), { result: tfResult, worktreeDir: wt }).blocked, true);
+  });
+  withRealRepo((wt) => {
+    tfAgenticSeed(wt);
+    fs.writeFileSync(path.join(wt, 'package.json'), JSON.stringify({ name: 'pkg', devDependencies: { jest: '^29' } }));
+    fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "describe('x', () => { jest.fn(); });\n");
+    assert.notEqual(resolveAgenticDraft(tfTaskFor('tf-agentic-dep'), { result: tfResult, worktreeDir: wt }).blocked, true, 'jest arrives with the same change');
+  });
+});
+
+test('resolveAgenticDraft(implemented): AGENT_MANAGER_TEST_FRAMEWORK_GATE=off disables the gate', () => {
+  const prev = process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE;
+  process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = 'off';
+  try {
+    withRealRepo((wt) => {
+      tfAgenticSeed(wt);
+      fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "describe('x', () => { jest.fn(); });\n");
+      assert.notEqual(resolveAgenticDraft(tfTaskFor('tf-agentic-off'), { result: tfResult, worktreeDir: wt }).blocked, true);
+    });
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE; else process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = prev; }
+});
+
+test('resolveAgenticDraft(implemented): AGENT_MANAGER_TEST_FRAMEWORK_GATE=advisory records the finding but does not block', () => {
+  const prev = process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE;
+  process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = 'advisory';
+  try {
+    withRealRepo((wt) => {
+      tfAgenticSeed(wt);
+      fs.writeFileSync(path.join(wt, 'src', 'new.test.js'), "describe('x', () => { jest.fn(); });\n");
+      const task = tfTaskFor('tf-agentic-adv');
+      assert.notEqual(resolveAgenticDraft(task, { result: tfResult, worktreeDir: wt }).blocked, true);
+      assert.ok(task.history.some((h) => h.stage === 'advisory' && /advisory mode/.test(h.detail || '')));
+    });
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE; else process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = prev; }
+});
+
 // --- resolveAgenticDraft(no-changes-needed) -- adhocNoChangesClaimProblem (2026-09-04) ---
 
 test('resolveAgenticDraft(no-changes-needed): no "Already covered:" block -> retryable block with pointed feedback', () => {
