@@ -13,7 +13,9 @@ test('checkerFor picks node for js/mjs/cjs, python for py, an in-process parse f
   assert.equal(py.bin, 'python');
   assert.deepEqual(py.args, ['-c', PY_CHECK_SCRIPT, 'python_services/x.py']);
   assert.equal(checkerFor('package.json').kind, 'json');
-  for (const f of ['a.ts', 'a.tsx', 'a.jsx', 'README.md', 'run.sh', 'noext', '', null, undefined]) assert.equal(checkerFor(f), null, String(f));
+  assert.equal(checkerFor('web/App.tsx').kind, 'ts');
+  assert.equal(checkerFor('a.ts').kind, 'ts');
+  for (const f of ['a.jsx', 'README.md', 'run.sh', 'noext', '', null, undefined]) assert.equal(checkerFor(f), null, String(f));
 });
 
 test('the python check compiles without writing a .pyc and catches a return outside a function (py_compile semantics)', () => {
@@ -58,4 +60,51 @@ test('resolvePython prefers explicit, then the repo .venv, then AGENT_MANAGER_PY
   assert.equal(resolvePython({ repoRoot: '/r', env: {}, exists: present(['/usr/local/bin/python3']) }), '/usr/local/bin/python3');
   assert.equal(resolvePython({ repoRoot: '/r', env: {}, exists: present([]) }), null);
   assert.equal(resolvePython({ env: {}, exists: () => { throw new Error('boom'); } }), null, 'a throwing existence check never throws');
+});
+
+
+// --- checkTypeScript (parse-only) ---
+
+const fs2 = require('node:fs');
+const os2 = require('node:os');
+const path2 = require('node:path');
+const { checkTypeScript, resolveEsbuild } = require('./syntax-check.js');
+
+function fakeEsbuildDir() {
+  const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'ts-tools-'));
+  fs2.mkdirSync(path2.join(dir, 'node_modules', 'esbuild'), { recursive: true });
+  fs2.writeFileSync(path2.join(dir, 'node_modules', 'esbuild', 'package.json'), '{"name":"esbuild","main":"index.js"}');
+  fs2.writeFileSync(path2.join(dir, 'node_modules', 'esbuild', 'index.js'),
+    "exports.transformSync = (text, o) => { if (String(text).includes('SYNTAXERR')) { const e = new Error('x'); e.errors = [{ text: 'Unexpected SYNTAXERR (' + o.loader + ')', location: { line: 3, column: 7 } }]; throw e; } return { code: '' }; };");
+  return path2.join(dir, 'node_modules');
+}
+
+test('checkTypeScript: with esbuild reachable via AGENT_MANAGER_TS_TOOLS, .tsx and .ts are parsed and an error carries file:line and the message', () => {
+  const tools = fakeEsbuildDir();
+  const env = { AGENT_MANAGER_TS_TOOLS: tools };
+  assert.deepEqual(checkTypeScript('web/App.tsx', 'const a = 1;', { repoRoot: '/nope', env }), { ok: true });
+  const bad = checkTypeScript('web/App.tsx', 'x SYNTAXERR', { repoRoot: '/nope', env });
+  assert.equal(bad.line, 3);
+  assert.equal(bad.column, 7);
+  assert.match(bad.error, /^web\/App\.tsx:3 Unexpected SYNTAXERR \(tsx\)/);
+  assert.match(checkTypeScript('lib/a.ts', 'SYNTAXERR', { repoRoot: '/nope', env }).error, /\(ts\)/, 'a .ts file uses the ts loader');
+  assert.ok(resolveEsbuild({ file: 'a.ts', repoRoot: '/nope', env: { AGENT_MANAGER_TS_TOOLS: path2.dirname(tools) } }), 'the parent of node_modules is accepted too');
+});
+
+test('checkTypeScript: esbuild is also found from the consumer repo (the file\'s own package), without the env var', () => {
+  const tools = fakeEsbuildDir();
+  const repo = path2.dirname(tools);
+  fs2.mkdirSync(path2.join(repo, 'frontend', 'src'), { recursive: true });
+  fs2.writeFileSync(path2.join(repo, 'package.json'), '{}');
+  assert.match(checkTypeScript('frontend/src/A.tsx', 'SYNTAXERR', { repoRoot: repo, env: {} }).error, /SYNTAXERR/);
+});
+
+test('checkTypeScript: no esbuild -> .tsx is SKIPPED with the setting to use; .ts falls back to Node\'s own parser and still catches a broken file', () => {
+  const skip = checkTypeScript('web/App.tsx', 'const a = 1;', { repoRoot: '/nope', env: {} });
+  assert.match(skip.skip, /no \.tsx parser/);
+  assert.match(skip.skip, /AGENT_MANAGER_TS_TOOLS/);
+  if (typeof require('node:module').stripTypeScriptTypes === 'function') {
+    assert.deepEqual(checkTypeScript('a.ts', 'export function f(a: number, b?: string): void { enum E { A } }\ninterface P { id: string }\n', { repoRoot: '/nope', env: {} }), { ok: true });
+    assert.match(checkTypeScript('a.ts', 'export function g( {\n', { repoRoot: '/nope', env: {} }).error, /^a\.ts /);
+  }
 });

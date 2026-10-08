@@ -164,3 +164,76 @@ test('recheckFinalEdits: a source with its own apply (adhoc diffs) is never rech
     assert.equal(task.implementResponse, BAD);
   });
 });
+
+// --- syntax step of recheckFinalEdits (lib/edit-set-syntax.js) ---
+
+const PYFILE = 'import os\nfrom util import (\n    a, b,\n)\n\ndef run(x):\n    return x + 1\n';
+const SPLIT = JSON.stringify([{ mode: 'edit', file: 'a.py', find: 'from util import', replace: 'from util import\nfrom constants import YEAR' }]);
+const FIXED = JSON.stringify([{ mode: 'edit', file: 'a.py', find: 'import os', replace: 'import os\nfrom constants import YEAR' }]);
+const withSyntaxEnv = async (mode, fn) => {
+  const prev = process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE;
+  if (mode === undefined) delete process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE; else process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = mode;
+  try { return await fn(); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE; else process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = prev; }
+};
+
+test('recheckFinalEdits: an edit set that leaves a file unparsable (AC-271) gets ONE fix call shown the resulting lines, and the corrected set is kept and stamped', async () => {
+  await withRepo({ 'a.py': PYFILE }, async () => {
+    const calls = [];
+    const task = mkTask('syn-1', { implementResponse: SPLIT });
+    assert.equal(await recheckFinalEdits(task, ctx([FIXED], calls)), false);
+    assert.equal(task.implementResponse, FIXED);
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /DOES NOT PARSE/);
+    assert.match(calls[0], /2\| from util import\n3\| from constants import YEAR \(/);
+    assert.deepEqual(task.editSetSyntax.checked, ['a.py']);
+    assert.deepEqual(task.editSetSyntax.failed, []);
+    assert.ok(task.history.some((h) => /edit-set syntax recheck: 1 failing item\(s\) corrected/.test(h.detail || '')));
+  });
+});
+
+test('recheckFinalEdits: a fix that still does not parse blocks the draft (edit-syntax-failed) with the parser error for the redraft; the same failure twice downgrades', async () => {
+  await withRepo({ 'a.py': PYFILE }, async () => {
+    const task = mkTask('syn-2', { implementResponse: SPLIT });
+    assert.equal(await recheckFinalEdits(task, ctx([SPLIT])), true);
+    assert.equal(task.critiqueOutcome, 'edit-syntax-failed');
+    assert.equal(task.blockedStage, 'review');
+    assert.match(task.blockedReason, /does not parse: Applying this edit set leaves a\.py with a syntax error: a\.py:2 SyntaxError/);
+    assert.match(task.priorRejectionFeedback.join('\n'), /syntax error/);
+    const calls = [];
+    const again = mkTask('syn-3', { implementResponse: SPLIT, findRecheckBlocked: task.findRecheckBlocked });
+    assert.equal(await recheckFinalEdits(again, ctx([FIXED], calls)), false);
+    assert.equal(calls.length, 0);
+    assert.ok(again.history.some((h) => h.stage === 'advisory' && /edit-set syntax recheck \(same failure blocked before/.test(h.detail || '')));
+  });
+});
+
+test('recheckFinalEdits: AGENT_MANAGER_EDIT_SYNTAX_GATE=advisory records but does not block, =off skips the syntax step; the find step still runs independently', async () => {
+  await withRepo({ 'a.py': PYFILE }, async () => {
+    const calls = [];
+    await withSyntaxEnv('advisory', async () => {
+      const t = mkTask('syn-adv', { implementResponse: SPLIT });
+      assert.equal(await recheckFinalEdits(t, ctx([FIXED], calls)), false);
+      assert.equal(t.implementResponse, SPLIT);
+      assert.ok(t.history.some((h) => h.stage === 'advisory' && /advisory mode/.test(h.detail || '')));
+    });
+    await withSyntaxEnv('off', async () => {
+      const t = mkTask('syn-off', { implementResponse: SPLIT });
+      assert.equal(await recheckFinalEdits(t, ctx([FIXED], calls)), false);
+      assert.equal(t.editSetSyntax, undefined);
+      // the find step is still live
+      const miss = mkTask('syn-off-find');
+      assert.equal(await recheckFinalEdits(miss, ctx([BAD])), true);
+      assert.equal(miss.critiqueOutcome, 'find-recheck-failed');
+    });
+    assert.equal(calls.length, 0);
+  });
+});
+
+test('recheckFinalEdits: a sound set is stamped with its coverage (checked and skipped files)', async () => {
+  await withRepo({ 'a.py': PYFILE, 'n.md': '# x' }, async () => {
+    const task = mkTask('syn-ok', { implementResponse: JSON.stringify([{ mode: 'edit', file: 'a.py', find: 'return x + 1', replace: 'return x + 2' }, { mode: 'edit', file: 'n.md', find: '# x', replace: '# y' }]) });
+    assert.equal(await recheckFinalEdits(task, ctx([])), false);
+    assert.deepEqual(task.editSetSyntax.checked, ['a.py']);
+    assert.deepEqual(task.editSetSyntax.skipped, [{ file: 'n.md', reason: 'no syntax checker for this file type' }]);
+  });
+});

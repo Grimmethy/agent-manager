@@ -227,36 +227,54 @@ async function runCritiqueAndRevision(task, {
   appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
 }
 
-// Hard find-string re-check of the FINAL edit set (lib/find-recheck.js, 2026-10-08, TaxHarvest AC-271): the pre-critique check is advisory and the
-// critique's revision replaces the edit set unchecked, so an edit whose `find` matches nothing used to reach review and fail at apply. Replays the
-// edits in apply order; on a failure makes ONE bounded fix call that shows the real nearby lines, and if that still fails blocks the draft with the same
-// feedback for the redraft. The same failure twice in a row, and advisory mode, record an advisory instead. Returns true when the draft was blocked.
+// Hard re-check of the FINAL edit set (lib/find-recheck.js + lib/edit-set-syntax.js, 2026-10-08, TaxHarvest AC-271): the pre-critique find-string check is
+// advisory and the critique's revision replaces the edit set unchecked, so an invented `find` (or an edit that leaves a file unparsable) used to reach
+// review and fail at apply -- or worse, reach pending-merge. Replays the edits in apply order and checks (1) every find matches exactly once and (2) every
+// created/edited .py/.js/.json/.ts/.tsx file still parses. On a problem it makes ONE bounded fix call that shows the real lines, and if that still fails
+// blocks the draft with the same feedback for the redraft. The same problem twice in a row, and advisory mode, record an advisory instead.
+// AGENT_MANAGER_FIND_RECHECK / AGENT_MANAGER_EDIT_SYNTAX_GATE = block|advisory|off. Returns true when the draft was blocked.
 async function recheckFinalEdits(task, { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall }) {
   try {
     if (!usesGroupB(task)) return false;
     const fr = require('./find-recheck.js');
-    const mode = fr.recheckMode();
-    if (mode === 'off') return false;
+    const es = require('./edit-set-syntax.js');
+    const findMode = fr.recheckMode();
+    const synMode = es.syntaxGateMode();
+    if (findMode === 'off' && synMode === 'off') return false;
     const parse = (text) => { try { const v = parseJsonMaybeFenced(text || ''); return v ? (Array.isArray(v) ? v : [v]) : null; } catch { return null; } };
+    const repoRoot = getConfig().repoRoot;
+    // -> null when the set is sound, else { kind, mode, feedback, sig, count }; the syntax report rides along for the task stamp.
+    const problemsOf = (items) => {
+      const sim = fr.simulateEditsDetailed(items, repoRoot);
+      if (findMode !== 'off' && sim.flags.length) return { kind: 'find', mode: findMode, feedback: fr.feedbackFor(sim.flags), sig: `find|${fr.signatureOf(sim.flags)}`, count: sim.flags.length };
+      if (synMode === 'off' || sim.flags.length) return { none: true, syntax: null };
+      const syn = es.checkEditSetSyntax(items, repoRoot, { detailed: sim });
+      if (syn.failed.length) return { kind: 'syntax', mode: synMode, feedback: es.syntaxFeedbackFor(syn.failed), sig: `syntax|${es.syntaxSignature(syn.failed)}`, count: syn.failed.length, syntax: syn };
+      return { none: true, syntax: syn };
+    };
+    const stamp = (syn) => {
+      if (!syn) return;
+      task.editSetSyntax = { at: new Date().toISOString(), checked: syn.checked, skipped: syn.skipped, failed: syn.failed.map((f) => f.file), preexisting: syn.preexisting };
+    };
     const items = parse(task.implementResponse);
     if (!items) return false;
-    const repoRoot = getConfig().repoRoot;
-    let flags = fr.simulateEdits(items, repoRoot);
-    if (!flags.length) return false;
-    const sig = fr.signatureOf(flags);
-    const repeat = task.findRecheckBlocked === sig;
-    if (mode === 'advisory' || repeat) {
-      appendHistoryEvent(task, 'advisory', `find-string recheck (${repeat ? 'same failure blocked before, not blocking again' : 'advisory mode'}): ${fr.feedbackFor(flags)}`.slice(0, 600));
+    const first = problemsOf(items);
+    if (first.none) { stamp(first.syntax); return false; }
+    const repeat = task.findRecheckBlocked === first.sig;
+    if (first.mode === 'advisory' || repeat) {
+      appendHistoryEvent(task, 'advisory', `${first.kind === 'syntax' ? 'edit-set syntax' : 'find-string'} recheck (${repeat ? 'same failure blocked before, not blocking again' : 'advisory mode'}): ${first.feedback}`.slice(0, 600));
       delete task.findRecheckBlocked;
       return false;
     }
     if (typeof resolvedLocalCall === 'function') {
       const prompt = [
-        'The edit set below CANNOT be applied: apply requires every `find` to match the real file EXACTLY ONCE, in order.',
+        first.kind === 'syntax'
+          ? 'The edit set below leaves a file that DOES NOT PARSE after it is applied, so it would break the module.'
+          : 'The edit set below CANNOT be applied: apply requires every `find` to match the real file EXACTLY ONCE, in order.',
         '', 'ORIGINAL TASK PLAN:', String(task.planResponse || '').slice(0, 3000),
         '', 'CURRENT EDIT SET:', String(task.implementResponse || '').slice(0, 9000),
-        '', 'WHAT WILL FAIL (with the real nearby lines):', fr.feedbackFor(flags),
-        '', 'Return the corrected edit set ONLY, as the same JSON array, with every `find` copied character for character from the real lines above. Do not add commentary.',
+        '', first.kind === 'syntax' ? 'WHAT WILL BREAK (with the lines of the resulting file):' : 'WHAT WILL FAIL (with the real nearby lines):', first.feedback,
+        '', 'Return the corrected edit set ONLY, as the same JSON array, with every `find` copied character for character from the real lines. Do not add commentary.',
       ].join('\n');
       const startedAt = new Date().toISOString();
       const startMs = Date.now();
@@ -265,26 +283,28 @@ async function recheckFinalEdits(task, { maybeLocked, resolvedCallIsLocal, resol
       const fixed = fixResult && !fixResult.degenerate ? fixResult.response : null;
       if (fixed && revisionKeepsAnswerShape(task, fixed)) {
         const fixedItems = parse(fixed);
-        if (fixedItems && fr.simulateEdits(fixedItems, repoRoot).length === 0) {
+        const again = fixedItems ? problemsOf(fixedItems) : null;
+        if (again && again.none) {
           task.implementResponse = fixed;
           task.revisionApplied = true;
           delete task.findRecheckBlocked;
-          appendHistoryEvent(task, 'advisory', `find-string recheck: ${flags.length} failing edit(s) corrected by one bounded fix call`);
+          stamp(again.syntax);
+          appendHistoryEvent(task, 'advisory', `${first.kind === 'syntax' ? 'edit-set syntax' : 'find-string'} recheck: ${first.count} failing item(s) corrected by one bounded fix call`);
           return false;
         }
       }
     }
-    const blockedReason = `Edit set would not apply: ${fr.feedbackFor(flags)}`.slice(0, 900);
-    task.findRecheckBlocked = sig;
-    task.critiqueOutcome = 'find-recheck-failed';
+    const blockedReason = (first.kind === 'syntax' ? `Edit set would leave a file that does not parse: ${first.feedback}` : `Edit set would not apply: ${first.feedback}`).slice(0, 900);
+    task.findRecheckBlocked = first.sig;
+    task.critiqueOutcome = first.kind === 'syntax' ? 'edit-syntax-failed' : 'find-recheck-failed';
     task.blockedStage = 'review';
     task.blockedReason = blockedReason;
     task.priorRejectionFeedback = [...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), blockedReason];
-    try { recordCritique(attempt, { outcome: 'find-recheck-failed' }); } catch { /* telemetry must not turn a block into a pass */ }
+    try { recordCritique(attempt, { outcome: task.critiqueOutcome }); } catch { /* telemetry must not turn a block into a pass */ }
     appendHistoryEvent(task, 'critique-done', blockedReason);
     return true;
   } catch (err) {
-    console.warn('[local-draft] find-string recheck failed (advisory):', (err && err.message) || err);
+    console.warn('[local-draft] edit-set recheck failed (advisory):', (err && err.message) || err);
     return false;
   }
 }
