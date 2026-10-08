@@ -970,7 +970,7 @@ test('syntax gate: a file the diff removed, a TypeScript file and an unknown ext
   assert.notEqual(r.status, 'failed');
   const why = Object.fromEntries(r.syntax.skipped.map((x) => [x.file, x.reason]));
   assert.match(why['src/gone.js'], /absent/);
-  assert.match(why['web/App.tsx'], /no syntax checker/);
+  assert.match(why['web/App.tsx'], /no \.tsx parser/);
   assert.match(why['run.sh'], /no syntax checker/);
   assert.deepEqual(r.syntax.checked.sort(), ['src/a.js', 'src/a.test.js']);
 });

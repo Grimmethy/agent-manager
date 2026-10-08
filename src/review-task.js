@@ -1334,6 +1334,38 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
+  // Edit-set syntax gate (lib/edit-set-syntax.js, 2026-10-08, TaxHarvest AC-271): the executed-verification block below runs only for adhoc drafts that carry
+  // a rawDiff, so a Group B draft (a JSON edit set -- arch_review / function_length_fix / observability_fix / change_review_fix ...) was never syntax-checked and
+  // an edit that split an import reached pending-merge. Replays the set against the repo and parses every created/edited file; a file that parsed before the
+  // edit and does not now is a deterministic block, same discipline as the gates above (no vote is spent). Coverage (checked / skipped with reasons) is
+  // stamped on task.editSetSyntax for the voters. Never throws; AGENT_MANAGER_EDIT_SYNTAX_GATE=advisory|off.
+  try {
+    const { usesGroupB } = require('./lib/apply-core.js');
+    const ess = require('./lib/edit-set-syntax.js');
+    const essMode = ess.syntaxGateMode();
+    if (essMode !== 'off' && usesGroupB(task) && trimmedImplResponse) {
+      let editItems = null;
+      try { const v = parseJsonMaybeFenced(trimmedImplResponse); editItems = v ? (Array.isArray(v) ? v : [v]) : null; } catch { editItems = null; }
+      if (editItems && editItems.some((i) => i && (i.mode === 'edit' || i.mode === 'create'))) {
+        const syn = ess.checkEditSetSyntax(editItems, repoRoot);
+        task.editSetSyntax = { at: new Date().toISOString(), checked: syn.checked, skipped: syn.skipped, failed: syn.failed.map((f) => f.file), preexisting: syn.preexisting };
+        if (syn.failed.length) {
+          const reason = `Deterministic gate: edit-set-syntax -- ${ess.syntaxFeedbackFor(syn.failed)}`.slice(0, 900);
+          if (essMode === 'advisory') {
+            appendHistoryEvent(task, 'advisory', reason.slice(0, 600));
+          } else {
+            task.reviewProvider = 'deterministic-edit-set-syntax';
+            recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+            appendHistoryEvent(task, 'blocked', reason);
+            return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`[review] edit-set syntax gate errored for ${task.id} (non-fatal, continuing): ${e && e.message}`);
+  }
+
   // Executed verification: see the block comment above summariseExecutedVerification. Adhoc implement drafts only (they carry a real rawDiff plus
   // the acceptance results the draft claims); every other source keeps its own gates.
   if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false'

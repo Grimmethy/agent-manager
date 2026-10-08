@@ -34,7 +34,7 @@ const { prepareAdhocWorktree, applyPartialDiff, cleanupAdhocWorktree, runGit } =
 const { findAffectedTestFiles, parseNodeTestFailures, parsePyTestFailures } = require('./scoped-test-runner.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { externalDependencyLinks, codeBindPaths } = require('./lib/draft-sandbox.js');
-const { checkerFor, isModuleFormatAmbiguity, summarizeSyntaxError, resolvePython } = require('./lib/syntax-check.js');
+const { checkerFor, isModuleFormatAmbiguity, summarizeSyntaxError, resolvePython, checkTypeScript } = require('./lib/syntax-check.js');
 
 const COMMAND_TIMEOUT_MS = 120000;
 // 2026-10-07: a single `node --test` call over the covering files must be able to fit the slowest
@@ -480,6 +480,13 @@ function checkChangedFilesSyntax({ worktreeDir, files, rawDiff, run, py, repoRoo
     if (!stat.isFile()) return { skip: 'not a regular file' };
     if (checker.kind === 'json') {
       try { JSON.parse(fs.readFileSync(full, 'utf8')); return { ok: true }; } catch (e) { return { error: `${file} ${String((e && e.message) || e).slice(0, 200)}` }; }
+    }
+    if (checker.kind === 'ts') {
+      // Parsed in-process (esbuild, or Node's own TypeScript stripper for .ts): no sandboxed command. Skipped with a reason when no parser is available.
+      let tsText;
+      try { tsText = fs.readFileSync(full, 'utf8'); } catch { return { skip: 'unreadable' }; }
+      const r = checkTypeScript(file, tsText, { repoRoot });
+      return r.ok ? { ok: true } : (r.skip ? { skip: r.skip } : { error: r.error });
     }
     if (checker.kind === 'python' && !py) return { skip: 'no python interpreter available' };
     const remaining = deadline - Date.now();

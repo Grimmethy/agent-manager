@@ -55,16 +55,28 @@ function nearestExcerpt(text, find) {
  * @param {{ readFile?: (abs: string) => (string|null) }} [o]
  * @returns {Array<{ type: string, index: number, file: string, detail: string, excerpt?: {nearLine: number|null, text: string} }>}
  */
-function simulateEdits(items, repoRoot, { readFile } = {}) {
+function simulateEdits(items, repoRoot, o = {}) {
+  return simulateEditsDetailed(items, repoRoot, o).flags;
+}
+
+/**
+ * Same replay, plus the resulting file texts for a downstream check (lib/edit-set-syntax.js).
+ * @returns {{ flags: Array<object>, files: Array<{ file: string, base: (string|null), text: (string|null) }> }}
+ *   files: every path the set touches, in first-touch order; `base` is the text on disk before the set (null = absent), `text` the text after the
+ *   whole set (null = deleted).
+ */
+function simulateEditsDetailed(items, repoRoot, { readFile } = {}) {
   const read = readFile || ((abs) => { try { return fs.readFileSync(abs, 'utf8'); } catch { return null; } });
   const flags = [];
+  const touched = new Map(); // abs -> { file, base }
+  const virt = new Map(); // abs path -> text, or null when deleted
   try {
     if (!Array.isArray(items)) items = items ? [items] : [];
-    const virt = new Map(); // abs path -> text, or null when deleted
     const get = (abs) => (virt.has(abs) ? virt.get(abs) : read(abs));
     items.forEach((item, index) => {
       if (!item || typeof item.file !== 'string' || !item.file) return;
       const abs = path.resolve(repoRoot, item.file);
+      if (!touched.has(abs)) touched.set(abs, { file: item.file, base: read(abs) });
       if (item.mode === 'create') {
         if (get(abs) !== null && get(abs) !== undefined) flags.push({ type: 'create_exists', index, file: item.file, detail: `item ${index + 1}: ${item.file} already exists (create refuses to overwrite)` });
         virt.set(abs, String(item.content || ''));
@@ -89,8 +101,8 @@ function simulateEdits(items, repoRoot, { readFile } = {}) {
       }
       virt.set(abs, text.replace(find, () => (typeof item.replace === 'string' ? item.replace : '')));
     });
-  } catch { return []; }
-  return flags;
+  } catch { return { flags: [], files: [] }; }
+  return { flags, files: [...touched].map(([abs, t]) => ({ file: t.file, base: t.base === undefined ? null : t.base, text: virt.has(abs) ? virt.get(abs) : t.base })) };
 }
 
 // The text a revise call / redraft sees: what failed and the real nearby lines to copy from.
@@ -105,4 +117,4 @@ function feedbackFor(flags) {
 
 const signatureOf = (flags) => flags.map((f) => `${f.type}:${f.file}:${f.index}`).sort().join('|');
 
-module.exports = { recheckMode, simulateEdits, feedbackFor, nearestExcerpt, signatureOf };
+module.exports = { recheckMode, simulateEdits, simulateEditsDetailed, feedbackFor, nearestExcerpt, signatureOf };

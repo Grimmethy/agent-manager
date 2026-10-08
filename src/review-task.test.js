@@ -2870,3 +2870,49 @@ test('formatExecutedVerificationSection separates files that finished and passed
   assert.deepEqual(sum.tests.timedOutFiles, ['b.test.js']);
   assert.deepEqual(sum.tests.partial, [{ file: 'b.test.js', count: 1, passed: true, tests: ['t'] }]);
 });
+
+// 2026-10-08 (TaxHarvest AC-271): a Group B draft (JSON edit set) used to get NO syntax check at review. The edit-set syntax gate blocks one whose result does not parse.
+test('reviewTask deterministically blocks a Group B edit set that leaves a python file unparsable -- no vote spent; a sound set is stamped and goes to the vote', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  fs.writeFileSync(path.join(repoRoot, 'img.py'), 'import os\nfrom util import (\n    a, b,\n)\n');
+  const split = JSON.stringify([{ mode: 'edit', file: 'img.py', find: 'from util import', replace: 'from util import\nfrom constants import YEAR' }]);
+  const task = baseTask({ domain: 'default', source: 'group_b_fixture', implementResponse: split });
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-edit-set-syntax');
+  assert.match(result.blockedReason, /edit-set-syntax/);
+  assert.match(result.blockedReason, /img\.py:2 SyntaxError/);
+  assert.equal(captured.length, 0, 'no review call is spent on a draft that cannot import');
+  assert.deepEqual(task.editSetSyntax.failed, ['img.py']);
+
+  const ok = baseTask({ id: 'ess-ok', domain: 'default', source: 'group_b_fixture', implementResponse: JSON.stringify([{ mode: 'edit', file: 'img.py', find: 'import os', replace: 'import os\nfrom constants import YEAR' }]) });
+  const captured2 = [];
+  await reviewTask(ok, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured2), recordModelOutcome: () => {} });
+  assert.notEqual(ok.reviewProvider, 'deterministic-edit-set-syntax');
+  assert.deepEqual(ok.editSetSyntax.checked, ['img.py']);
+  assert.equal(captured2.length, 1);
+});
+
+test('reviewTask: the edit-set syntax gate leaves adhoc diffs alone and honours advisory / off', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  fs.writeFileSync(path.join(repoRoot, 'img.py'), 'import os\nfrom util import (\n    a, b,\n)\n');
+  const split = JSON.stringify([{ mode: 'edit', file: 'img.py', find: 'from util import', replace: 'from util import\nfrom constants import YEAR' }]);
+  const adhoc = baseTask({ id: 'ess-adhoc', domain: 'default', source: 'manual', implementResponse: split });
+  await reviewTask(adhoc, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {} });
+  assert.equal(adhoc.editSetSyntax, undefined);
+  const prev = process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE;
+  try {
+    process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = 'advisory';
+    const adv = baseTask({ id: 'ess-adv', domain: 'default', source: 'group_b_fixture', implementResponse: split });
+    const captured = [];
+    await reviewTask(adv, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+    assert.notEqual(adv.reviewProvider, 'deterministic-edit-set-syntax');
+    assert.equal(captured.length, 1);
+    assert.ok(adv.history.some((h) => h.stage === 'advisory' && /edit-set-syntax/.test(h.detail || '')));
+    process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = 'off';
+    const off = baseTask({ id: 'ess-off', domain: 'default', source: 'group_b_fixture', implementResponse: split });
+    await reviewTask(off, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {} });
+    assert.equal(off.editSetSyntax, undefined);
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE; else process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = prev; }
+});
