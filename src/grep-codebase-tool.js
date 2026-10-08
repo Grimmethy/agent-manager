@@ -9,6 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { lineMatches } = require('./text-match.js');
+const { isArchivedDirName } = require('./lib/archived-dirs.js');
 
 // Was JS/TS-only, silently excluding every file in whichever of AGENT_MANAGER_GREP_DIRS
 // happened to hold Python/shell/docs content -- for this project's own real config
@@ -141,7 +142,7 @@ function grepCodebase({ query, dir, root, contextLines }) {
       if (hits.length >= maxMatches) return;
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
-        if (GREP_SKIP_DIRS.has(entry.name)) continue;
+        if (GREP_SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
         walk(fullPath);
       } else if (entry.isFile()) {
         grepOneFile(fullPath, false);
