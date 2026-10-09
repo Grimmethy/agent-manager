@@ -204,3 +204,58 @@ test('codeBindPaths: an allowlisted entry that is a symlink OUT of the target is
   fs.mkdirSync(path.join(t, 'lib'));
   assert.deepEqual(codeBindPaths(t).map((p) => path.basename(p)), ['lib']);
 });
+
+// --- copyPackageNodeModules (2026-10-08): a NESTED package's node_modules, on demand ---------------------------------------------------------------------------
+// TaxHarvest/frontend/node_modules was invisible to the review sandbox (copyNodeModules only knows <repoRoot>/node_modules), so frontend tests could never run.
+{
+  const fs2 = require('node:fs');
+  const os2 = require('node:os');
+  const path2 = require('node:path');
+  const test2 = require('node:test');
+  const assert2 = require('node:assert/strict');
+  const { copyPackageNodeModules } = require('./draft-sandbox.js');
+
+  const mk = () => {
+    const repo = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'cpkg-repo-'));
+    const wt = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'cpkg-wt-'));
+    fs2.mkdirSync(path2.join(repo, 'app', 'web', 'node_modules', 'vitest'), { recursive: true });
+    fs2.writeFileSync(path2.join(repo, 'app', 'web', 'node_modules', 'vitest', 'vitest.mjs'), '//');
+    return { repo, wt };
+  };
+  // A fake `run`: du reports `kb`, git check-ignore passes or throws, cp really copies.
+  const runner = ({ kb = 2048, ignored = true } = {}) => (cmd, args) => {
+    if (cmd === 'du') return `${kb}\t${args[1]}\n`;
+    if (cmd === 'git') { if (!ignored) throw new Error('not ignored'); return ''; }
+    if (cmd === 'cp') { fs2.cpSync(args[args.length - 2], args[args.length - 1], { recursive: true }); return ''; }
+    throw new Error(`unexpected ${cmd}`);
+  };
+
+  test2('copyPackageNodeModules copies <repo>/<pkg>/node_modules to the same place in the worktree, once', () => {
+    const { repo, wt } = mk();
+    const r = copyPackageNodeModules(repo, wt, 'app/web', { run: runner() });
+    assert2.equal(r.copied, true);
+    assert2.equal(r.sizeMb, 2);
+    assert2.ok(fs2.existsSync(path2.join(wt, 'app', 'web', 'node_modules', 'vitest', 'vitest.mjs')));
+    assert2.equal(copyPackageNodeModules(repo, wt, 'app/web', { run: runner() }).already, true, 'a second call is a no-op');
+  });
+
+  test2('copyPackageNodeModules reports why it did not copy: not installed, too large, not gitignored, switched off', () => {
+    const { repo, wt } = mk();
+    assert2.match(copyPackageNodeModules(repo, wt, 'app/api', { run: runner() }).reason, /app\/api\/node_modules is not installed in the repo \(run npm ci in app\/api\)/);
+    const big = copyPackageNodeModules(repo, wt, 'app/web', { run: runner({ kb: 900 * 1024 }) });
+    assert2.equal(big.copied, false);
+    assert2.match(big.reason, /900 MB \(cap 800 MB\)/);
+    assert2.equal(fs2.existsSync(path2.join(wt, 'app', 'web', 'node_modules')), false, 'nothing partial is left behind');
+    assert2.match(copyPackageNodeModules(repo, wt, 'app/web', { run: runner({ ignored: false }) }).reason, /not gitignored/);
+    assert2.match(copyPackageNodeModules(repo, wt, 'app/web', { run: runner(), env: { AGENT_MANAGER_DRAFT_NODE_MODULES: 'false' } }).reason, /AGENT_MANAGER_DRAFT_NODE_MODULES=false/);
+  });
+
+  test2('copyPackageNodeModules never leaves a partial copy when cp fails, and never throws', () => {
+    const { repo, wt } = mk();
+    const failingCp = (cmd, args) => { if (cmd === 'cp') { fs2.mkdirSync(args[args.length - 1], { recursive: true }); throw new Error('disk full'); } return cmd === 'du' ? '10\tx' : ''; };
+    const r = copyPackageNodeModules(repo, wt, 'app/web', { run: failingCp });
+    assert2.equal(r.copied, false);
+    assert2.match(r.reason, /copy failed: disk full/);
+    assert2.equal(fs2.existsSync(path2.join(wt, 'app', 'web', 'node_modules')), false);
+  });
+}
