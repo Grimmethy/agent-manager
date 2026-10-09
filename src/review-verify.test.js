@@ -1165,3 +1165,118 @@ test('per-file: a real failure in one file is not erased by another file timing 
   assert.equal(r.tests.passed, false);
   assert.deepEqual(r.tests.timedOutFiles, ['src/b.test.js']);
 });
+
+// --- vitest routing (2026-10-08): .tsx tests run through vitest from their own package -------------------------------------------------------------------------
+// `node --test` cannot execute a .tsx (ERR_UNKNOWN_FILE_EXTENSION), so a frontend test could never be verified. The runner now comes from the package that owns the file.
+const TSX_DIFF = 'diff --git a/web/src/Toast.tsx b/web/src/Toast.tsx\n--- a/web/src/Toast.tsx\n+++ b/web/src/Toast.tsx\n@@ -1 +1 @@\n-a\n+b\n';
+function vitestTree({ declareVitest = true, extra = {} } = {}) {
+  return () => {
+    const dir = worktreePaths('t1').worktreeDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+    const files = { 'web/package.json': JSON.stringify(declareVitest ? { devDependencies: { vitest: '^3.2.7' } } : {}), 'web/src/Toast.tsx': '// base\n', 'web/src/Toast.test.tsx': '// base\n', ...extra };
+    for (const [f, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), text); }
+    return { ok: true };
+  };
+}
+const ok = { ran: true, exitCode: 0, timedOut: false, output: '' };
+
+test('vitest routing: a .tsx covering test runs through vitest from its package dir, with package-relative paths; node --test is not used for it', () => {
+  const calls = [];
+  const f = fakeDeps({
+    prepare: vitestTree(),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx'], py: [] }),
+    provision: (root, wt, pkg) => { calls.push(['provision', pkg]); return { copied: true }; },
+    run: (a) => { calls.push(['run', a.bin, a.cwd, a.args]); return ok; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.deepEqual(calls.filter((c) => c[0] === 'provision'), [['provision', 'web']]);
+  const run = calls.find((c) => c[0] === 'run' && c[3].includes('run'));
+  assert.equal(run[1], 'node');
+  assert.equal(run[2], 'web', 'vitest starts in its own package dir');
+  assert.deepEqual(run[3], ['node_modules/vitest/vitest.mjs', 'run', '--reporter=default', 'src/Toast.test.tsx']);
+  assert.ok(!calls.some((c) => c[0] === 'run' && c[3].includes('--test')), 'no node --test run for a .tsx');
+  assert.deepEqual(r.tests.passedFiles, ['web/src/Toast.test.tsx']);
+});
+
+test('vitest routing: a failing .tsx test is a real failure named from vitest\'s output, once the base passes', () => {
+  let onBase = false;
+  const f = fakeDeps({
+    prepare: vitestTree(),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx'], py: [] }),
+    provision: () => ({ copied: true }),
+    unapplyDiff: () => { onBase = true; return { applied: true }; },
+    run: () => (onBase ? ok : { ran: true, exitCode: 1, timedOut: false, output: ' FAIL  src/Toast.test.tsx > Toast > auto-dismisses after the duration\nAssertionError\n' }),
+  });
+  const r = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(r.tests.failures, ['src/Toast.test.tsx > Toast > auto-dismisses after the duration']);
+});
+
+test('vitest routing: node_modules that cannot be provided, or a package with no runner, is reported as noRunner with the reason -- never as a failure of the diff', () => {
+  const noModules = fakeDeps({
+    prepare: vitestTree(),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx'], py: [] }),
+    provision: () => ({ copied: false, reason: 'web/node_modules is not installed in the repo (run npm ci in web)' }),
+    run: () => { throw new Error('nothing should run'); },
+  });
+  const a = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: noModules.deps });
+  assert.notEqual(a.status, 'failed');
+  assert.match(a.noRunner[0].reason, /vitest cannot run: web\/node_modules is not installed/);
+  assert.equal(a.noRunner[0].file, 'web/src/Toast.test.tsx');
+
+  const noRunner = fakeDeps({
+    prepare: vitestTree({ declareVitest: false }),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx'], py: [] }),
+    run: () => { throw new Error('nothing should run'); },
+  });
+  const b = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: noRunner.deps });
+  assert.notEqual(b.status, 'failed');
+  assert.match(b.noRunner[0].reason, /node:test cannot run \.tsx and web declares no test runner \(vitest\)/);
+});
+
+test('vitest routing: plain .js tests are untouched (node --test), and tests the diff adds to a .tsx test file run first through vitest -t', () => {
+  const calls = [];
+  const diff = 'diff --git a/web/src/Toast.tsx b/web/src/Toast.tsx\n--- a/web/src/Toast.tsx\n+++ b/web/src/Toast.tsx\n@@ -1 +1 @@\n-a\n+b\n'
+    + 'diff --git a/web/src/Toast.test.tsx b/web/src/Toast.test.tsx\n--- a/web/src/Toast.test.tsx\n+++ b/web/src/Toast.test.tsx\n@@ -1 +1,2 @@\n+  it(\'shows the message\', () => {});\n';
+  const f = fakeDeps({
+    prepare: vitestTree({ extra: { 'tools/a.test.js': '// base\n' } }),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx', 'tools/a.test.js'], py: [] }),
+    provision: () => ({ copied: true }),
+    run: (a) => { calls.push(a); return ok; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: diff, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  const narrowed = calls.find((c) => c.args.includes('-t'));
+  assert.ok(narrowed, 'a narrowed vitest run happened');
+  assert.equal(narrowed.cwd, 'web');
+  assert.equal(narrowed.args[narrowed.args.indexOf('-t') + 1], 'shows the message');
+  assert.ok(narrowed.args.includes('--passWithNoTests'), 'the control run on the base (no such test) must exit 0');
+  assert.ok(calls.some((c) => c.args[0] === '--test' && c.args.includes('tools/a.test.js') && !c.cwd), 'the .js test still runs through node --test, from the repo root');
+});
+
+test('vitest routing: a .tsx test that merely imports the changed module (dependents tier) also runs through vitest, from its package', () => {
+  const calls = [];
+  const f = fakeDeps({
+    prepare: vitestTree({ extra: { 'web/src/Other.test.tsx': '// imports Toast\n' } }),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx', 'web/src/Other.test.tsx'], py: [] }),    // Toast.test.tsx is co-located (primary); Other.test.tsx only imports it: the dependents tier
+    provision: () => ({ copied: true }),
+    run: (a) => { calls.push(a); return ok; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: f.deps });
+  const dep = calls.find((c) => c.args.includes('run') && c.args.some((x) => /Other\.test\.tsx$/.test(x)));
+  assert.ok(dep, 'the dependent test was run through vitest');
+  assert.equal(dep.cwd, 'web');
+  assert.ok((r.tests && r.tests.dependents || []).includes('web/src/Other.test.tsx'));
+});
+
+test('runSandboxed starts the command in the requested sub-directory of the worktree (cwd), and in the worktree root without one', (t) => {
+  const { runSandboxed } = require('./review-verify.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-cwd-'));
+  fs.mkdirSync(path.join(dir, 'pkg', 'inner'), { recursive: true });
+  const probe = runSandboxed({ worktreeDir: dir, bin: 'node', args: ['-e', 'console.log(process.cwd())'], timeoutMs: 20000, pythonBin: null, mainRepoRoot: null });
+  if (!probe.ran) { t.skip(`no sandbox here: ${probe.reason}`); return; }
+  assert.equal(probe.output.trim(), dir);
+  const inner = runSandboxed({ worktreeDir: dir, bin: 'node', args: ['-e', 'console.log(process.cwd())'], timeoutMs: 20000, pythonBin: null, mainRepoRoot: null, cwd: 'pkg/inner' });
+  assert.equal(inner.output.trim(), path.join(dir, 'pkg', 'inner'));
+});
