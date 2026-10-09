@@ -73,9 +73,13 @@ function priorVerdictBlock(task) {
     kept.push(text);
     used += text.length;
   }
+  // kind 'main-moved' (branch-conflict-readmit-sweep.js): nobody judged the change wrong, the branch just stopped merging.
+  const intro = pv.kind === 'main-moved'
+    ? 'Your previous attempt for this task was not rejected, but the code it was written against has changed and it no longer merges. Read what follows before you start:'
+    : 'A reviewer examined your previous attempt for this task and judged it needs-work. Do not repeat that change; the reasons below say what is wrong and what to do instead:';
   const lines = [
     '',
-    'A reviewer examined your previous attempt for this task and judged it needs-work. Do not repeat that change; the reasons below say what is wrong and what to do instead:',
+    intro,
     '',
   ];
   kept.forEach((reason, i) => lines.push(`${i + 1}. ${reason}`));
