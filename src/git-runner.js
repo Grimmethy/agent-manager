@@ -13,6 +13,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
+const { healGeneratedDirt } = require('./lib/apply-clone-dirt.js');
 
 const GIT_ENV = {
   ...process.env,
@@ -236,6 +237,10 @@ function createRealGitRunner(repoRoot) {
       return quarantineStash();
     },
     assertCleanTree: () => {
+      // Compiled-cache dirt (tracked __pycache__/*.pyc rewritten by any Python run) is restored first; see lib/apply-clone-dirt.js.
+      const healed = healGeneratedDirt(run);
+      if (healed.restored.length) console.error(`[git-runner] restored ${healed.restored.length} generated file(s) in ${repoRoot}: ${healed.restored.slice(0, 5).join(', ')}`);
+      else if (healed.wouldRestore.length) console.error(`[git-runner] (dry-run) would restore ${healed.wouldRestore.length} generated file(s) in ${repoRoot}: ${healed.wouldRestore.slice(0, 5).join(', ')}`);
       const lines = run(['status', '--porcelain', '--untracked-files=no']).split('\n').filter(Boolean);
       if (!lines.length) return;
       const files = lines.map((l) => l.slice(3)).slice(0, 8).join(', ');

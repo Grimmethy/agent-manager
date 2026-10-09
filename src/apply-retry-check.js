@@ -33,6 +33,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { healGeneratedDirt } = require('./lib/apply-clone-dirt.js');
 const { getConfig } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -112,8 +113,10 @@ function isInfraApplyFailure(task) {
 function defaultIsApplyCloneClean() {
   try {
     const { applyRepoRoot } = getConfig();
-    const out = require('child_process').execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: applyRepoRoot, encoding: 'utf8', stdio: 'pipe', timeout: 30_000 });
-    return out.trim() === '';
+    const run = (args) => require('child_process').execFileSync('git', args, { cwd: applyRepoRoot, encoding: 'utf8', stdio: 'pipe', timeout: 30_000 });
+    // Restore compiled-cache dirt first (lib/apply-clone-dirt.js); with the heal switch at dry-run/off this changes nothing and the count below is as before.
+    healGeneratedDirt(run);
+    return run(['status', '--porcelain', '--untracked-files=no']).trim() === '';
   } catch {
     return false;
   }
@@ -341,7 +344,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { applyRetryCheck, isDivergedHistoryFailure, isInfraApplyFailure };
+module.exports = { applyRetryCheck, isDivergedHistoryFailure, isInfraApplyFailure, defaultIsApplyCloneClean };
 
 if (require.main === module) {
   main();
