@@ -29,7 +29,11 @@
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .pipeline-dir { color: var(--muted); font-size: 12px; }
   .layout { display: flex; }
-  nav { width: 200px; padding: 16px 0; border-right: 2px solid var(--border); min-height: calc(100vh - 53px); }
+  /* The tab list is pinned to the viewport and scrolls on its own, the same way .plugin-sidebar
+     does, so a long tab list and a long #main page no longer share one page scroll. 53px is the
+     header height both rules already assume. align-self:flex-start stops the flex row from
+     stretching nav to #main's height (which would defeat the fixed height). */
+  nav { width: 200px; flex-shrink: 0; padding: 16px 0; border-right: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; align-self: flex-start; overflow-y: auto; overscroll-behavior: contain; }
   /* Chat panel (Brain Dump #153): a third flex sibling of nav/main, not a modal -- see
      app.py/chat_sessions.py for the backend. Collapsed state is a plain width/visibility
      toggle (localStorage-persisted, same convention nav-group expand/collapse already
@@ -233,7 +237,7 @@
     header { flex-wrap: wrap; padding: 10px 14px; gap: 8px 12px; }
     header .pipeline-dir { flex-basis: 100%; }
     .layout { flex-direction: column; }
-    nav { width: 100%; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
+    nav { width: 100%; height: auto; position: static; overflow-y: visible; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
     nav button { width: auto; white-space: nowrap; padding: 8px 12px; }
     nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
     main { padding: 12px; overflow-x: auto; }
