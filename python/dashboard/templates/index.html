@@ -311,9 +311,11 @@ const CORE_TABS = [
   { key: 'concepts', label: '🔬 Concepts', description: 'Track named concepts (e.g. chat-context-trimming) that get research-fork treatment -- a running audit log of research and build work per concept, plus a self-reported (unverified) built-from-scratch vs adapted tally.' },
   { key: 'reports', label: '🕒 Time Tracking', description: 'Review how much time the pipeline has spent per job, stage, or project.' },
   { key: 'tokenfold', label: '⚡ TokenFold Savings', description: 'See how many tokens the TokenFold compression proxy has saved across all pipeline model calls, broken down per model.' },
-  { key: 'promptforge', label: '🎨 PromptForge', description: 'ComfyUI-driven still-image shot generator (separate local app on PROMPTFORGE_URL, default :7430), embedded here.' },
-  { key: 'adforge', label: '🎬 AdForge', description: 'Advertisement-pipeline orchestrator (separate local app on ADFORGE_URL, default :7431), embedded here. Sequences ScriptForge/PromptForge/VoiceForge/CutForge/PostForge into a finished ad.' },
-  { key: 'scriptforge', label: '📝 ScriptForge', description: 'Ad-script generator (separate local app on SCRIPTFORGE_URL, default :7432) -- brief -> treatment + shot list + PromptForge shot-specs + VO + music brief, on the local model. Phase 1 of AdForge.' },
+  { group: 'Forges', children: [
+    { key: 'promptforge', label: '🎨 PromptForge', description: 'ComfyUI-driven still-image shot generator (separate local app on PROMPTFORGE_URL, default :7430), embedded here.' },
+    { key: 'adforge', label: '🎬 AdForge', description: 'Advertisement-pipeline orchestrator (separate local app on ADFORGE_URL, default :7431), embedded here. Sequences ScriptForge/PromptForge/VoiceForge/CutForge/PostForge into a finished ad.' },
+    { key: 'scriptforge', label: '📝 ScriptForge', description: 'Ad-script generator (separate local app on SCRIPTFORGE_URL, default :7432) -- brief -> treatment + shot list + PromptForge shot-specs + VO + music brief, on the local model. Phase 1 of AdForge.' },
+  ] },
   { key: 'branches', label: '🌿 Unmerged Branches', description: 'List branches the pipeline has created that have not yet been merged, so nothing gets lost or forgotten.' },
   { key: 'adhoc', label: '📌 Adhoc Tasks', description: 'Every adhoc task in one place, with which queue state it currently sits in -- cuts across the whole Job Status group instead of checking each state tab by hand.' },
   { group: 'Job Status', children: [
