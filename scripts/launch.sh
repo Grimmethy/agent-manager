@@ -34,6 +34,15 @@ if [[ -f "$COMFY_LEASE_PATH" ]]; then
     && echo "[launch] cleared ComfyUI GPU lease ($COMFY_LEASE_PATH) -- explicit pipeline start takes the GPU"
 fi
 
+# Forge family exclusion: the pipeline and the Forge family (ComfyUI) never hold the GPU together
+# (promptforge Docs/GPU_FAMILY_PROTOCOL.md). Besides deleting the lease, ask PromptForge to end its session and
+# stop ComfyUI right now instead of waiting for its keeper to notice (~20 s). Best-effort: PromptForge may be down.
+PROMPTFORGE_URL="${AGENT_MANAGER_PROMPTFORGE_URL:-${PROMPTFORGE_URL:-http://localhost:7430}}"
+if command -v curl >/dev/null 2>&1; then
+  yield_out="$(curl -s -m 30 -X POST "${PROMPTFORGE_URL%/}/api/gpu/yield" 2>/dev/null || true)"
+  [[ -n "$yield_out" ]] && echo "[launch] Forge GPU yield: $yield_out"
+fi
+
 AGENT_MANAGER_DASHBOARD_PORT="${AGENT_MANAGER_DASHBOARD_PORT:-7420}"
 
 # orc-common.sh and downstream scripts hard-requires MODEL_URL, HOME_LOGS already exported.
