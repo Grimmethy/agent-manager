@@ -372,13 +372,14 @@ function writeProjectsRegistryFixture(dir, labels) {
 
 test('nextBrainDumpSortTask sets selfProjectLabel when this package\'s own directory name is a tracked project', () => {
   const dir = makeBrainDumpFixtureRepo();
-  writeProjectsRegistryFixture(dir, ['agent-manager', 'some-other-project']);
+  const ownDirName = path.basename(path.join(__dirname, '..')); // the checkout's real dir name -- a worktree is not called 'agent-manager'
+  writeProjectsRegistryFixture(dir, [ownDirName, 'some-other-project']);
   fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
     entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
   }));
   const { nextBrainDumpSortTask } = freshTaskSources(dir);
   const task = nextBrainDumpSortTask();
-  assert.equal(task.promptContext.selfProjectLabel, 'agent-manager');
+  assert.equal(task.promptContext.selfProjectLabel, ownDirName);
 });
 
 test('nextBrainDumpSortTask leaves selfProjectLabel null when this package is not itself a tracked project', () => {

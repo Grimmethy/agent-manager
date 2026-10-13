@@ -8,7 +8,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { ensureGpuHeadroom } = require('./gpu-guard.js');
+const { ensureGpuHeadroom: realEnsureGpuHeadroom } = require('./gpu-guard.js');
+
+// ensureGpuHeadroom's default leaseHeld reads the REAL ~/.local/state/agent-manager/comfyui-lease.json, so
+// these tests failed (12 of 18) whenever PromptForge happened to hold a lease while the suite ran. Default it
+// to "not held"; the lease tests below pass their own leaseHeld and still override this.
+const ensureGpuHeadroom = (opts = {}) => realEnsureGpuHeadroom({ leaseHeld: () => false, ...opts });
 
 test('reports not-checked when nvidia-smi is unavailable (CPU-only box) rather than treating it as starved', async () => {
   const result = await ensureGpuHeadroom({ readFreeVram: () => null, fetchJsonFn: async () => { throw new Error('should not be called'); } });
