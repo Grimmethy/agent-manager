@@ -7,7 +7,7 @@ const { sharedInstancesDir } = require('../instances-dir.js');
 const { buildPlanGrounding } = require('../plan-grounding.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('../task-history.js');
 const {
-  beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordOrient, recordPlanCritique, recordTier, finalizeDraftAttempt,
+  beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordOrient, recordPlanCritique, recordFactCheck, recordTier, finalizeDraftAttempt,
 } = require('../draft-attempt-record.js');
 const { appendTierWorkLog, pruneWorkLogs } = require('../work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('../model-provider.js');
@@ -388,6 +388,10 @@ async function draftAdhocBranch(task, {
       // checkDraft returns { flags: [{ type, detail }, ...], ... } -- attach exactly the
       // flags array (guaranteed to be an array even when empty) per the pre-filter contract.
       task.preFilterFlags = Array.isArray(factCheck && factCheck.flags) ? factCheck.flags : [];
+      // Durable copy on this attempt's record (draft-attempt-record.js): task.preFilterFlags
+      // is overwritten on every run, so a blocked task's fact-check verdict would otherwise
+      // vanish. recordFactCheck tolerates an undefined attempt and keeps the record's [] default.
+      recordFactCheck(attempt, task.preFilterFlags);
     }
   } catch (err) {
     console.warn('[local-draft] pre-filter fact-check failed (non-fatal):', err?.message ?? err);

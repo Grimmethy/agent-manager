@@ -24,6 +24,8 @@
 //
 // Entry shape (a "full" record):
 //   { at, finishedAt, attemptNo, source, localRejectCount,
+//     factCheckWarnings: [{ type, detail?, symbol?, file? }],   // checkDraft flags (incl.
+//                                                               // 'symbol-not-found-in-cited-file')
 //     plan:      { chars, text?, degenerate?, attempts? },
 //     implement: { chars, text?, degenerate?, attempts?, note? },   // non-adhoc path
 //     critique:  { outcome, revised },                              // non-adhoc path
@@ -46,6 +48,9 @@ const RESPONSE_TEXT_CAP = 4000;
 const DIFF_TEXT_CAP = 8000;
 const TOOLCALL_LIST_CAP = 40;
 const MAX_FULL_ATTEMPTS = 6;
+// Cap on how many fact-check warnings a single attempt record keeps (the full list
+// also lives on task.preFilterFlags for the live pass -- this is the durable copy).
+const FACTCHECK_WARNING_CAP = 30;
 
 function cap(text, max) {
   const s = typeof text === 'string' ? text : String(text == null ? '' : text);
@@ -99,6 +104,7 @@ function beginDraftAttempt(task) {
     source: (task && task.source) || null,
     localRejectCount: (task && task.localRejectCount) || 0,
     tiers: [],
+    factCheckWarnings: [],
   };
 }
 
@@ -165,6 +171,30 @@ function recordPlanCritique(attempt, info = {}) {
   attempt.planCritique = { verdict: info.verdict || null, gapCount: Number(info.gapCount) || 0, viaModel: !!info.viaModel };
 }
 
+// Persists the pre-filter fact-check result (src/fact-checker.js's checkDraft flags,
+// the same array the caller stashes on task.preFilterFlags) onto this attempt so the
+// durable record says which claims the fact-checker flagged -- including the
+// 'symbol-not-found-in-cited-file' warning objects (flag type of the same name), which
+// the live pre-filter flag list is the only other home for. `flags` is the fact-checker
+// flag array: [{ type, detail, ... }] (symbol-not-found-in-cited-file entries carry the
+// extra `symbol` and `file` keys); undefined/empty/odd shapes leave the field as the
+// beginDraftAttempt [] default.
+function recordFactCheck(attempt, flags) {
+  if (!attempt) return;
+  const list = Array.isArray(flags) ? flags : [];
+  const warnings = [];
+  for (const f of list.slice(0, FACTCHECK_WARNING_CAP)) {
+    if (!f || typeof f !== 'object') continue;
+    const w = { type: String(f.type || 'unknown') };
+    if (f.detail != null) w.detail = String(f.detail);
+    if (f.symbol != null) w.symbol = String(f.symbol);
+    if (f.file != null) w.file = String(f.file);
+    warnings.push(w);
+  }
+  attempt.factCheckWarnings = warnings;
+  if (list.length > FACTCHECK_WARNING_CAP) attempt.factCheckWarningsTruncated = list.length;
+}
+
 // One rung of the adhoc implement ladder (harness-search / local-agentic /
 // local-agentic-write / a deterministic short-circuit / agentic-research). `info`:
 //   { tier, applied?, resolution?, blocked?, reason?, blockedReason?,
@@ -219,6 +249,10 @@ function collapseOldAttempts(attempts) {
       ...(a.plan && a.plan.degenerate ? { planDegenerate: a.plan.degenerate } : {}),
       ...(a.plan && a.plan.grounded ? { planGrounded: true } : {}),
       tiers: Array.isArray(a.tiers) ? a.tiers.map(slimTier) : [],
+      // Warnings are small and are the durable record of the fact-check verdict (the
+      // live task.preFilterFlags is overwritten every run) -- keep them through collapse.
+      ...(Array.isArray(a.factCheckWarnings) ? { factCheckWarnings: a.factCheckWarnings } : {}),
+      ...(a.factCheckWarningsTruncated != null ? { factCheckWarningsTruncated: a.factCheckWarningsTruncated } : {}),
       collapsed: true,
     };
   }
@@ -275,6 +309,7 @@ module.exports = {
   recordCritique,
   recordOrient,
   recordPlanCritique,
+  recordFactCheck,
   recordTier,
   finalizeDraftAttempt,
   collapseOldAttempts,
