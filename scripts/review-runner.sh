@@ -95,6 +95,14 @@ while :; do                                                                     
     continue
   fi
 
+  # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
+  if mem_pressure_high; then
+    printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+    if "$ONCE"; then exit 0; fi
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+
   # GPU headroom check -- review's own majorityVote call spends real Ollama calls too
   # (n=3 votes per item), same starvation risk local-worker.sh's tick guards against;
   # see gpu-guard.js's header for the live incident this responds to. Best-effort, never

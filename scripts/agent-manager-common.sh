@@ -118,6 +118,16 @@ comfyui_lease_held() {
 }
 
 
+# Host-RAM headroom (2026-10-12 freeze: RAM + all swap exhausted by ComfyUI + the P40 VM +
+# Ollama's runner, kernel thrashed until power-cycled). mem-guard.js measures MemAvailable /
+# SwapFree, asks ComfyUI to unload if short, and exits 3 only when pressure remains. Any
+# other outcome (ok, node missing, the check itself crashing) fails open.
+# mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise.
+mem_pressure_high() {
+  node "${PACKAGE_SRC_DIR}/mem-guard.js" >>"${LOG_FILE:-/dev/null}" 2>&1
+  [[ $? -eq 3 ]]
+}
+
 # Pipeline-wide single-flight mutex (2026-08-19, Grimmethy: "it's still running two jobs
 # at once. We really need it to do one at a time" -- reported AFTER should_yield_for_
 # model_swap's in-flight check above was already widened to treat any held lock, same

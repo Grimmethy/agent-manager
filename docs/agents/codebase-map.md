@@ -117,6 +117,10 @@ about," verified to still exist as of this writing.
 - `src/apply-task.js` — stages the artifact, writes the commit message (`Task:`/`Task-Log:` trailers), pushes.
 - `src/git-runner.js` — the injectable git port (`resetToMain`, `add`, `commit`, `push`) apply-task.js drives.
 
+**Resource guards (GPU / host RAM)**
+- `src/gpu-guard.js` — per-tick VRAM headroom check; ComfyUI `/free`, PromptForge `comfyui-lease` yield.
+- `src/mem-guard.js` — per-tick host-RAM/swap check (`MemAvailable`, `SwapFree`); asks ComfyUI to unload, exits 3 on remaining pressure. `mem_pressure_high` in `scripts/agent-manager-common.sh` makes `local-worker.sh`/`review-runner.sh` yield the tick. Thresholds: `AGENT_MANAGER_MIN_AVAILABLE_RAM_MB` (2048), `AGENT_MANAGER_MIN_SWAP_FREE_MB` (512). Added after the 2026-10-12 OOM freeze.
+
 **Concept tracking**
 - `src/concepts.js` — the Concept Chart registry (`createConcept`, `recordConceptResearch`, `getConceptTimeline`), backed by concepts.json (gitignored pipeline-generated state, present on a live host, not in the repo — same category as `queue/`).
 - `SecondBrain/Research/*.md` — the human-readable writeup a concept's row points at.
