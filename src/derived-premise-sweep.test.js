@@ -10,6 +10,15 @@ const os = require('os');
 const path = require('path');
 
 const { sweepDerivedPremise } = require('./derived-premise-sweep.js');
+const { registerTaskSource, registerSourceAlias, getRegisteredSource } = require('./task-source-registry.js');
+
+// Core names no dead-code source: a source opts its done/ records into the "genuine verdict" index via its
+// registration (`genuineVerdict`). Stand-in shaped like the dead-code triage plugin source (tasks stamp
+// source: 'deadcode_triage', registered under another name).
+if (!getRegisteredSource('triage_stand_in')) {
+  registerTaskSource('triage_stand_in', { priority: 90, next: () => null, genuineVerdict: { idPrefix: 'deadcode-' } });
+  registerSourceAlias('deadcode_triage', 'triage_stand_in');
+}
 
 const NOW = Date.parse('2026-09-21T12:00:00Z');
 const iso = (h) => new Date(NOW - h * 3600 * 1000).toISOString();

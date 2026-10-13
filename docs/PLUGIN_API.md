@@ -59,6 +59,9 @@ Registration fields added for the last holdouts (each opts a source into one cor
 | `requireCodeShapeInCandidate: true` | `review-task.js` | A draft that is an `### AC-NNN` candidate must show a fenced code block or diff hunk; prose-only verdicts (false positive / uncertain) still pass (`function_length_review`). |
 | `groundedPromptFiles: true` | `needs-clarification-triage.js` bucket L | `promptContext.files` is a verified list of real grounded paths, so a fabricated-file-path near-miss can be auto-repaired against it (`arch_discovery`). |
 | `noAutoRetry: true` | `reject-retry-check.js` | Opts a source out of the blind-redraft-and-retry sweep entirely (2026-09-28) -- a blocked task from this source is left exactly as-is (never auto-requeued for a fresh draft-started cycle, never counted toward `MAX_LOCAL_REJECT_RETRIES`/`exhausted`). For a source whose redraft is a genuine multi-minute plan+implement+critique cycle run at batch scale (`wiki_transcript_extract`/`wiki_page_promote`), the operator may prefer "one attempt and done, move to the next item" over spending that time re-attempting one that already failed. |
+| `genuineVerdict: { idPrefix? }` | `lib/inert-target.js` (derived-premise sweep) | This source's `done/` records (id/filename starting `idPrefix`) whose `implementResponse` carries a vetted `### AC-N` + `Strength: Strong` candidate count as a GENUINE verdict, letting the sweep RETIRE a derived finding about an unreferenced symbol instead of just holding it (the dead-code triage, `unused_export`). Core resolves a record's source through `registerSourceAlias`, so a source whose tasks stamp another `source` string just registers the alias. |
+
+A source that needs a mandatory, source-specific instruction in its implement prompt (e.g. `function_length_review`'s two-outcome verdict constraint) puts it in its own `buildImplementPrompt`; core's dispatcher no longer special-cases any source name.
 
 Known, deliberate exceptions:
 

@@ -4,14 +4,14 @@
 //
 // 2026-10-08 (TaxHarvest): a derived finding "`_patchRun` silently drops status changes when run is already 'Stopped'" went draft -> review -> apply -> a
 // branch awaiting a human, although `_patchRun` has no caller anywhere (the run state lives in importJobStore). The finding had been raised while a
-// deadcode_triage task examined the same module; nothing in the derived flow asked whether the thing it wanted fixed is ever called. The dead-code
+// dead-code triage task examined the same module; nothing in the derived flow asked whether the thing it wanted fixed is ever called. The dead-code
 // scanner ALREADY knew: queue/dead-code-flags.json listed `_patchRun` with callSites []. Replayed over the 196 TaxHarvest derived tasks, the same
 // lookup matches 3 distinct tasks, all in runStore.js, all dead-path work (one of them was MERGED); no other merged task. A modest filter, not a cure.
 //
 // Rule (pure, no model call, no grep of its own -- it reads what the scanner already wrote):
 //   target   the task's PRIMARY symbol: the first backticked identifier in the title, else the first in the body;
 //   inert    a flags entry for that symbol, defined in a file the task cites, with no call sites;
-//   genuine  a deadcode_triage record in done/ for the same symbol + file that reached a GENUINE verdict (its implementResponse carries the vetted
+//   genuine  a done/ record from a source registered with `genuineVerdict` (the dead-code triage) for the same symbol + file that reached a GENUINE verdict (its implementResponse carries the vetted
 //            `### AC-N` removal candidate, Strength: Strong). Only this lets the sweep RETIRE the task; an inert target without it is HELD.
 // A flags entry that now HAS call sites releases a held task and restores a retired one (the paired re-admission).
 //
@@ -22,6 +22,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { getRegisteredSource, resolveSourceName } = require('../task-source-registry.js');
 
 const IDENT_BACKTICK_RE = /`([A-Za-z_$][\w$]*)(?:\(\))?`/g;
 const FLAGS_FILE = 'dead-code-flags.json';
@@ -90,12 +91,15 @@ function genuineVerdictIndex(doneDir) {
     if (hit && hit.mtime === mtime) return hit.index;
     const index = new Set();
     for (const f of fs.readdirSync(doneDir)) {
-      if (!f.startsWith('deadcode-') || !f.endsWith('.json')) continue;
+      if (!f.endsWith('.json')) continue;
       let t;
       try { t = JSON.parse(fs.readFileSync(path.join(doneDir, f), 'utf8')); } catch { continue; }
       const pc = t && t.promptContext;
       if (!t || !pc || typeof pc.symbol !== 'string' || typeof pc.definedIn !== 'string') continue;
-      if (t.source !== 'deadcode_triage' && t.source !== 'unused_export') continue;
+      // Which sources' done/ records can carry a vetted verdict is the source's own registration
+      // (`genuineVerdict: { idPrefix }`), not a name list here -- see docs/PLUGIN_API.md.
+      const spec = (getRegisteredSource(resolveSourceName(t)) || {}).genuineVerdict;
+      if (!spec || (spec.idPrefix && !f.startsWith(spec.idPrefix))) continue;
       if (t.terminalDisposition === 'abandoned') continue;
       const resp = String(t.implementResponse || '');
       if (/^\s*###\s*AC-\d+\b/m.test(resp) && /^\s*Strength:\s*Strong\b/mi.test(resp)) index.add(`${pc.symbol}|${norm(pc.definedIn)}`);
