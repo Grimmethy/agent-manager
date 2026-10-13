@@ -8,6 +8,15 @@ const path = require('node:path');
 const {
   summariseReplay, inertTargetMode, readFlags, primarySymbol, findInertTarget, nowReferenced, genuineVerdictIndex, hasGenuineVerdict, formatInertTargetSection,
 } = require('./inert-target.js');
+const { registerTaskSource, registerSourceAlias, getRegisteredSource } = require('../task-source-registry.js');
+
+// A source opts its done/ records into genuineVerdictIndex() via its registration (`genuineVerdict`);
+// core names no source. Register a stand-in shaped like the dead-code triage plugin source, whose
+// generated tasks stamp a different `source` than the name it registered under (hence the alias).
+if (!getRegisteredSource('triage_stand_in')) {
+  registerTaskSource('triage_stand_in', { priority: 90, next: () => null, genuineVerdict: { idPrefix: 'deadcode-' } });
+  registerSourceAlias('deadcode_triage', 'triage_stand_in');
+}
 
 const RS = 'TaxHarvest/backend/src/services/runStore.js';
 const flag = (symbol, definedIn, callSites = []) => ({ symbol, definedIn, callSites, scannedAt: '2026-10-08T05:00:00Z' });
@@ -68,13 +77,14 @@ test('genuineVerdictIndex: only a triage record carrying the vetted Strong candi
     'deadcode-c.json': triage('weak', RS, '### AC-018 · Remove `weak`\nStrength: Worth exploring\nFiles: x'),
     'deadcode-d.json': triage('dropped', RS, GENUINE, { terminalDisposition: 'abandoned' }),
     'deadcode-e.json': { ...triage('wrongsource', RS, GENUINE), source: 'manual' },
+    'deadcode-f.json': { ...triage('nofield', RS, GENUINE), source: 'derived_task' }, // registered-or-not, no genuineVerdict on its registration
     'unrelated.json': triage('notprefixed', RS, GENUINE),
     'deadcode-bad.json': 'not json',
   });
   fs.writeFileSync(path.join(dir, 'deadcode-bad.json'), '{oops');
   const idx = genuineVerdictIndex(dir);
   assert.equal(hasGenuineVerdict(idx, { symbol: '_patchRun', definedIn: RS }), true);
-  for (const s of ['maybeUsed', 'weak', 'dropped', 'wrongsource', 'notprefixed']) assert.equal(hasGenuineVerdict(idx, { symbol: s, definedIn: RS }), false, s);
+  for (const s of ['maybeUsed', 'weak', 'dropped', 'wrongsource', 'nofield', 'notprefixed']) assert.equal(hasGenuineVerdict(idx, { symbol: s, definedIn: RS }), false, s);
   assert.equal(hasGenuineVerdict(idx, { symbol: '_patchRun', definedIn: 'elsewhere/runStore.js' }), false, 'same symbol, different file');
   assert.equal(hasGenuineVerdict(new Set(), { symbol: 'x', definedIn: 'y' }), false);
   assert.deepEqual([...genuineVerdictIndex('/no/such/dir')], []);
