@@ -170,6 +170,17 @@ throwing are all caught and shown as a plain error panel inside that tab's own `
 content -- never thrown up into the nav or the rest of the dashboard (`renderPluginTab`,
 `python/dashboard/static/js/core-ui.js`).
 
+**Starting the plugin's server.** If the plugin's `plugins.json` entry has a `process` block, core
+starts that process for you: before calling the tab's renderer, `renderPluginTab` POSTs
+`/api/plugins/<name>/ensure-started` (the same idempotent route as before), shows "Starting <label>..."
+while it waits, and shows an error panel with the start command and log path
+(`~/.local/state/agent-manager/logs/plugin-<name>.log`) if the server does not report healthy. A cold
+start can outlast the route's ~5s health wait, so a failure is retried on the next 5s render rather than
+treated as final; once the server is confirmed healthy core makes no further requests for that plugin
+for the life of the page. A tab script therefore no longer needs to call `ensure-started` itself, and an
+existing call is harmless because the route is idempotent. Entries without a `process` block are
+unaffected (no request is made).
+
 ### Lifecycle
 
 The nav re-syncs every 5s poll cycle (`refresh()`, `core-ui.js`), not just at page load, so
