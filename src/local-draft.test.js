@@ -2649,6 +2649,68 @@ test('draftTask blocks a candidate-fulfillment source that says mode "split" but
   });
 });
 
+test('parseCandidateSplit tags a too-few split with tooFew and the counts, but not a truncated-JSON one', () => {
+  const { parseCandidateSplit } = require('./local-draft.js');
+  const one = parseCandidateSplit(JSON.stringify({ mode: 'split', candidates: [{ title: 'Only one', problem: 'p', solution: 's' }] }));
+  assert.equal(one.tooFew, true);
+  assert.equal(one.usable, 1);
+  assert.equal(one.proposed, 1);
+  const none = parseCandidateSplit(JSON.stringify({ mode: 'split', candidates: [{ title: 'a' }, { title: 'b' }] }));
+  assert.equal(none.tooFew, true);
+  assert.equal(none.usable, 0);
+  assert.equal(none.proposed, 2);
+  const truncated = parseCandidateSplit('{"mode": "split", "candidates": [{"title": "cut off');
+  assert.equal(truncated.invalid, true);
+  assert.equal(truncated.tooFew, undefined, 'a truncated split is a different failure and keeps its own reason');
+});
+
+function splitTooFewTask(id, extra = {}) {
+  return {
+    id, domain: 'default', source: 'arch_review', title: 'test',
+    promptContext: { candidateId: 'AC-180', title: 'x', files: ['src/apply-task.js'], fetchedFiles: [{ path: 'src/apply-task.js', content: 'function applyTask() {}\n' }], body: 'Files: src/apply-task.js' },
+    ...extra,
+  };
+}
+const ONE_CHILD = JSON.stringify({ mode: 'split', candidates: [{ title: 'Only one', files: 'a.js, b.js', problem: 'p', solution: 's' }] });
+const TWO_CHILDREN = JSON.stringify({ mode: 'split', candidates: [
+  { title: 'Create the module', files: 'src/new.js', problem: 'p1', solution: 's1' },
+  { title: 'Rewire the original', files: 'src/apply-task.js', problem: 'p2', solution: 's2', dependsOn: 0 },
+] });
+
+test('draftTask retries a one-child candidate split once with the one-file-per-piece rule and accepts a real 2-piece answer', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = splitTooFewTask('split-too-few-1');
+    const prompts = [];
+    let n = 0;
+    const localCall = async ({ prompt } = {}) => { n += 1; prompts.push(String(prompt)); return n === 1 ? { response: 'plan text', degenerate: null, attempts: 1 } : { response: n === 2 ? ONE_CHILD : TWO_CHILDREN, degenerate: null, attempts: 1 }; };
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.notEqual(result.blocked, true);
+    assert.equal(task.candidateSplitProposals.length, 2);
+    assert.equal(task.splitTooFewRetried, true);
+    assert.equal(task.history.filter((h) => h.stage === 'implement-retry').length, 1);
+    assert.match(prompts[prompts.length - 1], /AT LEAST 2 sub-candidates.*exactly ONE file/s);
+    assert.ok(task.priorRejectionFeedback.some((f) => /only 1 of 1 sub-candidate/.test(f)));
+  });
+});
+
+test('draftTask retries the too-few split only ONCE and then blocks as before; an already-retried task is not retried again', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = splitTooFewTask('split-too-few-2');
+    let n = 0;
+    const localCall = async () => { n += 1; return n === 1 ? { response: 'plan text', degenerate: null, attempts: 1 } : { response: ONE_CHILD, degenerate: null, attempts: 1 }; };
+    const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+    assert.equal(result.blocked, true);
+    assert.match(result.blockedReason, /at least 2/);
+    assert.equal(task.history.filter((h) => h.stage === 'implement-retry').length, 1, 'exactly one retry');
+    const again = splitTooFewTask('split-too-few-3', { splitTooFewRetried: true });
+    let m = 0;
+    const localCall2 = async () => { m += 1; return m === 1 ? { response: 'plan text', degenerate: null, attempts: 1 } : { response: ONE_CHILD, degenerate: null, attempts: 1 }; };
+    const r2 = await draftTask(again, { localCall: localCall2, withLockFn: async (dir, fn) => fn() });
+    assert.equal(r2.blocked, true);
+    assert.equal((again.history || []).filter((h) => h.stage === 'implement-retry').length, 0, 'the flag stops a second retry');
+  });
+});
+
 test('draftTask retries the implement call once when a candidate-fulfillment source writes an unverifiable find, and accepts the corrected retry', async () => {
   await withFixtureRepo(async (draftTask, dir) => {
     fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
@@ -2986,30 +3048,69 @@ test('a task with NO model profile still defaults to think:true, unaffected by t
 // Uses staleness_audit (already in task-sources.js's base set this fixture loads) rather
 // than performance_review, so no "Cannot update unregistered task source" crash at
 // task-source-registry.js:114 (the prior attempt's failure).
-test('draftTask returns the archived shape with zero draft calls when the pre-dispatch gate archives the flagged rule', async () => {
+// 2026-10-07: the gate's archive verdict used to return {status:'archived'}, which scripts/local-worker.sh does not route, so the
+// task reached review/ with an EMPTY draft and looped to needs-clarification (39 TaxHarvest tasks). It is now a model-free FALSE
+// POSITIVE draft concluded like any other, so it flows to review and the source's own apply() records the suppression.
+const GATE_FANOUT_CODE = 'const results = await Promise.all(items.map(async (item) => process(item)));';
+const GATE_NO_AWAIT_CODE = 'for (const row of rows) {\n  total += row.amount;\n}';
+const GATE_SYNC_IO_CODE = 'function init() {\n  for (let i = 0; i < 3; i++) {\n    const t = fs.readFileSync(paths[i]);\n  }\n}';
+
+test('draftTask turns a pre-dispatch gate archive verdict into a model-free FALSE POSITIVE draft ready for review', async () => {
   await withFixtureRepo(async (draftTask) => {
     let callCount = 0;
-    const localCall = async () => {
-      callCount += 1;
-      return { response: 'must never be called', degenerate: null, attempts: 1 };
-    };
+    const localCall = async () => { callCount += 1; return { response: 'must never be called', degenerate: null, attempts: 1 }; };
     const task = {
       id: 'pre-dispatch-gate-test', domain: 'default', source: 'staleness_audit', title: 'test',
-      promptContext: {
-        ruleId: 'sequential-await-in-loop',
-        flaggedCode: 'const results = await Promise.all(items.map(async (item) => process(item)));',
-      },
+      promptContext: { ruleId: 'sequential-await-in-loop', flaggedCode: GATE_FANOUT_CODE },
     };
 
     const result = await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
 
-    assert.equal(result.status, 'archived', 'the gate archive verdict must produce the archived shape');
-    assert.match(result.reason, /fan-out \(parallel\)/, "the reason must be the detector's own");
     assert.equal(result.succeeded, true);
-    assert.equal(callCount, 0, 'an archive verdict must skip the entire plan/implement/critique cycle -- zero model calls');
-    assert.equal(task.status, 'archived');
-    assert.ok(task.history.some((h) => h.stage === 'pre-dispatch-gate'), 'a pre-dispatch-gate history event must be recorded');
+    assert.notEqual(result.blocked, true);
+    assert.equal(result.gateVerdict, 'false-positive');
+    assert.match(result.reason, /fan-out \(parallel\)/, "the reason must be the detector's own");
+    assert.equal(callCount, 0, 'a gate verdict must skip the entire plan/implement/critique cycle -- zero model calls');
+    assert.equal(task.status, 'needs-review', 'concluded like any draft so the worker files it to review/');
+    assert.match(task.implementResponse, /^FALSE POSITIVE\n\n/);
+    assert.match(task.implementResponse, /sequential-await-in-loop/);
+    assert.match(task.implementResponse, /fan-out \(parallel\)/);
+    assert.match(task.implementResponse, /Promise\.all/, 'quotes the flagged code it examined');
+    assert.equal(task.critiqueOutcome, 'no-issues');
+    assert.equal(task.preDispatchGate.verdict, 'archive');
+    for (const stage of ['pre-dispatch-gate', 'plan-done', 'implement-done', 'critique-done', 'draft-done', 'needs-review']) {
+      assert.ok(task.history.some((h) => h.stage === stage), `${stage} history event`);
+    }
   });
+});
+
+test('the gate draft covers a snippet with no await, the sync-io-in-loop gate, and a task with no snippet text', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const cases = [
+      ['sequential-await-in-loop', GATE_NO_AWAIT_CODE, /No await expression found/],
+      ['sync-io-in-loop', GATE_SYNC_IO_CODE, /Bounded \(<=10\) loop in startup/],
+    ];
+    for (const [ruleId, code, reasonRe] of cases) {
+      const task = { id: `gate-${ruleId}`, domain: 'default', source: 'staleness_audit', title: 't', promptContext: { ruleId, flaggedCode: code } };
+      const result = await draftTask(task, { localCall: async () => { throw new Error('no model call expected'); }, withLockFn: async (dir, fn) => fn() });
+      assert.equal(result.gateVerdict, 'false-positive', ruleId);
+      assert.match(task.implementResponse, reasonRe, ruleId);
+      assert.ok(!/\n\s*\n\s*\n/.test(task.implementResponse), 'one short paragraph after the verdict line');
+    }
+  });
+});
+
+test('gate-verdict: the draft is built only from the detector reason and the snippet, flattened and bounded', () => {
+  const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
+  const long = `for (const a of b) {\n${'  x += 1; // a very long line to test excerpt bounds\n'.repeat(40)}}`;
+  const d = buildGateFalsePositiveDraft({ ruleId: 'r-1', reason: 'No await expression found in flagged snippet.' }, { promptContext: { snippet: long } });
+  assert.match(d.implementResponse, /^FALSE POSITIVE\n\nThe deterministic pre-dispatch check for rule "r-1" found no real instance/);
+  assert.ok(!/found in flagged snippet\.\./.test(d.implementResponse), 'a trailing period on the reason is not doubled');
+  assert.ok(!d.implementResponse.slice(d.implementResponse.indexOf('\n\n') + 2).includes('\n'), 'a single paragraph, no newlines');
+  assert.ok(d.implementResponse.length < 700, `bounded (${d.implementResponse.length})`);
+  const bare = buildGateFalsePositiveDraft({ ruleId: 'r-2', reason: 'why' }, { promptContext: {} });
+  assert.ok(!/flagged code window/.test(bare.implementResponse), 'no quote when there is no snippet');
+  assert.match(bare.plan, /Rule: r-2\nDetector reason: why\nVerdict: FALSE POSITIVE\./);
 });
 
 test('draftTask skips the critique+revision pass entirely for an advisoryProse source', async () => {
@@ -3960,4 +4061,166 @@ test('installStdoutEpipeGuard: a non-EPIPE stdout error is still surfaced to std
     process.stderr.write = originalStderrWrite;
     process.exitCode = originalExitCode;
   }
+});
+
+// --- write-time candidate size gate (ADR-0023 S1; src/candidate-size-gate.js) --
+// A directToMain source's oversized candidate write-up is bounced through the NORMAL reject-retry path: blockedStage 'review',
+// reviewInconclusive NOT set (a size violation is deterministic, not a stochastic gate flake).
+const sizeGateBlock = (problem) => `### AC-1 · A candidate\nStrength: Strong\nFiles: src/x.js\n\nProblem:\n${problem}\n\nSolution:\nS\n\nBenefits:\nB\n`;
+
+async function runSizeGateDraft(sourceName, entryExtras, response, taskId) {
+  let task;
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource, getRegisteredSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    if (!getRegisteredSource(sourceName)) {
+      registerTaskSource(sourceName, { priority: 80, next: () => null, ...entryExtras });
+      updateTaskSource(sourceName, { buildPlanPrompt: p.archReviewPlanPrompt, buildImplementPrompt: p.archReviewImplementPrompt });
+    }
+    task = {
+      id: taskId, domain: 'default', source: sourceName, title: 'test',
+      promptContext: { candidateId: 'AC-1', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function f(){}\n' }], body: 'Files: src/x.js' },
+    };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+      return { response, degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (dir, fn) => fn() });
+  });
+  return task;
+}
+
+test('draftTask blocks an oversized candidate from a directToMain source as a genuine review rejection (reviewInconclusive unset)', async () => {
+  const { isReviewRejection } = require('./reject-retry-check.js');
+  const task = await runSizeGateDraft('size_gate_oversized_source', { directToMain: true }, sizeGateBlock('x'.repeat(4300)), 'size-gate-oversized-1');
+  assert.equal(task.blockedStage, 'review');
+  assert.equal(task.reviewInconclusive, undefined);
+  assert.match(task.blockedReason, /Oversized candidate/);
+  assert.match(task.blockedReason, /"A candidate" is \d+ chars/);
+  assert.deepEqual(task.priorRejectionFeedback, [task.blockedReason]);
+  assert.match(task.history.find((h) => h.stage === 'blocked').detail, /Oversized candidate/);
+  assert.equal(isReviewRejection(task), true);
+});
+
+test('draftTask does not block a short candidate from a directToMain source on size', async () => {
+  const task = await runSizeGateDraft('size_gate_short_source', { directToMain: true }, sizeGateBlock('tiny'), 'size-gate-short-1');
+  assert.doesNotMatch(String(task.blockedReason || ''), /Oversized candidate/);
+});
+
+test('draftTask does not apply the size gate to a source that is not directToMain', async () => {
+  const task = await runSizeGateDraft('size_gate_not_direct_source', {}, sizeGateBlock('x'.repeat(4300)), 'size-gate-not-direct-1');
+  assert.doesNotMatch(String(task.blockedReason || ''), /Oversized candidate/);
+});
+
+test('draftTask leaves an oversized draft unblocked when AGENT_MANAGER_CANDIDATE_SIZE_GATE=false', async () => {
+  const prev = process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE;
+  process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE = 'false';
+  try {
+    const task = await runSizeGateDraft('size_gate_killswitch_source', { directToMain: true }, sizeGateBlock('x'.repeat(4300)), 'size-gate-killswitch-1');
+    assert.doesNotMatch(String(task.blockedReason || ''), /Oversized candidate/);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE; else process.env.AGENT_MANAGER_CANDIDATE_SIZE_GATE = prev;
+  }
+});
+
+// ---- test-framework gate (lib/test-framework.js), 2026-10-08 --------------------------------------------------------------------------------------
+// A Group B draft that CREATES a test file for a framework its package cannot run is blocked before the critique call, with the fix in the feedback.
+function tfScript(createdFile, content) {
+  let n = 0;
+  const calls = [];
+  const fn = async (opts) => {
+    n += 1; calls.push(n);
+    if (n === 1) return { response: 'plan text', degenerate: null, attempts: 1 };
+    if (n === 2) return { response: JSON.stringify([{ mode: 'create', file: createdFile, content }]), degenerate: null, attempts: 1 };
+    return { response: 'NO ISSUES FOUND', degenerate: null, attempts: 1 };
+  };
+  fn.calls = calls;
+  return fn;
+}
+function tfTask(id, over = {}) {
+  return {
+    id, domain: 'default', source: 'observability_fix', title: 'Add a test for x', localRejectCount: 0, history: [],
+    promptContext: { candidateId: 'AC-3', title: 'x', files: ['src/x.js'], fetchedFiles: [{ path: 'src/x.js', content: 'function real() {\n  return 1;\n}\n' }], body: 'Files: src/x.js' }, ...over,
+  };
+}
+function tfSeed(dir) {
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'pkg', dependencies: {} }));
+  fs.writeFileSync(path.join(dir, 'src', 'x.js'), 'function real() {\n  return 1;\n}\n');
+  fs.writeFileSync(path.join(dir, 'src', 'sibling.test.js'), "const test = require('node:test');\ntest('s', () => {});\n");
+}
+const JESTY = "describe('x', () => { it('y', () => { const f = jest.fn(); expect(f).toBeDefined(); }); });\n";
+
+test('test-framework gate: a created jest test in a node:test package blocks the draft BEFORE the critique call, naming the sibling test as the example', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    tfSeed(dir);
+    const task = tfTask('tf-block-1');
+    const localCall = tfScript('src/new.test.js', JESTY);
+    const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+    assert.equal(task.critiqueOutcome, 'test-framework-failed');
+    assert.ok(task.blockedStage);
+    assert.match(task.blockedReason, /Test framework not usable/);
+    assert.match(task.blockedReason, /src\/new\.test\.js.*written for jest/);
+    assert.match(task.blockedReason, /sibling\.test\.js/, 'an existing test is named as the example to follow');
+    assert.ok(task.priorRejectionFeedback.some((f) => /Test framework not usable/.test(f)), 'the redraft sees the feedback');
+    assert.deepEqual(task.testFrameworkBlocked, ['src/new.test.js']);
+    assert.ok(result && result.blocked === true);
+    assert.deepEqual(localCall.calls, [1, 2], 'plan and implement only: the critique model was never called');
+  });
+});
+
+test('test-framework gate: a node:test file in the same package passes through to the critique; so does a framework the same change adds', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    tfSeed(dir);
+    const ok = tfTask('tf-ok-1');
+    const call = tfScript('src/new.test.js', "const test = require('node:test');\ntest('n', () => {});\n");
+    await draftTask(ok, { localCall: call, withLockFn: async (d, fn) => fn() });
+    assert.notEqual(ok.critiqueOutcome, 'test-framework-failed');
+    assert.ok(call.calls.length >= 3, 'the critique call happened');
+  });
+});
+
+test('test-framework gate: the same files blocked a second time are waved through as an advisory, so a false positive cannot strand the task', async () => {
+  await withFixtureRepo(async (draftTask, dir) => {
+    tfSeed(dir);
+    const task = tfTask('tf-repeat-1', { testFrameworkBlocked: ['src/new.test.js'] });
+    const call = tfScript('src/new.test.js', JESTY);
+    await draftTask(task, { localCall: call, withLockFn: async (d, fn) => fn() });
+    assert.notEqual(task.critiqueOutcome, 'test-framework-failed');
+    assert.equal(task.testFrameworkBlocked, undefined);
+    assert.ok(task.history.some((h) => h.stage === 'advisory' && /not blocking again/.test(h.detail || '')));
+    assert.ok(call.calls.length >= 3);
+  });
+});
+
+test('test-framework gate: AGENT_MANAGER_TEST_FRAMEWORK_GATE=off disables it', async () => {
+  const prev = process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE;
+  process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = 'off';
+  try {
+    await withFixtureRepo(async (draftTask, dir) => {
+      tfSeed(dir);
+      const task = tfTask('tf-off-1');
+      await draftTask(task, { localCall: tfScript('src/new.test.js', JESTY), withLockFn: async (d, fn) => fn() });
+      assert.notEqual(task.critiqueOutcome, 'test-framework-failed');
+    });
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE; else process.env.AGENT_MANAGER_TEST_FRAMEWORK_GATE = prev; }
+});
+
+test('test-framework prompt line: a task that concerns tests gets the repo\'s real conventions appended to the implement prompt; an unrelated task does not', () => {
+  const { withTestConventions } = require('./lib/implement-critique.js');
+  const tf = require('./lib/test-framework.js');
+  tf.clearCache();
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'tfp-'));
+  fs.mkdirSync(path.join(d, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(d, 'package.json'), '{}');
+  fs.writeFileSync(path.join(d, 'src', 'a.test.js'), "const test = require('node:test');\n");
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = d;
+  try {
+    const testy = { title: 'Add unit tests for a', planResponse: '', promptContext: { rawText: 'Write a test.', files: ['src/a.js'] } };
+    assert.match(withTestConventions(testy, 'BASE PROMPT'), /^BASE PROMPT\n\nTEST CONVENTIONS[\s\S]*tests use node:test/);
+    assert.equal(withTestConventions({ title: 'Rename a helper', promptContext: { rawText: 'no relation', files: ['src/a.js'] } }, 'BASE PROMPT'), 'BASE PROMPT');
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev; tf.clearCache(); }
 });

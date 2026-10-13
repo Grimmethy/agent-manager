@@ -236,6 +236,13 @@ while :; do
     grounding_recheck_result="$(node "${PACKAGE_SRC_DIR}/grounding-recheck-sweep.js" 2>>"${HOME_LOGS}/grounding-recheck-sweep.log")"
     printf '[watchdog] grounding-recheck-sweep: %s\n' "$grounding_recheck_result" >&2
 
+    # Branch-conflict re-admission (2026-10-09, TaxHarvest): a single-task agent/* branch that conflicts with main (seen on two runs >= 10 min apart) gets
+    # one redraft against current main, with a main-moved priorVerdict naming the conflicting files and telling the drafter to check first whether the change
+    # already landed. Never touches hub children, stacked tasks, shared branches, human-prioritised tasks, or rivals that conflict only with each other.
+    # AGENT_MANAGER_CONFLICT_READMIT=off|dry-run|on (default dry-run). See branch-conflict-readmit-sweep.js.
+    conflict_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-conflict-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-conflict-readmit-sweep.log")"
+    printf '[watchdog] branch-conflict-readmit-sweep: %s\n' "$conflict_readmit_result" >&2
+
     # Expiry sweep (2026-09-24, change_review flood): retires a QUEUED task whose subject went stale while it waited, for any source that
     # declares an `expiry` hook on its registration (change_review: a review of a commit older than its recency window). Source-agnostic --
     # core names no plugin source. archive -> done/_archived_no_action/ stamped terminalDisposition 'aged-out'; a task already holding an

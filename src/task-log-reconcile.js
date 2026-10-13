@@ -296,6 +296,19 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } 
     }
   }
 
+  // Re-check `abandoned` (a stable stage that never self-healed): correct the ones whose work is on <main>, restore hub siblings a requeue destroyed.
+  // Bounded and throttled (abandoned-recheck.js); never fatal to the sweep.
+  if (!dryRun && repoRoot && ctx) {
+    try {
+      const rc = require('./abandoned-recheck.js').recheckAbandoned({ pipelineDir, repoRoot, ctx });
+      summary.abandonedRechecked = rc.rechecked;
+      summary.abandonedCorrected = rc.corrected.length;
+      summary.siblingsRestored = rc.restored.length;
+      for (const c of rc.corrected) console.error(`[task-log-reconcile] abandoned-recheck: ${c.id} abandoned -> ${c.to}`);
+      for (const r of rc.restored) console.error(`[task-log-reconcile] shared-branch-restore: ${r.id} re-applying onto ${r.branch} (destroyed by the requeue of ${r.removedBy})`);
+    } catch (e) { console.error(`[task-log-reconcile] abandoned-recheck failed (ignored): ${e.message}`); }
+  }
+
   if (!dryRun) saveState(pipelineDir, state);
 
   if (report) {

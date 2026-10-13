@@ -94,3 +94,27 @@ ungatedTest('HUB0092 3/3: a NON-stale skipped directToMain artifact keeps the ol
   assert.equal(results[task.id].stale, undefined, 'a non-stale skip must NOT be re-labelled stale');
   assert.match(results[task.id].doneMarker, /no code change needed/i);
 });
+
+// 2026-10-07: the gated triage batch drops candidate blocks main already retracted right after the rolling branch is prepared.
+test('gated triage batch: pruneRetractedCandidates runs once, right after prepareStackedBranch', () => {
+  const src = registerProbeSource('mb_prune_probe', { skipped: true, reason: 'no code change needed' });
+  const task = { id: 'mb-prune-1', domain: 'stale_probe', source: src, title: 'prune batch', implementResponse: '' };
+  const gitRunner = createFakeGitRunner();
+  applyDirectToMainBatch([task], { repoRoot: REPO_ROOT, pipelineDir: REPO_ROOT, gitRunner });
+  const names = gitRunner.calls.map((c) => c.name);
+  assert.equal(names.filter((n) => n === 'pruneRetractedCandidates').length, 1);
+  const prepare = names.indexOf('prepareStackedBranch');
+  assert.ok(prepare >= 0, 'the gated path prepares the rolling branch');
+  const prune = names.indexOf('pruneRetractedCandidates');
+  assert.ok(prune > prepare, 'after the branch is prepared (the fake records its sub-operations in between)');
+  assert.ok(!names.slice(0, prune).some((n) => n === 'add' || n === 'commit' || n === 'push'), 'before anything is staged, committed or pushed');
+});
+
+test('gated triage batch: a throwing pruneRetractedCandidates never fails the batch', () => {
+  const src = registerProbeSource('mb_prune_throw_probe', { skipped: true, reason: 'no code change needed' });
+  const task = { id: 'mb-prune-2', domain: 'stale_probe', source: src, title: 'prune throw batch', implementResponse: '' };
+  const gitRunner = createFakeGitRunner();
+  gitRunner.pruneRetractedCandidates = () => { throw new Error('simulated git failure'); };
+  const { results } = applyDirectToMainBatch([task], { repoRoot: REPO_ROOT, pipelineDir: REPO_ROOT, gitRunner });
+  assert.equal(results[task.id].succeeded, true);
+});

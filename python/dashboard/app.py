@@ -1703,15 +1703,33 @@ def _pipeline_running() -> bool:
             if last_hb:
                 age = (datetime.now(timezone.utc) - last_hb).total_seconds()
                 threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
-                if age <= threshold:
+                # A fresh heartbeat only proves "running" while the process that wrote it
+                # still exists. A stop (or a crash) leaves the last heartbeat on disk, and a
+                # "working" one stays fresh for WORKING_STALE_SECONDS (20 min) -- so the old
+                # check kept reporting a pipeline that was already gone, and /api/pipeline/start
+                # refused ("a pipeline is already running") for ~20 min after every stop
+                # (2026-10-08, hit live twice). Liveness is judged against daemonPid when the
+                # heartbeat has one -- `pid` is the per-call child and is legitimately gone
+                # between calls (same rule as src/dead-process-check.js). No recorded pid at
+                # all (legacy heartbeat) keeps the old trust-the-timestamp behavior.
+                if age <= threshold and _heartbeat_owner_alive(data):
                     return True
 
-    # Stale or unparseable heartbeat -- believe a live process over a stale timestamp.
+    # Stale, unparseable, or ownerless heartbeat -- believe a live process over a timestamp.
     for name in (*lane_ids, "reviewer"):
         d = read_json_safe(inst_dir / f"{name}.json")
-        if d and d.get("pid") and _pid_alive(d["pid"]):
+        if d and any(d.get(k) and _pid_alive(d[k]) for k in ("daemonPid", "pid")):
             return True
     return bool(_pipeline_daemon_pids())
+
+
+def _heartbeat_owner_alive(data: dict) -> bool:
+    """Is the process that owns this heartbeat still alive? Owner = `daemonPid` (the lane's
+    bash loop) when recorded, else `pid`. True when the heartbeat records no pid at all."""
+    owner = data.get("daemonPid") if data.get("daemonPid") is not None else data.get("pid")
+    if owner is None:
+        return True
+    return _pid_alive(owner)
 
 
 # --- Unmerged branches (the "sandbox" visibility gap) -----------------------------------
@@ -1978,6 +1996,26 @@ def _label_for_branch(task_id, pipeline_dir, subject, repo_root=None):
     return {"title": subject or task_id, "domain": None, "source": None, "matchedTaskState": None, "description": None}
 
 
+# The rolling triage branch has no task record, so its card/detail title falls back to the TIP commit's subject, and every commit says "Triage batch: 1
+# candidate-doc update(s)" (one task per apply tick) -- a per-commit count shown as if it described the branch. For a branch in that state the title
+# becomes the branch total: the number of `### AC-` candidates it adds against the default branch (brain-dump #1755). The raw subject and the per-commit
+# rows are untouched. None = leave today's title (not a triage-style fallback, zero candidates, git failed, or AGENT_MANAGER_BRANCH_TITLE_COUNT=false).
+_TRIAGE_SUBJECT_RE = re.compile(r"^Triage batch: \d+ candidate-doc update\(s\)$")
+
+
+def _triage_candidate_count(repo_root, main_branch, full_ref, subject, label):
+    if os.environ.get("AGENT_MANAGER_BRANCH_TITLE_COUNT", "").strip().lower() == "false":
+        return None
+    if label.get("matchedTaskState") is not None or not _TRIAGE_SUBJECT_RE.match((subject or "").strip()):
+        return None
+    try:
+        import branch_removals  # lazy: keeps app.py's import block untouched
+        n = branch_removals.count_added_candidates(_run_git, repo_root, main_branch, full_ref)
+    except Exception:  # noqa: BLE001 -- a title decoration must never break the listing
+        return None
+    return n if isinstance(n, int) and n >= 1 else None
+
+
 def _branch_content_already_on_main(repo_root, main_branch, full_ref):
     """True when every file this branch changed (vs. where it forked from main) is byte-identical on origin/<main>: there is nothing left to merge.
 
@@ -2048,17 +2086,19 @@ def _list_unmerged_branches_uncached():
         conflict = _check_merge_conflict(repo_root, main_branch, branch)
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
+        candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
         qdir = (pipeline_dir / "queue") if pipeline_dir else None
         hub = get_hub_data_provider().hub_for_branch(qdir, branch, branch_task_ids(_run_git, repo_root, main_branch, full_ref, task_id))
         branches.append({
             "branch": branch,
             "taskId": task_id,
-            "title": label["title"],
+            "title": f"Triage batch: {candidate_count} candidate-doc update(s)" if candidate_count else label["title"],
             "domain": label["domain"],
             "source": label["source"],
             "matchedTaskState": label["matchedTaskState"],
             "description": label["description"],
             "subject": subject.strip(),
+            **({"candidateCount": candidate_count} if candidate_count else {}),
             "pushedAt": pushed_at,
             "ahead": ahead,
             "behind": behind,

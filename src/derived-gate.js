@@ -111,6 +111,8 @@ function isHeld(candidate, index, { now = Date.now() } = {}) {
   if (!files.length) return { held: false, by: [] };
   const created = createdAtMs(candidate);
   if (created && now - created > maxHoldMs()) return { held: false, by: [] };
+  // The finding's target is unreferenced per the dead-code scanner but has no GENUINE triage verdict yet (derived-premise-sweep.js stamped it): wait for the verdict.
+  if (candidate.inertTarget && candidate.inertTarget.held) return { held: true, by: ['inert-target'] };
   const by = [];
   for (const x of index) {
     if (x.id === candidate.id || !filesOverlap(files, x.files)) continue;

@@ -30,7 +30,12 @@ Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 
 ### Domain docs
 
-Single-context — one `CONTEXT.md` (to be created) and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context — one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Skills
+
+`act-as-local-agent` and `verify-unmerged-branches` ship in `docs/agents/skills/` (`.claude/` is
+gitignored). Run `scripts/install-skills.sh` once to link them into `~/.claude/skills`.
 
 ### Codebase map
 
@@ -50,7 +55,7 @@ gitignored here, so it can't ship in-repo):
 
 ```json
 "hooks": {"SessionStart": [{"matcher": "startup|clear|compact", "hooks": [{
-  "type": "command", "command": "python3 /media/model-cache/github/agent-manager/python/dashboard/codebase_map_digest.py"}]}]}
+  "type": "command", "command": "python3 <your agent-manager checkout>/python/dashboard/codebase_map_digest.py"}]}]}
 ```
 
 It no-ops silently when the cwd isn't inside a repo that has the map.

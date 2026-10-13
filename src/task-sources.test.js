@@ -372,13 +372,14 @@ function writeProjectsRegistryFixture(dir, labels) {
 
 test('nextBrainDumpSortTask sets selfProjectLabel when this package\'s own directory name is a tracked project', () => {
   const dir = makeBrainDumpFixtureRepo();
-  writeProjectsRegistryFixture(dir, ['agent-manager', 'some-other-project']);
+  const ownDirName = path.basename(path.join(__dirname, '..')); // the checkout's real dir name -- a worktree is not called 'agent-manager'
+  writeProjectsRegistryFixture(dir, [ownDirName, 'some-other-project']);
   fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
     entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
   }));
   const { nextBrainDumpSortTask } = freshTaskSources(dir);
   const task = nextBrainDumpSortTask();
-  assert.equal(task.promptContext.selfProjectLabel, 'agent-manager');
+  assert.equal(task.promptContext.selfProjectLabel, ownDirName);
 });
 
 test('nextBrainDumpSortTask leaves selfProjectLabel null when this package is not itself a tracked project', () => {
@@ -2713,6 +2714,31 @@ test('nextCandidateFulfillmentTask also fetches a src/ file named only in the ca
   assert.deepEqual(task.promptContext.files, ['src/local-draft.js'], 'the declared edit target list is unchanged');
   assert.ok(paths.includes('src/prompts.js'), 'the prose-named file is fetched too');
   assert.equal(task.promptContext.fetchedFiles.find((f) => f.path === 'src/prompts.js').context, true);
+});
+
+// 2026-10-05 (brain dump bd-1791177888894): a relative require specifier and an any-directory path in the prose are context too -- TaxHarvest arch-review-ac-47 was drafted
+// without agent-task-statuses.js because only src/-prefixed paths were recognised.
+test('nextCandidateFulfillmentTask fetches a module named only by a relative require specifier and a deep path, flagged as context, declared files unchanged', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'app/backend/pipeline'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'app/backend/pipeline/db-v2.js'), 'const [A, B] = require("./statuses");\n');
+  fs.writeFileSync(path.join(dir, 'app/backend/pipeline/statuses.js'), "module.exports = { STATUS: { pending: 'pending' } };\n");
+  fs.mkdirSync(path.join(dir, 'app/frontend/api'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'app/frontend/api/properties.ts'), 'export interface PropertyRecord {}\n');
+  const candidatesPath = path.join(dir, 'CANDIDATES.md');
+  fs.writeFileSync(candidatesPath, [
+    '### AC-47 · Replace positional destructuring with STATUS.* in db-v2.js',
+    'Strength: Strong',
+    'Files: app/backend/pipeline/db-v2.js',
+    '',
+    "Problem:\nPositional destructuring of the statuses array is fragile.\n\nSolution:\nReplace the import with `const { STATUS } = require('./statuses');` and use the PropertyRecord type from app/frontend/api/properties.ts where relevant.\n\nBenefits:\nSelf-documenting statuses.",
+  ].join('\n'));
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.deepEqual(task.promptContext.files, ['app/backend/pipeline/db-v2.js'], 'the declared edit target list is unchanged');
+  const ctx = task.promptContext.fetchedFiles.filter((f) => f.context).map((f) => f.path);
+  assert.deepEqual(ctx, ['app/backend/pipeline/statuses.js', 'app/frontend/api/properties.ts']);
+  assert.ok(task.promptContext.fetchedFiles.find((f) => f.path === 'app/backend/pipeline/db-v2.js' && !f.context), 'the declared file is fetched as before, not as context');
 });
 
 // Round-trip: applyArchDiscoveryCandidates (the writer, apply-group-a.js) through

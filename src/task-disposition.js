@@ -186,7 +186,10 @@ const BRANCH_DETAIL_RE = /^agent\//;
 // keeps its old, harsher reading. Returns { present, checked, files } or null.
 const MIN_LANDED_LINES = 5;
 const LANDED_FRACTION = 0.9;
-function diffAlreadyOnMain(git, repoRoot, mainBranch, rawDiff) {
+// How much of a recorded diff's distinctive added lines is present at `ref` (a branch name; the lookup is origin/<ref>)? -> { present, checked, files } or
+// null when the diff has no parseable files / no lines worth checking. No thresholds: diffAlreadyOnMain applies the "landed" one, the stacked-sibling
+// check below the "clearly absent" one.
+function diffPresence(git, repoRoot, ref, rawDiff) {
   if (!repoRoot || typeof rawDiff !== 'string' || !rawDiff) return null;
   const byFile = new Map();
   let file = null;
@@ -200,13 +203,34 @@ function diffAlreadyOnMain(git, repoRoot, mainBranch, rawDiff) {
   let present = 0; let checked = 0; let files = 0;
   for (const [f, added] of byFile) {
     if (!added.length) continue;
-    const content = git(repoRoot, ['show', `origin/${mainBranch}:${f}`]);
+    const content = git(repoRoot, ['show', `origin/${ref}:${f}`]);
     if (!content) continue; // gone / moved since: no evidence either way for this file
     const have = new Set(content.split('\n').map((l) => l.trim()));
     files += 1;
     for (const t of added) { checked += 1; if (have.has(t)) present += 1; }
   }
-  return checked >= MIN_LANDED_LINES && present / checked >= LANDED_FRACTION ? { present, checked, files } : null;
+  return checked > 0 ? { present, checked, files } : null;
+}
+
+function diffAlreadyOnMain(git, repoRoot, mainBranch, rawDiff) {
+  const p = diffPresence(git, repoRoot, mainBranch, rawDiff);
+  return p && p.checked >= MIN_LANDED_LINES && p.present / p.checked >= LANDED_FRACTION ? p : null;
+}
+
+// A stacked sibling's branch exists and is ahead of <main>, but is THIS task's change still on it? (2026-10-08: a requeue of another hub child deleted the
+// shared branch; the redraft recreated the same name with only its own commit, and the lost sibling still read `pending-merge`.) Definitive when the task's
+// `Task: <id> (` trailer is among the branch's own commits. Otherwise the recorded diff's distinctive lines decide, and only a CLEAR absence counts (< LOST
+// fraction of >= MIN_LANDED_LINES lines): a later sibling may legitimately have rewritten a line, and a diff too small to judge gives no verdict. null =
+// "carried or cannot tell"; { onMain } = the change is absent from the branch; the caller decides what that means.
+const LOST_FRACTION = 0.5;
+function stackedSiblingLost(git, repoRoot, mainBranch, branch, record) {
+  if (!record || !record.stacked || !record.stacked.branch || !repoRoot || typeof record.rawDiff !== 'string' || !record.rawDiff) return null;
+  const trailers = git(repoRoot, ['log', `origin/${mainBranch}..origin/${branch}`, '--format=%B']);
+  if (!trailers) return null; // could not read the branch's commits: never invent a loss
+  if (trailers.includes(`Task: ${record.id} (`) || trailers.includes(`(task ${record.id})`)) return null;
+  const p = diffPresence(git, repoRoot, branch, record.rawDiff);
+  if (!p || p.checked < MIN_LANDED_LINES || p.present / p.checked >= LOST_FRACTION) return null;
+  return { present: p.present, checked: p.checked, onMain: diffAlreadyOnMain(git, repoRoot, mainBranch, record.rawDiff) };
 }
 
 // record -> { stage, detail } to append, or null when there is nothing to do (the task
@@ -287,6 +311,13 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
       ({ exists, ahead } = branchAheadCount(git, repoRoot, mainBranch, branchLabel));
     }
     if (exists && ahead > 0) {
+      const lost = realBranch && record.stacked ? stackedSiblingLost(git, repoRoot, mainBranch, realBranch.replace(/^origin\//, ''), record) : null;
+      if (lost && lost.onMain) {
+        return { stage: 'superseded', detail: `${branchLabel} exists but no longer carries this task's change; ${lost.onMain.present} of ${lost.onMain.checked} distinctive added lines are already on ${mainBranch}` };
+      }
+      if (lost) {
+        return { stage: 'abandoned', detail: `${branchLabel} exists but carries none of this task's change (${lost.present} of ${lost.checked} distinctive added lines present): its commit was lost from the shared branch, and it is not on ${mainBranch}` };
+      }
       return { stage: 'pending-merge', detail: `${branchLabel} is ${ahead} commit(s) ahead of ${mainBranch}, not merged` };
     }
     if (exists && ahead === 0) {
@@ -356,4 +387,4 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   return { stage: classified.stage, detail: classified.detail };
 }
 
-module.exports = { diffAlreadyOnMain, resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain, isNoopApplyDetail, realGit };
+module.exports = { diffPresence, stackedSiblingLost, diffAlreadyOnMain, resolveDisposition, buildShipContext, TERMINAL_STAGES, STABLE_TERMINAL_STAGES, lastAppliedEvent, taskCommitOnMain, isNoopApplyDetail, realGit };

@@ -584,3 +584,15 @@ test('docs-only: a code deliverable is not hidden by a doc deliverable in the sa
   const t = adhoc('Add a retry loop to src/apply-task.js and document it in docs/apply.md.');
   assert.equal(adhocDiffSubstanceProblem(t, docDiff('docs/apply.md'), 'documented').code, 'docs-only');
 });
+
+// 2026-10-08: a CALL in a title is code, not a path (`res.json()` was read as the missing file "res.json" and blocked two TaxHarvest tasks at pre-implement).
+test('extractDeclaredTargets: a call expression in the title is not a declared target, a real path still is', () => {
+  const t = { title: '`res.json()` on a non-JSON 200 response throws inside the try\n\nIn `useSellerListActions.ts` line 53, the body may be HTML. Fix src/hooks/useSellerListActions.ts' };
+  const targets = extractDeclaredTargets(t, '');
+  assert.ok(!targets.includes('res.json'), 'res.json() is a call');
+  assert.ok(targets.includes('src/hooks/useSellerListActions.ts'));
+  assert.ok(!extractDeclaredTargets({ title: 'Fix fs.readFile() misuse and JSON.parse(x) usage' }, '').some((x) => /readFile|parse/.test(x)));
+  assert.ok(extractDeclaredTargets({ title: 'Edit config.json (the root one)' }, '').includes('config.json'), 'a path followed by a space and a parenthetical is still a path');
+  assert.ok(!extractDeclaredTargets({ title: 'x', promptContext: { rawText: 'In res.json(), fix every error path that assumes JSON.' } }, '').includes('res.json'), 'the leading In-clause form too (it has an edit verb, so only the call guard stops it)');
+  assert.ok(extractDeclaredTargets({ title: 'x', promptContext: { rawText: 'In src/api/admin.ts, fix every error path that assumes JSON.' } }, '').includes('src/api/admin.ts'), 'a real leading In-clause path is still a target');
+});

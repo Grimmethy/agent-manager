@@ -67,6 +67,7 @@ const { draftAdhocViaLocalAgenticWrite } = require('./local-agentic-write-draft.
 const { draftResearchImplement } = require('./research-agentic-draft.js');
 const { resolveSourceName, getRegisteredSource } = require('./task-source-registry.js');
 const { getPreDispatchGate } = require('./deterministic-recheck-registry.js');
+const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
 const { selectAbModel } = require('./ab-model-select.js');
 const { resolveStrategy } = require('./model-strategies.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
@@ -390,7 +391,7 @@ function parseCandidateSplit(implementResponse) {
   });
 
   if (valid.length < 2) {
-    return { invalid: true, reason: `Implement pass said mode "split" but only ${valid.length} of ${raw.length} proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required` };
+    return { invalid: true, tooFew: true, usable: valid.length, proposed: raw.length, reason: `Implement pass said mode "split" but only ${valid.length} of ${raw.length} proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required` };
   }
 
   valid.forEach((c, finalIndex) => {
@@ -1001,7 +1002,23 @@ function canonicalizeImplementFinds(task) {
 async function finalizeCandidateFulfillment(task, {
   maybeLocked, maybeLockedOn, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
 }, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
-  const split = parseCandidateSplit(task.implementResponse);
+  let split = parseCandidateSplit(task.implementResponse);
+  // Too-few-sub-candidates retry (class C, arch-review-ac-180): the model said mode "split" but gave ONE child that restated the whole
+  // single-file candidate (and itself spanned two files, against the prompt's own one-file-per-piece rule). That is a fixable answer, not
+  // a dead end -- ask once, naming the rule, before blocking for a human. Any later failure blocks exactly as before. The flag is not a
+  // clean-slate field, so a re-admitted task is not retried forever.
+  if (split && split.invalid && split.tooFew && !task.splitTooFewRetried) {
+    task.splitTooFewRetried = true;
+    const correction = `Your previous answer was mode "split" but only ${split.usable} of ${split.proposed} sub-candidate(s) were usable. A split needs AT LEAST 2 sub-candidates, each with a title, problem and solution, each touching exactly ONE file, listed in the order they must be applied (use dependsOn when a later piece needs an earlier one). For example: (1) create the new module, then (2) rewire the original file to use it. Do not put the whole job in a single sub-candidate.`;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(correction);
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: `${implPrompt}\n\n${correction}`, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      split = parseCandidateSplit(task.implementResponse);
+    }
+    appendHistoryEvent(task, 'implement-retry', `split had ${split && split.tooFew ? split.usable : 'too few'} usable sub-candidate(s) -- retried once asking for at least 2, one file each${retryResult.degenerate ? ' (retry degenerate, original answer kept)' : ''}`);
+  }
   if (split) {
     const pc = task.promptContext || {};
     const atSplitCap = (pc.splitDepth || 0) >= 1;
@@ -1243,6 +1260,26 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   // "the CANDIDATE itself rests on a false premise" (retrying redrafts against the exact
   // same false premise every time -- structurally futile, not stochastically unlucky).
   const postImplementEntry = getRegisteredSource(resolveSourceName(task));
+  // Write-time size gate (ADR-0023 S1): a directToMain candidate write-up over the fulfillment limit would be appended and then skipped
+  // forever, so it is bounced here with its measured size. Unlike the grounding gate below, this does NOT set reviewInconclusive: the
+  // violation is deterministic, so it goes through the normal reject-retry loop (feedback injected, MAX_LOCAL_REJECT_RETRIES, then
+  // needs-clarification). A throwing gate is advisory and never blocks a draft.
+  let sizeGate = null;
+  try {
+    sizeGate = require('./candidate-size-gate.js').checkCandidateSize(task, task.implementResponse, { entry: postImplementEntry });
+  } catch (e) {
+    sizeGate = null;
+  }
+  if (sizeGate && sizeGate.verdict === 'oversized') {
+    const blockedReason = `Oversized candidate: ${String(sizeGate.reason || '(no detail)')}`.slice(0, 500);
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(blockedReason);
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+  }
   if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
     let grounding;
     try {
@@ -1468,14 +1505,27 @@ function selectDraftStrategy(task, injectedFns = {}) {
 }
 
 async function draftTask(task, deps = {}) {
-  // Pre-dispatch gate: a deterministic 'archive' verdict ends the task here, before
-  // beginDraftAttempt/resolveDraftContext ever touch the task-source registry.
+  // Pre-dispatch gate: a deterministic 'archive' verdict ends the drafting here, before
+  // beginDraftAttempt/resolveDraftContext ever touch the task-source registry. It is expressed as a model-free
+  // FALSE POSITIVE draft (lib/gate-verdict.js) and concluded like any other draft, so the task goes to review and
+  // the source's own apply() records the scanner suppression and the dismissed disposition. It used to return
+  // {status:'archived'}, which nothing routed: the task reached review with an empty draft (39 stranded tasks).
   const gateHit = tryPreDispatchGate(task);
   if (gateHit) {
-    task.status = 'archived';
+    delete task.blockedStage;
+    delete task.blockedReason;
     task.preDispatchGate = { ruleId: gateHit.ruleId, verdict: 'archive', reason: gateHit.reason };
     appendHistoryEvent(task, 'pre-dispatch-gate', `rule "${gateHit.ruleId}" verdict 'archive' -- ${gateHit.reason}`);
-    return { status: 'archived', reason: gateHit.reason, succeeded: true, ruleId: gateHit.ruleId };
+    const draft = buildGateFalsePositiveDraft(gateHit, task);
+    task.planResponse = draft.plan;
+    task.lastGoodPlan = draft.plan;
+    task.implementResponse = draft.implementResponse;
+    task.critiqueOutcome = 'no-issues';
+    appendHistoryEvent(task, 'plan-done', 'pre-dispatch gate verdict, no model call');
+    appendHistoryEvent(task, 'implement-done', 'FALSE POSITIVE from the deterministic gate, no model call');
+    appendHistoryEvent(task, 'critique-done', 'no-issues (deterministic verdict, nothing for a critique pass to add)');
+    concludeDraft(task);
+    return { succeeded: true, blocked: false, gateVerdict: 'false-positive', ruleId: gateHit.ruleId, reason: gateHit.reason };
   }
   // One append-only record per draftTask() run (draft-attempt-record.js). runDraftPasses
   // threads `attempt` through every pass and records into it as output is produced;

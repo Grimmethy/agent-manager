@@ -519,6 +519,14 @@ while :; do                                                                     
     continue
   fi
 
+  # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
+  if mem_pressure_high; then
+    printf '[worker-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+    if "$ONCE"; then exit 0; fi
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+
   # GPU headroom check -- before spending any real model call this tick, see whether the
   # GPU actually has room for it and, if not, ask TheAgent to stop a known idle app
   # (ComfyUI/n8n) sitting on VRAM this pipeline doesn't need but isn't using either. Best

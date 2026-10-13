@@ -237,6 +237,12 @@ function mergePluginTabs(plugins, manifestTabsEnabled) {
       if (!isValidPluginTab(p.tab)) continue;
       const tab = p.tab;
       const row = { key: tab.key, label: tab.label, description: tab.description, pluginName: p.name, pluginScript: tab.script };
+      // A plugin whose entry has a `process` block owns a server core can start; renderPluginTab()
+      // ensures it is running before the tab's own renderer runs (see ensurePluginTabStarted).
+      if (p.process && typeof p.process === 'object' && p.process.command) {
+        row.startCommand = [p.process.command, ...(Array.isArray(p.process.args) ? p.process.args : [])].join(' ');
+        row.processLog = `~/.local/state/agent-manager/logs/plugin-${p.name}.log`;
+      }
       const replaces = tab.replaces;
       let replaced = false;
       if (replaces) {
@@ -350,9 +356,43 @@ function loadPluginTabScript(tab) {
   return promise;
 }
 
+// Core-owned lazy start (2026-10-12, found when the CharacterForge tab showed a blank
+// "refused to connect" iframe because its script never asked for its server to be started):
+// before a tab whose plugin has a `process` block renders, POST the idempotent
+// /api/plugins/<name>/ensure-started route. Per plugin: success is remembered for the page's
+// life (so the 5s re-render makes no further request), one request is in flight at a time, and
+// a failure or healthy:false (the route only waits ~5s, a cold venv can take longer) writes an
+// error panel and is retried by the next render. -> 'ready' | 'pending' | 'failed'.
+const pluginTabStarted = {};
+const pluginTabStarting = {};
+
+async function ensurePluginTabStarted(tab, main) {
+  if (!tab.startCommand || pluginTabStarted[tab.pluginName]) return 'ready';
+  if (pluginTabStarting[tab.pluginName]) return 'pending';
+  const hasContent = main.querySelector && (main.querySelector('iframe') || main.querySelector('[data-plugin-start-error]'));
+  if (!hasContent) main.innerHTML = `<div class="empty">Starting ${escapeHtml(tab.label)}...</div>`;
+  pluginTabStarting[tab.pluginName] = true;
+  let why = '';
+  try {
+    const r = await fetch(`/api/plugins/${encodeURIComponent(tab.pluginName)}/ensure-started`, { method: 'POST' });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok && body.healthy) { pluginTabStarted[tab.pluginName] = true; return 'ready'; }
+    why = body.description || (r.ok ? 'it did not report healthy within its start window (it may still be starting; this retries on the next refresh)' : `HTTP ${r.status}`);
+  } catch (e) {
+    why = e.message;
+  } finally {
+    delete pluginTabStarting[tab.pluginName];
+  }
+  main.innerHTML = `<div class="empty" data-plugin-start-error>Could not start the "${escapeHtml(tab.label)}" server (plugin ${escapeHtml(tab.pluginName)}): ${escapeHtml(why)}<br>Start command: <code>${escapeHtml(tab.startCommand)}</code><br>Log: <code>${escapeHtml(tab.processLog)}</code></div>`;
+  return 'failed';
+}
+
 async function renderPluginTab(tab) {
   const main = document.getElementById('main');
   try {
+    if (tab.startCommand) {   // no await for a plugin without a process block: the script load below must stay synchronous
+      if ((await ensurePluginTabStarted(tab, main)) !== 'ready') return;
+    }
     if (!pluginTabRenderers[tab.key]) {
       main.innerHTML = `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
       await loadPluginTabScript(tab);

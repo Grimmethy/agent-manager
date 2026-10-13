@@ -20,7 +20,7 @@ const { pendingBlock, filledBlock } = require('./product-spec-assembly.js');
 const { anchorFilesPromptBlock, backtickIdentifiers } = require('./task-anchor-files.js');
 const { CANONICAL_TOP_LEVEL } = require('./brain-dump-sort-classify.js');
 require('./task-sources.js');
-const { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, strictCiteConstraintBlock } = require('./lib/prompt-blocks.js');
+const { statedAcceptanceBlock, fixedLiteralsBlock, priorRejectionBlock, priorVerdictBlock, strictCiteConstraintBlock } = require('./lib/prompt-blocks.js');
 const { assemblePrompt } = require('./lib/prompt-assembly.js');
 const { troubleLogPlanPrompt, secondbrainPlanPrompt, brainDumpSortPlanPrompt, pathPrefetchResolvePlanPrompt, researchPlanPrompt, pipelineSelfAuditPlanPrompt, pipelineHealthAuditPlanPrompt, uiVisibilityAuditPlanPrompt, stalenessAuditPlanPrompt, productSpecPlanPrompt, backlogDecompositionPlanPrompt } = require('./lib/prompt-planning.js');
 const { pathPrefetchResolveImplementPrompt, deepDiveImplementPrompt, backlogDecompositionImplementPrompt, brainDumpSortImplementPrompt } = require('./lib/prompt-implementation.js');
@@ -1565,7 +1565,7 @@ updateTaskSource('pipeline_forensics_fix', { buildPlanPrompt: archReviewPlanProm
 function buildPlanPrompt(task) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
-  const prior = priorRejectionBlock(task);
+  const prior = priorRejectionBlock(task) + priorVerdictBlock(task);
   const base = source && typeof source.buildPlanPrompt === 'function'
     ? source.buildPlanPrompt(task)
     : genericFallbackPlanPrompt(task);
@@ -1575,26 +1575,12 @@ function buildPlanPrompt(task) {
 function buildImplementPrompt(task, planText, options) {
   const sourceName = resolveSourceName(task);
   const source = getRegisteredSource(sourceName);
-  const prior = priorRejectionBlock(task);
+  const prior = priorRejectionBlock(task) + priorVerdictBlock(task);
   const base = source && typeof source.buildImplementPrompt === 'function'
     ? source.buildImplementPrompt(task, planText)
     : genericFallbackImplementPrompt(task, planText);
-  // function_length_review verdict-constraint (HUB0097): the review's implement stage is a
-  // two-outcome GENUINE / FALSE POSITIVE verdict over a function snippet that is already
-  // present in the prompt (the source's own builder shows it above) -- a confirmed live
-  // failure mode is the model refusing or hedging ("Uncertain", "I cannot determine")
-  // instead of committing to one of the two allowed verdicts. Gated on the source name
-  // here, at the dispatcher level, so it is structurally impossible to leak into the
-  // sibling review sources (observability_review / performance_review) or any other
-  // source's prompt.
-  const functionLengthReviewVerdictBlock = sourceName === 'function_length_review'
-    ? '\n\nVERDICT CONSTRAINT (mandatory for this task):\n' +
-      '- The function snippet IS provided above in this prompt; you do not need to request it or assume it is missing.\n' +
-      '- You MUST render exactly one verdict: GENUINE or FALSE POSITIVE.\n' +
-      '- Refusals, hedging, or a third outcome (including "Uncertain", "I cannot determine", or any other qualifier) are NOT acceptable. Pick the one verdict that best fits the evidence in the snippet and commit to it.'
-    : '';
   const strict = (options && options.strictCite) ? strictCiteConstraintBlock(task) : '';
-  return (prior ? prior + base : base) + functionLengthReviewVerdictBlock + '\n\nDo not cite file:line references (e.g. src/foo.js:42) unless the file was confirmed in the pre-check; unconfirmed citations are stripped before review.' + strict;
+  return (prior ? prior + base : base) + '\n\nDo not cite file:line references (e.g. src/foo.js:42) unless the file was confirmed in the pre-check; unconfirmed citations are stripped before review.' + strict;
 }
 
 // Independent second-opinion pass: a fresh model call reviews the drafter's own Implement
@@ -1659,7 +1645,7 @@ function buildRevisionPrompt(task, planText, implementText, critiqueText) {
 }
 
 module.exports = {
-  buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents, priorRejectionBlock,
+  buildPlanPrompt, buildImplementPrompt, truncate, buildCritiquePrompt, buildRevisionPrompt, groupBJsonInstructions, candidateSplitInstructions, formatFileContents, priorRejectionBlock, priorVerdictBlock,
   adhocHarnessSearchPlanPrompt, adhocHarnessSearchImplementPrompt, skipPathDirective, seedPlanBlock, planGroundingBlock, hubStatusGroundingBlock, planCritiqueFeedbackBlock,
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
   secondBrainOpportunitiesPlanPrompt, secondBrainOpportunitiesImplementPrompt,

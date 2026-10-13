@@ -2,7 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { detectStaleDecomposePremise } = require('./decompose-premise-check.js');
+const { detectStaleDecomposePremise, resolveCitedFile, SUFFIX_MATCH_CAP } = require('./decompose-premise-check.js');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 // --- detectStaleDecomposePremise (2026-09-15, brain-dump bd-1789433484305, "pipeline
 // hardening 3/5") -- root-caused live against the real sub-task that cited src/local-
@@ -163,4 +166,65 @@ test('kill switch: AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK=false disables the chec
     if (prev === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK;
     else process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK = prev;
   }
+});
+
+// --- monorepo sub-roots (2026-10-07): a sub-task cites `src/routes/x.js` but the file lives at
+// `<sub-root>/src/routes/x.js`. The cited path alone is not a real location, so the check used to
+// call a real file missing and block HUB0007-02 / HUB0008-01 / HUB0012-02 on the TaxHarvest
+// pipeline as a "stale premise". These tests use a REAL temp tree (no lineCountFn injection). ---
+
+function monorepo(files) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'premise-suffix-'));
+  for (const [rel, lines] of Object.entries(files)) {
+    const abs = path.join(root, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, Array.from({ length: lines }, (_, i) => `// line ${i + 1}`).join('\n'));
+  }
+  return root;
+}
+const citing = (text) => ({ promptContext: { decomposedFrom: 'parent-1', rawText: text } });
+
+test('a cited file that exists only under a monorepo sub-root is NOT flagged missing', () => {
+  const root = monorepo({ 'sub/backend/src/routes/x.js': 400 });
+  assert.equal(detectStaleDecomposePremise(citing('In src/routes/x.js near line 120, reduce the handler.'), { repoRoot: root }), null);
+});
+
+test('a real overshoot is still reported through the suffix-resolved file, naming where it resolved', () => {
+  const root = monorepo({ 'sub/backend/src/routes/x.js': 100 });
+  const result = detectStaleDecomposePremise(citing('In src/routes/x.js at line 5000, reduce the handler.'), { repoRoot: root });
+  assert.ok(result, 'a line far past the resolved file must still be flagged');
+  assert.equal(result.findings[0].kind, 'line-overshoot');
+  assert.equal(result.findings[0].relPath, 'src/routes/x.js');
+  assert.equal(result.findings[0].resolvedPath, 'sub/backend/src/routes/x.js');
+  assert.equal(result.findings[0].realLineCount, 100);
+  assert.match(result.findings[0].detail, /resolved to `sub\/backend\/src\/routes\/x\.js`/);
+});
+
+test('a cited path that ends two different real files is ambiguous and is NOT flagged', () => {
+  const root = monorepo({ 'a/src/routes/x.js': 10, 'b/src/routes/x.js': 10 });
+  assert.equal(detectStaleDecomposePremise(citing('In src/routes/x.js at line 900, fix it.'), { repoRoot: root }), null);
+});
+
+test('a cited file that exists nowhere is still reported as missing-file', () => {
+  const root = monorepo({ 'sub/backend/src/routes/other.js': 10 });
+  const result = detectStaleDecomposePremise(citing('In src/routes/gone.js at line 20, fix it.'), { repoRoot: root });
+  assert.ok(result);
+  assert.equal(result.findings[0].kind, 'missing-file');
+});
+
+test('a file that only shares the BASENAME (not the cited path suffix) is not a match', () => {
+  const root = monorepo({ 'other/x.js': 400 });
+  const result = detectStaleDecomposePremise(citing('In src/routes/x.js at line 20, fix it.'), { repoRoot: root });
+  assert.ok(result, 'other/x.js is a different file; the cited src/routes/x.js really is missing');
+  assert.equal(result.findings[0].kind, 'missing-file');
+});
+
+test('resolveCitedFile: wide cap, normalised input, never throws', () => {
+  const calls = [];
+  const findFn = (root, base, cap) => { calls.push([base, cap]); return [path.join(root, 'sub', 'src', 'routes', 'x.js')]; };
+  assert.deepEqual(resolveCitedFile('/r', './src/routes/x.js', { findFn }), { status: 'unique', relPath: 'sub/src/routes/x.js' });
+  assert.deepEqual(calls[0], ['x.js', SUFFIX_MATCH_CAP]);
+  assert.ok(SUFFIX_MATCH_CAP > 10, 'must exceed findByBasename\'s default cap of 10');
+  assert.deepEqual(resolveCitedFile('/r', 'src/routes/x.js', { findFn: () => { throw new Error('disk gone'); } }), { status: 'none' });
+  assert.deepEqual(resolveCitedFile('/nonexistent-root-for-premise-test', 'src/a.js'), { status: 'none' });
 });

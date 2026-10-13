@@ -122,3 +122,28 @@ test('writeHeartbeatFile carries the borrowed-project label only while AGENT_MAN
   writeHeartbeatFile(dir, 'worker-x', 'idle', 'm', '', '', null);
   assert.equal(JSON.parse(fs2.readFileSync(path2.join(dir, 'worker-x.json'), 'utf8')).project, undefined);
 });
+
+test('writeHeartbeatFile leaves no temp file behind after a successful write', () => {
+  withTempInstancesDir((dir) => {
+    writeHeartbeatFile(dir, 'worker-atomic', 'working', 'm', 't1', 'plan');
+    writeHeartbeatFile(dir, 'worker-atomic', 'idle', 'm', '', '');
+    assert.deepEqual(fs.readdirSync(dir), ['worker-atomic.json']);
+  });
+});
+
+test('writeHeartbeatFile never leaves a partial heartbeat when the write dies before the rename', () => {
+  withTempInstancesDir((dir) => {
+    writeHeartbeatFile(dir, 'worker-atomic', 'working', 'm', 't1', 'plan');
+    const before = fs.readFileSync(path.join(dir, 'worker-atomic.json'), 'utf8');
+    const realRename = fs.renameSync;
+    fs.renameSync = () => { throw new Error('simulated crash before rename'); };
+    try {
+      assert.throws(() => writeHeartbeatFile(dir, 'worker-atomic', 'idle', 'm', '', ''), /simulated crash/);
+    } finally {
+      fs.renameSync = realRename;
+    }
+    // The visible heartbeat is still the previous, fully-valid one -- never truncated or half-written.
+    assert.equal(fs.readFileSync(path.join(dir, 'worker-atomic.json'), 'utf8'), before);
+    assert.equal(JSON.parse(before).status, 'working');
+  });
+});

@@ -12,7 +12,7 @@ require('../task-sources.js');
 const { TRIAGE_BRANCH, ungatedMainPushAllowed } = require('./main-push-policy.js');
 const { coAuthorTrailer, usesGroupB, applyCandidateSplit, writeArtifact, closeOriginatingBrainDumpEntry, assertStageableFiles } = require('./apply-core.js');
 
-// The shared checkout must never be left on the triage branch. That branch is based on whatever main was when it was first created and is never rebased, so a
+// The shared checkout must never be left on the triage branch. That branch is based on whatever main was when it was first created and is only brought up to date by merging main in on the next apply tick (never rebased: a rewritten branch was never pushed and looped, see git-runner.js prepareStackedBranch), so a
 // checkout parked on it (2026-09-20, PF: 4 h, 40 commits behind main) makes every read of "the repo" (plan grounding, review's live content, the staleness
 // sweep) see ancient code: false "file absent" flags, stale rejections. Only the single fully-successful path used to return to main; a batch that staged
 // nothing, a failed commit, or a failed push stayed on the branch. This wrapper returns to main on EVERY exit once the triage branch has been entered.
@@ -53,6 +53,14 @@ function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBr
     if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
     state.enteredTriageBranch = true;
     gitRunner.prepareStackedBranch(TRIAGE_BRANCH);
+    // Drop candidate blocks main already retracted that this branch still carries (the merge driver used to keep them; see
+    // src/lib/prune-retracted-candidates.js). Best-effort and never fatal: a failure here must not block the batch.
+    if (typeof gitRunner.pruneRetractedCandidates === 'function') {
+      try {
+        const pruned = gitRunner.pruneRetractedCandidates();
+        if (pruned && pruned.committed) console.error(`[apply-main-batch] pruned retracted candidate(s) from ${TRIAGE_BRANCH}: ${pruned.pruned.map((p) => `${p.doc} ${p.ids.map((i) => `AC-${i}`).join(',')}`).join('; ')}`);
+      } catch (e) { console.error(`[apply-main-batch] pruneRetractedCandidates failed (ignored): ${String(e && e.message).split('\n')[0].slice(0, 200)}`); }
+    }
   } else gitRunner.resetToMain();
 
   const staged = [];

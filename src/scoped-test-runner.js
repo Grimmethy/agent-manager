@@ -195,7 +195,7 @@ function withSandbox(fn) {
 // regression" on every commit touching a lock-contending file. `passed: null` marks this
 // inconclusive -- same "stay silent, let the LLM decide" treatment as no-coverage-exists,
 // never folded into a hard pass or fail.
-function runJsTests(repoRoot, files) {
+function runNodeTests(repoRoot, files) {
   if (!files.length) return null;
   try {
     withSandbox((sandbox) => execFileSync('node', ['--test', ...files], {
@@ -207,6 +207,48 @@ function runJsTests(repoRoot, files) {
     const out = `${e.stdout || ''}${e.stderr || ''}`;
     return { ran: files, passed: timedOut ? null : false, failures: parseNodeTestFailures(out), raw: out.slice(0, 4000), timedOut };
   }
+}
+
+// vitest, for a package that declares it (lib/js-test-runner.js): started through node on its own entry point from the package dir. A package whose node_modules is
+// not installed is INCONCLUSIVE (passed: null), never a regression.
+function runVitestTests(repoRoot, pkgRel, files) {
+  const pkgDir = path.join(repoRoot, pkgRel || '.');
+  const { vitestArgs } = require('./lib/js-test-runner.js');
+  const args = vitestArgs(pkgRel, files);
+  if (!fs.existsSync(path.join(pkgDir, args[0]))) {
+    return { ran: files, passed: null, failures: [], raw: `vitest is not installed for ${pkgRel || 'the repo root'} (run npm ci there)`, timedOut: false };
+  }
+  try {
+    withSandbox((sandbox) => execFileSync('node', args, { cwd: pkgDir, timeout: RUN_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: childEnv(sandbox) }));
+    return { ran: files, passed: true, failures: [] };
+  } catch (e) {
+    const timedOut = e.signal === 'SIGTERM' || e.code === 'ETIMEDOUT';
+    const out = `${e.stdout || ''}${e.stderr || ''}`;
+    return { ran: files, passed: timedOut ? null : false, failures: require('./lib/js-test-runner.js').parseVitestFailures(out), raw: out.slice(0, 4000), timedOut };
+  }
+}
+
+// JS test files run through the runner their own package uses: node:test, or vitest for a package that declares it. 2026-10-08: every file used to go to `node --test`,
+// which cannot execute a .tsx, so a commit touching a component with a vitest test would have auto-filed a false "confirmed regression" (change_review). Files with no
+// usable runner are simply not run: they are no evidence either way. Verdicts combine like runScopedTests does: any false wins, else any null, else true.
+function runJsTests(repoRoot, files) {
+  if (!files.length) return null;
+  const { partitionJsTests } = require('./lib/js-test-runner.js');
+  const plan = partitionJsTests(repoRoot, files);
+  const parts = [];
+  if (plan.nodeTest.length) parts.push(runNodeTests(repoRoot, plan.nodeTest));
+  for (const [pkgRel, group] of plan.vitest) parts.push(runVitestTests(repoRoot, pkgRel, group));
+  const real = parts.filter(Boolean);
+  if (!real.length) return null;
+  if (real.length === 1) return real[0];
+  const verdicts = real.map((x) => x.passed);
+  return {
+    ran: real.flatMap((x) => x.ran),
+    passed: verdicts.includes(false) ? false : verdicts.includes(null) ? null : true,
+    failures: real.flatMap((x) => x.failures || []),
+    raw: real.map((x) => x.raw).filter(Boolean).join('\n').slice(0, 4000),
+    timedOut: real.some((x) => x.timedOut),
+  };
 }
 
 // Defaults to the repo's own .venv when the caller doesn't name an interpreter -- plain

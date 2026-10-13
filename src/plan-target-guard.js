@@ -48,16 +48,23 @@ const CREATE_FILE_VERBS_RE = /\b(?:create|creates|creating|add(?:s|ing)?\s+a\s+n
 // `[\s*_]+` (not plain `\s+`) between words: a model routinely bolds "not" for emphasis
 // ("does **not** exist yet") -- confirmed live, this is the EXACT real phrasing that
 // caused the incident above, and a literal whitespace-only gap would miss it.
-const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+)?exist\b|\bdoesn'?t[\s*_]+(?:yet[\s*_]+)?exist\b|\bnot[\s*_]+yet[\s*_]+(?:present|created)\b/i;
+// 2026-10-08: also "is absent" / "not present" / "not found" / "no such file" (HUB0011-02: the plan said `<path>` "is absent" for a task titled "Create <file>" and was blocked).
+const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+)?exist\b|\bdoesn'?t[\s*_]+(?:yet[\s*_]+)?exist\b|\bnot[\s*_]+yet[\s*_]+(?:present|created)\b|\b(?:is|are|was)[\s*_]+(?:currently[\s*_]+)?absent\b|\b(?:is|are)[\s*_]+not[\s*_]+(?:present|found)\b|\bno[\s*_]+such[\s*_]+file\b/i;
 
-function isDeclaredCreateTarget(planText, targetPath) {
+// taskText (optional, 2026-10-08): the TASK's own title + body. A task that itself says "Create <file>" has declared the file a create target no matter how the
+// plan words it; the plan-only signals above missed that when the plan named the file by its full path and called it "absent".
+function isDeclaredCreateTarget(planText, targetPath, taskText = '') {
   const text = String(planText || '');
   const idx = text.indexOf(targetPath);
-  if (idx === -1) return false;
-  const before = text.slice(Math.max(0, idx - 80), idx);
-  if (CREATE_FILE_VERBS_RE.test(before)) return true;
-  const after = text.slice(idx + targetPath.length, idx + targetPath.length + 80);
-  return EXISTENCE_ACK_RE.test(before) || EXISTENCE_ACK_RE.test(after);
+  if (idx !== -1) {
+    const before = text.slice(Math.max(0, idx - 80), idx);
+    if (CREATE_FILE_VERBS_RE.test(before)) return true;
+    const after = text.slice(idx + targetPath.length, idx + targetPath.length + 80);
+    if (EXISTENCE_ACK_RE.test(before) || EXISTENCE_ACK_RE.test(after)) return true;
+  }
+  const task = String(taskText || '');
+  const tIdx = task.indexOf(targetPath);
+  return tIdx !== -1 && CREATE_FILE_VERBS_RE.test(task.slice(Math.max(0, tIdx - 80), tIdx));
 }
 
 // (task, planText, repoRoot, extraRoots, existsAtRef) -> { blocked, reason?, missing? }
@@ -71,7 +78,7 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
 
   const checked = checkFilePaths(targets.join(', '), repoRoot, extraRoots);
   const missing = checked.filter(
-    (entry) => entry.exists === false && !existsOnBranch(existsAtRef, entry.claimedPath) && !isDeclaredCreateTarget(planText, entry.claimedPath),
+    (entry) => entry.exists === false && !existsOnBranch(existsAtRef, entry.claimedPath) && !isDeclaredCreateTarget(planText, entry.claimedPath, taskTextOf(task)),
   );
 
   if (missing.length === 0) return { blocked: false };
@@ -83,6 +90,8 @@ function planTargetGuard(task, planText, repoRoot, extraRoots = [], existsAtRef 
     missing: paths,
   };
 }
+
+const taskTextOf = (task) => `${(task && task.title) || ''}\n${(task && task.promptContext && task.promptContext.rawText) || ''}`;
 
 function existsOnBranch(existsAtRef, claimedPath) {
   if (typeof existsAtRef !== 'function') return false;

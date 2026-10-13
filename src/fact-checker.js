@@ -18,10 +18,15 @@ const fs = require('fs');
 const path = require('path');
 const { lineRangeOf, extractChangedSpan, normalizeCode } = require('./lib/fact-checker-text-utils.js');
 const { extractDomainRoot } = require('./lib/fact-checker-url-utils.js');
+const { isArchivedDirName } = require('./lib/archived-dirs.js');
 
 // (?!\s*:\s*\d) rejects a match where a ":NNN" line-number suffix follows, so
 // "foo.js:310" is not silently truncated to the bare path "foo.js".
-const PATH_EXT_RE = /[A-Za-z0-9_.\-/\\]+\.(?:js|jsx|ts|tsx|py|json|md|csv)\b(?!\s*:\s*\d)/g;
+// (?!\() rejects a match immediately followed by "(": that is a method call, not a file --
+// `res.json({ ok: true })`, `r.json()`, `resp.json()` in the code a draft quotes in its `find` text were read as a cited
+// file "res.json" that does not exist and blocked the draft pre-critique. No whitespace is allowed before the paren, so
+// prose like "see foo.js (the helper)" still matches.
+const PATH_EXT_RE = /[A-Za-z0-9_.\-/\\]+\.(?:js|jsx|ts|tsx|py|json|md|csv)\b(?!\s*:\s*\d)(?!\()/g;
 const RELATIONSHIP_RE = /`([^`]+)`\s+(?:imports?|calls?|reads?\s+from|uses?)\s+`?([A-Za-z0-9_.]+)`?/gi;
 
 function extractFilePaths(text) {
@@ -139,7 +144,7 @@ function findByBasename(root, basename, maxResults = 10) {
     for (const entry of entries) {
       if (found.length >= maxResults) return;
       if (entry.isDirectory()) {
-        if (WALK_SKIP_DIRS.has(entry.name)) continue;
+        if (WALK_SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
         walk(path.join(dir, entry.name));
       } else if (entry.isFile() && entry.name === basename) {
         found.push(path.join(dir, entry.name));
@@ -599,10 +604,34 @@ function stripUnchangedDiffLines(text) {
   }).join('\n');
 }
 
+// 2026-10-08 (TaxHarvest http_get_bytes cache task): the draft's NEW test file used `http://ex.com/report/a.pdf` as an input fixture and the URL got flagged
+// ungrounded-url, escalating a correct draft to needs-clarification. A URL string that exists only as a literal in a test file the diff itself adds is
+// the draft's own test data, not a claim about anything in the repo -- the same reason a newly-declared constant is exempt above. Narrow: the URL must
+// appear on an added line of at least one test file AND on no added line of a non-test file (so a URL a production file also relies on is still checked),
+// and prose never exempts anything (a URL only ever cited in prose is still a claim).
+const TEST_FILE_RE = /(?:^|\/)(?:tests?|__tests__|specs?)\/|\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]+\.py$|_test\.py$/;
+
+function urlsOnlyInAddedTestFiles(text) {
+  const inTest = new Set();
+  const inProd = new Set();
+  let file = null;
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^diff --git a\/\S+ b\/(\S+)/);
+    if (m) { file = m[1]; continue; }
+    if (!file || !line.startsWith('+') || line.startsWith('+++')) continue;
+    for (const raw of line.match(URL_RE) || []) {
+      const url = raw.replace(/[.,;:]+$/, '');
+      (TEST_FILE_RE.test(file) ? inTest : inProd).add(url);
+    }
+  }
+  return new Set([...inTest].filter((u) => !inProd.has(u)));
+}
+
 function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   if (!sourceText) return [];
   const flags = [];
   const scannableText = stripUnchangedDiffLines(draftText);
+  const testFixtureUrls = urlsOnlyInAddedTestFiles(draftText);
   const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
   const echoMarkers = extractEchoMarkers(draftText);
 
@@ -610,6 +639,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   for (const raw of urls) {
     const url = raw.replace(/[.,;:]+$/, ''); // strip trailing sentence punctuation
     if (PLACEHOLDER_RE.test(url)) continue;
+    if (testFixtureUrls.has(url)) continue;
     if (sourceText.includes(url)) continue;
     if (isNamedServiceUrl(url, sourceText)) continue;
     if (existsLiterallyInRepo(url, repoRoot, ref)) continue;
@@ -1030,6 +1060,7 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
 }
 
 module.exports = {
+  urlsOnlyInAddedTestFiles,
   checkDraft,
   checkFilePaths,
   checkRelationships,
