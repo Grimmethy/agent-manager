@@ -28,6 +28,15 @@ function waitExit(cp) {
   });
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Resolve once a holder child has actually acquired (it writes 'ready' right after arb.acquire). A fixed
+// sleep(300) here was a race: under full-suite load the child starts late, so the waiter's measured wait
+// fell short of the assertion's floor (observed: 413ms < 500ms).
+function ready(cp) {
+  return new Promise((res, rej) => {
+    cp.stdout.once('data', () => res());
+    cp.once('exit', () => rej(new Error('holder exited before acquiring')));
+  });
+}
 
 test('withGpu: acquire, run, release -- ticket dir empties afterward', async () => {
   const inst = tmpInst();
@@ -49,9 +58,10 @@ test('priority: a draft acquire waits while an interactive ticket is live, proce
   // interactive holder in a child, holds for 1.2s
   const holder = child(`
     const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'interactive', model: 'm', taskId: 'chat' });
+    process.stdout.write('ready');
     setTimeout(() => { h.release(); process.exit(0); }, 1200);
   `);
-  await sleep(300); // let it acquire
+  await ready(holder);
 
   const start = Date.now();
   const draft = child(`
@@ -180,9 +190,10 @@ test('lockKey: two different models serialize against each other when they share
   const inst = tmpInst();
   const holder = child(`
     const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'draft', model: 'model-a', lockKey: 'shared-endpoint', taskId: 'w1' });
-    setTimeout(() => { h.release(); process.exit(0); }, 900);
+    process.stdout.write('ready');
+    setTimeout(() => { h.release(); process.exit(0); }, 1500);
   `);
-  await sleep(300); // let it acquire
+  await ready(holder);
 
   const waiter = child(`
     const s = Date.now();
@@ -199,9 +210,10 @@ test('lockKey: two different models do NOT serialize when each keeps its own def
   const inst = tmpInst();
   const holder = child(`
     const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'draft', model: 'model-a', taskId: 'w1' });
+    process.stdout.write('ready');
     setTimeout(() => { h.release(); process.exit(0); }, 900);
   `);
-  await sleep(300);
+  await ready(holder);
 
   const other = child(`
     const s = Date.now();
