@@ -174,6 +174,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { classifyVote, clip } = require('./auto-confirm-review.js');
 const { hasResolutionSignal } = require('./staleness-auto-archive.js');
@@ -885,6 +886,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             taskId: task.id, stage: 'nc-triage-premise-vote',
           });
         } catch (e) {
+          if (isForgePause(e)) { summary.paused = true; break; }   // the Forge family holds the GPU: stop this sweep quietly -- no history note, no stamp
           appendHistoryEvent(task, 'advisory',
             `needs-clarification-triage: premise vote could not run (${(e && e.message || 'vote error').slice(0, 140)}) -- will retry`);
           writeInPlace(file, task, summary);
@@ -1350,6 +1352,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             taskId: task.id, stage: 'nc-triage-premise-vote',
           });
         } catch (e) {
+          if (isForgePause(e)) { summary.paused = true; break; }   // the Forge family holds the GPU: stop this sweep quietly -- no history note, no stamp
           appendHistoryEvent(task, 'advisory',
             `needs-clarification-triage: premise vote could not run (${(e && e.message || 'vote error').slice(0, 140)}) -- will retry`);
           writeInPlace(file, task, summary);

@@ -55,6 +55,7 @@ const {
 } = require('./draft-attempt-record.js');
 const { appendTierWorkLog, pruneWorkLogs } = require('./work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('./model-provider.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { missingFileCheck } = require('./draft-file-guard.js');
 const { planTargetGuard } = require('./plan-target-guard.js');
@@ -824,6 +825,7 @@ async function runPlanPass(task, {
         task.oriented = true;
       }
     } catch (e) {
+      if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
       appendHistoryEvent(task, 'advisory', `orient pass errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
     }
   }
@@ -1040,6 +1042,7 @@ async function finalizeCandidateFulfillment(task, {
       try {
         premise = await entry.premiseCheck(task, { call: resolvedLocalCall, maybeLockedOn });
       } catch (e) {
+        if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
         // AC-170: log the swallowed premiseCheck exception so operators can see it.
         // entry.name / entry.sourceName are not confirmed present; fall back to constructor name.
         console.error(`[premiseCheck] task=${task.id || task.name || 'unknown'} source=${entry.name || entry.sourceName || entry.constructor?.name || 'unknown-source'} error=${e?.message ?? String(e)}`, e?.stack);
@@ -1285,6 +1288,7 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
     try {
       grounding = await postImplementEntry.postImplementCheck(task, task.implementResponse, { call: resolvedLocalCall, maybeLockedOn: ctx.maybeLockedOn });
     } catch (e) {
+      if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
       grounding = null; // advisory -- a throwing check must never block a real draft
     }
     if (grounding && (grounding.verdict === 'ungrounded' || grounding.verdict === 'invalid-premise')) {
@@ -1739,6 +1743,7 @@ async function runDraftPasses(task, attempt, {
             if (rePlan.blocked) return { succeeded: true, blocked: true, blockedReason: rePlan.blockedReason, blockedStage: rePlan.blockedStage };
           }
         } catch (e) {
+          if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
           appendHistoryEvent(task, 'advisory', `plan-critique errored (non-fatal): ${String(e && e.message || e).slice(0, 160)}`);
         }
       }

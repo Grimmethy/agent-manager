@@ -16,6 +16,7 @@ const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
+const gpuGuard = require('./gpu-guard.js');
 const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
@@ -260,6 +261,9 @@ function estimateTokens(text) {
 }
 
 async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+  // Forge exclusion (2026-10-14): never START a model call while PromptForge's comfyui-lease is held -- it would reload the model
+  // PromptForge just evicted. Checked here, before any prompt building, in-flight lock or network I/O. See gpu-guard.js ForgePauseError.
+  if (gpuGuard.forgePauseEnabled() && gpuGuard.comfyuiLeaseHeld()) throw new gpuGuard.ForgePauseError();
   // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header):
   // tell the model the SIDE-FINDING: convention exists, unless this specific call needs
   // clean/parseable-only output (allowSideFindings: false -- set by known strict-schema
@@ -466,6 +470,7 @@ async function call(opts, maxRetries = 2) {
     try {
       result = await callOnce(callOpts);
     } catch (e) {
+      if (gpuGuard.isForgePause(e)) throw e;   // not a failure: no retry, no hard-failure audit (the lease is still held on every attempt)
       lastError = e;
       logHardFailureAudit({
         source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
@@ -585,6 +590,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     try {
       result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
     } catch (e) {
+      if (gpuGuard.isForgePause(e)) throw e;   // the Forge family took the GPU mid-vote: abandon the whole vote (never tally the partial one)
       // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
       // retry above) -- must not abort the other n-1 votes, which may well succeed under
       // exactly the same slow-but-not-dead conditions. See this function's own 2026-08-23

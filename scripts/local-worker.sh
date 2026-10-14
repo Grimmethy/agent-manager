@@ -216,6 +216,16 @@ process_drafting_file() {
     # apply-task.sh's "applying X..." lines. The task JSON already carries a 'draft-done'
     # history event (src/local-draft.js concludeDraft()).
     printf '[worker-%s] draft complete, ready for review: %s\n' "$INSTANCE_ID" "$task_id" >&2
+  elif grep -qE "the Forge family holds the GPU" <<< "$draft_result"; then
+    # Forge GPU session (2026-10-14): local-client.js refused to START a model call because PromptForge holds the GPU (comfyui-lease)
+    # -- src/gpu-guard.js ForgePauseError / FORGE_PAUSE_MESSAGE. This is NOT a failure of the task and NOT an outage: it is a deliberate,
+    # open-ended pause (a Forge session lasts 20 min idle to 4 h), the same class as the 'manually paused' case below. So: no
+    # draftFailureCount increment, no infra-requeue round, no block. The item stays in drafting/ and resumes through the normal
+    # leftover-drafting pass once the lease clears; this tick stops claiming (TICK_HAD_INFRA_FAILURE) and the next ticks yield at the
+    # top while the lease holds. Without this branch the failure counting below could permanently block a good task.
+    # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
+    printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
+    TICK_HAD_INFRA_FAILURE=true
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
     # out under GPU contention) -- retry via the leftover-drafting resume pass at the top
