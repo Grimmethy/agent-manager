@@ -2512,7 +2512,8 @@ def _stop_pipeline(force: bool = False) -> list:
     stopped) while every daemon kept running untouched in the background. Linux instead
     shells out to scripts/stop.sh, which SIGTERMs each daemon by its launch.sh pidfile,
     waits out a grace period for it to exit cleanly (see each daemon's own trap), and
-    SIGKILLs stragglers -- the actual kill logic lives there, not duplicated here.
+    SIGKILLs stragglers -- the actual kill logic lives there, not duplicated here. Always passes --keep-dashboard
+    and --keep-plugins: stopping the PIPELINE must not take down this dashboard or the plugin tab servers.
 
     force=False (the toggle button's first click) launches stop.sh in the background and
     returns immediately -- the frontend's existing 3s status poll picks up the moment
@@ -2553,7 +2554,9 @@ def _stop_pipeline(force: bool = False) -> list:
     if os.name != "nt":
         stop_sh = PACKAGE_ROOT / "scripts" / "stop.sh"
         if stop_sh.is_file():
-            args = ["bash", str(stop_sh), "--keep-dashboard"]
+            # --keep-plugins: the plugin servers (promptforge, storyforge, ...) are tab servers, not pipeline daemons, but their
+            # pidfiles share stop.sh's folder; without this a pipeline stop took every plugin down (confirmed live 2026-10-14).
+            args = ["bash", str(stop_sh), "--keep-dashboard", "--keep-plugins"]
             if force:
                 args.append("--force")
             try:
