@@ -278,3 +278,71 @@ test('comfyuiLeaseHeld: acquiredAt past MAX_S even with a fresh refreshedAt -> f
 test('comfyuiLeaseHeld: missing file -> false (fails open)', () => {
   assert.equal(comfyuiLeaseHeld(path.join(os.tmpdir(), 'definitely-not-a-lease-file-xyz.json')), false);
 });
+
+// ---- Forge family exclusion: with no lease, a ComfyUI that is still up is asked to yield via PromptForge ----
+
+const { yieldForgeToPipeline } = require('./gpu-guard.js');
+
+test('yieldForgeToPipeline: ComfyUI not running -> nothing to do, PromptForge never called', async () => {
+  const urls = [];
+  const r = await yieldForgeToPipeline({ fetchJsonFn: async (u) => { urls.push(u); return { ok: false }; } });
+  assert.equal(r.acted, false);
+  assert.equal(urls.length, 1);
+  assert.match(urls[0], /\/system_stats$/);
+});
+
+test('yieldForgeToPipeline: ComfyUI up, PromptForge grants -> acted, POSTs /api/gpu/yield', async () => {
+  const calls = [];
+  const r = await yieldForgeToPipeline({
+    promptforgeUrl: 'http://pf:7430',
+    fetchJsonFn: async (u, o) => {
+      calls.push([u, o && o.method]);
+      if (u.endsWith('/system_stats')) return { ok: true, body: {} };
+      return { ok: true, body: { yielded: true, reason: 'forge session ended' } };
+    },
+  });
+  assert.equal(r.acted, true);
+  assert.deepEqual(calls[1], ['http://pf:7430/api/gpu/yield', 'POST']);
+  assert.match(r.note, /stopped it/);
+});
+
+test('yieldForgeToPipeline: PromptForge declines (a Forge job is running) -> not acted, says why', async () => {
+  const r = await yieldForgeToPipeline({
+    fetchJsonFn: async (u) => (u.endsWith('/system_stats') ? { ok: true, body: {} } : { ok: true, body: { yielded: false, reason: 'a Forge job is running' } }),
+  });
+  assert.equal(r.acted, false);
+  assert.match(r.note, /declined to yield: a Forge job is running/);
+});
+
+test('yieldForgeToPipeline: PromptForge down or the fetch throws -> never throws, falls back to the existing path', async () => {
+  const down = await yieldForgeToPipeline({ fetchJsonFn: async (u) => (u.endsWith('/system_stats') ? { ok: true, body: {} } : { ok: false, error: 'refused' }) });
+  assert.equal(down.acted, false);
+  const boom = await yieldForgeToPipeline({ fetchJsonFn: async () => { throw new Error('boom'); } });
+  assert.deepEqual(boom, { acted: false, note: '' });
+});
+
+test('ensureGpuHeadroom with forgeYield: no lease -> yields first and the note says so; plenty of VRAM afterwards = not starved', async () => {
+  let yielded = 0;
+  const r = await ensureGpuHeadroom({
+    minFreeMb: 4096, leaseHeld: () => false, readFreeVram: () => 20000,
+    forgeYield: async () => { yielded++; return { acted: true, note: 'ComfyUI stopped' }; },
+  });
+  assert.equal(yielded, 1);
+  assert.equal(r.starved, false);
+  assert.equal(r.note, 'ComfyUI stopped');
+});
+
+test('ensureGpuHeadroom with forgeYield: lease held -> the Forge family owns the card, yield is NOT attempted', async () => {
+  let yielded = 0;
+  const r = await ensureGpuHeadroom({
+    leaseHeld: () => true, forgeYield: async () => { yielded++; return { acted: true, note: 'x' }; },
+  });
+  assert.equal(yielded, 0);
+  assert.match(r.note, /comfyui-lease held/);
+});
+
+test('ensureGpuHeadroom without forgeYield (the default, and every existing caller): behaviour unchanged', async () => {
+  const r = await ensureGpuHeadroom({ minFreeMb: 4096, leaseHeld: () => false, readFreeVram: () => 20000, fetchJsonFn: async () => { throw new Error('must not be called'); } });
+  assert.equal(r.starved, false);
+  assert.equal(r.note, '');
+});
