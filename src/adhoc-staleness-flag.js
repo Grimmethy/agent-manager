@@ -25,6 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { findStalenessCandidates } = require('./staleness-audit.js');
 const { classifyVote } = require('./auto-confirm-review.js');
 
@@ -269,6 +270,7 @@ async function sweep({ pipelineDir, repoRoot, majorityVote, dryRun = false, now 
       try {
         vote = await runVote(task, flag, majorityVote);
       } catch (e) {
+        if (isForgePause(e)) { summary.paused = true; break; }   // the Forge family holds the GPU: stop this sweep quietly -- no history note, no stamp
         // all votes hard-failed (infra) -- stamp the medium flag anyway so the human sees it
         writeFlag(filePath, task, { ...flag, voteResult: 'vote-error' }, now);
         summary.flagged += 1; summary.errors += 1;

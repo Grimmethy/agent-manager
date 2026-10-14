@@ -66,6 +66,27 @@ function comfyuiLeaseHeld(leasePath = COMFY_LEASE_PATH) {
   }
 }
 
+// A local-model call that would START while the Forge family holds the GPU is refused with this error (2026-10-14).
+// The tick-level yield in local-worker.sh / review-runner.sh only sees a tick boundary; a task ALREADY running makes
+// several calls in a row, and one began ~5 min into a Forge session, reloaded the 19 GB model after PromptForge had
+// evicted it, and left ComfyUI with <1 GB of VRAM (the render stalled 7+ min). Callers must NOT treat this as a model
+// failure: the worker/reviewer leave the item in place with no failure count and no cap (same idea as the 'manually
+// paused' path in local-worker.sh), and advisory checks must rethrow it instead of degrading to "ok". Detect it with
+// isForgePause(), which also recognises the message text after an Error was re-wrapped.
+const FORGE_PAUSE_MESSAGE = 'paused: the Forge family holds the GPU (comfyui-lease) -- no model call was started';
+class ForgePauseError extends Error {
+  constructor() {
+    super(FORGE_PAUSE_MESSAGE);
+    this.name = 'ForgePauseError';
+    this.forgePause = true;
+  }
+}
+function isForgePause(e) {
+  return !!(e && (e.forgePause === true || e instanceof ForgePauseError || /the Forge family holds the GPU/.test(String(e.message || ''))));
+}
+// Kill switch, read per call (not at load): AGENT_MANAGER_FORGE_PAUSE=off restores the old behaviour.
+function forgePauseEnabled() { return process.env.AGENT_MANAGER_FORGE_PAUSE !== 'off'; }
+
 // Forge family exclusion (2026-10-13, Grimmethy: "we cannot run the Agent Manager pipeline and Forge pipeline
 // at the same time ... starting up one process should stop the other and clear the GPU"). PromptForge is the
 // Forge family's GPU broker (promptforge Docs/GPU_FAMILY_PROTOCOL.md): while a Forge session holds the
@@ -264,7 +285,7 @@ async function ensureGpuHeadroom(opts = {}) {
   return result;
 }
 
-module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld, yieldForgeToPipeline };
+module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld, yieldForgeToPipeline, ForgePauseError, FORGE_PAUSE_MESSAGE, isForgePause, forgePauseEnabled };
 
 if (require.main === module) {
   ensureGpuHeadroom({ forgeYield: yieldForgeToPipeline }).then((result) => {

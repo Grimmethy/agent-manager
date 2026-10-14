@@ -33,6 +33,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { batchContainsDeleteMode } = require('./apply-group-b.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
@@ -397,6 +398,7 @@ async function autoConfirmReview({ pipelineDir, repoRoot, grepDirs, majorityVote
         source: task.source,
       });
     } catch (e) {
+      if (isForgePause(e)) { summary.paused = true; break; }   // the Forge family holds the GPU: stop this sweep quietly -- no history note, no stamp
       // Every vote hard-failed (infra). Do NOT stamp -- next tick retries.
       appendHistoryEvent(task, 'advisory', `auto-confirm review could not run (${(e && e.message || 'vote error').slice(0, 160)}) -- will retry`);
       try { fs.writeFileSync(file, JSON.stringify(task, null, 2)); } catch { /* best-effort */ }
