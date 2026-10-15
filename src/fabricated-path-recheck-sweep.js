@@ -20,6 +20,8 @@ const path = require('path');
 const { failureText } = require('./known-fixed-failures.js');
 const { destinationDir, freshShape } = require('./fix-signature-sweep.js');
 const { parseFabricatedPaths, resolveCitedFileAtMain } = require('./candidate-path-grounding.js');
+const { readJsonSafe } = require('./task-anywhere.js');
+const { writeJsonAtomicSync } = require('./atomic-write.js');
 
 const ENTRY = {
   id: 'fabricated-path-exists-on-main',
@@ -28,8 +30,6 @@ const ENTRY = {
 const DIRS = ['blocked', 'needs-clarification'];
 
 const enabled = () => process.env.AGENT_MANAGER_FABRICATED_PATH_RECHECK !== 'false';
-function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
-function writeJson(p, data) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, JSON.stringify(data, null, 2)); }
 
 // existsAtMain(claimedPath) -> truthy is injectable so tests need no real repo.
 function sweepFabricatedPathRecheck({ pipelineDir, repoRoot, mainBranch = 'main', extraRoots = [], now = new Date(), dryRun = false, existsAtMain, fetch = true } = {}) {
@@ -46,7 +46,7 @@ function sweepFabricatedPathRecheck({ pipelineDir, repoRoot, mainBranch = 'main'
     try { names = fs.readdirSync(stateDir).filter((f) => f.endsWith('.json')); } catch { continue; }
     for (const name of names) {
       const filePath = path.join(stateDir, name);
-      const task = readJson(filePath);
+      const task = readJsonSafe(filePath);
       if (!task || typeof task !== 'object') continue;
       const paths = parseFabricatedPaths(failureText(task));
       if (!paths.length) continue;
@@ -73,7 +73,8 @@ function sweepFabricatedPathRecheck({ pipelineDir, repoRoot, mainBranch = 'main'
       if (!dryRun) {
         const fresh = freshShape(task, ENTRY, dir, nowIso);
         fresh.history[fresh.history.length - 1].detail = `auto-requeued from ${dir}/: every path the grounding gate called fabricated (${paths.join(', ')}) exists on origin/${mainBranch}, so the block was a stale-checkout false alarm`;
-        writeJson(dest, fresh);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        writeJsonAtomicSync(dest, fresh);
         fs.unlinkSync(filePath);
       }
       summary.requeued.push({ id: task.id, from: dir, paths });

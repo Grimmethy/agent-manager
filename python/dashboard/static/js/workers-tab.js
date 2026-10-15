@@ -266,6 +266,7 @@ async function renderWorkers(isPoll) {
       const r = await fetchJson(`/api/instances/${encodeURIComponent(inst.instanceId)}/assignable-tasks`);
       assignableByInstance[inst.instanceId] = r.items || [];
     } catch (e) {
+      console.warn(`[core-ui] Failed to fetch assignable-tasks for instance ${inst.instanceId}`, e);
       assignableByInstance[inst.instanceId] = [];
     }
   }));

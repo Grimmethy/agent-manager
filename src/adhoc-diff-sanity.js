@@ -76,7 +76,7 @@ const CODE_SIGNAL_RE = /\b(src|python|scripts|lib|app|dashboard|templates)\/|\.(
 // containing one of these is excluded from the code-signal scan, same "citation vs.
 // target" distinction extractDeclaredFiles/extractDeclaredTargets already draw elsewhere
 // in this file, just applied to the blind-scan fallback path instead of a structured one.
-const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|handle|contain)s?|documented in|as (?:shown|described|documented|seen|specified) in|mentioned in|cited in|referenced in|defined in|lives? in|found in|per\b|see\b|(?:anchor|grounding) is real|confirmed (?:real|in)|the (?:real|grounding) (?:source|evidence))\b/i;
+const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|handle|contain)s?|documented in|as (?:shown|described|documented|seen|specified) in|mentioned in|cited in|referenced in|defined in|lives? in|found in|(?:anchor|grounding) is real|confirmed (?:real|in)|the (?:real|grounding) (?:source|evidence))\b/i;
 
 // 2026-09-21 (needs-clarification clearing, in-app chat design review): the citation markers above cannot keep up with prose. Two genuine documentation tasks
 // (an AGENTS.md invariant note; a research note under docs/research/) were still blocked 3/3 by sentences that mention a code path only to say it is NOT to be touched

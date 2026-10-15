@@ -366,6 +366,7 @@ async function renderJobListTab() {
   try {
     jobTypes = await fetchJson('/api/job-types');
   } catch (e) {
+    console.error('renderJobListTab: failed to fetch /api/job-types', e);
     jobTypes = null;
   }
   // 2026-08-26, Grimmethy: "After looking at pipeline map I've realized that it really
@@ -379,6 +380,7 @@ async function renderJobListTab() {
   try {
     pipelineMap = await fetchJson('/api/pipeline-map');
   } catch (e) {
+    console.error('[pipeline-map] fetch failed:', e);
     pipelineMap = null;
   }
   const activeByName = {};
