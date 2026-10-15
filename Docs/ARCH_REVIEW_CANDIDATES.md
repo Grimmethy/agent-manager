@@ -1209,3 +1209,18 @@ Benefits:
 The structured return shape becomes internally consistent: `freeMb` always means "VRAM as last measured," regardless of how many actions the pipeline took. Callers that log or alert on the structured field no longer see a stale pre-action number in the most common "we did something but it wasn't enough" scenario.
 
 NOTE: Flags 1 and 2 were applied; AC-001 no longer claims shell callers branch on `note` or proposes updating them, since the header documents them as non-blocking and they are not provided in the input.
+
+### AC-119 · Hand-maintained global-stub list in vm.runInContext harness
+Strength: Worth exploring
+Files: python/dashboard/static/js/core-ui.test.js
+
+Problem:
+The `loadDashboardScripts` function constructs a `ctx` object literal containing a hard-coded set of browser-global stubs (such as `document`, `window`, `localStorage`, `activeTab`, `counts`, `CORE_TABS`, and various `enter*Tab` / `leave*Tab` hooks) and then loads three sibling scripts into that context via `vm.runInContext`. This stub list is the sole implicit contract for which globals those three scripts reference at load or call time. It is maintained by hand in one place with no cross-check against the actual scripts. When any of the three scripts gains a new global reference, the failure mode is a `ReferenceError` in the vm context. While the error message correctly names the missing identifier, it points at the script line rather than the stub list in this test file. This forces the author to manually trace back to the test file to locate where the stub should be added. Because the three scripts are plain global `<script>` tags with no module boundary, there is no import graph to follow; the stub list is the only documentation of the global surface and is invisible to any tooling.
+
+Solution:
+Extract the stub object into a named, exported constant at the top of the test file so it is visually distinct from test logic and easier to diff when a new global is added. Additionally, add a static analysis check (e.g., using an AST parser or a simple regex-based linter rule) that scans the three script files for global variable references and asserts that every identified global is present in the named stub constant. This turns the implicit contract into an explicit, self-checking one without relying on runtime execution order.
+
+Benefits:
+A new global reference in any of the three scripts will surface as a clear assertion failure in the static check, explicitly naming the missing identifier and pointing directly at the stub constant in the test file. This eliminates the need to manually trace a `ReferenceError` from the script back to the test file. The named constant makes the global surface visible in diffs and code review. The static check catches omissions at test-run time (or lint time) regardless of execution order, ensuring the stub list remains in sync with the scripts' actual global usage.
+
+NOTE: Flag 1 was addressed by replacing the infeasible runtime "bare context" smoke test with a static analysis check, which is technically feasible and correctly collects all missing globals.
