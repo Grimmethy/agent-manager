@@ -1181,3 +1181,31 @@ Extract the read-side contract into a small shared helper (e.g. `src/json-store.
 
 Benefits:
 The load contract (fallback shape, error message, shape guards) is defined in one place and cannot drift between registry files; a future schema or fallback change is a one-line edit in the shared helper rather than an N-file sweep. It also makes the load/write symmetry explicit — both now route through shared modules — which is the same property the codebase already relies on for writes, so the persistence story for any JSON registry becomes uniform.
+
+### AC-117 · `starved` return shape forces callers to parse free-text `note` to distinguish "acted" from "no-action"
+Strength: Strong
+Files: src/gpu-guard.js
+
+Problem:
+`ensureGpuHeadroomCore` returns a structured object with `starved`, `yielded`, `freed`, and a free-text `note`. The single decision a caller actually needs—*is it safe to proceed with a model call, or will it starve?*—is not exposed as a structured field. When the pipeline could not recover headroom, `starved` is `true` regardless of whether it freed ComfyUI and stopped apps (actionable, GPU is now usable) or whether nothing was running to free (truly starved, next model call will likely time out). The only signal distinguishing those two cases is the human-readable `note` string. The CLI block at the bottom of the file must therefore string-match `note` to branch correctly. This is the same class of fragility the `ForgePauseError` / `isForgePause` machinery was introduced to eliminate for the pause case: a future rewording of `note`, or a new caller that doesn't replicate the exact expected phrasing, silently loses the "we acted" vs "we didn't" signal and either blocks a tick unnecessarily or proceeds into a guaranteed timeout.
+
+Solution:
+Add an explicit structured field to the return object—e.g. `actionable: 'ok' | 'starved-no-action' | 'starved-acted'` (or equivalently `recovered: boolean` plus a reason enum)—that encodes the caller's branching decision directly. Update the CLI block to branch on that field instead of (or in addition to) `note`. Document the new field in the file header as the contract callers should rely on, and mark `note` as informational-only. Keep `starved` for backward compatibility but deprecate it as the sole decision signal.
+
+Benefits:
+Callers branch on a stable, machine-readable enum rather than a prose string, eliminating the silent-failure mode where a wording change in `note` breaks the "safe to proceed" check. The contract is now self-documenting in the return shape: a new integrator reading the object sees the decision field without needing to infer semantics from English text. The existing `ForgePauseError` pattern (structured signal + human-readable message) becomes the uniform convention across all advisory outcomes in this file, reducing the cognitive surface for future maintainers.
+
+### AC-118 · Structured `freeMb` understates post-action VRAM in the "freed ComfyUI + stopped apps" path
+Strength: Worth exploring
+Files: src/gpu-guard.js
+
+Problem:
+After a successful `ComfyUI /free` call that does not reach the target, the code computes `freeAfterMb` and uses it in the Ollama-resident branch's `note` and `freeMb`. However, in the subsequent TheAgent-stop branch (the "still starved even after freeing" path), the returned structured `freeMb` field is the original pre-free value, not `freeAfterMb`. The `freeAfterMb` appears only in the free-text `note`. A caller reading the structured `freeMb` to log, alert, or make a secondary decision will see a number that understates the actual VRAM available after the pipeline already acted.
+
+Solution:
+Thread `freeAfterMb` into the structured `freeMb` field in the final "still starved" return path, so the structured field always reflects the most recent measured VRAM state. If the pre-free value is still useful for diagnostics, add a separate `freeMbBeforeAction` field rather than relying on the caller to parse `note`.
+
+Benefits:
+The structured return shape becomes internally consistent: `freeMb` always means "VRAM as last measured," regardless of how many actions the pipeline took. Callers that log or alert on the structured field no longer see a stale pre-action number in the most common "we did something but it wasn't enough" scenario.
+
+NOTE: Flags 1 and 2 were applied; AC-001 no longer claims shell callers branch on `note` or proposes updating them, since the header documents them as non-blocking and they are not provided in the input.
