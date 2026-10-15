@@ -244,7 +244,11 @@
     table { min-width: 560px; }
     .plugin-sidebar { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: 65vh; border-left: none; border-top: 2px solid var(--border); z-index: 15; }
     .plugin-sidebar.sidebar-collapsed { height: 0; width: 100%; border-top: none; }
-    .plugin-sidebar-toggle { writing-mode: horizontal-tb; right: 12px; top: auto; bottom: 12px; border: 2px solid var(--border); border-radius: 20px; padding: 8px 14px; }
+    .plugin-sidebar-toggle { writing-mode: horizontal-tb; right: 12px; top: auto; bottom: 12px; border: 2px solid var(--border); border-radius: 20px; padding: 8px 14px; z-index: 20; }
+    /* The sheet above is z-index 15 and covers the bottom 65vh, so the pill used to sit UNDER it and could not be tapped to hide the chat
+       (2026-10-14, phone over Tailscale). Keep the pill above the sheet, and while the sheet is open move it up to the sheet's top edge so
+       it does not sit on the chat box. JS marks the pill .sidebar-open whenever the sheet is expanded. */
+    .plugin-sidebar-toggle.sidebar-open { bottom: calc(65vh + 10px); }
     .worker-card .row { flex-wrap: wrap; row-gap: 6px; }
     .worker-model-select { margin-left: 0; margin-right: 0; max-width: none; width: 100%; }
     .stat-row { flex-wrap: wrap; row-gap: 10px; }
