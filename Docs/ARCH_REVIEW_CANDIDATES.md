@@ -964,3 +964,29 @@ The merge becomes a correct three-way reconciliation for the delete-vs-edit case
 *AC-002 removed.*
 
 NOTE: AC-002 was removed because the critique correctly identifies that (a) the draft's description of the failure mode is factually wrong — the actual behavior is last-wins in the Map with the `order` array carrying the duplicate, not "the merge sees the slot as untouched" — and (b) the prescribed fix (throw on duplicate id) would be a behavioral regression for the live nine-branch collision scenario where the structural merge must reconcile independently-written same-id content rather than refuse to resolve.
+
+### AC-101 · Inconsistent error-handling contract in `readEntries`
+Strength: Strong
+Files: (no verified file paths in plan)
+
+Problem:
+`readEntries` treats file I/O failures asymmetrically: it silently swallows `ENOENT` by returning an empty array, but re-throws every other `readFileSync` error such as `EACCES` or `EIO`. Because `computeBudgetHealthy` iterates over a dynamically generated list of 500+ transcript files and concatenates their results, a single transient disk I/O error or a temporary permission change on any one file will propagate an unhandled exception out of the entire budget health check. The system cannot fall back to cached data or report a partial state; it simply crashes.
+
+Solution:
+Standardize the error-handling contract so that all `readFileSync` failures are treated as non-fatal. For any error (not just `ENOENT`), the function should log the specific error code and message (as it already does for non-ENOENT cases) and then return an empty array for that file. This lets `computeBudgetHealthy` continue iterating over the remaining files, producing a best-effort health report from whatever data is actually readable rather than failing the entire check.
+
+Benefits:
+A single bad file can no longer take down the whole budget health gate. Operators get a logged, diagnosable error for the specific file that failed while the rest of the 500+ files still contribute to the health calculation. The module's stated goal of being a lightweight, low-overhead gate is preserved because the failure mode is now graceful degradation instead of a hard crash, and downstream consumers receive a (possibly partial) result they can act on rather than an exception they must catch.
+
+### AC-102 · O(N²) complexity in `estimateBudgetCeiling`
+Strength: Strong
+Files: (no verified file paths in plan)
+
+Problem:
+`estimateBudgetCeiling` iterates over every rate-limit event and, for each one, performs a linear scan of the entire `allEntries` array to sum tokens within the preceding 5-hour window. With a high volume of rate-limit hits (e.g., 100) and a large dataset (e.g., 100,000 entries), this produces roughly 10 million inner-loop iterations per call. The resulting CPU spike and latency directly contradict the module's design goal of being a lightweight, low-overhead gate that runs frequently without noticeable cost.
+
+Solution:
+Refactor to a two-pointer sliding-window approach. Because `allEntries` is already sorted by timestamp when `computeBudgetHealthy` hands it off, a single left-to-right pass with two indices (one tracking the start of the 5-hour window, one tracking the current entry) can maintain a running token sum and emit the window total for each rate-limit event in O(N) total time. The nested loop is eliminated entirely, and no auxiliary data structure beyond the existing sorted array is needed.
+
+Benefits:
+The worst-case cost drops from O(N × M) to O(N + M) (where M is the number of rate-limit events), turning a 10-million-iteration workload into a single linear pass. CPU spikes during high-traffic periods disappear, the gate's latency becomes predictable and proportional to dataset size rather than the product of dataset size and event count, and the module can be called more frequently (or on larger datasets) without degrading the host process.
