@@ -69,7 +69,7 @@ needs a design decision (3).
 
 ## 5. Open questions for the verification pass (playbook step 2)
 
-- Does anything besides PromptForge and VideoForge call `/api/gpu/*` (StoryForge, SceneForge, CharacterForge go through PromptForge jobs; confirm)?
+- ~~Does anything besides PromptForge and VideoForge call `/api/gpu/*`?~~ Answered 2026-10-15 (repo-wide grep): only PromptForge (`server/app.py`, `server/core/comfy.py`), VideoForge (`server/app.py`, `server/core/gpu.py`, **`web/app.js`**, which G2 must also repoint) and core (`scripts/launch.sh`, `src/gpu-guard.js`). StoryForge, SceneForge and CharacterForge go through PromptForge jobs.
 - Is `instances/.model-locks` read anywhere else, or only by the session core?
 - Does `gpu-guard.js`'s ComfyUI `/free` reclaim path stay (it does not need the broker) or move?
 - What exactly does `POST /api/pipeline/stop` kill besides the lanes, so G5 changes the right thing?
