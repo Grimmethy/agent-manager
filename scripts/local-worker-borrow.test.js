@@ -273,3 +273,55 @@ test('the worker takes the JSON result line even when a stray line precedes it o
     fs.closeSync(out);
   }
 });
+
+// --- the claim loop re-ranks after every processed item (2026-10-15) -----------------------------------------------------------------------------
+// The `items` list is taken ONCE per tick and generation/ranking only run at the top of a tick, so a lane that drained its whole snapshot
+// first (worker-3090: 59 claims in one tick, ~6h) never saw a premium task that arrived meanwhile. Ending the tick after each processed item
+// makes the next tick re-run generation + ranking. The stub draft succeeds without a model, so the infra-failure break cannot mask this one.
+function ownProjectLane(sb, pkg, logFile, out) {
+  return spawn('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x'], {
+    detached: true, stdio: ['ignore', out, out],
+    env: { ...sb.env, ORC_TICK_SECS: '60', AGENT_MANAGER_POOL_BORROW: 'false', AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json') },
+  });
+}
+const ownClaims = (logFile) => [...fs.readFileSync(logFile, 'utf8').matchAll(/\] claimed \S+\/queue\/pending\/([\w-]+)\.json/g)].map((m) => m[1]);
+
+test('a lane ends its tick after each processed item: a new `tick at` line separates two claims taken from the same pending/ listing', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 1500);
+  const pending = path.join(sb.A, 'queue', 'pending');
+  taskFile(pending, 'o1'); taskFile(pending, 'o2');
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const child = ownProjectLane(sb, pkg, logFile, out);
+  try {
+    assert.ok(await waitFor(() => ownClaims(logFile).length >= 2, 60000), 'both tasks were claimed');
+    const log = fs.readFileSync(logFile, 'utf8');
+    const firstClaim = log.indexOf('claimed ');
+    const secondClaim = log.indexOf('claimed ', firstClaim + 1);
+    assert.match(log.slice(firstClaim, secondClaim), /tick at /, `the second claim must come from a NEW tick; log between the claims:\n${log.slice(firstClaim, secondClaim)}`);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+  }
+});
+
+test('a premium task that lands in pending/ while the first item is being processed is claimed BEFORE the older ordinary task still waiting', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 4000);
+  const pending = path.join(sb.A, 'queue', 'pending');
+  taskFile(pending, 'o1'); taskFile(pending, 'o2');
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const child = ownProjectLane(sb, pkg, logFile, out);
+  try {
+    assert.ok(await waitFor(() => ownClaims(logFile).length >= 1, 60000), 'the first task was claimed');
+    fs.writeFileSync(path.join(pending, 'prem.json'), JSON.stringify({ id: 'prem', domain: 'default', source: 'trouble_log', title: 'prem', promptContext: {}, premiumPriority: true }));
+    assert.ok(await waitFor(() => ownClaims(logFile).length >= 2, 60000), 'a second task was claimed');
+    const order = ownClaims(logFile);
+    assert.equal(order[1], 'prem', `the premium arrival is claimed second, ahead of the ordinary task that was already waiting; order: ${order.join(',')}`);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+  }
+});

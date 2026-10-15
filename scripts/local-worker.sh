@@ -753,6 +753,13 @@ while :; do                                                                     
           printf '[worker-%s] infra-shaped failure -- stopping this tick early instead of claiming more pending items\n' "$INSTANCE_ID" >&2
           break
         fi
+        # Re-rank after every processed item (2026-10-15, premium head-of-line starvation): `items` above is a snapshot taken ONCE at the top of the
+        # tick, and generation (task-sources.js) + ranking (next-claimable-task.js) only run at the top of a tick, so draining the whole snapshot
+        # meant a premium task generated or released meanwhile waited for every remaining item (worker-3090: 59 claims in one tick, ~6h; HUB0148-02..07
+        # and 17 other premium tasks sat unclaimed). End the tick here instead: did_work is already true, so the end-of-tick pause is the 1s
+        # busy-loop guard, not the idle poll, and the next tick regenerates and re-ranks before the next claim. Skips (`continue` above) did no work
+        # and correctly do not end the tick.
+        break
       fi
 
     done                                                                         # end per-filename loop within current tick — bash doesn't auto-close the `for name in "${items[@]}"` scope; 'done' keyword terminates it same way PowerShell closes each block with } or closing brace pattern (we use bash's explicit 'done' syntax which is required).
