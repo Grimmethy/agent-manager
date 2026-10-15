@@ -599,8 +599,12 @@ function stripUnchangedDiffLines(text) {
   return text.split('\n').map((line) => {
     if (DIFF_META_RE.test(line)) { inDiff = true; return ''; }
     if (!inDiff) return line; // prose (or a plain-text draft with no diff at all)
+    if (line === '') { inDiff = false; return line; } // blank line: exit diff block
+    if (line.startsWith(' ')) return ''; // context line -- pre-existing, never a new claim
+    if (line.startsWith('-')) return ''; // removed line -- pre-existing, never a new claim
     if (line.startsWith('+')) return line; // real addition -- a genuine new claim
-    return ''; // removed or unchanged context -- pre-existing, never a new claim
+    inDiff = false; // not a valid diff line (prose, bullet, indented text, etc.) -- exit diff block
+    return line;
   }).join('\n');
 }
 
