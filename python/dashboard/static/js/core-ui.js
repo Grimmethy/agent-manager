@@ -18,6 +18,7 @@ async function loadProjectHistory() {
     const data = await fetchJson('/api/projects/history');
     projectHistory = data.projects || [];
   } catch (e) {
+    console.error('loadProjectHistory failed to fetch project history', e);
     projectHistory = [];
   }
   const list = document.getElementById('project-history-list');

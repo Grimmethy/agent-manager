@@ -35,6 +35,7 @@ const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.j
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { acquire, release, taskMoveLockKey } = require('./single-flight-lock.js');
 const { sharedInstancesDir } = require('./instances-dir.js');
+const { recordAvoidedLane } = require('./premium-rotation.js');
 
 // Task-move lock (2026-09-27): every requeue/escalation below used to be a plain,
 // unguarded write-then-unlink -- no atomic rename, no check for whether a file for this
@@ -932,6 +933,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         delete task.planResponse;
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'plan-pass degenerate -- cleared stale plan state for a fresh plan pass');
+        // Steer the task away from the lane it degenerated on while another lane exists (premium-rotation.js): the P40 lane
+        // kept re-claiming the same task and blocking it on a truncated plan, starving every task behind it.
+        let laneCount = 0;
+        try { laneCount = require('./lanes.js').getLanes().length; } catch (_) { laneCount = 0; }
+        const avoided = recordAvoidedLane(task, laneCount);
+        if (avoided) appendHistoryEvent(task, 'lane-avoided', `plan degenerated on ${avoided}; other lanes get first claim`);
       } else if (implementDegenerateBlock) {
         // The plan completed and is kept; only the unusable (empty / truncated) implement output is dropped.
         delete task.implementResponse;
