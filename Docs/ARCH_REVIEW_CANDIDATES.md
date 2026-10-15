@@ -990,3 +990,29 @@ Refactor to a two-pointer sliding-window approach. Because `allEntries` is alrea
 
 Benefits:
 The worst-case cost drops from O(N × M) to O(N + M) (where M is the number of rate-limit events), turning a 10-million-iteration workload into a single linear pass. CPU spikes during high-traffic periods disappear, the gate's latency becomes predictable and proportional to dataset size rather than the product of dataset size and event count, and the module can be called more frequently (or on larger datasets) without degrading the host process.
+
+### AC-103 · `distinctivePhrases` hides a first-line-only contract in a comment rather than the interface
+Strength: Worth exploring
+Files: src/text-similarity.js
+
+Problem:
+`distinctivePhrases(text)` and `sharesDistinctivePhrase(a, b)` both internally truncate their argument to the first line via `String(text).split('\n')[0]`, yet the function signature accepts an arbitrary string and nothing in the name, parameter type, or JSDoc signals that everything after the first newline is silently discarded. Both current callers happen to pre-slice to their own first line before calling, so the internal truncation is redundant today—but that redundancy is the only thing protecting correctness. If a future caller passes a multi-line string (the in-file comment explicitly names a `blockedReason` from `agentic-draft-common.js` as a likely future input), the phrase set is computed from an incomplete string, producing a wrong similarity score that looks plausible rather than raising an error. The contract lives in a comment ("Revisit… if multi-line inputs become common") rather than in the API surface, so a new caller has no mechanical signal that the truncation exists.
+
+Solution:
+Remove the internal `split('\n')[0]` from both `distinctivePhrases` and `sharesDistinctivePhrase`, making the functions genuinely multi-line. Current callers already slice to their first line before calling, so this is a no-op for them. The JSDoc is updated to state that the function operates on the full string passed in, and any caller that wants first-line-only semantics performs its own slice at the call site (which they already do). This eliminates the hidden truncation and the redundant double-slice.
+
+Benefits:
+The API surface now matches its behavior: what you pass in is what gets processed. A future caller passing a multi-line string gets a correct, full-string similarity score instead of a silently truncated one. The "revisit" comment becomes unnecessary because the function no longer has a hidden first-line assumption. The redundancy of two independent `split('\n')[0]` calls (one in the caller, one in the callee) is removed, simplifying the mental model for anyone reading the call chain.
+
+### AC-104 · `writeSideFindingInbox` uses raw `fs.writeFileSync` while a purpose-built atomic-write utility sits in the same community
+Strength: Worth exploring
+Files: src/side-finding.js, src/atomic-write.js
+
+Problem:
+`writeSideFindingInbox` in `side-finding.js` writes inbox JSON files with a direct `fs.writeFileSync` call. In the same directory, `atomic-write.js` exports `writeJsonAtomicSync(file, data)` and its header comment describes the exact failure mode it prevents: a crash mid-write producing a truncated, unparseable file. The side-finding inbox is a queue that `side-finding-sweep.js` drains; a truncated JSON file in that queue is a malformed record the sweep must detect and skip. The non-use is defensible—the side-finding write is a create-new-file pattern, so a truncated write loses one optional side-finding rather than corrupting shared state—but that justification is not stated anywhere in `side-finding.js`. A maintainer reading the community sees a purpose-built atomic-write utility and a sibling file that bypasses it, and must re-derive the risk-level difference to decide whether the omission is intentional.
+
+Solution:
+Switch the `fs.writeFileSync` call in `writeSideFindingInbox` to `writeJsonAtomicSync(path.join(dir, name), record)`. The change is one line, the call is already inside a try/catch, and the cost of the extra temp-file-and-rename is negligible for a low-frequency inbox write. This removes the question entirely: the community now uses its own atomic-write utility consistently, and no reader needs to infer why it was skipped.
+
+Benefits:
+A crash mid-write can no longer leave a truncated, unparseable JSON file in the inbox queue, eliminating a class of malformed records that the sweep must detect and skip. The community's use of its own utility is consistent, removing the cognitive overhead for a maintainer who sees `atomic-write.js` next to a file that doesn't use it. The justification no longer needs to be re-derived from first principles each time someone reads the code.
