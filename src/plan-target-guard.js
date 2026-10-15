@@ -35,6 +35,21 @@ const { checkFilePaths } = require('./fact-checker.js');
 // path-grounding.js's own CREATE_MODE_VERBS: a creation verb elsewhere in an unrelated
 // sentence must not blanket-exempt every declared target in the plan.
 const CREATE_FILE_VERBS_RE = /\b(?:create|creates|creating|add(?:s|ing)?\s+a\s+new\s+file|new\s+file\s+(?:at|named)?)\b[^\n]{0,80}$/i;
+// 2026-10-15: design-doc tasks say "write ONE file, Docs/x.md" / "write the single file", not "create", and were blocked as missing-file targets (tuning-loops
+// design and rotation-findings tasks). The phrase must contain the word "file" between the verb and the path: a bare "write to src/x.js" or "write src/x.js back" stays
+// an ordinary edit, not a create signal.
+// The phrase must sit directly against the path (only punctuation/quotes between): "write ONE file, Docs/x.md" yes; "write the file list ... then edit src/x.js" no.
+const WRITE_FILE_PHRASE_RE = /\bwrite\s+(?:(?:the|a|an|one|single|new)\s+)+file[\s,:;(`'"*_-]*$/i;
+const isCreateVerbBefore = (before) => CREATE_FILE_VERBS_RE.test(before) || WRITE_FILE_PHRASE_RE.test(before);
+
+// every occurrence of needle in text, as start indexes (the guard used to look at the first only: 2026-10-15, a plan that quoted the task's "write ONE file" first and said
+// "one file to create" later was blocked because only the first mention was examined)
+function mentionIndexes(text, needle) {
+  const out = [];
+  if (!needle) return out;
+  for (let i = text.indexOf(needle); i !== -1; i = text.indexOf(needle, i + needle.length)) out.push(i);
+  return out;
+}
 
 // Existence-acknowledgment signal (2026-09-18, pipeline hardening -- confirmed live: a
 // task literally titled "Create src/review-parity.test.js" burned 16 real drafting
@@ -55,16 +70,18 @@ const EXISTENCE_ACK_RE = /\b(?:does|do)[\s*_]+not[\s*_]+(?:yet[\s*_]+)?exist\b|\
 // plan words it; the plan-only signals above missed that when the plan named the file by its full path and called it "absent".
 function isDeclaredCreateTarget(planText, targetPath, taskText = '') {
   const text = String(planText || '');
-  const idx = text.indexOf(targetPath);
-  if (idx !== -1) {
+  for (const idx of mentionIndexes(text, targetPath)) {
     const before = text.slice(Math.max(0, idx - 80), idx);
-    if (CREATE_FILE_VERBS_RE.test(before)) return true;
+    if (isCreateVerbBefore(before)) return true;
     const after = text.slice(idx + targetPath.length, idx + targetPath.length + 80);
     if (EXISTENCE_ACK_RE.test(before) || EXISTENCE_ACK_RE.test(after)) return true;
   }
+  // Task text: the broad create-verb window still looks at the FIRST mention only (an unrelated "Create a summary ..., then edit src/x.js" later in the body must not
+  // exempt a fabricated path -- the existing "create verb about a different file" test); the strict write-file phrase is checked at every mention.
   const task = String(taskText || '');
-  const tIdx = task.indexOf(targetPath);
-  return tIdx !== -1 && CREATE_FILE_VERBS_RE.test(task.slice(Math.max(0, tIdx - 80), tIdx));
+  const tIdxs = mentionIndexes(task, targetPath);
+  const win = (i) => task.slice(Math.max(0, i - 80), i);
+  return tIdxs.length > 0 && (CREATE_FILE_VERBS_RE.test(win(tIdxs[0])) || tIdxs.some((i) => WRITE_FILE_PHRASE_RE.test(win(i))));
 }
 
 // (task, planText, repoRoot, extraRoots, existsAtRef) -> { blocked, reason?, missing? }
