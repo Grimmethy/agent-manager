@@ -797,3 +797,29 @@ Extract a single helper, e.g. `_run_build_and_persist(cfg, *, use_model_naming, 
 
 Benefits:
 A single code path owns the build-and-persist contract, so schema changes, atomicity improvements, or new output artefacts are made once. The two call sites become thin wrappers that only differ in their `use_model_naming` source and post-persist side-effects, making the diff surface for future changes smaller and eliminating the class of "I fixed it in `check_due` but forgot `main`" regressions.
+
+### AC-87 · Two unrelated registries co-reside in one module with side-effect registration
+Strength: Strong
+Files: src/deterministic-recheck-registry.js, src/staleness-fastpath.js
+
+Problem:
+`src/deterministic-recheck-registry.js` is named and header-commented as a deterministic staleness-recheck rules registry, yet it also houses a pre-dispatch gate registry that serves a different pipeline stage. The two registries differ in key type (rule-ID string vs. source-name string), value shape (single detector function vs. a config object with nested per-file/repo-wide rule maps), and population strategy (module-load side-effect registration vs. external plugin calls). The sharpest consequence is that requiring the module for the recheck registry—as `staleness-fastpath.js` does—silently registers four pre-dispatch gates as a side effect. A test that calls `clearDeterministicRecheckRegistry()` to obtain a clean slate for recheck rules gets no equivalent clearing for the gate registry, so the auto-registered gates persist invisibly across test runs. A developer adding a new pre-dispatch gate must edit a file whose name and primary purpose describe a different concern, and a developer searching for gate registration has to know it lives inside the "recheck-registry" file.
+
+Solution:
+Extract the pre-dispatch gate registry—including its two built-in detectors and their registration calls—into its own module (e.g. `pre-dispatch-gate-registry.js`). The recheck registry file becomes a pure passive registry with no side effects on require. Each registry gets its own test file that can clear and inspect its own state without the other's interference, and `staleness-fastpath.js` imports from the two modules independently.
+
+Benefits:
+Requiring the recheck registry no longer has hidden side effects, eliminating a class of test-pollution bugs. Each registry is discoverable by its own name, so a developer searching for "where are gates registered?" finds the answer in a file whose name matches the concern. Test isolation becomes straightforward: clearing one registry cannot accidentally leave the other in a stale state. Future contributors can extend either registry without reading or understanding the other's key semantics, value shapes, or population strategy.
+
+### AC-88 · Recheck registry accepts non-function detectors, deferring a context-poor TypeError to call time
+Strength: Strong
+Files: src/deterministic-recheck-registry.js, src/staleness-fastpath.js
+
+Problem:
+`registerPreDispatchGate` in the same file checks `typeof detector !== 'function'` and throws a clear `TypeError` at registration, naming the offending value. `registerDeterministicRecheck` performs no equivalent check on the values inside `perFileRules` or `repoWideRules`. A misconfiguration such as `{ perFileRules: { 'silent-catch-block': 'some-string' } }`—a typo, a wrong import, a config-deserialization bug—registers successfully. The failure surfaces later, inside `staleness-fastpath.js`'s `deterministicRecheck()`, where `detector(text, originalFile)` throws `TypeError: detector is not a function`—an error message that names neither the rule key, the source, nor the registration site, and that occurs deep in a file-read-plus-call sequence that is harder to debug than a registration-time throw.
+
+Solution:
+In `registerDeterministicRecheck`, iterate the keys of `perFileRules` and `repoWideRules` and assert each value is a function, throwing a `TypeError` that names the source, the rule key, and the expected type—mirroring the gate registry's existing validation pattern already present in the same file.
+
+Benefits:
+A misconfiguration is caught immediately at registration with a self-describing error that identifies the source, the rule key, and the expected type, rather than surfacing minutes later as an opaque "not a function" throw buried in a call stack. This converts a deferred, context-poor runtime error into an immediate, actionable registration error, reducing debugging time and preventing a single bad rule from silently corrupting every subsequent recheck pass.
