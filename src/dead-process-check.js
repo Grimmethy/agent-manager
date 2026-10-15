@@ -38,30 +38,8 @@ const { sharedInstancesDir } = require('./instances-dir.js');
 const { laneById } = require('./lanes.js');
 const path = require('path');
 const { getConfig } = require('./config.js');
+const { STALE_HEARTBEAT_SECONDS, WORKER_ZOMBIE_THRESHOLD_SECONDS } = require('./heartbeat-thresholds.js');
 
-const STALE_HEARTBEAT_SECONDS = 300; // 5 min -- comfortably above local-client.js's 4-min REQUEST_TIMEOUT_MS per-call ceiling.
-// worker-only: pid alive but heartbeat stale this long means a hung call, not a slow one.
-// draftTask() (local-draft.js) chains up to 4 sequential localCall()s per task -- plan,
-// implement, critique, and (if critique flags issues) revise -- each individually bounded
-// by local-client.js's REQUEST_TIMEOUT_MS (240s default), with no heartbeat write between
-// passes. Worst case is therefore ~4*240s=960s of legitimate, non-hung work between the
-// "working" heartbeat at claim time and the "idle" heartbeat at completion. The old 300s
-// value only covered a single call and was killing every multi-pass task mid-flight,
-// confirmed live 2026-08-16: worker-1 was SIGKILL'd and restarted by the watchdog roughly
-// every 5 minutes for hours straight, re-starting the same leftover drafting/ tasks from
-// scratch each time (no partial-pass checkpointing) and never completing one.
-// reviewer-only: review-task.js's own single majorityVote() call (n=3 votes) now retries
-// each vote's call() up to maxRetries=1 (2 attempts) after 2026-08-23's fix for a
-// different bug (a single vote's hard failure no longer aborts the whole review -- see
-// local-client.js's own header on that commit). Worst case is therefore up to 3*2=6
-// sequential real network calls, each individually bounded by the same 240s ceiling draft
-// uses, before review-task.js finally reports failure: 6*240s=1440s -- ALREADY above the
-// 1200s value this constant used to be sized to, which would have started zombie-killing
-// a reviewer instance genuinely still working through its own new (and correct) retry
-// budget, the exact same SIGKILL-loop failure mode the comment above documents for
-// draft's own worst case. Sized to the LARGER of the two chains (review's 1440s, not
-// draft's 960s) plus the same 240s slack margin the original value used.
-const WORKER_ZOMBIE_THRESHOLD_SECONDS = 1680; // 28 min -- comfortably above review's real ~1440s worst-case chain (the larger of the two), not a single call.
 // 2026-09-11 (screaminggoatclubmt, "p40 is entirely blocked by ollama timeouts"): paired
 // with local-client.js's P40_PER_CALL_TIMEOUT_CEILING_MS (900s, a deliberate exception to
 // the 2026-07-19 5-minute-ceiling doctrine for this one categorically slower, physically
