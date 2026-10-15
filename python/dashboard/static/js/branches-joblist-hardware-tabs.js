@@ -379,6 +379,7 @@ async function renderJobListTab() {
   try {
     pipelineMap = await fetchJson('/api/pipeline-map');
   } catch (e) {
+    console.error('[pipeline-map] fetch failed:', e);
     pipelineMap = null;
   }
   const activeByName = {};
