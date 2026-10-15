@@ -1083,3 +1083,16 @@ When `nvidia-smi` is not found or fails to execute, emit an explicit `stderr` wa
 
 Benefits:
 Operators immediately see in their logs that the guard is inert and why, turning a silent failure into an actionable diagnostic. The injected-reader seam makes the guard portable to AMD/ROCm or virtualized-GPU environments without forking the codebase, and the secondary-path lookup reduces false negatives on systems where `nvidia-smi` exists but sits outside the default `PATH`.
+
+### AC-110 · Redundant per-branch git subprocesses and repeated JSON I/O in verdict enrichment
+Strength: Strong
+Files: python/dashboard/branch_verdicts.py
+
+Problem:
+The `enrich_branches_with_verdicts` function iterates over every branch and, for each one, calls `_git_out(run_git, ["rev-parse", f"origin/{branch}"], repo_root)` to obtain the head SHA, then immediately calls `run_deterministic_checks` which internally executes multiple additional git commands (e.g., `cherry`, `diff`, `merge-tree`). When a deterministic verdict is written or cleared, it also calls `save_verdicts` and `load_verdicts`, which read and write the entire `branch-verdicts.json` file to disk. This results in O(N) git subprocess spawns and O(N) full-file JSON read/write cycles for a list of N branches, creating a significant performance bottleneck and unnecessary I/O churn for what is a read-heavy dashboard operation.
+
+Solution:
+Refactor the function to batch the git operations where possible (e.g., using `git for-each-ref` to retrieve all head SHAs in a single call) and batch the verdict persistence. Instead of saving and reloading the JSON file for every single branch, the function should accumulate all verdict changes in memory and perform a single `save_verdicts` call at the end of the loop. This reduces the number of git subprocesses and disk I/O operations from O(N) to O(1) for the persistence layer.
+
+Benefits:
+Reducing per-branch subprocess spawning and full-file JSON I/O to a single batched operation dramatically cuts wall-clock time for dashboard loads that touch many branches, eliminates unnecessary disk churn that can contend with other processes, and simplifies the persistence path by making it a single atomic write rather than N interleaved read-modify-write cycles.
