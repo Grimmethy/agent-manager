@@ -161,7 +161,10 @@ def _assign_brain_dump_serials(entries: list) -> bool:
     missing = [e for e in entries if isinstance(e, dict) and not e.get("serial")]
     if not missing:
         return False
-    next_serial = max((e.get("serial") or 0) for e in entries if isinstance(e, dict)) + 1 if entries else 1
+    # Lazy import: app.py re-exports this module, so a top-level `from app import ...`
+    # here would be circular.
+    from app import _coerce_serial
+    next_serial = max((_coerce_serial(e.get("serial")) for e in entries if isinstance(e, dict)), default=0) + 1
     for e in sorted(missing, key=lambda e: e.get("capturedAt") or ""):
         e["serial"] = next_serial
         next_serial += 1
