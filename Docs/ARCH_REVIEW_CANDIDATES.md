@@ -903,3 +903,31 @@ Add the four dependencies as explicit parameters (or a single context object) to
 
 Benefits:
 The test suite can cover the DOM-integration path, catching regressions in the wiring logic. A rename or removal of any of the four globals in the hot file becomes a test-time error (the test's mock no longer matches the expected shape, or the hot file's call site fails to compile/lint) rather than a silent runtime `ReferenceError`. The module's public surface (the exported pure functions) and its actual runtime dependencies (the four globals) align, removing the one place where they currently diverge.
+
+### AC-98 · Hard-coded concept IDs in the generic card renderer
+Strength: Strong
+Files: python/dashboard/static/js/concepts-and-adhoc-tab.js
+
+Problem:
+The `renderConceptCard` function embeds two hard-coded string literals (`'concept-ghost-in-the-machine-0dbeea'` and `'concept-adhoc-task-lifecycle-64935e'`) to conditionally inject specialized UI panels (ghost telemetry and a static lifecycle flowchart) into specific concept cards. This tightly couples the generic rendering path to particular database records and violates locality: any new concept that requires a specialized panel forces a modification to this core function, and if the underlying concept is renamed or its ID changes in the database, the UI panel silently disappears with no error or warning. The rendering logic is no longer data-driven; it is a lookup table of specific IDs hidden inside a function that is supposed to be generic.
+
+Solution:
+Extract the hard-coded IDs and their associated HTML-generation code into a separate configuration object (or a dedicated "specialized panels" module) that maps concept IDs to a panel-rendering function. `renderConceptCard` then simply looks up the concept ID in that configuration and, if a match exists, invokes the corresponding panel renderer and appends the result. Adding a new specialized view becomes a matter of adding one entry to the configuration (or one new module file) without touching the core rendering logic at all.
+
+Benefits:
+The generic card renderer becomes truly generic and testable in isolation. New specialized panels can be added or removed without modifying shared code, eliminating the risk of a silent UI regression when a concept ID changes. The configuration object serves as a single, auditable registry of which concepts receive custom treatment, making the coupling explicit and discoverable rather than buried in conditional branches.
+
+### AC-99 · Implicit global-function dependencies break isolated testing
+Strength: Strong
+Files: python/dashboard/static/js/concepts-and-adhoc-tab.js, python/dashboard/static/js/concepts-and-adhoc-tab.test.js
+
+Problem:
+`renderConceptCard` calls `escapeHtml`, `escapeAttr`, and `renderReportMarkdown`, which are defined in other files (`core-ui.js`, `analytics-and-discovery.js`) and injected into the browser's global scope. Because these utilities are neither imported nor exported through the module system, the test file must manually stub them onto the `global` object before requiring the module under test. This creates a fragile dependency chain: the test relies on the exact names and signatures of functions defined in unrelated files, the module cannot be exercised in isolation, and any rename or signature change in the source file silently breaks the test with no compile-time or import-time signal.
+
+Solution:
+Refactor `concepts-and-adhoc-tab.js` to accept the required utilities (`escapeHtml`, `escapeAttr`, `renderReportMarkdown`) via dependency injection (e.g., a factory function or an initialization method that accepts a context object containing these functions). In the browser, the global instances are passed in during initialization. In the test file, the module can be initialized with mock functions directly, removing the need to pollute the global object. This preserves the browser's global scope architecture while making the module's dependencies explicit and testable in isolation.
+
+Benefits:
+The module's dependencies are explicit and self-documenting; a reader sees exactly which external functions it relies on. Tests become deterministic and isolated—mocking injected functions is straightforward, and no global-state cleanup is needed. Renaming or removing a utility in the source file will surface as a clear error during initialization or test setup rather than a silent `undefined is not a function` at runtime, catching integration drift at test time rather than in the browser.
+
+NOTE: The flag regarding AC-002 was applied; the solution was corrected to use dependency injection instead of CommonJS `require` to respect the browser global scope constraint.
