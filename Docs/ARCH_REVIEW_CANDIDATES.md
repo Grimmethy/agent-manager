@@ -836,3 +836,16 @@ Extract a single helper, e.g. `_run_build_and_persist(cfg, *, use_model_naming, 
 
 Benefits:
 A single code path owns the build-and-persist contract, so schema changes, atomicity improvements, or new output artefacts are made once. The two call sites become thin wrappers that only differ in their `use_model_naming` source and post-persist side-effects, making the diff surface for future changes smaller and eliminating the class of "I fixed it in `check_due` but forgot `main`" regressions.
+
+### AC-90 · Extract shared source-file detection regex into a single module
+Strength: Strong
+Files: src/review-inert.js, src/review-skip-paths.js
+
+Problem:
+Both `src/review-inert.js` and `src/review-skip-paths.js` independently define a local `SOURCE_RE` regular expression (currently `/\.js|\.mjs|\.cjs|\.py$/`) to decide which files count as source code. Because the pattern is copy-pasted rather than imported from a shared location, any future change—adding TypeScript (`.ts`/`.tsx`), supporting `.rb` or `.go`, or tightening the anchor—must be made in two places. A developer who updates one file and overlooks the other will cause the two review detectors to silently classify different sets of files as "source," producing inconsistent review output that is difficult to diagnose because neither file logs a mismatch.
+
+Solution:
+Create a small shared module (e.g. `src/source-file-pattern.js`) that exports the canonical `SOURCE_RE` (and, if useful, a `isSourceFile(path)` helper). Replace the local regex definitions in `src/review-inert.js` and `src/review-skip-paths.js` with an import from that module. Add a unit test that asserts both consumers resolve to the same pattern, so any accidental re-introduction of a local copy is caught at CI time.
+
+Benefits:
+A single source of truth for "what counts as source code" eliminates the class of silent-divergence bugs entirely. Adding a new language or adjusting extension rules becomes a one-line change in one file. The shared test gives immediate feedback if a future refactor accidentally re-introduces a second copy, and the codebase becomes easier to audit because the definition lives in one discoverable location rather than being scattered across detectors.
