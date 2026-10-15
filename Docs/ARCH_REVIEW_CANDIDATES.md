@@ -1168,3 +1168,16 @@ Benefits:
 Each task's history persistence becomes independently testable and swappable without side effects on other tasks. Visible, structured failure reporting turns a silent data-loss path into a diagnosable, recoverable event, and the task-scoped API removes the need for callers to inspect the `task` object to figure out which entry the hook is handling.
 
 NOTE: The critique's flag on AC-003 was applied — I removed the invented concurrency/race-condition framing (rapid-succession firing, "second invocation overwrites the first," inability to distinguish tasks) and re-grounded the finding in the code-supported points: the swallowed-hook-error visibility issue and the lack of per-task scoping.
+
+### AC-116 · `concepts.js` re-implements a load/validate/write persistence trio that the codebase already standardizes on a shared atomic-write helper
+Strength: Worth exploring
+Files: src/concepts.js
+
+Problem:
+`concepts.js` owns a three-function persistence layer — `conceptsPath()`, `loadConcepts()`, `writeConcepts()` — that re-implements, file-by-file, a pattern the project has already converged on elsewhere. `loadConcepts` is explicitly documented as mirroring `apply-group-a.js`'s `loadBrainDump` ("never let a missing/corrupt file break a caller"), and `writeConcepts` already delegates to the shared `./atomic-write.js` (`writeJsonAtomicSync`). The result is that the *load* side (exists-check → `JSON.parse` → `catch` → `console.error` → shape-normalize → empty-fallback) is duplicated per registry file, while the *write* side is already shared. The two halves of the same persistence contract therefore live at different levels of abstraction: writes go through a shared helper, reads do not. Each new JSON registry (concepts, brain-dump, and any future one) must re-derive the identical "safe load + shape guard" logic, and a fix to the read contract (adding a schema-version field, changing the fallback shape, tightening the `console.error` message) must be made in every file that carries its own copy — the exact "fixed it in one, forgot the other" divergence the codebase has already worked to eliminate for the write path.
+
+Solution:
+Extract the read-side contract into a small shared helper (e.g. `src/json-store.js`) that pairs with the existing `atomic-write.js`, exposing something like `loadJsonStore(filePath, { fallbackShape })` that encapsulates the exists-check, `JSON.parse`, the `catch` + `console.error` fallback, and the shape-normalization (null / object / array guards). `concepts.js`'s `loadConcepts` then becomes a thin wrapper that calls the helper with `conceptsPath(pipelineDir)` and the `{ concepts: [] }` fallback, while `writeConcepts` continues to call `writeJsonAtomicSync`. Other registry loaders (e.g. `apply-group-a.js`'s `loadBrainDump`) can adopt the same helper so the "safe load" behavior is defined once.
+
+Benefits:
+The load contract (fallback shape, error message, shape guards) is defined in one place and cannot drift between registry files; a future schema or fallback change is a one-line edit in the shared helper rather than an N-file sweep. It also makes the load/write symmetry explicit — both now route through shared modules — which is the same property the codebase already relies on for writes, so the persistence story for any JSON registry becomes uniform.
