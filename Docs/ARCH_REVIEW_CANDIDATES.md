@@ -931,3 +931,36 @@ Benefits:
 The module's dependencies are explicit and self-documenting; a reader sees exactly which external functions it relies on. Tests become deterministic and isolated—mocking injected functions is straightforward, and no global-state cleanup is needed. Renaming or removing a utility in the source file will surface as a clear error during initialization or test setup rather than a silent `undefined is not a function` at runtime, catching integration drift at test time rather than in the browser.
 
 NOTE: The flag regarding AC-002 was applied; the solution was corrected to use dependency injection instead of CommonJS `require` to respect the browser global scope constraint.
+
+### AC-100 · Merge conflates "ours never had this slot" with "ours deleted this slot"
+Strength: Strong
+Files: src/candidates-doc-merge.js
+
+Problem:
+In the theirs-walk branch of `mergeCandidatesDoc`, the guard `!ours.blocks.has(id)` is intended to mean "ours never touched this slot, so apply theirs' version." However, that same condition is true when ours *deleted* a block that the ancestor contained. In that case the code unconditionally sets `finalBlocks.set(id, theirsBlock)`, resurrecting a block that ours intentionally removed. The dedicated DELETIONS pass at the bottom of the function only fires when `theirs.blocks.has(id)` is false (i.e., theirs deleted it), which is the opposite scenario. The result is that the merge is not a true three-way merge for the "ours deleted + theirs edited/added the same slot" case: it silently violates the function's own stated intent of honoring ours' deletions and never silently dropping content someone changed. The defect is currently latent because the test suite has no case where ours deletes a slot that theirs also modifies, and the live nine-branch collision scenario is a same-slot edit, not a delete-vs-edit.
+
+Solution:
+Distinguish "ours never had this slot" from "ours deleted this slot" by consulting the ancestor map. In the theirs-walk branch, split the `!ours.blocks.has(id)` path into two sub-cases:
+
+1. **Clean-apply (theirs added a genuinely new slot):** `!ours.blocks.has(id) && !ancestor.blocks.has(id)`. Neither ours nor the ancestor had this id, so theirs introduced it. Apply theirs' block as before.
+
+2. **Delete-vs-edit conflict:** `!ours.blocks.has(id) && ancestor.blocks.has(id)`. The ancestor had the slot, ours removed it, and theirs still has it (either edited or retained). This is a true three-way conflict: both sides changed the slot in incompatible ways (ours deleted, theirs kept/edited). The correct resolution, consistent with the function's contract of degrading to git's conflict-marker behavior on ambiguity, is to **emit a conflict marker** for this id in the output. Specifically:
+   - Do **not** silently insert theirs' block (that resurrects a deletion).
+   - Do **not** silently skip the slot (that discards theirs' edit, violating the "never silently drop content someone changed" invariant).
+   - Instead, write a `<<<<<<< ours` / `=======` / `>>>>>>> theirs` block (or the equivalent structural conflict marker the function already uses for same-slot edit conflicts) that shows ours' side as empty (deleted) and theirs' side as their current content, so a human can decide.
+   - Log a warning to stderr naming the conflicting id.
+
+3. **Both-deleted (no conflict):** `!ours.blocks.has(id) && ancestor.blocks.has(id) && !theirs.blocks.has(id)`. Both sides removed the slot. Leave it out of `finalBlocks` with no marker. (This case is already handled by the existing DELETIONS pass, but make the interaction explicit.)
+
+Add two test cases:
+- **Delete-vs-edit:** Ancestor contains `### AC-3` with content X. Ours removes `### AC-3` entirely. Theirs edits `### AC-3` to content Y. Assert the merged output contains a conflict marker for AC-3 (not a clean application of Y, not a silent absence).
+- **Both-deleted:** Ancestor contains `### AC-3`. Both ours and theirs remove it. Assert AC-3 is absent from the output and no conflict marker is emitted.
+
+Benefits:
+The merge becomes a correct three-way reconciliation for the delete-vs-edit case. The function's stated invariant ("a block ours edited is kept; never silently drop content someone changed") is now symmetric: deletions are honored *without* silently discarding the other side's edits. The conflict-marker path is the same degradation mechanism the function already uses for same-slot edit conflicts, so the behavior is consistent and predictable. Future contributors can rely on the merge to surface delete-vs-edit conflicts for human resolution rather than silently choosing one side.
+
+---
+
+*AC-002 removed.*
+
+NOTE: AC-002 was removed because the critique correctly identifies that (a) the draft's description of the failure mode is factually wrong — the actual behavior is last-wins in the Map with the `order` array carrying the duplicate, not "the merge sees the slot as untouched" — and (b) the prescribed fix (throw on duplicate id) would be a behavioral regression for the live nine-branch collision scenario where the structural merge must reconcile independently-written same-id content rather than refuse to resolve.
