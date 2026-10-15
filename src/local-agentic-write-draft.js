@@ -34,6 +34,7 @@ const { priorVerdictBlock } = require('./lib/prompt-blocks.js');
 const { detectContradictoryLiteralAcceptance } = require('./acceptance-criteria.js');
 const { detectStaleDecomposePremise } = require('./decompose-premise-check.js');
 const { runDecomposePassIfAvailable } = require('./decompose-pass-route.js');
+const { deterministicPlanSplit, repairEnabled } = require('./plan-step-split.js');
 const { oversizedFiles } = require('./file-length-flags-reader.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
@@ -523,30 +524,52 @@ function partialDiffFallbackPrompt(prompt, task, info) {
   return `${prompt}\n\nCORRECTION: any note above saying a prior pass's edits are already applied does NOT hold for this run -- they could not be applied automatically. Re-apply them yourself, from this diff, then finish the remaining work:\n\n${task.priorPartialDiff.slice(0, 6000)}\n`;
 }
 
+// The block reason agentic-draft-common.js's resolveDecomposeZero gives a pass that said "decompose" and produced no
+// usable sub-task JSON. Matched here (not a flag) so only that exact first-miss shape triggers the early split.
+const NO_JSON_DECOMPOSE_MISS_RE = /no valid JSON array of \{title, rawText\} sub-tasks/;
+
 async function runGiveUpSplit(task, verdict) {
   const autoN = Number(task.autoDecomposeCount) || 0;
   const repeatedDecompose = (Number(task.decomposeBlockCount) || 0) >= 2;
+  // First-miss repair (2026-10-15): the FIRST "decompose, no usable JSON" pass (no partial-edit continuation chosen) used to
+  // be requeued for a whole second agentic pass (~5 min) plus the requeue wait (~17 min observed) before this split ran.
+  // Run the same single-call split now. AGENT_MANAGER_DECOMPOSE_REPAIR=off restores the old two-miss behaviour.
+  const noJsonMiss = repairEnabled()
+    && (Number(task.decomposeBlockCount) || 0) >= 1
+    && !task.isAgenticContinuation
+    && NO_JSON_DECOMPOSE_MISS_RE.test(String((verdict && verdict.blockedReason) || ''));
   const gaveUp = verdict.blocked || verdict.needsClarification;
   // A file-decompose child is already a single verbatim move -- splitting it again just
   // produces a hub of one sub-task and loops. If it can't land, it needs a human, not
   // another decompose pass.
-  if (task.atomic || !gaveUp || !(task.turnBudgetExhausted || repeatedDecompose) || autoN >= MAX_AUTO_DECOMPOSE) {
+  if (task.atomic || !gaveUp || !(task.turnBudgetExhausted || repeatedDecompose || noJsonMiss) || autoN >= MAX_AUTO_DECOMPOSE) {
     return null;
   }
   const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
-  const split = await runDecomposePassIfAvailable(task, {
+  let split = await runDecomposePassIfAvailable(task, {
     mode,
     priorAttemptBlock: priorAttemptAnalysisBlock(task),
   });
+  // Deterministic fallback for the "said decompose, gave nothing" shapes: split the task's own numbered plan steps when the
+  // single-call pass produced nothing usable. Never for a turn-budget exhaustion (that path is unchanged).
+  let splitSource = 'decompose-pass';
+  if ((!split || split.subTasks.length < 2) && !task.turnBudgetExhausted && (repeatedDecompose || noJsonMiss) && repairEnabled()) {
+    const mechanical = deterministicPlanSplit(task);
+    if (mechanical) { split = mechanical; splitSource = 'plan-steps'; }
+  }
   if (!split || split.subTasks.length < 2) return null;
 
   task.autoDecomposeCount = autoN + 1;
+  if (splitSource === 'plan-steps') task.autoDecomposeSource = 'plan-steps';
   task.adhocResolution = 'decompose';
   task.subTaskProposals = split.subTasks;
   task.rawDiff = '';
   const why = task.turnBudgetExhausted
     ? 'a turn-budget-exhausted implement pass'
-    : 'two implement passes that both chose RESOLUTION: decompose without usable pieces';
+    : (repeatedDecompose
+      ? 'two implement passes that both chose RESOLUTION: decompose without usable pieces'
+      : 'an implement pass that chose RESOLUTION: decompose without usable pieces')
+      + (splitSource === 'plan-steps' ? ', split mechanically from the plan\'s numbered steps' : '');
   task.implementResponse = `Auto-decomposed after ${why} (${split.subTasks.length} pieces).\n\n${verdict.blockedReason || ''}\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
   delete task.turnBudgetExhausted;
   delete task.retryableDraftBlock;
