@@ -1290,3 +1290,42 @@ The proposed `registerDomainResolver` hook would add an indirection layer for a 
 ---
 
 **No valid architecture findings remain after review.**
+
+### AC-124 · Duplicated Git invocation bypasses the module's own centralization helper
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The module header in `src/stacked-grounding.js` explicitly states its intent to be "that one place" for Git interactions so the logic "only needs to be gotten right once." Yet the `resolveAtRef` function bypasses the local `runGit` helper and calls `execFileSync` directly. While it correctly references the same shared `GIT_ENV` and `GIT_TIMEOUT_MS` constants, it does so to add a `maxBuffer` option that `runGit` does not currently support. The practical consequence is that `resolveAtRef` sits outside `runGit`'s error-handling wrapper, logging, and any future refinements (e.g., retry logic, structured error capture). A developer who updates `runGit` to add such behavior will not be prompted to update the inline `execFileSync` call in `resolveAtRef`, creating silent drift between the two code paths for everything beyond the shared constants.
+
+Solution:
+Extend `runGit` to accept an optional options parameter (e.g., `{ maxBuffer }`) that it forwards to `execFileSync`, then refactor `resolveAtRef` to call `runGit` with that option instead of invoking `execFileSync` directly. Remove the duplicated inline `execFileSync` call entirely. Because `runGit` already accepts `args` and `cwd` as parameters, the only change needed to the helper is threading the additional `maxBuffer` (or a general options bag) through to the `execFileSync` call.
+
+Benefits:
+A single code path governs all Git subprocess invocations in the module, so error-handling refinements, logging, or timeout tuning are made in exactly one place. The module's header promise of a single point of correction becomes true, reducing the risk of one call site silently behaving differently from the other under edge conditions such as a hung credential prompt, an oversized tree listing, or a slow remote.
+
+### AC-125 · Side-effect import creates a hidden load-order dependency in the apply pipeline
+Strength: Worth exploring
+Files: src/lib/apply-core.js, src/task-sources.js, src/task-source-registry.js
+
+Problem:
+`src/lib/apply-core.js` contains a bare `require('../task-sources.js')` with no assignment, relying on the side effect of that module registering sources into the registry managed by `src/task-source-registry.js`. The `usesGroupB` function in `apply-core.js` then calls `getRegisteredSource` to decide the apply strategy, but the registration that makes that lookup succeed is invisible in the destructured import list. If the registration mechanism is restructured—for example, if `task-sources.js` is split and the self-registering code moves to a different entry point, or if the module is refactored to export a registration function instead of auto-registering on import—`apply-core.js` will still load successfully (the file exists, the `require` resolves), but `getRegisteredSource` will return `undefined` and the pipeline will fail with a confusing "source not found" runtime error. Because the dependency is not expressed as a named import, a developer refactoring the registration mechanism has no compiler- or linter-visible signal that `apply-core.js` depends on the side effect.
+
+Solution:
+Replace the bare side-effect import with an explicit registration call. Have `task-sources.js` export a `registerAllSources()` function that `apply-core.js` calls directly (e.g., `const { registerAllSources } = require('../task-sources.js'); registerAllSources();`), or have `apply-core.js` import the specific source objects it needs and pass them to `getRegisteredSource`. This makes the dependency visible in the import graph: a rename, split, or removal of the registration function produces an immediate, locatable "named export missing" or "module not found" error at load time rather than a silent runtime lookup failure.
+
+Benefits:
+The dependency between the apply strategy selection and the source registration becomes explicit and enforceable by the module system. Refactoring `task-sources.js` will surface a clear error at load time, dramatically shortening the debugging cycle. The hidden load-order assumption is eliminated, so the pipeline is robust to changes in the order in which modules are required by the parent process.
+
+### AC-126 · History persistence is opt-in but the primary pipeline stages do not opt in
+Strength: Worth exploring
+Files: src/task-history.js, src/task-sources.js, src/apply-task.js, src/reject-retry-check.js
+
+Problem:
+`src/task-history.js` provides an `appendHistoryEvent` function that mutates the in-memory `task.history` array and then calls an optional `persistHook` if one has been registered via `setHistoryPersistHook`. The module's own comments acknowledge that `task-sources.js`, `apply-task.js`, and `reject-retry-check.js` do not register this hook. As a result, for the majority of stage transitions in the pipeline, history entries exist only in memory until the parent process eventually serializes the whole task object. If a worker process crashes between a stage transition and the parent's serialization, those history entries are lost. The persistence mechanism is therefore "best-effort" in name but effectively absent for the stages that matter most, creating inconsistent data durability across the pipeline.
+
+Solution:
+Either (a) make `persistHook` mandatory by having `appendHistoryEvent` throw or log a warning when no hook is registered, forcing every consumer to explicitly acknowledge the persistence contract; or (b) provide a default hook that appends each event to a per-task append-only log file, so that even consumers that never call `setHistoryPersistHook` get a durable record. In either case, update `task-sources.js`, `apply-task.js`, and `reject-retry-check.js` to register the hook (or benefit from the default) so that every stage transition is durably recorded at the moment it occurs rather than deferred to a later bulk serialization.
+
+Benefits:
+History durability becomes uniform across all pipeline stages, eliminating the split-brain window where a crash mid-draft or mid-review silently discards stage-transition records. Operators and debugging tools can rely on the history log being complete up to the last committed stage, regardless of which worker process was executing. The persistence contract shifts from "opt-in but nobody opts in" to a guaranteed invariant, simplifying reasoning about data-loss scenarios.
