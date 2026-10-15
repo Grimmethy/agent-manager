@@ -119,6 +119,7 @@ about," verified to still exist as of this writing.
 
 **Resource guards (GPU / host RAM)**
 - `src/gpu-guard.js` — per-tick VRAM headroom check; ComfyUI `/free`, PromptForge `comfyui-lease` yield.
+- `scripts/tailnet-gateway.js` — owner-only TCP forwarding from this machine's Tailscale address to the loopback-only dashboard and plugin ports (whole platform from a phone on the tailnet). Asks `tailscale whois` who each caller is and refuses everyone but `AGENT_MANAGER_TAILNET_OWNERS`; fails closed. The dashboard trusts loopback as the owner and `tailscale serve` proxies from loopback, so serve alone is token-less. See `docs/agents/tailnet-gateway.md`; tests in `scripts/tailnet-gateway.test.js`.
 - `src/mem-guard.js` — per-tick host-RAM/swap check (`MemAvailable`, `SwapFree`); asks ComfyUI to unload, exits 3 on remaining pressure. `mem_pressure_high` in `scripts/agent-manager-common.sh` makes `local-worker.sh`/`review-runner.sh` yield the tick. Thresholds: `AGENT_MANAGER_MIN_AVAILABLE_RAM_MB` (2048), `AGENT_MANAGER_MIN_SWAP_FREE_MB` (512). Added after the 2026-10-12 OOM freeze.
 
 **Concept tracking**
