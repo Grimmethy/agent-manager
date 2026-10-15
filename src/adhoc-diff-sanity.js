@@ -507,7 +507,8 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // path. Only falls back to CODE_SIGNAL_RE's blind scan when no Files: line exists.
   const nonDoc = files.filter((f) => !isDocPath(f.path));
   if (nonDoc.length === 0) {
-    if (taskWantsCodeFromText(rawText, combined)) {
+    const explicitDocCreation = /\bcreat\w*\b/i.test(rawText) && (rawText.includes('docs/') || /\.md\b/.test(rawText));
+    if (taskWantsCodeFromText(rawText, combined) && !explicitDocCreation) {
       return {
         code: 'docs-only',
         reason: `diff only touches documentation (${files.map((f) => f.path).join(', ')}) -- the task asks for a code change`,
