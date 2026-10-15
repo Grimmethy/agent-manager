@@ -1268,3 +1268,25 @@ Strength: Strong
 ---
 
 **Summary:** Both candidates in the original draft are retracted. No actionable findings remain in this revision.
+
+### AC-122 · ~~`registerTaskSource` diverges caller-visible config from registry-internal state~~
+Strength: Strong
+
+**Status: Withdrawn after review.**
+
+The original draft claimed a "hidden fork in state" between caller and registry because the local `config` binding is reassigned to a new object. This is incorrect. `registerTaskSource` explicitly returns the stored entry (`return registry[name] = { name, ...config };`), and the JSDoc documents `@returns {object} The stored entry`. Any caller following the documented contract receives the exact wrapped object the registry uses internally. There is no divergence for callers who use the return value.
+
+Furthermore, the original draft's proposed alternative—mutating the caller's object in place (`config.next = wrappedNext`)—would introduce a dangerous shared-reference side-effect that the current code deliberately avoids by constructing a fresh object. The existing design is the safer choice.
+
+### AC-123 · ~~`resolveSourceName` centralises domain-to-source mapping knowledge~~
+Strength: Strong
+
+**Status: Withdrawn after review.**
+
+The original draft framed the hardcoded `'adhoc'` / `'secondbrain'` branches as an open/closed violation. However, the JSDoc for `resolveSourceName` explicitly documents the design intent: *"A consumer with its own non-matching source … extends this by wrapping its own call sites rather than this function needing to know every consumer's naming quirks."* The hardcoded branches exist solely for the package's own internal domains, not for external plugins. Out-of-tree consumers already have the `registerSourceAlias` mechanism to declare their own mappings without touching core.
+
+The proposed `registerDomainResolver` hook would add an indirection layer for a problem the code already handles through its documented extension point, and would contradict the module's stated design rationale. This is a stylistic preference, not a defect.
+
+---
+
+**No valid architecture findings remain after review.**
