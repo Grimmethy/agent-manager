@@ -890,3 +890,16 @@ Extract the four-condition check into a small named predicate (e.g. `isValidEnab
 
 Benefits:
 "Change the entry contract" goes from "edit two files and hope they stay in sync" to "edit one file." The intent of the check is named at the call site, making the manifest-entry contract visible to readers of `resolve-plugin-root.js` without them having to mentally diff two inline boolean expressions. The existing tests already cover the back-compat fallback path, so the refactor is low-risk and immediately verified.
+
+### AC-97 · DOM-integration functions depend on invisible globals, making them untestable in isolation
+Strength: Worth exploring
+Files: python/dashboard/static/js/branches-joblist-hardware-tabs.js
+
+Problem:
+`renderBranchListInto` and `wireBranchVerdictFilterBar` reference four identifiers—`branchCardHtml`, `wireBranchCard`, `currentBranches`, `currentHeldHubs`—that are neither imported, declared, nor passed as parameters. They are expected to exist as globals provided by `branches-joblist-hardware-tabs.js` at call time. The comment in the code acknowledges this is deliberate (keeping the hot file lean), and the `module.exports` line correctly omits the two DOM functions, confirming they are browser-only. The concrete friction: the test file can only exercise the pure helpers. The two functions that actually wire the UI together are structurally untestable in isolation because their contract depends on four names that live in another file's global scope. A rename or removal in the hot file produces a `ReferenceError` at runtime with no import-graph signal, no lint warning, and no test failure. The dependency is real but invisible to any tooling that follows the module boundary.
+
+Solution:
+Add the four dependencies as explicit parameters (or a single context object) to the signatures of `renderBranchListInto` and `wireBranchVerdictFilterBar`. In production, `branches-joblist-hardware-tabs.js` passes its own values at the call site, exactly as it would have read them from the global scope before. In the test file, the test author calls the same two functions directly, supplying stub or mock values for each of the four parameters—no global setup, no dependency on the hot file being loaded. Because the parameters are part of the function's public signature, the test file is the entity that controls what those four names resolve to, and it can do so independently of any other module.
+
+Benefits:
+The test suite can cover the DOM-integration path, catching regressions in the wiring logic. A rename or removal of any of the four globals in the hot file becomes a test-time error (the test's mock no longer matches the expected shape, or the hot file's call site fails to compile/lint) rather than a silent runtime `ReferenceError`. The module's public surface (the exported pure functions) and its actual runtime dependencies (the four globals) align, removing the one place where they currently diverge.
