@@ -560,6 +560,99 @@ test('write tier: backstop runs the deterministic split when a decomposeBlockCou
   });
 });
 
+// First-miss repair (2026-10-15): the FIRST "decompose, no usable JSON" pass is split in the same draft attempt instead of being
+// requeued for a whole second agentic pass. decomposeBlockCount is 1 here because resolveDecomposeZero (agentic-draft-common.js) has
+// already counted the miss when the verdict reaches runGiveUpSplit.
+const NO_JSON_MISS = 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it';
+const NUMBERED_PLAN = 'PLAN\n1. Create the helper in src/a.js.\n2. Wire it into src/b.js.\n3. Add tests.\n\nCRITERIA:\n- done';
+
+async function firstMissRun(taskOverrides, { runner, env } = {}) {
+  return withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    const prevEnv = process.env.AGENT_MANAGER_DECOMPOSE_REPAIR;
+    if (env === 'off') process.env.AGENT_MANAGER_DECOMPOSE_REPAIR = 'off'; else delete process.env.AGENT_MANAGER_DECOMPOSE_REPAIR;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: true, blockedReason: NO_JSON_MISS });
+    setDecomposePassRunner(runner === undefined ? null : runner);
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'fm', source: 'manual', title: 'Parent', decomposeBlockCount: 1, promptContext: { rawText: 'big multi-part thing' }, ...taskOverrides };
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+      return { res, task };
+    } finally {
+      adc.runAgenticDraftInWorktree = realRun;
+      setDecomposePassRunner(null);
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_REPAIR; else process.env.AGENT_MANAGER_DECOMPOSE_REPAIR = prevEnv;
+    }
+  });
+}
+
+const TWO_PIECES = { runDecomposePass: async () => ({ subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] }) };
+
+test('write tier: a FIRST no-JSON decompose miss runs the single-call split in the same attempt (no requeue)', async () => {
+  const { res, task } = await firstMissRun({}, { runner: TWO_PIECES });
+  assert.equal(res.resolution, 'decompose');
+  assert.equal(task.adhocResolution, 'decompose');
+  assert.equal(task.subTaskProposals.length, 2);
+  assert.equal(task.autoDecomposeCount, 1);
+  assert.equal(task.autoDecomposeSource, undefined, 'the decompose pass, not the mechanical split, produced these');
+});
+
+test('write tier: first miss where the decompose pass returns nothing falls back to the plan\'s numbered steps', async () => {
+  const { res, task } = await firstMissRun({ planResponse: NUMBERED_PLAN }, { runner: { runDecomposePass: async () => null } });
+  assert.equal(res.resolution, 'decompose');
+  assert.equal(task.subTaskProposals.length, 3);
+  assert.equal(task.subTaskProposals[1].after, 0);
+  assert.equal(task.autoDecomposeSource, 'plan-steps');
+  assert.match(task.implementResponse, /split mechanically from the plan's numbered steps/);
+});
+
+test('write tier: first miss with the decompose plugin absent also uses the plan steps', async () => {
+  const { res, task } = await firstMissRun({ lastGoodPlan: NUMBERED_PLAN }, { runner: null });
+  assert.equal(res.resolution, 'decompose');
+  assert.equal(task.autoDecomposeSource, 'plan-steps');
+});
+
+test('write tier: first miss with no usable plan keeps the blocked verdict', async () => {
+  const { res, task } = await firstMissRun({}, { runner: { runDecomposePass: async () => null } });
+  assert.equal(res.blocked, true);
+  assert.equal(res.blockedReason, NO_JSON_MISS);
+  assert.equal(task.adhocResolution, undefined);
+  assert.equal(task.subTaskProposals, undefined);
+});
+
+test('write tier: a first miss that was chosen as a partial-edit continuation is NOT split', async () => {
+  const { res, task } = await firstMissRun({ isAgenticContinuation: true, planResponse: NUMBERED_PLAN }, { runner: TWO_PIECES });
+  assert.equal(res.blocked, true);
+  assert.equal(task.subTaskProposals, undefined);
+});
+
+test('write tier: AGENT_MANAGER_DECOMPOSE_REPAIR=off restores the two-miss behaviour at the first miss', async () => {
+  const { res, task } = await firstMissRun({ planResponse: NUMBERED_PLAN }, { runner: TWO_PIECES, env: 'off' });
+  assert.equal(res.blocked, true);
+  assert.equal(task.subTaskProposals, undefined);
+  assert.equal(task.autoDecomposeCount, undefined);
+});
+
+test('write tier: a different block reason at decomposeBlockCount 1 is NOT split', async () => {
+  const { res } = await withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass' });
+    setDecomposePassRunner(TWO_PIECES);
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'dr', source: 'manual', decomposeBlockCount: 1, planResponse: NUMBERED_PLAN, promptContext: { rawText: 'x' } };
+      return { res: await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) }) };
+    } finally { adc.runAgenticDraftInWorktree = realRun; setDecomposePassRunner(null); }
+  });
+  assert.equal(res.blocked, true);
+});
+
 test('write tier: turn cap default is 35, env override still wins', async () => {
   await withRepo(async () => {
     const prev = process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS;
