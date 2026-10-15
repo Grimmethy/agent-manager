@@ -407,10 +407,28 @@ async function renderPluginTab(tab) {
   }
 }
 
+// The tab list in display order. On a phone-sized screen the Forges group goes FIRST (the owner uses it most from the phone and should not have
+// to scroll the strip for it, 2026-10-14); everything else keeps its order, and a wide screen is untouched. Returns a new array.
+function navOrder(tabs, narrow) {
+  if (!narrow) return tabs.slice();
+  const forges = tabs.filter((t) => t.group === 'Forges');
+  return forges.length ? [...forges, ...tabs.filter((t) => t.group !== 'Forges')] : tabs.slice();
+}
+
+const NARROW_QUERY = '(max-width: 860px)';   // the same breakpoint the stylesheet's phone layout uses
+function isNarrowScreen() {
+  return typeof window !== 'undefined' && !!window.matchMedia && window.matchMedia(NARROW_QUERY).matches;
+}
+// Rotating a phone (or resizing a window) across the breakpoint changes the order, so the strip is rebuilt.
+if (typeof window !== 'undefined' && window.matchMedia) {
+  const mq = window.matchMedia(NARROW_QUERY);
+  if (mq.addEventListener) mq.addEventListener('change', () => { if (typeof renderNav === 'function' && document.getElementById('nav')) renderNav(); });
+}
+
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
-  for (const tab of TABS) {
+  for (const tab of navOrder(TABS, isNarrowScreen())) {
     if (tab.group) {
       const expanded = isGroupExpanded(tab.group);
       const header = document.createElement('button');
@@ -555,4 +573,4 @@ function adhocStateLabel(state) {
 // (`module` is undefined there, so this is a no-op in production) -- the guard exists
 // solely so safeSourceNames is requireable from a Node test, the first test coverage
 // this file has ever had.
-if (typeof module !== 'undefined') module.exports = { safeSourceNames, bumpRenderGeneration, renderStaleCheck, runRefreshGuarded, _resetRenderStateForTest };
+if (typeof module !== 'undefined') module.exports = { navOrder, safeSourceNames, bumpRenderGeneration, renderStaleCheck, runRefreshGuarded, _resetRenderStateForTest };
