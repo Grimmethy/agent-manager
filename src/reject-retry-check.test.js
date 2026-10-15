@@ -1292,6 +1292,50 @@ test('rejectRetryCheck requeues a plan-degenerate block under the retry cap, eve
   assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /plan-pass degenerate/.test(h.detail || '')));
 });
 
+test('rejectRetryCheck: a plan-degenerate block records the lane it happened on in avoidLanes when two lanes exist', () => {
+  const lanes = require('./lanes.js');
+  const prev = { url: process.env.AGENT_MANAGER_P40_OLLAMA_URL, model: process.env.AGENT_MANAGER_P40_MODEL };
+  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.0.2.1:11434';
+  process.env.AGENT_MANAGER_P40_MODEL = 'qwen-p40-test';
+  try {
+    assert.ok(lanes.getLanes().length >= 2, 'precondition: the P40 env creates a second lane');
+    const { blockedDir, pendingDir } = setupDirs();
+    writeBlockedTask(blockedDir, 'task-lane', {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      planResponse: 'a truncated, unusable plan',
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-p40', finishedAt: new Date().toISOString() }],
+    });
+    rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+    const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-lane.json'), 'utf8'));
+    assert.deepEqual(requeued.avoidLanes, ['worker-p40']);
+    assert.ok(requeued.history.some((h) => h.stage === 'lane-avoided' && /worker-p40/.test(h.detail || '')));
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_P40_OLLAMA_URL', prev.url], ['AGENT_MANAGER_P40_MODEL', prev.model]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test('rejectRetryCheck: a plan-degenerate block does NOT record avoidLanes on a single-lane setup', () => {
+  const prev = { url: process.env.AGENT_MANAGER_P40_OLLAMA_URL, model: process.env.AGENT_MANAGER_P40_MODEL };
+  delete process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  delete process.env.AGENT_MANAGER_P40_MODEL;
+  try {
+    const { blockedDir, pendingDir } = setupDirs();
+    writeBlockedTask(blockedDir, 'task-single', {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-3090', finishedAt: new Date().toISOString() }],
+    });
+    rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+    const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-single.json'), 'utf8'));
+    assert.equal(requeued.avoidLanes, undefined);
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_P40_OLLAMA_URL', prev.url], ['AGENT_MANAGER_P40_MODEL', prev.model]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
 test('rejectRetryCheck exhausts a non-adhoc plan-degenerate block at the retry cap without escalating', () => {
   const { blockedDir, pendingDir } = setupDirs();
   writeBlockedTask(blockedDir, 'task-1', {

@@ -1062,6 +1062,50 @@ test('nextAdhocTask picks a premiumPriority candidate ahead of an atomic decompo
   assert.equal(task.id, 'adhoc-premium-1', 'premiumPriority must win over both atomic and mtime ordering');
 });
 
+// Premium rotation (2026-10-15): a premium task that keeps getting blocked must not hold the front of the generation order.
+test('nextAdhocTask: a fresh premium candidate goes before a twice-blocked premium one, which still goes before an ordinary task', () => {
+  const dir = makeAdhocFixtureRepo();
+  const recent = () => new Date(Date.now() - 10 * 60_000).toISOString();
+  writeAdhocFile(dir, 'a-demoted.json', {
+    id: 'adhoc-demoted-1', title: 'keeps blocking', premiumPriority: true,
+    draftAttempts: [{ outcome: 'blocked', finishedAt: recent() }, { outcome: 'blocked', finishedAt: recent() }],
+  });
+  writeAdhocFile(dir, 'b-ordinary.json', { id: 'adhoc-ordinary-1', title: 'ordinary' });
+  writeAdhocFile(dir, 'c-fresh.json', { id: 'adhoc-fresh-premium-1', title: 'fresh premium', premiumPriority: true });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask().id, 'adhoc-fresh-premium-1', 'the fresh premium candidate wins over the older, twice-blocked one');
+});
+
+test('nextAdhocTask: with only a twice-blocked premium task and an ordinary one, the premium task is still picked (flag kept)', () => {
+  const dir = makeAdhocFixtureRepo();
+  const recent = () => new Date(Date.now() - 10 * 60_000).toISOString();
+  writeAdhocFile(dir, 'a-ordinary.json', { id: 'adhoc-ordinary-2', title: 'ordinary' });
+  writeAdhocFile(dir, 'b-demoted.json', {
+    id: 'adhoc-demoted-2', title: 'keeps blocking', premiumPriority: true,
+    draftAttempts: [{ outcome: 'blocked', finishedAt: recent() }, { outcome: 'blocked', finishedAt: recent() }],
+  });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask().id, 'adhoc-demoted-2');
+});
+
+test('nextAdhocTask: AGENT_MANAGER_PREMIUM_ROTATION=off restores today\'s order (oldest premium first)', () => {
+  const dir = makeAdhocFixtureRepo();
+  const recent = () => new Date(Date.now() - 10 * 60_000).toISOString();
+  writeAdhocFile(dir, 'a-demoted.json', {
+    id: 'adhoc-demoted-3', title: 'keeps blocking', premiumPriority: true,
+    draftAttempts: [{ outcome: 'blocked', finishedAt: recent() }, { outcome: 'blocked', finishedAt: recent() }],
+  });
+  writeAdhocFile(dir, 'b-fresh.json', { id: 'adhoc-fresh-premium-3', title: 'fresh premium', premiumPriority: true });
+  const prev = process.env.AGENT_MANAGER_PREMIUM_ROTATION;
+  process.env.AGENT_MANAGER_PREMIUM_ROTATION = 'off';
+  try {
+    const { nextAdhocTask } = freshTaskSources(dir);
+    assert.equal(nextAdhocTask().id, 'adhoc-demoted-3');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PREMIUM_ROTATION; else process.env.AGENT_MANAGER_PREMIUM_ROTATION = prev;
+  }
+});
+
 test('nextAdhocTask still applies oldest-first FIFO within each tier (two ordinary tasks, or two decompose children)', () => {
   const dir = makeAdhocFixtureRepo();
   writeAdhocFile(dir, 'a-older-ordinary.json', { id: 'adhoc-older-ordinary-1', title: 'older ordinary' });

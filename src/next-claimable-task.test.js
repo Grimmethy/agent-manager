@@ -669,3 +669,61 @@ test('hub tier: listAssignableTasks orders adhoc/ rows premium, then hub tier, t
   assert.deepEqual(rows.map((r) => r.id), ['m-premium', 'z-hub-child', 'a-plain']);
   assert.deepEqual(Object.keys(rows[0]).sort(), ['id', 'location', 'pinnedTo', 'premiumPriority', 'source', 'title']);
 });
+
+
+// --- Premium rotation + lane avoidance (2026-10-15, premium-rotation.js) ------------------------------------------------------------
+const FRESH_BLOCKED = () => new Date(Date.now() - 10 * 60_000).toISOString();
+const twiceBlocked = () => [{ outcome: 'blocked', finishedAt: FRESH_BLOCKED() }, { outcome: 'blocked', finishedAt: FRESH_BLOCKED() }];
+
+test('premium rotation: fresh premium ranks before a twice-blocked premium, which still ranks before ordinary work', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'a-demoted-premium', { source: 'adhoc', humanQueued: true, premiumPriority: true, draftAttempts: twiceBlocked() });
+  writeTask(pendingDir, 'b-ordinary', { source: 'adhoc', humanQueued: true });
+  writeTask(pendingDir, 'c-fresh-premium', { source: 'adhoc', humanQueued: true, premiumPriority: true });
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes: [{ id: 'worker-3090' }], graceMs: 0 }),
+    ['c-fresh-premium.json', 'a-demoted-premium.json', 'b-ordinary.json']);
+});
+
+test('premium rotation: the off switch restores the old order (the older premium task stays first)', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'a-demoted-premium', { source: 'adhoc', humanQueued: true, premiumPriority: true, draftAttempts: twiceBlocked() });
+  writeTask(pendingDir, 'c-fresh-premium', { source: 'adhoc', humanQueued: true, premiumPriority: true });
+  const prev = process.env.AGENT_MANAGER_PREMIUM_ROTATION;
+  process.env.AGENT_MANAGER_PREMIUM_ROTATION = 'off';
+  try {
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes: [{ id: 'worker-3090' }], graceMs: 0 }),
+      ['a-demoted-premium.json', 'c-fresh-premium.json']);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PREMIUM_ROTATION; else process.env.AGENT_MANAGER_PREMIUM_ROTATION = prev;
+  }
+});
+
+test('premium rotation: rankPriorityOfTask is unchanged for a demoted premium task (the generation throttle keeps its meaning)', () => {
+  const { rankPriorityOfTask } = require('./next-claimable-task.js');
+  assert.equal(rankPriorityOfTask({ id: 'x', source: 'adhoc', premiumPriority: true, draftAttempts: twiceBlocked() }, { hubTier: false }), -Infinity);
+});
+
+test('lane avoidance: a task that degenerated on worker-p40 is skipped by worker-p40 while worker-3090 exists, claimable by worker-3090', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'a-avoided', { source: 'adhoc', humanQueued: true, premiumPriority: true, avoidLanes: ['worker-p40'] });
+  writeTask(pendingDir, 'b-other', { source: 'adhoc', humanQueued: true });
+  const lanes = [{ id: 'worker-3090' }, { id: 'worker-p40' }];
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes, graceMs: 0 }), ['b-other.json']);
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes, graceMs: 0 }), ['a-avoided.json', 'b-other.json']);
+});
+
+test('lane avoidance: still claimable when worker-p40 is the only lane, or when pinned to it, or with the off switch', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'a-avoided', { source: 'adhoc', humanQueued: true, avoidLanes: ['worker-p40'] });
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes: [{ id: 'worker-p40' }], graceMs: 0 }), ['a-avoided.json']);
+  const pinnedDir = setupPending();
+  writeTask(pinnedDir, 'a-pinned', { source: 'adhoc', humanQueued: true, avoidLanes: ['worker-p40'], pinnedWorker: 'worker-p40' });
+  assert.deepEqual(pickClaimableTasks(pinnedDir, 'worker-p40', { lanes: [{ id: 'worker-3090' }, { id: 'worker-p40' }], graceMs: 0 }), ['a-pinned.json']);
+  const prev = process.env.AGENT_MANAGER_LANE_AVOIDANCE;
+  process.env.AGENT_MANAGER_LANE_AVOIDANCE = 'off';
+  try {
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes: [{ id: 'worker-3090' }, { id: 'worker-p40' }], graceMs: 0 }), ['a-avoided.json']);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_LANE_AVOIDANCE; else process.env.AGENT_MANAGER_LANE_AVOIDANCE = prev;
+  }
+});
