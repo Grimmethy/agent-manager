@@ -1070,3 +1070,16 @@ Introduce a blocking (candidate-reduction) step before the Jaccard computation. 
 
 Benefits:
 The number of expensive Jaccard evaluations drops from O(N²) to roughly O(N · k) where k is the average candidate-pair count after blocking, typically a small constant. `normalizeTaskTokens` is computed once per task and cached rather than re-derived for every comparison. The dedup step scales linearly with queue growth instead of quadratically, removing a bottleneck that would become noticeable at a few thousand queued tasks.
+
+### AC-109 · Silent guard disablement when nvidia-smi is unavailable
+Strength: Worth exploring
+Files: src/gpu-guard.js
+
+Problem:
+`readFreeVramMb` shells out to `nvidia-smi` via `execFileSync`. When the binary is absent from `PATH`—a common situation in minimal container images, non-standard driver installs, or CI runners—the function returns `null`, which causes `ensureGpuHeadroomCore` to set `checked: false` and skip all reclamation logic. The guard silently becomes a no-op with no warning surfaced to the operator, so a genuinely starved GPU goes unaddressed and the only trace is a missing `checked` flag that callers may never inspect.
+
+Solution:
+When `nvidia-smi` is not found or fails to execute, emit an explicit `stderr` warning (e.g. "gpu-headroom guard disabled: nvidia-smi not found in PATH") before returning `null`. Additionally, allow an injected `readFreeVram` implementation (the parameter already exists on the core function) so that environments with alternative GPU-query tools can supply their own reader without modifying the guard's internals. The default implementation should also attempt a secondary lookup (e.g. `/usr/bin/nvidia-smi`, `/usr/local/bin/nvidia-smi`) before giving up.
+
+Benefits:
+Operators immediately see in their logs that the guard is inert and why, turning a silent failure into an actionable diagnostic. The injected-reader seam makes the guard portable to AMD/ROCm or virtualized-GPU environments without forking the codebase, and the secondary-path lookup reduces false negatives on systems where `nvidia-smi` exists but sits outside the default `PATH`.
