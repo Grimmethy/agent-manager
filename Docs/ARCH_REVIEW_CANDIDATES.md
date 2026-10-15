@@ -849,3 +849,31 @@ Create a small shared module (e.g. `src/source-file-pattern.js`) that exports th
 
 Benefits:
 A single source of truth for "what counts as source code" eliminates the class of silent-divergence bugs entirely. Adding a new language or adjusting extension rules becomes a one-line change in one file. The shared test gives immediate feedback if a future refactor accidentally re-introduces a second copy, and the codebase becomes easier to audit because the definition lives in one discoverable location rather than being scattered across detectors.
+
+### AC-91 · Inconsistent slice boundary semantics between drift-scan and drift-fix
+Strength: Worth exploring
+Files: src/drift-scan.js, src/drift-fix.js
+
+Problem:
+Both `drift-scan.js` and `drift-fix.js` independently locate the static block using the same `staticStartMarker` and `staticEndMarker`, but they apply different slicing conventions. `drift-scan.js` uses `sliceBetween`, which includes the end marker in the extracted slice (`text.slice(startIdx, endIdx + endMarker.length)`), while `drift-fix.js` uses inline logic that excludes it (`text.slice(startIdx, endIdx)`). Today this is benign because the end marker is a Markdown heading that is not a data row, but the two modules disagree on what "the block" means. If a future pair definition uses an end marker that is itself part of the data (a closing delimiter, a sentinel row, etc.), the scanner would count that value as present in the static file while the fixer would not see the corresponding row to delete, producing a silent mismatch between scan and fix.
+
+Solution:
+Extract a single `locateBlock(text, startMarker, endMarker)` helper in `drift-scan.js` that returns the slice under one documented boundary convention (e.g., always inclusive of the end marker) and export it. `drift-fix.js` imports and calls this helper instead of re-implementing its own `indexOf`/`slice` pair. A unit test in the existing `node:test` suite asserts that both modules, given the same input text and markers, produce an identical set of rows, locking in the shared convention.
+
+Benefits:
+The two modules can no longer drift apart on what constitutes the block boundary, eliminating an entire class of latent scan/fix mismatches. Adding a new pair definition with a data-bearing end marker becomes safe without requiring the author to remember which module's slicing convention to match. The shared helper also gives a single place to document the boundary contract, reducing cognitive load for future contributors.
+
+### AC-92 · Test mutation of shared module state in drift-fix tests
+Strength: Worth exploring
+Files: src/drift-fix.test.js, src/drift-scan.js, src/drift-fix.js
+
+Problem:
+The tests in `drift-fix.test.js` inject fake pair definitions by directly mutating the `driftScan.PAIRS` array (setting `.length = 0` then `.push(...)`). This works only because `drift-fix.js` reads `PAIRS` at call time and the array is a plain mutable export. The tests are therefore coupled to an implementation detail of `drift-scan.js`—that `PAIRS` is a live, writable array—rather than to the interface `drift-fix.js` actually consumes. Any refactor of `drift-scan.js` (freezing the array, switching to a getter, moving pair definitions into a closure) would silently break the tests with no change to `drift-fix.js`'s public API, and the tests would fail for reasons unrelated to the code under test.
+
+Solution:
+Refactor `buildFixEvidence` in `drift-fix.js` to accept the pair definition as an explicit parameter (e.g., `buildFixEvidence(repoRoot, flag, pair)`), or introduce a lightweight dependency-injection seam (a `setPairsForTest` function or a constructor option). The tests in `drift-fix.test.js` then pass the fake pair directly to the function under test and no longer touch `driftScan.PAIRS`. The existing `node:test` test structure is preserved; only the setup/teardown lines that mutate the shared array are replaced with a local variable passed into the call.
+
+Benefits:
+`drift-fix.test.js` becomes independent of `drift-scan.js`'s internal state, so refactors to `drift-scan.js` (freezing, getters, restructured exports) no longer risk breaking unrelated tests. The dependency between the two modules is made explicit in the function signature rather than hidden in a shared mutable export, improving readability and making it straightforward to add or remove pairs in tests without global side effects.
+
+NOTE: Flag 2 was not applied because the draft's description that "only the setup/teardown lines... are replaced with a local variable passed into the call" is an accurate summary of the necessary changes; updating the call sites to pass the new parameter is the direct consequence of the proposed refactoring, not a contradiction of the preserved test structure.
