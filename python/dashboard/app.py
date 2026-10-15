@@ -99,6 +99,7 @@ from app_catalog_helpers import (  # noqa: F401
     CONCEPT_STABLE_STATUSES,
     GHOST_CONCEPT_ID,
     _BRANCH_CACHE_TTL_SECONDS,
+    _BRANCH_FETCH_TTL_SECONDS,
     _COMMUNITY_ID_SUFFIX_RE,
     _DEEP_DIVE_ITEM_RE,
     _FAMILY_LABELS,
@@ -113,6 +114,7 @@ from app_catalog_helpers import (  # noqa: F401
     _brain_dump_needs_attention_count,
     _branch_cache,
     _branch_cache_lock,
+    _branch_fetch_state,
     _call_chat,
     _find_concept_or_404,
     _find_live_task_file,
@@ -2038,14 +2040,20 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         return False
 
 
-def _list_unmerged_branches_uncached():
+def _list_unmerged_branches_uncached(force_fetch=True):
     repo_root = get_active_repo_root()
     if not repo_root:
         return []
     repo_root = Path(repo_root)
     pipeline_dir = get_pipeline_dir()
 
-    _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
+    # The fetch is the single slowest step (14-16 s measured at load 13) and moves no state a recompute depends on within a minute, so it has its own timer.
+    with _branch_cache_lock:
+        fetch_due = force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
+    if fetch_due:
+        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
+        with _branch_cache_lock:
+            _branch_fetch_state["at"] = time.time()
     main_branch = _detect_main_branch(repo_root)
 
     raw = _run_git(
@@ -2122,13 +2130,47 @@ def _list_unmerged_branches_uncached():
     return branches
 
 
+def _store_branch_list(branches):
+    with _branch_cache_lock:
+        _branch_cache["at"] = time.time()
+        _branch_cache["branches"] = branches
+
+
+def _refresh_branch_list_in_background():
+    """Runs on the refresh thread: recompute, store, ALWAYS clear the single-flight flag. A failure keeps the old list (same best-effort rule as the synchronous path)."""
+    try:
+        _store_branch_list(_list_unmerged_branches_uncached(force_fetch=False))
+    except (RuntimeError, subprocess.SubprocessError, OSError) as e:
+        print(f"[branches] background refresh failed (non-fatal): {e}", file=sys.stderr)
+    finally:
+        with _branch_cache_lock:
+            _branch_fetch_state["refreshing"] = False
+
+
 def list_unmerged_branches(force=False):
+    """Fresh cache -> it. force=True or no cache yet (including right after _invalidate_branch_cache) -> synchronous recompute. A STALE non-empty cache is returned
+    immediately while ONE background thread refreshes it (stale-while-revalidate): the full recompute costs ~37 s under load, longer than the tab's 30 s timeout."""
     with _branch_cache_lock:
         age = time.time() - _branch_cache["at"]
+        have_cache = _branch_cache["at"] > 0
         if not force and age < _BRANCH_CACHE_TTL_SECONDS:
             return _branch_cache["branches"]
+        if not force and have_cache:
+            stale = _branch_cache["branches"]
+            start_refresh = not _branch_fetch_state["refreshing"]
+            if start_refresh:
+                _branch_fetch_state["refreshing"] = True
+        else:
+            stale, start_refresh = None, False
+    if stale is not None:
+        if start_refresh:
+            t = threading.Thread(target=_refresh_branch_list_in_background, name="branch-list-refresh", daemon=True)
+            with _branch_cache_lock:
+                _branch_fetch_state["thread"] = t
+            t.start()
+        return stale
     try:
-        branches = _list_unmerged_branches_uncached()
+        branches = _list_unmerged_branches_uncached(force_fetch=force)
     except (RuntimeError, subprocess.SubprocessError, OSError) as e:
         # Best-effort, same "a check failing here must never block the rest of the
         # dashboard" rule as everything else that shells out in this file -- a git/network
@@ -2136,9 +2178,7 @@ def list_unmerged_branches(force=False):
         print(f"[branches] list failed (non-fatal): {e}", file=sys.stderr)
         with _branch_cache_lock:
             return _branch_cache["branches"]
-    with _branch_cache_lock:
-        _branch_cache["at"] = time.time()
-        _branch_cache["branches"] = branches
+    _store_branch_list(branches)
     return branches
 
 
@@ -2149,9 +2189,13 @@ def list_held_hub_groups():
         return list(_branch_cache.get("held") or [])
 
 
-def _invalidate_branch_cache():
+def _invalidate_branch_cache(refetch=True):
+    """Drop the cached list so the next one is recomputed synchronously. refetch=True (default: a merge/discard moved a remote ref) also forces the next recompute to
+    fetch; refetch=False (a verdict was recorded, no remote ref moved) keeps the fetch timer so the recompute does not pay for another fetch."""
     with _branch_cache_lock:
         _branch_cache["at"] = 0.0
+        if refetch:
+            _branch_fetch_state["at"] = 0.0
 
 
 def _sync_live_checkout(main_branch):

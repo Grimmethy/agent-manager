@@ -1,5 +1,6 @@
 from flask import Blueprint, abort, jsonify, request
 
+import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import json
@@ -75,8 +76,14 @@ def api_pipeline_stop():
 
 @pipeline_1_more_bp.route("/api/git/unmerged-branches")
 def api_git_unmerged_branches():
-    from app import list_unmerged_branches
-    return jsonify(list_unmerged_branches(force=True))
+    # Served from the cache (stale-while-revalidate, see app.list_unmerged_branches): the forced full recompute took ~37 s under load, past the tab's 30 s timeout.
+    from app import _branch_cache, _branch_cache_lock, list_unmerged_branches
+    branches = list_unmerged_branches(force=False)
+    with _branch_cache_lock:
+        filled = _branch_cache["at"]
+    resp = jsonify(branches)
+    resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
+    return resp
 
 
 @pipeline_1_more_bp.route("/api/git/held-hub-branches")
