@@ -877,3 +877,16 @@ Benefits:
 `drift-fix.test.js` becomes independent of `drift-scan.js`'s internal state, so refactors to `drift-scan.js` (freezing, getters, restructured exports) no longer risk breaking unrelated tests. The dependency between the two modules is made explicit in the function signature rather than hidden in a shared mutable export, improving readability and making it straightforward to add or remove pairs in tests without global side effects.
 
 NOTE: Flag 2 was not applied because the draft's description that "only the setup/teardown lines... are replaced with a local variable passed into the call" is an accurate summary of the necessary changes; updating the call sites to pass the new parameter is the direct consequence of the proposed refactoring, not a contradiction of the preserved test structure.
+
+### AC-93 · Extract shared "valid enabled entry" predicate
+Strength: Worth exploring
+Files: src/plugins-manifest.js, src/resolve-plugin-root.js
+
+Problem:
+The predicate that defines a loadable, enabled plugin manifest entry — a truthy object with a non-blank string `registerPath` and `enabled !== false` — is written independently in two files. In `plugins-manifest.js`, `enabledRegisterPaths` filters with `p && typeof p.registerPath === 'string' && p.registerPath.trim() && p.enabled !== false`. In `resolve-plugin-root.js`, `resolvePluginRoot` re-states the same four conditions inline when looking up a plugin by name. The shared kernel is the contract for what a valid manifest entry looks like, yet it lives in two places. If the entry schema evolves — a new required field, a tri-state `enabled`, a path-normalisation rule — both sites must be updated in lockstep, and a missed update in one file produces a silent divergence in which one code path accepts an entry the other rejects.
+
+Solution:
+Extract the four-condition check into a small named predicate (e.g. `isValidEnabledEntry(p)`) exported from `plugins-manifest.js`. `resolvePluginRoot` then composes it with its existing `p.name === pluginName` check instead of re-listing the conditions. The predicate becomes the single source of truth for the entry contract; any future schema change is a one-file edit.
+
+Benefits:
+"Change the entry contract" goes from "edit two files and hope they stay in sync" to "edit one file." The intent of the check is named at the call site, making the manifest-entry contract visible to readers of `resolve-plugin-root.js` without them having to mentally diff two inline boolean expressions. The existing tests already cover the back-compat fallback path, so the refactor is low-risk and immediately verified.
