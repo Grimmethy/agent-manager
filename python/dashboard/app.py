@@ -1302,6 +1302,30 @@ def community_coverage_path() -> Path | None:
     return (d / "community-coverage.json") if d else None
 
 
+def _coerce_serial(val) -> int:
+    """Coerce a brain-dump serial value to a non-negative int.
+
+    Returns 0 for None, booleans, negative numbers, non-numeric strings, or any
+    other non-integral type. Safe to call on raw JSON values (the capture path
+    and manual edits can emit string serials like '1792047142094' or junk like
+    ''/null) without prior type-checking; it never raises.
+    """
+    if val is None or isinstance(val, bool):
+        return 0
+    if isinstance(val, int):
+        return val if val >= 0 else 0
+    if isinstance(val, float):
+        iv = int(val)
+        return iv if iv >= 0 else 0
+    if isinstance(val, str):
+        try:
+            iv = int(val.strip())
+        except (ValueError, TypeError):
+            return 0
+        return iv if iv >= 0 else 0
+    return 0
+
+
 def read_brain_dump_entries() -> list:
     path = brain_dump_path()
     if not path:
