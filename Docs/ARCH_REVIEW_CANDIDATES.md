@@ -1096,3 +1096,34 @@ Refactor the function to batch the git operations where possible (e.g., using `g
 
 Benefits:
 Reducing per-branch subprocess spawning and full-file JSON I/O to a single batched operation dramatically cuts wall-clock time for dashboard loads that touch many branches, eliminates unnecessary disk churn that can contend with other processes, and simplifies the persistence path by making it a single atomic write rather than N interleaved read-modify-write cycles.
+
+### AC-111 · Lazy require couples SDK helper to monolith implementation detail
+Strength: Worth exploring
+Files: src/sdk/candidate-fulfillment.js, src/task-sources.js
+
+Problem:
+`candidate-fulfillment.js` performs a lazy `require()` of `task-sources.js` inside `nextCandidateFulfillmentTask` to obtain `taskIdExistsInQueue`, explicitly to avoid a load-time dependency on what the code calls a "monolith." This hides a real runtime dependency behind a function boundary: the module graph no longer reflects the true coupling, and if `task-sources.js` renames or restructures that export, the failure surfaces only at call-time in production rather than at import-time in CI or local development. It also makes `candidate-fulfillment.js` harder to unit-test in isolation or reuse in a context where `task-sources.js` is unavailable, since the dependency is not visible at the module boundary.
+
+Solution:
+Extract `taskIdExistsInQueue` (or a minimal `TaskIdLookup` interface) into a small, dependency-free module. `task-sources.js` can re-export it for backward compatibility, and `candidate-fulfillment.js` can import it statically at load time. If the circular-dependency concern is the root cause, break the cycle by having the consumer inject the lookup function (dependency injection) rather than reaching into the monolith at call time.
+
+Benefits:
+The dependency graph becomes honest and visible to tooling (tree-shaking, circular-dep linters, bundle analysis). `candidate-fulfillment.js` can be tested in isolation by passing a stub lookup, and it can be consumed in SDK contexts where the full task-sources monolith is not present. Runtime "module not found" or "undefined is not a function" errors from a renamed export are replaced by load-time failures that are caught in CI.
+
+### AC-112 · Hardcoded source-name branches violate the registry's own extension contract
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `task-source-registry.js` contains explicit `if` branches for `adhoc` and `secondbrain` alongside a `sourceAliases` map that is populated via `registerSourceAlias()`. The surrounding comment states that a plugin should declare its own naming quirk through `registerSourceAlias()` "instead of this file needing to know every consumer's naming," yet the file still hardcodes two of those very cases. This is an Open/Closed Principle violation: the registry is open for extension (new aliases can be registered) but not closed for modification (adding a new special-case source requires editing `resolveSourceName`). It also creates an inconsistency where `adhoc` and `secondbrain` are treated differently from every other source, making the resolution logic harder to reason about and test uniformly.
+
+Solution:
+The existing `registerSourceAlias(sourceValue, name)` maps a single `task.source` string to a registry name, but the `adhoc` branch is a compound condition (`task.domain === 'adhoc' || task.source === 'manual'`) and the `secondbrain` branch is keyed on `task.domain` rather than `task.source`. Neither can be expressed through the current alias signature. The fix is to generalize the registration mechanism: introduce `registerSourceResolver(name, predicate)` where `predicate` receives the full task object and returns a boolean. The existing `registerSourceAlias(sourceValue, name)` becomes a thin convenience wrapper that calls `registerSourceResolver(name, (task) => task.source === sourceValue)`. At module-initialization time (or in a dedicated setup module), register:
+
+- `registerSourceResolver('adhoc', (task) => task.domain === 'adhoc' || task.source === 'manual')`
+- `registerSourceResolver('secondbrain', (task) => task.domain === 'secondbrain')`
+
+`resolveSourceName` then becomes a linear scan of the registered resolvers (first match wins) with a single fallback, containing no source-specific logic. The scan is over a small, bounded list (a handful of built-ins plus any plugins), so the cost is negligible.
+
+Benefits:
+The registry's resolution path is uniform: every source, built-in or plugin, goes through the same data-driven predicate lookup. Adding a new special-case source no longer requires modifying `task-source-registry.js`; it is a one-line `registerSourceResolver` call in the source's own module. Testing `resolveSourceName` no longer requires special-casing `adhoc` and `secondbrain`—they are just registered predicates like any other, and the function can be tested with arbitrary resolver tables. The existing `registerSourceAlias` API remains available for the simple `task.source`-only case, preserving backward compatibility for any current callers.
