@@ -1057,3 +1057,16 @@ Benefits:
 The staging contract lives in one place, so adding a new artifact type or adjusting the gitignore exclusion is a one-line change rather than a multi-file hunt. It eliminates the recurring class of "staged a gitignored path" failures by making the exclusion rule impossible to forget in a new apply path, and it simplifies each apply function by removing a block of inline list-manipulation code.
 
 NOTE: Flag 3 was not applied because the critique's premise that "vague stylistic nitpicks do not count" is not part of the provided task constraints; the original draft's assessment of AC-002 as a "Worth exploring" architectural improvement is a valid code review observation, not a fabricated defect, and removing it would reduce the utility of the review.
+
+### AC-108 · Blocking strategy to avoid O(N²) Jaccard comparisons in dedup
+Strength: Strong
+Files: src/staleness-audit-dedup.js
+
+Problem:
+`findDuplicateTask` in `staleness-audit-dedup.js` iterates over the entire corpus for every incoming task, computing a full Jaccard similarity score (token normalization, set intersection, set union) against each existing entry. For a corpus of size N this is O(N²) pairwise comparisons, and `normalizeTaskTokens` is re-invoked for the same tasks on every pass. As the task queue grows into the thousands, the quadratic cost dominates wall-clock time for what is otherwise a lightweight dedup check. There is no pre-filtering or indexing: tasks from entirely different sources or domains are still subjected to the full similarity computation, wasting cycles on pairs that could never be duplicates.
+
+Solution:
+Introduce a blocking (candidate-reduction) step before the Jaccard computation. Group tasks by a coarse key such as `source` or `domain` so that only tasks within the same group are compared. Within a group, apply a lightweight pre-filter—e.g., require at least one shared distinctive token (a token appearing in fewer than 5 % of the corpus) before computing the full Jaccard score. Optionally, maintain a small inverted index (token → task-id set) that is updated incrementally as tasks are added, so the candidate set for a new task is the union of posting lists for its tokens, capped at a small threshold. The existing Jaccard threshold and scoring logic remain unchanged; only the set of pairs fed into it is reduced.
+
+Benefits:
+The number of expensive Jaccard evaluations drops from O(N²) to roughly O(N · k) where k is the average candidate-pair count after blocking, typically a small constant. `normalizeTaskTokens` is computed once per task and cached rather than re-derived for every comparison. The dedup step scales linearly with queue growth instead of quadratically, removing a bottleneck that would become noticeable at a few thousand queued tasks.
