@@ -79,4 +79,4 @@ function findTaskAnywhere(pipelineDir, taskId) {
   return null;
 }
 
-module.exports = { findTaskAnywhere, QUEUE_STATES };
+module.exports = { findTaskAnywhere, QUEUE_STATES, readJsonSafe };
