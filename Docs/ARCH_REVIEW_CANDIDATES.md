@@ -1016,3 +1016,44 @@ Switch the `fs.writeFileSync` call in `writeSideFindingInbox` to `writeJsonAtomi
 
 Benefits:
 A crash mid-write can no longer leave a truncated, unparseable JSON file in the inbox queue, eliminating a class of malformed records that the sweep must detect and skip. The community's use of its own utility is consistent, removing the cognitive overhead for a maintainer who sees `atomic-write.js` next to a file that doesn't use it. The justification no longer needs to be re-derived from first principles each time someone reads the code.
+
+### AC-105 · Duplicated direct-to-main eligibility check within apply-main-batch.js
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+
+Problem:
+Both `applyDirectToMainBatchOnBranch` and `mainPartition` (both defined in `apply-main-batch.js`) independently resolve the source name, fetch the registered source, and check for the `directToMain === true` flag to decide whether a task is eligible for batch processing. Because the two implementations live in separate functions within the same file with no shared helper, any change to the eligibility rule—renaming the flag, adding a second condition, or altering how the source is resolved—must be made in both places. A missed update in one function silently changes which tasks are accepted, producing a divergence bug that is hard to surface because each path still works in isolation.
+
+Solution:
+Extract the eligibility determination into a single shared function (e.g. `isDirectToMainTask(task, sources)`) that encapsulates the source-name resolution, source lookup, and flag check. Both `applyDirectToMainBatchOnBranch` and `mainPartition` call this one function, so the rule is defined in exactly one location and both paths stay in lockstep automatically.
+
+Benefits:
+A single source of truth for the "direct-to-main" rule eliminates the class of divergence bug where one path accepts a task the other rejects. Future changes to eligibility (new flags, compound conditions, source-type checks) require editing one function instead of hunting for every inline copy, reducing review surface and the chance of a subtle mismatch between the two apply paths.
+
+### AC-106 · Inline git command sequence in apply-main-batch.js couples batch logic to git-runner.js
+Strength: Worth exploring
+Files: src/lib/apply-main-batch.js, src/git-runner.js
+
+Problem:
+`applyDirectToMainBatchOnBranch` issues a long, ordered sequence of `gitRunner` calls—`fetchMain`, `prepareStackedBranch`, `resetToMain`, `add`, `commit`, `push`, `checkoutMain`, `retryPushAfterRebase`, and others—directly inlined in the batch-application logic. There is no intermediate abstraction (a "branch-apply" or "stack-push" helper) that groups these steps. As a result, the batch-eligibility and staging logic is entangled with the exact git command ordering, making it difficult to unit-test the batch logic in isolation (every test must stub the full gitRunner surface) and making it brittle if the push workflow gains a step (e.g., a pre-push hook or a rebase-retry loop) that must be inserted between existing calls.
+
+Solution:
+Introduce a thin orchestration layer (e.g. `applyStackedBatchToMain(branch, files, gitRunner)`) that owns the ordered git sequence and exposes a single entry point. `applyDirectToMainBatchOnBranch` then focuses on eligibility, file staging, and error handling, delegating the mechanical git steps to the orchestrator. The orchestrator can be tested with a mock gitRunner that asserts the call sequence, and the batch logic can be tested with a stubbed orchestrator.
+
+Benefits:
+Separating the "what to apply" decision from the "how to apply it via git" mechanics improves testability (batch logic tests no longer need a full gitRunner mock), localizes git-sequence changes to one file, and makes the push/retry workflow easier to evolve without touching the eligibility and staging code.
+
+### AC-107 · Task-file staging rules duplicated across apply paths
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+
+Problem:
+`apply-main-batch.js` manually builds the staging list (`artifact.files || [artifact.file]`) and then calls `assertStageableFiles`, with special handling to exclude `task-logs/` (which is gitignored) from the set of files to stage. The comments in the file indicate that other apply paths perform the same construction and exclusion inline. Because the "what is stageable" rule (including the `task-logs` exclusion and the `files`-vs-`file` fallback) is repeated across multiple apply paths, a change to the staging contract—adding a new artifact type, changing the gitignore rule, or altering the fallback shape—must be replicated everywhere, and a missed copy produces the exact staging-failure bug the comments describe.
+
+Solution:
+Create a single `resolveStageableFiles(artifact)` helper that encapsulates the `files`/`file` fallback, the `task-logs/` exclusion, and any future artifact-type filtering, returning the final list to pass to `assertStageableFiles`. Every apply path (`apply-main-batch.js` and any others) calls this helper instead of reconstructing the list inline.
+
+Benefits:
+The staging contract lives in one place, so adding a new artifact type or adjusting the gitignore exclusion is a one-line change rather than a multi-file hunt. It eliminates the recurring class of "staged a gitignored path" failures by making the exclusion rule impossible to forget in a new apply path, and it simplifies each apply function by removing a block of inline list-manipulation code.
+
+NOTE: Flag 3 was not applied because the critique's premise that "vague stylistic nitpicks do not count" is not part of the provided task constraints; the original draft's assessment of AC-002 as a "Worth exploring" architectural improvement is a valid code review observation, not a fabricated defect, and removing it would reduce the utility of the review.
