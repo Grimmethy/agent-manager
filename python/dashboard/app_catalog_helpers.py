@@ -157,10 +157,27 @@ def _assign_brain_dump_serials(entries: list) -> bool:
     capturedAt order (oldest first) so backfilled numbers land in a sensible reading
     order rather than dict/file order, continuing from whatever the current max already
     is so a re-run never reassigns or collides with a number already handed out.
+    String serials (e.g. '1792047142094') are coerced to int in place so the
+    dashboard's max() bookkeeping and any downstream JSON consumers never see a str.
+    Non-numeric junk ('abc', None, ...) is left untouched here -- _coerce_serial
+    maps those to 0 downstream when a serial is actually consumed.
     Returns True if anything changed, so the caller knows to persist it."""
+    changed = False
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        val = e.get("serial")
+        if isinstance(val, str):
+            try:
+                iv = int(val.strip())
+            except (ValueError, TypeError):
+                continue
+            if iv >= 0:
+                e["serial"] = iv
+                changed = True
     missing = [e for e in entries if isinstance(e, dict) and not e.get("serial")]
     if not missing:
-        return False
+        return changed
     # Lazy import: app.py re-exports this module, so a top-level `from app import ...`
     # here would be circular.
     from app import _coerce_serial
