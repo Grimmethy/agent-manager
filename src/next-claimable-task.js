@@ -4,6 +4,7 @@ const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
 const path = require('path');
 const { HUB_TIER_PRIORITY, isHubTierTask, hubIdForTask } = require('./hub-priority.js');
+const { ROTATION_DEMOTED_PRIORITY, rotationDemoted, laneAvoided } = require('./premium-rotation.js');
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
@@ -230,6 +231,9 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
 
   const { sourceEligibleHere, activeRepoIsCore } = require('./lib/source-scope.js');
   const coreActive = activeRepoIsCore();
+  // Lane avoidance (premium-rotation.js): how many lanes exist decides whether a task may skip one. 0 on any error = never skip.
+  let laneCount = 0;
+  try { laneCount = (opts.lanes || require('./lanes.js').getLanes()).length; } catch (_) { laneCount = 0; }
   const pinned = [];
   const rankable = [];
   for (const name of names) {
@@ -240,6 +244,10 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
       pinned.push({ name, mtimeMs });
       continue;
     }
+
+    // A task that degenerated on THIS lane (task.avoidLanes, stamped by reject-retry-check.js) is left to another lane while one exists.
+    // An explicit pin to this lane was handled above and still wins.
+    if (task && laneAvoided(task, instanceId, laneCount)) continue;
 
     // A scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is
     // not claimable, even if one is already sitting in pending/ (src/lib/source-scope.js). An explicit
@@ -265,7 +273,9 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     const hk = oc ? oc.hubKey : { isHubChild: false };
     const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt } : noHubKey;
     const hubTier = !!(oc && oc.isHubWork);
-    const priority = rankPriorityOfTask(task, { hubTier });
+    const rankedPriority = rankPriorityOfTask(task, { hubTier });
+    // A premium task that keeps getting blocked rotates behind fresh premium work, but still ahead of the hub tier and everything else.
+    const priority = (rankedPriority === -Infinity && rotationDemoted(task)) ? ROTATION_DEMOTED_PRIORITY : rankedPriority;
     const naturalPriority = hubTier ? rankPriorityOfTask(task, { hubTier: false }) : priority;
     rankable.push({ name, id: (task && task.id) || name.replace(/\.json$/, ''), hubId: hubIdForTask(task), priority, naturalPriority, hubTier, mtimeMs, hubKey });
   }

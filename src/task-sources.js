@@ -21,6 +21,7 @@ const { registerTaskSource, getRegisteredSources, getRegisteredSource, resolveSo
 const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
+const { rotationDemoted } = require('./premium-rotation.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
 const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport, applySecondBrainOpportunities } = require('./apply-group-a.js');
@@ -485,10 +486,13 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       const { isHubWork, hubKey } = parsed
         ? hubOrder.orderCandidate(pipelineDir, parsed, hubKeyCache)
         : { isHubWork: false, hubKey: { isHubChild: false } };
-      return { full, mtime, parsed, isPremium: !!(parsed && parsed.premiumPriority), isHubWork, hubKey };
+      const isPremium = !!(parsed && parsed.premiumPriority);
+      // A premium task that keeps getting blocked rotates behind fresh premium work (premium-rotation.js).
+      return { full, mtime, parsed, isPremium, demoted: isPremium && rotationDemoted(parsed), isHubWork, hubKey };
     })
     .sort((a, b) => {
       if (a.isPremium !== b.isPremium) return a.isPremium ? -1 : 1;
+      if (a.demoted !== b.demoted) return a.demoted ? 1 : -1;
       if (a.isHubWork !== b.isHubWork) return a.isHubWork ? -1 : 1;
       if (a.isHubWork && b.isHubWork) {
         const byHub = hubOrder.compareKeys(a.hubKey, b.hubKey);
