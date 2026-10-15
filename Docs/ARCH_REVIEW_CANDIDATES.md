@@ -1127,3 +1127,44 @@ The existing `registerSourceAlias(sourceValue, name)` maps a single `task.source
 
 Benefits:
 The registry's resolution path is uniform: every source, built-in or plugin, goes through the same data-driven predicate lookup. Adding a new special-case source no longer requires modifying `task-source-registry.js`; it is a one-line `registerSourceResolver` call in the source's own module. Testing `resolveSourceName` no longer requires special-casing `adhoc` and `secondbrain`—they are just registered predicates like any other, and the function can be tested with arbitrary resolver tables. The existing `registerSourceAlias` API remains available for the simple `task.source`-only case, preserving backward compatibility for any current callers.
+
+### AC-113 · Inconsistent error-handling contract across git-ref helpers in stacked-grounding.js
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+Within the same module, `grepAtRef` treats `git grep` exit code 1 (no matches) as a normal empty result and lets genuine errors propagate as thrown exceptions, while `readFileAtRef` and `resolveAtRef` catch every error indiscriminately and return `null`. This means a caller cannot tell whether a `null` from `readFileAtRef` means "the path legitimately does not exist at this ref" or "the ref itself is invalid / the git command failed for an unrelated reason." The mixed contract forces every consumer to either ignore real failures silently or add redundant pre-checks (e.g., verifying the ref exists before calling the function), duplicating logic that the module should own.
+
+Solution:
+Standardize all three functions to a single contract: distinguish "not found / no matches" (return a sentinel such as `null` or an empty string) from "operational failure" (throw a typed error). Concretely, `readFileAtRef` and `resolveAtRef` should inspect the underlying error (e.g., `git show` exit code 128 with a "bad revision" message vs. a genuine I/O failure) and only return `null` for the expected not-found case, rethrowing or wrapping everything else. A small shared helper in the module can encapsulate the exit-code classification so the three call sites stay consistent.
+
+Benefits:
+Callers gain a reliable signal: a thrown error means "something is wrong, investigate," while a `null`/empty return means "expected absence." This eliminates the need for redundant ref-existence pre-checks at every call site, makes debugging git-related failures straightforward (the real error surfaces instead of being masked as `null`), and removes the cognitive overhead of remembering which of the three functions uses which convention.
+
+### AC-114 · Latent crash when a registered source lacks a valid apply method
+Strength: Strong
+Files: src/lib/apply-core.js, src/task-source-registry.js
+
+Problem:
+`apply-core.js` determines whether a source is "Group B" via `usesGroupB`, which checks `!(source && typeof source.apply === 'function')`. When a source is registered but its `apply` property is missing, not a function, or otherwise invalid, `usesGroupB` returns `true` (treats it as Group B), yet the downstream `writeArtifact` path still calls `source.apply()` directly. There is no validation gate between the duck-typing check and the actual invocation, so a mis-registered or partially-implemented source will cause a runtime `TypeError` at write time rather than failing fast at registration or dispatch time. The tight coupling also means any interface change in `task-source-registry.js` (new required methods, changed return shape) silently breaks `apply-core.js` until the crash surfaces in production.
+
+Solution:
+Introduce an explicit validation step in `task-source-registry.js` at registration time: verify that a source object exposes a callable `apply` (or declare which method is optional) and reject or warn at registration if the contract is not met. In `apply-core.js`, replace the inline duck-typing check in `usesGroupB` with a call to a registry-provided predicate (e.g., `registry.isGroupB(source)`) so the classification logic lives alongside the source definitions. Additionally, guard `writeArtifact` with a `typeof source.apply === 'function'` check that throws a descriptive error naming the source and the missing method, converting the latent `TypeError` into an actionable diagnostic.
+
+Benefits:
+Mis-registered sources fail at registration (or at the first dispatch) with a clear message naming the source and the missing capability, rather than crashing deep inside `writeArtifact` with a generic `TypeError`. The classification logic is co-located with the source definitions, so adding a new source type or changing the Group A/B boundary requires updating one module rather than two. The explicit guard in `writeArtifact` also protects against future refactors that might bypass the registry predicate.
+
+### AC-115 · History-persist hook swallows errors and lacks per-task scoping
+Strength: Worth exploring
+Files: src/task-history.js
+
+Problem:
+`setHistoryPersistHook` installs a single global callback that `appendHistoryEvent` invokes synchronously. The hook receives the `task` object but the API provides no task-scoped identity parameter, so a hook implementation must dig into the `task` object to determine which task it is persisting, and the hook cannot be swapped or configured per-task without affecting other in-flight tasks. More concretely, the `try/catch` around the hook invocation swallows errors: a transient write failure inside the hook is caught and logged via `console.warn`, so a failed persist is visible only as a generic warning without a structured, queryable failure channel. Because the hook is a single process-global, unit-testing it in isolation or swapping it per-task without affecting other in-flight tasks is awkward.
+
+Solution:
+Scope the hook to a task: change the API to `setHistoryPersistHook(taskId, fn)` (or pass `taskId` as the first argument to the existing hook) so each task's persistence is independently configurable and testable. Replace the silent `try/catch` around the hook invocation with a structured warning that includes `taskId` and the error, so that a failed persist is visible in logs with enough context to diagnose and recover, rather than being buried under a generic `console.warn`.
+
+Benefits:
+Each task's history persistence becomes independently testable and swappable without side effects on other tasks. Visible, structured failure reporting turns a silent data-loss path into a diagnosable, recoverable event, and the task-scoped API removes the need for callers to inspect the `task` object to figure out which entry the hook is handling.
+
+NOTE: The critique's flag on AC-003 was applied — I removed the invented concurrency/race-condition framing (rapid-succession firing, "second invocation overwrites the first," inability to distinguish tasks) and re-grounded the finding in the code-supported points: the swallowed-hook-error visibility issue and the lack of per-task scoping.
