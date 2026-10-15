@@ -2762,13 +2762,39 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     doesn't exist yet) and spawns the relevant loops as real, visible console windows,
     same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
     /api/pipeline/start and _restart_pipeline()."""
+    # Pre-flight (2026-10-15): report -- and snapshot to a patch file -- uncommitted TRACKED changes in the
+    # repo being entered AND the one being left, before _build_pipeline_env overwrites the active repo
+    # root. Read-only on the repos and never blocks the start (see preflight.py).
+    preflight_report = _preflight_report(raw_path)
+
     child_env = _build_pipeline_env(raw_path, include_apply, skip_push)
 
     _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
 
     _ensure_registry_entry(child_env, raw_path)
 
-    return _launch_pipeline_subprocess(child_env, raw_path, include_apply, skip_push)
+    result = _launch_pipeline_subprocess(child_env, raw_path, include_apply, skip_push)
+    if isinstance(result, dict) and preflight_report is not None:
+        result["preflight"] = preflight_report
+    return result
+
+
+def _preflight_report(raw_path: str):
+    """The pre-flight object for a pipeline start, or None when the check is off. Never raises."""
+    import preflight
+    try:
+        if not preflight.enabled():
+            return {"enabled": False}
+        report = preflight.run([raw_path, get_active_repo_root()])
+        if report.get("dirty"):
+            logger.warning(
+                "pipeline start pre-flight: uncommitted tracked changes in %s; snapshot %s",
+                ", ".join(r["path"] for r in report.get("repos", []) if r.get("dirty")), report.get("snapshot"),
+            )
+        return report
+    except Exception as exc:  # noqa: BLE001 -- a pre-flight problem must never stop a pipeline start
+        logger.warning("pipeline start pre-flight failed: %s", exc)
+        return {"enabled": True, "error": str(exc)}
 
 
 def _restart_pipeline():
