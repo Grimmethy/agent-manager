@@ -797,3 +797,32 @@ Extract a single helper, e.g. `_run_build_and_persist(cfg, *, use_model_naming, 
 
 Benefits:
 A single code path owns the build-and-persist contract, so schema changes, atomicity improvements, or new output artefacts are made once. The two call sites become thin wrappers that only differ in their `use_model_naming` source and post-persist side-effects, making the diff surface for future changes smaller and eliminating the class of "I fixed it in `check_due` but forgot `main`" regressions.
+
+### AC-83 · AC-69a – Repoint grounding-test imports from candidate-fulfillment to their canonical lib modules
+Strength: Strong
+Split-Depth: 1
+Files: src/sdk/candidate-fulfillment.test.js
+
+Problem:
+The plugin's grounding tests currently import the five low-level helpers (findFuzzyMatch, windowAroundIndex, collectAnchorHits, snippetFromSection, quotedSymbolsFromSection) from the candidate-fulfillment SDK entry point. Those helpers are actually defined and exported by their own lib modules (fuzzy-matching.js, file-grounding.js, candidate-doc-parsing.js) and are merely re-exported through candidate-fulfillment.js for test convenience. This couples the test to the re-export surface and means the re-export must stay in place even though it is not part of the documented public API (docs/PLUGIN_API.md lists only nextCandidateFulfillmentTask, windowFetchedFileContent, and the candidateDocs namespace).
+
+Solution:
+In the grounding test file, replace the single destructuring import from '../candidate-fulfillment' (or the SDK top-level entry) with per-lib-module imports: const { findFuzzyMatch, windowAroundIndex } = require('./lib/fuzzy-matching.js'); const { collectAnchorHits } = require('./lib/file-grounding.js'); const { snippetFromSection, quotedSymbolsFromSection } = require('./lib/candidate-doc-parsing.js');. Keep any imports of nextCandidateFulfillmentTask, windowFetchedFileContent, or candidateDocs pointing at candidate-fulfillment (or their respective lib modules) unchanged. Do not alter any test logic, assertions, or fixture data—only the import source lines.
+
+Benefits:
+Tests now import each helper from the module that actually defines it, removing the dependency on the re-export. This unblocks the next sub-candidate (removing the helpers from candidate-fulfillment's export surface) without breaking the test suite, and makes the test's dependency graph honest: it depends on the implementation modules, not on a convenience re-export.
+
+### AC-84 · AC-69b – Remove the five test-only helpers from candidate-fulfillment.js export surface
+Strength: Strong
+Split-Depth: 1
+Files: src/sdk/candidate-fulfillment.js
+Depends-On: AC-83
+
+Problem:
+candidate-fulfillment.js's module.exports block currently re-exports five low-level helpers (findFuzzyMatch, windowAroundIndex, collectAnchorHits, snippetFromSection, quotedSymbolsFromSection) with a comment reading 'lower-level helpers, exported for the plugin's own grounding tests'. These are not part of the documented public API (docs/PLUGIN_API.md lists only nextCandidateFulfillmentTask, windowFetchedFileContent, and the candidateDocs write-side namespace). Their presence in the export surface (1) leaks test-only internals into the SDK's public API, and (2) forces candidate-fulfillment.js to require ./lib/fuzzy-matching.js and to destructure collectAnchorHits from ./lib/file-grounding.js purely to re-export them, coupling the read/fulfill path to modules it does not otherwise need at load time. AC-69a has already repointed the grounding tests to import directly from the lib modules, so nothing in-repo still consumes these names via candidate-fulfillment.
+
+Solution:
+In the module.exports block, delete the five helper names (findFuzzyMatch, windowAroundIndex, collectAnchorHits, snippetFromSection, quotedSymbolsFromSection) and the preceding comment line '// lower-level helpers, exported for the plugin's own grounding tests'. Keep ...candidateDocs, nextCandidateFulfillmentTask, windowFetchedFileContent, MAX_FETCHED_FILE_CHARS, and MAX_ARCH_REVIEW_TASK_CHARS. Then clean up the require destructurings at the top of the file: (a) change const { readIfExists, quotedSymbolsFromSection, snippetFromSection } = require('./lib/candidate-doc-parsing.js') to const { readIfExists } = require('./lib/candidate-doc-parsing.js'); (b) delete the line const { findFuzzyMatch, windowAroundIndex } = require('./lib/fuzzy-matching.js') entirely (neither name is used elsewhere in this file); (c) change const { collectAnchorHits, windowFetchedFileContent } = require('./lib/file-grounding.js') to const { windowFetchedFileContent } = require('./lib/file-grounding.js'). Do not touch the candidate-lifecycle.js require or any other line.
+
+Benefits:
+The SDK's public export surface now matches its documented API exactly. The load-time dependency on ./lib/fuzzy-matching.js is eliminated entirely, and the dependency on ./lib/file-grounding.js is reduced to only the one function actually used (windowFetchedFileContent). This decouples the read/fulfill path from the grounding-helper modules, reducing the blast radius of future changes to those lib files and making the module's import graph reflect its true responsibilities.
