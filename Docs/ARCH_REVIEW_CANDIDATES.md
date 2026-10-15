@@ -1252,3 +1252,19 @@ Benefits:
 A new global reference in any of the three scripts will surface as a clear assertion failure in the static check, explicitly naming the missing identifier and pointing directly at the stub constant in the test file. This eliminates the need to manually trace a `ReferenceError` from the script back to the test file. The named constant makes the global surface visible in diffs and code review. The static check catches omissions at test-run time (or lint time) regardless of execution order, ensuring the stub list remains in sync with the scripts' actual global usage.
 
 NOTE: Flag 1 was addressed by replacing the infeasible runtime "bare context" smoke test with a static analysis check, which is technically feasible and correctly collects all missing globals.
+
+### AC-120 · ~~Inconsistent state-transition vocabulary in blocked-drain.js~~ — **RETRACTED**
+Strength: Strong
+
+**Retraction rationale:** The original draft misread the inline comment in `src/blocked-drain.js` (lines 104–108). That comment documents a *prior* defect (use of an undocumented `{ status, at, note }` shape) that has already been corrected. The current code passes `'retry-context-stamped'` as the `stage` argument to the canonical `appendHistoryEvent` writer, producing a well-formed `{ stage, at, detail }` record. The string is a legitimate stage-name value within the existing vocabulary, not a format violation. No defect exists here; replacing or re-registering the name would break downstream consumers and audit-replay expectations with no correctness gain.
+
+---
+
+### AC-121 · ~~Redundant side-effect require in apply-main-batch.js~~ — **RETRACTED**
+Strength: Strong
+
+**Retraction rationale:** The original draft asserted the bare `require('../task-sources.js')` was dead code on the sole basis that no symbol is destructured from it. That reasoning is insufficient: `task-sources.js` almost certainly performs side-effectful registration (pushing entries into the registry that `getRegisteredSource` and `resolveSourceName` query). Removing the require without first confirming that `task-source-registry.js` (or some other guaranteed-load-time module) independently pulls in `task-sources.js` would leave the registry empty at call time, causing `getRegisteredSource` to return `undefined` and silently breaking the `eligible`-filtering logic in `applyDirectToMainBatchOnBranch`. No evidence was provided that the require is redundant, and the proposed "verify via a brief integration test" step is a speculative risk-mitigation, not a confirmed defect. The finding does not meet the bar for a safe, actionable change.
+
+---
+
+**Summary:** Both candidates in the original draft are retracted. No actionable findings remain in this revision.
