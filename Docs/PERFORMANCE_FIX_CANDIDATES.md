@@ -306,3 +306,26 @@ Mark the enclosing sweep function as async and replace each fs.readdirSync(state
 
 Benefits:
 The event loop is no longer held hostage for the cumulative duration of all directory reads. Concurrent requests, socket handlers, and timer callbacks can interleave between individual readdir calls, eliminating the latency spike that scaled with entry count. Under load—especially on network-backed or slow filesystems where a single readdir can take several milliseconds—the server maintains responsive throughput instead of stalling. The change is a drop-in async refactor with no new dependencies, no API surface change, and no behavioral difference for the sweep's own logic.
+
+### AC-17 · Parallelize blocking health-check HTTP calls with ThreadPoolExecutor
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    health_path = (entry.get("process") or {}).get("healthPath", "/healthz")
+    url = f"{entry['url']}{health_path}"
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as r:
+                if r.status == 200:
+```
+
+Problem:
+The health-check routine in `python/dashboard/app.py` calls `urllib.request.urlopen` (a fully blocking I/O call) inside a `while` retry loop bounded by a deadline. Because this is a synchronous dashboard backend (`app.py`), the call executes on the main thread. If the target service is slow or unreachable, each iteration blocks the thread for up to `timeout=1` second, and the loop can run for the full `timeout_s` window. When the outer context iterates over multiple `entry` records (the variable name implies a collection), the blocking times accumulate sequentially: ten services each timing out for 30 s would freeze the dashboard for 300 s, during which no other request, render, or user interaction can be serviced.
+
+Solution:
+Wrap the per-entry health-check body (the existing retry `while` loop plus `urllib.request.urlopen`) in a small function `check_health(entry, timeout_s)` and dispatch all entries concurrently through `concurrent.futures.ThreadPoolExecutor` (standard library, no new dependency). Submit every entry to the pool with `executor.submit(check_health, entry, timeout_s)`, then collect results with `concurrent.futures.as_completed` so the main thread is free to keep the dashboard responsive while up to `max_workers` (e.g. 8–10) HTTP checks proceed in parallel. The retry loop and timeout logic inside `check_health` remain unchanged; only the scheduling changes from sequential to concurrent.
+
+Benefits:
+Total wall-clock time for a batch of N health checks drops from the sum of individual timeouts to roughly the slowest single check (bounded by the pool size), so a ten-service batch that previously could block the UI for 300 s now completes in about 30 s. The main thread is never held hostage by a single slow or dead endpoint, keeping the dashboard responsive to user input and other requests. Because the fix uses only `concurrent.futures` from the standard library, no new dependency is introduced and the existing `urllib`-based retry logic is preserved as-is.
