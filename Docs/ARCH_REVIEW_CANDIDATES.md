@@ -1456,3 +1456,31 @@ Add an optional `excludeIdPatterns` parameter to `findDuplicateTask` (defaulting
 
 Benefits:
 The function's behavior becomes explicit and configurable. The exclusion rule lives where the policy decision is made (the caller), not in the generic similarity engine. Future callers that need to deduplicate corpora including those source types can simply omit the pattern, and the function's JSDoc and signature accurately describe its contract.
+
+### AC-136 · Scope-eligibility gate applied at registration but not at retrieval
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`registerTaskSource` intercepts `config.next` to wrap it with a `sourceEligibleHere` check so that `scope: 'core'` sources return `null` on non-core projects. However, `getRegisteredSources` and `getRegisteredSource` return raw registry entries without applying that same scope filter. Any consumer that iterates the registry to build a UI list, a task queue, or a dispatch table will see core sources as present and active, only to discover at call-time that `next` silently yields `null`. This forces every downstream consumer to independently re-evaluate `sourceEligibleHere` before displaying or scheduling, duplicating logic that was already centralized in the registration hook and creating a tight coupling between the registry's internal gating strategy and every external caller.
+
+Solution:
+Introduce a dedicated `getEligibleSources` method (and a corresponding `getEligibleSource` accessor) that applies the scope-eligibility filter, while leaving `getRegisteredSources` and `getRegisteredSource` unchanged to return the full registry state. This preserves the documented contract that the registry reflects *what is installed* (allowing admin UIs to show "installed but inactive" states and distinguish "not installed" from "installed but ineligible"), while providing a single, centralized API for consumers that need *what is active* in the current context. The registration-time wrapping of `config.next` remains as a safety net for direct calls, but consumers building lists or dispatch tables can now rely on the registry to filter, rather than re-deriving eligibility themselves.
+
+Benefits:
+Consumers no longer need to know about or re-implement the `sourceEligibleHere` predicate when they only care about active sources; a single filter in the registry guarantees that listing and execution agree. The registry's public contract remains self-consistent: `getRegisteredSources` reflects installation state, and `getEligibleSources` reflects active state. New scope categories can be added in one place without auditing every call-site, and the distinction between "not installed" and "installed but ineligible" remains explicit and queryable.
+
+### AC-137 · Hardcoded domain-to-source mapping in resolveSourceName bypasses the alias mechanism
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`registerSourceAlias` exists as the public, data-driven mechanism for mapping a `task.source` string to a registry name, allowing plugins to extend or override source resolution without modifying core code. Yet `resolveSourceName` contains hardcoded branches for the `adhoc` and `secondbrain` domains that execute before the alias map is consulted. This creates two parallel resolution paths—one code-driven and one data-driven—where the code-driven path always wins for those two domains. A plugin that wishes to remap or intercept `adhoc`/`secondbrain` tasks cannot do so through the documented alias API, violating the Open/Closed Principle and making the resolution logic harder to reason about because the effective mapping depends on both the hardcoded checks and the alias table.
+
+Solution:
+Refactor `resolveSourceName` to consult only the `sourceAliases` map. Move the existing `adhoc` and `secondbrain` mappings into the alias map during core initialization (or at the point where those sources are registered), so that all source-name resolution flows through the single, extensible data-driven path. The `registerSourceAlias` interface then becomes the sole extension point, and no future domain-specific special-casing is required in the resolver. To address the state-dependency concern, ensure that core initialization populates these aliases synchronously before any public API is exposed, and document that `resolveSourceName` requires the registry to be initialized.
+
+Benefits:
+Source resolution becomes uniform and data-driven, eliminating the dual-path reasoning burden. Plugins gain the ability to override or extend `adhoc`/`secondbrain` mappings through the existing public API without patching core code. Adding a new domain alias is a one-line registration rather than a code change to the resolver, reducing the risk of missed cases and making the resolution logic trivially testable by inspecting the alias table. The resolver remains deterministic given a fixed registry state, and the initialization order is documented to prevent state-dependent failures.
+
+NOTE: AC-002's solution was retained because the critique's concern about initialization order is a documentation and implementation detail (ensuring synchronous core init before public API exposure) rather than a fundamental flaw in the data-driven approach; the Open/Closed Principle violation and dual-path reasoning burden are real defects that the alias-map approach resolves.
