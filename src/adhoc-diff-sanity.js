@@ -92,7 +92,9 @@ const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|h
 //      verb, or one that opens with an imperative ("Lazy-load the rows in index.html") on a code path still wants code.
 const CODE_PATH_SIGNAL_RE = /\b(?:src|python|scripts|lib|app|dashboard|templates)\/|\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
 const CODE_PHRASE_SIGNAL_RE = /\b(?:implement|endpoint|route|task source|new (?:module|file|source|helper)|render\w*\(|def \w+\(|function \w+|wire (?:it|this|the|in)|add .{0,25}(?:to|in|into) \w[\w./-]*\.(?:py|js|html|sh)|api route|backend|cursor module|sweep logic)\b/i;
-const AFFIRMATIVE_EDIT_VERB_RE = /\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix|create|write|refactor|extract|move|rename)\b/i;
+// A verb glued to identifier characters is part of a NAME, not a request: "lease-delete+yield", "file.delete", "get_move_set" (2026-10-15, GPU broker verification tasks: a documentation task that cites
+// `lease-delete+yield` as evidence was blocked as asking for a code change). The lookbehind/lookahead keep a sentence-final "delete." and "delete the lease" as verbs.
+const AFFIRMATIVE_EDIT_VERB_RE = /(?<![-_+/.:])\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix|create|write|refactor|extract|move|rename)\b(?![-_+/:]|\.\w)/i;
 // A negator, up to three filler words, then an edit-ish verb: "do NOT modify", "not files to edit", "does not implement", "must not be edited".
 const NEGATED_VERB_RE = /\b(?:do\s*n[o']?t|don['’]t|does\s*n[o']?t|doesn['’]t|must\s+not|should\s+not|never|not|no)\b(?:\s+[\w'’-]+){0,3}?\s+(?:edit\w*|modif\w*|chang\w*|touch\w*|implement\w*|updat\w*|writ\w*|add\w*|alter\w*|delet\w*|creat\w*|replac\w*|rewrit\w*|insert\w*|remov\w*|fix\w*)\b/gi;
 // The sentence the needs-clarification picker appends to a human's answer ("This answer resolves the open question(s) above -- implement against it directly rather than
@@ -100,6 +102,9 @@ const NEGATED_VERB_RE = /\b(?:do\s*n[o']?t|don['’]t|does\s*n[o']?t|doesn['’]
 const PIPELINE_BOILERPLATE_RE = /\bimplement against (?:it|this|that|the answer)\b[^.!?\n]*/gi;
 // An affirmative sentence whose object is a documentation file: "Append X to AGENTS.md", "Create a single NEW Markdown file at docs/research/x.md".
 const DOC_DELIVERABLE_RE = /\b(?:append|prepend|create|write|add|merge|insert|document|record|draft)\b[^.!?\n]{0,160}?(?:\.md\b|\.txt\b|\bdocs?\/|\bMarkdown\b|\bADR\b|\bREADME\b|\bAGENTS\b)/i;
+// A task that says outright its code is read-only / nothing else is touched (2026-10-15: "RULES: read-only on the code; write ONLY the one findings file named below (a NEW file, nothing else
+// changed)" was itself read as a code request because of "NEW file" and "write"). Only meaningful together with a stated documentation deliverable, see wantsCodeChange.
+const READ_ONLY_RE = /\bread-only\b|\bnothing else (?:is |was |gets )?(?:touched|changed|modified|edited)\b|\bchange nothing else\b|\bwrite ONLY the one\b/i;
 
 function stripNonRequests(sen) {
   return sen.replace(NEGATED_VERB_RE, ' ').replace(PIPELINE_BOILERPLATE_RE, ' ');
@@ -154,6 +159,9 @@ const requestsCode = (c) => CODE_PHRASE_SIGNAL_RE.test(c) || AFFIRMATIVE_EDIT_VE
 function wantsCodeChange(combined, rawText = null) {
   if (rawText) {
     const raw = scanForCodeSignals(rawText);
+    // A stated documentation deliverable AND an explicit read-only statement: the verbs and phrases in code-citing sentences describe what the document will verify, so only a sentence
+    // that opens with an imperative aimed at a code path ("Rename the helper in src/a.js") still asks for code.
+    if (raw.docDeliverable && READ_ONLY_RE.test(rawText)) return raw.tripping.some(opensWithImperative);
     if (raw.docDeliverable) return raw.tripping.some(requestsCode);
   }
   const all = scanForCodeSignals(combined);
