@@ -410,3 +410,23 @@ Solution: Add a consistency check in src/local-draft.js that, after the implemen
 Benefits: This fix will prevent the class of tasks where the implement pass issues a blanket "NO CORRECTNESS ISSUES" verdict that contradicts the plan's own analysis, which is the root cause of all four failing tasks.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-change-review-3-34-est-api-cost-0-benefit-0-shipped-over-7d-1792179958751
+
+### AC-146 · on-demand task "adhoc-gpu-broker-verify-core-confirm-the-extraction-map-against-the-core-code-write-
+Strength: Strong
+Files: src/adhoc-diff-sanity.js
+
+Problem: The docs-only gate in `src/adhoc-diff-sanity.js` blocks tasks whose only deliverable is a new Markdown file, even when the task explicitly requests a doc deliverable and the agent has verified all citations. This causes legitimate documentation tasks to be rejected as "not a real implementation."
+Solution: Modify the gate logic in `src/adhoc-diff-sanity.js` to allow docs-only diffs when the task's `ask` field explicitly states a doc deliverable (e.g., "Create the NEW file Docs/...") and the diff only touches that file. Acceptance check: a task with `ask: "Create the NEW file Docs/test.md"` and a diff that only creates `Docs/test.md` should pass the gate.
+Benefits: Documentation verification tasks, which are a common class of agent-manager tasks, will stop being falsely blocked by the substance gate, reducing the need for manual requeue and operator intervention.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-gpu-broker-verify-core-confirm-the-extraction-map-against-t-1792123219739
+
+### AC-147 · on-demand task "adhoc-passive-tuning-loops-design-doc-for-the-shared-loop-shape-the-health-ledger-an
+Strength: Strong
+Files: src/review-task.js
+
+Problem: The review gate's grounding check rejects drafts that cite environment-specific tokens (e.g., `AGENT_MANAGER_LOOP_`) that are not present in the static source files used as the grounding source, even when the draft is a valid design document.
+Solution: Modify the grounding check in `src/review-task.js` to allow citations of environment-specific tokens (e.g., variables prefixed with `AGENT_MANAGER_`) when the draft is a design document or when the token is defined in the task's context. Acceptance check: A draft that cites `AGENT_MANAGER_LOOP_` and is a design document should pass the review gate.
+Benefits: Design document tasks that reference environment-specific tokens will no longer be rejected by the review gate.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-adhoc-passive-tuning-loops-design-doc-for-the-shared-loop-shape-t-1792124226356
