@@ -1484,3 +1484,31 @@ Benefits:
 Source resolution becomes uniform and data-driven, eliminating the dual-path reasoning burden. Plugins gain the ability to override or extend `adhoc`/`secondbrain` mappings through the existing public API without patching core code. Adding a new domain alias is a one-line registration rather than a code change to the resolver, reducing the risk of missed cases and making the resolution logic trivially testable by inspecting the alias table. The resolver remains deterministic given a fixed registry state, and the initialization order is documented to prevent state-dependent failures.
 
 NOTE: AC-002's solution was retained because the critique's concern about initialization order is a documentation and implementation detail (ensuring synchronous core init before public API exposure) rather than a fundamental flaw in the data-driven approach; the Open/Closed Principle violation and dual-path reasoning burden are real defects that the alias-map approach resolves.
+
+### AC-138 · UI consumer does not filter core-scoped sources in non-core contexts (registry itself is correct)
+Strength: Worth exploring
+Files: src/task-source-registry.js (consumer), src/lib/source-scope.js
+
+Problem:
+`getRegisteredSources()` is intentionally a static, context-agnostic listing: it returns all registered entries sorted by priority, and scope gating is applied exclusively at the execution boundary (the `next()` wrapper / `getNextTask` / `next-claimable-task`). This is the correct design for a registry that serves as a storage and enumeration layer. However, downstream UI consumers (source-selection dropdowns, configuration panels) call `getRegisteredSources()` and render every entry without consulting `sourceEligibleHere`. A developer in a non-core project therefore sees a core-only source listed, selects it, and receives a silent `null` from the execution path with no inline explanation. The gap is not in the registry's contract but in the consumer that fails to project the listing through the eligibility predicate before display.
+
+Solution:
+At the UI/consumer layer that renders the source list, filter the result of `getRegisteredSources()` through `sourceEligibleHere(entry)` (or an equivalent context-aware predicate) before populating the dropdown. Alternatively, provide a thin convenience helper (e.g., `getEligibleSources()`) in a UI-adjacent module that composes the two calls, leaving `getRegisteredSources()` unchanged as a pure enumeration. This keeps the registry's contract intact—static, context-agnostic, suitable for cross-project planning and configuration tooling—while ensuring end-users only see sources that will actually execute in the current context.
+
+Benefits:
+The registry remains a simple, predictable storage layer with a single, well-defined contract. The UX gap is closed at the layer that owns the presentation decision. Consumers that legitimately need the full list (cross-project planning, configuration UIs) continue to work unchanged.
+
+### AC-139 · Lazy `require` in `registerTaskSource` is a correct circular-dependency resolution; minor documentation gap
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` defers `require('./lib/source-scope.js')` into the function body. This is a standard and appropriate pattern for breaking the circular dependency chain (`task-source-registry → source-scope → config → accessible-roots → …`). Importantly, `source-scope.js` itself reads configuration lazily inside `activeRepoIsCore()` via `require('../config.js').getConfig()`, so the config value is always resolved at the moment `sourceEligibleHere` is invoked, regardless of when the module was first required. There is therefore no initialization-order hazard: the timing of the `require` in `task-source-registry.js` does not affect when or how config is read. The only residual cost is that the dependency is not visible in the top-of-file `require` block, which can slow a newcomer's mental model of the module graph.
+
+Solution:
+Add a brief comment at the site of the deferred `require` explaining that it is intentional (circular dependency with `source-scope.js` → `config.js` → `accessible-roots.js`) and that config is read at invocation time inside `source-scope.js`, so no additional initialization-order guarantee is needed. No structural change (injection, top-level require, or refactoring of `source-scope.js`) is warranted; doing so would either reintroduce the cycle or add complexity disproportionate to the benefit.
+
+Benefits:
+A reader encountering the in-function `require` immediately understands *why* it is there and that it is safe, removing the temptation to "fix" it into a top-level import and inadvertently re-create the circular dependency. The module graph remains correct and the pattern stays standard.
+
+NOTE: Flag 1 was applied by removing the original AC-001's premise that `getRegisteredSources()` should filter by scope; the corrected draft treats the registry's context-agnostic listing as correct design and relocates the UX concern to the consumer layer. Flag 2 was applied by removing the original AC-002's initialization-order hazard claim (which is mitigated by `source-scope.js`'s own lazy config access) and reframing the item as a minor documentation gap with no structural change recommended.
