@@ -1329,3 +1329,16 @@ Either (a) make `persistHook` mandatory by having `appendHistoryEvent` throw or 
 
 Benefits:
 History durability becomes uniform across all pipeline stages, eliminating the split-brain window where a crash mid-draft or mid-review silently discards stage-transition records. Operators and debugging tools can rely on the history log being complete up to the last committed stage, regardless of which worker process was executing. The persistence contract shifts from "opt-in but nobody opts in" to a guaranteed invariant, simplifying reasoning about data-loss scenarios.
+
+### AC-127 · writeSideFindingInbox bypasses the community's atomic-write guarantee
+Strength: Strong
+Files: src/side-finding.js, src/atomic-write.js
+
+Problem:
+The community defines a shared durability contract through `src/atomic-write.js`, whose entire purpose is to prevent the "crash mid-write → truncated, unparseable file" failure mode (documented in its header as the cause of 16+ tasks left claimed-but-undrafted by a mid-run crash). Yet `writeSideFindingInbox` in `src/side-finding.js` performs its own `fs.writeFileSync` directly, with no temp-file + fsync + rename. Both files are high-degree members of the same `src/{lib}` community, and `side-finding.js` already imports `fs` and `path` for this purpose — so the atomic writer is available but unused. The consequence is asymmetric: a crash during a side-finding inbox write can leave a half-written JSON file in `queue/side-findings-inbox/`, which the downstream `side-finding-sweep.js` will then have to parse or skip. The atomic-write module's own rationale applies equally to these inbox entries.
+
+Solution:
+Replace the direct `fs.writeFileSync(path.join(dir, name), JSON.stringify(record, null, 2))` call inside `writeSideFindingInbox` with a call to `writeJsonAtomicSync` from `src/atomic-write.js`, which is already in the same community and is the community's canonical writer. The `fs.mkdirSync` call stays as-is because directory creation is not subject to the same truncation risk. No other line in `side-finding.js` changes; the `fs` and `path` imports remain because `mkdirSync` and `path.join` are still used.
+
+Benefits:
+One code path owns the durability contract for all JSON writes in this community. A crash during a side-finding inbox write can no longer leave a truncated JSON file that the sweep consumer must special-case. The atomic-write module's guarantee becomes actually universal across the community rather than being silently bypassed by one of its own members.
