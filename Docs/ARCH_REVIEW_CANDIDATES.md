@@ -1822,3 +1822,51 @@ Delete the single `require('../task-sources.js');` line (and the one blank line 
 
 Benefits:
 Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies explicit. There is zero behavioural change because none of the exported functions reference any symbol from `task-sources.js`.
+
+### AC-162 · `ollama_client.generate()` sends `null` model when `LOCAL_MODEL` is unset
+Strength: Worth exploring
+Files: python/dashboard/ollama_client.py
+
+Problem:
+`MODEL = os.environ.get("LOCAL_MODEL")` is read once at import time with no fallback. The module's own header comment states the intent: an unset `LOCAL_MODEL` should surface as a real Ollama "model not found" error rather than a guessed name. However, the current implementation sends `"model": null` in the request body. While Ollama correctly rejects this with a `400 Bad Request` (e.g., "model is required"), this failure mode is suboptimal for two reasons:
+1. **Latency/Network Dependency:** The error is only discovered after a network round-trip to the Ollama server. If the server is down, unreachable, or slow, the operator receives a connection error or timeout instead of the specific configuration error.
+2. **Clarity:** A local `RuntimeError` explicitly naming the missing `LOCAL_MODEL` environment variable is more actionable and self-explanatory than a generic HTTP 400 response from a remote service.
+
+Because `MODEL` is captured at import time, a process that starts before the env var is set keeps sending `null` for its entire lifetime. The current behavior is not "silent" (Ollama does not fall back to a default model), but it is an indirect failure that relies on external service behavior to report a local configuration error.
+
+Solution:
+In `generate()`, before building the request body, check `if MODEL is None` and raise a `RuntimeError` (or a small dedicated exception) whose message names the missing `LOCAL_MODEL` environment variable. This makes the failure happen at the client boundary, is deterministic, and matches the module's own documented intent. No change to the request path when `MODEL` is set.
+
+Benefits:
+Converts a network-dependent configuration error into an immediate, self-explanatory local error; eliminates the need for a network round-trip to detect a missing environment variable; and makes the "no hardcoded fallback" design actually hold at runtime rather than only in a comment.
+
+### AC-163 · `test_client_timeout_handling.py` mutates `sys.path` to import its subjects
+Strength: Worth exploring
+Files: python/dashboard/test_client_timeout_handling.py
+
+Problem:
+The test executes `sys.path.insert(0, str(Path(__file__).parent))` and then imports `claude_client` and `local_tool_client` as top-level modules. This mutates global interpreter state as a side effect of importing the test module. The primary concern is not shadowing (since inserting at index 0 correctly prioritizes the local directory), but rather **global state pollution**. The mutation persists for the rest of the interpreter session, so any other test or module loaded afterward in the same process inherits the altered path. This can lead to subtle import resolution issues in other parts of the test suite if they rely on standard package resolution or if the local directory contains modules with names that conflict with installed packages.
+
+The header comment notes this matches a zero-extra-dependency stdlib-unittest convention, but that is an argument for consistency, not for the pattern being sound in a larger test suite.
+
+Solution:
+Use `importlib.util.spec_from_file_location` to load the modules directly from their file paths without modifying `sys.path`. This approach is isolated to the specific test module and does not pollute the global interpreter state. For example:
+```python
+import importlib.util
+from pathlib import Path
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+claude_client = load_module("claude_client", Path(__file__).parent / "claude_client.py")
+local_tool_client = load_module("local_tool_client", Path(__file__).parent / "local_tool_client.py")
+```
+This removes the `sys.path` mutation entirely while maintaining the ability to import local modules without requiring a full package structure.
+
+Benefits:
+Removes global `sys.path` mutation from the test process, eliminates the risk of path pollution affecting other tests, and makes the test's dependency on the modules under test explicit and isolated.
+
+NOTE: The critique regarding AC-002's "shadowing" claim was valid and addressed by reframing the problem as global state pollution rather than shadowing, and by proposing a more robust solution using `importlib` instead of package imports. The critique regarding AC-001's "silent fallback" claim was valid and addressed by correcting the problem statement to reflect that Ollama returns a clear error, but the local error is still preferable for latency and clarity reasons.
