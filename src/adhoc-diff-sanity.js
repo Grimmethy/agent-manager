@@ -146,9 +146,14 @@ const NON_IMPERATIVE_LEAD_RE = /^(?:(?:and|then|also|but|so|next|finally|plus)\s
 // "Populate it with at least three rows: routes/chat.py:140-148 (...)" and "Decision 1: ... touching scripts/local-worker.sh" are documentation, and a first version of this
 // rule, dry-run over the real queue, flipped both). A "Label:" / "Decision 1:" lead is not a verb either.
 const TARGET_PATH_RE = /\b(?:in|into|to|inside|within)\s+(?:the\s+|its\s+|a\s+)?(?:[\w.-]+\/)*[\w.-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
+// Verbs that ask the author to LOOK at a file, never to change it (2026-10-16: two read-only design/findings tasks, "Ground it in the current code with path:line ... in src/task-sources.js" and
+// "Read the real history ... the existing task sources in src/task-sources.js", were blocked because "Ground" / "Read" are not on the non-verb list above and the file is named after "in"). None of
+// these is a mutating verb; a sentence that ALSO contains a real edit verb ("Read the helper and rename it in src/a.js") still counts, see opensWithImperative.
+const READING_LEAD_RE = /^(?:read|ground|check|confirm|verify|compare|survey|inspect|review|examine|trace|count|group|audit|map|identify|investigate|analy[sz]e|look|study|scan|grep|search|find|classify|tabulate|quantify|cross-check|cross-reference)$/i;
 function opensWithImperative(c) {
   const m = /^[\s>*\-\d.)]*([A-Za-z][A-Za-z-]*)(?=\s)/.exec(c);
-  return !!m && !NON_IMPERATIVE_LEAD_RE.test(m[1]) && TARGET_PATH_RE.test(c);
+  if (!m || NON_IMPERATIVE_LEAD_RE.test(m[1]) || !TARGET_PATH_RE.test(c)) return false;
+  return !(READING_LEAD_RE.test(m[1]) && !AFFIRMATIVE_EDIT_VERB_RE.test(c));
 }
 // A sentence still counts as asking for code when it has a phrase signal, an affirmative edit verb, or opens with an imperative.
 const requestsCode = (c) => CODE_PHRASE_SIGNAL_RE.test(c) || AFFIRMATIVE_EDIT_VERB_RE.test(c) || opensWithImperative(c);
