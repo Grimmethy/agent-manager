@@ -1430,3 +1430,29 @@ Make `resolve` assert that a pending promise exists for the given URL before att
 
 Benefits:
 A test-authoring error (wrong URL, double-resolve) is reported as a clear test assertion failure with the problematic URL in the message, rather than a cryptic harness `TypeError` that requires reading the helper's source to diagnose. Debugging time for the rare but real "I resolved the wrong URL" mistake drops from "trace the TypeError back through the harness" to "read the assertion message." The helper's error path now serves the test author instead of obscuring their mistake.
+
+### AC-134 · pipeline-self-audit.js re-exports a classification API it no longer implements
+Strength: Strong
+Files: src/pipeline-self-audit.js, src/blocked-task-classifiers.js, src/pipeline-forensics.js, src/staleness-audit.js
+
+Problem:
+The file's own header comment (dated 2026-09-06) states that classification logic was moved to `src/blocked-task-classifiers.js` and that `pipeline-self-audit.js` is now a "pure delegation" module. Yet its `module.exports` still exposes `REASON_CATEGORIES`, `hasZeroHitHarnessSearch`, `categorizeBlockedReason`, and `signatureForTask` — all imported from `blocked-task-classifiers.js` and re-exported unchanged. The comment justifies this as keeping `pipeline-forensics.js` and `staleness-audit.js`'s existing `require('./pipeline-self-audit.js')` imports working with zero changes. The result is a misleading module boundary: a reader inspecting `pipeline-self-audit.js`'s exports would reasonably expect those functions to be implemented there, but they are not. The file's actual own logic is only `findAuditClusters`, `buildAuditRawText`, and `buildAuditTask`. The re-export exists solely to avoid updating two consumer files, creating a facade that hides the true dependency and breaks the principle that a module's public API should reflect what it actually does.
+
+Solution:
+Update `pipeline-forensics.js` and `staleness-audit.js` to import the four classification symbols directly from `src/blocked-task-classifiers.js`, then remove those four re-exported symbols from `pipeline-self-audit.js`'s `module.exports`. After the change, `pipeline-self-audit.js`'s public API will contain only the three functions it genuinely implements, and the classification API will be sourced from the module that owns it.
+
+Benefits:
+Each module's public API becomes honest about its own responsibilities, eliminating the "facade that hides the true dependency" pattern. Future changes to the classification API no longer require touching `pipeline-self-audit.js`, and any new consumer reading `pipeline-self-audit.js`'s source will see only the functions actually implemented there, removing the confusion about where the real implementation lives.
+
+### AC-135 · staleness-audit-dedup.js hardcodes a task-ID exclusion that belongs in the caller
+Strength: Strong
+Files: src/staleness-audit-dedup.js
+
+Problem:
+`findDuplicateTask` contains the line `if (/(^|-)(brain-dump-sort|product-spec-outline)-/.test(other.id)) continue;`. This is a business-rule exclusion (tasks from these two sources should never be considered duplicates of anything) baked into a function whose stated purpose is generic Jaccard-similarity deduplication. The function's name, parameters, and JSDoc make no mention of these source types. A caller that wants to deduplicate a corpus that does include `brain-dump-sort` tasks (for example, a future audit of those tasks themselves) would silently get wrong results because the exclusion is invisible in the function's contract. This violates the single-responsibility principle and makes the function's behavior dependent on a hardcoded list of source IDs that is not documented in the function's interface.
+
+Solution:
+Add an optional `excludeIdPatterns` parameter to `findDuplicateTask` (defaulting to an empty array), and move the `brain-dump-sort|product-spec-outline` regex into the caller that needs it. The caller, which knows the context of why those sources are excluded, passes the pattern explicitly. The dedup function itself remains a generic similarity engine with no knowledge of specific task sources.
+
+Benefits:
+The function's behavior becomes explicit and configurable. The exclusion rule lives where the policy decision is made (the caller), not in the generic similarity engine. Future callers that need to deduplicate corpora including those source types can simply omit the pattern, and the function's JSDoc and signature accurately describe its contract.
