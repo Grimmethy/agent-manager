@@ -4224,3 +4224,80 @@ test('test-framework prompt line: a task that concerns tests gets the repo\'s re
     assert.equal(withTestConventions({ title: 'Rename a helper', promptContext: { rawText: 'no relation', files: ['src/a.js'] } }, 'BASE PROMPT'), 'BASE PROMPT');
   } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev; tf.clearCache(); }
 });
+
+// 2026-10-16: an adhoc task requeued as an agentic continuation (isAgenticContinuation, priorPartialDiff) already holds its plan, orient notes and
+// acceptance criteria, yet the plan pass re-ran on every attempt and kept ending in 'Plan pass degenerate: truncated' (the extend-the-merged-doc
+// task: six blocked attempts). A continuation whose own earlier attempt wrote a plan with a CRITERIA: block now reuses it: no orient pass, no plan call.
+const CONTINUATION_PLAN = [
+  'PLAN',
+  '1. Read the current state of the working tree and confirm which of the edits from the earlier pass are already applied.',
+  '2. Finish the remaining edits in the one file the task names, building on what is already there without redoing it.',
+  '3. Run the targeted check on what changed and hand back the resulting diff for review.',
+  'CRITERIA:',
+  '- The remaining sections exist in the one file the task names',
+  '- No other file is touched',
+].join('\n');
+
+function continuationHarness(taskOverrides) {
+  const stages = [];
+  let orientCalls = 0;
+  const localCall = async (opts) => { stages.push(opts.stage || 'other'); return { response: PLAN_STUB, degenerate: null, attempts: 1 }; };
+  const runOrientPassFn = async () => { orientCalls += 1; return { skipped: true, notes: '' }; };
+  const task = {
+    id: 'adhoc-continuation-test', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'extend the doc' },
+    isAgenticContinuation: true, priorPartialDiff: 'diff --git a/x b/x\n', agenticContinuationCount: 1,
+    lastGoodPlan: CONTINUATION_PLAN, orientNotes: 'earlier orient report', oriented: true,
+    ...taskOverrides,
+  };
+  const deps = {
+    localCall, runOrientPassFn,
+    draftAdhocViaLocalAgenticWriteFn: async (t) => { t.adhocResolution = 'no-changes-needed'; t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do'; return { succeeded: true, blocked: false }; },
+  };
+  return { task, deps, stages, orientCount: () => orientCalls };
+}
+
+test('an agentic continuation with its own prior plan makes no orient pass and no plan call, and keeps the plan and its acceptance criteria', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const h = continuationHarness({});
+    await draftTask(h.task, h.deps);
+    assert.equal(h.stages.filter((s) => s === 'plan').length, 0, 'no plan model call');
+    assert.equal(h.orientCount(), 0, 'no orient pass');
+    assert.equal(h.task.planResponse, CONTINUATION_PLAN);
+    assert.deepEqual(h.task.acceptanceCriteria, ['The remaining sections exist in the one file the task names', 'No other file is touched']);
+    assert.equal(h.task.acceptanceCriteriaSource, 'plan-derived');
+    assert.ok(h.task.history.some((e) => e.stage === 'plan-done' && /reused the prior plan for an agentic continuation/.test(e.detail)));
+  });
+});
+
+test('a continuation whose prior plan is thin still runs the plan pass', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const h = continuationHarness({ lastGoodPlan: '1. Do it.' });
+    await draftTask(h.task, h.deps);
+    assert.ok(h.stages.filter((s) => s === 'plan').length >= 1, 'a thin plan is not reused');
+  });
+});
+
+test('a continuation whose prior plan has no CRITERIA: block still runs the plan pass', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const h = continuationHarness({ lastGoodPlan: CONTINUATION_PLAN.split('CRITERIA:')[0] });
+    await draftTask(h.task, h.deps);
+    assert.ok(h.stages.filter((s) => s === 'plan').length >= 1, 'no acceptance criteria derivable -> plan as before');
+  });
+});
+
+test('a task that is not an agentic continuation still runs the plan pass even when it has a lastGoodPlan', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const h = continuationHarness({ isAgenticContinuation: undefined, priorPartialDiff: undefined });
+    await draftTask(h.task, h.deps);
+    assert.ok(h.stages.filter((s) => s === 'plan').length >= 1);
+  });
+});
+
+test('reusePriorPlanForContinuation never short-circuits the plan-critique re-plan (_planCritiqueRevised)', async () => {
+  await withFixtureRepo(async () => {
+    const { reusePriorPlanForContinuation } = require('./local-draft.js');
+    const task = { id: 'adhoc-x', domain: 'adhoc', source: 'manual', promptContext: { rawText: 'x' }, isAgenticContinuation: true, lastGoodPlan: CONTINUATION_PLAN, _planCritiqueRevised: true };
+    assert.equal(reusePriorPlanForContinuation(task, null), false);
+    assert.equal(task.planResponse, undefined);
+  });
+});

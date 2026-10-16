@@ -596,3 +596,107 @@ test('majorityVote() does NOT file a SIDE-FINDING even when a vote response carr
     }
   );
 });
+
+// 2026-10-16: a hard failure (timeout / HTTP 5xx / connection refused) used to consume one of call()'s attempts. A plan call on the P40 hit an HTTP 500,
+// then a 427 s timeout, and its first real response (truncated at numPredict 1400) came on attempt 3 -- the loop was over, so the truncation escalation
+// (numPredict x2, think off) never ran and the task was recorded as 'Plan pass degenerate: truncated'. Hard failures now have their own allowance.
+function truncatedEmpty(body) {
+  return JSON.stringify({ response: '', done: true, done_reason: 'length', eval_count: body.options.num_predict });
+}
+
+test('hardFailureAllowance(maxRetries) equals the attempts a call that never gets a response has always made', () => {
+  const { hardFailureAllowance } = freshLocalClient('http://127.0.0.1:1');
+  assert.equal(hardFailureAllowance(2), 3);
+  assert.equal(hardFailureAllowance(1), 2);
+  assert.equal(hardFailureAllowance(0), 1);
+});
+
+test('call() still escalates numPredict and drops think when the first REAL response (a zero-content truncation) arrives after two hard failures', async () => {
+  const seen = [];
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        const body = JSON.parse(raw);
+        seen.push({ numPredict: body.options.num_predict, think: body.think });
+        if (seen.length <= 2) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end('{"error":"runner stopped"}'); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(seen.length === 3 ? truncatedEmpty(body) : generateResponse('a real plan, landed after the outage and the escalation.'));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: true, numPredict: 1400 }, 2);
+      assert.equal(result.degenerate, null, 'the call must recover, not end as "truncated" with a retry never taken');
+      assert.deepEqual(seen, [
+        { numPredict: 1400, think: true }, { numPredict: 1400, think: true }, { numPredict: 1400, think: true },
+        { numPredict: 2800, think: false },
+      ]);
+      assert.equal(result.attempts, 4, 'attempts counts every call made, hard failures included');
+    }
+  );
+});
+
+test('call() that only ever hard-fails still re-throws after exactly maxRetries + 1 attempts', async () => {
+  let requests = 0;
+  await withServer(
+    (req, res) => { requests += 1; req.on('data', () => {}); req.on('end', () => { res.writeHead(503); res.end('{}'); }); },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      await assert.rejects(() => call({ prompt: 'x', think: false }, 2), /503/);
+      assert.equal(requests, 3);
+    }
+  );
+});
+
+test('call() whose every response is truncated still stops after maxRetries + 1 responses (the response budget is unchanged)', async () => {
+  let requests = 0;
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => { requests += 1; res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(truncatedEmpty(JSON.parse(raw))); });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: true, numPredict: 1400 }, 2);
+      assert.equal(result.degenerate, 'truncated');
+      assert.equal(requests, 3);
+    }
+  );
+});
+
+test('the degenerate and hard-failure audit entries record whether think was on for that attempt', async () => {
+  let n = 0;
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        const body = JSON.parse(raw);
+        n += 1;
+        if (n === 1) { res.writeHead(503, { 'Content-Type': 'application/json' }); res.end('{}'); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(n <= 3 ? truncatedEmpty(body) : generateResponse('a real, complete response.'));
+      });
+    },
+    async (base) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-think-audit-test-'));
+      process.env.OLLAMA_URL = base;
+      process.env.LOCAL_MODEL = 'test-model';
+      process.env.ORNITH_TIMEOUT_MS = '5000';
+      process.env.AGENT_MANAGER_REPO_ROOT = dir;
+      process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+      delete require.cache[require.resolve('./local-client.js')];
+      const { call } = require('./local-client.js');
+      const result = await call({ prompt: 'x', think: true, numPredict: 1400, source: 'manual', taskId: 't-think', stage: 'plan' }, 2);
+      assert.equal(result.degenerate, null);
+      const lines = fs.readFileSync(path.join(dir, 'instances', 'pipeline-history.log'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const hard = lines.filter((l) => l.type === 'hard-failure');
+      const degenerate = lines.filter((l) => l.type === 'degenerate');
+      assert.deepEqual(hard.map((l) => l.think), [true]);
+      assert.deepEqual(degenerate.map((l) => l.think), [true, false], 'the first truncation asked for reasoning; the retry after a zero-content truncation did not');
+    }
+  );
+});
