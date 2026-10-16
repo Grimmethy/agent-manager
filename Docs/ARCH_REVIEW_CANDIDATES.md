@@ -1796,3 +1796,16 @@ Benefits:
 Adding a new task source is a single-step operation: the plugin declares its canonical name once, uses that same name for both registration and stamping, and the registry key and the stamped string are in sync by construction. The alias table in the registry shrinks to a frozen backward-compatibility shim for pre-existing task strings, rather than a parallel identity system that must be kept in lockstep with plugin code. The SDK remains a simple, testable utility with no knowledge of the registry or of source identity.
 
 NOTE: Flag 2 was applied — the AC-002 solution was rewritten to attribute identity ownership to the source plugin (not the SDK) and to treat the SDK as a generic parameterized utility, removing the incorrect "SDK queries the registry for the stamp" proposal. Flag 3 was applied — the AC-001 solution was rewritten to introduce a single `invokeSource` choke-point function that covers all callers (including direct watchdog sweeps), rather than naively moving the check to `getNextTask` alone.
+
+### AC-160 · Dead require of task-sources.js in apply-core.js
+Strength: Strong
+Files: src/lib/apply-core.js, src/task-sources.js
+
+Problem:
+`apply-core.js` contains a bare, unassigned side-effect require of `task-sources.js` at the top of the file. None of the functions in `apply-core.js`—`coAuthorTrailer`, `usesGroupB`, `applyCandidateSplit`, `writeArtifact`, or any other—reference a symbol imported from `task-sources.js`. This is the same class of dead require already identified in AC-85 and AC-86 for `prompt-assembly.js` and `prompt-blocks.js`. It adds a needless edge to the module dependency graph, introduces a small circular-require risk if `task-sources.js` (transitively) imports back into `apply-core.js`, and misleads readers into believing a functional dependency exists.
+
+Solution:
+Remove the `require('../task-sources.js');` line from `apply-core.js`. If a side-effect import is genuinely required (e.g., `task-sources.js` registers a global on load), document that intent with a comment and move the require to the entry point that actually depends on the side effect, rather than burying it in an unrelated module.
+
+Benefits:
+The module graph loses a spurious edge, reducing circular-require risk and making the true dependency surface of `apply-core.js` accurate. It aligns the codebase with the cleanup already performed in AC-85 and AC-86, and removes a source of confusion for anyone auditing imports or performing tree-shaking / bundle analysis.
