@@ -178,7 +178,7 @@ def _read_agents_md(session: dict) -> str:
     roots = session.get("roots") or [session["repoRoot"]]
     try:
         content = (Path(roots[0]) / "AGENTS.md").read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ""
     if not content:
         return ""
