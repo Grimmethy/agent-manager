@@ -1551,3 +1551,45 @@ Introduce one internal `acquireMutableConcept(data, conceptId)` (or `assertMutab
 
 Benefits:
 The "stable terminal states" invariant — the file's most important correctness property — is defined in one place. Adding a mutator becomes "call the gate" instead of "remember to copy the guard," which is exactly the failure mode the header comment warns about. The `reopenConcept` exception stays explicit and separate, so the two different predicates (may-mutate vs. may-reopen) are not conflated.
+
+### AC-143 · Registry enforces a specific scope rule, coupling it to one business concern
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` directly requires `./lib/source-scope.js` and wraps every source's `next` function with a core-scope eligibility check. This means the generic registry module carries a hard dependency on a specific business rule (core-repo scoping), so any source that does not need that check still pays for it, and any new scope policy must be threaded through the registry rather than the source that owns the rule. The registry is no longer a neutral registration mechanism; it is implicitly a scope-enforcement layer for one particular domain.
+
+Solution:
+Remove the `source-scope.js` require and the `next`-wrapping logic from `registerTaskSource`. Instead, have the source registration code (e.g., in `src/task-sources.js` or the individual source definition) compose the scope check into its own `next` function before calling `registerTaskSource`. The registry then stores and invokes the `next` function exactly as provided, remaining agnostic to which sources enforce which eligibility rules. If a shared middleware pattern is desired, the registry can expose a simple `wrapNext(middleware)` helper that callers opt into, but the default path stays unopinionated.
+
+Benefits:
+The registry becomes a true generic registration point that can be reused for any task-source type without dragging in scope-specific logic. Adding, removing, or changing scope policies no longer requires touching the registry module, reducing the blast radius of scope-related changes and making the dependency graph easier to reason about and test in isolation.
+
+### AC-144 · Source-name resolution mixes hardcoded branches with a data-driven alias map
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` contains explicit `if` checks for the `'adhoc'` domain (and `'manual'` source) and the `'secondbrain'` domain, alongside a generic `sourceAliases` map populated via `registerSourceAlias`. The hardcoded branches duplicate mappings that could be expressed as data, creating a split-brain: some name normalizations live in control flow, others in a lookup table. A developer adding a new source must remember to inspect both the `if` chain and the alias map, and the two mechanisms can silently disagree.
+
+It is important to note that the hardcoded branches are **not** semantically equivalent to simple source-alias entries. The `'secondbrain'` branch fires on `task.domain === 'secondbrain'` regardless of what `task.source` is, while the alias map (per the `registerSourceAlias` contract) matches only on `task.source === fromField`. Likewise, the `'adhoc'` branch fires on `task.domain === 'adhoc'` *or* `task.source === 'manual'`. Replacing a domain-level check with a source-level alias entry would silently break routing for any task under that domain whose `source` field differs from the one hardcoded alias expects.
+
+Solution:
+Unify the two mechanisms into a single data-driven rule list that supports **both** matching dimensions. Concretely:
+
+1. Extend the alias registration to accept a field specifier, e.g.
+   ```js
+   registerSourceAlias({ field: 'domain', value: 'secondbrain' }, 'secondbrain');
+   registerSourceAlias({ field: 'domain', value: 'adhoc' }, 'adhoc');
+   registerSourceAlias({ field: 'source', value: 'manual' }, 'adhoc');
+   ```
+   (The existing `registerSourceAlias('from', 'to')` signature can be kept as a shorthand for `{ field: 'source', value: 'from' }`.)
+
+2. Store rules in an ordered array (or two maps keyed by field) rather than a single flat `source → target` map, so that `resolveSourceName` iterates the rules in registration order and returns the first match. Domain-level rules naturally act as broader fallbacks; source-level rules can be registered first if they should take precedence.
+
+3. Delete the hardcoded `if` branches from `resolveSourceName`. The function reduces to: iterate the rule list, test `task[rule.field] === rule.value`, return `rule.target` on first hit; otherwise fall through to `return task.source`.
+
+4. Register the existing domain and source rules in a central initialization routine (or alongside each source's registration) so that the full set of normalizations is visible in one place.
+
+Benefits:
+All name-normalization rules live in one data structure, eliminating the cognitive overhead of checking two mechanisms. Adding a new alias—whether keyed on domain or source—is a one-line registration call with no risk of missing a branch in an `if` chain. The domain-level and source-level semantics are preserved because the rule's `field` explicitly states which task property is matched, so the broader domain fallback that the original `if (task.domain === 'secondbrain')` provided is not lost. The function is easier to unit-test (seed the rule array) and easier to audit for completeness.
