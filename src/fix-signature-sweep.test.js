@@ -225,6 +225,66 @@ test('docs-only-gate-negated-paths also drains the two real GPU broker verificat
   assert.equal(has(dir, 'needs-clarification', 'code'), true);
 });
 
+// --- docs-only-gate-read-only-deliverable (2026-10-16) ---------------------------------------------------------------------------------------
+// The sweep is once-per-entry: it stamps firstSeen[id] and skips tasks stuck AFTER it. The 2026-09-21 entry was first seen 2026-09-22, so the tasks the 2026-10-15 gate fix unblocks could only
+// be drained by an entry with a new id. The two texts are the real GPU broker verification task texts, verbatim from the stuck records.
+const READONLY_PF_TEXT = "Context: Docs/gpu-broker-extraction-map.md (merged, PR #561) maps pulling the Forge/pipeline GPU lease out of PromptForge into a standalone gpu-broker plugin (docs/agents/repo-extraction-playbook.md). Owner rule 2026-10-13: the pipeline's Ollama model and the Forge family never hold the GPU together. Premium, owner request 2026-10-15; this is one of three small read-only verification tasks replacing a single task that was too big. PromptForge: verify the map against /media/model-cache/github/promptforge-manual (server/core/gpu_session.py, comfy.py, comfy_proc.py, server/app.py routes /api/gpu/*, Docs/GPU_FAMILY_PROTOCOL.md, tests/test_gpu_session.py). Questions: where is the 120 s ComfyUI wait and how does an automatic job session call begin; which functions in gpu_session.py are broker logic vs PromptForge-specific; which tests would move with G1; per-device awareness (is anything GPU-index specific). RULES: read-only on the code; write ONLY the one findings file named below (a NEW file, nothing else changed). For every row/claim of the map that touches your area, state CONFIRMED / WRONG / UNCONFIRMED with path:line evidence, quote the corrected text for anything WRONG, and answer the section-5 open questions that fall in your area. Keep it under 120 lines. FILE TO WRITE: Docs/gpu-broker-verification-promptforge.md (in the agent-manager repo).";
+const READONLY_CORE_TEXT = "Create the NEW file Docs/gpu-broker-verification-core.md (\u2264120 lines, nothing else touched) verifying Docs/gpu-broker-extraction-map.md section 1/5 against core code. Use this evidence: launch.sh:31-42 lease-delete+yield CONFIRMED; comfyui_lease_held agent-manager-common.sh:98, local-worker.sh:525, review-runner.sh:91 CONFIRMED; gpu-guard.js 54/77/101 CONFIRMED; local-client.js:266 (map says 264 \u2014 quote corrected); stop route pipeline_1_more.py:68 \u2192 app.py _stop_pipeline \u2192 stop.sh --keep-dashboard --keep-plugins, stop.sh:125 skips plugin-*.pid, so G5's 'stop kills plugins today' is WRONG/stale (fixed 2026-10-14, see test_stop_pipeline_keeps_plugins.py); /free reclaim gpu-guard.js:214-217 self-contained, no broker needed; .model-locks writer model-inflight-lock.js:37 + reader chat_preempt.py:164-168,265,394; /api/gpu callers only launch.sh:42, gpu-guard.js:105; pause/resume needs drain status endpoint (.model-locks/gpu-arbiter) + Ollama eviction (KEEP_ALIVE 30m) + resume via app.py:2760. Re-verify each line number with grep before writing, tag every row CONFIRMED/WRONG/UNCONFIRMED with path:line, answer the four section-5 questions, then run `wc -l` (\u2264120) and `git status` (only this new file).";
+const OLD_DOCS_ENTRY_FIRST_SEEN = '2026-09-22T00:21:58.333Z';
+const NEW_ENTRY = 'docs-only-gate-read-only-deliverable';
+const verifyTask = (id, rawText, stuckAt) => stuck(id, {
+  domain: 'adhoc', source: 'manual', promptContext: { rawText }, planResponse: '', priorRejectionFeedback: [], // real tasks carry none; stuck()'s default would match an unrelated entry
+  needsClarification: { reason: 'design-decision', openQuestions: DOCS_ONLY_FAIL },
+  history: [{ stage: 'exhausted', at: stuckAt, detail: '10/10' }, { stage: 'needs-clarification', at: stuckAt, detail: 'escalated' }],
+});
+const seedState = (dir, firstSeen) => fs.writeFileSync(path.join(dir, 'queue', STATE_FILE), JSON.stringify({ firstSeen }));
+const readState = (dir) => JSON.parse(fs.readFileSync(path.join(dir, 'queue', STATE_FILE), 'utf8'));
+const SWEEP_NOW = new Date('2026-10-16T01:00:00Z');
+
+test('docs-only-gate-read-only-deliverable applies to both real verification tasks and not to a real code task', () => {
+  const e = byId[NEW_ENTRY];
+  assert.ok(e, 'the entry exists');
+  assert.equal(e.applies(verifyTask('pf', READONLY_PF_TEXT, '2026-10-16T00:41:26Z')), true);
+  assert.equal(e.applies(verifyTask('core', READONLY_CORE_TEXT, '2026-10-15T18:15:11Z')), true);
+  assert.equal(e.applies(verifyTask('code', 'Create docs/x.md and change the timeout in src/foo.js.', '2026-10-16T00:00:00Z')), false);
+});
+
+test('live state: with the old docs-only entry already first-seen in September, the NEW entry requeues the two real tasks and the old entry alone requeues nothing', () => {
+  const build = () => {
+    const dir = pipeline();
+    seedState(dir, { 'docs-only-gate-negated-paths': OLD_DOCS_ENTRY_FIRST_SEEN });
+    put(dir, 'needs-clarification', verifyTask('verify-pf', READONLY_PF_TEXT, '2026-10-16T00:41:26Z'));
+    put(dir, 'needs-clarification', verifyTask('verify-core', READONLY_CORE_TEXT, '2026-10-15T18:15:11Z'));
+    put(dir, 'needs-clarification', verifyTask('code', 'Create docs/x.md and change the timeout in src/foo.js.', '2026-10-15T18:15:11Z'));
+    return dir;
+  };
+  const dir = build();
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: SWEEP_NOW });
+  assert.deepEqual(s.requeued.map((r) => `${r.id}<-${r.entry}`).sort(), [`verify-core<-${NEW_ENTRY}`, `verify-pf<-${NEW_ENTRY}`]);
+  assert.equal(has(dir, 'adhoc', 'verify-pf'), true);
+  assert.equal(has(dir, 'adhoc', 'verify-core'), true);
+  assert.equal(has(dir, 'needs-clarification', 'code'), true);
+  assert.equal(readState(dir).firstSeen[NEW_ENTRY], SWEEP_NOW.toISOString());
+  assert.ok(read(dir, 'adhoc', 'verify-pf').requeuedForFixes.includes(NEW_ENTRY));
+  const old = build();
+  const sOld = sweepKnownFixedFailures({ pipelineDir: old, now: SWEEP_NOW, entries: [byId['docs-only-gate-negated-paths']] });
+  assert.deepEqual(sOld.requeued, [], 'this is what the owner saw: the old entry skips both as failed-after-the-fix');
+  assert.equal(has(old, 'needs-clarification', 'verify-pf'), true);
+});
+
+test('once only: a task stuck after the new entry was first seen is left alone, and a requeued task is not requeued again for the same entry', () => {
+  const dir = pipeline();
+  seedState(dir, { 'docs-only-gate-negated-paths': OLD_DOCS_ENTRY_FIRST_SEEN, [NEW_ENTRY]: SWEEP_NOW.toISOString() });
+  put(dir, 'needs-clarification', verifyTask('late', READONLY_PF_TEXT, '2026-10-16T02:00:00Z'));
+  const again = verifyTask('again', READONLY_CORE_TEXT, '2026-10-16T00:30:00Z');
+  again.requeuedForFixes = [NEW_ENTRY];
+  put(dir, 'needs-clarification', again);
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T03:00:00Z') });
+  assert.deepEqual(s.requeued, []);
+  assert.equal(has(dir, 'needs-clarification', 'late'), true, 'failed after the entry went live');
+  assert.equal(has(dir, 'needs-clarification', 'again'), true, 'already requeued for this entry once');
+});
+
 // --- stale-snippet-partial-anchor (2026-09-21) ----------------------------------------------------------------------------------------------
 const anchorRepo = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-repo-'));
