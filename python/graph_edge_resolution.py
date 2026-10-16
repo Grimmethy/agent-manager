@@ -172,66 +172,92 @@ def resolve_zig_import(from_file: Path, spec: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
-def _extract_edges_for_file(f: Path, repo_root: Path, file_set: set, text: str) -> list[str]:
-    """Returns the list of relative target paths f imports/requires/includes that also
-    exist in file_set (excluding self-edges) -- the actual regex-scan-and-resolve work,
-    pulled out of build_import_graph so it can be called only for files that actually
-    need it (a cache miss) instead of unconditionally for every file on every build."""
-    rel_from = str(f.relative_to(repo_root)).replace("\\", "/")
+def _extract_specs_for_file(f: Path, repo_root: Path, text: str) -> list[str]:
+    """Per-language regex scan only: returns the flat list of RAW, unresolved spec
+    strings f references (Python imports + template names, Lua include string
+    literals, Zig imports, JS/other imports). No resolve_* calls, no file_set
+    membership check, no self-edge exclusion -- that is _resolve_specs_to_edges's job.
+    repo_root is part of this sibling-pair's stable interface (callers pass it along
+    with the other args) even though the pure regex scan itself never needs it."""
+    specs: list[str] = []
     is_python = f.suffix in PY_EXTENSIONS
     is_lua = f.suffix in LUA_EXTENSIONS
     is_zig = f.suffix in ZIG_EXTENSIONS
-    edges = []
 
     if is_python:
         for match in IMPORT_RE_PY.finditer(text):
             spec = match.group(1) or match.group(2)
-            if not spec:
-                continue
-            target = resolve_python_import(f, spec, repo_root)
-            if target and target in file_set:
-                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                if rel_to != rel_from:
-                    edges.append(rel_to)
+            if spec:
+                specs.append(spec)
         for match in TEMPLATE_RE.finditer(text):
             template_name = match.group(1)
-            target = resolve_template_import(f, template_name)
-            if target and target in file_set:
-                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                if rel_to != rel_from:
-                    edges.append(rel_to)
+            if template_name:
+                specs.append(template_name)
     elif is_lua:
         for match in LUA_INCLUDE_RE.finditer(text):
             lit_matches = LUA_STRLIT_RE.findall(match.group(1))
-            if not lit_matches:
-                continue
-            target = resolve_lua_import(lit_matches[-1], repo_root, file_set)
-            if target and target in file_set:
-                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                if rel_to != rel_from:
-                    edges.append(rel_to)
+            if lit_matches:
+                specs.append(lit_matches[-1])
     elif is_zig:
         for match in ZIG_IMPORT_RE.finditer(text):
             spec = match.group(1)
-            if not spec:
-                continue
-            target = resolve_zig_import(f, spec)
-            if target and target in file_set:
-                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                if rel_to != rel_from:
-                    edges.append(rel_to)
+            if spec:
+                specs.append(spec)
     else:
         for match in IMPORT_RE.finditer(text):
             spec = match.group(1) or match.group(2) or match.group(3)
-            if not spec:
-                continue
-            target = resolve_import(f, spec, repo_root)
-            if target and target in file_set:
-                rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
-                if rel_to != rel_from:
-                    edges.append(rel_to)
+            if spec:
+                specs.append(spec)
+
+    return specs
+
+
+def _resolve_specs_to_edges(specs: list[str], from_file: Path, repo_root: Path, file_set: set) -> list[str]:
+    """Resolution + filtering half of edge extraction, independently callable from raw
+    specs (no regex, no file reads): dispatches each spec to the right resolver based
+    on from_file's own language, keeps only targets present in file_set, excludes
+    self-edges, and returns the resolved RELATIVE target paths -- exactly the step a
+    cache-hit path needs to re-check a file's previously-extracted specs against a
+    CHANGED file_set without re-reading or re-parsing the file. Python specs are tried
+    as module imports first, then as template names (the two regex families in
+    _extract_specs_for_file are not individually tagged, so a spec that resolves under
+    either shape yields its edge, matching the two-loop behaviour it replaces)."""
+    rel_from = str(from_file.relative_to(repo_root)).replace("\\", "/")
+    is_python = from_file.suffix in PY_EXTENSIONS
+    is_lua = from_file.suffix in LUA_EXTENSIONS
+    is_zig = from_file.suffix in ZIG_EXTENSIONS
+    edges = []
+
+    for spec in specs:
+        if not spec:
+            continue
+        if is_python:
+            target = resolve_python_import(from_file, spec, repo_root)
+            if target is None:
+                target = resolve_template_import(from_file, spec)
+        elif is_lua:
+            target = resolve_lua_import(spec, repo_root, file_set)
+        elif is_zig:
+            target = resolve_zig_import(from_file, spec)
+        else:
+            target = resolve_import(from_file, spec, repo_root)
+        if target and target in file_set:
+            rel_to = str(target.relative_to(repo_root)).replace("\\", "/")
+            if rel_to != rel_from:
+                edges.append(rel_to)
 
     return edges
+
+
+def _extract_edges_for_file(f: Path, repo_root: Path, file_set: set, text: str) -> list[str]:
+    """Returns the list of relative target paths f imports/requires/includes that also
+    exist in file_set (excluding self-edges) -- the actual regex-scan-and-resolve work,
+    pulled out of build_import_graph so it can be called only for files that actually
+    need it (a cache miss) instead of unconditionally for every file on every build.
+    Thin composition of _extract_specs_for_file (regex scan -> raw specs) and
+    _resolve_specs_to_edges (resolution + file_set filtering + self-edge exclusion)."""
+    specs = _extract_specs_for_file(f, repo_root, text)
+    return _resolve_specs_to_edges(specs, f, repo_root, file_set)
 
 
 def build_import_graph(repo_root: Path, grep_dirs: list[str], file_cache: dict = None) -> nx.Graph:
