@@ -362,3 +362,11 @@ _branch_cache = {"at": 0.0, "branches": []}
 
 
 _branch_cache_lock = threading.Lock()
+
+
+# 2026-10-15: `git fetch origin --prune` (14-16 s at load) used to run on EVERY list; it now runs at most once per this many seconds unless forced or invalidated. `refreshing` is the
+# single-flight flag for the background refresh list_unmerged_branches starts when it serves a stale cache. Both guarded by _branch_cache_lock.
+_BRANCH_FETCH_TTL_SECONDS = 60
+
+
+_branch_fetch_state = {"at": 0.0, "refreshing": False}
