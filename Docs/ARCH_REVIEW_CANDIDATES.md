@@ -1381,3 +1381,26 @@ Replace the direct `config.priority` read in `getRegisteredSources`'s comparator
 
 Benefits:
 The registry's sort respects operator-set overrides just like every other consumer of `taskPriority`. The precedence rule (override > static default) is already encoded in `taskPriority` and is now applied uniformly at this previously-bypassed call site. No new abstraction is needed; the existing function is simply invoked where it was previously skipped. Tests can verify that setting an override in `getConfig().taskPriorityOverrides` reorders the registry's output as expected.
+
+### AC-131 · Undocumented side-effect require of task-sources.js in apply-main-batch.js
+Strength: Worth noting
+Files: src/lib/apply-main-batch.js, src/task-source-registry.js, src/task-sources.js
+
+Problem:
+`src/lib/apply-main-batch.js` contains a bare, unassigned `require('../task-sources.js');` statement with no comment explaining its purpose. A reader scanning the file sees no symbol from `task-sources.js` used in any of the functions (`applyDirectToMainBatch`, `applyDirectToMainBatchOnBranch`, `mainPartition`) and may reasonably conclude the line is dead code. However, the require is almost certainly **functionally necessary**: `applyDirectToMainBatch` calls `getRegisteredSource(resolveSourceName(task))` and checks `reg.directToMain === true`. For that lookup to succeed, the source registry (managed by `src/task-source-registry.js`) must already be populated, and the standard pattern is that the module defining the sources (`task-sources.js`) registers itself as a side effect of being loaded. There is no evidence in the provided code that `task-source-registry.js` itself requires `task-sources.js`; if it does not, this bare require is the *only* thing guaranteeing the registry is populated before `applyDirectToMainBatch` executes. Removing it would cause `getRegisteredSource` to return `null` for every task, silently rejecting all of them with "source is not directToMain."
+
+The actual issue is therefore not redundancy but **lack of documentation**: the line's purpose is invisible to anyone who doesn't already know the registry-population pattern.
+
+Solution:
+Do **not** delete the `require('../task-sources.js');` line. Instead, add a brief comment immediately above it making the side-effect intent explicit, for example:
+
+```js
+// Side-effect import: ensures task-sources.js registers its sources
+// with the task-source-registry before any getRegisteredSource() call.
+require('../task-sources.js');
+```
+
+No other changes are needed.
+
+Benefits:
+A future maintainer (or a refactoring tool) will see the comment and understand that the require is load-order-critical rather than dead code, preventing an accidental deletion that would silently break every `applyDirectToMainBatch` call. The module graph and runtime behavior remain unchanged; only the in-file documentation improves.
