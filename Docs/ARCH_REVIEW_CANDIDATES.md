@@ -1404,3 +1404,29 @@ No other changes are needed.
 
 Benefits:
 A future maintainer (or a refactoring tool) will see the comment and understand that the require is load-order-critical rather than dead code, preventing an accidental deletion that would silently break every `applyDirectToMainBatch` call. The module graph and runtime behavior remain unchanged; only the in-file documentation improves.
+
+### AC-132 · VM integration harness stubs a hand-maintained mirror of three files' global contract
+Strength: Strong
+Files: the test file containing `loadDashboardScripts`
+
+Problem:
+The test file's `loadDashboardScripts` helper (and the inline `vm.createContext` in the `renderNav` test) builds a stub surface of globals—`document`, `localStorage`, `window`, `escapeHtml`, `escapeHtmlBright`, `escapeAttr`, `renderModelsTab`, `leave*Tab`/`enter*Tab`, `CORE_TABS`, `counts`, `activeTab`, `severityForTab`, `TAB_COUNT_SEVERITY_THRESHOLDS`, and others—that is a second, manually-synced copy of the global interface that `core-ui.js`, `concepts-and-adhoc-tab.js`, and `branches-joblist-hardware-tabs.js` actually read at runtime. There is no single source of truth for "which globals the dashboard scripts need." When any of those three files adds, renames, or removes a global it depends on, the stub in the test does not update automatically. The dangerous failure mode is not a loud crash but a silent pass: the code path under test stops reading the stubbed value, the assertion still succeeds, and the test now verifies a world that no longer matches production. The test's fidelity is only as good as a human remembering to keep the stub in sync with three files outside this community.
+
+Solution:
+Since the target scripts are plain global `<script>`s with no module system and reside outside the current community, the fix must be contained entirely within the test harness. Replace the hand-maintained list of globals with a dynamic discovery mechanism in `loadDashboardScripts`. Before executing the scripts in the `vm` context, use a static analysis pass (e.g., a lightweight AST parser like `acorn` or `esprima` available in the Node.js test environment) to scan the source code of the three external files. Extract all top-level identifier references that are not defined locally within the script (i.e., potential globals). Use this extracted list to automatically populate the `vm` context with `undefined` sentinels or appropriate stubs. This ensures the stub context is derived directly from the actual code under test, eliminating the manual synchronization burden. If a global is missing from the stub, the script will throw a clear "ReferenceError: X is not defined" or the harness can pre-validate and throw a descriptive "missing global X" error, making drift immediately visible.
+
+Benefits:
+The test can no longer silently drift from production. A rename or addition of a global in any of the three scripts immediately surfaces as a visible, named failure ("global X not provided in stub" or a ReferenceError) rather than a quiet pass that erodes trust in the suite. The test author no longer needs to know the full global surface of three sibling files to write or update a test, reducing the cognitive coupling between the test and the implementation. This approach respects the "plain global script" constraint and the community boundary by requiring no changes to the external files.
+
+### AC-133 · resolve() in the VM harness crashes with an opaque TypeError on an unknown or already-consumed URL
+Strength: Strong
+Files: the test file containing `loadDashboardScripts`
+
+Problem:
+Inside `loadDashboardScripts`, the `resolve` helper is defined as `(url, value) => pending.get(url).shift().resolve(value)`. If a test resolves a URL that was never fetched, `pending.get(url)` returns `undefined`, and the subsequent `.shift()` throws `TypeError: Cannot read properties of undefined (reading 'shift')`. If a test resolves a URL a second time after its promise was already consumed, `pending.get(url)` returns an empty array `[]`, `.shift()` returns `undefined`, and the subsequent `.resolve(value)` throws `TypeError: Cannot read properties of undefined (reading 'resolve')`. In both cases, the test fails with a harness-internal `TypeError` rather than an assertion message naming the wrong or duplicate URL. This makes a test-authoring mistake (a typo in the URL string, a double-resolve) look like a product bug and obscures the real cause. The helper conflates "no pending fetch for this URL" with a crash, so the error path provides no diagnostic value.
+
+Solution:
+Make `resolve` assert that a pending promise exists for the given URL before attempting to shift and resolve it. Concretely: look up `pending.get(url)`; if it is `undefined` or an empty array, throw (or call the test framework's `assert.fail`) with a message that includes the offending URL and the set of URLs that do have pending fetches, so the developer immediately sees the mismatch. This turns an opaque `TypeError` into a readable, actionable test failure that names the exact mistake.
+
+Benefits:
+A test-authoring error (wrong URL, double-resolve) is reported as a clear test assertion failure with the problematic URL in the message, rather than a cryptic harness `TypeError` that requires reading the helper's source to diagnose. Debugging time for the rare but real "I resolved the wrong URL" mistake drops from "trace the TypeError back through the harness" to "read the assertion message." The helper's error path now serves the test author instead of obscuring their mistake.
