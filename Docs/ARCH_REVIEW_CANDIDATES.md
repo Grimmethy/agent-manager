@@ -1632,3 +1632,42 @@ Make the set of "expected structural markers" (table delimiters, fence character
 
 Benefits:
 The implicit "these two files must stay in sync" contract becomes visible in the dependency graph, reducing the chance that a prompt-format change silently invalidates the truncation heuristic. The guard remains simple and heuristic (avoiding over-engineering), but the coupling is now explicit and discoverable rather than relying on a developer's memory of which files are related.
+
+### AC-148 · Shared protocol-marker inject/extract logic duplicated across two modules
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both `src/concepts.js` and `src/incident-amplification-marker.js` independently implement the same "marker protocol" pattern: an idempotent `inject…Instruction` function that checks whether a sentinel string is already present before appending a block of instructions, and an `extract…` function that applies a regex to a model response, cleans up the matched text, and tolerates missing or malformed output. The two implementations are near-identical in structure (idempotency guard → append; regex match → field extraction → error fallback), differing only in the marker string (`CONCEPT-BUILD:` vs `AMPLIFY:`) and the set of expected fields. Because the logic lives in two places, any change to parsing rules—stricter validation, a different delimiter, a new required field—must be made in lockstep across both files, and a missed update in one silently produces divergent behavior.
+
+Solution:
+Extract the common inject/extract mechanics into a single utility module (e.g. `src/protocol-markers.js`) that accepts a declarative marker definition—regex pattern, instruction text, list of required fields—and exposes generic `injectMarker(prompt, def)` and `extractMarker(response, def)` functions. `concepts.js` and `incident-amplification-marker.js` become thin configuration wrappers that supply their specific marker definition and delegate to the shared utility, eliminating the duplicated idempotency and parsing logic.
+
+Benefits:
+A single code path owns the idempotency check, regex application, field extraction, and error-tolerance behavior, so a change to any of those concerns is made once. New marker-based features can be added by writing a configuration object rather than re-implementing the inject/extract dance. The risk of the two modules drifting apart after a parsing-rule change is removed, and the shared module is straightforward to unit-test in isolation with `node:test`.
+
+### AC-149 · Current-date-line injection enforced by convention rather than by a shared call path
+Strength: Worth exploring
+Files: src/current-date-line.js, src/claude-client.js, src/local-client.js
+
+Problem:
+`src/current-date-line.js` is a single-purpose string provider whose sole consumer contract is "prepend this to every prompt before it reaches a model client." The header comment identifies `claude-client.js` and `local-client.js` as "the two real choke points," but the module itself has no awareness of those call sites. The coupling is purely conventional: a developer adding a new client (e.g. an OpenAI or Anthropic fallback) must remember to call `currentDateLine()` and splice it into the prompt, or the "single source of truth for the model's date context" guarantee silently breaks for that path. There is no compile-time or runtime mechanism that enforces the invariant.
+
+Solution:
+Introduce a thin `prompt-assembly` (or middleware) layer that every client funnels through before sending a request. This layer unconditionally prepends `currentDateLine()` to the prompt, so the policy "every model call carries the current date" is enforced by code structure rather than by each client remembering to call the helper. Clients become pure transport (auth, HTTP, streaming) and no longer carry prompt-assembly responsibilities.
+
+Benefits:
+Adding a new client type cannot accidentally omit the date line because the assembly step is structural, not optional. The "where is the date line needed" knowledge is centralized in one module instead of being scattered across N client files. Reviewers can verify the invariant by inspecting a single call site rather than auditing every client implementation.
+
+### AC-150 · Draft-truncation guard hard-coupled to a specific markdown layout with no shared contract
+Strength: Speculative
+Files: src/draft-truncation-guard.js, src/local-draft.js
+
+Problem:
+`src/draft-truncation-guard.js` detects truncation by checking for unclosed markdown tables and code fences—patterns that are specific to the "PLAN table" and "IMPLEMENT section" conventions emitted by `local-draft.js`. The two files have no direct import relationship or shared type/constant that ties them together; the guard simply assumes the draft will contain those particular structures. If the draft format evolves (a new section type, a different table style, a non-markdown output mode), the guard will either miss real truncation (false negative) or flag complete drafts as truncated (false positive), and nothing in the codebase signals that the two modules must be updated together.
+
+Solution:
+Make the set of "expected structural markers" (table delimiters, fence characters, section headings) a shared constant or small configuration object that both `local-draft.js` (as the producer) and `draft-truncation-guard.js` (as the consumer) import. This creates an explicit dependency edge: changing the draft format in one file forces a review of the other because they now reference the same symbol. Alternatively, if the guard's heuristic is deemed sufficient for the foreseeable format, add a co-located comment or a lightweight lint rule that cross-references the two files so a change to one triggers a reminder to audit the other.
+
+Benefits:
+The implicit "these two files must stay in sync" contract becomes visible in the dependency graph, reducing the chance that a prompt-format change silently invalidates the truncation heuristic. The guard remains simple and heuristic (avoiding over-engineering), but the coupling is now explicit and discoverable rather than relying on a developer's memory of which files are related.
