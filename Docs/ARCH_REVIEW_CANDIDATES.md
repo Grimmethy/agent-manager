@@ -1762,3 +1762,37 @@ Choose a single enforcement point and remove the other. If the registry wrapper 
 
 Benefits:
 Eliminating the duplicate check removes a whole category of "which check is the real one?" confusion and prevents the two sites from drifting out of sync. Control flow becomes linear and easier to reason about: a task is either eligible or it is not, determined in exactly one place. Testing simplifies because there is one code path to exercise rather than two that must be kept in agreement.
+
+### AC-158 · Registry hard-requires scope-resolution, breaking its "passive store" contract
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js, src/config.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` directly `require`s `src/lib/source-scope.js` in order to wrap the `next()` function for sources declared with `scope: 'core'`. That module in turn `require`s `src/config.js` (via `activeRepoIsCore`), and `src/config.js` is a central hub pulled in by nearly every other module in the codebase. The registry's stated contract is a "plain object keyed by source name" with "no validation," yet by injecting scope-gating logic at registration time it becomes an active participant in business-logic enforcement that depends on the runtime environment. This makes the registry impossible to unit-test in isolation (any test must stub `source-scope.js` or `config.js`) and introduces a latent circular-dependency risk: if `config.js` or any of its transitive dependencies ever need to `require` the registry, the load graph breaks.
+
+Solution:
+Remove the `require` of `src/lib/source-scope.js` from `registerTaskSource`. The registry should store the raw `next` function and the source's declared scope as plain metadata, with no gating logic applied at registration time.
+
+Introduce a single choke-point retrieval function—e.g. `invokeSource(name, …args)`—in a dedicated module (or in the execution layer) that **every** caller must use to obtain and invoke a source's `next()`. This function applies the `sourceEligibleHere` scope check before delegating to the stored function and returns `null` when the source is not eligible in the current environment. Crucially, this covers **all** invocation paths: `getNextTask` in the priority ladder, the always-run watchdog sweeps that call a source directly, and any future caller. The existing code comment in `task-source-registry.js`—"Wrap next() so that EVERY caller -- getNextTask, the always-run watchdog sweeps that call a source directly -- gets null on any other project"—confirms that the design intent is to gate at the *invocation* boundary, not at registration. Moving the gate to a shared `invokeSource` choke point preserves that guarantee while decoupling the registry from the scope/config dependency chain.
+
+Callers that currently destructure `registry[name].next` and call it directly are refactored to call `invokeSource(name, …)` instead. Because the choke point is a single function, there is exactly one place to reason about scope eligibility, and no caller can bypass it without going through a code path that is itself a bug (and easily caught by a lint rule or integration test that asserts no direct `.next` access on registry entries).
+
+Benefits:
+The registry becomes a true passive store that can be tested with zero external stubs. The hidden load-time dependency chain (registry → scope → config → everything) is eliminated, removing the circular-dependency risk. Scope-gating logic lives in one choke-point function that covers every invocation path—including the direct watchdog sweeps—so no caller can accidentally invoke a core-scoped source on a non-core project. New task sources can be registered in tests and integration harnesses without pulling in the full configuration stack.
+
+### AC-159 · Source identity is split-brain between plugin stamping and registry resolution
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/sdk/candidate-fulfillment.js, source plugin modules (e.g. arch_review, arch_import_review)
+
+Problem:
+The "source" string that identifies a task's origin is managed in two disconnected places. The **source plugin code** (e.g. the `arch_review` and `arch_import_review` modules) is responsible for *stamping* the `source` field when creating a task via the shared SDK utility `nextCandidateFulfillmentTask` in `src/sdk/candidate-fulfillment.js`. The SDK is a generic parameterized helper—it receives the source name as an argument from the calling plugin and does not itself decide which string to use. Meanwhile, `src/task-source-registry.js` defines `resolveSourceName(task)` to *resolve* that stamped string back to a registry key, including special-case aliases like `'manual'` → `'adhoc'` and `'deadcode_triage'` → `'unused_export'`. There is no single source of truth: adding a new task source requires the plugin to stamp a string *and* the registry to have a matching entry (or alias) for that string. A mismatch in either direction—stamping a string the registry doesn't resolve, or registering a key no plugin ever stamps—produces a silently dead source with no compile-time or test-time signal.
+
+Solution:
+Make the **source plugin** the single owner of its identity string. When a plugin registers itself via `registerTaskSource`, it passes its canonical name (e.g. `'arch_review'`) as the registry key. The same canonical name is the string the plugin stamps on tasks it creates (passed as the `source` parameter to `nextCandidateFulfillmentTask`). The registry's `resolveSourceName` is reduced to a thin backward-compatibility shim that maps a small, frozen set of legacy strings (e.g. `'manual'` → `'adhoc'`, `'deadcode_triage'` → `'unused_export'`) to their current canonical names; no new aliases are added. A lightweight assertion (run at registration time or in a startup test) verifies that every registered key is a string some plugin actually stamps, and conversely that every stamped string in the codebase resolves to a registered key—closing the "registered but never stamped" / "stamped but never registered" gap at test time rather than leaving it to production.
+
+The SDK utility (`nextCandidateFulfillmentTask`) remains a generic, source-agnostic helper. It does not query the registry or own identity logic; it simply forwards whatever `source` string the calling plugin provides.
+
+Benefits:
+Adding a new task source is a single-step operation: the plugin declares its canonical name once, uses that same name for both registration and stamping, and the registry key and the stamped string are in sync by construction. The alias table in the registry shrinks to a frozen backward-compatibility shim for pre-existing task strings, rather than a parallel identity system that must be kept in lockstep with plugin code. The SDK remains a simple, testable utility with no knowledge of the registry or of source identity.
+
+NOTE: Flag 2 was applied — the AC-002 solution was rewritten to attribute identity ownership to the source plugin (not the SDK) and to treat the SDK as a generic parameterized utility, removing the incorrect "SDK queries the registry for the stamp" proposal. Flag 3 was applied — the AC-001 solution was rewritten to introduce a single `invokeSource` choke-point function that covers all callers (including direct watchdog sweeps), rather than naively moving the check to `getNextTask` alone.
