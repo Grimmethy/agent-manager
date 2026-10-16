@@ -65,6 +65,90 @@ function buildAddPluginForm() {
     </div>`;
 }
 
+// Event-handler wiring for the plugins tab: each takes the rendered #main element and
+// attaches its handlers, extractable from renderPluginsTab so any one can be tested with
+// a minimal main element (HUB0150 · 2/3). Handlers are byte-identical to the inline
+// versions they replaced -- same selectors, fetch URLs, JSON bodies, and re-render calls.
+function wireSlotRadios(main) {
+  main.querySelectorAll('.slot-radio').forEach((radio) => {
+    radio.onchange = async () => {
+      const slot = radio.dataset.slot;
+      const name = radio.value || null;
+      const group = main.querySelector(`#slot-group-${slot}`);
+      const statusEl = group ? group.closest('div').parentElement.querySelector('.slot-status') : null;
+      group.querySelectorAll('input').forEach((r) => { r.disabled = true; });
+      if (statusEl) statusEl.textContent = name ? `Starting ${name}...` : 'Stopping...';
+      try {
+        const r = await fetch('/api/plugins/select-slot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ slot, name }),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(body.description || r.status);
+        if (name && !body.healthy) {
+          if (statusEl) statusEl.textContent = `${name} started but did not report healthy in time -- check its log.`;
+        }
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not switch plugin: ' + e.message);
+        await renderPluginsTab();
+      }
+    };
+  });
+}
+
+function wirePluginToggles(main) {
+  main.querySelectorAll('.plugin-toggle').forEach((cb) => {
+    cb.onchange = async () => {
+      cb.disabled = true;
+      try {
+        const r = await fetch('/api/plugins/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: cb.dataset.name, enabled: cb.checked }),
+        });
+        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).description || r.status);
+        await syncPluginTabs();
+        renderNav();
+        await renderPluginsTab();
+      } catch (e) {
+        alert('Could not update plugin: ' + e.message);
+        cb.checked = !cb.checked;
+        cb.disabled = false;
+      }
+    };
+  });
+}
+
+function wireAddPluginForm(main) {
+  const addBtn = main.querySelector('#plugin-add-btn');
+  addBtn.onclick = async () => {
+    const msg = main.querySelector('#plugin-add-msg');
+    const registerPath = main.querySelector('#plugin-add-path').value.trim();
+    const name = main.querySelector('#plugin-add-name').value.trim();
+    const description = main.querySelector('#plugin-add-desc').value.trim();
+    if (!registerPath) { msg.textContent = 'A register.js path is required.'; return; }
+    addBtn.disabled = true;
+    msg.textContent = 'Adding...';
+    try {
+      const r = await fetch('/api/plugins/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ registerPath, name, description }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(body.description || r.status);
+      await syncPluginTabs();
+      renderNav();
+      await renderPluginsTab();
+    } catch (e) {
+      msg.textContent = 'Could not add plugin: ' + e.message;
+      addBtn.disabled = false;
+    }
+  };
+}
+
 async function renderPluginsTab() {
   const main = document.getElementById('main');
   let data;
@@ -98,79 +182,9 @@ async function renderPluginsTab() {
     <div id="marketplace-note" class="meta" style="margin-bottom:10px;"></div>
     <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
 
-  main.querySelectorAll('.slot-radio').forEach((radio) => {
-    radio.onchange = async () => {
-      const slot = radio.dataset.slot;
-      const name = radio.value || null;
-      const group = main.querySelector(`#slot-group-${slot}`);
-      const statusEl = group ? group.closest('div').parentElement.querySelector('.slot-status') : null;
-      group.querySelectorAll('input').forEach((r) => { r.disabled = true; });
-      if (statusEl) statusEl.textContent = name ? `Starting ${name}...` : 'Stopping...';
-      try {
-        const r = await fetch('/api/plugins/select-slot', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ slot, name }),
-        });
-        const body = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(body.description || r.status);
-        if (name && !body.healthy) {
-          if (statusEl) statusEl.textContent = `${name} started but did not report healthy in time -- check its log.`;
-        }
-        await renderPluginsTab();
-      } catch (e) {
-        alert('Could not switch plugin: ' + e.message);
-        await renderPluginsTab();
-      }
-    };
-  });
-
-  main.querySelectorAll('.plugin-toggle').forEach((cb) => {
-    cb.onchange = async () => {
-      cb.disabled = true;
-      try {
-        const r = await fetch('/api/plugins/toggle', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: cb.dataset.name, enabled: cb.checked }),
-        });
-        if (!r.ok) throw new Error((await r.json().catch(() => ({}))).description || r.status);
-        await syncPluginTabs();
-        renderNav();
-        await renderPluginsTab();
-      } catch (e) {
-        alert('Could not update plugin: ' + e.message);
-        cb.checked = !cb.checked;
-        cb.disabled = false;
-      }
-    };
-  });
-
-  const addBtn = main.querySelector('#plugin-add-btn');
-  addBtn.onclick = async () => {
-    const msg = main.querySelector('#plugin-add-msg');
-    const registerPath = main.querySelector('#plugin-add-path').value.trim();
-    const name = main.querySelector('#plugin-add-name').value.trim();
-    const description = main.querySelector('#plugin-add-desc').value.trim();
-    if (!registerPath) { msg.textContent = 'A register.js path is required.'; return; }
-    addBtn.disabled = true;
-    msg.textContent = 'Adding...';
-    try {
-      const r = await fetch('/api/plugins/add', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ registerPath, name, description }),
-      });
-      const body = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(body.description || r.status);
-      await syncPluginTabs();
-      renderNav();
-      await renderPluginsTab();
-    } catch (e) {
-      msg.textContent = 'Could not add plugin: ' + e.message;
-      addBtn.disabled = false;
-    }
-  };
+  wireSlotRadios(main);
+  wirePluginToggles(main);
+  wireAddPluginForm(main);
 
   // Marketplace: fetch catalog entries annotated with install status and render
   // Install / Update / Installed controls per entry. 402/403 surface via showToast.
