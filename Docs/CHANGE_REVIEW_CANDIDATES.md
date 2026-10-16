@@ -1796,3 +1796,30 @@ index ce9538de..0fdd4b50 100644
 Problem: [severity: low; regression shipped in 77f8ff2] The "Snippet fuzzy-match flip" branch, documented as the strongest staleness signal and intended to fire in either direction, no longer reports the true->false (fuzzy-to-clean) flip.  Failure scenario: In sweep(), a declared entry has `usedSnippetFuzzyMatch: true` and `anchorConfidence: 'strong'` (rank 3). After re-anchoring, `windowed.usedSnippetFuzzyMatch` is `false` and `windowed.confidence` is `'strong'` (rank 3), with the windowed text length within MATERIAL_DELTA_RATIO of the old content length. Pre-diff, `oldUsedFuzzy !== newUsedFuzzy` (true !== false) returned `Snippet fuzzy-match true->false for <path>`, so `improvements` was non-empty and the task was requeued. Post-diff, the guard `oldUsedFuzzy !== newUsedFuzzy && newUsedFuzzy` is false (newUsedFuzzy is false), the confidence check `newRank > oldRank` is false (3 > 3), and the content-delta check is false, so `describeImprovement` returns null; `improvements` stays empty and the task is flagged stale-grounding-unrecoverable instead of being requeued.
 Solution: Revert the guard to `if (oldUsedFuzzy !== newUsedFuzzy)` so the fuzzy-match flip is reported in either direction, per the function's doc comment and the commit title.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 77f8ff2.
+
+### AC-112 · A task that states a doc deliverable, uses "read-only" descriptively (not as a constraint) (5ac1dee adhoc-diff-sanity.js)
+Strength: Strong
+Source: change_review of 5ac1dee "Merge Docs-only gate: do not read verbs inside identifiers or questions about co"
+Files: src/adhoc-diff-sanity.js
+
+Snippet:
+```
+diff --git a/src/adhoc-diff-sanity.js b/src/adhoc-diff-sanity.js
+index ca76fb1f..ec6b9bdf 100644
+--- a/src/adhoc-diff-sanity.js
++++ b/src/adhoc-diff-sanity.js
+@@ -83,32 +83,37 @@ const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|h
+ // ("... not files to edit", "Do NOT modify any file under src/", "cited only as a grounding anchor, not an edit target"), that merely name one inside the text the
+ // deliverable must contain ("the guard clause in src/foo.js"), or that are the pipeline's own boilerplate ("implement against it directly").
+ // Enumerating more negative markers is unbounded, and dropping whole sentences would also wave through real code tasks ("Change the timeout in src/foo.js but do not touch
+ // the tests"). An earlier draft that required an affirmative edit verb on EVERY path sentence broke real code tasks with unlisted verbs ("Combine job types into rows in
+ // index.html"). So:
+ //   1. negated verb phrases ("do not touch", "not files to edit", "does not implement") and the boilerplate are stripped from each sentence before the scan;
+ //   2. with NO stated documentation deliverable the scan is exactly the legacy one (any remaining code signal wants code);
+ //   3. only when the task positively states a documentation deliverable ("append ... to AGENTS.md", "create a new Markdown file at docs/...") do PATH-ONLY sentences
+ //      (a code path with no edit verb and no code phrase) stop counting; a sentence with a phrase signal (impleme
+```
+
+Problem: [severity: low; regression shipped in 5ac1dee] A task that states a doc deliverable, uses "read-only" descriptively (not as a constraint), and phrases its code request with a non-imperative lead (e.g. "Also fix …") is now classified as docs-only, where the pre-diff code correctly classified it as wanting code.  Failure scenario: Input rawText = "Create docs/x.md documenting the read-only mode of the API. Also fix the off-by-one in src/a.js." Pre-diff: `docDeliverable`=true, then `raw.tripping.some(requestsCode)` — the sentence "Also fix the off-by-one in src/a.js" matches `AFFIRMATIVE_EDIT_VERB_RE` on "fix" (space-delimited, passes the new lookarounds) → returns **true**. Post-diff: `READ_ONLY_RE` matches the bare word "read-only" in "read-only mode" → enters the new branch `return raw.tripping.some(opensWithImperative)` — "Also" is a non-imperative lead (adverb, not a verb) so `opensWithImperative` returns false for that sentence, and no other tripping sentence opens with an imperative → returns **false**. The code fix is silently dropped.
+Solution: Tighten `READ_ONLY_RE` so the bare `\bread-only\b` alternative requires a constraint context, e.g. replace it with `/\bread-only\b\s+on\s+(?:the\s+)?code\b|\bnothing else (?:is |was |gets )?(?:touched|changed|modified|edited)\b|\bchange nothing else\b|\bwrite ONLY the one\b/i` so that "read-only mode of the API" no longer triggers the branch while "read-only on the code" still does.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 5ac1dee.
