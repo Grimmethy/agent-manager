@@ -1809,3 +1809,16 @@ Remove the `require('../task-sources.js');` line from `apply-core.js`. If a side
 
 Benefits:
 The module graph loses a spurious edge, reducing circular-require risk and making the true dependency surface of `apply-core.js` accurate. It aligns the codebase with the cleanup already performed in AC-85 and AC-86, and removes a source of confusion for anyone auditing imports or performing tree-shaking / bundle analysis.
+
+### AC-161 · Remove redundant side-effect require of task-sources.js in apply-core.js
+Strength: Strong
+Files: src/lib/apply-core.js, src/apply-task.js
+
+Problem:
+`src/lib/apply-core.js` contains a bare, unassigned side-effect require of `task-sources.js` near the top of the file. No symbol from that module is destructured, assigned, or referenced anywhere in the file's exported functions (`coAuthorTrailer`, `usesGroupB`, `applyCandidateSplit`, `writeArtifact`, `closeOriginatingBrainDumpEntry`, `assertStageableFiles`). The module was extracted from `src/apply-task.js` (as noted in its header comment), and the caller `src/apply-task.js` already loads `task-sources.js` directly. The dead require therefore adds a needless edge to the module dependency graph and introduces a small circular-require risk for zero functional benefit.
+
+Solution:
+Delete the single `require('../task-sources.js');` line (and the one blank line immediately preceding it, to avoid leaving a double blank between the header comment and the first function definition). No other line in the file is touched: the `'use strict'` directive, the header comment, all function bodies, and the `module.exports` block remain byte-identical.
+
+Benefits:
+Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies explicit. There is zero behavioural change because none of the exported functions reference any symbol from `task-sources.js`.
