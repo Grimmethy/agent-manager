@@ -260,7 +260,7 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
 }
 
-async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+async function callOnce({ prompt, images, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
   // Forge exclusion (2026-10-14): never START a model call while PromptForge's comfyui-lease is held -- it would reload the model
   // PromptForge just evicted. Checked here, before any prompt building, in-flight lock or network I/O. See gpu-guard.js ForgePauseError.
   if (gpuGuard.forgePauseEnabled() && gpuGuard.comfyuiLeaseHeld()) throw new gpuGuard.ForgePauseError();
@@ -300,6 +300,8 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // implement draft came back ```json-fenced despite that exact instruction). The constraint
   // applies only to `response`; the `thinking` trace is left unconstrained.
   if (format) body.format = format;
+  // Vision call (lib/task-images.js): base64 pictures the model should look at. Ollama's /api/generate `images` field.
+  if (Array.isArray(images) && images.length) body.images = images;
 
   // In-flight lock (model-inflight-lock.js) -- held for the exact span of the real
   // network call, so agent-manager-common.sh's should_yield_for_model_swap can see "a
