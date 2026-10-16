@@ -400,3 +400,13 @@ Solution: Modify `detectStaleDecomposePremise` to skip the `missing-file` findin
 Benefits: Creation tasks that cite the file they intend to create will no longer be blocked by the premise check, allowing the implement pass to proceed.
 
 Full ranked root-cause analysis: forensic task pipeline-forensics-on-demand-task-function-length-fix-ac-34-1790098950143
+
+### AC-145 · "change_review" — $3.34 est. API cost, 0% benefit, 0 shipped over 7d
+Strength: Strong
+Files: src/local-draft.js, src/prompts.js
+
+Problem: The implement pass in src/local-draft.js does not enforce consistency between the plan's flagged hunks and the final verdict. When the plan identifies hunks as "SUSPECT" or "UNKNOWN", the implement pass should either report those specific correctness regressions or provide evidence that the flagged hunks are safe, rather than defaulting to a blanket "NO CORRECTNESS ISSUES" that contradicts the plan's own analysis.
+Solution: Add a consistency check in src/local-draft.js that, after the implement pass generates a verdict, verifies that any hunks flagged as "SUSPECT" or "UNKNOWN" in the plan are either explicitly addressed in the implement response or backed by evidence from the harness-search grounding. If a flagged hunk is not addressed, the implement pass should be forced to either report a specific correctness regression or provide a justification for why the hunk is safe. Acceptance check: Run the failing tasks (change-review-028e586, change-review-0889457, change-review-000698f, change-review-4c64a71) through the pipeline and verify that the implement pass no longer issues a "NO CORRECTNESS ISSUES" verdict when the plan has flagged hunks as "SUSPECT" or "UNKNOWN" without addressing them.
+Benefits: This fix will prevent the class of tasks where the implement pass issues a blanket "NO CORRECTNESS ISSUES" verdict that contradicts the plan's own analysis, which is the root cause of all four failing tasks.
+
+Full ranked root-cause analysis: forensic task pipeline-forensics-change-review-3-34-est-api-cost-0-benefit-0-shipped-over-7d-1792179958751
