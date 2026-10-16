@@ -1342,3 +1342,42 @@ Replace the direct `fs.writeFileSync(path.join(dir, name), JSON.stringify(record
 
 Benefits:
 One code path owns the durability contract for all JSON writes in this community. A crash during a side-finding inbox write can no longer leave a truncated JSON file that the sweep consumer must special-case. The atomic-write module's guarantee becomes actually universal across the community rather than being silently bypassed by one of its own members.
+
+### AC-128 · resolveSourceName hardcodes internal naming exceptions in a central registry
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` contains a series of hardcoded `if` branches that map specific `task.domain` or `task.source` strings (e.g. `'adhoc'`, `'secondbrain'`) to their canonical registry names. The file already exposes a `registerSourceAlias` mechanism intended for out-of-tree plugins, yet the core package's own internal naming mismatches bypass that mechanism and are baked directly into the function body. Because `task-source-registry.js` is a highly-connected module (link-degree ~50), every new internal source whose `source` field does not match its registry name forces an edit to this central file, violating locality and increasing the blast radius of a one-line change.
+
+Solution:
+Extend the existing `registerSourceAlias` (or the `registerTaskSource` registration call) so that each internal source can declare its own alias at registration time. The `resolveSourceName` function would then simply consult a lookup table populated during registration, removing all hardcoded `if` branches. A small migration step would register the current `'adhoc'` and `'secondbrain'` aliases through the same public API that plugins already use, after which the hardcoded branches can be deleted.
+
+Benefits:
+Adding or renaming an internal source becomes a local change at the source's own registration site rather than an edit to a 50-link-degree hub. The alias mechanism becomes a single, uniform code path for both core and plugin sources, reducing the chance that a new internal source is added with a mismatched `source` field and silently falls through to a default. Reviewers can verify alias correctness in the source's own file rather than hunting through a central dispatch function.
+
+### AC-129 · scope:'core' gate is enforced only at generation time, not at claim time
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` wraps the `config.next` function to check `sourceEligibleHere` at generation time, preventing a core-scoped source from *producing* tasks in the wrong project. However, `src/lib/source-scope.js` documents that the same eligibility gate must also be enforced at claim time (the `next-claimable-task` path) to prevent a task that is already sitting in another project's `pending/` directory from being claimed and executed. Because the registry only intercepts the `next` (generation) function, the claim-time gate lives entirely in a separate module and must be implemented and kept in sync manually. If a task is claimed directly from the queue—bypassing the registry's wrapped `next`—the scope restriction is silently absent, creating a correctness gap where a core-only task can run in a non-core project.
+
+Solution:
+Introduce a shared eligibility predicate (e.g. `isSourceEligibleForProject(source, project)`) in `src/lib/source-scope.js` and have both the registry's wrapped `next` and the `next-claimable-task` claim path call the same function. The registry would delegate its generation-time check to this shared predicate rather than inlining its own logic, and the claim path would invoke the identical predicate before dequeuing a task. This makes the gate a single, testable unit with one source of truth for the eligibility rules.
+
+Benefits:
+The scope restriction is enforced consistently at both the production and consumption boundaries of the task queue, eliminating the window where a pre-existing task in a foreign `pending/` directory can be claimed and executed. Adding a new eligibility rule (e.g. a per-tenant restriction) requires editing one predicate rather than two separate code paths, reducing the risk of drift. Tests can exercise the predicate in isolation and verify that both call sites respect it.
+
+### AC-130 · getRegisteredSources sort bypasses the taskPriority override mechanism
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/task-priority.js
+
+Problem:
+`getRegisteredSources` in `src/task-source-registry.js` sorts sources using the raw `config.priority` field directly in its comparator (defaulting to `Infinity` when absent). Meanwhile, `src/lib/task-priority.js` exposes `taskPriority(name, def)`, which returns `getConfig().taskPriorityOverrides[name] ?? def`—a standard override-or-fallback wrapper designed to be called with the static field as the default (e.g. `taskPriority(sourceName, config.priority)`). Because the registry's sort reads `config.priority` directly without routing through `taskPriority`, any operator-set override in `getConfig().taskPriorityOverrides` is silently ignored for the registry's source ordering. Other consumers that do call `taskPriority` see the override applied. The result is that the effective priority of a source depends on which code path reads it, producing inconsistent scheduling behavior across entry points.
+
+Solution:
+Replace the direct `config.priority` read in `getRegisteredSources`'s comparator with a call to `taskPriority(sourceName, config.priority)`. This is a one-line change that routes the sort through the existing override-or-fallback mechanism, so the static field serves as the default and any global override takes precedence—exactly the pattern `taskPriority` was designed to express.
+
+Benefits:
+The registry's sort respects operator-set overrides just like every other consumer of `taskPriority`. The precedence rule (override > static default) is already encoded in `taskPriority` and is now applied uniformly at this previously-bypassed call site. No new abstraction is needed; the existing function is simply invoked where it was previously skipped. Tests can verify that setting an override in `getConfig().taskPriorityOverrides` reorders the registry's output as expected.
