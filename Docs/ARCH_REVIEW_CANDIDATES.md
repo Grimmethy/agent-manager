@@ -1512,3 +1512,42 @@ Benefits:
 A reader encountering the in-function `require` immediately understands *why* it is there and that it is safe, removing the temptation to "fix" it into a top-level import and inadvertently re-create the circular dependency. The module graph remains correct and the pattern stays standard.
 
 NOTE: Flag 1 was applied by removing the original AC-001's premise that `getRegisteredSources()` should filter by scope; the corrected draft treats the registry's context-agnostic listing as correct design and relocates the UX concern to the consumer layer. Flag 2 was applied by removing the original AC-002's initialization-order hazard claim (which is mitigated by `source-scope.js`'s own lazy config access) and reframing the item as a minor documentation gap with no structural change recommended.
+
+### AC-140 · concepts.js mutators lack an atomic read-modify-write, making concurrent forks silently drop counter increments
+Strength: Strong
+Files: src/concepts.js
+
+Problem:
+Every state-changing function in `concepts.js` follows the same shape: `loadConcepts(pipelineDir)` reads `concepts.json` into memory, the function mutates the in-memory object (incrementing `researchForkCount`, `builtFromScratchCount`, `adaptedFromResourceCount`, or advancing `status`), then `writeConcepts(pipelineDir, data)` writes the whole object back. The write itself is atomic (it uses `writeJsonAtomicSync`), but the read→mutate→write window is not. If two research forks, or a fork plus a build-tally, run concurrently against the same `pipelineDir`, each loads the pre-increment state, each writes its own full copy, and one increment is silently lost — last writer wins over the entire object, not just the field it touched. The file's own header frames these as "tally counters" fed by "the first research fork on a new topic" and by "the implementing model," i.e. precisely the concurrent, uncoordinated callers the `createConcept` idempotency comment worries about ("no coordination between callers"). The atomic-write dependency is already in the dependency graph, so the missing piece is serialization around the load→mutate→write window. This is a genuine correctness gap in the one file that owns persistent state in the community, and it is invisible in the tests because they exercise single-threaded calls.
+
+Solution:
+Introduce a single internal `mutateConcept(pipelineDir, conceptId, fn)` helper that serializes the load→mutate→write cycle — for example an `fs` advisory lock on `concepts.json`, or a compare-and-retry loop that re-reads and re-applies `fn` if the file's mtime or content hash changed between read and write. Rewrite `recordConceptResearch`, `recordConceptBuildTally`, `shelveConcept`, `reopenConcept`, `shipConcept`, and `createConcept` to route through this helper. The public signatures and the `STABLE_CONCEPT_STATUSES` guard remain identical; only the persistence primitive changes.
+
+Benefits:
+Counters and status transitions become safe under the concurrent-fork usage the file's own comments describe. The atomic-write guarantee the file already pays for actually covers the whole mutation, not just the final write. One helper owns the concurrency contract instead of six copy-pasted load/mutate/write blocks, so a future mutator inherits the guarantee by construction.
+
+### AC-141 · concepts.js and incident-amplification-marker.js duplicate the same inject/extract marker idiom with divergent cleanText normalization
+Strength: Worth exploring
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both files implement the same two-part convention: an `inject*Instruction(text)` that is idempotent (checks `if (base.includes(MARKER)) return base`) and an `extract*(text)` that returns `{ cleanText, <payload> }` and is deliberately lenient (malformed → drop, never throw; strip the marker; collapse `\n{3,}`). The amplification file's header explicitly says it "mirrors side-finding.js's own injection/extraction shape exactly," and the concepts file says its marker "mirrors side-finding.js's … marker (one-line, lenient, strip-and-continue)." The shared idiom — idempotent inject, lenient strip-and-continue extract, and `cleanParts.join('').replace(/\n{3,}/g,'\n\n').trim()` normalization — is the thing that's actually common, but it lives in two places (and a third, referenced but outside this community) with no shared home. The two files have already begun to diverge: `extractConceptBuildReport` returns a single `report` string while `extractAmplificationRequests` returns a `requests` array, and the cleanText collapse is duplicated verbatim. A change to the idiom — making `cleanText` normalization stricter, adding a shared "malformed → log" behavior, or adjusting the idempotency sentinel check — must be made in every copy and can drift silently.
+
+Solution:
+Extract the shared marker idiom into one small module (e.g. `src/marker-contract.js`) exposing `makeIdempotentInjector(instruction, sentinel)` and a `stripAndNormalize(cleanParts)` helper (or a `parseBlocks(source, { sentinel, requiredFields })` that both call). `concepts.js` and `incident-amplification-marker.js` keep their public exports and their field-specific parsing, but delegate the inject-idempotency check and the cleanText normalization to the shared helper. This is a two-file refactor plus one new helper, not a rewrite.
+
+Benefits:
+The idempotency and leniency semantics are defined once, so the "never throw on a forgotten or malformed marker" guarantee cannot drift between the two implementations. The duplicated `cleanText` collapse logic lives in one place. New markers added later inherit the contract instead of re-implementing it, and a single change to normalization or error-handling propagates automatically.
+
+### AC-142 · The stable-terminal-status guard is hand-copied across four mutators, making the file's central invariant a silent-omission risk
+Strength: Worth exploring
+Files: src/concepts.js
+
+Problem:
+`STABLE_CONCEPT_STATUSES` is the file's central invariant — a sweep or mutation must never silently reopen a shelved or shipped concept. The guard that enforces it, `if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;`, is written out by hand in `recordConceptResearch`, `recordConceptBuildTally`, `shelveConcept`, and `shipConcept` (four copies), with `reopenConcept` intentionally inverting the predicate. The file's own header spends a paragraph explaining why this guard exists (the "stray research fork landing after Task Atomization was shelved" incident), which signals it is load-bearing and easy to get wrong. The friction is that the invariant is expressed as a repeated inline predicate rather than a single named gate: a new mutator added later (the file is clearly growing — `shelve`/`reopen`/`ship` were added after the research/build functions) that forgets the guard silently breaks the "terminal states are stable" contract, and nothing in the structure makes the omission visible. The concept of "is this concept in a state a mutator may touch?" is the same question asked four times with identical logic.
+
+Solution:
+Introduce one internal `acquireMutableConcept(data, conceptId)` (or `assertMutable(concept)`) that encapsulates the `findConcept` lookup plus the `STABLE_CONCEPT_STATUSES` check and returns the concept or `null`. The four forward-mutators call it; `reopenConcept` keeps its own inverted check (it is the one place the stable set is the *entry* condition, which is a different predicate and should stay distinct). This makes the invariant a single named gate and turns a future mutator that skips it into a visible omission rather than a silent one.
+
+Benefits:
+The "stable terminal states" invariant — the file's most important correctness property — is defined in one place. Adding a mutator becomes "call the gate" instead of "remember to copy the guard," which is exactly the failure mode the header comment warns about. The `reopenConcept` exception stays explicit and separate, so the two different predicates (may-mutate vs. may-reopen) are not conflated.
