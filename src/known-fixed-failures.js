@@ -79,6 +79,13 @@ function citedCodeMovedAndRelocatable(task) {
   } catch { return false; }
 }
 
+// Shared by the two docs-only-gate entries: the recorded failure is the docs-only block AND the current gate would no longer read the task as asking for code.
+function docsOnlyGateNoLongerBlocks(task) {
+  const t = failureText(task);
+  if (!/only (?:touches|created\/edited) documentation/.test(t) || !/code change/.test(t)) return false;
+  try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
+}
+
 const KNOWN_FIXED = [
   {
     id: 'wrong-block-whole-function-snippet',
@@ -122,11 +129,16 @@ const KNOWN_FIXED = [
     description: 'adhoc-diff-sanity blocked a CORRECT docs-only diff ("the task asks for a code change") because the task text mentioned code paths only to say they are NOT to be edited, or because the model plan described what the document will cite',
     dirs: ['blocked', 'needs-clarification'],
     // The failure text AND a structural precondition: the fixed gate would no longer read this task as asking for code (a task that really wants code stays put).
-    applies: (task) => {
-      const t = failureText(task);
-      if (!/only (?:touches|created\/edited) documentation/.test(t) || !/code change/.test(t)) return false;
-      try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
-    },
+    applies: docsOnlyGateNoLongerBlocks,
+  },
+  {
+    // A NEW id for the 2026-10-15 follow-up fix: the sweep stamps firstSeen once per id and skips tasks that got stuck after it, so the 2026-09-21 entry above could never drain
+    // the tasks the later fix unblocks (the PromptForge and core GPU broker verification tasks, stuck 2026-10-15/16, were skipped as "failed after the fix").
+    id: 'docs-only-gate-read-only-deliverable',
+    fixedIn: 'agent-manager (docs-only gate: read-only documentation tasks and edit verbs inside identifiers, 5ac1dee7, 2026-10-15)',
+    description: 'adhoc-diff-sanity blocked a CORRECT docs-only diff ("the task asks for a code change") for a task that states a documentation deliverable and says its code is read-only, because verbs and phrases in code-citing sentences ("would move", "lease-delete+yield", "a NEW file") were read as requests',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: docsOnlyGateNoLongerBlocks,
   },
   {
     id: 'stale-snippet-partial-anchor',
