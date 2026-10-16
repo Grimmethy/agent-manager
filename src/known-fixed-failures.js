@@ -86,6 +86,28 @@ function docsOnlyGateNoLongerBlocks(task) {
   try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
 }
 
+// The recorded failure says a sibling repo could not be reached from the implement pass AND the task really does name a registered sibling repo (an absolute path
+// inside one of `roots`, by default the read-only root list the implement pass itself now gets). Fail closed: no roots, no raw text or a throw is "no".
+const SIBLING_PATH_RE = /\/media\/model-cache\/github\/[A-Za-z0-9._-]+(?:\/[^\s'"`),;]*)?/g;
+function siblingRepoWasUnreachable(task, roots) {
+  const t = failureText(task);
+  const unreachable = /not inside any accessible repo|exactly one accessible repo/i.test(t)
+    || (/No such file or directory/i.test(t) && /\/media\/model-cache\/github\/[A-Za-z0-9._-]+/.test(t));
+  if (!unreachable) return false;
+  try {
+    const path = require('path');
+    const fs = require('fs');
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+    let list = roots;
+    if (!list) {
+      const core = process.env.AGENT_MANAGER_CORE_REPO_ROOT || require('./config.js').getConfig().repoRoot;
+      list = require('./accessible-roots.js').resolveReadOnlySiblingRoots({ repoRoot: core });
+    }
+    const named = String(task && task.promptContext && task.promptContext.rawText || '').match(SIBLING_PATH_RE) || [];
+    return named.some((p) => list.some((r) => { const rr = real(r); const pp = real(p); return pp === rr || pp.startsWith(rr + path.sep); }));
+  } catch { return false; }
+}
+
 const KNOWN_FIXED = [
   {
     id: 'wrong-block-whole-function-snippet',
@@ -141,6 +163,14 @@ const KNOWN_FIXED = [
     applies: docsOnlyGateNoLongerBlocks,
   },
   {
+    id: 'implement-pass-sibling-repos-readable',
+    fixedIn: 'agent-manager (implement pass reads registered plugin/project repos read-only, merged 028e586f, 2026-10-16)',
+    description: 'The agentic implement pass could see only its own worktree, so a read-only cross-repo verification task (GPU broker verify videoforge/promptforge) found "/media/model-cache/github/<repo> does not exist" or "path is not inside any accessible repo" and concluded the repo was not on this machine. It now gets every registered plugin repo as a read-only root.',
+    dirs: ['blocked', 'needs-clarification'],
+    // The failure text says a sibling repo was unreachable AND the task names a path inside one of the roots the implement pass now receives (a task about a repo that really is not registered stays put).
+    applies: (task) => siblingRepoWasUnreachable(task),
+  },
+  {
     id: 'stale-snippet-partial-anchor',
     fixedIn: 'agent-manager (grounding: prefix/suffix fallback for a stale candidate Snippet, 2026-09-21)',
     description: 'a candidate whose Snippet was edited inside (a comment or parameter added since it was written) matched nowhere, so the window fell back to blind head-truncation (anchorConfidence none) and the task was escalated as "no reliable anchor"',
@@ -184,4 +214,4 @@ const KNOWN_FIXED = [
   },
 ];
 
-module.exports = { KNOWN_FIXED, failureText };
+module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable };
