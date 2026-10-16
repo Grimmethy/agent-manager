@@ -596,3 +596,35 @@ test('extractDeclaredTargets: a call expression in the title is not a declared t
   assert.ok(!extractDeclaredTargets({ title: 'x', promptContext: { rawText: 'In res.json(), fix every error path that assumes JSON.' } }, '').includes('res.json'), 'the leading In-clause form too (it has an edit verb, so only the call guard stops it)');
   assert.ok(extractDeclaredTargets({ title: 'x', promptContext: { rawText: 'In src/api/admin.ts, fix every error path that assumes JSON.' } }, '').includes('src/api/admin.ts'), 'a real leading In-clause path is still a target');
 });
+
+// --- 2026-10-15: a documentation task that says its code is read-only must not be read as a code request (GPU broker verification tasks) -----------------------------------------------
+// The two task texts below are copied verbatim from the stuck queue records (queue/blocked/adhoc-gpu-broker-verify-promptforge-... and queue/needs-clarification/adhoc-gpu-broker-verify-core-...).
+const { taskWantsCodeChange } = require('./adhoc-diff-sanity.js');
+const REAL_PROMPTFORGE_VERIFY_TEXT = "Context: Docs/gpu-broker-extraction-map.md (merged, PR #561) maps pulling the Forge/pipeline GPU lease out of PromptForge into a standalone gpu-broker plugin (docs/agents/repo-extraction-playbook.md). Owner rule 2026-10-13: the pipeline's Ollama model and the Forge family never hold the GPU together. Premium, owner request 2026-10-15; this is one of three small read-only verification tasks replacing a single task that was too big. PromptForge: verify the map against /media/model-cache/github/promptforge-manual (server/core/gpu_session.py, comfy.py, comfy_proc.py, server/app.py routes /api/gpu/*, Docs/GPU_FAMILY_PROTOCOL.md, tests/test_gpu_session.py). Questions: where is the 120 s ComfyUI wait and how does an automatic job session call begin; which functions in gpu_session.py are broker logic vs PromptForge-specific; which tests would move with G1; per-device awareness (is anything GPU-index specific). RULES: read-only on the code; write ONLY the one findings file named below (a NEW file, nothing else changed). For every row/claim of the map that touches your area, state CONFIRMED / WRONG / UNCONFIRMED with path:line evidence, quote the corrected text for anything WRONG, and answer the section-5 open questions that fall in your area. Keep it under 120 lines. FILE TO WRITE: Docs/gpu-broker-verification-promptforge.md (in the agent-manager repo).";
+const REAL_CORE_VERIFY_TEXT = "Create the NEW file Docs/gpu-broker-verification-core.md (\u2264120 lines, nothing else touched) verifying Docs/gpu-broker-extraction-map.md section 1/5 against core code. Use this evidence: launch.sh:31-42 lease-delete+yield CONFIRMED; comfyui_lease_held agent-manager-common.sh:98, local-worker.sh:525, review-runner.sh:91 CONFIRMED; gpu-guard.js 54/77/101 CONFIRMED; local-client.js:266 (map says 264 \u2014 quote corrected); stop route pipeline_1_more.py:68 \u2192 app.py _stop_pipeline \u2192 stop.sh --keep-dashboard --keep-plugins, stop.sh:125 skips plugin-*.pid, so G5's 'stop kills plugins today' is WRONG/stale (fixed 2026-10-14, see test_stop_pipeline_keeps_plugins.py); /free reclaim gpu-guard.js:214-217 self-contained, no broker needed; .model-locks writer model-inflight-lock.js:37 + reader chat_preempt.py:164-168,265,394; /api/gpu callers only launch.sh:42, gpu-guard.js:105; pause/resume needs drain status endpoint (.model-locks/gpu-arbiter) + Ollama eviction (KEEP_ALIVE 30m) + resume via app.py:2760. Re-verify each line number with grep before writing, tag every row CONFIRMED/WRONG/UNCONFIRMED with path:line, answer the four section-5 questions, then run `wc -l` (\u2264120) and `git status` (only this new file).";
+const adhocTask = (rawText, extra = {}) => ({ domain: 'adhoc', source: 'manual', id: 't', title: 'Doc task', promptContext: { rawText }, planResponse: '', ...extra });
+
+test('read-only doc tasks: the real PromptForge and core verification task texts do not want code, and their docs-only diff passes', () => {
+  for (const [text, file] of [[REAL_PROMPTFORGE_VERIFY_TEXT, 'Docs/gpu-broker-verification-promptforge.md'], [REAL_CORE_VERIFY_TEXT, 'Docs/gpu-broker-verification-core.md']]) {
+    assert.equal(taskWantsCodeChange(adhocTask(text)), false, file);
+    assert.equal(adhocDiffSubstanceProblem(adhocTask(text), createDiff(file)), null, file);
+  }
+});
+
+test('identifier verbs: "lease-delete+yield" in a code-citing sentence is a name, but a free-standing "delete the lease in src/a.js" is a request', () => {
+  const doc = 'Create docs/notes.md listing the evidence. Evidence: launch.sh:31 lease-delete+yield is confirmed.';
+  assert.equal(taskWantsCodeChange(adhocTask(doc)), false);
+  assert.equal(taskWantsCodeChange(adhocTask('Create docs/notes.md listing the evidence. Also delete the lease in src/a.js.')), true);
+});
+
+test('read-only doc tasks: tasks that name a doc deliverable WITHOUT a read-only statement, or that give a real imperative at a code path, still want code', () => {
+  assert.equal(taskWantsCodeChange(adhocTask('Create docs/x.md and change the timeout in src/a.js.')), true);
+  assert.equal(taskWantsCodeChange(adhocTask('Add a retry to fetchThing in src/a.js and create docs/x.md describing it.')), true);
+  assert.equal(taskWantsCodeChange(adhocTask('Create docs/x.md describing the helper. Rename the helper in src/a.js. Nothing else is changed in docs.')), true);
+});
+
+test('read-only doc tasks: descriptive and question sentences about code do not count once the task states a doc deliverable and read-only code', () => {
+  const text = 'Create docs/x.md. Questions: which functions in a.py would move with the extraction; where is the new route registered in server/app.py. RULES: read-only on the code; nothing else touched.';
+  assert.equal(taskWantsCodeChange(adhocTask(text)), false);
+  assert.equal(taskWantsCodeChange(adhocTask(text.replace('read-only on the code; nothing else touched', 'be thorough'))), true, 'the same text without the read-only statement is unchanged');
+});

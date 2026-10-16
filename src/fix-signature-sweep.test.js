@@ -213,6 +213,18 @@ test('docs-only-gate-negated-paths drains the retry-exhausted documentation task
   assert.equal(has(dir, 'needs-clarification', 'code'), true);
 });
 
+test('docs-only-gate-negated-paths also drains the two real GPU broker verification tasks (read-only documentation deliverable) and leaves a real code task', () => {
+  const dir = pipeline();
+  const PF = "Context: Docs/gpu-broker-extraction-map.md (merged, PR #561) maps pulling the Forge/pipeline GPU lease out of PromptForge into a standalone gpu-broker plugin (docs/agents/repo-extraction-playbook.md). Owner rule 2026-10-13: the pipeline's Ollama model and the Forge family never hold the GPU together. Premium, owner request 2026-10-15; this is one of three small read-only verification tasks replacing a single task that was too big. PromptForge: verify the map against /media/model-cache/github/promptforge-manual (server/core/gpu_session.py, comfy.py, comfy_proc.py, server/app.py routes /api/gpu/*, Docs/GPU_FAMILY_PROTOCOL.md, tests/test_gpu_session.py). Questions: where is the 120 s ComfyUI wait and how does an automatic job session call begin; which functions in gpu_session.py are broker logic vs PromptForge-specific; which tests would move with G1; per-device awareness (is anything GPU-index specific). RULES: read-only on the code; write ONLY the one findings file named below (a NEW file, nothing else changed). For every row/claim of the map that touches your area, state CONFIRMED / WRONG / UNCONFIRMED with path:line evidence, quote the corrected text for anything WRONG, and answer the section-5 open questions that fall in your area. Keep it under 120 lines. FILE TO WRITE: Docs/gpu-broker-verification-promptforge.md (in the agent-manager repo).";
+  const CORE = "Create the NEW file Docs/gpu-broker-verification-core.md (\u2264120 lines, nothing else touched) verifying Docs/gpu-broker-extraction-map.md section 1/5 against core code. Use this evidence: launch.sh:31-42 lease-delete+yield CONFIRMED; comfyui_lease_held agent-manager-common.sh:98, local-worker.sh:525, review-runner.sh:91 CONFIRMED; gpu-guard.js 54/77/101 CONFIRMED; local-client.js:266 (map says 264 \u2014 quote corrected); stop route pipeline_1_more.py:68 \u2192 app.py _stop_pipeline \u2192 stop.sh --keep-dashboard --keep-plugins, stop.sh:125 skips plugin-*.pid, so G5's 'stop kills plugins today' is WRONG/stale (fixed 2026-10-14, see test_stop_pipeline_keeps_plugins.py); /free reclaim gpu-guard.js:214-217 self-contained, no broker needed; .model-locks writer model-inflight-lock.js:37 + reader chat_preempt.py:164-168,265,394; /api/gpu callers only launch.sh:42, gpu-guard.js:105; pause/resume needs drain status endpoint (.model-locks/gpu-arbiter) + Ollama eviction (KEEP_ALIVE 30m) + resume via app.py:2760. Re-verify each line number with grep before writing, tag every row CONFIRMED/WRONG/UNCONFIRMED with path:line, answer the four section-5 questions, then run `wc -l` (\u2264120) and `git status` (only this new file).";
+  put(dir, 'needs-clarification', docsTask('verify-pf', PF));
+  put(dir, 'needs-clarification', docsTask('verify-core', CORE));
+  put(dir, 'needs-clarification', docsTask('code', 'Create docs/x.md and change the timeout in src/foo.js.'));
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['docs-only-gate-negated-paths']] });
+  assert.deepEqual(s.requeued.map((r) => r.id).sort(), ['verify-core', 'verify-pf']);
+  assert.equal(has(dir, 'needs-clarification', 'code'), true);
+});
+
 // --- stale-snippet-partial-anchor (2026-09-21) ----------------------------------------------------------------------------------------------
 const anchorRepo = () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'anchor-repo-'));
