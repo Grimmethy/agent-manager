@@ -1736,3 +1736,29 @@ Extract the "pipeline-internal, non-searchable directory" policy into a single s
 
 Benefits:
 The "the inbox lives in a skipped dir" invariant becomes explicit and shared rather than coincidental. A future move of the inbox or a rename of a skip-list entry is a single-point change that both modules pick up. A reader of either file can trace the skip policy to one source of truth instead of inferring it from a string literal in a different module.
+
+### AC-156 · Registry hardcodes scope logic, creating a hidden coupling to `source-scope.js` internals
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`task-source-registry.js` (`registerTaskSource`) directly requires `lib/source-scope.js` and hardcodes the string `'core'` to decide when to wrap the `next` function. This creates a hidden coupling: the registry must know the internal API of `source-scope.js` (specifically `sourceEligibleHere`) and the specific scope value `'core'` in order to enforce eligibility. A registration function is expected to be a thin, scope-agnostic store; instead it carries scope-specific branching logic. If the scope model evolves (a new `'local'` scope, a change in how `sourceEligibleHere` resolves, a rename of the exported function), the registry must be updated in lockstep, and the coupling is invisible to anyone reading the registry in isolation because the dependency is a direct `require` rather than a documented interface.
+
+Solution:
+Move the scope-guarding responsibility into `lib/source-scope.js` itself. Export a function such as `applyScopeGuards(config)` (or a more granular `wrapNextWithScopeCheck(next, scope)`) that encapsulates the eligibility check and the closure wiring. The registry then calls that exported helper—e.g. `config = { ...config, next: wrapNextWithScopeCheck(config.next, config.scope) }`—without importing `sourceEligibleHere` directly or hardcoding the `'core'` string. The helper returns a new function (or a new config object), consistent with the existing spread-based pattern already in the registry, so the caller's original object is never touched. The registry becomes a thin, scope-agnostic store, and all scope-specific logic lives in one module.
+
+Benefits:
+The registry no longer needs to know which scopes exist, how eligibility is computed, or which internal function of `source-scope.js` to call. Adding or modifying a scope requires touching only `lib/source-scope.js`, and the registry's `require` list shrinks to the helper's public API. The control flow is easier to trace: a reader of the registry sees a single opaque call rather than an inline scope branch, and a reader of `source-scope.js` sees the full eligibility logic in one place. Testing simplifies because the scope-guarding logic can be unit-tested in isolation without standing up the registry.
+
+### AC-157 · Scope-eligibility check enforced redundantly at registration and at claim time
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`lib/source-scope.js` exports `sourceEligibleHere` and its own comment states the check is "Enforced at generation (getNextTask) AND claim (next-claimable-task)." Meanwhile, `task-source-registry.js` already wraps `next` at registration time so that the generation path is guarded. This means the same eligibility predicate is evaluated in at least two places for the same task, and a developer reading either site in isolation cannot tell which one is authoritative. If one site is updated (e.g., a new scope condition is added) and the other is missed, the two checks silently disagree, producing tasks that pass one gate but fail the other—or vice versa—with no obvious error.
+
+Solution:
+Choose a single enforcement point and remove the other. If the registry wrapper is sufficient (i.e., every task that enters the system passes through `registerTaskSource`), drop the claim-time re-check and document that registration-time guarding is the sole gate. If the claim-time check is necessary for tasks registered before a scope was set or for tasks injected through a path that bypasses the registry, remove the registry wrapper and make the claim-time check the documented, sole enforcement point. In either case, add a brief comment at the chosen site stating that it is the only place eligibility is enforced, so future readers do not add a second check.
+
+Benefits:
+Eliminating the duplicate check removes a whole category of "which check is the real one?" confusion and prevents the two sites from drifting out of sync. Control flow becomes linear and easier to reason about: a task is either eligible or it is not, determined in exactly one place. Testing simplifies because there is one code path to exercise rather than two that must be kept in agreement.
