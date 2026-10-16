@@ -520,13 +520,9 @@ function renderBrainDumpDiscussCard(entry, session) {
   `;
 }
 
-async function loadSecondBrainBrowser() {
-  const panel = document.getElementById('bd-browser');
-  if (!panel) return;
-  panel.innerHTML = '<div class="empty">Loading...</div>';
-  let data;
+async function fetchBrowseData(path) {
   try {
-    data = await fetchJson('/api/second-brain/browse?path=' + encodeURIComponent(brainDumpBrowsePath));
+    return await fetchJson('/api/second-brain/browse?path=' + encodeURIComponent(path));
   } catch (e) {
     // brainDumpBrowsePath is persisted in localStorage across sessions -- a folder it
     // points at can legitimately stop existing between visits (renamed, merged, deleted
@@ -536,26 +532,16 @@ async function loadSecondBrainBrowser() {
     // case-duplicate folders got merged, and a browser that had "projects" saved from
     // before the merge 404'd here forever after. Fall back to root once rather than
     // leaving a stale path permanently wedged.
-    if (brainDumpBrowsePath !== '') {
+    if (path !== '') {
       brainDumpBrowsePath = '';
       localStorage.setItem('agentManagerBrainDumpBrowsePath', '');
-      try {
-        data = await fetchJson('/api/second-brain/browse?path=');
-      } catch (e2) {
-        panel.innerHTML = `<div class="empty">Could not browse: ${e2.message}</div>`;
-        return;
-      }
-    } else {
-      panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
-      return;
+      return await fetchJson('/api/second-brain/browse?path=');
     }
+    throw e;
   }
+}
 
-  if (!data.configured) {
-    panel.innerHTML = '<div class="empty">SECOND_BRAIN_DIR is not configured for the active project.</div>';
-    return;
-  }
-
+function buildBrowserHtml(data, selectedFile) {
   // A plain path-as-text crumb here previously gave no way back to the root except
   // clicking "up" once per level -- easy to end up parked deep in a small folder (e.g.
   // Decisions/, 2 files) after a "jump to file" link, with no obvious cue you're not
@@ -580,7 +566,7 @@ async function loadSecondBrainBrowser() {
       const countLabel = entry.count === null ? '?' : entry.count;
       html += `<div class="browser-entry" data-nav="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}/</span><span class="entry-count">${countLabel}</span></div>`;
     } else {
-      const active = entry.path === brainDumpSelectedFile ? ' active' : '';
+      const active = entry.path === selectedFile ? ' active' : '';
       // Notes linked to a real GitHub repo (via /api/second-brain/sync-github-projects)
       // get a one-click way to make that repo the pipeline's active project, or a badge
       // if it already is -- the actual ask: buttons in Second Brain that set a project
@@ -599,6 +585,27 @@ async function loadSecondBrainBrowser() {
       html += `<div class="browser-entry${active}" data-file="${escapeAttr(entry.path)}"><span>${escapeHtml(entry.name)}</span>${projectControl}</div>`;
     }
   }
+  return html;
+}
+
+async function loadSecondBrainBrowser() {
+  const panel = document.getElementById('bd-browser');
+  if (!panel) return;
+  panel.innerHTML = '<div class="empty">Loading...</div>';
+  let data;
+  try {
+    data = await fetchBrowseData(brainDumpBrowsePath);
+  } catch (e) {
+    panel.innerHTML = `<div class="empty">Could not browse: ${e.message}</div>`;
+    return;
+  }
+
+  if (!data.configured) {
+    panel.innerHTML = '<div class="empty">SECOND_BRAIN_DIR is not configured for the active project.</div>';
+    return;
+  }
+
+  const html = buildBrowserHtml(data, brainDumpSelectedFile);
   panel.innerHTML = html;
 
   panel.querySelectorAll('[data-nav]').forEach((el) => {
