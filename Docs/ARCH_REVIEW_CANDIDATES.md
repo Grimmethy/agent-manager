@@ -1710,3 +1710,29 @@ Evaluate whether `createRealGitRunner` can be extended to cover `git show` and `
 
 Benefits:
 A single, consistent Git interaction strategy within the module reduces cognitive overhead when reading or modifying the code, ensures uniform error handling across all Git calls, and makes it straightforward to add cross-cutting concerns (logging, retry logic, or environment overrides) in one place rather than patching each call site individually.
+
+### AC-154 · Finding-identity contract split across side-finding.js and text-similarity.js
+Strength: Worth exploring
+Files: src/side-finding.js, src/text-similarity.js, src/side-finding-sweep.js
+
+Problem:
+Two modules independently encode "what counts as the same finding" with no shared definition of the comparison unit. `side-finding.js` dedups within a single response by exact lowercased title (`seenTitles` in `extractSideFindings`), treating identical titles with different bodies as one finding. `text-similarity.js` provides `jaccardSimilarity` and `sharesDistinctivePhrase` for the cross-response dedup that `side-finding-sweep.js` performs, treating different titles with a shared distinctive phrase as one finding. Both solve "is this finding already known?" at different granularities, but neither file states that the title is the canonical identity token and the phrase/Jaccard signals are secondary disambiguators. The only thread connecting them is the `conceptId` data field, which is a scope key, not a shared predicate. If the title convention changes (e.g. the model starts emitting a severity prefix or timestamp in the title), the within-response dedup in `side-finding.js` shifts silently while `text-similarity.js`'s consumers are unaffected, and vice versa. A reader of either file has no signal that the other module's output is being compared against a key built by the first.
+
+Solution:
+Introduce a single, named notion of "finding identity" shared by both dedup layers. Concretely: extract a small helper (or a documented contract block in both files) that states the canonical comparison key is the lowercased title, and that `text-similarity.js`'s phrase/Jaccard signals are applied only as a secondary disambiguator when titles do not already match. Both `extractSideFindings` in `side-finding.js` and the sweep's dedup in `side-finding-sweep.js` would call the same normalization function to produce the comparison key, making the two dedup layers explicitly ordered (exact-title first, fuzzy second) rather than two independent, coincidentally-complementary heuristics.
+
+Benefits:
+A future change to the title convention (prefix, suffix, case, length) is a single-point edit that both dedup paths pick up automatically, eliminating the silent-divergence risk. A reader of either file immediately sees the shared identity contract and the ordering of the two dedup layers. The `conceptId` scoping field and the fuzzy-similarity signals retain their roles, but their relationship to the primary identity key becomes explicit rather than implicit.
+
+### AC-155 · Pipeline-internal directory skip-list is enforced by two files that do not reference each other
+Strength: Speculative
+Files: src/grep-codebase-tool.js, src/side-finding.js, src/lib/archived-dirs.js
+
+Problem:
+`grep-codebase-tool.js` defines `GREP_SKIP_DIRS` (which includes `queue`) and separately calls `isArchivedDirName` from `lib/archived-dirs.js`. `side-finding.js` writes its inbox into `queue/side-findings-inbox/`. The invariant "pipeline-internal state directories are not searchable" is therefore enforced by two files that do not know about each other: the inbox lives inside a skipped directory purely because two independently-chosen string literals happen to agree on `queue`. If `side-finding.js` were moved to a top-level `side-findings/` directory (a plausible refactor given the inbox is a first-class concept with its own sweep module), it would silently become greppable and start polluting plan-grounding hits with the pipeline's own side-finding JSON files. Conversely, renaming or removing the `queue` entry from `GREP_SKIP_DIRS` would break the invariant with no compile-time, test-time, or documentation signal, because the coupling is purely lexical.
+
+Solution:
+Extract the "pipeline-internal, non-searchable directory" policy into a single shared constant, likely alongside `isArchivedDirName` in `lib/archived-dirs.js` or in a new `lib/pipeline-dirs.js`. Both `grep-codebase-tool.js`'s `GREP_SKIP_DIRS` and `side-finding.js`'s inbox-root derivation would reference this shared constant. A short comment on the constant states the invariant: "directories listed here hold pipeline state and must not appear in codebase-search results."
+
+Benefits:
+The "the inbox lives in a skipped dir" invariant becomes explicit and shared rather than coincidental. A future move of the inbox or a rename of a skip-list entry is a single-point change that both modules pick up. A reader of either file can trace the skip policy to one source of truth instead of inferring it from a string literal in a different module.
