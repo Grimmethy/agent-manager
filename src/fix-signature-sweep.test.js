@@ -408,3 +408,74 @@ test('context-only-file-falsely-parked drains the victim to pending/', () => {
   assert.equal(has(dir, 'pending', 'ac-44'), true);
   assert.equal(has(dir, 'needs-clarification', 'ac-44'), false);
 });
+
+// --- implement-pass-sibling-repos-readable (2026-10-16): the real stuck VideoForge verification task, copied verbatim from queue/needs-clarification/ ---
+const VF_RAW_TEXT = "Context: Docs/gpu-broker-extraction-map.md (merged, PR #561) maps pulling the Forge/pipeline GPU lease out of PromptForge into a standalone gpu-broker plugin (docs/agents/repo-extraction-playbook.md). Owner rule 2026-10-13: the pipeline's Ollama model and the Forge family never hold the GPU together. Premium, owner request 2026-10-15; this is one of three small read-only verification tasks replacing a single task that was too big. VideoForge: verify the map against /media/model-cache/github/videoforge (server/core/gpu.py, server/app.py, server/core/render.py, web/app.js). Questions: every place VideoForge calls the GPU endpoints (including web/app.js), whether the web page calls PromptForge directly from the browser (CORS/URL), and what G2 must change there. RULES: read-only on the code; write ONLY the one findings file named below (a NEW file, nothing else changed). For every row/claim of the map that touches your area, state CONFIRMED / WRONG / UNCONFIRMED with path:line evidence, quote the corrected text for anything WRONG, and answer the section-5 open questions that fall in your area. Keep it under 120 lines. FILE TO WRITE: Docs/gpu-broker-verification-videoforge.md (in the agent-manager repo).";
+const VF_OPEN_QUESTIONS = "The automated handler could not get this past review after 3 attempts:\n  1. A prior plan was blocked before implementation because it named an edit target that does not actually exist in the repo:\n\nplan cites missing-file target(s): Docs/gpu-broker-verification-videoforge.md\n\nOnly declare edit targets that are actually present in the repo (verify with a tool call before naming one). If this task genuinely requires a brand-new file, say so explicitly (e.g. \"create `path`\") so it is recognized as a create target, not a citation of an existing file.\n  2. A prior attempt hit a tool/environment failure (not a design question):\n\nI've exhausted the verification of where VideoForge's code is:\n\n- `list_roots` shows exactly one accessible repo: the agent-manager worktree.\n- `/media/model-cache/github/` contains only `agent-manager` (a bare `.git` dir); `/media/model-cache/github/videoforge` does **not** exist (ls: \"No such file or directory\").\n- Filesystem-wide `find` for `*videoforge*`, `*forge*`, and `gpu.py` (up to maxdepth 6) returns nothing relevant — no VideoForge, no PromptForge, no other Forge checkout anywhere on this machine.\n- The deterministic pre-filter independently confirmed: `server/core/gpu.py`, `server/core/render.py`, `web/app.js`, and all `/media/model-cache/github/videoforge/...` paths are missing from this checkout.\n\nThe one source I *can* read is the map itself (`Docs/gpu-broker-extraction-map.md`, 80 lines, fully read: section 1's \"VideoForge client\" row claims `videoforge/server/core/gpu.py` (45 lines) + `server/app.py` + `server/core/render.py`; G2 repoints `videoforge/server/core/gpu.py`, `render.py`, `app.py`; section 5 names `web/app.js` as a caller G2 must repoint). But every one of those claims needs `path:line` evidence inside the VideoForge tree — which is not present in this sandbox. Writing the findings file with every row \"UNCONFIRMED because the code is absent\" would be a blocker report in the wrong garment: the acceptance criteria demand real citations into `server/core/gpu.py` / `web/app.js`, and I have zero of them. I made no file changes, which is correct for this outcome.\n\nRESOLUTION: needs-human-decision\nBLOCKER-TYPE: infra-error\nThe verification target `/media/model-cache/github/videoforge` (server/core/gpu.py, server/app.py, server/core/render.py, web/app.js) is not mounted in this sandbox — the only accessible repo is agent-manager, and a full filesystem search found no VideoForge checkout anywhere. To act without re-investigating: run a fresh pass in a sandbox that mounts the videoforge checkout (the map's claims to check are all in `Docs/gpu-broker-extraction-map.md` §1 row \"VideoForge client\", §3 G2, and §5's `web/app.js` bullet), then **create** `Docs/gpu-broker-verification-videoforge.md` (new file, ≤120 lines, CONFIRMED/WRONG/UNCONFIRMED per claim with `path:line` citations into the videoforge tree, answering the §5 browser→PromptForge CORS/URL question and the G2 change list for `web/app.js`/`server/app.py`/`server/core/gpu.py`/`server/core/render.py`). Nothing needs deciding by design — this is purely the missing mount.\n\nRetry the operation from a clean pass. If a command genuinely fails identically again, end with RESOLUTION: needs-human-decision and BLOCKER-TYPE: infra-error, quoting the exact command and its full error output.\n  3. Agentic implement pass tagged BLOCKER-TYPE: infra-error -- a tool/environment failure, not a design question, requeued for a clean retry\n\nIf this is a request to EXTEND an existing feature (a \"should also\", a \"when X, also Y\", or it names a different object than a similarly-named feature already covers), say exactly what should change and which file(s). If it is genuinely already done, use Archive.";
+
+const SIBLING_ENTRY = 'implement-pass-sibling-repos-readable';
+const VF_ROOTS = ['/media/model-cache/github/videoforge', '/media/model-cache/github/promptforge-manual'];
+const { siblingRepoWasUnreachable } = require('./known-fixed-failures.js');
+const vfTask = (id, over = {}) => ({
+  id, domain: 'adhoc', source: 'manual', title: 'GPU broker verify videoforge', status: 'pending', createdAt: '2026-10-15T17:00:00Z',
+  promptContext: { rawText: VF_RAW_TEXT },
+  needsClarification: { reason: 'infra-error', openQuestions: VF_OPEN_QUESTIONS },
+  history: [at('2026-10-15T18:19:25Z'), { stage: 'exhausted', at: '2026-10-15T19:19:24Z' }, { stage: 'needs-clarification', at: '2026-10-15T19:19:24Z' }],
+  ...over,
+});
+// The real root list only exists on the host that has the repos; the sweep tests inject the roots, the wiring test below uses the real list when the repo is present.
+const withRoots = (roots) => KNOWN_FIXED.map((e) => (e.id === SIBLING_ENTRY ? { ...e, applies: (t) => siblingRepoWasUnreachable(t, roots) } : e));
+const LIVE_FIRST_SEEN = (extra = {}) => ({
+  firstSeen: Object.fromEntries(KNOWN_FIXED.filter((e) => e.id !== SIBLING_ENTRY).map((e) => [e.id, '2026-10-16T03:18:45.000Z'])), ...extra,
+});
+
+test('implement-pass-sibling-repos-readable applies to the real VideoForge task and to nothing that is not a sibling-repo-unreachable failure', () => {
+  assert.equal(siblingRepoWasUnreachable(vfTask('vf'), VF_ROOTS), true);
+  assert.equal(siblingRepoWasUnreachable(vfTask('vf', { needsClarification: { reason: 'infra-error', openQuestions: 'tests failed on line 3' } }), VF_ROOTS), false, 'unrelated failure');
+  assert.equal(siblingRepoWasUnreachable(vfTask('vf', { promptContext: { rawText: 'Edit /media/model-cache/github/agent-manager/src/a.js to add a retry.' } }), VF_ROOTS), false, 'names only agent-manager paths');
+  assert.equal(siblingRepoWasUnreachable(vfTask('vf', { needsClarification: undefined, priorRejectionFeedback: ['plan cites missing-file target(s): Docs/gpu-broker-verification-videoforge.md'] }), VF_ROOTS), false, 'missing create-target text alone');
+  assert.equal(siblingRepoWasUnreachable(vfTask('vf', { promptContext: { rawText: 'Read /media/model-cache/github/some-unregistered-repo/x.py' } }), VF_ROOTS), false, 'path outside the registered roots');
+  assert.equal(siblingRepoWasUnreachable(vfTask('vf'), []), false, 'empty roots');
+  assert.equal(siblingRepoWasUnreachable(vfTask('vf', { promptContext: {} }), VF_ROOTS), false, 'no raw text');
+});
+
+test('implement-pass-sibling-repos-readable is wired to the real read-only root list (plugins manifest -> resolveReadOnlySiblingRoots) when the repo is on this host', { skip: !fs.existsSync('/media/model-cache/github/videoforge') && 'videoforge is not on this host' }, () => {
+  // plugins-manifest reads its path at require time, so the wiring runs in a child process with a temp manifest that registers only videoforge.
+  const manifest = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'fixsig-manifest-')), 'plugins.json');
+  fs.writeFileSync(manifest, JSON.stringify([{ name: 'videoforge', registerPath: '/media/model-cache/github/videoforge/register.js', enabled: true }]));
+  const script = `const { KNOWN_FIXED } = require('./src/known-fixed-failures.js'); const e = KNOWN_FIXED.find((x) => x.id === ${JSON.stringify(SIBLING_ENTRY)}); `
+    + `const t = ${JSON.stringify(vfTask('vf'))}; process.stdout.write(String(e.applies(t)) + ',' + String(e.applies({ ...t, promptContext: { rawText: 'read /media/model-cache/github/some-unregistered-repo/x.py' } })));`;
+  const out = require('child_process').execFileSync(process.execPath, ['-e', script], {
+    cwd: path.join(__dirname, '..'), encoding: 'utf8',
+    env: { ...process.env, AGENT_MANAGER_PLUGINS_MANIFEST: manifest, AGENT_MANAGER_CORE_REPO_ROOT: path.join(__dirname, '..') },
+  });
+  assert.equal(out, 'true,false');
+});
+
+test('live state: with every older entry already first-seen, the NEW entry requeues the stuck VideoForge task once and the requeued record drops the false retire flag', () => {
+  const dir = pipeline();
+  fs.writeFileSync(path.join(dir, 'queue', STATE_FILE), JSON.stringify(LIVE_FIRST_SEEN()));
+  put(dir, 'needs-clarification', vfTask('adhoc-vf', { stalenessFlag: { reason: 'duplicate-of', disposition: 'retire', confidence: 'medium' } }));
+  const now = new Date('2026-10-16T09:00:00Z');
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now, entries: withRoots(VF_ROOTS) });
+  assert.deepEqual(s.requeued, [{ id: 'adhoc-vf', entry: SIBLING_ENTRY, from: 'needs-clarification' }]);
+  assert.deepEqual(s.newEntries, [SIBLING_ENTRY]);
+  const fresh = read(dir, 'adhoc', 'adhoc-vf');
+  assert.deepEqual(fresh.requeuedForFixes, [SIBLING_ENTRY]);
+  assert.equal(fresh.stalenessFlag, undefined, 'a requeue rebuilds the record from a whitelist, so the false duplicate-of/retire flag is gone');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'queue', STATE_FILE), 'utf8')).firstSeen[SIBLING_ENTRY], now.toISOString());
+  // once only: nothing more on a second pass, and a task that got stuck AFTER the new first sighting stays put
+  put(dir, 'needs-clarification', vfTask('adhoc-vf-late', { history: [at('2026-10-16T10:00:00Z'), { stage: 'exhausted', at: '2026-10-16T10:00:00Z' }] }));
+  const again = sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T11:00:00Z'), entries: withRoots(VF_ROOTS) });
+  assert.deepEqual(again.requeued, []);
+  assert.equal(has(dir, 'needs-clarification', 'adhoc-vf-late'), true);
+});
+
+test('mutation check: without the new entry the same live state requeues nothing (the failure the owner saw)', () => {
+  const dir = pipeline();
+  fs.writeFileSync(path.join(dir, 'queue', STATE_FILE), JSON.stringify(LIVE_FIRST_SEEN()));
+  put(dir, 'needs-clarification', vfTask('adhoc-vf'));
+  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T09:00:00Z'), entries: KNOWN_FIXED.filter((e) => e.id !== SIBLING_ENTRY) });
+  assert.deepEqual(s.requeued, []);
+  assert.equal(has(dir, 'needs-clarification', 'adhoc-vf'), true);
+});
