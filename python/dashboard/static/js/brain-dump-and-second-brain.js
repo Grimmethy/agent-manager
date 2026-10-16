@@ -588,6 +588,54 @@ function buildBrowserHtml(data, selectedFile) {
   return html;
 }
 
+// "Set Active Project" action for a Second Brain entry: confirm, then stop the
+// current pipeline and start it against the entry's repo path (safe defaults).
+async function handleSetActiveProject(btn, repoPath) {
+  if (!confirm(`Stop the current pipeline (if running) and start it against:\n${repoPath}\n\nStarts in the safe default (no apply/no push) -- switch that on later from the Project tab if you want it to write changes.`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Switching...';
+  try {
+    await fetch('/api/pipeline/stop', { method: 'POST' });
+    const resp = await fetch('/api/pipeline/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: repoPath, includeApply: false, skipPush: true }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.description || ('HTTP ' + resp.status));
+    }
+    await loadSecondBrainBrowser();
+  } catch (err) {
+    alert('Could not switch active project: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Set Active';
+  }
+}
+
+// "Create GitHub Project" action for a Second Brain note: confirm, then create a
+// new git repo seeded from the note and refresh to show the newly linked project.
+async function handleCreateGithubProject(btn, notePath) {
+  if (!confirm(`Create a new GitHub project seeded from this note?\n\nThis creates a new folder + git repo under your GitHub projects directory, with this note's content as README.md, and links the note to it here.`)) return;
+  btn.disabled = true;
+  btn.textContent = 'Creating...';
+  try {
+    const resp = await fetch('/api/second-brain/create-github-project', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notePath }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
+    await loadSecondBrainBrowser();
+    alert(`Created ${result.projectName} at ${result.repoPath}`);
+  } catch (err) {
+    alert('Could not create GitHub project: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'Create GitHub Project';
+  }
+}
+
 async function loadSecondBrainBrowser() {
   const panel = document.getElementById('bd-browser');
   if (!panel) return;
@@ -616,53 +664,15 @@ async function loadSecondBrainBrowser() {
     };
   });
   panel.querySelectorAll('.set-active-project').forEach((btn) => {
-    btn.onclick = async (e) => {
+    btn.onclick = (e) => {
       e.stopPropagation(); // don't also trigger the row's data-file "open note" handler
-      const repoPath = btn.dataset.repoPath;
-      if (!confirm(`Stop the current pipeline (if running) and start it against:\n${repoPath}\n\nStarts in the safe default (no apply/no push) -- switch that on later from the Project tab if you want it to write changes.`)) return;
-      btn.disabled = true;
-      btn.textContent = 'Switching...';
-      try {
-        await fetch('/api/pipeline/stop', { method: 'POST' });
-        const resp = await fetch('/api/pipeline/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: repoPath, includeApply: false, skipPush: true }),
-        });
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({}));
-          throw new Error(err.description || ('HTTP ' + resp.status));
-        }
-        await loadSecondBrainBrowser();
-      } catch (err) {
-        alert('Could not switch active project: ' + err.message);
-        btn.disabled = false;
-        btn.textContent = 'Set Active';
-      }
+      handleSetActiveProject(btn, btn.dataset.repoPath);
     };
   });
   panel.querySelectorAll('.create-github-project').forEach((btn) => {
-    btn.onclick = async (e) => {
+    btn.onclick = (e) => {
       e.stopPropagation(); // don't also trigger the row's data-file "open note" handler
-      const notePath = btn.dataset.notePath;
-      if (!confirm(`Create a new GitHub project seeded from this note?\n\nThis creates a new folder + git repo under your GitHub projects directory, with this note's content as README.md, and links the note to it here.`)) return;
-      btn.disabled = true;
-      btn.textContent = 'Creating...';
-      try {
-        const resp = await fetch('/api/second-brain/create-github-project', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ notePath }),
-        });
-        const result = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(result.description || ('HTTP ' + resp.status));
-        await loadSecondBrainBrowser();
-        alert(`Created ${result.projectName} at ${result.repoPath}`);
-      } catch (err) {
-        alert('Could not create GitHub project: ' + err.message);
-        btn.disabled = false;
-        btn.textContent = 'Create GitHub Project';
-      }
+      handleCreateGithubProject(btn, btn.dataset.notePath);
     };
   });
   panel.querySelectorAll('[data-file]').forEach((el) => {
