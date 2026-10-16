@@ -1751,3 +1751,48 @@ index 951e8e12..d9653a8c 100644
 Problem: [severity: high; regression shipped in b016e3f] Removing `OSError` from the except tuple in `_call_discuss` narrows the caught set from all `OSError` subclasses to only `TimeoutError` and `ConnectionError`, so `FileNotFoundError` and `PermissionError` (both `OSError` subclasses that are neither) now propagate uncaught as raw 500s instead of being converted to a 502 with an actionable message.  Failure scenario: A brain-dump discuss/start request arrives via `routes/brain_dump.py:297` (`_call_discuss(start_session, pipeline_dir, entry_id, entry["rawText"], kind="brain-dump", …)`). The project's `pipeline_dir` has been deleted or its permissions revoked (e.g. an admin removed the directory between requests). `start_session` (from `discuss_sessions`) attempts to open a session JSON file under that directory and raises `FileNotFoundError`. Before the diff, the `except (TimeoutError, ConnectionError, OSError)` clause caught it and returned HTTP 502 with the body "local model call failed ([Errno 2] No such file or directory: …) -- it may be busy with an active worker-lane task; try again shortly or switch to Claude." After the diff, `FileNotFoundError` is neither a `TimeoutError` nor a `ConnectionError`, so it escapes `_call_discuss`, Flask's default error handler fires, and the user sees a bare 500 "Internal Server Error" page with no explanation — the exact failure mode the function's docstring says it "already exists to prevent." The commit message itself names `FileNotFoundError` and `PermissionError` as the errors raised during the session call, confirming they are reachable in practice.
 Solution: Restore `OSError` in the tuple: `except (TimeoutError, ConnectionError, OSError) as e:` (or simply `except OSError as e:`, since both `TimeoutError` and `ConnectionError` are `OSError` subclasses in CPython 3). This matches the sibling `_call_chat` function in the same file, which still catches all three.
 Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in b016e3f.
+
+### AC-111 · The "Snippet fuzzy-match flip" branch, documented as the strongest staleness signal and in (77f8ff2 context-trim-sweep.js)
+Strength: Strong
+Source: change_review of 77f8ff2 "Merge AC-88 · `describeImprovement` treats a Snippet fuzzy-match flip in either "
+Files: src/context-trim-sweep.js
+
+Snippet:
+```
+diff --git a/src/context-trim-sweep.js b/src/context-trim-sweep.js
+index ce9538de..0fdd4b50 100644
+--- a/src/context-trim-sweep.js
++++ b/src/context-trim-sweep.js
+@@ -130,25 +130,25 @@ function reAnchorFile(repoRoot, fetched, body, task) {
+     return { fetched, windowed };
+   } catch {
+     return null;
+   }
+ }
+ 
+ // Compares OLD vs NEW anchoring for one file, in priority order: (a) a Snippet
+ // fuzzy-match flip -- the strongest staleness signal; (b) confidence tier improved;
+ // (c) a material content delta even at the same tier (the file simply moved).
+ function describeImprovement(oldEntry, windowed) {
+   const oldUsedFuzzy = !!oldEntry.usedSnippetFuzzyMatch;
+   const newUsedFuzzy = windowed.usedSnippetFuzzyMatch;
+-  if (oldUsedFuzzy !== newUsedFuzzy) {
++  if (oldUsedFuzzy !== newUsedFuzzy && newUsedFuzzy) {
+     return `Snippet fuzzy-match ${oldUsedFuzzy}->${newUsedFuzzy} for ${oldEntry.path}`;
+   }
+ 
+   const oldConfidence = oldEntry.anchorConfidence || 'none';
+   const oldRank = CONFIDENCE_RANK[oldConfidence] ?? 0;
+   const newRank = CONFIDENCE_RANK[windowed.confidence] ?? 0;
+   if (newRank > oldRank) {
+     return `anchor confidence ${oldConfidence}->${windowed.confidence} for ${oldEntry.path}`;
+   }
+ 
+   const oldLen = (oldEntry.content || '').length;
+   const newLen = (windowed.text || '').length;
+
+```
+
+Problem: [severity: low; regression shipped in 77f8ff2] The "Snippet fuzzy-match flip" branch, documented as the strongest staleness signal and intended to fire in either direction, no longer reports the true->false (fuzzy-to-clean) flip.  Failure scenario: In sweep(), a declared entry has `usedSnippetFuzzyMatch: true` and `anchorConfidence: 'strong'` (rank 3). After re-anchoring, `windowed.usedSnippetFuzzyMatch` is `false` and `windowed.confidence` is `'strong'` (rank 3), with the windowed text length within MATERIAL_DELTA_RATIO of the old content length. Pre-diff, `oldUsedFuzzy !== newUsedFuzzy` (true !== false) returned `Snippet fuzzy-match true->false for <path>`, so `improvements` was non-empty and the task was requeued. Post-diff, the guard `oldUsedFuzzy !== newUsedFuzzy && newUsedFuzzy` is false (newUsedFuzzy is false), the confidence check `newRank > oldRank` is false (3 > 3), and the content-delta check is false, so `describeImprovement` returns null; `improvements` stays empty and the task is flagged stale-grounding-unrecoverable instead of being requeued.
+Solution: Revert the guard to `if (oldUsedFuzzy !== newUsedFuzzy)` so the fuzzy-match flip is reported in either direction, per the function's doc comment and the commit title.
+Benefits: Restores correct behaviour for the scenario above; undoes the regression shipped in 77f8ff2.
