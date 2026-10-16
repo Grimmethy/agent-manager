@@ -1671,3 +1671,42 @@ Make the set of "expected structural markers" (table delimiters, fence character
 
 Benefits:
 The implicit "these two files must stay in sync" contract becomes visible in the dependency graph, reducing the chance that a prompt-format change silently invalidates the truncation heuristic. The guard remains simple and heuristic (avoiding over-engineering), but the coupling is now explicit and discoverable rather than relying on a developer's memory of which files are related.
+
+### AC-151 · Consolidate duplicated Git execution and environment configuration in stacked-grounding
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The module defines a local `runGit` helper alongside `GIT_ENV` and `GIT_TIMEOUT_MS` constants, yet `resolveAtRef` bypasses this helper and calls `execFileSync` directly with the same environment and timeout settings. This creates a tight coupling to the local configuration values and duplicates the execution logic, meaning any future change to the environment (e.g., adding a new `GIT_*` variable) or timeout policy must be applied in two places within the same file, increasing the risk of configuration drift.
+
+Solution:
+Refactor `resolveAtRef` to call the existing `runGit` helper instead of invoking `execFileSync` directly. The helper already encapsulates the environment variables (including `GIT_TERMINAL_PROMPT: '0'`) and the timeout, so `resolveAtRef` simply passes its command arguments through the same code path as every other Git interaction in the module.
+
+Benefits:
+All Git interactions within the module share a single execution path, so environment and timeout configuration lives in exactly one place. This eliminates the risk that a future change to `GIT_ENV` or `GIT_TIMEOUT_MS` is applied to the helper but missed in `resolveAtRef`, and it makes the module's Git interaction surface easier to audit and test.
+
+### AC-152 · Remove redundant side-effect require in apply-core
+Strength: Strong
+Files: src/lib/apply-core.js, src/prompts.js, src/task-sources.js
+
+Problem:
+`apply-core.js` includes a bare `require('../task-sources.js')` as a side-effect import, but none of the functions it exports (`writeArtifact`, `applyCandidateSplit`, etc.) reference any symbols from `task-sources.js`. The consuming module `src/prompts.js` already loads `task-sources.js` directly, so this edge in the dependency graph is a leftover from a prior refactoring and serves no functional purpose.
+
+Solution:
+Delete the `require('../task-sources.js')` line from `apply-core.js`. No other code in the module depends on the side effect, and the module that actually needs `task-sources.js` (`src/prompts.js`) already imports it.
+
+Benefits:
+The module dependency graph loses a spurious edge, eliminating a potential circular-require hazard if `task-sources.js` ever comes to import from `apply-core.js`. It also makes the true dependency surface of `apply-core.js` explicit and easier to reason about during future refactors.
+
+### AC-153 · Standardize Git ref resolution strategy in stacked-grounding
+Strength: Worth exploring
+Files: src/stacked-grounding.js
+
+Problem:
+Within the same module, `resolveGroundingRef` uses `createRealGitRunner` to check branch existence, while `readFileAtRef`, `grepAtRef`, and `resolveAtRef` interact with Git via direct `execFileSync` calls using `origin/${ref}`. This represents two distinct mechanisms for Git interaction coexisting in one file, which complicates reasoning about which commands are covered by the runner's error handling and which are not.
+
+Solution:
+Evaluate whether `createRealGitRunner` can be extended to cover `git show` and `git grep` invocations, or whether a thin internal wrapper (beyond the existing `runGit` helper) should be introduced so that all Git interactions in the module follow a single strategy for ref resolution, error handling, and environment setup.
+
+Benefits:
+A single, consistent Git interaction strategy within the module reduces cognitive overhead when reading or modifying the code, ensures uniform error handling across all Git calls, and makes it straightforward to add cross-cutting concerns (logging, retry logic, or environment overrides) in one place rather than patching each call site individually.
