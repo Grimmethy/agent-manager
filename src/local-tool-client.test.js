@@ -1997,3 +1997,94 @@ test('windowSectionText (read_task sections) pages every line exactly once acros
   const small = require('./local-tool-client.js').windowSectionText('a\nb\nc\nd', 2, 2);
   assert.deepEqual([small.content, small.nextOffset, small.truncated], ['b\nc', 4, false]);
 });
+
+// --- read-only sibling repos for the implement pass (2026-10-16) -------------------------------------------------------------------------------
+// The GPU broker verification tasks could not read /media/model-cache/github/videoforge: the implement pass's tool roots were its worktree only.
+function siblingFixture(fn) {
+  return withFixtureRepo((mod, dir) => {
+    const sib = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ltc-sibling-')));
+    fs.mkdirSync(path.join(sib, 'server', 'core'), { recursive: true });
+    fs.writeFileSync(path.join(sib, 'server', 'core', 'gpu.py'), 'def acquire():\n    pass\n');
+    fs.writeFileSync(path.join(sib, '.env'), 'TOKEN=abc\n');
+    fs.writeFileSync(path.join(sib, 'my-secret-notes.md'), 'TOKEN=abc in a grep-able extension\n');
+    fs.writeFileSync(path.join(sib, 'ordinary.md'), 'TOKEN is documented here\n');
+    fs.writeFileSync(path.join(dir, '.env'), 'LOCAL=1\n');
+    fs.writeFileSync(path.join(dir, 'mine.js'), 'const a = 1;\n');
+    const primary = fs.realpathSync(dir);
+    return fn(mod, primary, sib);
+  });
+}
+
+test('read-only sibling: read_file, list_directory and list_roots work there, and list_roots flags it readOnly', () => {
+  siblingFixture((mod, dir, sib) => {
+    const h = mod.buildToolHandlers([dir, sib], dir, [sib]);
+    assert.match(h.read_file({ path: path.join(sib, 'server/core/gpu.py') }).content, /def acquire/);
+    assert.ok(h.list_directory({ path: sib }).entries.some((e) => e.name === 'server'));
+    const roots = h.list_roots().roots;
+    assert.equal(roots.find((r) => r.path === sib).readOnly, true);
+    assert.equal(roots.find((r) => r.path === dir).primary, true);
+    assert.equal(roots.find((r) => r.path === dir).readOnly, undefined);
+    assert.ok(Array.isArray(h.grep_codebase({ query: 'acquire', root: sib })), 'grep accepts the sibling as a root');
+  });
+});
+
+test('read-only sibling: a path outside every root is still refused (a sibling root does not widen access)', () => {
+  siblingFixture((mod, dir, sib) => {
+    const h = mod.buildToolHandlers([dir, sib], dir, [sib]);
+    assert.match(h.read_file({ path: '/etc/hostname' }).error, /not inside any accessible repo/);
+    assert.match(h.grep_codebase({ query: 'x', root: '/etc' }).error, /not an accessible repo/);
+  });
+});
+
+test('read-only sibling: credential-looking files are refused or hidden there but not in the primary repo', () => {
+  siblingFixture((mod, dir, sib) => {
+    const h = mod.buildToolHandlers([dir, sib], dir, [sib]);
+    assert.match(h.read_file({ path: path.join(sib, '.env') }).error, /credential-looking file in a read-only sibling repo/);
+    assert.equal(h.read_file({ path: path.join(dir, '.env') }).content, 'LOCAL=1\n');
+    assert.ok(!h.list_directory({ path: sib }).entries.some((e) => e.name === '.env'), 'listing hides it');
+    assert.ok(h.list_directory({ path: dir }).entries.some((e) => e.name === '.env'), 'primary listing is unfiltered');
+    const hits = h.grep_codebase({ query: 'TOKEN', root: sib });
+    assert.ok(Array.isArray(hits) && hits.some((x) => x.file === 'ordinary.md'), 'grep still finds ordinary files in the sibling');
+    assert.ok(!hits.some((x) => /secret|\.env/.test(x.file)), 'grep never returns hits from a credential-looking file in a sibling');
+  });
+});
+
+test('read-only sibling: write_file and edit_file refuse it (file unchanged) while the primary repo is writable', () => {
+  siblingFixture((mod, dir, sib) => {
+    const w = mod.buildWriteToolHandlers([dir], dir, [sib]);
+    const target = path.join(sib, 'server', 'core', 'gpu.py');
+    const before = fs.readFileSync(target, 'utf8');
+    assert.match(w.write_file({ path: target, content: 'pwned' }).error, /read-only sibling repo/);
+    assert.match(w.edit_file({ path: target, find: 'acquire', replace: 'x' }).error, /read-only sibling repo/);
+    assert.match(w.write_file({ path: path.join(sib, 'new.txt'), content: 'n' }).error, /read-only sibling repo/);
+    assert.equal(fs.readFileSync(target, 'utf8'), before);
+    assert.equal(fs.existsSync(path.join(sib, 'new.txt')), false);
+    assert.equal(w.write_file({ path: 'made.txt', content: 'ok' }).written, true);
+    assert.equal(w.edit_file({ path: 'mine.js', find: 'const a = 1;', replace: 'const a = 2;' }).edited, true);
+  });
+});
+
+test('read-only sibling: run_bash can read it but a write into it fails, while writing in the primary repo works', () => {
+  siblingFixture((mod, dir, sib) => {
+    const w = mod.buildWriteToolHandlers([dir], dir, [sib]);
+    const read = w.run_bash({ command: `cat ${path.join(sib, 'server/core/gpu.py')}` });
+    if (read.error) { assert.match(read.error, /sandbox \(bwrap\) is not available/); return; } // no bwrap on this host: nothing further to prove
+    assert.match(read.stdout, /def acquire/);
+    const write = w.run_bash({ command: `echo pwned > ${path.join(sib, 'server/core/gpu.py')}; echo done > ${path.join(sib, 'new.txt')}` });
+    assert.notEqual(write.exitCode, 0, 'writing into the read-only mount must fail');
+    assert.match(fs.readFileSync(path.join(sib, 'server/core/gpu.py'), 'utf8'), /def acquire/);
+    assert.equal(fs.existsSync(path.join(sib, 'new.txt')), false);
+    const ok = w.run_bash({ command: 'echo fine > made-by-bash.txt' });
+    assert.equal(ok.exitCode, 0);
+    assert.equal(fs.readFileSync(path.join(dir, 'made-by-bash.txt'), 'utf8'), 'fine\n');
+  });
+});
+
+test('without readOnlyRoots the handlers behave exactly as before: a sibling path is not accessible', () => {
+  siblingFixture((mod, dir, sib) => {
+    const h = mod.buildToolHandlers([dir], dir);
+    assert.match(h.read_file({ path: path.join(sib, 'server/core/gpu.py') }).error, /not inside any accessible repo/);
+    const w = mod.buildWriteToolHandlers([dir], dir);
+    assert.match(w.write_file({ path: path.join(sib, 'x.txt'), content: 'x' }).error, /not inside any accessible repo/);
+  });
+});

@@ -8,6 +8,7 @@ const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { wrapWithSandbox } = require('./sandbox.js');
+const { isSecretLookingPath } = require('./accessible-roots.js');
 
 const MAX_READ_FILE_CHARS = 8000;
 
@@ -77,6 +78,12 @@ function boundWindow(lines, off, endLine) {
   };
 }
 
+// readOnlyRoots (the implement pass's sibling repos): the optional list of roots in `allowedRoots` that are read-only. Absent for every other caller.
+function inReadOnlyRoot(readOnlyRoots, full) {
+  if (!Array.isArray(readOnlyRoots) || !readOnlyRoots.length) return false;
+  return readOnlyRoots.some((r) => { const root = path.resolve(r); return full === root || full.startsWith(root + path.sep); });
+}
+
 function readFileTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const relPath = args.path;
@@ -88,6 +95,9 @@ function readFileTool(a, b) {
     return { error: `path is not inside any accessible repo, refusing to read: ${relPath}` };
   }
   const { full } = resolved;
+  if (inReadOnlyRoot(args.readOnlyRoots, full) && isSecretLookingPath(full)) {
+    return { error: `refusing to read a credential-looking file in a read-only sibling repo: ${relPath}` };
+  }
   let raw;
   try {
     raw = fs.readFileSync(full, 'utf8');
@@ -134,12 +144,17 @@ function listDirectoryTool(a, b) {
     return { error: `path is not inside any accessible repo, refusing to list: ${target}` };
   }
   const { full } = resolved;
+  const siblingRead = inReadOnlyRoot(args.readOnlyRoots, full);
+  if (siblingRead && isSecretLookingPath(full)) {
+    return { error: `refusing to list a credential-looking path in a read-only sibling repo: ${target}` };
+  }
   let entries;
   try {
     entries = fs.readdirSync(full, { withFileTypes: true });
   } catch (e) {
     return { error: `could not list ${target}: ${e.message}` };
   }
+  if (siblingRead) entries = entries.filter((e) => !isSecretLookingPath(e.name));
   // Names and kind only -- deliberately not a recursive full-tree dump (see this file's
   // own header: keep this simple, list_directory is one shallow level per call).
   return {
@@ -148,11 +163,13 @@ function listDirectoryTool(a, b) {
   };
 }
 
-function listRootsTool(a) {
+function listRootsTool(a, readOnlyRoots = []) {
   const roots = Array.isArray(a) ? a : [getConfig().repoRoot];
   return {
     primary: roots[0],
-    roots: roots.map((r, i) => ({ path: r, name: path.basename(r), primary: i === 0 })),
+    roots: roots.map((r, i) => (readOnlyRoots.includes(r)
+      ? { path: r, name: path.basename(r), primary: false, readOnly: true }
+      : { path: r, name: path.basename(r), primary: i === 0 })),
   };
 }
 
@@ -165,6 +182,10 @@ function capBashOutput(text) {
   };
 }
 
+function readOnlySiblingHit(readOnlyRoots, relPath) {
+  return path.isAbsolute(relPath) && inReadOnlyRoot(readOnlyRoots, path.resolve(relPath));
+}
+
 function writeFileTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const { path: relPath, content } = args;
@@ -173,6 +194,7 @@ function writeFileTool(a, b) {
   }
   const resolved = resolveInsideRoots(allowedRoots, relPath);
   if (!resolved) {
+    if (readOnlySiblingHit(args.readOnlyRoots, relPath)) return { error: `${relPath} is in a read-only sibling repo, refusing to write it. Writes are limited to this task's own checkout.` };
     return { error: `path is not inside any accessible repo, refusing to write: ${relPath}` };
   }
   const { full } = resolved;
@@ -197,6 +219,7 @@ function editFileTool(a, b) {
   }
   const resolved = resolveInsideRoots(allowedRoots, relPath);
   if (!resolved) {
+    if (readOnlySiblingHit(args.readOnlyRoots, relPath)) return { error: `${relPath} is in a read-only sibling repo, refusing to edit it. Writes are limited to this task's own checkout.` };
     return { error: `path is not inside any accessible repo, refusing to edit: ${relPath}` };
   }
   const { full } = resolved;
@@ -240,6 +263,7 @@ function withApplyLock(fn) {
 function runBashTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const { command, readOnly } = args;
+  const siblingRoots = readOnly ? [] : (Array.isArray(args.readOnlyRoots) ? args.readOnlyRoots : []).map((r) => { try { return fs.realpathSync(r); } catch { return null; } }).filter(Boolean);
   if (typeof command !== 'string' || !command.trim()) {
     return { error: 'run_bash requires a non-empty "command" argument' };
   }
@@ -269,7 +293,7 @@ function runBashTool(a, b) {
     // local-agentic-write-draft.js) -- unaffected, readOnly is never set there.
     readOnlyBinds: readOnly
       ? ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl', ...realRoots]
-      : ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl'],
+      : ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl', ...siblingRoots],
     writableBinds: readOnly ? [] : realRoots,
   });
   if (!wrapped.available) {
