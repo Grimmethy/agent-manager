@@ -559,6 +559,10 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   const coverageOverride = getSplitCoverageJudging().coverageGuidanceOverride(task);
   if (coverageOverride) {
     lines.push(coverageOverride);
+    if (task.source === 'manual') {
+      const manualGuidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task);
+      if (manualGuidance) lines.push(manualGuidance);
+    }
   } else {
     const guidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task);
     if (guidance) lines.push(guidance);
