@@ -78,6 +78,42 @@ test('every lane sees every task, in the same priority order (no lane/tier split
   assert.deepEqual(b, a);
 });
 
+// Lane task-class allowlist (lanes.js taskClasses, 2026-10-17): a small GPU lane is only offered the sources it is configured for.
+const RESTRICTED_LANES = [
+  { id: 'worker-3090', gpu: '3090', env: {}, local: true, preempt: 'always', taskClasses: null },
+  { id: 'worker-rx580', gpu: 'rx580', env: { OLLAMA_URL: 'http://g:11434' }, local: false, preempt: 'never', taskClasses: ['trouble_log'] },
+];
+
+test('a lane with a taskClasses allowlist is only offered tasks of those sources; an unrestricted lane still sees everything', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'adhoc-task', { source: 'adhoc', humanQueued: true }); // priority 10, NOT in the rx580 allowlist
+  writeTask(pendingDir, 'small-task', { source: 'trouble_log' });              // priority 20, in the allowlist
+
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', { lanes: RESTRICTED_LANES }), ['small-task.json']);
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes: RESTRICTED_LANES }), ['adhoc-task.json', 'small-task.json']);
+});
+
+test('a restricted lane with nothing allowlisted pending claims nothing (it never falls back to the rest of the queue)', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'adhoc-task', { source: 'adhoc', humanQueued: true });
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', { lanes: RESTRICTED_LANES }), []);
+});
+
+test('an operator pin to a restricted lane bypasses its allowlist (explicit human choice still wins)', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'pinned-adhoc', { source: 'adhoc', humanQueued: true, pinnedWorker: 'worker-rx580' });
+  writeTask(pendingDir, 'small-task', { source: 'trouble_log' });
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', { lanes: RESTRICTED_LANES }), ['pinned-adhoc.json', 'small-task.json']);
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes: RESTRICTED_LANES }), ['small-task.json'], 'pinned elsewhere: not a candidate here');
+});
+
+test('an instance that is not a lane (reviewer, watchdog) is never restricted by lane allowlists', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'adhoc-task', { source: 'adhoc', humanQueued: true });
+  writeTask(pendingDir, 'small-task', { source: 'trouble_log' });
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'reviewer', { lanes: LANES }), ['adhoc-task.json', 'small-task.json']);
+});
+
 // Hub priority (2026-09-09): within one source-priority band, a live hub's children are
 // ordered by their owning hub's key (explicit hubPriority asc, then hub createdAt asc),
 // so this path can't disagree with nextAdhocTask() about which hub is worked next.

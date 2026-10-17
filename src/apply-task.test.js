@@ -1636,3 +1636,10 @@ test('gated applyDirectToMainBatch: a clean apply clone proceeds to prepareStack
     if (saved === undefined) delete process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH; else process.env.AGENT_MANAGER_ALLOW_UNGATED_MAIN_PUSH = saved;
   }
 });
+
+test('recordApplyOutcome does NOT stamp noop for a real branch apply whose name contains a no-op word', () => {
+  const task = { id: 'degenerated-task', source: 'adhoc', history: [] };
+  recordApplyOutcome(task, { succeeded: true, branch: 'agent/adhoc-premium-head-of-line-starvation-rotate-repeatedly-blocked-premium-tasks-behind-fresh-ones-and-avoid-lanes-a-task-degenerated-on-1792061032268', pushed: true });
+  assert.equal(task.terminalDisposition, undefined);
+  assert.deepEqual(task.history.map((h) => h.stage), ['applied']);
+});

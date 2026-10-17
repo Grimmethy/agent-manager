@@ -223,3 +223,8 @@ test('buildDebriefBundle: a no-op-dominant window still produces a bundle, frame
   assert.match(bundle.evidenceText, /this window shipped only 2 of 14/);
   assert.match(bundle.evidenceText, /a cheaper deterministic early-exit/);
 });
+
+test('taskDidShip: an unstamped record applied to a branch whose name contains a no-op word still shipped', () => {
+  assert.equal(taskDidShip({ history: [{ stage: 'applied', detail: 'agent/adhoc-premium-head-of-line-starvation-rotate-repeatedly-blocked-premium-tasks-behind-fresh-ones-and-avoid-lanes-a-task-degenerated-on-1792061032268' }] }), true);
+  assert.equal(taskDidShip({ history: [{ stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' }] }), false);
+});

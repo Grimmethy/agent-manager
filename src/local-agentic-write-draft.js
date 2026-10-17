@@ -28,6 +28,7 @@ const path = require('path');
 const fs = require('fs');
 const { getConfig } = require('./config.js');
 const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js');
+const { resolveReadOnlySiblingRoots } = require('./accessible-roots.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { priorVerdictBlock } = require('./lib/prompt-blocks.js');
@@ -38,6 +39,8 @@ const { deterministicPlanSplit, repairEnabled } = require('./plan-step-split.js'
 const { oversizedFiles } = require('./file-length-flags-reader.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
+const { appendHistoryEvent } = require('./task-history.js');
+const { stampTaskShape, shapeBlocksDecompose, preliminaryDecomposeDecision } = require('./task-shape.js');
 
 // A leaf that blows a full tier-3 budget with zero edits is auto-decomposed as a backstop
 // (the preliminary check in local-draft.js should catch most of these first). Bounded: a
@@ -327,7 +330,8 @@ function isLeafTask(task) {
 // auto-decomposed once -- in those cases let it split again. MAX_AUTO_DECOMPOSE + review
 // still bound runaway splitting.
 function leafDecomposeLocked(task) {
-  return isLeafTask(task)
+  // A one-file-fix (task-shape.js) is treated like a confirmed-atomic leaf: decompose is off the table until it has burned a full turn budget.
+  return (isLeafTask(task) || shapeBlocksDecompose(task))
     && !(task && task.autoDecomposeCount)
     && !(task && task.turnBudgetExhaustedBefore)
     && !(task && Number(task.decomposeBlockCount) > 0);
@@ -421,6 +425,7 @@ function buildWriteAgenticPromptBase(task, { orientTurnLimit = ORIENT_TURN_LIMIT
   return [
     'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
     GIT_OWNERSHIP_RULE,
+    'Other registered repos on this machine (plugins and projects) are READ-ONLY and readable at their absolute paths: call list_roots to see them, then read_file / list_directory / grep_codebase (with root) or a read-only run_bash. You cannot write there, and you must never conclude a repo is absent from this machine without calling list_roots first. Do not cat .env, key, token or credential files in those repos.',
     'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Prefer read_file with offset/limit to page a large file and grep_codebase to locate code; a quick `run_bash` `sed -n \'3600,3700p\' path` slice is fine for a fast look, just do not burn turns re-listing the tree. Reserve run_bash otherwise for the final targeted check on files you actually changed.',
     'Files here can be thousands of lines. read_file returns a WINDOW of lines: check `totalLines` and `nextOffset` in the result and re-call with a higher `offset` to page -- never assume the first window is the whole file. grep_codebase searches this repo\'s configured dirs (or a subpath, or "." for all); it is a literal substring / all-words match, not a regex, and returns matching lines only -- read_file around a hit for context.',
     `TURN BUDGET: you have about ${LOCAL_AGENTIC_WRITE_MAX_TURNS} turns total. Spend at most the first ~${orientTurnLimit} on orientation (grep/read/list). By then you MUST have either started editing with edit_file/write_file, or concluded with a RESOLUTION: line. Do not keep exploring past that -- a rough first edit you then fix is far better than running out of turns having changed nothing. ${stillLostAdvice}`,
@@ -542,7 +547,7 @@ async function runGiveUpSplit(task, verdict) {
   // A file-decompose child is already a single verbatim move -- splitting it again just
   // produces a hub of one sub-task and loops. If it can't land, it needs a human, not
   // another decompose pass.
-  if (task.atomic || !gaveUp || !(task.turnBudgetExhausted || repeatedDecompose || noJsonMiss) || autoN >= MAX_AUTO_DECOMPOSE) {
+  if (task.atomic || (shapeBlocksDecompose(task) && !task.turnBudgetExhausted) || !gaveUp || !(task.turnBudgetExhausted || repeatedDecompose || noJsonMiss) || autoN >= MAX_AUTO_DECOMPOSE) {
     return null;
   }
   const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
@@ -681,12 +686,17 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   // burning the full LOCAL_AGENTIC_WRITE_MAX_TURNS budget on read-only orientation and only
   // landing in the post-exhaustion backstop below. Default-on kill switch, mirroring
   // isEnabled(): opt out by setting the env var in the check below to the string 'false'.
+  // Shape (task-shape.js): classified once per pass, before any decompose decision, and recorded on the task as task.shape = { class, reasons }.
+  stampTaskShape(task);
   if (process.env.AGENT_MANAGER_SCOPE_GATE !== 'false') {
-    const gate = scopeComplexityGate(task);
+    const gateVerdict = scopeComplexityGate(task);
+    const decision = preliminaryDecomposeDecision(task, gateVerdict);
+    if (decision.suppressedDetail) appendHistoryEvent(task, 'advisory', decision.suppressedDetail);
+    const gate = decision.decompose ? gateVerdict : null;
     if (gate && gate.shouldDecompose) {
       const split = await runDecomposePassIfAvailable(task, {
         mode: 'preliminary',
-        priorAttemptBlock: gate.reason,
+        priorAttemptBlock: decision.priorAttemptBlock,
       });
       // >= 2 subTasks -> this is a real decompose, return the same shape the post-exhaustion
       // backstop uses. A null split or a 0/1-subTask split means the split wasn't usable, so
@@ -719,6 +729,8 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       stage: 'agentic-write',
       allowWrite: true,
       primaryRoot: worktreeDir,
+      // Registered plugin/project repos, READ-ONLY (2026-10-16): cross-repo verification tasks need real path:line evidence from them; writes stay in worktreeDir.
+      readOnlyRoots: resolveReadOnlySiblingRoots({ repoRoot: getConfig().repoRoot, worktreeDir, applyRepoRoot: getConfig().applyRepoRoot }),
       // On a cap-exhausted run, spend one more no-tools turn forcing a RESOLUTION line
       // so resolveAgenticDraft has something to route on instead of a hard block.
       forceSummaryOnCap: true,
@@ -760,6 +772,6 @@ function modelStatsSafe(fn, args) {
 
 module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
-  isLeafTask, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
+  isLeafTask, leafDecomposeLocked, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
   detectExternalDependency, classifyExternalDependency, externalDependencyAdvisory, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
 };

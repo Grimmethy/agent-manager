@@ -1,0 +1,12 @@
+[
+  {
+    "gpu": "rx580",
+    "ollamaUrl": "http://100.96.112.78:11434",
+    "model": "qwen3-vl:8b-instruct",
+    "taskClasses": ["brain_dump_sort", "change_review", "observability_review", "staleness_audit"],
+    "preempt": "never",
+    "slow": false,
+    "numCtx": 16384,
+    "enabled": true
+  }
+]

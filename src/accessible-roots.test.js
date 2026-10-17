@@ -105,3 +105,42 @@ test('resolveAccessibleRoots: a NON-core project never gets agent-manager plugin
   assert.deepEqual(resolveAccessibleRoots({ repoRoot: otherProject }), [fs.realpathSync(otherProject)]);
   assert.deepEqual(resolveAccessibleRoots({ repoRoot: coreRepo }), [fs.realpathSync(coreRepo), fs.realpathSync(pluginRepo)]);
 });
+
+// --- read-only sibling roots for the implement pass (2026-10-16) ---------------------------------------------------------------------------------
+test('resolveReadOnlySiblingRoots: plugin repos only -- never the worktree, the live checkout, the core root or the apply clone', () => {
+  const coreRepo = makeRepoDir();
+  process.env.AGENT_MANAGER_CORE_REPO_ROOT = coreRepo;
+  const sibling = makeRepoDir();
+  const worktree = makeRepoDir();
+  const applyClone = makeRepoDir();
+  const manifestPath = tmpManifest(JSON.stringify([
+    { name: 'sib', registerPath: path.join(sibling, 'register.js'), enabled: true },
+    { name: 'wt', registerPath: path.join(worktree, 'register.js'), enabled: true },
+    { name: 'apply', registerPath: path.join(applyClone, 'register.js'), enabled: true },
+    { name: 'off', registerPath: path.join(makeRepoDir(), 'register.js'), enabled: false },
+  ]));
+  const { resolveReadOnlySiblingRoots } = loadWith(manifestPath);
+  const roots = resolveReadOnlySiblingRoots({ repoRoot: coreRepo, worktreeDir: worktree, applyRepoRoot: applyClone });
+  assert.deepEqual(roots, [fs.realpathSync(sibling)]);
+});
+
+test('resolveReadOnlySiblingRoots: a non-core active project gets no siblings, and a missing manifest is []', () => {
+  const coreRepo = makeRepoDir();
+  process.env.AGENT_MANAGER_CORE_REPO_ROOT = coreRepo;
+  const other = makeRepoDir();
+  const sibling = makeRepoDir();
+  const withManifest = loadWith(tmpManifest(JSON.stringify([{ name: 's', registerPath: path.join(sibling, 'register.js'), enabled: true }])));
+  assert.deepEqual(withManifest.resolveReadOnlySiblingRoots({ repoRoot: other, worktreeDir: makeRepoDir() }), []);
+  const noManifest = loadWith(path.join(os.tmpdir(), 'definitely-missing-' + Date.now(), 'plugins.json'));
+  assert.deepEqual(noManifest.resolveReadOnlySiblingRoots({ repoRoot: coreRepo, worktreeDir: makeRepoDir() }), []);
+});
+
+test('isSecretLookingPath: credential-looking names and .ssh/.gnupg paths, but not ordinary source', () => {
+  const { isSecretLookingPath } = loadWith(path.join(os.tmpdir(), 'definitely-missing-' + Date.now(), 'plugins.json'));
+  for (const p of ['.env', 'a/b/.env.local', 'pf-db.env', 'server.pem', 'k/private.key', 'id_rsa', 'id_ed25519.pub', 'config/credentials.json', 'my-secret.txt', 'api_token.json', 'home/.ssh/config', 'x/.gnupg/pubring.kbx']) {
+    assert.equal(isSecretLookingPath(p), true, p);
+  }
+  for (const p of ['server/core/gpu.py', 'web/app.js', 'README.md', 'env.js', 'src/environment.js', 'lexer.py']) {
+    assert.equal(isSecretLookingPath(p), false, p);
+  }
+});

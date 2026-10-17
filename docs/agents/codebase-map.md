@@ -73,6 +73,10 @@ Grouped to match the categories AGENTS.md's own principles already describe — 
 section is meant to answer "where is the code for the thing that principle is talking
 about," verified to still exist as of this writing.
 
+**Lanes (one worker per GPU endpoint)**
+- `src/lanes.js` — the single definition of every worker lane: host GPU lane + legacy `worker-p40` + the lanes registry file (lanes.json at the repo root, untracked/gitignored; `AGENT_MANAGER_LANES_PATH` overrides; example `lanes.example.json`). Adding a GPU is one registry entry, no code (`docs/agents/lanes.md`). Per-lane `taskClasses` allowlist enforced in `src/next-claimable-task.js` (`pickClaimableTasks`), `preempt` read by `python/dashboard/chat_preempt.py` via `app.worker_lane_defs()`, `slow` read by `src/local-client.js` / `src/local-tool-client.js` (per-call ceiling) and `src/dead-process-check.js` (zombie threshold), remote lane endpoints guarded from the chat takeover by `remoteLaneLockKeys()` in `src/lib/ollama-lock-key.js`.
+- `src/capability-ledger.js` — capability ledger: `src/local-draft.js` records one `attempt` line per draft attempt (source, lane, model, tier, outcome, wall time) in the pipeline-history log; `buildScorecard()` folds them into per-(source, model) success rate with a Wilson lower bound. CLI `node src/capability-ledger.js [days] [--json]`, dashboard `GET /api/capability` (`python/dashboard/routes/capability.py`) and the Models tab "Task Fit by Model" panel. Recording only; routing is unchanged (design: `docs/design-notes/capability-routing-and-benchmarking.md`).
+
 **Task sources & plugin boundary**
 - `src/task-sources.js` — the task-source registry and priority ladder (`registerTaskSource`, `getNextTask()`).
 - `src/deterministic-recheck-registry.js` — the `registerDeterministicRecheck` seam a plugin's own scanner rules re-run through.

@@ -682,3 +682,103 @@ test('partialDiffFallbackPrompt: an applied prior diff leaves the prompt unchang
   assert.match(out, /do NOT hold for this run|does NOT hold for this run/);
   assert.match(out, /diff --git a\/x b\/x/);
 });
+
+// --- read-only sibling repos (2026-10-16) ---------------------------------------------------------------------------------------------------------
+// The GPU broker verification tasks needed to read videoforge / promptforge-manual, but the pass's only tool root was its worktree.
+test('write tier: the implement pass hands the registered plugin repos to the tool loop as READ-ONLY roots, never the live checkout, apply clone or worktree', async () => {
+  // Own temp repo (not withRepo): withRepo removes its dir as soon as an async body first yields, and the draft resolves roots after its awaits.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'law-ro-core-'));
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  const sibling = fs.mkdtempSync(path.join(os.tmpdir(), 'law-sibling-'));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), 'law-worktree-'));
+  const manifest = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'law-manifest-')), 'plugins.json');
+  fs.writeFileSync(manifest, JSON.stringify([
+    { name: 'sib', registerPath: path.join(sibling, 'register.js'), enabled: true },
+    { name: 'wt', registerPath: path.join(worktree, 'register.js'), enabled: true },
+  ]));
+  // Pin the apply clone to its own dir: a harness that points AGENT_MANAGER_APPLY_REPO_ROOT at the tmpdir (the review sandbox does) would otherwise contain the sibling, and a repo inside the apply clone is rightly excluded.
+  const applyClone = fs.mkdtempSync(path.join(os.tmpdir(), 'law-apply-'));
+  const keys = ['AGENT_MANAGER_REPO_ROOT', 'AGENT_MANAGER_PIPELINE_DIR', 'LOCAL_MODEL', 'AGENT_MANAGER_LOCAL_AGENTIC_WRITE', 'AGENT_MANAGER_PLUGINS_MANIFEST', 'AGENT_MANAGER_CORE_REPO_ROOT', 'AGENT_MANAGER_APPLY_REPO_ROOT'];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  Object.assign(process.env, { AGENT_MANAGER_REPO_ROOT: dir, AGENT_MANAGER_PIPELINE_DIR: dir, LOCAL_MODEL: 'qwen-test', AGENT_MANAGER_PLUGINS_MANIFEST: manifest, AGENT_MANAGER_CORE_REPO_ROOT: dir, AGENT_MANAGER_APPLY_REPO_ROOT: applyClone });
+  delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE;
+  for (const m of ['./plugins-manifest.js', './accessible-roots.js', './agentic-draft-common.js']) delete require.cache[require.resolve(m)];
+  const adc = require('./agentic-draft-common.js');
+  const realRun = adc.runAgenticDraftInWorktree;
+  adc.runAgenticDraftInWorktree = async (_t, { runInWorktree }) => { await runInWorktree(worktree, {}); return { succeeded: true, blocked: false, response: 'RESOLUTION: implemented' }; };
+  try {
+    const { draftAdhocViaLocalAgenticWrite } = freshModule();
+    const calls = [];
+    const task = { id: 'ro-sib', source: 'manual', title: 'verify', promptContext: { rawText: 'read the sibling repo and write the findings doc' } };
+    await draftAdhocViaLocalAgenticWrite(task, { runPlan: async (opts) => { calls.push(opts); return { response: 'RESOLUTION: implemented' }; } });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].primaryRoot, worktree);
+    assert.deepEqual(calls[0].readOnlyRoots, [fs.realpathSync(sibling)]);
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(dir)), 'the live checkout is not exposed');
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(worktree)), 'the worktree is not listed twice');
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(applyClone)), 'the apply clone is not exposed');
+    assert.equal(calls[0].extraRoots, undefined, 'extraRoots keeps its Chat-only meaning');
+  } finally {
+    adc.runAgenticDraftInWorktree = realRun;
+    for (const k of keys) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; }
+    for (const m of ['./plugins-manifest.js', './accessible-roots.js']) delete require.cache[require.resolve(m)];
+    for (const d of [dir, sibling, worktree, applyClone, path.dirname(manifest)]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('write tier: the implement prompt says other registered repos are readable read-only and not to conclude a repo is absent', () => {
+  withRepo(() => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const prompt = buildWriteAgenticPrompt({ id: 'p', title: 't', promptContext: { rawText: 'verify against videoforge' } });
+    assert.match(prompt, /Other registered repos on this machine \(plugins and projects\) are READ-ONLY/);
+    assert.match(prompt, /never conclude a repo is absent from this machine without calling list_roots first/);
+    assert.match(prompt, /Do not cat \.env, key, token or credential files/);
+  });
+});
+
+// task-shape.js: the post-exhaustion / repeated-decompose backstop must not split a one-file-fix on a model "decompose" answer, but a REAL turn-budget exhaustion
+// (evidence the shape guess was wrong) still may -- same as a confirmed-atomic leaf.
+async function backstopRun(taskOverrides, { shapeEnv } = {}) {
+  return withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    const prevEnv = process.env.AGENT_MANAGER_TASK_SHAPE;
+    if (shapeEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = shapeEnv;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: false, needsClarification: true, response: 'ran out of turns' });
+    let splitCalls = 0;
+    setDecomposePassRunner({ runDecomposePass: async () => { splitCalls += 1; return { subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] }; } });
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'shape-bk', source: 'manual', title: 'Fix clamp', decomposeBlockCount: 2, needsClarification: { reason: 'x' }, promptContext: { rawText: 'In src/foo.js fix clamp and add a case to src/foo.test.js.' }, ...taskOverrides };
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+      return { res, task, splitCalls };
+    } finally {
+      adc.runAgenticDraftInWorktree = realRun;
+      setDecomposePassRunner(null);
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = prevEnv;
+    }
+  });
+}
+
+test('task-shape backstop: a one-file-fix that keeps answering "decompose" is NOT split', async () => {
+  const { res, task, splitCalls } = await backstopRun({});
+  assert.equal(task.shape.class, 'one-file-fix');
+  assert.equal(splitCalls, 0, 'the decompose pass is never asked');
+  assert.notEqual(res.resolution, 'decompose');
+  assert.equal(task.autoDecomposeCount, undefined);
+});
+
+test('task-shape backstop: a one-file-fix that really exhausted its turn budget may still be split', async () => {
+  const { res, splitCalls } = await backstopRun({ turnBudgetExhausted: true });
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
+});
+
+test('task-shape backstop: with AGENT_MANAGER_TASK_SHAPE=off the same task is split exactly as before', async () => {
+  const { res, task, splitCalls } = await backstopRun({}, { shapeEnv: 'off' });
+  assert.equal(task.shape, undefined);
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
+});

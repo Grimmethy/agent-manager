@@ -75,6 +75,7 @@ const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api
 // to cut the joined slice mid-line while nextOffset was still endLine + 1, so every line between the cut and endLine was never shown yet the model was told to page PAST them
 // (a comment even said "unknown exact line count when char-truncated"). Now only WHOLE lines that fit are returned, returnedThrough is the last of them, and the caller's
 const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
+const { isSecretLookingPath } = require('./accessible-roots.js');
 const { taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS } = require('./local-tool-task-tools.js');
 
 // nextOffset = returnedThrough + 1, so paging visits every line exactly once. A first line that alone exceeds the ceiling is shown as a prefix and paging continues with the NEXT line.
@@ -383,8 +384,10 @@ function turnLock(instancesDir, fn) {
 // scoped only to the P40 endpoint -- every other caller (the local RTX 3090 lane, Chat)
 // keeps the original 240s value unchanged.
 const IS_P40_ENDPOINT = !!process.env.AGENT_MANAGER_P40_OLLAMA_URL && OLLAMA_URL === process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+// 2026-10-17: any lane marked `slow` in src/lanes.js (the P40, or a registry lane with "slow": true) gets the long request timeout too.
+const IS_SLOW_ENDPOINT = IS_P40_ENDPOINT || require('./lanes.js').isSlowEndpoint(OLLAMA_URL);
 const P40_REQUEST_TIMEOUT_MS = 900_000;
-const REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || (IS_P40_ENDPOINT ? P40_REQUEST_TIMEOUT_MS : 240_000);
+const REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || (IS_SLOW_ENDPOINT ? P40_REQUEST_TIMEOUT_MS : 240_000);
 
 const TOOLS = [
   {
@@ -483,7 +486,7 @@ const TOOLS = [
 // threaded through for read_task/search_tasks (2026-09-07) the same way
 // buildWriteToolHandlers already threads it for queue_reviewed_task -- these two are
 // just not chat-only, since they're harmless reads.
-function buildToolHandlers(allowedRoots, pipelineDir) {
+function buildToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
   // A model-supplied `root` for grep_codebase must be one of THIS call's allowed roots --
   // otherwise the tool would grep any path on disk. allowedRoots is already realpath'd
   // (see runPlanWithTools), so compare on realpath. A `root` that resolves to the primary
@@ -500,11 +503,14 @@ function buildToolHandlers(allowedRoots, pipelineDir) {
     grep_codebase: (args) => {
       const r = grepRoot(args.root);
       if (!r.ok) return { error: `root is not an accessible repo: ${args.root} (call list_roots)` };
-      return grepCodebase({ query: args.query, dir: args.dir, root: r.root, contextLines: args.contextLines });
+      const hits = grepCodebase({ query: args.query, dir: args.dir, root: r.root, contextLines: args.contextLines });
+      // A read-only sibling repo's credential-looking files never come back as grep hits (see isSecretLookingPath).
+      if (Array.isArray(hits) && r.root && readOnlyRoots.includes(r.root)) return hits.filter((h) => !isSecretLookingPath(h.file || ''));
+      return hits;
     },
-    read_file: (args) => readFileTool(allowedRoots, { path: args.path, offset: args.offset, limit: args.limit }),
-    list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path }),
-    list_roots: () => listRootsTool(allowedRoots),
+    read_file: (args) => readFileTool(allowedRoots, { path: args.path, offset: args.offset, limit: args.limit, readOnlyRoots }),
+    list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path, readOnlyRoots }),
+    list_roots: () => listRootsTool(allowedRoots, readOnlyRoots),
     read_task: (args) => readTaskTool(pipelineDir, { taskId: args.taskId, section: args.section, offset: args.offset, limit: args.limit }),
     search_tasks: (args) => searchTasksTool(pipelineDir, { query: args.query, state: args.state, includeArchived: args.includeArchived }),
   };
@@ -539,11 +545,13 @@ function withGrepDirsHint(tools) {
   });
 }
 
-function buildWriteToolHandlers(allowedRoots, pipelineDir) {
+// readOnlyRoots: sibling repos the implement pass may read but not write -- they are NOT in allowedRoots here (so write_file/edit_file refuse them) and run_bash
+// mounts them read-only.
+function buildWriteToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
   return {
-    write_file: (args) => writeFileTool(allowedRoots, { path: args.path, content: args.content }),
-    edit_file: (args) => editFileTool(allowedRoots, { path: args.path, find: args.find, replace: args.replace }),
-    run_bash: (args) => runBashTool(allowedRoots, { command: args.command }),
+    write_file: (args) => writeFileTool(allowedRoots, { path: args.path, content: args.content, readOnlyRoots }),
+    edit_file: (args) => editFileTool(allowedRoots, { path: args.path, find: args.find, replace: args.replace, readOnlyRoots }),
+    run_bash: (args) => runBashTool(allowedRoots, { command: args.command, readOnlyRoots }),
     queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description }),
   };
 }
@@ -934,7 +942,7 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
 // to (a compliance gap no amount of prompt wording reliably closes), so shrinking the
 // window before the "stop exploring, edit now" nudge fires structurally bounds how much
 // re-verification a retry can do, rather than trying to argue the model out of doing it.
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, contextLogSessionId = null, orientTurnLimit = ORIENT_TURN_LIMIT }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], readOnlyRoots: rawReadOnlyRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, contextLogSessionId = null, orientTurnLimit = ORIENT_TURN_LIMIT }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -957,6 +965,15 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     if (!seen.has(real)) { seen.add(real); allowedRoots.push(real); }
   }
   if (allowedRoots.length === 0) allowedRoots.push(path.resolve(repoRoot));
+  // Read-only sibling repos (the implement pass only, see accessible-roots.js resolveReadOnlySiblingRoots): readable by every read tool, never in the write handlers'
+  // roots, mounted read-only for run_bash. Deduped on realpath and never overlapping a writable root.
+  const readOnlyRoots = [];
+  for (const r of Array.isArray(rawReadOnlyRoots) ? rawReadOnlyRoots : []) {
+    let real;
+    try { real = fs.realpathSync(r); } catch { continue; }
+    if (!seen.has(real)) { seen.add(real); readOnlyRoots.push(real); }
+  }
+  const readableRoots = [...allowedRoots, ...readOnlyRoots];
 
   // Chat (source:'chat') gets CHAT_TOOLS instead of the full WRITE_TOOLS even when it
   // opts into allowWrite -- see CHAT_TOOLS' own header. Every OTHER allowWrite caller
@@ -968,10 +985,10 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   );
   const toolHandlers = allowWrite
     ? {
-      ...buildToolHandlers(allowedRoots, pipelineDir),
-      ...(isChatCaller ? buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) : buildWriteToolHandlers(allowedRoots, pipelineDir)),
+      ...buildToolHandlers(readableRoots, pipelineDir, readOnlyRoots),
+      ...(isChatCaller ? buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) : buildWriteToolHandlers(allowedRoots, pipelineDir, readOnlyRoots)),
     }
-    : buildToolHandlers(allowedRoots, pipelineDir);
+    : buildToolHandlers(readableRoots, pipelineDir, readOnlyRoots);
   // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
   // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
   // resident Ollama model, the exact uncoordinated-contention bug the Discuss-side lock
@@ -1453,7 +1470,7 @@ module.exports = {
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
-  IS_P40_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
+  IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
   installStdoutEpipeGuard,
 };
 

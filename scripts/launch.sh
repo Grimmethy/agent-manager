@@ -186,7 +186,8 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
 
   # One worker lane per GPU, named for the GPU (src/lanes.js is the single definition -- the
   # watchdog's restart rule and the dashboard's expected-lane list read the same module). Every
-  # lane claims ANY pending task by priority; there is no reasoning/worker split any more.
+  # lane claims ANY pending task by priority (unless the lane declares a taskClasses allowlist in the lanes registry, see
+  # docs/agents/lanes.md); there is no reasoning/worker split any more.
   # A lane's own env (e.g. the P40 VM's OLLAMA_URL/LOCAL_MODEL) is scoped to just that child
   # process via `env`, so the other lanes and the reviewer keep talking to the host's Ollama.
   while IFS= read -r lane_id; do

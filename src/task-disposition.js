@@ -174,11 +174,16 @@ const NOOP_RE = /no candidates|no code change|degenerate|false positive|empty im
 // resolveDisposition() below, apply-task.js's apply-time noop stamp, and
 // debrief-bundle.js's shipped/no-op window split. python/dashboard/app.py's
 // _is_real_ship() mirrors the same markers on purpose (see the item-5 JS/PS-drift note).
+//
+// An `agent/<branch>` detail is never a no-op: a real apply writes its branch name, built from the task TITLE, so a title word such as "degenerated" or "skipped"
+// would otherwise match NOOP_RE and stamp shipped work `noop` (2026-10-15: a 10-file, 323-line apply read as a no-op).
+const BRANCH_DETAIL_RE = /^agent\//;
 function isNoopApplyDetail(detail) {
-  return NOOP_RE.test(String(detail || ''));
+  const text = String(detail || '');
+  if (BRANCH_DETAIL_RE.test(text.trim())) return false;
+  return NOOP_RE.test(text);
 }
 const DIRECT_RE = /committed to (?:master|main)|triage batch/i;
-const BRANCH_DETAIL_RE = /^agent\//;
 
 // Is the work a task's recorded diff describes already on origin/<main>? Compares the diff's distinctive ADDED lines (>= 20 chars trimmed) against the
 // current content of the same files on <main>. Deliberately conservative: it needs >= MIN_LINES such lines and >= 90% of them present, and a diff that
@@ -351,7 +356,7 @@ function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainO
   }
 
   // 5. The apply was an explicit no-op verdict.
-  if (NOOP_RE.test(detail)) {
+  if (isNoopApplyDetail(detail)) {
     // "verdict", not "apply": noop is a triage/verdict outcome, not a change application. Records written before 2026-10-01 say "no-op apply"; nothing matches on the text.
     return { stage: 'noop', detail: `no-op verdict: ${detail}`.slice(0, 200) };
   }
