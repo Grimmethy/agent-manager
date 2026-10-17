@@ -3760,6 +3760,27 @@ test('draft attempt record: a degenerate plan pass records the reason instead of
   });
 });
 
+test('lane escalation: a degenerate attempt on a small-tier lane stamps avoidLanes so a bigger lane takes the retry', async () => {
+  const lanesFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'esc-lanes-')), 'lanes.json');
+  fs.writeFileSync(lanesFile, JSON.stringify([{ gpu: 'rx580', ollamaUrl: 'http://g:11434', model: 'small:8b' }]));
+  const saved = {};
+  const set = { AGENT_MANAGER_LANES_PATH: lanesFile, AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_HOST_LOCAL_MODEL: 'big:27b', AGENT_MANAGER_INSTANCE_ID: 'worker-rx580' };
+  for (const k of Object.keys(set)) { saved[k] = process.env[k]; process.env[k] = set[k]; }
+  try {
+    await withFixtureRepo(async (draftTask) => {
+      const task = {
+        id: 'esc-degen', domain: 'default', source: 'product_spec', title: 'seed',
+        promptContext: { requestText: 'seed', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'greenfield' },
+      };
+      await draftTask(task, { localCall: async () => ({ response: '', degenerate: 'empty', attempts: 3 }), withLockFn: async (d, fn) => fn() });
+      assert.deepEqual(task.avoidLanes, ['worker-rx580']);
+      assert.ok(task.history.some((h) => h.stage === 'lane-escalated'));
+    });
+  } finally {
+    for (const k of Object.keys(set)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+});
+
 // --- Fix (2026-08-31, bra-1788142124203): plan-pass substance gate + prior-plan reuse ---
 
 test('runPlanPass (adhoc): a thin first plan is re-rolled once, and a substantive re-roll is kept', async () => {
