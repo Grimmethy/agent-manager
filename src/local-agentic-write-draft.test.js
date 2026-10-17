@@ -735,3 +735,50 @@ test('write tier: the implement prompt says other registered repos are readable 
     assert.match(prompt, /Do not cat \.env, key, token or credential files/);
   });
 });
+
+// task-shape.js: the post-exhaustion / repeated-decompose backstop must not split a one-file-fix on a model "decompose" answer, but a REAL turn-budget exhaustion
+// (evidence the shape guess was wrong) still may -- same as a confirmed-atomic leaf.
+async function backstopRun(taskOverrides, { shapeEnv } = {}) {
+  return withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    const prevEnv = process.env.AGENT_MANAGER_TASK_SHAPE;
+    if (shapeEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = shapeEnv;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: false, needsClarification: true, response: 'ran out of turns' });
+    let splitCalls = 0;
+    setDecomposePassRunner({ runDecomposePass: async () => { splitCalls += 1; return { subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] }; } });
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'shape-bk', source: 'manual', title: 'Fix clamp', decomposeBlockCount: 2, needsClarification: { reason: 'x' }, promptContext: { rawText: 'In src/foo.js fix clamp and add a case to src/foo.test.js.' }, ...taskOverrides };
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+      return { res, task, splitCalls };
+    } finally {
+      adc.runAgenticDraftInWorktree = realRun;
+      setDecomposePassRunner(null);
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = prevEnv;
+    }
+  });
+}
+
+test('task-shape backstop: a one-file-fix that keeps answering "decompose" is NOT split', async () => {
+  const { res, task, splitCalls } = await backstopRun({});
+  assert.equal(task.shape.class, 'one-file-fix');
+  assert.equal(splitCalls, 0, 'the decompose pass is never asked');
+  assert.notEqual(res.resolution, 'decompose');
+  assert.equal(task.autoDecomposeCount, undefined);
+});
+
+test('task-shape backstop: a one-file-fix that really exhausted its turn budget may still be split', async () => {
+  const { res, splitCalls } = await backstopRun({ turnBudgetExhausted: true });
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
+});
+
+test('task-shape backstop: with AGENT_MANAGER_TASK_SHAPE=off the same task is split exactly as before', async () => {
+  const { res, task, splitCalls } = await backstopRun({}, { shapeEnv: 'off' });
+  assert.equal(task.shape, undefined);
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
+});
