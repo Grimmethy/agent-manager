@@ -141,6 +141,66 @@ padding:.3rem .7rem;text-align:left}}h1{{font-size:1.3rem}}
             cfg.route_mode = route_hdr.lower()
             cfg.clamp()
 
+    def _encode_tokens(payload: dict, request: Request, cfg):
+        """Encode the request's messages in place; return the engine's report."""
+        model = payload.get("model", "")
+        messages = payload.get("messages", [])
+        sid_hdr = request.headers.get("x-tokenfold-session")
+        scope_hdr = request.headers.get("x-tokenfold-scope")
+        encoded, report = eng.encode(messages, model, session_id=sid_hdr, scope=scope_hdr)
+        payload["messages"] = encoded
+        return report
+
+    def _build_stream_response(payload: dict, request: Request, cfg, report) -> StreamingResponse:
+        """Build the SSE StreamingResponse for a streamed chat completion."""
+        upstream = f"{_upstream(request)}/chat/completions"
+        headers = _fwd_headers(request)
+        headers["content-type"] = "application/json"
+        model = payload.get("model", "")
+        sid = report.session_id
+        scope_hdr = request.headers.get("x-tokenfold-scope")
+
+        async def gen() -> AsyncIterator[bytes]:
+            sd = eng.stream_decoder(sid, scope=scope_hdr)
+            raw_acc, dec_acc = [], []
+            async with client.stream("POST", upstream, json=payload, timeout=STREAM_TIMEOUT,
+                                     headers=headers) as r:
+                async for line in r.aiter_lines():
+                    if not line.startswith("data:"):
+                        if line.strip():
+                            yield (line + "\n").encode()
+                        continue
+                    p = line[5:].strip()
+                    if p == "[DONE]":
+                        tail = sd.flush()
+                        if tail:
+                            dec_acc.append(tail)
+                            yield _sse_delta(tail)
+                        raw, dec = "".join(raw_acc), "".join(dec_acc)
+                        eng.record_output(model, raw, dec, sid, scope=scope_hdr)
+                        # streamed: can't retry, but note the ask so the
+                        # NEXT request ships the original automatically
+                        eng.expansion_requests(raw, sid)
+                        yield b"data: [DONE]\n\n"
+                        continue
+                    try:
+                        obj = json.loads(p)
+                        delta = obj["choices"][0]["delta"].get("content")
+                    except Exception:
+                        yield (line + "\n\n").encode()
+                        continue
+                    if delta:
+                        raw_acc.append(delta)
+                        piece = sd.feed(delta)
+                        if piece:
+                            dec_acc.append(piece)
+                            obj["choices"][0]["delta"]["content"] = piece
+                            yield ("data: " + json.dumps(obj) + "\n\n").encode()
+                        # swallowed partial: emitted once boundary is safe
+                    else:
+                        yield (line + "\n\n").encode()
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
         try:
@@ -154,58 +214,16 @@ padding:.3rem .7rem;text-align:left}}h1{{font-size:1.3rem}}
         _apply_header_overrides(request, eng.cfg)
 
         model = body.get("model", "")
-        messages = body.get("messages", [])
-        sid_hdr = request.headers.get("x-tokenfold-session")
-        scope_hdr = request.headers.get("x-tokenfold-scope")
-        encoded, report = eng.encode(messages, model, session_id=sid_hdr, scope=scope_hdr)
-        body["messages"] = encoded
+        report = _encode_tokens(body, request, eng.cfg)
         sid = report.session_id
+        scope_hdr = request.headers.get("x-tokenfold-scope")
 
         upstream = f"{_upstream(request)}/chat/completions"
         headers = _fwd_headers(request)
         headers["content-type"] = "application/json"
 
         if body.get("stream"):
-            async def gen() -> AsyncIterator[bytes]:
-                sd = eng.stream_decoder(sid, scope=scope_hdr)
-                raw_acc, dec_acc = [], []
-                async with client.stream("POST", upstream, json=body, timeout=STREAM_TIMEOUT,
-                                         headers=headers) as r:
-                    async for line in r.aiter_lines():
-                        if not line.startswith("data:"):
-                            if line.strip():
-                                yield (line + "\n").encode()
-                            continue
-                        payload = line[5:].strip()
-                        if payload == "[DONE]":
-                            tail = sd.flush()
-                            if tail:
-                                dec_acc.append(tail)
-                                yield _sse_delta(tail)
-                            raw, dec = "".join(raw_acc), "".join(dec_acc)
-                            eng.record_output(model, raw, dec, sid, scope=scope_hdr)
-                            # streamed: can't retry, but note the ask so the
-                            # NEXT request ships the original automatically
-                            eng.expansion_requests(raw, sid)
-                            yield b"data: [DONE]\n\n"
-                            continue
-                        try:
-                            obj = json.loads(payload)
-                            delta = obj["choices"][0]["delta"].get("content")
-                        except Exception:
-                            yield (line + "\n\n").encode()
-                            continue
-                        if delta:
-                            raw_acc.append(delta)
-                            piece = sd.feed(delta)
-                            if piece:
-                                dec_acc.append(piece)
-                                obj["choices"][0]["delta"]["content"] = piece
-                                yield ("data: " + json.dumps(obj) + "\n\n").encode()
-                            # swallowed partial: emitted once boundary is safe
-                        else:
-                            yield (line + "\n\n").encode()
-            return StreamingResponse(gen(), media_type="text/event-stream")
+            return _build_stream_response(body, request, eng.cfg, report)
 
         r = await client.post(upstream, json=body, headers=headers)
         try:
