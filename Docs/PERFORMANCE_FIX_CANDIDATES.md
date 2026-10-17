@@ -398,3 +398,26 @@ Replace the sequential `for` loop with a concurrent dispatch: build an array of 
 
 Benefits:
 All N inferences are in flight simultaneously, so wall-clock time drops from ≈ N × single-latency to ≈ 1 × single-latency (plus any server-side queuing). Even when the local model server serialises inference internally, the fix eliminates N − 1 full HTTP/TCP request→response round-trips, lets the server's internal queue batch or pipeline the requests, and keeps the Node event loop free for logging and bookkeeping between inferences. In multi-stage agent pipelines the savings multiply across every `majorityVote` call.
+
+### AC-21 · majorityVote serializes independent LLM calls
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+The `majorityVote` function fires `n` (default 3) LLM inference calls in a sequential `for` loop, each `await`-ed before the next begins. Every iteration passes the identical `prompt`, `model`, `temperature`, `taskId`, and `stage` to `call()`; there is no data dependency between iterations and no cross-iteration state. Because each call is a network round-trip to a local inference server that typically takes 1–30 s depending on model size and prompt length, serializing three calls multiplies user-facing wall-clock latency by 3× (e.g. ~9 s instead of ~3 s for a 7B model, or ~90 s instead of ~30 s for a 70B model or long prompt). The per-iteration LLM inference is the dominant cost in the entire request path, so the serialization penalty is the bottleneck, not loop overhead.
+
+Solution:
+Replace the sequential `for`-loop with a concurrent fan-out using `Promise.all` over `Array.from({ length: n }, …)`. Each element invokes the same `call(…)` with identical arguments and wraps the promise in `.then(result => ({ result })).catch(err => ({ error: err }))` so that per-call failures are captured individually. After `await Promise.all(…)`, iterate the settled array once, pushing successes into `votes` and failures into `voteErrors`, preserving the original collection semantics. The downstream majority-voting / classification logic is unchanged. No new dependency is introduced—`Promise.all` and `Array.from` are Node built-ins already available in this file's runtime.
+
+Benefits:
+Wall-clock latency for the majority-vote step drops from n × T to ≈ T (where T is a single inference call's latency), because all n calls are in flight simultaneously and the caller waits only for the slowest one. For the default n = 3 this is roughly a 3× reduction in perceived response time. Even if the local inference backend internally serializes (e.g. a single-threaded llama.cpp server), the client still saves per-request HTTP connection setup and lets the server's internal scheduler order the queue optimally, yielding a smaller but still positive gain. No behavioral change to the voting result, error handling, or public API surface.
