@@ -8,6 +8,7 @@
 // Pure decision functions take their inputs; only auditReservation / cachedScorecard touch disk, best-effort.
 
 const fs = require('fs');
+const crypto = require('crypto');
 const path = require('path');
 const { readScorecard } = require('./capability-ledger.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
@@ -32,6 +33,8 @@ function routingConfig(env = process.env) {
     minOkRate: num(env.AGENT_MANAGER_CAPABILITY_MIN_OK_RATE, 0.85),
     graceMs: Math.max(0, num(env.AGENT_MANAGER_RESERVATION_GRACE_SECS, 300)) * 1000,
     windowDays: num(env.AGENT_MANAGER_CAPABILITY_WINDOW_DAYS, 14),
+    probeFraction: Math.min(1, Math.max(0, num(env.AGENT_MANAGER_PROBE_FRACTION, 0.10))),
+    probeMaxFailStreak: num(env.AGENT_MANAGER_PROBE_MAX_FAIL_STREAK, 3),
   };
 }
 
@@ -52,15 +55,42 @@ function qualification(lane, source, rows, cfg) {
   return passesGate(lane, source, rows, cfg) ? 'scorecard' : null;
 }
 
+// ---- Probing (design note section 5) -------------------------------------------------------------------------------------------------------
+// A small fraction of eligible tasks of a source the lane has NOT proven are offered to that lane anyway, so smaller models keep getting tried.
+// Human-queued, premium, pinned and ad hoc work is never probed (ad hoc is hard even for the 27B); a source can opt out with `probe: false` in its
+// registration. A source pauses for a lane after probeMaxFailStreak consecutive failures there, until newer evidence changes the streak.
+
+function probeEligible(task, source, registered) {
+  if (!task || !source || task.humanQueued || task.premiumPriority || task.pinnedWorker) return false;
+  if (source === 'adhoc' || (registered && registered.probe === false)) return false;
+  return true;
+}
+
+// Deterministic per (task, lane): the same task gets the same answer on every tick, and the fraction is honoured across many tasks.
+function probeHash(taskId, laneId) {
+  return crypto.createHash('sha1').update(`${taskId}|${laneId}`).digest().readUInt32BE(0) / 4294967296;
+}
+
+function probeSelected({ task, source, registered, lane, lanes, rows, cfg }) {
+  if (!(cfg.probeFraction > 0) || !probeEligible(task, source, registered)) return false;
+  if (!lane || lane.tier == null || lane.reserve === false) return false;
+  if (!(lanes || []).some((l) => l.id !== lane.id && l.tier != null && l.tier > lane.tier)) return false; // nothing bigger to fall back to
+  if (qualification(lane, source, rows || [], cfg)) return false; // already proven -- reservation, not probing
+  const mine = (rows || []).find((r) => r.source === source && r.model === lane.model);
+  if (mine && mine.failStreak >= cfg.probeMaxFailStreak) return false;
+  return probeHash(task.id || '', lane.id) < cfg.probeFraction;
+}
+
 // Should `thisLane` hold off on a task of `source`? -> null | { holder, evidence }. `isAlive(laneId)` is the heartbeat test; `avoided(laneId)` says
 // the task already failed on that lane (escalated), in which case nothing is held for it.
-function decideReservation({ source, thisLane, lanes, rows, ageMs, cfg, isAlive, avoided = () => false }) {
+function decideReservation({ source, thisLane, lanes, rows, ageMs, cfg, isAlive, avoided = () => false, probing = () => false, isIdle = () => true }) {
   if (!source || !thisLane || thisLane.tier == null || ageMs >= cfg.graceMs) return null;
   const candidates = [];
   for (const l of lanes || []) {
     if (l.id === thisLane.id || l.tier == null || !(l.tier < thisLane.tier)) continue;
     if (avoided(l.id) || !isAlive(l.id)) continue;
-    const evidence = qualification(l, source, rows || [], cfg);
+    // A probe-selected task is held only for a lane that is idle right now (at most one probe in flight per small lane).
+    const evidence = qualification(l, source, rows || [], cfg) || (probing(l) && isIdle(l.id) ? 'probe' : null);
     if (evidence) candidates.push({ holder: l.id, tier: l.tier, evidence });
   }
   if (!candidates.length) return null;
@@ -73,6 +103,14 @@ function laneAliveFromHeartbeat(instancesDir, laneId, now = Date.now()) {
     const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, `${laneId}.json`), 'utf8'));
     const age = now - Date.parse(hb.lastHeartbeat);
     return Number.isFinite(age) && age >= 0 && age <= HEARTBEAT_FRESH_MS;
+  } catch (_) { return false; }
+}
+
+function laneIdleFromHeartbeat(instancesDir, laneId, now = Date.now()) {
+  try {
+    const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, `${laneId}.json`), 'utf8'));
+    const age = now - Date.parse(hb.lastHeartbeat);
+    return hb.status === 'idle' && Number.isFinite(age) && age >= 0 && age <= HEARTBEAT_FRESH_MS;
   } catch (_) { return false; }
 }
 
@@ -115,4 +153,4 @@ function escalationLane(attempt, lanes, env = process.env) {
   return (lanes || []).some((l) => l.id !== mine.id && l.tier != null && l.tier > mine.tier) ? mine.id : null;
 }
 
-module.exports = { escalationLane, routingConfig, passesGate, qualification, decideReservation, laneAliveFromHeartbeat, cachedScorecard, auditReservation };
+module.exports = { probeEligible, probeHash, probeSelected, laneIdleFromHeartbeat, escalationLane, routingConfig, passesGate, qualification, decideReservation, laneAliveFromHeartbeat, cachedScorecard, auditReservation };

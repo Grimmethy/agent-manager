@@ -77,11 +77,11 @@ function buildScorecard(entries) {
     const key = `${e.source}\u0000${e.model}`;
     let r = rows.get(key);
     if (!r) {
-      r = { source: e.source, model: e.model, tier: e.tier == null ? tierFromModel(e.model) : e.tier, lanes: new Set(), n: 0, ok: 0, outcomes: {}, walls: [] };
+      r = { source: e.source, model: e.model, tier: e.tier == null ? tierFromModel(e.model) : e.tier, lanes: new Set(), n: 0, ok: 0, outcomes: {}, walls: [], failStreak: 0 };
       rows.set(key, r);
     }
     r.n += 1;
-    if (e.outcome === 'ok') r.ok += 1;
+    if (e.outcome === 'ok') { r.ok += 1; r.failStreak = 0; } else r.failStreak += 1; // entries arrive oldest-first, so this ends as the trailing run of failures
     r.outcomes[e.outcome] = (r.outcomes[e.outcome] || 0) + 1;
     if (e.lane) r.lanes.add(e.lane);
     if (Number.isFinite(e.wallMs)) r.walls.push(e.wallMs);
@@ -91,7 +91,7 @@ function buildScorecard(entries) {
     return {
       source: r.source, model: r.model, tier: r.tier, lanes: [...r.lanes].sort(), n: r.n, ok: r.ok,
       okRate: r.n ? r.ok / r.n : 0, lower: wilsonLower(r.ok, r.n),
-      p50WallMs: percentile(walls, 0.5), p95WallMs: percentile(walls, 0.95), outcomes: r.outcomes,
+      p50WallMs: percentile(walls, 0.5), p95WallMs: percentile(walls, 0.95), outcomes: r.outcomes, failStreak: r.failStreak,
     };
   }).sort((a, b) => a.source.localeCompare(b.source) || (a.tier ?? 1e9) - (b.tier ?? 1e9) || a.model.localeCompare(b.model));
 }

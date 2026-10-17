@@ -61,4 +61,28 @@ test('escalationLane: timeout/degenerate/error on a lane with a bigger lane abov
   assert.equal(R.escalationLane(att('worker-x'), lanes, {}), null);
   assert.equal(R.escalationLane(att('worker-rx580'), lanes, { AGENT_MANAGER_LANE_ESCALATION: 'off' }), null);
   assert.equal(R.escalationLane({ outcome: 'error' }, lanes, {}), null);
+
+test('probeHash is deterministic and roughly uniform; probeSelected honours eligibility, tier, proven and paused', () => {
+  assert.equal(R.probeHash('t1', 'worker-rx580'), R.probeHash('t1', 'worker-rx580'));
+  let hits = 0;
+  for (let i = 0; i < 2000; i++) if (R.probeHash(`task-${i}`, 'worker-rx580') < 0.1) hits += 1;
+  assert.ok(hits > 140 && hits < 260, `10% of 2000 should land near 200, got ${hits}`);
+  const cfg = { ...CFG, probeFraction: 1, probeMaxFailStreak: 3 };
+  const base = { task: { id: 't' }, source: 'x', registered: {}, lane: small, lanes: [big, small], rows: [], cfg };
+  assert.equal(R.probeSelected(base), true);
+  assert.equal(R.probeSelected({ ...base, task: { id: 't', humanQueued: true } }), false);
+  assert.equal(R.probeSelected({ ...base, task: { id: 't', premiumPriority: true } }), false);
+  assert.equal(R.probeSelected({ ...base, source: 'adhoc' }), false);
+  assert.equal(R.probeSelected({ ...base, registered: { probe: false } }), false);
+  assert.equal(R.probeSelected({ ...base, lane: big }), false, 'the biggest lane never probes');
+  assert.equal(R.probeSelected({ ...base, lane: { ...small, reserve: false } }), false);
+  assert.equal(R.probeSelected({ ...base, rows: [row('s:8b', 8, 20, 20, 0.84)] }), false, 'a proven source is reserved, not probed');
+  assert.equal(R.probeSelected({ ...base, rows: [{ ...row('s:8b', 8, 3, 0, 0), failStreak: 3 }] }), false, 'paused after a fail streak');
+  assert.equal(R.probeSelected({ ...base, cfg: { ...cfg, probeFraction: 0 } }), false);
+});
+
+test('decideReservation: a probe-selected source holds only for an idle small lane', () => {
+  const args = { source: 'x', thisLane: big, lanes: [big, small], rows: [], ageMs: 1000, cfg: CFG, isAlive: () => true, probing: () => true };
+  assert.deepEqual(R.decideReservation({ ...args, isIdle: () => true }), { holder: 'worker-rx580', evidence: 'probe' });
+  assert.equal(R.decideReservation({ ...args, isIdle: () => false }), null);
 });
