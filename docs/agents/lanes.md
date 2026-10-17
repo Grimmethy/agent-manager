@@ -69,6 +69,16 @@ Human-queued and premium tasks, operator pins, and tasks that already failed on 
 nothing), `enforce`, or `off`. Design and rollout: `docs/design-notes/capability-routing-and-benchmarking.md`. `launch.sh` exports
 `AGENT_MANAGER_HOST_LOCAL_MODEL` so the host lane's tier is known inside remote-lane workers.
 
+### Probing
+
+So smaller lanes keep getting tried on work they have not proven, a **restricted lane** (one with `taskClasses`) is also offered a deterministic fraction
+(`AGENT_MANAGER_PROBE_FRACTION`, default 0.10; the choice is a hash of task id and lane, so it is stable across ticks) of **eligible** tasks outside its
+allowlist, one per claim call. Eligible = not human-queued, premium, pinned or `adhoc`, and the source's registration does not say `probe: false`. A
+lane that already passes the gate for a source gets reservation instead; a source pauses for a lane after `AGENT_MANAGER_PROBE_MAX_FAIL_STREAK`
+(3) consecutive failed attempts there. While a probe task is waiting and the small lane is idle, bigger lanes hold it for the reservation grace.
+A probe that fails escalates (below). Governed by the same `AGENT_MANAGER_CAPABILITY_ROUTING` switch: in `shadow` (default) it only logs `would-probe`
+lines. Next: the probe debrief (`docs/design-notes/capability-routing-and-benchmarking.md` section 5a).
+
 ### Escalation
 
 A draft attempt that ends in a **timeout, degenerate output or a hard error** on a lane that has a bigger-tier lane above it stamps that lane onto

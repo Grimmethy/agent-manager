@@ -61,6 +61,7 @@ test('escalationLane: timeout/degenerate/error on a lane with a bigger lane abov
   assert.equal(R.escalationLane(att('worker-x'), lanes, {}), null);
   assert.equal(R.escalationLane(att('worker-rx580'), lanes, { AGENT_MANAGER_LANE_ESCALATION: 'off' }), null);
   assert.equal(R.escalationLane({ outcome: 'error' }, lanes, {}), null);
+});
 
 test('probeHash is deterministic and roughly uniform; probeSelected honours eligibility, tier, proven and paused', () => {
   assert.equal(R.probeHash('t1', 'worker-rx580'), R.probeHash('t1', 'worker-rx580'));
