@@ -2070,3 +2070,35 @@ Benefits:
 The module is testable without loading the full source registry, and the dependency is visible at the call site, making it obvious to a reader which external state the function relies on. It eliminates a class of hard-to-reproduce runtime errors that only surface when module load order changes (e.g., after a refactor or in a bundler that reorders imports).
 
 NOTE: Flag 2 was not fully applied because the critique incorrectly claims the solution "breaks the existing API contract" in a way that contradicts the code's intent; however, the critique's core point about the "opt-in per process" design intent was valid, so the draft was revised to acknowledge this design choice while still recommending explicit parameters for clarity and testability.
+
+### AC-179 · Lazy-require in task-source-registry creates undocumented coupling to scope/config subsystems
+Strength: Moderate
+Files: src/task-source-registry.js, src/lib/source-scope.js, src/config.js, src/accessible-roots.js
+
+Problem:
+The `registerTaskSource` function in `src/task-source-registry.js` performs a conditional `require('./lib/source-scope.js')` inside its function body when wrapping the `next` function for `scope: 'core'` sources. The lazy-require is almost certainly a deliberate mitigation against a circular dependency: `source-scope.js` requires `../config.js` (via `activeRepoIsCore()`), and `config.js` sits in a foundational dependency chain that likely reaches back toward the registry or its siblings. Moving the require to the top level would therefore re-introduce the very cycle the lazy-require avoids.
+
+The real issue is not the laziness itself but the *undocumented* coupling. There is no comment, JSDoc annotation, or architectural note explaining *why* the require is deferred, what the circular path looks like, or what invariants must hold if the scope or config modules change. As a result:
+
+- A developer reading `task-source-registry.js` sees a bare `require` buried in a conditional branch and cannot tell whether it is a performance deferral, a circularity workaround, or an oversight.
+- Static-analysis and module-graph tools (madge, dependency-cruiser) either miss the edge entirely or flag it as a suspicious mid-function require, producing noise that buries real findings.
+- Any refactor of `config.js`, `accessible-roots.js`, or `source-scope.js` can silently alter the registry's runtime behaviour with no visible import relationship to prompt a review.
+
+Solution:
+Because the circular dependency is real, the fix is **not** to promote the require to top level. Instead, make the coupling explicit and the dependency direction unambiguous:
+
+1. **Invert the dependency (preferred).** Have the registry expose a registration hook, e.g. `registry.setScopeResolver(fn)`. The scope module (or a small bootstrap/setup module that already loads both) calls `registry.setScopeResolver(sourceEligibleHere)` at initialisation time. The registry then calls the stored function when wrapping `next` for core sources, and **never requires `source-scope.js` at all**—lazy or otherwise. The dependency arrow becomes `source-scope → task-source-registry` (one-directional), which is acyclic. This removes the mid-function `require` entirely and makes the coupling visible in the scope module's top-level imports.
+
+2. **If inversion is not feasible** (e.g., the registry is loaded before the scope module in a way that prevents the scope module from calling back), keep the lazy-require but **document it explicitly**:
+   - Add a `// NOTE: lazy require to break circular dep: registry → scope → config → … → registry` comment directly above the `require` call.
+   - Add a JSDoc `@depends` or `@circular` tag on `registerTaskSource` naming the specific modules in the cycle.
+   - Add a short "Dependency notes" section to the file's header comment listing `source-scope.js`, `config.js`, and `accessible-roots.js` as *runtime* (not load-time) dependencies and the reason.
+
+3. **Either way**, add a brief integration-test or smoke-test assertion that registers a core source and verifies the scope-wrapping path executes, so that a future refactor of the scope or config modules that breaks the wiring is caught in CI rather than in production.
+
+Benefits:
+- The circular-dependency constraint is preserved (no new cycle is introduced), so the refactor is safe.
+- The coupling becomes visible to both humans and tooling: either as a top-level import in the scope module (option 1) or as an explicit, commented runtime dependency (option 2).
+- Module-graph tools report a clean, one-directional edge instead of an unexplained mid-function require, reducing false-positive noise.
+- The smoke test (option 3) guards the registration path against silent breakage from future refactors of `config.js` or `accessible-roots.js`.
+- Developers no longer need to reverse-engineer the circular path to understand why the require is deferred; the rationale is stated in the code.
