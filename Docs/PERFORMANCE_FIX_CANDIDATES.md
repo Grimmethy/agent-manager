@@ -352,3 +352,26 @@ Replace the `for…of` loop with `await Promise.all(loaded.map(...))`. Inside th
 
 Benefits:
 The event loop is no longer frozen for the cumulative duration of all batch writes; concurrent writes overlap their I/O wait time, cutting total blocking time from O(n × write_time) to approximately O(max_write_time). Other I/O callbacks, timers, and network events can fire while writes are in flight, keeping the process responsive. The non-fatal error semantics are preserved exactly via the per-write `.catch(() => {})`, so no behavioral change is introduced for callers. No new dependency or API surface is added.
+
+### AC-19 · Parallelize independent LLM classification calls in majorityVote
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+The `majorityVote` function issues `n` (default 3) fully independent LLM classification calls—identical prompt, identical parameters, no data dependency between iterations—yet serializes them with `await` inside a `for` loop. Each iteration is a full model inference round-trip (typically 2–8 s), so the sequential pattern multiplies wall-clock latency to `n × single_call_latency` (6–24 s) when the calls could complete in roughly the time of one (2–8 s). The per-iteration `try/catch` and `voteErrors` array confirm the author already treats each call as an independent unit with its own failure mode, making the serialization purely an execution-ordering artifact with no functional benefit.
+
+Solution:
+Replace the sequential `for` loop with `Promise.allSettled` (a built-in JS primitive, no new dependency). Build an array of `n` promise values by calling `call(...)` `n` times up front, then await `Promise.allSettled` once. After settling, iterate the results: push `s.value` into `votes` for fulfilled entries and `s.reason` into `voteErrors` for rejected ones. The downstream majority-counting logic (`minAgreeing` threshold, tie-breaking, error reporting via `console.error`) remains unchanged. This preserves the existing per-call error tolerance—a single failing vote does not abort the others—while letting all `n` inferences execute concurrently.
+
+Benefits:
+Total wall-clock latency for the voting step drops from `n × single_call_latency` to approximately `1 × single_call_latency`, eliminating 2–3× redundant network and inference time on every classification call. Because the calls are truly independent (same immutable parameters, no shared mutable state, commutative voting), concurrency introduces no ordering hazard, no race condition, and no additional load beyond what the provider already permits for 3 simultaneous requests. The fix uses only a built-in language primitive and the `call` function the file already imports, so no new dependency, API surface, or configuration knob is introduced.
