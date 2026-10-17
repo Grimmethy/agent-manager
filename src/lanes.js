@@ -31,6 +31,8 @@
 //   slow        true marks a categorically slower endpoint (the P40 is the model case): its calls get the longer per-call timeout
 //               ceiling (local-client.js / local-tool-client.js) and the longer watchdog zombie threshold (dead-process-check.js), so a
 //               legitimately still-generating lane is not killed mid-call. Default false. The legacy P40 lane is slow.
+//   numBatch    optional whole number 32..8192: the prompt-processing batch (num_batch) this lane's calls use -> AGENT_MANAGER_LANE_NUM_BATCH. Measured
+//               on the RX 580: default 26 tok/s prompt processing, 1024 -> 178 tok/s.
 //   numCtx      optional whole number 2048..131072: the ONE context window (num_ctx) this lane's calls use, for a card that cannot hold the
 //               pipeline's default pin (49152, sized for the 24 GB cards). Becomes AGENT_MANAGER_LANE_NUM_CTX in the lane's env
 //               (gpu-capacity.js reads it). Measured on an 8 GB RX 580 with qwen3-vl:8b: 49152 -> 10.6 tok/s at 80% GPU, 16384 -> 26.2 tok/s at 100%.
@@ -131,6 +133,11 @@ function laneFromEntry(raw, index) {
     if (!Number.isInteger(raw.numCtx) || raw.numCtx < 2048 || raw.numCtx > 131072) { warnOnce(`${where} (${id}) numCtx must be a whole number between 2048 and 131072; skipped`); return null; }
     numCtx = raw.numCtx;
   }
+  let numBatch = null;
+  if (raw.numBatch !== undefined && raw.numBatch !== null) {
+    if (!Number.isInteger(raw.numBatch) || raw.numBatch < 32 || raw.numBatch > 8192) { warnOnce(`${where} (${id}) numBatch must be a whole number between 32 and 8192; skipped`); return null; }
+    numBatch = raw.numBatch;
+  }
   const preempt = raw.preempt === undefined ? 'never' : raw.preempt;
   if (!PREEMPT_MODES.includes(preempt)) { warnOnce(`${where} (${id}) preempt must be one of ${PREEMPT_MODES.join('|')}; skipped`); return null; }
   let tier = tierFromModel(model);
@@ -153,10 +160,12 @@ function laneFromEntry(raw, index) {
     env: {
       OLLAMA_URL: String(raw.ollamaUrl).trim(), LOCAL_MODEL: model, AGENT_MANAGER_GPU_YIELD_APPS: '',
       ...(numCtx ? { AGENT_MANAGER_LANE_NUM_CTX: String(numCtx) } : {}),
+      ...(numBatch ? { AGENT_MANAGER_LANE_NUM_BATCH: String(numBatch) } : {}),
     },
     local: false,
     slow: raw.slow === true,
     numCtx,
+    numBatch,
     preempt,
     taskClasses,
     model,
@@ -172,7 +181,7 @@ function getLanes(env = process.env) {
   // The host lane's model is the base LOCAL_MODEL, which launch.sh also exports as AGENT_MANAGER_HOST_LOCAL_MODEL because a remote lane's
   // worker overrides LOCAL_MODEL in its own process. Without either signal the tier is unknown (null) and capability routing leaves it alone.
   const hostModel = env.AGENT_MANAGER_HOST_LOCAL_MODEL || (!env.AGENT_MANAGER_INSTANCE_ID || env.AGENT_MANAGER_INSTANCE_ID === `worker-${local}` ? env.LOCAL_MODEL : '') || null;
-  const lanes = [{ id: `worker-${local}`, gpu: local, env: {}, local: true, slow: false, numCtx: null, preempt: 'always', taskClasses: null, model: hostModel, tier: tierFromModel(hostModel), reserve: 'auto' }];
+  const lanes = [{ id: `worker-${local}`, gpu: local, env: {}, local: true, slow: false, numCtx: null, numBatch: null, preempt: 'always', taskClasses: null, model: hostModel, tier: tierFromModel(hostModel), reserve: 'auto' }];
   if (env.AGENT_MANAGER_P40_OLLAMA_URL && env.AGENT_MANAGER_P40_MODEL) {
     lanes.push({
       id: 'worker-p40',
@@ -185,6 +194,7 @@ function getLanes(env = process.env) {
       local: false,
       slow: true,
       numCtx: null,
+      numBatch: null,
       preempt: 'never',
       taskClasses: null,
       model: env.AGENT_MANAGER_P40_MODEL,

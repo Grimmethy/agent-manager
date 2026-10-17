@@ -50,6 +50,14 @@ function laneNumCtx(env = process.env) {
 }
 const PINNED_NUM_CTX = laneNumCtx() || DEFAULT_PINNED_NUM_CTX;
 
+// 2026-10-17 (grimm's RX 580): a lane can also declare num_batch (lanes registry `numBatch` -> AGENT_MANAGER_LANE_NUM_BATCH, that lane's env only). Measured on
+// qwen3-vl:8b / RX 580 / Vulkan / q8 KV / 4392-token prompt: the default batch processed the prompt at 26 tok/s (169 s before the first token); num_batch 1024
+// -> 178 tok/s (26 s), generation unchanged at 25 tok/s; 2048 kept the 178 tok/s but halved generation to 13 tok/s; 256 -> 34 tok/s. null = Ollama's default.
+function laneNumBatch(env = process.env) {
+  const n = Number(env.AGENT_MANAGER_LANE_NUM_BATCH);
+  return Number.isInteger(n) && n >= 32 && n <= 8192 ? n : null;
+}
+
 // Kept so existing callers keep working: there is no longer a separate, larger tier.
 const EXTENDED_NUM_CTX = PINNED_NUM_CTX;
 
@@ -173,6 +181,7 @@ module.exports = {
   PINNED_NUM_CTX,
   DEFAULT_PINNED_NUM_CTX,
   laneNumCtx,
+  laneNumBatch,
   EXTENDED_NUM_CTX,
   HARD_TIMEOUT_CEILING_MS,
   MIN_TIMEOUT_MS,

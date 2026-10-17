@@ -324,6 +324,8 @@ async function callOnce({ prompt, images, think = true, temperature = 0.4, numCt
 
   const options = { num_ctx: resolvedNumCtx, num_predict: numPredict, temperature };
   if (repeatPenalty) options.repeat_penalty = repeatPenalty;
+  const laneBatch = gpuCapacity.laneNumBatch();
+  if (laneBatch) options.num_batch = laneBatch; // this lane's own prompt-processing batch (lanes registry numBatch)
 
   const body = { model: model || MODEL, prompt: datedPrompt, think, stream: false, keep_alive: KEEP_ALIVE, options };
   // Grammar-constrained decoding. When `format` is set ("json", or a full JSON-schema object),
