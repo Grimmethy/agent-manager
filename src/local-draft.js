@@ -78,6 +78,7 @@ const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { postJson } = require('./ollama-http.js');
 const { checkOllamaReachable } = require('./ollama-health.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { recordAttempt: recordLedgerAttempt } = require('./capability-ledger.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
 const { getModelProfile } = require('./model-profile-registry.js');
 const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./lib/draft-lifecycle.js');
@@ -1568,6 +1569,13 @@ async function draftTask(task, deps = {}) {
   // (a blocked network_unavailable task must not consume a draft-attempt slot).
   if (!(result && result.blocked && result.blockedReason === 'network_unavailable')) {
     finalizeDraftAttempt(task, attempt, result, { emitHistory: appendHistoryEvent });
+    // Capability ledger (docs/design-notes/capability-routing-and-benchmarking.md): one line per attempt, recording only.
+    const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+    if (repoRoot) {
+      let sourceName = null;
+      try { sourceName = resolveSourceName(task); } catch (_) { sourceName = task && task.source || null; }
+      recordLedgerAttempt(process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot, attempt, { source: sourceName, taskId: task && task.id });
+    }
   }
   return result;
 }
