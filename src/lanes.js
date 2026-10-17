@@ -31,6 +31,9 @@
 //   slow        true marks a categorically slower endpoint (the P40 is the model case): its calls get the longer per-call timeout
 //               ceiling (local-client.js / local-tool-client.js) and the longer watchdog zombie threshold (dead-process-check.js), so a
 //               legitimately still-generating lane is not killed mid-call. Default false. The legacy P40 lane is slow.
+//   numCtx      optional whole number 2048..131072: the ONE context window (num_ctx) this lane's calls use, for a card that cannot hold the
+//               pipeline's default pin (49152, sized for the 24 GB cards). Becomes AGENT_MANAGER_LANE_NUM_CTX in the lane's env
+//               (gpu-capacity.js reads it). Measured on an 8 GB RX 580 with qwen3-vl:8b: 49152 -> 10.6 tok/s at 80% GPU, 16384 -> 26.2 tok/s at 100%.
 //   taskClasses optional allowlist of task SOURCE names (brain_dump_sort, change_review, ...). Absent = the lane claims any
 //               task (today's behaviour for the host and P40 lanes). Present = the claim loop (next-claimable-task.js) only
 //               offers this lane tasks of those sources, so a small GPU can be given only the work that fits it. A task
@@ -122,6 +125,11 @@ function laneFromEntry(raw, index) {
   const model = typeof raw.model === 'string' ? raw.model.trim() : '';
   if (!model) { warnOnce(`${where} (${id}) needs a "model"; skipped`); return null; }
   if (raw.slow !== undefined && typeof raw.slow !== 'boolean') { warnOnce(`${where} (${id}) slow must be true or false; skipped`); return null; }
+  let numCtx = null;
+  if (raw.numCtx !== undefined && raw.numCtx !== null) {
+    if (!Number.isInteger(raw.numCtx) || raw.numCtx < 2048 || raw.numCtx > 131072) { warnOnce(`${where} (${id}) numCtx must be a whole number between 2048 and 131072; skipped`); return null; }
+    numCtx = raw.numCtx;
+  }
   const preempt = raw.preempt === undefined ? 'never' : raw.preempt;
   if (!PREEMPT_MODES.includes(preempt)) { warnOnce(`${where} (${id}) preempt must be one of ${PREEMPT_MODES.join('|')}; skipped`); return null; }
   let taskClasses = null;
@@ -134,19 +142,23 @@ function laneFromEntry(raw, index) {
     id,
     gpu,
     // GPU_YIELD_APPS emptied: the yield-to-ComfyUI check watches the HOST GPU, not a remote endpoint's.
-    env: { OLLAMA_URL: String(raw.ollamaUrl).trim(), LOCAL_MODEL: model, AGENT_MANAGER_GPU_YIELD_APPS: '' },
+    env: {
+      OLLAMA_URL: String(raw.ollamaUrl).trim(), LOCAL_MODEL: model, AGENT_MANAGER_GPU_YIELD_APPS: '',
+      ...(numCtx ? { AGENT_MANAGER_LANE_NUM_CTX: String(numCtx) } : {}),
+    },
     local: false,
     slow: raw.slow === true,
+    numCtx,
     preempt,
     taskClasses,
   };
 }
 
-// -> [{ id, gpu, env, local, slow, preempt, taskClasses }]. `env` is the per-lane environment launch.sh / the watchdog must apply
+// -> [{ id, gpu, env, local, slow, numCtx, preempt, taskClasses }]. `env` is the per-lane environment launch.sh / the watchdog must apply
 // when spawning the lane ({} = inherit, i.e. the host's own Ollama). `taskClasses` null = claims any task.
 function getLanes(env = process.env) {
   const local = slug(env.AGENT_MANAGER_LOCAL_GPU) || detectLocalGpu() || 'local';
-  const lanes = [{ id: `worker-${local}`, gpu: local, env: {}, local: true, slow: false, preempt: 'always', taskClasses: null }];
+  const lanes = [{ id: `worker-${local}`, gpu: local, env: {}, local: true, slow: false, numCtx: null, preempt: 'always', taskClasses: null }];
   if (env.AGENT_MANAGER_P40_OLLAMA_URL && env.AGENT_MANAGER_P40_MODEL) {
     lanes.push({
       id: 'worker-p40',
@@ -158,6 +170,7 @@ function getLanes(env = process.env) {
       },
       local: false,
       slow: true,
+      numCtx: null,
       preempt: 'never',
       taskClasses: null,
     });

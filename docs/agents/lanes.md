@@ -16,7 +16,8 @@ that the thing to remove.)
 
 ## Adding a GPU (the whole procedure)
 
-1. Run Ollama on that machine, reachable from this one (a tailnet address is fine). Pull the model it should serve.
+1. Run Ollama on that machine, reachable from this one (a tailnet address is fine). Pull the model it should serve. On a small card also set
+   `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0` on that Ollama (halves the context's memory) and size `numCtx` to fit (see below).
 2. Add an entry to `lanes.json`:
 
    ```json
@@ -36,6 +37,7 @@ that the thing to remove.)
 | `model` | yes | becomes the lane's `LOCAL_MODEL` |
 | `id` | no | override; must match `^worker-[a-z0-9]+$`. An id equal to an earlier lane **replaces** it (never the host lane) |
 | `enabled` | no | `false` keeps the entry on file but launches nothing |
+| `numCtx` | no | whole number 2048..131072: the one `num_ctx` this lane's calls use. **Set it for any card smaller than the 24 GB ones**: the pipeline pins `49152` (sized for the 3090/P40) and an 8 GB card cannot hold that next to an 8B model. Measured on an RX 580 8 GB, qwen3-vl:8b: `49152` -> 10.6 tok/s at 80% GPU; `16384` -> 26.2 tok/s at 100% GPU (with a q8 KV cache; f16 KV: 8.0 tok/s at `49152`). It is exported as `AGENT_MANAGER_LANE_NUM_CTX` to that lane's processes only |
 | `taskClasses` | no | allowlist of task **source** names (`brain_dump_sort`, `change_review`, `observability_review`, `staleness_audit`, ...). Absent = claims any task. Must be non-empty if present |
 | `preempt` | no | `always` \| `age-gated` \| `never` (default `never`): whether an interactive chat turn may kill this lane's in-flight call. Only the host lane is `always`: the chat takes over the host GPU only |
 | `slow` | no | `true` for a categorically slower endpoint (the P40 is the model case): longer per-call timeout ceiling and watchdog zombie threshold, so a slow-but-alive lane is not killed mid-call. Default `false` |
