@@ -64,3 +64,23 @@ test('probeEndpoint turns Ollama timing into tokens/s and fails soft', async () 
   assert.equal(bad.ok, false);
   assert.match(bad.error, /timed out/);
 });
+
+test('the probe request matches the lane\'s own calls (same num_ctx / num_batch / keep_alive) so it never evicts the resident model', async () => {
+  let body = null;
+  await H.probeEndpoint({ url: 'http://x', model: 'm', numCtx: 16384, numBatch: 1024, keepAlive: '30m', post: async (u, b) => { body = b; return { eval_count: 40, eval_duration: 1e9 }; } });
+  assert.equal(body.options.num_ctx, 16384);
+  assert.equal(body.options.num_batch, 1024);
+  assert.equal(body.keep_alive, '30m');
+  await H.probeEndpoint({ url: 'http://x', model: 'm', post: async (u, b) => { body = b; return { eval_count: 40, eval_duration: 1e9 }; } });
+  assert.equal(body.options.num_ctx, 49152, 'default lanes use the pinned 49152');
+  assert.equal(body.options.num_batch, undefined);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-health-ctx-'));
+  const now = Date.now();
+  fs.writeFileSync(path.join(dir, 'worker-rx580.json'), JSON.stringify({ status: 'idle', lastHeartbeat: new Date(now).toISOString() }));
+  let args = null;
+  await H.runDueProbes({ lanes: [{ id: 'worker-rx580', model: 'small:8b', numCtx: 16384, numBatch: 1024, env: { OLLAMA_URL: 'http://g:11434' } }], instancesDir: dir, pipelineDir: dir, env: {}, now, probe: async (a) => { args = a; return { ok: true, tps: 25, totalMs: 1 }; } });
+  assert.equal(args.numCtx, 16384);
+  assert.equal(args.numBatch, 1024);
+  assert.equal(args.keepAlive, '30m');
+});

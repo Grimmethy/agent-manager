@@ -12,6 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { DEFAULT_PINNED_NUM_CTX } = require('./gpu-capacity.js');
 
 const MAX_SAMPLES = 50;
 const FRESH_MS = 30 * 60 * 1000; // a verdict older than this is not trusted either way
@@ -87,12 +88,15 @@ function laneDegradedBetween(instancesDir, laneId, fromIso, toIso, cfg = healthC
   });
 }
 
-async function probeEndpoint({ url, model, post = postJson, timeoutMs = 90000 }) {
+// The probe MUST look exactly like the lane's own calls: Ollama reloads a resident model when num_ctx changes, so a probe at a different context
+// would evict the lane's pinned model (a 27B reload is ~100 s, longer than the probe timeout) and make a healthy lane look dead and busy. Same
+// num_ctx / num_batch / keep_alive as the lane's real requests (src/gpu-capacity.js pins, lane registry numCtx/numBatch, LOCAL_KEEP_ALIVE).
+async function probeEndpoint({ url, model, numCtx = DEFAULT_PINNED_NUM_CTX, numBatch = null, keepAlive = '30m', post = postJson, timeoutMs = 90000 }) {
   const started = Date.now();
   try {
     const r = await post(`${String(url).replace(/\/$/, '')}/api/generate`, {
-      model, prompt: PROBE_PROMPT, stream: false, think: false,
-      options: { num_predict: 48, temperature: 0, num_ctx: 2048 },
+      model, prompt: PROBE_PROMPT, stream: false, think: false, keep_alive: keepAlive,
+      options: { num_predict: 48, temperature: 0, num_ctx: numCtx, ...(numBatch ? { num_batch: numBatch } : {}) },
     }, timeoutMs);
     const evalNs = Number(r && r.eval_duration);
     const evalCount = Number(r && r.eval_count);
@@ -127,7 +131,7 @@ async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.en
     // The watchdog runs this in the background every tick; a probe still in flight (it can take up to the timeout) must not be doubled.
     if (probingSince && now - Date.parse(probingSince) < cfg.timeoutMs + 15000) continue;
     writeState(instancesDir, lane.id, { samples, probingSince: new Date(now).toISOString() });
-    const r = await probe({ url, model, timeoutMs: cfg.timeoutMs });
+    const r = await probe({ url, model, numCtx: lane.numCtx || DEFAULT_PINNED_NUM_CTX, numBatch: lane.numBatch || null, keepAlive: env.LOCAL_KEEP_ALIVE || env.ORNITH_KEEP_ALIVE || '30m', timeoutMs: cfg.timeoutMs });
     const sample = { at: new Date(now).toISOString(), ok: r.ok, tps: Math.round(r.tps * 100) / 100, totalMs: r.totalMs, error: r.error };
     const next = [...samples, sample].slice(-MAX_SAMPLES);
     writeState(instancesDir, lane.id, { samples: next });
