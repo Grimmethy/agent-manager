@@ -2115,3 +2115,44 @@ At the top of `generate` (or in a small helper called before the request is buil
 
 Benefits:
 The failure mode now matches the documented behavior: the user receives a clear, actionable message identifying the missing configuration rather than a generic server error that requires inference. Debugging time drops because the root cause (unset environment variable) is stated explicitly at the point of failure. The function's contract becomes reliable regardless of whether the caller is running in a container, a CI job, or a developer shell where `LOCAL_MODEL` may not yet be exported, and the error is independent of Ollama's internal error-message wording (which could change across server versions).
+
+### AC-181 · Registry hides a runtime dependency on source-scope via lazy require
+Strength: Not recommended
+Files: src/task-source-registry.js, src/lib/source-scope.js, src/accessible-roots.js, src/config.js
+
+Problem:
+The draft suggested removing the inline `require('./lib/source-scope.js')` from `registerTaskSource` to decouple the registry from scoping logic. However, the code explicitly documents that this wrapping is required to ensure **every** caller—including "always-run watchdog sweeps" that invoke `source.next()` directly—respects the `scope: 'core'` gate. Moving this logic to a bootstrap layer or a caller-provided decorator would break this guarantee for any execution path that bypasses the standard `getNextTask` priority ladder, leaving those paths vulnerable to cross-project data leakage or incorrect behavior.
+
+Solution:
+Retain the current implementation. The registry must own the wrapping logic to enforce the scope gate universally across all execution paths. The "hidden dependency" is a deliberate architectural choice to ensure correctness and safety over loose coupling in this specific context.
+
+Benefits:
+Ensures that all task source invocations, regardless of the calling context (priority ladder, watchdog, direct call), are consistently gated by the source-scope logic. Prevents potential security or correctness hazards that would arise if the gate were optional or context-dependent.
+
+### AC-182 · resolveSourceName mixes hardcoded built-in checks with the alias mechanism
+Strength: Not recommended
+Files: src/task-source-registry.js
+
+Problem:
+The draft suggested replacing hardcoded checks for `task.domain === 'adhoc'` with `registerSourceAlias`. This is factually incorrect because `registerSourceAlias` maps `task.source` values to registry names. The `adhoc` case is triggered by `task.domain === 'adhoc'` OR `task.source === 'manual'`. An alias for `'adhoc'` would only catch tasks where `task.source === 'adhoc'`, which is not the case. Furthermore, the alias mechanism cannot handle the `domain`-based check at all. The hardcoded logic is necessary because the resolution key (`domain` vs `source`) differs from the alias key (`source` only).
+
+Solution:
+Retain the current implementation. The hardcoded checks are required to handle the specific combination of `domain` and `source` values that define the `adhoc` source, which cannot be expressed through the existing `source`-only alias mechanism.
+
+Benefits:
+Ensures correct resolution of `adhoc` tasks, which have a unique identification pattern (`domain: 'adhoc'` or `source: 'manual'`) that does not fit the standard alias mapping. Prevents regression in task source resolution for this specific built-in source.
+
+### AC-183 · task-priority silently reads global config, masking initialization errors
+Strength: Not recommended
+Files: src/lib/task-priority.js, src/config.js
+
+Problem:
+The draft suggested removing the `try/catch` in `taskPriority` to surface initialization errors. However, the `try/catch` is a deliberate "fail-open" design pattern to ensure that a failure to load config (e.g., in a test environment, a minimal CLI context, or a misconfigured deployment) does not crash the entire task priority resolution. The function's contract is to return a priority, and falling back to `def` is the correct, safe behavior. Removing the `try/catch` or requiring explicit config injection would introduce a hard dependency on `config.js` initialization, potentially causing crashes in contexts where config is not fully loaded but a default priority is still needed.
+
+Solution:
+Retain the current implementation. The `try/catch` provides graceful degradation, ensuring that the system remains available and functional even when configuration is unavailable or misconfigured. This is appropriate for a utility function that must not become a single point of failure.
+
+Benefits:
+Ensures robustness and availability in diverse execution contexts (tests, minimal CLI, misconfigured deployments). Prevents crashes due to missing or uninitialized configuration, allowing the system to continue operating with default priorities rather than failing entirely.
+
+NOTE: All three flags were applied as they correctly identified that the original draft's proposed solutions would break existing functionality, violate design intent, or introduce unnecessary fragility.
