@@ -11991,3 +11991,223 @@ Extract the five pre-flight checks into a `runPreFlightGates(task, deps)` functi
 
 Benefits:
 Each gate becomes independently testable with a focused fixture that exercises only its own condition and return shape, without constructing the full orchestrator context. The `doRun` closure can be unit-tested for correct option assembly (turn-limit arithmetic, nudge-flag propagation, leaf-locked flag) in isolation, and a change to `runPlan` options produces a diff in `buildDoRunClosure` rather than in the middle of the orchestrator. Reviewers can evaluate a new pre-flight gate as a small, self-contained addition to `runPreFlightGates` rather than scanning a 170+ line function for where the new gate was inserted and whether it interacts with the scope sub-workflow. The top-level function reads as a clear four-step pipeline, making the control flow immediately legible.
+
+### AC-198 · Decompose needsClarificationTriage into per-bucket functions with an explicit ordering caller
+Strength: Strong
+Files: src/needs-clarification-triage.js
+Symbol: needsClarificationTriage
+Snippet:
+```
+}
+
+async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote }) {
+  const summary = { checked: 0, requeued: 0, archived: 0, flagged: 0, leftForHuman: 0, errors: 0 };
+  const { KILL, VOTE_ENABLED, DRY_RUN, MAX_REQUEUES, MAX_VOTES, VOTE_MODEL } = cfgEnv();
+  if (KILL) return summary;
+  if (DRY_RUN) summary.dryRun = true;
+
+  const ncDir = path.join(pipelineDir, 'queue', 'needs-clarification');
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const archiveDir = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+
+  let names;
+  try {
+    names = fs.readdirSync(ncDir).filter((f) => f.endsWith('.json'));
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return summary; // no needs-clarification/ dir
+    }
+    console.error('[needs-clarification-triage] readdirSync failed on', ncDir, err);
+    summary.errors += 1;
+    return summary;
+  }
+
+  const now = new Date().toISOString();
+  let votesUsed = 0;
+
+  for (const name of names) {
+    const file = path.join(ncDir, name);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch {
+      summary.errors += 1;
+      continue;
+    }
+
+    // --- Bucket K: decompose-review-blind signature -> repair in place, send to review --
+    // Checked BEFORE the `nc.reason` allowlist below (and everything else in the loop,
+    // including the decompose-loop/oversized-file deferral) -- SECOND positioning fix,
+    // same day as the first: root-caused live 2026-09-16 running the sweep for real
+    // after the first fix landed -- 2 of the remaining un-recovered targets carry
+    // needsClarification.reason === 'infra-error', not 'design-decision', so the
+    // allowlist below (`if (reason !== 'design-decision' && ...) continue`) excluded
+    // them before Bucket K ever got a look, identical in shape to the oversized-file
+    // dead zone the first fix closed. Real incident: a task's SECOND draft attempt
+    // produced a genuine decompose (real subTaskProposals) that review correctly
+    // rejected for the rendering bug this bucket exists to fix; the requeued THIRD
+    // attempt then hit an unrelated infra-error and exhausted retries -- escalation
+    // reason reflects only the LAST failure, not the fact that a valid decomposition
+    // is still sitting on the task from an earlier attempt. Bucket K's own detection
+    // (a real >=2-item subTaskProposals with no evidence in implementResponse) is
+    // already a narrow, deterministic, reason-independent signal, so it belongs ahead
+    // of a filter meant for buckets that actually need a specific escalation reason to
+    // make sense (H/I key off the reason value itself; this one doesn't use it at all).
+    //
+    // Checked BEFORE the decompose-loop/oversized-file deferral immediately below --
+    // root-caused live 2026-09-16, hours after this bucket first shipped: EVERY one of
+    // its intended targets also carries stalenessFlag.reason === 'decompose-loop' (the
+    // same repeated-decompose history that triggered the give-up backstop this bucket
+    // exists to repair), and a large fraction of those target an oversized file (the
+    // very files -- local-draft.js, agentic-draft-common.js -- this pipeline's own
+    // decompose-related fixes live in). The line below silently `continue`s any
+    // decompose-loop task whose target is oversized ("autoroute owns it") with NO log
+    // line and NO bucket ever getting a chance to run -- including this one, and
+    // including Bucket D above it, though D's own signature rarely overlaps in
+    // practice. decompose-loop-autoroute.js's OWN precondition then declines anyway
+    // when that same file is "actively developed" (a real, separate safety guard), so
+    // the net effect was a permanent dead zone: deferred here, declined there, visible
+    // nowhere. This bucket's own concern (a decomposition that ALREADY happened and
+    // just needs its rendering repaired) has nothing to do with whether the target file
+    // is oversized -- there is nothing left for autoroute to do -- so it must run
+    // before that deferral, not after it, unlike every requeue bucket below which
+    // genuinely does need to yield to autoroute's oversized-file ownership.
+    //
+    // Unlike every other bucket here, this does NOT redraft: the task already has a
+    // valid, complete decomposition (task.subTaskProposals), just an implementResponse
+    // that (pre-PR-#230) never mentioned it. Regenerate implementResponse from the real
+    // sub-tasks and file straight to queue/review/ for a real vote -- see the top-of-file
+    // header comment for the full incident.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
+      const isDecompose = task.adhocResolution === 'decompose' && subTasks.length >= 2;
+      const hasEvidence = isDecompose && subTasks.some((s) => s && s.title
+        && String(task.implementResponse || '').includes(String(s.title).slice(0, 30)));
+      if (isDecompose && !hasEvidence && bucketAttempts(task, 'K') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket K but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'K') + 1;
+          log(`${id0}: bucket K (decompose-review-blind signature) -> repaired in place, sent to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            delete task.needsClarification;
+            delete task.localRejectCount;
+            delete task.retryableDraftBlock;
+            delete task.preDrafted;
+            delete task.priorRejectionFeedback;
+            delete task.blockedReason;
+            delete task.blockedStage;
+            delete task.claimedAt;
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            bumpBucketAttempts(task, 'K');
+            task.status = 'needs-review';
+            task.implementResponse = `Decomposed into ${subTasks.length} sub-task(s).\n\n${formatSubTaskProposalsForReview(subTasks)}`;
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: decompose-review-blind signature (a since-fixed rendering gap, PR #230, hid a genuinely valid decomposition from review) -- implementResponse regenerated from the existing subTaskProposals, sent straight to review ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-K: decompose-review-blind signature', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket O: valid short change sets blocked by the deterministic non-implementation gate -> file to review ---
+    // Checked BEFORE the nc.reason allowlist, like K and N: these tasks escalate as 'design-decision' (deadcode_fix) but the
+    // signal here is the persisted reviewProvider stamp plus the response itself. review-task.js rejected any fence-free
+    // response under 80 characters as "a bare tool-call request or meta-commentary", which blocked the model's CORRECT
+    // `{"mode": "delete", "file": "<path>"}` (71-79 characters) three times with no model vote (9 TaxHarvest deadcode_fix
+    // tasks). The gate now exempts structurally valid change sets (lib/structured-change.js), so nothing needs redrafting:
+    // the draft was fine. Keep implementResponse exactly as written, clear the rejection state, and file it to review/.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (task.reviewProvider === 'deterministic-non-implementation'
+        && isStructuredGroupBChange(String(task.implementResponse || '').trim())
+        && bucketAttempts(task, 'O') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket O but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'O') + 1;
+          log(`${id0}: bucket O (valid short change set blocked by the non-implementation length gate) -> filed to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of ['needsClarification', 'localRejectCount', 'retryableDraftBlock', 'priorRejectionFeedback', 'blockedReason',
+              'blockedStage', 'claimedAt', 'reviewProvider', 'reviewInconclusive', 'localVotes', 'voteErrors', 'ncTriageDecision', 'ncTriageReviewedAt']) delete task[f];
+            bumpBucketAttempts(task, 'O');
+            task.status = 'needs-review';
+            appendHistoryEvent(task, 'requeued',
+              'needs-clarification-triage: the draft is a structurally valid change set (the deterministic non-implementation gate rejected it on length alone, since fixed) -- implementResponse kept as written, rejection state cleared, filed to review for a real vote');
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-O: valid short change set blocked by the non-implementation length gate', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: change-set repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket P: plan-target guard misfire (a call like `res.json()` read as a file, a create target called "absent") -> clean-state requeue ---
+    // Checked BEFORE the nc.reason allowlist, like K/N/O: the signal is the persisted guard reason plus a RE-RUN of the fixed guard on the task's own plan.
+    // adhoc-diff-sanity.js no longer reads a title call expression as a path, and plan-target-guard.js now honours the task's own "Create <file>" and an
+    // "is absent" acknowledgement. Only a task the CURRENT guard would let through is requeued; a genuinely fabricated target still blocks and stays here.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (planTargetNoLongerBlocks(task, repoRoot) && bucketAttempts(task, 'P') < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket P but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'P') + 1;
+          log(`${id0}: bucket P (plan-target guard misfire, since fixed) -> requeue ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            bumpBucketAttempts(task, 'P');
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: the plan-target guard blocked this on an illustrative token (a call expression read as a file, or a create target called absent); the fixed guard no longer blocks the stored plan -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-P: plan-target guard misfire', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+// ... [truncated for review: this function continues for 736 more line(s) not shown]
+```
+
+Problem:
+`needsClarificationTriage` spans 936 lines and interleaves ten or more triage buckets (K, O, P, and at least seven more in the truncated region), each with its own detection predicate, a distinct subset of task-state fields to clear, a different destination directory, and a unique `classifyRequeue` reasonHint. The buckets are not independent: a 40-line comment block above Bucket K exists solely to document why it must precede two other gates, and the shared `nc.reason` allowlist / decompose-loop deferral sits between buckets as a cross-cutting invariant. A developer adding a new bucket must scroll through the entire function, re-read every ordering comment, and confirm the insertion point does not violate a constraint that is invisible from the code structure. The per-bucket field-clearing lists are also styled inconsistently (individual `delete` calls, an inline array loop, and a shared `REQUEUE_STRIP_FIELDS` constant), which compounds the cognitive load because the reader cannot pattern-match on a uniform shape.
+
+Solution:
+Extract each bucket into a self-contained function that owns its detection predicate, its state-clearing list, its destination-directory move, and its reasonHint/history-event message, returning a small result object such as `{ action: 'requeued' | 'skipped' | 'deferred', attempt? }`. The shared `nc.reason` allowlist gate and the decompose-loop deferral become their own named functions (`sharedGate_ncReasonAllowlist`, `decomposeLoopDeferral`). The caller (`needsClarificationTriage`) then reduces to: read config, resolve directories, iterate task files, and for each task call `runTriageBuckets(task, ctx)` where `ctx` carries `pipelineDir`, `repoRoot`, `summary`, `DRY_RUN`, and `majorityVote`. `runTriageBuckets` is a short, linear list of roughly twelve `if (bucketX(task, ctx) !== 'skip') continue;` lines in the documented order, followed by the fall-through (archive / leftForHuman / error). Each bucket function is independently unit-testable: given a fixture task object, assert the correct action, the correct mutated state, and the correct file placement.
+
+Benefits:
+Readability improves because the ordering invariant is now a twelve-line list that a reviewer can verify in one glance, rather than a 900-line interleaving of predicates, deletes, and comment blocks. Testability improves because each bucket can be exercised in isolation with a minimal task fixture, and the ordering can be tested as a separate integration-level concern. Review-ability improves because a pull request adding Bucket Q touches one new file (or one new exported function) plus a single inserted line in the caller, making the diff small, the blast radius obvious, and the ordering constraint checkable by a reviewer who reads only the caller. The inconsistent field-clearing styles can also be normalized per-bucket without risk of accidentally altering another bucket's behavior.
