@@ -14,6 +14,7 @@ const { readScorecard } = require('./capability-ledger.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { laneAllowsSource } = require('./lanes.js');
 const { classifyOutcome } = require('./capability-ledger.js');
+const { laneDegraded } = require('./lane-health.js');
 
 const HEARTBEAT_FRESH_MS = 90 * 1000;
 const SCORECARD_TTL_MS = 60 * 1000;
@@ -71,8 +72,8 @@ function probeHash(taskId, laneId) {
   return crypto.createHash('sha1').update(`${taskId}|${laneId}`).digest().readUInt32BE(0) / 4294967296;
 }
 
-function probeSelected({ task, source, registered, lane, lanes, rows, cfg }) {
-  if (!(cfg.probeFraction > 0) || !probeEligible(task, source, registered)) return false;
+function probeSelected({ task, source, registered, lane, lanes, rows, cfg, degraded = false }) {
+  if (degraded || !(cfg.probeFraction > 0) || !probeEligible(task, source, registered)) return false;
   if (!lane || lane.tier == null || lane.reserve === false) return false;
   if (!(lanes || []).some((l) => l.id !== lane.id && l.tier != null && l.tier > lane.tier)) return false; // nothing bigger to fall back to
   if (qualification(lane, source, rows || [], cfg)) return false; // already proven -- reservation, not probing
@@ -98,11 +99,13 @@ function decideReservation({ source, thisLane, lanes, rows, ageMs, cfg, isAlive,
   return { holder: candidates[0].holder, evidence: candidates[0].evidence };
 }
 
+// Alive = fresh heartbeat AND not currently flagged degraded by the lane-health probe: work is never held for a lane that is up but crawling.
 function laneAliveFromHeartbeat(instancesDir, laneId, now = Date.now()) {
   try {
     const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, `${laneId}.json`), 'utf8'));
     const age = now - Date.parse(hb.lastHeartbeat);
-    return Number.isFinite(age) && age >= 0 && age <= HEARTBEAT_FRESH_MS;
+    if (!(Number.isFinite(age) && age >= 0 && age <= HEARTBEAT_FRESH_MS)) return false;
+    return !laneDegraded(instancesDir, laneId, { now });
   } catch (_) { return false; }
 }
 
