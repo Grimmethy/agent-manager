@@ -1977,3 +1977,42 @@ Delete the single line `require('../task-sources.js');` and the one blank line i
 
 Benefits:
 Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies (none beyond built-ins) explicit. Zero behavioural change: every function in the file is a pure function of its arguments and never touches any `task-sources.js` symbol.
+
+### AC-172 · Duplicated marker-inject/extract lifecycle with divergent contracts
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both `concepts.js` (via `injectConceptBuildInstruction` / `extractConceptBuildReport`) and `incident-amplification-marker.js` implement the same conceptual responsibility—inject a sentinel instruction into a prompt if not already present, then later parse and strip that marker from the model's response—but each defines its own parsing rules, required fields, scoping (e.g. "first blank line" boundary), and idempotency checks. Because there is no shared "marker protocol" contract, the two implementations can silently drift: one may tolerate multi-block markers while the other expects a single block, one may clean up extra blank lines while the other leaves them, and callers must memorize which module owns which marker. This shallow-interface duplication means a change to the injection or extraction semantics in one module has no enforcement mechanism to keep the other in sync.
+
+Solution:
+Extract a shared "marker protocol" helper (a small module or a set of pure functions) that encapsulates the inject-if-absent / extract-and-strip lifecycle: a single API that takes a marker template, a list of required fields, a scoping rule (e.g. "up to first blank line"), and a cleanup policy. Both `concepts.js` and `incident-amplification-marker.js` would then delegate to this shared helper, passing their specific marker strings and field requirements as configuration. The two modules retain their domain-specific naming and any domain-specific validation, but the mechanical inject/parse/strip/idempotency logic lives in one place.
+
+Benefits:
+A single source of truth for the inject/extract lifecycle eliminates the risk of divergent idempotency or cleanup behavior between the two markers. Adding a third marker in the future becomes a configuration change rather than a copy-paste of parsing logic. Callers no longer need to know which module "owns" which marker's mechanics; they only specify their marker's content and fields. The shared helper is trivially unit-testable in isolation (inject → extract round-trip, idempotency, malformed-input tolerance), which is harder to exercise when the logic is embedded in two larger modules.
+
+### AC-173 · concepts.js bundles registry persistence, state machine, and prompt-marker logic
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+`concepts.js` currently contains at least three distinct responsibilities: file I/O and registry persistence (`loadConcepts`, `writeConcepts`), a lifecycle state machine (`recordConceptResearch`, `recordConceptBuildTally`, `shelveConcept`, `reopenConcept`, `shipConcept`), timeline querying (`getConceptTimeline`), and prompt-marker injection/extraction (`injectConceptBuildInstruction`, `extractConceptBuildReport`). The prompt-marker logic is not conceptually part of the concept registry—it belongs to the "model response protocol" layer that `incident-amplification-marker.js` already represents. Bundling it here forces any caller that only needs lifecycle transitions to load marker-parsing code, and any caller that only needs the marker protocol to load registry I/O code. The two responsibilities have different change drivers (registry schema vs. prompt conventions) and different test surfaces, so coupling them in one module increases the blast radius of changes to either.
+
+Solution:
+Move `injectConceptBuildInstruction` and `extractConceptBuildReport` out of `concepts.js` into a dedicated module (e.g. `concept-build-marker.js`) that sits alongside `incident-amplification-marker.js` and, per AC-001, delegates its mechanical inject/extract work to the shared marker-protocol helper. `concepts.js` re-exports the two functions for backward compatibility (or callers are updated to import from the new module). The result is that `concepts.js` contains only registry persistence, state-machine transitions, and timeline queries—its true domain—while the prompt-marker concern is co-located with its sibling marker module.
+
+Benefits:
+Each module now has a single, coherent change driver: registry schema changes touch only `concepts.js`; prompt-convention changes touch only the marker modules. The state machine and file I/O in `concepts.js` become easier to reason about and test in isolation (no marker-parsing edge cases to account for). The marker modules form a visible, cohesive group that signals to a reader "this is the model-response-protocol layer," making the architecture self-documenting.
+
+### AC-174 · current-date-line.js is a standalone prompt-augmentation helper outside the marker protocol
+Strength: Worth exploring
+Files: src/current-date-line.js, src/claude-client.js, src/local-client.js
+
+Problem:
+`current-date-line.js` provides a single helper (`currentDateLine`) that is injected at choke points in `claude-client.js` and `local-client.js`. It is conceptually the same kind of concern as the concept-build marker and the amplify marker—prompt augmentation—but it is implemented as a free-standing one-function module with no shared inject/extract lifecycle, no idempotency guard, and no cleanup convention. The codebase thus has at least three separate "prompt augmentation" mechanisms, each with its own (or absent) idempotency, cleanup, and parsing rules. This is not a bug, but the absence of a unifying abstraction means that adding a fourth augmentation (or changing how the date line is injected) requires ad-hoc coordination across modules with no shared contract to enforce consistency.
+
+Solution:
+Fold `currentDateLine` into the shared marker-protocol helper introduced in AC-001 (or at minimum, give it the same inject-if-absent / idempotency-guard pattern). The date line would be registered as a "marker" whose template is the date string and whose extraction rule is "strip the line if present." `claude-client.js` and `local-client.js` would call the shared helper rather than the standalone function. This does not require a large refactor—the helper is small—but it brings the date line under the same idempotency and cleanup guarantees as the other two markers.
+
+Benefits:
+All three prompt-augmentation mechanisms share one idempotency contract and one cleanup policy, eliminating the risk that the date line is injected twice (or not stripped) while the other markers are handled correctly. A future augmentation (e.g. a system-prompt preamble) can be added by registering a new marker template rather than writing a new standalone module. The choke-point modules (`claude-client.js`, `local-client.js`) gain a single, uniform call site for all prompt augmentations, simplifying their code and making the set of active augmentations visible in one place.
