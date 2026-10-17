@@ -2102,3 +2102,16 @@ Benefits:
 - Module-graph tools report a clean, one-directional edge instead of an unexplained mid-function require, reducing false-positive noise.
 - The smoke test (option 3) guards the registration path against silent breakage from future refactors of `config.js` or `accessible-roots.js`.
 - Developers no longer need to reverse-engineer the circular path to understand why the require is deferred; the rationale is stated in the code.
+
+### AC-180 · `ollama_client.generate` sends `"model": null` to Ollama when `LOCAL_MODEL` is unset, producing a less actionable server error than the documented contract implies
+Strength: Strong
+Files: python/dashboard/ollama_client.py
+
+Problem:
+The module-level constant `MODEL` is initialized from `os.environ.get("LOCAL_MODEL")`, which yields `None` when the variable is unset. The `generate` function then builds its request body with `"model": MODEL` and serializes it via `json.dumps`. Because `None` is a valid JSON type (it serializes to `null`), no local exception is raised; the HTTP request is sent with the body `{"model": null, ...}`. Ollama receives a `null` model value and returns a server-side error (typically a generic "model not found" or "model must be a string" message). The user sees an opaque, server-generated error that does not identify the root cause — an unset `LOCAL_MODEL` environment variable — rather than the clear, actionable message the docstring describes. The failure mode is therefore less informative than the documented contract promises, and the user must infer the missing configuration from a generic server response.
+
+Solution:
+At the top of `generate` (or in a small helper called before the request is built), check whether `MODEL` is `None` or an empty string. If so, raise a `ValueError` (or a dedicated `OllamaClientError`) with a message such as `"LOCAL_MODEL environment variable is not set; please configure it to a valid Ollama model name."` This ensures the caller receives an immediate, locally-generated error that names the exact configuration problem, without depending on the wording of Ollama's server-side response.
+
+Benefits:
+The failure mode now matches the documented behavior: the user receives a clear, actionable message identifying the missing configuration rather than a generic server error that requires inference. Debugging time drops because the root cause (unset environment variable) is stated explicitly at the point of failure. The function's contract becomes reliable regardless of whether the caller is running in a container, a CI job, or a developer shell where `LOCAL_MODEL` may not yet be exported, and the error is independent of Ollama's internal error-message wording (which could change across server versions).
