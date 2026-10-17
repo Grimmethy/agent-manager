@@ -1,6 +1,6 @@
 # Design Note: Capability Routing and Task-Class Benchmarking
 
-**Status:** built 2026-10-17: step 1 (ledger, #570), step 2 (shadow reservation with an `enforce` switch, #571), escalation on timeout/degenerate/error (#572). Designed, not built: probing (section 5) and the probe debrief / shrink loop (section 5a). (Grimmethy + Claude)
+**Status:** built 2026-10-17: ledger (#570), shadow reservation with an `enforce` switch (#571), escalation on timeout/degenerate/error (#574), probing, shadow by default (#575), and the probe debrief's deterministic evidence bundle (#576). Not built: the `capability_debrief` report source, human-gated filing and the fix-merged reset (section 5a). (Grimmethy + Claude)
 **Related code:** `src/lanes.js`, `src/next-claimable-task.js`, `src/reject-retry-check.js`, `src/premium-rotation.js`
 **Related docs:** [lanes.md](../agents/lanes.md)
 

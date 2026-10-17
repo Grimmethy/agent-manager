@@ -179,6 +179,65 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         self._seed([])
         self.assertEqual(self.client.post("/api/brain-dump/nope/suppress").status_code, 404)
 
+    # HUB0148 (2026-10-15): string serials in brain-dump.json ('1752', ...) used to make
+    # capture's max() raise TypeError -> HTTP 500, and read left the str on disk. These two
+    # tests pin both halves: capture survives mixed int/string/junk serials and numbers
+    # one above the max int-coercible serial, and read_brain_dump_entries heals a string
+    # serial to an int PERSISTED on disk.
+    def test_capture_survives_mixed_int_string_and_junk_serials_and_numbers_above_max_int(self):
+        # Max int-coercible serial here is 1753 (the string '1752' is int-coercible but
+        # lower; the slug junk is not coercible at all), so the next serial must be 1754
+        # -- and capture must not 500 on the mixed types.
+        self._seed([
+            {"id": "bd-int-a", "serial": 1752, "rawText": "one", "status": "captured"},
+            {"id": "bd-int-b", "serial": 1753, "rawText": "two", "status": "captured"},
+            {"id": "bd-str", "serial": "1752", "rawText": "string serial", "status": "captured"},
+            {"id": "bd-junk", "serial": "bd-1791055597086-file-level-dead-code-scan",
+             "rawText": "junk serial", "status": "captured"},
+        ])
+        resp = self.client.post("/api/brain-dump/capture", json={"text": "capture must not 500"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        entry = resp.get_json()
+        self.assertEqual(entry["serial"], 1754)
+        self.assertIsInstance(entry["serial"], int)
+        appended = [e for e in self._entries() if e.get("id") == entry["id"]]
+        self.assertEqual(len(appended), 1)
+        self.assertEqual(appended[0]["serial"], 1754)
+        self.assertIsInstance(appended[0]["serial"], int)
+
+    # Pins the merged fix's real semantics: a string serial HIGHER than every int serial
+    # IS int-coerced and counts toward max (so '1754' as a string -> next is 1755, not
+    # 1754). The 2026-10-15 bug was that such strings crashed max() with TypeError; this
+    # confirms they are tolerated AND coerced.
+    def test_capture_int_coerces_a_higher_string_serial_and_increments_above_it(self):
+        self._seed([
+            {"id": "bd-int-a", "serial": 1752, "rawText": "one", "status": "captured"},
+            {"id": "bd-int-b", "serial": 1753, "rawText": "two", "status": "captured"},
+            {"id": "bd-str-high", "serial": "1754", "rawText": "string serial", "status": "captured"},
+            {"id": "bd-junk", "serial": "bd-1791055597086-file-level-dead-code-scan",
+             "rawText": "junk serial", "status": "captured"},
+        ])
+        resp = self.client.post("/api/brain-dump/capture", json={"text": "string serials tolerated"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        entry = resp.get_json()
+        self.assertEqual(entry["serial"], 1755)
+        self.assertIsInstance(entry["serial"], int)
+
+    def test_read_brain_dump_entries_heals_string_serial_to_int_on_disk(self):
+        self._seed([
+            {"id": "bd-str-heal", "serial": "1752", "rawText": "string serial", "status": "captured"},
+            {"id": "bd-int-keep", "serial": 1753, "rawText": "int serial", "status": "captured"},
+        ])
+        entries = app.read_brain_dump_entries()
+        by_id = {e.get("id"): e for e in entries if isinstance(e, dict)}
+        self.assertIsInstance(by_id["bd-str-heal"]["serial"], int)
+        self.assertEqual(by_id["bd-str-heal"]["serial"], 1752)
+        self.assertEqual(by_id["bd-int-keep"]["serial"], 1753)
+        # Independent re-read straight from disk: the heal must be persisted, not just in-memory.
+        on_disk = {e.get("id"): e for e in json.loads(self.brain_dump.read_text(encoding="utf-8"))["entries"]}
+        self.assertIsInstance(on_disk["bd-str-heal"]["serial"], int)
+        self.assertEqual(on_disk["bd-str-heal"]["serial"], 1752)
+
     def test_prioritize_queues_an_adhoc_task_and_actions_the_entry(self):
         self._seed([{"id": "bd-p", "serial": 1, "rawText": "do this now", "status": "captured"}])
         resp = self.client.post("/api/brain-dump/bd-p/prioritize")
