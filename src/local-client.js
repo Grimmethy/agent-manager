@@ -264,6 +264,36 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
 }
 
+// 2026-10-17 (first call on grimm's 8 GB lane): a model WITHOUT the thinking capability (qwen3-vl:8b-instruct) rejects any request carrying
+// think:true with HTTP 400 `"<model>" does not support thinking`, and callOnce's default is think:true, so every plan/implement pass on such a
+// lane hard-failed in ~2 ms. Learn it once per (endpoint, model): on that exact 400, retry the same request WITHOUT the think field (omitted rather
+// than false, so it is accepted whichever way a given Ollama treats think:false on a non-thinking model), and send later requests for that model
+// without it up front. Any other error, or a request that did not ask for thinking, is untouched.
+const THINK_UNSUPPORTED = new Set(); // `${url}|${model}`
+const THINK_UNSUPPORTED_RE = /does not support thinking/i;
+function isThinkUnsupportedError(e) {
+  return !!e && e.statusCode === 400 && THINK_UNSUPPORTED_RE.test(String(e.message || ''));
+}
+function withoutThink(body) {
+  const { think, ...rest } = body;
+  void think;
+  return rest;
+}
+async function postGenerate({ url, body, timeoutMs, headers, post = postJson, unsupported = THINK_UNSUPPORTED }) {
+  const key = `${url}|${body.model}`;
+  const target = `${url}/api/generate`;
+  const sent = (body.think && unsupported.has(key)) ? withoutThink(body) : body;
+  try {
+    return await post(target, sent, timeoutMs, headers);
+  } catch (e) {
+    if (sent.think && isThinkUnsupportedError(e)) {
+      unsupported.add(key);
+      return post(target, withoutThink(sent), timeoutMs, headers);
+    }
+    throw e;
+  }
+}
+
 async function callOnce({ prompt, images, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
   // Forge exclusion (2026-10-14): never START a model call while PromptForge's comfyui-lease is held -- it would reload the model
   // PromptForge just evicted. Checked here, before any prompt building, in-flight lock or network I/O. See gpu-guard.js ForgePauseError.
@@ -334,7 +364,7 @@ async function callOnce({ prompt, images, think = true, temperature = 0.4, numCt
   // default/global scope when omitted, same as it always did before this existed.
   if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
   try {
-    const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs, tokenFoldHeaders);
+    const result = await postGenerate({ url: OLLAMA_URL, body, timeoutMs: resolvedTimeoutMs, headers: tokenFoldHeaders });
     localThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration, endpoint: OLLAMA_URL, model: lockModel });
     // 2026-08-23, Grimmethy: "we need a way to differentiate 'working' from 'loading'...
     // this isn't the first time a lack of verbosity has caused us confusion" -- Ollama's
@@ -675,7 +705,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,
