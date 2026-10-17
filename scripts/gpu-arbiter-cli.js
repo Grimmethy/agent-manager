@@ -35,12 +35,12 @@ function instancesDir() {
 }
 
 const cmd = process.argv[2];
-const { localOllamaLockKey, p40OllamaLockKey } = require(path.join(__dirname, '..', 'src', 'lib', 'ollama-lock-key.js'));
+const { localOllamaLockKey, remoteLaneLockKeys } = require(path.join(__dirname, '..', 'src', 'lib', 'ollama-lock-key.js'));
 // The serialization key the arbiter functions look tickets up by (model is only a key when nothing better is given).
 function resolveKey() {
   if (process.argv.includes('--local')) {
     const key = localOllamaLockKey();
-    if (key === p40OllamaLockKey()) { process.stderr.write(`gpu-arbiter-cli: --local resolves to the P40 endpoint (${key}); refusing, the chat only takes over the host GPU\n`); return null; }
+    if (remoteLaneLockKeys().includes(key)) { process.stderr.write(`gpu-arbiter-cli: --local resolves to a remote lane's endpoint (${key}); refusing, the chat only takes over the host GPU\n`); return null; }
     return key;
   }
   return arg('key', arg('model', process.env.LOCAL_MODEL || ''));

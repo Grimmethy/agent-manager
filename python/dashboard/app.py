@@ -140,6 +140,7 @@ from app_task_helpers import (  # noqa: F401
     _DIFF_GIT_HEADER_RE,
     _FENCED_JSON_RE,
     _GIVE_UP_ARCHIVE_STATES,
+    _LANE_DEFS_CACHE,
     _LANE_IDS_CACHE,
     _LANE_IDS_TTL_S,
     _QUOTED_SYMBOL_RE,
@@ -747,6 +748,32 @@ def worker_lane_ids() -> list[str]:
         _LANE_IDS_CACHE.update(at=now, ids=ids)
         return list(ids)
     return list(_LANE_IDS_CACHE["ids"]) or ["worker-local"]
+
+
+def worker_lane_defs() -> list[dict]:
+    """The pipeline's lanes as full definitions ({id, gpu, local, preempt, taskClasses, env}), in lane order.
+    Same single source as worker_lane_ids() (src/lanes.js: the host lane, the legacy P40 lane, and the lanes registry file), shelled out to
+    so the two languages cannot drift, and cached briefly. Returns the last good answer, or [] when node/lanes.js is unavailable --
+    callers must treat [] as "unknown" and fall back, never as "no lanes"."""
+    now = time.monotonic()
+    if _LANE_DEFS_CACHE["lanes"] and now - _LANE_DEFS_CACHE["at"] < _LANE_IDS_TTL_S:
+        return list(_LANE_DEFS_CACHE["lanes"])
+    lanes: list[dict] = []
+    try:
+        cp = subprocess.run(
+            ["node", str(SRC_DIR / "lanes.js")],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        parsed = json.loads(cp.stdout)
+        if isinstance(parsed, list):
+            lanes = [l for l in parsed if isinstance(l, dict) and l.get("id")]
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.warning("could not read worker lane definitions from src/lanes.js: %s", exc)
+    if lanes:
+        _LANE_DEFS_CACHE.update(at=now, lanes=lanes)
+        return list(lanes)
+    return list(_LANE_DEFS_CACHE["lanes"])
 
 
 def _expected_instance_ids() -> list[str]:

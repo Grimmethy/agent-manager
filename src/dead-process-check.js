@@ -35,7 +35,7 @@
 
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
-const { laneById } = require('./lanes.js');
+const { laneById, isSlowLane } = require('./lanes.js');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { STALE_HEARTBEAT_SECONDS, WORKER_ZOMBIE_THRESHOLD_SECONDS } = require('./heartbeat-thresholds.js');
@@ -49,8 +49,8 @@ const { STALE_HEARTBEAT_SECONDS, WORKER_ZOMBIE_THRESHOLD_SECONDS } = require('./
 // 3600s worst case, well past the general 1680s threshold, so the watchdog would kill a
 // legitimately still-generating P40 worker mid-call. Same slack-margin discipline as the
 // general value (+240s), applied only to the two P40 instanceIds.
-const WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 = 3840; // 64 min -- 4*900s draft chain (3600s) + 240s slack, mirrors the general value's own margin.
-const P40_INSTANCE_IDS = new Set(['worker-p40']);
+const WORKER_ZOMBIE_THRESHOLD_SECONDS_SLOW = 3840; // 64 min -- 4*900s draft chain (3600s) + 240s slack, mirrors the general value's own margin.
+// 2026-10-17: the long threshold now applies to every lane marked `slow` in src/lanes.js (isSlowLane; worker-p40 always counts), not just worker-p40.
 const RESTART_COOLDOWN_SECONDS = 120; // don't re-restart the same instanceId again this soon -- a fresh replacement's own first heartbeat can take a moment to land.
 
 // instanceId -> { script, args, pidfileName, env? }. A worker lane restarts EXACTLY as launch.sh
@@ -174,7 +174,7 @@ async function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }
       const ownerPid = hb.daemonPid != null ? hb.daemonPid : hb.pid;
       const pidAlive = isProcessAlive(ownerPid);
       const isWorker = hb.instanceId.startsWith('worker-');
-      const zombieThreshold = P40_INSTANCE_IDS.has(hb.instanceId) ? WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 : WORKER_ZOMBIE_THRESHOLD_SECONDS;
+      const zombieThreshold = isSlowLane(hb.instanceId) ? WORKER_ZOMBIE_THRESHOLD_SECONDS_SLOW : WORKER_ZOMBIE_THRESHOLD_SECONDS;
       const isZombie = pidAlive && isWorker && ageSeconds >= zombieThreshold;
 
       if (pidAlive && !isZombie) continue; // still alive, just a slow single call (or a non-worker instance, which keeps the strict PID-gate).

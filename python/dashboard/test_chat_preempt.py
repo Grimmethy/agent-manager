@@ -66,12 +66,24 @@ class PreemptDecisionTest(unittest.TestCase):
             self.assertFalse(app._is_preemptable_child_pass(p), repr(p))
 
     def test_lane_sets_are_the_local_gpu_lane_plus_age_gated_reviewer_never_the_p40(self):
-        with mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40"]):
+        defs = [{"id": "worker-3090", "preempt": "always"}, {"id": "worker-p40", "preempt": "never"}]
+        with mock.patch.object(app, "worker_lane_defs", return_value=defs):
             self.assertEqual(app._preempt_lane_sets(), (("worker-3090",), ("reviewer",)))
 
     def test_a_p40_only_layout_preempts_no_worker_lane(self):
-        with mock.patch.object(app, "worker_lane_ids", return_value=["worker-p40"]):
+        with mock.patch.object(app, "worker_lane_defs", return_value=[{"id": "worker-p40", "preempt": "never"}]):
             self.assertEqual(app._preempt_lane_sets(), ((), ("reviewer",)))
+
+    def test_a_registry_lane_is_never_preempted_unless_it_opts_in_to_age_gating(self):
+        defs = [{"id": "worker-3090", "preempt": "always"}, {"id": "worker-rx580", "preempt": "never"},
+                {"id": "worker-a770", "preempt": "age-gated"}]
+        with mock.patch.object(app, "worker_lane_defs", return_value=defs):
+            self.assertEqual(app._preempt_lane_sets(), (("worker-3090",), ("reviewer", "worker-a770")))
+
+    def test_unreadable_lane_definitions_fall_back_to_the_old_everything_but_the_p40_rule(self):
+        with mock.patch.object(app, "worker_lane_defs", return_value=[]), \
+                mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40", "worker-rx580"]):
+            self.assertEqual(app._preempt_lane_sets(), (("worker-3090", "worker-rx580"), ("reviewer",)))
 
 
 class ArbiterCancelBelowArgsTest(unittest.TestCase):
