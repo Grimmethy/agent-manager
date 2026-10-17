@@ -763,3 +763,76 @@ test('lane avoidance: still claimable when worker-p40 is the only lane, or when 
     if (prev === undefined) delete process.env.AGENT_MANAGER_LANE_AVOIDANCE; else process.env.AGENT_MANAGER_LANE_AVOIDANCE = prev;
   }
 });
+
+// Capability routing (src/capability-routing.js): a bigger lane leaves a task to a proven smaller lane.
+const TIERED_LANES = [
+  { id: 'worker-3090', gpu: '3090', env: {}, local: true, preempt: 'always', taskClasses: null, model: 'big:27b', tier: 27, reserve: 'auto' },
+  { id: 'worker-rx580', gpu: 'rx580', env: { OLLAMA_URL: 'http://g:11434' }, local: false, preempt: 'never', taskClasses: null, model: 'small:8b', tier: 8, reserve: 'auto' },
+];
+const PROVEN = [{ source: 'trouble_log', model: 'small:8b', tier: 8, n: 12, ok: 12, okRate: 1, lower: 0.76 }];
+
+function withRouting(mode, fn) {
+  const prev = process.env.AGENT_MANAGER_CAPABILITY_ROUTING;
+  process.env.AGENT_MANAGER_CAPABILITY_ROUTING = mode;
+  try { fn(); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_CAPABILITY_ROUTING; else process.env.AGENT_MANAGER_CAPABILITY_ROUTING = prev; }
+}
+
+function routingOpts(extra = {}) {
+  return { lanes: TIERED_LANES, graceMs: 0, scorecard: PROVEN, laneAlive: () => true, instancesDir: fs.mkdtempSync(path.join(os.tmpdir(), 'routing-inst-')), ...extra };
+}
+
+test('capability routing (enforce): the big lane skips a source a live smaller lane has proven, the small lane still takes it', () => {
+  withRouting('enforce', () => {
+    const pendingDir = setupPending();
+    writeTask(pendingDir, 'small-task', { source: 'trouble_log' });
+    writeTask(pendingDir, 'adhoc-task', { source: 'adhoc', humanQueued: true });
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', routingOpts()), ['adhoc-task.json']);
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', routingOpts()), ['adhoc-task.json', 'small-task.json']);
+  });
+});
+
+test('capability routing: shadow mode (the default) changes nothing but writes an audit line once', () => {
+  withRouting('shadow', () => {
+    const pendingDir = setupPending();
+    writeTask(pendingDir, 'small-task', { source: 'trouble_log' });
+    const opts = routingOpts();
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', opts), ['small-task.json']);
+    pickClaimableTasks(pendingDir, 'worker-3090', opts);
+    const log = fs.readFileSync(path.join(pendingDir, '..', '..', 'instances', 'pipeline-history.log'), 'utf8').trim().split('\n');
+    assert.equal(log.length, 1);
+    const entry = JSON.parse(log[0]);
+    assert.equal(entry.type, 'reservation');
+    assert.equal(entry.action, 'would-hold');
+    assert.equal(entry.holder, 'worker-rx580');
+  });
+});
+
+test('capability routing (enforce): no hold when the small lane is dead, the grace expired, the source is unproven, or the task is human-queued/escalated', () => {
+  withRouting('enforce', () => {
+    const pendingDir = setupPending();
+    writeTask(pendingDir, 'small-task', { source: 'trouble_log' });
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', routingOpts({ laneAlive: () => false })), ['small-task.json']);
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', routingOpts({ now: Date.now() + 10 * 60 * 1000 })), ['small-task.json']);
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', routingOpts({ scorecard: [] })), ['small-task.json']);
+    const humanDir = setupPending();
+    writeTask(humanDir, 'human-task', { source: 'trouble_log', humanQueued: true });
+    assert.deepEqual(pickClaimableTasks(humanDir, 'worker-3090', routingOpts()), ['human-task.json']);
+    const escalated = setupPending();
+    writeTask(escalated, 'esc-task', { source: 'trouble_log', avoidLanes: ['worker-rx580'] });
+    assert.deepEqual(pickClaimableTasks(escalated, 'worker-3090', routingOpts()), ['esc-task.json']);
+  });
+});
+
+test('capability routing: off switch and untiered lanes behave exactly as before', () => {
+  withRouting('off', () => {
+    const pendingDir = setupPending();
+    writeTask(pendingDir, 'small-task', { source: 'trouble_log' });
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', routingOpts()), ['small-task.json']);
+  });
+  withRouting('enforce', () => {
+    const pendingDir = setupPending();
+    writeTask(pendingDir, 'small-task', { source: 'trouble_log' });
+    const untiered = TIERED_LANES.map((l) => ({ ...l, tier: null }));
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', routingOpts({ lanes: untiered })), ['small-task.json']);
+  });
+});

@@ -40,6 +40,8 @@ that the thing to remove.)
 | `numCtx` | no | whole number 2048..131072: the one `num_ctx` this lane's calls use. **Set it for any card smaller than the 24 GB ones**: the pipeline pins `49152` (sized for the 3090/P40) and an 8 GB card cannot hold that next to an 8B model. Measured on an RX 580 8 GB, qwen3-vl:8b: `49152` -> 10.6 tok/s at 80% GPU; `16384` -> 26.2 tok/s at 100% GPU (with a q8 KV cache; f16 KV: 8.0 tok/s at `49152`). It is exported as `AGENT_MANAGER_LANE_NUM_CTX` to that lane's processes only |
 | `taskClasses` | no | allowlist of task **source** names (`brain_dump_sort`, `change_review`, `observability_review`, `staleness_audit`, ...). Absent = claims any task. Must be non-empty if present |
 | `preempt` | no | `always` \| `age-gated` \| `never` (default `never`): whether an interactive chat turn may kill this lane's in-flight call. Only the host lane is `always`: the chat takes over the host GPU only |
+| `tier` | no | positive number, billions of parameters. Defaults to the size parsed from `model` (`qwen3-vl:8b-instruct` -> 8); set it when the tag carries no size. Capability routing only compares tiers; a lane with an unknown tier is never reserved around |
+| `reserve` | no | `"auto"` (default: this lane is reserved for a source once the capability ledger shows it handles it), `"always"` (reserved for everything in its `taskClasses`, no evidence needed), or `false` (never reserve work for this lane) |
 | `slow` | no | `true` for a categorically slower endpoint (the P40 is the model case): longer per-call timeout ceiling and watchdog zombie threshold, so a slow-but-alive lane is not killed mid-call. Default `false` |
 
 ## Behaviours worth knowing
@@ -54,6 +56,18 @@ that the thing to remove.)
 - `generation-throttle.js` counts every live lane when deciding how many tasks may be in flight, so a restricted lane raises that count even
   though it can only take some tasks. Revisit if a tiny lane starts causing over-generation.
 - The reviewer's CONFIRM/DENY votes and other non-task model calls use the process's own `OLLAMA_URL`; they are **not** routed to lanes.
+
+## Capability routing (`src/capability-routing.js`)
+
+A bigger-tier lane leaves a task alone while a **lower-tier** lane that has proven itself on that task's source is alive, for at most
+`AGENT_MANAGER_RESERVATION_GRACE_SECS` (default 300). "Proven" = the capability ledger scorecard (`src/capability-ledger.js`) shows at least
+`AGENT_MANAGER_CAPABILITY_MIN_ATTEMPTS` (8) attempts and a success-rate lower bound within `AGENT_MANAGER_CAPABILITY_MARGIN` (0.10) of the best larger
+tier's (or, with no larger-tier data, a success rate of at least `AGENT_MANAGER_CAPABILITY_MIN_OK_RATE`, 0.85), or the lane says `reserve: "always"`.
+Human-queued and premium tasks, operator pins, and tasks that already failed on the small lane (`avoidLanes`) are never held.
+
+`AGENT_MANAGER_CAPABILITY_ROUTING` = `shadow` (default: decide and log one `reservation` line per task/lane/holder to the pipeline-history log, change
+nothing), `enforce`, or `off`. Design and rollout: `docs/design-notes/capability-routing-and-benchmarking.md`. `launch.sh` exports
+`AGENT_MANAGER_HOST_LOCAL_MODEL` so the host lane's tier is known inside remote-lane workers.
 
 ## Tests
 
