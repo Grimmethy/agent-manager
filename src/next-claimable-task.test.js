@@ -771,10 +771,15 @@ const TIERED_LANES = [
 ];
 const PROVEN = [{ source: 'trouble_log', model: 'small:8b', tier: 8, n: 12, ok: 12, okRate: 1, lower: 0.76 }];
 
-function withRouting(mode, fn) {
+function withRouting(mode, fn, probeFraction = '0') {
   const prev = process.env.AGENT_MANAGER_CAPABILITY_ROUTING;
+  const prevProbe = process.env.AGENT_MANAGER_PROBE_FRACTION;
   process.env.AGENT_MANAGER_CAPABILITY_ROUTING = mode;
-  try { fn(); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_CAPABILITY_ROUTING; else process.env.AGENT_MANAGER_CAPABILITY_ROUTING = prev; }
+  process.env.AGENT_MANAGER_PROBE_FRACTION = probeFraction;
+  try { fn(); } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_CAPABILITY_ROUTING; else process.env.AGENT_MANAGER_CAPABILITY_ROUTING = prev;
+    if (prevProbe === undefined) delete process.env.AGENT_MANAGER_PROBE_FRACTION; else process.env.AGENT_MANAGER_PROBE_FRACTION = prevProbe;
+  }
 }
 
 function routingOpts(extra = {}) {
@@ -835,4 +840,44 @@ test('capability routing: off switch and untiered lanes behave exactly as before
     const untiered = TIERED_LANES.map((l) => ({ ...l, tier: null }));
     assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', routingOpts({ lanes: untiered })), ['small-task.json']);
   });
+});
+
+test('probing (enforce, fraction 1): a restricted small lane is offered ONE unproven off-allowlist task per call; the big lane holds probe tasks for an idle small lane', () => {
+  const RESTRICTED = TIERED_LANES.map((l) => (l.id === 'worker-rx580' ? { ...l, taskClasses: ['adhoc'] } : l));
+  withRouting('enforce', () => {
+    const pendingDir = setupPending();
+    writeTask(pendingDir, 'probe-a', { source: 'trouble_log' });
+    writeTask(pendingDir, 'probe-b', { source: 'trouble_log' });
+    writeTask(pendingDir, 'adhoc-task', { source: 'adhoc', humanQueued: true });
+    const small = pickClaimableTasks(pendingDir, 'worker-rx580', routingOpts({ lanes: RESTRICTED, scorecard: [] }));
+    assert.equal(small.filter((n) => n.startsWith('probe-')).length, 1, 'exactly one probe');
+    const bigWhenIdle = pickClaimableTasks(pendingDir, 'worker-3090', routingOpts({ lanes: RESTRICTED, scorecard: [], laneIdle: () => true }));
+    assert.deepEqual(bigWhenIdle, ['adhoc-task.json'], 'big lane leaves probe tasks to the idle small lane');
+    const bigWhenBusy = pickClaimableTasks(pendingDir, 'worker-3090', routingOpts({ lanes: RESTRICTED, scorecard: [], laneIdle: () => false }));
+    assert.equal(bigWhenBusy.length, 3, 'a busy small lane holds nothing');
+  }, '1');
+});
+
+test('probing: shadow mode and fraction 0 change nothing; paused/ineligible tasks are never probed', () => {
+  const RESTRICTED = TIERED_LANES.map((l) => (l.id === 'worker-rx580' ? { ...l, taskClasses: ['adhoc'] } : l));
+  withRouting('shadow', () => {
+    const pendingDir = setupPending();
+    writeTask(pendingDir, 'probe-a', { source: 'trouble_log' });
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', routingOpts({ lanes: RESTRICTED, scorecard: [] })), []);
+    const log = fs.readFileSync(path.join(pendingDir, '..', '..', 'instances', 'pipeline-history.log'), 'utf8');
+    assert.match(log, /"action":"would-probe"/);
+  }, '1');
+  withRouting('enforce', () => {
+    const pendingDir = setupPending();
+    writeTask(pendingDir, 'probe-a', { source: 'trouble_log' });
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', routingOpts({ lanes: RESTRICTED, scorecard: [] })), [], 'fraction 0 = never');
+  }, '0');
+  withRouting('enforce', () => {
+    const pendingDir = setupPending();
+    writeTask(pendingDir, 'probe-a', { source: 'trouble_log' });
+    const paused = [{ source: 'trouble_log', model: 'small:8b', tier: 8, n: 3, ok: 0, okRate: 0, lower: 0, failStreak: 3 }];
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', routingOpts({ lanes: RESTRICTED, scorecard: paused })), []);
+    writeTask(pendingDir, 'human-a', { source: 'trouble_log', humanQueued: true });
+    assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', routingOpts({ lanes: RESTRICTED, scorecard: [] })), ['probe-a.json']);
+  }, '1');
 });

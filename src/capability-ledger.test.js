@@ -53,3 +53,9 @@ test('recordAttempt never throws on a bad dir or null attempt', () => {
   L.recordAttempt(__filename, { outcome: 'succeeded' }, {}); // a file where a dir is expected
   L.recordAttempt('/tmp', null, {});
 });
+
+test('buildScorecard: failStreak is the trailing run of non-ok attempts', () => {
+  const mk = (outcome) => ({ source: 's', model: 'm:8b', outcome });
+  assert.equal(L.buildScorecard([mk('ok'), mk('timeout'), mk('error')])[0].failStreak, 2);
+  assert.equal(L.buildScorecard([mk('timeout'), mk('ok')])[0].failStreak, 0);
+});

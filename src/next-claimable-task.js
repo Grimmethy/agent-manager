@@ -247,6 +247,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     _rows: null,
     rows() { if (!this._rows) this._rows = opts.scorecard || capRouting.cachedScorecard(pipelineDir, this.cfg); return this._rows; },
   };
+  let probesOffered = 0;
   const pinned = [];
   const rankable = [];
   for (const name of names) {
@@ -268,7 +269,22 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     if (task && thisLane && Array.isArray(thisLane.taskClasses)) {
       let sourceName = null;
       try { sourceName = resolveSourceName(task); } catch (_) { sourceName = null; }
-      if (!require('./lanes.js').laneAllowsSource(thisLane, sourceName)) continue;
+      if (!require('./lanes.js').laneAllowsSource(thisLane, sourceName)) {
+        // Probing (capability-routing.js): outside its allowlist, a small lane is still offered a deterministic fraction of eligible tasks of
+        // sources it has not proven. Shadow mode only logs; enforce lets ONE probe through per call.
+        let probe = false;
+        if (routing.cfg.mode !== 'off') {
+          try {
+            probe = capRouting.probeSelected({ task, source: sourceName, registered: getRegisteredSource(sourceName), lane: thisLane, lanes: opts.lanes || require('./lanes.js').getLanes(), rows: routing.rows(), cfg: routing.cfg });
+          } catch (_) { probe = false; }
+        }
+        if (!probe) continue;
+        capRouting.auditReservation(pipelineDir, routing.instancesDir, {
+          mode: routing.cfg.mode, action: routing.cfg.mode === 'enforce' ? 'probe' : 'would-probe', taskId: task.id || name, source: sourceName, lane: thisLane.id, holder: thisLane.id, evidence: 'probe',
+        });
+        if (routing.cfg.mode !== 'enforce' || probesOffered >= 1) continue;
+        probesOffered += 1;
+      }
     }
 
     // Capability routing (src/capability-routing.js): a lane leaves a task to a lower-tier lane that has proven itself on its source, for a
@@ -282,6 +298,8 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
         source: srcName, thisLane, lanes: allLanes, rows: routing.rows(), ageMs: (opts.now !== undefined ? opts.now : Date.now()) - mtimeMs, cfg: routing.cfg,
         isAlive: (id) => (opts.laneAlive ? opts.laneAlive(id) : require('./capability-routing.js').laneAliveFromHeartbeat(routing.instancesDir, id)),
         avoided: (id) => laneAvoided(task, id, allLanes.length),
+        probing: (l) => capRouting.probeSelected({ task, source: srcName, registered: getRegisteredSource(srcName), lane: l, lanes: allLanes, rows: routing.rows(), cfg: routing.cfg }),
+        isIdle: (id) => (opts.laneIdle ? opts.laneIdle(id) : capRouting.laneIdleFromHeartbeat(routing.instancesDir, id)),
       });
       if (decision) {
         require('./capability-routing.js').auditReservation(pipelineDir, routing.instancesDir, {
