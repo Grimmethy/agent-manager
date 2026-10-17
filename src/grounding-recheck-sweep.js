@@ -51,7 +51,7 @@ const {
 require('./task-sources.js');
 try { require('./config.js').ensureRegistered(); } catch { /* no live config (e.g. a unit test) -- fine, nothing to register */ }
 
-const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief']);
+const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief', 'capability_debrief']);
 const DIRS = ['blocked', 'needs-clarification'];
 
 const enabled = () => process.env.AGENT_MANAGER_GROUNDING_RECHECK !== 'false';

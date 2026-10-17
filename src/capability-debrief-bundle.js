@@ -84,6 +84,14 @@ function markDebriefed(instancesDir, cluster, extra = {}) {
   fs.writeFileSync(path.join(instancesDir, STATE_FILE), JSON.stringify(state, null, 2));
 }
 
+// Same record as markDebriefed, keyed by the cluster key a queued task carries in promptContext (the task generator has no cluster object after the write).
+function markDebriefedByKey(instancesDir, key, extra = {}) {
+  const state = readState(instancesDir);
+  state[key] = { at: new Date().toISOString(), ...extra };
+  fs.mkdirSync(instancesDir, { recursive: true });
+  fs.writeFileSync(path.join(instancesDir, STATE_FILE), JSON.stringify(state, null, 2));
+}
+
 function resetCluster(instancesDir, cluster) {
   const state = readState(instancesDir);
   delete state[clusterKey(cluster)];
@@ -180,7 +188,7 @@ function readLedgerEntries(pipelineDir, { windowDays = DEFAULT_WINDOW_DAYS, now 
 }
 
 module.exports = {
-  failureSignature, clusterKey, collectFailureClusters, pendingClusters, markDebriefed, resetCluster,
+  failureSignature, clusterKey, collectFailureClusters, pendingClusters, markDebriefed, markDebriefedByKey, resetCluster,
   buildCapabilityDebriefBundle, readLedgerEntries, DEFAULT_MIN_FAILURES, STATE_FILE,
 };
 
