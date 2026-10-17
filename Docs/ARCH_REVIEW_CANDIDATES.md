@@ -1964,3 +1964,16 @@ Extract the destination-path construction and directory-ensuring logic into a si
 
 Benefits:
 A single source of truth for the archive destination means any future change to bucketing granularity, directory naming, or filesystem-creation strategy is made in exactly one place. The two public functions become thinner and more obviously equivalent, reducing the cognitive load on reviewers and eliminating the class of "I updated one but forgot the other" regressions.
+
+### AC-171 · Redundant side-effect require of task-sources.js in apply-core.js
+Strength: Strong
+Files: src/lib/apply-core.js
+
+Problem:
+`src/lib/apply-core.js` contains a bare, unassigned side-effect require of `../task-sources.js` sitting between the header comment and the first exported function. None of the file's exported functions (`coAuthorTrailer`, `usesGroupB`, `applyCandidateSplit`, `writeArtifact`, `closeOriginatingBrainDumpEntry`, `assertStageableFiles`) reference any symbol originating from `task-sources.js`. The require is redundant because `src/prompts.js`, the primary consumer of these functions, already loads `./task-sources.js` directly. The dead require adds a needless module-graph edge and a small circular-require risk without providing any value to this file.
+
+Solution:
+Delete the single line `require('../task-sources.js');` and the one blank line immediately preceding it, so the header comment is followed by a single blank line and then the first function. No other line in the file is touched: the `'use strict'` directive, header comment, all function bodies, and the `module.exports` statement remain byte-identical.
+
+Benefits:
+Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies (none beyond built-ins) explicit. Zero behavioural change: every function in the file is a pure function of its arguments and never touches any `task-sources.js` symbol.
