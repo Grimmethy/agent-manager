@@ -11828,3 +11828,166 @@ No behavioural change: every `try/catch` boundary, every `continue`, every `summ
 
 Benefits:
 Each helper is unit-testable in isolation (feed a synthetic `parent` with a stuck child and assert the `coordinatorBlocked` shape without touching the filesystem or the full loop). The main loop reads top-to-bottom as a numbered pipeline, so the ordering invariant is visible at a glance rather than buried in 254 lines of interleaved `try/catch` blocks. New responsibilities get their own numbered step and helper instead of another 20-line block spliced into the middle of the loop. The `summary` object is passed explicitly, making data flow auditable in code review.
+
+### AC-197 · Draft adhoc orchestrator mixes five pre-flight gates, a scope sub-workflow, and an execution closure
+Strength: Strong
+Files: src/local-agentic-write-draft.js
+Symbol: draftAdhocViaLocalAgenticWrite
+Snippet:
+```
+ * @param {function} [deps.recordModelCall]
+ */
+async function draftAdhocViaLocalAgenticWrite(task, {
+  runPlan = runPlanWithTools,
+  runInWorktree,
+  recordModelCall = defaultRecordModelCall,
+} = {}) {
+  // A deliberately-disabled tier is a clean block for a human, not an infra failure to
+  // retry -- return the {succeeded:true, blocked:true} shape so draftAdhocBranch routes
+  // the task to queue/blocked/ with a legible reason.
+  if (!isEnabled()) {
+    return { succeeded: true, blocked: true, blockedReason: 'local write-agentic adhoc tier is disabled (AGENT_MANAGER_LOCAL_AGENTIC_WRITE=false) and the cheaper local tiers could not complete this task -- needs a human.' };
+  }
+  if (writeToolsDisabled()) {
+    return { succeeded: true, blocked: true, blockedReason: 'local write-agentic adhoc tier is disabled (queue/.chat-write-tools-disabled kill switch) and the cheaper local tiers could not complete this task -- needs a human.' };
+  }
+
+  // AC-13a: bail before spending a single turn on a task that's structurally impossible
+  // for this sandbox -- see EXTERNAL_DEP_MARKERS/detectExternalDependency's own header.
+  const extDep = detectExternalDependency(task);
+  if (extDep) {
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `task requires external-state operation (${extDep}) that the local sandbox cannot perform -- needs a human to provision the resource first.`,
+      needsClarification: {
+        reason: 'external-dependency',
+        openQuestions: [`This task references an external resource (${extDep}). Please confirm: (a) the resource already exists and its URL/credentials, or (b) you want it created, in which case this must be handled outside the local sandbox.`],
+      },
+    };
+  }
+
+  // Contradictory-literal-acceptance gate (2026-09-15, brain-dump bd-1789433484492,
+  // "pipeline hardening 5/5"): a task can mandate an exact multi-line literal to write
+  // AND separately demand an exact-phrase grep check that the literal, as specified,
+  // structurally cannot satisfy (the phrase spans a line boundary the mandated text
+  // itself introduces) -- no draft attempt could ever pass. Root-caused live: burned 3
+  // real automated attempts on system-report.js's LESSONS-LEARNED comment task before a
+  // human caught it. See detectContradictoryLiteralAcceptance's own header.
+  const contradiction = detectContradictoryLiteralAcceptance(task);
+  if (contradiction) {
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `task's own literal instructions are self-contradictory: ${contradiction.reason}`,
+      needsClarification: {
+        reason: 'contradictory-literal-acceptance',
+        openQuestions: [`${contradiction.reason} Please either drop the exact-phrase check, or rewrite the mandated literal text so "${contradiction.requiredPhrase}" appears unbroken on one line.`],
+      },
+    };
+  }
+
+  // Stale-decompose-premise gate (2026-09-15, brain-dump bd-1789433484305, "pipeline
+  // hardening 3/5"): a sub-task filed by an internal decompose can cite a specific line
+  // in a file that's since been restructured by a LATER, independent decompose -- the
+  // cited site cannot possibly still be there. Root-caused live: burned a real draft
+  // attempt on a local-draft.js sub-task citing line 2178 against a file decompose #226
+  // had already shrunk to 1327 lines. See detectStaleDecomposePremise's own header for
+  // what this does and (importantly) does not catch.
+  const staleDecompose = detectStaleDecomposePremise(task, { repoRoot: getConfig().repoRoot });
+  if (staleDecompose) {
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedReason: `sub-task premise may be stale: ${staleDecompose.reason}`,
+      needsClarification: {
+        reason: 'stale-decompose-premise',
+        openQuestions: [`${staleDecompose.reason} Please confirm the real current location of what this sub-task is meant to change, or re-scope it.`],
+      },
+    };
+  }
+
+  // Scope-complexity gate (pre-plan, before the first model call): a task that is
+  // structurally too broad for one tier-3 pass (anchor app.py + 3+ endpoint paths or
+  // subsystems -- see scopeComplexityGate's own header) is decomposed up front instead of
+  // burning the full LOCAL_AGENTIC_WRITE_MAX_TURNS budget on read-only orientation and only
+  // landing in the post-exhaustion backstop below. Default-on kill switch, mirroring
+  // isEnabled(): opt out by setting the env var in the check below to the string 'false'.
+  if (process.env.AGENT_MANAGER_SCOPE_GATE !== 'false') {
+    const gate = scopeComplexityGate(task);
+    if (gate && gate.shouldDecompose) {
+      const split = await runDecomposePassIfAvailable(task, {
+        mode: 'preliminary',
+        priorAttemptBlock: gate.reason,
+      });
+      // >= 2 subTasks -> this is a real decompose, return the same shape the post-exhaustion
+      // backstop uses. A null split or a 0/1-subTask split means the split wasn't usable, so
+      // we deliberately fall through to the normal tier-3 path rather than misrouting.
+      if (split && split.subTasks && split.subTasks.length >= 2) {
+        task.adhocResolution = 'decompose';
+        task.subTaskProposals = split.subTasks;
+        task.implementResponse = `Scope-complexity gate: this task spans ${split.subTasks.length} independent pieces, so it was decomposed before any implementation attempt.\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
+        return { succeeded: true, blocked: false, resolution: 'decompose' };
+      }
+    }
+  }
+
+  // A retry that already has its own prior attempt's verified findings fed forward (see
+  // priorAttemptAnalysisBlock) gets a much shorter orientation window -- see
+  // RETRY_ORIENT_TURN_LIMIT's own header for why.
+  const orientTurnLimit = priorAttemptAnalysisBlock(task) ? RETRY_ORIENT_TURN_LIMIT : ORIENT_TURN_LIMIT;
+  const prompt = buildWriteAgenticPrompt(task, { orientTurnLimit });
+  const started = Date.now();
+
+  const doRun = runInWorktree || (async (worktreeDir, info) => {
+    // A continuation's prior edits are normally APPLIED to this worktree (agentic-draft-common.js applyPartialDiff) and the requeue note says
+    // so. When that failed, the note is wrong for this run: hand the model the diff as text and say the edits are NOT on disk.
+    const runPrompt = partialDiffFallbackPrompt(prompt, task, info);
+    const result = await runPlan({
+      prompt: runPrompt,
+      maxTurns: LOCAL_AGENTIC_WRITE_MAX_TURNS,
+      source: task.source,
+      taskId: task.id,
+      stage: 'agentic-write',
+      allowWrite: true,
+      primaryRoot: worktreeDir,
+      // On a cap-exhausted run, spend one more no-tools turn forcing a RESOLUTION line
+      // so resolveAgenticDraft has something to route on instead of a hard block.
+      forceSummaryOnCap: true,
+      // Edit-by-turn-N forcing function: this tier's whole job is to produce a diff, and
+      // it has repeatedly burned its entire budget on read-only orientation. If it hasn't
+      // edited anything by orientTurnLimit turns, runPlanWithTools pushes one firm
+      // "stop exploring, act now" message.
+      nudgeToEditEarly: true,
+      orientTurnLimit,
+      // A confirmed-atomic leaf (decomposedFrom / rescopedFromDecompose) that still hasn't
+      // edited a few turns after the soft nudge gets one firmer push: edit now or conclude
+      // needs-human-decision -- decompose is off the table for a leaf.
+      leafMustEdit: leafDecomposeLocked(task),
+    });
+    modelStatsSafe(recordModelCall, {
+      taskId: task.id, stage: 'implement', model: localDraftModelLabel(),
+      startedAt: new Date(started).toISOString(), latencyMs: Date.now() - started,
+      result, source: task.source,
+    });
+    return result;
+  });
+
+  try {
+    const verdict = await runAgenticDraftInWorktree(task, {
+      runInWorktree: doRun,
+      modelLabel: localDraftModelLabel(),
+    });
+    const giveUp = await runGiveUpSplit(task, verdict);
+    if (giveUp) return giveUp;
+    return verdict;
+```
+
+Problem:
+The 144-line `draftAdhocViaLocalAgenticWrite` function accretes at least four independently testable responsibilities that were added at different times (comments cite separate brain-dumps and dates). The five pre-flight gates each carry a distinct condition, a heterogeneous return shape (some embed `needsClarification.openQuestions`, the scope gate returns a wholly different `{resolution:'decompose'}` object), and their own domain-detection helpers. The `AGENT_MANAGER_SCOPE_GATE` block is a mini-state-machine with internal branching (call decompose, inspect result, either return or fall through), not a simple guard. The ~30-line `doRun` closure assembles execution configuration (prompt, turn limits, nudge flags, leaf-locked flag) and records model stats, coupling execution policy to orchestration. Because every gate is only reachable through the full function, unit-testing the contradictory-literal gate in isolation requires constructing a valid `task`, a valid `deps` object, and ensuring four prior gates all pass first. The next hardening pass will add another gate, pushing the function to ~170 lines with no structural change.
+
+Solution:
+Extract the five pre-flight checks into a `runPreFlightGates(task, deps)` function that returns `null` on pass or the appropriate block object on failure, with each gate as a small named helper (`checkTierEnabled`, `checkWriteToolsDisabled`, `checkExternalDependency`, `checkContradictoryLiteral`, `checkStaleDecomposePremise`, `checkScopeComplexity`). Pull the `doRun` closure into a `buildDoRunClosure(task, prompt, orientTurnLimit)` factory that returns the configured execution function. Move the post-execution routing (`runAgenticDraftInWorktree` call plus `runGiveUpSplit` verdict return) into an `executeAndRoute(task, doRun)` helper. The top-level `draftAdhocViaLocalAgenticWrite` then shrinks to roughly 25 lines: call `runPreFlightGates`, early-return if blocked, compute `orientTurnLimit` and `prompt`, call `buildDoRunClosure`, and delegate to `executeAndRoute`. Each extracted unit is 10–35 lines with a single purpose.
+
+Benefits:
+Each gate becomes independently testable with a focused fixture that exercises only its own condition and return shape, without constructing the full orchestrator context. The `doRun` closure can be unit-tested for correct option assembly (turn-limit arithmetic, nudge-flag propagation, leaf-locked flag) in isolation, and a change to `runPlan` options produces a diff in `buildDoRunClosure` rather than in the middle of the orchestrator. Reviewers can evaluate a new pre-flight gate as a small, self-contained addition to `runPreFlightGates` rather than scanning a 170+ line function for where the new gate was inserted and whether it interacts with the scope sub-workflow. The top-level function reads as a clear four-step pipeline, making the control flow immediately legible.
