@@ -48,3 +48,17 @@ test('routingConfig: shadow by default, unknown values fall back to shadow', () 
   assert.equal(R.routingConfig({ AGENT_MANAGER_CAPABILITY_ROUTING: 'enforce' }).mode, 'enforce');
   assert.equal(R.routingConfig({ AGENT_MANAGER_RESERVATION_GRACE_SECS: '60' }).graceMs, 60000);
 });
+
+test('escalationLane: timeout/degenerate/error on a lane with a bigger lane above it escalates; ok, rejected, top lane and unknown tiers do not', () => {
+  const lanes = [big, small, { id: 'worker-x', tier: null }];
+  const att = (lane, extra) => ({ lane, outcome: 'error', reason: 'Ollama request timed out after 300000ms', ...extra });
+  assert.equal(R.escalationLane(att('worker-rx580'), lanes, {}), 'worker-rx580');
+  assert.equal(R.escalationLane(att('worker-rx580', { reason: undefined, outcome: 'blocked', blockedReason: 'Plan pass degenerate: truncated' }), lanes, {}), 'worker-rx580');
+  assert.equal(R.escalationLane(att('worker-rx580', { reason: 'boom' }), lanes, {}), 'worker-rx580');
+  assert.equal(R.escalationLane(att('worker-rx580', { outcome: 'succeeded', reason: undefined }), lanes, {}), null);
+  assert.equal(R.escalationLane(att('worker-rx580', { outcome: 'blocked', reason: undefined, blockedReason: 'reviewer said no' }), lanes, {}), null);
+  assert.equal(R.escalationLane(att('worker-3090'), lanes, {}), null);
+  assert.equal(R.escalationLane(att('worker-x'), lanes, {}), null);
+  assert.equal(R.escalationLane(att('worker-rx580'), lanes, { AGENT_MANAGER_LANE_ESCALATION: 'off' }), null);
+  assert.equal(R.escalationLane({ outcome: 'error' }, lanes, {}), null);
+});

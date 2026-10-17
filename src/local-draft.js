@@ -79,6 +79,7 @@ const { postJson } = require('./ollama-http.js');
 const { checkOllamaReachable } = require('./ollama-health.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { recordAttempt: recordLedgerAttempt } = require('./capability-ledger.js');
+const { recordAvoidedLane } = require('./premium-rotation.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
 const { getModelProfile } = require('./model-profile-registry.js');
 const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./lib/draft-lifecycle.js');
@@ -1569,6 +1570,14 @@ async function draftTask(task, deps = {}) {
   // (a blocked network_unavailable task must not consume a draft-attempt slot).
   if (!(result && result.blocked && result.blockedReason === 'network_unavailable')) {
     finalizeDraftAttempt(task, attempt, result, { emitHistory: appendHistoryEvent });
+    // Escalation: a timeout / degenerate / error on a lane with a bigger tier above it sends the retry up a tier (avoidLanes).
+    try {
+      const lanes = require('./lanes.js').getLanes();
+      if (require('./capability-routing.js').escalationLane(attempt, lanes)) {
+        const avoided = recordAvoidedLane(task, lanes.length);
+        if (avoided) appendHistoryEvent(task, 'lane-escalated', `${attempt.reason || attempt.blockedReason || attempt.outcome} on ${avoided}; a larger lane gets the retry`);
+      }
+    } catch (_) { /* escalation is best-effort */ }
     // Capability ledger (docs/design-notes/capability-routing-and-benchmarking.md): one line per attempt, recording only.
     const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
     if (repoRoot) {
