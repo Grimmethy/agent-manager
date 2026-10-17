@@ -462,26 +462,40 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model
 const TRUNCATION_RETRY_MULTIPLIER = 2;
 const TRUNCATION_RETRY_NUM_PREDICT_CEILING = 8000;
 
+// How many HARD failures (timeout, connection refused, HTTP 5xx -- anything that makes callOnce() throw) one call() may absorb. Kept
+// separate from `maxRetries`, which now bounds only attempts that returned a response: 2026-10-16, a plan call on the P40 hit an HTTP 500,
+// then a 427 s timeout, and its first real response (truncated at numPredict 1400) arrived on attempt 3 -- the loop was over, so the
+// truncation escalation below (numPredict x2, think off) never got to run and the task was recorded as 'Plan pass degenerate: truncated'.
+// Equal to maxRetries + 1, i.e. exactly the attempts a call that never gets any response has always made.
+function hardFailureAllowance(maxRetries) {
+  return maxRetries + 1;
+}
+
 async function call(opts, maxRetries = 2) {
   let lastDegenerate = null;
   let lastError = null;
   let gotAnyResponse = false;
   let callOpts = opts;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  let responses = 0;
+  let hardFailures = 0;
+  const maxHardFailures = hardFailureAllowance(maxRetries);
+  for (let attempt = 0; responses <= maxRetries && hardFailures < maxHardFailures; attempt++) {
     let result;
     try {
       result = await callOnce(callOpts);
     } catch (e) {
       if (gpuGuard.isForgePause(e)) throw e;   // not a failure: no retry, no hard-failure audit (the lease is still held on every attempt)
       lastError = e;
+      hardFailures += 1;
       logHardFailureAudit({
         source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
         model: opts.model || MODEL, code: e.code || null, message: String(e.message || e).slice(0, 300),
-        timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode,
+        timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode, think: callOpts.think,
       });
       continue;
     }
     gotAnyResponse = true;
+    responses += 1;
     // Extract any SIDE-FINDING: block(s) BEFORE degenerate-detection judges the response,
     // so a response that's otherwise degenerate/empty except for a stray finding isn't
     // misjudged either way, and so the caller's own downstream RESOLUTION:/JSON parsing
@@ -527,6 +541,9 @@ async function call(opts, maxRetries = 2) {
       source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
       model: opts.model || MODEL, numPredict: callOpts.numPredict, doneReason: result.done_reason,
       degenerate, promptEvalCount: result.prompt_eval_count, evalCount: result.eval_count,
+      // Whether THIS attempt asked for reasoning: the think-off retry below could not be verified from the log before (2026-10-16: 3090 attempts 2
+      // and 3 still hit their ceiling with evalCount == numPredict and nothing recorded about think).
+      think: callOpts.think,
     });
     if (degenerate === 'truncated' && callOpts.numPredict) {
       const escalated = Math.min(
@@ -558,7 +575,7 @@ async function call(opts, maxRetries = 2) {
   // not -- a degenerate response on an earlier attempt followed by a hard failure on a
   // later retry is still a real, legitimate degenerate outcome, not an infra failure.
   if (!gotAnyResponse && lastError) throw lastError;
-  return { response: '', thinking: '', degenerate: lastDegenerate, attempts: maxRetries + 1 };
+  return { response: '', thinking: '', degenerate: lastDegenerate, attempts: responses + hardFailures };
 }
 
 // Majority-vote helper for qualitative judgment calls. Runs the SAME prompt `n` times
@@ -654,7 +671,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

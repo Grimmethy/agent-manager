@@ -40,7 +40,7 @@ const path = require('path');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
 const { buildPlanGrounding } = require('./plan-grounding.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
-const { resolveAcceptanceCriteria } = require('./acceptance-criteria.js');
+const { resolveAcceptanceCriteria, parseCriteriaBlock } = require('./acceptance-criteria.js');
 const { filterCriteriaForSandbox } = require('./lib/draft-sandbox.js');
 const { runOrientPass } = require('./orient-pass.js');
 const { runPlanCritique } = require('./plan-critique.js');
@@ -749,10 +749,43 @@ async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRo
   return { planResult: seedReroll.planResult, totalAttempts: seedReroll.totalAttempts, reRolled: seedReroll.reRolled, stillThin: seedReroll.stillThin, seededFromPrior: seedReroll.seededFromPrior };
 }
 
+// The acceptance-criteria step of runPlanPass, unchanged, as its own function so the plan-reuse path below applies exactly the same rules.
+function applyPlanAcceptanceCriteria(task) {
+  const ac = resolveAcceptanceCriteria(task);
+  // A plan-derived criterion that needs a JS toolchain (tsc, build, tests) is dropped when the draft sandbox will have none (lib/draft-sandbox.js):
+  // the draft cannot run it, and review rejects an unverified criterion (PF HUB0005-01).
+  const sandboxFiltered = filterCriteriaForSandbox({ criteria: ac.criteria, source: ac.source, repoRoot: getConfig().repoRoot });
+  if (sandboxFiltered.dropped.length) {
+    appendHistoryEvent(task, 'advisory', `dropped ${sandboxFiltered.dropped.length} plan-derived acceptance criterion(s) that need a JS toolchain the draft sandbox does not have: ${sandboxFiltered.dropped.map((c) => c.slice(0, 90)).join(' | ')}`);
+  }
+  task.acceptanceCriteria = sandboxFiltered.criteria;
+  task.acceptanceCriteriaSource = ac.source;
+}
+
+// Agentic-continuation plan reuse (2026-10-16): an adhoc task that already ran an agentic implement pass and was requeued as a continuation
+// (isAgenticContinuation, priorPartialDiff) keeps its plan (lastGoodPlan survives the requeue) and its orientNotes, yet the plan pass ran again
+// on every attempt -- and kept ending in 'Plan pass degenerate: truncated' (the extend-the-merged-doc task: six blocked attempts, ~33k-char prompt,
+// reasoning ate the whole numPredict). The plan already exists, so no orient pass and no plan call are made. Only a plan this task's own earlier
+// attempt wrote counts (bestPriorPlan), and only one that carries a CRITERIA: block, so the acceptance criteria the review holds the diff to
+// are still derivable. The plan-critique re-plan (_planCritiqueRevised) is a deliberate second plan and is never short-circuited. Returns true
+// when the plan was reused.
+function reusePriorPlanForContinuation(task, attempt) {
+  if (resolveSourceName(task) !== 'adhoc' || task.isAgenticContinuation !== true || task._planCritiqueRevised) return false;
+  const plan = bestPriorPlan(task);
+  if (!plan || parseCriteriaBlock(plan).length === 0) return false;
+  task.planResponse = plan;
+  task.lastGoodPlan = plan;
+  if (process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text: plan, seededFromPrior: true });
+  appendHistoryEvent(task, 'plan-done', 'reused the prior plan for an agentic continuation -- no model call');
+  return true;
+}
+
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
   runOrientPassFn = runOrientPass, recordModelCall,
 }) {
+  if (reusePriorPlanForContinuation(task, attempt)) return { blocked: false };
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
   // trial lookup): researchPlanPrompt's own header used to call the research plan pass
   // "intentionally throwaway" and never gave it tool access -- so it could (and did)
@@ -868,17 +901,7 @@ async function runPlanPass(task, {
   // held to. From promptContext.acceptanceCriteria if the caller gave one, else the
   // trailing CRITERIA: block the plan pass was asked to write. Kill switch
   // AGENT_MANAGER_ADHOC_ACCEPTANCE=false.
-  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') {
-    const ac = resolveAcceptanceCriteria(task);
-    // A plan-derived criterion that needs a JS toolchain (tsc, build, tests) is dropped when the draft sandbox will have none (lib/draft-sandbox.js):
-    // the draft cannot run it, and review rejects an unverified criterion (PF HUB0005-01).
-    const sandboxFiltered = filterCriteriaForSandbox({ criteria: ac.criteria, source: ac.source, repoRoot: getConfig().repoRoot });
-    if (sandboxFiltered.dropped.length) {
-      appendHistoryEvent(task, 'advisory', `dropped ${sandboxFiltered.dropped.length} plan-derived acceptance criterion(s) that need a JS toolchain the draft sandbox does not have: ${sandboxFiltered.dropped.map((c) => c.slice(0, 90)).join(' | ')}`);
-    }
-    task.acceptanceCriteria = sandboxFiltered.criteria;
-    task.acceptanceCriteriaSource = ac.source;
-  }
+  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') applyPlanAcceptanceCriteria(task);
 
   // Harness-search grounding step (HUB0079 2/3): extracted from this function into
   // runHarnessSearchStep above -- same behavior, now unit-testable in isolation (which
@@ -2052,7 +2075,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
+module.exports = { reusePriorPlanForContinuation, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on
