@@ -42,6 +42,15 @@ STREAM_STALL_S = float(os.environ.get("TOKENFOLD_STREAM_STALL_S", "600"))
 STREAM_TIMEOUT = httpx.Timeout(None, connect=15, read=STREAM_STALL_S, write=60, pool=15)
 
 
+class MalformedRequestError(Exception):
+    """Inbound body was not valid JSON; raw bytes captured for raw passthrough."""
+
+    def __init__(self, raw_body: bytes, request: Request):
+        self.raw_body = raw_body
+        self.request = request
+        super().__init__("malformed JSON in inbound request")
+
+
 def create_app(engine: Engine | None = None) -> FastAPI:
     app = FastAPI(title="TokenFold", version="0.1.0")
     eng = engine or Engine()
@@ -114,24 +123,35 @@ padding:.3rem .7rem;text-align:left}}h1{{font-size:1.3rem}}
                         media_type=r.headers.get("content-type", "application/json"))
 
     # -----------------------------------------------------------------
+    async def _parse_inbound(request: Request):
+        """Parse the JSON body, or raise MalformedRequestError with the raw bytes."""
+        try:
+            return await request.json()
+        except Exception:
+            raise MalformedRequestError(await request.body(), request)
+
+    def _apply_header_overrides(request: Request, cfg) -> None:
+        """Apply per-request X-TokenFold-Mode / X-TokenFold-Route overrides."""
+        mode_hdr = request.headers.get("x-tokenfold-mode")
+        route_hdr = request.headers.get("x-tokenfold-route")
+        if mode_hdr:
+            cfg.mode = mode_hdr.upper()
+            cfg.clamp()
+        if route_hdr:
+            cfg.route_mode = route_hdr.lower()
+            cfg.clamp()
+
     @app.post("/v1/chat/completions")
     async def chat(request: Request):
         try:
-            body = await request.json()
-        except Exception:
-            raw = await request.body()
+            body = await _parse_inbound(request)
+        except MalformedRequestError as exc:
+            raw = exc.raw_body
             r = await client.post(f"{_upstream(request)}/chat/completions",
                                   content=raw, headers=_fwd_headers(request))
             return Response(r.content, r.status_code)
 
-        mode_hdr = request.headers.get("x-tokenfold-mode")
-        route_hdr = request.headers.get("x-tokenfold-route")
-        if mode_hdr:
-            eng.cfg.mode = mode_hdr.upper()
-            eng.cfg.clamp()
-        if route_hdr:
-            eng.cfg.route_mode = route_hdr.lower()
-            eng.cfg.clamp()
+        _apply_header_overrides(request, eng.cfg)
 
         model = body.get("model", "")
         messages = body.get("messages", [])
