@@ -350,3 +350,74 @@ test('reconcile: an abandoned verdict carries the ledger reason for the vanished
   assert.match(tail(withLedger).detail, /removed \d{4}-\d{2}-\d{2} by dashboard-discard \(discarded: discarded via the dashboard\)/);
   assert.match(tail(without).detail, /no removal recorded -- deleted outside the pipeline/);
 });
+
+// --reclassify idempotence (2026-10-17): resolveDisposition's rule 7 appends an `apply` event to the record in memory, and the sweep used to read the tail AFTER
+// that, so every already-closed noop that reached rule 7 was rewritten with two more events on every run (measured: 1370 live records, +2740 events per run).
+const UNCLASSIFIED = 'outcome=unclassified: change review: no correctness issues found';
+const stages = (f) => JSON.parse(fs.readFileSync(f, 'utf8')).history.map((e) => e.stage);
+
+test('reconcile --reclassify: a closed noop that reaches rule 7 is neither rewritten nor given events, on any run', () => {
+  const dir = tmpPipeline();
+  const f = writeRec(dir, '', 'rule7-closed', [
+    { stage: 'created' },
+    { stage: 'applied', detail: UNCLASSIFIED },
+    { stage: 'apply', detail: UNCLASSIFIED },
+    { stage: 'noop', detail: UNCLASSIFIED },
+  ], { source: 'change_review', terminalDisposition: 'noop' });
+  const before = fs.readFileSync(f, 'utf8');
+  for (let run = 1; run <= 2; run += 1) {
+    const s = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: ['--reclassify'] });
+    assert.equal(s.resolved, 0, `run ${run} reports nothing resolved`);
+    assert.equal(fs.readFileSync(f, 'utf8'), before, `run ${run} leaves the file byte-identical`);
+  }
+});
+
+test('reconcile --reclassify: a terminal event followed by a non-terminal one gets no duplicate terminal event', () => {
+  const dir = tmpPipeline();
+  const f = writeRec(dir, '', 'abandoned-then-note', [
+    { stage: 'created' },
+    { stage: 'applied', detail: 'agent/x' },
+    { stage: 'abandoned', detail: 'applied to agent/x -- branch gone' },
+    { stage: 'triage-note', detail: 'looked at it' },
+  ], { source: 'adhoc', terminalDisposition: 'abandoned' });
+  const before = fs.readFileSync(f, 'utf8');
+  for (let run = 1; run <= 2; run += 1) {
+    reconcile({ pipelineDir: dir, repoRoot: undefined, argv: ['--reclassify'] });
+    assert.equal(fs.readFileSync(f, 'utf8'), before, `run ${run} leaves the file byte-identical`);
+  }
+});
+
+test('reconcile --reclassify: real changes still append exactly once (FALSE-POSITIVE flip; first-time classification)', () => {
+  const dir = tmpPipeline();
+  const fp = writeRec(dir, '', 'fp-flip', [
+    { stage: 'created' },
+    { stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' },
+    { stage: 'noop', detail: 'no-op verdict: no candidates in implement response -- nothing to apply' },
+  ], { source: 'observability_review', terminalDisposition: 'noop', implementResponse: 'FALSE POSITIVE. The except binds the exception and returns a documented default.' });
+  const fresh = writeRec(dir, '', 'fresh-noop', [
+    { stage: 'created' },
+    { stage: 'applied', detail: 'no candidates in implement response -- nothing to apply' },
+  ], { source: 'adhoc' });
+  reconcile({ pipelineDir: dir, repoRoot: undefined, argv: ['--reclassify'] });
+  assert.deepEqual(stages(fp), ['created', 'applied', 'noop', 'dismissed']);
+  assert.deepEqual(stages(fresh), ['created', 'applied', 'noop']);
+  reconcile({ pipelineDir: dir, repoRoot: undefined, argv: ['--reclassify'] });
+  assert.deepEqual(stages(fp), ['created', 'applied', 'noop', 'dismissed'], 'a second run adds nothing');
+  assert.deepEqual(stages(fresh), ['created', 'applied', 'noop'], 'a second run adds nothing');
+});
+
+test('reconcile --reclassify: a first-time rule-7 classification appends one apply and one terminal event, then is stable', () => {
+  const dir = tmpPipeline();
+  const f = writeRec(dir, '', 'rule7-fresh', [
+    { stage: 'created' },
+    { stage: 'applied', detail: UNCLASSIFIED },
+  ], { source: 'change_review' });
+  reconcile({ pipelineDir: dir, repoRoot: undefined, argv: [] });
+  assert.deepEqual(stages(f), ['created', 'applied', 'apply', 'noop']);
+  const after = fs.readFileSync(f, 'utf8');
+  for (let run = 1; run <= 2; run += 1) {
+    const s = reconcile({ pipelineDir: dir, repoRoot: undefined, argv: ['--reclassify'] });
+    assert.equal(s.resolved, 0);
+    assert.equal(fs.readFileSync(f, 'utf8'), after);
+  }
+});
