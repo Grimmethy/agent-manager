@@ -1709,3 +1709,65 @@ test('applyProjectSearchFindings still appends real findings to a pre-existing i
   assert.match(text, /\[example-repo\]\(https:\/\/example\.com\)/);
   assert.doesNotMatch(text, /No results/);
 });
+
+// --- applyCapabilityDebriefReport (capability_debrief, design note section 5a) -----------
+
+const CAP_REPORT = [
+  'CAUSE',
+  'PROMPT/CONTEXT TOO LARGE: the plan call carried ~9k tokens against numCtx 16384 and timed out at 300 s on every attempt, while the 3090 finished the same tasks.',
+  '',
+  'EVIDENCE',
+  'change-review-bf3fe41 attempt 1 on worker-rx580 timed out after 300000ms; attempt 2 on worker-3090 succeeded in 90 s.',
+  '',
+  'NOW WHAT',
+  '1. Window the diff fed to the change_review plan pass -- cap each hunk context so the prompt stays under 4k tokens; the small-lane pass rate for change_review should then rise above 85%. Files: src/prompts.js',
+].join('\n');
+
+function withCapPipeline(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-capdebrief-test-'));
+  const prev = { r: process.env.AGENT_MANAGER_REPO_ROOT, p: process.env.AGENT_MANAGER_PIPELINE_DIR };
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+  try { return fn(dir); } finally {
+    if (prev.r === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev.r;
+    if (prev.p === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR; else process.env.AGENT_MANAGER_PIPELINE_DIR = prev.p;
+  }
+}
+
+test('applyCapabilityDebriefReport: first pass holds the report for human confirmation; empty is skipped', () => {
+  const { applyCapabilityDebriefReport } = require('./apply-group-a.js');
+  const task = { id: 'cd1', promptContext: { clusterKey: 'k|m|s' } };
+  const held = applyCapabilityDebriefReport({ implementResponse: CAP_REPORT, task });
+  assert.equal(held.succeeded, false);
+  assert.equal(held.needsConfirmation, true);
+  assert.equal(applyCapabilityDebriefReport({ implementResponse: '  ', task }).skipped, true);
+});
+
+test('applyCapabilityDebriefReport: a confirmed report files each NOW WHAT item and records the cluster', () => {
+  const { applyCapabilityDebriefReport } = require('./apply-group-a.js');
+  withCapPipeline((dir) => {
+    const task = { id: 'cd2', debriefReportConfirmedAt: new Date().toISOString(), promptContext: { clusterKey: 'change_review|m|timeout:x' } };
+    const r = applyCapabilityDebriefReport({ implementResponse: CAP_REPORT, task });
+    assert.equal(r.skipped, true);
+    assert.match(r.reason, /1 proposal\(s\) queued/);
+    const adhoc = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+    assert.equal(adhoc.length, 1);
+    const filed = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', adhoc[0]), 'utf8'));
+    assert.equal(filed.raisedBy.source, 'capability_debrief');
+    const state = JSON.parse(fs.readFileSync(path.join(dir, 'instances', 'capability-debrief-state.json'), 'utf8'));
+    assert.equal(state['change_review|m|timeout:x'].verdict, 'proposals-filed');
+  });
+});
+
+test('applyCapabilityDebriefReport: NOT SHRINKABLE AT THIS TIER closes as a recorded no-op without a human hold', () => {
+  const { applyCapabilityDebriefReport } = require('./apply-group-a.js');
+  withCapPipeline((dir) => {
+    const report = 'CAUSE\nNEEDS REASONING DEPTH THE TIER LACKS\n\nEVIDENCE\nthe 27B needed 3 critique rounds.\n\nNOT SHRINKABLE AT THIS TIER -- the task needs cross-file reasoning the 8B failed on even at 4k tokens.';
+    const r = applyCapabilityDebriefReport({ implementResponse: report, task: { id: 'cd3', promptContext: { clusterKey: 'k2' } } });
+    assert.equal(r.skipped, true);
+    assert.match(r.reason, /not shrinkable at this tier/);
+    assert.ok(!r.needsConfirmation);
+    const state = JSON.parse(fs.readFileSync(path.join(dir, 'instances', 'capability-debrief-state.json'), 'utf8'));
+    assert.equal(state.k2.verdict, 'not-shrinkable');
+  });
+});

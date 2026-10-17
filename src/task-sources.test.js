@@ -3334,3 +3334,64 @@ test('the hold applies to the derived source only: an adhoc task is never held b
   const { nextAdhocTask } = freshTaskSources(dir);
   assert.ok(nextAdhocTask(), 'overlapping adhoc tasks still run');
 });
+
+// capability_debrief (2026-10-17, design note section 5a) -------------------------------
+
+function writeCapabilityLedger(dir, rows) {
+  const { logPipelineEvent } = require('./pipeline-history.js');
+  for (const r of rows) logPipelineEvent(dir, 'attempt', r);
+}
+
+const CAP_SMALL = { source: 'change_review', model: 'qwen3-vl:8b-instruct', tier: 8, lane: 'worker-rx580', numCtx: 16384, wallMs: 300000, reason: 'Ollama request timed out after 300000ms' };
+const CAP_BIG = { source: 'change_review', model: 'qwen3.8:27b', tier: 27, lane: 'worker-3090', outcome: 'ok', wallMs: 90000 };
+
+test('nextCapabilityDebriefTask: null with no failure cluster; one deterministic task per cluster once 3 small-lane failures sit beside a larger tier', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief-test-'));
+  let { nextCapabilityDebriefTask } = freshTaskSources(dir);
+  assert.equal(nextCapabilityDebriefTask(), null);
+
+  writeCapabilityLedger(dir, [{ ...CAP_SMALL, taskId: 'a1', outcome: 'timeout' }, { ...CAP_SMALL, taskId: 'a2', outcome: 'timeout' }, CAP_BIG]);
+  ({ nextCapabilityDebriefTask } = freshTaskSources(dir));
+  assert.equal(nextCapabilityDebriefTask(), null, 'two failures is below the cluster threshold');
+
+  writeCapabilityLedger(dir, [{ ...CAP_SMALL, taskId: 'a3', outcome: 'timeout' }]);
+  ({ nextCapabilityDebriefTask } = freshTaskSources(dir));
+  const task = nextCapabilityDebriefTask();
+  assert.ok(task);
+  assert.equal(task.source, 'capability_debrief');
+  assert.match(task.id, /^capability-debrief-[0-9a-f]{12}$/);
+  assert.equal(task.promptContext.clusterSource, 'change_review');
+  assert.ok(task.promptContext.evidenceText.includes('CAPABILITY DEBRIEF BUNDLE'));
+  assert.equal(nextCapabilityDebriefTask().id, task.id, 'same id on a second call: two workers must collide on it');
+});
+
+test('nextCapabilityDebriefTask: a debriefed cluster is not offered again, and a cluster on a degraded lane is skipped as a hardware suspect', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief2-test-'));
+  const rows = ['a1', 'a2', 'a3'].map((taskId) => ({ ...CAP_SMALL, taskId, outcome: 'timeout' }));
+  writeCapabilityLedger(dir, [...rows, CAP_BIG]);
+  const { nextCapabilityDebriefTask } = freshTaskSources(dir);
+  const task = nextCapabilityDebriefTask();
+  assert.ok(task);
+  const { markDebriefedByKey } = require('./capability-debrief-bundle.js');
+  markDebriefedByKey(path.join(dir, 'instances'), task.promptContext.clusterKey, { verdict: 'queued' });
+  assert.equal(nextCapabilityDebriefTask(), null);
+
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief3-test-'));
+  writeCapabilityLedger(dir2, [...rows, CAP_BIG]);
+  const now = Date.now();
+  const sample = (tps, ago) => ({ at: new Date(now - ago).toISOString(), ok: true, tps, totalMs: 1, error: null });
+  fs.mkdirSync(path.join(dir2, 'instances'), { recursive: true });
+  fs.writeFileSync(path.join(dir2, 'instances', 'lane-health.worker-rx580.json'), JSON.stringify({ samples: [sample(26, 9e5), sample(27, 8e5), sample(25, 7e5), sample(0.6, 1e3)] }));
+  const fresh = freshTaskSources(dir2);
+  assert.equal(fresh.nextCapabilityDebriefTask(), null);
+});
+
+test('capability_debrief is registered as a core, advisory-prose source at priority 96 that probing must never offer to a small lane', () => {
+  freshTaskSources(fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief4-test-')));
+  const reg = require('./task-source-registry.js').getRegisteredSource('capability_debrief');
+  assert.equal(reg.priority, 96);
+  assert.equal(reg.scope, 'core');
+  assert.equal(reg.advisoryProse, true);
+  assert.equal(reg.probe, false);
+  assert.equal(typeof reg.apply, 'function');
+});

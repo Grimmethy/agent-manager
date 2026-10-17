@@ -356,7 +356,7 @@ def api_task_confirm_delete(task_id):
     # report here for a human read. Confirming it stamps debriefReportConfirmedAt so the
     # re-run's second pass archives the window's own done/ tasks (see applyDebriefReport in
     # src/apply-group-a.js).
-    if data.get("source") == "pipeline_debrief":
+    if data.get("source") in ("pipeline_debrief", "capability_debrief"):  # capability_debrief reuses the same second-pass gate
         data["debriefReportConfirmedAt"] = now_iso
     if data.get("source") == "decompose_design_question":
         data["decomposeQuestionConfirmedAt"] = now_iso

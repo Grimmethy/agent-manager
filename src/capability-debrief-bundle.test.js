@@ -96,3 +96,16 @@ test('a cluster on a lane the health probe flagged is a hardware suspect: marked
   const [healthy] = B.collectFailureClusters(entries, { isDegraded: () => false });
   assert.equal(healthy.suspect, false);
 });
+
+test('capabilityDebrief prompts carry the evidence, the closed file list, the four cause classes and the NOT SHRINKABLE escape', () => {
+  const P = require('./prompts.js');
+  const task = { promptContext: { evidenceText: 'EVIDENCE-BLOB', clusterSource: 'change_review', taskIds: ['t1'], contrastIds: ['ok1'], harnessHits: [{ file: 'src/prompts.js', line: 10, query: 'changeReview', text: 'x' }], harnessFiles: [{ path: 'src/prompts.js', content: 'code' }] } };
+  const plan = P.capabilityDebriefPlanPrompt(task);
+  assert.match(plan, /EVIDENCE-BLOB/);
+  assert.match(plan, /change_review/);
+  assert.match(plan, /QUERY:/);
+  const impl = P.capabilityDebriefImplementPrompt(task, 'QUERY: changeReview');
+  for (const needle of ['EVIDENCE-BLOB', 'PROMPT/CONTEXT TOO LARGE', 'SEVERAL JOBS IN ONE CALL', 'MECHANICALLY DECIDABLE', 'NEEDS REASONING DEPTH', 'NOT SHRINKABLE AT THIS TIER', 'AVAILABLE FILES', '- src/prompts.js', 'NOW WHAT']) {
+    assert.ok(impl.includes(needle), `implement prompt should include ${needle}`);
+  }
+});

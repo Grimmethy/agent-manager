@@ -239,7 +239,7 @@ function buildExhaustedFulfillmentQuestion(task) {
 // usually already moot by the time they exhaust (a later window supersedes it), not
 // something a human needs to individually triage -- see this session's own manual
 // retirement of 24 exhausted pipeline_debrief tasks for exactly that reasoning.
-const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief']);
+const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief', 'capability_debrief']);
 
 function isReviewVerdictAdvisoryProseSource(source) {
   return isAdvisoryProseSource(source) && !REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED.has(source);
