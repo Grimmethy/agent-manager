@@ -1896,3 +1896,42 @@ Remove the bare `require('../task-sources.js')` line from `apply-core.js`. Since
 
 Benefits:
 The module graph becomes smaller and more honest—every edge reflects a real dependency. It eliminates a potential circular-require hazard and makes it easier for a reader (or a bundler) to understand the true dependency surface of `apply-core.js`.
+
+### AC-166 · Unify Marker Extraction and Injection Logic
+Strength: Strong
+Files: src/incident-amplification-marker.js, src/concepts.js
+
+Problem:
+Both `src/incident-amplification-marker.js` and `src/concepts.js` implement the same "find marker, extract payload, strip from text" pattern independently. Each file checks for marker idempotency (`if (base.includes('MARKER:')) return base;`), splits the response text on a marker string, parses the payload with regex-based key-value extraction, and returns a `{ cleanText, ... }` object. The `concepts.js` variant (`extractConceptBuildReport`) is a simplified single-marker version, while `incident-amplification-marker.js` handles multiple instances and more complex block structures. Because the logic is duplicated rather than shared, any change to marker format, whitespace handling, or delimiter conventions must be made in two places, and the two implementations can drift apart in how they handle edge cases such as multiple marker lines or malformed blocks.
+
+Solution:
+Extract a shared `extractMarkerBlock(text, markerRegex, parserFn)` utility (or a small `MarkerExtractor` class) that encapsulates the idempotency guard, text splitting, payload parsing, and clean-text reconstruction. Both `concepts.js` and `incident-amplification-marker.js` would delegate their extraction and injection logic to this single utility, passing in their specific marker regex and a parser callback. The utility would standardize behavior for multiple markers, malformed blocks, and whitespace variations, so both call sites inherit identical edge-case handling.
+
+Benefits:
+A single code path owns the marker protocol, so a format change (new delimiter, stricter whitespace, additional fields) is made in one place and both consumers pick it up automatically. The risk of the two implementations diverging—where `concepts.js` silently mishandles a multi-line payload that `incident-amplification-marker.js` handles correctly—is eliminated. Testing the extraction logic once in the shared utility covers both call sites, reducing the test surface and the chance of a regression in one file going unnoticed because the other file's tests mask it.
+
+### AC-167 · Decouple `getConceptTimeline` from Hardcoded Filesystem Paths
+Strength: Worth exploring
+Files: src/concepts.js
+
+Problem:
+`getConceptTimeline` in `src/concepts.js` accepts `loadBrainDump` and `listTaskHistory` as optional function parameters, which suggests a dependency-injection design. However, the function also internally constructs a path via `path.join(pipelineDir, 'brain-dump.json')` and passes that concrete path to the loader. This means the module still encodes a specific storage location and filename, violating the Dependency Inversion Principle: `concepts.js` should depend only on an abstract "give me brain-dump entries" contract, not on where the file lives. Testing the function with a different data source (in-memory array, database row, alternate filename) requires either mocking `path.join` or the filesystem, or passing a loader that happens to read from the exact path the function constructs, which is a hidden coupling.
+
+Solution:
+Refactor `getConceptTimeline` to accept either a pre-loaded `brainDumpEntries` array or a `getBrainDumpEntries(conceptId)` callback that the caller fully controls. Remove the internal `path.join(pipelineDir, 'brain-dump.json')` call entirely. The caller (dashboard, API layer, CLI) resolves the storage location, loads the data, and passes only the relevant entries into `concepts.js`. This makes `concepts.js` a pure logic module that operates on data structures rather than file paths.
+
+Benefits:
+`concepts.js` becomes trivially testable: pass an in-memory array, no filesystem mocking required. Migrating brain-dump storage to a database, a different filename, or a remote service is a caller-side change with zero edits to `concepts.js`. The module's public contract becomes explicit and honest—its parameters describe exactly what it needs—rather than implying decoupling while secretly depending on a specific path layout.
+
+### AC-168 · Centralize Stable-Status Guard Across Concept Mutators
+Strength: Strong
+Files: src/concepts.js
+
+Problem:
+`src/concepts.js` defines `STABLE_CONCEPT_STATUSES` and then manually repeats the guard `if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;` at the top of `recordConceptResearch`, `recordConceptBuildTally`, `shelveConcept`, and `reopenConcept`. This is a classic shotgun-surgery risk: adding a new mutator (e.g., `updateConceptDescription`, `reassignConceptOwner`) requires the developer to remember to insert the same guard. If they forget, a stable concept can be silently mutated, violating the invariant that stable states are terminal. The invariant is scattered across N call sites rather than enforced by a single mechanism, increasing cognitive load and the probability of an oversight.
+
+Solution:
+Introduce a `guardStableStatus(concept)` helper that throws a descriptive error (or returns a sentinel) when the concept is in a stable state. Every mutator calls this guard as its first statement. Alternatively, wrap concept mutation in a class method or a Proxy that intercepts property writes and rejects them when `status ∈ STABLE_CONCEPT_STATUSES`, making it structurally impossible for any current or future mutator to bypass the check. The key is that the invariant lives in one place and is enforced by the mechanism, not by developer memory.
+
+Benefits:
+Adding a new mutator no longer requires remembering to add the guard—the guard is either a mandatory first call or is enforced by the wrapper itself. Code review becomes simpler: reviewers check that the mutator calls `guardStableStatus` (or that the wrapper handles it) rather than scanning for a hand-rolled `if` that might be subtly different. The invariant "stable concepts are terminal" is stated once, in one function, and is impossible to accidentally weaken by editing one of several scattered copies.
