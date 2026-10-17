@@ -329,3 +329,26 @@ Wrap the per-entry health-check body (the existing retry `while` loop plus `urll
 
 Benefits:
 Total wall-clock time for a batch of N health checks drops from the sum of individual timeouts to roughly the slowest single check (bounded by the pool size), so a ten-service batch that previously could block the UI for 300 s now completes in about 30 s. The main thread is never held hostage by a single slow or dead endpoint, keeping the dashboard responsive to user input and other requests. Because the fix uses only `concurrent.futures` from the standard library, no new dependency is introduced and the existing `urllib`-based retry logic is preserved as-is.
+
+### AC-18 · Replace sequential sync file writes with parallel async writes in batch-apply loop
+Strength: Strong
+Files: src/apply-task.js
+Snippet:
+```
+    for (const { task } of loaded) results[task.id] = batchOutcome;
+  }
+
+  for (const { task, path: p } of loaded) {
+    const r = results[task.id] || { succeeded: false, reason: 'no batch result produced for this task' };
+    recordApplyOutcome(task, r);
+    try { fs.writeFileSync(p, JSON.stringify(task, null, 2)); } catch { /* non-fatal, same as single path */ }
+```
+
+Problem:
+The batch-apply loop in `apply-task.js` iterates over `loaded` (the set of tasks in a batch) and calls `fs.writeFileSync(p, JSON.stringify(task, null, 2))` once per task, sequentially. Each call blocks the event loop for the duration of the disk write, and because the calls are serial the total blocking time is the sum across all iterations. For a batch of 50–200 tasks on a throttled or slow volume, this can freeze the event loop for several hundred milliseconds to several seconds, during which no other I/O callbacks, timers, or network events fire. The `catch { /* non-fatal */ }` swallows any error, so a stuck disk simply extends the freeze with no visible timeout.
+
+Solution:
+Replace the `for…of` loop with `await Promise.all(loaded.map(...))`. Inside the map callback, keep the synchronous `recordApplyOutcome(task, r)` call (pure in-memory bookkeeping keyed by `task.id`, safe in any order), then return `fs.promises.writeFile(p, JSON.stringify(task, null, 2)).catch(() => {})` to preserve the existing non-fatal error semantics. The enclosing function must be `async` (or the caller must `await` the returned promise). This uses only `fs.promises` (built-in Node) and `Promise.all` (built-in); no new dependency is introduced. Because each write targets a distinct file, the operations are independent and can proceed concurrently, reducing total wall-clock time from the sum of all writes to roughly the slowest single write.
+
+Benefits:
+The event loop is no longer frozen for the cumulative duration of all batch writes; concurrent writes overlap their I/O wait time, cutting total blocking time from O(n × write_time) to approximately O(max_write_time). Other I/O callbacks, timers, and network events can fire while writes are in flight, keeping the process responsive. The non-fatal error semantics are preserved exactly via the per-write `.catch(() => {})`, so no behavioral change is introduced for callers. No new dependency or API surface is added.
