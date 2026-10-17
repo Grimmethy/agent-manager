@@ -375,3 +375,26 @@ Replace the sequential `for` loop with `Promise.allSettled` (a built-in JS primi
 
 Benefits:
 Total wall-clock latency for the voting step drops from `n × single_call_latency` to approximately `1 × single_call_latency`, eliminating 2–3× redundant network and inference time on every classification call. Because the calls are truly independent (same immutable parameters, no shared mutable state, commutative voting), concurrency introduces no ordering hazard, no race condition, and no additional load beyond what the provider already permits for 3 simultaneous requests. The fix uses only a built-in language primitive and the `call` function the file already imports, so no new dependency, API surface, or configuration knob is introduced.
+
+### AC-20 · Parallelise majorityVote inference calls
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+`majorityVote` dispatches its N (default 3) LLM inference calls sequentially inside a `for` loop, `await`-ing each `call(…)` before issuing the next. Every call receives the same `prompt`, `model`, `temperature`, and parameter set, and no iteration reads or writes state that a later iteration depends on, so the sequential ordering is purely an artefact of the loop structure. For a typical 1–10 s inference the user waits roughly 2 × single-inference-latency (≈ 2–20 s) of pure round-trip overhead for no logical reason, and in an agent pipeline where `majorityVote` is invoked per stage the penalty compounds.
+
+Solution:
+Replace the sequential `for` loop with a concurrent dispatch: build an array of N promises up front (each wrapping the existing `call(…)` in a `.then`/`.catch` pair that tags the outcome as `{ ok: true, result }` or `{ ok: false, err }`), then `await Promise.all(tasks)` once. After the single `await`, iterate the settled array to partition into `votes` and `voteErrors` exactly as the original per-iteration try/catch did. `Promise.all` is a built-in global; no new dependency is introduced, and the per-call error semantics are preserved because each promise resolves to a tagged object rather than rejecting the outer `Promise.all`.
+
+Benefits:
+All N inferences are in flight simultaneously, so wall-clock time drops from ≈ N × single-latency to ≈ 1 × single-latency (plus any server-side queuing). Even when the local model server serialises inference internally, the fix eliminates N − 1 full HTTP/TCP request→response round-trips, lets the server's internal queue batch or pipeline the requests, and keeps the Node event loop free for logging and bookkeeping between inferences. In multi-stage agent pipelines the savings multiply across every `majorityVote` call.
