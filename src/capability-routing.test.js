@@ -87,3 +87,18 @@ test('decideReservation: a probe-selected source holds only for an idle small la
   assert.deepEqual(R.decideReservation({ ...args, isIdle: () => true }), { holder: 'worker-rx580', evidence: 'probe' });
   assert.equal(R.decideReservation({ ...args, isIdle: () => false }), null);
 });
+
+test('a degraded lane is neither a reservation holder nor a probe target', () => {
+  const dir = require('fs').mkdtempSync(require('path').join(require('os').tmpdir(), 'route-health-'));
+  const now = Date.now();
+  const ok = (tps, ago) => ({ at: new Date(now - ago).toISOString(), ok: true, tps, totalMs: 1, error: null });
+  const fsm = require('fs'); const pth = require('path');
+  fsm.writeFileSync(pth.join(dir, 'worker-rx580.json'), JSON.stringify({ status: 'idle', lastHeartbeat: new Date(now).toISOString() }));
+  assert.equal(R.laneAliveFromHeartbeat(dir, 'worker-rx580', now), true);
+  fsm.writeFileSync(pth.join(dir, 'lane-health.worker-rx580.json'), JSON.stringify({ samples: [ok(26, 4e6), ok(27, 3e6), ok(25, 2e6), ok(0.6, 6e4)] }));
+  assert.equal(R.laneAliveFromHeartbeat(dir, 'worker-rx580', now), false);
+  const cfg = { ...CFG, probeFraction: 1, probeMaxFailStreak: 3 };
+  const base = { task: { id: 't' }, source: 'x', registered: {}, lane: small, lanes: [big, small], rows: [], cfg };
+  assert.equal(R.probeSelected(base), true);
+  assert.equal(R.probeSelected({ ...base, degraded: true }), false);
+});

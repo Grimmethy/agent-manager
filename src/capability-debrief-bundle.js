@@ -40,7 +40,7 @@ function clusterKey(c) { return `${c.source}|${c.model}|${c.signature}`; }
 
 // Failure clusters among small-lane attempts: entries with a known tier that has a larger tier above it in the ledger window, grouped by
 // (source, model, signature), keeping groups with >= minFailures failures. Newest cluster first.
-function collectFailureClusters(entries, { minFailures = DEFAULT_MIN_FAILURES } = {}) {
+function collectFailureClusters(entries, { minFailures = DEFAULT_MIN_FAILURES, isDegraded = null } = {}) {
   const tiers = (entries || []).map((e) => e.tier).filter((t) => typeof t === 'number');
   const maxTier = tiers.length ? Math.max(...tiers) : null;
   const groups = new Map();
@@ -56,7 +56,14 @@ function collectFailureClusters(entries, { minFailures = DEFAULT_MIN_FAILURES } 
   }
   return [...groups.values()]
     .filter((g) => g.entries.length >= minFailures)
-    .map((g) => ({ ...g, failures: g.entries.length, firstAt: g.entries[0].at || null, lastAt: g.entries[g.entries.length - 1].at || null }))
+    .map((g) => {
+      const firstAt = g.entries[0].at || null;
+      const lastAt = g.entries[g.entries.length - 1].at || null;
+      // A lane that was measurably slow while these failed makes the cluster a hardware suspect, not evidence about the task.
+      const lanes = [...new Set(g.entries.map((e) => e.lane).filter(Boolean))];
+      const suspect = typeof isDegraded === 'function' && lanes.some((l) => isDegraded(l, firstAt, lastAt));
+      return { ...g, failures: g.entries.length, firstAt, lastAt, suspect };
+    })
     .sort((a, b) => String(b.lastAt).localeCompare(String(a.lastAt)));
 }
 
@@ -64,10 +71,10 @@ function readState(instancesDir) {
   try { return JSON.parse(fs.readFileSync(path.join(instancesDir, STATE_FILE), 'utf8')); } catch (_) { return {}; }
 }
 
-// Clusters not yet debriefed. One debrief per cluster until a fix lands: markDebriefed records it; resetCluster (called when a fix merges) clears it.
+// Clusters not yet debriefed (and not hardware suspects: a debrief of a degraded lane would blame the task for the GPU). One debrief per cluster until a fix lands: markDebriefed records it; resetCluster (called when a fix merges) clears it.
 function pendingClusters(clusters, instancesDir) {
   const state = readState(instancesDir);
-  return clusters.filter((c) => !state[clusterKey(c)]);
+  return clusters.filter((c) => !c.suspect && !state[clusterKey(c)]);
 }
 
 function markDebriefed(instancesDir, cluster, extra = {}) {
@@ -112,6 +119,7 @@ function renderFraming(cluster, now) {
     `CAPABILITY DEBRIEF BUNDLE — assembled ${new Date(now).toISOString()}`,
     `cluster: source=${cluster.source} model=${cluster.model} (tier ${cluster.tier}) signature="${cluster.signature}"`,
     `${cluster.failures} failed attempt(s) across ${cluster.taskIds.length} task(s), ${cluster.firstAt || '?'} .. ${cluster.lastAt || '?'}`,
+    ...(cluster.suspect ? ['WARNING: the lane health probe flagged this lane as degraded while these attempts ran. Treat the failures as possible hardware/server faults before blaming the task.'] : []),
     '',
     'Question: why does this task class fail on the small model, and what is the smallest change to the SYSTEM that would let it fit? Classify the cause:',
     '  1. prompt or context too large for the lane (numCtx, prompt tokens vs the limit)  -> trim/window the input, or split it by file/section',
@@ -183,10 +191,13 @@ if (require.main === module) {
   const pipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT || process.cwd();
   const dbPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH || path.join(pipelineDir, 'model-stats.db');
   const entries = readLedgerEntries(pipelineDir, { windowDays: Number(get('days')) || DEFAULT_WINDOW_DAYS });
-  const clusters = collectFailureClusters(entries, { minFailures: Number(get('min')) || DEFAULT_MIN_FAILURES });
+  const { sharedInstancesDir } = require('./instances-dir.js');
+  const laneHealth = require('./lane-health.js');
+  const instancesDir = sharedInstancesDir(pipelineDir);
+  const clusters = collectFailureClusters(entries, { minFailures: Number(get('min')) || DEFAULT_MIN_FAILURES, isDegraded: (lane, from, to) => laneHealth.laneDegradedBetween(instancesDir, lane, from, to) });
   if (get('index') == null) {
     if (!clusters.length) console.log('no failure clusters');
-    clusters.forEach((c, i) => console.log(`[${i}] ${c.source} on ${c.model}: ${c.failures} x ${c.signature} (${c.taskIds.length} tasks, last ${c.lastAt})`));
+    clusters.forEach((c, i) => console.log(`[${i}] ${c.source} on ${c.model}: ${c.failures} x ${c.signature} (${c.taskIds.length} tasks, last ${c.lastAt})${c.suspect ? ' [LANE DEGRADED - hardware suspect]' : ''}`));
   } else {
     const cluster = clusters[Number(get('index'))];
     if (!cluster) { console.error('no such cluster'); process.exit(1); }

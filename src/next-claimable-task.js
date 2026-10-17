@@ -275,7 +275,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
         let probe = false;
         if (routing.cfg.mode !== 'off') {
           try {
-            probe = capRouting.probeSelected({ task, source: sourceName, registered: getRegisteredSource(sourceName), lane: thisLane, lanes: opts.lanes || require('./lanes.js').getLanes(), rows: routing.rows(), cfg: routing.cfg });
+            probe = capRouting.probeSelected({ task, source: sourceName, registered: getRegisteredSource(sourceName), lane: thisLane, lanes: opts.lanes || require('./lanes.js').getLanes(), rows: routing.rows(), cfg: routing.cfg, degraded: opts.laneDegraded ? opts.laneDegraded(thisLane.id) : require('./lane-health.js').laneDegraded(routing.instancesDir, thisLane.id) });
           } catch (_) { probe = false; }
         }
         if (!probe) continue;

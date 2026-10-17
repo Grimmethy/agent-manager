@@ -59,3 +59,12 @@ test('buildScorecard: failStreak is the trailing run of non-ok attempts', () => 
   assert.equal(L.buildScorecard([mk('ok'), mk('timeout'), mk('error')])[0].failStreak, 2);
   assert.equal(L.buildScorecard([mk('timeout'), mk('ok')])[0].failStreak, 0);
 });
+
+test('ledger entry carries the attempt throughput, and the scorecard reports the median', () => {
+  const entry = L.buildEntry({ outcome: 'succeeded', at: new Date(Date.now() - 1000).toISOString(), finishedAt: new Date().toISOString() }, { source: 's', env: { LOCAL_MODEL: 'm:8b' }, throughput: { tps: 25.5, tokens: 300 } });
+  assert.equal(entry.tps, 25.5);
+  assert.equal(entry.evalTokens, 300);
+  assert.equal(L.buildEntry({ outcome: 'error' }, { env: {} }).tps, null);
+  const rows = L.buildScorecard([{ source: 's', model: 'm:8b', outcome: 'ok', tps: 20 }, { source: 's', model: 'm:8b', outcome: 'ok', tps: 30 }, { source: 's', model: 'm:8b', outcome: 'timeout' }]);
+  assert.equal(rows[0].tpsP50, 30);
+});

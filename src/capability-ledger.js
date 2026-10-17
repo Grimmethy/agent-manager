@@ -45,6 +45,8 @@ function buildEntry(attempt, ctx = {}) {
     outcome: classifyOutcome(attempt),
     attemptNo: attempt ? attempt.attemptNo || null : null,
     wallMs: Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null,
+    tps: ctx.throughput ? ctx.throughput.tps : null,
+    evalTokens: ctx.throughput ? ctx.throughput.tokens : null,
     reason: attempt && (attempt.blockedReason || attempt.reason) ? String(attempt.blockedReason || attempt.reason).slice(0, 200) : null,
   };
 }
@@ -77,7 +79,7 @@ function buildScorecard(entries) {
     const key = `${e.source}\u0000${e.model}`;
     let r = rows.get(key);
     if (!r) {
-      r = { source: e.source, model: e.model, tier: e.tier == null ? tierFromModel(e.model) : e.tier, lanes: new Set(), n: 0, ok: 0, outcomes: {}, walls: [], failStreak: 0 };
+      r = { source: e.source, model: e.model, tier: e.tier == null ? tierFromModel(e.model) : e.tier, lanes: new Set(), n: 0, ok: 0, outcomes: {}, walls: [], tpss: [], failStreak: 0 };
       rows.set(key, r);
     }
     r.n += 1;
@@ -85,13 +87,15 @@ function buildScorecard(entries) {
     r.outcomes[e.outcome] = (r.outcomes[e.outcome] || 0) + 1;
     if (e.lane) r.lanes.add(e.lane);
     if (Number.isFinite(e.wallMs)) r.walls.push(e.wallMs);
+    if (Number.isFinite(e.tps) && e.tps > 0) r.tpss.push(e.tps);
   }
   return [...rows.values()].map((r) => {
     const walls = r.walls.sort((a, b) => a - b);
+    const tpss = r.tpss.sort((a, b) => a - b);
     return {
       source: r.source, model: r.model, tier: r.tier, lanes: [...r.lanes].sort(), n: r.n, ok: r.ok,
       okRate: r.n ? r.ok / r.n : 0, lower: wilsonLower(r.ok, r.n),
-      p50WallMs: percentile(walls, 0.5), p95WallMs: percentile(walls, 0.95), outcomes: r.outcomes, failStreak: r.failStreak,
+      p50WallMs: percentile(walls, 0.5), p95WallMs: percentile(walls, 0.95), outcomes: r.outcomes, failStreak: r.failStreak, tpsP50: percentile(tpss, 0.5),
     };
   }).sort((a, b) => a.source.localeCompare(b.source) || (a.tier ?? 1e9) - (b.tier ?? 1e9) || a.model.localeCompare(b.model));
 }

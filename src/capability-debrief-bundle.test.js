@@ -85,3 +85,14 @@ test('readLedgerEntries reads back what the ledger wrote', () => {
   logPipelineEvent(dir, 'degenerate', { x: 1 });
   assert.equal(B.readLedgerEntries(dir).length, 1);
 });
+
+test('a cluster on a lane the health probe flagged is a hardware suspect: marked, kept out of pendingClusters, and warned in the bundle', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cap-debrief-suspect-'));
+  const entries = [entry('t1', 'timeout'), entry('t2', 'timeout'), entry('t3', 'timeout'), entry('b', 'ok', { model: BIG, tier: 27 })];
+  const [cluster] = B.collectFailureClusters(entries, { isDegraded: (lane) => lane === 'worker-rx580' });
+  assert.equal(cluster.suspect, true);
+  assert.equal(B.pendingClusters([cluster], dir).length, 0);
+  assert.match(B.buildCapabilityDebriefBundle({ pipelineDir: dir, dbPath: path.join(dir, 'x.db'), cluster, entries }).evidenceText, /flagged this lane as degraded/);
+  const [healthy] = B.collectFailureClusters(entries, { isDegraded: () => false });
+  assert.equal(healthy.suspect, false);
+});

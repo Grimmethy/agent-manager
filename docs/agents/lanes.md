@@ -69,6 +69,16 @@ Human-queued and premium tasks, operator pins, and tasks that already failed on 
 nothing), `enforce`, or `off`. Design and rollout: `docs/design-notes/capability-routing-and-benchmarking.md`. `launch.sh` exports
 `AGENT_MANAGER_HOST_LOCAL_MODEL` so the host lane's tier is known inside remote-lane workers.
 
+### Lane health
+
+`src/lane-health.js` (run from the watchdog tick, in the background) sends each **idle** lane's endpoint one tiny fixed generation about every 10 minutes
+(`AGENT_MANAGER_LANE_HEALTH_INTERVAL_SECS`, 600) and records tokens/s in `<instances>/lane-health.<lane>.json` and as a `lane-health` pipeline-history
+line. A lane is **degraded** when its latest probe failed or ran below `AGENT_MANAGER_LANE_HEALTH_MIN_FRACTION` (0.5) of its own 75th-percentile
+baseline. Why it exists: on 2026-10-17 the RX 580's memory clock stuck at 300 MHz (0.6 instead of 26 tok/s) and three timeouts looked like a task that
+was too big for the 8B. Consumers: reservation and probing never use a degraded lane; `capability-debrief-bundle.js` marks clusters that ran on a
+degraded lane as hardware suspects and keeps them out of the debrief queue. `AGENT_MANAGER_LANE_HEALTH=off` disables. CLI: `node src/lane-health.js --status`.
+The capability ledger also records each attempt's own `tps` (from calls that returned) and the scorecard shows its median.
+
 ### Probing
 
 So smaller lanes keep getting tried on work they have not proven, a **restricted lane** (one with `taskClasses`) is also offered a deterministic fraction

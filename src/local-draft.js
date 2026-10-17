@@ -1583,7 +1583,7 @@ async function draftTask(task, deps = {}) {
     if (repoRoot) {
       let sourceName = null;
       try { sourceName = resolveSourceName(task); } catch (_) { sourceName = task && task.source || null; }
-      recordLedgerAttempt(process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot, attempt, { source: sourceName, taskId: task && task.id });
+      recordLedgerAttempt(process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot, attempt, { source: sourceName, taskId: task && task.id, throughput: require('./local-throughput.js').takeAttemptThroughput() });
     }
   }
   return result;

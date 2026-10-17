@@ -153,6 +153,10 @@ while :; do
       printf '[watchdog] restarted %s (was pid %s, %s) -- new pid %s via %s\n' "$action_instance" "$action_pid" "$action_reason" "$new_pid" "$action_script" >&2
     done < <(node "${PACKAGE_SRC_DIR}/dead-process-check.js" 2>>"${HOME_LOGS}/dead-process-check.log")
 
+    # Lane health probe (src/lane-health.js): one tiny generation per idle lane every ~10 min, so a lane that is up but crawling (2026-10-17: RX 580 memory
+    # clock stuck at 300 MHz, 0.6 tok/s) is flagged as degraded instead of looking like a task that is too big. Self-throttled and run in the background (a probe of a crawling lane can take its full timeout); kill switch AGENT_MANAGER_LANE_HEALTH=off.
+    ( node "${PACKAGE_SRC_DIR}/lane-health.js" >/dev/null 2>>"${HOME_LOGS}/lane-health.log" || true ) &
+
     # Reject-retry-requeue: a task genuinely rejected by review (blockedStage:'review') gets
     # one more redraft attempt, up to reject-retry-check.js's own retry cap -- port of
     # queue-watchdog.ps1's Invoke-RejectRetryCheck (that script's OTHER job, dead-process

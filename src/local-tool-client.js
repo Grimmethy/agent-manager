@@ -1062,6 +1062,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     usageAcc.prompt_eval_count += Number(u.prompt_eval_count) || 0;
     usageAcc.eval_count += Number(u.eval_count) || 0;
     usageAcc.eval_duration += Number(u.eval_duration) || 0;
+    require('./local-throughput.js').noteAttemptSample({ evalCount: Number(u.eval_count) || 0, evalDurationNs: Number(u.eval_duration) || 0 });
   };
   // Same extraction as local-client.js's call()/claude-client.js's call() -- see
   // side-finding.js's own header. Hooked into this one shared wrapper so every return
