@@ -1935,3 +1935,19 @@ Introduce a `guardStableStatus(concept)` helper that throws a descriptive error 
 
 Benefits:
 Adding a new mutator no longer requires remembering to add the guard—the guard is either a mandatory first call or is enforced by the wrapper itself. Code review becomes simpler: reviewers check that the mutator calls `guardStableStatus` (or that the wrapper handles it) rather than scanning for a hand-rolled `if` that might be subtly different. The invariant "stable concepts are terminal" is stated once, in one function, and is impossible to accidentally weaken by editing one of several scattered copies.
+
+### AC-169 · ~~Duplicated priority-resolution logic across registry and priority modules~~ — **RETRACTED**
+Strength: ~~Strong~~ → **Invalid**
+Files: src/task-source-registry.js, src/lib/task-priority.js
+
+**Retraction:**
+The original draft mischaracterized the relationship between these two modules. They do **not** implement the same resolution pattern, and there is no duplicated logic to consolidate.
+
+- `task-source-registry.js` → `getRegisteredSources` reads the `priority` value **stored in each registry entry** (set at `registerTaskSource` call time) and uses it solely for **sorting the list** of registered sources (`a.priority ?? Infinity`). It never consults `getConfig().taskPriorityOverrides`.
+- `task-priority.js` → `taskPriority` is a **config-lookup helper** that returns `getConfig().taskPriorityOverrides[name] ?? def`, where `def` is a caller-supplied default. It never reads from the registry.
+
+These are complementary mechanisms with different inputs (registry entry vs. config object) and different purposes (list-sorting key vs. single-value resolution). They are not competing implementations of the same function, and the "divergence" the draft described is simply the intended design: the registry holds a base priority for ordering, while config overrides allow per-context or per-environment adjustment for consumers that explicitly opt in.
+
+**No code change is warranted.** The proposed `resolvePriority(sourceName, registeredEntry)` utility would conflate two unrelated data sources, break `taskPriority`'s general-purpose contract (it is not registry-specific), and introduce a coupling that does not exist today.
+
+NOTE: All three flags were applied; the entire finding was retracted because the core premise (duplicated logic / two sources of truth) was factually incorrect per the critique's code-level analysis.
