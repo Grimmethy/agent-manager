@@ -1870,3 +1870,29 @@ Benefits:
 Removes global `sys.path` mutation from the test process, eliminates the risk of path pollution affecting other tests, and makes the test's dependency on the modules under test explicit and isolated.
 
 NOTE: The critique regarding AC-002's "shadowing" claim was valid and addressed by reframing the problem as global state pollution rather than shadowing, and by proposing a more robust solution using `importlib` instead of package imports. The critique regarding AC-001's "silent fallback" claim was valid and addressed by correcting the problem statement to reflect that Ollama returns a clear error, but the local error is still preferable for latency and clarity reasons.
+
+### AC-164 · Inconsistent error-handling contract between resolveAtRef and grepAtRef
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The `resolveAtRef` function swallows all `execFileSync` exceptions and returns `null`, treating a genuine git infrastructure failure (network timeout, corrupted object database, missing git binary) identically to a legitimate "path not found" result. Its sibling `grepAtRef` in the same file explicitly distinguishes between a "no match" exit code (1) and a real failure (exit code > 1), re-throwing the latter. Because `resolveAtRef` is used to validate target files for stacked tasks, a transient git error causes the system to falsely report a real file as "absent," leading to a valid task being blocked or rejected as a "fabricated path" rather than surfacing the underlying infrastructure failure to the operator.
+
+Solution:
+Align `resolveAtRef` with the error-handling contract already established by `grepAtRef`: catch the `execFileSync` exception, inspect the exit code, and re-throw (or throw a typed error) when the exit code indicates a genuine failure rather than a simple "not found" result. Only return `null` when the exit code specifically means the path does not exist at the given ref.
+
+Benefits:
+Operators and downstream task-validation logic can distinguish between "the file truly isn't there" and "git itself failed," preventing valid tasks from being silently rejected as fabricated. It also makes the module's error contract internally consistent, reducing the cognitive load on anyone reading or extending `stacked-grounding.js`.
+
+### AC-165 · Dead require of task-sources.js in apply-core.js
+Strength: Worth exploring
+Files: src/lib/apply-core.js, src/task-sources.js, src/apply-task.js
+
+Problem:
+`apply-core.js` contains a bare, unassigned side-effect require of `../task-sources.js`. No symbol from `task-sources.js` is destructured, assigned, or referenced anywhere in `apply-core.js`; the functions in `task-sources.js` (`writeArtifact`, `applyCandidateSplit`, and others) operate purely on their arguments and other imported modules. The caller, `src/apply-task.js`, already loads `./task-sources.js` directly. The dead require adds a needless edge to the module graph and introduces a small circular-require risk for no functional benefit.
+
+Solution:
+Remove the bare `require('../task-sources.js')` line from `apply-core.js`. Since no binding from that module is used and the caller already loads it, the require is pure dead weight.
+
+Benefits:
+The module graph becomes smaller and more honest—every edge reflects a real dependency. It eliminates a potential circular-require hazard and makes it easier for a reader (or a bundler) to understand the true dependency surface of `apply-core.js`.
