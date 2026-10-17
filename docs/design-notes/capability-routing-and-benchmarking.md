@@ -1,6 +1,6 @@
 # Design Note: Capability Routing and Task-Class Benchmarking
 
-**Status:** steps 1 (ledger, #570) and 2 (shadow reservation, with the `enforce` switch already in the code) built 2026-10-17; escalation, probing and the shrink loop are not (Grimmethy + Claude)
+**Status:** built 2026-10-17: step 1 (ledger, #570), step 2 (shadow reservation with an `enforce` switch, #571), escalation on timeout/degenerate/error (#572). Designed, not built: probing (section 5) and the probe debrief / shrink loop (section 5a). (Grimmethy + Claude)
 **Related code:** `src/lanes.js`, `src/next-claimable-task.js`, `src/reject-retry-check.js`, `src/premium-rotation.js`
 **Related docs:** [lanes.md](../agents/lanes.md)
 
@@ -89,8 +89,8 @@ there, which is how a source gets *un-reserved* automatically when a model regre
 
 Reservation only reserves what is already proven, which alone would freeze the system at today's answer. So the claim loop also does **probing**:
 
-- A small, bounded fraction (default 10%) of eligible tasks of an *unproven* `(source, small-lane)` pair are offered to the small lane first, as a
-  trial. Eligible means low-stakes: the source is flagged re-runnable, a big lane can redo it, and the task is not premium or human-queued.
+- A small, bounded fraction (default 10%, `AGENT_MANAGER_PROBE_FRACTION`, chosen deterministically per task) of eligible tasks of an *unproven* `(source, small-lane)` pair are offered to the small lane first, as a
+  trial. Eligible means low-stakes: the source is flagged re-runnable, a big lane can redo it, and the task is not premium or **human-queued** (decided 2026-10-17: human-queued work is ad hoc, hard even for the 27B, and the 8B never probes it). At most one probe in flight per small lane. Probing for a source stops after it passes the gate, and after several consecutive failed probes until a debrief fix lands (section 5a).
 - A trial that fails escalates (section 4) and costs one attempt of time, nothing else.
 - When a source passes the gate, probing for that pair stops and reservation starts. When a smaller tier exists below it, probing moves down.
 - This is the "improve every task class to fit smaller models" loop: tasks keep getting tried on the next tier down at a trickle.
@@ -98,6 +98,43 @@ Reservation only reserves what is already proven, which alone would freeze the s
 A separate **shrink** half of the goal is outside this note's code but is what the ledger enables: a source with a poor small-model scorecard is
 a candidate for atomizing (smaller prompts, split plan/write stages, tighter context) and the scorecard says which source to atomize first and
 shows whether the change worked. The Pipeline Forensics source can consume the scorecard as evidence.
+
+## 5a. Probe debrief: turning a failed probe into a smaller task
+
+Probing finds out *that* a task class does not fit a small model. It does not make it fit. The shrink loop is the follow-up that does (requested
+2026-10-17: after a probe, a higher-level model debriefs the attempt and proposes system fixes that break the task into smaller scoped work).
+
+**Trigger.** A probe fails (timeout, degenerate, error, or the draft is rejected) and the task is then finished on a larger lane via escalation.
+That pairing is the evidence: the same task, same inputs, one small-lane failure and one large-lane result. Debriefs fire per *failure cluster*
+(source + failure signature, e.g. `change_review` + plan-call timeout), not per attempt: default after 3 failed probes in a cluster, and once per
+cluster until a fix lands.
+
+**Who debriefs.** A larger-tier **local** lane (the 27B), never a premium or hosted model: local-model failures are solved by splitting the work,
+not by switching provider. It runs as an ordinary low-priority task from a new `capability_debrief` source.
+
+**Shape: reuse, don't reinvent.** It mirrors `pipeline_debrief` / `pipeline_forensics`: a deterministic bundle builder
+(`forensic-bundle.js`'s `gatherEvidenceForTask`) assembles the evidence, a model writes the report, and the existing so-what, premise-check and
+candidate-dedupe gates apply. The bundle for a cluster holds: the failed small-lane attempts (prompt size in tokens, `numCtx`, which stage failed,
+wall time, response length or truncation), the large-lane result for the same task, and a contrast set of probes of the same source that passed.
+
+**Output is structured, not prose.** Each proposal names a cause class and a concrete fix:
+
+| cause | typical fix |
+|---|---|
+| prompt or context too large for the lane's `numCtx` | window or trim the input; split the input by file/section |
+| task is several jobs in one call | split into stages (plan / write / verify) or per-file sub-tasks, each a smaller registered source |
+| a call is mechanically decidable | replace it with a deterministic check (the `pipeline_debrief` determinism audit already looks for these) |
+| needs reasoning depth the tier lacks | verdict `not shrinkable at this tier`, with the reason; probing for the source pauses |
+
+**Landing a fix.** Proposals are filed for a human decision first (brain dump, as Pipeline Forensics does), not auto-applied; an approved one
+becomes ordinary AM tasks that go through the normal review and merge gates. Once a fix merges, the source's probe failure streak resets and the
+scorecard is read before/after the fix commit, so the loop closes on evidence: a fix that does not raise the small lane's pass rate is visible.
+
+**Guards.** One debrief per cluster; a daily debrief cap so it cannot crowd out real work; a proposal that cites a file, symbol or metric not in the
+bundle is rejected by the premise check; `not shrinkable` is a valid outcome and is recorded, not retried.
+
+**Rollout.** After probing is in shadow and the ledger has failed-probe clusters to analyse: bundle builder and report only (no filing), then
+human-gated filing, then optional auto-filing of low-risk classes (context trimming) once the proposals have a track record.
 
 ## 6. Where it surfaces
 
