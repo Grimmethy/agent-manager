@@ -1,6 +1,6 @@
 # Design Note: Capability Routing and Task-Class Benchmarking
 
-**Status:** proposed, nothing built (2026-10-17, Grimmethy + Claude)
+**Status:** steps 1 (ledger, #570) and 2 (shadow reservation, with the `enforce` switch already in the code) built 2026-10-17; escalation, probing and the shrink loop are not (Grimmethy + Claude)
 **Related code:** `src/lanes.js`, `src/next-claimable-task.js`, `src/reject-retry-check.js`, `src/premium-rotation.js`
 **Related docs:** [lanes.md](../agents/lanes.md)
 

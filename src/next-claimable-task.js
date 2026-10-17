@@ -240,6 +240,13 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     laneCount = allLanes.length;
     thisLane = allLanes.find((l) => l.id === instanceId) || null;
   } catch (_) { laneCount = 0; thisLane = null; }
+  const capRouting = require('./capability-routing.js');
+  const routing = {
+    cfg: capRouting.routingConfig(),
+    instancesDir: opts.instancesDir || sharedInstancesDir(pipelineDir),
+    _rows: null,
+    rows() { if (!this._rows) this._rows = opts.scorecard || capRouting.cachedScorecard(pipelineDir, this.cfg); return this._rows; },
+  };
   const pinned = [];
   const rankable = [];
   for (const name of names) {
@@ -262,6 +269,27 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
       let sourceName = null;
       try { sourceName = resolveSourceName(task); } catch (_) { sourceName = null; }
       if (!require('./lanes.js').laneAllowsSource(thisLane, sourceName)) continue;
+    }
+
+    // Capability routing (src/capability-routing.js): a lane leaves a task to a lower-tier lane that has proven itself on its source, for a
+    // bounded grace. Shadow mode (default) only logs the decision. Human-queued / premium tasks and tasks that already failed on the
+    // holder (avoidLanes) are never held.
+    if (task && thisLane && routing.cfg.mode !== 'off' && !task.humanQueued && !task.premiumPriority) {
+      let srcName = null;
+      try { srcName = resolveSourceName(task); } catch (_) { srcName = null; }
+      const allLanes = opts.lanes || (() => { try { return require('./lanes.js').getLanes(); } catch (_) { return []; } })();
+      const decision = require('./capability-routing.js').decideReservation({
+        source: srcName, thisLane, lanes: allLanes, rows: routing.rows(), ageMs: (opts.now !== undefined ? opts.now : Date.now()) - mtimeMs, cfg: routing.cfg,
+        isAlive: (id) => (opts.laneAlive ? opts.laneAlive(id) : require('./capability-routing.js').laneAliveFromHeartbeat(routing.instancesDir, id)),
+        avoided: (id) => laneAvoided(task, id, allLanes.length),
+      });
+      if (decision) {
+        require('./capability-routing.js').auditReservation(pipelineDir, routing.instancesDir, {
+          mode: routing.cfg.mode, action: routing.cfg.mode === 'enforce' ? 'held' : 'would-hold', taskId: task.id || name, source: srcName, lane: thisLane.id,
+          holder: decision.holder, evidence: decision.evidence,
+        });
+        if (routing.cfg.mode === 'enforce') continue;
+      }
     }
 
     // A scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is

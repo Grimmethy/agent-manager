@@ -28,7 +28,7 @@ test('gpuSlugFromName: last digit-bearing token, lowercased', () => {
 
 test('local lane is named for AGENT_MANAGER_LOCAL_GPU; no P40 vars, no registry -> exactly one lane', () => {
   const lanes = getLanes({ ...noRegistry, AGENT_MANAGER_LOCAL_GPU: '3090' });
-  assert.deepEqual(lanes, [{ id: 'worker-3090', gpu: '3090', env: {}, local: true, slow: false, numCtx: null, preempt: 'always', taskClasses: null }]);
+  assert.deepEqual(lanes, [{ id: 'worker-3090', gpu: '3090', env: {}, local: true, slow: false, numCtx: null, preempt: 'always', taskClasses: null, model: null, tier: null, reserve: 'auto' }]);
 });
 
 test('both P40 vars set -> second lane worker-p40 carrying its own Ollama env, never preempted', () => {
@@ -57,7 +57,7 @@ test('registry: one entry adds a lane with the full env, defaults id/preempt, cl
   const lanes = getLanes(withRegistry([RX580]));
   assert.deepEqual(lanes.map((l) => l.id), ['worker-3090', 'worker-rx580']);
   assert.deepEqual(lanes[1], {
-    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, numCtx: null, preempt: 'never', taskClasses: null,
+    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, numCtx: null, preempt: 'never', taskClasses: null, model: 'qwen3-vl:8b-instruct', tier: 8, reserve: 'auto',
     env: { OLLAMA_URL: 'http://100.96.112.78:11434', LOCAL_MODEL: 'qwen3-vl:8b-instruct', AGENT_MANAGER_GPU_YIELD_APPS: '' },
   });
 });
@@ -172,4 +172,22 @@ test('numCtx: a whole number 2048..131072 becomes AGENT_MANAGER_LANE_NUM_CTX in 
     assert.deepEqual(getLanes(withRegistry([{ ...RX580, numCtx: bad }])).map((l) => l.id), ['worker-3090'], `numCtx ${JSON.stringify(bad)} is invalid`);
   }
   assert.equal(getLanes(withRegistry([RX580]))[1].env.AGENT_MANAGER_LANE_NUM_CTX, undefined, 'no numCtx = no override');
+});
+
+test('tier comes from the model tag, can be overridden, and reserve is validated', () => {
+  assert.equal(getLanes(withRegistry([RX580]))[1].tier, 8);
+  assert.equal(getLanes(withRegistry([{ ...RX580, model: 'custom-tag', tier: 7 }]))[1].tier, 7);
+  assert.equal(getLanes(withRegistry([{ ...RX580, model: 'custom-tag' }]))[1].tier, null);
+  assert.equal(getLanes(withRegistry([{ ...RX580, reserve: false }]))[1].reserve, false);
+  assert.equal(getLanes(withRegistry([{ ...RX580, reserve: 'always' }]))[1].reserve, 'always');
+  assert.equal(getLanes(withRegistry([{ ...RX580, reserve: 'sometimes' }])).length, 1, 'bad reserve fails closed');
+  assert.equal(getLanes(withRegistry([{ ...RX580, tier: -1 }])).length, 1, 'bad tier fails closed');
+});
+
+test('host lane tier: from AGENT_MANAGER_HOST_LOCAL_MODEL, else LOCAL_MODEL only inside the host lane itself, else unknown', () => {
+  const host = (env) => getLanes({ ...env, AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_LANES_PATH: '/nonexistent/lanes.json' })[0].tier;
+  assert.equal(host({ AGENT_MANAGER_HOST_LOCAL_MODEL: 'x:27b', LOCAL_MODEL: 'y:8b' }), 27);
+  assert.equal(host({ LOCAL_MODEL: 'x:27b' }), 27);
+  assert.equal(host({ LOCAL_MODEL: 'y:8b', AGENT_MANAGER_INSTANCE_ID: 'worker-rx580' }), null);
+  assert.equal(host({}), null);
 });

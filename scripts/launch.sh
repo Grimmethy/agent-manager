@@ -190,6 +190,8 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
   # docs/agents/lanes.md); there is no reasoning/worker split any more.
   # A lane's own env (e.g. the P40 VM's OLLAMA_URL/LOCAL_MODEL) is scoped to just that child
   # process via `env`, so the other lanes and the reviewer keep talking to the host's Ollama.
+  # A remote lane's worker overrides LOCAL_MODEL in its own process; keep the host's model visible to src/lanes.js (capability tiers).
+  export AGENT_MANAGER_HOST_LOCAL_MODEL="${AGENT_MANAGER_HOST_LOCAL_MODEL:-${LOCAL_MODEL:-}}"
   while IFS= read -r lane_id; do
     [[ -n "$lane_id" ]] || continue
     mapfile -t lane_env < <(node "${SCRIPT_DIR}/../src/lanes.js" --env "$lane_id")

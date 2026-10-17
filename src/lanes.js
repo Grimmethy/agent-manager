@@ -46,6 +46,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { tierFromModel } = require('./capability-ledger.js');
 
 const REPO = path.resolve(__dirname, '..');
 const LANE_ID_RE = /^worker-[a-z0-9]+$/;
@@ -132,6 +133,13 @@ function laneFromEntry(raw, index) {
   }
   const preempt = raw.preempt === undefined ? 'never' : raw.preempt;
   if (!PREEMPT_MODES.includes(preempt)) { warnOnce(`${where} (${id}) preempt must be one of ${PREEMPT_MODES.join('|')}; skipped`); return null; }
+  let tier = tierFromModel(model);
+  if (raw.tier !== undefined && raw.tier !== null) {
+    if (typeof raw.tier !== 'number' || !(raw.tier > 0)) { warnOnce(`${where} (${id}) tier must be a positive number (billions of parameters); skipped`); return null; }
+    tier = raw.tier;
+  }
+  const reserve = raw.reserve === undefined || raw.reserve === null ? 'auto' : raw.reserve;
+  if (reserve !== 'auto' && reserve !== 'always' && reserve !== false) { warnOnce(`${where} (${id}) reserve must be "auto", "always" or false; skipped`); return null; }
   let taskClasses = null;
   if (raw.taskClasses !== undefined && raw.taskClasses !== null) {
     const list = Array.isArray(raw.taskClasses) ? raw.taskClasses.map((c) => String(c).trim()).filter(Boolean) : [];
@@ -151,14 +159,20 @@ function laneFromEntry(raw, index) {
     numCtx,
     preempt,
     taskClasses,
+    model,
+    tier,
+    reserve,
   };
 }
 
-// -> [{ id, gpu, env, local, slow, numCtx, preempt, taskClasses }]. `env` is the per-lane environment launch.sh / the watchdog must apply
+// -> [{ id, gpu, env, local, slow, numCtx, preempt, taskClasses, model, tier, reserve }]. `env` is the per-lane environment launch.sh / the watchdog must apply
 // when spawning the lane ({} = inherit, i.e. the host's own Ollama). `taskClasses` null = claims any task.
 function getLanes(env = process.env) {
   const local = slug(env.AGENT_MANAGER_LOCAL_GPU) || detectLocalGpu() || 'local';
-  const lanes = [{ id: `worker-${local}`, gpu: local, env: {}, local: true, slow: false, numCtx: null, preempt: 'always', taskClasses: null }];
+  // The host lane's model is the base LOCAL_MODEL, which launch.sh also exports as AGENT_MANAGER_HOST_LOCAL_MODEL because a remote lane's
+  // worker overrides LOCAL_MODEL in its own process. Without either signal the tier is unknown (null) and capability routing leaves it alone.
+  const hostModel = env.AGENT_MANAGER_HOST_LOCAL_MODEL || (!env.AGENT_MANAGER_INSTANCE_ID || env.AGENT_MANAGER_INSTANCE_ID === `worker-${local}` ? env.LOCAL_MODEL : '') || null;
+  const lanes = [{ id: `worker-${local}`, gpu: local, env: {}, local: true, slow: false, numCtx: null, preempt: 'always', taskClasses: null, model: hostModel, tier: tierFromModel(hostModel), reserve: 'auto' }];
   if (env.AGENT_MANAGER_P40_OLLAMA_URL && env.AGENT_MANAGER_P40_MODEL) {
     lanes.push({
       id: 'worker-p40',
@@ -173,6 +187,9 @@ function getLanes(env = process.env) {
       numCtx: null,
       preempt: 'never',
       taskClasses: null,
+      model: env.AGENT_MANAGER_P40_MODEL,
+      tier: tierFromModel(env.AGENT_MANAGER_P40_MODEL),
+      reserve: 'auto',
     });
   }
   readRegistry(env).forEach((raw, i) => {
