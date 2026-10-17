@@ -12,6 +12,7 @@ const path = require('path');
 const { readScorecard } = require('./capability-ledger.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { laneAllowsSource } = require('./lanes.js');
+const { classifyOutcome } = require('./capability-ledger.js');
 
 const HEARTBEAT_FRESH_MS = 90 * 1000;
 const SCORECARD_TTL_MS = 60 * 1000;
@@ -102,4 +103,16 @@ function auditReservation(pipelineDir, instancesDir, entry) {
   } catch (_) { /* best-effort */ }
 }
 
-module.exports = { routingConfig, passesGate, qualification, decideReservation, laneAliveFromHeartbeat, cachedScorecard, auditReservation };
+// Escalation (design note section 4): a timeout / degenerate / hard-error attempt on a lane that has a bigger-tier lane above it marks the task
+// to avoid that lane (task.avoidLanes, honoured by the claim loop's laneAvoided), so the retry goes up a tier instead of looping on the small one.
+// -> the lane id to avoid, or null. Off with AGENT_MANAGER_LANE_ESCALATION=off. Both lanes need a known tier; the biggest lane never escalates.
+const ESCALATION_OUTCOMES = new Set(['timeout', 'degenerate', 'error']);
+function escalationLane(attempt, lanes, env = process.env) {
+  if (String(env.AGENT_MANAGER_LANE_ESCALATION || '').trim().toLowerCase() === 'off') return null;
+  if (!attempt || typeof attempt.lane !== 'string' || !ESCALATION_OUTCOMES.has(classifyOutcome(attempt))) return null;
+  const mine = (lanes || []).find((l) => l.id === attempt.lane);
+  if (!mine || mine.tier == null) return null;
+  return (lanes || []).some((l) => l.id !== mine.id && l.tier != null && l.tier > mine.tier) ? mine.id : null;
+}
+
+module.exports = { escalationLane, routingConfig, passesGate, qualification, decideReservation, laneAliveFromHeartbeat, cachedScorecard, auditReservation };

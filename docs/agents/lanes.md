@@ -69,6 +69,14 @@ Human-queued and premium tasks, operator pins, and tasks that already failed on 
 nothing), `enforce`, or `off`. Design and rollout: `docs/design-notes/capability-routing-and-benchmarking.md`. `launch.sh` exports
 `AGENT_MANAGER_HOST_LOCAL_MODEL` so the host lane's tier is known inside remote-lane workers.
 
+### Escalation
+
+A draft attempt that ends in a **timeout, degenerate output or a hard error** on a lane that has a bigger-tier lane above it stamps that lane onto
+the task's `avoidLanes` (the same mechanism plan-degenerate blocks already used) and writes a `lane-escalated` history event, so the retry goes
+to a larger lane instead of looping on the small one. A reviewer rejection is not an escalation. `AGENT_MANAGER_LANE_ESCALATION=off` disables it.
+Needs known tiers on both lanes; the biggest lane never escalates. Caveat: `avoidLanes` is per task and permanent, so a task escalated off the
+8B waits for a bigger lane even if none is currently alive.
+
 ## Tests
 
 `src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),
