@@ -39,6 +39,8 @@ const { deterministicPlanSplit, repairEnabled } = require('./plan-step-split.js'
 const { oversizedFiles } = require('./file-length-flags-reader.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
+const { appendHistoryEvent } = require('./task-history.js');
+const { stampTaskShape, shapeBlocksDecompose, preliminaryDecomposeDecision } = require('./task-shape.js');
 
 // A leaf that blows a full tier-3 budget with zero edits is auto-decomposed as a backstop
 // (the preliminary check in local-draft.js should catch most of these first). Bounded: a
@@ -328,7 +330,8 @@ function isLeafTask(task) {
 // auto-decomposed once -- in those cases let it split again. MAX_AUTO_DECOMPOSE + review
 // still bound runaway splitting.
 function leafDecomposeLocked(task) {
-  return isLeafTask(task)
+  // A one-file-fix (task-shape.js) is treated like a confirmed-atomic leaf: decompose is off the table until it has burned a full turn budget.
+  return (isLeafTask(task) || shapeBlocksDecompose(task))
     && !(task && task.autoDecomposeCount)
     && !(task && task.turnBudgetExhaustedBefore)
     && !(task && Number(task.decomposeBlockCount) > 0);
@@ -544,7 +547,7 @@ async function runGiveUpSplit(task, verdict) {
   // A file-decompose child is already a single verbatim move -- splitting it again just
   // produces a hub of one sub-task and loops. If it can't land, it needs a human, not
   // another decompose pass.
-  if (task.atomic || !gaveUp || !(task.turnBudgetExhausted || repeatedDecompose || noJsonMiss) || autoN >= MAX_AUTO_DECOMPOSE) {
+  if (task.atomic || (shapeBlocksDecompose(task) && !task.turnBudgetExhausted) || !gaveUp || !(task.turnBudgetExhausted || repeatedDecompose || noJsonMiss) || autoN >= MAX_AUTO_DECOMPOSE) {
     return null;
   }
   const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
@@ -683,12 +686,17 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   // burning the full LOCAL_AGENTIC_WRITE_MAX_TURNS budget on read-only orientation and only
   // landing in the post-exhaustion backstop below. Default-on kill switch, mirroring
   // isEnabled(): opt out by setting the env var in the check below to the string 'false'.
+  // Shape (task-shape.js): classified once per pass, before any decompose decision, and recorded on the task as task.shape = { class, reasons }.
+  stampTaskShape(task);
   if (process.env.AGENT_MANAGER_SCOPE_GATE !== 'false') {
-    const gate = scopeComplexityGate(task);
+    const gateVerdict = scopeComplexityGate(task);
+    const decision = preliminaryDecomposeDecision(task, gateVerdict);
+    if (decision.suppressedDetail) appendHistoryEvent(task, 'advisory', decision.suppressedDetail);
+    const gate = decision.decompose ? gateVerdict : null;
     if (gate && gate.shouldDecompose) {
       const split = await runDecomposePassIfAvailable(task, {
         mode: 'preliminary',
-        priorAttemptBlock: gate.reason,
+        priorAttemptBlock: decision.priorAttemptBlock,
       });
       // >= 2 subTasks -> this is a real decompose, return the same shape the post-exhaustion
       // backstop uses. A null split or a 0/1-subTask split means the split wasn't usable, so
@@ -764,6 +772,6 @@ function modelStatsSafe(fn, args) {
 
 module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
-  isLeafTask, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
+  isLeafTask, leafDecomposeLocked, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
   detectExternalDependency, classifyExternalDependency, externalDependencyAdvisory, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
 };
