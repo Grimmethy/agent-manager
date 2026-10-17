@@ -136,3 +136,9 @@ test('PINNED_NUM_CTX is the lane override in a lane process and 49152 everywhere
   assert.deepEqual(run({}), { pin: 49152, resolved: 49152, clamped: 4096 });
   assert.deepEqual(run({ AGENT_MANAGER_LANE_NUM_CTX: '16384' }), { pin: 16384, resolved: 16384, clamped: 4096 });
 });
+
+test('laneNumBatch reads AGENT_MANAGER_LANE_NUM_BATCH, whole numbers 32..8192 only', () => {
+  const { laneNumBatch } = require('./gpu-capacity.js');
+  assert.equal(laneNumBatch({ AGENT_MANAGER_LANE_NUM_BATCH: '1024' }), 1024);
+  for (const bad of [undefined, '', 'x', '16', '9000', '1.5']) assert.equal(laneNumBatch({ AGENT_MANAGER_LANE_NUM_BATCH: bad }), null);
+});
