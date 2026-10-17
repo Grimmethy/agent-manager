@@ -1951,3 +1951,16 @@ These are complementary mechanisms with different inputs (registry entry vs. con
 **No code change is warranted.** The proposed `resolvePriority(sourceName, registeredEntry)` utility would conflate two unrelated data sources, break `taskPriority`'s general-purpose contract (it is not registry-specific), and introduce a coupling that does not exist today.
 
 NOTE: All three flags were applied; the entire finding was retracted because the core premise (duplicated logic / two sources of truth) was factually incorrect per the critique's code-level analysis.
+
+### AC-170 · Extract shared destination-path and mkdir logic in done-archive
+Strength: Strong
+Files: src/done-archive.js
+
+Problem:
+Both `archiveDoneTasks` and `archiveSpecificDoneTasks` independently construct the archive destination directory path via `path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)))` and manage a `destDirEnsured` flag to call `fs.mkdirSync(destDir, { recursive: true })`. The header comment on `archiveSpecificDoneTasks` states the two functions are intended to produce indistinguishable output for downstream consumers, yet the shared "resolve destination and ensure it exists" logic is duplicated rather than centralized. If the bucketing scheme, directory naming, or creation strategy changes, a developer must remember to update both call sites, creating a realistic risk that the two paths silently diverge.
+
+Solution:
+Extract the destination-path construction and directory-ensuring logic into a single internal helper (e.g., `resolveArchiveDest(doneDir, now)`) that returns the resolved `destDir` and guarantees it exists. Both `archiveDoneTasks` and `archiveSpecificDoneTasks` then call this helper once, eliminating the duplicated `path.join` / `monthBucket` / `mkdirSync` sequence and the per-function `destDirEnsured` bookkeeping.
+
+Benefits:
+A single source of truth for the archive destination means any future change to bucketing granularity, directory naming, or filesystem-creation strategy is made in exactly one place. The two public functions become thinner and more obviously equivalent, reducing the cognitive load on reviewers and eliminating the class of "I updated one but forgot the other" regressions.
