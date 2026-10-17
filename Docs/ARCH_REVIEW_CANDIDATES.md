@@ -2029,3 +2029,44 @@ Introduce a parallel `domainAliases` map in the same module that follows the ide
 
 Benefits:
 The two most important built-in mappings become expressible through the same public extension API that out-of-tree plugins use, eliminating the reserved-namespace collision and the silent mis-routing of plugin tasks that happen to stamp `domain: 'adhoc'` or `source: 'manual'`. The hardcoded `if` branches are deleted, so the file's own documented promise ("no hardcoded `if` for every out-of-tree source's naming quirk") becomes true for the package's own sources as well. The additive `registerDomainAlias` function follows the exact same single-string contract as `registerSourceAlias`, so no existing caller's code changes and the API surface remains predictable. The corrected doc comments remove the misleading "wrapping call sites" language, giving a contributor an accurate mental model of the extension point on first read.
+
+### AC-176 · Module-level singleton hook in task-history creates hidden global state
+Strength: Weak (Revised)
+Files: src/task-history.js
+
+Problem:
+`setHistoryPersistHook` assigns to a module-level `persistHook` variable that `appendHistoryEvent` later invokes. While the code comments describe this as an intentional "opt-in per process" design, this pattern creates a hidden global state dependency. Any two independent pipeline workers (e.g., a local-draft worker and a review-task worker) that load this module in the same Node.js process will silently overwrite each other's hook. The module's behavior therefore depends on the execution order of its callers rather than on explicit, inspectable parameters. This makes concurrency bugs difficult to diagnose and violates the principle of locality, as the dependency is not visible in the function signature of `appendHistoryEvent`.
+
+Solution:
+Replace the module-level `persistHook` variable with an explicit parameter. `appendHistoryEvent` should accept a `persist` function (or a small options object containing it) as an argument, and callers should pass their own hook at the call site. If a default no-op is needed for backward compatibility, it can be supplied as a default parameter value, but the dependency becomes visible in the function signature and is no longer shared mutable state. This requires updating existing callers to explicitly pass their persistence strategy, which clarifies the dependency graph.
+
+Benefits:
+Each worker owns its persistence strategy explicitly, eliminating the class of race conditions where one worker's hook clobbers another's. The module becomes trivially testable in isolation (pass a spy), and code review can verify the dependency at the call site rather than hunting for a side-effecting `setHistoryPersistHook` call elsewhere in the process. This aligns the implementation with the principle of explicit dependencies, even if it deviates from the original "singleton" design intent.
+
+### AC-177 · Duplicated Git env/timeout constants bypass the shared runner in stacked-grounding
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The header comment in `src/stacked-grounding.js` states that the file reuses `git-runner.js`'s adapter for `resolveGroundingRef` to avoid hand-rolling Git checks. Yet `readFileAtRef`, `grepAtRef`, and `resolveAtRef` each call `execFileSync` directly with locally defined `GIT_ENV` and `GIT_TIMEOUT_MS` constants, bypassing the shared runner entirely. This breaks the "one place to get it right" goal the header promises and means any future change to Git execution standards (a new environment variable, a timeout adjustment, a sandbox flag) must be replicated across three call sites in the same file, increasing the chance of drift.
+
+Solution:
+Route `readFileAtRef`, `grepAtRef`, and `resolveAtRef` through the same `git-runner.js` adapter that `resolveGroundingRef` already uses. Remove the local `GIT_ENV` and `GIT_TIMEOUT_MS` definitions from `src/stacked-grounding.js` and let the runner own those constants. If the runner's API does not yet cover the specific sub-commands (`show`, `grep`, `rev-parse`), extend the runner with thin wrappers rather than duplicating the `execFileSync` boilerplate.
+
+Benefits:
+Git execution configuration lives in exactly one module, so a single change propagates everywhere. The file's public behavior matches its documented intent, reducing cognitive load for maintainers who read the header and expect the runner to be the sole Git-execution path. New sub-commands added later inherit the correct env/timeout automatically.
+
+### AC-178 · apply-core depends on side-effect require of task-sources for registry population
+Strength: Worth exploring
+Files: src/lib/apply-core.js, src/task-sources.js
+
+Problem:
+`writeArtifact` in `src/lib/apply-core.js` calls `getRegisteredSource`, which is only populated as a side effect of the top-level `require('../task-sources.js')` at the top of the file. While this is a standard CommonJS pattern, it creates an implicit, order-sensitive dependency: if `apply-core.js` is loaded in a context where `task-sources.js` has not yet been required (or if the registry is reset between tests), `getRegisteredSource` will return `undefined` and `writeArtifact` will fail at runtime with an error that is not visible from the function's own signature. The module's correctness is thus coupled to the load order of an external module rather than to an explicit dependency.
+
+Solution:
+Make the source registry an explicit dependency. Either (a) have `writeArtifact` accept the source object (or a lookup function) as a parameter, or (b) have the caller inject the registry via a small factory/initialiser that `apply-core.js` exposes (e.g., `initApplyCore({ getRegisteredSource })`). Remove the bare side-effect `require` from the top of `apply-core.js` so that the module's dependencies are visible in its public API rather than hidden in a load-order assumption.
+
+Benefits:
+The module is testable without loading the full source registry, and the dependency is visible at the call site, making it obvious to a reader which external state the function relies on. It eliminates a class of hard-to-reproduce runtime errors that only surface when module load order changes (e.g., after a refactor or in a bundler that reorders imports).
+
+NOTE: Flag 2 was not fully applied because the critique incorrectly claims the solution "breaks the existing API contract" in a way that contradicts the code's intent; however, the critique's core point about the "opt-in per process" design intent was valid, so the draft was revised to acknowledge this design choice while still recommending explicit parameters for clarity and testability.
