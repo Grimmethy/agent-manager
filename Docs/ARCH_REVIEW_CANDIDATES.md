@@ -2156,3 +2156,42 @@ Benefits:
 Ensures robustness and availability in diverse execution contexts (tests, minimal CLI, misconfigured deployments). Prevents crashes due to missing or uninitialized configuration, allowing the system to continue operating with default priorities rather than failing entirely.
 
 NOTE: All three flags were applied as they correctly identified that the original draft's proposed solutions would break existing functionality, violate design intent, or introduce unnecessary fragility.
+
+### AC-184 · Task-source registry hardwired to core-scope policy
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` directly `require`s `./lib/source-scope.js` and, when the registration config specifies `scope: 'core'`, wraps the caller's `next` function with `sourceEligibleHere` gating. This means the registry—a general-purpose storage and dispatch mechanism—carries an opinion about a specific project-scoping policy ("core" vs. non-core). Any change to the scoping rules, or the introduction of a different conditional-gating strategy (e.g., environment-based, feature-flag-based), forces a modification to the registry itself. The coupling is also invisible to consumers: they register a source with a `scope` string and the registry silently injects a config-reading side effect into every task-generation call, which is not apparent from the registry's public API.
+
+Solution:
+Remove the `require` of `source-scope.js` and the `scope === 'core'` branch from `registerTaskSource`. Instead, let the caller supply an already-wrapped `next` function (or a generic `wrap` function in the registration config) that encapsulates whatever eligibility logic is needed. The registry then stores and invokes the function as-is, remaining agnostic to the business policy. The existing call site that currently passes `scope: 'core'` is updated to wrap `next` with `sourceEligibleHere` before handing it to the registry.
+
+Benefits:
+The registry becomes a pure, policy-free storage mechanism that can be reused in any context without dragging in `source-scope.js` or its transitive config dependencies. Scoping rules can evolve, be replaced, or be composed without touching the registry. The dependency graph shrinks: consumers of the registry no longer transitively load `source-scope.js`, `getConfig`, or `isCoreRepo`.
+
+### AC-185 · Candidate-fulfillment god module obscures the dependency graph
+Strength: Strong
+Files: src/sdk/candidate-fulfillment.js
+
+Problem:
+`src/sdk/candidate-fulfillment.js` was assembled by moving code "verbatim out of task-sources.js" and re-exporting `candidate-docs.js` so that a plugin has "one import for the whole candidate lifecycle." In practice the module mixes at least four distinct concerns: the write side (`candidateDocs`), the read/claim side (`nextCandidateFulfillmentTask`), a cluster of low-level text helpers (`findFuzzyMatch`, `windowAroundIndex`, `collectAnchorHits`, `snippetFromSection`, `quotedSymbolsFromSection`), and a block of tuning constants (`MAX_FETCHED_FILE_CHARS`, `MIN_REGION_CHARS`, `MAX_ANCHOR_REGIONS`, `QUOTED_SYMBOL_RE`, `LINE_CITATION_RE`, etc.). Because the module re-exports `candidate-docs`, any consumer that imports even one helper transitively loads `candidate-docs`, `candidate-premise-check`, `pipeline-forensics`, `task-history`, and several `lib` modules. This makes the effective dependency footprint of a simple utility import far larger than necessary, increases the surface area for circular-dependency bugs, and means that a change to any one of those transitive modules can invalidate a module that only needed `findFuzzyMatch`.
+
+Solution:
+Extract the low-level helpers and their associated constants into a dedicated module (e.g., `src/lib/candidate-grounding.js`) that has no dependency on the candidate-lifecycle write/read path. `src/sdk/candidate-fulfillment.js` then retains only the high-level orchestration (`nextCandidateFulfillmentTask`) and the re-export of `candidate-docs` for backward compatibility, while importing the helpers from the new module. Consumers that only need the text helpers import the new module directly, avoiding the full lifecycle dependency chain.
+
+Benefits:
+The dependency graph becomes honest: importing a fuzzy-match helper no longer pulls in the entire candidate lifecycle. The module boundary aligns with the actual unit of change—tuning constants and text-extraction logic can be refactored independently of the task-claiming logic. The risk of circular dependencies is reduced because the new helper module sits lower in the graph and has no back-edges to the lifecycle modules.
+
+### AC-186 · Hidden config read via default parameter in sourceEligibleHere
+Strength: Worth exploring
+Files: src/lib/source-scope.js, src/task-source-registry.js
+
+Problem:
+`sourceEligibleHere` in `src/lib/source-scope.js` declares a default parameter `coreActive = activeRepoIsCore()`. Because the registry's wrapper in `src/task-source-registry.js` calls `sourceEligibleHere` without passing `coreActive`, every task-generation invocation triggers `activeRepoIsCore()`, which reads `getConfig().repoRoot` and evaluates `isCoreRepo()`. The concern here is not performance—the read is a cheap in-process object access—but *visibility*: the function signature does not advertise that it will read global configuration, and the call site in the registry makes no reference to `source-scope.js` or `activeRepoIsCore`. A reader of `registerTaskSource` sees a bare `sourceEligibleHere()` call with no indication that a global config lookup is happening underneath. If the scoping policy is later made injectable (per AC-001), the hidden default becomes a silent coupling that is easy to miss during refactoring.
+
+Solution:
+Remove the default parameter from `sourceEligibleHere` so the function signature reads `sourceEligibleHere(coreActive)` with no implicit fallback. At the call site (the wrapper that AC-001 moves out of the registry into the caller), resolve `activeRepoIsCore()` at **call time**—inside the `next` wrapper, on each invocation—and pass the resulting boolean explicitly: `sourceEligibleHere(activeRepoIsCore())`. This preserves the gate's intended semantics (re-evaluate the *current* active repo on every task-generation call, fail-open on read errors) while making the config dependency visible in the call chain. No value is cached or captured at registration time.
+
+Benefits:
+The function's contract becomes honest—no hidden global reads hidden behind a default parameter. The call site explicitly names `activeRepoIsCore()`, so a reader immediately sees the config dependency and the fact that it is re-evaluated per call. If the scoping policy is later made injectable (per AC-001), the explicit parameter makes it straightforward to swap in a different eligibility source without hunting for a hidden default. The gate's fail-open, re-evaluate-on-each-call semantics are preserved unchanged.
