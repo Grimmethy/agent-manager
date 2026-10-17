@@ -35,7 +35,7 @@ _Avoid_: orphaned claim
 One running process identified by an `instanceId` (a worker lane named for its GPU such as `worker-3090` or `worker-p40`, `reviewer`, `queue-watchdog`), which owns exactly one heartbeat file.
 
 **Lane**:
-One worker process pinned to one GPU endpoint, named for the GPU (`worker-3090`, `worker-p40`, `worker-rx580`). Lanes are data, not code: the host lane, the legacy P40 lane and every entry of the lanes registry file (`lanes.json`, see `docs/agents/lanes.md`) are turned into lane definitions by `src/lanes.js`, the single definition `launch.sh`, the watchdog's restart rule, the claim loop and the dashboard all read. A lane may declare a `taskClasses` allowlist (only those task sources are offered to it), `preempt` (whether an interactive chat turn may kill its call) and `slow` (longer timeouts for a categorically slower endpoint).
+One worker process pinned to one GPU endpoint, named for the GPU (`worker-3090`, `worker-p40`, `worker-rx580`). Lanes are data, not code: the host lane, the legacy P40 lane and every entry of the lanes registry file (`lanes.json`, see `docs/agents/lanes.md`) are turned into lane definitions by `src/lanes.js`, the single definition `launch.sh`, the watchdog's restart rule, the claim loop and the dashboard all read. A lane may declare a `taskClasses` allowlist (only those task sources are offered to it), `preempt` (whether an interactive chat turn may kill its call) and `slow` (longer timeouts for a categorically slower endpoint) and `numCtx` (the lane's one pinned context window, for cards smaller than the 24 GB ones).
 _Avoid_: worker type, tier (the old reasoning/worker split is gone)
 
 **Heartbeat**:

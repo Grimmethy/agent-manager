@@ -28,7 +28,7 @@ test('gpuSlugFromName: last digit-bearing token, lowercased', () => {
 
 test('local lane is named for AGENT_MANAGER_LOCAL_GPU; no P40 vars, no registry -> exactly one lane', () => {
   const lanes = getLanes({ ...noRegistry, AGENT_MANAGER_LOCAL_GPU: '3090' });
-  assert.deepEqual(lanes, [{ id: 'worker-3090', gpu: '3090', env: {}, local: true, slow: false, preempt: 'always', taskClasses: null }]);
+  assert.deepEqual(lanes, [{ id: 'worker-3090', gpu: '3090', env: {}, local: true, slow: false, numCtx: null, preempt: 'always', taskClasses: null }]);
 });
 
 test('both P40 vars set -> second lane worker-p40 carrying its own Ollama env, never preempted', () => {
@@ -57,7 +57,7 @@ test('registry: one entry adds a lane with the full env, defaults id/preempt, cl
   const lanes = getLanes(withRegistry([RX580]));
   assert.deepEqual(lanes.map((l) => l.id), ['worker-3090', 'worker-rx580']);
   assert.deepEqual(lanes[1], {
-    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, preempt: 'never', taskClasses: null,
+    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, numCtx: null, preempt: 'never', taskClasses: null,
     env: { OLLAMA_URL: 'http://100.96.112.78:11434', LOCAL_MODEL: 'qwen3-vl:8b-instruct', AGENT_MANAGER_GPU_YIELD_APPS: '' },
   });
 });
@@ -161,4 +161,15 @@ test('isSlowEndpoint / isSlowLane: keyed off the lane definition (endpoint for t
   assert.equal(isSlowLane('worker-a770', env), false);
   assert.equal(isSlowLane('worker-3090', env), false);
   assert.equal(isSlowLane('worker-p40', { ...noRegistry, AGENT_MANAGER_LOCAL_GPU: '3090' }), true, 'worker-p40 keeps the long threshold even when its lane is not configured');
+});
+
+test('numCtx: a whole number 2048..131072 becomes AGENT_MANAGER_LANE_NUM_CTX in that lane\'s env only; anything else drops the entry', () => {
+  const lanes = getLanes(withRegistry([{ ...RX580, numCtx: 16384 }]));
+  assert.equal(lanes[1].numCtx, 16384);
+  assert.equal(lanes[1].env.AGENT_MANAGER_LANE_NUM_CTX, '16384');
+  assert.equal(lanes[0].env.AGENT_MANAGER_LANE_NUM_CTX, undefined, 'the host lane keeps the default pin');
+  for (const bad of [1024, 200000, 8192.5, '16384', true]) {
+    assert.deepEqual(getLanes(withRegistry([{ ...RX580, numCtx: bad }])).map((l) => l.id), ['worker-3090'], `numCtx ${JSON.stringify(bad)} is invalid`);
+  }
+  assert.equal(getLanes(withRegistry([RX580]))[1].env.AGENT_MANAGER_LANE_NUM_CTX, undefined, 'no numCtx = no override');
 });

@@ -6,6 +6,7 @@
     "taskClasses": ["brain_dump_sort", "change_review", "observability_review", "staleness_audit"],
     "preempt": "never",
     "slow": false,
+    "numCtx": 16384,
     "enabled": true
   }
 ]
