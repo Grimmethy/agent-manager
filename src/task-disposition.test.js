@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { resolveDisposition, TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
+const { resolveDisposition, TERMINAL_STAGES, lastAppliedEvent, isNoopApplyDetail } = require('./task-disposition.js');
 
 // A fake buildShipContext() result.
 function ctx({ onMain = {}, branches = {} } = {}) {
@@ -510,4 +510,25 @@ test('diffPresence counts distinctive added lines at a ref and returns null with
   assert.equal(stackedSiblingLost(git, '', 'master', 'x', stackedRec()), null);
   assert.equal(stackedSiblingLost(git, '/r', 'master', 'x', { id: 'a', rawDiff: sibDiff() }), null);
   assert.equal(stackedSiblingLost(git, '/r', 'master', 'x', stackedRec({ rawDiff: '' })), null);
+});
+
+// A real apply's detail is the branch name, built from the task title -- a title word that NOOP_RE knows must not turn shipped work into a noop (2026-10-15).
+const NOOP_WORD_BRANCH = 'agent/adhoc-premium-head-of-line-starvation-rotate-repeatedly-blocked-premium-tasks-behind-fresh-ones-and-avoid-lanes-a-task-degenerated-on-1792061032268';
+test('isNoopApplyDetail: an agent/ branch name is never a no-op, whatever words the title put in it', () => {
+  assert.equal(isNoopApplyDetail(NOOP_WORD_BRANCH), false);
+  for (const word of ['skipped', 'no-op', 'false positive', 'nothing to do', 'no candidates', 'empty implement']) {
+    assert.equal(isNoopApplyDetail(`agent/adhoc-handle-${word}-1792061032268`), false, word);
+  }
+  assert.equal(isNoopApplyDetail('no candidates in implement response -- nothing to apply'), true);
+  assert.equal(isNoopApplyDetail('False positive. The catch block is not silent.'), true);
+});
+
+test('resolveDisposition: a branch apply whose name contains a no-op word is classified by its branch, never noop', () => {
+  const id = 'adhoc-premium-head-of-line-starvation-a-task-degenerated-on-1792061032268';
+  const rec = { id, ...applied(NOOP_WORD_BRANCH) };
+  assert.equal(resolveDisposition(rec, { ctx: ctx({ onMain: { [id]: 'abc123def456' } }) }).stage, 'merged');
+  assert.equal(resolveDisposition(rec, { ctx: ctx({ branches: { [NOOP_WORD_BRANCH.replace(/^agent\//, '')]: 2 } }) }).stage, 'pending-merge');
+  const gone = resolveDisposition(rec, { ctx: ctx() });
+  assert.notEqual(gone.stage, 'noop');
+  assert.equal(gone.stage, 'abandoned');
 });
