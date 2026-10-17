@@ -384,8 +384,10 @@ function turnLock(instancesDir, fn) {
 // scoped only to the P40 endpoint -- every other caller (the local RTX 3090 lane, Chat)
 // keeps the original 240s value unchanged.
 const IS_P40_ENDPOINT = !!process.env.AGENT_MANAGER_P40_OLLAMA_URL && OLLAMA_URL === process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+// 2026-10-17: any lane marked `slow` in src/lanes.js (the P40, or a registry lane with "slow": true) gets the long request timeout too.
+const IS_SLOW_ENDPOINT = IS_P40_ENDPOINT || require('./lanes.js').isSlowEndpoint(OLLAMA_URL);
 const P40_REQUEST_TIMEOUT_MS = 900_000;
-const REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || (IS_P40_ENDPOINT ? P40_REQUEST_TIMEOUT_MS : 240_000);
+const REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || (IS_SLOW_ENDPOINT ? P40_REQUEST_TIMEOUT_MS : 240_000);
 
 const TOOLS = [
   {
@@ -1468,7 +1470,7 @@ module.exports = {
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
-  IS_P40_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
+  IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
   installStdoutEpipeGuard,
 };
 

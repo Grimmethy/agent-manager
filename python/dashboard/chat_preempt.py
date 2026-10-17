@@ -125,14 +125,22 @@ def _chat_preempt_max_age_s() -> int:
         return 180
 
 
-# lanes.js's P40 lane id (a literal there): the one lane whose endpoint is NOT the chat's.
+# Legacy fallback only (node/lanes.js unreadable): the one lane whose endpoint is NOT the chat's. Normal operation reads each lane's `preempt` setting.
 _P40_LANE_ID = "worker-p40"
 
 
 def _preempt_lane_sets():
-    """(always_kill, age_gated) lane tuples for this chat turn. Always-kill = the LOCAL GPU lane(s) only (worker-3090): the chat runs on the host GPU and takes it over.
-    The P40 lane is a different endpoint and is never preempted (2026-09-21, Grimmethy: "only take over the 3090. P40 should remain in action"). The reviewer is age-gated."""
-    from app import worker_lane_ids
+    """(always_kill, age_gated) lane tuples for this chat turn, read from each lane's `preempt` setting in src/lanes.js (lanes are data now:
+    the host lane is 'always', the P40 and every lanes-registry lane default to 'never'; a registry entry may opt into 'age-gated').
+    The chat runs on the host GPU and takes it over; every other lane is a different endpoint and is left running (2026-09-21, Grimmethy:
+    "only take over the 3090. P40 should remain in action"). The reviewer is always age-gated.
+    If the lane definitions cannot be read at all, fall back to the old rule: every lane but worker-p40 is always-kill."""
+    from app import worker_lane_defs, worker_lane_ids
+    defs = worker_lane_defs()
+    if defs:
+        always = tuple(l["id"] for l in defs if l.get("preempt") == "always")
+        gated = tuple(l["id"] for l in defs if l.get("preempt") == "age-gated" and l["id"] not in _PREEMPT_LANES_AGE_GATED)
+        return always, (*_PREEMPT_LANES_AGE_GATED, *gated)
     return tuple(l for l in worker_lane_ids() if l != _P40_LANE_ID), _PREEMPT_LANES_AGE_GATED
 
 

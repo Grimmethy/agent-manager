@@ -17,6 +17,7 @@ const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
 const gpuGuard = require('./gpu-guard.js');
+const { isSlowEndpoint } = require('./lanes.js');
 const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
@@ -148,6 +149,9 @@ const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 // the P40 lane, confirmed by comparing the two resolved env vars directly rather than
 // guessing from a hostname pattern.
 const IS_P40_ENDPOINT = !!process.env.AGENT_MANAGER_P40_OLLAMA_URL && OLLAMA_URL === process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+// 2026-10-17: lanes are data now (src/lanes.js). ANY lane marked `slow` -- the P40 and any registry lane with "slow": true -- gets the same
+// longer per-call ceiling; IS_P40_ENDPOINT stays for the legacy match, IS_SLOW_ENDPOINT is what the ceiling below keys on.
+const IS_SLOW_ENDPOINT = IS_P40_ENDPOINT || isSlowEndpoint(OLLAMA_URL);
 // No hardcoded fallback tag here on purpose (2026-08-22, Grimmethy: "The models are or
 // should be fully interchangeable and their names should not be hardcoded anywhere") --
 // this used to fall back to the bare literal string 'ornith', which isn't a real Ollama
@@ -410,8 +414,8 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model
     promptTokens,
     numPredict,
     tokensPerSecond,
-    ceilingMs: IS_P40_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : PER_CALL_TIMEOUT_CEILING_MS,
-    hardCeilingMs: IS_P40_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : undefined,
+    ceilingMs: IS_SLOW_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : PER_CALL_TIMEOUT_CEILING_MS,
+    hardCeilingMs: IS_SLOW_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : undefined,
   });
 }
 
@@ -671,7 +675,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

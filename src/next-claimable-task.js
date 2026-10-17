@@ -233,7 +233,13 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   const coreActive = activeRepoIsCore();
   // Lane avoidance (premium-rotation.js): how many lanes exist decides whether a task may skip one. 0 on any error = never skip.
   let laneCount = 0;
-  try { laneCount = (opts.lanes || require('./lanes.js').getLanes()).length; } catch (_) { laneCount = 0; }
+  // This instance's own lane definition, for the task-class allowlist below (null for a non-lane instance, or on any error = unrestricted).
+  let thisLane = null;
+  try {
+    const allLanes = opts.lanes || require('./lanes.js').getLanes();
+    laneCount = allLanes.length;
+    thisLane = allLanes.find((l) => l.id === instanceId) || null;
+  } catch (_) { laneCount = 0; thisLane = null; }
   const pinned = [];
   const rankable = [];
   for (const name of names) {
@@ -248,6 +254,15 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     // A task that degenerated on THIS lane (task.avoidLanes, stamped by reject-retry-check.js) is left to another lane while one exists.
     // An explicit pin to this lane was handled above and still wins.
     if (task && laneAvoided(task, instanceId, laneCount)) continue;
+
+    // A lane with a taskClasses allowlist (lanes.js; e.g. an 8 GB GPU given only small bounded sources) is only offered tasks of
+    // those sources. Fail closed: a task whose source can't be resolved is not offered to a restricted lane. An operator pin to
+    // this lane was handled above and bypasses this, same as it bypasses lane avoidance.
+    if (task && thisLane && Array.isArray(thisLane.taskClasses)) {
+      let sourceName = null;
+      try { sourceName = resolveSourceName(task); } catch (_) { sourceName = null; }
+      if (!require('./lanes.js').laneAllowsSource(thisLane, sourceName)) continue;
+    }
 
     // A scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is
     // not claimable, even if one is already sitting in pending/ (src/lib/source-scope.js). An explicit
