@@ -158,6 +158,13 @@ function validateSecondBrainPath(relPath, secondBrainDir, trackedProjectLabels =
     return `filename "${baseName}" is too generic to find again later -- name it after the actual subject of the note (e.g. "ebay-cross-post-automation.md", not "ideas.md")`;
   }
 
+  // A file named after nothing but a tracked project ("Projects/agent-manager.md") is as unfindable as "ideas.md": every note about that project would
+  // want the same name. Seen twice in 24 notes from the RX 580 8B (2026-10-18); the 27B never did it.
+  const normName = (s) => String(s).toLowerCase().replace(/[_\s]+/g, '-');
+  if ((Array.isArray(trackedProjectLabels) ? trackedProjectLabels : []).some((l) => normName(l) === normName(stem))) {
+    return `filename "${baseName}" is just the project name -- name the file after the actual subject of the note (e.g. "apply-task-path-validation.md", not "${baseName}")`;
+  }
+
   const topLevel = segments[0];
   const allowed = new Set([...CANONICAL_TOP_LEVEL, ...(Array.isArray(trackedProjectLabels) ? trackedProjectLabels : [])]);
   // Case-insensitive membership check (2026-09-15): a caller upstream (apply-group-a-

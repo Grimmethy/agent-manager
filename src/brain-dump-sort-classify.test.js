@@ -356,3 +356,20 @@ test('the implement prompt no longer ships a copyable placeholder tag list', () 
   assert.ok(!p.includes('["short", "lowercase", "keywords"]'));
   assert.match(p, /3 to 6 lowercase keywords taken from THIS note/);
 });
+
+
+test('validateSecondBrainPath rejects a file named only after a tracked project, with a usable reason; descriptive names still pass', () => {
+  const labels = ['agent-manager', 'PF-Client-Portal', 'credit-manager-plugin'];
+  assert.match(validateSecondBrainPath('Projects/agent-manager.md', null, labels), /just the project name/);
+  assert.match(validateSecondBrainPath('agent-manager/agent_manager.md', null, labels), /just the project name/);
+  assert.match(validateSecondBrainPath('Projects/pf-client-portal.md', null, labels), /just the project name/, 'case-insensitive');
+  assert.equal(validateSecondBrainPath('Projects/agent-manager/mobile-chat-panel-z-index-trap.md', null, labels), null);
+  assert.equal(validateSecondBrainPath('agent-manager/agent-manager-hygiene-notes.md', null, labels), null, 'only an exact name match is rejected');
+  assert.equal(validateSecondBrainPath('Projects/agent-manager.md', null, []), null, 'no labels, no check');
+});
+
+test('reviewBrainDumpSort surfaces the project-name filename as a retryable reason', () => {
+  const r = reviewBrainDumpSort({ implementResponse: JSON.stringify({ secondBrainPath: 'Projects/agent-manager.md', tags: ['x'], actionable: true, belongsToProject: 'agent-manager' }), promptContext: { projectLabels: ['agent-manager'], selfProjectLabel: 'agent-manager', rawText: 'fix the mobile chat panel z-index' } }, { trackedProjectLabels: ['agent-manager'] });
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /just the project name/);
+});
