@@ -13560,3 +13560,232 @@ Caller:
 
 Benefits:
 Drops the function to ~83 lines, clearing the 100-line threshold. The helper is unit-testable in isolation (no git repo, no lock). Lock scope, git-delete, and snapshot blocks are untouched.
+
+### AC-206 · Extract maybeRetryOversized from runImplementPass
+Strength: Strong
+Files: src/local-draft.js
+Symbol: runImplementPass
+Snippet:
+```
+// a terminal outcome was reached (deterministic empty, degenerate block, or a candidate
+// split), else { done: false } so draftTask continues to critique + revision.
+async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
+  const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
+
+  // 2026-08-23, Grimmethy: "Investigate: arch_review/arch_import drafts hedge instead
+  // of grounding in real source" -- confirmed live: even with archImportImplementPrompt's
+  // explicit "if the searches found nothing... output the empty string" instruction,
+  // the model frequently fabricated a plausible-looking candidate anyway (invented
+  // file paths, classes, APIs) rather than reliably following it -- caught by fact-
+  // check/review every time (so nothing wrong ever shipped), but burning a real call
+  // and a full review cycle on a draft that was doomed from the moment harness search
+  // came back empty. Skipping the implement call entirely on a genuine zero-hit
+  // search removes the temptation altogether -- deterministic, not a prompt tweak the
+  // model can still ignore. The source opts in via `skipImplementWhenNoHarnessHits` on
+  // its registration (ADR-0022 Stage A4) and is also an emptyApproval source, so this
+  // empty implementResponse auto-approves with zero further local-model spend -- the
+  // exact outcome a compliant model would have produced anyway.
+  const skipImplementOnNoHits = getRegisteredSource(resolveSourceName(task))?.skipImplementWhenNoHarnessHits;
+  if (skipImplementOnNoHits && Array.isArray(task.promptContext.harnessHits) && task.promptContext.harnessHits.length === 0) {
+    task.implementResponse = '';
+    recordImplement(attempt, { note: 'deterministic empty (harness search found zero real matches)' });
+    appendHistoryEvent(task, 'implement-done', 'deterministic empty (harness search found zero real matches -- implement call skipped, not left to the model to follow the empty-string instruction)');
+    concludeDraft(task);
+    return { done: true, result: { succeeded: true, blocked: false } };
+  }
+
+  const implPrompt = buildImplementPrompt(task, task.planResponse);
+  const budget = computeImplementBudget(task, implPrompt);
+  const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
+
+  // Bookend to 'implement-done' below -- same -started/-done pairing plan/critique/review
+  // have. A single implement call can legitimately run close to its timeout; with the
+  // persist hook this makes a draft killed mid-call show 'implement-started' rather than
+  // ending at 'plan-done'.
+  appendHistoryEvent(task, 'implement-started', hasFixedLiterals ? 'fixed-literals implement pass' : 'implement pass');
+  const implCallStartMs = Date.now();
+  let implResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget });
+  let implLatencyMs = Date.now() - implCallStartMs;
+
+  if (implResult.degenerate) {
+    const blockedReason = `Implement pass degenerate: ${implResult.degenerate}`;
+    recordImplement(attempt, { degenerate: implResult.degenerate, attempts: implResult.attempts });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    // 2026-09-21: this used to carry NO blockedStage -- invisible to reject-retry-check.js's entry gate, so the task sat in queue/blocked/ forever with zero automated retry
+    // (function-length-fix-ac-34 was stuck a day on "Implement pass degenerate: empty"). Same shape the plan-pass degenerate block had until 2026-09-17; see
+    // reject-retry-check.js's isImplementDegenerateBlock. 'implement' is deliberately none of 'review'/'apply'/'pre-critique'/'pre-implement'/'draft'/'plan'.
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason, blockedStage: 'implement' } };
+  }
+  task.implementResponse = implResult.response;
+
+  // evalTok/latency cap routing (2026-09-08, brain-dump bd-1788725054994 "cap the
+  // implement-pass token/latency budget per draft and route oversized drafts to
+  // strict-cite retry"): computeImplementBudget's evalTokCap/latencyMsCap (added
+  // 2026-09-10) sat inert until now -- nothing ever read them, and prompts.js's
+  // strictCiteConstraintBlock (added alongside them) was never invoked either. A draft
+  // that blows well past the normal generation length or latency for an implement pass
+  // is usually not a legitimately large but correct change -- it is the model
+  // re-deriving or hedging on context it was already given. One bounded retry with the
+  // strict-cite prompt variant reins it back in without burning a second full free-form
+  // pass. Capped at exactly one retry -- oversizedImplementRetried guards against
+  // retrying the retry, so a second oversized result is left as-is and flows through the
+  // normal postImplementCheck/candidate-fulfillment/review path below unchanged.
+  const isOversized = (Number(implResult.eval_count) || 0) > budget.evalTokCap
+    || implLatencyMs > budget.latencyMsCap;
+  if (isOversized && !task.oversizedImplementRetried) {
+    task.oversizedImplementRetried = true;
+    const strictPrompt = buildImplementPrompt(task, task.planResponse, { strictCite: true });
+    const retryStartMs = Date.now();
+    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt: strictPrompt, budget });
+    const retryLatencyMs = Date.now() - retryStartMs;
+    appendHistoryEvent(
+      task,
+      'implement-oversized',
+      `evalTok=${implResult.eval_count || 0} latencyMs=${implLatencyMs} (caps ${budget.evalTokCap}/${budget.latencyMsCap}ms) -- retried once with strict-cite, ${retryResult.degenerate ? `retry degenerate (${retryResult.degenerate}), keeping original` : `retry evalTok=${retryResult.eval_count || 0} latencyMs=${retryLatencyMs}`}`,
+    );
+    if (!retryResult.degenerate) {
+      implResult = retryResult;
+      implLatencyMs = retryLatencyMs;
+      task.implementResponse = retryResult.response;
+    }
+  }
+
+  // A source can register a `postImplementCheck(task, implementResponse, {call,
+  // maybeLockedOn})` -- generic, source-agnostic hook, same convention as premiseCheck
+  // above but for the implement pass's OWN output rather than a candidate-fulfillment
+  // split decision. Catches a draft that hallucinates a detail contradicting its own real
+  // grounding BEFORE it burns a full local review vote round on something already doomed
+  // to be rejected for exactly that reason (function-length-grounding-check.js in the
+  // hygiene plugin, 2026-09-05: 8 of 9 blocked function_length_review tasks shared this
+  // exact shape -- "proposes extracting X, but the grounding source shows Y"). Routes an
+  // ungrounded verdict into the SAME blockedStage:'review' path a real review rejection
+  // takes -- reject-retry-check.js's existing, already-proven redraft/priorRejectionFeedback/
+  // exhaustion machinery handles everything from here, unchanged; this hook only decides
+  // WHETHER a rejection happens; never invents a new one.
+  //
+  // 2026-09-06: also accepts verdict:'invalid-premise' (src/candidate-premise-check.js,
+  // wired onto pipeline_forensics_fix -- AC-16/AC-18 drafted a real, well-implemented
+  // guard against a prerequisite that was never actually built) -- a DISTINCT blockedReason
+  // prefix from 'ungrounded' (matching the wording finalizeCandidateFulfillment's own
+  // split-gated premiseCheck already uses) so blocked-task-classifiers.js can tell "the
+  // draft fabricated something" (model-side, worth a feedback-driven retry) apart from
+  // "the CANDIDATE itself rests on a false premise" (retrying redrafts against the exact
+  // same false premise every time -- structurally futile, not stochastically unlucky).
+  const postImplementEntry = getRegisteredSource(resolveSourceName(task));
+  // Write-time size gate (ADR-0023 S1): a directToMain candidate write-up over the fulfillment limit would be appended and then skipped
+  // forever, so it is bounced here with its measured size. Unlike the grounding gate below, this does NOT set reviewInconclusive: the
+  // violation is deterministic, so it goes through the normal reject-retry loop (feedback injected, MAX_LOCAL_REJECT_RETRIES, then
+  // needs-clarification). A throwing gate is advisory and never blocks a draft.
+  let sizeGate = null;
+  try {
+    sizeGate = require('./candidate-size-gate.js').checkCandidateSize(task, task.implementResponse, { entry: postImplementEntry });
+  } catch (e) {
+    sizeGate = null;
+  }
+  if (sizeGate && sizeGate.verdict === 'oversized') {
+    const blockedReason = `Oversized candidate: ${String(sizeGate.reason || '(no detail)')}`.slice(0, 500);
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+    appendHistoryEvent(task, 'blocked', blockedReason);
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(blockedReason);
+    return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+  }
+  if (postImplementEntry && typeof postImplementEntry.postImplementCheck === 'function') {
+    let grounding;
+    try {
+      grounding = await postImplementEntry.postImplementCheck(task, task.implementResponse, { call: resolvedLocalCall, maybeLockedOn: ctx.maybeLockedOn });
+    } catch (e) {
+      if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
+      grounding = null; // advisory -- a throwing check must never block a real draft
+    }
+    if (grounding && (grounding.verdict === 'ungrounded' || grounding.verdict === 'invalid-premise')) {
+      const prefix = grounding.verdict === 'invalid-premise' ? 'Invalid premise' : 'Ungrounded draft';
+      const blockedReason = `${prefix}: ${String(grounding.reason || '(no detail)')}`.slice(0, 500);
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: blockedReason });
+      appendHistoryEvent(task, 'blocked', blockedReason);
+      task.blockedStage = 'review';
+      task.blockedReason = blockedReason;
+      // Stochastic harness gate, not a genuine reviewer rejection -- reject-retry-check.js's
+      // isReviewRejection() currently keys only on blockedStage:'review', which silently
+      // conflates a re-roll-worthy gate flake with a real REJECT verdict. This structured
+      // flag lets downstream consumers (retry, drain, self-audit) tell them apart without
+      // depending on blockedStage alone. Never set at a genuine review-time rejection site
+      // (see src/review-task.js's own blockedStage:'review' assignments, which do not set
+      // this) -- only here and postImplementCheck's sibling gate in implement-critique.js.
+      task.reviewInconclusive = true;
+      task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+      task.priorRejectionFeedback.push(blockedReason);
+      return { done: true, result: { succeeded: true, blocked: true, blockedReason } };
+    }
+    // An 'ok' verdict may still carry `warnings`: things the check could not verify but that
+    // are not proof of a defect (e.g. a symbol not found by literal grep in the cited files).
+    // Kept on the task for review-task.js's buildVerdictPrompt so the votes can weigh them,
+    // instead of blocking a draft on a heuristic. Reset every pass so a redraft never
+    // inherits a stale warning.
+    delete task.groundingWarnings;
+    if (grounding && grounding.verdict === 'ok' && Array.isArray(grounding.warnings) && grounding.warnings.length) {
+      task.groundingWarnings = grounding.warnings.slice(0, 10).map((w) => String(w).slice(0, 300));
+      appendHistoryEvent(task, 'grounding-warning', task.groundingWarnings.join('; ').slice(0, 300));
+    }
+  }
+
+  // Deterministic find-verification retry (see findUnverifiedEdit's own header) --
+  // ONLY for the five candidate-fulfillment sources, which are the only ones with
+  // fetchedFiles to verify against. Bounded to a single retry, same "one real second
+  // chance, then let the existing downstream gates catch it" shape as the adhoc
+  // turn-budget retry -- a find string that's still wrong on a second, explicitly-
+  // warned attempt is a genuine mismatch (stale/truncated fetched content, a
+  // candidate whose Problem no longer matches current code, etc.), not something a
+  // third guess would likely fix either.
+  if (isCandidateFulfillmentSource(task.source)) {
+    return await finalizeCandidateFulfillment(task, ctx, {
+      implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt,
+    });
+  }
+  recordImplement(attempt, {
+    text: task.implementResponse,
+    attempts: implResult.attempts,
+    ...(task.oversizedImplementRetried ? { promptVariant: 'oversized-strict-cite' } : {}),
+  });
+  appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
+  if (!task.nonCompliantImplementRetried && !isImplementOutputCompliant(task, task.implementResponse)) {
+    task.nonCompliantImplementRetried = true;
+    console.warn(`[local-draft] non-compliant implement output (missing JSON and missing FALSE POSITIVE token) -- retrying once, task=${task.id}, source=${task.source}`);
+    const retryResult = await callImplementModel(task, ctx, { recordModelCall, implPrompt, budget });
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      canonicalizeImplementFinds(task);
+    }
+    appendHistoryEvent(task, 'implement-retry', 'non-compliant output (missing JSON and missing FALSE POSITIVE token) -- retried once before critique');
+  }
+  return { done: false };
+}
+```
+
+Problem:
+runImplementPass inlines six gate/retry branches in one 193-line body. The oversized-retry block is the only one carrying mutable state (task.oversizedImplementRetried), a prompt-variant switch (strictCite), and a result-swap of implResult/implLatencyMs. Testing it requires exercising the entire pass, making coverage brittle and slow.
+
+Solution:
+Extract that block into a standalone async helper maybeRetryOversized(task, ctx, { recordModelCall, implResult, implLatencyMs, budget }) that returns the (possibly swapped) pair. The call site collapses to one line:
+
+```diff
+-  const isOversized = (Number(implResult.eval_count)||0) > budget.evalTokCap
+-    || implLatencyMs > budget.latencyMsCap;
+-  if (isOversized && !task.oversizedImplementRetried) {
+-    task.oversizedImplementRetried = true;
+-    const strictPrompt = buildImplementPrompt(task, task.planResponse, { strictCite: true });
+-    const t0 = Date.now();
+-    const r = await callImplementModel(task, ctx, { recordModelCall, implPrompt: strictPrompt, budget });
+-    const rl = Date.now() - t0;
+-    appendHistoryEvent(task, 'implement-oversized', `evalTok=${implResult.eval_count||0} latencyMs=${implLatencyMs} ...`);
+-    if (!r.degenerate) { implResult = r; implLatencyMs = rl; task.implementResponse = r.response; }
+-  }
++  ({ implResult, implLatencyMs } = await maybeRetryOversized(task, ctx, { recordModelCall, implResult, implLatencyMs, budget }));
+```
+
+The helper owns the flag check, prompt build, model call, latency capture, history append, and degenerate fallback in roughly 15 lines.
+
+Benefits:
+The retry state machine is testable in isolation with a stubbed callImplementModel, without triggering the skip, degenerate, grounding, or non-compliant gates. Future changes to retry count, cap source, or prompt variant touch one small function. runImplementPass shrinks by ~15 lines and reads as a flat sequence of five simpler, stateless gates.
