@@ -14458,3 +14458,193 @@ async function renderPluginsTab() {
 
 Benefits:
 The marketplace IIFE becomes testable by mocking fetchJson('/api/plugins/marketplace') and asserting on #marketplace-list. The three handler families share a "disable → POST → re-render" shape; naming them makes the pattern visible. The template builders are pure functions of their input, enabling unit tests that assert exact HTML without a DOM. The orchestrator drops below 100 lines.
+
+### AC-210 · Extract retry idiom from finalizeCan
+Strength: Strong
+Files: src/local-draft.js
+Symbol: finalizeCandidateFulfillment
+Snippet:
+```
+}
+
+async function finalizeCandidateFulfillment(task, {
+  maybeLocked, maybeLockedOn, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink,
+}, { implResult, implPrompt, hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement, attempt }) {
+  let split = parseCandidateSplit(task.implementResponse);
+  // Too-few-sub-candidates retry (class C, arch-review-ac-180): the model said mode "split" but gave ONE child that restated the whole
+  // single-file candidate (and itself spanned two files, against the prompt's own one-file-per-piece rule). That is a fixable answer, not
+  // a dead end -- ask once, naming the rule, before blocking for a human. Any later failure blocks exactly as before. The flag is not a
+  // clean-slate field, so a re-admitted task is not retried forever.
+  if (split && split.invalid && split.tooFew && !task.splitTooFewRetried) {
+    task.splitTooFewRetried = true;
+    const correction = `Your previous answer was mode "split" but only ${split.usable} of ${split.proposed} sub-candidate(s) were usable. A split needs AT LEAST 2 sub-candidates, each with a title, problem and solution, each touching exactly ONE file, listed in the order they must be applied (use dependsOn when a later piece needs an earlier one). For example: (1) create the new module, then (2) rewire the original file to use it. Do not put the whole job in a single sub-candidate.`;
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(correction);
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: `${implPrompt}\n\n${correction}`, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      split = parseCandidateSplit(task.implementResponse);
+    }
+    appendHistoryEvent(task, 'implement-retry', `split had ${split && split.tooFew ? split.usable : 'too few'} usable sub-candidate(s) -- retried once asking for at least 2, one file each${retryResult.degenerate ? ' (retry degenerate, original answer kept)' : ''}`);
+  }
+  if (split) {
+    const pc = task.promptContext || {};
+    const atSplitCap = (pc.splitDepth || 0) >= 1;
+    // A noCandidateSplit source's candidate is already a decomposition, EXCEPT when the
+    // deterministic pre-split gate (nextCandidateFulfillmentTask) marked it too broad to
+    // land in one diff -- that split IS wanted. But a candidate already at Split-Depth >= 1
+    // is never re-split, whatever the source: the hard recursion stop.
+    const entry = getRegisteredSource(resolveSourceName(task));
+    const splitBlocked = atSplitCap || (entry && entry.noCandidateSplit && !pc.mustPreSplit);
+    // A source can register a `premiseCheck(task, {call, maybeLockedOn})` -- generic,
+    // source-agnostic hook, same convention as `noCandidateSplit` above -- run BEFORE a
+    // split is honored, never after: this is the fan-out point, so it's the cheapest place
+    // to stop a candidate whose Problem statement makes a checkable claim about the
+    // codebase that the fetched content contradicts (arch-import-premise-check.js in the
+    // hygiene plugin; see AC-8, which split into 3 children before anyone checked its
+    // premise was false). Skipped once splitBlocked is already true -- cheapest check first.
+    if (!splitBlocked && entry && typeof entry.premiseCheck === 'function') {
+      let premise;
+      try {
+        premise = await entry.premiseCheck(task, { call: resolvedLocalCall, maybeLockedOn });
+      } catch (e) {
+        if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (it resumes later) -- never degrade to 'skipped'
+        // AC-170: log the swallowed premiseCheck exception so operators can see it.
+        // entry.name / entry.sourceName are not confirmed present; fall back to constructor name.
+        console.error(`[premiseCheck] task=${task.id || task.name || 'unknown'} source=${entry.name || entry.sourceName || entry.constructor?.name || 'unknown-source'} error=${e?.message ?? String(e)}`, e?.stack);
+        premise = null; // advisory mechanism -- a throwing premiseCheck must never block a real split
+      }
+      if (premise && premise.verdict === 'invalid-premise') {
+        const reason = `Invalid premise: ${String(premise.reason || '(no detail)')}`.slice(0, 500);
+        recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: reason });
+        appendHistoryEvent(task, 'blocked', reason);
+        return { done: true, result: { succeeded: true, blocked: true, blockedReason: reason } };
+      }
+    }
+    // A blocked split used to stop here, "for a human to narrow the fix" -- PropertyForager function-length-fix-ac-2 (a candidate that
+    // proposed four extractions), arch-review-ac-6 (a Split-Depth 1 sub-candidate still too big). Agent-manager already has a system
+    // for work that is too big for one pass: a coordinator hub of ordered adhoc sub-tasks (see apply-adhoc-diff.js). Route the
+    // well-formed split there; the review pass judges it as it does any candidate split (coverage of the original), and apply
+    // (apply-core.js writeArtifact) queues the pieces. The doc-split's re-split loop cannot recur: children are adhoc tasks that
+    // produce real diffs and carry `decomposedFrom`, which marks them as leaves. AGENT_MANAGER_CANDIDATE_SPLIT_TO_HUB=false restores
+    // the old block.
+    if (splitBlocked && !split.invalid && candidateSplitToHubEnabled()) {
+      const childDepth = (pc.splitDepth || 0) + 1;
+      task.candidateSplitProposals = split.candidates.map((c) => ({ ...c, splitDepth: childDepth }));
+      task.candidateSplitRoute = 'hub';
+      const why = atSplitCap ? 'a Split-Depth >= 1 sub-candidate' : 'a source whose candidates are already decompositions';
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `too large for one pass (${why}) -- split into ${split.candidates.length} piece(s) routed to a coordinator hub` });
+      appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), too large for one pass (${why}) -- ${split.candidates.length} piece(s) routed to a coordinator hub: ${split.candidates.map((c) => c.title).join('; ')}`);
+      concludeDraft(task);
+      return { done: true, result: { succeeded: true, blocked: false } };
+    }
+    if (splitBlocked) {
+      const reason = atSplitCap
+        ? 'implement pass tried to split a sub-candidate that is already a one-level decomposition (Split-Depth >= 1) -- blocked for a human to narrow the fix'
+        : 'implement pass tried to split a candidate that must be implemented directly (this source does not allow re-splitting) -- blocked for a human to narrow the fix';
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: reason });
+      appendHistoryEvent(task, 'blocked', reason);
+      return { done: true, result: { succeeded: true, blocked: true, blockedReason: reason } };
+    }
+    if (split.invalid) {
+      recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `invalid candidate split: ${split.reason}` });
+      appendHistoryEvent(task, 'blocked', split.reason);
+      return { done: true, result: { succeeded: true, blocked: true, blockedReason: split.reason } };
+    }
+    const childDepth = (pc.splitDepth || 0) + 1;
+    task.candidateSplitProposals = split.candidates.map((c) => ({ ...c, splitDepth: childDepth }));
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note: `split into ${split.candidates.length} sub-candidate(s)` });
+    appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), split into ${split.candidates.length} sub-candidate(s): ${split.candidates.map((c) => c.title).join('; ')}`);
+    concludeDraft(task);
+    return { done: true, result: { succeeded: true, blocked: false } };
+  }
+  canonicalizeImplementFinds(task);
+  const anchorSnippet = extractCandidateSnippet(task.promptContext && task.promptContext.body);
+  const unverified = findUnverifiedEdit(
+    task.implementResponse,
+    task.promptContext && task.promptContext.fetchedFiles,
+    { anchorSnippet, declaredFiles: (task.promptContext && task.promptContext.files) || [] },
+  );
+  if (unverified) {
+    let correction;
+    if (unverified.problem === 'files-incomplete') {
+      correction = `This candidate's "Files:" line names ${unverified.declared.length} files that all need changes: ${unverified.declared.join(', ')}. Your previous attempt only edits ${unverified.declared.filter((f) => !unverified.missing.includes(f)).join(', ') || '(none of them)'} and leaves ${unverified.missing.join(', ')} untouched. Add the edit(s) to ${unverified.missing.join(' and ')} that the Solution describes -- the change is not complete without them.`;
+    } else if (unverified.problem === 'helper-not-wired') {
+      correction = `Your previous attempt defines \`${unverified.helper}\` in ${unverified.file} but nothing ever calls it -- neither another edit in your diff nor the file's existing code. A new helper that is never invoked is a no-op. Add the edit that actually calls \`${unverified.helper}\` at the site the candidate's Solution describes (and, if the Solution says to, the edit that clears/resets any field it uses afterwards).`;
+    } else if (unverified.problem === 'duplicate-import') {
+      correction = `Your previous attempt for ${unverified.file} ADDS the line \`${unverified.duplicateLine}\`, but that line ALREADY EXISTS in the file's real content shown above. Do not add it again -- reuse the existing import/logger. If a module logger genuinely does not exist yet, add ONE line at the top of the file with the other imports, never inside a function.`;
+    } else if (unverified.problem === 'wrong-block') {
+      correction = `Your previous "find" string for ${unverified.file} matches the file -- but a DIFFERENT block than the one this candidate flagged. The flagged code is:\n\n${unverified.anchorSnippet}\n\nYour "find" must be a verbatim substring of THAT block (or the real file text immediately around it) -- not a similar-looking try/except/catch elsewhere in the file. Copy from the flagged block above.`;
+    } else {
+      correction = `Your previous attempt proposed this "find" string for ${unverified.file}, but it does not appear verbatim anywhere in that file's real content given above:\n\n${unverified.find}\n\nLook again at the REAL file content above and either copy an EXACT substring that is actually there, or -- if nothing in the real file content genuinely matches what this candidate describes -- output the empty string instead of guessing.`;
+    }
+    // 2026-09-10, brain-dump bd-1788748625403 ("before spending a second implement
+    // attempt on an observability_fix requeue, feed the prior rejection reason"): this
+    // correction text was built for ONE inline retry here and then discarded -- if this
+    // candidate still gets rejected later (critique/review) and reject-retry-check.js
+    // redrafts it from scratch, the fresh attempt had no memory of this exact mistake and
+    // could easily reproduce it. Pushing it onto task.priorRejectionFeedback lets
+    // priorRejectionBlock() (prompts.js/lib/prompt-blocks.js) fold it into the next
+    // attempt's prompt as a hard constraint, same as every other rejection reason already
+    // does -- no signature changes, just one more caller of the existing mechanism.
+    task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+    task.priorRejectionFeedback.push(correction);
+    const retryPrompt = `${implPrompt}\n\n${correction}`;
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: retryPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      canonicalizeImplementFinds(task);
+    }
+    const note = `retried once (${unverified.problem})`;
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts, note, promptVariant: 'strict-cite' });
+    appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars (${note})`);
+  } else {
+    recordImplement(attempt, { text: task.implementResponse, attempts: implResult.attempts });
+    appendHistoryEvent(task, 'implement-done', `${implResult.attempts} attempt(s), ${task.implementResponse.length} chars`);
+  }
+  if (!task.nonCompliantImplementRetried && !isImplementOutputCompliant(task, task.implementResponse)) {
+    task.nonCompliantImplementRetried = true;
+    console.warn(`[local-draft] non-compliant implement output (missing JSON and missing FALSE POSITIVE token) -- retrying once, task=${task.id}, source=${task.source}`);
+    const retryResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: implPrompt, think: profileSupportsThink && !implNoThink, temperature: RETRY_TEMPERATURE, numPredict: implNumPredict, numCtx: implNumCtx, allowEmpty: allowEmptyImplement, source: task.source, taskId: task.id, stage: 'implement-retry', isDraft: true }), 'implement-retry');
+    if (!retryResult.degenerate) {
+      task.implementResponse = retryResult.response;
+      canonicalizeImplementFinds(task);
+    }
+    appendHistoryEvent(task, 'implement-retry', 'non-compliant output (missing JSON and missing FALSE POSITIVE token) -- retried once before critique');
+  }
+```
+
+Problem:
+finalizeCan interleaves three responsibilities across 145 lines. The clearest duplication is a retry-with-correction idiom (build prompt → maybeLocked call → check degenerate → write back task.implementResponse) repeated three times for split-too-few, unverified-edit, and non-compliant-output retries. Each block is ~8 lines of identical shape parameterised only by the prompt string, so any contract change to maybeLocked must be patched in three places.
+
+Solution:
+Extract one helper, retryImplementOnce, that takes the task, a base prompt, an optional correction string, and the shared call options. It builds the combined prompt, performs the maybeLocked call with stage 'implement-retry', and writes back to task.implementResponse when the result is not degenerate. Each of the three inline blocks collapses to a single call-site:
+
+```js
+async function retryImplementOnce(task, { implPrompt, correction, ...opts }) {
+  const prompt = correction ? `${implPrompt}\n\n${correction}` : implPrompt;
+  const result = await maybeLocked(opts.isLocal, () => opts.localCall({
+    prompt,
+    think: opts.supportsThink && !opts.noThink,
+    temperature: RETRY_TEMPERATURE,
+    numPredict: opts.numPredict,
+    numCtx: opts.numCtx,
+    allowEmpty: opts.allowEmpty,
+    source: task.source,
+    taskId: task.id,
+    stage: 'implement-retry',
+    isDraft: true,
+  }), 'implement-retry');
+  if (!result.degenerate) task.implementResponse = result.response;
+  return result;
+}
+```
+
+Each call-site becomes:
+
+```js
+const r = await retryImplementOnce(task, { implPrompt, correction, ...sharedOpts });
+```
+
+Benefits:
+Removes ~24 lines of duplicated call-shape, gives a single place to adjust if the maybeLocked contract or retry parameters change, and makes the remaining split-decision tree and correction-text logic easier to scan because the retry noise is gone. No behaviour change; purely mechanical deduplication of an identical call shape.
