@@ -2403,3 +2403,29 @@ Benefits:
 The shared-vs-local distinction becomes a call-site decision encoded in the function name rather than a convention that lives in a comment. A new piece of shared state is added by calling `getSharedLockPath('my-new-lock')` and cannot accidentally land in the project-local tree, eliminating the foot-gun that produces the GPU and lock bugs described in the existing comments.
 
 NOTE: Flag 3 (AC-001 solution "architecturally unsound") was applied by replacing the per-call `scopeWrapper` injection with a module-level `setScopePolicy` override hook, which preserves the registry's generic public API and keeps the scoping policy encapsulated within the agent-manager package rather than leaking it to every plugin caller.
+
+### AC-203 · Duplicated Git Execution Configuration
+Strength: Strong
+Files: src/stacked-grounding.js, src/git-runner.js
+
+Problem:
+src/stacked-grounding.js defines its own local git environment and timeout constants and uses them in a local runGit helper for functions such as readFileAtRef, grepAtRef, and resolveAtRef. At the same time, the same file imports createRealGitRunner from git-runner.js and uses that runner in resolveGroundingRef. This leaves the module with two parallel paths for executing git commands that carry potentially different environment settings and timeout values. If a global change is needed—for example, adjusting the timeout or adding a new environment variable—it must be applied in both places, and a missed update produces inconsistent behavior between the two code paths within the very same module.
+
+Solution:
+Refactor readFileAtRef, grepAtRef, and resolveAtRef to obtain their git-execution capability from the same runner instance (or a shared utility exported by git-runner.js) that resolveGroundingRef already uses. Remove the local runGit helper and the locally defined environment and timeout constants from stacked-grounding.js so that every git interaction in the module draws from a single configuration source.
+
+Benefits:
+A single source of truth for git environment variables and timeouts eliminates the risk of the two code paths drifting apart. Future changes to timeout or environment settings require editing one location instead of two. The module's dependency on git-runner.js becomes explicit and uniform, which simplifies maintenance and makes unit testing straightforward—mocking one runner instead of two separate execution paths.
+
+### AC-204 · Hidden Side-Effect Require of task-sources.js
+Strength: Worth exploring
+Files: src/lib/apply-core.js, src/task-sources.js
+
+Problem:
+apply-core.js contains a bare side-effect require of task-sources.js that is not accompanied by any direct use of a symbol from that module. The require exists solely to trigger registration of task sources into a shared registry before getRegisteredSource is called later. Because the dependency is expressed as a side effect rather than an explicit import of an initialization function, the module's contract is implicit: a reader or a test harness cannot tell from the import statement alone that loading apply-core.js presupposes task-sources.js having been evaluated. This makes initialization-order bugs harder to detect and complicates isolated unit testing of apply-core.js.
+
+Solution:
+Replace the bare side-effect require with an explicit call to a named initialization or registration function exported by task-sources.js (or by a dedicated registry module). If the registration is truly a one-time global side effect, move that call to the application entry point that first loads apply-core.js and remove the require from apply-core.js entirely. Either way, the dependency becomes visible in the module's import list or in the entry-point code.
+
+Benefits:
+The module's dependencies become explicit and auditable. Unit tests for apply-core.js no longer need to reproduce the side-effect loading order. If the module graph is reorganized, the explicit import or the entry-point call makes the registration dependency visible to anyone reading the code, reducing the chance of a silent "source not registered" failure at runtime.
