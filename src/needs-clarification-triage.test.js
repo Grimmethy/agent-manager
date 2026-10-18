@@ -1017,6 +1017,35 @@ test('bucket D being exhausted does NOT block bucket K from firing on the same t
   assert.match(moved.implementResponse, /Add the allowlist constant/);
 });
 
+// 2026-10-02, widened gate (re-landed WITHOUT the dead flat-counter condition from the
+// reviewed draft): a task whose adhocResolution is only 'draft' (never promoted to
+// 'decompose') but which ALREADY carries a real, valid subTaskProposals decomposition --
+// with ncTriageAttempts 0 (the flat, pre-2026-09-16 counter master no longer increments)
+// and an implementResponse that names none of the sub-task titles -- must still be
+// rescued by bucket K. Same signature as tk1, one gate-step earlier in the adhoc
+// lifecycle; ncTriageAttempts 0 proves the gate does not depend on that field at all.
+test('bucket K: fires for adhocResolution "draft" with a real decomposition sitting unused (widened gate)', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, baseTask('tk8', {
+    adhocResolution: 'draft',
+    subTaskProposals: REAL_SUB_TASKS,
+    // Deliberately names NO sub-task title (contrast tk2, which shows the real titles
+    // and is left alone) -- the blind signature this bucket repairs.
+    implementResponse: 'Implement pass drafted a fix for the widget but the response body is otherwise generic.',
+    needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
+    ncTriageAttempts: 0,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tk8.json')));
+  const moved = read(at(dir, 'review', 'tk8.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.equal(moved.ncTriageBucketAttempts.K, 1, 'bucket K consumed its OWN budget, not the flat ncTriageAttempts');
+  assert.match(moved.implementResponse, /Add the allowlist constant/);
+  assert.match(moved.implementResponse, /Wire the allowlist into the check/);
+});
+
 // --- Ghost-in-the-Machine: bucket C retry-exhausted -> ghost debt (2026-09-09) ---------
 
 const sfInbox = (dir) => {
