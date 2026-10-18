@@ -822,7 +822,7 @@ function checkCitationsAgainstHarnessFiles(draftText, harnessFiles) {
 // draft is correct. `sourceText` (optional) is the material the local model was actually given for
 // this task; when provided, the grounded-value check runs against it.
 function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
-  const rawFileChecks = checkFilePaths(draftText, repoRoot, extraRoots);
+  const rawFileChecks = checkFilePaths(draftText, repoRoot, extraRoots, ref);
   const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
   const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot, ref);

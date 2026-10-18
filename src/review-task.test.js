@@ -1132,6 +1132,77 @@ test('reviewTask STILL hard-blocks the same stacked task citing a genuinely fabr
     'a value fabricated everywhere, including on the stacked branch, must still be caught -- proves this is not a blanket loosening of the gate');
 });
 
+// Pull the exact deterministic fact-check object (flags + per-path fileChecks) that
+// buildVerdictPrompt hands the reviewer model out of the captured vote prompt, so these
+// tests assert on the real per-file existence verdict -- not just the derived
+// factCheckVerdict label, which a badly-derived flag set could still obscure.
+function factCheckFromPrompt(prompt) {
+  const idx = prompt.indexOf('--- Deterministic fact-check pre-filter (necessary, NOT sufficient) ---');
+  assert.ok(idx !== -1, 'the verdict prompt must carry the deterministic fact-check section');
+  return JSON.parse(prompt.slice(idx).split('\n', 2)[1]);
+}
+
+// HUB0109 3/3 stacked regression: a seq-2 task cites a file its predecessor committed
+// to the shared stacked branch. That file does NOT exist in the working-tree checkout
+// (main), so a working-tree-only existence check flags the sibling's real file as
+// fabricated. With the branch ref threaded through checkDraft -> checkFilePaths it must
+// resolve against the stacked branch's real tip (exists: true) and stay 'pass'.
+test('stacked seq-2: a file that exists only on the predecessor branch is NOT flagged missing-file', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeGitFixtureWithStackedBranch();
+  assert.equal(fs.existsSync(path.join(repoRoot, 'src', 'sibling.js')), false,
+    'precondition: the cited file must be ABSENT from the working-tree checkout (main)');
+  const task = {
+    id: 'stacked-missing-file-regression', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Follow on from the sibling move task on this stacked branch: src/sibling.js already defines SIBLING_ONLY_FIELD there, so wire the existing call site through it and drop the duplicated setup, with enough detail here to clear the length floor.',
+    promptContext: { body: 'unrelated grounding material' },
+    stacked: { branch: 'agent/stacked-family', seq: 2, total: 2 },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(captured.length, 1, 'must reach the real review vote, not a false hard-block');
+  const factCheck = factCheckFromPrompt(captured[0]);
+  const siblingEntry = (factCheck.fileChecks || []).find((f) => f.claimedPath === 'src/sibling.js');
+  assert.ok(siblingEntry, 'the cited sibling-branch file must appear in fileChecks at all');
+  assert.equal(siblingEntry.exists, true,
+    'a file the predecessor really committed to the stacked branch must resolve exists:true via the branch ref');
+  assert.equal(
+    (factCheck.flags || []).some((f) => f.type === 'missing-file' && f.detail === 'src/sibling.js'),
+    false, 'a sibling-only real file must NOT produce a missing-file flag');
+  assert.equal(result.factCheckVerdict, 'pass', 'no missing-file flag => fact-check verdict stays pass');
+});
+
+// HUB0109 3/3 control: the SAME fact-check machinery on a NON-stacked task must still
+// flag a file that exists nowhere -- the ref threading must be inert (ref null) here,
+// not a blanket loosening of the existence check.
+test('non-stacked: a file that does not exist on master IS still flagged missing-file', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  assert.equal(fs.existsSync(path.join(repoRoot, 'notes', 'ghost.md')), false,
+    'precondition: notes/ghost.md must not exist on disk');
+  const task = {
+    id: 'non-stacked-missing-file-regression', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Move the duplicated helper out of the two call sites and into notes/ghost.md as the single new home both will import from going forward, with enough detail here to clear the length floor.',
+    promptContext: { body: 'unrelated grounding material' },
+  };
+  assert.ok(!task.stacked, 'control precondition: this task is NOT stacked, so no branch ref applies');
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(captured.length, 1, 'flags are advisory to the vote -- the draft still reaches the reviewer');
+  const factCheck = factCheckFromPrompt(captured[0]);
+  const ghostEntry = (factCheck.fileChecks || []).find((f) => f.claimedPath === 'notes/ghost.md');
+  assert.ok(ghostEntry, 'the cited nonexistent file must appear in fileChecks');
+  assert.equal(ghostEntry.exists, false, 'a file absent from the working tree (and nowhere else) must resolve exists:false');
+  assert.ok(
+    (factCheck.flags || []).some((f) => f.type === 'missing-file' && f.detail === 'notes/ghost.md'),
+    'the missing-file flag must still be raised for a genuinely absent file');
+  assert.equal(result.factCheckVerdict, 'flagged', 'a real missing-file flag must flip the verdict label to flagged');
+});
+
 // 2026-09-08, Second Brain [[dspy-deterministic-prompt-tuning]] research applied: this
 // gate's own header comment calls itself "high-precision, almost never a false positive,"
 // but this session found 4 confirmed false positives against that exact claim, discovered
