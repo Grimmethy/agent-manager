@@ -13973,3 +13973,249 @@ Each helper is 15–40 lines, independently testable, and owns exactly one decis
 
 Benefits:
 Each sub-function can be tested with a single fixture (e.g. one merged-branch record for resolveGitState) without mocking the full ctx/repoRoot environment. Precedence is now explicit in call order. A reviewer can approve or reject one 30-line helper instead of scanning 147 lines.
+
+### AC-208 · Extract repeated re-admission blocks into a shared helper
+Strength: Strong
+Files: src/reject-retry-check.js
+Symbol: rejectRetryCheck
+Snippet:
+```
+}
+
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, repoRoot: repoRootOverride, recordModelOutcome = defaultRecordModelOutcome }) {
+  const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
+  // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
+  // only matters for tests that don't bother passing pipelineDir explicitly (it was never
+  // load-bearing before the move-lock existed); a real caller always passes it directly.
+  const instancesDir = sharedInstancesDir(pipelineDir || path.dirname(path.dirname(blockedDir)));
+  // Ghost-debt needs the pipeline root for its state file + the side-finding inbox.
+  // Derive it from needsClarificationDir (<pipelineDir>/queue/needs-clarification) when a
+  // caller (older tests) didn't pass it explicitly.
+  const ghostRoot = pipelineDir
+    || (needsClarificationDir ? path.dirname(path.dirname(needsClarificationDir)) : null);
+  // Lazy, best-effort (deterministicReviewRecoveryCheck below tolerates undefined) -- same
+  // "read env inside the sweep, never at module load, never let a missing config block a
+  // sweep tick" discipline every other watchdog sweep in this codebase already follows.
+  // Callers that pass approvedDir explicitly (tests) skip this derivation entirely.
+  const approvedDirResolved = approvedDir
+    || (ghostRoot ? path.join(ghostRoot, 'queue', 'approved') : null);
+  let recoveryConfig = {};
+  try { recoveryConfig = getConfig(); } catch { /* no live config (e.g. a unit test) -- recovery check just no-ops */ }
+  // repoRoot: an explicit caller/test override wins over the live config (the stale-premise re-admission below checks files against it).
+  const sweepRepoRoot = repoRootOverride || recoveryConfig.repoRoot;
+  const entries = discoverBlockedEntries({ blockedDir, adhocDir, derivedDir });
+
+  if (entries.length === 0) return summary;
+
+  for (const { dir: sourceDir, name } of entries) {
+    const filePath = path.join(sourceDir, name);
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      if (!raw) continue;
+      const task = JSON.parse(raw);
+      summary.checked++;
+
+      // A source can opt out of blind-redraft-and-retry entirely
+      // (registerTaskSource(name, { noAutoRetry: true })) -- e.g. wikiforge's
+      // wiki_transcript_extract/wiki_page_promote, where a full redraft costs a genuine
+      // 15-40min plan+implement+critique cycle and, running a large batch overnight, the
+      // operator would rather move on to the next item than spend that time re-attempting
+      // one that already failed once ("one attempt and done"). Checked before any of the
+      // eligibility classifiers below so it applies uniformly regardless of WHY the task
+      // blocked; the task is simply left as-is in blocked/ for a human to look at later,
+      // same as any task this sweep was never eligible to touch at all.
+      const noAutoRetryEntry = getRegisteredSource(resolveSourceName(task));
+      if (noAutoRetryEntry && noAutoRetryEntry.noAutoRetry === true) continue;
+
+      // Only a genuine review-stage rejection is eligible -- never an apply-stage failure
+      // that happens to still carry localVotes from an earlier, unrelated successful
+      // review (redrafting can't fix that; see agent-manager-common.sh's
+      // test_review_rejection, the bash equivalent of this exact check).
+      //
+      // 2026-09-01: also eligible -- an adhoc tier-3 draft-stage block that a redraft could
+      // plausibly fix (resolveAgenticDraft sets task.retryableDraftBlock):
+      //   - the model exhausted its turn budget without making a single edit
+      //     (task.turnBudgetExhausted) -- the redraft is NOT blind: plan + tier-2
+      //     investigation are folded into the prompt and the feedback below says "edit early".
+      //   - the model chose RESOLUTION: decompose but botched the sub-task JSON -- a redraft
+      //     can emit valid JSON or just implement the change; the feedback reminds it of the
+      //     format.
+      // Bounded by the same MAX_LOCAL_REJECT_RETRIES cap; on exhaustion it takes the same
+      // adhoc -> needs-clarification escalation as a stuck review rejection.
+      const retryableDraftBlock = isAdhocTask(task) && task.retryableDraftBlock === true;
+      const preCritiqueBlock = isPreCritiqueBlock(task);
+      const preImplementBlock = isPreImplementBlock(task);
+      const draftFailureBlock = isDraftFailureBlock(task);
+      const planDegenerateBlock = isPlanDegenerateBlock(task);
+      const implementDegenerateBlock = isImplementDegenerateBlock(task);
+      const critiqueDegenerateBlock = isCritiqueDegenerateBlock(task);
+      // An "Invalid premise:" verdict is recognized whatever its blockedStage (or lack of
+      // one) -- see invalidPremiseBeforeCheckExisted / hasInvalidPremise: it is either
+      // re-admitted once or escalated by the classifier below, never left invisible.
+      const invalidPremiseBlock = hasInvalidPremise(task);
+      // A "sub-task premise may be stale" block whose gate no longer fires (it used to call a monorepo
+      // sub-root file missing) is recognized whatever its stage -- re-admitted once below.
+      const stalePremiseFalsePositive = stalePremiseGateNoLongerFires(task, { repoRoot: sweepRepoRoot });
+      const externalDepFalsePositive = externalDepGateNoLongerBlocks(task);
+      const splitTooFewReadmit = splitTooFewStillRetryable(task);
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock && !stalePremiseFalsePositive && !externalDepFalsePositive && !splitTooFewReadmit) continue;
+
+      // A continuation (agentic-draft-common.js: the model ran out of turns mid-
+      // implementation, no real design question) is forward progress, not a failed
+      // redraft -- it has its OWN cap (MAX_AGENTIC_CONTINUATIONS, enforced there) and must
+      // not be gated by, or count against, the blind-redraft cap.
+      const isContinuation = retryableDraftBlock && task.isAgenticContinuation === true;
+
+      // A task already carrying ANY needsClarification (e.g. external-dependency,
+      // stamped at DRAFT time by AC-13a; or a design-decision left by some other
+      // mechanism) has already been triaged -- never overwrite or re-decide it, and
+      // never let a stale blockedStage:'review' from an earlier, unrelated rejection
+      // cycle re-enable a blind-retry loop for a task a human is already meant to be
+      // looking at. Generalizes AC-13b's original external-dependency-specific check
+      // (2026-09-06): once ANY prior mechanism flags a needed human decision, nothing
+      // here should ever re-decide it, regardless of which reason string it used.
+      if (task.needsClarification) continue;
+
+      // A source with deterministicReview (mechanical validate, no model judgment) that was
+      // blocked by that SAME validator -- re-run it against the existing implementResponse;
+      // if the underlying rule has since been fixed and it now passes, this is exactly the
+      // outcome a normal review pass would produce, so skip the wasted redraft and land it
+      // straight in queue/approved/ instead. See deterministicReviewRecoveryCheck's own
+      // header for the real incident this recovers. Checked before the forbidden-path
+      // readmit below since it's a distinct, unrelated signal, not a fallback to it.
+      if (deterministicReviewRecoveryCheck(task, { secondBrainDir: recoveryConfig.secondBrainDir, repoRoot: recoveryConfig.repoRoot })) {
+        task.reviewedAt = new Date().toISOString();
+        task.reviewProvider = 'deterministic-review-recovery';
+        task.localVerdict = 'Auto-approved on re-check: the deterministic rule that originally blocked this has since been fixed, and the existing (unchanged) classification now passes it -- no redraft needed.';
+        delete task.blockedReason;
+        delete task.blockedStage;
+        appendHistoryEvent(task, 'approved', 'reject-retry-check: deterministic-review-recovery -- re-validated against the existing implementResponse, now passes');
+        recordModelOutcome({ callId: task.abCallId, outcome: 'approved', outcomeStage: 'watchdog', outcomeReason: 'deterministic-review-recovery' });
+        summary.recovered += 1;
+        if (approvedDirResolved) {
+          try {
+            fs.mkdirSync(approvedDirResolved, { recursive: true });
+            writeTaskAndUnlinkOld(instancesDir, task, path.join(approvedDirResolved, name), filePath);
+          } catch (e) {
+            console.warn(`[reject-retry-check] deterministic-review-recovery move to approved/ failed for ${task.id || name}:`, e.message);
+            summary.errors += 1;
+          }
+        }
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) forbidden-path gate bug wrongly ran to exhaustion:
+      // its block named one of its OWN declared edit targets, so no blind retry could ever
+      // have differed. The pipeline itself brings it back -- clean slate, retry budget
+      // reset -- exactly once (the forbiddenPathReadmitted stamp bounds it, so a task that
+      // somehow still fails this way after the fix is not re-admitted forever). This is the
+      // deterministic counterpart to an operator manually requeueing it.
+      if (!task.forbiddenPathReadmitted && forbiddenPathBlockNamesOwnTarget(task)) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.forbiddenPathReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior forbidden-path block named one of the task's own declared edit targets (adhoc-diff-sanity gate bug, since fixed) -- re-admitted with a clean slate, retry budget reset");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'forbidden-path-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) stale-premise gate wrongly blocked: it cited a file that
+      // exists under a monorepo sub-root and the gate called it missing. The re-check above already
+      // proved the gate no longer fires, so no blind retry is involved -- clean slate, exactly once
+      // (the stalePremiseReadmitted stamp is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS, so a
+      // later clean-slate pass keeps the bound).
+      if (stalePremiseFalsePositive) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.stalePremiseReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was a stale-premise verdict from decompose-premise-check that called a cited file missing (it exists under a monorepo sub-root; resolved by path suffix since) -- re-admitted with a clean slate, exactly once");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'stale-premise-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) external-dependency gate wrongly blocked: it matched a
+      // credential/network word in prose, a code span, or the plan echo of an ordinary code edit.
+      // The re-check above proved the gate no longer blocks, so no blind retry is involved -- clean
+      // slate, exactly once (externalDepReadmitted is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS).
+      if (externalDepFalsePositive) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.externalDepReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was the external-dependency gate matching credential/network vocabulary in prose, a code span, or the plan echo (code spans and the plan are no longer scanned, and soft markers only advise by default) -- re-admitted with a clean slate, exactly once");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'external-dep-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a candidate whose split was rejected for having fewer than 2 usable sub-candidates before the in-draft retry existed
+      // (class C): clean slate, exactly once, so the draft's one corrective retry gets to run on it.
+      if (splitTooFewReadmit) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.splitTooFewReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          'reject-retry-check: prior block was a candidate split with fewer than 2 usable sub-candidates; the draft now retries that once with the one-file-per-piece rule spelled out -- re-admitted with a clean slate, exactly once');
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'split-too-few-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // 2026-09-06: candidate-premise-check.js's premise gate can reject a task whose
+// ... [truncated for review: this function continues for 295 more line(s) not shown]
+```
+
+Problem:
+The 495-line function contains four structurally-identical re-admission blocks (forbidden-path, stale-premise, external-dep, split-too-few) that differ only in a stamp field name and a message string. A typo in one stamp silently breaks the "exactly once" guard for that path, and any protocol change (e.g. adding a field to clear) must be replicated four times.
+
+Solution:
+Extract the shared re-admission sequence into one helper; each of the four blocks becomes a single call:
+
+```js
+function readmitCleanSlate(task, { stampField, reason, outcomeReason, ctx }) {
+  for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+  task[stampField] = true;
+  if (task.status === 'blocked') task.status = 'pending';
+  appendHistoryEvent(task, 'requeued', reason);
+  recordModelOutcome({ callId: task.abCallId, outcome: 'requeued',
+    outcomeStage: 'watchdog', outcomeReason });
+  const destDir = (task.source === 'derived_task' && ctx.derivedDir) ? ctx.derivedDir
+    : (isAdhocTask(task) && ctx.adhocDir) ? ctx.adhocDir : ctx.pendingDir;
+  fs.mkdirSync(destDir, { recursive: true });
+  writeTaskAndUnlinkOld(ctx.instancesDir, task, path.join(destDir, ctx.name), ctx.filePath);
+  ctx.summary.requeued++;
+}
+```
+
+Each call-site shrinks to:
+
+```js
+if (stalePremiseFalsePositive) {
+  readmitCleanSlate(task, { stampField: 'stalePremiseReadmitted',
+    reason: 'stale-premise false positive', outcomeReason: 'stale-premise-readmit', ctx });
+  continue;
+}
+```
+
+Benefits:
+~60 lines of duplication collapse into one helper. The stamp contract is visible in a single place, so a misspelled stamp is caught at the call-site rather than buried in a 15-line block. Each re-admission path becomes independently unit-testable by stubbing the helper.
