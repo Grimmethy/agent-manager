@@ -70,4 +70,14 @@ function writeHeartbeatFile(instancesDir, instanceId, status, model, taskId, pas
   writeAtomicSync(hbPath, JSON.stringify(hb, null, 2));
 }
 
-module.exports = { writeHeartbeatFile };
+// Reader-side rule (2026-10-18, brain-dump 1905; owner decision): a process that writes a
+// worker-* heartbeat only so its job shows on the Workers tab -- an external eval runner,
+// first worker-kaggle-p40 -- sets `"assignable": false` because it never claims from
+// queue/pending/. Such a heartbeat is not lane capacity and not a draft contending for the
+// local model. Only the boolean false opts out; a missing field, null or true keep the old
+// behaviour. Dashboard twin: python/dashboard/app.py _worker_lane_refusal.
+function isNonAssignableHeartbeat(hb) {
+  return !!hb && typeof hb === 'object' && hb.assignable === false;
+}
+
+module.exports = { writeHeartbeatFile, isNonAssignableHeartbeat };

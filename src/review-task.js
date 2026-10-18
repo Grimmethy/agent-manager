@@ -45,6 +45,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { isNonAssignableHeartbeat } = require('./heartbeat.js');
 const { checkDraft, preValidateCitedPaths } = require('./fact-checker.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
 const { resolveModelProfile } = require('./model-provider.js');
@@ -109,6 +110,9 @@ function getWorkDir(cfg, { repoRoot, secondBrainDir }) {
 // Wait-ForLocalAvailability does. Best-effort: never blocks more than ~15s total.
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// A worker-* heartbeat with assignable:false (heartbeat.js isNonAssignableHeartbeat -- an external
+// runner, not an AM draft) is skipped: it does not use this slot, and as a refreshed 'working'
+// heartbeat it would otherwise delay every review for nothing.
 async function waitForLocalAvailability(instancesDir, maxWaitAttempts = 3, waitSeconds = 5) {
   for (let i = 0; i < maxWaitAttempts; i++) {
     let busy = false;
@@ -117,7 +121,7 @@ async function waitForLocalAvailability(instancesDir, maxWaitAttempts = 3, waitS
     for (const f of files) {
       try {
         const w = JSON.parse(fs.readFileSync(path.join(instancesDir, f), 'utf8'));
-        if (w.status !== 'working') continue;
+        if (w.status !== 'working' || isNonAssignableHeartbeat(w)) continue;
         if ((Date.now() - new Date(w.lastHeartbeat).getTime()) / 1000 < 10) { busy = true; break; }
       } catch (e) { /* unreadable/mid-write heartbeat -- ignore */ }
     }
@@ -1681,7 +1685,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
