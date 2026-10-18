@@ -40,6 +40,40 @@ LOG_DIR="${LOG_DIR:-$HOME_LOGS}"                                                
 # Infinite polling loop same structure as all daemon scripts: bash 'while : do ... sleep' pattern matches what PowerShell does via while(true){ ... Start-Sleep -Seconds TICK } form in each .ps1 file.
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
+# Per-item claim (2026-10-18, a second review daemon on the P40): this loop lists queue/review/ and used to review every file it saw, which is fine for ONE
+# daemon and double-reviews with two (the single-flight lock below is keyed by model name, so the 3090 and the P40 reviewer do not serialize against each
+# other). A claim is an atomic `mkdir` under the instances dir; the claim is held until the NEXT item starts (or the loop/daemon ends) so it outlives the
+# approve/block move that follows the review -- releasing right after the review would leave a window where the other daemon re-reviews a file that is
+# about to move. A claim whose owner pid is dead, or that is older than 3 h, is stale and taken over.
+CLAIM_DIR="${INSTANCES_DIR}/review-claims"
+CURRENT_CLAIM=""
+release_current_claim() {
+  [[ -n "$CURRENT_CLAIM" ]] && rm -rf "${CLAIM_DIR}/${CURRENT_CLAIM}.d"
+  CURRENT_CLAIM=""
+}
+claim_review_item() {
+  local name="$1" d="${CLAIM_DIR}/${1}.d" owner_pid age
+  mkdir -p "$CLAIM_DIR" 2>/dev/null
+  if mkdir "$d" 2>/dev/null; then
+    printf '%s %s\n' "$$" "$INSTANCE_ID" > "${d}/owner"
+    CURRENT_CLAIM="$name"
+    return 0
+  fi
+  owner_pid="$(awk '{print $1}' "${d}/owner" 2>/dev/null)"
+  age=$(( $(date +%s) - $(stat -c %Y "$d" 2>/dev/null || echo 0) ))
+  if [[ -n "$owner_pid" ]] && kill -0 "$owner_pid" 2>/dev/null && (( age < 10800 )); then
+    return 1   # another live daemon is reviewing it
+  fi
+  rm -rf "$d"
+  if mkdir "$d" 2>/dev/null; then
+    printf '%s %s\n' "$$" "$INSTANCE_ID" > "${d}/owner"
+    CURRENT_CLAIM="$name"
+    return 0
+  fi
+  return 1
+}
+trap release_current_claim EXIT
+
 # Re-read a dashboard model-override for THIS instanceId once per tick (Workers tab
 # dropdown, 2026-08-18) -- exports LOCAL_MODEL for this tick so every write_heartbeat_file
 # and review-task.js call below picks it up automatically; no per-call-site change needed.
@@ -134,9 +168,12 @@ while :; do                                                                     
   # 30; done` loop has no equivalent fast-repeat path, so processing the whole snapshot
   # per tick is what keeps a backlog from taking N*30s longer than it needs to).
   for name in "${items[@]}"; do
+    release_current_claim                                                      # the previous item's approve/block move is done by now -- see claim_review_item
     file="${review_dir}/${name}"
     [[ -f "$file" && -s "$file" ]]                                             || continue        # skip non-file / empty (likely mid-write by another process) — same safety check local-worker.sh's claim loop uses.
 
+    claim_review_item "$name" || continue                                      # another review daemon has it
+    [[ -f "$file" && -s "$file" ]]                                             || continue        # it moved between our listing and our claim
     task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$file" 2>/dev/null)"
 
     # 2026-08-27, Grimmethy: "Review should never be gated behind claude. Please allow
@@ -287,6 +324,7 @@ while :; do                                                                     
     did_work=true
     if "$ONCE"; then break; fi   # a borrowed tick reviews ONE item, then the reviewer re-checks its home review/ before borrowing again
   done
+  release_current_claim                                                         # the last item of this tick is done too
 
   # Idle-only backoff: only pay the full poll interval when this tick genuinely found
   # nothing to review. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the

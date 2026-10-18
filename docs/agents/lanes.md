@@ -43,6 +43,7 @@ that the thing to remove.)
 | `preempt` | no | `always` \| `age-gated` \| `never` (default `never`): whether an interactive chat turn may kill this lane's in-flight call. Only the host lane is `always`: the chat takes over the host GPU only |
 | `tier` | no | positive number, billions of parameters. Defaults to the size parsed from `model` (`qwen3-vl:8b-instruct` -> 8); set it when the tag carries no size. Capability routing only compares tiers; a lane with an unknown tier is never reserved around |
 | `reserve` | no | `"auto"` (default: this lane is reserved for a source once the capability ledger shows it handles it), `"always"` (reserved for everything in its `taskClasses`, no evidence needed), or `false` (never reserve work for this lane) |
+| `reviewer` | no | `true` also runs a **review daemon** on this lane's GPU (`reviewer-<gpu>`, `scripts/review-runner.sh`), so its three CONFIRM/DENY votes go to this lane's Ollama instead of queueing behind the host GPU. Default `false`. The host lane always has the plain `reviewer`; the legacy P40 lane (not in the registry) opts in with `AGENT_MANAGER_P40_REVIEWER=true` in `agent-manager.env`. Needs a pipeline restart. See "Review daemons" below |
 | `slow` | no | `true` for a categorically slower endpoint (the P40 is the model case): longer per-call timeout ceiling and watchdog zombie threshold, so a slow-but-alive lane is not killed mid-call. Default `false` |
 
 ## Behaviours worth knowing
@@ -97,6 +98,21 @@ the task's `avoidLanes` (the same mechanism plan-degenerate blocks already used)
 to a larger lane instead of looping on the small one. A reviewer rejection is not an escalation. `AGENT_MANAGER_LANE_ESCALATION=off` disables it.
 Needs known tiers on both lanes; the biggest lane never escalates. Caveat: `avoidLanes` is per task and permanent, so a task escalated off the
 8B waits for a bigger lane even if none is currently alive.
+
+## Review daemons (2026-10-18)
+
+Reviews (the three-vote gate in `src/review-task.js`) used to run on ONE daemon on the host GPU, queueing behind the host lane's drafts; the 3090 is the busiest card, and
+a review waiting behind it can hit the 5-minute per-call limit (seen on the first task a grimm-driven session pushed through review). A lane with `reviewer: true` (or
+`AGENT_MANAGER_P40_REVIEWER=true` for the P40) also gets its own `review-runner.sh` daemon, `reviewer-<gpu>`, started by `launch.sh` and restarted by the watchdog
+(`restartTargetFor`) with that lane's Ollama env, shown in the Workers tab through `app.reviewer_instance_ids()`.
+
+- **No double reviews:** the daemons share `queue/review/`, so each item is **claimed** (an atomic `mkdir` under `<instances>/review-claims/`, owner pid recorded) before it is
+  reviewed and kept until the next item starts, so it outlives the approve/block move. A claim whose owner is dead, or that is older than 3 h, is taken over.
+- **What it does not do:** one review still runs its three votes on ONE GPU (the claimer's); it parallelises across tasks, not within one. The P40 is ~3x slower than
+  the 3090 per token, so a task claimed by the P40 reviewer finishes later than it would have on a free 3090: the gain is throughput when the 3090 reviewer is busy, not latency.
+- **Single-flight locks** are keyed by model name; the P40's model tag differs from the 3090's, so they do not serialise against each other (that is the point). Do not give
+  two review lanes the same model tag on different GPUs unless you want them to.
+- **Priority:** the arbiter class of a review outranks a draft on the same endpoint, so on the P40 a review goes before a waiting `worker-p40` draft, as on the 3090.
 
 ## Tests
 

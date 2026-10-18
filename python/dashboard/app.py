@@ -777,12 +777,24 @@ def worker_lane_defs() -> list[dict]:
     return list(_LANE_DEFS_CACHE["lanes"])
 
 
+def reviewer_instance_ids() -> list[str]:
+    """Every review daemon the pipeline runs: the plain `reviewer` (host lane) plus one `reviewer-<gpu>` per lane that opted in
+    (src/lanes.js `reviewer`; AGENT_MANAGER_P40_REVIEWER=true for the legacy P40 lane). Read from the same lane definitions as
+    worker_lane_ids(); falls back to just ["reviewer"] when the definitions are unavailable."""
+    ids = ["reviewer"]
+    for lane in worker_lane_defs():
+        rid = lane.get("reviewerId")
+        if lane.get("reviewer") and rid and rid not in ids:
+            ids.append(rid)
+    return ids
+
+
 def _expected_instance_ids() -> list[str]:
     """Every daemon scripts/launch.sh starts: one worker lane per GPU (worker_lane_ids()), the
-    reviewer, and the queue-watchdog. apply-task-loop is deliberately excluded -- it's a single-shot
+    review daemons (reviewer_instance_ids()), and the queue-watchdog. apply-task-loop is deliberately excluded -- it's a single-shot
     pass with no heartbeat file of its own (see launch.sh's own comment), so it never has a slot to
     be "offline" in."""
-    return [*worker_lane_ids(), "reviewer", "watchdog"]
+    return [*worker_lane_ids(), *reviewer_instance_ids(), "watchdog"]
 
 
 def _is_live_worker_instance(instance_id: str) -> bool:
@@ -1726,7 +1738,7 @@ def _pipeline_stoppable() -> bool:
         return True
     inst_dir = instances_dir()
     if inst_dir and inst_dir.is_dir():
-        for name in (*worker_lane_ids(), "reviewer", "watchdog"):
+        for name in (*worker_lane_ids(), *reviewer_instance_ids(), "watchdog"):
             data = read_json_safe(inst_dir / f"{name}.json")
             if data and data.get("pid") and _pid_alive(data["pid"]):
                 return True
@@ -1770,7 +1782,7 @@ def _pipeline_running() -> bool:
                     return True
 
     # Stale, unparseable, or ownerless heartbeat -- believe a live process over a timestamp.
-    for name in (*lane_ids, "reviewer"):
+    for name in (*lane_ids, *reviewer_instance_ids()):
         d = read_json_safe(inst_dir / f"{name}.json")
         if d and any(d.get(k) and _pid_alive(d[k]) for k in ("daemonPid", "pid")):
             return True

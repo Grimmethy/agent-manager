@@ -28,7 +28,7 @@ test('gpuSlugFromName: last digit-bearing token, lowercased', () => {
 
 test('local lane is named for AGENT_MANAGER_LOCAL_GPU; no P40 vars, no registry -> exactly one lane', () => {
   const lanes = getLanes({ ...noRegistry, AGENT_MANAGER_LOCAL_GPU: '3090' });
-  assert.deepEqual(lanes, [{ id: 'worker-3090', gpu: '3090', env: {}, local: true, slow: false, numCtx: null, numBatch: null, preempt: 'always', taskClasses: null, model: null, tier: null, reserve: 'auto' }]);
+  assert.deepEqual(lanes, [{ id: 'worker-3090', gpu: '3090', env: {}, local: true, slow: false, numCtx: null, numBatch: null, reviewer: true, reviewerId: 'reviewer', preempt: 'always', taskClasses: null, model: null, tier: null, reserve: 'auto' }]);
 });
 
 test('both P40 vars set -> second lane worker-p40 carrying its own Ollama env, never preempted', () => {
@@ -57,7 +57,7 @@ test('registry: one entry adds a lane with the full env, defaults id/preempt, cl
   const lanes = getLanes(withRegistry([RX580]));
   assert.deepEqual(lanes.map((l) => l.id), ['worker-3090', 'worker-rx580']);
   assert.deepEqual(lanes[1], {
-    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, numCtx: null, numBatch: null, preempt: 'never', taskClasses: null, model: 'qwen3-vl:8b-instruct', tier: 8, reserve: 'auto',
+    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, numCtx: null, numBatch: null, reviewer: false, reviewerId: 'reviewer-rx580', preempt: 'never', taskClasses: null, model: 'qwen3-vl:8b-instruct', tier: 8, reserve: 'auto',
     env: { OLLAMA_URL: 'http://100.96.112.78:11434', LOCAL_MODEL: 'qwen3-vl:8b-instruct', AGENT_MANAGER_GPU_YIELD_APPS: '' },
   });
 });
@@ -199,4 +199,22 @@ test('numBatch: validated, exported as AGENT_MANAGER_LANE_NUM_BATCH in that lane
   assert.equal(lanes[0].env.AGENT_MANAGER_LANE_NUM_BATCH, undefined);
   assert.equal(getLanes(withRegistry([RX580]))[1].env.AGENT_MANAGER_LANE_NUM_BATCH, undefined);
   for (const bad of [1, 16, 9000, 1.5, '1024']) assert.equal(getLanes(withRegistry([{ ...RX580, numBatch: bad }])).length, 1, `numBatch ${bad} fails closed`);
+});
+
+test('review daemons: the host lane always has `reviewer`; the P40 opts in by env, a registry lane by `reviewer: true`; bad values fail closed', () => {
+  const { reviewerLanes } = require('./lanes.js');
+  const p40 = { AGENT_MANAGER_P40_OLLAMA_URL: 'http://p40:11434', AGENT_MANAGER_P40_MODEL: 'qwen3.8-p40:27b' };
+  assert.deepEqual(reviewerLanes({ ...withRegistry([]), ...p40 }).map((r) => r.reviewerId), ['reviewer'], 'P40 does not review by default');
+  assert.deepEqual(reviewerLanes({ ...withRegistry([]), ...p40, AGENT_MANAGER_P40_REVIEWER: 'true' }).map((r) => r.reviewerId), ['reviewer', 'reviewer-p40']);
+  assert.deepEqual(reviewerLanes({ ...withRegistry([]), ...p40, AGENT_MANAGER_P40_REVIEWER: 'no' }).map((r) => r.reviewerId), ['reviewer']);
+  assert.deepEqual(reviewerLanes(withRegistry([{ ...RX580, reviewer: true }])).map((r) => r.reviewerId), ['reviewer', 'reviewer-rx580']);
+  assert.equal(getLanes(withRegistry([{ ...RX580, reviewer: 'yes' }])).length, 1, 'a non-boolean reviewer fails closed');
+});
+
+test('node src/lanes.js --reviewers lists "<reviewerId> <workerLaneId>" for the extra review daemons only', () => {
+  const { execFileSync } = require('child_process');
+  const out = execFileSync(process.execPath, [path.join(__dirname, 'lanes.js'), '--reviewers'], {
+    env: { ...process.env, AGENT_MANAGER_LANES_PATH: '/nonexistent/lanes.json', AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_P40_OLLAMA_URL: 'http://p40:11434', AGENT_MANAGER_P40_MODEL: 'm', AGENT_MANAGER_P40_REVIEWER: 'true' }, encoding: 'utf8',
+  });
+  assert.equal(out.trim(), 'reviewer-p40 worker-p40');
 });

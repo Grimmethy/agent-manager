@@ -31,6 +31,8 @@
 //   slow        true marks a categorically slower endpoint (the P40 is the model case): its calls get the longer per-call timeout
 //               ceiling (local-client.js / local-tool-client.js) and the longer watchdog zombie threshold (dead-process-check.js), so a
 //               legitimately still-generating lane is not killed mid-call. Default false. The legacy P40 lane is slow.
+//   reviewer    optional boolean (default false): also run a REVIEW daemon on this lane's GPU (reviewer-<gpu>, src/review-runner.sh). The host lane always
+//               has the plain `reviewer`; the legacy P40 lane reads AGENT_MANAGER_P40_REVIEWER=true. Two reviewers share queue/review/ through per-item claims.
 //   numBatch    optional whole number 32..8192: the prompt-processing batch (num_batch) this lane's calls use -> AGENT_MANAGER_LANE_NUM_BATCH. Measured
 //               on the RX 580: default 26 tok/s prompt processing, 1024 -> 178 tok/s.
 //   numCtx      optional whole number 2048..131072: the ONE context window (num_ctx) this lane's calls use, for a card that cannot hold the
@@ -138,6 +140,7 @@ function laneFromEntry(raw, index) {
     if (!Number.isInteger(raw.numBatch) || raw.numBatch < 32 || raw.numBatch > 8192) { warnOnce(`${where} (${id}) numBatch must be a whole number between 32 and 8192; skipped`); return null; }
     numBatch = raw.numBatch;
   }
+  if (raw.reviewer !== undefined && typeof raw.reviewer !== 'boolean') { warnOnce(`${where} (${id}) reviewer must be true or false; skipped`); return null; }
   const preempt = raw.preempt === undefined ? 'never' : raw.preempt;
   if (!PREEMPT_MODES.includes(preempt)) { warnOnce(`${where} (${id}) preempt must be one of ${PREEMPT_MODES.join('|')}; skipped`); return null; }
   let tier = tierFromModel(model);
@@ -166,6 +169,8 @@ function laneFromEntry(raw, index) {
     slow: raw.slow === true,
     numCtx,
     numBatch,
+    reviewer: raw.reviewer === true,
+    reviewerId: `reviewer-${gpu}`,
     preempt,
     taskClasses,
     model,
@@ -181,7 +186,7 @@ function getLanes(env = process.env) {
   // The host lane's model is the base LOCAL_MODEL, which launch.sh also exports as AGENT_MANAGER_HOST_LOCAL_MODEL because a remote lane's
   // worker overrides LOCAL_MODEL in its own process. Without either signal the tier is unknown (null) and capability routing leaves it alone.
   const hostModel = env.AGENT_MANAGER_HOST_LOCAL_MODEL || (!env.AGENT_MANAGER_INSTANCE_ID || env.AGENT_MANAGER_INSTANCE_ID === `worker-${local}` ? env.LOCAL_MODEL : '') || null;
-  const lanes = [{ id: `worker-${local}`, gpu: local, env: {}, local: true, slow: false, numCtx: null, numBatch: null, preempt: 'always', taskClasses: null, model: hostModel, tier: tierFromModel(hostModel), reserve: 'auto' }];
+  const lanes = [{ id: `worker-${local}`, gpu: local, env: {}, local: true, slow: false, numCtx: null, numBatch: null, reviewer: true, reviewerId: 'reviewer', preempt: 'always', taskClasses: null, model: hostModel, tier: tierFromModel(hostModel), reserve: 'auto' }];
   if (env.AGENT_MANAGER_P40_OLLAMA_URL && env.AGENT_MANAGER_P40_MODEL) {
     lanes.push({
       id: 'worker-p40',
@@ -195,6 +200,8 @@ function getLanes(env = process.env) {
       slow: true,
       numCtx: null,
       numBatch: null,
+      reviewer: /^(1|true|yes|on)$/i.test(String(env.AGENT_MANAGER_P40_REVIEWER || '').trim()),
+      reviewerId: 'reviewer-p40',
       preempt: 'never',
       taskClasses: null,
       model: env.AGENT_MANAGER_P40_MODEL,
@@ -226,6 +233,12 @@ function getLanes(env = process.env) {
   });
 }
 
+// The review daemons the pipeline runs: the host lane's plain `reviewer` first, then one `reviewer-<gpu>` per lane that opted in. Each entry
+// carries the lane it runs on (its env decides which Ollama the votes go to).
+function reviewerLanes(env = process.env) {
+  return getLanes(env).filter((l) => l.reviewer).map((l) => ({ reviewerId: l.reviewerId, lane: l }));
+}
+
 function laneById(id, env = process.env) {
   return getLanes(env).find((l) => l.id === id) || null;
 }
@@ -250,19 +263,22 @@ function isSlowLane(id, env = process.env) {
   try { const l = laneById(id, env); return !!(l && l.slow); } catch { return false; }
 }
 
-module.exports = { getLanes, laneById, laneAllowsSource, isSlowEndpoint, isSlowLane, gpuSlugFromName, lanesRegistryPath };
+module.exports = { reviewerLanes, getLanes, laneById, laneAllowsSource, isSlowEndpoint, isSlowLane, gpuSlugFromName, lanesRegistryPath };
 
 if (require.main === module) {
   const [flag, arg] = process.argv.slice(2);
   const lanes = getLanes();
   if (flag === '--ids') {
     for (const l of lanes) console.log(l.id);
+  } else if (flag === '--reviewers') {
+    // "<reviewerId> <workerLaneId>" for every reviewer daemon EXCEPT the host's plain `reviewer` (launch.sh starts that one itself).
+    for (const l of lanes) if (l.reviewer && !l.local) console.log(`${l.reviewerId} ${l.id}`);
   } else if (flag === '--json') {
     // The documented read surface for plugins (docs/PLUGIN_API.md): every lane with its tier, context/batch settings and allowlist. `env` is omitted
     // (it carries endpoint URLs and is launch plumbing, not part of the contract); `endpoint` is the Ollama URL a lane's calls go to.
     console.log(JSON.stringify(lanes.map((l) => ({
       id: l.id, gpu: l.gpu, model: l.model || null, tier: l.tier ?? null, numCtx: l.numCtx ?? null, numBatch: l.numBatch ?? null,
-      slow: !!l.slow, local: !!l.local, preempt: l.preempt, taskClasses: l.taskClasses || null, reserve: l.reserve ?? 'auto',
+      slow: !!l.slow, local: !!l.local, reviewer: !!l.reviewer, reviewerId: l.reviewerId || null, preempt: l.preempt, taskClasses: l.taskClasses || null, reserve: l.reserve ?? 'auto',
       endpoint: (l.env && l.env.OLLAMA_URL) || null,
     })), null, 2));
   } else if (flag === '--env') {
