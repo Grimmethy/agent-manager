@@ -421,3 +421,26 @@ Replace the sequential `for`-loop with a concurrent fan-out using `Promise.all` 
 
 Benefits:
 Wall-clock latency for the majority-vote step drops from n × T to ≈ T (where T is a single inference call's latency), because all n calls are in flight simultaneously and the caller waits only for the slowest one. For the default n = 3 this is roughly a 3× reduction in perceived response time. Even if the local inference backend internally serializes (e.g. a single-threaded llama.cpp server), the client still saves per-request HTTP connection setup and lets the server's internal scheduler order the queue optimally, yielding a smaller but still positive gain. No behavioral change to the voting result, error handling, or public API surface.
+
+### AC-22 · Parallelize independent majority-vote calls in local-client.js
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+`majorityVote` in `src/local-client.js` issues `n` (default 3) calls to `call()` in a sequential `for` loop, awaiting each one before starting the next. Every iteration passes the identical argument object—same `prompt`, `model`, `temperature`, `numCtx`, `numPredict`, `taskId`, `stage`—and the loop index is never used in the call, so there is zero data dependency between iterations. For a local LLM backend where a single inference can take 2–10 s of wall-clock time, the caller pays 3 T (or n T) of latency instead of roughly T, adding 4–20 s of avoidable delay per `majorityVote` invocation in an agent pipeline that may call this per stage.
+
+Solution:
+Replace the sequential `for` loop with `Promise.allSettled` over an array of `n` concurrently-started `call()` promises (built via `Array.from({ length: n }, () => call({...}, 1))`). After the single `await`, iterate the settled results: push fulfilled values into `votes` and rejected reasons into `voteErrors`, preserving the existing per-vote error-collection semantics. No new dependency is introduced—`Promise.allSettled` is an ES2020 built-in available in every Node version the project targets, and `Array.from` is a plain standard-library call. The downstream tally / majority logic is unchanged.
+
+Benefits:
+When the local model server can handle concurrent requests (multiple workers, batched KV-cache, or a queue that overlaps decode with prefill), wall-clock latency drops from n × T to approximately T, cutting the 4–20 s penalty to near zero. When the server serializes internally, the change is a no-op—`Promise.allSettled` simply awaits the same total work—so the fix is strictly non-inferior in every deployment configuration. The code also becomes more readable: the "fire n independent samples, collect results" intent is expressed in one statement rather than an imperative loop with per-iteration `await`.
