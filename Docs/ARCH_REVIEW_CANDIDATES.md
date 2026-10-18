@@ -2524,3 +2524,42 @@ Benefits:
 The function's dependencies become visible in its signature, making it trivially testable with arbitrary values and eliminating the need to mock `src/config.js`. The search utility is decoupled from the application's configuration management, improving locality and making it straightforward to reuse in other tools or test harnesses without pulling in the full config stack.
 
 NOTE: Both flags were not applied because the critique itself concluded "NO ISSUES FOUND," explicitly stating that each item is a valid architectural proposal with no factual error, contradiction, or violation of the output contract.
+
+### AC-212 · writeArtifact bypasses the source-registry dispatch contract for candidate-split and Group B tasks
+Strength: Strong
+Files: src/lib/apply-core.js
+
+Problem:
+`writeArtifact` in `src/lib/apply-core.js` performs source-registry lookups and branches on `task.candidateSplitRoute` inline rather than delegating to the source's registered `apply` method. It checks `task.candidateSplitRoute === 'hub'` and calls `getCandidateSplitHubFiler().applyCandidateSplitAsHub(task, pipelineDir)` directly, bypassing the `source.apply` contract. For non-hub candidate splits it calls `applyCandidateSplit(task, getRegisteredSource(resolveSourceName(task)))`, and for Group B tasks it calls `applyGroupB` directly. The source registry pattern (`getRegisteredSource`, `source.apply`) is the established extension point, but `writeArtifact` introduces a second, parallel dispatch path that is not expressed through the registry. A new source that needs custom candidate-split behavior must either register a `candidatesPath` function and hope `applyCandidateSplit` handles it, or be special-cased in `writeArtifact`. The hub-route branch is a concrete example of a special case that could instead be a registered source with an `apply` method, making the dispatch logic harder to reason about and test in isolation.
+
+Solution:
+Introduce a registered source entry for the hub candidate-split route (e.g., a `hub-candidate-split` source whose `apply` method wraps the existing `applyCandidateSplitAsHub` call) and a similar entry for Group B tasks. Then reduce `writeArtifact` to a single dispatch: resolve the source name from the task, look it up via `getRegisteredSource`, and call `source.apply(task, pipelineDir)`. The hub-specific and Group B-specific logic moves into their respective source modules, leaving `writeArtifact` as a thin, registry-driven dispatcher with no inline branching on `candidateSplitRoute` or task group.
+
+Benefits:
+Adding a new source with custom candidate-split or Group B behavior becomes a matter of registering a new source object rather than editing `writeArtifact`. The dispatch path is single and uniform, which simplifies unit testing (each source's `apply` can be tested independently) and removes the risk of a new task type silently falling through the inline branches. The registry becomes the single source of truth for "what can be applied and how," restoring locality of the extension point.
+
+### AC-213 · resolveAtRef duplicates the three-tier basename-matching logic already in fact-checker.js
+Strength: Worth exploring
+Files: src/stacked-grounding.js, src/fact-checker.js
+
+Problem:
+`resolveAtRef` in `src/stacked-grounding.js` implements a three-tier resolution strategy—exact path, then `extraRoots`-prefixed, then unique basename—and its own comment states it "mirrors fact-checker.js's resolveAgainstRepoDetailed tiers against git's object database instead of the working tree." The two implementations are structurally identical but operate on different data sources (git `ls-tree` output versus the filesystem). If the resolution semantics change (adding a new tier, altering ambiguity handling, or changing how `extraRoots` are expanded), both implementations must be updated in lockstep. A bug fix in one is unlikely to be propagated to the other, leading to divergent behavior between the working-tree and ref-based resolution paths.
+
+Solution:
+Extract the three-tier resolution logic into a shared pure function (e.g., `resolvePath(tiers, candidate, extraRoots)`) that accepts an abstract "listing" (an array of paths) and a candidate string, and returns the resolved path or an ambiguity signal. `resolveAtRef` feeds it the `ls-tree` output; `resolveAgainstRepoDetailed` in `fact-checker.js` feeds it the filesystem listing. Both call sites become thin adapters that produce the listing and delegate the matching to the shared function.
+
+Benefits:
+A single implementation of the resolution semantics means a change (new tier, different ambiguity rule, `extraRoots` normalization) is made once and is automatically consistent across both the working-tree and ref-based paths. The shared function is trivially unit-testable with synthetic path lists, and the two call sites become easier to audit because the matching logic is no longer duplicated.
+
+### AC-214 · appendHistoryEvent hides its persistence side-effect behind a module-level singleton hook
+Strength: Worth exploring
+Files: src/task-history.js, src/local-draft.js, src/review-task.js, src/task-sources.js, src/apply-task.js, src/reject-retry-check.js
+
+Problem:
+`appendHistoryEvent` in `src/task-history.js` uses a module-level `persistHook` singleton set via `setHistoryPersistHook`. After every entry is appended, the hook is invoked. The code's own comment notes that `local-draft.js` and `review-task.js` register a hook that rewrites the task JSON, while `task-sources.js`, `apply-task.js`, and `reject-retry-check.js` do not register one and are unaffected. The persistence behavior is therefore not a parameter of `appendHistoryEvent` but a side effect of global state that must be set by the caller before calling. If two different callers in the same process need different persistence strategies (one wants to flush to disk, another wants to batch), they cannot both use `appendHistoryEvent` without overwriting each other's hook. The interface is shallow: `appendHistoryEvent(task, stage, detail)` looks like a pure append, but its side effects depend on global state invisible in the function signature.
+
+Solution:
+Change `appendHistoryEvent` to accept an optional `persist` callback as its last parameter (defaulting to a no-op). Remove the module-level `persistHook` and `setHistoryPersistHook` entirely. Callers that need persistence (`local-draft.js`, `review-task.js`) pass their rewrite-and-flush function explicitly; callers that do not (`task-sources.js`, `apply-task.js`, `reject-retry-check.js`) simply omit the argument. The function signature now fully describes its side effects.
+
+Benefits:
+The persistence contract is visible at every call site, eliminating the hidden coupling to global state. Two callers in the same process can use different (or no) persistence strategies without risk of overwriting each other's hook. The function becomes easier to test in isolation—passing a spy as `persist` verifies the side effect without mutating module-level state—and the module no longer carries mutable global state that can leak across test boundaries.
