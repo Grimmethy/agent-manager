@@ -257,6 +257,14 @@ if (require.main === module) {
   const lanes = getLanes();
   if (flag === '--ids') {
     for (const l of lanes) console.log(l.id);
+  } else if (flag === '--json') {
+    // The documented read surface for plugins (docs/PLUGIN_API.md): every lane with its tier, context/batch settings and allowlist. `env` is omitted
+    // (it carries endpoint URLs and is launch plumbing, not part of the contract); `endpoint` is the Ollama URL a lane's calls go to.
+    console.log(JSON.stringify(lanes.map((l) => ({
+      id: l.id, gpu: l.gpu, model: l.model || null, tier: l.tier ?? null, numCtx: l.numCtx ?? null, numBatch: l.numBatch ?? null,
+      slow: !!l.slow, local: !!l.local, preempt: l.preempt, taskClasses: l.taskClasses || null, reserve: l.reserve ?? 'auto',
+      endpoint: (l.env && l.env.OLLAMA_URL) || null,
+    })), null, 2));
   } else if (flag === '--env') {
     // KEY=VALUE lines for one lane, for `env "${lane_env[@]}" bash local-worker.sh <id>`.
     const lane = lanes.find((l) => l.id === arg);

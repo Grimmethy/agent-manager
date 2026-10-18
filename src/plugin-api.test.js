@@ -12,7 +12,10 @@ const assert = require('node:assert/strict');
 // module path -> { functions: [...], other: [name -> typeof] }. `other` covers the two
 // prompt FRAGMENTS (plain strings the plugin splices into its own templates).
 const CONTRACT = {
-  './task-source-registry.js': { functions: ['registerTaskSource', 'updateTaskSource', 'getRegisteredSource', 'getRegisteredSources', 'clearRegistry'] },
+  './task-source-registry.js': { functions: ['registerTaskSource', 'updateTaskSource', 'getRegisteredSource', 'getRegisteredSources', 'clearRegistry', 'variantParentOf', 'getVariantsOf'] },
+  './dry-run.js': { functions: ['dryRunDraft', 'freshTaskForReplay'] },
+  './capability-ledger.js': { functions: ['readScorecard', 'buildScorecard', 'annotateVariants'] },
+  './lanes.js': { functions: ['getLanes', 'laneById'] },
   './config.js': { functions: ['getConfig', 'resolveGraphPath'] },
   './task-sources.js': { functions: ['nextCandidateFulfillmentTask', 'taskIdExistsInQueue', 'taskPriority', 'windowFetchedFileContent'] },
   './sdk/candidate-fulfillment.js': { functions: ['nextCandidateFulfillmentTask', 'windowFetchedFileContent', 'applyArchDiscoveryCandidates', 'parseArchDiscoveryCandidates', 'nextAvailableCandidateId', 'isEffectivelyEmptyResponse'] },

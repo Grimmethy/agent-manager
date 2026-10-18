@@ -468,3 +468,17 @@ test('restartTargetFor: the host GPU lane restarts with no env (it inherits the 
   assert.equal(target.pidfileName, 'worker-3090.pid');
   assert.equal('env' in target, false);
 });
+
+
+test('findOrphanedModelCallProcesses leaves a dry-run replay (AGENT_MANAGER_DRY_RUN=1 in its environment) alone but still reports a real orphan', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orphans-dryrun-'));
+  const listProcesses = () => [
+    { pid: 901, ppid: 1, cmd: 'node /x/src/local-draft.js /tmp/dry-run-abc/task.json' },
+    { pid: 902, ppid: 1, cmd: 'node /x/src/local-draft.js /queue/drafting/worker-1/t.json' },
+  ];
+  const readEnviron = (pid) => (pid === 901 ? 'A=1\0AGENT_MANAGER_DRY_RUN=1\0B=2' : 'A=1\0B=2');
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir, readEnviron });
+  assert.deepEqual(orphans.map((o) => o.pid), [902]);
+  const { isDryRunProcess } = require('./dead-process-check.js');
+  assert.equal(isDryRunProcess(1, () => { throw new Error('no /proc'); }), false, 'unreadable environ = not a dry run (fail toward the old behaviour)');
+});

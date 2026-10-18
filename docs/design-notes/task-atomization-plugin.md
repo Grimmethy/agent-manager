@@ -1,6 +1,6 @@
 # Design Note: Task Atomization Plugin
 
-**Status:** proposed (2026-10-18, Grimmethy + Claude). Nothing built.
+**Status:** proposed (2026-10-18, Grimmethy + Claude). Phase 0 hooks built (variantOf, dry-run, read surface; see PLUGIN_API.md); the in-tree replay lab and everything after it are not.
 **Builds on:** [capability-routing-and-benchmarking.md](capability-routing-and-benchmarking.md) (ledger, scorecard, probing, escalation, probe debrief).
 **Related:** [ADR-0022](../adr/0022-core-is-a-platform-plugins-define-the-work.md), [PLUGIN_API.md](../PLUGIN_API.md), [repo-extraction-playbook.md](../agents/repo-extraction-playbook.md).
 
