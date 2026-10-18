@@ -12357,3 +12357,210 @@ function commitAndPush(gitRunner, gated) { /* commit, push, non-FF rebase-retry 
 
 Benefits:
 Each helper is unit-testable against a mock `gitRunner` with a two-task fixture, no full-pipeline exercise needed. Review diffs shrink to one phase. The orchestrator reads as a table of contents.
+
+### AC-200 · Extract queue-state branches into named helpers
+Strength: Strong
+Files: python/dashboard/routes/shared_misc.py
+Symbol: api_queue_state
+Snippet:
+```
+
+@shared_misc_bp.route("/api/queue/<state>")
+def api_queue_state(state):
+    """Returns {items: [...], total: N}. Incremental loading (2026-07-26, Grimmethy:
+    "long task lists take a while to load"): optional ?limit=N&offset=M page the result --
+    file METADATA is sorted first (cheap, no content read) and only the requested slice
+    ever gets read_json_safe'd, so a 200+-item done/ folder no longer means reading and
+    JSON-parsing every single file on every 5s poll, just the page actually being shown."""
+    from app import QUEUE_STATES, queue_dir, read_json_safe, task_summary
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"items": [], "total": 0})
+
+    if state == "drafting":
+        # Never paginated -- an in-flight claim count is always small (bounded by worker
+        # count), nothing like done/'s unbounded historical backlog.
+        entries = []
+        drafting_root = qdir / "drafting"
+        if drafting_root.is_dir():
+            for sub in drafting_root.iterdir():
+                if not sub.is_dir():
+                    continue
+                for f in sub.glob("*.json"):
+                    data = read_json_safe(f)
+                    if data:
+                        s = task_summary(data, f.stem)
+                        s["claimedBy"] = sub.name
+                        entries.append(s)
+            for f in drafting_root.glob("*.json"):  # legacy: no subfolder
+                data = read_json_safe(f)
+                if data:
+                    entries.append(task_summary(data, f.stem))
+        return jsonify({"items": entries, "total": len(entries)})
+
+    if state not in QUEUE_STATES:
+        abort(404)
+
+    limit = request.args.get("limit", type=int)
+    offset = request.args.get("offset", default=0, type=int)
+    source_filter = (request.args.get("source") or "").strip()
+
+    if state == "coordinating":
+        # Never paginated before ordering -- hub counts are small (same "in-flight, bounded"
+        # reasoning the drafting branch above already uses), and a family tree can only be
+        # built correctly with every hub in hand at once. Builds a parent->children map on
+        # `parentHub` (see decompose-loop-autoroute.js / apply-task.js's recordApplyOutcome)
+        # and walks it pre-order so a child always renders immediately beneath its parent,
+        # tagging `hubDepth` for the frontend's indent -- then pages the flattened result.
+        state_dir = qdir / "coordinating"
+        by_id = {}
+        if state_dir.is_dir():
+            for f in state_dir.glob("*.json"):
+                data = read_json_safe(f)
+                if data and (not source_filter or data.get("source") == source_filter):
+                    by_id[data.get("id", f.stem)] = task_summary(data, f.stem)
+        explicit_parent = {}
+        for tid, entry in by_id.items():
+            parent = entry.get("parentHub")
+            # A dangling/self/foreign parentHub (parent not among today's coordinating
+            # records -- already resolved and moved on, or a cycle) is not used.
+            if parent and parent in by_id and parent != tid:
+                explicit_parent[tid] = parent
+        # Fallback: a hub id sitting in another hub's subTasks[] is ALSO a real parent link
+        # -- rewireCoordinatorParent() (src/decompose-loop-autoroute.js) has rewritten
+        # subTasks entries to point at a rescuing hub since before `parentHub` existed
+        # (2026-09-08), so real families already live in the data this way with no backfill
+        # needed; explicit `parentHub` wins when both are present.
+        derived_parent = {}
+        for tid, entry in by_id.items():
+            for st in entry.get("subTasks") or []:
+                sid = st.get("id") if isinstance(st, dict) else None
+                if sid and sid in by_id and sid != tid:
+                    derived_parent.setdefault(sid, tid)
+
+        children_of = {}
+        for tid in by_id:
+            parent = explicit_parent.get(tid) or derived_parent.get(tid)
+            children_of.setdefault(parent, []).append(tid)
+        for kids in children_of.values():
+            kids.sort(key=lambda tid: by_id[tid].get("createdAt") or "", reverse=True)
+
+        # Root-hub ordering (2026-09-09, Grimmethy: "I'd like the hubs to be sortable
+        # either alphabetically by name or by priority ... The highest priority hub should
+        # always be worked on next"). Only the ROOT list is reordered -- each family's
+        # subtree keeps its newest-first child order from the loop above, so families stay
+        # contiguous. `sort=priority` (default): explicit `hubPriority` ascending (LOWER =
+        # more urgent), then unranked hubs oldest-first by createdAt (FIFO -- the direct
+        # answer to "new hubs being worked before old hubs are finished"). `sort=name`:
+        # case-insensitive by title. The same rule the worker claim path uses for this
+        # hub's children (src/hub-priority.js), so the tab shows the real work order.
+        sort_mode = (request.args.get("sort") or "priority").strip().lower()
+        roots = children_of.get(None, [])
+        if sort_mode == "name":
+            roots.sort(key=lambda tid: (by_id[tid].get("title") or tid).casefold())
+        else:
+            def _root_key(tid):
+                hp = by_id[tid].get("hubPriority")
+                rank = hp if isinstance(hp, (int, float)) and not isinstance(hp, bool) else float("inf")
+                return (rank, by_id[tid].get("createdAt") or "￿")
+            roots.sort(key=_root_key)
+        children_of[None] = roots
+
+        ordered = []
+        visited = set()
+
+        def walk(tid, depth, family_label):
+            if tid in visited:
+                return
+            visited.add(tid)
+            entry = dict(by_id[tid])
+            entry["hubDepth"] = depth
+            # hubFamily: the topmost hub's own title, carried onto every descendant so the
+            # frontend can render a family-header row even on a page that doesn't include
+            # the root itself.
+            entry["hubFamily"] = family_label if depth > 0 else entry.get("title") or tid
+            ordered.append(entry)
+            for child_id in children_of.get(tid, []):
+                walk(child_id, depth + 1, entry["hubFamily"])
+
+        for root_id in children_of.get(None, []):
+            walk(root_id, 0, None)
+        # Any hub left unvisited only happens via a parentHub cycle -- append as a root so
+        # it still shows up instead of disappearing.
+        for tid in by_id:
+            if tid not in visited:
+                walk(tid, 0, None)
+
+        total = len(ordered)
+        page = ordered[offset:offset + limit] if limit is not None else ordered[offset:]
+        return jsonify({"items": page, "total": total})
+
+    entries = []
+    total = 0
+    state_dir = qdir / state
+    if state_dir.is_dir():
+        files = sorted(state_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if source_filter:
+            # Filtering by task type (Job Status > Done tab, 2026-08-17: "Done is getting
+            # huge, need to filter by task type") needs each file's own `source` field --
+            # unlike sorting, that's not derivable from the filename/mtime alone, so this
+            # reads every file in the state dir instead of just the requested page. Only
+            # pays that cost when a filter is actually selected; the default unfiltered
+            # request below keeps the cheap stat-only-sort-then-page-only-read behavior.
+            filtered = []
+            for f in files:
+                data = read_json_safe(f)
+                if data and data.get("source") == source_filter:
+                    filtered.append((f, data))
+            total = len(filtered)
+            page = filtered[offset:offset + limit] if limit is not None else filtered[offset:]
+            entries = [task_summary(data, f.stem) for f, data in page]
+        else:
+            total = len(files)
+            page = files[offset:offset + limit] if limit is not None else files[offset:]
+            for f in page:
+                data = read_json_safe(f)
+                if data:
+                    entries.append(task_summary(data, f.stem))
+    return jsonify({"items": entries, "total": total})
+```
+
+Problem:
+`api_queue_state` is 157 lines with three independent handlers (drafting, coordinating, generic) that have different data shapes, sorting, and edge cases. The coordinating branch embeds ~60 lines of parent-map and DFS logic that cannot be unit-tested without a full Flask request context.
+
+Solution:
+Extract the three branches into module-level helpers. The route becomes a short dispatch. No logic or response-shape changes.
+
+Benefits:
+Each helper is callable with a plain dict, enabling unittest without a request context. The tree-walk becomes testable in isolation. New states add one dispatch line instead of a 20-line mid-function block.
+
+```python
+@shared_misc_bp.route("/api/queue/<state>")
+def api_queue_state(state):
+    from app import QUEUE_STATES, queue_dir
+    qdir = queue_dir()
+    if not qdir:
+        return jsonify({"items": [], "total": 0})
+    if state == "drafting":
+        return _drafting_response(qdir)
+    if state not in QUEUE_STATES:
+        abort(404)
+    if state == "coordinating":
+        return _coordinating_response(qdir)
+    return _generic_state_response(qdir, state)
+
+
+def _drafting_response(qdir):
+    """Drafting queue state (body unchanged)."""
+    ...
+
+
+def _coordinating_response(qdir):
+    """Coordinating queue state (body unchanged)."""
+    ...
+
+
+def _generic_state_response(qdir, state):
+    """Remaining queue states (body unchanged)."""
+    ...
+```
