@@ -2260,3 +2260,18 @@ Introduce a single private helper, e.g. `parseSignature(signature)`, that return
 
 Benefits:
 The parsing rule now exists in exactly one location, eliminating the divergence risk between the two call sites. Future format changes require editing a single function, and any validation or error-handling logic (e.g., guarding against a missing `::`) can be added once and inherited by both consumers. Code review surface shrinks because reviewers no longer need to verify that two inline blocks remain in lockstep, and the helper is trivially unit-testable in isolation.
+
+### AC-192 · Test files for the same concern live in two different directories with inconsistent naming
+Strength: Worth exploring
+Files: src/lib/prompt-implementation.test.js, src/test_project_search_zero_findings_prompt.js
+
+Problem:
+The community contains two regression tests that both verify prompt instruction text, yet they are placed in different directories and follow different naming conventions. `src/lib/prompt-implementation.test.js` sits alongside the source code it exercises in `src/lib/` and uses the `*.test.js` suffix that the rest of the repository's node:test suite relies on. `src/test_project_search_zero_findings_prompt.js`, by contrast, is dropped in the `src/` root with a `test_` prefix and no `.test.js` suffix. A developer looking for prompt-related tests must check two locations and recognise two naming patterns, and a tool that globs `**/*.test.js` will silently miss the second file.
+
+Solution:
+Move `src/test_project_search_zero_findings_prompt.js` into `src/lib/` and rename it to `src/lib/project-search-zero-findings-prompt.test.js`, following the `*.test.js` convention already used by its sibling `src/lib/prompt-implementation.test.js`. The original file at `src/test_project_search_zero_findings_prompt.js` is removed. This co-locates all prompt-instruction regression tests in one directory and makes them discoverable by the same glob pattern the rest of the test suite uses.
+
+Benefits:
+All prompt-related tests are found in a single directory, reducing the chance that a new test is added to the wrong location or with the wrong suffix and thus skipped by the test runner. The naming convention becomes uniform across the community, which lowers cognitive load for anyone onboarding to the codebase and makes it straightforward to add further prompt regression tests without a second decision about where and how to name the file.
+
+NOTE: Flag 1's core claim of a filename collision was incorrect — the proposed target `project-search-zero-findings-prompt.test.js` is distinct from the existing `prompt-implementation.test.js`; only the minor clarity improvement (explicitly stating the old file is removed) was applied.
