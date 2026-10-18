@@ -123,6 +123,18 @@ function inferMissingAfterLinks(subTasks) {
 const CODE_CHANGE_VERB_RE = /\b(add|modify|change|fix|implement|create|write|remove|refactor|update|replace|wire|extract|rename|delete|insert|adjust|tighten|expand|introduce|migrate|split|merge|patch|restructure|drop|disable|enable)\b/i;
 const VERIFICATION_LEAD_RE = /^(run|confirm|verify|check|validate|ensure|audit|test)\b/i;
 
+// 2026-09-27 (HUB0119 2/4): a sub-task proposal whose title/description DISPOSES a
+// brain-dump entry (file/route/classify/archive/reject/approve/triage it) is a
+// brain_dump_disposition task, not adhoc work -- apply-task.js's brain_dump_disposition
+// branch (HUB0119 3/4) owns it. Same high-precision discipline as CREATED_FILE_RE and
+// VERIFICATION_LEAD_RE above: a disposition verb must stand close before the entry ID
+// (bounded `[^.\n]` window -- never crosses a sentence boundary, so a passing mention of
+// "bd-..." elsewhere in the text never fires), and the ID must carry the brain-dump
+// entry format ("bd-" + 13-digit ms epoch, cf. `adhoc-brain-dump-<id>-<ts>` in
+// apply-group-a-brain-dump.js -- 6+ digits would also accept unrelated hex strings).
+// Capture group 1 is the entryId.
+const BRAIN_DUMP_DISPOSITION_RE = /\b(?:file|route|classify|archive|reject|approve|triage)\b[^.\n]{0,60}?\bbd-(\d{13})\b/i;
+
 function isVerificationOnlySubTask(sub) {
   const title = String((sub && sub.title) || '').trim();
   if (!title) return false;
@@ -200,6 +212,26 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
   const queued = [];
   subTasks.forEach((sub, i) => {
     if (foldTargets.has(i)) return; // folded into a sibling's acceptanceCriteria instead of becoming its own no-diff-possible task
+    // HUB0119 2/4: a brain-dump DISPOSITION proposal (BRAIN_DUMP_DISPOSITION_RE above) is
+    // routed to domain 'brain_dump_disposition' (apply-task.js owns that branch) INSTEAD
+    // of becoming an adhoc/decompose sub-task -- it disposes an entry, it has no code diff
+    // of its own. Checked BEFORE any adhoc record is built, so a matching proposal never
+    // lands on the adhoc/decompose queue as domain 'adhoc'.
+    const brainDumpDisposal = BRAIN_DUMP_DISPOSITION_RE.exec(`${sub.title || ''}\n${sub.rawText || ''}`);
+    if (brainDumpDisposal) {
+      const routed = {
+        id: ids[i],
+        domain: 'brain_dump_disposition',
+        source: 'manual',
+        title: sub.title,
+        payload: { entryId: brainDumpDisposal[1], evidenceText: String(sub.rawText || sub.title || '').trim() },
+        promptContext: { rawText: sub.rawText, decomposedFrom: parentTaskId },
+      };
+      if (parentTask && parentTask.premiumPriority) routed.premiumPriority = true;
+      fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(routed, null, 2) + '\n');
+      queued.push({ id: ids[i], title: sub.title });
+      return;
+    }
     const record = {
       id: ids[i],
       domain: 'adhoc',
@@ -382,4 +414,4 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, BRAIN_DUMP_DISPOSITION_RE };
