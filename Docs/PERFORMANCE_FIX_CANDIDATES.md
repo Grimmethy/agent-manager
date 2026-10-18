@@ -444,3 +444,26 @@ Replace the sequential `for` loop with `Promise.allSettled` over an array of `n`
 
 Benefits:
 When the local model server can handle concurrent requests (multiple workers, batched KV-cache, or a queue that overlaps decode with prefill), wall-clock latency drops from n × T to approximately T, cutting the 4–20 s penalty to near zero. When the server serializes internally, the change is a no-op—`Promise.allSettled` simply awaits the same total work—so the fix is strictly non-inferior in every deployment configuration. The code also becomes more readable: the "fire n independent samples, collect results" intent is expressed in one statement rather than an imperative loop with per-iteration `await`.
+
+### AC-23 · Replace synchronous per-file reads in the claim loop with concurrent fs.promises calls
+Strength: Strong
+Files: src/next-claimable-task.js
+Snippet:
+```
+  let probesOffered = 0;
+  const pinned = [];
+  const rankable = [];
+  for (const name of names) {
+    const { task, mtimeMs } = readTaskSafe(path.join(pendingDir, name));
+    const pinnedWorker = task && task.pinnedWorker;
+    if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
+```
+
+Problem:
+`next-claimable-task.js` iterates over every entry returned by `readdir` on `pendingDir` and calls `readTaskSafe(path.join(pendingDir, name))` for each one. The "Safe" wrapper is a synchronous `fs.readFileSync` + `fs.statSync` pair (returning `{ task, mtimeMs }`), so each iteration blocks the event loop for the duration of two syscalls. Under a realistic backlog—hundreds or thousands of pending task files after a worker crash, a burst of enqueued work, or workers running slower than producers—this serialises into 0.5–5+ seconds of event-loop starvation. During that window no other I/O, timers, or network callbacks on the same process can execute, delaying health-check pings, heartbeat responses, and incoming task-submission requests. Because the `instanceId` / `pinnedWorker` logic implies a multi-instance deployment, every worker instance serialises its own reads concurrently, amplifying the stall across the cluster.
+
+Solution:
+Add a `readTaskSafeAsync` sibling in the same module that uses `fs.promises.readFile` and `fs.promises.stat` (or a single `fs.promises.stat` for `mtimeMs`), preserving the identical `{ task, mtimeMs }` return shape and the null-on-error contract (catch and return `{ task: null, mtimeMs: null }`). Convert the flagged `for…of` loop to `const results = await Promise.all(names.map(name => readTaskSafeAsync(path.join(pendingDir, name))))`, making the enclosing function `async` and propagating `async`/`await` up the call chain to the point where the result is consumed (wrapping the top-level entry in `main().catch(...)` if it is a CLI or one-shot script). Keep the original synchronous `readTaskSafe` available for any truly one-shot, non-loop callers (e.g. a CLI `--inspect` flag) so those code paths are not forced into an async refactor. No new dependency is introduced; `fs.promises` is part of the Node standard library.
+
+Benefits:
+The kernel pipelines the file reads concurrently (bounded by the OS I/O scheduler), so wall-clock time drops from the sum of all individual reads to roughly the slowest single read. The event loop is no longer blocked for the duration of the loop, so health-check pings, heartbeat timers, and incoming request handlers continue to fire within their expected windows even under a large backlog. Multi-instance deployments no longer each serialise their own reads on the same event loop, reducing cross-request latency for all workers in the cluster. Error handling semantics are unchanged: a missing file or permission error still yields `task: null` rather than throwing, so downstream claim-ordering logic is unaffected.
