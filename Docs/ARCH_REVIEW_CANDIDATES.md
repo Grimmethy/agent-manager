@@ -2576,3 +2576,29 @@ Move `getConceptTimeline` out of `src/concepts.js` into the module that already 
 
 Benefits:
 The module boundary now matches the data boundary: `concepts.js` contains only functions that read/write `concepts.json`, and its `require` list accurately describes its dependencies. The timeline query lives in the module that owns the data it queries, so its real dependencies are visible as static `require`s instead of hidden injected parameters. Callers importing only the timeline query no longer pull in the registry's persistence machinery (atomic-write, crypto, filesystem I/O), and a reader of either module's `require` block can correctly predict its runtime data needs. This eliminates the "why does this function take injected loaders when its module doesn't require them?" confusion and the "why does importing a pure query load the whole registry?" coupling, without changing any behavior.
+
+### AC-216 · Implicit conditional dependency on `source-scope.js` inside `registerTaskSource`
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` performs a conditional `require('./lib/source-scope.js')` at registration time and wraps the `next` function when `config.scope === 'core'`. This creates a hidden, runtime-only dependency that is invisible to anyone reading the module's top-level imports. The registry's observable behavior therefore depends on whether `source-scope.js` is resolvable and on the scope value passed at registration, yet neither is declared as a module-level dependency. This makes the registry harder to test in isolation (a unit test must stub or provide `source-scope.js` or the `core` path silently no-ops), harder to reason about (the wrapping logic executes once at registration, so any later change to `source-scope.js`'s exports is not picked up), and it violates the principle that a module's dependencies should be explicit and statically discoverable.
+
+Solution:
+Hoist the `source-scope.js` import to the top of `task-source-registry.js` as an explicit, unconditional dependency (or, if it is truly optional, accept a `scopeResolver` function as a parameter to `registerTaskSource` so the caller injects the behavior). Move the wrapping decision from registration time to call time by storing the scope metadata on the registered source record and applying the scope logic inside the invocation path, so the registry remains a thin, stateless key-value store and the scope concern lives in a single, testable function.
+
+Benefits:
+Dependencies become statically visible and auditable; the registry can be unit-tested without mocking a sibling module; the scope-wrapping logic is exercised on every call rather than frozen at registration, eliminating a class of stale-state bugs; and new scope policies can be added by passing a different resolver without modifying the registry's internal branching.
+
+### AC-217 · Hardcoded built-in source aliases break the registry's generic abstraction
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` mixes a generic alias-lookup mechanism (`sourceAliases`) with hardcoded `if` branches for specific built-in sources (`adhoc`, `secondbrain`). The file's own comments acknowledge that it "still has hardcoded fallbacks for this package's own built-in quirks." This means a consumer that registers a source named `adhoc` or `secondbrain` gets different resolution behavior than any other name, and that behavior is not discoverable through the registry's public API. The registry therefore leaks knowledge of specific consumer implementations, preventing it from being reused as a pure, generic key-value store for source definitions and forcing every new built-in quirk to be added as another inline branch.
+
+Solution:
+Replace the hardcoded `if` branches with entries in the same `sourceAliases` (or a parallel `builtInResolvers`) map that the generic path already consults. Each built-in source registers its own resolution rule at module-load time (or via an explicit `registerBuiltinSource` call), so `resolveSourceName` becomes a single uniform lookup with no special cases. If a built-in source needs richer logic than a simple alias, it supplies a small resolver function rather than an inline branch.
+
+Benefits:
+The registry's code path is uniform and testable without knowing which names are "special"; adding a new built-in source no longer requires editing the resolver function; and the module can be extracted or reused in another package without dragging along knowledge of `adhoc` or `secondbrain` internals.
