@@ -1,6 +1,6 @@
 # Design Note: Task Atomization Plugin
 
-**Status:** proposed (2026-10-18, Grimmethy + Claude). Phase 0 hooks built (variantOf, dry-run, read surface; see PLUGIN_API.md); the in-tree replay lab and everything after it are not.
+**Status:** proposed (2026-10-18, Grimmethy + Claude). Phase 0 hooks built (variantOf, dry-run, read surface; see PLUGIN_API.md); the in-tree replay lab (`src/replay-lab.js`) is built too; variant sources, the coordinator and everything after them are not.
 **Builds on:** [capability-routing-and-benchmarking.md](capability-routing-and-benchmarking.md) (ledger, scorecard, probing, escalation, probe debrief).
 **Related:** [ADR-0022](../adr/0022-core-is-a-platform-plugins-define-the-work.md), [PLUGIN_API.md](../PLUGIN_API.md), [repo-extraction-playbook.md](../agents/repo-extraction-playbook.md).
 
@@ -68,6 +68,11 @@ are local and gitignored, so the corpus is local). Run: for each task, build the
 A *variant* is the unit under test: same corpus, original vs variant on the small model. The 20- and 24-entry comparisons done by hand for `brain_dump_sort`
 (2026-10-17/18) are the manual form of this and found real defects (placeholder tags, an invented project label) that the format check missed, which is the
 point of the lab.
+
+**Score by recorded class, not overall.** Hygiene sources end mostly in a noop (`change_review`: 612 noop against 33 merged in `queue/done`), so a model that
+always answers "nothing to flag" would agree with the record ~95% of the time and be useless. The lab therefore classes every replay by what the pipeline
+recorded (positive / noop / dismissed) and reports **recall on positives** and the **false-positive rate on noops** as the headline, with the corpus built
+to over-sample positives. (Built: `src/replay-lab.js`.)
 
 **Promotion gate.** A variant is promoted when it passes the gate on at least `N` replays (default 30) at or above the parent's 27B rate minus a margin, with no
 class of failure the parent does not have, and a human has read a sample (default 10). After promotion the live ledger takes over: the variant's scorecard row
