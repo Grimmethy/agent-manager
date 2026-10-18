@@ -113,9 +113,10 @@ a review waiting behind it can hit the 5-minute per-call limit (seen on the firs
 - **Single-flight locks** are keyed by model name; the P40's model tag differs from the 3090's, so they do not serialise against each other (that is the point). Do not give
   two review lanes the same model tag on different GPUs unless you want them to.
 - **Priority:** the arbiter class of a review outranks a draft on the same endpoint, so on the P40 a review goes before a waiting `worker-p40` draft, as on the 3090.
+- **Reservation (hold):** a process that is not a lane can reserve a lane's endpoint with `node scripts/gpu-arbiter-cli.js hold --key <endpoint key> --pid <its pid> [--cls review] [--task ID]`: an arbiter place ticket that every lower class on that key yields to, released when the pid exits, on SIGTERM, or on a higher class's cancel-below; `status --key K` lists it under `reserved`, and each start/release is a `gpu-hold` line in `pipeline-history.log`. Lanes do not yet stop CLAIMING while a reservation holds their key: a draft claimed during a long hold waits the arbiter deadline (600 s) and fails that attempt.
 
 ## Tests
 
 `src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),
-`scripts/gpu-arbiter-cli-endpoint.test.js` (remote-lane guard), `python/dashboard/test_chat_preempt.py` + `test_expected_instances.py`
+`scripts/gpu-arbiter-cli-endpoint.test.js` (remote-lane guard), `scripts/gpu-arbiter-cli.test.js` (hold lifecycle), `python/dashboard/test_chat_preempt.py` + `test_expected_instances.py`
 (dashboard parity and preemption sets).
