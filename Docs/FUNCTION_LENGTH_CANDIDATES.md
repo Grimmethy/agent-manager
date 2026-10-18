@@ -13389,3 +13389,174 @@ function buildWorkerCard(inst, ctx) {
 
 Benefits:
 renderWorkers drops from ~243 to ~100 lines. buildWorkerCard is a pure function of (inst, ctx) → string, unit-testable without a DOM. Reviewers can diff card markup changes in isolation from fetch/poll logic.
+
+### AC-205 · Extract task-archiving block from api_git_discard_branch
+Strength: Strong
+Files: python/dashboard/routes/pipeline_1_more.py
+Symbol: api_git_discard_branch
+Snippet:
+```
+
+@pipeline_1_more_bp.route("/api/git/branches/<path:branch>/discard", methods=["POST"])
+def api_git_discard_branch(branch):
+    """The Unmerged Branches tab's other action (2026-09-08, Grimmethy: "If we aren't
+    merging it we definitely need to archive it. It's still visible in my unmerged
+    branches tab... leaves us open to accidentally opening it back up in the future.") --
+    root-caused live via change-review-fix-ac-1: list_unmerged_branches is a pure git scan
+    (refs/remotes/origin/agent/* with ahead>0 vs. main), with zero awareness of task
+    disposition -- archiving a task record alone (api_task_archive) never removes its
+    branch from this list. This is the other half api_git_merge_branch's own delete-on-
+    success step never covers: a branch you've decided NOT to merge, which needs its
+    remote ref actually deleted plus its task archived, not just hidden.
+
+    Mirrors api_git_merge_branch for the parts that overlap (the same-list re-validation
+    gate, the apply-lock, the two-location task lookup) minus the merge/checkout/push-to-
+    main steps this doesn't need."""
+    from app import _acquire_apply_lock, _archive_task_file, _delete_local_branch, _invalidate_branch_cache, _release_apply_lock, _run_git, get_active_repo_root, list_unmerged_branches, logger, queue_dir, read_json_safe
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+
+    # Same "only act on what we ourselves already offered" gate api_git_merge_branch/
+    # api_task_archive/api_task_requeue all already use.
+    branches = list_unmerged_branches(force=True)
+    match = next((b for b in branches if b["branch"] == branch), None)
+    if not match:
+        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+
+    try:
+        lock_fd = _acquire_apply_lock()
+    except RuntimeError:
+        abort(409, description="the pipeline is mid-apply right now -- try again in a few seconds")
+
+    local_branch = {"deleted": False, "reason": "not attempted"}
+
+    # Brain-dump #1740: capture WHAT this branch holds (commits, the candidate headings it added, the verdict recorded on its card) and
+    # pin its head under refs/discarded/ BEFORE the remote delete below, so a discarded batch is no longer just "discarded via the
+    # dashboard" and stays recoverable once both the remote and local branch are gone. Best-effort: nothing in this block may stop the discard.
+    snapshot, reason = {}, ""
+    try:
+        from branch_removals import snapshot_branch
+        snapshot = snapshot_branch(_run_git, repo_root, match.get("mainBranch") or "main", branch, match.get("headSha"), queue_dir(), keep_ref=True)
+        body = request.get_json(silent=True)
+        reason = str(body.get("reason") or "").strip() if isinstance(body, dict) else ""
+        if not reason:
+            default_reasons = (snapshot.get("verdict") or {}).get("reasons") or []
+            reason = str(default_reasons[0]) if default_reasons else ""
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Non-fatal: could not snapshot %r before discarding it: %s", branch, exc)
+
+    try:
+        try:
+            _run_git(["push", "origin", "--delete", branch], repo_root)
+        except RuntimeError as e:
+            # A delete failing because the ref is already gone (deleted by hand, or a
+            # duplicate click) means the actual goal -- this branch not existing on origin
+            # -- is already achieved; only a REAL git failure (auth, network, etc.) should
+            # surface as an error. Same "remote ref does not exist" shape git itself uses
+            # for this case.
+            if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
+                raise
+        from branch_removals import record_branch_removal
+        record_branch_removal(queue_dir(), branch, "discarded", task_id=branch.removeprefix("agent/"),
+                              detail="discarded via the dashboard Unmerged Branches tab", actor="dashboard-discard",
+                              reason=reason or None, snapshot=snapshot or None)
+        # Also drop the LOCAL copy (only reached when the remote delete succeeded or the ref was
+        # already gone) -- see _delete_local_branch for why leaving it is a real hazard.
+        local_branch = _delete_local_branch(repo_root, branch)
+    except RuntimeError as e:
+        return jsonify({"succeeded": False, "reason": str(e)}), 500
+    finally:
+        _release_apply_lock(lock_fd)
+
+    # Archive the matching task record, same 2-location lookup api_git_merge_branch's own
+    # mergedAt-stamping step already does. Best-effort: no task record found (a branch
+    # pushed with nothing matching in done/) is not an error, just nothing to reconcile;
+    # already-archived (a human archived it by hand first, or a duplicate click) is a
+    # silent no-op, not a 409 -- the branch delete above is the part that mattered.
+    task_archived = False
+    qdir = queue_dir()
+    if qdir:
+        task_id = branch.removeprefix("agent/")
+        done_path = qdir / "done" / f"{task_id}.json"
+        archived_path = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+        if done_path.is_file():
+            data = read_json_safe(done_path)
+            if data is not None:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                if data.get("terminalDisposition") != "dismissed":
+                    hist = data.get("history")
+                    if not isinstance(hist, list):
+                        hist = data["history"] = []
+                    hist.append({
+                        "stage": "dismissed",
+                        "at": now_iso,
+                        "detail": f"branch {branch} discarded via the dashboard Unmerged Branches tab -- not merging this",
+                    })
+                    data["terminalDisposition"] = "dismissed"
+                try:
+                    done_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except OSError as exc:
+                    logger.error("Failed to persist dismissed-state for branch %r to %s: %s", branch, done_path, exc)
+                    raise
+            try:
+                _archive_task_file(qdir, done_path)
+                task_archived = True
+            except FileExistsError:
+                pass
+        elif archived_path.is_file():
+            task_archived = True  # already archived (e.g. by hand) -- nothing more to do
+
+    _invalidate_branch_cache()
+    return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch,
+                    "snapshotRef": (snapshot or {}).get("snapshotRef")})
+```
+
+Problem:
+api_git_discard_branch (113 lines) mixes five responsibilities with three distinct error policies. The ~30-line task-archive block is pure file-state logic with no git dependency, yet it sits inside the lock-protected region, making the lock boundary hard to track and the block untestable without a live repo.
+
+Solution:
+Extract the task-archive block into a module-level helper; replace the inline block with a three-line call.
+
+```python
+def _archive_task_for_discarded_branch(qdir: Path, branch: str) -> bool:
+    task_id = branch.removeprefix("agent/")
+    done_path = qdir / "done" / f"{task_id}.json"
+    archived_path = qdir / "done" / "_archived_no_action" / f"{task_id}.json"
+    if done_path.is_file():
+        data = read_json_safe(done_path)
+        if data is not None:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            if data.get("terminalDisposition") != "dismissed":
+                hist = data.get("history")
+                if not isinstance(hist, list):
+                    hist = data["history"] = []
+                hist.append({"stage": "dismissed", "at": now_iso,
+                            "detail": f"branch {branch} discarded via dashboard"})
+                data["terminalDisposition"] = "dismissed"
+            try:
+                done_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            except OSError as exc:
+                logger.error("Failed to persist dismissed-state for %r: %s", branch, exc)
+                raise
+        try:
+            _archive_task_file(qdir, done_path)
+        except FileExistsError:
+            pass
+        return True
+    elif archived_path.is_file():
+        return True
+    return False
+```
+
+Caller:
+```python
+    task_archived = False
+    qdir = queue_dir()
+    if qdir:
+        task_archived = _archive_task_for_discarded_branch(qdir, branch)
+```
+
+Benefits:
+Drops the function to ~83 lines, clearing the 100-line threshold. The helper is unit-testable in isolation (no git repo, no lock). Lock scope, git-delete, and snapshot blocks are untouched.
