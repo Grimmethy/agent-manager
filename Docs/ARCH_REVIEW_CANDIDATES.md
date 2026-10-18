@@ -2675,3 +2675,33 @@ Benefits:
 A single code path owns the `git ls-tree` mechanics, so environment setup and buffer sizing are maintained in one place and any future change (timeout, transport swap, `--recurse` flag) touches one helper instead of two call sites. The logged warning on non-zero exit gives operators a signal that a git failure occurred, without altering the intentional best-effort `null`-return contract that the file's comment documents. The helper's exit-code handling is correct for `ls-tree` (0 = success, non-zero = error) rather than importing `git grep`'s "exit 1 = no match" convention, which does not apply here.
 
 NOTE: The critique's flag that AC-001's "new source" motivation is invalid because the guards are source-agnostic is correct and has been addressed by reframing the problem and benefits around contract explicitness and co-location rather than "remembering to extend a guard list." The critique's point that the draft's proposed `{skipped:true}` return "would require changing the model's output format" is not applied as a flag: the `apply` function already receives the model's raw text and is free to inspect it and return a structured skip object; no change to the model's output format is required, so that particular sub-claim in the critique is inapplicable to the corrected draft.
+
+### AC-223 · Missing warning when a task file is not found in a known queue-state directory
+Strength: Worth exploring
+Files: python/dashboard/branch_verdicts.py
+
+Problem:
+`write_task_log` in `branch_verdicts.py` iterates over task IDs and calls `_task_file` to locate the JSON file for each task. If `_task_file` returns `None` (because the task resides in a queue-state directory not listed in `_TASK_DIRS`), the function silently skips that task with `if not path: continue`. Unlike the I/O or parse-error paths—which already emit a `logger.warning`—this "not found" path produces no log output. As a result, if a new queue-state directory is added to `app.py` but not to `_TASK_DIRS`, the verdict is persisted to `branch-verdicts.json` and the UI displays it, but the owning task’s `history` array never receives the entry, and no operator-visible signal indicates the gap.
+
+Solution:
+Add a `logger.warning` inside `write_task_log` whenever a task_id is supplied but `_task_file` returns `None`. This makes the skip visible in logs, turning an undetectable no-op into a one-line diagnostic that operators can investigate.
+
+Benefits:
+Operators gain a concrete log line to identify and resolve missing task-history entries. The fix is minimal, proportional to the actual risk, and does not introduce new modules or import dependencies.
+
+---
+
+### AC-224 · Unrecoverable partial-write gap between verdict store and task history
+Strength: Strong
+Files: python/dashboard/branch_verdicts.py
+
+Problem:
+When a deterministic verdict is new or changed, `enrich_branches_with_verdicts` performs two independent file writes in sequence: first `record_verdict` persists to `branch-verdicts.json`, then `write_task_log` appends a history entry to one or more task JSON files. These are separate atomic writes with no transactional link. If `write_task_log` fails for any task (I/O error, the task file was deleted between the existence check and the write, a JSON parse error from a concurrent writer), the verdict is already in the store but the task history is missing the entry. On the next call to `enrich_branches_with_verdicts`, the verdict is detected as `unchanged` (same verdict string, same reasons list), so the `if not unchanged:` guard is false and `write_task_log` is never retried. The task’s history is permanently missing that event. `write_task_log` does catch per-task exceptions and log a warning, but the caller does not inspect the return count or re-attempt, and the `unchanged` short-circuit on the next pass makes the gap permanent.
+
+Solution:
+Accept the documented trade-off that the `unchanged` guard intentionally prevents redundant history writes, and add a `logger.warning` in `enrich_branches_with_verdicts` whenever `write_task_log` returns fewer successful writes than expected. This makes the partial-write gap visible in logs, allowing operators to manually reconcile the missing history entry if needed. The fix respects the existing design intent of avoiding redundant writes while ensuring that any divergence between the verdict store and task history is detectable.
+
+Benefits:
+Operators gain a visible signal when the verdict store and task history diverge, enabling manual reconciliation if necessary. The fix preserves the documented optimization of avoiding redundant history writes while eliminating the silent data-loss risk.
+
+NOTE: Flag 1 was addressed by changing AC-002's solution to respect the documented `unchanged` guard and adding a warning instead of a retry mechanism. Flag 2 was addressed by changing AC-001's primary proposal to the lighter-weight warning-only fix and removing the speculative shared-module proposal.
