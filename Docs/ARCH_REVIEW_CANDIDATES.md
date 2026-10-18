@@ -2602,3 +2602,44 @@ Replace the hardcoded `if` branches with entries in the same `sourceAliases` (or
 
 Benefits:
 The registry's code path is uniform and testable without knowing which names are "special"; adding a new built-in source no longer requires editing the resolver function; and the module can be extracted or reused in another package without dragging along knowledge of `adhoc` or `secondbrain` internals.
+
+### AC-218 · Lazy `require` hides a runtime dependency from static analysis
+Strength: Worth exploring
+Files: src/sdk/candidate-fulfillment.js, src/task-sources.js
+
+Problem:
+`candidate-fulfillment.js` deliberately defers its `require` of `src/task-sources.js` into the body of `nextCandidateFulfillmentTask` to ensure the SDK has no load-time dependency on the monolith it was extracted from. While this successfully decouples module loading, the consequence is that the true coupling surface is invisible to any tool that resolves dependencies at parse time—dependency-graph visualizers, circular-import linters, and bundle analyzers all see a clean, self-contained module. If `task-sources.js` is renamed, refactored, or its export signature changes, the failure surfaces only at the first runtime call to `nextCandidateFulfillmentTask`, potentially in production, with no startup signal and no static-analysis warning.
+
+Solution:
+Since the architectural intent is to avoid load-time coupling, the top-level `require` should not be reintroduced. Instead, introduce a thin adapter interface (e.g., a `TaskSourceQueue` contract) that `candidate-fulfillment.js` depends on. The concrete implementation from `task-sources.js` should be injected at composition time (e.g., via a setter function or constructor parameter) rather than being `require`d inside the function body. This preserves the lazy-load benefit (the SDK module can be loaded without `task-sources.js` being present) while making the dependency explicit in the module's public API and visible to static analysis tools that track interface contracts, rather than hiding it in an opaque function body.
+
+Benefits:
+The dependency becomes visible to static-analysis tools through the explicit interface contract, making refactors of `task-sources.js` safer and more discoverable. The SDK module's true coupling surface is explicit in its type definitions or API surface, so a reader immediately sees what it depends on. The module also becomes independently testable with a mock queue, removing the need to stub a `require` cache entry in tests, while still respecting the original architectural constraint of avoiding load-time dependencies.
+
+### AC-219 · `taskPriority` silently swallows all `getConfig` errors
+Strength: Strong
+Files: src/lib/task-priority.js
+
+Problem:
+The `taskPriority` function wraps its call to `getConfig()` in a blanket `try/catch` that returns the default priority on any thrown error. This conflates "no override was configured for this task" with "the configuration subsystem is broken (missing file, syntax error, missing key, permission denied, etc.)." A consumer that expects a specific priority to be enforced will silently receive the default, and no log line, metric, or error signal is emitted. In a production scheduling pipeline this can cause tasks to run at the wrong priority for an extended period with no alert, making the root cause extremely difficult to diagnose because the failure mode is indistinguishable from a legitimate "no override" case.
+
+Solution:
+Narrow the `try/catch` to handle only the specific "key not present" case (e.g., check for `undefined`/`null` on the returned override value) and let genuine configuration errors propagate to the caller. Alternatively, if the function must remain non-throwing for backward compatibility, log a structured warning (including the task identifier and the error message) before falling back to the default, and expose a `taskPriorityWithSource` variant that returns `{ priority, source: 'override' | 'default' | 'error-fallback' }` so callers can distinguish the three cases and act accordingly.
+
+Benefits:
+Configuration failures become observable at the moment they occur rather than manifesting as subtle scheduling misbehavior hours or days later. Operators can add an alert on the structured warning, and developers can unit-test the error path without it being indistinguishable from the happy path. The explicit source tag in the variant return value removes the ambiguity for any downstream code that needs to make decisions based on where the priority value came from.
+
+### AC-220 · Registry hardcodes a domain-specific `require` inside a generic registration path
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `task-source-registry.js` contains a lazy `require('./lib/source-scope.js')` inside the `if (config.scope === 'core')` branch. This embeds a domain-specific concept (`core` scope) and its implementation directly into what is otherwise a generic registry module. The dependency is invisible to static analysis (same opacity issue as AC-001), and it couples the registry to a particular module's file path and export shape. Testing the registry in isolation requires either stubbing the `require` cache or ensuring `source-scope.js` is resolvable, even when the test only exercises non-`core` registrations. The registry also becomes harder to reuse in a different service that has its own scope semantics.
+
+Solution:
+Introduce a scope-handler registry: `registerTaskSource` accepts an optional `scopeHandlers` map (or the registry exposes a `registerScopeHandler(scopeName, handler)` method). The `core` scope handler, which currently lives inline, is extracted into `source-scope.js` and registered at composition time. The generic registry then contains no `require` of any domain module and no knowledge of what `core` means. If a `core`-scoped source is registered without a handler, the registry throws a clear, immediate error at registration time rather than failing later at runtime.
+
+Benefits:
+The registry becomes a truly generic, domain-agnostic component that is trivially testable with any set of scope handlers. Adding a new scope (e.g., `tenant`, `edge`) no longer requires modifying the registry source. The hidden `require` is eliminated, so the dependency graph is accurate and refactors of `source-scope.js` are caught at composition time. The immediate "handler not registered" error replaces a later, harder-to-diagnose runtime failure.
+
+NOTE: The flag for AC-002 was not applied because the critique's claim that the current code "already correctly distinguishes" between missing keys and config errors is factually incorrect regarding the *observable behavior* described in the problem statement; the `try/catch` still swallows `getConfig()` errors silently without logging or distinction, which is the core defect identified.
