@@ -2470,3 +2470,29 @@ Benefits:
 The public SDK surface becomes an honest reflection of what the module actually depends on, so a consumer (or a future refactoring agent) can assess the blast radius of a change to any collaborator without reading the full implementation. Isolating the orchestration logic also makes it straightforward to write focused unit tests for the public API by stubbing the internal layer, reducing the need for heavy integration scaffolding.
 
 NOTE: Flag #2 was not applied because the critique's claim that the two mechanisms are "complementary" and not duplicative is incorrect; both resolve a source's effective priority for ordering purposes, and the divergence in fallback semantics (`Infinity` vs. config-based default) creates a real synchronization hazard that a shared helper would eliminate without conflating distinct concepts.
+
+### AC-208 · Decouple concepts.js persistence from its business logic
+Strength: Strong
+Files: src/concepts.js
+
+Problem:
+`concepts.js` is the only file in this community that performs direct filesystem I/O (`fs.readFileSync`, `fs.mkdirSync`, `writeJsonAtomicSync`). It hardcodes both the storage location (`concepts.json` in `pipelineDir`) and the serialization format (JSON) directly inside the same module that implements the concept-registry business logic (`createConcept`, `recordConceptResearch`, etc.). This tight coupling means the module cannot be unit-tested without mocking `fs` or spinning up temp directories, and the registry logic cannot be reused in contexts where the backing store is a database, an in-memory structure, or a different file layout.
+
+Solution:
+Refactor `concepts.js` so that its core functions operate on a plain data object and return the updated object, accepting `load` and `save` callbacks (or a small `ConceptStore` interface) as injected dependencies. The existing JSON-file implementation becomes a default adapter that the module exports alongside the pure logic, so callers that want a different persistence mechanism simply supply their own `load`/`save` pair.
+
+Benefits:
+The business logic becomes a pure, stateless transformation that is trivially testable with plain objects—no filesystem mocks, no temp directories. Any future change to where or how concepts are stored (SQLite, a remote API, a different directory convention) is a one-line swap at the call site rather than a rewrite of the module. It also removes the single point of `fs` coupling in this community, making the rest of the codebase uniformly side-effect-free.
+
+### AC-209 · Unify the marker injection/extraction pattern shared by concepts.js and incident-amplification-marker.js
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both `concepts.js` (via `injectConceptBuildInstruction` / `extractConceptBuildReport`) and `incident-amplification-marker.js` (via `injectAmplificationInstruction` / `extractAmplificationRequests`) implement the same three-step pattern: (1) check for a sentinel marker string to avoid double-injection, (2) append a structured instruction block, and (3) parse a regex from the model's response to extract structured fields while cleaning the surrounding text. The logic is nearly identical—same idempotency guard, same "strip-and-continue" fallback, same lenient-extraction strategy—differing only in the marker string, the instruction text, and the target regex/field names. This duplication means any improvement to edge-case handling (e.g., a new leniency rule, a change to how partial matches are treated) must be implemented and tested in two separate files, and the two implementations can silently drift apart.
+
+Solution:
+Extract the shared mechanics into a small utility module (e.g., `src/marker-utils.js`) exposing two generic functions: `injectInstruction(text, marker, instructionBlock)` and `extractMarkerData(text, markerRegex, parser)`. Both `concepts.js` and `incident-amplification-marker.js` then call these utilities, passing their specific marker strings, instruction text, regex, and field-mapping parser. The idempotency check, the strip-and-continue fallback, and the lenient-extraction logic live in exactly one place.
+
+Benefits:
+A single code path owns the tricky edge cases (partial matches, already-injected text, malformed model output), so a fix or improvement is made once and applies everywhere. New marker-based features in the future can be added by supplying a marker, instruction, and parser—no copy-paste of the guard/strip/parse boilerplate. The two existing modules become thinner and more readable, each focused on *what* data it injects/extracts rather than *how* the injection/extraction mechanics work.
