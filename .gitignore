@@ -84,3 +84,6 @@ reclaim-log.jsonl
 # still written locally (apply-task.js/task-log-store.js unchanged otherwise) for the
 # user's own reference, just never staged/committed/pushed.
 task-logs/
+
+# replay lab output (src/replay-lab.js)
+replay-reports/
