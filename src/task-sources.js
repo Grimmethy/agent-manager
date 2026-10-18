@@ -2973,6 +2973,7 @@ if (require.main === module) {
         candidateFulfillment: !!source.candidateFulfillment,
         emptyApproval: !!source.emptyApproval,
         advisoryProse: !!source.advisoryProse,
+        variantOf: source.variantOf || null,
         hasCustomApply: typeof source.apply === 'function',
         directToMain: source.directToMain === true,
         hasCandidatesPath: typeof source.candidatesPath === 'function',

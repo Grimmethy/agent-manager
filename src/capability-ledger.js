@@ -100,17 +100,29 @@ function buildScorecard(entries) {
   }).sort((a, b) => a.source.localeCompare(b.source) || (a.tier ?? 1e9) - (b.tier ?? 1e9) || a.model.localeCompare(b.model));
 }
 
+// Adds `variantOf` (the root parent source, or null) to each row, given a `parentOf(sourceName)` lookup; rows keep their own (source, model) identity.
+function annotateVariants(rows, parentOf) {
+  return rows.map((r) => ({ ...r, variantOf: (typeof parentOf === 'function' && parentOf(r.source)) || null }));
+}
+
 function readScorecard(pipelineDir, { windowDays = DEFAULT_WINDOW_DAYS, now = Date.now() } = {}) {
   const since = new Date(now - windowDays * 86400000).toISOString();
   return buildScorecard(readPipelineHistory(pipelineDir, { type: LEDGER_TYPE, since }));
 }
 
-module.exports = { LEDGER_TYPE, tierFromModel, classifyOutcome, buildEntry, recordAttempt, wilsonLower, buildScorecard, readScorecard };
+module.exports = { annotateVariants, LEDGER_TYPE, tierFromModel, classifyOutcome, buildEntry, recordAttempt, wilsonLower, buildScorecard, readScorecard };
 
 if (require.main === module) {
   const dir = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT || process.cwd();
   const days = Number(process.argv[2]) || DEFAULT_WINDOW_DAYS;
-  const rows = readScorecard(dir, { windowDays: days });
+  let rows = readScorecard(dir, { windowDays: days });
+  // --with-variants loads the source registry (heavy: needs AGENT_MANAGER_REPO_ROOT) to tag each row with its variantOf parent.
+  if (process.argv.includes('--with-variants')) {
+    try {
+      require('./task-sources.js');
+      rows = annotateVariants(rows, require('./task-source-registry.js').variantParentOf);
+    } catch (e) { console.error(`--with-variants: registry unavailable (${e.message}); rows left unannotated`); }
+  }
   if (process.argv.includes('--json')) console.log(JSON.stringify(rows, null, 2));
   else {
     console.log(`source`.padEnd(30) + `model`.padEnd(26) + `n`.padStart(4) + `  ok%  lower  p50s`);
