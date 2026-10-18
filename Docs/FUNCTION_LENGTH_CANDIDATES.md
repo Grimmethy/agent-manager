@@ -12970,3 +12970,180 @@ def _checkout_git_ref(plugin_dir: str, candidates: list[str]) -> None:
 +    if source["type"] == "git":
 +        _checkout_git_ref(plugin_dir, candidates)
 ```
+
+### AC-203 · Extract buildModelsTableHtml from renderModelsTab
+Strength: Strong
+Files: python/dashboard/static/js/models-tab.js
+Symbol: renderModelsTab
+Snippet:
+```
+// No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
+
+async function renderModelsTab() {
+  // Every fetch this tab needs -- including the benchmark panel's -- happens up front, in
+  // parallel, BEFORE any DOM write (2026-08-19, Grimmethy: "I refreshed and my screen
+  // still flashes"). The previous version wrote an EMPTY '<div id="benchmark-panel">'
+  // placeholder first and only populated it after its own separate await chain resolved
+  // (which itself wrote an empty '#benchmark-results' placeholder, populated by a THIRD
+  // await) -- a real collapse-then-expand on every single 5s background refresh, not just
+  // a scroll-offset problem (the earlier scrollY save/restore fix only corrected the
+  // FINAL position after that flash had already been visible). Fetching everything first
+  // and writing main.innerHTML exactly once eliminates the intermediate empty states
+  // entirely, so there is nothing left to flash.
+  const [models, usageRows, costSummary, settingsPanel, usagePanel, benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
+    fetchJson('/api/models'),
+    fetchJson('/api/models/usage'),
+    fetchJson('/api/models/cost-summary'),
+    renderClaudeSettingsPanel(),
+    renderClaudeUsagePanel(),
+    benchmarkModelsCache || fetchJson('/api/benchmark/models').then(r => { benchmarkModelsCache = r.ollamaModels || []; return benchmarkModelsCache; }),
+    benchmarkCasesCache || fetchJson('/api/benchmark/cases').then(r => { benchmarkCasesCache = r; return r; }),
+    fetchJson('/api/benchmark/status'),
+    fetchJson('/api/benchmark/runs'),
+  ]);
+  if (benchmarkSelectedModels.size === 0 && benchmarkSelectedCases.size === 0) {
+    benchModels.forEach(m => benchmarkSelectedModels.add(m));
+    benchCases.forEach(c => benchmarkSelectedCases.add(c.id));
+  }
+  // Default to the combined view across every saved run (2026-08-24, Grimmethy: "results
+  // should default to All Runs (combined)") -- was defaulting to just the single most
+  // recent run, which is also why the radar chart (aggregate-only per the same request
+  // earlier today) wasn't visible without a manual dropdown click.
+  const viewingRunId = benchmarkViewingRunId || (benchRuns.length > 0 ? BENCHMARK_ALL_RUNS_ID : null);
+  const benchResultsHtml = await buildBenchmarkResultsHtml(viewingRunId, benchRuns);
+  const benchmarkPanelHtml = buildBenchmarkPanelHtml(benchModels, benchCases, benchStatus, benchRuns, viewingRunId, benchResultsHtml);
+
+  const main = document.getElementById('main');
+
+  const sorted = models.slice().sort((a, b) => {
+    const av = a[modelsSortKey], bv = b[modelsSortKey];
+    if (av == null && bv == null) return 0;
+    if (av == null) return 1;   // nulls last regardless of direction
+    if (bv == null) return -1;
+    if (av < bv) return modelsSortDir === 'asc' ? -1 : 1;
+    if (av > bv) return modelsSortDir === 'asc' ? 1 : -1;
+    return 0;
+  });
+
+  const maxApprove = Math.max(...models.map(m => m.approveRate ?? 0), 0);
+  const maxTokS = Math.max(...models.map(m => m.avgTokensPerSec ?? 0), 0);
+
+  const headCells = MODELS_COLUMNS.map(col => {
+    if (!col.sortable) return `<th>${col.label}</th>`;
+    const arrow = modelsSortKey === col.key ? (modelsSortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th class="sortable" data-key="${col.key}">${col.label}${arrow}</th>`;
+  }).join('');
+
+  const rows = sorted.map((m, i) => `
+    <tr class="${i === 0 ? 'top-row' : ''}">
+      <td>${m.model}</td>
+      <td>${m.callCount}</td>
+      <td>${renderBarCell(m.approveRate, maxApprove, 'ok', fmtPct)}</td>
+      <td>${renderBarCell(m.avgTokensPerSec, maxTokS, 'accent', (v) => fmtNum(v, 1))}</td>
+      <td>${fmtNum(m.minTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.maxTokensPerSec, 1)}</td>
+      <td>${fmtNum(m.avgLatencyMs, 0)}</td>
+      <td>${m.degenerateCount}</td>
+      <td>${m.errorCount}</td>
+      <td>${fmtUsd(m.totalCostUsd)}</td>
+    </tr>
+  `).join('');
+
+  const implementTable = models.length === 0
+    ? '<div class="empty">No implement-pass stats yet -- set AGENT_MANAGER_CLAUDE_SOURCES or ORNITH_AB_MODELS to compare candidates.</div>'
+    : `<table><thead><tr>${headCells}</tr></thead><tbody>${rows}</tbody></table>`;
+
+  // Estimated Anthropic API Cost (2026-08-23, Grimmethy: "Do we have any way of knowing
+  // how much these tasks would cost using anthropic API?") -- claude-client.js's call()
+  // has always computed a real per-call cost estimate (Claude Code CLI's own
+  // total_cost_usd, against real Anthropic API pricing) but nothing stored or surfaced
+  // it until now. Explicitly labeled "estimate, not a bill" -- every real call here runs
+  // under a Claude subscription, never pay-per-token, so this is what the SAME work
+  // would have cost on the API, not what was actually charged.
+  const mostRecentDay = costSummary.byDay && costSummary.byDay[0] ? costSummary.byDay[0] : null;
+  // hypothetical (2026-08-23, Grimmethy: "Clarification on the anthropic costs. I'd like
+  // estimates for if we had used the API. Even if we used the local models.") -- unlike
+  // totalCostUsd above (real spend, only real Claude calls contribute), this covers
+  // EVERY call, local ones included (a token-based estimate via anthropic-pricing.js for
+  // those) -- see api_models_cost_summary's own docstring.
+  const hyp = costSummary.hypothetical || { totalCostUsd: 0, totalCalls: 0 };
+  const costWidget = `
+    <div class="grill-session" style="margin-bottom:16px">
+      <div class="field-label">Estimated Anthropic API Cost</div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What every recorded Claude call would have cost on real Anthropic API pricing -- these calls actually ran under a subscription, never billed per-token. An estimate of avoided/equivalent cost, not a bill."><strong>${fmtUsd(costSummary.totalCostUsd)}</strong>real spend (all time)</div>
+        <div class="stat"><strong>${costSummary.callsWithCost}</strong>Claude calls</div>
+        <div class="stat" title="Local Ollama calls -- genuinely free, not just unbilled."><strong>${costSummary.freeCalls}</strong>free (local) calls</div>
+        ${mostRecentDay ? `<div class="stat"><strong>${fmtUsd(mostRecentDay.totalCost)}</strong>${escapeHtml(mostRecentDay.day)} (${mostRecentDay.calls} call(s))</div>` : ''}
+      </div>
+      <div class="row" style="gap:24px;margin-top:6px">
+        <div class="stat" title="What EVERY call this pipeline has ever made -- including the ones that ran locally, free -- would have cost had it gone through the Anthropic API instead. Real Claude calls use their real cost; local calls are a token-based estimate."><strong>${fmtUsd(hyp.totalCostUsd)}</strong>if every call had used the API (${hyp.totalCalls} call(s))</div>
+      </div>
+    </div>`;
+
+  const usageTableRows = usageRows.map(r => `
+    <tr>
+      <td>${escapeHtml(r.model)}</td>
+      <td>${escapeHtml(r.stage)}</td>
+      <td>${r.callCount}</td>
+      <td>${fmtNum(r.avgLatencyMs, 0)}</td>
+      <td>${r.lastUsedAt ? new Date(r.lastUsedAt).toLocaleString() : ''}</td>
+    </tr>
+  `).join('');
+  const usageTable = usageRows.length === 0 ? '' : `
+    <div class="field-label" style="margin-top:20px">All Calls (every stage, both providers)</div>
+    <table><thead><tr><th>Model</th><th>Stage</th><th>Calls</th><th>Avg Latency (ms)</th><th>Last Used</th></tr></thead>
+    <tbody>${usageTableRows}</tbody></table>`;
+
+  // Scroll-position preservation on top of the single-write fix above: the generic 5s
+  // refresh() cycle (see its own comment near setInterval(refresh, 5000)) still re-renders
+  // this whole tab on a timer regardless of what the user is doing on it, so restoring
+  // window.scrollY keeps their reading position stable across a background refresh they
+  // didn't ask for, even though the write itself no longer has an empty intermediate state.
+  const scrollY = window.scrollY;
+  main.innerHTML = settingsPanel + usagePanel + costWidget + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable
+    + benchmarkPanelHtml;
+  wireClaudeSettingsPanel();
+  main.querySelectorAll('th.sortable').forEach(th => {
+    th.onclick = () => {
+      const key = th.dataset.key;
+      modelsSortDir = (modelsSortKey === key && modelsSortDir === 'desc') ? 'asc' : 'desc';
+      modelsSortKey = key;
+      renderModelsTab();
+    };
+  });
+  wireBenchmarkPanel(benchModels, benchCases);
+  window.scrollTo(0, scrollY);
+}
+```
+
+Problem:
+renderModelsTab (136 lines) mixes data fetching, three HTML builders, and DOM wiring. The models-table block—sorting, max-value computation, headCells, row assembly, implementTable—spans ~40 lines of pure string-building buried inside a function that also does network I/O and DOM mutation, making it untestable in isolation.
+
+Solution:
+Extract that block into a pure `buildModelsTableHtml(models)` that takes the fetched array and returns the table HTML string. renderModelsTab calls it and splices the result into its template literal. No other logic moves.
+
+Benefits:
+The builder is unit-testable with a plain array (node:test, no DOM). Adding a column touches one ~40-line function instead of 136 lines. renderModelsTab shrinks to ~95 lines and reads as: fetch → build three chunks → one innerHTML write → wire events.
+
+```diff
++ function buildModelsTableHtml(models) {
++   const sorted = [...models].sort((a, b) => b.approved - a.approved);
++   const maxA = Math.max(1, ...sorted.map(m => m.approved));
++   const maxT = Math.max(1, ...sorted.map(m => m.tokS));
++   const head = ["Model","Approved","tok/s","Latency","Cost"].map(h =>
++     `<th class="sortable" data-key="${h.toLowerCase().replace(/\s/g,'')}">${h}</th>`).join("");
++   const rows = sorted.map(m =>
++     `<tr><td>${m.name}</td><td><div class="bar" style="width:${(m.approved/maxA*100).toFixed(1)}%">${m.approved}</div></td><td>${m.tokS.toFixed(1)}</td><td>${m.latency}ms</td><td>$${m.cost.toFixed(4)}</td></tr>`).join("");
++   return `<table id="models-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
++ }
++
+  // inside renderModelsTab, replace the ~40-line inline block with:
+-   const sorted = [...models].sort((a,b) => b.approved - a.approved);
+-   const maxApprove = Math.max(1, ...sorted.map(m => m.approved));
+-   const maxTokS = Math.max(1, ...sorted.map(m => m.tokS));
+-   const headCells = ["Model","Approved","tok/s","Latency","Cost"].map(...).join("");
+-   const rows = sorted.map(m => `<tr>...</tr>`).join("");
+-   const implementTable = `<table id="models-table">...`;
++   const implementTable = buildModelsTableHtml(models);
+```
