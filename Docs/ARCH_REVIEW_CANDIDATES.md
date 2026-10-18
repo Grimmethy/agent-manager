@@ -2496,3 +2496,31 @@ Extract the shared mechanics into a small utility module (e.g., `src/marker-util
 
 Benefits:
 A single code path owns the tricky edge cases (partial matches, already-injected text, malformed model output), so a fix or improvement is made once and applies everywhere. New marker-based features in the future can be added by supplying a marker, instruction, and parser—no copy-paste of the guard/strip/parse boilerplate. The two existing modules become thinner and more readable, each focused on *what* data it injects/extracts rather than *how* the injection/extraction mechanics work.
+
+### AC-210 · Consolidate side-finding writes onto the atomic-write path
+Strength: Strong
+Files: src/side-finding.js, src/atomic-write.js
+
+Problem:
+`atomic-write.js` provides a crash-safe write strategy (temp file + fsync + rename) that the rest of the pipeline relies on to guarantee state durability. However, `writeSideFindingInbox` in `side-finding.js` bypasses that utility entirely, issuing a raw `fs.writeFileSync` inside a `try/catch` that only logs a warning on failure. If the process is killed or the disk fails mid-write, the side-finding JSON is left truncated or missing, and the warning is the only trace. Because the side-finding channel is explicitly the "best-effort" capture path for critical defects, the most important metadata in the system ends up with weaker durability guarantees than routine pipeline state—an architectural inconsistency that silently degrades the very safety net the channel is meant to provide.
+
+Solution:
+Refactor `writeSideFindingInbox` to call `writeJsonAtomicSync` (or the equivalent exported helper) from `src/atomic-write.js` instead of `fs.writeFileSync`. The existing `try/catch` and warning-log can be retained as a secondary safety net for I/O errors that the atomic helper does not handle (e.g., permission denied), but the write itself will now go through the temp-file → fsync → rename sequence, so a mid-write crash can never leave a partial file on disk.
+
+Benefits:
+Side-finding records gain the same crash-safety guarantees as every other piece of pipeline state, eliminating the risk of truncated JSON or silent loss. The codebase now has a single, well-tested write path for durable JSON, reducing the surface area for future write-related bugs and making the "best-effort" qualifier refer only to the decision to emit a side-finding, not to the durability of the write once it is emitted.
+
+### AC-211 · Make grep-codebase-tool's config dependency explicit
+Strength: Worth exploring
+Files: src/grep-codebase-tool.js, src/config.js
+
+Problem:
+`grepCodebase` in `src/grep-codebase-tool.js` imports `getConfig` from `src/config.js` to resolve `repoRoot` and `grepAllowedDirs` when the caller does not supply them. This hidden dependency on global configuration state means the function cannot be unit-tested in isolation without mocking the config module, and it creates a dual-path code path (explicit argument vs. config fallback) that is harder to reason about. The search logic is also tightly coupled to this project's specific configuration schema, reducing its reusability and making the function's true inputs invisible from its signature alone.
+
+Solution:
+Change `grepCodebase` to accept `repoRoot` and `grepAllowedDirs` as explicit parameters (or a small options object) and remove the `getConfig` import. The caller—e.g., `local-tool-client.js`—resolves the configuration and passes the values in. If a default is still desired for convenience, it can be a module-level constant rather than a live read from a global config singleton.
+
+Benefits:
+The function's dependencies become visible in its signature, making it trivially testable with arbitrary values and eliminating the need to mock `src/config.js`. The search utility is decoupled from the application's configuration management, improving locality and making it straightforward to reuse in other tools or test harnesses without pulling in the full config stack.
+
+NOTE: Both flags were not applied because the critique itself concluded "NO ISSUES FOUND," explicitly stating that each item is a valid architectural proposal with no factual error, contradiction, or violation of the output contract.
