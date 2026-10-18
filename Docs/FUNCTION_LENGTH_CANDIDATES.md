@@ -12811,3 +12811,162 @@ if (gate.skip) continue;
 
 Benefits:
 Each guard becomes independently testable with node:test (e.g. "Strength: Weak skips", "...-only Problem skips") without exercising the parser, file fetch, or archive path. The main loop drops from ~55 lines of inline regex to two lines, making the remaining phases (file resolution, premise recheck, pre-split) easier to read and to extract in a follow-up change.
+
+### AC-202 · Extract git-checkout fallback into _checkout_git_ref
+Strength: Strong
+Files: python/dashboard/routes/plugins.py
+Symbol: api_plugins_update
+Snippet:
+```
+
+@plugins_bp.route("/api/plugins/update", methods=["POST"])
+def api_plugins_update():
+    """Updates one installed plugin to the catalog's latest version: fetch/checkout the
+    new source revision (or npm update), re-run npm install, record the new version +
+    source in plugins.json, and restart the pipeline if it's running."""
+    from app import _pipeline_running, _plugins_install_dir, _read_plugin_catalog, _read_plugins_manifest, _restart_pipeline, _run_plugin_subprocess, _version_tuple, _write_plugins_manifest
+    body = request.get_json(silent=True) or {}
+    plugin_id = (body.get("id") or "").strip()
+    if not plugin_id:
+        abort(400, description="id is required")
+
+    doc, _err = _read_plugin_catalog()
+    catalog_entry = next(
+        (e for e in doc.get("plugins", []) if isinstance(e, dict) and e.get("id") == plugin_id),
+        None,
+    )
+    if catalog_entry is None:
+        abort(404, description=f"plugin '{plugin_id}' not in catalog")
+
+    manifest = _read_plugins_manifest()
+    entry = next(
+        (p for p in manifest if isinstance(p, dict) and p.get("name") == plugin_id),
+        None,
+    )
+    if entry is None:
+        abort(404, description=f"plugin '{plugin_id}' not installed")
+
+    installed_version = entry.get("version")
+    new_version = catalog_entry.get("version")
+    if not (new_version and _version_tuple(new_version) > _version_tuple(installed_version or "")):
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "reason": "no update available",
+            "installedVersion": installed_version,
+            "latestVersion": new_version,
+        })
+
+    plugin_dir = _plugins_install_dir() / plugin_id
+    if not plugin_dir.is_dir():
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": f"plugin checkout not found at {plugin_dir}",
+        }), 404
+
+    source = catalog_entry.get("source") or {}
+    if source.get("type") not in ("git", "npm"):
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": f"unsupported source.type: {source.get('type')!r}",
+        }), 400
+
+    try:
+        if source["type"] == "git":
+            _run_plugin_subprocess(["git", "fetch", "--tags", "--prune"], plugin_dir)
+            candidates = [c for c in (source.get("ref"), new_version) if c]
+            checked_out = False
+            for ref in candidates:
+                try:
+                    _run_plugin_subprocess(["git", "checkout", ref], plugin_dir)
+                    checked_out = True
+                    break
+                except subprocess.CalledProcessError:
+                    continue
+            if not checked_out:
+                # No usable ref/tag -- fall back to origin's default branch.
+                out, _ = _run_plugin_subprocess(
+                    ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], plugin_dir
+                )
+                default_ref = out.strip()
+                if not default_ref:
+                    raise subprocess.CalledProcessError(
+                        1, "git checkout",
+                        stderr="no source.ref, no version tag, and no origin/HEAD default",
+                    )
+                _run_plugin_subprocess(["git", "checkout", default_ref], plugin_dir)
+        else:  # npm
+            pkg = (source.get("url") or "").strip() or plugin_id
+            _run_plugin_subprocess(["npm", "update", pkg], plugin_dir)
+        _run_plugin_subprocess(["npm", "install"], plugin_dir)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        detail = (getattr(e, "stderr", None) or getattr(e, "stdout", None) or str(e)).strip()
+        return jsonify({
+            "id": plugin_id,
+            "updated": False,
+            "error": "plugin update failed",
+            "detail": detail,
+        }), 500
+
+    entry["version"] = new_version
+    entry["source"] = source
+    _write_plugins_manifest(manifest)
+    restarted = False
+    if _pipeline_running():
+        _restart_pipeline()
+        restarted = True
+    return jsonify({
+        "id": plugin_id,
+        "updated": True,
+        "installedVersion": installed_version,
+        "latestVersion": new_version,
+        "restarted": restarted,
+    })
+```
+
+Problem:
+The update handler mixes git ref-resolution (fetch, multi-candidate checkout, symbolic-ref fallback) with npm install, manifest write, and pipeline restart in one 104-line body. The git branch is a nested try/except state machine that cannot be unit-tested without a live Flask request.
+
+Solution:
+Extract the `if source["type"] == "git":` block into `_checkout_git_ref(plugin_dir, candidates)`: fetch, try each candidate ref, fall back to origin/HEAD, raise RuntimeError on total failure.
+
+Benefits:
+Ref-fallback logic is testable in isolation with a temp repo; the handler loses ~20 lines; new ref strategies slot into the candidate list without touching the handler.
+
+```python
+def _checkout_git_ref(plugin_dir: str, candidates: list[str]) -> None:
+    """Fetch and check out the first candidate ref; fall back to origin/HEAD."""
+    subprocess.run(["git", "fetch", "--all"], cwd=plugin_dir, check=True,
+                   capture_output=True)
+    last_err = None
+    for ref in candidates:
+        try:
+            subprocess.run(["git", "checkout", ref], cwd=plugin_dir, check=True,
+                           capture_output=True)
+            return
+        except subprocess.CalledProcessError as e:
+            last_err = e
+    try:
+        subprocess.run(["git", "checkout", "origin/HEAD"], cwd=plugin_dir,
+                       check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"git checkout failed for all refs {candidates}: {last_err}") from e
+```
+
+```diff
+-    if source["type"] == "git":
+-        subprocess.run(["git", "fetch", "--all"], cwd=plugin_dir, check=True, ...)
+-        for ref in candidates:
+-            try:
+-                subprocess.run(["git", "checkout", ref], ...)
+-                break
+-            except subprocess.CalledProcessError:
+-                continue
+-        else:
+-            subprocess.run(["git", "checkout", "origin/HEAD"], ...)
++    if source["type"] == "git":
++        _checkout_git_ref(plugin_dir, candidates)
+```
