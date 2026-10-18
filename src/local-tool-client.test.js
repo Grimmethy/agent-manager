@@ -742,9 +742,10 @@ function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallRespons
       sentBodies.push(body);
       const turn = queue.length ? queue.shift() : {};
       // A scripted turn may carry `_usage: { prompt_eval_count, eval_count }` to exercise
-      // token accounting -- lift it onto the response envelope where Ollama really puts it.
-      const { _usage, ...message } = turn || {};
-      return { message, ...(_usage || {}) };
+      // token accounting, and `_done_reason` for the turn's stop reason -- lift both onto
+      // the response envelope where Ollama really puts them.
+      const { _usage, _done_reason, ...message } = turn || {};
+      return { message, ...(_usage || {}), ...(_done_reason !== undefined ? { done_reason: _done_reason } : {}) };
     },
     postJsonStream: async () => { throw new Error('streaming path not exercised in this test'); },
   });
@@ -2087,4 +2088,124 @@ test('without readOnlyRoots the handlers behave exactly as before: a sibling pat
     const w = mod.buildWriteToolHandlers([dir], dir);
     assert.match(w.write_file({ path: path.join(sib, 'x.txt'), content: 'x' }).error, /not inside any accessible repo/);
   });
+});
+
+// --- tool-loop audit (2026-10-18, brain-dump 1889) --------------------------------------
+// runPlanWithTools writes one 'turn-end' line per turn and one 'tool-outcome' line per
+// edit_file/write_file call to instances/tool-loop-audit.log (see tool-loop-audit.js),
+// never to pipeline-history.log, and the non-streaming branch now carries done_reason.
+
+function readAuditLines(dir) {
+  const p = path.join(dir, 'instances', 'tool-loop-audit.log');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+function readHistoryLines(dir) {
+  const p = path.join(dir, 'instances', 'pipeline-history.log');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test('tool-loop audit: a multi-turn write run logs one turn-end per turn and one tool-outcome per edit/write call, only in tool-loop-audit.log', async () => {
+  const SENTINEL_PATH = 'secret-dir-7f3a/notes.txt';
+  const SENTINEL_TEXT = 'SENTINEL_PRIVATE_TEXT_91c2';
+  const prevAudit = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  try {
+    await withMockedChat([
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: SENTINEL_TEXT, replace: 'x' } } }] },
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [
+        { function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'beta', replace: 'x' } } },
+        { function: { name: 'write_file', arguments: { path: SENTINEL_PATH, content: SENTINEL_TEXT } } },
+      ] },
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'alpha', replace: 'ALPHA' } } }] },
+      { role: 'assistant', content: 'done', _done_reason: 'stop', _usage: { prompt_eval_count: 120, eval_count: 7 } },
+    ], async (mod, dir) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'alpha\nbeta\nbeta\n');
+      const result = await mod.runPlanWithTools({ prompt: 'fix it', allowWrite: true, source: 'manual', taskId: 'audit-t1', stage: 'agentic-write', maxTurns: 6 });
+      assert.equal(result.response, 'done');
+      assert.equal(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), 'ALPHA\nbeta\nbeta\n', 'the real edit_file handler ran');
+
+      const lines = readAuditLines(dir);
+      const turnEnds = lines.filter((e) => e.type === 'turn-end');
+      assert.deepEqual(turnEnds.map((e) => e.endClass), ['tool-calls', 'tool-calls', 'tool-calls', 'stop']);
+      assert.deepEqual(turnEnds.map((e) => e.turn), [0, 1, 2, 3]);
+      assert.ok(turnEnds.every((e) => e.taskId === 'audit-t1' && e.stage === 'agentic-write' && e.source === 'manual' && e.phase === 'loop'));
+      assert.deepEqual(turnEnds[1].toolNames, ['edit_file', 'write_file']);
+      assert.equal(turnEnds[3].promptEvalCount, 120);
+      const outcomes = lines.filter((e) => e.type === 'tool-outcome');
+      assert.deepEqual(outcomes.map((e) => `${e.tool}:${e.outcome}`), ['edit_file:not-found', 'edit_file:ambiguous', 'write_file:applied', 'edit_file:applied']);
+      assert.deepEqual(outcomes.map((e) => e.turn), [0, 1, 1, 2]);
+
+      const historyTypes = readHistoryLines(dir).map((e) => e.type);
+      assert.ok(!historyTypes.includes('turn-end') && !historyTypes.includes('tool-outcome'), 'nothing per-turn lands in pipeline-history.log');
+
+      const raw = fs.readFileSync(path.join(dir, 'instances', 'tool-loop-audit.log'), 'utf8');
+      assert.ok(!raw.includes('secret-dir-7f3a') && !raw.includes('SENTINEL_PRIVATE_TEXT') && !raw.includes('a.txt'), 'no paths or text in the audit log');
+
+      // Read side over the log this real loop run just wrote.
+      const out = execFileSync(process.execPath, [path.join(__dirname, 'tool-loop-audit.js'), '7', '--json'], {
+        env: { ...process.env, AGENT_MANAGER_PIPELINE_DIR: dir }, encoding: 'utf8',
+      });
+      const rows = JSON.parse(out);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].turns, 4);
+      assert.equal(rows[0].tools.edit_file.total, 3);
+      assert.equal(rows[0].tools.edit_file.outcomes.applied, 1);
+      assert.equal(rows[0].tools.write_file.missRate, 0);
+    });
+  } finally {
+    if (prevAudit === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+    else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prevAudit;
+  }
+});
+
+test('tool-loop audit: a non-streaming turn with done_reason "length" now fires the existing context-budget truncated event', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'I was in the middle of', _done_reason: 'length', _usage: { prompt_eval_count: 900, eval_count: 300 } },
+  ], async (mod, dir) => {
+    await mod.runPlanWithTools({ prompt: 'go', taskId: 'audit-t2', stage: 'plan' });
+    const truncated = readHistoryLines(dir).filter((e) => e.type === 'context-budget' && e.event === 'truncated');
+    assert.equal(truncated.length, 1);
+    assert.equal(truncated[0].taskId, 'audit-t2');
+    const turnEnds = readAuditLines(dir).filter((e) => e.type === 'turn-end');
+    assert.equal(turnEnds.length, 1);
+    assert.equal(turnEnds[0].doneReason, 'length');
+    assert.equal(turnEnds[0].endClass, 'length');
+  });
+});
+
+test('tool-loop audit: a turn whose reply carries no done_reason is logged with doneReason null and endClass unknown', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'here is the answer' }], async (mod, dir) => {
+    await mod.runPlanWithTools({ prompt: 'hi', taskId: 'audit-t3' });
+    const [e] = readAuditLines(dir);
+    assert.equal(e.type, 'turn-end');
+    assert.ok(Object.prototype.hasOwnProperty.call(e, 'doneReason'), 'doneReason is present, not omitted');
+    assert.equal(e.doneReason, null);
+    assert.equal(e.endClass, 'unknown');
+  });
+});
+
+test('tool-loop audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes no audit file and the loop result is unchanged', async () => {
+  const prev = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = 'off';
+  try {
+    await withMockedChat([{ role: 'assistant', content: 'here is the answer', _done_reason: 'stop' }], async (mod, dir) => {
+      const result = await mod.runPlanWithTools({ prompt: 'hi' });
+      assert.equal(result.response, 'here is the answer');
+      assert.equal(fs.existsSync(path.join(dir, 'instances', 'tool-loop-audit.log')), false);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+    else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
+  }
+});
+
+test('tool-loop audit: executeToolCalls keeps its 5-parameter declaration (outcomes are classified from toolCallLog in the loop instead)', () => {
+  // executeToolCalls is module-private, so its arity is checked on the source declaration.
+  const src = fs.readFileSync(path.join(__dirname, 'local-tool-client.js'), 'utf8');
+  const m = src.match(/async function executeToolCalls\(([^)]*)\)/);
+  assert.ok(m, 'executeToolCalls declaration found');
+  assert.deepEqual(m[1].split(',').map((s) => s.trim()), ['assistantMessage', 'toolCalls', 'toolHandlers', 'messages', 'toolCallLog']);
 });
