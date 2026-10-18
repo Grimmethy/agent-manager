@@ -2429,3 +2429,44 @@ Replace the bare side-effect require with an explicit call to a named initializa
 
 Benefits:
 The module's dependencies become explicit and auditable. Unit tests for apply-core.js no longer need to reproduce the side-effect loading order. If the module graph is reorganized, the explicit import or the entry-point call makes the registration dependency visible to anyone reading the code, reducing the chance of a silent "source not registered" failure at runtime.
+
+### AC-205 · `resolveSourceName` hardcodes fallbacks that bypass the alias registry
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` is documented as the single entry point for mapping a task's `source` field to a registry name, with the explicit promise that plugins can extend the mapping via `registerSourceAlias` without touching core code. In practice, the function short-circuits with hardcoded checks for `adhoc` (when `task.domain === 'adhoc'` or `task.source === 'manual'`) and `secondbrain` (when `task.domain === 'secondbrain'`) before consulting the alias map at all. This means the alias map is not the authoritative source of truth: a plugin that registers an alias intending to override or shadow one of those two names will be silently ignored, and the two special-cased sources cannot be re-mapped or removed without editing the core function. The interface advertises open extensibility while the implementation enforces a closed set, violating the principle of least surprise for downstream consumers.
+
+Solution:
+Extend the `registerSourceAlias` API to accept a `domain` field as an optional second key, or introduce a parallel `registerDomainAlias` function, to allow mapping `task.domain` values. Then, remove the hardcoded `if` branches from `resolveSourceName` and seed the alias map at module-initialisation time with the existing mappings: `registerSourceAlias('manual', 'adhoc')`, `registerSourceAlias('inbox', 'secondbrain')`, and `registerDomainAlias('adhoc', 'adhoc')`, `registerDomainAlias('secondbrain', 'secondbrain')`. The function then reduces to a lookup chain that checks `source` aliases first, then `domain` aliases, then falls back to the raw value: `sourceAliases[task.source] ?? domainAliases[task.domain] ?? task.source`. This makes the alias maps the sole source of truth, keeps the public API backward-compatible (existing `registerSourceAlias` calls still work), and lets any future plugin override or extend the built-in names without a core-code edit.
+
+Benefits:
+The alias maps become the single source of truth for source-name resolution, so the documented extension mechanism actually works for every name, including the two that are currently special-cased. Removing the hardcoded branches eliminates a class of silent-override bugs where a plugin's registration is ignored, and it reduces the function to a flat lookup that is trivially testable and auditable.
+
+### AC-206 · Priority-resolution logic duplicated across two modules
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/task-priority.js
+
+Problem:
+Both `task-source-registry.js` and `task-priority.js` independently resolve a source's priority, but they do so with different fallback semantics: the registry uses `a.priority ?? Infinity` when ordering registered sources, while the priority library uses `getConfig().taskPriorityOverrides[name] ?? def`. Because the two paths diverge, a change to the fallback strategy (for example, switching from `Infinity` to a finite sentinel, or adding a per-environment override layer) must be discovered and applied in both files in lockstep. If only one is updated, sources will be ordered differently depending on which code path a caller happens to hit, producing inconsistent task ordering that is difficult to reproduce and debug.
+
+Solution:
+Extract a single `resolvePriority(name, defaultPriority)` helper into `src/lib/task-priority.js` (or a shared utility module) that encapsulates the full resolution chain—config overrides, per-source defaults, and the ultimate fallback. Have `task-source-registry.js` import and call that helper instead of inlining its own `?? Infinity` expression. The helper's signature makes the fallback contract explicit, and a single unit-test suite around it covers every resolution path.
+
+Benefits:
+Priority resolution lives in exactly one place, so a change to the fallback strategy or the override mechanism is a one-file edit with one test suite to update. The registry module's ordering logic becomes a thin call site, reducing the surface area that must be kept in sync and eliminating the risk of the two modules disagreeing on what a source's effective priority is.
+
+### AC-207 · `candidate-fulfillment.js` exposes a flat SDK interface over a deep, unmediated dependency fan-out
+Strength: Worth exploring
+Files: src/sdk/candidate-fulfillment.js
+
+Problem:
+The module is presented as an SDK entry point for candidate fulfillment, but its implementation reaches directly into `../config.js`, `../candidate-docs.js`, `../candidate-premise-check.js`, `../pipeline-forensics.js`, `../task-history.js`, and several `./lib/` helpers. None of these dependencies are surfaced in the module's public interface or its documented contract; they are internal implementation details that a consumer of the SDK has no way to know about. In practice this means that a seemingly unrelated change to, say, `pipeline-forensics.js` can alter the observable behaviour of `candidate-fulfillment.js` without any signal in the SDK's API surface, making the module harder to test in isolation and harder to reason about when debugging cross-cutting regressions.
+
+Solution:
+Introduce a thin internal orchestration layer (e.g. `src/sdk/candidate-fulfillment-internal.js`) that owns the multi-module coordination, and have the public `candidate-fulfillment.js` delegate to it through a narrow, explicitly-typed interface. Alternatively, if the dependency fan-out is genuinely required by the public contract, document each dependency in the module's header comment and add an integration-test fixture that pins the expected interaction with each collaborator, so that a change in any one of them is caught by a named test rather than discovered in production.
+
+Benefits:
+The public SDK surface becomes an honest reflection of what the module actually depends on, so a consumer (or a future refactoring agent) can assess the blast radius of a change to any collaborator without reading the full implementation. Isolating the orchestration logic also makes it straightforward to write focused unit tests for the public API by stubbing the internal layer, reducing the need for heavy integration scaffolding.
+
+NOTE: Flag #2 was not applied because the critique's claim that the two mechanisms are "complementary" and not duplicative is incorrect; both resolve a source's effective priority for ordering purposes, and the divergence in fallback semantics (`Infinity` vs. config-based default) creates a real synchronization hazard that a shared helper would eliminate without conflating distinct concepts.
