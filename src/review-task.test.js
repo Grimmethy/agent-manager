@@ -2987,3 +2987,22 @@ test('reviewTask: the edit-set syntax gate leaves adhoc diffs alone and honours 
     assert.equal(off.editSetSyntax, undefined);
   } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE; else process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = prev; }
 });
+
+// 2026-10-18 (brain-dump 1905): waitForLocalAvailability skips a fresh 'working' heartbeat that opts
+// out with assignable:false (an external runner, not an AM draft) but still waits for a real lane.
+test('waitForLocalAvailability: an assignable:false working heartbeat does not delay review; a working lane still does', async () => {
+  const { waitForLocalAvailability } = require('./review-task.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-wait-'));
+  const hb = (id, extra) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({
+    instanceId: id, pid: process.pid, status: 'working', lastHeartbeat: new Date().toISOString(), ...extra }));
+
+  hb('worker-kaggle-p40', { assignable: false });
+  let t0 = Date.now();
+  await waitForLocalAvailability(dir, 3, 0.3);
+  assert.ok(Date.now() - t0 < 150, `opted-out heartbeat must not delay (took ${Date.now() - t0} ms)`);
+
+  hb('worker-3090', {});
+  t0 = Date.now();
+  await waitForLocalAvailability(dir, 3, 0.3);
+  assert.ok(Date.now() - t0 >= 250, `a working lane still delays (took ${Date.now() - t0} ms)`);
+});
