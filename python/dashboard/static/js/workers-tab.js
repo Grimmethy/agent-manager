@@ -38,9 +38,11 @@ async function setWorkerModel(instanceId, model) {
 
 // Only worker-* lanes (worker-1, worker-reasoning, worker-p40, worker-reasoning-p40)
 // claim from queue/pending/ via local-worker.sh -- reviewer/watchdog have nothing to
-// pin a pending task onto.
+// pin a pending task onto. A worker-* heartbeat with assignable:false (an external runner
+// that only shows its job here, brain-dump 1903) opts out too; same rule as app.py's
+// _worker_lane_refusal. Its card keeps the run-log expander (expandedIsWorker below).
 function canAssignTask(inst) {
-  return inst.instanceId.startsWith('worker');
+  return inst.instanceId.startsWith('worker') && inst.assignable !== false;
 }
 
 // Operator override (2026-09-06, Grimmethy: "I need to be able to select the task I
