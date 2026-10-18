@@ -114,8 +114,36 @@ a review waiting behind it can hit the 5-minute per-call limit (seen on the firs
   two review lanes the same model tag on different GPUs unless you want them to.
 - **Priority:** the arbiter class of a review outranks a draft on the same endpoint, so on the P40 a review goes before a waiting `worker-p40` draft, as on the 3090.
 
+## Endpoint-scoped GPU lease (2026-10-18)
+
+The Forge-family lease (`~/.local/state/agent-manager/comfyui-lease.json`, see PromptForge's `Docs/GPU_FAMILY_PROTOCOL.md`) is how anything outside the pipeline takes a
+card from it. While a fresh lease is held, `local-client.js` refuses to START a model call (`ForgePauseError`, "paused, not failed": no retry, no failure count), and
+`local-worker.sh` / `review-runner.sh` yield their ticks. That covers drafts, the reviewer's votes and every other `local-client.js` caller. It does **not** go through
+the gpu-arbiter: a reviewer vote takes no arbiter ticket, so an arbiter place ticket (`holdPlace`) holds off drafts only. Use the lease to reserve a card.
+
+A lease may now be **scoped to some cards**, so a plugin that reserves one card (a KaggleForge eval on the P40) does not pause the lanes on the others:
+
+```json
+{ "holder": "kaggleforge", "family": "forge", "owner": "KAG-gemma-dev-0009", "endpoints": ["http://192.168.122.29:11434"],
+  "acquiredAt": "2026-10-18T09:00:00Z", "refreshedAt": "2026-10-18T09:00:20Z" }
+```
+
+- **`endpoints`** is optional. Absent or empty = the whole pipeline, exactly as before (PromptForge's lease has no such field and is unchanged). Present = only calls to those
+  Ollama URLs are held off. Matching is `host:port`; `localhost`, `127.0.0.1` and `::1` are one host; a missing port means 11434. A caller whose own URL cannot be parsed stays held.
+- **Who checks it:** `gpu-guard.js` `leaseHeldFor(url)` (used by `local-client.js` with the lane's `OLLAMA_URL`, and by `lane-health.js`, which skips a leased card so a probe
+  does not reload the model the holder evicted); the shell twin `comfyui_lease_held [url]` in `agent-manager-common.sh` (the daemons pass `${OLLAMA_URL:-http://localhost:11434}`),
+  which calls the same JS function so the rule exists once. `comfyuiLeaseHeld()` / `comfyui_lease_held` with no argument keep the old meaning: any fresh lease = held.
+- **Freshness is unchanged:** `refreshedAt` within 90 s and `acquiredAt` within 900 s (`AGENT_MANAGER_COMFY_LEASE_TTL_S` / `_MAX_S`). The holder must renew **both** timestamps
+  about every 20 s, as PromptForge's keeper does, or the 900 s ceiling ends the lease. Kill switch: `AGENT_MANAGER_FORGE_PAUSE=off`.
+- **One file, one holder.** Do not write over a fresh lease whose `holder` is someone else. PromptForge's `lease_intact()` ends its own session when the holder changes. The
+  holder must treat the file disappearing, or its `holder` changing, as preemption and get off the card.
+- **Pipeline start wins.** `scripts/launch.sh` deletes the lease on an explicit pipeline start, scoped or not. A holder that finds its lease gone must stop, not rewrite it.
+- **Still to do outside this repo:** PromptForge's `Docs/GPU_FAMILY_PROTOCOL.md` should describe `endpoints` and the holder rule. KaggleForge's runner (`server/gpu_lease.py`) is the first writer.
+- **Not true as written elsewhere in this file:** the "Review daemons" section says a review's arbiter class outranks a draft on the same endpoint. Reviews take no arbiter
+  ticket (`review-task.js` and `local-client.js` never call the arbiter), so that priority does not exist; the lease is what holds a review off.
+
 ## Tests
 
 `src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),
-`scripts/gpu-arbiter-cli-endpoint.test.js` (remote-lane guard), `python/dashboard/test_chat_preempt.py` + `test_expected_instances.py`
+`scripts/gpu-arbiter-cli-endpoint.test.js` (remote-lane guard), `src/gpu-guard.test.js` + `scripts/comfyui-lease-endpoint.test.js` (endpoint-scoped lease, shell/JS parity), `python/dashboard/test_chat_preempt.py` + `test_expected_instances.py`
 (dashboard parity and preemption sets).
