@@ -203,6 +203,17 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
   start_bg "review-runner" "${PID_DIR}/review-runner.pid" "${LOG_DIR}/review-runner.log" \
     bash "${SCRIPT_DIR}/review-runner.sh" reviewer
 
+  # Extra review daemons: one per lane that opted in (src/lanes.js `reviewer`; the legacy P40 lane reads AGENT_MANAGER_P40_REVIEWER=true). Each runs with
+  # its lane's own Ollama env so its three votes go to THAT GPU, and claims items from queue/review/ per item (review-runner.sh), so two daemons never
+  # review the same task.
+  while read -r reviewer_id reviewer_lane; do
+    [[ -n "$reviewer_id" ]] || continue
+    mapfile -t reviewer_env < <(node "${SCRIPT_DIR}/../src/lanes.js" --env "$reviewer_lane")
+    start_bg "$reviewer_id" "${PID_DIR}/review-runner-${reviewer_id#reviewer-}.pid" "${LOG_DIR}/${reviewer_id}.log" \
+      env ${reviewer_env[@]+"${reviewer_env[@]}"} \
+      bash "${SCRIPT_DIR}/review-runner.sh" "$reviewer_id"
+  done < <(node "${SCRIPT_DIR}/../src/lanes.js" --reviewers)
+
   start_bg "queue-watchdog" "${PID_DIR}/queue-watchdog.pid" "${LOG_DIR}/queue-watchdog.log" \
     bash "${SCRIPT_DIR}/queue-watcher.sh" watchdog
 

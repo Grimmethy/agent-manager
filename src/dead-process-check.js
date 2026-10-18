@@ -35,7 +35,7 @@
 
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
-const { laneById, isSlowLane } = require('./lanes.js');
+const { laneById, isSlowLane, reviewerLanes } = require('./lanes.js');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { STALE_HEARTBEAT_SECONDS, WORKER_ZOMBIE_THRESHOLD_SECONDS } = require('./heartbeat-thresholds.js');
@@ -70,6 +70,13 @@ function restartTargetFor(instanceId) {
   }
   if (instanceId === 'reviewer') {
     return { script: 'review-runner.sh', args: ['reviewer'], pidfileName: 'review-runner.pid' };
+  }
+  if (instanceId.startsWith('reviewer-')) {
+    // An extra review daemon on a lane that opted in (src/lanes.js `reviewer`): restarts with that lane's Ollama env, exactly as launch.sh starts it.
+    const found = reviewerLanes().find((r) => r.reviewerId === instanceId);
+    if (!found) return null;
+    const hasEnv = Object.keys(found.lane.env).length > 0;
+    return { script: 'review-runner.sh', args: [instanceId], pidfileName: `review-runner-${instanceId.slice('reviewer-'.length)}.pid`, ...(hasEnv ? { env: found.lane.env } : {}) };
   }
   return null; // no rule -- e.g. 'watchdog' (never restarts itself) or an unrecognized instanceId.
 }

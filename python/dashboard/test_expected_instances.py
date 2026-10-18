@@ -27,7 +27,23 @@ class ExpectedInstancesTest(unittest.TestCase):
 
     def test_expected_ids_are_lanes_plus_reviewer_and_watchdog(self):
         with mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40"]):
-            self.assertEqual(app._expected_instance_ids(), ["worker-3090", "worker-p40", "reviewer", "watchdog"])
+            with mock.patch.object(app, "worker_lane_defs", return_value=[]):
+                self.assertEqual(app._expected_instance_ids(), ["worker-3090", "worker-p40", "reviewer", "watchdog"])
+
+    def test_a_lane_that_opts_in_adds_its_review_daemon(self):
+        defs = [{"id": "worker-3090", "reviewer": True, "reviewerId": "reviewer"},
+                {"id": "worker-p40", "reviewer": True, "reviewerId": "reviewer-p40"},
+                {"id": "worker-rx580", "reviewer": False, "reviewerId": "reviewer-rx580"}]
+        with mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40", "worker-rx580"]), \
+             mock.patch.object(app, "worker_lane_defs", return_value=defs):
+            self.assertEqual(app.reviewer_instance_ids(), ["reviewer", "reviewer-p40"])
+            self.assertEqual(app._expected_instance_ids(), ["worker-3090", "worker-p40", "worker-rx580", "reviewer", "reviewer-p40", "watchdog"])
+
+    def test_p40_reviewer_env_switch_reaches_the_dashboard_through_lanes_js(self):
+        env = {**os.environ, "AGENT_MANAGER_LOCAL_GPU": "3090", "AGENT_MANAGER_P40_OLLAMA_URL": "http://p40:11434",
+               "AGENT_MANAGER_P40_MODEL": "m", "AGENT_MANAGER_P40_REVIEWER": "true"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(app, "read_env_file", return_value={}):
+            self.assertEqual(app.reviewer_instance_ids(), ["reviewer", "reviewer-p40"])
 
     def test_worker_lane_ids_matches_the_node_lane_definition(self):
         """Parity: whatever src/lanes.js says, the dashboard says. One P40 configured -> two lanes."""
