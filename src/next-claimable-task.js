@@ -235,11 +235,14 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   let laneCount = 0;
   // This instance's own lane definition, for the task-class allowlist below (null for a non-lane instance, or on any error = unrestricted).
   let thisLane = null;
+  // The whole lane list, kept for the lane-avoidance check below (is there anywhere ELSE this task can go?). [] on any error = never avoid.
+  let claimLanes = [];
   try {
     const allLanes = opts.lanes || require('./lanes.js').getLanes();
+    claimLanes = allLanes;
     laneCount = allLanes.length;
     thisLane = allLanes.find((l) => l.id === instanceId) || null;
-  } catch (_) { laneCount = 0; thisLane = null; }
+  } catch (_) { laneCount = 0; thisLane = null; claimLanes = []; }
   const capRouting = require('./capability-routing.js');
   const routing = {
     cfg: capRouting.routingConfig(),
@@ -261,7 +264,21 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
 
     // A task that degenerated on THIS lane (task.avoidLanes, stamped by reject-retry-check.js) is left to another lane while one exists.
     // An explicit pin to this lane was handled above and still wins.
-    if (task && laneAvoided(task, instanceId, laneCount)) continue;
+    // The skip only holds while another lane exists that is not avoided, is allowed this task's source and is alive (premium-rotation.js laneAvoided ctx),
+    // so avoidance can never leave a task that no lane will claim. The source and heartbeat lookups only happen for a task that actually names this lane.
+    if (task && Array.isArray(task.avoidLanes) && task.avoidLanes.includes(instanceId)) {
+      let avoidSource = null;
+      try { avoidSource = resolveSourceName(task); } catch (_) { avoidSource = null; }
+      // "Alive" here means "not known to be down": a lane whose heartbeat file exists but is stale or flagged degraded is down; a lane that has never written a
+      // heartbeat is unknown, and unknown counts as a place the task can go (avoidance still steers it there). Only evidence of death strands nothing.
+      const avoidAlive = (id) => {
+        if (opts.laneAlive) return opts.laneAlive(id);
+        if (!fs.existsSync(path.join(routing.instancesDir, `${id}.json`))) return true;
+        return capRouting.laneAliveFromHeartbeat(routing.instancesDir, id);
+      };
+      const avoidCtx = { lanes: claimLanes, source: avoidSource, alive: avoidAlive };
+      if (laneAvoided(task, instanceId, laneCount, process.env, avoidCtx)) continue;
+    }
 
     // A lane with a taskClasses allowlist (lanes.js; e.g. an 8 GB GPU given only small bounded sources) is only offered tasks of
     // those sources. Fail closed: a task whose source can't be resolved is not offered to a restricted lane. An operator pin to

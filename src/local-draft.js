@@ -1574,7 +1574,7 @@ async function draftTask(task, deps = {}) {
     try {
       const lanes = require('./lanes.js').getLanes();
       if (require('./capability-routing.js').escalationLane(attempt, lanes)) {
-        const avoided = recordAvoidedLane(task, lanes.length);
+        const avoided = recordAvoidedLane(task, lanes.length, process.env, lanes);
         if (avoided) appendHistoryEvent(task, 'lane-escalated', `${attempt.reason || attempt.blockedReason || attempt.outcome} on ${avoided}; a larger lane gets the retry`);
       }
     } catch (_) { /* escalation is best-effort */ }
