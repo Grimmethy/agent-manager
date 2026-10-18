@@ -9,6 +9,7 @@ const path = require('path');
 const {
   CANONICAL_TOP_LEVEL,
   parseBrainDumpSortResult,
+  sanitizeTags,
   validateSecondBrainPath,
   normalizeSecondBrainPathCase,
   deriveBelongsToProject,
@@ -312,4 +313,46 @@ test('reviewBrainDumpSort: without promptContext, untracked label rejected (orig
   // Rejection shape is { ok:false, reason } (no belongsToProject leaked into the result).
   assert.match(result.reason, /not a tracked project label/);
   assert.ok(!('belongsToProject' in result), 'result must not carry belongsToProject');
+});
+
+
+// --- tags / project-label recovery (2026-10-17, quality check of the RX 580 8B) ------------
+
+test('placeholder tags copied from the prompt example are dropped; the note falls back to keywords from its file name', () => {
+  assert.deepEqual(sanitizeTags(['short', 'lowercase', 'keywords'], 'agent-manager/hub-task-extraction-plan.md'), ['hub', 'task', 'extraction', 'plan']);
+  assert.deepEqual(sanitizeTags(['<keyword>', 'retry'], 'x/y.md'), ['retry'], 'real tags survive, template tags are filtered out');
+  assert.deepEqual(sanitizeTags([], 'Journal/onboardingOnline-short-circuit-triage.md'), ['onboardingonline', 'short', 'circuit', 'triage']);
+  assert.deepEqual(sanitizeTags(['ui', 'progress'], 'a/b.md'), ['ui', 'progress']);
+  assert.deepEqual(sanitizeTags(null, ''), []);
+});
+
+test('parseBrainDumpSortResult applies the tag sanitizing to a model that copied the placeholder', () => {
+  const r = parseBrainDumpSortResult(JSON.stringify({ secondBrainPath: 'agent-manager/worker-daemon-reclaim-bug.md', tags: ['short', 'lowercase', 'keywords'], actionable: true }));
+  assert.deepEqual(r.tags, ['worker', 'daemon', 'reclaim', 'bug']);
+});
+
+test('an invented project label is recovered to the ONE other tracked project the note actually names, before self-recovery', () => {
+  const projectLabels = ['agent-manager', 'crm-plugin', 'credit-manager-plugin', 'PF-Client-Portal', 'inventory-plugin'];
+  const rawText = 'https://docs.google.com/spreadsheets/d/x/edit There is a lot to unpack here. This was my dashboard before dashboards were easy to make. There is credit and private debt information to automate.';
+  const d = deriveBelongsToProject({ belongsToProject: 'agent-manager-plugin-research', actionable: true, rationale: 'Automate data extraction from a legacy Google Sheet dashboard.' }, { projectLabels, selfProjectLabel: 'agent-manager', rawText });
+  assert.deepEqual(d, { belongsToProject: 'credit-manager-plugin', actionable: true });
+});
+
+test('invented-label recovery stays conservative: two evidenced projects, none evidenced, or a tracked label leave the old behaviour', () => {
+  const projectLabels = ['agent-manager', 'crm-plugin', 'inventory-plugin'];
+  const base = { selfProjectLabel: 'agent-manager', projectLabels };
+  const two = deriveBelongsToProject({ belongsToProject: 'made-up', actionable: true, rationale: '' }, { ...base, rawText: 'the crm and the inventory need the same field' });
+  assert.notEqual(two.belongsToProject, 'crm-plugin');
+  assert.notEqual(two.belongsToProject, 'inventory-plugin');
+  const none = deriveBelongsToProject({ belongsToProject: 'made-up', actionable: false, rationale: '' }, { ...base, rawText: 'buy milk' });
+  assert.equal(none.belongsToProject, 'made-up');
+  const tracked = deriveBelongsToProject({ belongsToProject: 'crm-plugin', actionable: true, rationale: '' }, { ...base, rawText: 'fix the crm export' });
+  assert.equal(tracked.belongsToProject, 'crm-plugin');
+});
+
+test('the implement prompt no longer ships a copyable placeholder tag list', () => {
+  const { brainDumpSortImplementPrompt } = require('./lib/prompt-implementation.js');
+  const p = brainDumpSortImplementPrompt({ promptContext: { rawText: 'x', projectLabels: [] } }, 'plan');
+  assert.ok(!p.includes('["short", "lowercase", "keywords"]'));
+  assert.match(p, /3 to 6 lowercase keywords taken from THIS note/);
 });
