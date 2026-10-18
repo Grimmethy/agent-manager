@@ -16,6 +16,8 @@ const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const inflightLock = require('./model-inflight-lock.js');
 const gpuCapacity = require('./gpu-capacity.js');
+const gpuGuard = require('./gpu-guard.js');
+const { isSlowEndpoint } = require('./lanes.js');
 const localThroughput = require('./local-throughput.js');
 const { currentDateLine } = require('./current-date-line.js');
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
@@ -147,6 +149,9 @@ const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
 // the P40 lane, confirmed by comparing the two resolved env vars directly rather than
 // guessing from a hostname pattern.
 const IS_P40_ENDPOINT = !!process.env.AGENT_MANAGER_P40_OLLAMA_URL && OLLAMA_URL === process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+// 2026-10-17: lanes are data now (src/lanes.js). ANY lane marked `slow` -- the P40 and any registry lane with "slow": true -- gets the same
+// longer per-call ceiling; IS_P40_ENDPOINT stays for the legacy match, IS_SLOW_ENDPOINT is what the ceiling below keys on.
+const IS_SLOW_ENDPOINT = IS_P40_ENDPOINT || isSlowEndpoint(OLLAMA_URL);
 // No hardcoded fallback tag here on purpose (2026-08-22, Grimmethy: "The models are or
 // should be fully interchangeable and their names should not be hardcoded anywhere") --
 // this used to fall back to the bare literal string 'ornith', which isn't a real Ollama
@@ -259,7 +264,40 @@ function estimateTokens(text) {
   return Math.ceil((text || '').length / 4); // rough chars-per-token estimate -- only used to bucket a context window and a timeout budget, not to enforce a hard limit.
 }
 
-async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+// 2026-10-17 (first call on grimm's 8 GB lane): a model WITHOUT the thinking capability (qwen3-vl:8b-instruct) rejects any request carrying
+// think:true with HTTP 400 `"<model>" does not support thinking`, and callOnce's default is think:true, so every plan/implement pass on such a
+// lane hard-failed in ~2 ms. Learn it once per (endpoint, model): on that exact 400, retry the same request WITHOUT the think field (omitted rather
+// than false, so it is accepted whichever way a given Ollama treats think:false on a non-thinking model), and send later requests for that model
+// without it up front. Any other error, or a request that did not ask for thinking, is untouched.
+const THINK_UNSUPPORTED = new Set(); // `${url}|${model}`
+const THINK_UNSUPPORTED_RE = /does not support thinking/i;
+function isThinkUnsupportedError(e) {
+  return !!e && e.statusCode === 400 && THINK_UNSUPPORTED_RE.test(String(e.message || ''));
+}
+function withoutThink(body) {
+  const { think, ...rest } = body;
+  void think;
+  return rest;
+}
+async function postGenerate({ url, body, timeoutMs, headers, post = postJson, unsupported = THINK_UNSUPPORTED }) {
+  const key = `${url}|${body.model}`;
+  const target = `${url}/api/generate`;
+  const sent = (body.think && unsupported.has(key)) ? withoutThink(body) : body;
+  try {
+    return await post(target, sent, timeoutMs, headers);
+  } catch (e) {
+    if (sent.think && isThinkUnsupportedError(e)) {
+      unsupported.add(key);
+      return post(target, withoutThink(sent), timeoutMs, headers);
+    }
+    throw e;
+  }
+}
+
+async function callOnce({ prompt, images, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
+  // Forge exclusion (2026-10-14): never START a model call while PromptForge's comfyui-lease is held -- it would reload the model
+  // PromptForge just evicted. Checked here, before any prompt building, in-flight lock or network I/O. See gpu-guard.js ForgePauseError.
+  if (gpuGuard.forgePauseEnabled() && gpuGuard.comfyuiLeaseHeld()) throw new gpuGuard.ForgePauseError();
   // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header):
   // tell the model the SIDE-FINDING: convention exists, unless this specific call needs
   // clean/parseable-only output (allowSideFindings: false -- set by known strict-schema
@@ -286,6 +324,8 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
 
   const options = { num_ctx: resolvedNumCtx, num_predict: numPredict, temperature };
   if (repeatPenalty) options.repeat_penalty = repeatPenalty;
+  const laneBatch = gpuCapacity.laneNumBatch();
+  if (laneBatch) options.num_batch = laneBatch; // this lane's own prompt-processing batch (lanes registry numBatch)
 
   const body = { model: model || MODEL, prompt: datedPrompt, think, stream: false, keep_alive: KEEP_ALIVE, options };
   // Grammar-constrained decoding. When `format` is set ("json", or a full JSON-schema object),
@@ -296,6 +336,8 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // implement draft came back ```json-fenced despite that exact instruction). The constraint
   // applies only to `response`; the `thinking` trace is left unconstrained.
   if (format) body.format = format;
+  // Vision call (lib/task-images.js): base64 pictures the model should look at. Ollama's /api/generate `images` field.
+  if (Array.isArray(images) && images.length) body.images = images;
 
   // In-flight lock (model-inflight-lock.js) -- held for the exact span of the real
   // network call, so agent-manager-common.sh's should_yield_for_model_swap can see "a
@@ -324,7 +366,7 @@ async function callOnce({ prompt, think = true, temperature = 0.4, numCtx, numPr
   // default/global scope when omitted, same as it always did before this existed.
   if (source) tokenFoldHeaders['X-TokenFold-Scope'] = source;
   try {
-    const result = await postJson(`${OLLAMA_URL}/api/generate`, body, resolvedTimeoutMs, tokenFoldHeaders);
+    const result = await postGenerate({ url: OLLAMA_URL, body, timeoutMs: resolvedTimeoutMs, headers: tokenFoldHeaders });
     localThroughput.recordSample(instancesDir, { evalCount: result.eval_count, evalDurationNs: result.eval_duration, endpoint: OLLAMA_URL, model: lockModel });
     // 2026-08-23, Grimmethy: "we need a way to differentiate 'working' from 'loading'...
     // this isn't the first time a lack of verbosity has caused us confusion" -- Ollama's
@@ -404,8 +446,8 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model
     promptTokens,
     numPredict,
     tokensPerSecond,
-    ceilingMs: IS_P40_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : PER_CALL_TIMEOUT_CEILING_MS,
-    hardCeilingMs: IS_P40_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : undefined,
+    ceilingMs: IS_SLOW_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : PER_CALL_TIMEOUT_CEILING_MS,
+    hardCeilingMs: IS_SLOW_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : undefined,
   });
 }
 
@@ -456,25 +498,40 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model
 const TRUNCATION_RETRY_MULTIPLIER = 2;
 const TRUNCATION_RETRY_NUM_PREDICT_CEILING = 8000;
 
+// How many HARD failures (timeout, connection refused, HTTP 5xx -- anything that makes callOnce() throw) one call() may absorb. Kept
+// separate from `maxRetries`, which now bounds only attempts that returned a response: 2026-10-16, a plan call on the P40 hit an HTTP 500,
+// then a 427 s timeout, and its first real response (truncated at numPredict 1400) arrived on attempt 3 -- the loop was over, so the
+// truncation escalation below (numPredict x2, think off) never got to run and the task was recorded as 'Plan pass degenerate: truncated'.
+// Equal to maxRetries + 1, i.e. exactly the attempts a call that never gets any response has always made.
+function hardFailureAllowance(maxRetries) {
+  return maxRetries + 1;
+}
+
 async function call(opts, maxRetries = 2) {
   let lastDegenerate = null;
   let lastError = null;
   let gotAnyResponse = false;
   let callOpts = opts;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  let responses = 0;
+  let hardFailures = 0;
+  const maxHardFailures = hardFailureAllowance(maxRetries);
+  for (let attempt = 0; responses <= maxRetries && hardFailures < maxHardFailures; attempt++) {
     let result;
     try {
       result = await callOnce(callOpts);
     } catch (e) {
+      if (gpuGuard.isForgePause(e)) throw e;   // not a failure: no retry, no hard-failure audit (the lease is still held on every attempt)
       lastError = e;
+      hardFailures += 1;
       logHardFailureAudit({
         source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
         model: opts.model || MODEL, code: e.code || null, message: String(e.message || e).slice(0, 300),
-        timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode,
+        timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode, think: callOpts.think,
       });
       continue;
     }
     gotAnyResponse = true;
+    responses += 1;
     // Extract any SIDE-FINDING: block(s) BEFORE degenerate-detection judges the response,
     // so a response that's otherwise degenerate/empty except for a stray finding isn't
     // misjudged either way, and so the caller's own downstream RESOLUTION:/JSON parsing
@@ -520,6 +577,9 @@ async function call(opts, maxRetries = 2) {
       source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
       model: opts.model || MODEL, numPredict: callOpts.numPredict, doneReason: result.done_reason,
       degenerate, promptEvalCount: result.prompt_eval_count, evalCount: result.eval_count,
+      // Whether THIS attempt asked for reasoning: the think-off retry below could not be verified from the log before (2026-10-16: 3090 attempts 2
+      // and 3 still hit their ceiling with evalCount == numPredict and nothing recorded about think).
+      think: callOpts.think,
     });
     if (degenerate === 'truncated' && callOpts.numPredict) {
       const escalated = Math.min(
@@ -551,7 +611,7 @@ async function call(opts, maxRetries = 2) {
   // not -- a degenerate response on an earlier attempt followed by a hard failure on a
   // later retry is still a real, legitimate degenerate outcome, not an infra failure.
   if (!gotAnyResponse && lastError) throw lastError;
-  return { response: '', thinking: '', degenerate: lastDegenerate, attempts: maxRetries + 1 };
+  return { response: '', thinking: '', degenerate: lastDegenerate, attempts: responses + hardFailures };
 }
 
 // Majority-vote helper for qualitative judgment calls. Runs the SAME prompt `n` times
@@ -585,6 +645,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
     try {
       result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
     } catch (e) {
+      if (gpuGuard.isForgePause(e)) throw e;   // the Forge family took the GPU mid-vote: abandon the whole vote (never tally the partial one)
       // This ONE vote hard-failed (e.g. a network timeout that survived call()'s own
       // retry above) -- must not abort the other n-1 votes, which may well succeed under
       // exactly the same slow-but-not-dead conditions. See this function's own 2026-08-23
@@ -646,7 +707,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

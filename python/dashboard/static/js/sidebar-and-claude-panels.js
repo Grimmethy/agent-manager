@@ -15,6 +15,15 @@
 // path without re-fetching /api/plugins on every single click.
 let _persistentSidebarPlugins = [];
 
+// Expand or collapse a persistent-sidebar plugin's sheet and keep its toggle pill in step: the pill carries .sidebar-open while the sheet
+// is expanded (on a phone the CSS moves it up to the sheet's top edge so the sheet cannot cover the one control that hides it), and the
+// choice is stored. Mounting does not call this (it must not overwrite a stored choice with the screen-size default).
+function setPluginSidebarCollapsed(aside, toggle, collapsed) {
+  aside.classList.toggle('sidebar-collapsed', collapsed);
+  if (toggle) toggle.classList.toggle('sidebar-open', !collapsed);
+  localStorage.setItem(`agentManagerPluginSidebar:${aside.dataset.plugin}`, collapsed ? 'collapsed' : 'expanded');
+}
+
 async function mountPersistentSidebarPlugins() {
   const layout = document.getElementById('layout');
   if (!layout) return;
@@ -32,7 +41,10 @@ async function mountPersistentSidebarPlugins() {
   document.querySelectorAll('.plugin-sidebar-toggle').forEach((el) => el.remove());
   for (const plugin of plugins) {
     const storageKey = `agentManagerPluginSidebar:${plugin.name}`;
-    const collapsed = localStorage.getItem(storageKey) === 'collapsed';
+    // A stored choice wins; with none, a phone-sized screen starts collapsed (the sheet is 65vh there) and a desktop starts expanded.
+    const stored = localStorage.getItem(storageKey);
+    const narrow = !!(window.matchMedia && window.matchMedia('(max-width: 860px)').matches);
+    const collapsed = stored === 'collapsed' || (stored === null && narrow);
     const proxyBase = `/api/plugins/${encodeURIComponent(plugin.name)}/proxy`;
     // Every plugin route this dashboard proxies to is expected to serve its own real
     // page at "<proxyBase>/<something>" (see agent-manager-chat-plugin's own GET /chat
@@ -57,10 +69,8 @@ async function mountPersistentSidebarPlugins() {
     toggle.dataset.plugin = plugin.name;
     toggle.title = `Show/hide ${plugin.description || plugin.name}`;
     toggle.textContent = plugin.sidebarLabel || 'Chat';
-    toggle.onclick = () => {
-      const isCollapsed = aside.classList.toggle('sidebar-collapsed');
-      localStorage.setItem(storageKey, isCollapsed ? 'collapsed' : 'expanded');
-    };
+    toggle.onclick = () => setPluginSidebarCollapsed(aside, toggle, !aside.classList.contains('sidebar-collapsed'));
+    toggle.classList.toggle('sidebar-open', !collapsed);
     document.body.appendChild(toggle);
   }
 }
@@ -89,8 +99,7 @@ async function sendTextToChat(text) {
   await r.json().catch(() => null);
   const aside = document.querySelector(`.plugin-sidebar[data-plugin="${plugin.name}"]`);
   if (aside) {
-    aside.classList.remove('sidebar-collapsed');
-    localStorage.setItem(`agentManagerPluginSidebar:${plugin.name}`, 'expanded');
+    setPluginSidebarCollapsed(aside, document.querySelector(`.plugin-sidebar-toggle[data-plugin="${plugin.name}"]`), false);
     const iframe = aside.querySelector('iframe');
     if (iframe && iframe.contentWindow) iframe.contentWindow.postMessage({ type: 'agent-manager-chat-refresh' }, '*');
   }

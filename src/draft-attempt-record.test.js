@@ -238,3 +238,17 @@ test('collapseOldAttempts is idempotent and a no-op below the threshold', () => 
   collapseOldAttempts(task.draftAttempts);
   assert.equal(JSON.stringify(task.draftAttempts), snapshot, 're-collapsing changes nothing');
 });
+
+
+test('beginDraftAttempt stamps the lane (AGENT_MANAGER_INSTANCE_ID) so a plan-degenerate block can steer the task away from it', () => {
+  const { beginDraftAttempt } = require('./draft-attempt-record.js');
+  const prev = process.env.AGENT_MANAGER_INSTANCE_ID;
+  try {
+    process.env.AGENT_MANAGER_INSTANCE_ID = 'worker-p40';
+    assert.equal(beginDraftAttempt({ id: 't' }).lane, 'worker-p40');
+    delete process.env.AGENT_MANAGER_INSTANCE_ID;
+    assert.equal(beginDraftAttempt({ id: 't' }).lane, null);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_INSTANCE_ID; else process.env.AGENT_MANAGER_INSTANCE_ID = prev;
+  }
+});

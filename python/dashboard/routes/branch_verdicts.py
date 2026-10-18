@@ -20,7 +20,7 @@ def api_git_record_branch_verdict(branch):
         abort(404, description="no pipeline queue directory resolvable")
 
     # Only branches this process itself lists are accepted -- same gate as the merge/discard endpoints.
-    match = next((b for b in list_unmerged_branches(force=True) if b["branch"] == branch), None)
+    match = next((b for b in list_unmerged_branches(force=False) if b["branch"] == branch), None)
     if not match:
         abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 
@@ -32,6 +32,8 @@ def api_git_record_branch_verdict(branch):
     if err:
         return jsonify({"succeeded": False, "reason": err}), 400
 
+    # A stale cached card can only make this a spurious 409 (re-verify) or bind the verdict to the older commit the caller named, which then reads back stale -- never a wrong
+    # verdict for a commit nobody checked, so the cached headSha (with the rev-parse fallback) is kept.
     head_sha = match.get("headSha") or _run_git(["rev-parse", f"origin/{branch}"], repo_root).strip()
     claimed = body.get("sha")
     if claimed and claimed != head_sha:
@@ -41,6 +43,6 @@ def api_git_record_branch_verdict(branch):
     if written:
         task_ids, hub_id = bv.resolve_owner(repo_root, match.get("mainBranch") or "master", branch, _run_git, qdir,
                                             get_hub_data_provider().hub_for_branch, match.get("taskId"))
-        bv.write_task_log(qdir, task_ids, hub_id or (match.get("hub") or {}).get("id"), branch, verdict, reasons, source)
-    _invalidate_branch_cache()
+        bv.write_task_log(qdir, task_ids, hub_id or (match.get("hub") or {}).get("id"), branch, verdict, reasons, source, head_sha)
+    _invalidate_branch_cache(refetch=False)  # a verdict moves no remote ref: drop the cached cards (they carry the verdict) but skip the fetch
     return jsonify({"succeeded": True, "written": written, "headSha": head_sha, **bv.get_verdict(qdir, branch, head_sha)})

@@ -28,11 +28,21 @@ GRACE_SEC="${AGENT_MANAGER_STOP_GRACE_SEC:-90}"
 # dashboard toggle button's second click ("Force Stop Pipeline"), for when a daemon is
 # stuck (wedged mid model-call, ignoring its own trap) and the user doesn't want to wait
 # out the grace period.
+#
+# --keep-plugins: skip every plugin-<name>.pid (promptforge, characterforge, storyforge, videoforge, ...).
+# Plugin servers are the dashboard's tab servers, started by POST /api/plugins/<name>/ensure-started, NOT by
+# launch.sh -- but python/dashboard/plugin_process_manager.py writes their pidfiles into this same folder, so
+# the loop below used to SIGTERM them along with the pipeline daemons. Confirmed live 2026-10-14 (three
+# times): every pipeline stop took all plugin ports down, killing a Forge render job mid-run and causing the
+# earlier unexplained "plugins found down" outages. The dashboard's /api/pipeline/stop passes this flag; a
+# bare `scripts/stop.sh` from a terminal ("stop everything") keeps stopping plugins too.
 KEEP_DASHBOARD=false
+KEEP_PLUGINS=false
 FORCE=false
 for arg in "$@"; do
   case "$arg" in
     --keep-dashboard) KEEP_DASHBOARD=true ;;
+    --keep-plugins) KEEP_PLUGINS=true ;;
     --force) FORCE=true ;;
   esac
 done
@@ -111,6 +121,10 @@ for pidfile in "${pidfiles[@]}"; do
   if [[ "$name" == "dashboard" && "$KEEP_DASHBOARD" == true ]]; then
     printf '[stop] skipping dashboard (--keep-dashboard)\n'
     continue
+  fi
+  if [[ "$name" == plugin-* && "$KEEP_PLUGINS" == true ]]; then
+    printf '[stop] skipping %s (--keep-plugins)\n' "$name"
+    continue                                    # BEFORE the rm -f below: the pidfile must survive too
   fi
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -194,7 +208,13 @@ sweep_orphans
 # that pair even when the tracked pid IS the true parent. `pgrep -f` matches both the
 # reloader and its re-exec'd child (same cmdline), same as --keep-dashboard is honored below
 # by simply not adding this pattern when that flag is set.
-if [[ "$KEEP_DASHBOARD" != true ]]; then
+# AGENT_MANAGER_STOP_STRAY_PATTERN overrides the pgrep pattern (like AGENT_MANAGER_STOP_ORPHAN_PATTERN above) so
+# tests that give this script pidfiles -- and therefore reach this system-wide sweep -- can point it at a private
+# marker instead of SIGKILLing a real pipeline's local-worker.sh / review-runner.sh on the same machine. Unset,
+# the patterns below are exactly what they always were.
+if [[ -n "${AGENT_MANAGER_STOP_STRAY_PATTERN:-}" ]]; then
+  stray_pids="$(pgrep -f "$AGENT_MANAGER_STOP_STRAY_PATTERN" 2>/dev/null || true)"
+elif [[ "$KEEP_DASHBOARD" != true ]]; then
   stray_pids="$(pgrep -f 'scripts/(local-worker|review-runner)\.sh|python/dashboard/app\.py' 2>/dev/null || true)"
 else
   stray_pids="$(pgrep -f 'scripts/(local-worker|review-runner)\.sh' 2>/dev/null || true)"

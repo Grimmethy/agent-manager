@@ -40,6 +40,12 @@ function revisionKeepsAnswerShape(task, revised) {
 async function runCritiqueAndRevision(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
 }) {
+  // Deliberate 2026-08-25 data-driven skip, NOT dead weight: advisory-prose sources
+  // (observability_review / performance_review et al.) produce short prose verdicts, not
+  // code diffs, and critique was a measurable no-op 90.9%/94.9% of the time across
+  // 1341+453 real runs (12.2 combined hours) while the same verdict already goes through
+  // the full independent majority-vote review immediately after. Full rationale with the
+  // measured data: src/local-draft.js:956-974 (this file's pre-extraction home).
   if (isAdvisoryProseSource(resolveSourceName(task))) {
     return;
   }
@@ -85,6 +91,44 @@ async function runCritiqueAndRevision(task, {
     }
   } catch (err) {
     console.warn('[local-draft] pre-critique find-string check failed (advisory):', (err && err.message) || err);
+  }
+
+  // Test-framework gate (lib/test-framework.js, 2026-10-08): a test file this change CREATES must be written for a framework its package can run. Three
+  // TaxHarvest drafts created jest / @testing-library tests in packages that have neither (the frontend has no runner at all); each was dead code that only a
+  // hand check caught. Deterministic and precise, so unlike the advisory pre-filters above it blocks the draft BEFORE the critique call, with the exact
+  // fix in the feedback the redraft sees. The same files blocked twice in a row downgrade to an advisory, so a false positive can never strand a task.
+  // AGENT_MANAGER_TEST_FRAMEWORK_GATE=block|advisory|off.
+  try {
+    const tfw = require('./test-framework.js');
+    const mode = tfw.gateMode();
+    if (mode !== 'off') {
+      let items = null;
+      try { items = parseJsonMaybeFenced(task.implementResponse || ''); } catch { items = null; }
+      if (items && !Array.isArray(items)) items = [items];
+      const { files, packageText } = tfw.inspectChangeSet(items || []);
+      const tfFlags = files.length ? tfw.checkNewTestFiles({ repoRoot: getConfig().repoRoot, files, packageText }) : [];
+      if (tfFlags.length) {
+        const names = tfFlags.map((f) => f.file).sort();
+        const repeat = Array.isArray(task.testFrameworkBlocked) && task.testFrameworkBlocked.join('|') === names.join('|');
+        const feedback = tfw.feedbackFor(tfFlags);
+        if (mode === 'advisory' || repeat) {
+          appendHistoryEvent(task, 'advisory', `test-framework gate (${repeat ? 'same files blocked before, not blocking again' : 'advisory mode'}): ${feedback}`.slice(0, 600));
+          delete task.testFrameworkBlocked;
+        } else {
+          const blockedReason = `Test framework not usable: ${feedback}`.slice(0, 700);
+          task.testFrameworkBlocked = names;
+          task.critiqueOutcome = 'test-framework-failed';
+          task.blockedStage = 'review';
+          task.blockedReason = blockedReason;
+          task.priorRejectionFeedback = [...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), blockedReason];
+          recordCritique(attempt, { outcome: 'test-framework-failed' });
+          appendHistoryEvent(task, 'critique-done', blockedReason);
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[local-draft] test-framework gate failed (advisory):', (err && err.message) || err);
   }
 
   const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
@@ -216,8 +260,91 @@ async function runCritiqueAndRevision(task, {
     // Revision came back degenerate: bounded to one attempt, leave original draft
     // intact rather than lose a working draft to a bad revision call.
   }
+  if (await recheckFinalEdits(task, { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall })) return;
   recordCritique(attempt, { outcome: task.critiqueOutcome, revised: !!task.revisionApplied });
   appendHistoryEvent(task, 'critique-done', task.revisionApplied ? `${task.critiqueOutcome}, revised` : task.critiqueOutcome);
+}
+
+// Hard re-check of the FINAL edit set (lib/find-recheck.js + lib/edit-set-syntax.js, 2026-10-08, TaxHarvest AC-271): the pre-critique find-string check is
+// advisory and the critique's revision replaces the edit set unchecked, so an invented `find` (or an edit that leaves a file unparsable) used to reach
+// review and fail at apply -- or worse, reach pending-merge. Replays the edits in apply order and checks (1) every find matches exactly once and (2) every
+// created/edited .py/.js/.json/.ts/.tsx file still parses. On a problem it makes ONE bounded fix call that shows the real lines, and if that still fails
+// blocks the draft with the same feedback for the redraft. The same problem twice in a row, and advisory mode, record an advisory instead.
+// AGENT_MANAGER_FIND_RECHECK / AGENT_MANAGER_EDIT_SYNTAX_GATE = block|advisory|off. Returns true when the draft was blocked.
+async function recheckFinalEdits(task, { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall }) {
+  try {
+    if (!usesGroupB(task)) return false;
+    const fr = require('./find-recheck.js');
+    const es = require('./edit-set-syntax.js');
+    const findMode = fr.recheckMode();
+    const synMode = es.syntaxGateMode();
+    if (findMode === 'off' && synMode === 'off') return false;
+    const parse = (text) => { try { const v = parseJsonMaybeFenced(text || ''); return v ? (Array.isArray(v) ? v : [v]) : null; } catch { return null; } };
+    const repoRoot = getConfig().repoRoot;
+    // -> null when the set is sound, else { kind, mode, feedback, sig, count }; the syntax report rides along for the task stamp.
+    const problemsOf = (items) => {
+      const sim = fr.simulateEditsDetailed(items, repoRoot);
+      if (findMode !== 'off' && sim.flags.length) return { kind: 'find', mode: findMode, feedback: fr.feedbackFor(sim.flags), sig: `find|${fr.signatureOf(sim.flags)}`, count: sim.flags.length };
+      if (synMode === 'off' || sim.flags.length) return { none: true, syntax: null };
+      const syn = es.checkEditSetSyntax(items, repoRoot, { detailed: sim });
+      if (syn.failed.length) return { kind: 'syntax', mode: synMode, feedback: es.syntaxFeedbackFor(syn.failed), sig: `syntax|${es.syntaxSignature(syn.failed)}`, count: syn.failed.length, syntax: syn };
+      return { none: true, syntax: syn };
+    };
+    const stamp = (syn) => {
+      if (!syn) return;
+      task.editSetSyntax = { at: new Date().toISOString(), checked: syn.checked, skipped: syn.skipped, failed: syn.failed.map((f) => f.file), preexisting: syn.preexisting };
+    };
+    const items = parse(task.implementResponse);
+    if (!items) return false;
+    const first = problemsOf(items);
+    if (first.none) { stamp(first.syntax); return false; }
+    const repeat = task.findRecheckBlocked === first.sig;
+    if (first.mode === 'advisory' || repeat) {
+      appendHistoryEvent(task, 'advisory', `${first.kind === 'syntax' ? 'edit-set syntax' : 'find-string'} recheck (${repeat ? 'same failure blocked before, not blocking again' : 'advisory mode'}): ${first.feedback}`.slice(0, 600));
+      delete task.findRecheckBlocked;
+      return false;
+    }
+    if (typeof resolvedLocalCall === 'function') {
+      const prompt = [
+        first.kind === 'syntax'
+          ? 'The edit set below leaves a file that DOES NOT PARSE after it is applied, so it would break the module.'
+          : 'The edit set below CANNOT be applied: apply requires every `find` to match the real file EXACTLY ONCE, in order.',
+        '', 'ORIGINAL TASK PLAN:', String(task.planResponse || '').slice(0, 3000),
+        '', 'CURRENT EDIT SET:', String(task.implementResponse || '').slice(0, 9000),
+        '', first.kind === 'syntax' ? 'WHAT WILL BREAK (with the lines of the resulting file):' : 'WHAT WILL FAIL (with the real nearby lines):', first.feedback,
+        '', 'Return the corrected edit set ONLY, as the same JSON array, with every `find` copied character for character from the real lines. Do not add commentary.',
+      ].join('\n');
+      const startedAt = new Date().toISOString();
+      const startMs = Date.now();
+      const fixResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt, think: profileSupportsThink, temperature: 0.2, numPredict: 1400, source: task.source, taskId: task.id, stage: 'revise' }), 'revise');
+      if (recordModelCall) recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: fixResult, source: task.source, stage: 'revise' });
+      const fixed = fixResult && !fixResult.degenerate ? fixResult.response : null;
+      if (fixed && revisionKeepsAnswerShape(task, fixed)) {
+        const fixedItems = parse(fixed);
+        const again = fixedItems ? problemsOf(fixedItems) : null;
+        if (again && again.none) {
+          task.implementResponse = fixed;
+          task.revisionApplied = true;
+          delete task.findRecheckBlocked;
+          stamp(again.syntax);
+          appendHistoryEvent(task, 'advisory', `${first.kind === 'syntax' ? 'edit-set syntax' : 'find-string'} recheck: ${first.count} failing item(s) corrected by one bounded fix call`);
+          return false;
+        }
+      }
+    }
+    const blockedReason = (first.kind === 'syntax' ? `Edit set would leave a file that does not parse: ${first.feedback}` : `Edit set would not apply: ${first.feedback}`).slice(0, 900);
+    task.findRecheckBlocked = first.sig;
+    task.critiqueOutcome = first.kind === 'syntax' ? 'edit-syntax-failed' : 'find-recheck-failed';
+    task.blockedStage = 'review';
+    task.blockedReason = blockedReason;
+    task.priorRejectionFeedback = [...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), blockedReason];
+    try { recordCritique(attempt, { outcome: task.critiqueOutcome }); } catch { /* telemetry must not turn a block into a pass */ }
+    appendHistoryEvent(task, 'critique-done', blockedReason);
+    return true;
+  } catch (err) {
+    console.warn('[local-draft] edit-set recheck failed (advisory):', (err && err.message) || err);
+    return false;
+  }
 }
 
 function computeImplementBudget(task, implPrompt) {
@@ -387,7 +514,21 @@ function computeImplementBudget(task, implPrompt) {
   };
 }
 
-async function callImplementModel(task, ctx, { recordModelCall, implPrompt, budget }) {
+// The project's real test conventions (lib/test-framework.js), appended to an implement prompt when the task concerns tests. Never throws.
+function withTestConventions(task, prompt) {
+  try {
+    const { extractDeclaredTargets } = require('../adhoc-diff-sanity.js');
+    const tfw = require('./test-framework.js');
+    const files = new Set(extractDeclaredTargets(task, task.planResponse || ''));
+    const pf = task.promptContext && task.promptContext.files;
+    if (Array.isArray(pf)) for (const f of pf) { const p = typeof f === 'string' ? f : f && f.path; if (p) files.add(p); }
+    const block = tfw.testConventionsBlock(getConfig().repoRoot, task, [...files]);
+    return block ? `${prompt}\n\n${block}` : prompt;
+  } catch { return prompt; }
+}
+
+async function callImplementModel(task, ctx, { recordModelCall, implPrompt: baseImplPrompt, budget }) {
+  const implPrompt = withTestConventions(task, baseImplPrompt);
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
   const { hasFixedLiterals, implNoThink, implNumPredict, implNumCtx, allowEmptyImplement } = budget;
   const implStartedAt = new Date().toISOString();
@@ -503,4 +644,4 @@ function checkFindStrings(implementResponse, repoRoot) {
   return flags;
 }
 
-module.exports = { revisionKeepsAnswerShape, runCritiqueAndRevision, computeImplementBudget, callImplementModel, checkFindStrings };
+module.exports = { withTestConventions, recheckFinalEdits, revisionKeepsAnswerShape, runCritiqueAndRevision, computeImplementBudget, callImplementModel, checkFindStrings };

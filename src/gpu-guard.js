@@ -66,6 +66,51 @@ function comfyuiLeaseHeld(leasePath = COMFY_LEASE_PATH) {
   }
 }
 
+// A local-model call that would START while the Forge family holds the GPU is refused with this error (2026-10-14).
+// The tick-level yield in local-worker.sh / review-runner.sh only sees a tick boundary; a task ALREADY running makes
+// several calls in a row, and one began ~5 min into a Forge session, reloaded the 19 GB model after PromptForge had
+// evicted it, and left ComfyUI with <1 GB of VRAM (the render stalled 7+ min). Callers must NOT treat this as a model
+// failure: the worker/reviewer leave the item in place with no failure count and no cap (same idea as the 'manually
+// paused' path in local-worker.sh), and advisory checks must rethrow it instead of degrading to "ok". Detect it with
+// isForgePause(), which also recognises the message text after an Error was re-wrapped.
+const FORGE_PAUSE_MESSAGE = 'paused: the Forge family holds the GPU (comfyui-lease) -- no model call was started';
+class ForgePauseError extends Error {
+  constructor() {
+    super(FORGE_PAUSE_MESSAGE);
+    this.name = 'ForgePauseError';
+    this.forgePause = true;
+  }
+}
+function isForgePause(e) {
+  return !!(e && (e.forgePause === true || e instanceof ForgePauseError || /the Forge family holds the GPU/.test(String(e.message || ''))));
+}
+// Kill switch, read per call (not at load): AGENT_MANAGER_FORGE_PAUSE=off restores the old behaviour.
+function forgePauseEnabled() { return process.env.AGENT_MANAGER_FORGE_PAUSE !== 'off'; }
+
+// Forge family exclusion (2026-10-13, Grimmethy: "we cannot run the Agent Manager pipeline and Forge pipeline
+// at the same time ... starting up one process should stop the other and clear the GPU"). PromptForge is the
+// Forge family's GPU broker (promptforge Docs/GPU_FAMILY_PROTOCOL.md): while a Forge session holds the
+// comfyui-lease the pipeline yields (above). The other direction is here: with NO lease, a ComfyUI that is
+// still up is the Forge family holding VRAM + RAM the pipeline is about to need, so ask PromptForge to end its
+// session and stop ComfyUI. PromptForge refuses while a Forge job is actually running; if PromptForge is down
+// we do nothing here and the existing starved -> /free path below still applies. Opt-in via the `forgeYield`
+// parameter (the CLI passes it; unit tests do not, so they never touch the live PromptForge).
+const PROMPTFORGE_URL = (process.env.AGENT_MANAGER_PROMPTFORGE_URL || process.env.PROMPTFORGE_URL || 'http://localhost:7430').replace(/\/$/, '');
+
+// Returns { acted, note }. Never throws.
+async function yieldForgeToPipeline({ comfyUrl = COMFY_URL, promptforgeUrl = PROMPTFORGE_URL, fetchJsonFn = fetchJson } = {}) {
+  try {
+    const up = await fetchJsonFn(`${comfyUrl}/system_stats`, {}, 2000);
+    if (!up || !up.ok) return { acted: false, note: '' };            // ComfyUI is not running: nothing to clear
+    const r = await fetchJsonFn(`${promptforgeUrl}/api/gpu/yield`, { method: 'POST' }, 30000);
+    if (!r || !r.ok || !r.body) return { acted: false, note: `ComfyUI is up with no Forge lease but PromptForge (${promptforgeUrl}) did not answer /api/gpu/yield` };
+    if (r.body.yielded) return { acted: true, note: `ComfyUI was up with no Forge lease -- PromptForge ended its session and stopped it (${r.body.reason || 'yielded'})` };
+    return { acted: false, note: `ComfyUI is up and PromptForge declined to yield: ${r.body.reason || 'busy'}` };
+  } catch (e) {
+    return { acted: false, note: '' };
+  }
+}
+
 const MIN_FREE_VRAM_MB = Number(process.env.AGENT_MANAGER_MIN_FREE_VRAM_MB) || 4096;
 const THEAGENT_URL = process.env.AGENT_MANAGER_THEAGENT_URL || 'http://localhost:4519';
 // ComfyUI exposes its own POST /free -- it unloads models and frees VRAM without
@@ -138,7 +183,7 @@ async function fetchJson(url, options = {}, timeoutMs = 5000) {
 // Never throws -- every failure mode (no nvidia-smi, TheAgent not running, app already
 // stopped, stop call itself fails) degrades to "did nothing" rather than blocking the
 // caller's own tick.
-async function ensureGpuHeadroom({
+async function ensureGpuHeadroomCore({
   minFreeMb = MIN_FREE_VRAM_MB,
   theAgentUrl = THEAGENT_URL,
   comfyUrl = COMFY_URL,
@@ -226,10 +271,24 @@ async function ensureGpuHeadroom({
   };
 }
 
-module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld };
+// Public entry: the Forge family yield (see yieldForgeToPipeline) runs first, only when no Forge lease is held,
+// then the unchanged headroom check. Its note is prepended so the tick log says what was cleared.
+async function ensureGpuHeadroom(opts = {}) {
+  const { forgeYield = null, leaseHeld = comfyuiLeaseHeld } = opts;
+  let forgeNote = '';
+  if (forgeYield && !leaseHeld()) {
+    const y = await forgeYield();
+    forgeNote = y && y.note ? y.note : '';
+  }
+  const result = await ensureGpuHeadroomCore({ ...opts, leaseHeld });
+  if (forgeNote) result.note = result.note ? `${forgeNote}; ${result.note}` : forgeNote;
+  return result;
+}
+
+module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld, yieldForgeToPipeline, ForgePauseError, FORGE_PAUSE_MESSAGE, isForgePause, forgePauseEnabled };
 
 if (require.main === module) {
-  ensureGpuHeadroom().then((result) => {
+  ensureGpuHeadroom({ forgeYield: yieldForgeToPipeline }).then((result) => {
     if (result.note) {
       console.error(`[gpu-guard] ${result.note}`);
     } else if (result.checked) {

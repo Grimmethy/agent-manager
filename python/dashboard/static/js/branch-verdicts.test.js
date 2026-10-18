@@ -57,3 +57,12 @@ test('filter bar shows counts and marks the active filter', () => {
   assert.match(html, /Unverified \(1\)/);
   assert.match(html, /class="action" data-verdict-filter="merge"/);
 });
+
+test('heldHubsHtml: empty placeholder when nothing is held, one row per held hub naming what it waits on', () => {
+  const { heldHubsHtml } = require('./branch-verdicts.js');
+  assert.equal(heldHubsHtml([]), '<div data-held-hubs></div>');
+  const html = heldHubsHtml([{ hubId: 'h', title: 'HUB0113 <x>', progress: { built: 2, total: 4 }, waitingOn: ['HUB0113-03'], branches: ['a', 'b'] }]);
+  assert.match(html, /Waiting on siblings \(1\)/);
+  assert.match(html, /2 of 4 built, 2 held, waiting on HUB0113-03/);
+  assert.ok(!html.includes('<x>'), 'hub title is escaped');
+});

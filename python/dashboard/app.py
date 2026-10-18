@@ -99,6 +99,7 @@ from app_catalog_helpers import (  # noqa: F401
     CONCEPT_STABLE_STATUSES,
     GHOST_CONCEPT_ID,
     _BRANCH_CACHE_TTL_SECONDS,
+    _BRANCH_FETCH_TTL_SECONDS,
     _COMMUNITY_ID_SUFFIX_RE,
     _DEEP_DIVE_ITEM_RE,
     _FAMILY_LABELS,
@@ -113,6 +114,7 @@ from app_catalog_helpers import (  # noqa: F401
     _brain_dump_needs_attention_count,
     _branch_cache,
     _branch_cache_lock,
+    _branch_fetch_state,
     _call_chat,
     _find_concept_or_404,
     _find_live_task_file,
@@ -138,6 +140,7 @@ from app_task_helpers import (  # noqa: F401
     _DIFF_GIT_HEADER_RE,
     _FENCED_JSON_RE,
     _GIVE_UP_ARCHIVE_STATES,
+    _LANE_DEFS_CACHE,
     _LANE_IDS_CACHE,
     _LANE_IDS_TTL_S,
     _QUOTED_SYMBOL_RE,
@@ -183,6 +186,8 @@ from app_branch_helpers import (  # noqa: F401
     _norm_path,
     _summarize_hub,
     _summarize_task_record,
+    branch_task_ids,
+    partition_held_hub_branches,
 )
 
 # Moved verbatim into app_source_plugin_helpers.py (2026-10-01 breakdown); re-exported so every importer of app.X is unchanged.
@@ -745,6 +750,32 @@ def worker_lane_ids() -> list[str]:
     return list(_LANE_IDS_CACHE["ids"]) or ["worker-local"]
 
 
+def worker_lane_defs() -> list[dict]:
+    """The pipeline's lanes as full definitions ({id, gpu, local, preempt, taskClasses, env}), in lane order.
+    Same single source as worker_lane_ids() (src/lanes.js: the host lane, the legacy P40 lane, and the lanes registry file), shelled out to
+    so the two languages cannot drift, and cached briefly. Returns the last good answer, or [] when node/lanes.js is unavailable --
+    callers must treat [] as "unknown" and fall back, never as "no lanes"."""
+    now = time.monotonic()
+    if _LANE_DEFS_CACHE["lanes"] and now - _LANE_DEFS_CACHE["at"] < _LANE_IDS_TTL_S:
+        return list(_LANE_DEFS_CACHE["lanes"])
+    lanes: list[dict] = []
+    try:
+        cp = subprocess.run(
+            ["node", str(SRC_DIR / "lanes.js")],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        parsed = json.loads(cp.stdout)
+        if isinstance(parsed, list):
+            lanes = [l for l in parsed if isinstance(l, dict) and l.get("id")]
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.warning("could not read worker lane definitions from src/lanes.js: %s", exc)
+    if lanes:
+        _LANE_DEFS_CACHE.update(at=now, lanes=lanes)
+        return list(lanes)
+    return list(_LANE_DEFS_CACHE["lanes"])
+
+
 def _expected_instance_ids() -> list[str]:
     """Every daemon scripts/launch.sh starts: one worker lane per GPU (worker_lane_ids()), the
     reviewer, and the queue-watchdog. apply-task-loop is deliberately excluded -- it's a single-shot
@@ -1300,6 +1331,30 @@ def community_coverage_path() -> Path | None:
     return (d / "community-coverage.json") if d else None
 
 
+def _coerce_serial(val) -> int:
+    """Coerce a brain-dump serial value to a non-negative int.
+
+    Returns 0 for None, booleans, negative numbers, non-numeric strings, or any
+    other non-integral type. Safe to call on raw JSON values (the capture path
+    and manual edits can emit string serials like '1792047142094' or junk like
+    ''/null) without prior type-checking; it never raises.
+    """
+    if val is None or isinstance(val, bool):
+        return 0
+    if isinstance(val, int):
+        return val if val >= 0 else 0
+    if isinstance(val, float):
+        iv = int(val)
+        return iv if iv >= 0 else 0
+    if isinstance(val, str):
+        try:
+            iv = int(val.strip())
+        except (ValueError, TypeError):
+            return 0
+        return iv if iv >= 0 else 0
+    return 0
+
+
 def read_brain_dump_entries() -> list:
     path = brain_dump_path()
     if not path:
@@ -1701,15 +1756,33 @@ def _pipeline_running() -> bool:
             if last_hb:
                 age = (datetime.now(timezone.utc) - last_hb).total_seconds()
                 threshold = WORKING_STALE_SECONDS if data.get("status") == "working" else OTHER_STALE_SECONDS
-                if age <= threshold:
+                # A fresh heartbeat only proves "running" while the process that wrote it
+                # still exists. A stop (or a crash) leaves the last heartbeat on disk, and a
+                # "working" one stays fresh for WORKING_STALE_SECONDS (20 min) -- so the old
+                # check kept reporting a pipeline that was already gone, and /api/pipeline/start
+                # refused ("a pipeline is already running") for ~20 min after every stop
+                # (2026-10-08, hit live twice). Liveness is judged against daemonPid when the
+                # heartbeat has one -- `pid` is the per-call child and is legitimately gone
+                # between calls (same rule as src/dead-process-check.js). No recorded pid at
+                # all (legacy heartbeat) keeps the old trust-the-timestamp behavior.
+                if age <= threshold and _heartbeat_owner_alive(data):
                     return True
 
-    # Stale or unparseable heartbeat -- believe a live process over a stale timestamp.
+    # Stale, unparseable, or ownerless heartbeat -- believe a live process over a timestamp.
     for name in (*lane_ids, "reviewer"):
         d = read_json_safe(inst_dir / f"{name}.json")
-        if d and d.get("pid") and _pid_alive(d["pid"]):
+        if d and any(d.get(k) and _pid_alive(d[k]) for k in ("daemonPid", "pid")):
             return True
     return bool(_pipeline_daemon_pids())
+
+
+def _heartbeat_owner_alive(data: dict) -> bool:
+    """Is the process that owns this heartbeat still alive? Owner = `daemonPid` (the lane's
+    bash loop) when recorded, else `pid`. True when the heartbeat records no pid at all."""
+    owner = data.get("daemonPid") if data.get("daemonPid") is not None else data.get("pid")
+    if owner is None:
+        return True
+    return _pid_alive(owner)
 
 
 # --- Unmerged branches (the "sandbox" visibility gap) -----------------------------------
@@ -1976,6 +2049,26 @@ def _label_for_branch(task_id, pipeline_dir, subject, repo_root=None):
     return {"title": subject or task_id, "domain": None, "source": None, "matchedTaskState": None, "description": None}
 
 
+# The rolling triage branch has no task record, so its card/detail title falls back to the TIP commit's subject, and every commit says "Triage batch: 1
+# candidate-doc update(s)" (one task per apply tick) -- a per-commit count shown as if it described the branch. For a branch in that state the title
+# becomes the branch total: the number of `### AC-` candidates it adds against the default branch (brain-dump #1755). The raw subject and the per-commit
+# rows are untouched. None = leave today's title (not a triage-style fallback, zero candidates, git failed, or AGENT_MANAGER_BRANCH_TITLE_COUNT=false).
+_TRIAGE_SUBJECT_RE = re.compile(r"^Triage batch: \d+ candidate-doc update\(s\)$")
+
+
+def _triage_candidate_count(repo_root, main_branch, full_ref, subject, label):
+    if os.environ.get("AGENT_MANAGER_BRANCH_TITLE_COUNT", "").strip().lower() == "false":
+        return None
+    if label.get("matchedTaskState") is not None or not _TRIAGE_SUBJECT_RE.match((subject or "").strip()):
+        return None
+    try:
+        import branch_removals  # lazy: keeps app.py's import block untouched
+        n = branch_removals.count_added_candidates(_run_git, repo_root, main_branch, full_ref)
+    except Exception:  # noqa: BLE001 -- a title decoration must never break the listing
+        return None
+    return n if isinstance(n, int) and n >= 1 else None
+
+
 def _branch_content_already_on_main(repo_root, main_branch, full_ref):
     """True when every file this branch changed (vs. where it forked from main) is byte-identical on origin/<main>: there is nothing left to merge.
 
@@ -1998,14 +2091,20 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         return False
 
 
-def _list_unmerged_branches_uncached():
+def _list_unmerged_branches_uncached(force_fetch=True):
     repo_root = get_active_repo_root()
     if not repo_root:
         return []
     repo_root = Path(repo_root)
     pipeline_dir = get_pipeline_dir()
 
-    _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
+    # The fetch is the single slowest step (14-16 s measured at load 13) and moves no state a recompute depends on within a minute, so it has its own timer.
+    with _branch_cache_lock:
+        fetch_due = force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
+    if fetch_due:
+        _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
+        with _branch_cache_lock:
+            _branch_fetch_state["at"] = time.time()
     main_branch = _detect_main_branch(repo_root)
 
     raw = _run_git(
@@ -2046,17 +2145,19 @@ def _list_unmerged_branches_uncached():
         conflict = _check_merge_conflict(repo_root, main_branch, branch)
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
+        candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
         qdir = (pipeline_dir / "queue") if pipeline_dir else None
-        hub = get_hub_data_provider().hub_for_branch(qdir, branch, [task_id])
+        hub = get_hub_data_provider().hub_for_branch(qdir, branch, branch_task_ids(_run_git, repo_root, main_branch, full_ref, task_id))
         branches.append({
             "branch": branch,
             "taskId": task_id,
-            "title": label["title"],
+            "title": f"Triage batch: {candidate_count} candidate-doc update(s)" if candidate_count else label["title"],
             "domain": label["domain"],
             "source": label["source"],
             "matchedTaskState": label["matchedTaskState"],
             "description": label["description"],
             "subject": subject.strip(),
+            **({"candidateCount": candidate_count} if candidate_count else {}),
             "pushedAt": pushed_at,
             "ahead": ahead,
             "behind": behind,
@@ -2070,6 +2171,9 @@ def _list_unmerged_branches_uncached():
             "hub": hub,
         })
 
+    branches, held = partition_held_hub_branches(branches)
+    with _branch_cache_lock:
+        _branch_cache["held"] = held
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
     branch_verdicts.enrich_branches_with_verdicts(queue_dir(), repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
@@ -2077,13 +2181,47 @@ def _list_unmerged_branches_uncached():
     return branches
 
 
+def _store_branch_list(branches):
+    with _branch_cache_lock:
+        _branch_cache["at"] = time.time()
+        _branch_cache["branches"] = branches
+
+
+def _refresh_branch_list_in_background():
+    """Runs on the refresh thread: recompute, store, ALWAYS clear the single-flight flag. A failure keeps the old list (same best-effort rule as the synchronous path)."""
+    try:
+        _store_branch_list(_list_unmerged_branches_uncached(force_fetch=False))
+    except (RuntimeError, subprocess.SubprocessError, OSError) as e:
+        print(f"[branches] background refresh failed (non-fatal): {e}", file=sys.stderr)
+    finally:
+        with _branch_cache_lock:
+            _branch_fetch_state["refreshing"] = False
+
+
 def list_unmerged_branches(force=False):
+    """Fresh cache -> it. force=True or no cache yet (including right after _invalidate_branch_cache) -> synchronous recompute. A STALE non-empty cache is returned
+    immediately while ONE background thread refreshes it (stale-while-revalidate): the full recompute costs ~37 s under load, longer than the tab's 30 s timeout."""
     with _branch_cache_lock:
         age = time.time() - _branch_cache["at"]
+        have_cache = _branch_cache["at"] > 0
         if not force and age < _BRANCH_CACHE_TTL_SECONDS:
             return _branch_cache["branches"]
+        if not force and have_cache:
+            stale = _branch_cache["branches"]
+            start_refresh = not _branch_fetch_state["refreshing"]
+            if start_refresh:
+                _branch_fetch_state["refreshing"] = True
+        else:
+            stale, start_refresh = None, False
+    if stale is not None:
+        if start_refresh:
+            t = threading.Thread(target=_refresh_branch_list_in_background, name="branch-list-refresh", daemon=True)
+            with _branch_cache_lock:
+                _branch_fetch_state["thread"] = t
+            t.start()
+        return stale
     try:
-        branches = _list_unmerged_branches_uncached()
+        branches = _list_unmerged_branches_uncached(force_fetch=force)
     except (RuntimeError, subprocess.SubprocessError, OSError) as e:
         # Best-effort, same "a check failing here must never block the rest of the
         # dashboard" rule as everything else that shells out in this file -- a git/network
@@ -2091,15 +2229,24 @@ def list_unmerged_branches(force=False):
         print(f"[branches] list failed (non-fatal): {e}", file=sys.stderr)
         with _branch_cache_lock:
             return _branch_cache["branches"]
-    with _branch_cache_lock:
-        _branch_cache["at"] = time.time()
-        _branch_cache["branches"] = branches
+    _store_branch_list(branches)
     return branches
 
 
-def _invalidate_branch_cache():
+def list_held_hub_groups():
+    """Hubs whose built children are pushed but not listed yet (see partition_held_hub_branches)."""
+    list_unmerged_branches(force=False)
+    with _branch_cache_lock:
+        return list(_branch_cache.get("held") or [])
+
+
+def _invalidate_branch_cache(refetch=True):
+    """Drop the cached list so the next one is recomputed synchronously. refetch=True (default: a merge/discard moved a remote ref) also forces the next recompute to
+    fetch; refetch=False (a verdict was recorded, no remote ref moved) keeps the fetch timer so the recompute does not pay for another fetch."""
     with _branch_cache_lock:
         _branch_cache["at"] = 0.0
+        if refetch:
+            _branch_fetch_state["at"] = 0.0
 
 
 def _sync_live_checkout(main_branch):
@@ -2460,7 +2607,8 @@ def _stop_pipeline(force: bool = False) -> list:
     stopped) while every daemon kept running untouched in the background. Linux instead
     shells out to scripts/stop.sh, which SIGTERMs each daemon by its launch.sh pidfile,
     waits out a grace period for it to exit cleanly (see each daemon's own trap), and
-    SIGKILLs stragglers -- the actual kill logic lives there, not duplicated here.
+    SIGKILLs stragglers -- the actual kill logic lives there, not duplicated here. Always passes --keep-dashboard
+    and --keep-plugins: stopping the PIPELINE must not take down this dashboard or the plugin tab servers.
 
     force=False (the toggle button's first click) launches stop.sh in the background and
     returns immediately -- the frontend's existing 3s status poll picks up the moment
@@ -2501,7 +2649,9 @@ def _stop_pipeline(force: bool = False) -> list:
     if os.name != "nt":
         stop_sh = PACKAGE_ROOT / "scripts" / "stop.sh"
         if stop_sh.is_file():
-            args = ["bash", str(stop_sh), "--keep-dashboard"]
+            # --keep-plugins: the plugin servers (promptforge, storyforge, ...) are tab servers, not pipeline daemons, but their
+            # pidfiles share stop.sh's folder; without this a pipeline stop took every plugin down (confirmed live 2026-10-14).
+            args = ["bash", str(stop_sh), "--keep-dashboard", "--keep-plugins"]
             if force:
                 args.append("--force")
             try:
@@ -2707,13 +2857,39 @@ def _start_pipeline(raw_path: str, include_apply: bool, skip_push: bool) -> dict
     doesn't exist yet) and spawns the relevant loops as real, visible console windows,
     same as launch.bat's own `start powershell.exe -NoExit ...` pattern -- shared by
     /api/pipeline/start and _restart_pipeline()."""
+    # Pre-flight (2026-10-15): report -- and snapshot to a patch file -- uncommitted TRACKED changes in the
+    # repo being entered AND the one being left, before _build_pipeline_env overwrites the active repo
+    # root. Read-only on the repos and never blocks the start (see preflight.py).
+    preflight_report = _preflight_report(raw_path)
+
     child_env = _build_pipeline_env(raw_path, include_apply, skip_push)
 
     _ensure_task_domains(child_env, raw_path, list(read_active_job_types()))
 
     _ensure_registry_entry(child_env, raw_path)
 
-    return _launch_pipeline_subprocess(child_env, raw_path, include_apply, skip_push)
+    result = _launch_pipeline_subprocess(child_env, raw_path, include_apply, skip_push)
+    if isinstance(result, dict) and preflight_report is not None:
+        result["preflight"] = preflight_report
+    return result
+
+
+def _preflight_report(raw_path: str):
+    """The pre-flight object for a pipeline start, or None when the check is off. Never raises."""
+    import preflight
+    try:
+        if not preflight.enabled():
+            return {"enabled": False}
+        report = preflight.run([raw_path, get_active_repo_root()])
+        if report.get("dirty"):
+            logger.warning(
+                "pipeline start pre-flight: uncommitted tracked changes in %s; snapshot %s",
+                ", ".join(r["path"] for r in report.get("repos", []) if r.get("dirty")), report.get("snapshot"),
+            )
+        return report
+    except Exception as exc:  # noqa: BLE001 -- a pre-flight problem must never stop a pipeline start
+        logger.warning("pipeline start pre-flight failed: %s", exc)
+        return {"enabled": True, "error": str(exc)}
 
 
 def _restart_pipeline():
@@ -2736,6 +2912,7 @@ from routes.concepts import concepts_bp  # noqa: E402
 from routes.second_brain import second_brain_bp  # noqa: E402
 from routes.brain_dump import brain_dump_bp  # noqa: E402
 from routes.benchmark import benchmark_bp  # noqa: E402
+from routes.capability import capability_bp  # noqa: E402
 from routes.embedded_tools import embedded_tools_bp  # noqa: E402
 from routes.hardware import hardware_bp  # noqa: E402
 from routes.claude_settings import claude_settings_bp  # noqa: E402
@@ -2761,6 +2938,7 @@ app.register_blueprint(concepts_bp)
 app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
 app.register_blueprint(benchmark_bp)
+app.register_blueprint(capability_bp)
 app.register_blueprint(embedded_tools_bp)
 app.register_blueprint(hardware_bp)
 app.register_blueprint(claude_settings_bp)

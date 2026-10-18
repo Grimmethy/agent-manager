@@ -95,6 +95,14 @@ while :; do                                                                     
     continue
   fi
 
+  # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
+  if mem_pressure_high; then
+    printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+    if "$ONCE"; then exit 0; fi
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+
   # GPU headroom check -- review's own majorityVote call spends real Ollama calls too
   # (n=3 votes per item), same starvation risk local-worker.sh's tick guards against;
   # see gpu-guard.js's header for the live incident this responds to. Best-effort, never
@@ -186,6 +194,13 @@ while :; do                                                                     
       mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
       mv -n "$file" "${QUEUE_DIR}/blocked/${name}"
       printf '[review-%s] blocked %s: %s\n' "$INSTANCE_ID" "$task_id" "$review_result" >&2
+    elif grep -qE "the Forge family holds the GPU" <<< "$review_result"; then
+      # Forge GPU session (2026-10-14): local-client.js refused to START a model call because PromptForge holds the GPU (comfyui-lease)
+      # -- src/gpu-guard.js ForgePauseError / FORGE_PAUSE_MESSAGE. Not a failure and not an outage but a deliberate, open-ended pause
+      # (a Forge session lasts 20 min idle to 4 h), so: NO reviewFailureCount increment, NO infra-requeue round, NO block. The review
+      # stays in review/ and is picked up again once the lease clears; the next ticks yield at the top while it holds. Mirrors the
+      # matching branch in local-worker.sh; the pattern is the FORGE_PAUSE_MESSAGE text, pinned by src/local-client-forge-pause.test.js.
+      printf '[review-%s] review paused for a Forge GPU session -- not counted as a failure; %s stays in review/\n' "$INSTANCE_ID" "$task_id" >&2
     else
       # Review call itself failed (unknown domain, Ollama unreachable, etc.) -- leave the
       # file in review/ rather than lose it; it's picked up again next tick. Matches

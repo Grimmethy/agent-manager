@@ -216,6 +216,16 @@ process_drafting_file() {
     # apply-task.sh's "applying X..." lines. The task JSON already carries a 'draft-done'
     # history event (src/local-draft.js concludeDraft()).
     printf '[worker-%s] draft complete, ready for review: %s\n' "$INSTANCE_ID" "$task_id" >&2
+  elif grep -qE "the Forge family holds the GPU" <<< "$draft_result"; then
+    # Forge GPU session (2026-10-14): local-client.js refused to START a model call because PromptForge holds the GPU (comfyui-lease)
+    # -- src/gpu-guard.js ForgePauseError / FORGE_PAUSE_MESSAGE. This is NOT a failure of the task and NOT an outage: it is a deliberate,
+    # open-ended pause (a Forge session lasts 20 min idle to 4 h), the same class as the 'manually paused' case below. So: no
+    # draftFailureCount increment, no infra-requeue round, no block. The item stays in drafting/ and resumes through the normal
+    # leftover-drafting pass once the lease clears; this tick stops claiming (TICK_HAD_INFRA_FAILURE) and the next ticks yield at the
+    # top while the lease holds. Without this branch the failure counting below could permanently block a good task.
+    # The pattern is the FORGE_PAUSE_MESSAGE text (pinned by src/local-client-forge-pause.test.js so the copies cannot drift).
+    printf '[worker-%s] draft paused for a Forge GPU session -- not counted as a failure; %s stays in drafting/ and resumes when the lease clears\n' "$INSTANCE_ID" "$task_id" >&2
+    TICK_HAD_INFRA_FAILURE=true
   else
     # Draft call itself failed (e.g. Ollama unreachable, or a real generation call timing
     # out under GPU contention) -- retry via the leftover-drafting resume pass at the top
@@ -519,6 +529,14 @@ while :; do                                                                     
     continue
   fi
 
+  # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
+  if mem_pressure_high; then
+    printf '[worker-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
+    if "$ONCE"; then exit 0; fi
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+
   # GPU headroom check -- before spending any real model call this tick, see whether the
   # GPU actually has room for it and, if not, ask TheAgent to stop a known idle app
   # (ComfyUI/n8n) sitting on VRAM this pipeline doesn't need but isn't using either. Best
@@ -735,6 +753,13 @@ while :; do                                                                     
           printf '[worker-%s] infra-shaped failure -- stopping this tick early instead of claiming more pending items\n' "$INSTANCE_ID" >&2
           break
         fi
+        # Re-rank after every processed item (2026-10-15, premium head-of-line starvation): `items` above is a snapshot taken ONCE at the top of the
+        # tick, and generation (task-sources.js) + ranking (next-claimable-task.js) only run at the top of a tick, so draining the whole snapshot
+        # meant a premium task generated or released meanwhile waited for every remaining item (worker-3090: 59 claims in one tick, ~6h; HUB0148-02..07
+        # and 17 other premium tasks sat unclaimed). End the tick here instead: did_work is already true, so the end-of-tick pause is the 1s
+        # busy-loop guard, not the idle poll, and the next tick regenerates and re-ranks before the next claim. Skips (`continue` above) did no work
+        # and correctly do not end the tick.
+        break
       fi
 
     done                                                                         # end per-filename loop within current tick — bash doesn't auto-close the `for name in "${items[@]}"` scope; 'done' keyword terminates it same way PowerShell closes each block with } or closing brace pattern (we use bash's explicit 'done' syntax which is required).

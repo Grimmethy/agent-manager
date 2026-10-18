@@ -29,7 +29,11 @@
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .pipeline-dir { color: var(--muted); font-size: 12px; }
   .layout { display: flex; }
-  nav { width: 200px; padding: 16px 0; border-right: 2px solid var(--border); min-height: calc(100vh - 53px); }
+  /* The tab list is pinned to the viewport and scrolls on its own, the same way .plugin-sidebar
+     does, so a long tab list and a long #main page no longer share one page scroll. 53px is the
+     header height both rules already assume. align-self:flex-start stops the flex row from
+     stretching nav to #main's height (which would defeat the fixed height). */
+  nav { width: 200px; flex-shrink: 0; padding: 16px 0; border-right: 2px solid var(--border); height: calc(100vh - 53px); position: sticky; top: 53px; align-self: flex-start; overflow-y: auto; overscroll-behavior: contain; }
   /* Chat panel (Brain Dump #153): a third flex sibling of nav/main, not a modal -- see
      app.py/chat_sessions.py for the backend. Collapsed state is a plain width/visibility
      toggle (localStorage-persisted, same convention nav-group expand/collapse already
@@ -233,14 +237,18 @@
     header { flex-wrap: wrap; padding: 10px 14px; gap: 8px 12px; }
     header .pipeline-dir { flex-basis: 100%; }
     .layout { flex-direction: column; }
-    nav { width: 100%; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
+    nav { width: 100%; height: auto; position: static; overflow-y: visible; min-height: 0; border-right: none; border-bottom: 2px solid var(--border); display: flex; overflow-x: auto; padding: 6px 8px; -webkit-overflow-scrolling: touch; }
     nav button { width: auto; white-space: nowrap; padding: 8px 12px; }
     nav button.active { border-left: none; border-bottom: 3px solid var(--accent); }
     main { padding: 12px; overflow-x: auto; }
     table { min-width: 560px; }
     .plugin-sidebar { position: fixed; left: 0; right: 0; bottom: 0; top: auto; width: 100%; height: 65vh; border-left: none; border-top: 2px solid var(--border); z-index: 15; }
     .plugin-sidebar.sidebar-collapsed { height: 0; width: 100%; border-top: none; }
-    .plugin-sidebar-toggle { writing-mode: horizontal-tb; right: 12px; top: auto; bottom: 12px; border: 2px solid var(--border); border-radius: 20px; padding: 8px 14px; }
+    .plugin-sidebar-toggle { writing-mode: horizontal-tb; right: 12px; top: auto; bottom: 12px; border: 2px solid var(--border); border-radius: 20px; padding: 8px 14px; z-index: 20; }
+    /* The sheet above is z-index 15 and covers the bottom 65vh, so the pill used to sit UNDER it and could not be tapped to hide the chat
+       (2026-10-14, phone over Tailscale). Keep the pill above the sheet, and while the sheet is open move it up to the sheet's top edge so
+       it does not sit on the chat box. JS marks the pill .sidebar-open whenever the sheet is expanded. */
+    .plugin-sidebar-toggle.sidebar-open { bottom: calc(65vh + 10px); }
     .worker-card .row { flex-wrap: wrap; row-gap: 6px; }
     .worker-model-select { margin-left: 0; margin-right: 0; max-width: none; width: 100%; }
     .stat-row { flex-wrap: wrap; row-gap: 10px; }
@@ -307,9 +315,11 @@ const CORE_TABS = [
   { key: 'concepts', label: '🔬 Concepts', description: 'Track named concepts (e.g. chat-context-trimming) that get research-fork treatment -- a running audit log of research and build work per concept, plus a self-reported (unverified) built-from-scratch vs adapted tally.' },
   { key: 'reports', label: '🕒 Time Tracking', description: 'Review how much time the pipeline has spent per job, stage, or project.' },
   { key: 'tokenfold', label: '⚡ TokenFold Savings', description: 'See how many tokens the TokenFold compression proxy has saved across all pipeline model calls, broken down per model.' },
-  { key: 'promptforge', label: '🎨 PromptForge', description: 'ComfyUI-driven still-image shot generator (separate local app on PROMPTFORGE_URL, default :7430), embedded here.' },
-  { key: 'adforge', label: '🎬 AdForge', description: 'Advertisement-pipeline orchestrator (separate local app on ADFORGE_URL, default :7431), embedded here. Sequences ScriptForge/PromptForge/VoiceForge/CutForge/PostForge into a finished ad.' },
-  { key: 'scriptforge', label: '📝 ScriptForge', description: 'Ad-script generator (separate local app on SCRIPTFORGE_URL, default :7432) -- brief -> treatment + shot list + PromptForge shot-specs + VO + music brief, on the local model. Phase 1 of AdForge.' },
+  { group: 'Forges', children: [
+    { key: 'promptforge', label: '🎨 PromptForge', description: 'ComfyUI-driven still-image shot generator (separate local app on PROMPTFORGE_URL, default :7430), embedded here.' },
+    { key: 'adforge', label: '🎬 AdForge', description: 'Advertisement-pipeline orchestrator (separate local app on ADFORGE_URL, default :7431), embedded here. Sequences ScriptForge/PromptForge/VoiceForge/CutForge/PostForge into a finished ad.' },
+    { key: 'scriptforge', label: '📝 ScriptForge', description: 'Ad-script generator (separate local app on SCRIPTFORGE_URL, default :7432) -- brief -> treatment + shot list + PromptForge shot-specs + VO + music brief, on the local model. Phase 1 of AdForge.' },
+  ] },
   { key: 'branches', label: '🌿 Unmerged Branches', description: 'List branches the pipeline has created that have not yet been merged, so nothing gets lost or forgotten.' },
   { key: 'adhoc', label: '📌 Adhoc Tasks', description: 'Every adhoc task in one place, with which queue state it currently sits in -- cuts across the whole Job Status group instead of checking each state tab by hand.' },
   { group: 'Job Status', children: [

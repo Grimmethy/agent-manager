@@ -94,7 +94,7 @@ function extractPythonFrozensetLiterals(text, varName) {
   return new Set(literals);
 }
 
-test('every real maybeLocked() pass label is covered by _PREEMPT_CHILD_PASSES (app.py)', () => {
+test('every real maybeLocked() pass label is covered by _PREEMPT_CHILD_PASSES (chat_preempt.py)', () => {
   // decompose-pass.js moved to the agent-manager-hub-tasks plugin (S4b, 2026-09-25) -- it
   // never called maybeLocked() itself (its callers, draft-context.js and
   // local-agentic-write-draft.js, already wrap the call), so dropping it from this scan
@@ -109,12 +109,12 @@ test('every real maybeLocked() pass label is covered by _PREEMPT_CHILD_PASSES (a
   // changed) and every subsequent assertion would trivially pass for the wrong reason.
   assert.ok(realLabels.size > 0, 'extractMaybeLockedLabels found zero labels across all source files -- the extractor itself is broken (maybeLocked call shape changed?), not a real "nothing to check" result');
 
-  const allowlist = extractPythonFrozensetLiterals(read('python/dashboard/app.py'), '_PREEMPT_CHILD_PASSES');
+  const allowlist = extractPythonFrozensetLiterals(read('python/dashboard/chat_preempt.py'), '_PREEMPT_CHILD_PASSES');
   const missing = [...realLabels].filter((l) => !allowlist.has(l));
   assert.deepEqual(
     missing,
     [],
-    `python/dashboard/app.py's _PREEMPT_CHILD_PASSES is missing real pass label(s) currently in use: ${missing.join(', ')}. ` +
+    `python/dashboard/chat_preempt.py's _PREEMPT_CHILD_PASSES is missing real pass label(s) currently in use: ${missing.join(', ')}. ` +
     `A task caught in any of these passes cannot be preempted by chat-preempt or the Workers-tab assign-task override -- ` +
     `add them to _PREEMPT_CHILD_PASSES (or, if this label is meant to be excluded on purpose, add it to this test's own ` +
     `intentional-exclusions handling instead of just leaving the test broken).`,

@@ -174,12 +174,16 @@ const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
 const { classifyVote, clip } = require('./auto-confirm-review.js');
 const { hasResolutionSignal } = require('./staleness-auto-archive.js');
 const { checkCompletionClaimsInNote } = require('./fact-checker.js');
 const { targetOversizedFile, oversizedFiles } = require('./file-length-flags-reader.js');
 const { classifyRequeue } = require('./requeue-attribution.js');
+const { buildGateFalsePositiveDraft } = require('./lib/gate-verdict.js');
+const { isStructuredGroupBChange } = require('./lib/structured-change.js');
+const { planTargetNoLongerBlocks, ungroundedUrlsAreTestFixtures } = require('./lib/gate-readmit.js');
 const { getRegisteredSource } = require('./task-source-registry.js');
 const { REASON_CATEGORIES } = require('./blocked-task-classifiers.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
@@ -589,6 +593,184 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
       }
     }
 
+    // --- Bucket O: valid short change sets blocked by the deterministic non-implementation gate -> file to review ---
+    // Checked BEFORE the nc.reason allowlist, like K and N: these tasks escalate as 'design-decision' (deadcode_fix) but the
+    // signal here is the persisted reviewProvider stamp plus the response itself. review-task.js rejected any fence-free
+    // response under 80 characters as "a bare tool-call request or meta-commentary", which blocked the model's CORRECT
+    // `{"mode": "delete", "file": "<path>"}` (71-79 characters) three times with no model vote (9 TaxHarvest deadcode_fix
+    // tasks). The gate now exempts structurally valid change sets (lib/structured-change.js), so nothing needs redrafting:
+    // the draft was fine. Keep implementResponse exactly as written, clear the rejection state, and file it to review/.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (task.reviewProvider === 'deterministic-non-implementation'
+        && isStructuredGroupBChange(String(task.implementResponse || '').trim())
+        && bucketAttempts(task, 'O') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket O but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'O') + 1;
+          log(`${id0}: bucket O (valid short change set blocked by the non-implementation length gate) -> filed to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of ['needsClarification', 'localRejectCount', 'retryableDraftBlock', 'priorRejectionFeedback', 'blockedReason',
+              'blockedStage', 'claimedAt', 'reviewProvider', 'reviewInconclusive', 'localVotes', 'voteErrors', 'ncTriageDecision', 'ncTriageReviewedAt']) delete task[f];
+            bumpBucketAttempts(task, 'O');
+            task.status = 'needs-review';
+            appendHistoryEvent(task, 'requeued',
+              'needs-clarification-triage: the draft is a structurally valid change set (the deterministic non-implementation gate rejected it on length alone, since fixed) -- implementResponse kept as written, rejection state cleared, filed to review for a real vote');
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-O: valid short change set blocked by the non-implementation length gate', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: change-set repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket P: plan-target guard misfire (a call like `res.json()` read as a file, a create target called "absent") -> clean-state requeue ---
+    // Checked BEFORE the nc.reason allowlist, like K/N/O: the signal is the persisted guard reason plus a RE-RUN of the fixed guard on the task's own plan.
+    // adhoc-diff-sanity.js no longer reads a title call expression as a path, and plan-target-guard.js now honours the task's own "Create <file>" and an
+    // "is absent" acknowledgement. Only a task the CURRENT guard would let through is requeued; a genuinely fabricated target still blocks and stays here.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (planTargetNoLongerBlocks(task, repoRoot) && bucketAttempts(task, 'P') < MAX_REQUEUES) {
+        const adhocPath = path.join(adhocDir, `${id0}.json`);
+        if (fs.existsSync(adhocPath)) {
+          log(`${id0}: bucket P but ${id0}.json already in adhoc/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'P') + 1;
+          log(`${id0}: bucket P (plan-target guard misfire, since fixed) -> requeue ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            resetStatusForFreshAdhocAttempt(task);
+            delete task.ncTriageDecision;
+            delete task.ncTriageReviewedAt;
+            bumpBucketAttempts(task, 'P');
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: the plan-target guard blocked this on an illustrative token (a call expression read as a file, or a create target called absent); the fixed guard no longer blocks the stored plan -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-P: plan-target guard misfire', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(adhocDir, { recursive: true });
+              fs.writeFileSync(adhocPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: requeue move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket Q: ungrounded-url gate misfire (fixture URLs in a test file the draft adds) -> file to review ---
+    // The draft was fine: every flagged value is a URL that exists only in an added test file (fact-checker.js urlsOnlyInAddedTestFiles). Keep
+    // implementResponse exactly as written, clear the rejection state and file it to review/ for a real vote (Bucket O's shape). A task flagged for ANY
+    // field, or for a URL that also appears in non-test code, is not matched.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      if (ungroundedUrlsAreTestFixtures(task) && bucketAttempts(task, 'Q') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket Q but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'Q') + 1;
+          log(`${id0}: bucket Q (ungrounded-url flags are test fixtures) -> filed to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of ['needsClarification', 'localRejectCount', 'retryableDraftBlock', 'priorRejectionFeedback', 'blockedReason',
+              'blockedStage', 'claimedAt', 'reviewProvider', 'reviewInconclusive', 'localVotes', 'voteErrors', 'ncTriageDecision', 'ncTriageReviewedAt']) delete task[f];
+            bumpBucketAttempts(task, 'Q');
+            task.status = 'needs-review';
+            appendHistoryEvent(task, 'requeued',
+              'needs-clarification-triage: every ungrounded-url flag is a fixture URL in a test file the draft itself adds (the gate now exempts those) -- implementResponse kept as written, rejection state cleared, sent to review');
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-Q: ungrounded-url flags are test fixtures', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: fixture-url repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    // --- Bucket N: stranded pre-dispatch-gate archive verdicts -> repair in place, send to review ---
+    // Checked BEFORE the nc.reason allowlist, like K: the escalation reason of these tasks is
+    // 'empty-degenerate-draft' (not in that allowlist) and the signal here is the preDispatchGate stamp, not the reason.
+    // Before 2026-10-07 draftTask returned {status:'archived'} for a gate hit, which nothing routed, so the task reached
+    // review with an empty draft, was rejected three times and escalated (39 TaxHarvest performance_review tasks). The
+    // gate's verdict is already known and deterministic, so nothing needs redrafting: regenerate the FALSE POSITIVE
+    // draft the fixed draftTask now writes (lib/gate-verdict.js) and file the task to review/ for a real vote.
+    {
+      const id0 = task.id || name.replace(/\.json$/, '');
+      const gate = task.preDispatchGate;
+      if (gate && gate.verdict === 'archive' && gate.ruleId && bucketAttempts(task, 'N') < MAX_REQUEUES) {
+        const reviewDir = path.join(pipelineDir, 'queue', 'review');
+        const reviewPath = path.join(reviewDir, `${id0}.json`);
+        if (fs.existsSync(reviewPath)) {
+          log(`${id0}: bucket N but ${id0}.json already in review/ -- already handled, skipping`);
+        } else {
+          summary.checked += 1;
+          const attempt = bucketAttempts(task, 'N') + 1;
+          log(`${id0}: bucket N (stranded pre-dispatch gate archive, rule "${gate.ruleId}") -> FALSE POSITIVE draft rebuilt, sent to review ${attempt}/${MAX_REQUEUES}`);
+          summary.requeued += 1;
+          if (!DRY_RUN) {
+            for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
+            for (const f of ['localVotes', 'voteErrors', 'reviewProvider', 'ncTriageDecision', 'ncTriageReviewedAt', 'critiqueOutcome']) delete task[f];
+            bumpBucketAttempts(task, 'N');
+            const draft = buildGateFalsePositiveDraft(gate, task);
+            task.planResponse = draft.plan;
+            task.lastGoodPlan = draft.plan;
+            task.implementResponse = draft.implementResponse;
+            task.critiqueOutcome = 'no-issues';
+            task.status = 'needs-review';
+            appendHistoryEvent(task, 'requeued',
+              `needs-clarification-triage: stranded pre-dispatch gate archive verdict (rule "${gate.ruleId}": ${String(gate.reason || '').slice(0, 120)}) -- the gate's deterministic false positive was never executed and the empty draft looped through review; FALSE POSITIVE draft rebuilt and filed to review for a real vote`);
+            try {
+              await classifyRequeue(task, { reasonHint: 'bucket-N: stranded pre-dispatch gate archive', requeueWriter: 'needs-clarification-triage', repoRoot });
+            } catch { /* classification must never block the real requeue */ }
+            try {
+              fs.mkdirSync(reviewDir, { recursive: true });
+              fs.writeFileSync(reviewPath, JSON.stringify(task, null, 2));
+              fs.unlinkSync(file);
+            } catch (e) {
+              log(`${id0}: gate-archive repair-and-review move failed: ${e.message}`);
+              summary.requeued -= 1;
+              summary.errors += 1;
+            }
+          }
+          continue;
+        }
+      }
+    }
+
     // --- Bucket L: fabricated-file-path near-miss auto-repair (sources whose promptContext.files is a verified grounded list only) ---
     // Checked BEFORE the `nc.reason` allowlist below, same reasoning as bucket K:
     // reason:'fabricated-file-path' is not in that allowlist, so this would otherwise be
@@ -704,6 +886,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             taskId: task.id, stage: 'nc-triage-premise-vote',
           });
         } catch (e) {
+          if (isForgePause(e)) { summary.paused = true; break; }   // the Forge family holds the GPU: stop this sweep quietly -- no history note, no stamp
           appendHistoryEvent(task, 'advisory',
             `needs-clarification-triage: premise vote could not run (${(e && e.message || 'vote error').slice(0, 140)}) -- will retry`);
           writeInPlace(file, task, summary);
@@ -1169,6 +1352,7 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             taskId: task.id, stage: 'nc-triage-premise-vote',
           });
         } catch (e) {
+          if (isForgePause(e)) { summary.paused = true; break; }   // the Forge family holds the GPU: stop this sweep quietly -- no history note, no stamp
           appendHistoryEvent(task, 'advisory',
             `needs-clarification-triage: premise vote could not run (${(e && e.message || 'vote error').slice(0, 140)}) -- will retry`);
           writeInPlace(file, task, summary);

@@ -34,6 +34,15 @@ if [[ -f "$COMFY_LEASE_PATH" ]]; then
     && echo "[launch] cleared ComfyUI GPU lease ($COMFY_LEASE_PATH) -- explicit pipeline start takes the GPU"
 fi
 
+# Forge family exclusion: the pipeline and the Forge family (ComfyUI) never hold the GPU together
+# (promptforge Docs/GPU_FAMILY_PROTOCOL.md). Besides deleting the lease, ask PromptForge to end its session and
+# stop ComfyUI right now instead of waiting for its keeper to notice (~20 s). Best-effort: PromptForge may be down.
+PROMPTFORGE_URL="${AGENT_MANAGER_PROMPTFORGE_URL:-${PROMPTFORGE_URL:-http://localhost:7430}}"
+if command -v curl >/dev/null 2>&1; then
+  yield_out="$(curl -s -m 30 -X POST "${PROMPTFORGE_URL%/}/api/gpu/yield" 2>/dev/null || true)"
+  [[ -n "$yield_out" ]] && echo "[launch] Forge GPU yield: $yield_out"
+fi
+
 AGENT_MANAGER_DASHBOARD_PORT="${AGENT_MANAGER_DASHBOARD_PORT:-7420}"
 
 # orc-common.sh and downstream scripts hard-requires MODEL_URL, HOME_LOGS already exported.
@@ -177,9 +186,12 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
 
   # One worker lane per GPU, named for the GPU (src/lanes.js is the single definition -- the
   # watchdog's restart rule and the dashboard's expected-lane list read the same module). Every
-  # lane claims ANY pending task by priority; there is no reasoning/worker split any more.
+  # lane claims ANY pending task by priority (unless the lane declares a taskClasses allowlist in the lanes registry, see
+  # docs/agents/lanes.md); there is no reasoning/worker split any more.
   # A lane's own env (e.g. the P40 VM's OLLAMA_URL/LOCAL_MODEL) is scoped to just that child
   # process via `env`, so the other lanes and the reviewer keep talking to the host's Ollama.
+  # A remote lane's worker overrides LOCAL_MODEL in its own process; keep the host's model visible to src/lanes.js (capability tiers).
+  export AGENT_MANAGER_HOST_LOCAL_MODEL="${AGENT_MANAGER_HOST_LOCAL_MODEL:-${LOCAL_MODEL:-}}"
   while IFS= read -r lane_id; do
     [[ -n "$lane_id" ]] || continue
     mapfile -t lane_env < <(node "${SCRIPT_DIR}/../src/lanes.js" --env "$lane_id")

@@ -30,6 +30,7 @@
 // Kill switch: AGENT_MANAGER_DEEP_DIVE_GROUNDING_CHECK=false.
 
 const { call: localCall } = require('./local-client.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { builtinModules } = require('module');
 
 // 2026 'Cheap Verifiers, Large Blind Spots' caveat: Check 2 (this cheap model) is a better-than-nothing second layer, NOT a substitute for Check 1's deterministic match -- its blind spot is largest in this cheap/cheap config. See src/deterministic-recheck-registry.js header.
@@ -200,6 +201,7 @@ async function runGroundingCheck(task, implementResponse = (task && (task.implem
   try {
     result = maybeLockedOn ? await maybeLockedOn(GROUNDING_CHECK_MODEL, fn, 'deep-dive-grounding') : await fn();
   } catch (e) {
+    if (isForgePause(e)) throw e;   // the Forge family holds the GPU: do not turn the pause into "grounded" (the draft would skip its check)
     return { verdict: 'ok', error: String((e && e.message) || e).slice(0, 160) }; // advisory -- never blocks on a model-call failure
   }
   if (result && result.degenerate) return { verdict: 'ok' };

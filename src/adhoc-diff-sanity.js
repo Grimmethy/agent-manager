@@ -76,7 +76,7 @@ const CODE_SIGNAL_RE = /\b(src|python|scripts|lib|app|dashboard|templates)\/|\.(
 // containing one of these is excluded from the code-signal scan, same "citation vs.
 // target" distinction extractDeclaredFiles/extractDeclaredTargets already draw elsewhere
 // in this file, just applied to the blind-scan fallback path instead of a structured one.
-const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|handle|contain)s?|documented in|as (?:shown|described|documented|seen|specified) in|mentioned in|cited in|referenced in|defined in|lives? in|found in|per\b|see\b|(?:anchor|grounding) is real|confirmed (?:real|in)|the (?:real|grounding) (?:source|evidence))\b/i;
+const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|handle|contain)s?|documented in|as (?:shown|described|documented|seen|specified) in|mentioned in|cited in|referenced in|defined in|lives? in|found in|(?:anchor|grounding) is real|confirmed (?:real|in)|the (?:real|grounding) (?:source|evidence))\b/i;
 
 // 2026-09-21 (needs-clarification clearing, in-app chat design review): the citation markers above cannot keep up with prose. Two genuine documentation tasks
 // (an AGENTS.md invariant note; a research note under docs/research/) were still blocked 3/3 by sentences that mention a code path only to say it is NOT to be touched
@@ -92,7 +92,9 @@ const CITATION_CONTEXT_RE = /\b(?:enforced by|already (?:exist|implement|cover|h
 //      verb, or one that opens with an imperative ("Lazy-load the rows in index.html") on a code path still wants code.
 const CODE_PATH_SIGNAL_RE = /\b(?:src|python|scripts|lib|app|dashboard|templates)\/|\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
 const CODE_PHRASE_SIGNAL_RE = /\b(?:implement|endpoint|route|task source|new (?:module|file|source|helper)|render\w*\(|def \w+\(|function \w+|wire (?:it|this|the|in)|add .{0,25}(?:to|in|into) \w[\w./-]*\.(?:py|js|html|sh)|api route|backend|cursor module|sweep logic)\b/i;
-const AFFIRMATIVE_EDIT_VERB_RE = /\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix|create|write|refactor|extract|move|rename)\b/i;
+// A verb glued to identifier characters is part of a NAME, not a request: "lease-delete+yield", "file.delete", "get_move_set" (2026-10-15, GPU broker verification tasks: a documentation task that cites
+// `lease-delete+yield` as evidence was blocked as asking for a code change). The lookbehind/lookahead keep a sentence-final "delete." and "delete the lease" as verbs.
+const AFFIRMATIVE_EDIT_VERB_RE = /(?<![-_+/.:])\b(?:change|edit|update|modify|replace|rewrite|append|prepend|insert|remove|delete|add|fix|create|write|refactor|extract|move|rename)\b(?![-_+/:]|\.\w)/i;
 // A negator, up to three filler words, then an edit-ish verb: "do NOT modify", "not files to edit", "does not implement", "must not be edited".
 const NEGATED_VERB_RE = /\b(?:do\s*n[o']?t|don['’]t|does\s*n[o']?t|doesn['’]t|must\s+not|should\s+not|never|not|no)\b(?:\s+[\w'’-]+){0,3}?\s+(?:edit\w*|modif\w*|chang\w*|touch\w*|implement\w*|updat\w*|writ\w*|add\w*|alter\w*|delet\w*|creat\w*|replac\w*|rewrit\w*|insert\w*|remov\w*|fix\w*)\b/gi;
 // The sentence the needs-clarification picker appends to a human's answer ("This answer resolves the open question(s) above -- implement against it directly rather than
@@ -100,6 +102,9 @@ const NEGATED_VERB_RE = /\b(?:do\s*n[o']?t|don['’]t|does\s*n[o']?t|doesn['’]
 const PIPELINE_BOILERPLATE_RE = /\bimplement against (?:it|this|that|the answer)\b[^.!?\n]*/gi;
 // An affirmative sentence whose object is a documentation file: "Append X to AGENTS.md", "Create a single NEW Markdown file at docs/research/x.md".
 const DOC_DELIVERABLE_RE = /\b(?:append|prepend|create|write|add|merge|insert|document|record|draft)\b[^.!?\n]{0,160}?(?:\.md\b|\.txt\b|\bdocs?\/|\bMarkdown\b|\bADR\b|\bREADME\b|\bAGENTS\b)/i;
+// A task that says outright its code is read-only / nothing else is touched (2026-10-15: "RULES: read-only on the code; write ONLY the one findings file named below (a NEW file, nothing else
+// changed)" was itself read as a code request because of "NEW file" and "write"). Only meaningful together with a stated documentation deliverable, see wantsCodeChange.
+const READ_ONLY_RE = /\bread-only\b|\bnothing else (?:is |was |gets )?(?:touched|changed|modified|edited)\b|\bchange nothing else\b|\bwrite ONLY the one\b/i;
 
 function stripNonRequests(sen) {
   return sen.replace(NEGATED_VERB_RE, ' ').replace(PIPELINE_BOILERPLATE_RE, ' ');
@@ -141,9 +146,14 @@ const NON_IMPERATIVE_LEAD_RE = /^(?:(?:and|then|also|but|so|next|finally|plus)\s
 // "Populate it with at least three rows: routes/chat.py:140-148 (...)" and "Decision 1: ... touching scripts/local-worker.sh" are documentation, and a first version of this
 // rule, dry-run over the real queue, flipped both). A "Label:" / "Decision 1:" lead is not a verb either.
 const TARGET_PATH_RE = /\b(?:in|into|to|inside|within)\s+(?:the\s+|its\s+|a\s+)?(?:[\w.-]+\/)*[\w.-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css)\b/i;
+// Verbs that ask the author to LOOK at a file, never to change it (2026-10-16: two read-only design/findings tasks, "Ground it in the current code with path:line ... in src/task-sources.js" and
+// "Read the real history ... the existing task sources in src/task-sources.js", were blocked because "Ground" / "Read" are not on the non-verb list above and the file is named after "in"). None of
+// these is a mutating verb; a sentence that ALSO contains a real edit verb ("Read the helper and rename it in src/a.js") still counts, see opensWithImperative.
+const READING_LEAD_RE = /^(?:read|ground|check|confirm|verify|compare|survey|inspect|review|examine|trace|count|group|audit|map|identify|investigate|analy[sz]e|look|study|scan|grep|search|find|classify|tabulate|quantify|cross-check|cross-reference)$/i;
 function opensWithImperative(c) {
   const m = /^[\s>*\-\d.)]*([A-Za-z][A-Za-z-]*)(?=\s)/.exec(c);
-  return !!m && !NON_IMPERATIVE_LEAD_RE.test(m[1]) && TARGET_PATH_RE.test(c);
+  if (!m || NON_IMPERATIVE_LEAD_RE.test(m[1]) || !TARGET_PATH_RE.test(c)) return false;
+  return !(READING_LEAD_RE.test(m[1]) && !AFFIRMATIVE_EDIT_VERB_RE.test(c));
 }
 // A sentence still counts as asking for code when it has a phrase signal, an affirmative edit verb, or opens with an imperative.
 const requestsCode = (c) => CODE_PHRASE_SIGNAL_RE.test(c) || AFFIRMATIVE_EDIT_VERB_RE.test(c) || opensWithImperative(c);
@@ -154,6 +164,9 @@ const requestsCode = (c) => CODE_PHRASE_SIGNAL_RE.test(c) || AFFIRMATIVE_EDIT_VE
 function wantsCodeChange(combined, rawText = null) {
   if (rawText) {
     const raw = scanForCodeSignals(rawText);
+    // A stated documentation deliverable AND an explicit read-only statement: the verbs and phrases in code-citing sentences describe what the document will verify, so only a sentence
+    // that opens with an imperative aimed at a code path ("Rename the helper in src/a.js") still asks for code.
+    if (raw.docDeliverable && READ_ONLY_RE.test(rawText)) return raw.tripping.some(opensWithImperative);
     if (raw.docDeliverable) return raw.tripping.some(requestsCode);
   }
   const all = scanForCodeSignals(combined);
@@ -294,7 +307,9 @@ function extractDeclaredTargets(task, planText = '') {
   for (const frag of String((task && task.title) || '').split(/(?<=[.!?:;])\s+|\s+[—-]\s+/)) {
     if (RESTRICTION_SENTENCE_RE.test(frag)) continue;
     for (const m of frag.matchAll(/\b(?:src|python|scripts|lib|tests?|docs|node_modules)\/[\w./@-]*[\w]/gi)) add(m[0]);
-    for (const m of frag.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b/gi)) add(m[0]);
+    // `(?!\()`: a CALL such as `res.json()` / `fs.readFile()` in a title is code, not a file path (2026-10-08: two TaxHarvest tasks whose title is the whole
+    // brain-dump text, "`res.json()` on a non-JSON 200 ...", were blocked by the plan-target guard as "cites missing-file target(s): res.json"; same shape as #514).
+    for (const m of frag.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b(?!\()/gi)) add(m[0]);
   }
   // 3. Explicit edit-target mentions in the plan body.
   const plan = String(planText || '');
@@ -349,7 +364,7 @@ function leadingInClauseTargets(text) {
   for (const frag of String(text || '').split(/(?<=[.!?:;])\s+|\n+/)) {
     const sentence = frag.trim();
     if (RESTRICTION_SENTENCE_RE.test(sentence)) continue;
-    const leading = /^(?:In|At)\s+[`'"]?([\w./@-]+\.\w+)[`'"]?\s*(?:\([^)]*\)\s*)?,/i.exec(sentence);
+    const leading = /^(?:In|At)\s+[`'"]?([\w./@-]+\.\w+)(?!\()[`'"]?\s*(?:\([^)]*\)\s*)?,/i.exec(sentence);
     if (leading && EDIT_VERB_RE.test(sentence)) out.push(leading[1]);
   }
   return out;

@@ -551,6 +551,17 @@ function recordApplyOutcome(task, result) {
   task.status = { applied: 'done', 'apply-failed': 'blocked', 'awaiting-confirm': 'awaiting-confirm', coordinating: 'coordinating' }[applyStage];
   const marker = result.doneMarker || result.branch || result.reason;
   appendHistoryEvent(task, applyStage, marker);
+  // HUB0116 (silent-catch in the apply path): the crash used to land a task in
+  // queue/blocked/ whose history ended at 'approved' with nothing after it -- the
+  // 'apply-failed' entry above records the stage, but consumers triaging blocked tasks
+  // (and the local-draft/review-stage convention, see task-history.js's stage vocabulary)
+  // scan for a 'blocked' entry that names the WHY. Record the blockedReason itself as a
+  // 'blocked' history event, on top of the stage entry -- this runs before main()/
+  // mainBatch() write the task file back, which is before apply-task.sh's own move into
+  // queue/blocked/, so the reason is persisted in the file that ends up in blocked/.
+  if (applyStage === 'apply-failed') {
+    appendHistoryEvent(task, 'blocked', task.blockedReason);
+  }
 
   // Apply-time no-op stamp (2026-09-10): a `skipped` apply -- empty/degenerate implement,
   // "no candidates in implement response -- nothing to apply" -- still returns

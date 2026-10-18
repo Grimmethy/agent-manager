@@ -20,6 +20,7 @@ const { checkDraft } = require('../fact-checker.js');
 const { resolveSourceName, getRegisteredSource } = require('../task-source-registry.js');
 const { isClaudePaused } = require('../claude-pause.js');
 const { writeHeartbeatFile } = require('../heartbeat.js');
+const { loadTaskImages } = require('./task-images.js');
 const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./draft-lifecycle.js');
 
 function resolveDraftContext(task, { localCall, withLockFn }) {
@@ -40,8 +41,13 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
   // as it always has; wrapping it here would silently change what a test believes it's
   // calling.
   const modelProfile = resolveModelProfile(task);
-  const profileOverrides = modelProfile
-    ? { model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict }
+  // Vision tasks (lib/task-images.js): promptContext.imagePaths -> base64 `images` on every local call of the task.
+  const taskImages = loadTaskImages(task && task.promptContext);
+  const profileOverrides = (modelProfile || taskImages.length)
+    ? {
+      ...(modelProfile ? { model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict } : {}),
+      ...(taskImages.length ? { images: taskImages } : {}),
+    }
     : null;
   const baseLocalCall = localCall || providerFor(task).call;
   const profileWrappedCall = profileOverrides && !localCall

@@ -132,6 +132,61 @@ function invalidPremiseBeforeCheckExisted(task) {
   return hasInvalidPremise(task);
 }
 
+// 2026-10-07: decompose-premise-check.js's stale-premise gate (blockedReason "sub-task premise
+// may be stale: ...") called a cited file missing when it only exists under a monorepo
+// sub-root (TaxHarvest-Cowork: src/routes/counties.js cited, TaxHarvest/backend/src/routes/
+// counties.js real), so a sub-task blocked on a premise that was never stale -- and nothing
+// brought it back: the block has no blockedStage and no needsClarification, so every gate in
+// this sweep skipped it. Re-evaluate the SAME gate now (it resolves a cited path by suffix):
+// when it no longer fires, the block was the gate's false positive, not a real signal, and
+// the task is re-admitted clean-slate exactly once. Fires only while task.stalePremiseReadmitted
+// is falsy and the block text is the gate's own, so a block that still holds (the file really is
+// gone / really is shorter than the cited line) is never re-admitted, and a task that somehow
+// trips it again after the fix is not re-admitted forever. Any doubt (no repoRoot, an exception)
+// answers false. Mirrors forbiddenPathBlockNamesOwnTarget / invalidPremiseBeforeCheckExisted.
+const STALE_PREMISE_REASON_RE = /^sub-task premise may be stale/i;
+function stalePremiseGateNoLongerFires(task, { repoRoot, detectFn } = {}) {
+  if (!task || task.stalePremiseReadmitted) return false;
+  if (!STALE_PREMISE_REASON_RE.test(String(task.blockedReason || '').trim())) return false;
+  if (!repoRoot) return false;
+  try {
+    const detect = detectFn || require('../decompose-premise-check.js').detectStaleDecomposePremise;
+    return detect(task, { repoRoot }) === null;
+  } catch {
+    return false;
+  }
+}
+
+// 2026-10-07 (blocked class B): local-agentic-write-draft.js's external-dependency gate blocked
+// ordinary code edits on prose/identifier words (credential.idToken, "auth token", access_token in
+// a snippet) before any model call. The block carries no persisted needsClarification and no
+// blockedStage, so the entry gate never admitted it. Re-evaluate the gate now (code spans and the
+// plan echo are no longer scanned; soft markers only advise by default): when it no longer blocks,
+// the block was the gate's false positive and the task is re-admitted clean-slate exactly once.
+// A genuine hard-marker block (new repo, hosting, git remote) still reproduces and is never
+// re-admitted; externalDepReadmitted is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS.
+const EXTERNAL_DEP_REASON_RE = /^task requires external-state operation/i;
+function externalDepGateNoLongerBlocks(task, { detectFn } = {}) {
+  if (!task || task.externalDepReadmitted) return false;
+  if (!EXTERNAL_DEP_REASON_RE.test(String(task.blockedReason || '').trim())) return false;
+  try {
+    const detect = detectFn || require('../local-agentic-write-draft.js').detectExternalDependency;
+    return detect(task) === null;
+  } catch {
+    return false;
+  }
+}
+
+// 2026-10-07 (blocked class C, arch-review-ac-180): a candidate split with fewer than 2 usable sub-candidates is now retried once inside the
+// draft (local-draft.js finalizeCandidateFulfillment, flag splitTooFewRetried). A task blocked that way BEFORE the retry existed carries no
+// such flag, so it is re-admitted clean-slate exactly once and gets the retry; a task that already had it (the retry also failed) stays
+// blocked, and splitTooFewReadmitted (deliberately NOT in READMIT_CLEAN_SLATE_FIELDS) bounds the re-admission itself.
+const SPLIT_TOO_FEW_REASON_RE = /only \d+ of \d+ proposed sub-candidate\(s\) had a real title\/problem\/solution/i;
+function splitTooFewStillRetryable(task) {
+  if (!task || task.splitTooFewRetried || task.splitTooFewReadmitted) return false;
+  return SPLIT_TOO_FEW_REASON_RE.test(String(task.blockedReason || ''));
+}
+
 // 2026-09-17: every escalation site in this file used to check "has this task EVER, in
 // its whole lifetime, carried a needs-clarification history stage" -- correct the FIRST
 // time a task exhausts, but permanently wrong afterward: a task legitimately re-admitted
@@ -240,4 +295,4 @@ function isImplementDegenerateBlock(task) {
   return task.blockedStage === 'implement';
 }
 
-module.exports = { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock };
+module.exports = { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, externalDepGateNoLongerBlocks, splitTooFewStillRetryable, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock };

@@ -153,6 +153,10 @@ while :; do
       printf '[watchdog] restarted %s (was pid %s, %s) -- new pid %s via %s\n' "$action_instance" "$action_pid" "$action_reason" "$new_pid" "$action_script" >&2
     done < <(node "${PACKAGE_SRC_DIR}/dead-process-check.js" 2>>"${HOME_LOGS}/dead-process-check.log")
 
+    # Lane health probe (src/lane-health.js): one tiny generation per idle lane every ~10 min, so a lane that is up but crawling (2026-10-17: RX 580 memory
+    # clock stuck at 300 MHz, 0.6 tok/s) is flagged as degraded instead of looking like a task that is too big. Self-throttled and run in the background (a probe of a crawling lane can take its full timeout); kill switch AGENT_MANAGER_LANE_HEALTH=off.
+    ( node "${PACKAGE_SRC_DIR}/lane-health.js" >/dev/null 2>>"${HOME_LOGS}/lane-health.log" || true ) &
+
     # Reject-retry-requeue: a task genuinely rejected by review (blockedStage:'review') gets
     # one more redraft attempt, up to reject-retry-check.js's own retry cap -- port of
     # queue-watchdog.ps1's Invoke-RejectRetryCheck (that script's OTHER job, dead-process
@@ -235,6 +239,13 @@ while :; do
     # AGENT_MANAGER_GROUNDING_RECHECK=false. See grounding-recheck-sweep.js.
     grounding_recheck_result="$(node "${PACKAGE_SRC_DIR}/grounding-recheck-sweep.js" 2>>"${HOME_LOGS}/grounding-recheck-sweep.log")"
     printf '[watchdog] grounding-recheck-sweep: %s\n' "$grounding_recheck_result" >&2
+
+    # Branch-conflict re-admission (2026-10-09, TaxHarvest): a single-task agent/* branch that conflicts with main (seen on two runs >= 10 min apart) gets
+    # one redraft against current main, with a main-moved priorVerdict naming the conflicting files and telling the drafter to check first whether the change
+    # already landed. Never touches hub children, stacked tasks, shared branches, human-prioritised tasks, or rivals that conflict only with each other.
+    # AGENT_MANAGER_CONFLICT_READMIT=off|dry-run|on (default dry-run). See branch-conflict-readmit-sweep.js.
+    conflict_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-conflict-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-conflict-readmit-sweep.log")"
+    printf '[watchdog] branch-conflict-readmit-sweep: %s\n' "$conflict_readmit_result" >&2
 
     # Expiry sweep (2026-09-24, change_review flood): retires a QUEUED task whose subject went stale while it waited, for any source that
     # declares an `expiry` hook on its registration (change_review: a review of a commit older than its recency window). Source-agnostic --
