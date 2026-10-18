@@ -881,3 +881,34 @@ test('probing: shadow mode and fraction 0 change nothing; paused/ineligible task
     assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', routingOpts({ lanes: RESTRICTED, scorecard: [] })), ['probe-a.json']);
   }, '1');
 });
+
+// --- Lane avoidance must never strand a task (2026-10-17) ---------------------------------------------------------------------------------------------------
+// Fields copied from the stranded record (queue/pending/adhoc-initiative-record-design-doc-extend-..., premium): avoidLanes held the biggest lane AND the P40, and the
+// only other lane (rx580) has a taskClasses allowlist, so pickClaimableTasks offered it on NO lane.
+const STRANDED_RECORD = '{"id": "adhoc-initiative-record-design-doc-extend-the-merged-doc-with-the-missing-sections-docs-only-one-file-1792157631660", "domain": "adhoc", "source": "manual", "humanQueued": true, "premiumPriority": true, "avoidLanes": ["worker-3090", "worker-p40"]}';
+const STRANDED_LANES = [
+  { id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', tier: 27, taskClasses: null },
+  { id: 'worker-rx580', model: 'qwen3-vl:8b-instruct', tier: 8, taskClasses: ['brain_dump_sort'] },
+];
+
+test('lane avoidance never strands: the stranded premium record is claimable on the biggest lane even though it names it', () => {
+  const pendingDir = setupPending();
+  const rec = JSON.parse(STRANDED_RECORD);
+  writeTask(pendingDir, 'stranded', { ...rec, id: 'stranded' });
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes: STRANDED_LANES, graceMs: 0, laneAlive: () => true }), ['stranded.json']);
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', { lanes: STRANDED_LANES, graceMs: 0, laneAlive: () => true }), [], 'the restricted lane still never offers it');
+});
+
+test('lane avoidance still steers a task off a lower-tier lane while the bigger lane can take it', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'sort-avoid', { source: 'brain_dump_sort', avoidLanes: ['worker-rx580'] });
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', { lanes: STRANDED_LANES, graceMs: 0, laneAlive: () => true }), [], 'the small lane steps aside');
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes: STRANDED_LANES, graceMs: 0, laneAlive: () => true }), ['sort-avoid.json']);
+});
+
+test('lane avoidance does not hold a task for a lane that is known to be down', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'sort-avoid', { source: 'brain_dump_sort', avoidLanes: ['worker-rx580'] });
+  const bigDown = (id) => id !== 'worker-3090';
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', { lanes: STRANDED_LANES, graceMs: 0, laneAlive: bigDown }), ['sort-avoid.json'], 'the 3090 is down, so the small lane takes it');
+});

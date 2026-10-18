@@ -1785,3 +1785,47 @@ test('a too-few split block is NOT re-admitted when the draft retry already ran,
     assert.ok(fs.existsSync(path.join(d.blockedDir, `${id}.json`)));
   }
 });
+
+test('rejectRetryCheck: a plan-degenerate block on the BIGGEST lane records no avoidLanes and files one deterministic systemic side finding', () => {
+  const lanes = [
+    { id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', tier: 27, taskClasses: null },
+    { id: 'worker-rx580', model: 'qwen3-vl:8b-instruct', tier: 8, taskClasses: ['brain_dump_sort'] },
+  ];
+  const { root, blockedDir, pendingDir } = setupDirs();
+  for (const id of ['top-a', 'top-b']) {
+    writeBlockedTask(blockedDir, id, {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      planResponse: 'a truncated, unusable plan',
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-3090', finishedAt: new Date().toISOString() }],
+    });
+  }
+  rejectRetryCheck({ blockedDir, pendingDir, pipelineDir: root, lanes, recordModelOutcome: () => {} });
+  const a = JSON.parse(fs.readFileSync(path.join(pendingDir, 'top-a.json'), 'utf8'));
+  assert.equal(a.avoidLanes, undefined, 'the biggest lane must never be recorded');
+  assert.ok(a.history.some((h) => h.stage === 'advisory' && /filed a systemic side finding/.test(h.detail || '')));
+  assert.ok(!a.history.some((h) => h.stage === 'lane-avoided'));
+  const inbox = path.join(root, 'queue', 'side-findings-inbox');
+  const files = fs.readdirSync(inbox).filter((f) => f.endsWith('.json'));
+  assert.equal(files.length, 2, 'one inbox entry per blocked task...');
+  const recs = files.map((f) => JSON.parse(fs.readFileSync(path.join(inbox, f), 'utf8')));
+  assert.equal(recs[0].title, recs[1].title, '...with identical text, so the side-finding sweep merges them into one entry');
+  assert.equal(recs[0].body, recs[1].body);
+  assert.deepEqual(recs.map((r) => r.taskId).sort(), ['top-a', 'top-b'], 'the task id lives in the metadata, not the text');
+  assert.equal(recs[0].source, 'lane_avoidance');
+});
+
+test('rejectRetryCheck: the same block on a lower-tier lane records avoidLanes and files no side finding', () => {
+  const lanes = [
+    { id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', tier: 27, taskClasses: null },
+    { id: 'worker-rx580', model: 'qwen3-vl:8b-instruct', tier: 8, taskClasses: ['brain_dump_sort'] },
+  ];
+  const { root, blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'low-a', {
+    status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+    draftAttempts: [{ outcome: 'blocked', lane: 'worker-rx580', finishedAt: new Date().toISOString() }],
+  });
+  rejectRetryCheck({ blockedDir, pendingDir, pipelineDir: root, lanes, recordModelOutcome: () => {} });
+  const a = JSON.parse(fs.readFileSync(path.join(pendingDir, 'low-a.json'), 'utf8'));
+  assert.deepEqual(a.avoidLanes, ['worker-rx580']);
+  assert.ok(!fs.existsSync(path.join(root, 'queue', 'side-findings-inbox')) || fs.readdirSync(path.join(root, 'queue', 'side-findings-inbox')).length === 0);
+});
