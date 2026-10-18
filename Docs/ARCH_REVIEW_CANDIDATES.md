@@ -2247,3 +2247,16 @@ Replace the `fs.writeFileSync` call in `writeSideFindingInbox` with `writeJsonAt
 
 Benefits:
 Closes a real durability gap in the same `queue/` tree the project has already lost work to, reuses the existing shared primitive instead of a private divergent implementation, and makes the "best-effort" intent accurate (it now means "swallow the error classes that are recoverable" rather than "skip the durability guarantee"). Zero behavioral change in the success path; the only observable difference is that a crash mid-write now leaves the previous state of the inbox intact instead of a truncated, unparseable file.
+
+### AC-191 · Extract duplicated signature-parsing logic into a shared helper
+Strength: Strong
+Files: src/pipeline-self-audit.js
+
+Problem:
+In `src/pipeline-self-audit.js`, the logic that splits a `signature` string into its `source` and `category` components (via `lastIndexOf('::')` and `slice`) is duplicated verbatim inside both `buildAuditRawText` and `buildAuditTask`. This tight coupling to the exact string format means that any future change to the signature convention—such as introducing a new separator, an additional metadata segment, or a different ordering—requires a synchronized edit in two separate functions. A missed update in one location will silently produce inconsistent evidence text versus task titles, and because the two copies are structurally identical, a reviewer scanning one function may assume the other is already correct.
+
+Solution:
+Introduce a single private helper, e.g. `parseSignature(signature)`, that returns `{ source, category }` (or `null` for malformed input). Replace the inline `lastIndexOf`/`slice` expressions in both `buildAuditRawText` and `buildAuditTask` with a call to this helper. Add a brief JSDoc comment on the helper documenting the expected signature format so the contract lives in one place. If the format is already defined as a constant or type elsewhere in the module, reference it in the helper's documentation.
+
+Benefits:
+The parsing rule now exists in exactly one location, eliminating the divergence risk between the two call sites. Future format changes require editing a single function, and any validation or error-handling logic (e.g., guarding against a missing `::`) can be added once and inherited by both consumers. Code review surface shrinks because reviewers no longer need to verify that two inline blocks remain in lockstep, and the helper is trivially unit-testable in isolation.
