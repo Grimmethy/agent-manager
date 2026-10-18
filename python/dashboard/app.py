@@ -40,6 +40,7 @@ from werkzeug.exceptions import HTTPException
 # this whole project's no-build-step, run-from-source philosophy.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import graph_build  # noqa: E402
+from app_proactive_sweep import proactive_sweep_argv, proactive_sweep_lock_path  # noqa: E402
 import visualize_graph  # noqa: E402
 
 import plugin_process_manager
@@ -2797,9 +2798,10 @@ def _launch_pipeline_subprocess(child_env: dict, raw_path: str, include_apply: b
     # never blocks this response: the sweep can make a real local-model call (Tier B/C of
     # runFileDecomposePlanPass) if the file has no comment-banner structure to group
     # deterministically, and this route's own caller (the Project tab) should not wait on
-    # that. --force bypasses the sweep's own 24h internal gate for this one on-demand
-    # trigger; the periodic queue-watchdog tick still runs it every 24h regardless of
-    # whether a project switch happens to trigger it in between.
+    # that. --force bypasses the sweep's own time floor (5 minutes) for this one on-demand
+    # trigger; the periodic queue-watchdog tick still starts it on its own. Both go through the
+    # same flock lock (app_proactive_sweep.py / scripts/lib/start-singleton-bg.sh), so a copy
+    # that is already running makes this start a no-op instead of a second concurrent run.
     try:
         # S4a of the hub-tasks extraction (2026-09-24): proactive-file-decompose-sweep.js
         # moved to agent-manager-hygiene. Resolved BY NAME via _resolve_plugin_root (S5a,
@@ -2811,7 +2813,7 @@ def _launch_pipeline_subprocess(child_env: dict, raw_path: str, include_apply: b
             _decompose_log_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
             _decompose_log_dir.mkdir(parents=True, exist_ok=True)
             subprocess.Popen(
-                ["node", str(_proactive_sweep), "--force"],
+                proactive_sweep_argv(_proactive_sweep, proactive_sweep_lock_path()),
                 env=child_env,
                 cwd=str(_proactive_sweep.parent),
                 stdout=(_decompose_log_dir / "proactive-file-decompose-sweep.log").open("a"),

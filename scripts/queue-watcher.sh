@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Load shared env + require AGENT_MANAGER_REPO_ROOT, MODEL_URL (same check
 # applied to every daemon; logs [common] ERROR and exits if missing).
 source "${SCRIPT_DIR}/orc-common.sh"
+source "${SCRIPT_DIR}/lib/start-singleton-bg.sh"
 
 readonly INSTANCE_ID="${1:-watchdog}"    # same naming as PowerShell's $env:InstanceID per-daemon.
 
@@ -30,6 +31,8 @@ trap 'printf "[watchdog] SIGTERM/SIGINT received -- exiting after current tick.\
 # this daemon restarts something.
 PID_DIR="${HOME}/.local/state/agent-manager/pids"
 mkdir -p "$PID_DIR" 2>/dev/null
+# Shared with python/dashboard/app.py (proactive_sweep_lock_path): whoever starts the proactive decompose sweep takes this lock first.
+PROACTIVE_LOCK="${PID_DIR}/proactive-file-decompose.lock"
 
 # HOME_LOGS: temp dir for watchdog status logs (same shape PS pipeline-doctor.ps1 uses).
 HOME_LOGS="$(mktemp -d)"
@@ -459,9 +462,11 @@ while :; do
     # gated to once per 24h internally (isDue/markChecked); runs the file-length-scan
     # result from THIS same tick, so it always sees fresh flags. Disable with
     # AGENT_MANAGER_PROACTIVE_FILE_DECOMPOSE=false.
+    # Run DETACHED and single-instance (2026-10-17): one run is 15+ minutes of model calls, and running it inline held every other sweep in this tick behind it (the coordinator
+    # sweep went ~16 minutes without a pass). The dashboard's --force start takes the same lock (python/dashboard/app.py proactive_sweep_argv), so the two can no longer overlap.
+    # The sweep's own summary line now goes to its log instead of this tick's output.
     if [[ -n "$_hygiene_src" ]] && [[ -f "${_hygiene_src}/proactive-file-decompose-sweep.js" ]]; then
-      proactive_decompose_result="$(node "${_hygiene_src}/proactive-file-decompose-sweep.js" 2>>"${HOME_LOGS}/proactive-file-decompose-sweep.log")"
-      printf '[watchdog] proactive-file-decompose-sweep: %s\n' "$proactive_decompose_result" >&2
+      start_singleton_bg "$PROACTIVE_LOCK" "${HOME_LOGS}/proactive-file-decompose-sweep.log" node "${_hygiene_src}/proactive-file-decompose-sweep.js"
     fi
 
     # merged-work-sweep (2026-09-18): wires verify-merged-work.js -- built 2026-09-16,
