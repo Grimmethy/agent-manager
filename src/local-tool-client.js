@@ -20,6 +20,7 @@ const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { logToolLoopEvent, buildTurnEndEntry, buildToolOutcomeEntries } = require('./tool-loop-audit.js');
 const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { localOllamaLockKey } = require('./lib/ollama-lock-key.js');
@@ -624,7 +625,10 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
     const res = await postJson(`${OLLAMA_URL}/api/chat`, {
       model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: CHAT_OPTIONS,
     }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
-    return { message: res.message || {}, usage: pickUsage(res) };
+    // doneReason here too (2026-10-18, brain-dump 1889): every pipeline draft takes this
+    // non-streaming branch, and without it the 'truncated' audit events below could only
+    // ever fire for Chat. Consumed by logging only -- no branch acts on it.
+    return { message: res.message || {}, usage: pickUsage(res), doneReason: res.done_reason || null };
   }
   let contentAcc = '';
   let toolCalls = null;
@@ -1065,6 +1069,26 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     usageAcc.eval_duration += Number(u.eval_duration) || 0;
     require('./local-throughput.js').noteAttemptSample({ evalCount: Number(u.eval_count) || 0, evalDurationNs: Number(u.eval_duration) || 0 });
   };
+  // Tool-loop audit (see tool-loop-audit.js's own header): one 'turn-end' line per model
+  // turn and one 'tool-outcome' line per edit_file/write_file call, in their own log.
+  // Log-only -- nothing below reads these back. A flaked turn has no message to describe
+  // and is skipped (the flake is recorded by its own path).
+  const auditCtx = (turn, phase) => ({
+    source, taskId, stage, lane: process.env.AGENT_MANAGER_INSTANCE_ID || null, model: MODEL || null, turn, phase,
+  });
+  const logTurnEnd = (turn, phase, turnRes) => {
+    try {
+      if (!turnRes || turnRes.flakeErr || !turnRes.message) return;
+      logToolLoopEvent(pipelineDir, 'turn-end', buildTurnEndEntry(auditCtx(turn, phase), turnRes));
+    } catch { /* best-effort -- see logToolLoopEvent */ }
+  };
+  const logToolOutcomes = (turn, calls) => {
+    try {
+      for (const entry of buildToolOutcomeEntries(auditCtx(turn, 'loop'), calls)) {
+        logToolLoopEvent(pipelineDir, 'tool-outcome', entry);
+      }
+    } catch { /* best-effort -- see logToolLoopEvent */ }
+  };
   // Same extraction as local-client.js's call()/claude-client.js's call() -- see
   // side-finding.js's own header. Hooked into this one shared wrapper so every return
   // path (normal finish, forced-summary, maxTurns-exhausted fallback) is covered from a
@@ -1173,6 +1197,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       toolCallLog, turnStartLengths, turnStartLogLengths,
     });
     addUsage(summaryUsage);
+    logTurnEnd(turnsUsed, 'forced-summary', { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake });
     // The forced-summary turn itself can, in principle, also get clipped -- worth its own
     // audit entry (see logContextAudit's own header) since RESERVED_RESPONSE_TOKENS is
     // exactly the margin betting this never happens.
@@ -1215,6 +1240,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         toolCallLog, turnStartLengths, turnStartLogLengths,
       });
       addUsage(retryResult.usage);
+      logTurnEnd(turnsUsed, 'forced-summary-retry', retryResult);
       const retryContent = (!retryResult.flakeErr && retryResult.message && retryResult.message.content) ? retryResult.message.content : '';
       if (HAS_RESOLUTION_RE.test(retryContent)) {
         summaryContent = retryContent;
@@ -1355,6 +1381,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         ceiling: PINNED_NUM_CTX,
       });
     }
+    logTurnEnd(turn, 'loop', { message, usage, doneReason, flakeErr });
     if (flakeErr) {
       // Rollback exhausted too (or there was no prior turn to roll back -- a first-turn
       // failure is a genuinely different, unexplained case). Graceful-degrade if the
@@ -1424,7 +1451,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       }
       return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
     }
+    const toolLogStart = toolCallLog.length;
     await executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
+    logToolOutcomes(turn, toolCallLog.slice(toolLogStart));
   }
 
   // maxTurns reached without a final (no-tool-calls) response -- deliberate forced stop,
