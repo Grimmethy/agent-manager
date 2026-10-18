@@ -2291,3 +2291,29 @@ Strength: Strong
 **Status: Withdrawn**
 
 Upon re-examination, the draft mischaracterized the control flow. `deriveBelongsToProject` is invoked *inside* `reviewBrainDumpSort` immediately before the canonical-folder coercion check. The coercion in `reviewBrainDumpSort` is a deliberate final safety net for edge cases (e.g., a model output that bypasses the derivation recovery paths), not a duplicated or independent enforcement of the same rule. The separation of "derivation/recovery" from "final validation/coercion" is a valid and intentional layering. Extracting a shared helper called by both functions would not change behavior and would obscure the two distinct responsibilities. The "risk of partial update" the draft cited is speculative and not supported by the code's actual call structure.
+
+### AC-195 · Registry enforces the core-scope gate; SDK is a passive utility
+Strength: N/A (No defect)
+Files: src/task-source-registry.js, src/sdk/candidate-fulfillment.js
+
+Problem:
+None. The initial draft incorrectly identified a "hidden contract" or enforcement gap. In reality, `src/sdk/candidate-fulfillment.js` provides helper functions (parsing, grounding, etc.) that plugins use to construct their `next` logic. It does not register sources or bypass the registry. The registry (`src/task-source-registry.js`) is the sole enforcement point: when a plugin calls `registerTaskSource` with `scope: 'core'`, the registry automatically wraps the provided `next` function with `sourceEligibleHere`. This is a standard, explicit API contract. The "gap" described in the draft does not exist because the SDK is not an active enforcement path; it is a passive library.
+
+Solution:
+No code changes required. The current architecture is correct. The registry remains the single source of truth for scope-gate enforcement. Plugin authors are responsible for setting `scope: 'core'` in their registration config if they wish to be gated, which is a configuration decision, not a missing SDK feature.
+
+Benefits:
+Maintains a clear separation of concerns: the SDK provides logic, the registry manages lifecycle and policy enforcement. No risk of breaking existing plugins or introducing redundant enforcement layers.
+
+### AC-196 · Source ordering and task priority are orthogonal concerns
+Strength: N/A (No defect)
+Files: src/task-source-registry.js, src/lib/task-priority.js
+
+Problem:
+None. The initial draft incorrectly characterized the relationship between static source ordering (registry) and dynamic task priority (lib) as a "divergence" causing bugs. In reality, these are distinct, intentional layers. Source ordering determines *which* source is polled for a task (scheduling). Task priority determines *how* that specific task is ranked within a queue or for selection (execution). A low-priority source can legitimately produce high-priority tasks, and dynamic task priority overrides allow fine-grained control without re-registering sources. This separation is a feature, not a bug.
+
+Solution:
+No code changes required. The current design correctly separates source scheduling order from task execution priority. Developers should understand that `getRegisteredSources()` order affects polling sequence, while `taskPriority()` affects task ranking. These are independent knobs for different aspects of the system.
+
+Benefits:
+Preserves the ability to have fine-grained control over both source selection and task ranking. Avoids the complexity and potential breakage of unifying two orthogonal concerns. Maintains flexibility for dynamic priority adjustments without impacting source registration.
