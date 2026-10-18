@@ -2317,3 +2317,35 @@ No code changes required. The current design correctly separates source scheduli
 
 Benefits:
 Preserves the ability to have fine-grained control over both source selection and task ranking. Avoids the complexity and potential breakage of unifying two orthogonal concerns. Maintains flexibility for dynamic priority adjustments without impacting source registration.
+
+### AC-197 · Single-function prompt-assembly module adds no value
+Strength: ~~Strong~~ → **Not actionable**
+Files: src/lib/prompt-assembly.js, src/prompts.js, src/lib/prompt-blocks.js
+
+Problem:
+`src/lib/prompt-assembly.js` houses the `assemblePrompt` function, a short newline-join of two arrays. At first glance this looks like a trivial one-liner that could be inlined at the call site. However, the module's dependency-graph degree is 3: it is imported by at least three separate consumers (including `src/prompts.js` and `src/lib/prompt-blocks.js`). That makes it a genuine shared utility, not a single-consumer wrapper.
+
+Solution:
+No change recommended. The module earns its place as a shared helper consumed by three call sites. Inlining the join into one consumer would either break the other two or force them to duplicate the logic, which is strictly worse than the current single-file, single-`require` arrangement.
+
+Benefits:
+(n/a — no action taken.) Keeping the module preserves DRY across the three consumers and avoids introducing a new indirection or duplication.
+
+---
+
+### AC-198 · Brain-dump sort/classify logic split across prompt and validator creates sync risk
+Strength: Worth exploring
+Files: src/brain-dump-sort-classify.js, src/task-sources.js, src/apply-group-a.js
+
+Problem:
+`src/brain-dump-sort-classify.js` was extracted specifically to break a require cycle between `task-sources.js` and `apply-group-a.js` (as documented in the file's header comment). In doing so it became a shared validator that must stay in lockstep with the prompt-generation side (the `brainDumpSortPlanPrompt` schema). Because the prompt schema and the validator live in different modules, a change to the classification taxonomy or field structure in one place must be manually mirrored in the other; nothing in the type system or module boundary enforces that they agree.
+
+Solution:
+Do **not** merge the prompt builder and validator into a single module—that would likely reintroduce the very `task-sources.js ↔ apply-group-a.js` require cycle the extraction was designed to eliminate, directly contradicting the documented design decision. Instead, introduce a small **shared schema-definition module** (e.g. `src/lib/brain-dump-sort-schema.js`) that exports the canonical taxonomy/field structure as a plain object or constant. Both the prompt-builder side and the validator in `src/brain-dump-sort-classify.js` then `require` that schema module and derive their respective text/validation from it. This gives a single source of truth for the taxonomy without altering the existing dependency direction, so the cycle-avoidance property is preserved.
+
+Benefits:
+Schema and validation are guaranteed consistent because both sides read from the same exported constant, eliminating the manual-mirroring step. The dependency graph gains one small leaf node (the schema module) but does not gain any new edges between the existing modules, so the `task-sources.js ↔ apply-group-a.js` cycle remains broken. Reduces the maintenance burden of remembering to update a validator whenever the prompt taxonomy changes, lowering the risk of silent mismatches between what the model is asked to produce and what the validator accepts.
+
+---
+
+NOTE: Flag 1 (AC-002 cycle contradiction) and Flag 2 (AC-001 degree-3 / multiple-consumer premise) were both applied; no flag was left unaddressed.
