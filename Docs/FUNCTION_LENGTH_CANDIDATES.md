@@ -12211,3 +12211,149 @@ Extract each bucket into a self-contained function that owns its detection predi
 
 Benefits:
 Readability improves because the ordering invariant is now a twelve-line list that a reviewer can verify in one glance, rather than a 900-line interleaving of predicates, deletes, and comment blocks. Testability improves because each bucket can be exercised in isolation with a minimal task fixture, and the ordering can be tested as a separate integration-level concern. Review-ability improves because a pull request adding Bucket Q touches one new file (or one new exported function) plus a single inserted line in the caller, making the diff small, the blast radius obvious, and the ordering constraint checkable by a reviewer who reads only the caller. The inconsistent field-clearing styles can also be normalized per-bucket without risk of accidentally altering another bucket's behavior.
+
+### AC-199 · Decompose applyDirectToMainBatchOnBranch into phase-scoped helpers
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+Symbol: applyDirectToMainBatchOnBranch
+Snippet:
+```
+}
+
+function applyDirectToMainBatchOnBranch(tasks, { repoRoot, pipelineDir, secondBrainDir, brainDumpPath, gitRunner, state }) {
+  const results = {};
+  const eligible = [];
+  for (const task of tasks) {
+    const reg = getRegisteredSource(resolveSourceName(task));
+    if (reg && reg.directToMain === true) {
+      eligible.push(task);
+    } else {
+      results[task.id] = { succeeded: false, reason: 'source is not directToMain -- must be applied individually, not in the triage batch' };
+    }
+  }
+  if (eligible.length === 0) return { results, committed: false };
+
+  // Gated (default): append onto the rolling TRIAGE_BRANCH, never main -- see main-push-policy.js.
+  // prepareStackedBranch syncs it from origin if it exists (earlier unmerged batches stay on it),
+  // or starts it fresh off current main (also after a human merged + deleted it).
+  const gated = !ungatedMainPushAllowed();
+  gitRunner.fetchMain();
+  if (gated) {
+    // Pre-flight BEFORE entering the branch: a dirty apply clone aborts prepareStackedBranch's `checkout -B` / `rebase`
+    // (2026-09-23: ~266 change_review tasks blocked one-by-one on it). Self-heal a dedicated clone, else fail once, loudly.
+    if (typeof gitRunner.quarantineDirtyTree === 'function') gitRunner.quarantineDirtyTree();
+    if (typeof gitRunner.assertCleanTree === 'function') gitRunner.assertCleanTree();
+    state.enteredTriageBranch = true;
+    gitRunner.prepareStackedBranch(TRIAGE_BRANCH);
+    // Drop candidate blocks main already retracted that this branch still carries (the merge driver used to keep them; see
+    // src/lib/prune-retracted-candidates.js). Best-effort and never fatal: a failure here must not block the batch.
+    if (typeof gitRunner.pruneRetractedCandidates === 'function') {
+      try {
+        const pruned = gitRunner.pruneRetractedCandidates();
+        if (pruned && pruned.committed) console.error(`[apply-main-batch] pruned retracted candidate(s) from ${TRIAGE_BRANCH}: ${pruned.pruned.map((p) => `${p.doc} ${p.ids.map((i) => `AC-${i}`).join(',')}`).join('; ')}`);
+      } catch (e) { console.error(`[apply-main-batch] pruneRetractedCandidates failed (ignored): ${String(e && e.message).split('\n')[0].slice(0, 200)}`); }
+    }
+  } else gitRunner.resetToMain();
+
+  const staged = [];
+  for (const task of eligible) {
+    try {
+      const artifact = writeArtifact(task, repoRoot, pipelineDir);
+      // HUB0092 · 2/3: a source.apply that saw its source move past the approved draft
+      // (apply-group-a.js's stale guard: {skipped:true, stale:true, success:false}) used
+      // to be swallowed by the `artifact.skipped` branch below and recorded as
+      // succeeded:true -- the task landed in done/ as if the CURRENT file state had been
+      // reviewed and shipped, when in fact nothing was applied. (Sibling 1/3's guard in
+      // recordApplyOutcome was abandoned, so this inline check is the last gate before
+      // the success branch.) Route every stale artifact to the non-success shape the
+      // single-task path already uses for stale results (apply-group-a.js:51):
+      // succeeded:false, so recordApplyOutcome files it apply-failed, not applied.
+      if (artifact && artifact.stale === true) {
+        results[task.id] = { succeeded: false, stale: true, reason: artifact.reason || 'stale apply result -- source changed after approval, nothing applied' };
+        continue;
+      }
+      if (artifact && artifact.skipped) {
+        results[task.id] = { succeeded: true, doneMarker: artifact.reason };
+        closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
+        continue;
+      }
+      if (artifact && artifact.needsConfirmation) {
+        results[task.id] = artifact; // -> awaiting-confirm/, nothing staged for this one
+        continue;
+      }
+      const files = artifact.files || [artifact.file];
+      assertStageableFiles(task, files);
+      // 2026-09-16: task-logs/ is gitignored (see task-log-store.js's own 2026-09-15
+      // RE-EVALUATED header -- it can retain a task's full rawText/implementResponse
+      // verbatim, which for a brain_dump-derived task is the user's own free-typed
+      // personal/business note content, and this repo is public). apply-task.js's
+      // single-task path was updated to only write it to disk, never stage it -- this
+      // batch path was missed, so EVERY batched directToMain apply (arch_discovery,
+      // arch_review, observability_review, ...) started failing `git add` with "The
+      // following paths are ignored by one of your .gitignore files: task-logs" the
+      // moment a task whose artifact needed staging reached here, root-caused live via
+      // a real stuck task (arch-discovery-community-15) that got approved at review and
+      // then failed at apply with exactly this error, looping on requeue forever since
+      // the failure is deterministic. writeTaskLogFile still writes the file to disk
+      // (for the user's own local reference, and so the commit message's `Task-Log:`
+      // line below still points somewhere real); it just never joins `files` here.
+      const taskLogRel = writeTaskLogFile(repoRoot, task);
+      gitRunner.add(files);
+      staged.push({ task, files, taskLogRel });
+    } catch (e) {
+      // This task's append threw. Its file may carry a partial trailing line -- cosmetic
+      // in an append-only markdown candidate doc and visible in review; not worth a
+      // resetToMain here (that would discard every sibling's already-good append too).
+      results[task.id] = { succeeded: false, reason: `writeArtifact failed: ${e.message}` };
+    }
+  }
+
+  if (staged.length === 0) return { results, committed: false };
+
+  const msgPath = path.join(require('os').tmpdir(), `apply-batch-msg-${process.pid}.txt`);
+  const commitMessage = [
+    `Triage batch: ${staged.length} candidate-doc update(s)`,
+    '',
+    ...staged.map((s) => `- ${s.task.title} (task ${s.task.id})`),
+    '',
+    ...staged.map((s) => `Task-Log: ${s.taskLogRel}`),
+    '',
+    coAuthorTrailer(staged[0].task),
+  ].join('\n');
+  fs.writeFileSync(msgPath, commitMessage);
+  try {
+    gitRunner.commit(msgPath);
+  } finally {
+    fs.unlinkSync(msgPath);
+  }
+
+  if (gated) {
+    try {
+      gitRunner.push(TRIAGE_BRANCH);
+    } catch (pushErr) {
+      // 2026-09-24: an ordinary non-fast-forward rejection (origin moved between this run's
+      // fetch and its own push -- e.g. a different apply tick landed first) used to leave
+      // this commit orphaned for prepareStackedBranch's NEXT call to find as genuine
+      // two-sided divergence and refuse to touch until a human reconciled it by hand
+      // (confirmed live twice in two days: 2026-09-23, then four more times on 2026-09-24).
+      // Retry once via fetch+rebase+push -- these are simple appends to different lines of
+      // the same candidate doc, not real code, so a clean rebase is the common case -- before
+```
+
+Problem:
+The 157-line function interleaves four independent phases (eligibility filter, branch prep, per-task staging, commit-and-push-retry), each with distinct failure modes. Tracing any single phase requires scrolling through all four; a `pruneRetractedCandidates` regression, for instance, is buried mid-function with no visual boundary separating it from the staging loop.
+
+Solution:
+Extract three helpers so the top-level function becomes a ~12-line orchestrator:
+
+```js
+function filterEligible(tasks) { /* → { eligible, results } */ }
+function prepareBranch(gitRunner, state, gated) { /* quarantine → assert → prepareStackedBranch | resetToMain */ }
+function stageEligibleTasks(eligible, ctx, results) { /* writeArtifact loop, git add; returns staged[] */ }
+function commitAndPush(gitRunner, gated) { /* commit, push, non-FF rebase-retry */ }
+```
+
+`applyDirectToMainBatchOnBranch` calls them in order, returning early when `eligible` or `staged` is empty.
+
+Benefits:
+Each helper is unit-testable against a mock `gitRunner` with a two-task fixture, no full-pipeline exercise needed. Review diffs shrink to one phase. The orchestrator reads as a table of contents.
