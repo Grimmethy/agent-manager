@@ -2349,3 +2349,16 @@ Schema and validation are guaranteed consistent because both sides read from the
 ---
 
 NOTE: Flag 1 (AC-002 cycle contradiction) and Flag 2 (AC-001 degree-3 / multiple-consumer premise) were both applied; no flag was left unaddressed.
+
+### AC-199 · reviewBrainDumpSort conflates validation gate with routing transformation
+Strength: Worth exploring
+Files: src/brain-dump-sort-classify.js, src/apply-group-a-brain-dump.js
+
+Problem:
+`reviewBrainDumpSort` presents itself as a pure accept/reject gate (return type `{ ok: true } | { ok: false, reason }`), yet internally it calls `deriveBelongsToProject` — the full multi-branch project-routing algorithm (note-vs-task detection, head-scoped label matching, distinctive-token matching, self-project signal check, investigation-finding regex) — solely to re-derive a `belongsToProject` value so it can perform a label-membership check. The caller never receives the derived values; the apply path (`apply-group-a-brain-dump.js`) independently calls `deriveBelongsToProject` again to obtain the values it actually uses. This means the routing logic executes twice per task with no shared result, and a reader of the gate's interface cannot tell from its signature or return type that the full routing algorithm is a hidden dependency of the validation. If `deriveBelongsToProject` gains a new fallback branch, the gate's acceptance criteria silently shift without the caller being aware the gate is doing more than checking "is this label in the tracked list?"
+
+Solution:
+Have the orchestration layer (the caller that invokes both review and apply) run `deriveBelongsToProject` once, pass the derived `belongsToProject` value into a slimmer `reviewBrainDumpSort` whose contract is strictly parse → normalize → path-check → label-membership-check, and let the apply path consume the same derived value. The gate's signature would then reflect its actual responsibility, and the routing algorithm would execute exactly once per task.
+
+Benefits:
+Eliminates duplicate computation of the routing algorithm per task. Makes the gate's public contract match its name and return type, so a reader no longer has to trace into the function body to discover a hidden dependency on the full routing pipeline. Reduces the blast radius of future changes to `deriveBelongsToProject`: adding a new fallback branch can no longer silently alter the review gate's acceptance criteria, because the gate no longer invokes that function.
