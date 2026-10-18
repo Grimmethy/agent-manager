@@ -13789,3 +13789,187 @@ The helper owns the flag check, prompt build, model call, latency capture, histo
 
 Benefits:
 The retry state machine is testable in isolation with a stubbed callImplementModel, without triggering the skip, degenerate, grounding, or non-compliant gates. Future changes to retry count, cap source, or prompt variant touch one small function. runImplementPass shrinks by ~15 lines and reads as a flat sequence of five simpler, stateless gates.
+
+### AC-207 · Decompose resolveDisposition into named sub-procedures
+Strength: Strong
+Files: src/task-disposition.js
+Symbol: resolveDisposition
+Snippet:
+```
+// calls (the fast path). Without it, falls back to a direct git probe per id (fine for a
+// single record, e.g. from the dashboard right after a merge).
+function resolveDisposition(record, { repoRoot, git = realGit, mainBranch: mainOverride, ctx, allowReopenFrom, pipelineDir } = {}) {
+  if (!record || typeof record !== 'object') return null;
+  const history = record.history;
+  const applied = lastAppliedEvent(history);
+  if (!applied) return null; // never applied -- blocked/needs-clarification in done, not this sweep's job
+
+  const tail = lastEvent(history);
+  if (tail && STABLE_TERMINAL_STAGES.has(tail.stage)
+      && !(allowReopenFrom && allowReopenFrom.has(tail.stage))) {
+    return null; // already closed (unless the caller explicitly asked to re-resolve this stage)
+  }
+  // A 'pending-merge' tail IS re-resolved (the branch may have been merged since).
+
+  const detail = String(applied.detail || '').trim();
+  const taskId = record.id || '';
+  const mainBranch = (ctx && ctx.mainBranch) || mainOverride || (repoRoot ? detectDefaultBranch(repoRoot) : 'master');
+
+  // 0. Structured triage outcome, stamped by a *_review source's apply(). The authoritative
+  //    signal -- a dismissed review never has code on <main>, so this wins over every git
+  //    check below. `genuine` deliberately falls through (a candidate was filed; it becomes
+  //    `merged`/`filed`/`applied-direct` by the normal path, and can still ship later).
+  const rd = String(record.reviewDisposition || '').trim();
+  if (rd === 'dismissed') {
+    return { stage: 'dismissed', detail: `review dismissed a scanner false positive${detail ? `: ${detail}` : ''}`.slice(0, 200) };
+  }
+  if (rd === 'inconclusive') {
+    return { stage: 'noop', detail: `review reached a verdict but produced nothing: ${detail || '(no detail)'}`.slice(0, 200) };
+  }
+
+  // 1. Definitively on origin/<main>?
+  if (taskId) {
+    const sha = ctx
+      ? (ctx.onMainIds.get(taskId) || '')
+      : (repoRoot ? taskCommitOnMain(git, repoRoot, mainBranch, taskId) : '');
+    if (sha) {
+      return { stage: 'merged', detail: `on origin/${mainBranch} @ ${sha.slice(0, 12)} (commit-trailer)` };
+    }
+  }
+
+  // 2. directToMain source that says it committed straight to main, trailer not locatable
+  //    (batch commit older than the current message format, or origin not fetched).
+  if (DIRECT_RE.test(detail)) {
+    return { stage: 'applied-direct', detail: `directToMain apply: ${detail}`.slice(0, 200) };
+  }
+
+  // 3. An agent/<id> branch still around? A stacked file-decompose sub-task (see
+  //    file-decompose-to-hub.js) shares ONE branch across its whole move sequence --
+  //    record.stacked.branch, e.g. "agent/decompose-<plan-slug>" -- NOT agent/<own id>.
+  //    2026-09-08, root-caused live: this fell straight through to the 'abandoned'
+  //    verdict below for a real, still-open, reviewed stacked sub-task, because
+  //    buildShipContext's branchAhead map is keyed by the REAL branch name (shared
+  //    across the whole stack), which never matches an individual sub-task's own id --
+  //    `ctx.branchAhead.has(taskId)` was structurally guaranteed false for every stacked
+  //    sub-task that ever existed, not just this one. Prefer the real branch name when
+  //    the record carries one; fall back to agent/<taskId> for a normal (non-stacked)
+  //    apply, unchanged from before.
+  if (taskId) {
+    // A gated triage-batch task shares ONE rolling branch (agent/triage-queue), named in its apply
+    // note -- not agent/<own id>. Same shape as the stacked case above.
+    const detailBranch = (detail.match(/\bagent\/[A-Za-z0-9._\/-]+/) || [])[0];
+    const realBranch = (record.stacked && record.stacked.branch) || detailBranch;
+    const branchKey = realBranch ? realBranch.replace(/^agent\//, '') : taskId;
+    const branchLabel = realBranch || `agent/${taskId}`;
+    let exists = false;
+    let ahead = 0;
+    if (ctx) {
+      exists = ctx.branchAhead.has(branchKey);
+      ahead = ctx.branchAhead.get(branchKey) || 0;
+    } else if (repoRoot) {
+      ({ exists, ahead } = branchAheadCount(git, repoRoot, mainBranch, branchLabel));
+    }
+    if (exists && ahead > 0) {
+      const lost = realBranch && record.stacked ? stackedSiblingLost(git, repoRoot, mainBranch, realBranch.replace(/^origin\//, ''), record) : null;
+      if (lost && lost.onMain) {
+        return { stage: 'superseded', detail: `${branchLabel} exists but no longer carries this task's change; ${lost.onMain.present} of ${lost.onMain.checked} distinctive added lines are already on ${mainBranch}` };
+      }
+      if (lost) {
+        return { stage: 'abandoned', detail: `${branchLabel} exists but carries none of this task's change (${lost.present} of ${lost.checked} distinctive added lines present): its commit was lost from the shared branch, and it is not on ${mainBranch}` };
+      }
+      return { stage: 'pending-merge', detail: `${branchLabel} is ${ahead} commit(s) ahead of ${mainBranch}, not merged` };
+    }
+    if (exists && ahead === 0) {
+      return { stage: 'merged', detail: `${branchLabel} fully contained in ${mainBranch} (branch not ahead)` };
+    }
+  }
+
+  // 4. The apply wrote a doc / note -- nothing to merge.
+  if (FILED_RE.test(detail)) {
+    return { stage: 'filed', detail: `apply wrote a doc/note: ${detail}`.slice(0, 200) };
+  }
+
+  // 4a. pipeline_debrief's own apply -- see DEBRIEF_ARCHIVED_RE above. Archiving a window
+  //     of done/ tasks and filing Now-What findings is real terminal work, not a no-op.
+  if (DEBRIEF_ARCHIVED_RE.test(detail)) {
+    return { stage: 'filed', detail: `debrief archived its window + filed its findings: ${detail}`.slice(0, 200) };
+  }
+
+  // 4b. Records with no structured reviewDisposition (older plugin build, or a historical
+  //     backfill): a *_review whose verdict text reads "FALSE POSITIVE" is a clean dismissal,
+  //     not a bare no-op. For these records the verdict lives in implementResponse/
+  //     planResponse, not the apply detail (which is a generic "no candidates ..."). Gated to
+  //     triage-review sources so a stray "not a false positive" in some adhoc diff can't trip
+  //     it. Must run BEFORE NOOP_RE -- NOOP_RE also matches "false positive".
+  const isReviewSource = /_review(_digest)?$/.test(String(record.source || ''));
+  if (isReviewSource) {
+    const verdictText = `${detail}\n${record.implementResponse || ''}\n${record.planResponse || record.lastGoodPlan || ''}`;
+    if (DISMISSED_RE.test(verdictText)) {
+      return { stage: 'dismissed', detail: `${record.source} verdict: false-positive dismissal`.slice(0, 200) };
+    }
+  }
+
+  // 5. The apply was an explicit no-op verdict.
+  if (NOOP_RE.test(detail)) {
+    // "verdict", not "apply": noop is a triage/verdict outcome, not a change application. Records written before 2026-10-01 say "no-op apply"; nothing matches on the text.
+    return { stage: 'noop', detail: `no-op verdict: ${detail}`.slice(0, 200) };
+  }
+
+  // 6. The apply detail names an agent/<id> branch, but it is gone AND not on <main>:
+  //    the work was lost. The loud one.
+  //    Two facts soften the bare verdict (2026-09-21, throughput analysis: 20 tasks read "work lost", and of five checked by content three had their whole
+  //    diff on master already): (a) the task's own recorded diff may already be on <main> -- landed another way (a sibling task, a re-do, a squash merge
+  //    with no trailer) -- which is `superseded`, not lost; (b) branch-removal-ledger.js may know why the branch was deleted.
+  if (BRANCH_DETAIL_RE.test(detail)) {
+    const landed = diffAlreadyOnMain(git, repoRoot, mainBranch, record.rawDiff);
+    if (landed) {
+      return {
+        stage: 'superseded',
+        detail: `applied to ${detail} -- branch gone, but ${landed.present} of ${landed.checked} distinctive added lines (${landed.files} file(s)) are already on ${mainBranch}: the work landed another way`.slice(0, 240),
+      };
+    }
+    // A stacked sub-task's branch is the SHARED one on record.stacked.branch, which may differ from the branch its apply detail names (same resolution as step 3): try both.
+    const removal = pipelineDir
+      ? [record.stacked && record.stacked.branch, detail.split(/\s/)[0]].filter(Boolean).map((b) => lastRemoval(pipelineDir, b)).find(Boolean) || null
+      : null;
+    const why = removal
+      ? `removed ${String(removal.at || '').slice(0, 10)} by ${removal.actor || 'unknown'} (${removal.cause}${removal.detail ? `: ${removal.detail}` : ''})`
+      : 'no removal recorded -- deleted outside the pipeline';
+    return { stage: 'abandoned', detail: `applied to ${detail} -- branch gone, not on ${mainBranch}: work lost; ${why}`.slice(0, 320) };
+  }
+
+  // 7. Unclassifiable apply outcome from a non-branch source -- delegate to the
+  //    apply-outcome classifier, record a 'apply' history event, then return the
+  //    classified terminal stage.
+  const classified = classifyApplyOutcome({ task: record, detail, taskId, mainBranch, shipCtx: ctx, applied });
+  appendHistoryEvent(record, 'apply', classified.detail);
+  return { stage: classified.stage, detail: classified.detail };
+}
+```
+
+Problem:
+resolveDisposition is 147 lines and mixes six unrelated responsibilities—precondition checks, review-disposition short-circuits, git-state branching (merged / applied-direct / pending-merge / superseded / abandoned), detail-string regex matching, lost-branch recovery, and fallback classification—into one body. The git-state block alone is ~60 lines with nested conditionals and two probe paths. No branch can be unit-tested in isolation, and precedence rules (e.g. DISMISSED_RE before NOOP_RE) are implicit in line order.
+
+Solution:
+Replace the monolith with a thin dispatcher that calls six small, named helpers in fixed precedence order:
+
+```js
+function resolveDisposition(record, opts = {}) {
+  const pre    = validatePreconditions(record, opts);
+  if (!pre) return null;
+  const review = resolveReviewDisposition(record, opts);
+  if (review) return review;
+  const git    = resolveGitState(record, opts);
+  if (git) return git;
+  const detail = resolveDetailPatterns(record, opts);
+  if (detail) return detail;
+  const lost   = resolveLostBranch(record, opts);
+  if (lost) return lost;
+  return classifyAndRecord(record, opts);
+}
+```
+
+Each helper is 15–40 lines, independently testable, and owns exactly one decision branch.
+
+Benefits:
+Each sub-function can be tested with a single fixture (e.g. one merged-branch record for resolveGitState) without mocking the full ctx/repoRoot environment. Precedence is now explicit in call order. A reviewer can approve or reject one 30-line helper instead of scanning 147 lines.
