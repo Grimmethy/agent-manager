@@ -51,19 +51,57 @@ const COMFY_LEASE_TTL_S = Number(process.env.AGENT_MANAGER_COMFY_LEASE_TTL_S) ||
 // no matter how fresh its refreshedAt looks.
 const COMFY_LEASE_MAX_S = Number(process.env.AGENT_MANAGER_COMFY_LEASE_MAX_S) || 900;
 
-function comfyuiLeaseHeld(leasePath = COMFY_LEASE_PATH) {
+// The lease body when it is fresh (refreshed within the TTL, acquired within the MAX ceiling), else null. Fails open: no file, unreadable or
+// malformed -> null.
+function readFreshLease(leasePath = COMFY_LEASE_PATH) {
   try {
     const d = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
     const now = Date.now();
     const refreshed = Date.parse(d.refreshedAt);
     const acquired = Date.parse(d.acquiredAt);
-    if (!Number.isFinite(refreshed) || !Number.isFinite(acquired)) return false;
+    if (!Number.isFinite(refreshed) || !Number.isFinite(acquired)) return null;
     return (now - refreshed) <= COMFY_LEASE_TTL_S * 1000
-      && (now - acquired) <= COMFY_LEASE_MAX_S * 1000;
+      && (now - acquired) <= COMFY_LEASE_MAX_S * 1000 ? d : null;
   } catch (e) {
     // No file / unreadable / malformed -- not held. Fail open.
-    return false;
+    return null;
   }
+}
+
+// Any fresh lease = held, whatever it covers (the whole-pipeline meaning every existing caller relies on).
+function comfyuiLeaseHeld(leasePath = COMFY_LEASE_PATH) {
+  return readFreshLease(leasePath) !== null;
+}
+
+// Endpoint-scoped lease (2026-10-18): the lease may carry an optional `endpoints` array of Ollama URLs. Absent or empty = the whole pipeline (PromptForge's
+// leases, unchanged). Present = only calls to those endpoints are held off, so a plugin that reserves ONE card (a KaggleForge eval on the P40 or the
+// 3090) does not pause the lanes on the other cards. An endpoint is compared as host:port; localhost, 127.0.0.1 and ::1 are one host, and a missing
+// port means Ollama's 11434.
+function normalizeEndpoint(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return null;
+  try {
+    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`);
+    let host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (host === '127.0.0.1' || host === '::1') host = 'localhost';
+    return `${host}:${u.port || '11434'}`;
+  } catch (e) {
+    return null;
+  }
+}
+
+function leaseCovers(lease, endpointUrl) {
+  const list = lease && lease.endpoints;
+  if (!Array.isArray(list) || list.length === 0) return true;   // unscoped: the whole pipeline
+  const want = normalizeEndpoint(endpointUrl);
+  if (!want) return true;                                       // cannot tell which card this caller uses: stay held (the safe side)
+  return list.some((e) => normalizeEndpoint(e) === want);
+}
+
+// Is the GPU behind `endpointUrl` leased right now? Same freshness rules as comfyuiLeaseHeld; scoped leases hold only their own endpoints.
+function leaseHeldFor(endpointUrl, leasePath = COMFY_LEASE_PATH) {
+  const lease = readFreshLease(leasePath);
+  return lease !== null && leaseCovers(lease, endpointUrl);
 }
 
 // A local-model call that would START while the Forge family holds the GPU is refused with this error (2026-10-14).
@@ -285,7 +323,7 @@ async function ensureGpuHeadroom(opts = {}) {
   return result;
 }
 
-module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld, yieldForgeToPipeline, ForgePauseError, FORGE_PAUSE_MESSAGE, isForgePause, forgePauseEnabled };
+module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld, yieldForgeToPipeline, ForgePauseError, FORGE_PAUSE_MESSAGE, isForgePause, forgePauseEnabled, leaseHeldFor, leaseCovers, normalizeEndpoint };
 
 if (require.main === module) {
   ensureGpuHeadroom({ forgeYield: yieldForgeToPipeline }).then((result) => {

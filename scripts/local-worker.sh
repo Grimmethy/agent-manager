@@ -522,7 +522,7 @@ while :; do                                                                     
   [[ -r "$HOME_LOGS" ]]                                                          || mkdir -p "$HOME_LOGS"                  # ensure log dir exists (might not have been created yet between launch.sh running and this script actually reaching this step). Same pattern as PowerShell's `$logFolder = if (-not (Test-Path $dir)) { New-Item ... } else { $dir }` conditional creation block which is what we're replacing with simpler shell here.
 
   # Yield this tick while PromptForge holds the GPU (comfyui-lease).
-  if comfyui_lease_held; then
+  if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[worker-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"

@@ -122,7 +122,7 @@ while :; do                                                                     
 
   # ComfyUI GPU lease (agent-manager-common.sh's comfyui_lease_held) -- PromptForge owns
   # the GPU for an image generation this tick.
-  if comfyui_lease_held; then
+  if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"

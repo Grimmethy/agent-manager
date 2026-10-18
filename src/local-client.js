@@ -297,7 +297,8 @@ async function postGenerate({ url, body, timeoutMs, headers, post = postJson, un
 async function callOnce({ prompt, images, think = true, temperature = 0.4, numCtx, numPredict = 1200, repeatPenalty, format, model, timeoutMs, source, allowSideFindings = true, allowAmplification = false, conceptId = null }) {
   // Forge exclusion (2026-10-14): never START a model call while PromptForge's comfyui-lease is held -- it would reload the model
   // PromptForge just evicted. Checked here, before any prompt building, in-flight lock or network I/O. See gpu-guard.js ForgePauseError.
-  if (gpuGuard.forgePauseEnabled() && gpuGuard.comfyuiLeaseHeld()) throw new gpuGuard.ForgePauseError();
+  // A lease may be scoped to certain endpoints (gpu-guard.js leaseHeldFor): only a call to a leased card is refused, the other cards' lanes carry on.
+  if (gpuGuard.forgePauseEnabled() && gpuGuard.leaseHeldFor(OLLAMA_URL)) throw new gpuGuard.ForgePauseError();
   // Pipeline-wide side-finding capture (2026-09-05, see side-finding.js's own header):
   // tell the model the SIDE-FINDING: convention exists, unless this specific call needs
   // clean/parseable-only output (allowSideFindings: false -- set by known strict-schema
