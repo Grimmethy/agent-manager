@@ -2221,3 +2221,16 @@ Replace the global-registry lookup with an explicit dependency: accept an option
 
 Benefits:
 `apply-core` becomes independently testable—tests supply a stub filer or the absence of one and assert the expected outcome without needing to load the full plugin. The dependency graph is explicit and visible in the function signature, so static analysis and code review can surface missing wiring. Deployments that do not use the hub plugin no longer risk an unhandled crash in a core path, and the "not configured" state is a first-class, inspectable result rather than an opaque throw from a global.
+
+### AC-189 · Extract shared marker-injection/extraction primitives to eliminate duplicated parsing logic
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+`concepts.js` and `incident-amplification-marker.js` each implement a nearly identical marker-injection and extraction pattern: an instruction string, an idempotent `inject*Instruction` function that checks for the marker's presence before appending, and an `extract*` function that splits the model's response on a marker regex, cleans the text (collapsing extra newlines, trimming whitespace), and returns a structured report. The two implementations use similar regex patterns and text-cleaning steps but are written independently. Any change to the marker convention—adding an optional field, adjusting the delimiter, or improving the cleaning pipeline—must be replicated in both files, creating a divergence risk and doubling the maintenance surface.
+
+Solution:
+Introduce a new module `src/marker-utils.js` exporting two generic helpers: `injectMarker(text, markerString)`, which appends `markerString` to `text` only if it is not already present, and `extractMarker(text, markerRegex, parseBlock)`, which splits `text` on `markerRegex`, applies the caller-supplied `parseBlock` to each matched segment to produce structured data, and returns `{ cleanText, reports }`. Refactor `concepts.js` to call these utilities with its `CONCEPT_BUILD_MARKER_RE` and a small parser for `scratch|adapted` fields, and refactor `incident-amplification-marker.js` to call them with its `AMPLIFY_SPLIT_RE` and a parser for `AMPLIFY/QUERY/DIR/EXCLUDE`. The per-module instruction strings and field-specific parsing remain in their respective files; only the shared injection/extraction mechanics move to the utility.
+
+Benefits:
+The duplicated injection and extraction logic is eliminated, so a change to the marker convention (new optional field, delimiter tweak, cleaning improvement) is made in exactly one place. Adding a future marker type becomes a matter of supplying a regex and a parser to the same two helpers rather than re-implementing the split-clean-parse pipeline. The two existing modules become thinner and their behavior is guaranteed to stay in lockstep because they share the same code path.
