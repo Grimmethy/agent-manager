@@ -2362,3 +2362,44 @@ Have the orchestration layer (the caller that invokes both review and apply) run
 
 Benefits:
 Eliminates duplicate computation of the routing algorithm per task. Makes the gate's public contract match its name and return type, so a reader no longer has to trace into the function body to discover a hidden dependency on the full routing pipeline. Reduces the blast radius of future changes to `deriveBelongsToProject`: adding a new fallback branch can no longer silently alter the review gate's acceptance criteria, because the gate no longer invokes that function.
+
+### AC-200 · Registry reaches into a specific policy module at runtime
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` performs a lazy `require('./lib/source-scope.js')` inside the function body to wrap the `next` method of `core`-scoped sources. The lazy, in-function `require` makes the dependency invisible at module-load time and couples the registry's runtime behaviour to whatever `source-scope.js` exports at the moment a source happens to be registered. This is a deliberate design choice to keep the registry generic while applying an internal agent-manager policy only when a `core`-scoped source is encountered, and the critique of the *design intent* is not the issue here. The practical concern is narrower: the in-function `require` makes the dependency harder to reason about (it is not visible in the module's top-level import graph) and makes isolated unit-testing of the registry require mocking the `require` call or stubbing the `source-scope` module, coupling the test to an implementation detail the registry's public contract does not declare.
+
+Solution:
+Keep the registry's generic, policy-agnostic public API unchanged—plugins and external callers continue to call `registerTaskSource(name, core)` with no knowledge of scoping policy. Make the internal dependency explicit and testable by moving the `require` to a top-level (module-load-time) import and exposing a single module-level override hook, e.g. `setScopePolicy(wrapper | null)`, that the agent-manager package (or a test) can call once at startup to install or remove the wrapping behaviour. The registry applies the installed policy when a `core`-scoped source is registered and leaves other sources untouched. This preserves encapsulation (no caller needs to know about scoping), makes the dependency visible in the import graph, and lets a unit test call `setScopePolicy(null)` to exercise the registry in isolation without any module-system mocking.
+
+Benefits:
+The registry's public contract stays identical for plugins and external callers. The hidden runtime dependency becomes a visible, top-level import that a linter or dependency-graph tool can surface. Unit tests gain a clean seam (`setScopePolicy(null)`) without mocking `require`, and the one-time registration by the agent-manager package keeps the internal policy encapsulated where it belongs.
+
+### AC-201 · Source-name resolution logic is partially hardcoded alongside the alias mechanism
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`src/task-source-registry.js` contains a `resolveSourceName` function that maps task-source strings to registry names. Alongside the dynamic `registerSourceAlias` mechanism, the function carries hardcoded fallback branches for built-in quirks (e.g. `if (task.domain === 'adhoc')` and a similar special case for `secondbrain`). Because these special cases live as inline conditionals rather than as data registered through the existing alias mechanism, adding a new built-in source or renaming an existing one requires editing the resolver's internal logic rather than simply calling `registerSourceAlias`. The coexistence of two registration paths (hardcoded `if`-branches and the alias table) creates a maintenance hazard: a developer adding a new source may register an alias but miss the hardcoded branch, or vice-versa, leading to silent misrouting.
+
+Solution:
+Route the `adhoc` and `secondbrain` special cases through the existing `registerSourceAlias` mechanism at module-load time (or via a small `registerBuiltinAliases()` function called once at startup), making `resolveSourceName` a pure lookup against the alias table with no inline domain checks. The resolver's signature and public behaviour remain the same; only the internal implementation changes from "hardcoded branches + alias table" to "alias table only."
+
+Benefits:
+A single, data-driven source of truth for name resolution eliminates the class of bugs where the hardcoded branch and the alias table disagree. Adding a new built-in source becomes a one-line `registerSourceAlias` call rather than a code change inside the resolver, and the resolver can be unit-tested with a flat table of expected mappings without exercising conditional branches.
+
+### AC-202 · Shared-vs-local state policy is enforced by convention rather than by the API
+Strength: Worth exploring
+Files: src/instances-dir.js
+
+Problem:
+`src/instances-dir.js` exposes `sharedInstancesDir`, a path resolver that returns the directory for shared runtime state (heartbeats, locks) that must not follow the project context. The module's own comment articulates the architectural rule—"this state is shared, that state is project-local"—but the interface is a bare path: it returns a directory string and leaves it to each caller to remember that this root is for shared state and not to mix it with the project-local `pipelineDir/instances` tree. Because the distinction lives in a comment and in caller discipline rather than in the shape of the API, a new piece of shared state can be written into the project-local directory (or vice-versa) without any interface-level signal, reproducing the GPU-thrashing and lock-invisibility issues the comment describes.
+
+Solution:
+Extend `src/instances-dir.js` (or a thin sibling module) with intent-named helpers such as `getSharedLockPath(name)` and `getLocalLogPath(name)`, each returning a fully-qualified path under the correct root. Existing callers migrate to the helpers; the raw `sharedInstancesDir` export can be retained for backward compatibility but annotated `@internal` (or moved to a private module) so that new code is steered toward the intent-named API. The helpers encode the shared-vs-local distinction in the function name, making the policy visible at the call site rather than in a comment.
+
+Benefits:
+The shared-vs-local distinction becomes a call-site decision encoded in the function name rather than a convention that lives in a comment. A new piece of shared state is added by calling `getSharedLockPath('my-new-lock')` and cannot accidentally land in the project-local tree, eliminating the foot-gun that produces the GPU and lock bugs described in the existing comments.
+
+NOTE: Flag 3 (AC-001 solution "architecturally unsound") was applied by replacing the per-call `scopeWrapper` injection with a module-level `setScopePolicy` override hook, which preserves the registry's generic public API and keeps the scoping policy encapsulated within the agent-manager package rather than leaking it to every plugin caller.
