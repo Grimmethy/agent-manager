@@ -2275,3 +2275,19 @@ Benefits:
 All prompt-related tests are found in a single directory, reducing the chance that a new test is added to the wrong location or with the wrong suffix and thus skipped by the test runner. The naming convention becomes uniform across the community, which lowers cognitive load for anyone onboarding to the codebase and makes it straightforward to add further prompt regression tests without a second decision about where and how to name the file.
 
 NOTE: Flag 1's core claim of a filename collision was incorrect — the proposed target `project-search-zero-findings-prompt.test.js` is distinct from the existing `prompt-implementation.test.js`; only the minor clarity improvement (explicitly stating the old file is removed) was applied.
+
+### AC-193 · ~~Case-sensitivity mismatch between path normalization and validation~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+Upon re-examination, the draft's premise was incorrect. `validateSecondBrainPath` already constructs a lower-cased set (`allowedLower`) and performs the membership test against that normalized form (`allowedLower.has(topLevel.toLowerCase())`). The case-insensitive validation the draft proposed to add is already present in the code. There is no gap to close, and the proposed refactor would be a no-op.
+
+---
+
+### AC-194 · ~~Scattered `belongsToProject` validation and coercion across two functions~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+Upon re-examination, the draft mischaracterized the control flow. `deriveBelongsToProject` is invoked *inside* `reviewBrainDumpSort` immediately before the canonical-folder coercion check. The coercion in `reviewBrainDumpSort` is a deliberate final safety net for edge cases (e.g., a model output that bypasses the derivation recovery paths), not a duplicated or independent enforcement of the same rule. The separation of "derivation/recovery" from "final validation/coercion" is a valid and intentional layering. Extracting a shared helper called by both functions would not change behavior and would obscure the two distinct responsibilities. The "risk of partial update" the draft cited is speculative and not supported by the code's actual call structure.
