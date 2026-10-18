@@ -810,11 +810,34 @@ def _is_live_worker_instance(instance_id: str) -> bool:
     lane actually IS, not what launch.sh would have started under some other env -- is
     both simpler and correct. _expected_instance_ids() itself is unaffected: its one
     remaining caller (api_instances' offline-placeholder logic) has a different, correct
-    use for "would launch.sh have started this," not "is this assignable right now."""
+    use for "would launch.sh have started this," not "is this assignable right now."
+
+    2026-10-18 (brain-dump 1903, owner decision): a heartbeat may carry `"assignable": false`.
+    A process that writes a worker-* heartbeat so it shows on the Workers tab (with the run-log
+    expander) but does NOT claim from pending/ -- the first one is an external eval runner,
+    worker-kaggle-p40 -- opts out that way. It must never be offered or pinned a task: the
+    assign-task route would kill its process to make it "pick up" the pinned task. Only the
+    boolean false opts out; a missing field, null or true keep the old behaviour. See
+    _worker_lane_refusal for the reason text the routes return."""
+    return _worker_lane_refusal(instance_id) is None
+
+
+def _worker_lane_refusal(instance_id: str) -> str | None:
+    """Why `instance_id` is NOT an assignable worker lane, or None when it is (the single
+    rule behind _is_live_worker_instance, returned as text so the assign routes can tell the
+    operator why they refused)."""
+    not_a_lane = f"'{instance_id}' is not a worker lane that claims tasks from pending/"
     if not instance_id.startswith("worker"):
-        return False
+        return not_a_lane
     inst_dir = instances_dir()
-    return bool(inst_dir and (inst_dir / f"{instance_id}.json").is_file())
+    hb_path = (inst_dir / f"{instance_id}.json") if inst_dir else None
+    if not (hb_path and hb_path.is_file()):
+        return not_a_lane
+    hb = read_json_safe(hb_path) or {}
+    if hb.get("assignable") is False:
+        return (f"'{instance_id}' opts out of task assignment (assignable: false in its heartbeat) "
+                "-- it shows on the Workers tab but does not claim from pending/")
+    return None
 
 
 def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
