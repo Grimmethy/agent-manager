@@ -2643,3 +2643,35 @@ Benefits:
 The registry becomes a truly generic, domain-agnostic component that is trivially testable with any set of scope handlers. Adding a new scope (e.g., `tenant`, `edge`) no longer requires modifying the registry source. The hidden `require` is eliminated, so the dependency graph is accurate and refactors of `source-scope.js` are caught at composition time. The immediate "handler not registered" error replaces a later, harder-to-diagnose runtime failure.
 
 NOTE: The flag for AC-002 was not applied because the critique's claim that the current code "already correctly distinguishes" between missing keys and config errors is factually incorrect regarding the *observable behavior* described in the problem statement; the `try/catch` still swallows `getConfig()` errors silently without logging or distinction, which is the core defect identified.
+
+### AC-221 · Consolidate "empty / false-positive" response guards into source-level `apply` contracts
+Strength: Strong
+Files: src/lib/apply-core.js, src/apply-group-a.js, src/apply-group-b.js
+
+Problem:
+`apply-core.js` contains two ad-hoc text checks (`isEffectivelyEmptyResponse` and a regex matching "false positive") that intercept the model's raw text output before it is handed to `applyGroupB`. These guards were added reactively for specific Group B sources (`observability_fix`, `arch_review`, etc.) and live in the core orchestration path rather than at the point where a source's `apply` function decides it has nothing to produce. Because the checks are text-pattern based, they are source-agnostic in the narrow sense (a new source emitting the same empty or "false positive" string is already covered), but the *decision logic*—what counts as a no-op, what reason string to surface—is scattered across the core file instead of being co-located with the source that knows its own output semantics. This makes the `apply` interface's contract implicit: a source can return a raw string that happens to match a guard, or a string that doesn't, and the core file's string-matching is the only thing standing between the two.
+
+Solution:
+Move the "is this a no-op?" decision into the `apply` implementations in `apply-group-a.js` / `apply-group-b.js`. Each source's `apply` function already receives the model's text; it should inspect that text and, when there is nothing to apply, return the standard `{ skipped: true, reason: '…' }` object directly. `apply-core.js` then reduces to a single uniform check: if the return value carries `skipped`, record the reason and move on. The two bespoke string-matching guards in the core path are removed; the contract becomes explicit ("either return an artifact or return `{ skipped: true }`") and is enforced at the boundary where the source already has full context for its own output format.
+
+Benefits:
+The `apply` interface gains a single, testable contract that can be asserted in unit tests per source without exercising the full orchestration path. The core file's string-matching surface shrinks, reducing the chance that a future source's legitimate output accidentally trips a pattern meant for another source's no-op phrasing. Adding or modifying a source's no-op detection is a local change in that source's `apply` function rather than a cross-file edit to the shared guard list, which simplifies code review and keeps the "what does this source consider a no-op?" knowledge where it belongs.
+
+### AC-222 · Extract a shared `listFilesAtRef` helper and align environment setup with `grepAtRef`
+Strength: Moderate
+Files: src/stacked-grounding.js
+
+Problem:
+`resolveAtRef` in `src/stacked-grounding.js` manually runs `git ls-tree` via `execFileSync`, duplicating the `GIT_ENV` and `maxBuffer` setup that `grepAtRef` already handles for `git grep`. The two call sites maintain identical environment and buffer configuration independently, so a change to one (e.g., adding a timeout, adjusting `maxBuffer`, or switching the transport) must be remembered in the other.
+
+Separately, `resolveAtRef` wraps the call in a catch-all `try/catch` that returns `null` on any error. The file's own comment documents this as intentional: "an unreadable ref reads as 'not found,' which leaves the caller's own working-tree verdict in force." That is a reasonable best-effort design for the grounding pipeline, and the draft should not be read as demanding that behavior be removed. However, the catch-all also swallows *genuine* failures (bad ref, permission error, git not found) into the same `null` that a clean "path absent in tree" lookup produces, with no log line or sentinel to distinguish the two. In practice this is low-risk because the caller's fallback (working-tree verdict) is safe, but it means a real git misconfiguration is silently invisible in logs.
+
+Solution:
+Extract a shared `listFilesAtRef(repoRoot, ref)` helper that encapsulates the `git ls-tree` invocation, the `GIT_ENV` / `maxBuffer` configuration, and the exit-code handling. For `git ls-tree` the relevant semantics are: exit 0 = success (output may be empty if the tree has no entries at that path); non-zero exit = error (bad ref, missing repo, permission, etc.). There is no "exit 1 = no match" convention for `ls-tree` the way `git grep` has one. The helper should therefore treat exit 0 as success (return the possibly-empty line list) and non-zero as an error.
+
+`resolveAtRef` calls the helper and, in the error case, logs a one-line warning (ref, path, exit code) before returning `null`, preserving the documented best-effort contract while making genuine failures visible in logs. This is a logging improvement, not a behavior change: callers still receive `null` and fall back to their working-tree verdict exactly as the file's comment describes.
+
+Benefits:
+A single code path owns the `git ls-tree` mechanics, so environment setup and buffer sizing are maintained in one place and any future change (timeout, transport swap, `--recurse` flag) touches one helper instead of two call sites. The logged warning on non-zero exit gives operators a signal that a git failure occurred, without altering the intentional best-effort `null`-return contract that the file's comment documents. The helper's exit-code handling is correct for `ls-tree` (0 = success, non-zero = error) rather than importing `git grep`'s "exit 1 = no match" convention, which does not apply here.
+
+NOTE: The critique's flag that AC-001's "new source" motivation is invalid because the guards are source-agnostic is correct and has been addressed by reframing the problem and benefits around contract explicitness and co-location rather than "remembering to extend a guard list." The critique's point that the draft's proposed `{skipped:true}` return "would require changing the model's output format" is not applied as a flag: the `apply` function already receives the model's raw text and is free to inspect it and return a structured skip object; no change to the model's output format is required, so that particular sub-claim in the critique is inapplicable to the corrected draft.
