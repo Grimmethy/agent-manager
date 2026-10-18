@@ -2195,3 +2195,29 @@ Remove the default parameter from `sourceEligibleHere` so the function signature
 
 Benefits:
 The function's contract becomes honest—no hidden global reads hidden behind a default parameter. The call site explicitly names `activeRepoIsCore()`, so a reader immediately sees the config dependency and the fact that it is re-evaluated per call. If the scoping policy is later made injectable (per AC-001), the explicit parameter makes it straightforward to swap in a different eligibility source without hunting for a hidden default. The gate's fail-open, re-evaluate-on-each-call semantics are preserved unchanged.
+
+### AC-187 · Duplicated git execution path in stacked-grounding
+Strength: Strong
+Files: src/stacked-grounding.js, src/git-runner.js
+
+Problem:
+`src/stacked-grounding.js` defines its own `runGit` helper along with local `GIT_ENV` and `GIT_TIMEOUT_MS` constants, yet in the same module it also imports `createRealGitRunner` from `src/git-runner.js` to power `resolveGroundingRef`. This leaves two independent code paths for spawning git processes inside one file, each with its own environment setup, timeout handling, and error-shaping logic. Any future change to the shared runner—tightening timeouts, adding credential scrubbing, altering exit-code interpretation—will silently apply to one call site and not the other, producing inconsistent behavior that is hard to reproduce because it depends on which internal function happens to be invoked.
+
+Solution:
+Remove the local `runGit`, `GIT_ENV`, and `GIT_TIMEOUT_MS` definitions from `src/stacked-grounding.js`. Replace every call site that currently uses `runGit` with the runner produced by `createRealGitRunner` (or a thin wrapper around it that accepts the same arguments). If `stacked-grounding` needs a slightly different timeout or environment override, pass those as options into the runner factory rather than re-implementing the spawn logic. This yields a single, testable seam for all git interaction in the module.
+
+Benefits:
+Environment variables, timeouts, and error handling live in exactly one place, so a fix or hardening change propagates uniformly. Unit tests can mock or stub a single runner object instead of patching two separate spawn helpers. New contributors see one canonical pattern for "run a git command" rather than guessing which of two local implementations is the sanctioned one, reducing the chance of accidental divergence in future refactors.
+
+### AC-188 · Hard dependency on hub plugin global in apply-core
+Strength: Strong
+Files: src/lib/apply-core.js
+
+Problem:
+`writeArtifact` in `src/lib/apply-core.js` branches on `task.candidateSplitRoute === 'hub'` and then calls `getCandidateSplitHubFiler()`, a global-registry lookup that throws a hard error when the `agent-manager-hub-tasks` plugin has not registered a filer. This makes a core library function crash at runtime based on an implicit, order-sensitive registration performed by an unrelated plugin. It prevents `apply-core` from being exercised in isolation (unit tests, CLI tooling, or a deployment that intentionally omits the hub plugin) and hides a configuration-state problem behind an untyped global that is easy to miss during refactoring.
+
+Solution:
+Replace the global-registry lookup with an explicit dependency: accept an optional `filer` (or a small strategy object) as a parameter to `writeArtifact`, or read it from a context/injection object that the caller is expected to provide. When the hub route is requested but no filer is supplied, return a structured, recoverable result (e.g. `{ ok: false, reason: 'hub-filer-not-configured' }`) or throw a typed error that the caller can catch and translate into a user-facing configuration message. The plugin can still register itself, but it does so by injecting into the context rather than mutating a process-global that `apply-core` reaches into opaquely.
+
+Benefits:
+`apply-core` becomes independently testable—tests supply a stub filer or the absence of one and assert the expected outcome without needing to load the full plugin. The dependency graph is explicit and visible in the function signature, so static analysis and code review can surface missing wiring. Deployments that do not use the hub plugin no longer risk an unhandled crash in a core path, and the "not configured" state is a first-class, inspectable result rather than an opaque throw from a global.
