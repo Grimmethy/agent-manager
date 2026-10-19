@@ -1954,6 +1954,50 @@ test('nextStalenessAuditTask returns null when nothing in queue/blocked or queue
   assert.equal(nextStalenessAuditTask(), null);
 });
 
+// Acceptance, 2026-09-09 (HUB0158 4/4): the live bug this closes -- a stale/likely-fabricated
+// task whose TITLE has no file:line ref (this one: 60 days blocked, "AC-34 - Add a metrics
+// counter") made buildStalenessAuditTask() return null, and that null used to flow straight
+// into taskIdExistsInQueue(task.id) below it, throwing a TypeError on EVERY staleness_audit
+// tick while the same candidate got re-picked forever. The guard in nextStalenessAuditTask()
+// (HUB0158 3/4) marks such a candidate skipped in the same coverage file a real report uses
+// (markStalenessAuditReported()'s own comment names this exact path) and moves on -- so for a
+// gate-less title the ONLY observable outcome is that coverage stamp plus a null return, and
+// this test asserts both. Remove the `if (task === null)` branch in task-sources.js and this
+// test dies with a TypeError on the call itself.
+test('nextStalenessAuditTask handles a 60-day-old blocked task whose title has no file:line ref without throwing, marking it skipped/reported', () => {
+  const dir = makeBlockedFixtureRepo();
+  const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+  const blockedDir = path.join(dir, 'queue', 'blocked');
+  fs.mkdirSync(blockedDir, { recursive: true });
+  fs.writeFileSync(path.join(blockedDir, 'ac-34.json'), JSON.stringify({
+    id: 'ac-34',
+    title: 'AC-34 - Add a metrics counter', // no "word:digits" ref -- titleHasFileLineRef()'s gate declines this candidate
+    source: 'manual',
+    createdAt: sixtyDaysAgo,
+    history: [{ stage: 'blocked', at: sixtyDaysAgo }], // 60 days of no forward progress -- comfortably past the staleness threshold
+  }));
+
+  const { nextStalenessAuditTask } = freshTaskSources(dir);
+
+  // Must not throw: without the null-guard in task-sources.js this call is a TypeError
+  // (buildStalenessAuditTask() declined, so task.id was read on null).
+  assert.doesNotThrow(() => nextStalenessAuditTask());
+
+  // Candidate marked skipped in the same coverage file a real report uses -- this is the
+  // ONLY record of the decision, since no real staleness_audit task was ever filed.
+  const coveragePath = path.join(dir, 'staleness-audit-coverage.json');
+  assert.ok(fs.existsSync(coveragePath), 'the skipped candidate must be stamped into the staleness coverage file');
+  const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
+  assert.ok(coverage['ac-34'], 'coverage is keyed by the ORIGINAL task id, as markStalenessAuditReported() does');
+  assert.ok(coverage['ac-34'].reason, 'the coverage entry records WHY the candidate was skipped');
+  assert.equal(coverage['ac-34'].taskId, null, 'no real task was filed for a skipped candidate');
+
+  // Skipped candidates are suppressed by the same coverage key a normal report uses, so the
+  // next tick does not re-offer them (and does not loop on the same null again) until the
+  // cooldown window passes.
+  assert.equal(nextStalenessAuditTask(), null);
+});
+
 // --- nextSecondBrainOpportunitiesTask ----------------------------------------------------
 
 function makeSecondBrainOpportunitiesFixtureRepo() {
