@@ -2209,3 +2209,38 @@ test('tool-loop audit: executeToolCalls keeps its 5-parameter declaration (outco
   assert.ok(m, 'executeToolCalls declaration found');
   assert.deepEqual(m[1].split(',').map((s) => s.trim()), ['assistantMessage', 'toolCalls', 'toolHandlers', 'messages', 'toolCallLog']);
 });
+
+// --- trajectory export (2026-10-18, brain-dump 1892 part 1) --------------------------------
+test('trajectory: a multi-turn write run leaves one gzip trajectory with the messages, turns and tool-call arguments', async () => {
+  const prev = process.env.AGENT_MANAGER_TRAJECTORY;
+  delete process.env.AGENT_MANAGER_TRAJECTORY;
+  try {
+    await withMockedChat([
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'alpha', replace: 'ALPHA' } } }] },
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] },
+      { role: 'assistant', content: 'all done', _done_reason: 'stop', _usage: { prompt_eval_count: 300, eval_count: 12 } },
+    ], async (mod, dir) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'alpha\n');
+      const result = await mod.runPlanWithTools({ prompt: 'fix it', allowWrite: true, source: 'manual', taskId: 'traj-t1', stage: 'agentic-write', maxTurns: 5 });
+      assert.equal(result.response, 'all done');
+      const { listTrajectories, readTrajectory } = require('./trajectory.js');
+      const rows = listTrajectories(dir, 'traj-t1');
+      assert.equal(rows.length, 1, 'exactly one trajectory for the run');
+      const t = readTrajectory(rows[0].file);
+      assert.equal(t.taskId, 'traj-t1');
+      assert.equal(t.stage, 'agentic-write');
+      assert.equal(t.source, 'manual');
+      assert.deepEqual(t.turns.map((x) => x.endClass), ['tool-calls', 'tool-calls', 'stop']);
+      assert.equal(t.result.turnsUsed, 3);
+      assert.equal(t.result.responseChars, 'all done'.length);
+      const assistantWithEdit = t.messages.find((m) => m.tool_calls && m.tool_calls[0].name === 'edit_file');
+      assert.deepEqual(JSON.parse(assistantWithEdit.tool_calls[0].arguments), { path: 'a.txt', find: 'alpha', replace: 'ALPHA' });
+      assert.ok(t.messages.some((m) => m.role === 'tool' && /"edited":true/.test(m.content)), 'the tool result is kept');
+      const finalMsg = t.messages[t.messages.length - 1];
+      assert.equal(finalMsg.content, 'all done');
+      assert.equal(finalMsg.final, true, 'the final answer is appended (the loop returns it without pushing it)');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TRAJECTORY; else process.env.AGENT_MANAGER_TRAJECTORY = prev;
+  }
+});

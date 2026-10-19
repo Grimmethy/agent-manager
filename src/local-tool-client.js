@@ -21,6 +21,7 @@ const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { logToolLoopEvent, buildTurnEndEntry, buildToolOutcomeEntries } = require('./tool-loop-audit.js');
+const { buildTrajectory, writeTrajectory } = require('./trajectory.js');
 const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { localOllamaLockKey } = require('./lib/ollama-lock-key.js');
@@ -1051,6 +1052,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   }
   const toolCallLog = [];
   let turnsUsed = 0;
+  // Trajectory record (trajectory.js, brain-dump 1892): run start + every turn's end entry, written once from withUsage.
+  const trajectoryStartedMs = Date.now();
+  const trajectoryTurns = [];
   let lastMessage = null;
 
   // Ollama token accounting, summed across every turn (incl. flake-retried and
@@ -1079,7 +1083,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   const logTurnEnd = (turn, phase, turnRes) => {
     try {
       if (!turnRes || turnRes.flakeErr || !turnRes.message) return;
-      logToolLoopEvent(pipelineDir, 'turn-end', buildTurnEndEntry(auditCtx(turn, phase), turnRes));
+      const entry = buildTurnEndEntry(auditCtx(turn, phase), turnRes);
+      trajectoryTurns.push(entry);
+      logToolLoopEvent(pipelineDir, 'turn-end', entry);
     } catch { /* best-effort -- see logToolLoopEvent */ }
   };
   const logToolOutcomes = (turn, calls) => {
@@ -1126,6 +1132,13 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       merged.response = cleanText;
       if (entry) writeContextLogInbox(entry, { sessionId: contextLogSessionId, pipelineDir });
     }
+    // Every return path passes here, so this is the one place the run's trajectory is complete. Best-effort (writeTrajectory never throws).
+    try {
+      writeTrajectory(pipelineDir, buildTrajectory({
+        meta: { taskId, stage, source, lane: process.env.AGENT_MANAGER_INSTANCE_ID || null, model: MODEL || null, startedMs: trajectoryStartedMs, endedMs: Date.now() },
+        messages, turns: trajectoryTurns, result: merged,
+      }));
+    } catch { /* best-effort -- see trajectory.js */ }
     return merged;
   };
 
