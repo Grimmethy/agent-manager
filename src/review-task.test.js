@@ -2070,7 +2070,7 @@ test('gate replay: with AGENT_MANAGER_GATE_REPLAY_BLOCK=true an over-limit gate 
   } finally { delete process.env.AGENT_MANAGER_GATE_REPLAY_BLOCK; }
 }));
 
-const POLICY_DIFF = 'diff --git a/src/single-flight-lock.js b/src/single-flight-lock.js\n--- a/src/single-flight-lock.js\n+++ b/src/single-flight-lock.js\n@@ -1 +1 @@\n-const DISCUSS_PRIORITY_MAX_WAIT_MS = 120000;\n+const DISCUSS_PRIORITY_SAFETY_VALVE_MS = 900000;\n';
+const POLICY_DIFF = 'diff --git a/src/single-flight-lock.js b/src/single-flight-lock.js\n--- a/src/single-flight-lock.js\n+++ b/src/single-flight-lock.js\n@@ -1 +1 @@\n-const DISCUSS_PRIORITY_MAX_WAIT_SEC = 120;\n+const DISCUSS_PRIORITY_SAFETY_VALVE_MS = 900000;\n';
 const withPolicyEnv = (routing, fn) => async () => {
   if (routing) process.env.AGENT_MANAGER_POLICY_CHANGE_ROUTING = 'true'; else delete process.env.AGENT_MANAGER_POLICY_CHANGE_ROUTING;
   try { await fn(); } finally { delete process.env.AGENT_MANAGER_POLICY_CHANGE_ROUTING; }
