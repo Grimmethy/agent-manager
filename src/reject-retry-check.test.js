@@ -12,7 +12,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const { rejectRetryCheck, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, isReviewVerdictAdvisoryProseSource } = require('./reject-retry-check.js');
+const { rejectRetryCheck, computeBlockSignature, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, isReviewVerdictAdvisoryProseSource } = require('./reject-retry-check.js');
 
 function setupDirs() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'reject-retry-test-'));
@@ -1828,4 +1828,90 @@ test('rejectRetryCheck: the same block on a lower-tier lane records avoidLanes a
   const a = JSON.parse(fs.readFileSync(path.join(pendingDir, 'low-a.json'), 'utf8'));
   assert.deepEqual(a.avoidLanes, ['worker-rx580']);
   assert.ok(!fs.existsSync(path.join(root, 'queue', 'side-findings-inbox')) || fs.readdirSync(path.join(root, 'queue', 'side-findings-inbox')).length === 0);
+});
+
+// ============================================================================
+// Deterministic-block short-circuit (ADR-0022) -- computeBlockSignature.
+// Drives rejectRetryCheck through its REAL directory-scanning contract (task JSON
+// on disk in blocked/, requeued JSON in pending/), NOT a bare in-memory object:
+// computeBlockSignature (src/lib/reject-retry-check.js:87) recomputes the sha256 of
+// task.promptContext.originalFile against getConfig().repoRoot (src/config.js:109 --
+// process.env.AGENT_MANAGER_REPO_ROOT), so the signature only changes when the ON-DISK
+// file bytes change. An in-memory mutation never triggers the requeue path.
+// ============================================================================
+const DETERM_REASON = 'deterministic recheck: rule failed on the unchanged file bytes (a re-run will reproduce the identical block)';
+
+test('deterministic block: NOT requeued when signature unchanged', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const originalFile = path.join(root, 'original.txt');
+  fs.writeFileSync(originalFile, 'deterministic-content-v1', 'utf8');
+
+  // computeBlockSignature reads repoRoot from getConfig() (AGENT_MANAGER_REPO_ROOT).
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = root;
+  try {
+    const sig = computeBlockSignature({ blockedReason: DETERM_REASON, promptContext: { originalFile } });
+    assert.ok(sig !== null, 'computeBlockSignature must fingerprint this deterministic block');
+
+    const task = {
+      id: 'task-1', blockedStage: 'review', blockedReason: DETERM_REASON, history: [],
+      localRejectCount: 2, escalated: false, _prevBlockSignature: sig,
+      promptContext: { originalFile },
+    };
+    fs.writeFileSync(path.join(blockedDir, 'task-1.json'), JSON.stringify(task, null, 2));
+
+    const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+    assert.equal(summary.exhausted, 1, 'signature unchanged -> short-circuit to exhausted');
+    assert.equal(summary.requeued, 0, 'must NOT requeue');
+    assert.ok(!fs.existsSync(path.join(pendingDir, 'task-1.json')), 'must not land in pending/');
+    const onDisk = JSON.parse(fs.readFileSync(path.join(blockedDir, 'task-1.json'), 'utf8'));
+    assert.equal(onDisk.localRejectCount, 2, 'pinned at MAX_LOCAL_REJECT_RETRIES, not incremented past it');
+    assert.equal(onDisk.escalated, true, 'escalated for a human');
+  } finally {
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT;
+    else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('deterministic block: IS requeued when signature changes (file content changed on disk)', () => {
+  const { root, blockedDir, pendingDir } = setupDirs();
+  const originalFile = path.join(root, 'original.txt');
+  fs.writeFileSync(originalFile, 'deterministic-content-v1', 'utf8');
+
+  const prevRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+  process.env.AGENT_MANAGER_REPO_ROOT = root;
+  try {
+    const sig = computeBlockSignature({ blockedReason: DETERM_REASON, promptContext: { originalFile } });
+    assert.ok(sig !== null, 'computeBlockSignature must fingerprint this deterministic block');
+
+    // Freshly blocked at count 0, carrying the PREVIOUS sweep's signature (v1 content).
+    const task = {
+      id: 'task-1', blockedStage: 'review', blockedReason: DETERM_REASON, history: [],
+      localRejectCount: 0, escalated: false, _prevBlockSignature: sig,
+      promptContext: { originalFile },
+    };
+    fs.writeFileSync(path.join(blockedDir, 'task-1.json'), JSON.stringify(task, null, 2));
+
+    // The underlying file changed on disk since the previous sweep -> the recomputed
+    // signature (sha256 of the new bytes) differs from the stored _prevBlockSignature.
+    fs.writeFileSync(originalFile, 'deterministic-content-v2', 'utf8');
+    const newSig = computeBlockSignature({ blockedReason: DETERM_REASON, promptContext: { originalFile } });
+    assert.notEqual(newSig, sig, 'recomputed signature must differ after the file bytes change');
+
+    const summary = rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+
+    assert.equal(summary.requeued, 1, 'signature changed -> requeue');
+    assert.ok(fs.existsSync(path.join(pendingDir, 'task-1.json')), 'task must land in pending/');
+    assert.ok(!fs.existsSync(path.join(blockedDir, 'task-1.json')), 'task must leave blocked/');
+    const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-1.json'), 'utf8'));
+    assert.equal(requeued.localRejectCount, 1, 'count advances 0 -> 1 on requeue');
+    assert.equal(requeued.escalated, false, 'a changed deterministic block is retryable, not escalated');
+    assert.equal(requeued._prevBlockSignature, newSig, 'stored signature advances to the new one');
+  } finally {
+    if (prevRoot === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT;
+    else process.env.AGENT_MANAGER_REPO_ROOT = prevRoot;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

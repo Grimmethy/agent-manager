@@ -763,7 +763,10 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         summary.exhausted++;
         continue;
       }
-      if (blockSig !== null) task._prevBlockSignature = blockSig;
+      // Do NOT stamp task._prevBlockSignature here when blockSig differs from the stored
+      // one: doing so would make the increment-site check below (incSig === task._prevBlockSignature)
+      // match for a CHANGED deterministic block and skip the requeue entirely. The signature
+      // is stored only at the requeue site (incSig stamp below), where it belongs.
       if (retryCount >= MAX_LOCAL_REJECT_RETRIES && !isContinuation) {
         // Exhaustion policy (which sources escalate to a human vs stamp-and-stay, the
         // idempotency guards, ghost-debt filing, file move) extracted to the standalone
