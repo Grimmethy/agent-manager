@@ -2828,3 +2828,29 @@ The draft's "fail-fast" proposal would break every `gitRunner` implementation th
 ---
 
 *Both findings in the original draft were retracted. No code changes are recommended.*
+
+### AC-234 · Redundant `destDirEnsured` guard in archive loop
+Strength: Worth exploring
+Files: src/done-archive.js
+
+Problem:
+Both `archiveDoneTasks` and `archiveSpecificDoneTasks` maintain a local boolean (`destDirEnsured`) that gates a call to `fs.mkdirSync(destDir, { recursive: true })` so the directory is created at most once per loop. However, `fs.mkdirSync` with the `recursive: true` option is idempotent by contract: it does not throw when the target directory already exists. The flag therefore adds a mutable piece of loop-local state and an `if` branch that serve no functional or performance purpose, increasing cognitive load for anyone reading the archive loop.
+
+Solution:
+Remove the `destDirEnsured` variable and its conditional entirely. Call `fs.mkdirSync(destDir, { recursive: true })` unconditionally immediately before each `fs.renameSync` (or once before the loop, if the destination is constant across iterations). The Node.js `fs` module guarantees the call is a no-op when the directory is already present, so the behaviour is identical without the guard.
+
+Benefits:
+The archive loop loses a state variable and a branch, making the control flow linear and easier to audit. Future maintainers no longer need to reason about whether the flag could be reset or fall out of sync, and the code relies on a well-documented, standard library guarantee rather than hand-rolled bookkeeping.
+
+### AC-235 · Inconsistent failure semantics between `readState` and `listArchivedMonthDirs`
+Strength: Worth exploring
+Files: src/done-archive.js
+
+Problem:
+`readState` catches `ENOENT` and returns an empty object, but re-throws every other read failure (permission denied, I/O error, corruption). Meanwhile `listArchivedMonthDirs` catches any `readdirSync` failure and silently returns an empty array. The two functions in the same module therefore disagree on whether a non-`ENOENT` file-system error should crash the caller or degrade gracefully. In `checkDue`, a transient permission blip on the state file will throw and abort the entire archive pass, while an equally transient `readdir` failure on the archive directory will be swallowed and the pass will continue with an empty list—producing inconsistent observable behaviour for the same class of underlying fault.
+
+Solution:
+Align `readState` with the graceful-degradation pattern already used by `listArchivedMonthDirs`: catch all read errors, log the error (including the original `errno` and `message`) via the module's existing logging path, and return `{}`. This ensures `checkDue` and any other caller treat a missing state file and an unreadable state file identically—both yield "no prior state"—and a transient I/O hiccup no longer aborts the archive run.
+
+Benefits:
+Error-handling semantics become uniform across the module, so callers can rely on a single contract: file-system hiccups degrade to empty data rather than uncaught exceptions. The archive pipeline becomes resilient to transient `EACCES`, `EIO`, or `ENOSPC`-adjacent conditions on the state file without a code-path change, and the logging call preserves enough context for operators to investigate the underlying issue after the fact.
