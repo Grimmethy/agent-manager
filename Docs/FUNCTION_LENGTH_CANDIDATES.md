@@ -15098,3 +15098,153 @@ Extract the two advisory checks into a single helper that mutates task.preFilter
 
 Benefits:
 The main function loses ~30 lines of inline validation. The helper is independently unit-testable (pass a mock task, assert preFilterFlags). Adding a third pre-filter is a one-line insertion inside the helper rather than a mid-function edit. No behavior change; purely structural.
+
+### AC-213 · Extract response-marker post-processing from call() retry loop
+Strength: Strong
+Files: src/local-client.js
+Symbol: call
+Snippet:
+```
+  return maxRetries + 1;
+}
+
+async function call(opts, maxRetries = 2) {
+  let lastDegenerate = null;
+  let lastError = null;
+  let gotAnyResponse = false;
+  let callOpts = opts;
+  let responses = 0;
+  let hardFailures = 0;
+  const maxHardFailures = hardFailureAllowance(maxRetries);
+  for (let attempt = 0; responses <= maxRetries && hardFailures < maxHardFailures; attempt++) {
+    let result;
+    try {
+      result = await callOnce(callOpts);
+    } catch (e) {
+      if (gpuGuard.isForgePause(e)) throw e;   // not a failure: no retry, no hard-failure audit (the lease is still held on every attempt)
+      lastError = e;
+      hardFailures += 1;
+      logHardFailureAudit({
+        source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
+        model: opts.model || MODEL, code: e.code || null, message: String(e.message || e).slice(0, 300),
+        timeoutMs: e.timeoutMs, statusCode: e.statusCode, nodeCode: e.nodeCode, think: callOpts.think,
+      });
+      continue;
+    }
+    gotAnyResponse = true;
+    responses += 1;
+    // Extract any SIDE-FINDING: block(s) BEFORE degenerate-detection judges the response,
+    // so a response that's otherwise degenerate/empty except for a stray finding isn't
+    // misjudged either way, and so the caller's own downstream RESOLUTION:/JSON parsing
+    // never sees the raw marker text.
+    if (opts.allowSideFindings !== false && result.response && result.response.includes('SIDE-FINDING:')) {
+      const { cleanText, findings } = extractSideFindings(result.response);
+      result = { ...result, response: cleanText };
+      if (findings.length) {
+        const pipelineDir = resolvePipelineDir();
+        for (const finding of findings) {
+          writeSideFindingInbox(finding, { source: opts.source, taskId: opts.taskId, stage: opts.stage, pipelineDir });
+        }
+      }
+    }
+    if (opts.allowAmplification && result.response && result.response.includes('AMPLIFY:')) {
+      const { cleanText, requests } = extractAmplificationRequests(result.response);
+      result = { ...result, response: cleanText };
+      if (requests.length) {
+        const pipelineDir = resolvePipelineDir();
+        for (const req of requests) {
+          runAmplificationSweep({
+            rootCauseSummary: req.rootCauseSummary, query: req.query, dir: req.dir,
+            excludeFiles: req.exclude, pipelineDir, source: opts.source, taskId: opts.taskId,
+          });
+        }
+      }
+    }
+    if (opts.conceptId && result.response && result.response.includes('CONCEPT-BUILD:')) {
+      const { cleanText, report } = extractConceptBuildReport(result.response);
+      result = { ...result, response: cleanText };
+      if (report) {
+        recordConceptBuildTally(resolvePipelineDir(), opts.conceptId, report.kind);
+      }
+    }
+    const degenerate = detectDegenerate(result.response, { allowEmpty: opts.allowEmpty, doneReason: result.done_reason, isDraft: opts.isDraft });
+    if (!degenerate) return { ...result, degenerate: null, attempts: attempt + 1 };
+    lastDegenerate = degenerate;
+    // Logged for THIS attempt, not just once the whole call gives up -- so a later
+    // investigation can see the retry PATTERN (e.g. all 3 attempts hit numPredict
+    // identically vs. attempt 1 empty then 2-3 truncated), not just the final verdict
+    // task.blockedReason alone preserves today.
+    logDegenerateAudit({
+      source: opts.source, taskId: opts.taskId, stage: opts.stage, attempt: attempt + 1, maxRetries,
+      model: opts.model || MODEL, numPredict: callOpts.numPredict, doneReason: result.done_reason,
+      degenerate, promptEvalCount: result.prompt_eval_count, evalCount: result.eval_count,
+      // Whether THIS attempt asked for reasoning: the think-off retry below could not be verified from the log before (2026-10-16: 3090 attempts 2
+      // and 3 still hit their ceiling with evalCount == numPredict and nothing recorded about think).
+      think: callOpts.think,
+    });
+    if (degenerate === 'truncated' && callOpts.numPredict) {
+      const escalated = Math.min(
+        Math.round(callOpts.numPredict * TRUNCATION_RETRY_MULTIPLIER),
+        TRUNCATION_RETRY_NUM_PREDICT_CEILING,
+      );
+      if (escalated > callOpts.numPredict) callOpts = { ...callOpts, numPredict: escalated };
+      // 2026-09-14, root-caused against a real blocked backlog (21 tasks, every one
+      // truncated with ZERO visible characters -- confirmed via model_calls: eval_count
+      // present, response empty): doneReason:'length' with no real content at all means
+      // <think> reasoning ate the WHOLE budget before any visible answer, not that a
+      // real answer got cut short partway. Escalating numPredict alone doesn't
+      // reliably fix this -- observability-fix-ac-37's own history shows numPredict
+      // already escalated 1400 -> 2800 -> 5600 across 3 attempts and STILL came back
+      // truncated at 0 chars, because a runaway reasoning chain just keeps consuming
+      // whatever budget it's given rather than converging. Mirrors the ALREADY-PROVEN
+      // implNoThink pattern (local-draft.js's computeImplementBudget: think disabled
+      // outright for pipeline_forensics/pipeline_debrief, sources where reasoning was
+      // found not to help) -- but scoped precisely to the confirmed failure signature
+      // (truncated + zero real content) rather than a blanket per-source list, so it
+      // only touches the exact case that needs it and never a partial-but-real
+      // truncation that might still be benefiting from the reasoning already spent.
+      if (callOpts.think && !(result.response || '').trim()) {
+        callOpts = { ...callOpts, think: false };
+      }
+    }
+  }
+  // Only propagate the hard error if NO attempt ever got a real response, degenerate or
+  // not -- a degenerate response on an earlier attempt followed by a hard failure on a
+  // later retry is still a real, legitimate degenerate outcome, not an infra failure.
+  if (!gotAnyResponse && lastError) throw lastError;
+  return { response: '', thinking: '', degenerate: lastDegenerate, attempts: responses + hardFailures };
+```
+
+Problem:
+The call() retry loop inlines three near-identical marker blocks (SIDE-FINDING, AMPLIFY, CONCEPT-BUILD), each roughly ten lines of check-extract-clean-dispatch. They are independent of retry state, duplicate the same shape, and force any unit test to drive the full retry path just to exercise one marker.
+
+Solution:
+Extract the three blocks into a single `processResponseMarkers(result, opts)` helper that checks each marker, cleans the response text, and fires the side-effect, then call it once in the loop body.
+
+```diff
+--- a/src/local-client.js
++++ b/src/local-client.js
+@@ call() loop body @@
+     gotAnyResponse = true;
+     responses += 1;
+-    if (opts.allowSideFindings !== false && result.response.includes('SIDE-FINDING:')) {
+-      const { cleanText, findings } = extractSideFindings(result.response);
+-      result = { ...result, response: cleanText };
+-      if (findings.length) { /* writeSideFindingInbox per finding */ }
+-    }
+-    if (opts.allowAmplification && result.response.includes('AMPLIFY:')) {
+-      const { cleanText, requests } = extractAmplificationRequests(result.response);
+-      result = { ...result, response: cleanText };
+-      if (requests.length) { /* runAmplificationSweep per request */ }
+-    }
+-    if (opts.conceptId && result.response.includes('CONCEPT-BUILD:')) {
+-      const { cleanText, report } = extractConceptBuildReport(result.response);
+-      result = { ...result, response: cleanText };
+-      if (report) recordConceptBuildTally(resolvePipelineDir(), opts.conceptId, report.kind);
+-    }
++    result = processResponseMarkers(result, opts);
+     const degenerate = detectDegenerate(result.response, { … });
+```
+
+Benefits:
+The loop body shrinks by roughly thirty lines. Because the helper takes `(result, opts)` and returns `result`, a node:test case can feed a synthetic response containing an `AMPLIFY:` marker and assert the sweep fired without entering the retry loop, and reviewers see one call site instead of three copy-pasted blocks.
