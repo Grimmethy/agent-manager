@@ -782,3 +782,49 @@ test('task-shape backstop: with AGENT_MANAGER_TASK_SHAPE=off the same task is sp
   assert.equal(splitCalls, 1);
   assert.equal(res.resolution, 'decompose');
 });
+
+// --- TIME BUDGET prompt line (2026-10-19, brain-dump 1895) -------------------------------------------------
+// Behind AGENT_MANAGER_PROMPT_BUDGET_BLOCK (default off): states the lane's per-call ceiling and the keep-turns-short instruction.
+
+function withBudgetSwitch(value, fn) {
+  const prev = process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK;
+  if (value === undefined) delete process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK; else process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK = value;
+  try { return fn(); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK; else process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK = prev; }
+}
+
+test('TIME BUDGET line: buildTimeBudgetLine states the ceiling in seconds for 240 s, 900 s (slow endpoint) and a custom value', () => {
+  const { buildTimeBudgetLine } = freshModule();
+  assert.match(buildTimeBudgetLine(240000), /cut off after about 240 seconds/);
+  assert.match(buildTimeBudgetLine(900000), /cut off after about 900 seconds/);
+  assert.match(buildTimeBudgetLine(90000), /cut off after about 90 seconds/);
+  const line = buildTimeBudgetLine(240000);
+  assert.match(line, /Keep your thinking to a few sentences/);
+  assert.match(line, /several small edit_file calls/);
+  assert.match(line, /~30 s/);
+});
+
+test('TIME BUDGET line: with the switch on the prompt gains exactly that line, after the TURN BUDGET line, using the lane ceiling', async () => {
+  await withRepo(async () => {
+    const task = { title: 'T', promptContext: { rawText: 'the ask' } };
+    const { REQUEST_TIMEOUT_MS } = require('./local-tool-client.js');
+    const off = withBudgetSwitch(undefined, () => freshModule().buildWriteAgenticPrompt(task));
+    for (const v of ['on', '1', 'true', 'ON']) {
+      const m = freshModule();
+      const on = withBudgetSwitch(v, () => m.buildWriteAgenticPrompt(task));
+      assert.ok(on.includes(`cut off after about ${Math.round(REQUEST_TIMEOUT_MS / 1000)} seconds`), v);
+      assert.equal(on.replace(`${m.buildTimeBudgetLine()}\n`, ''), off, `${v}: the only difference is the inserted line`);
+      assert.ok(on.indexOf('TURN BUDGET:') < on.indexOf('TIME BUDGET:') && on.indexOf('TIME BUDGET:') < on.indexOf('Title: T'), 'placed between the turn budget and the task');
+    }
+  });
+});
+
+test('TIME BUDGET line: switch off (unset, off, 0, false) leaves the prompt without it', async () => {
+  await withRepo(async () => {
+    const task = { title: 'T', promptContext: { rawText: 'the ask' } };
+    for (const v of [undefined, 'off', '0', 'false', '']) {
+      const p = withBudgetSwitch(v, () => freshModule().buildWriteAgenticPrompt(task));
+      assert.ok(!p.includes('TIME BUDGET'), String(v));
+      assert.match(p, /TURN BUDGET: you have about/);
+    }
+  });
+});
