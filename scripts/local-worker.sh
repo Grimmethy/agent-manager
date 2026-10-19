@@ -15,6 +15,20 @@ ONCE=false
 # Every heartbeat this lane writes carries the DAEMON's pid (write_heartbeat_file), not a borrowed child's, so dead-process-check never sees a
 # dead pid between borrowed ticks.
 if ! "$ONCE"; then export AGENT_MANAGER_DAEMON_PID="$$"; fi
+# Premium-only borrowed tick (2026-10-18, premium reach -- src/pool-projects.js header): the daemon runs a --once child with
+# AGENT_MANAGER_PREMIUM_ONLY_TICK=true when ANOTHER registered project holds premium work and the home project holds none. Such a child
+# resumes, seeds and claims premium tasks only, so it can never take (or generate) that project's regular work. Ignored without --once.
+PREMIUM_ONLY=false
+if "$ONCE" && [[ "${AGENT_MANAGER_PREMIUM_ONLY_TICK:-}" == "true" ]]; then PREMIUM_ONLY=true; fi
+# Exit 0 when the task file's top-level premiumPriority is true (same test as pool-projects.js hasPremium).
+is_premium_file() {
+  node -e 'try{process.exit(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).premiumPriority===true?0:1)}catch(e){process.exit(1)}' "$1" 2>/dev/null
+}
+# Reads file names (one per line) on stdin and prints, in the same order, those in dir $1 whose task is premium. One node process for a
+# whole ranked pending/ list, instead of one per file.
+filter_premium_names() {
+  node -e 'const fs=require("fs"),path=require("path"),d=process.argv[1];for(const n of fs.readFileSync(0,"utf8").split("\n")){if(!n)continue;try{if(JSON.parse(fs.readFileSync(path.join(d,n),"utf8")).premiumPriority===true)console.log(n)}catch(e){}}' "$1" 2>/dev/null
+}
 
 # Worker lanes are one per GPU, named for the GPU (src/lanes.js: worker-3090, worker-p40). Every
 # lane claims ANY pending task by priority -- there is no reasoning/worker split (2026-09-19).
@@ -511,6 +525,75 @@ borrow_from_pool() {
   return 0
 }
 
+# The pause at the end of a tick, shared by the normal tick and a tick that ended on a premium borrow (it reads did_work and
+# TICK_HAD_INFRA_FAILURE and maintains CONSECUTIVE_INFRA_FAILURES, exactly as when it was inline at the bottom of the loop).
+end_of_tick_pause() {
+  # Idle-only backoff: only pay the full poll interval when this tick genuinely found
+  # nothing to do. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the
+  # end of EVERY tick regardless of whether more work was sitting right there waiting --
+  # confirmed live 2026-08-15: a real backlog with tasks completing in well under 30s each
+  # still spent the majority of wall-clock time asleep between them, under 50% utilization.
+  # A brief sleep even when work was done avoids a true zero-delay busy-loop hammering the
+  # filesystem tick after tick when a large backlog is draining.
+  if "$did_work" && "$TICK_HAD_INFRA_FAILURE"; then
+    # Jittered exponential backoff (2026-08-25, Grimmethy: "boost throughput" -- shape
+    # borrowed from nullboiler's retry_base_delay_ms=1000/retry_max_delay_ms=30000/
+    # retry_jitter_ms=250, see single-flight-lock.js's per-model-lock change from the same
+    # request for the sibling half of this fix). Confirmed live 2026-08-24: with the flat
+    # `sleep 1` this replaces, a struggling Ollama instance got re-hammered by this same
+    # worker's very next claim every ~150s (the timeout duration) for 90 minutes straight,
+    # zero backoff, zero recovery room. Doubles (1s, 2s, 4s, ... capped at 30s) with each
+    # consecutive infra-failure tick, plus up to 250ms of jitter so multiple lanes backing
+    # off at once don't re-hammer in lockstep; resets to 0 (flat 1s again) the instant a
+    # tick's work is NOT an infra failure. This only paces THIS worker's own next claim --
+    # it does not change DRAFT_FAILURE_RETRY_LIMIT/DRAFT_INFRA_REQUEUE_LIMIT's existing,
+    # separate give-up bounds at all.
+    CONSECUTIVE_INFRA_FAILURES=$((CONSECUTIVE_INFRA_FAILURES + 1))
+    backoff_secs=$((1 << (CONSECUTIVE_INFRA_FAILURES - 1)))                        # 1,2,4,8,16,32,... (bit-shift doubling)
+    if (( backoff_secs > 30 )); then backoff_secs=30; fi
+    jitter_ms=$((RANDOM % 250))
+    sleep "${backoff_secs}.$(printf '%03d' "$jitter_ms")"
+  elif "$did_work"; then
+    CONSECUTIVE_INFRA_FAILURES=0
+    sleep 1
+  else
+    CONSECUTIVE_INFRA_FAILURES=0
+    sleep "${ORC_TICK_SECS:-60}"                                                   # wait between polls (default: 60s) — same delay PowerShell uses via its `Start-Sleep -Seconds $env:TICK_INTERVAL` inside main daemon loop body (we read from ORC_TICK_SECS env var so user can customize per-instance without editing the script; bash ${VAR:-default} form is exactly that kind of fallback assignment which matches what PowerShell's `$interval = if ($null -ne $env:INTERVAL) { $env:INTERVAL } else { 60}` does for same purpose.
+  fi
+}
+
+# Premium reach (2026-10-18, Grimmethy: "premium priority tasks happen regardless of what project repo is currently selected (currently
+# selected repo still wins the tie)"). Called by the daemon BEFORE its home tick: when the home project has no premium work for this lane
+# and another registered project (pooled or not) does, run ONE premium-only --once tick there (least-recently-premium-borrowed first) and
+# return 0; the caller then ends this tick. A project whose tick took nothing (e.g. the task is restricted to another lane) is backed off for
+# this lane. Every premium borrow is a 'premium-borrow' event in the HOME pipeline history. Kill switch AGENT_MANAGER_PREMIUM_REACH=false.
+borrow_premium_from_projects() {
+  [[ "${AGENT_MANAGER_PREMIUM_REACH:-true}" != "false" ]] || return 1
+  local pipes=() env_args=() pipe rc
+  if node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-premium "$PIPELINE_DIR" worker "$INSTANCE_ID" 2>>"$LOG_FILE"; then
+    return 1   # the home project has premium work for this lane: it wins the tie, the home tick takes it
+  fi
+  mapfile -t pipes < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --premium-projects worker "$INSTANCE_ID" 2>>"$LOG_FILE")
+  for pipe in "${pipes[@]}"; do
+    [[ -n "$pipe" ]] || continue
+    env_args=()
+    mapfile -t env_args < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$pipe" "$INSTANCES_DIR" 2>>"$LOG_FILE")
+    (( ${#env_args[@]} > 0 )) || continue
+    printf '[worker-%s] home has no premium work -- borrowing a PREMIUM tick from %s\n' "$INSTANCE_ID" "$pipe"
+    rc=0
+    env "${env_args[@]}" AGENT_MANAGER_PREMIUM_ONLY_TICK=true bash "${SCRIPT_DIR}/local-worker.sh" "$INSTANCE_ID" --once || rc=$?
+    if (( rc == 10 || rc == 11 )); then
+      node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-premium "$pipe" worker "$PIPELINE_DIR" "$INSTANCE_ID" >>"$LOG_FILE" 2>&1 || true
+      did_work=true
+      if (( rc == 11 )); then TICK_HAD_INFRA_FAILURE=true; fi
+      return 0
+    fi
+    if (( rc != 0 )); then printf '[worker-%s] premium tick from %s exited %s (treated as empty)\n' "$INSTANCE_ID" "$pipe" "$rc" >&2; fi
+    node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-premium-empty "$pipe" worker "$INSTANCE_ID" >>"$LOG_FILE" 2>&1 || true
+  done
+  return 1
+}
+
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
   TICK_HAD_INFRA_FAILURE=false                                                   # set by process_drafting_file (a global, not a subshell -- it's called directly) when this tick's draft call failed on an apparent infra outage. Drives the backoff decision below, separate from did_work.
@@ -546,6 +629,9 @@ while :; do                                                                     
   # every ornithCall this tick would have timed out at 240s with no indication why.
   node "${PACKAGE_SRC_DIR}/gpu-guard.js" >>"$LOG_FILE" 2>&1 || true
 
+  # Premium reach: another project's premium task goes before this lane's home REGULAR work (home premium still wins -- see the function).
+  if ! "$ONCE" && borrow_premium_from_projects; then end_of_tick_pause; continue; fi
+
   # Seed pending/ with a new task if the queue has room to generate one -- local-worker.ps1
   # calls this every tick (task-sources.js's own CLI header: "Safe to call on every worker
   # tick"). Previously never called anywhere in this bash port, so pending/ could never
@@ -560,7 +646,11 @@ while :; do                                                                     
   # ever been attempted or why Scouted Repos stayed empty despite tasks completing.
   # Every lane runs generation, unfiltered: getNextTask() walks the ONE priority ladder and returns the
   # best eligible task; the in-flight throttle is bounded by the number of live lanes (generation-throttle.js).
-  node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+  # A premium-only borrowed tick seeds only when this project's adhoc/ or derived/ holds premium work (task-selection.js then generates it
+  # first), so borrowing a premium tick never generates regular work in another project.
+  if ! "$PREMIUM_ONLY" || node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-premium "$PIPELINE_DIR" worker-seed 2>>"$LOG_FILE"; then
+    node "${PACKAGE_SRC_DIR}/task-sources.js" >>"$LOG_FILE" 2>&1 || true
+  fi
 
   # Resume any task already sitting in THIS instance's own drafting/ folder before claiming
   # anything new -- a claim only ever gets processed by whichever worker process happened
@@ -595,6 +685,7 @@ while :; do                                                                     
       [[ "$name" == *.json ]]                                                  || continue
       wpath="${drafting_instance_dir}/${name}"
       [[ -f "$wpath" && -s "$wpath" ]]                                        || continue
+      if "$PREMIUM_ONLY" && ! is_premium_file "$wpath"; then continue; fi       # a premium-only borrowed tick leaves regular leftovers for later
       printf '[worker-%s] resuming leftover drafting item: %s\n' "$INSTANCE_ID" "$name"
       # A resumed item that predates the claimedAt stamp (or a chat-preempt requeue that
       # skipped drafting/) gets one now, set-once -- see the claim site's comment.
@@ -661,7 +752,7 @@ while :; do                                                                     
   if [[ -r "$pdir" ]] && ! "$TICK_HAD_INFRA_FAILURE" && ! { "$ONCE" && "$did_work"; }; then   # a borrowed tick that already resumed its one leftover item claims nothing more. check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
     while IFS= read -r name; do
       [[ -n "$name" ]] && items+=("$name")
-    done < <(node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" 2>/dev/null)
+    done < <(if "$PREMIUM_ONLY"; then node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" 2>/dev/null | filter_premium_names "$pdir"; else node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" 2>/dev/null; fi)
 
     # Iterate each pending draft, process if ready:
     for name in "${items[@]}"; do                                             # loop over collected filenames one at a time — bash array iteration via `${array[@]}` syntax (each element becomes separate word when quoted). Equivalent of PowerShell's `foreach ($item in $drafts)` which we're mirroring here since both languages use the same conceptual model for "do this to every X in collection".
@@ -774,36 +865,5 @@ while :; do                                                                     
   # Nothing to do in the home project this tick -> work another suite project NOW rather than idle (docs/idle-pool-borrowing.md).
   if ! "$did_work" && ! "$TICK_HAD_INFRA_FAILURE"; then borrow_from_pool; fi
 
-  # Idle-only backoff: only pay the full poll interval when this tick genuinely found
-  # nothing to do. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the
-  # end of EVERY tick regardless of whether more work was sitting right there waiting --
-  # confirmed live 2026-08-15: a real backlog with tasks completing in well under 30s each
-  # still spent the majority of wall-clock time asleep between them, under 50% utilization.
-  # A brief sleep even when work was done avoids a true zero-delay busy-loop hammering the
-  # filesystem tick after tick when a large backlog is draining.
-  if "$did_work" && "$TICK_HAD_INFRA_FAILURE"; then
-    # Jittered exponential backoff (2026-08-25, Grimmethy: "boost throughput" -- shape
-    # borrowed from nullboiler's retry_base_delay_ms=1000/retry_max_delay_ms=30000/
-    # retry_jitter_ms=250, see single-flight-lock.js's per-model-lock change from the same
-    # request for the sibling half of this fix). Confirmed live 2026-08-24: with the flat
-    # `sleep 1` this replaces, a struggling Ollama instance got re-hammered by this same
-    # worker's very next claim every ~150s (the timeout duration) for 90 minutes straight,
-    # zero backoff, zero recovery room. Doubles (1s, 2s, 4s, ... capped at 30s) with each
-    # consecutive infra-failure tick, plus up to 250ms of jitter so multiple lanes backing
-    # off at once don't re-hammer in lockstep; resets to 0 (flat 1s again) the instant a
-    # tick's work is NOT an infra failure. This only paces THIS worker's own next claim --
-    # it does not change DRAFT_FAILURE_RETRY_LIMIT/DRAFT_INFRA_REQUEUE_LIMIT's existing,
-    # separate give-up bounds at all.
-    CONSECUTIVE_INFRA_FAILURES=$((CONSECUTIVE_INFRA_FAILURES + 1))
-    backoff_secs=$((1 << (CONSECUTIVE_INFRA_FAILURES - 1)))                        # 1,2,4,8,16,32,... (bit-shift doubling)
-    if (( backoff_secs > 30 )); then backoff_secs=30; fi
-    jitter_ms=$((RANDOM % 250))
-    sleep "${backoff_secs}.$(printf '%03d' "$jitter_ms")"
-  elif "$did_work"; then
-    CONSECUTIVE_INFRA_FAILURES=0
-    sleep 1
-  else
-    CONSECUTIVE_INFRA_FAILURES=0
-    sleep "${ORC_TICK_SECS:-60}"                                                   # wait between polls (default: 60s) — same delay PowerShell uses via its `Start-Sleep -Seconds $env:TICK_INTERVAL` inside main daemon loop body (we read from ORC_TICK_SECS env var so user can customize per-instance without editing the script; bash ${VAR:-default} form is exactly that kind of fallback assignment which matches what PowerShell's `$interval = if ($null -ne $env:INTERVAL) { $env:INTERVAL } else { 60}` does for same purpose.
-  fi
+  end_of_tick_pause
 done                                                                             # end top-level 'while' loop here — bash `do...done` syntax pair; mirror of PowerShell's `while (...){ ... }` curly-brace structure we're replacing (bash has no native boolean true so ':' used as the always-true condition).
