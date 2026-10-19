@@ -4,7 +4,9 @@
 // (the "wire-classifier-into-task-disposition" sibling), NOT the discarded sibling
 // implementation's incompatible ctx/return shape. Pins the contract task-disposition.js's
 // step-7 call site depends on: classifyApplyOutcome(ctx) -> { stage, detail }, where stage
-// is a TERMINAL_STAGES value ('noop' is the safe fallback when RULES is empty).
+// is a TERMINAL_STAGES value ('noop' is the safe fallback when no rule matches).
+// 2026-09-27: RULES now ships with one seeded rule (classifyAdvisoryReport) routing
+// the advisory report sources to 'filed' instead of the 'noop' fall-through.
 //
 // 2026-09-11: two siblings of the same coordinator hub independently authored a FULL,
 // incompatible src/apply-outcome-classifiers.js (add/add conflict caught by cherry-pick
@@ -14,6 +16,12 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { classifyApplyOutcome, RULES } = require('./apply-outcome-classifiers.js');
+const { TERMINAL_STAGES } = require('./task-disposition.js');
+
+// The advisory report sources named by src/advisory-null-outcome.js's null-outcome
+// recogniser -- an applied report from any of them is a completed inspection whose
+// record is archival material, classified to the in-contract 'filed' stage.
+const ADVISORY_SOURCES = ['pipeline_debrief', 'pipeline_forensics', 'pipeline_health_audit', 'capability_debrief'];
 
 function ctxFor(overrides = {}) {
   return {
@@ -27,7 +35,7 @@ function ctxFor(overrides = {}) {
   };
 }
 
-test('default fallback with empty RULES: stage is noop and detail carries the outcome= prefix', () => {
+test('default fallback (a non-advisory ctx the seeded rule skips): stage is noop and detail carries the outcome= prefix', () => {
   const result = classifyApplyOutcome(ctxFor({ detail: 'mystery apply outcome' }));
   assert.equal(result.stage, 'noop');
   assert.equal(typeof result.detail, 'string');
@@ -91,10 +99,33 @@ test('rules receive the caller-provided ctx (task-disposition.js step-7 shape)',
   }
 });
 
-test('export surface: classifyApplyOutcome is a function, RULES is a (shipped-empty) array', () => {
+test('export surface: classifyApplyOutcome is a function, RULES is a non-empty array seeded with the advisory rule', () => {
   assert.equal(typeof classifyApplyOutcome, 'function');
   assert.ok(Array.isArray(RULES));
-  assert.equal(RULES.length, 0, 'the shipped module is a stub: RULES is empty by default');
+  assert.equal(RULES.length, 1, 'RULES ships with exactly the seeded advisory-report rule');
+});
+
+test('an advisory report apply (each named advisory source) classifies to the in-contract filed stage', () => {
+  for (const source of ADVISORY_SOURCES) {
+    const result = classifyApplyOutcome(ctxFor({ task: { id: 't-1', source } }));
+    assert.equal(result.stage, 'filed', `${source} should classify to filed`);
+    assert.ok(result.detail.startsWith('outcome=filed'), `${source} detail should start with "outcome=filed", got: ${result.detail}`);
+    assert.ok(result.detail.includes(source), `${source} detail should name the source, got: ${result.detail}`);
+    assert.ok(TERMINAL_STAGES.has(result.stage), `${source}: stage "${result.stage}" must be a TERMINAL_STAGES member`);
+  }
+});
+
+test('a non-advisory unclassifiable apply still falls through to the noop default (regression guard)', () => {
+  const result = classifyApplyOutcome(ctxFor({ task: { id: 't-1', source: 'candidate-fulfillment' }, detail: 'mystery apply outcome' }));
+  assert.equal(result.stage, 'noop');
+  assert.ok(result.detail.startsWith('outcome=unclassified'), `detail should start with "outcome=unclassified", got: ${result.detail}`);
+  assert.ok(TERMINAL_STAGES.has(result.stage), 'noop must be a TERMINAL_STAGES member');
+});
+
+test('TERMINAL_STAGES is unchanged: exactly the 9 pre-existing values (the classifier adds no new stage)', () => {
+  const sorted = [...TERMINAL_STAGES].sort();
+  assert.equal(sorted.length, 9, 'TERMINAL_STAGES must still have exactly 9 members (the 8 named stages plus the pre-existing aged-out)');
+  assert.deepEqual(sorted, ['abandoned', 'aged-out', 'applied-direct', 'dismissed', 'filed', 'merged', 'noop', 'pending-merge', 'superseded']);
 });
 
 test('tolerates a minimal ctx (missing detail/taskId/mainBranch/shipCtx/applied) without throwing', () => {
