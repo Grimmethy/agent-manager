@@ -2043,6 +2043,7 @@ test('gate replay: the numbers reach the voters and the task record, and by defa
   assert.match(prompt, /Gate replay over tasks that already ran/);
   assert.match(prompt, /checkDraftQuality .*flags 93 merged task\(s\) = 27\.8%/);
   assert.match(prompt, /THIS GATE IS OVER THE LIMIT/);
+  assert.match(prompt, /the limit applies to merged tasks the change newly flags \(27\.8% here\)/);
   assert.match(prompt, /No real-data replay was possible for checkOdd/);
   assert.ok(task.history.some((h) => h.stage === 'advisory' && /gate replay: checkDraftQuality flags 93\/335/.test(h.detail || '')));
 }));
@@ -2057,7 +2058,7 @@ test('gate replay: with AGENT_MANAGER_GATE_REPLAY_BLOCK=true an over-limit gate 
     assert.equal(result.verdict, 'blocked');
     assert.equal(result.blockedStage, 'review');
     assert.equal(task.reviewProvider, 'deterministic-gate-replay');
-    assert.match(result.blockedReason, /would flag 93 of 335 already-merged tasks \(27\.8%, limit 2\.0%\)/);
+    assert.match(result.blockedReason, /newly flags 93 of 335 already-merged tasks \(27\.8%, limit 2\.0%\)/);
     assert.match(result.blockedReason, /HUB0060-01|already-merged/);
     assert.equal(captured.length, 0, 'no vote is spent');
     // a within-limit gate is never blocked, switch on or not

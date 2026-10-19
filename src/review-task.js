@@ -784,6 +784,7 @@ function summariseGateReplay(replay) {
       name: String(c.name || '').slice(0, 80), file: String(c.file || '').slice(0, 120), family: String(c.family || '').slice(0, 20), blocking: !!c.blocking, total: n(c.total), mergedTotal: n(c.mergedTotal),
       beforeFlaggedMerged: c.before ? n(c.before.flaggedMerged) : null, afterFlaggedMerged: c.after ? n(c.after.flaggedMerged) : 0, afterFlagged: c.after ? n(c.after.flagged) : 0,
       rateMerged: Number.isFinite(c.rateMerged) ? c.rateMerged : null, newCount: n(c.newlyFlaggedMergedCount),
+      newRateMerged: n(c.mergedTotal) ? n(c.newlyFlaggedMergedCount) / n(c.mergedTotal) : null,
       examples: (Array.isArray(c.newlyFlaggedMerged) ? c.newlyFlaggedMerged : []).slice(0, 3).map((x) => ({ id: String((x && x.id) || '').slice(0, 70), detail: String((x && x.detail) || '').slice(0, 100) })),
     })),
     skipped: skipped.slice(0, GATE_REPLAY_MAX_ITEMS).map((x) => ({ name: String((x && x.name) || '').slice(0, 80), reason: String((x && x.reason) || '').slice(0, 160) })),
@@ -797,7 +798,8 @@ function formatGateReplaySection(gr) {
     const pct = c.rateMerged == null ? 'n/a' : `${(c.rateMerged * 100).toFixed(1)}%`;
     out.push(`The diff adds or changes the gate ${c.name} (${c.file}). Run over the real corpus (${c.total} finished tasks, ${c.mergedTotal} of them merged), it flags ${c.afterFlaggedMerged} merged task(s) = ${pct}`
       + `${c.beforeFlaggedMerged == null ? ' (it is a new gate)' : `; the base version flags ${c.beforeFlaggedMerged}`}; ${c.newCount} merged task(s) are newly flagged${c.examples.length ? `, e.g. ${c.examples.map((x) => `${x.id}${x.detail ? ` (${x.detail})` : ''}`).join('; ')}` : ''}.`);
-    if (c.blocking) out.push(`Work that already merged should not be flagged by a new gate; the limit here is ${(gr.maxRate * 100).toFixed(1)}%. ${gr.block ? 'THIS GATE IS OVER THE LIMIT: treat it as a false-positive defect unless the task text says the merged tasks listed were wrong to merge.' : 'This gate is within the limit.'}`);
+    if (c.blocking) out.push(`Work that already merged should not be newly flagged by this change; the limit applies to merged tasks the change newly flags`
+      + `${c.newRateMerged == null ? '' : ` (${(c.newRateMerged * 100).toFixed(1)}% here)`} and is ${(gr.maxRate * 100).toFixed(1)}%. ${gr.block ? 'THIS GATE IS OVER THE LIMIT: treat it as a false-positive defect unless the task text says the merged tasks listed were wrong to merge.' : 'This gate is within the limit.'}`);
     else out.push('This corpus has no "must not flag" population, so the count is reported for information only.');
   }
   for (const x of gr.skipped || []) out.push(`No real-data replay was possible for ${x.name}: ${x.reason}. Ask what real inputs the draft tested it against.`);
