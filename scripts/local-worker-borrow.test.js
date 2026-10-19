@@ -453,3 +453,75 @@ test('premium reach: a premium-only borrowed tick does not resume the other proj
     assert.ok(!/resuming leftover drafting item: c-leftover\.json/.test(log), 'the regular leftover was never resumed by a premium tick');
   } finally { stop(child); }
 });
+
+// --- premium reach, reviewer (2026-10-18): another project's premium review before home REGULAR reviews; home premium wins the tie ----------
+
+const reviewItem = (dir, id, premium, mtimeSecsAgo = 0) => {
+  const p = path.join(dir, 'queue', 'review', `${id}.json`);
+  fs.writeFileSync(p, JSON.stringify({ id, domain: 'default', source: 'trouble_log', title: id, status: 'needs-review', promptContext: {}, planResponse: 'p', implementResponse: 'i', ...(premium ? { premiumPriority: true } : {}) }));
+  if (mtimeSecsAgo) { const t = new Date(Date.now() - mtimeSecsAgo * 1000); fs.utimesSync(p, t, t); }
+};
+// The reviewer's "reviewing <file>" lines go to stderr; capture the daemon's (and its borrowed children's) output in the sandbox.
+const spawnReviewer = (sb, extra = {}) => {
+  const out = path.join(sb.root, 'reviewer.out');
+  const fd = fs.openSync(out, 'a');
+  const child = spawn('bash', [path.join(__dirname, 'review-runner.sh'), 'review-x'], { detached: true, stdio: ['ignore', fd, fd], env: homeEnv(sb, extra) });
+  fs.closeSync(fd);
+  return { child, reviewed: () => { try { return [...fs.readFileSync(out, 'utf8').matchAll(/\] reviewing (\S+\.json)/g)].map((m) => m[1]); } catch { return []; } } };
+};
+
+test('premium reach (reviewer): a reviewer with a REGULAR home review reviews a NON-pool project\'s premium review first, and records a premium-borrow event at home', async () => {
+  const sb = sandbox({ nonPool: true });
+  reviewItem(sb.A, 'a-regular', false, 600);
+  reviewItem(sb.C, 'c-premium', true);
+  const { child, reviewed } = spawnReviewer(sb);
+  try {
+    const events = await waitFor(() => (premiumEvents(sb).some((e) => e.role === 'reviewer') ? premiumEvents(sb) : null), 120000);
+    assert.ok(events, 'a reviewer premium-borrow event was written to the HOME pipeline history');
+    assert.equal(reviewed()[0], 'c-premium.json', 'the first item reviewed was C\'s premium item, not the older home regular one');
+    const ev = events.find((e) => e.role === 'reviewer');
+    assert.equal(ev.project, 'C');
+  } finally { stop(child); }
+});
+
+test('premium reach (reviewer): a premium review at home wins the tie -- no other project is visited', async () => {
+  const sb = sandbox({ nonPool: true });
+  reviewItem(sb.A, 'a-premium', true);
+  reviewItem(sb.C, 'c-premium', true);
+  const { child, reviewed } = spawnReviewer(sb);
+  try {
+    const got = await waitFor(() => reviewed().includes('a-premium.json'), 90000);
+    assert.ok(got, 'the home premium review was reviewed');
+    await new Promise((r) => setTimeout(r, 6000));
+    assert.ok(!reviewed().includes('c-premium.json'), 'the other project\'s premium review was not touched');
+    assert.deepEqual(premiumEvents(sb), []);
+  } finally { stop(child); }
+});
+
+test('premium reach (reviewer): a premium-only borrowed review tick reviews only the premium item, never the other project\'s OLDER regular review item', async () => {
+  const sb = sandbox({ nonPool: true });
+  reviewItem(sb.A, 'a-regular', false, 600);
+  reviewItem(sb.C, 'c-regular-older', false, 900);
+  reviewItem(sb.C, 'c-premium', true);
+  const { child, reviewed } = spawnReviewer(sb);
+  try {
+    const events = await waitFor(() => (premiumEvents(sb).filter((e) => e.role === 'reviewer').length >= 2 ? premiumEvents(sb) : null), 180000);
+    assert.ok(events, 'premium review ticks were borrowed from C');
+    assert.ok(reviewed().includes('c-premium.json'));
+    assert.ok(!reviewed().includes('c-regular-older.json'), 'C\'s older regular review item was never reviewed by a premium tick');
+  } finally { stop(child); }
+});
+
+test('premium reach (reviewer): AGENT_MANAGER_PREMIUM_REACH=false keeps the reviewer on its home review/', async () => {
+  const sb = sandbox({ nonPool: true });
+  reviewItem(sb.A, 'a-regular', false);
+  reviewItem(sb.C, 'c-premium', true);
+  const { child, reviewed } = spawnReviewer(sb, { AGENT_MANAGER_PREMIUM_REACH: 'false' });
+  try {
+    const got = await waitFor(() => reviewed().includes('a-regular.json'), 90000);
+    assert.ok(got, 'the home review item was reviewed');
+    await new Promise((r) => setTimeout(r, 6000));
+    assert.ok(!reviewed().includes('c-premium.json'), 'the other project\'s premium review was not touched');
+    assert.deepEqual(premiumEvents(sb), []);
+  } finally { stop(child); }
+});
