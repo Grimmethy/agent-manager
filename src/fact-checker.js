@@ -672,6 +672,32 @@ function urlsOnlyInAddedTestFiles(text) {
   return new Set([...inTest].filter((u) => !inProd.has(u)));
 }
 
+// 2026-10-19, root-caused live (brain-dump 1891's review): an ALL_CAPS dummy string in an ADDED unit test ('SENTINEL_THOUGHT', a stand-in for
+// model thinking text) was hard-blocked 'ungrounded-field', although urlsOnlyInAddedTestFiles above already exempts a URL that lives only in
+// the draft's own test data. Same reason, narrower on purpose: the token must sit INSIDE A STRING LITERAL on an added line of at least one
+// test file and appear on no added line of a non-test file -- and nowhere outside a string literal in a test file either. A bare identifier
+// in test code (`x = INVENTED_FIELD_NAME`) is a reference to a symbol that should exist, so it stays checked (test 'an ungrounded ALLCAPS
+// field in a test file is still flagged'); prose neither exempts nor un-exempts anything. Replayed over every historic ungrounded-field
+// block (41 blocks, 28 tasks, 2026-10-19) it would have exempted two names -- FOO_BAR_BAZ and RETRY_BACKOFF_CAP, both string fixtures in
+// tests of the checkers themselves -- and kept the other 39. (1889's similar sentinel passed only because its lowercase suffix defeated
+// GIS_FIELD_RE's trailing \b, by accident.)
+const STRING_LITERAL_RE = /(['"`])(?:\\.|(?!\1)[^\\])*\1/g;
+
+function fieldsOnlyInAddedTestFiles(text) {
+  const inTestStrings = new Set();
+  const elsewhere = new Set();
+  let file = null;
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^diff --git a\/\S+ b\/(\S+)/);
+    if (m) { file = m[1]; continue; }
+    if (!file || !line.startsWith('+') || line.startsWith('+++')) continue;
+    if (!TEST_FILE_RE.test(file)) { for (const f of line.match(GIS_FIELD_RE) || []) elsewhere.add(f); continue; }
+    for (const lit of line.match(STRING_LITERAL_RE) || []) for (const f of lit.match(GIS_FIELD_RE) || []) inTestStrings.add(f);
+    for (const f of line.replace(STRING_LITERAL_RE, ' ').match(GIS_FIELD_RE) || []) elsewhere.add(f);
+  }
+  return new Set([...inTestStrings].filter((f) => !elsewhere.has(f)));
+}
+
 function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   if (!sourceText) return [];
   const flags = [];
@@ -679,6 +705,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   const testFixtureUrls = urlsOnlyInAddedTestFiles(draftText);
   const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
   const envReads = extractEnvReadIdentifiers(draftText);
+  const testFixtureFields = fieldsOnlyInAddedTestFiles(draftText);
   const echoMarkers = extractEchoMarkers(draftText);
 
   const urls = [...new Set(scannableText.match(URL_RE) || [])];
@@ -697,6 +724,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
     if (PLACEHOLDER_RE.test(field)) continue;
     if (newlyDeclared.has(field)) continue;
     if (envReads.has(field)) continue;
+    if (testFixtureFields.has(field)) continue;
     if (echoMarkers.has(field)) continue;
     if (sourceText.includes(field)) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
@@ -1049,6 +1077,7 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
 module.exports = {
   urlsOnlyInAddedTestFiles,
   extractEnvReadIdentifiers,
+  fieldsOnlyInAddedTestFiles,
   checkDraft,
   checkFilePaths,
   checkRelationships,

@@ -229,6 +229,22 @@ const KNOWN_FIXED = [
       return names.every((n) => reads.has(n));
     },
   },
+  {
+    // 2026-10-19: the same gate flagged an ALL_CAPS dummy string that exists only in a test file the draft itself adds (brain-dump 1891's
+    // SENTINEL_THOUGHT). fact-checker.js now exempts those, as it already did for URLs; this re-runs that same extraction on the parked
+    // task's own diff and re-admits it only when EVERY flagged name qualifies (a name production code also uses stays flagged).
+    id: 'ungrounded-field-test-fixture',
+    fixedIn: 'agent-manager (fact-checker: a fixture token only in the draft\'s own added test files is not ungrounded, 2026-10-19)',
+    description: 'an ungrounded-field block on an ALL_CAPS name that appears only on added lines of test files in the draft\'s own diff',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const names = [...failureText(task).matchAll(/ungrounded-field: ([A-Z][A-Z0-9]*_[A-Z0-9_]+)/g)].map((m) => m[1]);
+      if (!names.length) return false;
+      const { fieldsOnlyInAddedTestFiles } = require('./fact-checker.js');
+      const fixtures = fieldsOnlyInAddedTestFiles((task && (task.implementResponse || task.rawDiff)) || '');
+      return names.every((n) => fixtures.has(n));
+    },
+  },
 ];
 
 module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable };
