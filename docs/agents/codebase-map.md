@@ -93,7 +93,7 @@ about," verified to still exist as of this writing.
 - `src/task-sources.js` — the task-source registry and priority ladder (`registerTaskSource`, `getNextTask()`).
 - `src/deterministic-recheck-registry.js` — the `registerDeterministicRecheck` seam a plugin's own scanner rules re-run through.
 - `src/arch-discovery-structcheck.js`, `src/arch-import-fetch.js` — the two core files that stay here rather than in the hygiene plugin (worker subprocess by hardcoded path; shared repo-search harness).
-- `python/graph_build.py` — produces graph.json/community-coverage.json (generated, gitignored — not checked into the repo) the plugin's `arch_discovery` reads read-only.
+- `python/graph_build.py` — produces graph.json/community-coverage.json (generated, gitignored — not checked into the repo) the plugin's `arch_discovery` reads read-only. Its links are undirected file-level adjacency (measured against real `require` edges 2026-10-19: all real, direction arbitrary, no function-level call edges), which is why the agent loop has no graph-backed neighbors tool -- `docs/design-notes/code-graph-tools-for-the-agent-loop.md`.
 - `docs/PLUGIN_API.md` + `src/plugin-api.test.js` — the plugin contract and the CI test that enforces it.
 
 **Watchdog sweeps**
