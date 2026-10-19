@@ -2245,16 +2245,50 @@ function nextStalenessAuditTask() {
   // adhoc tasks still show 35 blocked? It hasn't gone down" -- plain candidates[0] let
   // whichever domain held the globally-oldest task monopolize every tick; see
   // pickFairCandidate's own header in staleness-audit.js).
-  const picked = pickFairCandidate(candidates, coverage);
-  const task = buildStalenessAuditTask(picked, defaultDomain);
-  if (taskIdExistsInQueue(task.id)) return null;
+  //
+  // Walk the fair ranking, candidate by candidate (2026-09-09, HUB0158):
+  // buildStalenessAuditTask() returns NULL for a candidate whose title has no concrete
+  // file:line ref (staleness-audit.js's titleHasFileLineRef gate) -- and that null used
+  // to flow straight into taskIdExistsInQueue(task.id) below, throwing a TypeError on
+  // EVERY tick while the same candidate got re-picked forever. A candidate that build
+  // declines is marked skipped in the same coverage file markStalenessAuditReported()
+  // writes (findStalenessCandidates() suppresses on exactly that key, for the same
+  // cooldown as a normal report), then the walk moves to the next fair candidate.
+  // pickFairCandidate() re-sorts the same remaining set each round, so repeated
+  // extraction yields its full ranking without duplicating that sort here.
+  const remaining = candidates.slice();
+  while (remaining.length > 0) {
+    const picked = pickFairCandidate(remaining, coverage);
+    remaining.splice(remaining.indexOf(picked), 1);
 
-  // Coverage written by markStalenessAuditReported(), AFTER writeTask() actually
-  // persists this task -- not here. Same discipline nextPipelineSelfAuditTask() follows
-  // and the same reason: every next() function here is a pure read with no queue-write
-  // side effect (see getNextTask()'s own comment), so a tier mismatch discarding this
-  // task must not have already marked it reported.
-  return task;
+    const task = buildStalenessAuditTask(picked, defaultDomain);
+    if (task === null) {
+      // Synthesize the exact shape markStalenessAuditReported() reads (promptContext.
+      // originalTaskId/.originalDomain) so the skip lands in the same coverage file with
+      // the same reportedAt/domain fields -- plus a reason recording WHY it was skipped.
+      // No queue write is lost by stamping coverage here (unlike the "report after
+      // writeTask()" discipline below, which exists because a REAL task may still be
+      // discarded by a tier mismatch): nothing gets persisted for a skipped candidate.
+      markStalenessAuditReported({
+        id: null,
+        promptContext: {
+          originalTaskId: picked.task && picked.task.id,
+          originalDomain: (picked.task && picked.task.domain) || null,
+        },
+        skippedReason: 'title has no file:line ref',
+      });
+      continue;
+    }
+    if (taskIdExistsInQueue(task.id)) continue;
+
+    // Coverage written by markStalenessAuditReported(), AFTER writeTask() actually
+    // persists this task -- not here. Same discipline nextPipelineSelfAuditTask() follows
+    // and the same reason: every next() function here is a pure read with no queue-write
+    // side effect (see getNextTask()'s own comment), so a tier mismatch discarding this
+    // task must not have already marked it reported.
+    return task;
+  }
+  return null;
 }
 
 // Called once from the CLI, only after writeTask() has actually persisted a
@@ -2272,11 +2306,16 @@ function markStalenessAuditReported(task) {
   // domain: the FLAGGED task's own domain (promptContext.originalDomain), not this
   // staleness-audit task's own domain (always defaultDomain) -- read by
   // pickFairCandidate() to track per-domain report throughput.
-  coverage[originalTaskId] = {
+  const entry = {
     reportedAt: new Date().toISOString(),
     taskId: task.id,
     domain: (task.promptContext && task.promptContext.originalDomain) || null,
   };
+  // set only on the skip path nextStalenessAuditTask() takes when buildStalenessAuditTask()
+  // declined the candidate (no file:line ref in the title) -- no real task was ever filed
+  // for it, hence taskId above is null and this is the only record of WHY it was skipped.
+  if (task.skippedReason) entry.reason = task.skippedReason;
+  coverage[originalTaskId] = entry;
   fs.mkdirSync(path.dirname(stalenessAuditCoveragePath), { recursive: true });
   fs.writeFileSync(stalenessAuditCoveragePath, JSON.stringify(coverage, null, 2));
 }

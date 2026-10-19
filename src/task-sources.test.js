@@ -1897,7 +1897,11 @@ function writeStaleBlockedTask(dir, id, extra = {}) {
   fs.mkdirSync(blockedDir, { recursive: true });
   fs.writeFileSync(path.join(blockedDir, `${id}.json`), JSON.stringify({
     id,
-    title: `stale task ${id}`,
+    // Title must name a concrete file:line -- staleness-audit.js's titleHasFileLineRef
+    // gate makes buildStalenessAuditTask() return null (and nextStalenessAuditTask()
+    // mark the candidate skipped) for titles without one, so a gate-less title like the
+    // old "stale task <id>" could never produce the audit task these tests assert on.
+    title: `stale task ${id} (src/example.js:42)`,
     source: 'manual',
     history: [{ stage: 'blocked', at: '2020-01-01T00:00:00.000Z' }], // far enough in the past to always be stale
     ...extra,
