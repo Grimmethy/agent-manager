@@ -505,6 +505,27 @@ function extractNewlyDeclaredIdentifiers(text) {
   return new Set([...text.matchAll(NEW_DECLARATION_RE)].map((m) => m[1]));
 }
 
+// 2026-10-18, root-caused live (brain-dump 1890's review, this pipeline): a draft that adds an env switch -- read as
+// process.env.AGENT_MANAGER_EDIT_FILE_TIERS on an added line of an EXISTING file -- was hard-blocked 'ungrounded-field'
+// before any vote. Same class as the newly-declared exemption above: the draft's own diff is what introduces the name, so
+// no pre-change grounding can contain it. But an environment variable is introduced by being READ, never by a `NAME =`
+// line, so NEW_DECLARATION_RE can never exempt it. Exempts a token an ADDED diff line reads from the environment:
+// process.env.NAME / process.env['NAME'], os.environ['NAME'], os.environ.get('NAME', os.getenv('NAME', getenv('NAME',
+// and shell ${NAME:-x} / ${NAME-x} / ${NAME:=x} (default-value forms only -- a JS template ${NAME} referencing a constant
+// is not an env read and stays checked). Prose, context and removed lines never exempt anything.
+const ENV_READ_RE = /(?:process\.env\.|process\.env\[\s*['"`]|os\.environ\[\s*['"]|os\.environ\.get\(\s*['"]|(?:os\.)?getenv\(\s*['"])([A-Z][A-Z0-9]*_[A-Z0-9_]+)|\$\{([A-Z][A-Z0-9]*_[A-Z0-9_]+):?[-=]/g;
+
+function extractEnvReadIdentifiers(text) {
+  const out = new Set();
+  let inDiff = false;
+  for (const line of String(text || '').split('\n')) {
+    if (DIFF_META_RE.test(line)) { inDiff = true; continue; }
+    if (!inDiff || !line.startsWith('+') || line.startsWith('+++')) continue;
+    for (const m of line.matchAll(ENV_READ_RE)) out.add(m[1] || m[2]);
+  }
+  return out;
+}
+
 // 2026-09-08, root-caused live via a real blocked adhoc task (the analytics-and-discovery.js
 // file-decompose child): the draft's own agentic run really did execute `node --check
 // newfile.js && echo "NEWFILE_SYNTAX_OK"` in a sandboxed run_bash call, got real, live
@@ -657,6 +678,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   const scannableText = stripUnchangedDiffLines(draftText);
   const testFixtureUrls = urlsOnlyInAddedTestFiles(draftText);
   const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
+  const envReads = extractEnvReadIdentifiers(draftText);
   const echoMarkers = extractEchoMarkers(draftText);
 
   const urls = [...new Set(scannableText.match(URL_RE) || [])];
@@ -674,6 +696,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   for (const field of fields) {
     if (PLACEHOLDER_RE.test(field)) continue;
     if (newlyDeclared.has(field)) continue;
+    if (envReads.has(field)) continue;
     if (echoMarkers.has(field)) continue;
     if (sourceText.includes(field)) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
@@ -1025,6 +1048,7 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
 
 module.exports = {
   urlsOnlyInAddedTestFiles,
+  extractEnvReadIdentifiers,
   checkDraft,
   checkFilePaths,
   checkRelationships,
