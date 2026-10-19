@@ -525,3 +525,61 @@ test('premium reach (reviewer): AGENT_MANAGER_PREMIUM_REACH=false keeps the revi
     assert.deepEqual(premiumEvents(sb), []);
   } finally { stop(child); }
 });
+
+// --- premium reach, apply (2026-10-18): premium approved tasks of every registered project, never a non-pool project's regular ones -----
+
+const approvedTask = (dir, id, premium) => {
+  fs.mkdirSync(path.join(dir, 'queue', 'approved'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'approved', `${id}.json`), JSON.stringify({ id, domain: 'default', source: 'trouble_log', title: id, status: 'approved', promptContext: {}, ...(premium ? { premiumPriority: true } : {}) }));
+};
+const landedIn = (dir, id) => ['done', 'blocked', 'awaiting-confirm', 'coordinating'].some((d) => fs.existsSync(path.join(dir, 'queue', d, `${id}.json`)));
+const runApplyLoop = (sb, pkg, extra = {}) => spawnSync('bash', [path.join(pkg, 'scripts', 'apply-loop.sh'), '--once'], { encoding: 'utf8', timeout: 180000, env: { ...process.env, HOME: path.join(sb.root, 'home'), ORC_TICK_SECS: '1', ...extra } });
+
+test('premium reach (apply): a NON-pool project\'s premium approved task is applied in ITS queue, its regular approved task waits, and the pass is a premium-borrow event at home', () => {
+  const sb = sandbox({ nonPool: true });
+  const pkg = packageWithEnvFile(sb);
+  fs.mkdirSync(path.join(sb.A, 'queue', 'approved'), { recursive: true });
+  approvedTask(sb.C, 'c-premium', true);
+  approvedTask(sb.C, 'c-regular', false);
+  const r = runApplyLoop(sb, pkg);
+  assert.match(r.stdout, /applying PREMIUM approved tasks of .*\/C/, r.stderr);
+  assert.ok(landedIn(sb.C, 'c-premium'), 'the premium task was applied inside C\'s own queue');
+  assert.ok(!landedIn(sb.A, 'c-premium'), 'and not filed into the active project');
+  assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'approved', 'c-regular.json')), 'C\'s regular approved task waits for C to be selected');
+  const ev = premiumEvents(sb).find((e) => e.role === 'apply');
+  assert.ok(ev, 'premium-borrow {role apply} in the active project\'s history');
+  assert.equal(ev.project, 'C');
+});
+
+test('premium reach (apply): a POOL project\'s premium approved task is applied once, by the pool pass -- no second premium pass for it', () => {
+  const sb = sandbox({ nonPool: true });
+  const pkg = packageWithEnvFile(sb);
+  fs.mkdirSync(path.join(sb.A, 'queue', 'approved'), { recursive: true });
+  approvedTask(sb.B, 'b-premium', true);
+  const r = runApplyLoop(sb, pkg);
+  assert.match(r.stdout, /applying approved tasks of borrowed project .*\/B/, r.stderr);
+  assert.doesNotMatch(r.stdout, /applying PREMIUM approved tasks of .*\/B/);
+  assert.ok(landedIn(sb.B, 'b-premium'));
+  assert.equal(premiumEvents(sb).filter((e) => e.role === 'apply').length, 0);
+});
+
+test('premium reach (apply): AGENT_MANAGER_PREMIUM_REACH=false skips the premium pass', () => {
+  const sb = sandbox({ nonPool: true });
+  const pkg = packageWithEnvFile(sb);
+  fs.mkdirSync(path.join(sb.A, 'queue', 'approved'), { recursive: true });
+  approvedTask(sb.C, 'c-premium', true);
+  const r = runApplyLoop(sb, pkg, { AGENT_MANAGER_PREMIUM_REACH: 'false' });
+  assert.doesNotMatch(r.stdout, /PREMIUM/);
+  assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'approved', 'c-premium.json')), 'untouched');
+});
+
+test('premium reach (apply): AGENT_MANAGER_POOL_BORROW=false still applies a non-pool project\'s premium task (premium reach is independent)', () => {
+  const sb = sandbox({ nonPool: true });
+  const pkg = packageWithEnvFile(sb);
+  fs.mkdirSync(path.join(sb.A, 'queue', 'approved'), { recursive: true });
+  approvedTask(sb.C, 'c-premium', true);
+  const r = runApplyLoop(sb, pkg, { AGENT_MANAGER_POOL_BORROW: 'false' });
+  assert.doesNotMatch(r.stdout, /applying approved tasks of borrowed project/, 'the pool pass is off');
+  assert.match(r.stdout, /applying PREMIUM approved tasks of .*\/C/, r.stderr);
+  assert.ok(landedIn(sb.C, 'c-premium'));
+});
