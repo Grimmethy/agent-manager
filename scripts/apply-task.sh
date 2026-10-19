@@ -72,7 +72,7 @@ source "${SCRIPT_DIR}/agent-manager-common.sh"
 # against not being caught on that one tick.
 move_task_file_locked() {
   local tid="$1" src="$2" dst="$3"
-  if acquire_single_flight_lock "move.${tid}"; then
+  if acquire_single_flight_lock "move.${tid}" "skip"; then
     mv "$src" "$dst"
     release_single_flight_lock
   else
