@@ -15479,3 +15479,227 @@ Extract the suite-construction block (extractChangedFiles → splitCoveringTiers
 
 Benefits:
 Each phase is independently testable with a mocked d and fixture rawDiff. Shared-mutable surface drops from seven threaded variables to explicit return objects. Reviewers evaluate one phase's contract in isolation.
+
+### AC-215 · Extract per-task eligibility filter pipeline from pickClaimableTasks
+Strength: Strong
+Files: src/next-claimable-task.js
+Symbol: pickClaimableTasks
+Snippet:
+```
+// (local-worker.sh) iterates this list attempting an atomic claim (mv -n) on each in
+// turn, same as it did with the old inline script's output.
+function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
+  let names;
+  try {
+    names = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
+  } catch (_) {
+    return [];
+  }
+
+  // Side-effect requires: task-sources.js's registerTaskSource() calls populate
+  // task-source-registry.js's registry as a load-time side effect -- must be required
+  // before getRegisteredSource() can resolve anything (see local-worker.sh's own
+  // comment on this same gotcha, confirmed live 2026-08-17: requiring model-provider.js
+  // alone reported every source as 'low' every time).
+  loadSourceRegistry();
+  const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
+  const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
+
+  // <queue>/pending -> pipelineDir (hub-priority.js re-joins queue/coordinating itself).
+  const pipelineDir = path.join(pendingDir, '..', '..');
+  const hubKeyCache = new Map();
+  const noHubKey = { rank: Infinity, createdAt: null };
+
+  const { sourceEligibleHere, activeRepoIsCore } = require('./lib/source-scope.js');
+  const coreActive = activeRepoIsCore();
+  // Lane avoidance (premium-rotation.js): how many lanes exist decides whether a task may skip one. 0 on any error = never skip.
+  let laneCount = 0;
+  // This instance's own lane definition, for the task-class allowlist below (null for a non-lane instance, or on any error = unrestricted).
+  let thisLane = null;
+  // The whole lane list, kept for the lane-avoidance check below (is there anywhere ELSE this task can go?). [] on any error = never avoid.
+  let claimLanes = [];
+  try {
+    const allLanes = opts.lanes || require('./lanes.js').getLanes();
+    claimLanes = allLanes;
+    laneCount = allLanes.length;
+    thisLane = allLanes.find((l) => l.id === instanceId) || null;
+  } catch (_) { laneCount = 0; thisLane = null; claimLanes = []; }
+  const capRouting = require('./capability-routing.js');
+  const routing = {
+    cfg: capRouting.routingConfig(),
+    instancesDir: opts.instancesDir || sharedInstancesDir(pipelineDir),
+    _rows: null,
+    rows() { if (!this._rows) this._rows = opts.scorecard || capRouting.cachedScorecard(pipelineDir, this.cfg); return this._rows; },
+  };
+  let probesOffered = 0;
+  const pinned = [];
+  const rankable = [];
+  for (const name of names) {
+    const { task, mtimeMs } = readTaskSafe(path.join(pendingDir, name));
+    const pinnedWorker = task && task.pinnedWorker;
+    if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
+    if (pinnedWorker === instanceId) {
+      pinned.push({ name, mtimeMs });
+      continue;
+    }
+
+    // A task that degenerated on THIS lane (task.avoidLanes, stamped by reject-retry-check.js) is left to another lane while one exists.
+    // An explicit pin to this lane was handled above and still wins.
+    // The skip only holds while another lane exists that is not avoided, is allowed this task's source and is alive (premium-rotation.js laneAvoided ctx),
+    // so avoidance can never leave a task that no lane will claim. The source and heartbeat lookups only happen for a task that actually names this lane.
+    if (task && Array.isArray(task.avoidLanes) && task.avoidLanes.includes(instanceId)) {
+      let avoidSource = null;
+      try { avoidSource = resolveSourceName(task); } catch (_) { avoidSource = null; }
+      // "Alive" here means "not known to be down": a lane whose heartbeat file exists but is stale or flagged degraded is down; a lane that has never written a
+      // heartbeat is unknown, and unknown counts as a place the task can go (avoidance still steers it there). Only evidence of death strands nothing.
+      const avoidAlive = (id) => {
+        if (opts.laneAlive) return opts.laneAlive(id);
+        if (!fs.existsSync(path.join(routing.instancesDir, `${id}.json`))) return true;
+        return capRouting.laneAliveFromHeartbeat(routing.instancesDir, id);
+      };
+      const avoidCtx = { lanes: claimLanes, source: avoidSource, alive: avoidAlive };
+      if (laneAvoided(task, instanceId, laneCount, process.env, avoidCtx)) continue;
+    }
+
+    // A lane with a taskClasses allowlist (lanes.js; e.g. an 8 GB GPU given only small bounded sources) is only offered tasks of
+    // those sources. Fail closed: a task whose source can't be resolved is not offered to a restricted lane. An operator pin to
+    // this lane was handled above and bypasses this, same as it bypasses lane avoidance.
+    if (task && thisLane && Array.isArray(thisLane.taskClasses)) {
+      let sourceName = null;
+      try { sourceName = resolveSourceName(task); } catch (_) { sourceName = null; }
+      if (!require('./lanes.js').laneAllowsSource(thisLane, sourceName)) {
+        // Probing (capability-routing.js): outside its allowlist, a small lane is still offered a deterministic fraction of eligible tasks of
+        // sources it has not proven. Shadow mode only logs; enforce lets ONE probe through per call.
+        let probe = false;
+        if (routing.cfg.mode !== 'off') {
+          try {
+            probe = capRouting.probeSelected({ task, source: sourceName, registered: getRegisteredSource(sourceName), lane: thisLane, lanes: opts.lanes || require('./lanes.js').getLanes(), rows: routing.rows(), cfg: routing.cfg, degraded: opts.laneDegraded ? opts.laneDegraded(thisLane.id) : require('./lane-health.js').laneDegraded(routing.instancesDir, thisLane.id) });
+          } catch (_) { probe = false; }
+        }
+        if (!probe) continue;
+        capRouting.auditReservation(pipelineDir, routing.instancesDir, {
+          mode: routing.cfg.mode, action: routing.cfg.mode === 'enforce' ? 'probe' : 'would-probe', taskId: task.id || name, source: sourceName, lane: thisLane.id, holder: thisLane.id, evidence: 'probe',
+        });
+        if (routing.cfg.mode !== 'enforce' || probesOffered >= 1) continue;
+        probesOffered += 1;
+      }
+    }
+
+    // Capability routing (src/capability-routing.js): a lane leaves a task to a lower-tier lane that has proven itself on its source, for a
+    // bounded grace. Shadow mode (default) only logs the decision. Human-queued / premium tasks and tasks that already failed on the
+    // holder (avoidLanes) are never held.
+    if (task && thisLane && routing.cfg.mode !== 'off' && !task.humanQueued && !task.premiumPriority) {
+      let srcName = null;
+      try { srcName = resolveSourceName(task); } catch (_) { srcName = null; }
+      const allLanes = opts.lanes || (() => { try { return require('./lanes.js').getLanes(); } catch (_) { return []; } })();
+      const decision = require('./capability-routing.js').decideReservation({
+        source: srcName, thisLane, lanes: allLanes, rows: routing.rows(), ageMs: (opts.now !== undefined ? opts.now : Date.now()) - mtimeMs, cfg: routing.cfg,
+        isAlive: (id) => (opts.laneAlive ? opts.laneAlive(id) : require('./capability-routing.js').laneAliveFromHeartbeat(routing.instancesDir, id)),
+        avoided: (id) => laneAvoided(task, id, allLanes.length),
+        probing: (l) => capRouting.probeSelected({ task, source: srcName, registered: getRegisteredSource(srcName), lane: l, lanes: allLanes, rows: routing.rows(), cfg: routing.cfg }),
+        isIdle: (id) => (opts.laneIdle ? opts.laneIdle(id) : capRouting.laneIdleFromHeartbeat(routing.instancesDir, id)),
+      });
+      if (decision) {
+        require('./capability-routing.js').auditReservation(pipelineDir, routing.instancesDir, {
+          mode: routing.cfg.mode, action: routing.cfg.mode === 'enforce' ? 'held' : 'would-hold', taskId: task.id || name, source: srcName, lane: thisLane.id,
+          holder: decision.holder, evidence: decision.evidence,
+        });
+        if (routing.cfg.mode === 'enforce') continue;
+      }
+    }
+
+    // A scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is
+    // not claimable, even if one is already sitting in pending/ (src/lib/source-scope.js). An explicit
+    // operator pin (handled above) still wins.
+    try {
+      if (task && !sourceEligibleHere(getRegisteredSource(resolveSourceName(task)), coreActive)) continue;
+    } catch (_) { /* unresolvable source -- not gated */ }
+
+    // Within one source-priority band, order a live hub's children by their owning hub's
+    // key (explicit hubPriority asc, then hub createdAt asc) so this path can't contradict
+    // nextAdhocTask()'s hub ordering -- same "the two must never disagree" discipline this
+    // file's own header already documents for the tier split. Non-hub tasks get noHubKey
+    // (rank Infinity), so hub children sort ahead of unrelated work at the same priority.
+    // Resolved through the task's own registered source's `hubOrder` hook (S1 of the
+    // hub-tasks extraction, 2026-09-23; same derived_task-carries-domain-adhoc special case
+    // rankPriorityOfTask above already needs, so a derived_task-specific override stays
+    // reachable), falling back to hub-priority.js's default bundle -- today's behaviour --
+    // when a registration hasn't declared one.
+    const registeredName = task && task.source === 'derived_task' ? 'derived_task' : (task ? resolveSourceName(task) : null);
+    const registered = registeredName ? getRegisteredSource(registeredName) : null;
+    const hubOrder = (registered && registered.hubOrder) || DEFAULT_HUB_ORDER;
+    const oc = task ? hubOrder.orderCandidate(pipelineDir, task, hubKeyCache) : null;
+    const hk = oc ? oc.hubKey : { isHubChild: false };
+    const hubKey = hk.isHubChild ? { rank: hk.rank, createdAt: hk.createdAt } : noHubKey;
+    const hubTier = !!(oc && oc.isHubWork);
+    const rankedPriority = rankPriorityOfTask(task, { hubTier });
+    // A premium task that keeps getting blocked rotates behind fresh premium work, but still ahead of the hub tier and everything else.
+    const priority = (rankedPriority === -Infinity && rotationDemoted(task)) ? ROTATION_DEMOTED_PRIORITY : rankedPriority;
+    const naturalPriority = hubTier ? rankPriorityOfTask(task, { hubTier: false }) : priority;
+    rankable.push({ name, id: (task && task.id) || name.replace(/\.json$/, ''), hubId: hubIdForTask(task), priority, naturalPriority, hubTier, mtimeMs, hubKey });
+  }
+
+  pinned.sort((a, b) => a.mtimeMs - b.mtimeMs);
+  // Comparator itself stays on the DEFAULT bundle's compareKeys: this is a single global
+  // sort across tasks that may resolve to different sources, and every source's hub records
+  // share the same kernel/shape today, so there is exactly one meaningful way to compare a
+  // { rank, createdAt } pair regardless of which registration produced it. A per-task
+  // compareKeys override would only make sense once a hub-tasks plugin can register a
+  // genuinely different record shape -- not needed by S1.
+  rankable.sort((a, b) => (a.priority - b.priority) || DEFAULT_HUB_ORDER.compareKeys(a.hubKey, b.hubKey) || (a.mtimeMs - b.mtimeMs));
+  const instancesDir = opts.instancesDir || sharedInstancesDir(pipelineDir);
+  recordHubTierAudit(rankable, instancesDir);
+  // Leave the top-ranked task for an idle preferred lane (see lanePreferenceGraceMs above), while it is still fresh.
+  const now = opts.now !== undefined ? opts.now : Date.now();
+  const graceMs = opts.graceMs !== undefined ? opts.graceMs : lanePreferenceGraceMs();
+  if (graceMs > 0 && rankable.length > 0 && (now - rankable[0].mtimeMs) < graceMs) {
+    let lanes = opts.lanes;
+    if (!lanes) { try { lanes = require('./lanes.js').getLanes(); } catch (_) { lanes = []; } }
+    if (preferredLaneIsIdle({ instanceId, instancesDir, lanes, now })) rankable.shift();
+  }
+  return [...pinned.map((r) => r.name), ...rankable.map((r) => r.name)];
+}
+```
+
+Problem:
+pickClaimableTasks is 171 lines because its loop body inlines five independent eligibility checks (pinned-worker, lane-avoidance, task-class allowlist, capability-routing hold, source-scope), each with its own try/catch and a different module dependency, alongside a ~30-line setup block and a ~20-line post-loop sort/audit block. No check is a one-liner; each carries 8–20 lines of branching, making the function hard to review or test in isolation.
+
+Solution:
+Extract the five per-task filter stages into a new module src/claim-filters.js exposing applyEligibilityFilters(task, name, mtimeMs, ctx). The loop body shrinks to: read task, call the filter, skip or push a ranked entry. Setup and post-loop blocks stay in place.
+
+```js
+// NEW: src/claim-filters.js
+function applyEligibilityFilters(task, name, mtimeMs, ctx) {
+  if (task?.pinnedWorker && task.pinnedWorker !== ctx.instanceId)
+    return { skip: true };
+  if (task?.avoidLanes?.includes(ctx.instanceId)
+      && laneAvoided(task, ctx.instanceId, ctx.laneCount, process.env,
+                     buildAvoidCtx(task, ctx)))
+    return { skip: true };
+  if (task && ctx.thisLane?.taskClasses
+      && !passesAllowlistOrProbe(task, ctx))
+    return { skip: true };
+  if (task && ctx.thisLane && ctx.routing.cfg.mode !== 'off'
+      && !task.humanQueued && !task.premiumPriority
+      && shouldHoldForLowerTier(task, ctx))
+    return { skip: true };
+  if (task && !sourceEligibleHere(
+        ctx.getRegisteredSource(ctx.resolveSourceName(task)), ctx.coreActive))
+    return { skip: true };
+  return { skip: false };
+}
+```
+
+```js
+// IN src/next-claimable-task.js — loop body becomes:
+for (const name of names) {
+  const { task, mtimeMs } = readTaskSafe(path.join(pendingDir, name));
+  if (task?.pinnedWorker === instanceId) { pinned.push({ name, mtimeMs }); continue; }
+  const { skip } = applyEligibilityFilters(task, name, mtimeMs, ctx);
+  if (skip) continue;
+  rankable.push(computeRankedEntry(task, name, mtimeMs, ctx));
+}
+```
+
+Benefits:
+Each filter stage becomes independently unit-testable (e.g. "given avoidLanes ['lane-2'] and laneCount 3, does it skip?"). The orchestrator drops to ~80 lines. Reviewers evaluate one 5-line guard at a time instead of scanning 171 lines of interleaved logic.
