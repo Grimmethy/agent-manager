@@ -3395,3 +3395,46 @@ test('capability_debrief is registered as a core, advisory-prose source at prior
   assert.equal(reg.probe, false);
   assert.equal(typeof reg.apply, 'function');
 });
+
+// 2026-10-18: an entry whose work already exists as a task is linked to it, not sorted again (brain-dump-existing-work.js).
+test('nextBrainDumpSortTask links an entry whose work already exists, keeps a concurrent edit, and returns the next entry', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  const entries = [
+    { id: 'bd-done-work', serial: 1903, rawText: 'already carried by hand', status: 'captured', capturedAt: '2026-10-18T03:00:00.000Z' },
+    { id: 'bd-fresh', serial: 1904, rawText: 'not started', status: 'captured', capturedAt: '2026-10-18T03:00:00.000Z' },
+  ];
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({ entries }));
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'adhoc-carried-1.json'), JSON.stringify({ id: 'adhoc-carried-1', promptContext: { raisedFrom: 'brain-dump-1903' } }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+
+  // A dashboard capture lands between the generator's read and its write: the write must keep it.
+  const realRead = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function patched(p, ...rest) {
+    const out = realRead.call(fs, p, ...rest);
+    if (p === process.env.AGENT_MANAGER_BRAIN_DUMP_PATH && ++reads === 1) {
+      const d = JSON.parse(String(out));
+      d.entries.push({ id: 'bd-new-capture', rawText: 'captured meanwhile', status: 'captured' });
+      fs.writeFileSync(p, JSON.stringify(d));
+    }
+    return out;
+  };
+  let task;
+  try { task = nextBrainDumpSortTask(); } finally { fs.readFileSync = realRead; }
+
+  assert.equal(task.id, 'brain-dump-sort-bd-fresh', 'the entry with existing work is skipped');
+  const saved = JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, 'utf8')).entries;
+  const linked = saved.find((e) => e.id === 'bd-done-work');
+  assert.equal(linked.status, 'actioned');
+  assert.equal(linked.queuedTaskId, 'adhoc-carried-1');
+  assert.equal(linked.linkedExistingWork.how, 'raisedFrom');
+  assert.equal(linked.linkedExistingWork.by, 'generator');
+  assert.equal(saved.find((e) => e.id === 'bd-fresh').status, 'captured');
+  assert.ok(saved.find((e) => e.id === 'bd-new-capture'), 'the concurrent capture survived the link write');
+  const hist = fs.readFileSync(path.join(dir, 'instances', 'pipeline-history.log'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    .filter((e) => e.type === 'brain-dump-existing-work');
+  assert.equal(hist.length, 1);
+  assert.equal(hist[0].entryId, 'bd-done-work');
+  assert.equal(hist[0].taskId, 'adhoc-carried-1');
+});
