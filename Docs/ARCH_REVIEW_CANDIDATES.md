@@ -2761,3 +2761,29 @@ Benefits:
 Preserves the success-path return shape (`Array<Hit>`) that the tool-call and LLM-serialization layers depend on, while making the failure path idiomatic and catchable without ad-hoc `Array.isArray` checks. Closes the path-traversal exposure on the alternate-root path so a malicious or erroneous `dir` value cannot redirect the search outside the intended directory. Unifies the trust model for `dir` across both code paths. Makes the extension-allowlist bypass visible to readers who do not read the internal `grepOneFile` function, reducing the chance of a future refactor accidentally removing or altering the behavior.
 
 NOTE: Flag 3 was partially applied (the "single call site" assertion and inlining recommendation were removed), but the critique's suggestion that keeping `sharesDistinctivePhrase` as a public export makes the entire cohesion concern "inapplicable" is overstated—the tokenization divergence and hidden line-truncation issues remain valid and are retained in the corrected draft.
+
+### AC-229 · Duplicated archive destination-directory resolution
+Strength: Strong
+Files: src/done-archive.js
+
+Problem:
+The logic for constructing the target archive path (`path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)))`) and the subsequent directory creation (`fs.mkdirSync(destDir, { recursive: true })`) is duplicated verbatim across `archiveDoneTasks` and `archiveSpecificDoneTasks`. This violates the DRY principle and creates a concrete maintenance hazard: if the archive directory naming scheme changes (e.g., switching from monthly to yearly buckets, or adding a sub-directory structure), a developer must remember to update the path construction in both functions. If they only update one, the two functions will silently write to different locations, breaking the module's documented guarantee that "both passes' output is indistinguishable to every existing consumer."
+
+Solution:
+Extract a private helper function (e.g., `resolveArchiveDestDir(pipelineDir, now)`) that encapsulates the path construction and directory creation in a single place. Both `archiveDoneTasks` and `archiveSpecificDoneTasks` should call this helper to obtain the destination directory. The helper becomes the single source of truth for the naming scheme, and any future change to the bucketing strategy or directory layout is made in exactly one location.
+
+Benefits:
+Eliminates the risk of the two public functions silently diverging in where they write archived tasks. Reduces the cognitive load on future maintainers who need to change the archive layout—they edit one function instead of hunting for all call sites. Makes the module's internal invariant (both passes produce indistinguishable output) structurally guaranteed rather than relying on developer discipline.
+
+### AC-230 · Duplicated signature parsing logic
+Strength: Worth exploring
+Files: src/pipeline-self-audit.js
+
+Problem:
+The logic for splitting the `signature` string into `source` and `category` using `lastIndexOf('::')` is duplicated in both `buildAuditRawText` and `buildAuditTask`. This is a minor but real duplication of a string-parsing operation. If the signature format ever changes (e.g., adding a third component, or changing the delimiter), both functions must be updated in lockstep. While currently low-risk because the format is stable, it is a classic "shallow interface" issue where the internal representation of the signature is leaking into multiple consumer functions rather than being encapsulated.
+
+Solution:
+Create a small helper function `parseSignature(signature)` that returns `{ source, category }`. Both `buildAuditRawText` and `buildAuditTask` should use this helper instead of performing the split inline. This centralizes the parsing logic in one place and makes the code more robust to future format changes.
+
+Benefits:
+Removes the lockstep-update requirement between two functions. If the signature format evolves, the change is isolated to a single small helper. Makes the intent of the parsing step explicit and testable in isolation, and reduces the surface area for subtle off-by-one or delimiter-handling bugs to be introduced in one place but missed in the other.
