@@ -14648,3 +14648,199 @@ const r = await retryImplementOnce(task, { implPrompt, correction, ...sharedOpts
 
 Benefits:
 Removes ~24 lines of duplicated call-shape, gives a single place to adjust if the maybeLocked contract or retry parameters change, and makes the remaining split-decision tree and correction-text logic easier to scan because the retry noise is gone. No behaviour change; purely mechanical deduplication of an identical call shape.
+
+### AC-211 · Extract amplification-sweep side-effect from reconcile loop
+Strength: Strong
+Files: src/task-log-reconcile.js
+Symbol: reconcile
+Snippet:
+```
+}
+
+function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } = {}) {
+  const report = argv.includes('--report');
+  const reclassify = argv.includes('--reclassify');
+  const backfill = argv.includes('--backfill') || reclassify;
+  const dryRun = argv.includes('--dry-run');
+  // 2026-09-08, Grimmethy: root-caused live a false "abandoned -- branch gone, work
+  // lost" verdict on TWO separate, genuinely still-open agent/<id> branches. Both were
+  // real, reviewed, tested work -- confirmed alive on origin the whole time -- but this
+  // routine tick had never fetched, so buildShipContext()'s git for-each-ref only ever
+  // saw whatever refs/remotes/origin/agent/* happened to already be cached locally,
+  // which one sibling apply's own git operations on this SAME shared repoRoot can
+  // perturb between ticks (confirmed: one of the two read correctly as pending-merge on
+  // one tick, then flipped to abandoned 17 minutes later with no merge in between).
+  // `abandoned` is a STABLE_TERMINAL_STAGE -- once wrong, it never self-heals. Fetch is
+  // now unconditional on every tick (still cheap/bounded/best-effort, same as before) so
+  // the routine path is never working from a staler view of origin than a --backfill run
+  // would have used. `--no-fetch` is the explicit opt-out for a sandboxed/offline run
+  // that wants to trust local refs on purpose.
+  const doFetch = !argv.includes('--no-fetch');
+  const doneDir = path.join(pipelineDir, 'queue', 'done');
+  // Under --reclassify, records already closed as `noop` are re-resolved (a FALSE-POSITIVE
+  // dismissal recorded before the `dismissed` stage existed). `abandoned` reopens too, as
+  // of the same 2026-09-08 fix above -- a wrong "work lost" verdict deserves the same
+  // audit-triggered correction path noop already had; re-resolving it now runs against a
+  // freshly-fetched ctx, so a genuinely still-open branch reclassifies correctly instead
+  // of being re-confirmed as lost by the same stale-ref bug that produced it.
+  const allowReopenFrom = reclassify ? new Set(['noop', 'abandoned']) : undefined;
+
+  if (doFetch && repoRoot) {
+    const fetch = fetchFn || (() => execFileSync('git', ['-C', repoRoot, 'fetch', 'origin', '--quiet'], { stdio: 'ignore', timeout: 60000 }));
+    try { fetch(); } catch { /* offline -- use local refs */ }
+  }
+
+  const state = loadState(pipelineDir);
+  const ctx = repoRoot ? buildShipContext(repoRoot) : null;
+
+  if (shipContextLooksBroken(ctx, { repoRoot, commitCountFn })) {
+    console.error(`[task-log-reconcile] onMainIds is empty despite origin/${ctx.mainBranch} having real merge history -- buildShipContext likely failed silently (see task-disposition.js's own maxBuffer fix). Skipping this reconcile pass entirely rather than risk a false merged/abandoned verdict; will retry next tick.`);
+    return { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0, skippedReason: 'onMainIds-empty' };
+  }
+
+  const summary = { scanned: 0, resolved: 0, merged: 0, 'applied-direct': 0, filed: 0, dismissed: 0, noop: 0, 'pending-merge': 0, abandoned: 0, errors: 0 };
+  const pendingList = [];
+  const abandonedList = [];
+
+  for (const { id, file } of candidateRecords(doneDir, { backfill, state })) {
+    const record = readJson(file);
+    if (record === null) { summary.errors += 1; continue; }
+    summary.scanned += 1;
+
+    // Taken BEFORE resolveDisposition: its rule 7 appends an `apply` event to this record in memory, which would otherwise be mistaken for the tail below.
+    const terminalBefore = lastTerminalStage(record.history);
+    let outcome;
+    try {
+      outcome = resolveDisposition(record, { repoRoot, ctx, allowReopenFrom, pipelineDir });
+    } catch (err) {
+      console.error(`task-log-reconcile: resolve failed for ${id}: ${err.message}`);
+      summary.errors += 1;
+      continue;
+    }
+    if (!outcome) {
+      // Stable states that need no further work: already carries a non-pending terminal
+      // event, OR the record was never applied at all (a blocked / needs-clarification task
+      // that reached done/). Remember either so it is not re-read every tick -- without this
+      // the ~2000 never-applied done records get a full readdir+parse pass forever.
+      const tail = Array.isArray(record.history) && record.history[record.history.length - 1];
+      const closed = tail && STABLE_TERMINAL_STAGES.has(tail.stage);
+      if (closed || !lastAppliedEvent(record.history)) {
+        state.resolvedIds.add(id); state.pendingIds.delete(id);
+      }
+      continue;
+    }
+
+    // Nothing to append or write when the resolved stage already IS the record's current terminal stage: the pending-merge re-check, and (under
+    // --reclassify) a noop record that stays noop because its verdict was inconclusive, not a false positive. Compared against the terminal stage
+    // captured before resolving, so neither an event appended after it nor the resolver's own in-memory `apply` event makes it look changed.
+    const tailUnchanged = terminalBefore === outcome.stage;
+    if (!tailUnchanged && !dryRun) {
+      appendHistoryEvent(record, outcome.stage, outcome.detail);
+      record.terminalDisposition = outcome.stage;
+      if (outcome.stage === 'merged' && !record.mergedAt) {
+        record.mergedAt = new Date().toISOString();
+        record.mergedAtSource = 'task-log-reconcile';
+      }
+      if ((outcome.stage === 'merged' || outcome.stage === 'applied-direct')
+        && (record.source === 'pipeline_self_audit' || record.source === 'pipeline_forensics_fix')) {
+        const req = deriveAmplificationRequestFromFix(record);
+        if (req) {
+          try {
+            runAmplificationSweep({
+              rootCauseSummary: req.rootCauseSummary, query: req.query, excludeFiles: req.excludeFiles,
+              root: repoRoot, pipelineDir, source: record.source, taskId: record.id, stage: 'task-log-reconcile',
+            });
+          } catch (e) { /* best-effort -- never break reconcile over an amplification sweep */ }
+        }
+      }
+      try {
+        fs.writeFileSync(file, JSON.stringify(record, null, 2));
+      } catch (err) {
+        console.error(`task-log-reconcile: write failed for ${id}: ${err.message}`);
+        summary.errors += 1;
+        continue;
+      }
+    }
+
+    if (!tailUnchanged) { summary.resolved += 1; summary[outcome.stage] = (summary[outcome.stage] || 0) + 1; }
+    if (outcome.stage === 'pending-merge') {
+      state.pendingIds.add(id); state.resolvedIds.delete(id);
+      pendingList.push(`${record.id} -- ${outcome.detail}`);
+    } else {
+      state.resolvedIds.add(id); state.pendingIds.delete(id);
+      if (outcome.stage === 'abandoned') abandonedList.push(`${record.id} -- ${outcome.detail}`);
+    }
+  }
+
+  // Re-check `abandoned` (a stable stage that never self-healed): correct the ones whose work is on <main>, restore hub siblings a requeue destroyed.
+  // Bounded and throttled (abandoned-recheck.js); never fatal to the sweep.
+  if (!dryRun && repoRoot && ctx) {
+    try {
+      const rc = require('./abandoned-recheck.js').recheckAbandoned({ pipelineDir, repoRoot, ctx });
+      summary.abandonedRechecked = rc.rechecked;
+      summary.abandonedCorrected = rc.corrected.length;
+      summary.siblingsRestored = rc.restored.length;
+      for (const c of rc.corrected) console.error(`[task-log-reconcile] abandoned-recheck: ${c.id} abandoned -> ${c.to}`);
+      for (const r of rc.restored) console.error(`[task-log-reconcile] shared-branch-restore: ${r.id} re-applying onto ${r.branch} (destroyed by the requeue of ${r.removedBy})`);
+    } catch (e) { console.error(`[task-log-reconcile] abandoned-recheck failed (ignored): ${e.message}`); }
+  }
+
+  if (!dryRun) saveState(pipelineDir, state);
+
+  if (report) {
+    if (pendingList.length) {
+      console.error(`\n[task-log-reconcile] ${pendingList.length} task(s) PENDING MERGE (agent/<id> branch ahead of main):`);
+      for (const l of pendingList) console.error(`  ${l}`);
+    }
+    if (abandonedList.length) {
+      console.error(`\n[task-log-reconcile] ${abandonedList.length} task(s) ABANDONED (applied, branch gone, not on main -- work lost):`);
+      for (const l of abandonedList) console.error(`  ${l}`);
+    }
+    if (!pendingList.length && !abandonedList.length) console.error('[task-log-reconcile] no pending-merge or abandoned tasks this pass.');
+  }
+
+  return summary;
+}
+```
+
+Problem:
+The per-record loop in `reconcile` interleaves a 9-line amplification-sweep block (stage/source guard, request derivation, `runAmplificationSweep` call, catch) directly between the resolve step and the `writeFileSync` step. That side-effect is unrelated to the core write path, makes the loop body hard to scan, and has no independent test surface.
+
+Solution:
+Extract the block into `maybeRunAmplificationSweep(record, outcome, { repoRoot, pipelineDir })`. It early-returns on non-matching stage or source, derives the request, calls `runAmplificationSweep`, and swallows errors. The loop body then reads as a linear resolve → sweep → write → tally sequence.
+
+```diff
+-      if ((outcome.stage === 'merged' || outcome.stage === 'applied-direct')
+-        && (record.source === 'pipeline_self_audit' || record.source === 'pipeline_forensics_fix')) {
+-        const req = deriveAmplificationRequestFromFix(record);
+-        if (req) {
+-          try {
+-            runAmplificationSweep({
+-              rootCauseSummary: req.rootCauseSummary, query: req.query, excludeFiles: req.excludeFiles,
+-              root: repoRoot, pipelineDir, source: record.source, taskId: record.id, stage: 'task-log-reconcile',
+-            });
+-          } catch (e) { /* best-effort */ }
+-        }
+-      }
++      maybeRunAmplificationSweep(record, outcome, { repoRoot, pipelineDir });
+```
+
+New function (append after `reconcile`):
+
+```js
+function maybeRunAmplificationSweep(record, outcome, { repoRoot, pipelineDir }) {
+  if (outcome.stage !== 'merged' && outcome.stage !== 'applied-direct') return;
+  if (record.source !== 'pipeline_self_audit' && record.source !== 'pipeline_forensics_fix') return;
+  const req = deriveAmplificationRequestFromFix(record);
+  if (!req) return;
+  try {
+    runAmplificationSweep({
+      rootCauseSummary: req.rootCauseSummary, query: req.query, excludeFiles: req.excludeFiles,
+      root: repoRoot, pipelineDir, source: record.source, taskId: record.id, stage: 'task-log-reconcile',
+    });
+  } catch { /* best-effort */ }
+}
+```
+
+Benefits:
+The loop body shrinks to a flat resolve → sweep → write → tally sequence. The sweep becomes independently unit-testable (merged + matching source → called; other stage/source → not called) without exercising the full reconcile path. Reviewers can assess the sweep's guard logic and error handling in isolation.
