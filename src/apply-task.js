@@ -16,6 +16,8 @@ const { getHubApplyRouting } = require('./hub-apply-routing.js');
 const { getApplyBranchPrep } = require('./apply-branch-prep-route.js');
 const { getWikiContentApply } = require('./wiki-content-apply-route.js');
 const { getDomainApply } = require('./domain-apply-route.js');
+const { resolveApplyTargetRoot } = require('./apply-route.js');
+const { resolveAccessibleRoots } = require('./accessible-roots.js');
 const path = require('path');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
@@ -101,7 +103,10 @@ ensureRegistered();
  * @param {string} [config.deepDiveAnalysisDir]
  * @param {string} [config.deepDiveCoveragePath]
  * @param {string} [config.brainDumpPath]
- * @param {object} [config.gitRunner] - Defaults to a real git runner against repoRoot.
+ * @param {object} [config.gitRunner] - Defaults to a real git runner against targetRoot
+ *   (repoRoot, or the plugin's dedicated apply clone when the resolver routes it).
+ * @param {string[]} [config.accessibleRoots] - Roots for the resolver (roots[0] = primary);
+ *   defaults to resolveAccessibleRoots({ repoRoot }).
  * @param {boolean} [config.skipPush] - "Implement" mode. No longer skips the push itself
  *   (see the git-branch-diff flow's own comment for why an unpushed branch is a
  *   durability risk, not just an inspection nicety) -- the branch/direct-to-main commit
@@ -122,7 +127,19 @@ ensureRegistered();
 // pathspec failure: artifact.files absent AND artifact.file undefined yields
 // [undefined] from `artifact.files || [artifact.file]`. Fails fast with the task
 // id in the message instead of a cryptic git pathspec error.
-function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, gitRunner = createRealGitRunner(repoRoot), skipPush = false }) {
+function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchIndexPath, deepDiveAnalysisDir, deepDiveCoveragePath, brainDumpPath, gitRunner, accessibleRoots, skipPush = false }) {
+  // HUB0156 · 2/2: a cross-repo adhoc diff whose touched files live in a PLUGIN repo routes
+  // to that plugin's DEDICATED apply clone (apply-route.js's decision table) instead of
+  // force-applying against the primary clone, where the same path either does not exist or
+  // is an unrelated file. resolveApplyTargetRoot() returns null for every case the primary
+  // apply path already owns (no rawDiff, no AGENT_MANAGER_APPLY_REPO_ROOT base, the default
+  // root contains all touched paths, or an ambiguous/split match) -- in all of those
+  // targetRoot === repoRoot and every line below behaves exactly as before.
+  const resolvedRoot = resolveApplyTargetRoot(task, {
+    accessibleRoots: accessibleRoots || resolveAccessibleRoots({ repoRoot }),
+  });
+  const targetRoot = resolvedRoot && resolvedRoot !== repoRoot ? resolvedRoot : repoRoot;
+  if (!gitRunner) gitRunner = createRealGitRunner(targetRoot);
   try {
     if (task.domain === 'secondbrain') {
       const result = applySecondBrainNote({
@@ -333,7 +350,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
 
     let artifact;
     try {
-      artifact = writeArtifact(task, repoRoot, pipelineDir);
+      artifact = writeArtifact(task, targetRoot, pipelineDir);
     } catch (writeErr) {
       // checkoutMain + deleteBranch here only ever cleans up the git branch pointer -- it
       // does NOT touch uncommitted working-tree writes (an untracked file persists
@@ -400,7 +417,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // rawText/implementResponse/planResponse verbatim, which for a brain_dump-derived
     // task is the user's own free-typed personal/business note content -- no longer
     // staged/committed/pushed, written to disk only.
-    writeTaskLogFile(repoRoot, task);
+    writeTaskLogFile(targetRoot, task);
     gitRunner.add(filesToAdd);
 
     const msgPath = path.join(require('os').tmpdir(), `apply-commit-msg-${task.id}.txt`);

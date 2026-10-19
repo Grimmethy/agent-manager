@@ -122,6 +122,73 @@ test.after(() => {
   fs.rmSync(REPO_ROOT, { recursive: true, force: true });
 });
 
+// HUB0156 · 2/2: cross-repo routing. A diff whose touched file lives in a PLUGIN repo
+// must apply against that plugin's DEDICATED apply clone (under AGENT_MANAGER_APPLY_REPO_ROOT),
+// never against the primary clone -- and the clone it lands in is the one whose
+// remote.origin.url is the plugin's own origin, not a copy of the primary repo.
+test('plugin-repo-targeted rawDiff routes to the plugin apply clone (HUB0156 · 2/2)', () => {
+  const { execFileSync } = require('child_process');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-task-route-'));
+  const savedBase = process.env.AGENT_MANAGER_APPLY_REPO_ROOT;
+  try {
+    const applyBase = path.join(tmp, 'apply-base');
+    const primaryRoot = path.join(tmp, 'agent-manager');
+    const pluginLive = path.join(tmp, 'agent-manager-hygiene'); // live checkout the resolver checks
+    const pluginClone = path.join(applyBase, 'agent-manager-hygiene'); // what resolveApplyTargetRoot() returns
+    fs.mkdirSync(pluginClone, { recursive: true });
+    fs.mkdirSync(path.join(pluginClone, 'src'), { recursive: true });
+    // The resolver's contains-check runs against the LIVE plugin checkout -- seed it too.
+    fs.mkdirSync(path.join(pluginLive, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(pluginLive, 'src', 'route-target.js'), 'a\n');
+    const touched = path.join(pluginClone, 'src', 'route-target.js');
+    fs.writeFileSync(touched, 'a\n');
+    fs.mkdirSync(primaryRoot, { recursive: true });
+    fs.writeFileSync(path.join(primaryRoot, 'foo.js'), 'unrelated\n'); // primary does NOT hold the touched path
+    // The apply clone is a real git repo whose origin is the plugin's own origin.
+    const pluginOrigin = 'git@github.com:example/agent-manager-hygiene.git';
+    execFileSync('git', ['init', '-q'], { cwd: pluginClone });
+    execFileSync('git', ['remote', 'add', 'origin', pluginOrigin], { cwd: pluginClone });
+
+    process.env.AGENT_MANAGER_APPLY_REPO_ROOT = applyBase;
+    const task = {
+      id: 'route-plugin-task-1',
+      domain: 'default',
+      source: 'trouble_log',
+      title: 'Route to plugin',
+      rawDiff: 'diff --git a/src/route-target.js b/src/route-target.js\n--- a/src/route-target.js\n+++ b/src/route-target.js\n@@ -1 +1 @@\n-a\n+b\n',
+      implementResponse: JSON.stringify({ mode: 'edit', file: 'src/route-target.js', find: 'a', replace: 'b' }),
+    };
+    const gitRunner = createFakeGitRunner();
+    const result = applyTask(task, {
+      repoRoot: primaryRoot,
+      pipelineDir: primaryRoot,
+      gitRunner,
+      accessibleRoots: [primaryRoot, pluginLive],
+    });
+
+    assert.equal(result.succeeded, true);
+    // The edit landed in the plugin's dedicated apply clone, not the primary clone.
+    assert.equal(fs.readFileSync(touched, 'utf8'), 'b\n');
+    // ...and the clone it landed in is the one pointing at the plugin's own origin.
+    assert.equal(
+      execFileSync('git', ['remote', 'get-url', 'origin'], { cwd: pluginClone }).toString().trim(),
+      pluginOrigin,
+    );
+    // The runner staged the touched path -- which writeArtifact resolved against the
+    // plugin clone (proven above: its content changed, the primary clone's did not).
+    const addCall = gitRunner.calls.find((c) => c.name === 'add');
+    assert.ok(addCall, 'gitRunner.add was not called');
+    assert.equal(addCall.args[0][0], 'src/route-target.js');
+    // The primary clone's working tree was never touched by the write.
+    assert.ok(!fs.existsSync(path.join(primaryRoot, 'src', 'route-target.js')),
+      'primary clone must not have gained the plugin file');
+  } finally {
+    if (savedBase === undefined) delete process.env.AGENT_MANAGER_APPLY_REPO_ROOT;
+    else process.env.AGENT_MANAGER_APPLY_REPO_ROOT = savedBase;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('happy path: fetch/reset/(delete stale branch)/branch/add/commit/push/checkout in order, succeeds', () => {
   const gitRunner = createFakeGitRunner();
   const result = applyTask(baseTask(), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner });
