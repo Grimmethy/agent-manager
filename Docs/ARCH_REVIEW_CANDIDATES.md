@@ -2787,3 +2787,20 @@ Create a small helper function `parseSignature(signature)` that returns `{ sourc
 
 Benefits:
 Removes the lockstep-update requirement between two functions. If the signature format evolves, the change is isolated to a single small helper. Makes the intent of the parsing step explicit and testable in isolation, and reduces the surface area for subtle off-by-one or delimiter-handling bugs to be introduced in one place but missed in the other.
+
+### AC-231 · Unused priority-override module
+Strength: Worth exploring
+Files: src/lib/task-priority.js, src/task-source-registry.js
+
+Problem:
+Within the four files in this community (`task-priority.js`, `task-source-registry.js`, `candidate-fulfillment.js`, `instances-dir.js`), no file imports or calls `taskPriority`. The registry's `registerTaskSource` stores `{ name, …config }` as-is, so the `priority` field is whatever the caller placed in their config object at registration time. However, `task-priority.js`'s own header notes it was *extracted from* `src/task-sources.js`, a module that is **not** among the four files shown here and is the most likely consumer of `taskPriority`. The absence of a caller within this 4-file sample therefore does not confirm the module is dead; it only confirms that the visible community does not reference it. The practical concern is narrower: a reader of this community alone cannot tell whether `priority` is a raw caller-supplied value or a computed one, and the module's purpose is invisible without tracing back to `task-sources.js`.
+
+Solution:
+Before any structural change, confirm whether `task-sources.js` (or any other module outside this sample) actually calls `taskPriority`. If it does, the module is integrated and no change is needed—only a cross-reference comment in `task-priority.js` pointing to its consumer would help discoverability. If, after that check, no caller exists anywhere, then (a) delete `task-priority.js` and remove its export. Option (b)—wiring `taskPriority` into `registerTaskSource` so the stored priority is `taskPriority(config.priority, …)`—is a **behavioral change** to the registry's sorting semantics (from raw caller value to a computed/overridden value) and should only be pursued if the override semantics are a confirmed design goal and no existing caller depends on the current pass-through behavior.
+
+Benefits:
+Resolving the question (dead vs. integrated) removes ambiguity for anyone reading this community in isolation. If the module is confirmed dead, deleting it shrinks the import graph and eliminates a misleading export. If it is integrated, a one-line cross-reference makes the wiring discoverable without altering any runtime behavior.
+
+---
+
+*AC-004 (candidate-fulfillment re-export) was in the prior draft but has been removed. The module's header explicitly documents the re-export as an intentional barrel—"one import for the whole candidate lifecycle"—and no consumer in the provided inputs is shown to be harmed by it. The coupling of write-side and read-side symbols in a single namespace is a deliberate API-convenience choice, not a defect, and the prior draft's proposed fix (remove the re-export or split into a separate barrel) would undo a documented design decision without evidence of actual harm. No action is recommended.*
