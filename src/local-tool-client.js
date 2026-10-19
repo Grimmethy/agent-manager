@@ -20,7 +20,7 @@ const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
-const { logToolLoopEvent, buildTurnEndEntry, buildToolOutcomeEntries } = require('./tool-loop-audit.js');
+const { logToolLoopEvent, buildTurnEndEntry, buildEmptyAttemptEntry, buildToolOutcomeEntries } = require('./tool-loop-audit.js');
 const { buildTrajectory, writeTrajectory } = require('./trajectory.js');
 const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
@@ -837,7 +837,7 @@ async function runWithoutToolsFallback(prompt, pipelineDir) {
 // the model regenerates that turn from a fresh sample. Mutates messages / toolCallLog /
 // turnStartLengths / turnStartLogLengths in place on each rollback. Returns
 // { message } once a call succeeds, or { flakeErr } when both recovery layers are spent.
-async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths }) {
+async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths, onEmptyAttempt }) {
   let rollbackAttempts = 0;
   for (;;) {
     let message;
@@ -848,6 +848,8 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
       try {
         const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }));
         if (isEmptyCompletion(turnRes.message)) {
+          // Audit-only (brain-dump 1891): record the blank sample (done_reason, thinking size) before it is resampled.
+          if (onEmptyAttempt) { try { onEmptyAttempt({ attempt: attempt + 1, message: turnRes.message, usage: turnRes.usage, doneReason: turnRes.doneReason }); } catch { /* best-effort */ } }
           attemptErr = new Error('local model returned an empty completion (no content, no tool calls)');
           continue;
         }
@@ -1088,6 +1090,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       logToolLoopEvent(pipelineDir, 'turn-end', entry);
     } catch { /* best-effort -- see logToolLoopEvent */ }
   };
+  const logEmptyAttempt = (turn, phase, info) => {
+    try { logToolLoopEvent(pipelineDir, 'empty-attempt', buildEmptyAttemptEntry(auditCtx(turn, phase), info)); } catch { /* best-effort */ }
+  };
   const logToolOutcomes = (turn, calls) => {
     try {
       for (const entry of buildToolOutcomeEntries(auditCtx(turn, 'loop'), calls)) {
@@ -1208,6 +1213,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
       messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
       toolCallLog, turnStartLengths, turnStartLogLengths,
+      onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary', info),
     });
     addUsage(summaryUsage);
     logTurnEnd(turnsUsed, 'forced-summary', { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake });
@@ -1251,6 +1257,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       const retryResult = await chatTurnWithFlakeRecovery({
         messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
         toolCallLog, turnStartLengths, turnStartLogLengths,
+        onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary-retry', info),
       });
       addUsage(retryResult.usage);
       logTurnEnd(turnsUsed, 'forced-summary-retry', retryResult);
@@ -1373,6 +1380,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     const { message, usage, doneReason, flakeErr } = await chatTurnWithFlakeRecovery({
       messages, tools, tokenFoldHeaders, onChunk, instancesDir,
       toolCallLog, turnStartLengths, turnStartLogLengths,
+      onEmptyAttempt: (info) => logEmptyAttempt(turn, 'loop', info),
     });
     addUsage(usage);
     // Real anchor for estimateContextTokens (see its own header) -- prompt_eval_count is
