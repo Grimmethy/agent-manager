@@ -2804,3 +2804,27 @@ Resolving the question (dead vs. integrated) removes ambiguity for anyone readin
 ---
 
 *AC-004 (candidate-fulfillment re-export) was in the prior draft but has been removed. The module's header explicitly documents the re-export as an intentional barrel—"one import for the whole candidate lifecycle"—and no consumer in the provided inputs is shown to be harmed by it. The coupling of write-side and read-side symbols in a single namespace is a deliberate API-convenience choice, not a defect, and the prior draft's proposed fix (remove the re-export or split into a separate barrel) would undo a documented design decision without evidence of actual harm. No action is recommended.*
+
+### AC-232 · Non-standard stage value in blocked-drain history event — **RETRACTED**
+Strength: Strong
+
+Upon re-reading `src/blocked-drain.js` against its own header comment, the draft's premise was inverted. The file explicitly documents that a prior incident arose from an *undocumented* `{ status, at, note }` vocabulary, and that the current use of `appendHistoryEvent` with `'retry-context-stamped'` is the **canonical fix** that routes the record through the standard `{ stage, at, detail }` schema enforced by `task-history.js`. The value `'retry-context-stamped'` is the intended, descriptive stage label for this specific lifecycle transition; it is not a mislabeled event-type. Downstream consumers (dashboard, `task-disposition.js`, forensics tooling) parse whatever `appendHistoryEvent` emits, and the schema contract is satisfied.
+
+No change is warranted. The proposed "solution" (substituting `'pending'` or adding a `type` parameter) would discard the descriptive specificity the code was written to preserve and would re-introduce the ambiguity the header comment warns against.
+
+---
+
+### AC-233 · Duck-typed gitRunner silently bypasses safety pre-flight checks — **RETRACTED**
+Strength: Strong
+
+Re-reading `src/lib/apply-main-batch.js` and its inline comments, the `typeof` guards are **intentional, documented graceful-degradation** for optional, best-effort methods:
+
+- `pruneRetractedCandidates` is explicitly annotated "Best-effort and never fatal: a failure here must not block the batch."
+- `quarantineDirtyTree` / `assertCleanTree` are newer additions (the comment references a 2026-09-23 incident). The guards exist so that older `gitRunner` implementations and test mocks that predate those methods continue to function.
+- When `assertCleanTree` **is** present, it is called without a surrounding try-catch in the gated path, so a failing clean-tree check **does** throw and abort the batch. The safety check is not silently bypassed; it is only skipped when the method does not exist, which is the documented compatibility contract.
+
+The draft's "fail-fast" proposal would break every `gitRunner` implementation that predates the optional methods, contradicting the code's explicit design goal. No change is warranted.
+
+---
+
+*Both findings in the original draft were retracted. No code changes are recommended.*
