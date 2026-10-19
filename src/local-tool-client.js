@@ -36,6 +36,7 @@ const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask,
 } = require('./chat-task-requeue.js');
 const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
+const { assembleCappedBlock } = require('./context-compaction.js');
 
 // Read-only file-exploration tools (2026-08-22, Grimmethy: "expand the tooling
 // capabilities so that the local reasoning model can handle the work... I'd like to see
@@ -1187,9 +1188,35 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     // another showed this turn's own compliance-retry (below) overwriting a real answer
     // with a near-empty one. See the voluntary-stop call site's own comment for why that
     // trigger no longer fires for chat at all now.
-    const content = isChatCaller
+    // HUB0155 2/3: when the forced-summary turn fires because the context window is
+    // nearly full, compact the full message history into a bounded preamble so the
+    // model can still see what happened without the un-capped history blowing the
+    // already-tight budget. Best-effort: a compaction failure must never break the
+    // summary turn itself -- it just proceeds without the preamble.
+    let compactedPreamble = '';
+    if (reason === 'context' && messages.length > 0) {
+      try {
+        const splitIdx = Math.max(0, messages.length - 2);
+        const olderTurns = messages.slice(0, splitIdx);
+        const recentTurns = messages.slice(splitIdx);
+        const serializeTurns = (arr) => arr
+          .map((m) => `${m.role}: ${typeof m.content === 'string' ? m.content : JSON.stringify(m.content)}`)
+          .join('\n');
+        const compactedContext = assembleCappedBlock(
+          [
+            { label: 'olderTurns', text: serializeTurns(olderTurns) },
+            { label: 'recentTurns', text: serializeTurns(recentTurns) },
+          ],
+          1000,
+        );
+        compactedPreamble = `Here is a compacted summary of the conversation so far:\n${compactedContext}\n\n`;
+      } catch (_compactionErr) {
+        // best-effort: skip the preamble and proceed with the un-compacted path
+      }
+    }
+    const content = compactedPreamble + (isChatCaller
       ? `${leadIn} Using only what you have already learned, give your best complete answer now -- a real, substantive reply, not a placeholder or a single word.${budgetWarning}`
-      : `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires.${budgetWarning} If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`;
+      : `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires.${budgetWarning} If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`);
     messages.push({ role: 'user', content });
     turnsUsed += 1;
     const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
