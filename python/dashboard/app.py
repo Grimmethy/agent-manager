@@ -17,6 +17,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -1380,6 +1381,8 @@ def _coerce_serial(val) -> int:
     if isinstance(val, int):
         return val if val >= 0 else 0
     if isinstance(val, float):
+        if not math.isfinite(val):
+            return 0  # NaN/Infinity: int() would raise ValueError/OverflowError
         iv = int(val)
         return iv if iv >= 0 else 0
     if isinstance(val, str):
