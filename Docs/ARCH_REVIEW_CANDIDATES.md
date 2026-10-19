@@ -2854,3 +2854,29 @@ Align `readState` with the graceful-degradation pattern already used by `listArc
 
 Benefits:
 Error-handling semantics become uniform across the module, so callers can rely on a single contract: file-system hiccups degrade to empty data rather than uncaught exceptions. The archive pipeline becomes resilient to transient `EACCES`, `EIO`, or `ENOSPC`-adjacent conditions on the state file without a code-path change, and the logging call preserves enough context for operators to investigate the underlying issue after the fact.
+
+### AC-236 · Decouple phrase-extraction from side-finding deduplication
+Strength: Strong
+Files: src/text-similarity.js, src/side-finding-sweep.js, src/staleness-audit.js
+
+Problem:
+`src/text-similarity.js` houses `distinctivePhrases` and `sharesDistinctivePhrase`, which were originally extracted from `staleness-audit.js` to avoid duplication. However, the implementation is now tightly coupled to the single-line deduplication needs of `side-finding-sweep.js`: the header comments document a "FIRST-LINE-ONLY by design" constraint that matches every current caller. This makes the module fragile for any other consumer—`staleness-audit.js` or a future module that needs to compare multi-line bodies cannot reuse these functions without modification or code duplication, undermining the "shared primitive" intent stated in the extraction comments.
+
+Solution:
+Refactor `src/text-similarity.js` to expose a generic `extractPhrases(text, { multiLine: boolean })` (or an equivalent option parameter) so the core phrase-extraction logic is reusable across comparison tasks. `side-finding-sweep.js` then opts into the single-line behavior by passing `{ multiLine: false }`, while `staleness-audit.js` or any future consumer can pass `{ multiLine: true }` to compare full bodies. The public API of the module becomes a true shared primitive rather than a side-finding-specific wrapper.
+
+Benefits:
+Any module that needs phrase-level similarity (staleness auditing, future deduplication passes, cross-file comparison) can call the same utility without forking the logic. The "first-line-only" constraint becomes an explicit caller choice rather than a baked-in assumption, eliminating the risk that a new consumer silently gets the wrong granularity. It also makes the module's contract self-documenting: the option name signals intent at the call site.
+
+### AC-237 · Extract shared directory-walking utility from grep-codebase-tool
+Strength: Strong
+Files: src/grep-codebase-tool.js, src/atomic-write.js
+
+Problem:
+`src/grep-codebase-tool.js` implements a custom synchronous `walk` function that traverses directories while respecting `GREP_SKIP_DIRS` and `isArchivedDirName`. This skip-list logic is hardcoded locally to that one tool. The project already demonstrates a preference for small, focused utilities (evidenced by `src/atomic-write.js` as a pure leaf utility), yet the directory-traversal concern is not extracted into a shared module. Any future tool that needs to walk the repository (a `list-files-tool`, a `stat-tool`, a lint sweep) will either duplicate this skip-list logic or diverge from it—risking "silent exclusion" bugs such as the Python/Shell exclusion issue already noted in the codebase comments.
+
+Solution:
+Extract the directory-walking logic (traversal, skip-list filtering via `GREP_SKIP_DIRS` and `isArchivedDirName`) from `src/grep-codebase-tool.js` into a new `src/lib/fs-walk.js` that exports a `walkDirectory(root, { skipDirs, onFile })` utility. `src/grep-codebase-tool.js` then consumes this shared utility. The skip-list configuration remains externalized (consistent with the existing `src/config.js` pattern), so adding or removing a directory to skip is a single-point change.
+
+Benefits:
+All tools that traverse the repository share one tested, consistent skip-list implementation, eliminating the class of "silent exclusion" bugs where a new tool forgets to skip `.venv`, `node_modules`, or archived directories. The project's existing pattern of small, focused leaf utilities (as seen in `src/atomic-write.js`) is extended coherently to the file-system-traversal concern, keeping each tool's code focused on its domain logic rather than re-implementing directory mechanics.
