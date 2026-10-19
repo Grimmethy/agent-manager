@@ -233,3 +233,148 @@ test('buildForensicBundle: no winners -> no digest section', () => {
   const b = buildForensicBundle({ pipelineDir: dir, dbPath: '/no/db', subject: { kind: 'task', key: 'subj-1' } });
   assert.doesNotMatch(b.evidenceText, /WINNER DIGEST/);
 });
+
+// --- winner-contrast regression: MAX_WINNERS = 5, winnerTasks / winnerContrastAvailable ---
+(function () {
+  const os = require('os');
+  const path = require('path');
+  const fs = require('fs');
+  const { buildForensicBundle } = require('./forensic-bundle.js');
+
+  function freshDir() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'forensic-bundle-winners-'));
+    fs.mkdirSync(path.join(dir, 'queue', 'needs-clarification'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'queue', 'needs-clarification', 'fail-1.json'), JSON.stringify({
+      id: 'fail-1',
+      source: 'manual',
+      title: 'failing task',
+      needsClarification: { reason: 'retryable-draft-block' },
+      history: [{ stage: 'needs-clarification', at: '2026-09-01T00:00:00Z', detail: 'failed after 3 attempts' }],
+    }));
+    return dir;
+  }
+  function writeWinner(dir, n) {
+    fs.writeFileSync(path.join(dir, 'queue', 'done', `win-${n}.json`), JSON.stringify({
+      id: `win-${n}`,
+      source: 'manual',
+      title: `winner ${n}`,
+      mergedAt: '2026-09-01T00:00:00Z',
+      history: [{ stage: 'applied', at: '2026-09-01T00:00:00Z' }],
+    }));
+  }
+
+  test('bundle includes at least one winner when a successful task shares the failing task source', () => {
+    const dir = freshDir();
+    writeWinner(dir, 1);
+    const bundle = buildForensicBundle({ pipelineDir: dir, dbPath: undefined, subject: { kind: 'source', key: 'manual' } });
+    assert.ok(Array.isArray(bundle.winnerTasks), 'winnerTasks must be an array');
+    assert.ok(bundle.winnerTasks.length >= 1, 'winner set must not be empty when a shipped same-source sibling exists');
+    assert.equal(bundle.winnerContrastAvailable, true);
+    assert.ok(bundle.winnerTasks.some((w) => w.id === 'win-1'), 'seeded winner must be in winnerTasks');
+  });
+
+  test('bundle degrades gracefully (empty winnerTasks, winnerContrastAvailable=false) when no successful task exists', () => {
+    const dir = freshDir();
+    const bundle = buildForensicBundle({ pipelineDir: dir, dbPath: undefined, subject: { kind: 'source', key: 'manual' } });
+    assert.deepStrictEqual(bundle.winnerTasks, []);
+    assert.equal(bundle.winnerContrastAvailable, false);
+    assert.equal(typeof bundle.evidenceText, 'string');
+    assert.ok(Array.isArray(bundle.subjectIds) && bundle.subjectIds.includes('fail-1'));
+  });
+
+  test('winner set is capped at MAX_WINNERS (5)', () => {
+    const dir = freshDir();
+    for (let n = 1; n <= 10; n += 1) writeWinner(dir, n);
+    const bundle = buildForensicBundle({ pipelineDir: dir, dbPath: undefined, subject: { kind: 'source', key: 'manual' } });
+    assert.ok(bundle.winnerTasks.length >= 1);
+    assert.ok(bundle.winnerTasks.length <= 5, `winnerTasks.length ${bundle.winnerTasks.length} exceeds MAX_WINNERS=5`);
+    assert.equal(bundle.winnerContrastAvailable, true);
+  });
+})();
+
+// --- pinning tests: each one must FAIL when the behaviour it names is reverted ---------
+
+test('winner fallback: a shipped task with a DIFFERENT source and parent yields >= 1 winner when no matched sibling exists', () => {
+  const dir = makePipeline();
+  // subject: source AND decomposition parent are both different from every shipped task
+  writeTask(dir, 'needs-clarification', {
+    id: 'fail-spec',
+    source: 'wiki_page_promote',
+    domain: 'wiki',
+    promptContext: { rawText: 'promote the spec page', decomposedFrom: 'product_spec_outline' },
+    needsClarification: { reason: 'retryable-draft-block' },
+    history: [{ stage: 'needs-clarification', at: '2026-09-01T00:00:00Z', detail: 'failed after 3 attempts' }],
+  });
+  // the ONLY shipped task: different source AND different parent -> score 0, fallback tier
+  writeTask(dir, 'done', {
+    id: 'win-unrelated',
+    source: 'manual',
+    promptContext: { rawText: 'unrelated shipped task', decomposedFrom: 'some-legacy-project' },
+    mergedAt: '2026-09-01T00:00:00Z',
+    history: [{ stage: 'applied', at: '2026-09-01T00:00:00Z' }],
+  });
+
+  const b = buildForensicBundle({ pipelineDir: dir, dbPath: undefined, subject: { kind: 'task', key: 'fail-spec' } });
+  assert.equal(b.winnerContrastAvailable, true, 'a score-0 shipped fallback winner must be available (hard-skip revert -> 0 winners)');
+  assert.ok(b.winnerTasks.length >= 1, 'winner set must not be empty when a shipped (unmatched) sibling exists');
+  assert.equal(b.winnerTasks[0].id, 'win-unrelated', 'the fallback winner must be selected');
+  assert.equal(b.winnerTasks[0].source, 'manual');
+});
+
+test('matched winner outranks the fallback: score-0 tasks never join a non-empty matched pool', () => {
+  const dir = makePipeline();
+  writeTask(dir, 'needs-clarification', {
+    id: 'fail-spec',
+    source: 'wiki_page_promote',
+    promptContext: { rawText: 'promote the spec page', decomposedFrom: 'product_spec_outline' },
+    needsClarification: { reason: 'retryable-draft-block' },
+    history: [{ stage: 'needs-clarification', at: '2026-09-01T00:00:00Z' }],
+  });
+  // score-1 matched winner (same source), OLDER mergedAt
+  writeTask(dir, 'done', {
+    id: 'win-matched',
+    source: 'wiki_page_promote',
+    promptContext: { rawText: 'smaller promote', decomposedFrom: 'other-parent' },
+    mergedAt: '2026-01-01T00:00:00Z',
+    history: [{ stage: 'applied', at: '2026-01-01T00:00:00Z' }],
+  });
+  // score-0 candidate (different source AND different parent), NEWER mergedAt
+  writeTask(dir, 'done', {
+    id: 'win-fallback',
+    source: 'manual',
+    promptContext: { rawText: 'unrelated shipped task', decomposedFrom: 'some-legacy-project' },
+    mergedAt: '2026-06-01T00:00:00Z',
+    history: [{ stage: 'applied', at: '2026-06-01T00:00:00Z' }],
+  });
+
+  const b = buildForensicBundle({ pipelineDir: dir, dbPath: undefined, subject: { kind: 'task', key: 'fail-spec' } });
+  assert.equal(b.winnerContrastAvailable, true);
+  assert.equal(b.winnerTasks[0].id, 'win-matched', 'the matched winner must outrank the (newer) fallback candidate');
+  assert.equal(b.winnerTasks.length, 1, 'the score-0 fallback must not join a non-empty matched pool');
+  assert.ok(b.winnerTasks.every((w) => w.id !== 'win-fallback'), 'fallback candidate excluded when a matched winner exists');
+});
+
+test('MAX_WINNERS is exactly 5: 7 matched shipped winners -> exactly 5 in winnerTasks', () => {
+  const dir = makePipeline();
+  writeTask(dir, 'needs-clarification', {
+    id: 'fail-spec',
+    source: 'wiki_page_promote',
+    promptContext: { rawText: 'promote the spec page', decomposedFrom: 'product_spec_outline' },
+    needsClarification: { reason: 'retryable-draft-block' },
+    history: [{ stage: 'needs-clarification', at: '2026-09-01T00:00:00Z' }],
+  });
+  for (let n = 1; n <= 7; n += 1) {
+    writeTask(dir, 'done', {
+      id: `win-${n}`,
+      source: 'wiki_page_promote',
+      promptContext: { rawText: `winner ${n}`, decomposedFrom: 'other-parent' },
+      mergedAt: `2026-09-01T00:00:0${n}Z`,
+      history: [{ stage: 'applied', at: `2026-09-01T00:00:0${n}Z` }],
+    });
+  }
+
+  const b = buildForensicBundle({ pipelineDir: dir, dbPath: undefined, subject: { kind: 'task', key: 'fail-spec' } });
+  assert.equal(b.winnerContrastAvailable, true);
+  assert.equal(b.winnerTasks.length, 5, `expected exactly 5 winners (MAX_WINNERS), got ${b.winnerTasks.length} -- fails if MAX_WINNERS is reverted to 3`);
+});
