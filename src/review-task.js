@@ -45,12 +45,14 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { isNonAssignableHeartbeat } = require('./heartbeat.js');
 const { checkDraft, preValidateCitedPaths } = require('./fact-checker.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
 const { resolveModelProfile } = require('./model-provider.js');
 const { majorityVote: localMajorityVoteBackend } = require('./local-client.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { parseJsonMaybeFenced } = require('./json-fence.js');
+const { isStructuredGroupBChange, looksLikeReadToolCall } = require('./lib/structured-change.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('./task-history.js');
 const { unnamedChangedFiles, changedFilesOfDiff } = require('./lib/draft-side-effects.js');
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
@@ -108,6 +110,9 @@ function getWorkDir(cfg, { repoRoot, secondBrainDir }) {
 // Wait-ForLocalAvailability does. Best-effort: never blocks more than ~15s total.
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// A worker-* heartbeat with assignable:false (heartbeat.js isNonAssignableHeartbeat -- an external
+// runner, not an AM draft) is skipped: it does not use this slot, and as a refreshed 'working'
+// heartbeat it would otherwise delay every review for nothing.
 async function waitForLocalAvailability(instancesDir, maxWaitAttempts = 3, waitSeconds = 5) {
   for (let i = 0; i < maxWaitAttempts; i++) {
     let busy = false;
@@ -116,7 +121,7 @@ async function waitForLocalAvailability(instancesDir, maxWaitAttempts = 3, waitS
     for (const f of files) {
       try {
         const w = JSON.parse(fs.readFileSync(path.join(instancesDir, f), 'utf8'));
-        if (w.status !== 'working') continue;
+        if (w.status !== 'working' || isNonAssignableHeartbeat(w)) continue;
         if ((Date.now() - new Date(w.lastHeartbeat).getTime()) / 1000 < 10) { busy = true; break; }
       } catch (e) { /* unreadable/mid-write heartbeat -- ignore */ }
     }
@@ -278,8 +283,9 @@ function verifyDeterministicOnePassDecomposeDraft(task, repoRoot) {
   return verifyDeterministicDraft(task, repoRoot);
 }
 
+// The mode:"read" tool-call request is matched structurally by looksLikeReadToolCall (lib/structured-change.js), not by a bare
+// regex: a diff that merely mentions the string must not be rejected as a tool call.
 const NON_IMPL_PATTERNS = [
-  /"mode"\s*:\s*"read"/,
   /^(let me|i need to|i will|i'll|i am going to|i'm going to)\s+(read|check|look at|search|verify|examine|understand)\b/i,
 ];
 
@@ -393,6 +399,15 @@ function formatExecutedVerificationSection(ev) {
   } else {
     out.push('- No covering test file could be found for the changed files.');
   }
+  // Per-file evidence (review-verify runs each covering file in its own process): what FINISHED and passed is separated from what could not finish, so one
+  // slow file no longer reads as "nothing was verified".
+  if (Array.isArray(tests.passedFiles) && tests.passedFiles.length) out.push(`- Covering test files that ran to completion and PASSED (${tests.passedFiles.length}): ${evList(tests.passedFiles, EV_MAX_FILES)}.`);
+  if (Array.isArray(tests.preexistingOnlyFiles) && tests.preexistingOnlyFiles.length) out.push(`- Covering test files whose ONLY failures are tests that fail identically on the base branch in this sandbox -- the diff introduced no failure there, and every other test in them passed: ${evList(tests.preexistingOnlyFiles, EV_MAX_FILES)}.`);
+  if (Array.isArray(tests.partial) && tests.partial.length) {
+    for (const x of tests.partial) out.push(`- In ${x.file} the ${x.count} test(s) THIS DIFF ADDS were run on their own: ${x.passed ? 'PASSED' : 'FAILED'} (${evList(x.tests || [], EV_MAX_ITEMS)}).`);
+  }
+  if (Array.isArray(tests.timedOutFiles) && tests.timedOutFiles.length) out.push(`- Covering test files that did NOT finish within the review's per-run cap, so the REST of their tests are unverified -- not a failure and not a reason to reject by itself: ${evList(tests.timedOutFiles, EV_MAX_FILES)}.`);
+  if (Array.isArray(tests.dependentsUnverified) && tests.dependentsUnverified.length) out.push(`- Dependent test files (they only import a changed module) that did NOT finish in the review budget, so they are unverified -- NOT a failure and not a reason to reject on their own: ${evList(tests.dependentsUnverified, EV_MAX_FILES)}.`);
   if (Array.isArray(tests.failures) && tests.failures.length) out.push(`- Failing tests the diff introduced: ${evList(tests.failures.map((f) => String(f).slice(0, 120)), EV_MAX_ITEMS)}.`);
   if (Array.isArray(tests.preexisting) && tests.preexisting.length) {
     out.push(`- Tests that ALREADY fail on the base branch in this sandbox (not caused by the diff, so not counted against it): ${evList(tests.preexisting.map((f) => String(f).slice(0, 120)), EV_MAX_ITEMS)}.`);
@@ -404,6 +419,14 @@ function formatExecutedVerificationSection(ev) {
   if (confirmed.length) out.push(`- Claimed checks the harness re-ran and CONFIRMED (they exited 0): ${evList(confirmed, EV_MAX_ITEMS)}.`);
   if (contradicted.length) out.push(`- Claimed checks that FAILED when re-run: ${evList(contradicted, EV_MAX_ITEMS)}.`);
   if (skipped) out.push(`- ${skipped} claimed check(s) could not be re-run from the repo root (not runnable as written); they are neither confirmed nor contradicted.`);
+  const syn = ev.syntax && typeof ev.syntax === 'object' ? ev.syntax : null;
+  if (syn && Array.isArray(syn.skipped)) {
+    const noChecker = syn.skipped.filter((x) => x && /no syntax checker/.test(String(x.reason))).map((x) => String(x.file));
+    if (noChecker.length) out.push(`- NOT syntax-checked (no checker for the file type, e.g. TypeScript): ${evList(noChecker, EV_MAX_ITEMS)}. A syntax error there would not have been caught by the harness -- read those files for it.`);
+    const noPython = syn.skipped.filter((x) => x && /no python interpreter/.test(String(x.reason))).map((x) => String(x.file));
+    if (noPython.length) out.push(`- NOT syntax-checked (no Python interpreter was available): ${evList(noPython, EV_MAX_ITEMS)}.`);
+  }
+  if (syn && Array.isArray(syn.preexisting) && syn.preexisting.length) out.push(`- Files that already fail to parse on the base branch (not caused by the diff): ${evList(syn.preexisting.map(String), EV_MAX_ITEMS)}.`);
   const unpinned = ev.unpinned && typeof ev.unpinned === 'object' ? ev.unpinned : null;
   if (unpinned && Array.isArray(unpinned.hunks) && unpinned.hunks.length) {
     const where = unpinned.hunks.map((h) => `${String(h.file).slice(0, 120)}:${h.start}${h.end > h.start ? `-${h.end}` : ''}`);
@@ -488,6 +511,16 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(inertSection);
     lines.push('');
   }
+  const inertTargetSection = require('./lib/inert-target.js').formatInertTargetSection(task.inertTarget);
+  if (inertTargetSection) {
+    lines.push(inertTargetSection);
+    lines.push('');
+  }
+  const undefinedSection = formatUndefinedRemovalSection(task.undefinedAfterRemoval);
+  if (undefinedSection) {
+    lines.push(undefinedSection);
+    lines.push('');
+  }
   const gateReplaySection = formatGateReplaySection(task.gateReplay);
   if (gateReplaySection) {
     lines.push(gateReplaySection);
@@ -530,6 +563,10 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
   const coverageOverride = getSplitCoverageJudging().coverageGuidanceOverride(task);
   if (coverageOverride) {
     lines.push(coverageOverride);
+    if (task.source === 'manual') {
+      const manualGuidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task);
+      if (manualGuidance) lines.push(manualGuidance);
+    }
   } else {
     const guidance = resolveDynamicReviewField(registeredSource && registeredSource.reviewGuidance, task);
     if (guidance) lines.push(guidance);
@@ -577,7 +614,22 @@ function classifyVote(markers, minReasoningChars) {
 // private scratch worktree, runs the tests that cover it and re-runs the commands the draft claims PASS on (sandboxed), and returns failed /
 // passed / inconclusive. Only a genuine `failed` blocks; `inconclusive` (diff will not apply -- often a stacked slice that depends on an unmerged
 // one --, sandbox missing, timeout, nothing runnable) goes on to the vote exactly as before. Kill switch: AGENT_MANAGER_REVIEW_EXECUTED_VERIFY=false.
-const EXECUTED_VERIFY_BUDGET_MS = 240000;
+// 2026-10-07: must exceed review-verify.js's test timeout (210s) plus the syntax/command checks, or the
+// budget clamp turns a slow-but-passing covering suite into a timeout. Override with
+// AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS.
+const EXECUTED_VERIFY_BUDGET_MS = 360000;
+
+// Changed-file syntax gate result (review-verify checkChangedFilesSyntax): counts, plus the skipped files with the reason, capped.
+function summariseSyntax(s) {
+  const list = (a) => (Array.isArray(a) ? a : []).slice(0, EV_MAX_ITEMS).map((x) => String(x).slice(0, 160));
+  return {
+    checked: Array.isArray(s.checked) ? s.checked.length : 0,
+    failed: list(s.failed),
+    preexisting: list(s.preexisting),
+    skipped: (Array.isArray(s.skipped) ? s.skipped : []).slice(0, EV_MAX_ITEMS)
+      .map((x) => ({ file: String((x && x.file) || '').slice(0, 160), reason: String((x && x.reason) || '').slice(0, 120) })),
+  };
+}
 
 // A compact, record-safe view of a review-verify result for task.executedVerification (no raw output beyond what a redraft needs).
 function summariseExecutedVerification(ev) {
@@ -585,11 +637,12 @@ function summariseExecutedVerification(ev) {
     status: ev.status,
     at: new Date().toISOString(),
     reasons: (ev.reasons || []).slice(0, 6).map((r) => String(r).slice(0, 300)),
-    tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10), ...(ev.tests.preexisting && ev.tests.preexisting.length ? { preexisting: ev.tests.preexisting.slice(0, 10) } : {}) } : null,
+    tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10), ...(ev.tests.preexisting && ev.tests.preexisting.length ? { preexisting: ev.tests.preexisting.slice(0, 10) } : {}), ...(ev.tests.dependentsUnverified && ev.tests.dependentsUnverified.length ? { dependentsUnverified: ev.tests.dependentsUnverified.slice(0, 10) } : {}), ...(ev.tests.passedFiles && ev.tests.passedFiles.length ? { passedFiles: ev.tests.passedFiles.slice(0, 10) } : {}), ...(ev.tests.timedOutFiles && ev.tests.timedOutFiles.length ? { timedOutFiles: ev.tests.timedOutFiles.slice(0, 10) } : {}), ...(ev.tests.preexistingOnlyFiles && ev.tests.preexistingOnlyFiles.length ? { preexistingOnlyFiles: ev.tests.preexistingOnlyFiles.slice(0, 10) } : {}), ...(ev.tests.partial && ev.tests.partial.length ? { partial: ev.tests.partial.slice(0, 6).map((x) => ({ file: x.file, count: x.count, passed: x.passed, tests: (x.tests || []).slice(0, 6).map((t) => String(t).slice(0, 100)) })) } : {}) } : null,
     commands: (ev.commands || []).map((c) => ({
       criterion: String(c.criterion || '').slice(0, 160), command: c.command, claimedPass: !!c.claimedPass, outcome: c.outcome, exitCode: c.exitCode,
     })),
     ...(ev.unpinned && typeof ev.unpinned === 'object' ? { unpinned: summariseUnpinned(ev.unpinned) } : {}),
+    ...(ev.syntax && typeof ev.syntax === 'object' ? { syntax: summariseSyntax(ev.syntax) } : {}),
   };
 }
 
@@ -642,6 +695,50 @@ function resolveInertBaseRef(repoRoot, branch) {
     } catch { /* try the next */ }
   }
   return null;
+}
+
+// Undefined-identifier-after-removal (src/review-undefined-after-removal.js, brain dump #1768): a change that deletes a declaration but leaves a use of the name in the
+// post-change file. The draft is read from whichever shape it has: an adhoc rawDiff, or a Group B edit array (the arch_review / *_fix lanes carry no rawDiff).
+// AGENT_MANAGER_REVIEW_UNDEFINED_CHECK: 'false' = off, 'advisory' = evidence for the voters only, anything else (default) = block.
+function editsOfImplementResponse(task) {
+  try {
+    const parsed = parseJsonMaybeFenced(task && task.implementResponse);
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    const isOp = (i) => i && typeof i === 'object' && typeof i.file === 'string'
+      && ((i.mode === 'edit' && typeof i.find === 'string' && typeof i.replace === 'string') || (i.mode === 'create' && typeof i.content === 'string') || i.mode === 'delete');
+    return items.length && items.every(isOp) ? items : null;
+  } catch { return null; }
+}
+
+function summariseUndefinedRemoval(r) {
+  const n = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  const uses = Array.isArray(r && r.uses) ? r.uses : [];
+  return {
+    at: new Date().toISOString(), considered: n(r && r.considered), unknown: n(r && r.unknown), total: uses.length,
+    uses: uses.slice(0, 8).map((u) => ({
+      file: String((u && u.file) || '').slice(0, 160), name: String((u && u.name) || '').slice(0, 120),
+      lines: (Array.isArray(u && u.lines) ? u.lines : []).slice(0, 5).map((l) => ({ line: n(l && l.line), text: String((l && l.text) || '').slice(0, 140) })),
+    })),
+  };
+}
+
+function undefinedRemovalWhere(u) {
+  return `\`${u.name}\` in ${u.file} (${u.lines.map((l) => `line ${l.line}: ${l.text}`).join(' | ')})`;
+}
+
+function undefinedRemovalBlockReason(summary) {
+  const items = (summary && summary.uses) || [];
+  return `Deterministic gate: undefined identifier after removal -- the change deletes the declaration of ${items.length} name(s) that the file still uses, so the code would throw a ReferenceError when that line runs: ${items.map(undefinedRemovalWhere).join('; ')}. Either keep the declaration, or replace every remaining use with the new form.`;
+}
+
+function formatUndefinedRemovalSection(ua) {
+  if (!ua || typeof ua !== 'object' || !Array.isArray(ua.uses) || !ua.uses.length) return '';
+  return [
+    '--- Removed declarations that are still used (deterministic check; advisory) ---',
+    'The harness rebuilt each changed file as it would be after the change. These names lose their declaration in the change, are not declared again anywhere in the change or the file, and are still used (a use outside the edited lines is easy to miss): '
+      + ua.uses.map(undefinedRemovalWhere).join('; ') + '.',
+    'Unless a remaining use is unreachable or the name is a global, this draft throws a ReferenceError at that line: it should be rejected.',
+  ].join('\n');
 }
 
 function summariseInertAdditions(r, hubChild) {
@@ -754,7 +851,7 @@ function formatSkipPathSection(sp) {
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported (via
  * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
  */
-async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null } = {}) {
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null, findUndefinedFn = null } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
@@ -1141,8 +1238,13 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
 
   let isNonImplementation = false;
   if (!effectivelyEmpty) {
-    isNonImplementation = NON_IMPL_PATTERNS.some((pat) => pat.test(trimmedImplResponse));
-    if (!isNonImplementation && trimmedImplResponse.length < 80 && !trimmedImplResponse.includes('```')) {
+    isNonImplementation = looksLikeReadToolCall(trimmedImplResponse) || NON_IMPL_PATTERNS.some((pat) => pat.test(trimmedImplResponse));
+    // A short fence-free response is presumed to be meta-commentary -- unless it IS a structurally valid change set
+    // (lib/structured-change.js): `{"mode": "delete", "file": "<path>"}` is 71-79 characters for this repo's short paths and
+    // was blocked on length alone (deadcode_fix, 9 stranded tasks). NON_IMPL_PATTERNS above still win, so a short
+    // mode:"read" request is rejected exactly as before, and the delete-specific safeguards downstream are untouched.
+    if (!isNonImplementation && trimmedImplResponse.length < 80 && !trimmedImplResponse.includes('```')
+      && !isStructuredGroupBChange(trimmedImplResponse)) {
       isNonImplementation = true;
     }
   }
@@ -1240,6 +1342,38 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
   }
 
+  // Edit-set syntax gate (lib/edit-set-syntax.js, 2026-10-08, TaxHarvest AC-271): the executed-verification block below runs only for adhoc drafts that carry
+  // a rawDiff, so a Group B draft (a JSON edit set -- arch_review / function_length_fix / observability_fix / change_review_fix ...) was never syntax-checked and
+  // an edit that split an import reached pending-merge. Replays the set against the repo and parses every created/edited file; a file that parsed before the
+  // edit and does not now is a deterministic block, same discipline as the gates above (no vote is spent). Coverage (checked / skipped with reasons) is
+  // stamped on task.editSetSyntax for the voters. Never throws; AGENT_MANAGER_EDIT_SYNTAX_GATE=advisory|off.
+  try {
+    const { usesGroupB } = require('./lib/apply-core.js');
+    const ess = require('./lib/edit-set-syntax.js');
+    const essMode = ess.syntaxGateMode();
+    if (essMode !== 'off' && usesGroupB(task) && trimmedImplResponse) {
+      let editItems = null;
+      try { const v = parseJsonMaybeFenced(trimmedImplResponse); editItems = v ? (Array.isArray(v) ? v : [v]) : null; } catch { editItems = null; }
+      if (editItems && editItems.some((i) => i && (i.mode === 'edit' || i.mode === 'create'))) {
+        const syn = ess.checkEditSetSyntax(editItems, repoRoot);
+        task.editSetSyntax = { at: new Date().toISOString(), checked: syn.checked, skipped: syn.skipped, failed: syn.failed.map((f) => f.file), preexisting: syn.preexisting };
+        if (syn.failed.length) {
+          const reason = `Deterministic gate: edit-set-syntax -- ${ess.syntaxFeedbackFor(syn.failed)}`.slice(0, 900);
+          if (essMode === 'advisory') {
+            appendHistoryEvent(task, 'advisory', reason.slice(0, 600));
+          } else {
+            task.reviewProvider = 'deterministic-edit-set-syntax';
+            recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+            appendHistoryEvent(task, 'blocked', reason);
+            return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`[review] edit-set syntax gate errored for ${task.id} (non-fatal, continuing): ${e && e.message}`);
+  }
+
   // Executed verification: see the block comment above summariseExecutedVerification. Adhoc implement drafts only (they carry a real rawDiff plus
   // the acceptance results the draft claims); every other source keeps its own gates.
   if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false'
@@ -1309,6 +1443,40 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       }
     } catch (e) {
       console.error(`[review] inert-addition check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+  }
+
+  // Undefined identifier after removal (see undefinedRemovalBlockReason): a declaration the change deletes whose name the file still uses. Covers an adhoc rawDiff and a
+  // Group B edit array. Blocks by default; AGENT_MANAGER_REVIEW_UNDEFINED_CHECK=advisory only shows the voters; =false skips it. Never throws.
+  const undefinedMode = process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK;
+  if (undefinedMode !== 'false') {
+    const rawDiffOk = resolveSourceName(task) === 'adhoc' && task.adhocResolution === 'implemented' && typeof task.rawDiff === 'string' && task.rawDiff.trim();
+    const edits = rawDiffOk ? null : editsOfImplementResponse(task);
+    if (rawDiffOk || edits) {
+      try {
+        const find = findUndefinedFn || require('./review-undefined-after-removal.js').findUndefinedAfterRemoval;
+        const branch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
+        const baseRef = resolveInertBaseRef(repoRoot, branch) || (findUndefinedFn ? branch : null);
+        if (baseRef) {
+          const r = find({ rawDiff: rawDiffOk ? task.rawDiff : undefined, edits: edits || undefined, repoRoot, baseRef });
+          if (r && Array.isArray(r.uses)) {
+            task.undefinedAfterRemoval = summariseUndefinedRemoval(r);
+            if (r.uses.length) {
+              if (undefinedMode === 'advisory') {
+                appendHistoryEvent(task, 'advisory', `undefined-after-removal check: ${r.uses.length} removed declaration(s) still used (${r.uses.slice(0, 4).map((u) => u.name).join(', ')})`);
+              } else {
+                const reason = undefinedRemovalBlockReason(task.undefinedAfterRemoval);
+                task.reviewProvider = 'deterministic-undefined-after-removal';
+                recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+                appendHistoryEvent(task, 'blocked', reason);
+                return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error(`[review] undefined-after-removal check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+      }
     }
   }
 
@@ -1517,7 +1685,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { reviewTask, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();

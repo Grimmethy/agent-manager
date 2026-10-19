@@ -236,9 +236,10 @@ def api_instance_assignable_tasks(instance_id):
     to scripts/gpu-arbiter-cli.js: source resolution depends on the real registered
     task sources + config overrides and must never be re-derived in Python, where it could silently drift from the Node source of truth that
     local-worker.sh's actual claim loop uses."""
-    from app import ENV_FILE_PATH, PACKAGE_ROOT, _is_live_worker_instance, queue_dir, read_env_file
-    if not _is_live_worker_instance(instance_id):
-        abort(404, description=f"'{instance_id}' is not a worker lane that claims tasks from pending/")
+    from app import ENV_FILE_PATH, PACKAGE_ROOT, _worker_lane_refusal, queue_dir, read_env_file
+    refusal = _worker_lane_refusal(instance_id)
+    if refusal:
+        abort(404, description=refusal)
     qdir = queue_dir()
     if not qdir:
         return jsonify({"items": []})
@@ -287,9 +288,11 @@ def api_instance_assign_task(instance_id):
     or just relocating it if it's merely sitting in that lane's own drafting/ backlog)
     and moves it into pending/ first, so everything below operates on it the same way
     either way."""
-    from app import _is_live_worker_instance, _kill_and_requeue_instance, _relocate_task_to_pending, instances_dir, queue_dir, read_json_safe
-    if not _is_live_worker_instance(instance_id):
-        abort(404, description=f"'{instance_id}' is not a worker lane that claims tasks from pending/")
+    from app import _kill_and_requeue_instance, _relocate_task_to_pending, _worker_lane_refusal, instances_dir, queue_dir, read_json_safe
+    # Checked before any relocate/kill: an opted-out heartbeat (assignable: false) is refused here, so its process is never killed.
+    refusal = _worker_lane_refusal(instance_id)
+    if refusal:
+        abort(404, description=refusal)
 
     body = request.get_json(silent=True) or {}
     task_id = body.get("taskId")

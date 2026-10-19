@@ -188,9 +188,8 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     // into fetchedFiles (NOT into `files` -- those stay the candidate's declared edit
     // targets, which the review/decompose gates count against), so the drafter can ground
     // a cross-file change instead of editing blind or refusing.
-    const contextFiles = [...new Set(
-      [...section.matchAll(/(?<![\w/.-])((?:src|python|scripts|lib)\/[\w./-]+\.(?:js|ts|py|mjs|cjs))\b/g)].map((m) => m[1]),
-    )].filter((p) => !filesArray.includes(p)).slice(0, 3);
+    // Files the prose names (src/-style paths, relative require/import specifiers, any-directory paths); see citedContextFiles. Declared files never repeat as context.
+    const contextFiles = require('../../candidate-path-grounding.js').citedContextFiles({ section, declaredFiles: filesArray, repoRoot: getConfig().repoRoot, max: 3 });
 
     // Grounding fix (2026-08-21, confirmed live: observability-fix-ac-5 fabricated a
     // plausible-but-wrong `find` string -- "catch { return []; }" -- that matched nothing

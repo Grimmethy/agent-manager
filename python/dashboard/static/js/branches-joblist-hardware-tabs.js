@@ -2,6 +2,11 @@
 // render and the background poll below so click handlers always resolve against
 // whatever's actually on screen, not a stale closure from whichever fetch built it.
 let currentBranches = [];
+let currentHeldHubs = [];
+
+async function fetchHeldHubs() {
+  try { return await fetchJson('/api/git/held-hub-branches', { timeoutMs: 30000 }); } catch (e) { return []; }
+}
 let branchesPollTimer = null;
 
 function branchCardHtml(b) {
@@ -175,7 +180,8 @@ async function renderBranchesTab() {
     return;
   }
   currentBranches = branches;
-  if (branches.length === 0) {
+  currentHeldHubs = await fetchHeldHubs();
+  if (branches.length === 0 && currentHeldHubs.length === 0) {
     main.innerHTML = '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
     return;
   }
@@ -252,6 +258,10 @@ async function refreshBranchesTab() {
   });
   currentBranches = branches;
   refreshBranchVerdictFilterBar(main, branches);
+  currentHeldHubs = await fetchHeldHubs();
+  const heldEl = main.querySelector('[data-held-hubs]');
+  if (heldEl) heldEl.outerHTML = heldHubsHtml(currentHeldHubs);
+  else main.insertAdjacentHTML('beforeend', heldHubsHtml(currentHeldHubs));
 }
 
 async function renderBranchDetailModal(b) {
@@ -356,6 +366,7 @@ async function renderJobListTab() {
   try {
     jobTypes = await fetchJson('/api/job-types');
   } catch (e) {
+    console.error('renderJobListTab: failed to fetch /api/job-types', e);
     jobTypes = null;
   }
   // 2026-08-26, Grimmethy: "After looking at pipeline map I've realized that it really
@@ -369,6 +380,7 @@ async function renderJobListTab() {
   try {
     pipelineMap = await fetchJson('/api/pipeline-map');
   } catch (e) {
+    console.error('[pipeline-map] fetch failed:', e);
     pipelineMap = null;
   }
   const activeByName = {};

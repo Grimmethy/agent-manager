@@ -154,3 +154,132 @@ test('borrowing is tracked per role: a worker finding a project empty does not h
   assert.deepEqual(list('reviewer'), ['b', 'a']);
   assert.deepEqual(list('worker'), ['b'], 'the worker ordering/backoff is untouched by reviewer borrows');
 });
+
+// --- premium reach (2026-10-18): every registered project, premium work only -----------------------------------------------------------
+
+const { registeredProjects, hasPremium, premiumProjects, markPremiumBorrowed, markPremiumEmpty, premiumReachEnabled } = require('./pool-projects.js');
+
+const writeTask = (pipelineDir, stage, name, task, compact = false) => {
+  const dir = path.join(pipelineDir, 'queue', stage);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${name}.json`), compact ? JSON.stringify(task) : JSON.stringify(task, null, 2));
+};
+
+test('registeredProjects includes non-pool projects with the same dedupe / active / missing-dir rules; poolProjects still needs pool:true', () => {
+  const fx = fixture([
+    { name: 'active', pool: true }, { name: 'a', pool: true }, { name: 'plain' }, { name: 'off', pool: false },
+    { name: 'norepo', repo: false }, { name: 'noqueue', queue: false },
+  ]);
+  const dup = { ...fx.list[2], repoRoot: path.join(fx.root, 'plain-mirror-repo'), label: 'plain-dup' };
+  fs.mkdirSync(dup.repoRoot);
+  fs.writeFileSync(fx.projectsPath, JSON.stringify([...fx.list, dup]));
+  const active = { repoRoot: fx.list[0].repoRoot, pipelineDir: fx.list[0].pipelineDir };
+  assert.deepEqual(registeredProjects({ projectsPath: fx.projectsPath, active }).map((p) => p.label), ['a', 'plain', 'off']);
+  assert.deepEqual(poolProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active }).map((p) => p.label), ['a']);
+  const plain = registeredProjects({ projectsPath: fx.projectsPath, active }).find((p) => p.label === 'plain');
+  assert.deepEqual(Object.keys(plain).sort(), ['applyRepoRoot', 'domainsPath', 'grepDirs', 'label', 'pipelineDir', 'repoRoot']);
+});
+
+test('hasPremium looks only at the stages a role works from, and only at this lane\'s drafting dir', () => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  const has = (role, lane) => hasPremium(pipe, { role, lane });
+  assert.equal(has('worker', 'worker-a'), false, 'empty queue');
+  writeTask(pipe, 'pending', 'plain', { id: 'plain', premiumPriority: false });
+  writeTask(pipe, 'pending', 'nested', { id: 'nested', promptContext: { premiumPriority: true }, premiumPriority: 'true' });
+  writeTask(pipe, 'blocked', 'stuck', { id: 'stuck', premiumPriority: true });
+  fs.writeFileSync(path.join(pipe, 'queue', 'pending', 'partial.json'), '{"id":"partial","premiumPriority":tr');
+  assert.equal(has('worker', 'worker-a'), false, 'premiumPriority:false, a nested or string flag, a corrupt file and a premium task in blocked/ do not count');
+  writeTask(pipe, 'drafting/worker-b', 'theirs', { id: 'theirs', premiumPriority: true });
+  assert.equal(has('worker', 'worker-a'), false, 'another lane\'s drafting dir is not this lane\'s');
+  assert.equal(has('worker', 'worker-b'), true, 'the lane\'s own drafting dir counts');
+  assert.equal(has('worker', '../x'), false, 'a malformed lane is ignored, not joined into a path');
+  writeTask(pipe, 'derived', 'child', { id: 'child', premiumPriority: true });
+  assert.equal(has('worker', 'worker-a'), true, 'derived/ counts for the worker');
+  fs.rmSync(path.join(pipe, 'queue', 'derived', 'child.json'));
+  writeTask(pipe, 'adhoc', 'waiting', { id: 'waiting', premiumPriority: true }, true);
+  assert.equal(has('worker', 'worker-a'), true, 'adhoc/ counts for the worker (compact JSON too)');
+  assert.equal(has('reviewer'), false);
+  assert.equal(has('apply'), false);
+  writeTask(pipe, 'review', 'r', { id: 'r', premiumPriority: true });
+  writeTask(pipe, 'approved', 'ap', { id: 'ap', premiumPriority: true });
+  assert.equal(has('reviewer'), true);
+  assert.equal(has('apply'), true);
+  assert.equal(has('worker-seed'), true, 'worker-seed sees the premium adhoc/ task');
+  fs.rmSync(path.join(pipe, 'queue', 'adhoc', 'waiting.json'));
+  writeTask(pipe, 'pending', 'queued', { id: 'queued', premiumPriority: true });
+  assert.equal(has('worker', 'worker-a'), true, 'pending/ counts for the worker');
+  assert.equal(has('worker-seed'), false, 'but worker-seed looks only at adhoc/ and derived/');
+  writeTask(pipe, 'derived', 'child2', { id: 'child2', premiumPriority: true });
+  assert.equal(has('worker-seed'), true, 'derived/ counts for worker-seed');
+  assert.equal(has('nobody'), false, 'unknown role has no stages');
+  assert.equal(hasPremium(path.join(fx.root, 'missing')), false, 'a missing pipeline dir is not an error');
+});
+
+test('premiumProjects: premium-holding registered projects only, least-recently-premium-borrowed first, per-lane backoff, kill switch, separate from idle borrowing', () => {
+  const fx = fixture([{ name: 'active' }, { name: 'a', pool: true }, { name: 'b' }, { name: 'c' }]);
+  const [act, a, b, c] = fx.list;
+  const active = { repoRoot: act.repoRoot, pipelineDir: act.pipelineDir };
+  writeTask(act.pipelineDir, 'pending', 'home', { id: 'home', premiumPriority: true });
+  writeTask(a.pipelineDir, 'pending', 'pa', { id: 'pa', premiumPriority: true });
+  writeTask(b.pipelineDir, 'adhoc', 'pb', { id: 'pb', premiumPriority: true });
+  writeTask(c.pipelineDir, 'pending', 'pc', { id: 'pc' });
+  const t0 = new Date('2026-10-18T09:00:00Z');
+  const list = (lane = 'worker-x', now = new Date(t0.getTime() + 1000), role = 'worker') => premiumProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active, role, lane, now }).map((p) => p.label);
+  assert.deepEqual(list(), ['a', 'b'], 'the active project and the premium-free c are excluded');
+  markPremiumBorrowed(a.pipelineDir, { lane: 'worker-x', now: t0, file: fx.stateFile, projectsPath: fx.projectsPath });
+  assert.deepEqual(list(), ['b', 'a'], 'a borrow moves the project to the back');
+  assert.deepEqual(list('worker-y'), ['a', 'b'], 'another lane has its own order');
+  markPremiumEmpty(b.pipelineDir, { lane: 'worker-x', now: t0, file: fx.stateFile, ttlMs: 300000 });
+  assert.deepEqual(list(), ['a'], 'b is backed off for worker-x');
+  assert.deepEqual(list('worker-y'), ['a', 'b'], 'but not for worker-y');
+  assert.deepEqual(list('worker-x', new Date(t0.getTime() + 301000)), ['b', 'a'], 'the backoff expires');
+  const pooled = poolProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active }).map((p) => p.label);
+  assert.deepEqual(pooled, ['a'], 'idle borrowing still sees only the pool project and its order is untouched by premium borrows');
+  const state = JSON.parse(fs.readFileSync(fx.stateFile, 'utf8'));
+  assert.equal(state.lastBorrowedAt[fs.realpathSync(a.pipelineDir)], undefined, 'no idle-borrowing (worker) key was written');
+  writeTask(a.pipelineDir, 'review', 'ra', { id: 'ra', premiumPriority: true });
+  assert.deepEqual(list(null, undefined, 'reviewer'), ['a'], 'the reviewer role looks at review/');
+  process.env.AGENT_MANAGER_PREMIUM_REACH = 'false';
+  try {
+    assert.equal(premiumReachEnabled(), false);
+    assert.deepEqual(list(), []);
+    assert.deepEqual(poolProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active }).map((p) => p.label), ['a'], 'idle borrowing is not affected by the premium switch');
+  } finally { delete process.env.AGENT_MANAGER_PREMIUM_REACH; }
+});
+
+test('CLI: --env-args resolves a non-pool project, --has-premium exits 0/1, --premium-projects lists, --mark-premium writes one home history event', () => {
+  const fx = fixture([{ name: 'active' }, { name: 'plain', grepDirs: 'src' }]);
+  const [act, plain] = fx.list;
+  writeTask(plain.pipelineDir, 'pending', 'p1', { id: 'p1', premiumPriority: true });
+  const env = { ...process.env, AGENT_MANAGER_REPO_ROOT: act.repoRoot, AGENT_MANAGER_PIPELINE_DIR: act.pipelineDir, AGENT_MANAGER_POOL_STATE_PATH: fx.stateFile };
+  delete env.AGENT_MANAGER_PREMIUM_REACH;
+  const dir = path.join(fx.root, 'pkg');
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  for (const f of ['pool-projects.js', 'pipeline-history.js']) fs.copyFileSync(path.join(__dirname, f), path.join(dir, 'src', f));
+  fs.copyFileSync(fx.projectsPath, path.join(dir, 'projects.json'));
+  const cli = path.join(dir, 'src', 'pool-projects.js');
+  const run = (...args) => execFileSync('node', [cli, ...args], { env, encoding: 'utf8' });
+  const status = (...args) => spawnSyncStatus(cli, args, env);
+  const tokens = run('--env-args', 'plain', '/home/instances').trim().split('\n');
+  assert.ok(tokens.includes(`AGENT_MANAGER_PIPELINE_DIR=${plain.pipelineDir}`) && tokens.includes('AGENT_MANAGER_GREP_DIRS=src'));
+  assert.throws(() => run('--env-args', 'nope'), /no pool project/);
+  assert.equal(status('--has-premium', plain.pipelineDir, 'worker', 'worker-x'), 0);
+  assert.equal(status('--has-premium', plain.pipelineDir, 'reviewer'), 1);
+  assert.deepEqual(run('--premium-projects', 'worker', 'worker-x').trim().split('\n'), [plain.pipelineDir]);
+  assert.equal(run('--premium-projects', 'reviewer').trim(), '');
+  run('--mark-premium', plain.pipelineDir, 'worker', act.pipelineDir, 'worker-x');
+  const log = path.join(act.pipelineDir, 'instances', 'pipeline-history.log');
+  const lines = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].type, 'premium-borrow');
+  assert.equal(lines[0].role, 'worker');
+  assert.equal(lines[0].lane, 'worker-x');
+  assert.equal(lines[0].project, 'plain');
+  assert.ok(!fs.existsSync(path.join(plain.pipelineDir, 'instances')), 'the event goes to the HOME project, not the borrowed one');
+  assert.ok(JSON.parse(fs.readFileSync(fx.stateFile, 'utf8')).lastBorrowedAt[`premium-worker:worker-x|${fs.realpathSync(plain.pipelineDir)}`]);
+});
+
+function spawnSyncStatus(cli, args, env) {
+  return require('child_process').spawnSync('node', [cli, ...args], { env, encoding: 'utf8' }).status;
+}

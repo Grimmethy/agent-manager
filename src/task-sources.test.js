@@ -372,13 +372,14 @@ function writeProjectsRegistryFixture(dir, labels) {
 
 test('nextBrainDumpSortTask sets selfProjectLabel when this package\'s own directory name is a tracked project', () => {
   const dir = makeBrainDumpFixtureRepo();
-  writeProjectsRegistryFixture(dir, ['agent-manager', 'some-other-project']);
+  const ownDirName = path.basename(path.join(__dirname, '..')); // the checkout's real dir name -- a worktree is not called 'agent-manager'
+  writeProjectsRegistryFixture(dir, [ownDirName, 'some-other-project']);
   fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({
     entries: [{ id: 'bd-1', rawText: 'x', status: 'captured' }],
   }));
   const { nextBrainDumpSortTask } = freshTaskSources(dir);
   const task = nextBrainDumpSortTask();
-  assert.equal(task.promptContext.selfProjectLabel, 'agent-manager');
+  assert.equal(task.promptContext.selfProjectLabel, ownDirName);
 });
 
 test('nextBrainDumpSortTask leaves selfProjectLabel null when this package is not itself a tracked project', () => {
@@ -1059,6 +1060,50 @@ test('nextAdhocTask picks a premiumPriority candidate ahead of an atomic decompo
   const task = nextAdhocTask();
   assert.ok(task);
   assert.equal(task.id, 'adhoc-premium-1', 'premiumPriority must win over both atomic and mtime ordering');
+});
+
+// Premium rotation (2026-10-15): a premium task that keeps getting blocked must not hold the front of the generation order.
+test('nextAdhocTask: a fresh premium candidate goes before a twice-blocked premium one, which still goes before an ordinary task', () => {
+  const dir = makeAdhocFixtureRepo();
+  const recent = () => new Date(Date.now() - 10 * 60_000).toISOString();
+  writeAdhocFile(dir, 'a-demoted.json', {
+    id: 'adhoc-demoted-1', title: 'keeps blocking', premiumPriority: true,
+    draftAttempts: [{ outcome: 'blocked', finishedAt: recent() }, { outcome: 'blocked', finishedAt: recent() }],
+  });
+  writeAdhocFile(dir, 'b-ordinary.json', { id: 'adhoc-ordinary-1', title: 'ordinary' });
+  writeAdhocFile(dir, 'c-fresh.json', { id: 'adhoc-fresh-premium-1', title: 'fresh premium', premiumPriority: true });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask().id, 'adhoc-fresh-premium-1', 'the fresh premium candidate wins over the older, twice-blocked one');
+});
+
+test('nextAdhocTask: with only a twice-blocked premium task and an ordinary one, the premium task is still picked (flag kept)', () => {
+  const dir = makeAdhocFixtureRepo();
+  const recent = () => new Date(Date.now() - 10 * 60_000).toISOString();
+  writeAdhocFile(dir, 'a-ordinary.json', { id: 'adhoc-ordinary-2', title: 'ordinary' });
+  writeAdhocFile(dir, 'b-demoted.json', {
+    id: 'adhoc-demoted-2', title: 'keeps blocking', premiumPriority: true,
+    draftAttempts: [{ outcome: 'blocked', finishedAt: recent() }, { outcome: 'blocked', finishedAt: recent() }],
+  });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask().id, 'adhoc-demoted-2');
+});
+
+test('nextAdhocTask: AGENT_MANAGER_PREMIUM_ROTATION=off restores today\'s order (oldest premium first)', () => {
+  const dir = makeAdhocFixtureRepo();
+  const recent = () => new Date(Date.now() - 10 * 60_000).toISOString();
+  writeAdhocFile(dir, 'a-demoted.json', {
+    id: 'adhoc-demoted-3', title: 'keeps blocking', premiumPriority: true,
+    draftAttempts: [{ outcome: 'blocked', finishedAt: recent() }, { outcome: 'blocked', finishedAt: recent() }],
+  });
+  writeAdhocFile(dir, 'b-fresh.json', { id: 'adhoc-fresh-premium-3', title: 'fresh premium', premiumPriority: true });
+  const prev = process.env.AGENT_MANAGER_PREMIUM_ROTATION;
+  process.env.AGENT_MANAGER_PREMIUM_ROTATION = 'off';
+  try {
+    const { nextAdhocTask } = freshTaskSources(dir);
+    assert.equal(nextAdhocTask().id, 'adhoc-demoted-3');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_PREMIUM_ROTATION; else process.env.AGENT_MANAGER_PREMIUM_ROTATION = prev;
+  }
 });
 
 test('nextAdhocTask still applies oldest-first FIFO within each tier (two ordinary tasks, or two decompose children)', () => {
@@ -2715,6 +2760,31 @@ test('nextCandidateFulfillmentTask also fetches a src/ file named only in the ca
   assert.equal(task.promptContext.fetchedFiles.find((f) => f.path === 'src/prompts.js').context, true);
 });
 
+// 2026-10-05 (brain dump bd-1791177888894): a relative require specifier and an any-directory path in the prose are context too -- TaxHarvest arch-review-ac-47 was drafted
+// without agent-task-statuses.js because only src/-prefixed paths were recognised.
+test('nextCandidateFulfillmentTask fetches a module named only by a relative require specifier and a deep path, flagged as context, declared files unchanged', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'app/backend/pipeline'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'app/backend/pipeline/db-v2.js'), 'const [A, B] = require("./statuses");\n');
+  fs.writeFileSync(path.join(dir, 'app/backend/pipeline/statuses.js'), "module.exports = { STATUS: { pending: 'pending' } };\n");
+  fs.mkdirSync(path.join(dir, 'app/frontend/api'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'app/frontend/api/properties.ts'), 'export interface PropertyRecord {}\n');
+  const candidatesPath = path.join(dir, 'CANDIDATES.md');
+  fs.writeFileSync(candidatesPath, [
+    '### AC-47 · Replace positional destructuring with STATUS.* in db-v2.js',
+    'Strength: Strong',
+    'Files: app/backend/pipeline/db-v2.js',
+    '',
+    "Problem:\nPositional destructuring of the statuses array is fragile.\n\nSolution:\nReplace the import with `const { STATUS } = require('./statuses');` and use the PropertyRecord type from app/frontend/api/properties.ts where relevant.\n\nBenefits:\nSelf-documenting statuses.",
+  ].join('\n'));
+  const { nextCandidateFulfillmentTask } = freshTaskSources(dir);
+  const task = nextCandidateFulfillmentTask(candidatesPath, 'arch_review');
+  assert.deepEqual(task.promptContext.files, ['app/backend/pipeline/db-v2.js'], 'the declared edit target list is unchanged');
+  const ctx = task.promptContext.fetchedFiles.filter((f) => f.context).map((f) => f.path);
+  assert.deepEqual(ctx, ['app/backend/pipeline/statuses.js', 'app/frontend/api/properties.ts']);
+  assert.ok(task.promptContext.fetchedFiles.find((f) => f.path === 'app/backend/pipeline/db-v2.js' && !f.context), 'the declared file is fetched as before, not as context');
+});
+
 // Round-trip: applyArchDiscoveryCandidates (the writer, apply-group-a.js) through
 // nextCandidateFulfillmentTask (the reader, here) -- confirms the two independent
 // parsers actually agree on the Snippet: field's shape, not just that each one
@@ -3263,4 +3333,108 @@ test('the hold applies to the derived source only: an adhoc task is never held b
   }
   const { nextAdhocTask } = freshTaskSources(dir);
   assert.ok(nextAdhocTask(), 'overlapping adhoc tasks still run');
+});
+
+// capability_debrief (2026-10-17, design note section 5a) -------------------------------
+
+function writeCapabilityLedger(dir, rows) {
+  const { logPipelineEvent } = require('./pipeline-history.js');
+  for (const r of rows) logPipelineEvent(dir, 'attempt', r);
+}
+
+const CAP_SMALL = { source: 'change_review', model: 'qwen3-vl:8b-instruct', tier: 8, lane: 'worker-rx580', numCtx: 16384, wallMs: 300000, reason: 'Ollama request timed out after 300000ms' };
+const CAP_BIG = { source: 'change_review', model: 'qwen3.8:27b', tier: 27, lane: 'worker-3090', outcome: 'ok', wallMs: 90000 };
+
+test('nextCapabilityDebriefTask: null with no failure cluster; one deterministic task per cluster once 3 small-lane failures sit beside a larger tier', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief-test-'));
+  let { nextCapabilityDebriefTask } = freshTaskSources(dir);
+  assert.equal(nextCapabilityDebriefTask(), null);
+
+  writeCapabilityLedger(dir, [{ ...CAP_SMALL, taskId: 'a1', outcome: 'timeout' }, { ...CAP_SMALL, taskId: 'a2', outcome: 'timeout' }, CAP_BIG]);
+  ({ nextCapabilityDebriefTask } = freshTaskSources(dir));
+  assert.equal(nextCapabilityDebriefTask(), null, 'two failures is below the cluster threshold');
+
+  writeCapabilityLedger(dir, [{ ...CAP_SMALL, taskId: 'a3', outcome: 'timeout' }]);
+  ({ nextCapabilityDebriefTask } = freshTaskSources(dir));
+  const task = nextCapabilityDebriefTask();
+  assert.ok(task);
+  assert.equal(task.source, 'capability_debrief');
+  assert.match(task.id, /^capability-debrief-[0-9a-f]{12}$/);
+  assert.equal(task.promptContext.clusterSource, 'change_review');
+  assert.ok(task.promptContext.evidenceText.includes('CAPABILITY DEBRIEF BUNDLE'));
+  assert.equal(nextCapabilityDebriefTask().id, task.id, 'same id on a second call: two workers must collide on it');
+});
+
+test('nextCapabilityDebriefTask: a debriefed cluster is not offered again, and a cluster on a degraded lane is skipped as a hardware suspect', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief2-test-'));
+  const rows = ['a1', 'a2', 'a3'].map((taskId) => ({ ...CAP_SMALL, taskId, outcome: 'timeout' }));
+  writeCapabilityLedger(dir, [...rows, CAP_BIG]);
+  const { nextCapabilityDebriefTask } = freshTaskSources(dir);
+  const task = nextCapabilityDebriefTask();
+  assert.ok(task);
+  const { markDebriefedByKey } = require('./capability-debrief-bundle.js');
+  markDebriefedByKey(path.join(dir, 'instances'), task.promptContext.clusterKey, { verdict: 'queued' });
+  assert.equal(nextCapabilityDebriefTask(), null);
+
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief3-test-'));
+  writeCapabilityLedger(dir2, [...rows, CAP_BIG]);
+  const now = Date.now();
+  const sample = (tps, ago) => ({ at: new Date(now - ago).toISOString(), ok: true, tps, totalMs: 1, error: null });
+  fs.mkdirSync(path.join(dir2, 'instances'), { recursive: true });
+  fs.writeFileSync(path.join(dir2, 'instances', 'lane-health.worker-rx580.json'), JSON.stringify({ samples: [sample(26, 9e5), sample(27, 8e5), sample(25, 7e5), sample(0.6, 1e3)] }));
+  const fresh = freshTaskSources(dir2);
+  assert.equal(fresh.nextCapabilityDebriefTask(), null);
+});
+
+test('capability_debrief is registered as a core, advisory-prose source at priority 96 that probing must never offer to a small lane', () => {
+  freshTaskSources(fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief4-test-')));
+  const reg = require('./task-source-registry.js').getRegisteredSource('capability_debrief');
+  assert.equal(reg.priority, 96);
+  assert.equal(reg.scope, 'core');
+  assert.equal(reg.advisoryProse, true);
+  assert.equal(reg.probe, false);
+  assert.equal(typeof reg.apply, 'function');
+});
+
+// 2026-10-18: an entry whose work already exists as a task is linked to it, not sorted again (brain-dump-existing-work.js).
+test('nextBrainDumpSortTask links an entry whose work already exists, keeps a concurrent edit, and returns the next entry', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  const entries = [
+    { id: 'bd-done-work', serial: 1903, rawText: 'already carried by hand', status: 'captured', capturedAt: '2026-10-18T03:00:00.000Z' },
+    { id: 'bd-fresh', serial: 1904, rawText: 'not started', status: 'captured', capturedAt: '2026-10-18T03:00:00.000Z' },
+  ];
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({ entries }));
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'adhoc-carried-1.json'), JSON.stringify({ id: 'adhoc-carried-1', promptContext: { raisedFrom: 'brain-dump-1903' } }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+
+  // A dashboard capture lands between the generator's read and its write: the write must keep it.
+  const realRead = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function patched(p, ...rest) {
+    const out = realRead.call(fs, p, ...rest);
+    if (p === process.env.AGENT_MANAGER_BRAIN_DUMP_PATH && ++reads === 1) {
+      const d = JSON.parse(String(out));
+      d.entries.push({ id: 'bd-new-capture', rawText: 'captured meanwhile', status: 'captured' });
+      fs.writeFileSync(p, JSON.stringify(d));
+    }
+    return out;
+  };
+  let task;
+  try { task = nextBrainDumpSortTask(); } finally { fs.readFileSync = realRead; }
+
+  assert.equal(task.id, 'brain-dump-sort-bd-fresh', 'the entry with existing work is skipped');
+  const saved = JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, 'utf8')).entries;
+  const linked = saved.find((e) => e.id === 'bd-done-work');
+  assert.equal(linked.status, 'actioned');
+  assert.equal(linked.queuedTaskId, 'adhoc-carried-1');
+  assert.equal(linked.linkedExistingWork.how, 'raisedFrom');
+  assert.equal(linked.linkedExistingWork.by, 'generator');
+  assert.equal(saved.find((e) => e.id === 'bd-fresh').status, 'captured');
+  assert.ok(saved.find((e) => e.id === 'bd-new-capture'), 'the concurrent capture survived the link write');
+  const hist = fs.readFileSync(path.join(dir, 'instances', 'pipeline-history.log'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    .filter((e) => e.type === 'brain-dump-existing-work');
+  assert.equal(hist.length, 1);
+  assert.equal(hist[0].entryId, 'bd-done-work');
+  assert.equal(hist[0].taskId, 'adhoc-carried-1');
 });

@@ -20,10 +20,13 @@ const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { logToolLoopEvent, buildTurnEndEntry, buildToolOutcomeEntries } = require('./tool-loop-audit.js');
+const { buildTrajectory, writeTrajectory } = require('./trajectory.js');
 const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { localOllamaLockKey } = require('./lib/ollama-lock-key.js');
-const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
+const { PINNED_NUM_CTX, laneNumBatch } = require('./gpu-capacity.js');
+const CHAT_OPTIONS = { num_ctx: PINNED_NUM_CTX, ...(laneNumBatch() ? { num_batch: laneNumBatch() } : {}) };
 const { injectSideFindingInstruction, extractSideFindings, writeSideFindingInbox } = require('./side-finding.js');
 const { injectAmplificationInstruction, extractAmplificationRequests } = require('./incident-amplification-marker.js');
 const { injectContextLogInstruction, extractContextLog, writeContextLogInbox } = require('./context-log-marker.js');
@@ -75,6 +78,7 @@ const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api
 // to cut the joined slice mid-line while nextOffset was still endLine + 1, so every line between the cut and endLine was never shown yet the model was told to page PAST them
 // (a comment even said "unknown exact line count when char-truncated"). Now only WHOLE lines that fit are returned, returnedThrough is the last of them, and the caller's
 const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
+const { isSecretLookingPath } = require('./accessible-roots.js');
 const { taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS } = require('./local-tool-task-tools.js');
 
 // nextOffset = returnedThrough + 1, so paging visits every line exactly once. A first line that alone exceeds the ceiling is shown as a prefix and paging continues with the NEXT line.
@@ -383,8 +387,10 @@ function turnLock(instancesDir, fn) {
 // scoped only to the P40 endpoint -- every other caller (the local RTX 3090 lane, Chat)
 // keeps the original 240s value unchanged.
 const IS_P40_ENDPOINT = !!process.env.AGENT_MANAGER_P40_OLLAMA_URL && OLLAMA_URL === process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+// 2026-10-17: any lane marked `slow` in src/lanes.js (the P40, or a registry lane with "slow": true) gets the long request timeout too.
+const IS_SLOW_ENDPOINT = IS_P40_ENDPOINT || require('./lanes.js').isSlowEndpoint(OLLAMA_URL);
 const P40_REQUEST_TIMEOUT_MS = 900_000;
-const REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || (IS_P40_ENDPOINT ? P40_REQUEST_TIMEOUT_MS : 240_000);
+const REQUEST_TIMEOUT_MS = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || (IS_SLOW_ENDPOINT ? P40_REQUEST_TIMEOUT_MS : 240_000);
 
 const TOOLS = [
   {
@@ -483,7 +489,7 @@ const TOOLS = [
 // threaded through for read_task/search_tasks (2026-09-07) the same way
 // buildWriteToolHandlers already threads it for queue_reviewed_task -- these two are
 // just not chat-only, since they're harmless reads.
-function buildToolHandlers(allowedRoots, pipelineDir) {
+function buildToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
   // A model-supplied `root` for grep_codebase must be one of THIS call's allowed roots --
   // otherwise the tool would grep any path on disk. allowedRoots is already realpath'd
   // (see runPlanWithTools), so compare on realpath. A `root` that resolves to the primary
@@ -500,11 +506,14 @@ function buildToolHandlers(allowedRoots, pipelineDir) {
     grep_codebase: (args) => {
       const r = grepRoot(args.root);
       if (!r.ok) return { error: `root is not an accessible repo: ${args.root} (call list_roots)` };
-      return grepCodebase({ query: args.query, dir: args.dir, root: r.root, contextLines: args.contextLines });
+      const hits = grepCodebase({ query: args.query, dir: args.dir, root: r.root, contextLines: args.contextLines });
+      // A read-only sibling repo's credential-looking files never come back as grep hits (see isSecretLookingPath).
+      if (Array.isArray(hits) && r.root && readOnlyRoots.includes(r.root)) return hits.filter((h) => !isSecretLookingPath(h.file || ''));
+      return hits;
     },
-    read_file: (args) => readFileTool(allowedRoots, { path: args.path, offset: args.offset, limit: args.limit }),
-    list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path }),
-    list_roots: () => listRootsTool(allowedRoots),
+    read_file: (args) => readFileTool(allowedRoots, { path: args.path, offset: args.offset, limit: args.limit, readOnlyRoots }),
+    list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path, readOnlyRoots }),
+    list_roots: () => listRootsTool(allowedRoots, readOnlyRoots),
     read_task: (args) => readTaskTool(pipelineDir, { taskId: args.taskId, section: args.section, offset: args.offset, limit: args.limit }),
     search_tasks: (args) => searchTasksTool(pipelineDir, { query: args.query, state: args.state, includeArchived: args.includeArchived }),
   };
@@ -539,11 +548,13 @@ function withGrepDirsHint(tools) {
   });
 }
 
-function buildWriteToolHandlers(allowedRoots, pipelineDir) {
+// readOnlyRoots: sibling repos the implement pass may read but not write -- they are NOT in allowedRoots here (so write_file/edit_file refuse them) and run_bash
+// mounts them read-only.
+function buildWriteToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
   return {
-    write_file: (args) => writeFileTool(allowedRoots, { path: args.path, content: args.content }),
-    edit_file: (args) => editFileTool(allowedRoots, { path: args.path, find: args.find, replace: args.replace }),
-    run_bash: (args) => runBashTool(allowedRoots, { command: args.command }),
+    write_file: (args) => writeFileTool(allowedRoots, { path: args.path, content: args.content, readOnlyRoots }),
+    edit_file: (args) => editFileTool(allowedRoots, { path: args.path, find: args.find, replace: args.replace, readOnlyRoots }),
+    run_bash: (args) => runBashTool(allowedRoots, { command: args.command, readOnlyRoots }),
     queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description }),
   };
 }
@@ -613,9 +624,12 @@ function pickUsage(o) {
 async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   if (!onChunk) {
     const res = await postJson(`${OLLAMA_URL}/api/chat`, {
-      model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
+      model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: CHAT_OPTIONS,
     }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
-    return { message: res.message || {}, usage: pickUsage(res) };
+    // doneReason here too (2026-10-18, brain-dump 1889): every pipeline draft takes this
+    // non-streaming branch, and without it the 'truncated' audit events below could only
+    // ever fire for Chat. Consumed by logging only -- no branch acts on it.
+    return { message: res.message || {}, usage: pickUsage(res), doneReason: res.done_reason || null };
   }
   let contentAcc = '';
   let toolCalls = null;
@@ -623,7 +637,7 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
   let usage = pickUsage(null);
   let doneReason = null;
   await postJsonStream(`${OLLAMA_URL}/api/chat`, {
-    model: MODEL, messages, tools, keep_alive: KEEP_ALIVE, options: { num_ctx: PINNED_NUM_CTX },
+    model: MODEL, messages, tools, keep_alive: KEEP_ALIVE, options: CHAT_OPTIONS,
   }, REQUEST_TIMEOUT_MS, tokenFoldHeaders, (obj) => {
     if (obj.error || obj.done_reason === 'error') {
       streamError = obj.error || obj.done_reason || 'unknown stream error';
@@ -906,7 +920,14 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
     const handler = toolHandlers[name];
     let result;
     if (!handler) {
-      result = { error: `unknown tool: ${name}` };
+      // 2026-09-22 (pipeline hardening, 2nd repro): the bare "unknown tool: X" gave the
+      // model no way to self-correct -- a tier-3 run called one hallucinated name
+      // (`list_files`), got back nothing but the rejection, then spent its remaining
+      // turns refusing to proceed and answered RESOLUTION: needs-human-decision without
+      // ever trying `list_directory` (a real tool, one typo away). Enumerating the
+      // actually-registered handlers in the error string is cheap and deterministic:
+      // the model gets exactly what it needs to pick a real tool on its very next turn.
+      result = { error: `unknown tool: ${name}. Available tools: ${Object.keys(toolHandlers).join(', ')}.` };
     } else {
       try {
         result = await handler(args);
@@ -927,7 +948,7 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
 // to (a compliance gap no amount of prompt wording reliably closes), so shrinking the
 // window before the "stop exploring, edit now" nudge fires structurally bounds how much
 // re-verification a retry can do, rather than trying to argue the model out of doing it.
-async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, contextLogSessionId = null, orientTurnLimit = ORIENT_TURN_LIMIT }) {
+async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, source, allowWrite = false, onChunk, primaryRoot, extraRoots = [], readOnlyRoots: rawReadOnlyRoots = [], forceSummaryOnCap = false, nudgeToEditEarly = false, leafMustEdit = false, allowSideFindings = true, allowAmplification = false, taskId = null, stage = null, conceptId = null, contextLogSessionId = null, orientTurnLimit = ORIENT_TURN_LIMIT }) {
   const { pipelineDir, repoRoot } = getConfig();
   // allowWrite=true (Chat panel only) checks its OWN kill switch, separate from
   // arch_discovery's -- see WRITE_TOOLS' own header for why these must stay independent.
@@ -950,6 +971,15 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     if (!seen.has(real)) { seen.add(real); allowedRoots.push(real); }
   }
   if (allowedRoots.length === 0) allowedRoots.push(path.resolve(repoRoot));
+  // Read-only sibling repos (the implement pass only, see accessible-roots.js resolveReadOnlySiblingRoots): readable by every read tool, never in the write handlers'
+  // roots, mounted read-only for run_bash. Deduped on realpath and never overlapping a writable root.
+  const readOnlyRoots = [];
+  for (const r of Array.isArray(rawReadOnlyRoots) ? rawReadOnlyRoots : []) {
+    let real;
+    try { real = fs.realpathSync(r); } catch { continue; }
+    if (!seen.has(real)) { seen.add(real); readOnlyRoots.push(real); }
+  }
+  const readableRoots = [...allowedRoots, ...readOnlyRoots];
 
   // Chat (source:'chat') gets CHAT_TOOLS instead of the full WRITE_TOOLS even when it
   // opts into allowWrite -- see CHAT_TOOLS' own header. Every OTHER allowWrite caller
@@ -961,10 +991,10 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   );
   const toolHandlers = allowWrite
     ? {
-      ...buildToolHandlers(allowedRoots, pipelineDir),
-      ...(isChatCaller ? buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) : buildWriteToolHandlers(allowedRoots, pipelineDir)),
+      ...buildToolHandlers(readableRoots, pipelineDir, readOnlyRoots),
+      ...(isChatCaller ? buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) : buildWriteToolHandlers(allowedRoots, pipelineDir, readOnlyRoots)),
     }
-    : buildToolHandlers(allowedRoots, pipelineDir);
+    : buildToolHandlers(readableRoots, pipelineDir, readOnlyRoots);
   // 2026-08-24 -- caught live via the Chat panel's first real message: this loop's own
   // /api/chat calls had NO coordination with worker-1/reviewer's use of the same single
   // resident Ollama model, the exact uncoordinated-contention bug the Discuss-side lock
@@ -1022,6 +1052,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   }
   const toolCallLog = [];
   let turnsUsed = 0;
+  // Trajectory record (trajectory.js, brain-dump 1892): run start + every turn's end entry, written once from withUsage.
+  const trajectoryStartedMs = Date.now();
+  const trajectoryTurns = [];
   let lastMessage = null;
 
   // Ollama token accounting, summed across every turn (incl. flake-retried and
@@ -1038,6 +1071,29 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     usageAcc.prompt_eval_count += Number(u.prompt_eval_count) || 0;
     usageAcc.eval_count += Number(u.eval_count) || 0;
     usageAcc.eval_duration += Number(u.eval_duration) || 0;
+    require('./local-throughput.js').noteAttemptSample({ evalCount: Number(u.eval_count) || 0, evalDurationNs: Number(u.eval_duration) || 0 });
+  };
+  // Tool-loop audit (see tool-loop-audit.js's own header): one 'turn-end' line per model
+  // turn and one 'tool-outcome' line per edit_file/write_file call, in their own log.
+  // Log-only -- nothing below reads these back. A flaked turn has no message to describe
+  // and is skipped (the flake is recorded by its own path).
+  const auditCtx = (turn, phase) => ({
+    source, taskId, stage, lane: process.env.AGENT_MANAGER_INSTANCE_ID || null, model: MODEL || null, turn, phase,
+  });
+  const logTurnEnd = (turn, phase, turnRes) => {
+    try {
+      if (!turnRes || turnRes.flakeErr || !turnRes.message) return;
+      const entry = buildTurnEndEntry(auditCtx(turn, phase), turnRes);
+      trajectoryTurns.push(entry);
+      logToolLoopEvent(pipelineDir, 'turn-end', entry);
+    } catch { /* best-effort -- see logToolLoopEvent */ }
+  };
+  const logToolOutcomes = (turn, calls) => {
+    try {
+      for (const entry of buildToolOutcomeEntries(auditCtx(turn, 'loop'), calls)) {
+        logToolLoopEvent(pipelineDir, 'tool-outcome', entry);
+      }
+    } catch { /* best-effort -- see logToolLoopEvent */ }
   };
   // Same extraction as local-client.js's call()/claude-client.js's call() -- see
   // side-finding.js's own header. Hooked into this one shared wrapper so every return
@@ -1076,6 +1132,13 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       merged.response = cleanText;
       if (entry) writeContextLogInbox(entry, { sessionId: contextLogSessionId, pipelineDir });
     }
+    // Every return path passes here, so this is the one place the run's trajectory is complete. Best-effort (writeTrajectory never throws).
+    try {
+      writeTrajectory(pipelineDir, buildTrajectory({
+        meta: { taskId, stage, source, lane: process.env.AGENT_MANAGER_INSTANCE_ID || null, model: MODEL || null, startedMs: trajectoryStartedMs, endedMs: Date.now() },
+        messages, turns: trajectoryTurns, result: merged,
+      }));
+    } catch { /* best-effort -- see trajectory.js */ }
     return merged;
   };
 
@@ -1147,6 +1210,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       toolCallLog, turnStartLengths, turnStartLogLengths,
     });
     addUsage(summaryUsage);
+    logTurnEnd(turnsUsed, 'forced-summary', { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake });
     // The forced-summary turn itself can, in principle, also get clipped -- worth its own
     // audit entry (see logContextAudit's own header) since RESERVED_RESPONSE_TOKENS is
     // exactly the margin betting this never happens.
@@ -1189,6 +1253,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         toolCallLog, turnStartLengths, turnStartLogLengths,
       });
       addUsage(retryResult.usage);
+      logTurnEnd(turnsUsed, 'forced-summary-retry', retryResult);
       const retryContent = (!retryResult.flakeErr && retryResult.message && retryResult.message.content) ? retryResult.message.content : '';
       if (HAS_RESOLUTION_RE.test(retryContent)) {
         summaryContent = retryContent;
@@ -1329,6 +1394,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         ceiling: PINNED_NUM_CTX,
       });
     }
+    logTurnEnd(turn, 'loop', { message, usage, doneReason, flakeErr });
     if (flakeErr) {
       // Rollback exhausted too (or there was no prior turn to roll back -- a first-turn
       // failure is a genuinely different, unexplained case). Graceful-degrade if the
@@ -1398,7 +1464,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       }
       return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
     }
+    const toolLogStart = toolCallLog.length;
     await executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
+    logToolOutcomes(turn, toolCallLog.slice(toolLogStart));
   }
 
   // maxTurns reached without a final (no-tool-calls) response -- deliberate forced stop,
@@ -1446,7 +1514,7 @@ module.exports = {
   withApplyLock, APPLY_LOCK_PATH, ORIENT_TURN_LIMIT,
   capBashOutput, MAX_BASH_OUTPUT_CHARS,
   estimateMessagesTokens, estimateContextTokens, RESERVED_RESPONSE_TOKENS, logContextAudit,
-  IS_P40_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
+  IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, P40_REQUEST_TIMEOUT_MS, REQUEST_TIMEOUT_MS,
   installStdoutEpipeGuard,
 };
 

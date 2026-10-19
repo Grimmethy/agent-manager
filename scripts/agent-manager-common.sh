@@ -94,10 +94,28 @@ get_claude_paused() {
 # stuck/runaway generation can never starve this pipeline indefinitely. Fails open --
 # any parse error / missing file -> not held.
 #
-# comfyui_lease_held -> exit 0 if held, 1 otherwise.
+# comfyui_lease_held [endpoint_url] -> exit 0 if held, 1 otherwise.
+#
+# Endpoint-scoped leases (2026-10-18): a lease may carry an `endpoints` array of Ollama URLs (a plugin reserving ONE card, e.g. a KaggleForge eval on the
+# P40). Given an endpoint_url, a scoped lease counts as held only when it lists that endpoint; an unscoped lease (no `endpoints`, PromptForge's) is held
+# for every endpoint. Called with no argument it keeps the old meaning (any fresh lease = held). The rule lives once, in src/gpu-guard.js leaseHeldFor.
 comfyui_lease_held() {
+  local endpoint="${1:-}"
   local lease_path="${AGENT_MANAGER_COMFY_LEASE_PATH:-${HOME}/.local/state/agent-manager/comfyui-lease.json}"
   [[ -f "$lease_path" ]] || return 1
+  if [[ -n "$endpoint" ]]; then
+    local guard_js
+    guard_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/gpu-guard.js"
+    if [[ -f "$guard_js" ]]; then
+      node -e '
+        try {
+          const g = require(process.argv[1]);
+          process.exit(g.leaseHeldFor(process.argv[2], process.argv[3]) ? 0 : 1);
+        } catch (e) { process.exit(1); }
+      ' "$guard_js" "$endpoint" "$lease_path"
+      return $?
+    fi
+  fi
   local ttl="${AGENT_MANAGER_COMFY_LEASE_TTL_S:-90}"
   local max_s="${AGENT_MANAGER_COMFY_LEASE_MAX_S:-900}"
   local verdict
@@ -117,6 +135,16 @@ comfyui_lease_held() {
   [[ "$verdict" == "held" ]]
 }
 
+
+# Host-RAM headroom (2026-10-12 freeze: RAM + all swap exhausted by ComfyUI + the P40 VM +
+# Ollama's runner, kernel thrashed until power-cycled). mem-guard.js measures MemAvailable /
+# SwapFree, asks ComfyUI to unload if short, and exits 3 only when pressure remains. Any
+# other outcome (ok, node missing, the check itself crashing) fails open.
+# mem_pressure_high -> exit 0 if the lane should yield this tick, 1 otherwise.
+mem_pressure_high() {
+  node "${PACKAGE_SRC_DIR}/mem-guard.js" >>"${LOG_FILE:-/dev/null}" 2>&1
+  [[ $? -eq 3 ]]
+}
 
 # Pipeline-wide single-flight mutex (2026-08-19, Grimmethy: "it's still running two jobs
 # at once. We really need it to do one at a time" -- reported AFTER should_yield_for_

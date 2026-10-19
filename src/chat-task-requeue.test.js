@@ -324,3 +324,42 @@ test('requeueBlockedTask: a successful superseded-branch delete is recorded in t
   assert.equal((await requeueBlockedTask(dir, dir, 't15', { state: 'blocked' })).ok, true);
   assert.equal(lastRemoval(dir, 'agent/t15-never-pushed'), null);
 });
+
+// 2026-10-08: a requeue (via Chat) keeps a branch other live work sits on (lib/shared-branch.js); HUB0018-01 was lost to the old behaviour.
+test('requeueBlockedTask: a branch shared with a live sibling is KEPT -- no delete, no ledger entry, no abandonment, a branch-kept event; a terminal sibling does not protect it', async () => {
+  const { lastRemoval } = require('./branch-removal-ledger.js');
+  const dir = makePipeline();
+  const bare = fs.mkdtempSync(path.join(require('os').tmpdir(), 'rq-bare-'));
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', bare]);
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'README.md'), 'x\n');
+  execFileSync('git', ['add', 'README.md'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+  execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: dir });
+  execFileSync('git', ['push', '-q', 'origin', 'main'], { cwd: dir });
+  const remoteBranches = () => execFileSync('git', ['ls-remote', '--heads', bare], { encoding: 'utf8' });
+  const applied = (b) => [{ stage: 'applied', at: 'y', detail: b }];
+
+  execFileSync('git', ['push', '-q', 'origin', 'main:agent/shared-hub-branch'], { cwd: dir });
+  write(dir, 'blocked', { id: 'child', domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', stacked: { branch: 'agent/shared-hub-branch', seq: 2, total: 2 }, history: applied('agent/shared-hub-branch') });
+  fs.mkdirSync(at(dir, 'done'), { recursive: true });
+  fs.writeFileSync(at(dir, 'done', 'sibling.json'), JSON.stringify({ id: 'sibling', stacked: { branch: 'agent/shared-hub-branch', seq: 1, total: 2 }, history: applied('agent/shared-hub-branch') }));
+  assert.equal((await requeueBlockedTask(dir, dir, 'child', { state: 'blocked' })).ok, true);
+  assert.match(remoteBranches(), /agent\/shared-hub-branch/, 'the shared branch survives');
+  assert.equal(lastRemoval(dir, 'agent/shared-hub-branch'), null, 'nothing was removed, so nothing is recorded');
+  const pending = JSON.parse(fs.readFileSync(at(dir, 'pending', 'child.json'), 'utf8'));
+  const stages = pending.history.map((h) => h.stage);
+  assert.ok(stages.includes('branch-kept'));
+  assert.ok(!stages.includes('abandoned'));
+  assert.match(pending.history.find((h) => h.stage === 'branch-kept').detail, /shared with sibling/);
+
+  // the sibling is already merged: nothing live depends on the branch, so it is deleted as before
+  execFileSync('git', ['push', '-q', 'origin', 'main:agent/other-hub-branch'], { cwd: dir });
+  write(dir, 'blocked', { id: 'child2', domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', stacked: { branch: 'agent/other-hub-branch', seq: 2, total: 2 }, history: applied('agent/other-hub-branch') });
+  fs.writeFileSync(at(dir, 'done', 'merged-sibling.json'), JSON.stringify({ id: 'merged-sibling', terminalDisposition: 'merged', stacked: { branch: 'agent/other-hub-branch' }, history: applied('agent/other-hub-branch') }));
+  assert.equal((await requeueBlockedTask(dir, dir, 'child2', { state: 'blocked' })).ok, true);
+  assert.doesNotMatch(remoteBranches(), /agent\/other-hub-branch/);
+  assert.equal(lastRemoval(dir, 'agent/other-hub-branch').cause, 'superseded-by-requeue');
+});

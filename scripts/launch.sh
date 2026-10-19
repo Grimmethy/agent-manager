@@ -34,6 +34,15 @@ if [[ -f "$COMFY_LEASE_PATH" ]]; then
     && echo "[launch] cleared ComfyUI GPU lease ($COMFY_LEASE_PATH) -- explicit pipeline start takes the GPU"
 fi
 
+# Forge family exclusion: the pipeline and the Forge family (ComfyUI) never hold the GPU together
+# (promptforge Docs/GPU_FAMILY_PROTOCOL.md). Besides deleting the lease, ask PromptForge to end its session and
+# stop ComfyUI right now instead of waiting for its keeper to notice (~20 s). Best-effort: PromptForge may be down.
+PROMPTFORGE_URL="${AGENT_MANAGER_PROMPTFORGE_URL:-${PROMPTFORGE_URL:-http://localhost:7430}}"
+if command -v curl >/dev/null 2>&1; then
+  yield_out="$(curl -s -m 30 -X POST "${PROMPTFORGE_URL%/}/api/gpu/yield" 2>/dev/null || true)"
+  [[ -n "$yield_out" ]] && echo "[launch] Forge GPU yield: $yield_out"
+fi
+
 AGENT_MANAGER_DASHBOARD_PORT="${AGENT_MANAGER_DASHBOARD_PORT:-7420}"
 
 # orc-common.sh and downstream scripts hard-requires MODEL_URL, HOME_LOGS already exported.
@@ -177,9 +186,12 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
 
   # One worker lane per GPU, named for the GPU (src/lanes.js is the single definition -- the
   # watchdog's restart rule and the dashboard's expected-lane list read the same module). Every
-  # lane claims ANY pending task by priority; there is no reasoning/worker split any more.
+  # lane claims ANY pending task by priority (unless the lane declares a taskClasses allowlist in the lanes registry, see
+  # docs/agents/lanes.md); there is no reasoning/worker split any more.
   # A lane's own env (e.g. the P40 VM's OLLAMA_URL/LOCAL_MODEL) is scoped to just that child
   # process via `env`, so the other lanes and the reviewer keep talking to the host's Ollama.
+  # A remote lane's worker overrides LOCAL_MODEL in its own process; keep the host's model visible to src/lanes.js (capability tiers).
+  export AGENT_MANAGER_HOST_LOCAL_MODEL="${AGENT_MANAGER_HOST_LOCAL_MODEL:-${LOCAL_MODEL:-}}"
   while IFS= read -r lane_id; do
     [[ -n "$lane_id" ]] || continue
     mapfile -t lane_env < <(node "${SCRIPT_DIR}/../src/lanes.js" --env "$lane_id")
@@ -190,6 +202,17 @@ if [[ -n "${AGENT_MANAGER_REPO_ROOT:-}" && -d "${AGENT_MANAGER_REPO_ROOT}" ]]; t
 
   start_bg "review-runner" "${PID_DIR}/review-runner.pid" "${LOG_DIR}/review-runner.log" \
     bash "${SCRIPT_DIR}/review-runner.sh" reviewer
+
+  # Extra review daemons: one per lane that opted in (src/lanes.js `reviewer`; the legacy P40 lane reads AGENT_MANAGER_P40_REVIEWER=true). Each runs with
+  # its lane's own Ollama env so its three votes go to THAT GPU, and claims items from queue/review/ per item (review-runner.sh), so two daemons never
+  # review the same task.
+  while read -r reviewer_id reviewer_lane; do
+    [[ -n "$reviewer_id" ]] || continue
+    mapfile -t reviewer_env < <(node "${SCRIPT_DIR}/../src/lanes.js" --env "$reviewer_lane")
+    start_bg "$reviewer_id" "${PID_DIR}/review-runner-${reviewer_id#reviewer-}.pid" "${LOG_DIR}/${reviewer_id}.log" \
+      env ${reviewer_env[@]+"${reviewer_env[@]}"} \
+      bash "${SCRIPT_DIR}/review-runner.sh" "$reviewer_id"
+  done < <(node "${SCRIPT_DIR}/../src/lanes.js" --reviewers)
 
   start_bg "queue-watchdog" "${PID_DIR}/queue-watchdog.pid" "${LOG_DIR}/queue-watchdog.log" \
     bash "${SCRIPT_DIR}/queue-watcher.sh" watchdog

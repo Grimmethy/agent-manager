@@ -40,6 +40,40 @@ LOG_DIR="${LOG_DIR:-$HOME_LOGS}"                                                
 # Infinite polling loop same structure as all daemon scripts: bash 'while : do ... sleep' pattern matches what PowerShell does via while(true){ ... Start-Sleep -Seconds TICK } form in each .ps1 file.
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
+# Per-item claim (2026-10-18, a second review daemon on the P40): this loop lists queue/review/ and used to review every file it saw, which is fine for ONE
+# daemon and double-reviews with two (the single-flight lock below is keyed by model name, so the 3090 and the P40 reviewer do not serialize against each
+# other). A claim is an atomic `mkdir` under the instances dir; the claim is held until the NEXT item starts (or the loop/daemon ends) so it outlives the
+# approve/block move that follows the review -- releasing right after the review would leave a window where the other daemon re-reviews a file that is
+# about to move. A claim whose owner pid is dead, or that is older than 3 h, is stale and taken over.
+CLAIM_DIR="${INSTANCES_DIR}/review-claims"
+CURRENT_CLAIM=""
+release_current_claim() {
+  [[ -n "$CURRENT_CLAIM" ]] && rm -rf "${CLAIM_DIR}/${CURRENT_CLAIM}.d"
+  CURRENT_CLAIM=""
+}
+claim_review_item() {
+  local name="$1" d="${CLAIM_DIR}/${1}.d" owner_pid age
+  mkdir -p "$CLAIM_DIR" 2>/dev/null
+  if mkdir "$d" 2>/dev/null; then
+    printf '%s %s\n' "$$" "$INSTANCE_ID" > "${d}/owner"
+    CURRENT_CLAIM="$name"
+    return 0
+  fi
+  owner_pid="$(awk '{print $1}' "${d}/owner" 2>/dev/null)"
+  age=$(( $(date +%s) - $(stat -c %Y "$d" 2>/dev/null || echo 0) ))
+  if [[ -n "$owner_pid" ]] && kill -0 "$owner_pid" 2>/dev/null && (( age < 10800 )); then
+    return 1   # another live daemon is reviewing it
+  fi
+  rm -rf "$d"
+  if mkdir "$d" 2>/dev/null; then
+    printf '%s %s\n' "$$" "$INSTANCE_ID" > "${d}/owner"
+    CURRENT_CLAIM="$name"
+    return 0
+  fi
+  return 1
+}
+trap release_current_claim EXIT
+
 # Re-read a dashboard model-override for THIS instanceId once per tick (Workers tab
 # dropdown, 2026-08-18) -- exports LOCAL_MODEL for this tick so every write_heartbeat_file
 # and review-task.js call below picks it up automatically; no per-call-site change needed.
@@ -88,8 +122,16 @@ while :; do                                                                     
 
   # ComfyUI GPU lease (agent-manager-common.sh's comfyui_lease_held) -- PromptForge owns
   # the GPU for an image generation this tick.
-  if comfyui_lease_held; then
+  if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    if "$ONCE"; then exit 0; fi
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+
+  # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
+  if mem_pressure_high; then
+    printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
@@ -126,9 +168,12 @@ while :; do                                                                     
   # 30; done` loop has no equivalent fast-repeat path, so processing the whole snapshot
   # per tick is what keeps a backlog from taking N*30s longer than it needs to).
   for name in "${items[@]}"; do
+    release_current_claim                                                      # the previous item's approve/block move is done by now -- see claim_review_item
     file="${review_dir}/${name}"
     [[ -f "$file" && -s "$file" ]]                                             || continue        # skip non-file / empty (likely mid-write by another process) — same safety check local-worker.sh's claim loop uses.
 
+    claim_review_item "$name" || continue                                      # another review daemon has it
+    [[ -f "$file" && -s "$file" ]]                                             || continue        # it moved between our listing and our claim
     task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$file" 2>/dev/null)"
 
     # 2026-08-27, Grimmethy: "Review should never be gated behind claude. Please allow
@@ -186,6 +231,13 @@ while :; do                                                                     
       mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
       mv -n "$file" "${QUEUE_DIR}/blocked/${name}"
       printf '[review-%s] blocked %s: %s\n' "$INSTANCE_ID" "$task_id" "$review_result" >&2
+    elif grep -qE "the Forge family holds the GPU" <<< "$review_result"; then
+      # Forge GPU session (2026-10-14): local-client.js refused to START a model call because PromptForge holds the GPU (comfyui-lease)
+      # -- src/gpu-guard.js ForgePauseError / FORGE_PAUSE_MESSAGE. Not a failure and not an outage but a deliberate, open-ended pause
+      # (a Forge session lasts 20 min idle to 4 h), so: NO reviewFailureCount increment, NO infra-requeue round, NO block. The review
+      # stays in review/ and is picked up again once the lease clears; the next ticks yield at the top while it holds. Mirrors the
+      # matching branch in local-worker.sh; the pattern is the FORGE_PAUSE_MESSAGE text, pinned by src/local-client-forge-pause.test.js.
+      printf '[review-%s] review paused for a Forge GPU session -- not counted as a failure; %s stays in review/\n' "$INSTANCE_ID" "$task_id" >&2
     else
       # Review call itself failed (unknown domain, Ollama unreachable, etc.) -- leave the
       # file in review/ rather than lose it; it's picked up again next tick. Matches
@@ -272,6 +324,7 @@ while :; do                                                                     
     did_work=true
     if "$ONCE"; then break; fi   # a borrowed tick reviews ONE item, then the reviewer re-checks its home review/ before borrowing again
   done
+  release_current_claim                                                         # the last item of this tick is done too
 
   # Idle-only backoff: only pay the full poll interval when this tick genuinely found
   # nothing to review. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the

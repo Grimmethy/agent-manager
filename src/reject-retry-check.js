@@ -35,6 +35,8 @@ const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.j
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { acquire, release, taskMoveLockKey } = require('./single-flight-lock.js');
 const { sharedInstancesDir } = require('./instances-dir.js');
+const { recordAvoidedLane, describeTopTierFailure } = require('./premium-rotation.js');
+const { writeSideFindingInbox } = require('./side-finding.js');
 
 // Task-move lock (2026-09-27): every requeue/escalation below used to be a plain,
 // unguarded write-then-unlink -- no atomic rename, no check for whether a file for this
@@ -56,7 +58,7 @@ function writeTaskAndUnlinkOld(instancesDir, task, destPath, srcPath) {
 }
 const { getRegisteredSource, resolveSourceName } = require('./task-source-registry.js');
 const { isCandidateFulfillmentSource, isAdvisoryProseSource } = require('./lib/harness-search.js');
-const { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock } = require('./lib/reject-retry-check.js');
+const { deterministicReviewRecoveryCheck, forbiddenPathBlockNamesOwnTarget, computeBlockSignature, invalidPremiseBeforeCheckExisted, stalePremiseGateNoLongerFires, externalDepGateNoLongerBlocks, splitTooFewStillRetryable, alreadyEscalatedSinceLastReadmission, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock } = require('./lib/reject-retry-check.js');
 // 2026-09-16: registers this package's built-in sources (side effect of the require) --
 // deterministicReviewRecoveryCheck below looks a task's source up in this SAME registry
 // (getRegisteredSource), but this file itself never required task-sources.js, so a
@@ -238,7 +240,7 @@ function buildExhaustedFulfillmentQuestion(task) {
 // usually already moot by the time they exhaust (a later window supersedes it), not
 // something a human needs to individually triage -- see this session's own manual
 // retirement of 24 exhausted pipeline_debrief tasks for exactly that reasoning.
-const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief']);
+const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief', 'capability_debrief']);
 
 function isReviewVerdictAdvisoryProseSource(source) {
   return isAdvisoryProseSource(source) && !REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED.has(source);
@@ -521,7 +523,7 @@ function buildFeedbackString(ctx) {
   }
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, recordModelOutcome = defaultRecordModelOutcome }) {
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, repoRoot: repoRootOverride, lanes: lanesOverride = null, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
   // only matters for tests that don't bother passing pipelineDir explicitly (it was never
@@ -540,6 +542,8 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
     || (ghostRoot ? path.join(ghostRoot, 'queue', 'approved') : null);
   let recoveryConfig = {};
   try { recoveryConfig = getConfig(); } catch { /* no live config (e.g. a unit test) -- recovery check just no-ops */ }
+  // repoRoot: an explicit caller/test override wins over the live config (the stale-premise re-admission below checks files against it).
+  const sweepRepoRoot = repoRootOverride || recoveryConfig.repoRoot;
   const entries = discoverBlockedEntries({ blockedDir, adhocDir, derivedDir });
 
   if (entries.length === 0) return summary;
@@ -590,7 +594,12 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       // one) -- see invalidPremiseBeforeCheckExisted / hasInvalidPremise: it is either
       // re-admitted once or escalated by the classifier below, never left invisible.
       const invalidPremiseBlock = hasInvalidPremise(task);
-      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock) continue;
+      // A "sub-task premise may be stale" block whose gate no longer fires (it used to call a monorepo
+      // sub-root file missing) is recognized whatever its stage -- re-admitted once below.
+      const stalePremiseFalsePositive = stalePremiseGateNoLongerFires(task, { repoRoot: sweepRepoRoot });
+      const externalDepFalsePositive = externalDepGateNoLongerBlocks(task);
+      const splitTooFewReadmit = splitTooFewStillRetryable(task);
+      if (!isReviewRejection(task) && !retryableDraftBlock && !preCritiqueBlock && !preImplementBlock && !draftFailureBlock && !planDegenerateBlock && !implementDegenerateBlock && !critiqueDegenerateBlock && !invalidPremiseBlock && !stalePremiseFalsePositive && !externalDepFalsePositive && !splitTooFewReadmit) continue;
 
       // A continuation (agentic-draft-common.js: the model ran out of turns mid-
       // implementation, no real design question) is forward progress, not a failed
@@ -649,6 +658,62 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         appendHistoryEvent(task, 'requeued',
           "reject-retry-check: prior forbidden-path block named one of the task's own declared edit targets (adhoc-diff-sanity gate bug, since fixed) -- re-admitted with a clean slate, retry budget reset");
         recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'forbidden-path-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) stale-premise gate wrongly blocked: it cited a file that
+      // exists under a monorepo sub-root and the gate called it missing. The re-check above already
+      // proved the gate no longer fires, so no blind retry is involved -- clean slate, exactly once
+      // (the stalePremiseReadmitted stamp is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS, so a
+      // later clean-slate pass keeps the bound).
+      if (stalePremiseFalsePositive) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.stalePremiseReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was a stale-premise verdict from decompose-premise-check that called a cited file missing (it exists under a monorepo sub-root; resolved by path suffix since) -- re-admitted with a clean slate, exactly once");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'stale-premise-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a task the (now-fixed) external-dependency gate wrongly blocked: it matched a
+      // credential/network word in prose, a code span, or the plan echo of an ordinary code edit.
+      // The re-check above proved the gate no longer blocks, so no blind retry is involved -- clean
+      // slate, exactly once (externalDepReadmitted is deliberately NOT in READMIT_CLEAN_SLATE_FIELDS).
+      if (externalDepFalsePositive) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.externalDepReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          "reject-retry-check: prior block was the external-dependency gate matching credential/network vocabulary in prose, a code span, or the plan echo (code spans and the plan are no longer scanned, and soft markers only advise by default) -- re-admitted with a clean slate, exactly once");
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'external-dep-false-positive-readmit' });
+        const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
+        fs.mkdirSync(destDir, { recursive: true });
+        const newPath = path.join(destDir, name);
+        writeTaskAndUnlinkOld(instancesDir, task, newPath, filePath);
+        summary.requeued++;
+        continue;
+      }
+
+      // Re-admit a candidate whose split was rejected for having fewer than 2 usable sub-candidates before the in-draft retry existed
+      // (class C): clean slate, exactly once, so the draft's one corrective retry gets to run on it.
+      if (splitTooFewReadmit) {
+        for (const f of READMIT_CLEAN_SLATE_FIELDS) delete task[f];
+        task.splitTooFewReadmitted = true;
+        if (task.status === 'blocked') task.status = 'pending';
+        appendHistoryEvent(task, 'requeued',
+          'reject-retry-check: prior block was a candidate split with fewer than 2 usable sub-candidates; the draft now retries that once with the one-file-per-piece rule spelled out -- re-admitted with a clean slate, exactly once');
+        recordModelOutcome({ callId: task.abCallId, outcome: 'requeued', outcomeStage: 'watchdog', outcomeReason: 'split-too-few-readmit' });
         const destDir = (task.source === 'derived_task' && derivedDir) ? derivedDir : (isAdhocTask(task) && adhocDir) ? adhocDir : pendingDir;
         fs.mkdirSync(destDir, { recursive: true });
         const newPath = path.join(destDir, name);
@@ -916,6 +981,22 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         delete task.planResponse;
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'plan-pass degenerate -- cleared stale plan state for a fresh plan pass');
+        // Steer the task away from the lane it degenerated on while another lane exists (premium-rotation.js): the P40 lane
+        // kept re-claiming the same task and blocking it on a truncated plan, starving every task behind it.
+        // Tier rule (premium-rotation.js recordAvoidedLane): only a lane with a bigger lane above it is recorded. A degenerate plan on the BIGGEST lane records
+        // nothing (a block there would leave the task nowhere to go -- the stranded extend-the-doc premium task, 2026-10-17) and files a systemic side finding.
+        let lanes = [];
+        try { lanes = lanesOverride || require('./lanes.js').getLanes(); } catch (_) { lanes = []; }
+        const avoided = recordAvoidedLane(task, lanes.length, process.env, lanes);
+        if (avoided) {
+          appendHistoryEvent(task, 'lane-avoided', `plan degenerated on ${avoided}; other lanes get first claim`);
+        } else {
+          const finding = describeTopTierFailure(task, lanes);
+          if (finding) {
+            writeSideFindingInbox(finding, { source: 'lane_avoidance', taskId: task.id, stage: 'plan', pipelineDir });
+            appendHistoryEvent(task, 'advisory', `plan degenerated on the biggest lane; no lane avoidance recorded (nowhere bigger to go) -- filed a systemic side finding instead: ${finding.title}`);
+          }
+        }
       } else if (implementDegenerateBlock) {
         // The plan completed and is kept; only the unusable (empty / truncated) implement output is dropped.
         delete task.implementResponse;

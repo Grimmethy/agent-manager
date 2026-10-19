@@ -742,9 +742,10 @@ function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallRespons
       sentBodies.push(body);
       const turn = queue.length ? queue.shift() : {};
       // A scripted turn may carry `_usage: { prompt_eval_count, eval_count }` to exercise
-      // token accounting -- lift it onto the response envelope where Ollama really puts it.
-      const { _usage, ...message } = turn || {};
-      return { message, ...(_usage || {}) };
+      // token accounting, and `_done_reason` for the turn's stop reason -- lift both onto
+      // the response envelope where Ollama really puts them.
+      const { _usage, _done_reason, ...message } = turn || {};
+      return { message, ...(_usage || {}), ...(_done_reason !== undefined ? { done_reason: _done_reason } : {}) };
     },
     postJsonStream: async () => { throw new Error('streaming path not exercised in this test'); },
   });
@@ -831,7 +832,13 @@ test('runPlanWithTools reports an unknown tool as an error string result and kee
   ], async (mod) => {
     const result = await mod.runPlanWithTools({ prompt: 'go' });
     assert.equal(result.response, 'recovered');
-    assert.deepEqual(result.toolCallLog[0].result, { error: 'unknown tool: nonexistent_tool' });
+    // 2026-09-22: the error string must now enumerate the actually-registered tools so
+    // the model can self-correct on its next turn (a bare "unknown tool: X" let one
+    // tier-3 run conclude it was stuck after a single hallucinated `list_files` call).
+    // Assert the FORMAT (name + comma-separated available list), not the exact tool
+    // list, so this stays correct as the read-only tool set grows.
+    assert.match(result.toolCallLog[0].result.error,
+      /^unknown tool: nonexistent_tool\. Available tools: \w+(, \w+)+\.$/);
   });
 });
 
@@ -1990,4 +1997,250 @@ test('windowSectionText (read_task sections) pages every line exactly once acros
   assert.deepEqual(pageAll((offset) => require('./local-tool-client.js').windowSectionText(text, offset, 200)), all);
   const small = require('./local-tool-client.js').windowSectionText('a\nb\nc\nd', 2, 2);
   assert.deepEqual([small.content, small.nextOffset, small.truncated], ['b\nc', 4, false]);
+});
+
+// --- read-only sibling repos for the implement pass (2026-10-16) -------------------------------------------------------------------------------
+// The GPU broker verification tasks could not read /media/model-cache/github/videoforge: the implement pass's tool roots were its worktree only.
+function siblingFixture(fn) {
+  return withFixtureRepo((mod, dir) => {
+    const sib = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'ltc-sibling-')));
+    fs.mkdirSync(path.join(sib, 'server', 'core'), { recursive: true });
+    fs.writeFileSync(path.join(sib, 'server', 'core', 'gpu.py'), 'def acquire():\n    pass\n');
+    fs.writeFileSync(path.join(sib, '.env'), 'TOKEN=abc\n');
+    fs.writeFileSync(path.join(sib, 'my-secret-notes.md'), 'TOKEN=abc in a grep-able extension\n');
+    fs.writeFileSync(path.join(sib, 'ordinary.md'), 'TOKEN is documented here\n');
+    fs.writeFileSync(path.join(dir, '.env'), 'LOCAL=1\n');
+    fs.writeFileSync(path.join(dir, 'mine.js'), 'const a = 1;\n');
+    const primary = fs.realpathSync(dir);
+    return fn(mod, primary, sib);
+  });
+}
+
+test('read-only sibling: read_file, list_directory and list_roots work there, and list_roots flags it readOnly', () => {
+  siblingFixture((mod, dir, sib) => {
+    const h = mod.buildToolHandlers([dir, sib], dir, [sib]);
+    assert.match(h.read_file({ path: path.join(sib, 'server/core/gpu.py') }).content, /def acquire/);
+    assert.ok(h.list_directory({ path: sib }).entries.some((e) => e.name === 'server'));
+    const roots = h.list_roots().roots;
+    assert.equal(roots.find((r) => r.path === sib).readOnly, true);
+    assert.equal(roots.find((r) => r.path === dir).primary, true);
+    assert.equal(roots.find((r) => r.path === dir).readOnly, undefined);
+    assert.ok(Array.isArray(h.grep_codebase({ query: 'acquire', root: sib })), 'grep accepts the sibling as a root');
+  });
+});
+
+test('read-only sibling: a path outside every root is still refused (a sibling root does not widen access)', () => {
+  siblingFixture((mod, dir, sib) => {
+    const h = mod.buildToolHandlers([dir, sib], dir, [sib]);
+    assert.match(h.read_file({ path: '/etc/hostname' }).error, /not inside any accessible repo/);
+    assert.match(h.grep_codebase({ query: 'x', root: '/etc' }).error, /not an accessible repo/);
+  });
+});
+
+test('read-only sibling: credential-looking files are refused or hidden there but not in the primary repo', () => {
+  siblingFixture((mod, dir, sib) => {
+    const h = mod.buildToolHandlers([dir, sib], dir, [sib]);
+    assert.match(h.read_file({ path: path.join(sib, '.env') }).error, /credential-looking file in a read-only sibling repo/);
+    assert.equal(h.read_file({ path: path.join(dir, '.env') }).content, 'LOCAL=1\n');
+    assert.ok(!h.list_directory({ path: sib }).entries.some((e) => e.name === '.env'), 'listing hides it');
+    assert.ok(h.list_directory({ path: dir }).entries.some((e) => e.name === '.env'), 'primary listing is unfiltered');
+    const hits = h.grep_codebase({ query: 'TOKEN', root: sib });
+    assert.ok(Array.isArray(hits) && hits.some((x) => x.file === 'ordinary.md'), 'grep still finds ordinary files in the sibling');
+    assert.ok(!hits.some((x) => /secret|\.env/.test(x.file)), 'grep never returns hits from a credential-looking file in a sibling');
+  });
+});
+
+test('read-only sibling: write_file and edit_file refuse it (file unchanged) while the primary repo is writable', () => {
+  siblingFixture((mod, dir, sib) => {
+    const w = mod.buildWriteToolHandlers([dir], dir, [sib]);
+    const target = path.join(sib, 'server', 'core', 'gpu.py');
+    const before = fs.readFileSync(target, 'utf8');
+    assert.match(w.write_file({ path: target, content: 'pwned' }).error, /read-only sibling repo/);
+    assert.match(w.edit_file({ path: target, find: 'acquire', replace: 'x' }).error, /read-only sibling repo/);
+    assert.match(w.write_file({ path: path.join(sib, 'new.txt'), content: 'n' }).error, /read-only sibling repo/);
+    assert.equal(fs.readFileSync(target, 'utf8'), before);
+    assert.equal(fs.existsSync(path.join(sib, 'new.txt')), false);
+    assert.equal(w.write_file({ path: 'made.txt', content: 'ok' }).written, true);
+    assert.equal(w.edit_file({ path: 'mine.js', find: 'const a = 1;', replace: 'const a = 2;' }).edited, true);
+  });
+});
+
+test('read-only sibling: run_bash can read it but a write into it fails, while writing in the primary repo works', () => {
+  siblingFixture((mod, dir, sib) => {
+    const w = mod.buildWriteToolHandlers([dir], dir, [sib]);
+    const read = w.run_bash({ command: `cat ${path.join(sib, 'server/core/gpu.py')}` });
+    if (read.error) { assert.match(read.error, /sandbox \(bwrap\) is not available/); return; } // no bwrap on this host: nothing further to prove
+    assert.match(read.stdout, /def acquire/);
+    const write = w.run_bash({ command: `echo pwned > ${path.join(sib, 'server/core/gpu.py')}; echo done > ${path.join(sib, 'new.txt')}` });
+    assert.notEqual(write.exitCode, 0, 'writing into the read-only mount must fail');
+    assert.match(fs.readFileSync(path.join(sib, 'server/core/gpu.py'), 'utf8'), /def acquire/);
+    assert.equal(fs.existsSync(path.join(sib, 'new.txt')), false);
+    const ok = w.run_bash({ command: 'echo fine > made-by-bash.txt' });
+    assert.equal(ok.exitCode, 0);
+    assert.equal(fs.readFileSync(path.join(dir, 'made-by-bash.txt'), 'utf8'), 'fine\n');
+  });
+});
+
+test('without readOnlyRoots the handlers behave exactly as before: a sibling path is not accessible', () => {
+  siblingFixture((mod, dir, sib) => {
+    const h = mod.buildToolHandlers([dir], dir);
+    assert.match(h.read_file({ path: path.join(sib, 'server/core/gpu.py') }).error, /not inside any accessible repo/);
+    const w = mod.buildWriteToolHandlers([dir], dir);
+    assert.match(w.write_file({ path: path.join(sib, 'x.txt'), content: 'x' }).error, /not inside any accessible repo/);
+  });
+});
+
+// --- tool-loop audit (2026-10-18, brain-dump 1889) --------------------------------------
+// runPlanWithTools writes one 'turn-end' line per turn and one 'tool-outcome' line per
+// edit_file/write_file call to instances/tool-loop-audit.log (see tool-loop-audit.js),
+// never to pipeline-history.log, and the non-streaming branch now carries done_reason.
+
+function readAuditLines(dir) {
+  const p = path.join(dir, 'instances', 'tool-loop-audit.log');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+function readHistoryLines(dir) {
+  const p = path.join(dir, 'instances', 'pipeline-history.log');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test('tool-loop audit: a multi-turn write run logs one turn-end per turn and one tool-outcome per edit/write call, only in tool-loop-audit.log', async () => {
+  const SENTINEL_PATH = 'secret-dir-7f3a/notes.txt';
+  const SENTINEL_TEXT = 'SENTINEL_PRIVATE_TEXT_91c2';
+  const prevAudit = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  try {
+    await withMockedChat([
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: SENTINEL_TEXT, replace: 'x' } } }] },
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [
+        { function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'beta', replace: 'x' } } },
+        { function: { name: 'write_file', arguments: { path: SENTINEL_PATH, content: SENTINEL_TEXT } } },
+      ] },
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'alpha', replace: 'ALPHA' } } }] },
+      { role: 'assistant', content: 'done', _done_reason: 'stop', _usage: { prompt_eval_count: 120, eval_count: 7 } },
+    ], async (mod, dir) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'alpha\nbeta\nbeta\n');
+      const result = await mod.runPlanWithTools({ prompt: 'fix it', allowWrite: true, source: 'manual', taskId: 'audit-t1', stage: 'agentic-write', maxTurns: 6 });
+      assert.equal(result.response, 'done');
+      assert.equal(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), 'ALPHA\nbeta\nbeta\n', 'the real edit_file handler ran');
+
+      const lines = readAuditLines(dir);
+      const turnEnds = lines.filter((e) => e.type === 'turn-end');
+      assert.deepEqual(turnEnds.map((e) => e.endClass), ['tool-calls', 'tool-calls', 'tool-calls', 'stop']);
+      assert.deepEqual(turnEnds.map((e) => e.turn), [0, 1, 2, 3]);
+      assert.ok(turnEnds.every((e) => e.taskId === 'audit-t1' && e.stage === 'agentic-write' && e.source === 'manual' && e.phase === 'loop'));
+      assert.deepEqual(turnEnds[1].toolNames, ['edit_file', 'write_file']);
+      assert.equal(turnEnds[3].promptEvalCount, 120);
+      const outcomes = lines.filter((e) => e.type === 'tool-outcome');
+      assert.deepEqual(outcomes.map((e) => `${e.tool}:${e.outcome}`), ['edit_file:not-found', 'edit_file:ambiguous', 'write_file:applied', 'edit_file:applied']);
+      assert.deepEqual(outcomes.map((e) => e.turn), [0, 1, 1, 2]);
+
+      const historyTypes = readHistoryLines(dir).map((e) => e.type);
+      assert.ok(!historyTypes.includes('turn-end') && !historyTypes.includes('tool-outcome'), 'nothing per-turn lands in pipeline-history.log');
+
+      const raw = fs.readFileSync(path.join(dir, 'instances', 'tool-loop-audit.log'), 'utf8');
+      assert.ok(!raw.includes('secret-dir-7f3a') && !raw.includes('SENTINEL_PRIVATE_TEXT') && !raw.includes('a.txt'), 'no paths or text in the audit log');
+
+      // Read side over the log this real loop run just wrote.
+      const out = execFileSync(process.execPath, [path.join(__dirname, 'tool-loop-audit.js'), '7', '--json'], {
+        env: { ...process.env, AGENT_MANAGER_PIPELINE_DIR: dir }, encoding: 'utf8',
+      });
+      const rows = JSON.parse(out);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].turns, 4);
+      assert.equal(rows[0].tools.edit_file.total, 3);
+      assert.equal(rows[0].tools.edit_file.outcomes.applied, 1);
+      assert.equal(rows[0].tools.write_file.missRate, 0);
+    });
+  } finally {
+    if (prevAudit === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+    else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prevAudit;
+  }
+});
+
+test('tool-loop audit: a non-streaming turn with done_reason "length" now fires the existing context-budget truncated event', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'I was in the middle of', _done_reason: 'length', _usage: { prompt_eval_count: 900, eval_count: 300 } },
+  ], async (mod, dir) => {
+    await mod.runPlanWithTools({ prompt: 'go', taskId: 'audit-t2', stage: 'plan' });
+    const truncated = readHistoryLines(dir).filter((e) => e.type === 'context-budget' && e.event === 'truncated');
+    assert.equal(truncated.length, 1);
+    assert.equal(truncated[0].taskId, 'audit-t2');
+    const turnEnds = readAuditLines(dir).filter((e) => e.type === 'turn-end');
+    assert.equal(turnEnds.length, 1);
+    assert.equal(turnEnds[0].doneReason, 'length');
+    assert.equal(turnEnds[0].endClass, 'length');
+  });
+});
+
+test('tool-loop audit: a turn whose reply carries no done_reason is logged with doneReason null and endClass unknown', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'here is the answer' }], async (mod, dir) => {
+    await mod.runPlanWithTools({ prompt: 'hi', taskId: 'audit-t3' });
+    const [e] = readAuditLines(dir);
+    assert.equal(e.type, 'turn-end');
+    assert.ok(Object.prototype.hasOwnProperty.call(e, 'doneReason'), 'doneReason is present, not omitted');
+    assert.equal(e.doneReason, null);
+    assert.equal(e.endClass, 'unknown');
+  });
+});
+
+test('tool-loop audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes no audit file and the loop result is unchanged', async () => {
+  const prev = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = 'off';
+  try {
+    await withMockedChat([{ role: 'assistant', content: 'here is the answer', _done_reason: 'stop' }], async (mod, dir) => {
+      const result = await mod.runPlanWithTools({ prompt: 'hi' });
+      assert.equal(result.response, 'here is the answer');
+      assert.equal(fs.existsSync(path.join(dir, 'instances', 'tool-loop-audit.log')), false);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+    else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
+  }
+});
+
+test('tool-loop audit: executeToolCalls keeps its 5-parameter declaration (outcomes are classified from toolCallLog in the loop instead)', () => {
+  // executeToolCalls is module-private, so its arity is checked on the source declaration.
+  const src = fs.readFileSync(path.join(__dirname, 'local-tool-client.js'), 'utf8');
+  const m = src.match(/async function executeToolCalls\(([^)]*)\)/);
+  assert.ok(m, 'executeToolCalls declaration found');
+  assert.deepEqual(m[1].split(',').map((s) => s.trim()), ['assistantMessage', 'toolCalls', 'toolHandlers', 'messages', 'toolCallLog']);
+});
+
+// --- trajectory export (2026-10-18, brain-dump 1892 part 1) --------------------------------
+test('trajectory: a multi-turn write run leaves one gzip trajectory with the messages, turns and tool-call arguments', async () => {
+  const prev = process.env.AGENT_MANAGER_TRAJECTORY;
+  delete process.env.AGENT_MANAGER_TRAJECTORY;
+  try {
+    await withMockedChat([
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'alpha', replace: 'ALPHA' } } }] },
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] },
+      { role: 'assistant', content: 'all done', _done_reason: 'stop', _usage: { prompt_eval_count: 300, eval_count: 12 } },
+    ], async (mod, dir) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'alpha\n');
+      const result = await mod.runPlanWithTools({ prompt: 'fix it', allowWrite: true, source: 'manual', taskId: 'traj-t1', stage: 'agentic-write', maxTurns: 5 });
+      assert.equal(result.response, 'all done');
+      const { listTrajectories, readTrajectory } = require('./trajectory.js');
+      const rows = listTrajectories(dir, 'traj-t1');
+      assert.equal(rows.length, 1, 'exactly one trajectory for the run');
+      const t = readTrajectory(rows[0].file);
+      assert.equal(t.taskId, 'traj-t1');
+      assert.equal(t.stage, 'agentic-write');
+      assert.equal(t.source, 'manual');
+      assert.deepEqual(t.turns.map((x) => x.endClass), ['tool-calls', 'tool-calls', 'stop']);
+      assert.equal(t.result.turnsUsed, 3);
+      assert.equal(t.result.responseChars, 'all done'.length);
+      const assistantWithEdit = t.messages.find((m) => m.tool_calls && m.tool_calls[0].name === 'edit_file');
+      assert.deepEqual(JSON.parse(assistantWithEdit.tool_calls[0].arguments), { path: 'a.txt', find: 'alpha', replace: 'ALPHA' });
+      assert.ok(t.messages.some((m) => m.role === 'tool' && /"edited":true/.test(m.content)), 'the tool result is kept');
+      const finalMsg = t.messages[t.messages.length - 1];
+      assert.equal(finalMsg.content, 'all done');
+      assert.equal(finalMsg.final, true, 'the final answer is appended (the loop returns it without pushing it)');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TRAJECTORY; else process.env.AGENT_MANAGER_TRAJECTORY = prev;
+  }
 });

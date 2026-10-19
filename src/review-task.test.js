@@ -36,6 +36,7 @@ process.env.AGENT_MANAGER_REPO_ROOT = require('os').tmpdir();
 process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false';
 process.env.AGENT_MANAGER_REVIEW_INERT_CHECK = 'false';
 process.env.AGENT_MANAGER_REVIEW_SKIPPATH_RULE = 'false';
+process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK = 'false';
 process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
 // 2026-08-23: review-task.js's own isEmptyApprovalSource/isAdvisoryProseSource now read
@@ -553,6 +554,68 @@ test('NON_IMPL gate: non-exempt source short prose IS flagged', async () => {
   assert.equal(result.blockedStage, 'review');
   assert.match(result.blockedReason, /Deterministic gate: implementResponse is a bare tool-call request or meta-commentary/);
   assert.equal(captured.length, 0, 'no reviewer vote spent on a mechanically-decidable rejection');
+});
+
+// 2026-10-07: the <80-char rule blocked the model's CORRECT whole-file delete directive (71-79 chars) on length alone (9 stranded
+// deadcode_fix tasks; every delete of 80+ chars had merged). A structurally valid change set now skips the length heuristic.
+async function gateOutcomeFor(implementResponse, source = 'trouble_log') {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = baseTask({ source, planResponse: '1. Remove the unused file.', implementResponse });
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  return { task, result, votes: captured.length };
+}
+
+test('NON_IMPL gate: a short valid delete directive reaches the real vote instead of the deterministic block', async () => {
+  const resp = '{"mode": "delete", "file": "TaxHarvest/frontend/src/components/ui/form.tsx"}';
+  assert.ok(resp.length < 80, `fixture must be under the heuristic length (${resp.length})`);
+  const { task, result, votes } = await gateOutcomeFor(resp);
+  assert.notEqual(task.reviewProvider, 'deterministic-non-implementation');
+  assert.equal(result.verdict, 'approved');
+  assert.equal(votes, 1, 'the delete must be judged by the real reviewer vote');
+});
+
+test('NON_IMPL gate: a short valid edit and a short valid create also reach the vote', async () => {
+  for (const resp of ['{"mode":"edit","file":"a.js","find":"x","replace":"y"}', '{"mode":"create","file":"a.js","content":"z"}', '[{"mode":"delete","file":"a.js"},{"mode":"delete","file":"b.js"}]']) {
+    assert.ok(resp.length < 80, resp);
+    const { task, votes } = await gateOutcomeFor(resp);
+    assert.notEqual(task.reviewProvider, 'deterministic-non-implementation', resp);
+    assert.equal(votes, 1, resp);
+  }
+});
+
+test('NON_IMPL gate: a short mode "read" request, short prose, an item without a file, and malformed JSON are STILL blocked', async () => {
+  for (const resp of [
+    '{"mode": "read", "file": "TaxHarvest/frontend/src/App.tsx"}',
+    'This is a false positive; no action needed.',
+    '{"mode": "delete"}',
+    '{"mode": "delete", "file": "../../etc/passwd"}',
+    '{"mode": "delete", "file": "a.js"',
+    '[]',
+  ]) {
+    const { task, result, votes } = await gateOutcomeFor(resp);
+    assert.equal(task.reviewProvider, 'deterministic-non-implementation', resp);
+    assert.equal(result.verdict, 'blocked', resp);
+    assert.equal(votes, 0, resp);
+  }
+});
+
+test('NON_IMPL gate: a mode "read" tool-call request is blocked even when it is 80+ characters (the length rule alone would not catch it)', async () => {
+  const resp = `{"mode": "read", "file": "TaxHarvest/frontend/src/components/some/deeply/nested/directory/Component.tsx"}`;
+  assert.ok(resp.length >= 80, `fixture must be past the length heuristic (${resp.length})`);
+  const { task, result, votes } = await gateOutcomeFor(resp);
+  assert.equal(task.reviewProvider, 'deterministic-non-implementation');
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(votes, 0);
+});
+
+test('NON_IMPL gate: a long implementResponse (summary plus diff) that merely MENTIONS "mode": "read" is NOT rejected as a tool call', async () => {
+  const body = `Added gate tests.\n\n=== DIFF ===\n${'diff --git a/src/x.test.js b/src/x.test.js\n+  const resp = \'{"mode": "read", "file": "a.js"}\';\n+  assert.equal(blocked(resp), true);\n'.repeat(8)}`;
+  assert.ok(body.length > 300);
+  const { task, result, votes } = await gateOutcomeFor(body);
+  assert.notEqual(task.reviewProvider, 'deterministic-non-implementation');
+  assert.equal(result.verdict, 'approved');
+  assert.equal(votes, 1);
 });
 
 // Regression, 2026-08-23: caught live -- observabilityReviewImplementPrompt/
@@ -1130,6 +1193,77 @@ test('reviewTask STILL hard-blocks the same stacked task citing a genuinely fabr
   assert.equal(result.verdict, 'blocked');
   assert.equal(task.reviewProvider, 'deterministic-ungrounded-value',
     'a value fabricated everywhere, including on the stacked branch, must still be caught -- proves this is not a blanket loosening of the gate');
+});
+
+// Pull the exact deterministic fact-check object (flags + per-path fileChecks) that
+// buildVerdictPrompt hands the reviewer model out of the captured vote prompt, so these
+// tests assert on the real per-file existence verdict -- not just the derived
+// factCheckVerdict label, which a badly-derived flag set could still obscure.
+function factCheckFromPrompt(prompt) {
+  const idx = prompt.indexOf('--- Deterministic fact-check pre-filter (necessary, NOT sufficient) ---');
+  assert.ok(idx !== -1, 'the verdict prompt must carry the deterministic fact-check section');
+  return JSON.parse(prompt.slice(idx).split('\n', 2)[1]);
+}
+
+// HUB0109 3/3 stacked regression: a seq-2 task cites a file its predecessor committed
+// to the shared stacked branch. That file does NOT exist in the working-tree checkout
+// (main), so a working-tree-only existence check flags the sibling's real file as
+// fabricated. With the branch ref threaded through checkDraft -> checkFilePaths it must
+// resolve against the stacked branch's real tip (exists: true) and stay 'pass'.
+test('stacked seq-2: a file that exists only on the predecessor branch is NOT flagged missing-file', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeGitFixtureWithStackedBranch();
+  assert.equal(fs.existsSync(path.join(repoRoot, 'src', 'sibling.js')), false,
+    'precondition: the cited file must be ABSENT from the working-tree checkout (main)');
+  const task = {
+    id: 'stacked-missing-file-regression', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Follow on from the sibling move task on this stacked branch: src/sibling.js already defines SIBLING_ONLY_FIELD there, so wire the existing call site through it and drop the duplicated setup, with enough detail here to clear the length floor.',
+    promptContext: { body: 'unrelated grounding material' },
+    stacked: { branch: 'agent/stacked-family', seq: 2, total: 2 },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(captured.length, 1, 'must reach the real review vote, not a false hard-block');
+  const factCheck = factCheckFromPrompt(captured[0]);
+  const siblingEntry = (factCheck.fileChecks || []).find((f) => f.claimedPath === 'src/sibling.js');
+  assert.ok(siblingEntry, 'the cited sibling-branch file must appear in fileChecks at all');
+  assert.equal(siblingEntry.exists, true,
+    'a file the predecessor really committed to the stacked branch must resolve exists:true via the branch ref');
+  assert.equal(
+    (factCheck.flags || []).some((f) => f.type === 'missing-file' && f.detail === 'src/sibling.js'),
+    false, 'a sibling-only real file must NOT produce a missing-file flag');
+  assert.equal(result.factCheckVerdict, 'pass', 'no missing-file flag => fact-check verdict stays pass');
+});
+
+// HUB0109 3/3 control: the SAME fact-check machinery on a NON-stacked task must still
+// flag a file that exists nowhere -- the ref threading must be inert (ref null) here,
+// not a blanket loosening of the existence check.
+test('non-stacked: a file that does not exist on master IS still flagged missing-file', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  assert.equal(fs.existsSync(path.join(repoRoot, 'notes', 'ghost.md')), false,
+    'precondition: notes/ghost.md must not exist on disk');
+  const task = {
+    id: 'non-stacked-missing-file-regression', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Move the duplicated helper out of the two call sites and into notes/ghost.md as the single new home both will import from going forward, with enough detail here to clear the length floor.',
+    promptContext: { body: 'unrelated grounding material' },
+  };
+  assert.ok(!task.stacked, 'control precondition: this task is NOT stacked, so no branch ref applies');
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(captured.length, 1, 'flags are advisory to the vote -- the draft still reaches the reviewer');
+  const factCheck = factCheckFromPrompt(captured[0]);
+  const ghostEntry = (factCheck.fileChecks || []).find((f) => f.claimedPath === 'notes/ghost.md');
+  assert.ok(ghostEntry, 'the cited nonexistent file must appear in fileChecks');
+  assert.equal(ghostEntry.exists, false, 'a file absent from the working tree (and nowhere else) must resolve exists:false');
+  assert.ok(
+    (factCheck.flags || []).some((f) => f.type === 'missing-file' && f.detail === 'notes/ghost.md'),
+    'the missing-file flag must still be raised for a genuinely absent file');
+  assert.equal(result.factCheckVerdict, 'flagged', 'a real missing-file flag must flip the verdict label to flagged');
 });
 
 // 2026-09-08, Second Brain [[dspy-deterministic-prompt-tuning]] research applied: this
@@ -2612,3 +2746,263 @@ test('replay: the real detector flags a diff that adds a gate returning an archi
   assert.equal(plain.task.skipPaths.paths.length, 0);
   assert.doesNotMatch(plain.prompt, /Skip \/ dismiss paths/);
 }));
+
+
+// --- undefined identifier after removal (brain dump #1768): a change that deletes a declaration whose name the file still uses -----------------------------
+function withUndefinedCheck(mode, fn) {
+  return async () => {
+    const prev = process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK;
+    if (mode === undefined) delete process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK; else process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK = mode;
+    try { await fn(); } finally { process.env.AGENT_MANAGER_REVIEW_UNDEFINED_CHECK = prev; }
+  };
+}
+const UNDEF_EDITS = JSON.stringify([{ mode: 'edit', file: 'src/db.js', find: 'const [STATUS_PENDING, STATUS_DRAFTING] = AGENT_TASK_STATUSES;', replace: "const { STATUS } = require('./statuses');" }]);
+const UNDEF_FOUND = { considered: 2, unknown: 0, uses: [{ file: 'src/db.js', name: 'STATUS_PENDING', lines: [{ line: 121, text: 'if (prev.status !== STATUS_PENDING) {' }] }] };
+const candidateEditTask = (id, extra = {}) => baseTask({ id, source: 'arch_review', implementResponse: UNDEF_EDITS, ...extra });
+
+test('undefined-after-removal, default mode: the review is blocked before any vote, and the reason names the identifier, the file and the line', withUndefinedCheck(undefined, async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = candidateEditTask('undef-block');
+  const captured = [];
+  const outcomes = [];
+  let seen = null;
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: (o) => outcomes.push(o), findUndefinedFn: (a) => { seen = a; return UNDEF_FOUND; } });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.match(result.blockedReason, /Deterministic gate: undefined identifier after removal/);
+  assert.match(result.blockedReason, /`STATUS_PENDING` in src\/db\.js \(line 121: if \(prev\.status !== STATUS_PENDING\) \{\)/);
+  assert.equal(captured.length, 0, 'no vote is spent');
+  assert.equal(task.reviewProvider, 'deterministic-undefined-after-removal');
+  assert.equal(outcomes[0].outcome, 'rejected');
+  assert.equal(Array.isArray(seen.edits) && seen.edits[0].file, 'src/db.js');
+  assert.equal(seen.rawDiff, undefined, 'an edit-array draft is passed as edits, not as a diff');
+  assert.equal(task.undefinedAfterRemoval.total, 1);
+  assert.ok(task.history.some((h) => h.stage === 'blocked' && /undefined identifier after removal/.test(h.detail)));
+}));
+
+test('undefined-after-removal covers an implemented adhoc rawDiff too', withUndefinedCheck(undefined, async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'undef-adhoc-diff' });
+  let seen = null;
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findUndefinedFn: (a) => { seen = a; return UNDEF_FOUND; } });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(seen.rawDiff, task.rawDiff);
+  assert.equal(seen.edits, undefined);
+}));
+
+test('undefined-after-removal, advisory mode: the voters see the finding, the history notes it, and the vote still happens', withUndefinedCheck('advisory', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = candidateEditTask('undef-advisory');
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findUndefinedFn: () => UNDEF_FOUND });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1);
+  assert.match(captured[0], /Removed declarations that are still used \(deterministic check; advisory\)/);
+  assert.match(captured[0], /`STATUS_PENDING` in src\/db\.js \(line 121/);
+  assert.match(task.history.find((h) => h.stage === 'advisory' && /undefined-after-removal check/.test(h.detail)).detail, /1 removed declaration\(s\) still used \(STATUS_PENDING\)/);
+}));
+
+test('undefined-after-removal: nothing found means no section and no note; a throwing or junk finder cannot break the review', withUndefinedCheck(undefined, async () => {
+  for (const [label, finder] of [['clean', () => ({ considered: 3, unknown: 0, uses: [] })], ['throws', () => { throw new Error('git exploded'); }], ['junk', () => 'nope']]) {
+    const { repoRoot, domainsPath } = makeFixture();
+    const task = candidateEditTask(`undef-${label}`);
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, findUndefinedFn: finder });
+    assert.equal(result.verdict, 'approved', label);
+    assert.equal(captured.length, 1, label);
+    assert.doesNotMatch(captured[0], /Removed declarations that are still used/, label);
+    assert.equal(task.history.some((h) => /undefined-after-removal|undefined identifier/.test(h.detail || '')), false, label);
+  }
+}));
+
+test('undefined-after-removal: the finder is not called when the switch is off, or for a draft that is neither an implemented adhoc diff nor an edit array', async () => {
+  let calls = 0;
+  const finder = () => { calls += 1; return UNDEF_FOUND; };
+  const run = async (task) => {
+    const { repoRoot, domainsPath } = makeFixture();
+    await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {}, findUndefinedFn: finder });
+  };
+  await run(candidateEditTask('undef-off'));                                               // switch is 'false' here (set at the top of the file)
+  assert.equal(calls, 0);
+  await withUndefinedCheck(undefined, async () => {
+    await run(baseTask({ id: 'undef-prose', source: 'arch_review', implementResponse: 'Plain prose: rename the constants everywhere.' }));
+    await run(baseTask({ id: 'undef-not-ops', source: 'arch_review', implementResponse: JSON.stringify([{ title: 'a sub-task proposal' }]) }));
+    await run(adhocImplementedTask({ id: 'undef-no-diff', rawDiff: '', implementResponse: 'prose only' }));
+    assert.equal(calls, 0);
+    await run(candidateEditTask('undef-on'));
+    assert.equal(calls, 1);
+  })();
+});
+
+test('undefined-after-removal helpers: the summary clamps junk, the section is empty when nothing was found', () => {
+  const { summariseUndefinedRemoval, formatUndefinedRemovalSection, undefinedRemovalBlockReason, editsOfImplementResponse } = require('./review-task.js');
+  const s = summariseUndefinedRemoval({ considered: -1, unknown: 'x', uses: Array.from({ length: 12 }, (_, i) => ({ file: 'f.js', name: `n${i}`.padEnd(300, 'x'), lines: Array.from({ length: 9 }, (_, k) => ({ line: k, text: 'y'.repeat(400) })) })) });
+  assert.deepEqual([s.considered, s.unknown, s.total, s.uses.length, s.uses[0].lines.length, s.uses[0].name.length, s.uses[0].lines[0].text.length], [0, 0, 12, 8, 5, 120, 140]);
+  for (const none of [undefined, null, {}, { uses: [] }]) assert.equal(formatUndefinedRemovalSection(none), '');
+  assert.match(undefinedRemovalBlockReason(summariseUndefinedRemoval(UNDEF_FOUND)), /1 name\(s\) that the file still uses/);
+  assert.equal(editsOfImplementResponse({ implementResponse: 'prose' }), null);
+  assert.equal(editsOfImplementResponse({ implementResponse: '{"mode":"edit","file":"a.js","find":"x","replace":"y"}' }).length, 1);
+  assert.equal(editsOfImplementResponse({ implementResponse: '[{"mode":"edit","file":"a.js","find":"x","replace":"y"},{"nope":1}]' }), null);
+});
+
+// Real engine, real git: the AC-46 shape against a real remote -- the destructuring is replaced, one use survives on an untouched line.
+// (withReplayRepo removes its temp dir as soon as the callback first yields, so each review gets its own repo.)
+const UNDEF_REPLAY_BASE = "const { AGENT_TASK_STATUSES } = require('./s');\nconst [STATUS_PENDING, STATUS_DRAFTING] = AGENT_TASK_STATUSES;\nfunction a() { return { status: STATUS_PENDING }; }\nfunction b(prev) { return prev.status !== STATUS_PENDING; }\n";
+const UNDEF_REPLAY_PARTIAL = [
+  { mode: 'edit', file: 'src/db.js', find: 'const [STATUS_PENDING, STATUS_DRAFTING] = AGENT_TASK_STATUSES;', replace: "const { STATUS } = require('./s');" },
+  { mode: 'edit', file: 'src/db.js', find: 'status: STATUS_PENDING', replace: 'status: STATUS.pending' },
+];
+
+test('replay: the real check, against a real git remote, blocks the AC-46 shape', withUndefinedCheck(undefined, async () => {
+  await withReplayRepo({ 'src/db.js': UNDEF_REPLAY_BASE }, async ({ work, domainsPath }) => {
+    const bad = baseTask({ id: 'replay-undef-bad', source: 'arch_review', implementResponse: JSON.stringify(UNDEF_REPLAY_PARTIAL) });
+    const r = await reviewTask(bad, { repoRoot: work, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {} });
+    assert.equal(r.verdict, 'blocked');
+    assert.match(r.blockedReason, /`STATUS_PENDING` in src\/db\.js \(line 4: function b\(prev\) \{ return prev\.status !== STATUS_PENDING; \}\)/);
+  });
+}));
+
+test('replay: the real check, against a real git remote, passes the complete rename and lets the vote happen', withUndefinedCheck(undefined, async () => {
+  await withReplayRepo({ 'src/db.js': UNDEF_REPLAY_BASE }, async ({ work, domainsPath }) => {
+    const complete = [...UNDEF_REPLAY_PARTIAL, { mode: 'edit', file: 'src/db.js', find: 'prev.status !== STATUS_PENDING', replace: 'prev.status !== STATUS.pending' }];
+    const good = baseTask({ id: 'replay-undef-good', source: 'arch_review', implementResponse: JSON.stringify(complete) });
+    const captured = [];
+    const r = await reviewTask(good, { repoRoot: work, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+    assert.equal(r.verdict, 'approved');
+    assert.equal(captured.length, 1);
+    assert.equal(good.undefinedAfterRemoval.total, 0);
+  });
+}));
+
+test('the executed-verification budget exceeds the covering-test timeout so a slow passing suite is not clamped into a timeout', () => {
+  const { EXECUTED_VERIFY_BUDGET_MS } = require('./review-task.js');
+  const { DEFAULT_TEST_TIMEOUT_MS } = require('./review-verify.js');
+  assert.ok(EXECUTED_VERIFY_BUDGET_MS >= DEFAULT_TEST_TIMEOUT_MS + 120000, `budget ${EXECUTED_VERIFY_BUDGET_MS} must leave room for the syntax/command checks after a full-length test run (${DEFAULT_TEST_TIMEOUT_MS})`);
+});
+
+test('formatExecutedVerificationSection tells reviewers unverified dependent test files are not a failure', () => {
+  const { formatExecutedVerificationSection } = require('./review-task.js');
+  const out = formatExecutedVerificationSection({ status: 'passed', tests: { ran: ['src/a.test.js', 'src/dep.test.js'], passed: true, failures: [], dependentsUnverified: ['src/dep.test.js'] }, commands: [] });
+  assert.match(out, /Dependent test files .* did NOT finish .*unverified -- NOT a failure.*src\/dep\.test\.js/);
+  assert.ok(!formatExecutedVerificationSection({ status: 'passed', tests: { ran: ['src/a.test.js'], passed: true, failures: [] }, commands: [] }).includes('Dependent test files'));
+});
+
+// --- changed-file syntax gate: what the reviewers and the record see (2026-10-07) ---
+test('executed verification: the compact summary carries the syntax result, and a failed syntax result becomes the deterministic block text', () => {
+  const { summariseExecutedVerification, executedVerificationBlockReason } = require('./review-task.js');
+  const ev = {
+    status: 'failed', reasons: ['syntax error in a file the diff changes -- cadastral_image.py:12 SyntaxError: invalid syntax (the base version parses; fix the syntax before anything else)'],
+    tests: null, commands: [],
+    syntax: { checked: ['a.js'], skipped: [{ file: 'web/App.tsx', reason: 'no syntax checker for this file type' }], failed: ['cadastral_image.py'], preexisting: [] },
+  };
+  const sum = summariseExecutedVerification(ev);
+  assert.equal(sum.status, 'failed');
+  assert.deepEqual(sum.syntax, { checked: 1, failed: ['cadastral_image.py'], preexisting: [], skipped: [{ file: 'web/App.tsx', reason: 'no syntax checker for this file type' }] });
+  const reason = executedVerificationBlockReason(ev);
+  assert.match(reason, /^Deterministic gate: executed verification failed/);
+  assert.match(reason, /cadastral_image\.py:12 SyntaxError: invalid syntax/, 'the drafter is told the file and line');
+  assert.equal(summariseExecutedVerification({ status: 'passed', reasons: [], tests: null, commands: [] }).syntax, undefined, 'absent when the harness did not report one');
+});
+
+test('executed verification: reviewers are told which files were NOT syntax-checked (TypeScript) and which already fail on the base', () => {
+  const { formatExecutedVerificationSection } = require('./review-task.js');
+  const out = formatExecutedVerificationSection({
+    status: 'passed', reasons: [], commands: [], tests: { ran: ['a.test.js'], passed: true, failures: [] },
+    syntax: { checked: ['a.js'], failed: [], preexisting: ['old.py'], skipped: [{ file: 'web/App.tsx', reason: 'no syntax checker for this file type' }, { file: 'svc/x.py', reason: 'no python interpreter available' }, { file: 'gone.js', reason: 'absent (removed or renamed by the diff)' }] },
+  });
+  assert.match(out, /NOT syntax-checked \(no checker for the file type[^)]*\): web\/App\.tsx/);
+  assert.match(out, /NOT syntax-checked \(no Python interpreter was available\): svc\/x\.py/);
+  assert.match(out, /already fail to parse on the base branch[^:]*: old\.py/);
+  assert.ok(!/gone\.js/.test(out), 'a removed file is not a coverage gap worth telling the reviewers about');
+  assert.ok(!/NOT syntax-checked/.test(formatExecutedVerificationSection({ status: 'passed', reasons: [], commands: [], tests: { ran: ['a.test.js'], passed: true, failures: [] }, syntax: { checked: ['a.js'], failed: [], preexisting: [], skipped: [] } })));
+});
+
+// 2026-10-08: a task carrying an inert-target stamp (derived-premise-sweep.js) shows the reviewer an advisory line; one without it does not.
+test('buildVerdictPrompt: the inert-target advisory appears only for a task stamped with one', () => {
+  const { buildVerdictPrompt } = require('./review-task.js');
+  const base = { id: 't', title: 'x', domain: 'adhoc', source: 'derived_task', planResponse: 'p', implementResponse: 'i', promptContext: { rawText: 'r' } };
+  const stamped = buildVerdictPrompt({ ...base, inertTarget: { symbol: '_patchRun', definedIn: 'TaxHarvest/backend/src/services/runStore.js', held: true } }, { verdict: 'pass' }, '');
+  assert.match(stamped, /Inert target \(deterministic, advisory\)/);
+  assert.match(stamped, /`_patchRun`.*runStore\.js.*NO call sites/s);
+  assert.doesNotMatch(buildVerdictPrompt(base, { verdict: 'pass' }, ''), /Inert target/);
+});
+
+test('formatExecutedVerificationSection separates files that finished and passed from files that could not finish, and shows the diff-added tests that ran', () => {
+  const { formatExecutedVerificationSection, summariseExecutedVerification } = require('./review-task.js');
+  const out = formatExecutedVerificationSection({
+    status: 'inconclusive',
+    tests: { ran: ['a.test.js', 'b.test.js'], passed: null, passedFiles: ['a.test.js'], timedOutFiles: ['b.test.js'], partial: [{ file: 'b.test.js', count: 2, passed: true, tests: ['x one', 'x two'] }] },
+    commands: [], reasons: [],
+  });
+  assert.match(out, /ran to completion and PASSED \(1\): a\.test\.js/);
+  assert.match(out, /In b\.test\.js the 2 test\(s\) THIS DIFF ADDS were run on their own: PASSED \(x one, x two\)/);
+  assert.match(out, /did NOT finish within the review's per-run cap.*not a failure and not a reason to reject by itself: b\.test\.js/);
+  const sum = summariseExecutedVerification({ status: 'inconclusive', reasons: [], tests: { ran: ['b.test.js'], passed: null, passedFiles: [], timedOutFiles: ['b.test.js'], partial: [{ file: 'b.test.js', count: 1, passed: true, tests: ['t'] }] }, commands: [] });
+  assert.deepEqual(sum.tests.timedOutFiles, ['b.test.js']);
+  assert.deepEqual(sum.tests.partial, [{ file: 'b.test.js', count: 1, passed: true, tests: ['t'] }]);
+});
+
+// 2026-10-08 (TaxHarvest AC-271): a Group B draft (JSON edit set) used to get NO syntax check at review. The edit-set syntax gate blocks one whose result does not parse.
+test('reviewTask deterministically blocks a Group B edit set that leaves a python file unparsable -- no vote spent; a sound set is stamped and goes to the vote', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  fs.writeFileSync(path.join(repoRoot, 'img.py'), 'import os\nfrom util import (\n    a, b,\n)\n');
+  const split = JSON.stringify([{ mode: 'edit', file: 'img.py', find: 'from util import', replace: 'from util import\nfrom constants import YEAR' }]);
+  const task = baseTask({ domain: 'default', source: 'group_b_fixture', implementResponse: split });
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(task.reviewProvider, 'deterministic-edit-set-syntax');
+  assert.match(result.blockedReason, /edit-set-syntax/);
+  assert.match(result.blockedReason, /img\.py:2 SyntaxError/);
+  assert.equal(captured.length, 0, 'no review call is spent on a draft that cannot import');
+  assert.deepEqual(task.editSetSyntax.failed, ['img.py']);
+
+  const ok = baseTask({ id: 'ess-ok', domain: 'default', source: 'group_b_fixture', implementResponse: JSON.stringify([{ mode: 'edit', file: 'img.py', find: 'import os', replace: 'import os\nfrom constants import YEAR' }]) });
+  const captured2 = [];
+  await reviewTask(ok, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured2), recordModelOutcome: () => {} });
+  assert.notEqual(ok.reviewProvider, 'deterministic-edit-set-syntax');
+  assert.deepEqual(ok.editSetSyntax.checked, ['img.py']);
+  assert.equal(captured2.length, 1);
+});
+
+test('reviewTask: the edit-set syntax gate leaves adhoc diffs alone and honours advisory / off', async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  fs.writeFileSync(path.join(repoRoot, 'img.py'), 'import os\nfrom util import (\n    a, b,\n)\n');
+  const split = JSON.stringify([{ mode: 'edit', file: 'img.py', find: 'from util import', replace: 'from util import\nfrom constants import YEAR' }]);
+  const adhoc = baseTask({ id: 'ess-adhoc', domain: 'default', source: 'manual', implementResponse: split });
+  await reviewTask(adhoc, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {} });
+  assert.equal(adhoc.editSetSyntax, undefined);
+  const prev = process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE;
+  try {
+    process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = 'advisory';
+    const adv = baseTask({ id: 'ess-adv', domain: 'default', source: 'group_b_fixture', implementResponse: split });
+    const captured = [];
+    await reviewTask(adv, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {} });
+    assert.notEqual(adv.reviewProvider, 'deterministic-edit-set-syntax');
+    assert.equal(captured.length, 1);
+    assert.ok(adv.history.some((h) => h.stage === 'advisory' && /edit-set-syntax/.test(h.detail || '')));
+    process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = 'off';
+    const off = baseTask({ id: 'ess-off', domain: 'default', source: 'group_b_fixture', implementResponse: split });
+    await reviewTask(off, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {} });
+    assert.equal(off.editSetSyntax, undefined);
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE; else process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = prev; }
+});
+
+// 2026-10-18 (brain-dump 1905): waitForLocalAvailability skips a fresh 'working' heartbeat that opts
+// out with assignable:false (an external runner, not an AM draft) but still waits for a real lane.
+test('waitForLocalAvailability: an assignable:false working heartbeat does not delay review; a working lane still does', async () => {
+  const { waitForLocalAvailability } = require('./review-task.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-wait-'));
+  const hb = (id, extra) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({
+    instanceId: id, pid: process.pid, status: 'working', lastHeartbeat: new Date().toISOString(), ...extra }));
+
+  hb('worker-kaggle-p40', { assignable: false });
+  let t0 = Date.now();
+  await waitForLocalAvailability(dir, 3, 0.3);
+  assert.ok(Date.now() - t0 < 150, `opted-out heartbeat must not delay (took ${Date.now() - t0} ms)`);
+
+  hb('worker-3090', {});
+  t0 = Date.now();
+  await waitForLocalAvailability(dir, 3, 0.3);
+  assert.ok(Date.now() - t0 >= 250, `a working lane still delays (took ${Date.now() - t0} ms)`);
+});

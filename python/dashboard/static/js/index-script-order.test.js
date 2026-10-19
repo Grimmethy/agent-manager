@@ -62,6 +62,7 @@ test('every function the inline script uses at load time is defined by a script 
     'fetchJson', 'renderNav', 'showToast', 'postTaskAction', 'renderQueueTab', 'renderPluginsTab', 'safeSourceNames',
     'wireHubSort', 'setHubPriority', 'hubTag', 'hubProgressChip', 'wireQueueSourceFilter',
     'renderPluginsTab', 'pipelineFlagBadges',
+    'renderModelsTab', 'buildBenchmarkPanelHtml', 'wireBenchmarkPanel', 'buildRadarChartSvg', 'buildResponseTable', 'renderDeepDiveTab', 'renderDiscoveryTab',
   ];
   for (const name of mustExist) assert.equal(vm.runInContext(`typeof ${name}`, ctx), 'function', `${name} is not defined by the scripts above the inline block`);
   // The inline block's own load-time schedule must reference only names that exist by then.

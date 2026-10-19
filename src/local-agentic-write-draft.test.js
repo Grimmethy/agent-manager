@@ -84,9 +84,9 @@ test('detectExternalDependency matches each real marker category via title/rawTe
   const { detectExternalDependency } = freshModule();
   assert.equal(detectExternalDependency({ title: 'Create a new repo for this' }), 'creating a new repo');
   assert.equal(detectExternalDependency({ promptContext: { rawText: 'deploy to production' } }), 'hosting/deploying/publishing');
-  assert.equal(detectExternalDependency({ planResponse: 'run git push origin main' }), 'a git remote operation');
-  assert.equal(detectExternalDependency({ title: 'add the API key to config' }), 'credentials/API keys/tokens/secrets');
-  assert.equal(detectExternalDependency({ lastGoodPlan: 'call a third-party service for weather data' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'run git push origin main' } }), 'a git remote operation');
+  assert.equal(detectExternalDependency({ title: 'add the API key to config' }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'call a third-party service for weather data' } }, { mode: 'block' }), 'a network/third-party service call');
 });
 
 test('detectExternalDependency returns null for an ordinary local code task', () => {
@@ -103,17 +103,17 @@ test('detectExternalDependency returns null for an ordinary local code task', ()
 // matches, the same discipline "api[\s_-]?keys?" already used (never a bare "key").
 test('detectExternalDependency does NOT false-positive on "token counts" / LLM-metrics token vocabulary', () => {
   const { detectExternalDependency } = freshModule();
-  assert.equal(detectExternalDependency({ planResponse: 'they read/report model_calls and token counts but do not make the pass/reject decision' }), null);
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'they read/report model_calls and token counts but do not make the pass/reject decision' } }), null);
   assert.equal(detectExternalDependency({ title: 'Reduce the promptTok/evalTok climb in 3-call tasks' }), null);
   assert.equal(detectExternalDependency({ promptContext: { rawText: 'tighten the tokens used per implement pass' } }), null);
 });
 
 test('detectExternalDependency still matches a real auth/API token reference', () => {
   const { detectExternalDependency } = freshModule();
-  assert.equal(detectExternalDependency({ title: 'Store the API token in a secrets manager' }), 'credentials/API keys/tokens/secrets');
-  assert.equal(detectExternalDependency({ promptContext: { rawText: 'you will need an OAuth token to call this' } }), 'credentials/API keys/tokens/secrets');
-  assert.equal(detectExternalDependency({ planResponse: 'generate a personal access token from GitHub settings' }), 'credentials/API keys/tokens/secrets');
-  assert.equal(detectExternalDependency({ title: 'Set the bearer token on every request' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ title: 'Store the API token in a secrets manager' }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'you will need an OAuth token to call this' } }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'generate a personal access token from GitHub settings' } }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency({ title: 'Set the bearer token on every request' }, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
 });
 
 // 2026-09-11, root-caused live from two real blocked hub-children: the bare "network"/
@@ -125,18 +125,18 @@ test('detectExternalDependency still matches a real auth/API token reference', (
 test('detectExternalDependency does NOT false-positive on a negated or merely-mentioned "network"', () => {
   const { detectExternalDependency } = freshModule();
   assert.equal(detectExternalDependency({
-    planResponse: 'The test does not depend on network access, external services, or mutable global state; it is fully deterministic.',
+    promptContext: { rawText: 'The test does not depend on network access, external services, or mutable global state; it is fully deterministic.' },
   }), null);
   assert.equal(detectExternalDependency({
-    planResponse: 'The existing retry path for other errors (network, timeout, `detectDegenerate`) must remain untouched.',
+    promptContext: { rawText: 'The existing retry path for other errors (network, timeout, `detectDegenerate`) must remain untouched.' },
   }), null);
 });
 
 test('detectExternalDependency still matches a real network/third-party dependency', () => {
   const { detectExternalDependency } = freshModule();
-  assert.equal(detectExternalDependency({ lastGoodPlan: 'call a third-party service for weather data' }), 'a network/third-party service call');
-  assert.equal(detectExternalDependency({ title: 'Requires network access to fetch the remote schema' }), 'a network/third-party service call');
-  assert.equal(detectExternalDependency({ planResponse: 'make a network call to the upstream pricing API' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'call a third-party service for weather data' } }, { mode: 'block' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ title: 'Requires network access to fetch the remote schema' }, { mode: 'block' }), 'a network/third-party service call');
+  assert.equal(detectExternalDependency({ promptContext: { rawText: 'make a network call to the upstream pricing API' } }, { mode: 'block' }), 'a network/third-party service call');
 });
 
 test('write tier: a task requiring an external resource is blocked with needsClarification BEFORE any model call', async () => {
@@ -154,19 +154,53 @@ test('write tier: a task requiring an external resource is blocked with needsCla
   });
 });
 
-test('write tier: a task whose PLAN (not the original ask) reveals an external dependency is still caught', async () => {
+test('detectExternalDependency ignores the plan echo and code spans/fences (class B false positives)', () => {
+  const { detectExternalDependency, classifyExternalDependency } = freshModule();
+  const block = { mode: 'block' };
+  assert.equal(detectExternalDependency({ title: 'Wire notifications', promptContext: { rawText: 'add notifications' }, planResponse: 'call an external API (Twilio) to send the SMS' }, block), null);
+  assert.equal(detectExternalDependency({ lastGoodPlan: 'make a network call to the pricing API' }, block), null);
+  assert.equal(detectExternalDependency({ title: 'Fix ensureDriveToken', promptContext: { rawText: 'In `credential.idToken` handling, the `access_token` variable is stale.' } }, block), null);
+  assert.equal(detectExternalDependency({ title: 'Fix updateItem', promptContext: { rawText: 'See:\n```js\nconst h = { Authorization: bearer_token, secret: api_key };\n```\nthe loop never exits.' } }, block), null);
+  assert.equal(classifyExternalDependency({ title: 'Create a new repo' }).severity, 'hard');
+  assert.equal(classifyExternalDependency({ title: 'add the API key to config' }).severity, 'soft');
+});
+
+test('detectExternalDependency modes: hard markers block unless off; soft markers block only in block mode', () => {
+  const { detectExternalDependency, externalDependencyAdvisory } = freshModule();
+  const hard = { title: 'Create a new repo for the plugin' };
+  const soft = { title: 'add the API key to config' };
+  assert.equal(detectExternalDependency(hard, { mode: 'advisory' }), 'creating a new repo');
+  assert.equal(detectExternalDependency(hard, { mode: 'block' }), 'creating a new repo');
+  assert.equal(detectExternalDependency(hard, { mode: 'off' }), null);
+  assert.equal(detectExternalDependency(soft, { mode: 'advisory' }), null);
+  assert.equal(detectExternalDependency(soft, { mode: 'block' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(detectExternalDependency(soft, { mode: 'off' }), null);
+  assert.equal(externalDependencyAdvisory(soft, { mode: 'advisory' }), 'credentials/API keys/tokens/secrets');
+  assert.equal(externalDependencyAdvisory(soft, { mode: 'block' }), null);
+  assert.equal(externalDependencyAdvisory(hard, { mode: 'advisory' }), null);
+});
+
+test('write tier: the default advisory mode does not block a soft-marker task and adds a prompt hint; block mode blocks it', async () => {
   await withRepo(async () => {
-    const { draftAdhocViaLocalAgenticWrite } = freshModule();
-    const task = {
-      id: 'w-ext-plan', source: 'manual', title: 'Wire up the notification feature',
-      promptContext: { rawText: 'add notifications when a task completes' },
-      planResponse: 'Plan: call an external API (Twilio) to send the SMS notification.',
-    };
-    const res = await draftAdhocViaLocalAgenticWrite(task, {
-      runInWorktree: async () => { throw new Error('must not run once the plan reveals an external dependency'); },
-    });
-    assert.equal(res.blocked, true);
-    assert.equal(res.needsClarification.reason, 'external-dependency');
+    const { draftAdhocViaLocalAgenticWrite, buildWriteAgenticPrompt } = freshModule();
+    const task = { id: 'w-soft', source: 'manual', title: 'Rename the auth token variable', promptContext: { rawText: 'rename the auth token variable in getHeaders' } };
+    assert.match(buildWriteAgenticPrompt(task), /mentions credentials\/API keys\/tokens\/secrets/);
+    assert.ok(!buildWriteAgenticPrompt({ id: 'x', title: 'Fix countPending', promptContext: { rawText: 'narrow the catch' } }).includes('Confirm this is an ordinary code edit'));
+    // Advisory mode lets the task past the gate: it reaches worktree prep (which fails cleanly
+    // here -- no origin) instead of returning the blocked external-dependency shape.
+    const through = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+    assert.notEqual(through.blocked, true);
+    assert.equal(through.needsClarification, undefined);
+    assert.equal(through.succeeded, false);
+    assert.match(through.reason, /worktree|fetch|origin/i);
+    process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE = 'block';
+    try {
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => { throw new Error('must not run in block mode'); } });
+      assert.equal(res.blocked, true);
+      assert.equal(res.needsClarification.reason, 'external-dependency');
+    } finally {
+      delete process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE;
+    }
   });
 });
 
@@ -183,6 +217,17 @@ test('write tier: buildWriteAgenticPrompt asks for real edits + targeted checks 
     assert.match(p, /the ask/);
     // Fix 5: steer exploration onto the structured read-only tools, not run_bash.
     assert.match(p, /grep_codebase \/ read_file \/ list_directory/);
+  });
+});
+
+test('write tier: buildWriteAgenticPrompt includes a prior needs-work verdict when promptContext.priorVerdict is set, and not otherwise', async () => {
+  await withRepo(async () => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const base = { title: 'T', promptContext: { rawText: 'the ask' } };
+    const withV = { title: 'T', promptContext: { rawText: 'the ask', priorVerdict: { verdict: 'needs-work', reasons: ['keep the return type `any`'], source: 'chat' } } };
+    assert.ok(buildWriteAgenticPrompt(withV).includes('A reviewer examined your previous attempt'));
+    assert.ok(buildWriteAgenticPrompt(withV).includes('keep the return type `any`'));
+    assert.ok(!buildWriteAgenticPrompt(base).includes('A reviewer examined your previous attempt'));
   });
 });
 
@@ -515,6 +560,99 @@ test('write tier: backstop runs the deterministic split when a decomposeBlockCou
   });
 });
 
+// First-miss repair (2026-10-15): the FIRST "decompose, no usable JSON" pass is split in the same draft attempt instead of being
+// requeued for a whole second agentic pass. decomposeBlockCount is 1 here because resolveDecomposeZero (agentic-draft-common.js) has
+// already counted the miss when the verdict reaches runGiveUpSplit.
+const NO_JSON_MISS = 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it';
+const NUMBERED_PLAN = 'PLAN\n1. Create the helper in src/a.js.\n2. Wire it into src/b.js.\n3. Add tests.\n\nCRITERIA:\n- done';
+
+async function firstMissRun(taskOverrides, { runner, env } = {}) {
+  return withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    const prevEnv = process.env.AGENT_MANAGER_DECOMPOSE_REPAIR;
+    if (env === 'off') process.env.AGENT_MANAGER_DECOMPOSE_REPAIR = 'off'; else delete process.env.AGENT_MANAGER_DECOMPOSE_REPAIR;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: true, blockedReason: NO_JSON_MISS });
+    setDecomposePassRunner(runner === undefined ? null : runner);
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'fm', source: 'manual', title: 'Parent', decomposeBlockCount: 1, promptContext: { rawText: 'big multi-part thing' }, ...taskOverrides };
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+      return { res, task };
+    } finally {
+      adc.runAgenticDraftInWorktree = realRun;
+      setDecomposePassRunner(null);
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_REPAIR; else process.env.AGENT_MANAGER_DECOMPOSE_REPAIR = prevEnv;
+    }
+  });
+}
+
+const TWO_PIECES = { runDecomposePass: async () => ({ subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] }) };
+
+test('write tier: a FIRST no-JSON decompose miss runs the single-call split in the same attempt (no requeue)', async () => {
+  const { res, task } = await firstMissRun({}, { runner: TWO_PIECES });
+  assert.equal(res.resolution, 'decompose');
+  assert.equal(task.adhocResolution, 'decompose');
+  assert.equal(task.subTaskProposals.length, 2);
+  assert.equal(task.autoDecomposeCount, 1);
+  assert.equal(task.autoDecomposeSource, undefined, 'the decompose pass, not the mechanical split, produced these');
+});
+
+test('write tier: first miss where the decompose pass returns nothing falls back to the plan\'s numbered steps', async () => {
+  const { res, task } = await firstMissRun({ planResponse: NUMBERED_PLAN }, { runner: { runDecomposePass: async () => null } });
+  assert.equal(res.resolution, 'decompose');
+  assert.equal(task.subTaskProposals.length, 3);
+  assert.equal(task.subTaskProposals[1].after, 0);
+  assert.equal(task.autoDecomposeSource, 'plan-steps');
+  assert.match(task.implementResponse, /split mechanically from the plan's numbered steps/);
+});
+
+test('write tier: first miss with the decompose plugin absent also uses the plan steps', async () => {
+  const { res, task } = await firstMissRun({ lastGoodPlan: NUMBERED_PLAN }, { runner: null });
+  assert.equal(res.resolution, 'decompose');
+  assert.equal(task.autoDecomposeSource, 'plan-steps');
+});
+
+test('write tier: first miss with no usable plan keeps the blocked verdict', async () => {
+  const { res, task } = await firstMissRun({}, { runner: { runDecomposePass: async () => null } });
+  assert.equal(res.blocked, true);
+  assert.equal(res.blockedReason, NO_JSON_MISS);
+  assert.equal(task.adhocResolution, undefined);
+  assert.equal(task.subTaskProposals, undefined);
+});
+
+test('write tier: a first miss that was chosen as a partial-edit continuation is NOT split', async () => {
+  const { res, task } = await firstMissRun({ isAgenticContinuation: true, planResponse: NUMBERED_PLAN }, { runner: TWO_PIECES });
+  assert.equal(res.blocked, true);
+  assert.equal(task.subTaskProposals, undefined);
+});
+
+test('write tier: AGENT_MANAGER_DECOMPOSE_REPAIR=off restores the two-miss behaviour at the first miss', async () => {
+  const { res, task } = await firstMissRun({ planResponse: NUMBERED_PLAN }, { runner: TWO_PIECES, env: 'off' });
+  assert.equal(res.blocked, true);
+  assert.equal(task.subTaskProposals, undefined);
+  assert.equal(task.autoDecomposeCount, undefined);
+});
+
+test('write tier: a different block reason at decomposeBlockCount 1 is NOT split', async () => {
+  const { res } = await withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass' });
+    setDecomposePassRunner(TWO_PIECES);
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'dr', source: 'manual', decomposeBlockCount: 1, planResponse: NUMBERED_PLAN, promptContext: { rawText: 'x' } };
+      return { res: await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) }) };
+    } finally { adc.runAgenticDraftInWorktree = realRun; setDecomposePassRunner(null); }
+  });
+  assert.equal(res.blocked, true);
+});
+
 test('write tier: turn cap default is 35, env override still wins', async () => {
   await withRepo(async () => {
     const prev = process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS;
@@ -543,4 +681,104 @@ test('partialDiffFallbackPrompt: an applied prior diff leaves the prompt unchang
   assert.match(out, /^P\n\nCORRECTION:/);
   assert.match(out, /do NOT hold for this run|does NOT hold for this run/);
   assert.match(out, /diff --git a\/x b\/x/);
+});
+
+// --- read-only sibling repos (2026-10-16) ---------------------------------------------------------------------------------------------------------
+// The GPU broker verification tasks needed to read videoforge / promptforge-manual, but the pass's only tool root was its worktree.
+test('write tier: the implement pass hands the registered plugin repos to the tool loop as READ-ONLY roots, never the live checkout, apply clone or worktree', async () => {
+  // Own temp repo (not withRepo): withRepo removes its dir as soon as an async body first yields, and the draft resolves roots after its awaits.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'law-ro-core-'));
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  const sibling = fs.mkdtempSync(path.join(os.tmpdir(), 'law-sibling-'));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), 'law-worktree-'));
+  const manifest = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'law-manifest-')), 'plugins.json');
+  fs.writeFileSync(manifest, JSON.stringify([
+    { name: 'sib', registerPath: path.join(sibling, 'register.js'), enabled: true },
+    { name: 'wt', registerPath: path.join(worktree, 'register.js'), enabled: true },
+  ]));
+  // Pin the apply clone to its own dir: a harness that points AGENT_MANAGER_APPLY_REPO_ROOT at the tmpdir (the review sandbox does) would otherwise contain the sibling, and a repo inside the apply clone is rightly excluded.
+  const applyClone = fs.mkdtempSync(path.join(os.tmpdir(), 'law-apply-'));
+  const keys = ['AGENT_MANAGER_REPO_ROOT', 'AGENT_MANAGER_PIPELINE_DIR', 'LOCAL_MODEL', 'AGENT_MANAGER_LOCAL_AGENTIC_WRITE', 'AGENT_MANAGER_PLUGINS_MANIFEST', 'AGENT_MANAGER_CORE_REPO_ROOT', 'AGENT_MANAGER_APPLY_REPO_ROOT'];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  Object.assign(process.env, { AGENT_MANAGER_REPO_ROOT: dir, AGENT_MANAGER_PIPELINE_DIR: dir, LOCAL_MODEL: 'qwen-test', AGENT_MANAGER_PLUGINS_MANIFEST: manifest, AGENT_MANAGER_CORE_REPO_ROOT: dir, AGENT_MANAGER_APPLY_REPO_ROOT: applyClone });
+  delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE;
+  for (const m of ['./plugins-manifest.js', './accessible-roots.js', './agentic-draft-common.js']) delete require.cache[require.resolve(m)];
+  const adc = require('./agentic-draft-common.js');
+  const realRun = adc.runAgenticDraftInWorktree;
+  adc.runAgenticDraftInWorktree = async (_t, { runInWorktree }) => { await runInWorktree(worktree, {}); return { succeeded: true, blocked: false, response: 'RESOLUTION: implemented' }; };
+  try {
+    const { draftAdhocViaLocalAgenticWrite } = freshModule();
+    const calls = [];
+    const task = { id: 'ro-sib', source: 'manual', title: 'verify', promptContext: { rawText: 'read the sibling repo and write the findings doc' } };
+    await draftAdhocViaLocalAgenticWrite(task, { runPlan: async (opts) => { calls.push(opts); return { response: 'RESOLUTION: implemented' }; } });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].primaryRoot, worktree);
+    assert.deepEqual(calls[0].readOnlyRoots, [fs.realpathSync(sibling)]);
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(dir)), 'the live checkout is not exposed');
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(worktree)), 'the worktree is not listed twice');
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(applyClone)), 'the apply clone is not exposed');
+    assert.equal(calls[0].extraRoots, undefined, 'extraRoots keeps its Chat-only meaning');
+  } finally {
+    adc.runAgenticDraftInWorktree = realRun;
+    for (const k of keys) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; }
+    for (const m of ['./plugins-manifest.js', './accessible-roots.js']) delete require.cache[require.resolve(m)];
+    for (const d of [dir, sibling, worktree, applyClone, path.dirname(manifest)]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('write tier: the implement prompt says other registered repos are readable read-only and not to conclude a repo is absent', () => {
+  withRepo(() => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const prompt = buildWriteAgenticPrompt({ id: 'p', title: 't', promptContext: { rawText: 'verify against videoforge' } });
+    assert.match(prompt, /Other registered repos on this machine \(plugins and projects\) are READ-ONLY/);
+    assert.match(prompt, /never conclude a repo is absent from this machine without calling list_roots first/);
+    assert.match(prompt, /Do not cat \.env, key, token or credential files/);
+  });
+});
+
+// task-shape.js: the post-exhaustion / repeated-decompose backstop must not split a one-file-fix on a model "decompose" answer, but a REAL turn-budget exhaustion
+// (evidence the shape guess was wrong) still may -- same as a confirmed-atomic leaf.
+async function backstopRun(taskOverrides, { shapeEnv } = {}) {
+  return withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    const prevEnv = process.env.AGENT_MANAGER_TASK_SHAPE;
+    if (shapeEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = shapeEnv;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: false, needsClarification: true, response: 'ran out of turns' });
+    let splitCalls = 0;
+    setDecomposePassRunner({ runDecomposePass: async () => { splitCalls += 1; return { subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] }; } });
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'shape-bk', source: 'manual', title: 'Fix clamp', decomposeBlockCount: 2, needsClarification: { reason: 'x' }, promptContext: { rawText: 'In src/foo.js fix clamp and add a case to src/foo.test.js.' }, ...taskOverrides };
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+      return { res, task, splitCalls };
+    } finally {
+      adc.runAgenticDraftInWorktree = realRun;
+      setDecomposePassRunner(null);
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = prevEnv;
+    }
+  });
+}
+
+test('task-shape backstop: a one-file-fix that keeps answering "decompose" is NOT split', async () => {
+  const { res, task, splitCalls } = await backstopRun({});
+  assert.equal(task.shape.class, 'one-file-fix');
+  assert.equal(splitCalls, 0, 'the decompose pass is never asked');
+  assert.notEqual(res.resolution, 'decompose');
+  assert.equal(task.autoDecomposeCount, undefined);
+});
+
+test('task-shape backstop: a one-file-fix that really exhausted its turn budget may still be split', async () => {
+  const { res, splitCalls } = await backstopRun({ turnBudgetExhausted: true });
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
+});
+
+test('task-shape backstop: with AGENT_MANAGER_TASK_SHAPE=off the same task is split exactly as before', async () => {
+  const { res, task, splitCalls } = await backstopRun({}, { shapeEnv: 'off' });
+  assert.equal(task.shape, undefined);
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
 });

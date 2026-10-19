@@ -21,9 +21,13 @@ const { registerTaskSource, getRegisteredSources, getRegisteredSource, resolveSo
 const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
+const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
+const { writeJsonAtomicSync: writeBrainDumpAtomic } = require('./atomic-write.js');
+const { rotationDemoted } = require('./premium-rotation.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
-const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport, applySecondBrainOpportunities } = require('./apply-group-a.js');
+const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport, applyCapabilityDebriefReport, applySecondBrainOpportunities } = require('./apply-group-a.js');
 const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-assembly.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
@@ -485,10 +489,13 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       const { isHubWork, hubKey } = parsed
         ? hubOrder.orderCandidate(pipelineDir, parsed, hubKeyCache)
         : { isHubWork: false, hubKey: { isHubChild: false } };
-      return { full, mtime, parsed, isPremium: !!(parsed && parsed.premiumPriority), isHubWork, hubKey };
+      const isPremium = !!(parsed && parsed.premiumPriority);
+      // A premium task that keeps getting blocked rotates behind fresh premium work (premium-rotation.js).
+      return { full, mtime, parsed, isPremium, demoted: isPremium && rotationDemoted(parsed), isHubWork, hubKey };
     })
     .sort((a, b) => {
       if (a.isPremium !== b.isPremium) return a.isPremium ? -1 : 1;
+      if (a.demoted !== b.demoted) return a.demoted ? 1 : -1;
       if (a.isHubWork !== b.isHubWork) return a.isHubWork ? -1 : 1;
       if (a.isHubWork && b.isHubWork) {
         const byHub = hubOrder.compareKeys(a.hubKey, b.hubKey);
@@ -1192,6 +1199,30 @@ function brainDumpSortTaskId(entry) {
   return n > 0 ? `brain-dump-sort-${entry.id}-a${n}` : `brain-dump-sort-${entry.id}`;
 }
 
+// At most this many entries are linked to existing work in one generator call (each check reads the queue: ~170 ms
+// typical, ~3.4 s worst measured live), so one call stays bounded; the rest are reached on later ticks.
+const MAX_EXISTING_WORK_LINKS_PER_CALL = 5;
+
+// Re-reads brain-dump.json right before writing so an edit made since nextBrainDumpSortTask read it (a dashboard capture,
+// the apply stage) is not lost, and only links an entry that is still 'captured'.
+function linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, by) {
+  try {
+    const fresh = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+    const list = Array.isArray(fresh.entries) ? fresh.entries : [];
+    let changed = 0;
+    for (const { entry, found } of links) {
+      const cur = list.find((x) => x && x.id === entry.id);
+      if (!cur || cur.status !== 'captured') continue;
+      linkEntryToExistingWork(cur, found, by);
+      changed += 1;
+      logPipelineEvent(pipelineDir, 'brain-dump-existing-work', { entryId: cur.id, serial: cur.serial ?? null, taskId: found.taskId, state: found.state, how: found.how, by });
+    }
+    if (changed) writeBrainDumpAtomic(brainDumpPath, fresh);
+  } catch (e) {
+    console.error(`[task-sources] brain-dump existing-work link failed (best-effort): ${e.message}`);
+  }
+}
+
 function nextBrainDumpSortTask() {
   const { brainDumpPath, secondBrainDir, pipelineDir } = getConfig();
   if (!brainDumpPath) return null;
@@ -1215,9 +1246,19 @@ function nextBrainDumpSortTask() {
   // nothing to act on, because generation itself had stopped dead. Same "skip an
   // in-queue one and keep looking" loop nextArchImportTask/nextUnusedExportTask already
   // use for their own oldest-first selection.
-  const chosen = entries.find((e) => e && e.status === 'captured' && !e.suppressed
+  const eligible = entries.filter((e) => e && e.status === 'captured' && !e.suppressed
     && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
     && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+  // Existing-work check (2026-10-18, see brain-dump-existing-work.js): an entry whose work is already a task -- queued,
+  // done or archived -- is linked to that task instead of being sorted again (no classification spent). Bounded per call.
+  let chosen = null;
+  const links = [];
+  for (const e of eligible) {
+    const found = links.length < MAX_EXISTING_WORK_LINKS_PER_CALL ? findExistingWorkForEntry([pipelineDir], e) : null;
+    if (!found) { chosen = e; break; }
+    links.push({ entry: e, found });
+  }
+  if (links.length) linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, 'generator');
   if (!chosen) return null;
 
   const taskId = brainDumpSortTaskId(chosen);
@@ -1473,7 +1514,7 @@ const PROJECT_SEARCH_REVIEW_GUIDANCE = 'This is a project-search task: the draft
 const STALENESS_AUDIT_REVIEW_GUIDANCE = 'This is a staleness-audit task: the implement draft is DELIBERATELY an advisory prose report, not code or a diff -- there is nothing to implement here, the whole point is a grounded opinion on whether an old flagged task is still worth chasing. Hedged, uncertain language ("inconclusive," "cannot confirm," "needs further investigation") is the EXPECTED and CORRECT way to report a genuinely inconclusive finding -- do NOT reject it under the generic hedging rule above; that rule exists for tasks asking for real content the model is dodging, not for a task whose deliverable IS a calibrated judgment call. IMPORTANT: a RECOMMENDATION: archive verdict now has a REAL, AUTOMATIC effect once you approve this report -- it moves the original flagged task out of the queue for good, with no further human check. If it recommends "archive," it must EARN it, not assert it: either it names a specific commit that implemented the original request (a real hash the fact-check above confirms), OR it shows the current code covers EVERY concrete thing the original task names (each named UI element / endpoint / data field / behavior, with a real file:symbol). REJECT an "archive" that rests on loosely-related code, a same-named feature acting on a different object, or the bare fact that the pipeline could not build the task (fabrication-repeat / retries-exhausted are "stuck," not "resolved") -- reject it the same as you would a fabricated code change. "worth a fresh investigation" carries no such risk (it takes no action at all), so hold it to the normal calibrated-judgment bar only. Reject only if: it lacks an explicit RECOMMENDATION line, it contradicts the real harness search results shown above (claims a match was found when harnessHits is empty, or vice versa), it fabricates a claim about the original flagged task not present in the evidence text it was given, or it recommends "archive" without a verifiable cited commit or a full per-object coverage match in the real evidence above.';
 const STALENESS_AUDIT_COMPLETENESS_QUESTION = 'Does it contain a genuine three-part analysis (does the concern still hold, was the original fabrication finding genuine, and an explicit RECOMMENDATION), grounded in the real harness search results shown above rather than invented?';
 
-const PIPELINE_FORENSICS_REVIEW_GUIDANCE = 'This is a pipeline_forensics task: the implement draft is DELIBERATELY an advisory prose report -- a RANKED root-cause analysis of why a class of pipeline tasks keeps failing -- not code or a diff. There is nothing to implement here. Judge it on: (1) does it rank concrete causes and, for each, state a real COUNTERFACTUAL ("if this alone were fixed, the failing case WOULD / WOULD NOT have shipped, because ...")? (2) does it actually CONTRAST the failing tasks with the named winner tasks in the evidence, rather than analysing the failures in isolation? (3) is every cited file a real src/ path from the harness hits or the tier->file map in the evidence -- not an invented module name? (4) is the RECOMMENDED FOLLOW-UP FIX a change to THIS PIPELINE, scoped and with an acceptance check, not a re-attempt of the failed task or a hand-built version of the feature it was trying to build? "NO CLEAR ROOT CAUSE" is a valid, correct outcome when the evidence genuinely does not support one -- do NOT reject it under the hedging rule. Likewise, when the evidence shows ZERO winner tasks available to contrast against, a CONTRAST section that plainly says so (e.g. "0 contrast winner task(s) -- there are no successful sibling tasks to contrast against") is the CORRECT, REQUIRED behavior, not a violation of requirement (2) -- do NOT reject a draft for failing to contrast against winners that do not exist in the evidence it was given; only reject a contrast section that fabricates a divergence the evidence cannot support. Reject only if: it invents a file/symbol not in the evidence, it contradicts the evidence (claims a tier did something the draftAttempts/worklog show it did not), it proposes hand-building the failed feature instead of fixing the pipeline, or it asserts a root cause with no counterfactual and no contrast when winner tasks WERE actually available in the evidence.';
+const PIPELINE_FORENSICS_REVIEW_GUIDANCE = 'This is a pipeline_forensics task: the implement draft is DELIBERATELY an advisory prose report -- a RANKED root-cause analysis of why a class of pipeline tasks keeps failing -- not code or a diff. There is nothing to implement here. Judge it on: (1) does it rank concrete causes and, for each, state a real COUNTERFACTUAL ("if this alone were fixed, the failing case WOULD / WOULD NOT have shipped, because ...")? (2) does it actually CONTRAST the failing tasks with the named winner tasks in the evidence, rather than analysing the failures in isolation? (3) is every cited file a real src/ path from the harness hits or the tier->file map in the evidence -- not an invented module name? (4) is the RECOMMENDED FOLLOW-UP FIX a change to THIS PIPELINE, scoped and with an acceptance check, not a re-attempt of the failed task or a hand-built version of the feature it was trying to build? "NO CLEAR ROOT CAUSE" is a valid, correct outcome when the evidence genuinely does not support one -- do NOT reject it under the hedging rule. Likewise, when the evidence shows ZERO winner tasks available to contrast against, a CONTRAST section that plainly says so (e.g. "0 contrast winner task(s) -- there are no successful sibling tasks to contrast against") is a valid, correct terminal outcome (the CORRECT, REQUIRED behavior), not a violation of requirement (2) -- do not reject a draft for failing to contrast against winners that do not exist in the evidence it was given; only reject a contrast section that fabricates a divergence the evidence cannot support. Reject only if: it invents a file/symbol not in the evidence, it contradicts the evidence (claims a tier did something the draftAttempts/worklog show it did not), it proposes hand-building the failed feature instead of fixing the pipeline, or it asserts a root cause with no counterfactual and no contrast when winner tasks WERE actually available in the evidence.';
 const PIPELINE_FORENSICS_COMPLETENESS_QUESTION = 'Does it contain a ranked ROOT CAUSE list with a counterfactual per cause, an explicit CONTRAST with the successful sibling tasks, and a RECOMMENDED FOLLOW-UP FIX (or a justified NO CLEAR ROOT CAUSE) -- all grounded in the real evidence and citing real src/ files?';
 // 2026-09-12 (screaminggoatclubmt, from the single biggest identifiable sub-pattern in a
 // 31-task pipeline_debrief blocked cluster): the drafting prompt (pipelineDebriefPlanPrompt/
@@ -1491,6 +1532,9 @@ const PIPELINE_FORENSICS_COMPLETENESS_QUESTION = 'Does it contain a ranked ROOT 
 // draft with REAL available files skip citing one).
 const PIPELINE_DEBRIEF_REVIEW_GUIDANCE = 'This is a pipeline_debrief task: the implement draft is DELIBERATELY an advisory prose report -- a DETERMINISM AUDIT (WHAT / SO WHAT / NOW WHAT) over a WINDOW of pipeline tasks that already SHIPPED, finding model calls spent deciding something a deterministic check/transform/lookup/existing-gate could have decided -- not code or a diff. There is nothing to implement here. Judge it on: (1) does WHAT give a per-task/cluster model-call profile grounded in the evidence (real stages, call counts, attempt counts -- not invented)? (2) does SO WHAT flag SPECIFIC model calls as mechanically decidable, each with a cited task id + history stage + model_calls row, rather than a generic platitude? (3) does the ALREADY-DETERMINISTIC CHECK actually check the AVAILABLE FILES content for an existing gate/normalizer before proposing one -- classifying each as not-wired-here / stale / genuinely absent -- rather than skip it? (4) is NOW WHAT at most 2-3 concrete, bounded items, each naming a stage + an exact deterministic mechanism + rough calls-saved, citing a real src/ file from AVAILABLE FILES when one genuinely fits (not an invented module name, not a wish list)? If AVAILABLE FILES was empty, or none of the listed files actually fit the recommendation, omitting the Files: line and recommending in prose is the CORRECT, REQUIRED behavior per the drafting instructions -- do NOT reject a draft for doing this; only reject if a real, relevant file WAS available and the draft skipped citing it anyway. "NO CONFIDENT INEFFICIENCY" is a valid, correct outcome when the evidence genuinely shows none -- do NOT reject it under the hedging rule. Reject only if: it invents a file/symbol not in the evidence, it contradicts the evidence (claims a task/history entry says something the record does not), it skips the ALREADY-DETERMINISTIC CHECK when AVAILABLE FILES were provided, it re-proposes something already present in the fetched file content, or NOW WHAT is vague/unbounded AND a real, relevant file from AVAILABLE FILES existed but was not cited.';
 const PIPELINE_DEBRIEF_COMPLETENESS_QUESTION = 'Does it contain all four sections (WHAT, SO WHAT, ALREADY-DETERMINISTIC CHECK, NOW WHAT) or a justified NO CONFIDENT INEFFICIENCY, with SO WHAT flagging specific model calls as mechanically decidable (cited) and NOW WHAT (if present) bounded to 2-3 items each naming a stage + deterministic mechanism + a real src/ file when one genuinely fits (omitting the Files: line in prose is correct and complete when AVAILABLE FILES was empty or none fit) -- all grounded in the real evidence rather than invented?';
+
+const CAPABILITY_DEBRIEF_REVIEW_GUIDANCE = 'This is a capability_debrief task: the implement draft is DELIBERATELY an advisory prose report, not code or a diff. A deterministic scan found a task source that keeps FAILING on a small-tier model lane (timeouts, degenerate output, errors) while a larger lane finishes the same work, and the report must say why and propose smaller scoped work so the task fits a smaller model. Judge it on: (1) does CAUSE name exactly one of the four cause classes (prompt/context too large, several jobs in one call, a mechanically decidable call, needs reasoning depth the tier lacks) and ground it in the evidence (numCtx, prompt size, stage, wall time, the paired larger-lane result) rather than assert it? (2) does EVIDENCE cite specific tasks, attempts and numbers that appear in the bundle? (3) is NOW WHAT at most 2-3 concrete, bounded proposals, each naming the exact stage or prompt to split, trim or make deterministic and how the scorecard would show it worked, citing only files from AVAILABLE FILES? "NOT SHRINKABLE AT THIS TIER -- <reason>" is a valid, correct outcome when the evidence supports it -- do NOT reject it. Reject only if it invents a file/symbol/metric not in the evidence, contradicts the evidence, blames the task when the bundle flags the lane as degraded, or proposes something vague or unbounded.';
+const CAPABILITY_DEBRIEF_COMPLETENESS_QUESTION = 'Does it contain CAUSE (one named class, grounded), EVIDENCE (cited from the bundle) and either a NOW WHAT of at most 2-3 bounded proposals or a justified NOT SHRINKABLE AT THIS TIER line?';
 
 const DOC_DRIFT_FIX_REVIEW_GUIDANCE = 'This is a doc_drift_fix task: a deterministic scan (drift-scan.js) found a static doc list out of sync with a live registry, and the evidence already gives the drafter every fact it needs -- the exact missing/stale names, the REAL priority number for each missing one (never guessed), the real current table rows to insert after, and any stale row\'s exact text to remove. Judge it as a small, mechanical edit, not a judgment call: (1) does it add ONE new row for every name in missingFromStatic, with the EXACT given priority number, and nothing else; (2) does it remove ONLY the exact stale rows given, verbatim; (3) does each new row\'s description come from the real fetched code shown (the harness hits/files), not invented behavior; (4) does it leave every OTHER row and all other content in the file completely untouched. Reject a draft that touches any row not named in missingFromStatic/staleInStatic, that uses a priority number different from the one given, that invents a description not grounded in the real fetched code, or that reformats/reorders existing rows beyond the specific add/remove asked for. An empty draft, or a "FALSE POSITIVE" claim, is NOT a valid "nothing to do" here -- the evidence already guarantees a real, fixable gap exists (drift-scan.js only flags a pair when it found a genuine difference); reject either and let it redraft.';
 const DOC_DRIFT_FIX_COMPLETENESS_QUESTION = 'Does the diff add exactly the rows named in missingFromStatic (with the given priority, grounded description) and remove exactly the rows named in staleInStatic, touching nothing else in the file?';
@@ -2035,6 +2079,47 @@ function nextPipelineDebriefTask() {
   };
 }
 
+// capability_debrief (design note section 5a, docs/design-notes/capability-routing-and-benchmarking.md): a failure cluster in the capability ledger (a source
+// keeps failing on a small-tier lane while a larger lane finishes the same work) becomes ONE task for a larger local model to explain the failure and propose
+// smaller scoped work. One task per cluster until it is debriefed; clusters on a lane the health probe flagged are skipped as hardware suspects.
+function nextCapabilityDebriefTask() {
+  const { pipelineDir, defaultDomain } = getConfig();
+  const bundleLib = require('./capability-debrief-bundle.js');
+  const { sharedInstancesDir } = require('./instances-dir.js');
+  const laneHealth = require('./lane-health.js');
+  const instancesDir = sharedInstancesDir(pipelineDir);
+  const dbPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH || path.join(pipelineDir, 'model-stats.db');
+
+  let entries;
+  try { entries = bundleLib.readLedgerEntries(pipelineDir); } catch { return null; }
+  const clusters = bundleLib.pendingClusters(
+    bundleLib.collectFailureClusters(entries, { isDegraded: (lane, from, to) => laneHealth.laneDegradedBetween(instancesDir, lane, from, to) }),
+    instancesDir,
+  );
+  for (const cluster of clusters) {
+    const key = bundleLib.clusterKey(cluster);
+    // Deterministic id (no Date.now()): two workers ticking together must compute the same id so taskIdExistsInQueue() sees the collision.
+    const id = `capability-debrief-${crypto.createHash('sha1').update(key).digest('hex').slice(0, 12)}`;
+    if (taskIdExistsInQueue(id)) continue;
+    const bundle = bundleLib.buildCapabilityDebriefBundle({ pipelineDir, dbPath, cluster, entries });
+    return {
+      id,
+      domain: defaultDomain,
+      source: 'capability_debrief',
+      title: `Capability debrief: ${cluster.source} on ${cluster.model} (${cluster.failures} x ${cluster.signature.split(':')[0]})`.slice(0, 140),
+      promptContext: {
+        evidenceText: bundle.evidenceText,
+        clusterKey: key,
+        clusterSource: cluster.source,
+        clusterModel: cluster.model,
+        taskIds: bundle.subjectIds,
+        contrastIds: bundle.contrastIds,
+      },
+    };
+  }
+  return null;
+}
+
 // Called once from the CLI, only after writeTask() persists a pipeline_debrief task --
 // advances the cursor PAST this window (windowEnd) so the next call never re-selects any of
 // these same done/ tasks, same "record coverage only after the write actually landed" lesson
@@ -2359,6 +2444,20 @@ registerTaskSource('pipeline_forensics', { scope: 'core',
 // source in the file by design: a debrief window only ever grows (debrief-bundle.js's own
 // MIN_WINDOW_TASKS floor gates it, not a clock), so ranking it last has zero crowd-out cost
 // and never starves a task that would otherwise fix something actually broken.
+// capability_debrief (2026-10-17): priority 96, one below pipeline_debrief -- the least urgent source in the file. `probe: false` keeps the capability
+// probing (capability-routing.js) from ever handing it to a small lane: explaining why a task does not fit a small model is a larger model's job.
+registerTaskSource('capability_debrief', { scope: 'core',
+  priority: taskPriority('capability_debrief', 96),
+  next: nextCapabilityDebriefTask,
+  apply: applyCapabilityDebriefReport,
+  advisoryProse: true,
+  probe: false,
+  harnessSearch: 'archImport',
+  reasoningTier: 'low',
+  reportClass: 'housekeeping',
+  reviewGuidance: CAPABILITY_DEBRIEF_REVIEW_GUIDANCE,
+  reviewCompletenessQuestion: CAPABILITY_DEBRIEF_COMPLETENESS_QUESTION,
+});
 registerTaskSource('pipeline_debrief', { scope: 'core',
   priority: taskPriority('pipeline_debrief', 95),
   next: nextPipelineDebriefTask,
@@ -2789,7 +2888,7 @@ module.exports = {
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
   nextPipelineForensicsTask, markPipelineForensicsReported,
-  nextPipelineDebriefTask, markPipelineDebriefReported,
+  nextPipelineDebriefTask, nextCapabilityDebriefTask, markPipelineDebriefReported,
   nextDriftFixTask, markDriftFixReported,
   nextPipelineHealthAuditTask, markPipelineHealthAuditChecked,
   nextUiVisibilityAuditTask, markUiVisibilityAuditChecked,
@@ -2911,6 +3010,7 @@ if (require.main === module) {
         candidateFulfillment: !!source.candidateFulfillment,
         emptyApproval: !!source.emptyApproval,
         advisoryProse: !!source.advisoryProse,
+        variantOf: source.variantOf || null,
         hasCustomApply: typeof source.apply === 'function',
         directToMain: source.directToMain === true,
         hasCandidatesPath: typeof source.candidatesPath === 'function',
@@ -3092,6 +3192,10 @@ if (require.main === module) {
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
       if (task.source === 'pipeline_forensics') markPipelineForensicsReported(task);
       if (task.source === 'pipeline_debrief') markPipelineDebriefReported(task);
+      if (task.source === 'capability_debrief') {
+        // Mark the cluster at generation time (a denied/archived report must not regenerate forever); the apply pass refines the verdict.
+        try { require('./capability-debrief-bundle.js').markDebriefedByKey(require('./instances-dir.js').sharedInstancesDir(getConfig().pipelineDir), task.promptContext.clusterKey, { verdict: 'queued', taskId: task.id }); } catch (_) { /* best-effort */ }
+      }
       if (task.source === 'doc_drift_fix') markDriftFixReported(task);
       if (task.source === 'pipeline_health_audit') markPipelineHealthAuditChecked();
       if (task.source === 'ui_visibility_audit') markUiVisibilityAuditChecked();

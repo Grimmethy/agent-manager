@@ -96,6 +96,8 @@ function beginDraftAttempt(task) {
   return {
     at: new Date().toISOString(),
     attemptNo: prior.length + 1,
+    // The lane (worker instance) that ran this attempt -- lets reject-retry-check.js steer a task away from a lane it degenerated on.
+    lane: process.env.AGENT_MANAGER_INSTANCE_ID || null,
     source: (task && task.source) || null,
     localRejectCount: (task && task.localRejectCount) || 0,
     tiers: [],

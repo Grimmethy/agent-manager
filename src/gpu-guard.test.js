@@ -8,7 +8,12 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { ensureGpuHeadroom } = require('./gpu-guard.js');
+const { ensureGpuHeadroom: realEnsureGpuHeadroom } = require('./gpu-guard.js');
+
+// ensureGpuHeadroom's default leaseHeld reads the REAL ~/.local/state/agent-manager/comfyui-lease.json, so
+// these tests failed (12 of 18) whenever PromptForge happened to hold a lease while the suite ran. Default it
+// to "not held"; the lease tests below pass their own leaseHeld and still override this.
+const ensureGpuHeadroom = (opts = {}) => realEnsureGpuHeadroom({ leaseHeld: () => false, ...opts });
 
 test('reports not-checked when nvidia-smi is unavailable (CPU-only box) rather than treating it as starved', async () => {
   const result = await ensureGpuHeadroom({ readFreeVram: () => null, fetchJsonFn: async () => { throw new Error('should not be called'); } });
@@ -272,4 +277,141 @@ test('comfyuiLeaseHeld: acquiredAt past MAX_S even with a fresh refreshedAt -> f
 
 test('comfyuiLeaseHeld: missing file -> false (fails open)', () => {
   assert.equal(comfyuiLeaseHeld(path.join(os.tmpdir(), 'definitely-not-a-lease-file-xyz.json')), false);
+});
+
+// ---- Forge family exclusion: with no lease, a ComfyUI that is still up is asked to yield via PromptForge ----
+
+const { yieldForgeToPipeline } = require('./gpu-guard.js');
+
+test('yieldForgeToPipeline: ComfyUI not running -> nothing to do, PromptForge never called', async () => {
+  const urls = [];
+  const r = await yieldForgeToPipeline({ fetchJsonFn: async (u) => { urls.push(u); return { ok: false }; } });
+  assert.equal(r.acted, false);
+  assert.equal(urls.length, 1);
+  assert.match(urls[0], /\/system_stats$/);
+});
+
+test('yieldForgeToPipeline: ComfyUI up, PromptForge grants -> acted, POSTs /api/gpu/yield', async () => {
+  const calls = [];
+  const r = await yieldForgeToPipeline({
+    promptforgeUrl: 'http://pf:7430',
+    fetchJsonFn: async (u, o) => {
+      calls.push([u, o && o.method]);
+      if (u.endsWith('/system_stats')) return { ok: true, body: {} };
+      return { ok: true, body: { yielded: true, reason: 'forge session ended' } };
+    },
+  });
+  assert.equal(r.acted, true);
+  assert.deepEqual(calls[1], ['http://pf:7430/api/gpu/yield', 'POST']);
+  assert.match(r.note, /stopped it/);
+});
+
+test('yieldForgeToPipeline: PromptForge declines (a Forge job is running) -> not acted, says why', async () => {
+  const r = await yieldForgeToPipeline({
+    fetchJsonFn: async (u) => (u.endsWith('/system_stats') ? { ok: true, body: {} } : { ok: true, body: { yielded: false, reason: 'a Forge job is running' } }),
+  });
+  assert.equal(r.acted, false);
+  assert.match(r.note, /declined to yield: a Forge job is running/);
+});
+
+test('yieldForgeToPipeline: PromptForge down or the fetch throws -> never throws, falls back to the existing path', async () => {
+  const down = await yieldForgeToPipeline({ fetchJsonFn: async (u) => (u.endsWith('/system_stats') ? { ok: true, body: {} } : { ok: false, error: 'refused' }) });
+  assert.equal(down.acted, false);
+  const boom = await yieldForgeToPipeline({ fetchJsonFn: async () => { throw new Error('boom'); } });
+  assert.deepEqual(boom, { acted: false, note: '' });
+});
+
+test('ensureGpuHeadroom with forgeYield: no lease -> yields first and the note says so; plenty of VRAM afterwards = not starved', async () => {
+  let yielded = 0;
+  const r = await ensureGpuHeadroom({
+    minFreeMb: 4096, leaseHeld: () => false, readFreeVram: () => 20000,
+    forgeYield: async () => { yielded++; return { acted: true, note: 'ComfyUI stopped' }; },
+  });
+  assert.equal(yielded, 1);
+  assert.equal(r.starved, false);
+  assert.equal(r.note, 'ComfyUI stopped');
+});
+
+test('ensureGpuHeadroom with forgeYield: lease held -> the Forge family owns the card, yield is NOT attempted', async () => {
+  let yielded = 0;
+  const r = await ensureGpuHeadroom({
+    leaseHeld: () => true, forgeYield: async () => { yielded++; return { acted: true, note: 'x' }; },
+  });
+  assert.equal(yielded, 0);
+  assert.match(r.note, /comfyui-lease held/);
+});
+
+test('ensureGpuHeadroom without forgeYield (the default, and every existing caller): behaviour unchanged', async () => {
+  const r = await ensureGpuHeadroom({ minFreeMb: 4096, leaseHeld: () => false, readFreeVram: () => 20000, fetchJsonFn: async () => { throw new Error('must not be called'); } });
+  assert.equal(r.starved, false);
+  assert.equal(r.note, '');
+});
+
+// ---- endpoint-scoped lease (2026-10-18): a plugin reserving ONE card holds off that card's callers only -------------------------------------------
+const { leaseHeldFor, leaseCovers, normalizeEndpoint } = require('./gpu-guard.js');
+
+const P40 = 'http://192.168.122.29:11434';
+const HOST = 'http://localhost:11434';
+const freshLease = (extra = {}) => { const now = new Date().toISOString(); return { holder: 'kaggleforge', acquiredAt: now, refreshedAt: now, ...extra }; };
+
+test('normalizeEndpoint: localhost, 127.0.0.1 and ::1 are one host; a missing port means 11434; junk is null', () => {
+  assert.equal(normalizeEndpoint('http://127.0.0.1:11434'), 'localhost:11434');
+  assert.equal(normalizeEndpoint('http://[::1]:11434/'), 'localhost:11434');
+  assert.equal(normalizeEndpoint('localhost'), 'localhost:11434');
+  assert.equal(normalizeEndpoint('HTTP://LocalHost:11434'), 'localhost:11434');
+  assert.equal(normalizeEndpoint('http://192.168.122.29:11434/api'), '192.168.122.29:11434');
+  assert.equal(normalizeEndpoint('http://192.168.122.29'), '192.168.122.29:11434');
+  assert.equal(normalizeEndpoint(''), null);
+  assert.equal(normalizeEndpoint(undefined), null);
+});
+
+test('leaseCovers: no endpoints field (PromptForge) or an empty list = the whole pipeline, for any endpoint', () => {
+  assert.equal(leaseCovers({ holder: 'promptforge' }, P40), true);
+  assert.equal(leaseCovers({ holder: 'promptforge', endpoints: [] }, HOST), true);
+  assert.equal(leaseCovers({ endpoints: 'not-an-array' }, HOST), true, 'a malformed field is not a scope: stay held');
+});
+
+test('leaseCovers: a scoped lease covers only the endpoints it lists', () => {
+  assert.equal(leaseCovers({ endpoints: [P40] }, P40), true);
+  assert.equal(leaseCovers({ endpoints: [P40] }, HOST), false);
+  assert.equal(leaseCovers({ endpoints: [HOST] }, 'http://127.0.0.1:11434'), true, 'localhost and 127.0.0.1 are the same card');
+  assert.equal(leaseCovers({ endpoints: [P40, HOST] }, HOST), true);
+  assert.equal(leaseCovers({ endpoints: [P40] }, 'http://192.168.122.29:11435'), false, 'same host, other port, other server');
+});
+
+test('leaseCovers: a caller whose endpoint cannot be parsed stays held (the safe side)', () => {
+  assert.equal(leaseCovers({ endpoints: [P40] }, ''), true);
+});
+
+test('leaseHeldFor: an unscoped fresh lease is held for every endpoint (existing behaviour)', () => {
+  withLeaseFile(freshLease({ holder: 'promptforge' }), (p) => {
+    assert.equal(leaseHeldFor(P40, p), true);
+    assert.equal(leaseHeldFor(HOST, p), true);
+  });
+});
+
+test('leaseHeldFor: a scoped fresh lease is held for its endpoint and NOT for the other card', () => {
+  withLeaseFile(freshLease({ endpoints: [P40] }), (p) => {
+    assert.equal(leaseHeldFor(P40, p), true);
+    assert.equal(leaseHeldFor(HOST, p), false);
+  });
+});
+
+test('leaseHeldFor: staleness and the MAX ceiling still apply to a scoped lease', () => {
+  const now = new Date().toISOString();
+  const staleRefresh = new Date(Date.now() - 600 * 1000).toISOString();   // past the 90 s TTL
+  const pastCeiling = new Date(Date.now() - 1000 * 1000).toISOString();   // past the 900 s MAX
+  withLeaseFile({ holder: 'kaggleforge', endpoints: [P40], acquiredAt: now, refreshedAt: staleRefresh }, (p) => assert.equal(leaseHeldFor(P40, p), false, 'refreshedAt past the TTL'));
+  withLeaseFile({ holder: 'kaggleforge', endpoints: [P40], acquiredAt: pastCeiling, refreshedAt: now }, (p) => assert.equal(leaseHeldFor(P40, p), false, 'acquiredAt past the MAX ceiling'));
+});
+
+test('leaseHeldFor: missing or malformed file -> not held (fails open)', () => {
+  assert.equal(leaseHeldFor(P40, path.join(os.tmpdir(), 'definitely-not-a-lease-file-xyz.json')), false);
+  const p = path.join(os.tmpdir(), `comfyui-lease-bad-${Math.random().toString(36).slice(2)}.json`);
+  fs.writeFileSync(p, '{not json');
+  try { assert.equal(leaseHeldFor(P40, p), false); } finally { fs.unlinkSync(p); }
+});
+
+test('comfyuiLeaseHeld keeps its whole-pipeline meaning for a scoped lease (ensureGpuHeadroom and the Forge paths see "some lease is held")', () => {
+  withLeaseFile(freshLease({ endpoints: [P40] }), (p) => assert.equal(comfyuiLeaseHeld(p), true));
 });

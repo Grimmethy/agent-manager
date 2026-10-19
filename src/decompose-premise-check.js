@@ -129,7 +129,35 @@ function resolveExistingPath(raw, repoRoot, lineCountFn) {
   return raw;
 }
 
-function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCount } = {}) {
+// A sub-task cites paths the way the task text wrote them ("src/routes/counties.js"), but a
+// monorepo keeps its code under sub-roots (TaxHarvest-Cowork: TaxHarvest/backend/src/routes/
+// counties.js, TaxHarvest/frontend/src/api/admin.ts), so probing repoRoot/<cited> alone calls
+// a perfectly real file "missing" and the task blocks as a stale premise (2026-10-07: HUB0007-02,
+// HUB0008-01 and HUB0012-02 on the TaxHarvest pipeline, nothing re-admitted them afterwards).
+// Resolve the cited path by PATH-SUFFIX instead: a hit must equal the cited path or end with
+// "/" + the cited path, so an unrelated file that merely shares a basename never counts.
+// Returns { status: 'unique', relPath } (judge that file), { status: 'ambiguous', matches }
+// (more than one real file ends with the cited path -- we cannot tell which the sub-task meant,
+// and this check's posture is cheap and high-confidence, so the caller does not flag it) or
+// { status: 'none' } (no such file anywhere: a real missing-file). Never throws.
+const SUFFIX_MATCH_CAP = 200; // findByBasename defaults to 10; a common basename must not be truncated before the suffix filter
+function resolveCitedFile(repoRoot, relPath, { findFn } = {}) {
+  try {
+    const find = findFn || require('./fact-checker.js').findByBasename;
+    const cited = String(relPath).replace(/\\/g, '/').replace(/^\.?\//, '');
+    const hits = find(repoRoot, path.basename(cited), SUFFIX_MATCH_CAP) || [];
+    const matches = [...new Set(hits
+      .map((h) => path.relative(repoRoot, h).replace(/\\/g, '/'))
+      .filter((rel) => rel === cited || rel.endsWith('/' + cited)))];
+    if (matches.length === 1) return { status: 'unique', relPath: matches[0] };
+    if (matches.length > 1) return { status: 'ambiguous', matches };
+    return { status: 'none' };
+  } catch {
+    return { status: 'none' };
+  }
+}
+
+function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCount, resolveFn = resolveCitedFile } = {}) {
   if (!isEnabled()) return null;
   const pc = (task && task.promptContext) || {};
   if (!pc.decomposedFrom) return null; // only ever a decompose product -- see header
@@ -166,16 +194,31 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
   const checkedFiles = new Map(); // relPath -> lineCount | null, avoid re-reading the same file per ref
   for (const ref of lineRefs) {
     const p = nearestPathFor(ref.index);
-    if (!checkedFiles.has(p.relPath)) checkedFiles.set(p.relPath, lineCountFn(repoRoot, p.relPath));
-    const lineCount = checkedFiles.get(p.relPath);
+    if (!checkedFiles.has(p.relPath)) {
+      let lines = lineCountFn(repoRoot, p.relPath);
+      let resolvedPath = null;
+      if (lines === null) {
+        // Not at the cited location -- look for it under a monorepo sub-root before calling it missing.
+        const r = resolveFn(repoRoot, p.relPath);
+        if (r && r.status === 'unique') {
+          lines = lineCountFn(repoRoot, r.relPath);
+          resolvedPath = r.relPath;
+        } else if (r && r.status === 'ambiguous') {
+          lines = 'ambiguous';
+        }
+      }
+      checkedFiles.set(p.relPath, { lines, resolvedPath });
+    }
+    const { lines: lineCount, resolvedPath } = checkedFiles.get(p.relPath);
+    if (lineCount === 'ambiguous') continue; // several real files end with the cited path: cannot tell which one, so do not flag
     if (lineCount === null) {
       findings.push({ kind: 'missing-file', relPath: p.relPath, detail: `cites \`${p.relPath}\`, but that file does not exist in the repo` });
       continue;
     }
     if (ref.line > lineCount + LINE_OVERSHOOT_SLACK) {
       findings.push({
-        kind: 'line-overshoot', relPath: p.relPath, citedLine: ref.line, realLineCount: lineCount,
-        detail: `cites line ${ref.line} of \`${p.relPath}\`, but that file is only ${lineCount} lines long now -- it has likely been restructured (a decompose, a split) since this citation was written`,
+        kind: 'line-overshoot', relPath: p.relPath, resolvedPath: resolvedPath || undefined, citedLine: ref.line, realLineCount: lineCount,
+        detail: `cites line ${ref.line} of \`${p.relPath}\`${resolvedPath ? ` (resolved to \`${resolvedPath}\`)` : ''}, but that file is only ${lineCount} lines long now -- it has likely been restructured (a decompose, a split) since this citation was written`,
       });
     }
   }
@@ -197,4 +240,4 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
   };
 }
 
-module.exports = { detectStaleDecomposePremise, PATH_RE, LINE_REF_RE, LINE_OVERSHOOT_SLACK, maskTimestamps, resolveExistingPath };
+module.exports = { detectStaleDecomposePremise, resolveCitedFile, SUFFIX_MATCH_CAP, PATH_RE, LINE_REF_RE, LINE_OVERSHOOT_SLACK, maskTimestamps, resolveExistingPath };

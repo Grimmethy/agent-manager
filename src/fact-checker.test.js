@@ -106,6 +106,22 @@ test('extractFilePaths still extracts a bare path with no line suffix', () => {
   assert.deepEqual(extractFilePaths('see src/real-file.js for detail'), ['src/real-file.js']);
 });
 
+// A method call that happens to end in a file extension (res.json(...), r.json(), resp.json()) is code, not a cited file.
+test('extractFilePaths does not read a method call like res.json({...}), r.json() or resp.json() as a file path', () => {
+  assert.deepEqual(extractFilePaths('await res.json({ ok: 1 }) then r.json() and resp.json()'), []);
+});
+
+test('extractFilePaths still extracts real, backticked and quoted paths and a path followed by prose in parentheses', () => {
+  assert.deepEqual(
+    extractFilePaths("see foo.js (the helper) and src/data.json and `config.json` and require('./lib/x.js')"),
+    ['foo.js', 'src/data.json', 'config.json', './lib/x.js'],
+  );
+});
+
+test('extractFilePaths returns only the real path when a call and a path share one text', () => {
+  assert.deepEqual(extractFilePaths('const d = await r.json(); // reads src/real-file.js'), ['src/real-file.js']);
+});
+
 test('checkFilePaths does not leak a :NNN-suffixed token as an existing file', () => {
   const repoRoot = makeRepo();
   assert.deepEqual(checkFilePaths('see src/real-file.js:310 for detail', repoRoot, ['src']), []);
@@ -923,4 +939,37 @@ test('extractDiffCreateTargets attributes a /dev/null marker to its OWN file hea
 test('extractDiffCreateTargets finds a newly created BINARY file, which has a new file mode header but no ---/+++ lines', () => {
   const binary = ['diff --git a/assets/logo.png b/assets/logo.png', 'new file mode 100644', 'index 0000000..abc1234', 'GIT binary patch', 'literal 12', 'zcmZ?wbhEHb'].join('\n');
   assert.deepEqual([...extractDiffCreateTargets(binary)], ['assets/logo.png']);
+});
+
+// 2026-10-08: fixture URLs the draft itself adds in a TEST file are its own test data, not claims about the repo (TaxHarvest http_get_bytes cache task).
+const { urlsOnlyInAddedTestFiles } = require('./fact-checker.js');
+const diffOf = (...files) => files.map(([f, lines]) => `diff --git a/${f} b/${f}\nnew file mode 100644\n--- /dev/null\n+++ b/${f}\n@@ -0,0 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join('\n')}`).join('\n');
+const SRC = 'unrelated grounding text with nothing in it';
+
+test('checkGroundedValues: a URL that exists only in added TEST files is exempt; the same URL in a production file, in both, or only in prose is still flagged', () => {
+  const testOnly = diffOf(['pkg/tests/test_cache.py', ['url = "http://ex.com/report/a.pdf"']]);
+  assert.deepEqual(checkGroundedValues(testOnly, SRC, null, null), []);
+  assert.deepEqual([...urlsOnlyInAddedTestFiles(testOnly)], ['http://ex.com/report/a.pdf']);
+
+  const prod = diffOf(['pkg/cache.py', ['URL = "http://ex.com/report/a.pdf"']]);
+  assert.deepEqual(checkGroundedValues(prod, SRC, null, null).map((f) => f.detail), ['http://ex.com/report/a.pdf']);
+
+  const both = diffOf(['pkg/cache.py', ['URL = "http://ex.com/report/a.pdf"']], ['pkg/tests/test_cache.py', ['url = "http://ex.com/report/a.pdf"']]);
+  assert.deepEqual(checkGroundedValues(both, SRC, null, null).map((f) => f.detail), ['http://ex.com/report/a.pdf'], 'a production file relies on it too');
+
+  assert.deepEqual(checkGroundedValues('The fix fetches http://ex.com/report/a.pdf from the portal.', SRC, null, null).map((f) => f.detail), ['http://ex.com/report/a.pdf'], 'prose only');
+
+  const proseAndTest = `Tests use http://ex.com/page.html.\n${diffOf(['src/foo.test.js', ['const u = "http://ex.com/page.html";']])}`;
+  assert.deepEqual(checkGroundedValues(proseAndTest, SRC, null, null), [], 'prose describing the fixture does not veto it');
+});
+
+test('test-file recognition covers tests/ dirs, *.test.js/ts, *.spec.*, test_*.py and *_test.py, and nothing else', () => {
+  const urlIn = (f) => [...urlsOnlyInAddedTestFiles(diffOf([f, ['x = "http://t.example.org/a"']]))].length;
+  for (const f of ['a/tests/x.py', 'a/test/x.js', 'a/__tests__/x.ts', 'a/x.test.js', 'a/x.spec.tsx', 'a/test_x.py', 'a/x_test.py']) assert.equal(urlIn(f), 1, f);
+  for (const f of ['a/contest.py', 'a/latest/x.py', 'a/attest.js', 'a/x.js', 'a/testing_notes.md']) assert.equal(urlIn(f), 0, f);
+});
+
+test('an ungrounded ALLCAPS field in a test file is still flagged (only URLs are exempt)', () => {
+  const d = diffOf(['pkg/tests/test_cache.py', ['x = INVENTED_FIELD_NAME']]);
+  assert.deepEqual(checkGroundedValues(d, SRC, null, null).map((f) => f.type), ['ungrounded-field']);
 });

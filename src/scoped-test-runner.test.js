@@ -296,3 +296,67 @@ test('runScopedTests: a real covering test run under a live-looking env sees a t
     assert.equal(result.passed, true, result.raw || JSON.stringify(result));
   });
 });
+
+// --- vitest packages (2026-10-08) ------------------------------------------------------------------------------------------------------------------------------
+// change_review runs runScopedTests over merged commits. `node --test` cannot execute a .tsx, so a commit touching a component with a vitest test would have
+// auto-filed a false "confirmed regression". The runner now comes from the package that owns the test file.
+{
+  const fs2 = require('node:fs');
+  const os2 = require('node:os');
+  const path2 = require('node:path');
+  const test2 = require('node:test');
+  const assert2 = require('node:assert/strict');
+  const { runJsTests } = require('./scoped-test-runner.js');
+
+  // A repo with a vitest package whose "vitest.mjs" is a stub: it exits with the code in STUB_EXIT.mjs's text and prints a FAIL line when it fails.
+  const mk = ({ installed = true, fail = false } = {}) => {
+    const dir = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'sc-vitest-'));
+    const put = (rel, text) => { fs2.mkdirSync(path2.dirname(path2.join(dir, rel)), { recursive: true }); fs2.writeFileSync(path2.join(dir, rel), text); };
+    put('web/package.json', JSON.stringify({ devDependencies: { vitest: '^3.2.7' } }));
+    put('web/src/A.test.tsx', 'x');
+    put('plain.test.js', "const test = require('node:test'); test('ok', () => {});\n");
+    put('package.json', '{}');
+    if (installed) put('web/node_modules/vitest/vitest.mjs', fail
+      ? "console.log(' FAIL  ' + process.argv.slice(2).filter((a) => a.endsWith('.tsx'))[0] + ' > A > breaks'); process.exit(1);"
+      : 'process.exit(0);');
+    return dir;
+  };
+
+  test2('runJsTests: a .tsx test goes to vitest from its package (pass), and a plain .js test still goes to node --test', () => {
+    const dir = mk();
+    const r = runJsTests(dir, ['web/src/A.test.tsx', 'plain.test.js']);
+    assert2.equal(r.passed, true);
+    assert2.deepEqual([...r.ran].sort(), ['plain.test.js', 'web/src/A.test.tsx']);
+  });
+
+  test2('runJsTests: a failing vitest test is a real failure with its name; a package without installed node_modules is INCONCLUSIVE, never a regression', () => {
+    const failing = runJsTests(mk({ fail: true }), ['web/src/A.test.tsx']);
+    assert2.equal(failing.passed, false);
+    assert2.deepEqual(failing.failures, ['src/A.test.tsx > A > breaks']);
+    const missing = runJsTests(mk({ installed: false }), ['web/src/A.test.tsx']);
+    assert2.equal(missing.passed, null);
+    assert2.match(missing.raw, /vitest is not installed for web \(run npm ci there\)/);
+  });
+
+  test2('runJsTests: when one package fails and another is inconclusive the combined verdict is false (a real failure always wins), and inconclusive + pass is null', () => {
+    const dir = mk({ fail: true });
+    const put = (rel, text) => { fs2.mkdirSync(path2.dirname(path2.join(dir, rel)), { recursive: true }); fs2.writeFileSync(path2.join(dir, rel), text); };
+    put('web2/package.json', JSON.stringify({ devDependencies: { vitest: '^3.2.7' } }));      // declares vitest but has no node_modules: inconclusive
+    put('web2/src/B.test.tsx', 'x');
+    assert2.equal(runJsTests(dir, ['web/src/A.test.tsx', 'web2/src/B.test.tsx']).passed, false);
+    const ok = mk();
+    fs2.mkdirSync(path2.join(ok, 'web2', 'src'), { recursive: true });
+    fs2.writeFileSync(path2.join(ok, 'web2', 'package.json'), JSON.stringify({ devDependencies: { vitest: '^3.2.7' } }));
+    fs2.writeFileSync(path2.join(ok, 'web2', 'src', 'B.test.tsx'), 'x');
+    assert2.equal(runJsTests(ok, ['web/src/A.test.tsx', 'web2/src/B.test.tsx']).passed, null);
+  });
+
+  test2('runJsTests: a .tsx test in a package with no runner is not run at all (no evidence either way), and mixed results combine false > null > true', () => {
+    const dir = mk();
+    fs2.writeFileSync(path2.join(dir, 'web', 'package.json'), '{}');
+    assert2.equal(runJsTests(dir, ['web/src/A.test.tsx']), null, 'nothing runnable -> no verdict');
+    const both = runJsTests(mk({ fail: true }), ['web/src/A.test.tsx', 'plain.test.js']);
+    assert2.equal(both.passed, false, 'a failing suite wins over a passing one');
+    assert2.deepEqual(both.failures, ['src/A.test.tsx > A > breaks']);
+  });
+}

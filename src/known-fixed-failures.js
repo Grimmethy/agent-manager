@@ -79,6 +79,35 @@ function citedCodeMovedAndRelocatable(task) {
   } catch { return false; }
 }
 
+// Shared by the two docs-only-gate entries: the recorded failure is the docs-only block AND the current gate would no longer read the task as asking for code.
+function docsOnlyGateNoLongerBlocks(task) {
+  const t = failureText(task);
+  if (!/only (?:touches|created\/edited) documentation/.test(t) || !/code change/.test(t)) return false;
+  try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
+}
+
+// The recorded failure says a sibling repo could not be reached from the implement pass AND the task really does name a registered sibling repo (an absolute path
+// inside one of `roots`, by default the read-only root list the implement pass itself now gets). Fail closed: no roots, no raw text or a throw is "no".
+const SIBLING_PATH_RE = /\/media\/model-cache\/github\/[A-Za-z0-9._-]+(?:\/[^\s'"`),;]*)?/g;
+function siblingRepoWasUnreachable(task, roots) {
+  const t = failureText(task);
+  const unreachable = /not inside any accessible repo|exactly one accessible repo/i.test(t)
+    || (/No such file or directory/i.test(t) && /\/media\/model-cache\/github\/[A-Za-z0-9._-]+/.test(t));
+  if (!unreachable) return false;
+  try {
+    const path = require('path');
+    const fs = require('fs');
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+    let list = roots;
+    if (!list) {
+      const core = process.env.AGENT_MANAGER_CORE_REPO_ROOT || require('./config.js').getConfig().repoRoot;
+      list = require('./accessible-roots.js').resolveReadOnlySiblingRoots({ repoRoot: core });
+    }
+    const named = String(task && task.promptContext && task.promptContext.rawText || '').match(SIBLING_PATH_RE) || [];
+    return named.some((p) => list.some((r) => { const rr = real(r); const pp = real(p); return pp === rr || pp.startsWith(rr + path.sep); }));
+  } catch { return false; }
+}
+
 const KNOWN_FIXED = [
   {
     id: 'wrong-block-whole-function-snippet',
@@ -122,11 +151,24 @@ const KNOWN_FIXED = [
     description: 'adhoc-diff-sanity blocked a CORRECT docs-only diff ("the task asks for a code change") because the task text mentioned code paths only to say they are NOT to be edited, or because the model plan described what the document will cite',
     dirs: ['blocked', 'needs-clarification'],
     // The failure text AND a structural precondition: the fixed gate would no longer read this task as asking for code (a task that really wants code stays put).
-    applies: (task) => {
-      const t = failureText(task);
-      if (!/only (?:touches|created\/edited) documentation/.test(t) || !/code change/.test(t)) return false;
-      try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
-    },
+    applies: docsOnlyGateNoLongerBlocks,
+  },
+  {
+    // A NEW id for the 2026-10-15 follow-up fix: the sweep stamps firstSeen once per id and skips tasks that got stuck after it, so the 2026-09-21 entry above could never drain
+    // the tasks the later fix unblocks (the PromptForge and core GPU broker verification tasks, stuck 2026-10-15/16, were skipped as "failed after the fix").
+    id: 'docs-only-gate-read-only-deliverable',
+    fixedIn: 'agent-manager (docs-only gate: read-only documentation tasks and edit verbs inside identifiers, 5ac1dee7, 2026-10-15)',
+    description: 'adhoc-diff-sanity blocked a CORRECT docs-only diff ("the task asks for a code change") for a task that states a documentation deliverable and says its code is read-only, because verbs and phrases in code-citing sentences ("would move", "lease-delete+yield", "a NEW file") were read as requests',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: docsOnlyGateNoLongerBlocks,
+  },
+  {
+    id: 'implement-pass-sibling-repos-readable',
+    fixedIn: 'agent-manager (implement pass reads registered plugin/project repos read-only, merged 028e586f, 2026-10-16)',
+    description: 'The agentic implement pass could see only its own worktree, so a read-only cross-repo verification task (GPU broker verify videoforge/promptforge) found "/media/model-cache/github/<repo> does not exist" or "path is not inside any accessible repo" and concluded the repo was not on this machine. It now gets every registered plugin repo as a read-only root.',
+    dirs: ['blocked', 'needs-clarification'],
+    // The failure text says a sibling repo was unreachable AND the task names a path inside one of the roots the implement pass now receives (a task about a repo that really is not registered stays put).
+    applies: (task) => siblingRepoWasUnreachable(task),
   },
   {
     id: 'stale-snippet-partial-anchor',
@@ -172,4 +214,4 @@ const KNOWN_FIXED = [
   },
 ];
 
-module.exports = { KNOWN_FIXED, failureText };
+module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable };
