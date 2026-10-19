@@ -204,6 +204,7 @@ acquire_single_flight_lock() {
   # that identity is the entire mechanism; a bash `sed` step that drifted from the JS
   # regex even slightly would silently recreate this exact bug.
   local key="${1:-}"
+  local skip="${2:-}"
   local lockfile queue_dir
   if [[ -n "$key" ]]; then
     local safe_key
@@ -222,8 +223,8 @@ acquire_single_flight_lock() {
   # yield the GPU until the newest marker's mtime goes stale (>15s) or it is removed. Was a
   # flat 8s wall -- far too short for a multi-turn chat turn (2026-09-02). AGENT_MANAGER_
   # PRIORITY_HOLDER (set on the chat turn's own node child) skips this entirely.
-  if [[ -z "${AGENT_MANAGER_PRIORITY_HOLDER:-}" ]]; then
-    local waited=0 fresh_secs=15 max_wait="${DISCUSS_PRIORITY_MAX_WAIT_SEC:-120}"
+  if [[ -z "${AGENT_MANAGER_PRIORITY_HOLDER:-}" && -z "$skip" ]]; then
+    local waited=0 fresh_secs=15 max_wait="${DISCUSS_PRIORITY_MAX_WAIT_SEC:-900}"
     while (( waited < max_wait )); do
       local newest_age=99999 now_s f mt
       now_s="$(date +%s)"
