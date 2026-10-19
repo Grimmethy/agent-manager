@@ -145,3 +145,31 @@ test('possibleDuplicateOf guard: a claimed title that IS in the real candidate l
   assert.equal(isValidDuplicateMatch('Add authentication to the Agent Manager dashboard session persistence', realTitles), true,
     'a truncated/extended form of a real title still matches, so a real duplicate is not lost to the guard');
 });
+
+// 2026-10-18: work for the entry appeared AFTER its sort was drafted -> link, do not queue (brain-dump-existing-work.js).
+test('applyBrainDumpSort: existing work for the entry -> skipped existingWork result, entry linked, nothing queued or filed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-existing-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const entry = brainDumpEntry({ id: 'bd-7', serial: 1905, capturedAt: '2026-10-18T03:00:00.000Z' });
+  const brainDumpPath = writeBrainDump(dir, [entry]);
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'adhoc-by-hand.json'), JSON.stringify({ id: 'adhoc-by-hand', promptContext: { raisedFrom: 'brain-dump-1905' } }));
+  const task = { promptContext: { brainDumpEntryId: 'bd-7', rawText: 'original' } };
+  const implementResponse = JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md' });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: dir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.existingWork, true);
+  assert.equal(result.linkedTo, 'adhoc-by-hand');
+  assert.match(result.reason, /already exists: adhoc-by-hand \(done, matched by raisedFrom\)/);
+  const saved = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  assert.equal(saved.status, 'actioned');
+  assert.equal(saved.queuedTaskId, 'adhoc-by-hand');
+  assert.equal(saved.linkedExistingWork.by, 'apply');
+  assert.deepEqual(fs.readdirSync(secondBrainDir), [], 'no note filed');
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false, 'no adhoc task queued');
+  const hist = fs.readFileSync(path.join(dir, 'instances', 'pipeline-history.log'), 'utf8');
+  assert.match(hist, /"type":"brain-dump-existing-work".*"by":"apply"/);
+});

@@ -7,6 +7,8 @@ const path = require('path');
 const { resolveAnchors, extractKeywords } = require('./path-prefetch.js');
 const { resolveGraphPath, getSecondBrainDir } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
+const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
 const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 const {
   CANONICAL_TOP_LEVEL,
@@ -537,11 +539,40 @@ function filePassiveNote(ctx) {
   return { file: fullPath };
 }
 
+// The pipeline dirs to search for an entry's existing work: this pipeline, plus the project the classifier named (its own
+// queue is where a new task would go).
+function existingWorkDirs(pipelineDir, result) {
+  const dirs = [];
+  try { dirs.push(pipelineDir || require('./config.js').getConfig().pipelineDir); } catch { if (pipelineDir) dirs.push(pipelineDir); }
+  const label = result && result.belongsToProject;
+  if (label) {
+    const p = readProjectRegistry().find((x) => x.label === label);
+    if (p && p.pipelineDir) dirs.push(p.pipelineDir);
+  }
+  return dirs.filter(Boolean);
+}
+
 function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
   const loaded = loadAndClassifyEntry({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
   if (loaded.done) return loaded.done;
   const { ctx } = loaded;
   const { result, data, entry } = ctx;
+
+  // Existing-work re-check (2026-10-18, brain-dump-existing-work.js): work for this entry can appear between drafting
+  // this sort and applying it (an operator carrying the entry by hand, the dashboard's prioritize). Link instead of queueing.
+  const existing = findExistingWorkForEntry(existingWorkDirs(pipelineDir, result), entry);
+  if (existing) {
+    linkEntryToExistingWork(entry, existing, 'apply');
+    fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+    writeJsonAtomicSync(brainDumpPath, data);
+    logPipelineEvent(existing.pipelineDir, 'brain-dump-existing-work', { entryId: entry.id, serial: entry.serial ?? null, taskId: existing.taskId, state: existing.state, how: existing.how, by: 'apply' });
+    return {
+      skipped: true,
+      existingWork: true,
+      linkedTo: existing.taskId,
+      reason: `work for this brain-dump entry already exists: ${existing.taskId} (${existing.state}, matched by ${existing.how}) -- not queueing another task`,
+    };
+  }
 
   // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
   // change -- "investigate X, document findings" needs real web research, not a diff
