@@ -973,3 +973,38 @@ test('an ungrounded ALLCAPS field in a test file is still flagged (only URLs are
   const d = diffOf(['pkg/tests/test_cache.py', ['x = INVENTED_FIELD_NAME']]);
   assert.deepEqual(checkGroundedValues(d, SRC, null, null).map((f) => f.type), ['ungrounded-field']);
 });
+
+// checkGroundedValues: env var the draft's own diff reads -------------------------------------
+// 2026-10-18, root-caused live: brain-dump 1890's review was hard-blocked on AGENT_MANAGER_EDIT_FILE_TIERS, an env switch
+// the draft itself introduced by READING it (process.env.X) on an added line of an existing file -- the newly-declared
+// exemption only knows `NAME =` lines. See extractEnvReadIdentifiers in fact-checker.js.
+
+function envDraft(addedLines, { prose = 'Added a switch.', context = [] } = {}) {
+  return [prose, '', '=== DIFF ===', 'diff --git a/src/a.js b/src/a.js', '@@ -1,2 +1,3 @@', ...context, ...addedLines].join('\n');
+}
+
+test('checkGroundedValues does not flag an env var read on an added line (JS, Python, shell forms)', () => {
+  const { checkGroundedValues, extractEnvReadIdentifiers } = require('./fact-checker.js');
+  const cases = [
+    "+const on = process.env.AGENT_MANAGER_EDIT_FILE_TIERS === 'on';",
+    "+const v = process.env['AGENT_MANAGER_EDIT_FILE_TIERS'];",
+    "+v = os.environ['AGENT_MANAGER_EDIT_FILE_TIERS']",
+    "+v = os.environ.get('AGENT_MANAGER_EDIT_FILE_TIERS', '')",
+    "+v = os.getenv(\"AGENT_MANAGER_EDIT_FILE_TIERS\")",
+    '+tiers="${AGENT_MANAGER_EDIT_FILE_TIERS:-off}"',
+  ];
+  for (const line of cases) {
+    const draft = envDraft([line], { prose: 'Set AGENT_MANAGER_EDIT_FILE_TIERS=on to enable it.' });
+    assert.deepEqual(checkGroundedValues(draft, 'grounding that predates the switch'), [], line);
+    assert.ok(extractEnvReadIdentifiers(draft).has('AGENT_MANAGER_EDIT_FILE_TIERS'), line);
+  }
+});
+
+test('checkGroundedValues still flags a name only in prose, only on a context or removed line, or as a JS template constant', () => {
+  const { checkGroundedValues } = require('./fact-checker.js');
+  const flagged = (draft) => checkGroundedValues(draft, 'unrelated grounding').map((f) => f.detail);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Set INVENTED_SWITCH_NAME=on.' })), ['INVENTED_SWITCH_NAME']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Uses CONTEXT_SWITCH.', context: [' const c = process.env.CONTEXT_SWITCH;'] })), ['CONTEXT_SWITCH']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Drops REMOVED_SWITCH.', context: ['-const c = process.env.REMOVED_SWITCH;'] })), ['REMOVED_SWITCH']);
+  assert.deepEqual(flagged(envDraft(['+const t = `${TEMPLATE_CONST_NAME}`;'])), ['TEMPLATE_CONST_NAME']);
+});
