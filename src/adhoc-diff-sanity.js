@@ -619,7 +619,83 @@ function adhocNoChangesClaimProblem(task, summary) {
   };
 }
 
+// --- import-binding steps in a plan (HUB0159 · 1/3) ---------------------------
+//
+// A plan step that tells the implementer to add a require/import binding is exactly where
+// a token-gesture plan tends to show itself. Two deterministic shapes are worth a retry
+// round-trip:
+//   - >= 2 separate import-binding steps: spreading one binding across several steps
+//     almost always means the plan is doing the wiring instead of the feature;
+//   - exactly 1 import-binding step that never shows the binding verbatim (no complete
+//     require('...') / import ... from '...' statement inside its fenced snippet): the
+//     implementer has to guess the exact line and where it goes.
+//
+// Tightened heuristic (this is the point of this check, and why it was never a blind
+// keyword scan): a binding token ONLY counts when it appears INSIDE a fenced code block
+// (```...```). A `require(` or `import ... from` mentioned in plain prose -- a citation,
+// an explanation, a quoted example -- is NOT an import-binding step, so a plan that merely
+// talks about a binding is never flagged.
+
+const PLAN_IMPORT_BINDING_TOKEN_RE = /\brequire\s*\(|\bimport\b[^\n;]*\bfrom\b/;
+// A VERBATIM anchor: the complete statement with a quoted module specifier, which is what
+// the implementer can actually `find` and place an edit against.
+const PLAN_IMPORT_VERBATIM_ANCHOR_RE = /\brequire\s*\(\s*['"][^'"\n]+['"]\s*\)|\bimport\s+(?:\{[^}\n]*\}|[A-Za-z_$][\w$]*)\s+from\s+['"][^'"\n]+['"]/;
+
+// Per-branch tally: every pass/flag branch in planImportBindingProblem increments exactly
+// one counter before returning, so a wrongly-dismissed case can be located by inspecting
+// which branch fired (sibling gates in this file have no equivalent; this is local to the
+// new heuristic).
+const planImportBindingStats = {
+  skippedNotAdhoc: 0,
+  passNoImportStep: 0,
+  passVerbatimAnchor: 0,
+  flagMissingVerbatimAnchor: 0,
+  flagTooManySteps: 0,
+};
+
+// Returns null if the plan's import-binding steps look sane, else
+// { code, reason, retryFeedback }.
+function planImportBindingProblem(task, summary) {
+  if (!isAdhoc(task)) {
+    planImportBindingStats.skippedNotAdhoc++;
+    return null;
+  }
+  // The plan text (planResponse / lastGoodPlan) plus the caller-supplied summary.
+  const text = `${String(task.planResponse || task.lastGoodPlan || '')}\n${String(summary || '')}`;
+
+  // Fenced blocks only: an unclosed trailing fence still captures to end-of-text.
+  const blocks = [];
+  const fenceRe = /```[\s\S]*?(?:```|$)/g;
+  let m;
+  while ((m = fenceRe.exec(text)) !== null) blocks.push(m[0]);
+
+  const steps = blocks.filter((b) => PLAN_IMPORT_BINDING_TOKEN_RE.test(b));
+  if (steps.length === 0) {
+    planImportBindingStats.passNoImportStep++;
+    return null; // no fenced import-binding step -- prose mentions never count
+  }
+  if (steps.length >= 2) {
+    planImportBindingStats.flagTooManySteps++;
+    return {
+      code: 'too-many-import-binding-steps',
+      reason: `the plan spreads import bindings across ${steps.length} separate fenced steps`,
+      retryFeedback: 'Your plan has more than one step adding a require/import binding. That is almost always the wiring being done instead of the feature. Collapse it to ONE step that adds the single binding the feature needs, then spend the rest of the plan on the feature itself.',
+    };
+  }
+  if (steps.some((b) => PLAN_IMPORT_VERBATIM_ANCHOR_RE.test(b))) {
+    planImportBindingStats.passVerbatimAnchor++;
+    return null; // exactly one step and it shows the verbatim binding statement to find/add
+  }
+  planImportBindingStats.flagMissingVerbatimAnchor++;
+  return {
+    code: 'missing-verbatim-find-anchor',
+    reason: "the plan's single import-binding step shows the binding only in shorthand -- no verbatim require('...') / import ... from '...' statement inside its fenced snippet",
+    retryFeedback: "Your single import-binding step never shows the exact line to add. Put the verbatim statement (e.g. const { x } = require('./module.js'); or import x from './module.js'); inside a fenced code block in that step, together with the existing line it goes after, so the edit has a findable anchor.",
+  };
+}
+
 module.exports = {
   adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
   extractDeclaredTargets, pathsRefEqual, taskWantsCodeChange,
+  planImportBindingProblem, planImportBindingStats,
 };
