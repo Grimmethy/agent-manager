@@ -2880,3 +2880,29 @@ Extract the directory-walking logic (traversal, skip-list filtering via `GREP_SK
 
 Benefits:
 All tools that traverse the repository share one tested, consistent skip-list implementation, eliminating the class of "silent exclusion" bugs where a new tool forgets to skip `.venv`, `node_modules`, or archived directories. The project's existing pattern of small, focused leaf utilities (as seen in `src/atomic-write.js`) is extended coherently to the file-system-traversal concern, keeping each tool's code focused on its domain logic rather than re-implementing directory mechanics.
+
+### AC-238 · resolveSourceName hardcodes built-in source aliases in core logic
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` contains a chain of `if` statements that map specific `task.domain` and `task.source` literal values (e.g. `domain === 'adhoc'`, `source === 'manual'`) to their corresponding registry names. The inline comments acknowledge this is a "hardcoded fallback" for "built-in quirks" and direct plugins to use `registerSourceAlias` for their own naming mismatches. The result is that the core resolution path is tightly coupled to the naming conventions of the `adhoc` and `secondbrain` sources: adding or renaming any future built-in source with a similar mismatch forces a change to this central function, and the set of special-cased sources is invisible from the registration API.
+
+Solution:
+Extend the `config` object accepted by `registerTaskSource` with an optional `sourceAliases` array (e.g. `{ domain: 'adhoc', source: 'manual' }` entries). During registration, the registry stores these aliases in an internal lookup map. `resolveSourceName` then consults that map first and falls back to the identity mapping, eliminating the per-source `if` chain. The existing `registerSourceAlias` helper for plugins can be refactored to simply push into the same map, unifying the built-in and plugin paths.
+
+Benefits:
+Adding or renaming a built-in source becomes a one-line change in its own registration call rather than an edit to shared core logic. The full set of alias mappings is discoverable at the registration site, improving locality. Plugin and built-in sources follow the same code path, reducing the surface area for divergence and making the resolution function trivially testable by inspecting the alias map.
+
+### AC-239 · Lazy require of source-scope.js obscures the registry's true dependency graph
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` performs a `require('./lib/source-scope.js')` inside the function body, triggered only when `config.scope === 'core'`. Because the import is buried in a conditional branch rather than at the top of the module, the full set of `task-source-registry.js`'s dependencies is not visible from the file's header. A reader (or a static-analysis tool) scanning the top-level `require` statements will not see `source-scope.js`, making the dependency graph incomplete. If `source-scope.js` carries side effects at load time, or if the lazy `require` throws in an edge-case environment, the failure is deferred and harder to diagnose.
+
+Solution:
+Move the `require('./lib/source-scope.js')` to the top of `src/task-source-registry.js` alongside the other module-level imports. If the original motivation was a circular dependency (e.g. `source-scope.js` imports from `task-source-registry.js`), break the cycle by extracting the shared interface into a small leaf module, or by passing the `sourceEligibleHere` function as an explicit parameter to `registerTaskSource` from the caller that already holds the reference. Either way the dependency becomes visible at the module boundary.
+
+Benefits:
+The module's import list accurately reflects its runtime dependencies, making the graph auditable by eye and by tooling. Load-time errors in `source-scope.js` surface immediately at startup rather than on the first `core`-scoped registration call. Removing the conditional `require` also eliminates a subtle code path where the module is loaded in one process but not another, simplifying reasoning about initialization order.
