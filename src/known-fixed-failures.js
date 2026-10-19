@@ -212,6 +212,23 @@ const KNOWN_FIXED = [
       return !hasUnreliableGrounding(task);
     },
   },
+  {
+    // 2026-10-18: the review fact-checker's ungrounded-field gate flagged an environment variable the draft's own diff
+    // introduces (read as process.env.X / os.environ / getenv / shell ${X:-}) -- e.g. AGENT_MANAGER_EDIT_FILE_TIERS on
+    // brain-dump 1890. fact-checker.js now exempts those names; this re-runs that same extraction on the parked task's
+    // own diff and re-admits it only when EVERY flagged name is such an env read (one genuinely invented name keeps it parked).
+    id: 'ungrounded-field-new-env-var',
+    fixedIn: 'agent-manager (fact-checker: an env var read by the draft\'s own diff is not ungrounded, 2026-10-18)',
+    description: 'an ungrounded-field block on a name the draft itself introduces as an environment variable it reads',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const names = [...failureText(task).matchAll(/ungrounded-field: ([A-Z][A-Z0-9]*_[A-Z0-9_]+)/g)].map((m) => m[1]);
+      if (!names.length) return false;
+      const { extractEnvReadIdentifiers } = require('./fact-checker.js');
+      const reads = extractEnvReadIdentifiers((task && (task.implementResponse || task.rawDiff)) || '');
+      return names.every((n) => reads.has(n));
+    },
+  },
 ];
 
 module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable };
