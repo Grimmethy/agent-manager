@@ -156,9 +156,11 @@ const LANE_RE = /^[A-Za-z0-9_.-]+$/;   // a lane is an instance id (worker-3090)
 
 // The queue stages a role takes work from: a worker claims from pending/ and resumes its own drafting/<lane>/, and the tick's own seeding
 // generates a premium adhoc/ or derived/ task first, ahead of every source and the generation throttle (lib/task-selection.js
-// premiumPreemptedTask); the reviewer reads review/; the apply loop reads approved/.
+// premiumPreemptedTask); the reviewer reads review/; the apply loop reads approved/. 'worker-seed' is just the generation stages, which a
+// premium-only borrowed tick checks before running the seeding step (so it never generates regular work in another project).
 function premiumStageDirs(role, lane) {
   if (role === 'worker') return ['adhoc', 'derived', 'pending', ...(lane && LANE_RE.test(lane) ? [path.join('drafting', lane)] : [])];
+  if (role === 'worker-seed') return ['adhoc', 'derived'];
   if (role === 'reviewer') return ['review'];
   if (role === 'apply') return ['approved'];
   return [];
@@ -166,7 +168,9 @@ function premiumStageDirs(role, lane) {
 
 // True when a task in one of the role's stages has a top-level premiumPriority === true -- the same test as lib/task-selection.js
 // hasPremiumPriorityInQueue (not required from there: that module loads the config and source registry, and this one is called from
-// bash every tick). Unreadable dirs and corrupt/partial files are skipped; never throws.
+// bash every tick). Unreadable dirs and corrupt/partial files are skipped; never throws. A file whose text never mentions the field is not
+// parsed at all: measured on wok 2026-10-18 over 2213 worker-stage files (32 MB, 17 projects), warm cache, read+parse every file took
+// 232-275 ms and read+substring prefilter 157-173 ms (cold cache 2.7 s either way -- the read dominates). The parse still decides.
 function hasPremium(pipelineDir, { role = 'worker', lane = null } = {}) {
   if (!pipelineDir) return false;
   for (const stage of premiumStageDirs(role, lane)) {
@@ -176,7 +180,9 @@ function hasPremium(pipelineDir, { role = 'worker', lane = null } = {}) {
     for (const e of entries) {
       if (!e.isFile() || !e.name.endsWith('.json')) continue;
       try {
-        const task = JSON.parse(fs.readFileSync(path.join(dir, e.name), 'utf8'));
+        const text = fs.readFileSync(path.join(dir, e.name), 'utf8');
+        if (!text.includes('"premiumPriority"')) continue;
+        const task = JSON.parse(text);
         if (task && task.premiumPriority === true) return true;
       } catch { /* corrupt or partial write: not a premium flag */ }
     }

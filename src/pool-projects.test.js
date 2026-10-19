@@ -205,6 +205,13 @@ test('hasPremium looks only at the stages a role works from, and only at this la
   writeTask(pipe, 'approved', 'ap', { id: 'ap', premiumPriority: true });
   assert.equal(has('reviewer'), true);
   assert.equal(has('apply'), true);
+  assert.equal(has('worker-seed'), true, 'worker-seed sees the premium adhoc/ task');
+  fs.rmSync(path.join(pipe, 'queue', 'adhoc', 'waiting.json'));
+  writeTask(pipe, 'pending', 'queued', { id: 'queued', premiumPriority: true });
+  assert.equal(has('worker', 'worker-a'), true, 'pending/ counts for the worker');
+  assert.equal(has('worker-seed'), false, 'but worker-seed looks only at adhoc/ and derived/');
+  writeTask(pipe, 'derived', 'child2', { id: 'child2', premiumPriority: true });
+  assert.equal(has('worker-seed'), true, 'derived/ counts for worker-seed');
   assert.equal(has('nobody'), false, 'unknown role has no stages');
   assert.equal(hasPremium(path.join(fx.root, 'missing')), false, 'a missing pipeline dir is not an error');
 });
