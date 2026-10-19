@@ -2705,3 +2705,29 @@ Benefits:
 Operators gain a visible signal when the verdict store and task history diverge, enabling manual reconciliation if necessary. The fix preserves the documented optimization of avoiding redundant history writes while eliminating the silent data-loss risk.
 
 NOTE: Flag 1 was addressed by changing AC-002's solution to respect the documented `unchanged` guard and adding a warning instead of a retry mechanism. Flag 2 was addressed by changing AC-001's primary proposal to the lighter-weight warning-only fix and removing the speculative shared-module proposal.
+
+### AC-225 · Registry primitive entangled with core-scope domain logic
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` is intended to be a generic registry primitive, yet it contains a hardcoded conditional `require('./lib/source-scope.js')` and an inline wrapper that rewrites `config.next` specifically when `scope: 'core'` is supplied. This embeds a domain concept ("core scope") and a concrete module dependency inside what should be a framework-agnostic registration function, violating single-responsibility and making the registry's behavior harder to test in isolation or to reuse in a context where "core scope" has no meaning.
+
+Solution:
+Extract the `scope: 'core'` wrapping logic into a dedicated, explicitly named function (e.g. `wrapCoreScopeNext`) in its own module or as a clearly separated export. Refactor `registerTaskSource` to accept an optional `nextWrapper` callback (or to delegate to a separate `applyScopeMiddleware` step) so the registry itself stays free of domain-specific branching. Migrate existing `scope: 'core'` call sites to pass the new explicit middleware, preserving identical runtime behavior while making the coupling visible and independently testable.
+
+Benefits:
+The registry becomes a pure, predictable primitive that can be unit-tested without loading `source-scope.js`. New scope-like behaviors can be added as composable middleware without editing the registry. The dependency graph becomes honest—`source-scope.js` is required only where it is actually used—simplifying tree-shaking, circular-dependency detection, and onboarding for contributors who need to understand what the registry does.
+
+### AC-226 · Two-tier source-name resolution (hardcoded domain checks + alias map)
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` contains hardcoded fallbacks for `task.domain === 'adhoc'` and `task.domain === 'secondbrain'` that duplicate the resolution work plugins are expected to perform via `registerSourceAlias`. This creates a fragile, two-tiered system: some sources are resolved by an invisible domain check baked into the registry, while others go through the extensible alias map. Adding a new domain-specific quirk requires editing the registry's internals rather than registering an alias, and the full resolution path is difficult to reason about or audit.
+
+Solution:
+Audit every source that currently relies on the hardcoded domain checks. For each, register the appropriate alias at startup (either in the owning plugin or in the core package's bootstrap), using the existing `registerSourceAlias` mechanism. Then remove the domain-specific branches from `resolveSourceName`, leaving only the alias-map lookup and the default `task.source` fallback, so all resolution flows through a single, extensible, and inspectable path.
+
+Benefits:
+Source-name resolution becomes a single, uniform mechanism that is trivially extensible: adding a new source alias is a one-line registration with no registry edit. The resolution path is easier to debug (one map lookup + one default) and to test (the alias map is the sole source of truth). It eliminates the risk of drift where a new domain quirk is added to the hardcoded branch but forgotten in documentation or in the alias-based path.
