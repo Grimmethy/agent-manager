@@ -15248,3 +15248,234 @@ Extract the three blocks into a single `processResponseMarkers(result, opts)` he
 
 Benefits:
 The loop body shrinks by roughly thirty lines. Because the helper takes `(result, opts)` and returns `result`, a node:test case can feed a synthetic response containing an `AMPLIFY:` marker and assert the sweep fired without entering the retry loop, and reviewers see one call site instead of three copy-pasted blocks.
+
+### AC-214 · Extract phase functions from verifyDiff
+Strength: Strong
+Files: src/review-verify.js
+Symbol: verifyDiff
+Snippet:
+```
+}
+
+function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, deps = {} }) {
+  const d = {
+    prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
+    relink: relinkExternalDependencies, provision: copyPackageNodeModules, resolvePy: resolvePython, findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args), ...deps,
+  };
+  const result = { status: 'inconclusive', reasons: [], apply: null, tests: null, commands: [] };
+  const inconclusive = (reason) => { result.reasons.push(reason); return result; };
+  if (!String(rawDiff || '').trim()) return inconclusive('no diff to verify');
+  const { worktreeDir, branchName } = worktreePaths(taskId);
+  const deadline = Date.now() + budgetMs;
+  const py = d.resolvePy({ explicit: pythonBin, repoRoot });
+  let prepared = false;
+  try {
+    const prep = d.prepare(repoRoot, mainBranch, worktreeDir, branchName);
+    prepared = true;
+    if (!prep || !prep.ok) return inconclusive(`could not create a scratch worktree: ${(prep && prep.reason) || 'unknown'}`);
+    d.relink(repoRoot, worktreeDir);
+    const applied = d.applyDiff(worktreeDir, rawDiff);
+    result.apply = { applied: !!applied.applied, reason: applied.reason || null };
+    if (!applied.applied) return inconclusive(`the diff does not apply to ${mainBranch} (often a slice that depends on an unmerged earlier one): ${applied.reason || 'unknown'}`);
+
+    // 0. Do the changed files still parse? Decided before any test is spent on them.
+    const syn = checkChangedFilesSyntax({ worktreeDir, files: extractChangedFiles(rawDiff), rawDiff, run: d.syntaxRun || d.run, py, repoRoot, d, deadline });
+    result.syntax = { checked: syn.checked, skipped: syn.skipped, failed: syn.failed.map((f) => f.file), preexisting: syn.preexisting.map((f) => f.file) };
+    if (syn.restoreFailed) return inconclusive('the diff could not be re-applied after the syntax base check, so nothing further was run');
+    if (syn.unattributable.length) return inconclusive(`a changed file does not parse with the diff, but the diff could not be un-applied to tell whether the base already failed: ${syn.unattributable.map((f) => f.error).join('; ')}`);
+    if (syn.failed.length) {
+      result.status = 'failed';
+      result.reasons.push(...syn.failed.map((f) => `syntax error in a file the diff changes -- ${f.error} (the base version parses; fix the syntax before anything else)`));
+      return result;
+    }
+
+    let anyTimeout = false;
+    let sandboxMissing = false;
+    const notRunReasons = new Set();
+    let anyExecuted = false;
+    const failures = [];
+    const failedSuites = [];       // suites that failed WITH the diff, pending attribution against the base
+    const contradictedCmds = [];   // claimed-PASS commands that exited non-zero WITH the diff, pending attribution
+    const runOne = (bin, args, timeoutMs, { tolerateTimeout = false, cwd } = {}) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 1000) { if (!tolerateTimeout) anyTimeout = true; return { ran: true, timedOut: true, exitCode: null, output: '' }; }
+      const r = d.run({ worktreeDir, bin, args, timeoutMs: Math.min(timeoutMs, remaining), pythonBin: py, mainRepoRoot: repoRoot, ...(cwd ? { cwd } : {}) });
+      if (!r.ran) { sandboxMissing = true; notRunReasons.add(r.reason || 'bwrap sandbox unavailable'); return r; }
+      anyExecuted = true;
+      if (r.timedOut && !tolerateTimeout) anyTimeout = true;
+      return r;
+    };
+
+    // 1. The tests that cover the changed files.
+    const changed = extractChangedFiles(rawDiff);
+    const found = d.findTests(worktreeDir, changed, rawDiff);
+    const tiers = splitCoveringTiers(changed, found);
+    const affected = tiers.primary;
+    const suites = [];
+    const depSuites = [];
+    const jsArgs = (files) => ['--test', ...files];
+    const pyArgs = (files) => ['-m', 'unittest', ...files.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'))];
+    // JS test files go to the runner their own package uses (lib/js-test-runner.js): node:test for plain .js, vitest for a package that declares it (.tsx!), and a
+    // stated 'no runner' skip otherwise -- node cannot execute a .tsx, so running it anyway only ever produced a spurious failure.
+    const jsPlan = partitionJsTests(worktreeDir, affected.js);
+    const depJsPlan = partitionJsTests(worktreeDir, tiers.dependents.js);
+    const vitestSuite = (pkgRel, files) => ({ label: 'vitest', bin: 'node', cwd: pkgRel || undefined, pkgRel, buildArgs: (fs2) => vitestArgs(pkgRel, fs2), files, parse: parseVitestFailures });
+    const noRunner = [...jsPlan.none, ...depJsPlan.none];
+    if (noRunner.length) { result.noRunner = noRunner.map((x) => ({ file: x.file, reason: x.reason })).slice(0, 12); }
+    if (jsPlan.nodeTest.length) suites.push({ label: 'js', bin: 'node', buildArgs: jsArgs, files: jsPlan.nodeTest, parse: parseNodeTestFailures });
+    for (const [pkgRel, files] of jsPlan.vitest) suites.push(vitestSuite(pkgRel, files));
+    if (affected.py.length) suites.push({ label: 'py', bin: 'python', buildArgs: pyArgs, files: affected.py, parse: parsePyTestFailures });
+    if (depJsPlan.nodeTest.length) depSuites.push({ label: 'js', bin: 'node', buildArgs: jsArgs, files: depJsPlan.nodeTest, parse: parseNodeTestFailures });
+    for (const [pkgRel, files] of depJsPlan.vitest) depSuites.push(vitestSuite(pkgRel, files));
+    if (tiers.dependents.py.length) depSuites.push({ label: 'py', bin: 'python', buildArgs: pyArgs, files: tiers.dependents.py, parse: parsePyTestFailures });
+    // A vitest suite needs its package's node_modules inside the sandbox worktree (copied on demand, size-capped). If it cannot be provided the files are
+    // reported as 'no runner' with the reason -- never as a failure of the diff.
+    const provisioned = new Map();
+    const ready = (s) => {
+      if (s.label !== 'vitest') return true;
+      if (!provisioned.has(s.pkgRel)) { let r; try { r = d.provision(repoRoot, worktreeDir, s.pkgRel); } catch (e) { r = { copied: false, reason: String((e && e.message) || e) }; } provisioned.set(s.pkgRel, r); }
+      const r = provisioned.get(s.pkgRel);
+      if (!r.copied) { result.noRunner = [...(result.noRunner || []), ...s.files.map((f) => ({ file: f, reason: `vitest cannot run: ${r.reason}` }))].slice(0, 12); return false; }
+      return true;
+    };
+    for (let i = suites.length - 1; i >= 0; i -= 1) if (!ready(suites[i])) suites.splice(i, 1);
+    for (let i = depSuites.length - 1; i >= 0; i -= 1) if (!ready(depSuites[i])) depSuites.splice(i, 1);
+    if (suites.length) {
+      result.tests = { ran: [], passed: true, failures: [], timedOut: false };
+      // 2026-10-08: every covering file runs in its OWN process (cheapest first) instead of one `node --test a b c d`. TaxHarvest-style incident: the four
+      // files covering the test-framework gate included src/local-draft.test.js, which alone takes ~9 minutes; in one process its timeout discarded the
+      // three fast files' passes too, and the reviewers rejected on "unverified". Now a slow file leaves only ITSELF unverified. For a file the diff adds
+      // named tests to, those tests run FIRST (seconds) and are recorded as partial evidence, so even a file that cannot finish whole says what ran.
+      const sizeOf = (f) => { try { return fs.statSync(path.join(worktreeDir, f)).size; } catch { return 0; } };
+      for (const s of suites) {
+        for (const file of [...s.files].sort((a, b) => sizeOf(a) - sizeOf(b))) {
+          const one = { ...s, files: [file] };
+          const added = (s.label === 'js' || s.label === 'vitest') ? addedTestNames(rawDiff, file) : [];
+          if (added.length) {
+            const pattern = added.map(escapeRegex).join('|');
+            // vitest: -t is its name filter; --passWithNoTests keeps the control run on the base (where the added tests do not exist) at exit 0, like node's.
+            const narrowed = s.label === 'vitest'
+              ? { ...s, files: [file], buildArgs: (files) => [...vitestArgs(s.pkgRel, files), '-t', pattern, '--passWithNoTests'] }
+              : { ...s, files: [file], buildArgs: (files) => ['--test', '--test-name-pattern', pattern, ...files] };
+            const n = runOne(s.bin, narrowed.buildArgs([file]), TEST_TIMEOUT_MS, { tolerateTimeout: true, cwd: s.cwd });
+            if (n.ran && !n.timedOut) {
+              (result.tests.partial = result.tests.partial || []).push({ file, tests: added.slice(0, 12), count: added.length, passed: n.exitCode === 0 });
+              if (n.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: narrowed, names: s.parse(n.output), raw: n.output, missing: n.missingModules || [] }); }
+            }
+          }
+          const r = runOne(s.bin, one.buildArgs(one.files), TEST_TIMEOUT_MS, { cwd: s.cwd });
+          if (!r.ran) { result.tests = null; break; }
+          result.tests.ran.push(file);
+          if (r.timedOut) { result.tests.timedOut = true; if (result.tests.passed !== false) result.tests.passed = null; (result.tests.timedOutFiles = result.tests.timedOutFiles || []).push(file); continue; }
+          if (r.exitCode !== 0) { result.tests.passed = false; failedSuites.push({ s: one, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] }); }
+        }
+        if (!result.tests) break;
+      }
+      // Files that ran to completion and passed (the evidence the reviewers can lean on even when another file could not finish).
+      if (result.tests) {
+        const bad = new Set([...(result.tests.timedOutFiles || []), ...failedSuites.map((f) => f.s.files[0])]);
+        result.tests.passedFiles = result.tests.ran.filter((f) => !bad.has(f));
+      }
+    }
+
+    // 2. Re-run the commands the draft claims PASS on.
+    for (const ar of (acceptanceResults || []).slice(0, MAX_COMMANDS)) {
+      const cmds = extractRunnableCommands(ar.check);
+      for (const c of cmds) {
+        // A claimed command is re-run from the repo root. If its target does not exist there EVEN WITH the diff applied, the draft ran it from somewhere else
+        // (e.g. `python3 -m unittest test_x` from python/dashboard/) and the exit code from here says nothing about the diff -- confirmed live 2026-09-30, HUB0068-02's
+        // redraft. Skip it: neither a confirmation nor a contradiction.
+        const missing = commandTargets(c).filter((t) => !fs.existsSync(path.join(worktreeDir, t)));
+        if (missing.length) {
+          result.commands.push({ criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome: 'skipped', detail: `target not found from the repo root even with the diff applied (${missing.join(', ')}); the draft probably ran it from another directory` });
+          continue;
+        }
+        const r = runOne(c.bin, c.args, COMMAND_TIMEOUT_MS);
+        if (!r.ran) { result.commands.push({ criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome: 'skipped', detail: r.reason }); continue; }
+        let outcome;
+        if (r.timedOut) outcome = 'inconclusive';
+        else if (r.exitCode === 0) outcome = 'confirmed';
+        else outcome = ar.pass ? 'contradicted' : 'confirmed-fail';
+        const entry = { criterion: ar.criterion, command: c.text, claimedPass: !!ar.pass, outcome, exitCode: r.exitCode, detail: outcome === 'contradicted' ? r.output.slice(-800) : '' };
+        result.commands.push(entry);
+        if (outcome === 'contradicted') contradictedCmds.push({ entry, c });
+      }
+    }
+
+    // 2a. Dependent tier: tests that only import a changed module. Run with whatever budget is left; a timeout or exhausted budget is
+    // reported (result.tests.dependentsUnverified), never a reason for inconclusive. A real failure goes through the same base attribution.
+    if (result.tests && depSuites.length) {
+      for (const s of depSuites) {
+        const r = runOne(s.bin, s.buildArgs(s.files), TEST_TIMEOUT_MS, { tolerateTimeout: true, cwd: s.cwd });
+        if (!r.ran) continue;
+        result.tests.dependents = [...(result.tests.dependents || []), ...s.files];
+        if (r.timedOut) { result.tests.dependentsUnverified = [...(result.tests.dependentsUnverified || []), ...s.files]; continue; }
+        if (r.exitCode !== 0) failedSuites.push({ s, dependent: true, names: s.parse(r.output), raw: r.output, missing: r.missingModules || [] });   // result.tests.passed is only touched once the failure is attributed to the diff
+      }
+    }
+
+    // 2b. Gate replay (src/gate-replay.js, brain dump 7/8): while the diff is still applied (step 3 reverses it), replay any gate/guard/detector the diff adds or changes
+    // over tasks that already ran. Advisory data on the result; it never changes the status, and any failure here is swallowed.
+    if (checkReplay && pipelineDir && deadline - Date.now() > REPLAY_MIN_REMAINING_MS) {
+      try {
+        result.replay = d.replay({
+          rawDiff, worktreeDir, pipelineDir, mainBranch,
+          run: (a) => d.run({ ...a, pythonBin: py, mainRepoRoot: repoRoot, timeoutMs: Math.min(a.timeoutMs || REPLAY_TIMEOUT_MS, Math.max(1000, deadline - Date.now())) }),
+        });
+      } catch { /* advisory */ }
+    }
+
+    // 3. Differential check: a failure only counts against the diff if the SAME check passes on the base. Tests that already fail on the base inside
+    // this sandbox (a throwaway HOME with no ~/.local/state/..., no network, ...) say nothing about the diff -- confirmed live 2026-09-30, HUB0068-02: a
+    // good draft was blocked because python/dashboard/test_start_pipeline_apply_root.py fails on the untouched base in the review sandbox. The diff is
+    // reversed in this throwaway worktree and each failing check re-run; anything that also fails on the base is reported inconclusive, never a block.
+    const unattributable = [];
+    // A dependent-tier failure that cannot be pinned on the diff (it also fails on the base in this sandbox, cannot run, or cannot be re-checked)
+    // is reported unverified; only a primary-tier one makes the whole result inconclusive.
+    const unverifiedOrUnattributable = (f, msg) => {
+      if (!f.dependent) { unattributable.push(msg); return; }
+      const have = (result.tests && result.tests.dependentsUnverified) || [];
+      result.tests.dependentsUnverified = [...have, ...f.s.files.filter((x) => !have.includes(x))];
+    };
+    if (failedSuites.length || contradictedCmds.length) {
+      const back = d.unapplyDiff(worktreeDir, rawDiff);
+      if (!back || !back.applied) {
+        for (const f of failedSuites) unverifiedOrUnattributable(f, `covering ${f.s.label} tests failed, but the diff could not be reversed to check them against the base`);
+        for (const x of contradictedCmds) { x.entry.outcome = 'inconclusive'; unattributable.push(`\`${x.c.text}\` failed, but the diff could not be reversed to check it against the base`); }
+        if (result.tests && failedSuites.some((f) => !f.dependent)) result.tests.passed = null;
+      } else {
+        for (const f of failedSuites) {
+          const unresolved = f.s.label === 'js' ? sandboxUnresolvedDependency(f.missing, repoRoot) : null;
+          if (unresolved) {
+            unverifiedOrUnattributable(f, `covering ${f.s.label} tests (${f.s.files.join(', ')}) could not run: sandbox cannot resolve ${unresolved} (present on the host, missing in the review sandbox), so the failure says nothing about the diff`);
+            continue;
+          }
+          const baseFiles = f.s.files.filter((file) => fs.existsSync(path.join(worktreeDir, file)));
+          let attributable = f.names;
+          let baseTimedOut = false;
+          let allPreexisting = false;
+          if (baseFiles.length) {
+            const b = runOne(f.s.bin, f.s.buildArgs(baseFiles), TEST_TIMEOUT_MS, { tolerateTimeout: !!f.dependent, cwd: f.s.cwd });
+            if (b.ran && b.timedOut) baseTimedOut = true;
+// ... [truncated for review: this function continues for 67 more line(s) not shown]
+```
+
+Problem:
+verifyDiff spans 267 lines and interleaves six phases (worktree apply, syntax gate, suite construction, per-file execution, command re-verification, differential attribution) that share seven mutable variables and a deadline clock. No phase is unit-testable without mocking every d.* call across the full body.
+
+Solution:
+Extract the suite-construction block (extractChangedFiles → splitCoveringTiers → partitionJsTests → building suites/depSuites → d.provision loop) and the nested execution loop (for s of suites, per-file addedTestNames/escapeRegex, sizeOf sort) into named functions returning small result objects. The orchestrator merges them into result.
+
+```diff
+-  // ~40 lines: extractChangedFiles, splitCoveringTiers, partitionJsTests,
+-  // build suites/depSuites, d.provision loop (s.label === 'vitest')
+-  // ~50 lines: for (const s of suites) { for (const file of …) { … } }
++  const { suites, depSuites } = buildSuites(d, ctx);
++  const exec = executeSuites(d, ctx, suites);
++  result.ran = exec.ran;
++  failedSuites.push(...exec.failures);
++  anyTimeout ||= exec.timedOut;
+```
+
+Benefits:
+Each phase is independently testable with a mocked d and fixture rawDiff. Shared-mutable surface drops from seven threaded variables to explicit return objects. Reviewers evaluate one phase's contract in isolation.
