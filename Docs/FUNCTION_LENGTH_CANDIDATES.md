@@ -14844,3 +14844,257 @@ function maybeRunAmplificationSweep(record, outcome, { repoRoot, pipelineDir }) 
 
 Benefits:
 The loop body shrinks to a flat resolve → sweep → write → tally sequence. The sweep becomes independently unit-testable (merged + matching source → called; other stage/source → not called) without exercising the full reconcile path. Reviewers can assess the sweep's guard logic and error handling in isolation.
+
+### AC-212 · Extract advisory pre-filter gate from runCritiqueAndRevision
+Strength: Strong
+Files: src/lib/implement-critique.js
+Symbol: runCritiqueAndRevision
+Snippet:
+```
+}
+
+async function runCritiqueAndRevision(task, {
+  maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, attempt, recordModelCall,
+}) {
+  // Deliberate 2026-08-25 data-driven skip, NOT dead weight: advisory-prose sources
+  // (observability_review / performance_review et al.) produce short prose verdicts, not
+  // code diffs, and critique was a measurable no-op 90.9%/94.9% of the time across
+  // 1341+453 real runs (12.2 combined hours) while the same verdict already goes through
+  // the full independent majority-vote review immediately after. Full rationale with the
+  // measured data: src/local-draft.js:956-974 (this file's pre-extraction home).
+  if (isAdvisoryProseSource(resolveSourceName(task))) {
+    return;
+  }
+
+  // Advisory pre-critique fact-check on the IMPLEMENT RESPONSE (brain-dump
+  // bd-1788725054994): missingFileCheck (src/draft-file-guard.js -- a pure checkDraft
+  // wrapper) flags file paths the draft names that do not exist in the repo and are not
+  // its own create targets. Merged into task.preFilterFlags so buildCritiquePrompt
+  // surfaces them to the critic as leads. Deliberately NOT a hard block: checkFilePaths
+  // over-matches prose/example paths, which is exactly why review-task.js has always
+  // treated missing-file as a reviewer hint, never an auto-reject. Best-effort -- any
+  // failure leaves task.preFilterFlags untouched and critique proceeds unchanged.
+  try {
+    const cfg = getConfig();
+    const { missing } = require('../draft-file-guard.js').missingFileCheck(
+      task.implementResponse || '',
+      cfg.repoRoot,
+      Array.isArray(cfg.grepAllowedDirs) ? cfg.grepAllowedDirs : [],
+    );
+    if (Array.isArray(missing) && missing.length) {
+      const existing = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
+      const seen = new Set(existing.map((f) => `${f.type} ${f.detail}`));
+      const added = missing
+        .map((p) => ({ type: 'missing-file', detail: p }))
+        .filter((f) => !seen.has(`${f.type} ${f.detail}`));
+      if (added.length) task.preFilterFlags = [...existing, ...added];
+    }
+  } catch (err) {
+    console.warn('[local-draft] pre-critique missing-file check failed (advisory):', (err && err.message) || err);
+  }
+
+  // Advisory find-string uniqueness check (HUB0043): flags edit-mode items whose find
+  // string matches 0 times (would fail at apply time) or >1 times (ambiguous target).
+  // Same best-effort contract as the missing-file check above -- any failure leaves
+  // task.preFilterFlags untouched and critique proceeds unchanged.
+  try {
+    const findFlags = checkFindStrings(task.implementResponse || '', getConfig().repoRoot);
+    if (findFlags.length) {
+      const existing = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
+      const seen = new Set(existing.map((f) => `${f.type} ${f.detail}`));
+      const added = findFlags.filter((f) => !seen.has(`${f.type} ${f.detail}`));
+      if (added.length) task.preFilterFlags = [...existing, ...added];
+    }
+  } catch (err) {
+    console.warn('[local-draft] pre-critique find-string check failed (advisory):', (err && err.message) || err);
+  }
+
+  // Test-framework gate (lib/test-framework.js, 2026-10-08): a test file this change CREATES must be written for a framework its package can run. Three
+  // TaxHarvest drafts created jest / @testing-library tests in packages that have neither (the frontend has no runner at all); each was dead code that only a
+  // hand check caught. Deterministic and precise, so unlike the advisory pre-filters above it blocks the draft BEFORE the critique call, with the exact
+  // fix in the feedback the redraft sees. The same files blocked twice in a row downgrade to an advisory, so a false positive can never strand a task.
+  // AGENT_MANAGER_TEST_FRAMEWORK_GATE=block|advisory|off.
+  try {
+    const tfw = require('./test-framework.js');
+    const mode = tfw.gateMode();
+    if (mode !== 'off') {
+      let items = null;
+      try { items = parseJsonMaybeFenced(task.implementResponse || ''); } catch { items = null; }
+      if (items && !Array.isArray(items)) items = [items];
+      const { files, packageText } = tfw.inspectChangeSet(items || []);
+      const tfFlags = files.length ? tfw.checkNewTestFiles({ repoRoot: getConfig().repoRoot, files, packageText }) : [];
+      if (tfFlags.length) {
+        const names = tfFlags.map((f) => f.file).sort();
+        const repeat = Array.isArray(task.testFrameworkBlocked) && task.testFrameworkBlocked.join('|') === names.join('|');
+        const feedback = tfw.feedbackFor(tfFlags);
+        if (mode === 'advisory' || repeat) {
+          appendHistoryEvent(task, 'advisory', `test-framework gate (${repeat ? 'same files blocked before, not blocking again' : 'advisory mode'}): ${feedback}`.slice(0, 600));
+          delete task.testFrameworkBlocked;
+        } else {
+          const blockedReason = `Test framework not usable: ${feedback}`.slice(0, 700);
+          task.testFrameworkBlocked = names;
+          task.critiqueOutcome = 'test-framework-failed';
+          task.blockedStage = 'review';
+          task.blockedReason = blockedReason;
+          task.priorRejectionFeedback = [...(Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : []), blockedReason];
+          recordCritique(attempt, { outcome: 'test-framework-failed' });
+          appendHistoryEvent(task, 'critique-done', blockedReason);
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[local-draft] test-framework gate failed (advisory):', (err && err.message) || err);
+  }
+
+  const critiquePrompt = buildCritiquePrompt(task, task.planResponse, task.implementResponse);
+  let startedAt = new Date().toISOString();
+  let startMs = Date.now();
+  const critiqueResult = await maybeLocked(resolvedCallIsLocal, () => resolvedLocalCall({ prompt: critiquePrompt, think: profileSupportsThink, temperature: 0.4, numPredict: 900, source: task.source, taskId: task.id, stage: 'critique' }), 'critique');
+  // Records the critique (and, when triggered, revise) call into model-stats.db -- see
+  // runPlanPass's own identical comment for the full incident this closes (2026-09-06,
+  // Grimmethy: "We need to fix cost tracking before we can even begin to properly work
+  // on this problem").
+  if (recordModelCall) {
+    recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: critiqueResult, source: task.source, stage: 'critique' });
+  }
+
+  // Gate critique-done on a grounding check: for sources whose drafts cite REAL code
+  // (deep_dive, or any registered source with its own postImplementCheck), an ungrounded
+  // draft must not reach the review queue -- block it right here, before any revise call
+  // or degenerate/no-issues assignment. Advisory: a throwing check never blocks a real
+  // draft (same contract as the postImplementCheck disposition in runImplementPass).
+  {
+    const src = resolveSourceName(task);
+    const regEntry = getRegisteredSource(src);
+    const realFiles = (task.promptContext && Array.isArray(task.promptContext.files))
+      ? task.promptContext.files.filter((f) => f && typeof f.content === 'string')
+      : [];
+    if (realFiles.length > 0 && (src === 'deep_dive' || (regEntry && typeof regEntry.postImplementCheck === 'function'))) {
+      let groundingVerdict = null;
+      try {
+        groundingVerdict = await require('../deep-dive-grounding-check.js').runGroundingCheck(task, task.implementResponse, { call: resolvedLocalCall });
+      } catch (e) {
+        console.warn('[local-draft] grounding check failed (advisory):', (e && e.message) || e);
+      }
+      // The generic check below was written for deep_dive write-ups. On the arch candidate
+      // generators (candidateDocFormat: arch_discovery/arch_import) it hard-blocked real drafts:
+      // it greps backticked filenames (`legalContent.tsx` -- TS imports omit the extension, so
+      // ".tsx" never appears in any file's content) and proposed class-shaped names against the
+      // fetched content (2026-09-19, PF arch-discovery-community-1). Same decision as their own
+      // postImplementCheck symbol check: warn (task.groundingWarnings -> the review votes), don't
+      // block. AGENT_MANAGER_SYMBOL_CHECK_BLOCKING=true restores the block.
+      if (groundingVerdict && groundingVerdict.verdict === 'ungrounded'
+          && regEntry && regEntry.candidateDocFormat && !symbolCheckBlocks()) {
+        const warning = `critique-time grounding check could not verify: ${String(groundingVerdict.reason || '(no detail)').slice(0, 250)}`;
+        task.groundingWarnings = [...(Array.isArray(task.groundingWarnings) ? task.groundingWarnings : []), warning].slice(0, 10);
+        appendHistoryEvent(task, 'grounding-warning', warning.slice(0, 300));
+      } else if (groundingVerdict && groundingVerdict.verdict === 'ungrounded') {
+        const blockedReason = `Ungrounded draft: ${String(groundingVerdict.reason || '(no detail)')}`.slice(0, 500);
+        task.critiqueOutcome = 'grounding-failed';
+        task.blockedStage = 'review';
+        task.blockedReason = blockedReason;
+        // Stochastic harness gate, not a genuine reviewer rejection -- see local-draft.js's
+        // sibling postImplementCheck gate for the full reasoning; this is its other real
+        // site (moved here from local-draft.js by the #226 decompose).
+        task.reviewInconclusive = true;
+        task.priorRejectionFeedback = Array.isArray(task.priorRejectionFeedback) ? task.priorRejectionFeedback : [];
+        task.priorRejectionFeedback.push(blockedReason);
+        recordCritique(attempt, { outcome: 'grounding-failed' });
+        appendHistoryEvent(task, 'critique-done', blockedReason);
+        return;
+      }
+    }
+  }
+
+  // task.critiqueOutcome is a STRING enum, NOT an object: it has no `.facts` property.
+  // The only values it ever holds are the four outcome literals assigned just below
+  // ('no-issues' | 'grounding-failed' | 'critique-degenerate' | 'issues-flagged').
+  // Structured findings live in a SEPARATE field -- task.preFilterFlags (an
+  // Array<{ type: string, detail: string }>, populated by the pre-filter fact-check
+  // and the missingFileCheck advisory above) -- NOT on critiqueOutcome itself.
+  /** @type {'no-issues'|'grounding-failed'|'critique-degenerate'|'issues-flagged'} */
+  if (critiqueResult.degenerate) {
+    task.critiqueOutcome = 'critique-degenerate';
+    // 2026-09 (degenerate-as-skip): a degenerate critique response is a FAILURE of the
+    // critic call, not a completed critique pass -- falling through to the shared
+    // recordCritique() / 'critique-done' tail made it look like a pass signal downstream.
+    // Mirror the advisory-prose early-return above: mark the outcome, log the skip, and
+    // stop before the shared recordCritique / 'critique-done' tail.
+    //
+    // 2026-09-16 (degenerate-as-block, supersedes skip): skipping only stopped the
+    // pass SIGNAL -- the draft still flowed on to the review vote un-critiqued, i.e. a
+    // rubber-stamp (the flagged COMPLETED 5/6/8/11/12/14/20/22 cohort). So like the
+    // grounding-failed branch above, this stamps blockedStage/blockedReason (which
+    // local-draft.js's post-critique `if (task.blockedStage)` disposal turns into
+    // `{ succeeded: true, blocked: true }` BEFORE concludeDraft, so it never reaches
+    // the review queue) and files the recurring "degenerate draft" failure class via
+    // ghost-debt.js -- deduped by failure signature on the concept timeline instead of
+    // silently shipping. fileGhostDebt is best-effort and never throws (see its header:
+    // a telemetry write must never break a draft), so it is safe to call inline.
+    task.blockedStage = 'critique';
+    task.blockedReason = `Critique call degenerate (${String(critiqueResult.degenerate || 'unspecified')}) -- the draft never received a real critique pass; blocking rather than rubber-stamping it into review`.slice(0, 500);
+    appendHistoryEvent(task, 'critique-skipped', 'degenerate model response -- not a pass signal');
+    appendHistoryEvent(task, 'blocked', task.blockedReason);
+    try {
+      const { pipelineDir } = getConfig();
+      if (pipelineDir) {
+        fileGhostDebt({ task, reasonText: task.blockedReason, site: 'implement-critique:critique-degenerate', pipelineDir });
+      }
+    } catch { /* best-effort -- a ghost-debt filing must never break the draft block path */ }
+    return;
+  }
+  if (critiqueResult.response.trim() === 'NO ISSUES FOUND') {
+    task.critiqueOutcome = 'no-issues';
+  } else {
+    task.critiqueOutcome = 'issues-flagged';
+    // 2026-08-24 (pipeline hardening): only the OUTCOME enum used to survive past this
+    // function -- the actual critique text was discarded the moment the revision call
+    // finished, so review-task.js's buildVerdictPrompt had no way to show a reviewer
+    // what the critique actually found, even when a revision WAS applied and the
+    // reviewer might want to verify it really addressed those specific points.
+// ... [truncated for review: this function continues for 25 more line(s) not shown]
+```
+
+Problem:
+runCritiqueAndRevision (225 lines) inlines the missing-file and find-string advisory checks directly in the main body. These checks mutate task.preFilterFlags, carry their own try/catch handling, and are logically independent of the test-framework and grounding gates that follow. Because they share the same function scope, adding or reordering a pre-filter requires editing the middle of a 225-line body with no clear insertion point.
+
+Solution:
+Extract the two advisory checks into a single helper that mutates task.preFilterFlags in place. The main function calls it as the first step after the advisory-prose-source early return.
+
+```diff
++function runAdvisoryPreFilters(task) {
++  try {
++    const cfg = getConfig();
++    const { missing } = require('../draft-file-guard.js').missingFileCheck(
++      task.implementResponse || '', cfg.repoRoot,
++      Array.isArray(cfg.grepAllowedDirs) ? cfg.grepAllowedDirs : []);
++    if (Array.isArray(missing) && missing.length) {
++      const ex = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
++      const seen = new Set(ex.map((f) => `${f.type} ${f.detail}`));
++      const added = missing.map((p) => ({ type: 'missing-file', detail: p }))
++        .filter((f) => !seen.has(`${f.type} ${f.detail}`));
++      if (added.length) task.preFilterFlags = [...ex, ...added];
++    }
++  } catch (err) {
++    console.warn('[local-draft] missing-file check failed:', (err && err.message) || err);
++  }
++  try {
++    const ff = checkFindStrings(task.implementResponse || '', getConfig().repoRoot);
++    if (ff.length) {
++      const ex = Array.isArray(task.preFilterFlags) ? task.preFilterFlags : [];
++      const seen = new Set(ex.map((f) => `${f.type} ${f.detail}`));
++      const added = ff.filter((f) => !seen.has(`${f.type} ${f.detail}`));
++      if (added.length) task.preFilterFlags = [...ex, ...added];
++    }
++  } catch (err) {
++    console.warn('[local-draft] find-string check failed:', (err && err.message) || err);
++  }
++}
++
+  // in runCritiqueAndRevision, replace the inline block with:
++runAdvisoryPreFilters(task);
+```
+
+Benefits:
+The main function loses ~30 lines of inline validation. The helper is independently unit-testable (pass a mock task, assert preFilterFlags). Adding a third pre-filter is a one-line insertion inside the helper rather than a mid-function edit. No behavior change; purely structural.
