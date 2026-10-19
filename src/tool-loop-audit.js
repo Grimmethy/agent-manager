@@ -120,6 +120,13 @@ function buildTurnEndEntry(ctx, { message, usage, doneReason }) {
   };
 }
 
+// One entry per BLANK sample (brain-dump 1891): a turn that came back with no tool calls and no content is treated as a
+// flake and resampled inside chatTurnWithFlakeRecovery before turn-end is ever logged -- which is exactly what a thought cut
+// off at the token limit looks like, so the audit was blind to it. info: { attempt (1-based), message, usage, doneReason }.
+function buildEmptyAttemptEntry(ctx, { attempt, message, usage, doneReason }) {
+  return { ...buildTurnEndEntry(ctx, { message, usage, doneReason }), attempt: attempt == null ? null : attempt };
+}
+
 // One entry per edit_file/write_file call in `calls` (a slice of runPlanWithTools'
 // toolCallLog). Other tools are not logged here -- their outcomes are not what the
 // follow-up decisions need, and turn-end's toolNames already counts them.
@@ -167,7 +174,7 @@ function buildSummary(entries) {
   const rows = new Map();
   const rowFor = (e) => {
     const key = `${e.lane || '-'}\u0000${e.model || '-'}`;
-    if (!rows.has(key)) rows.set(key, { lane: e.lane || null, model: e.model || null, turns: 0, endClass: {}, doneReasonNull: 0, heuristic: 0, tools: {} });
+    if (!rows.has(key)) rows.set(key, { lane: e.lane || null, model: e.model || null, turns: 0, endClass: {}, doneReasonNull: 0, heuristic: 0, emptyAttempts: { total: 0, byEndClass: {} }, tools: {} });
     return rows.get(key);
   };
   for (const e of entries) {
@@ -177,6 +184,10 @@ function buildSummary(entries) {
       r.endClass[e.endClass] = (r.endClass[e.endClass] || 0) + 1;
       if (e.doneReason == null) r.doneReasonNull += 1;
       if (e.heuristic) r.heuristic += 1;
+    } else if (e.type === 'empty-attempt') {
+      const r = rowFor(e);
+      r.emptyAttempts.total += 1;
+      r.emptyAttempts.byEndClass[e.endClass] = (r.emptyAttempts.byEndClass[e.endClass] || 0) + 1;
     } else if (e.type === 'tool-outcome') {
       const r = rowFor(e);
       const t = r.tools[e.tool] || (r.tools[e.tool] = { total: 0, outcomes: {}, missRate: 0 });
@@ -197,7 +208,7 @@ function readSummary(pipelineDir, { windowDays = DEFAULT_WINDOW_DAYS, now = Date
 
 module.exports = {
   AUDIT_FILENAME, CUT_OFF_TOOL_CALL_RE, isAuditEnabled, auditPath, logToolLoopEvent,
-  classifyTurnEnd, classifyToolOutcome, buildTurnEndEntry, buildToolOutcomeEntries,
+  classifyTurnEnd, classifyToolOutcome, buildTurnEndEntry, buildEmptyAttemptEntry, buildToolOutcomeEntries,
   readToolLoopAudit, buildSummary, readSummary,
 };
 
@@ -207,12 +218,12 @@ if (require.main === module) {
   const rows = readSummary(dir, { windowDays: days });
   if (process.argv.includes('--json')) console.log(JSON.stringify(rows, null, 2));
   else {
-    console.log('lane'.padEnd(16) + 'model'.padEnd(26) + 'turns'.padStart(6) + '  length  unknown  edit_file miss%');
+    console.log('lane'.padEnd(16) + 'model'.padEnd(26) + 'turns'.padStart(6) + '  length  unknown  empty  edit_file miss%');
     for (const r of rows) {
       const len = (r.endClass.length || 0) + (r.endClass['length-tool-call-suspected'] || 0);
       const ef = r.tools.edit_file;
       console.log(String(r.lane || '-').padEnd(16) + String(r.model || '-').padEnd(26) + String(r.turns).padStart(6)
-        + `  ${String(len).padStart(6)}  ${String(r.doneReasonNull).padStart(7)}  ${ef ? `${(ef.missRate * 100).toFixed(0)}% of ${ef.total}` : '-'}`);
+        + `  ${String(len).padStart(6)}  ${String(r.doneReasonNull).padStart(7)}  ${String(r.emptyAttempts.total).padStart(5)}  ${ef ? `${(ef.missRate * 100).toFixed(0)}% of ${ef.total}` : '-'}`);
     }
   }
 }

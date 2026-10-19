@@ -2244,3 +2244,66 @@ test('trajectory: a multi-turn write run leaves one gzip trajectory with the mes
     if (prev === undefined) delete process.env.AGENT_MANAGER_TRAJECTORY; else process.env.AGENT_MANAGER_TRAJECTORY = prev;
   }
 });
+
+// --- empty-attempt audit (2026-10-19, brain-dump 1891) -----------------------------------------
+// A blank sample (no content, no tool calls -- what a thought cut off at the token limit looks like) is resampled inside
+// chatTurnWithFlakeRecovery; each one now leaves an 'empty-attempt' line in the tool-loop audit. Behaviour is unchanged.
+
+function readAudit(dir) {
+  const p = path.join(dir, 'instances', 'tool-loop-audit.log');
+  return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+}
+
+test('empty-attempt audit: blank samples are logged with done_reason and thinking size, and the run result is unchanged', async () => {
+  const prev = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  try {
+    const blankCut = { role: 'assistant', content: '', thinking: 'x'.repeat(4000), _done_reason: 'length', _usage: { prompt_eval_count: 900, eval_count: 700 } };
+    const blankStop = { role: 'assistant', content: '', _done_reason: 'stop' };
+    await withMockedChat([blankCut, blankStop, { role: 'assistant', content: 'real answer', _done_reason: 'stop' }], async (mod, dir) => {
+      const result = await mod.runPlanWithTools({ prompt: 'say something', maxTurns: 5, taskId: 'empty-t1', stage: 'plan' });
+      assert.equal(result.response, 'real answer');
+      assert.equal(result.turnsUsed, 1, 'same turn count as without the audit');
+      const lines = readAudit(dir);
+      const empties = lines.filter((e) => e.type === 'empty-attempt');
+      assert.deepEqual(empties.map((e) => [e.attempt, e.endClass, e.doneReason, e.thinkingChars, e.phase, e.turn]),
+        [[1, 'length', 'length', 4000, 'loop', 0], [2, 'stop', 'stop', null, 'loop', 0]]);
+      assert.equal(empties[0].promptEvalCount, 900);
+      assert.equal(lines.filter((e) => e.type === 'turn-end').length, 1, 'the turn itself is still one turn-end line');
+      assert.ok(!JSON.stringify(lines).includes('xxxxxxxx'), 'no model text in the log');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT; else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
+  }
+});
+
+test('empty-attempt audit: a first turn that never recovers still rejects as before, with all three blank attempts logged', async () => {
+  const prev = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  try {
+    const empty = { role: 'assistant', content: '', _done_reason: 'length' };
+    await withMockedChat([empty, empty, empty], async (mod, dir) => {
+      await assert.rejects(() => mod.runPlanWithTools({ prompt: 'say something', maxTurns: 5, taskId: 'empty-t2' }), /empty completion/i);
+      const lines = readAudit(dir);
+      assert.deepEqual(lines.filter((e) => e.type === 'empty-attempt').map((e) => e.attempt), [1, 2, 3]);
+      assert.equal(lines.filter((e) => e.type === 'turn-end').length, 0, 'no turn completed');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT; else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
+  }
+});
+
+test('empty-attempt audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes nothing and the resample behaviour is identical', async () => {
+  const prev = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = 'off';
+  try {
+    const empty = { role: 'assistant', content: '', _done_reason: 'length' };
+    await withMockedChat([empty, { role: 'assistant', content: 'real answer' }], async (mod, dir) => {
+      const result = await mod.runPlanWithTools({ prompt: 'x', maxTurns: 5 });
+      assert.equal(result.response, 'real answer');
+      assert.equal(fs.existsSync(path.join(dir, 'instances', 'tool-loop-audit.log')), false);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT; else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
+  }
+});
