@@ -777,6 +777,38 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
       const classification = classifyBlockedTask(task);
       if (!classification.retryable) {
         if (needsClarificationDir) {
+          // HUB0114 2/3: an unreliable-grounding escalation can be STALE -- the
+          // candidate's premise may already be satisfied because someone else landed
+          // the feature after the candidate was created. Ahead of the
+          // needs-clarification move (the only path that would file this task for a
+          // human), ask the REAL target file whether the feature is in it. implemented
+          // -> auto-archive (already-implemented) and skip the enqueue; NOT implemented
+          // (feature absent, title missing, or the target file is
+          // missing/unreadable -- the helper reads the file itself and reports
+          // implemented:false on a read failure) -> fall through and the
+          // needs-clarification enqueue below runs EXACTLY as before, byte-for-byte.
+          if (classification.category === 'unreliable-grounding') {
+            const _declaredTargets = extractDeclaredTargets(task); // a Set of repo-relative path strings
+            const _targetPath = (Array.isArray(_declaredTargets) ? _declaredTargets[0] : (_declaredTargets && _declaredTargets.size > 0 ? Array.from(_declaredTargets)[0] : null)) || task.targetFile || null;
+            const _featureTitle = String(task.title || task.featureTitle || task.feature || '').trim();
+            if (_targetPath && _featureTitle) {
+              const _absTarget = path.isAbsolute(_targetPath)
+                ? _targetPath
+                : path.resolve(pipelineDir || '.', _targetPath);
+              const _impl = alreadyImplementedInTarget({ title: _featureTitle }, _absTarget);
+              if (_impl.implemented) {
+                const _archiveReason = 'already-implemented';
+                appendHistoryEvent(task, 'archived', `auto-archived as already-implemented: feature "${_featureTitle}" found in target "${_absTarget}" (task ${task.name || name}; matched line: ${_impl.matchedLine}) -- ${_archiveReason}`);
+                task.status = 'done';
+                task.archivedNoAction = _archiveReason;
+                const _archiveDir = path.join(pipelineDir, 'queue', 'done', '_archived_no_action');
+                fs.mkdirSync(_archiveDir, { recursive: true });
+                writeTaskAndUnlinkOld(instancesDir, task, path.join(_archiveDir, name), filePath);
+                summary.exhausted++;
+                continue;
+              }
+            }
+          }
           const alreadyEscalated = alreadyEscalatedSinceLastReadmission(task);
           if (!alreadyEscalated) {
             const classifier = findClassifier(classification.classifierName);
