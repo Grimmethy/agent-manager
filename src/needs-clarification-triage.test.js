@@ -1610,3 +1610,47 @@ test('bucket Q: a field flag, a URL in production code, a capped task and an alr
   for (const id of ['url-field', 'url-prod', 'url-capped', 'url-inreview']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), `${id} stays`);
   assert.equal(summary.requeued, 0);
 });
+
+// --- Bucket J paired re-admission (2026-10-18): one more retry per truncation-gate version, only when the current gate passes ----------
+const { TRUNCATION_GATE_VERSION } = require('./validate-implement-truncation.js');
+const COMPLETE_DIFF_RESPONSE = ['RESOLUTION: implemented', '', '=== DIFF ===', '--- a/x.sh', '+++ b/x.sh', '@@ -1,2 +1,2 @@',
+  '-a', '+b', '   # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"', ''].join('\n');
+const STILL_TRUNCATED_RESPONSE = 'All checks pass. Final line: return "Topology';
+
+test('bucket J: an EXHAUSTED task the fixed gate now passes is requeued once under the gate-version key, and not again', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj6', {
+    reviewProvider: 'deterministic-truncation-guard',
+    blockedReason: 'truncated output',
+    ncTriageDecision: 'leave-for-human',
+    ncTriageBucketAttempts: { J: 1 },
+    implementResponse: COMPLETE_DIFF_RESPONSE,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 1);
+  const moved = read(at(dir, 'adhoc', 'tj6.json'));
+  assert.equal(moved.ncTriageBucketAttempts.J, 1, 'the legacy counter is untouched');
+  assert.equal(moved.ncTriageBucketAttempts[`J@${TRUNCATION_GATE_VERSION}`], 1);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && h.detail.includes(`gate version ${TRUNCATION_GATE_VERSION}`)));
+  // The same task blocked again by the same gate version: no second versioned retry.
+  fs.unlinkSync(at(dir, 'adhoc', 'tj6.json'));
+  held(dir, { ...moved, reviewProvider: 'deterministic-truncation-guard', blockedReason: 'truncated output', implementResponse: COMPLETE_DIFF_RESPONSE, ncTriageDecision: 'leave-for-human' });
+  const s2 = await needsClarificationTriage(args(dir));
+  assert.equal(s2.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tj6.json')));
+});
+
+test('bucket J: an EXHAUSTED task whose stored response the current gate still flags stays where it is', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj7', {
+    reviewProvider: 'deterministic-truncation-guard',
+    blockedReason: 'truncated output',
+    ncTriageDecision: 'leave-for-human',
+    ncTriageBucketAttempts: { J: 1 },
+    implementResponse: STILL_TRUNCATED_RESPONSE,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tj7.json')));
+  assert.equal(read(at(dir, 'needs-clarification', 'tj7.json')).ncTriageBucketAttempts[`J@${TRUNCATION_GATE_VERSION}`], undefined);
+});
