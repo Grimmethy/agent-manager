@@ -2906,3 +2906,16 @@ Move the `require('./lib/source-scope.js')` to the top of `src/task-source-regis
 
 Benefits:
 The module's import list accurately reflects its runtime dependencies, making the graph auditable by eye and by tooling. Load-time errors in `source-scope.js` surface immediately at startup rather than on the first `core`-scoped registration call. Removing the conditional `require` also eliminates a subtle code path where the module is loaded in one process but not another, simplifying reasoning about initialization order.
+
+### AC-240 · Unify the divergent marker extraction logic in `concepts.js` and `incident-amplification-marker.js`
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both `concepts.js` and `incident-amplification-marker.js` implement the same architectural pattern—inject a structured instruction block into a prompt, then parse a corresponding marker out of the model's response and strip it from the clean text—but the extraction logic has diverged into two structurally different code paths. `concepts.js` relies on a single regex (`CONCEPT_BUILD_MARKER_RE`) to locate a match, extract the data, and remove the matched substring. `incident-amplification-marker.js` instead uses a lookahead split (`AMPLIFY_SPLIT_RE`) to divide the text into blocks, parses each block for specific fields, and manually reconstructs the clean text by joining the non-matching parts. This duplication means any future change to marker handling—whitespace edge cases, multiple markers of the same type, altered cleaning semantics—must be implemented and tested independently in two places that do not share a common code path, increasing the risk of silent behavioral drift between the two markers.
+
+Solution:
+Extract the common "marker extraction" logic into a shared utility module (e.g., `src/marker-extraction.js`). The utility accepts a configuration object that defines the marker's structure: a regex for the start delimiter, a list of required and optional fields each with their own extraction regex, and the cleaning strategy (strip-matched-substring vs. join-non-matching-blocks). Both `concepts.js` and `incident-amplification-marker.js` then delegate to this shared utility, passing their specific marker definitions as configuration. The two call sites become thin wrappers that supply their field schemas and receive a uniform `{ data, cleanText }` result.
+
+Benefits:
+A single source of truth for splitting, parsing, and cleaning model responses guarantees consistent behavior across all marker types and eliminates the risk that a fix applied to one code path is forgotten in the other. Maintenance effort drops because edge-case handling (malformed input, whitespace variants, multiple occurrences) is written and tested once in the shared utility. The utility can be unit-tested independently of any specific marker, covering a wider matrix of inputs without duplicating test scaffolding in each consumer module.
