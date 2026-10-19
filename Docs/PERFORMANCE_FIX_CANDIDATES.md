@@ -467,3 +467,26 @@ Add a `readTaskSafeAsync` sibling in the same module that uses `fs.promises.read
 
 Benefits:
 The kernel pipelines the file reads concurrently (bounded by the OS I/O scheduler), so wall-clock time drops from the sum of all individual reads to roughly the slowest single read. The event loop is no longer blocked for the duration of the loop, so health-check pings, heartbeat timers, and incoming request handlers continue to fire within their expected windows even under a large backlog. Multi-instance deployments no longer each serialise their own reads on the same event loop, reducing cross-request latency for all workers in the cluster. Error handling semantics are unchanged: a missing file or permission error still yields `task: null` rather than throwing, so downstream claim-ordering logic is unaffected.
+
+### AC-24 · Parallelize independent LLM votes in majorityVote
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+`majorityVote` issues `n` (default 3) identical LLM inference calls inside a `for` loop, each gated by `await call(…)`. Because every iteration blocks on the previous one's response before dispatching the next, total wall-clock is approximately `n × T` (where `T` is a single inference round-trip). With the default of three votes and a typical 2-second inference, the caller waits roughly 6 seconds for work that has zero data dependency between iterations—same prompt, same model, same temperature, same `taskId`/`stage`. There is no rate-limiting, backoff, or cross-iteration state that would require serialization, so the sequential ordering is pure latency waste.
+
+Solution:
+Replace the sequential `for` loop with `Promise.all` over an `Array.from({ length: n }, …)` array. Each element invokes the same `call(…)` with identical arguments and wraps the promise in `.then(r => ({ ok: true, result: r })).catch(e => ({ ok: false, error: e }))` so a single failed vote still lands in `voteErrors` without rejecting the whole batch—preserving the original per-call error isolation. After `Promise.all` resolves, partition the results into `votes` and `voteErrors` exactly as before, then run the existing majority-tally logic unchanged. No new dependency is introduced; `Promise.all` and `Array.from` are core JavaScript already available in the runtime.
+
+Benefits:
+All `n` inference requests are dispatched in the same event-loop tick and are in-flight simultaneously, reducing wall-clock from `n × T` to roughly `max(T)` (i.e., one inference round-trip plus minor scheduling overhead). With the default `n = 3` and a 2-second per-call latency, the user-visible wait drops from ~6 s to ~2 s. Even in the worst case where the backend (e.g., a single-slot local model server) serializes the requests internally, the fix eliminates the inter-call network round-trip and event-loop scheduling overhead, and it costs nothing in complexity or new dependencies.
