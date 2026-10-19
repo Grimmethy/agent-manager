@@ -21,6 +21,9 @@ const { registerTaskSource, getRegisteredSources, getRegisteredSource, resolveSo
 const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
+const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
+const { writeJsonAtomicSync: writeBrainDumpAtomic } = require('./atomic-write.js');
 const { rotationDemoted } = require('./premium-rotation.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
@@ -1196,6 +1199,30 @@ function brainDumpSortTaskId(entry) {
   return n > 0 ? `brain-dump-sort-${entry.id}-a${n}` : `brain-dump-sort-${entry.id}`;
 }
 
+// At most this many entries are linked to existing work in one generator call (each check reads the queue: ~170 ms
+// typical, ~3.4 s worst measured live), so one call stays bounded; the rest are reached on later ticks.
+const MAX_EXISTING_WORK_LINKS_PER_CALL = 5;
+
+// Re-reads brain-dump.json right before writing so an edit made since nextBrainDumpSortTask read it (a dashboard capture,
+// the apply stage) is not lost, and only links an entry that is still 'captured'.
+function linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, by) {
+  try {
+    const fresh = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+    const list = Array.isArray(fresh.entries) ? fresh.entries : [];
+    let changed = 0;
+    for (const { entry, found } of links) {
+      const cur = list.find((x) => x && x.id === entry.id);
+      if (!cur || cur.status !== 'captured') continue;
+      linkEntryToExistingWork(cur, found, by);
+      changed += 1;
+      logPipelineEvent(pipelineDir, 'brain-dump-existing-work', { entryId: cur.id, serial: cur.serial ?? null, taskId: found.taskId, state: found.state, how: found.how, by });
+    }
+    if (changed) writeBrainDumpAtomic(brainDumpPath, fresh);
+  } catch (e) {
+    console.error(`[task-sources] brain-dump existing-work link failed (best-effort): ${e.message}`);
+  }
+}
+
 function nextBrainDumpSortTask() {
   const { brainDumpPath, secondBrainDir, pipelineDir } = getConfig();
   if (!brainDumpPath) return null;
@@ -1219,9 +1246,19 @@ function nextBrainDumpSortTask() {
   // nothing to act on, because generation itself had stopped dead. Same "skip an
   // in-queue one and keep looking" loop nextArchImportTask/nextUnusedExportTask already
   // use for their own oldest-first selection.
-  const chosen = entries.find((e) => e && e.status === 'captured' && !e.suppressed
+  const eligible = entries.filter((e) => e && e.status === 'captured' && !e.suppressed
     && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
     && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+  // Existing-work check (2026-10-18, see brain-dump-existing-work.js): an entry whose work is already a task -- queued,
+  // done or archived -- is linked to that task instead of being sorted again (no classification spent). Bounded per call.
+  let chosen = null;
+  const links = [];
+  for (const e of eligible) {
+    const found = links.length < MAX_EXISTING_WORK_LINKS_PER_CALL ? findExistingWorkForEntry([pipelineDir], e) : null;
+    if (!found) { chosen = e; break; }
+    links.push({ entry: e, found });
+  }
+  if (links.length) linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, 'generator');
   if (!chosen) return null;
 
   const taskId = brainDumpSortTaskId(chosen);
