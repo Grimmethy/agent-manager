@@ -24,3 +24,20 @@ test('ungrounded-field-new-env-var: re-admits only when every flagged name is an
   assert.equal(entry.applies({ blockedReason: 'something else entirely', implementResponse: task1890.implementResponse }), false);
   assert.equal(entry.applies({}), false);
 });
+
+// --- ungrounded-field-test-fixture (2026-10-19) ---------------------------------------------------------------
+
+test('ungrounded-field-test-fixture: re-admits only when every flagged name is only in the task own added test files', () => {
+  const fx = KNOWN_FIXED.find((e) => e.id === 'ungrounded-field-test-fixture');
+  assert.ok(fx, 'entry registered');
+  assert.deepEqual(fx.dirs, ['blocked', 'needs-clarification']);
+  const diff = (...lines) => ['Summary', '', '=== DIFF ===', 'diff --git a/src/audit.test.js b/src/audit.test.js', '@@ -1 +1,3 @@', ...lines].join('\n');
+  const task1891 = { blockedReason: BLOCK('SENTINEL_THOUGHT'), implementResponse: diff("+  thinking: 'SENTINEL_THOUGHT '.repeat(500),") };
+  assert.equal(fx.applies(task1891), true);
+  assert.equal(fx.applies({ blockedReason: BLOCK('SENTINEL_THOUGHT'), rawDiff: task1891.implementResponse }), true);
+  assert.equal(fx.applies({ blockedReason: `${BLOCK('SENTINEL_THOUGHT')}\n${BLOCK('MADE_UP_FIELD')}`, implementResponse: task1891.implementResponse }), false, 'one name that does not qualify');
+  const alsoProd = `${task1891.implementResponse}\ndiff --git a/src/x.js b/src/x.js\n@@ -1 +1,2 @@\n+const t = 'SENTINEL_THOUGHT';`;
+  assert.equal(fx.applies({ blockedReason: BLOCK('SENTINEL_THOUGHT'), implementResponse: alsoProd }), false, 'production code uses it too');
+  assert.equal(fx.applies({ blockedReason: 'something else', implementResponse: task1891.implementResponse }), false);
+  assert.equal(fx.applies({}), false);
+});

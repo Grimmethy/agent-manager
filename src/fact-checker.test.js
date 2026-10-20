@@ -1008,3 +1008,43 @@ test('checkGroundedValues still flags a name only in prose, only on a context or
   assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Drops REMOVED_SWITCH.', context: ['-const c = process.env.REMOVED_SWITCH;'] })), ['REMOVED_SWITCH']);
   assert.deepEqual(flagged(envDraft(['+const t = `${TEMPLATE_CONST_NAME}`;'])), ['TEMPLATE_CONST_NAME']);
 });
+
+// checkGroundedValues: fixture token only in an added test file ---------------------------------------
+// 2026-10-19, root-caused live: brain-dump 1891's review was blocked on SENTINEL_THOUGHT, a dummy string in its new unit test. The
+// gate already exempts a URL that lives only in the draft's own added test files (urlsOnlyInAddedTestFiles); fields had no such rule.
+
+function twoFileDraft({ testPath, testLine, prodLine = null, prose = 'Added a test.' }) {
+  const out = [prose, '', '=== DIFF ===', `diff --git a/${testPath} b/${testPath}`, '@@ -1,1 +1,2 @@', ' const a = 1;', testLine];
+  if (prodLine) out.push('diff --git a/src/thing.js b/src/thing.js', '@@ -1,1 +1,2 @@', ' const b = 2;', prodLine);
+  return out.join('\n');
+}
+
+test('checkGroundedValues does not flag an ALL_CAPS token inside a string literal on an added test-file line, even if prose mentions it (js, py, ts paths)', () => {
+  const { checkGroundedValues, fieldsOnlyInAddedTestFiles } = require('./fact-checker.js');
+  for (const [testPath, name, testLine] of [
+    ['src/audit.test.js', 'SENTINEL_THOUGHT', "+  const text = 'SENTINEL_THOUGHT '.repeat(500);"],
+    ['python/dashboard/test_viewer.py', 'FIXTURE_ROW_KEY', '+    row = {"FIXTURE_ROW_KEY": 1}'],
+    ['tests/unit/thing.spec.ts', 'TS_FIXTURE_NAME', '+  expect(f(`TS_FIXTURE_NAME`)).toBe(1);'],
+  ]) {
+    const draft = twoFileDraft({ testPath, testLine, prose: `The test uses ${name} as a stand-in.` });
+    assert.deepEqual(checkGroundedValues(draft, 'grounding that predates the test'), [], testPath);
+    assert.ok(fieldsOnlyInAddedTestFiles(draft).has(name), testPath);
+  }
+});
+
+test('checkGroundedValues keeps flagging a bare identifier in test code, a token also used bare next to its string, and a comment-only mention', () => {
+  const { checkGroundedValues } = require('./fact-checker.js');
+  const flagged = (draft) => checkGroundedValues(draft, 'unrelated grounding').map((f) => f.detail);
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'pkg/tests/test_cache.py', testLine: '+x = INVENTED_FIELD_NAME' })), ['INVENTED_FIELD_NAME'], 'bare reference: a symbol that should exist');
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: "+  use(BARE_AND_STRING, 'BARE_AND_STRING');" })), ['BARE_AND_STRING'], 'also used bare on the same line');
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: '+  // checks COMMENT_ONLY_NAME' })), ['COMMENT_ONLY_NAME'], 'a comment is not test data');
+});
+
+test('checkGroundedValues still flags the token when it is also on an added production line, only in prose, or only on a context or removed test line', () => {
+  const { checkGroundedValues } = require('./fact-checker.js');
+  const flagged = (draft) => checkGroundedValues(draft, 'unrelated grounding').map((f) => f.detail);
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: "+  const x = 'FIXTURE_TOKEN';", prodLine: "+const y = 'FIXTURE_TOKEN';" })), ['FIXTURE_TOKEN'], 'a production line uses it too');
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: '+  const x = 1;', prose: 'Mentions ONLY_IN_PROSE here.' })), ['ONLY_IN_PROSE']);
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: ' const CONTEXT_FIXTURE = 1;', prose: 'Uses CONTEXT_FIXTURE.' })), ['CONTEXT_FIXTURE']);
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: '-const REMOVED_FIXTURE = 1;', prose: 'Drops REMOVED_FIXTURE.' })), ['REMOVED_FIXTURE']);
+});
