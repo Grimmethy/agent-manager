@@ -672,7 +672,54 @@ function urlsOnlyInAddedTestFiles(text) {
   return new Set([...inTest].filter((u) => !inProd.has(u)));
 }
 
-function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
+// 2026-11-xx (HUB0162, root-caused live: the re-flag loop): a draft rejected on an
+// ungrounded-field / ungrounded-url flag has that flag's token quoted VERBATIM in its
+// priorRejectionFeedback (apply-retry-check.js's existing retry loop) -- so the retry,
+// which is forced to keep citing the same marker/field by the feedback's own wording,
+// gets the very token the feedback itself named re-flagged by this deterministic check
+// before any reviewer ever spends a token. Exemption is deliberately the narrowest
+// possible reading of "the human already told the drafter this exact token in the
+// feedback": the token must appear in the feedback text, AND every one of its
+// occurrences in the draft must be prose -- i.e. NOT on an added '+' diff line and NOT
+// inside a fenced code block. A token on an added '+' code line is NEVER exempt (that
+// is the draft's own new claim, exactly what this gate exists to check). No
+// negation-clause heuristic: the feedback match is a plain containment test against the
+// feedback strings, nothing more.
+const FENCE_RE = /^\s*(?:```|~~~)/;
+
+// True only if `token` occurs at least once in `draftText` and EVERY occurrence of it
+// sits on a plain prose line -- not an added '+' diff line (a real new claim) and not
+// inside a fenced code block (``` / ~~~). Any single occurrence on an added line or in
+// a code block returns false, so such a token is never exempt.
+function tokenOccursOnlyInProse(draftText, token) {
+  if (!draftText || !token) return false;
+  const re = new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  let sawAny = false;
+  let inCodeBlock = false;
+  let inDiff = false;
+  for (const line of String(draftText).split('\n')) {
+    if (FENCE_RE.test(line)) inCodeBlock = !inCodeBlock;
+    if (DIFF_META_RE.test(line)) inDiff = true;
+    const onAddedLine = inDiff && line.startsWith('+') && !line.startsWith('+++');
+    if (re.test(line)) {
+      sawAny = true;
+      if (onAddedLine || inCodeBlock) return false; // added '+' line: never exempt
+    }
+  }
+  return sawAny;
+}
+
+// Exemption predicate (HUB0162 · 1/5): a token is exempt from the ungrounded-field /
+// ungrounded-url flags only when it appears in the prior rejection feedback text AND
+// every occurrence of it in the draft is prose. Feedback absent/empty => false for
+// every token, i.e. byte-for-byte the pre-change behavior.
+function isExemptByPriorRejectionFeedback(token, draftText, priorRejectionFeedback) {
+  const items = Array.isArray(priorRejectionFeedback) ? priorRejectionFeedback : [];
+  if (!items.some((s) => String(s).includes(token))) return false;
+  return tokenOccursOnlyInProse(draftText, token);
+}
+
+function checkGroundedValues(draftText, sourceText, repoRoot, ref, priorRejectionFeedback) {
   if (!sourceText) return [];
   const flags = [];
   const scannableText = stripUnchangedDiffLines(draftText);
@@ -686,6 +733,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
     const url = raw.replace(/[.,;:]+$/, ''); // strip trailing sentence punctuation
     if (PLACEHOLDER_RE.test(url)) continue;
     if (testFixtureUrls.has(url)) continue;
+    if (isExemptByPriorRejectionFeedback(url, draftText, priorRejectionFeedback)) continue;
     if (sourceText.includes(url)) continue;
     if (isNamedServiceUrl(url, sourceText)) continue;
     if (existsLiterallyInRepo(url, repoRoot, ref)) continue;
@@ -698,6 +746,7 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
     if (newlyDeclared.has(field)) continue;
     if (envReads.has(field)) continue;
     if (echoMarkers.has(field)) continue;
+    if (isExemptByPriorRejectionFeedback(field, draftText, priorRejectionFeedback)) continue;
     if (sourceText.includes(field)) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
     flags.push({ type: 'ungrounded-field', detail: field });
@@ -874,11 +923,11 @@ function checkCitationsAgainstHarnessFiles(draftText, harnessFiles) {
 // list means "nothing suspicious found by this cheap pass" -- it does NOT mean the
 // draft is correct. `sourceText` (optional) is the material the local model was actually given for
 // this task; when provided, the grounded-value check runs against it.
-function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
+function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref, priorRejectionFeedback) {
   const rawFileChecks = checkFilePaths(draftText, repoRoot, extraRoots, ref);
   const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
-  const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot, ref);
+  const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot, ref, priorRejectionFeedback);
   const { unconfirmedCitations } = checkFileLineCitations(draftText, sourceText);
   let cleanedText = draftText;
   let strippedFileLineCitations = [];
