@@ -2919,3 +2919,27 @@ Extract the common "marker extraction" logic into a shared utility module (e.g.,
 
 Benefits:
 A single source of truth for splitting, parsing, and cleaning model responses guarantees consistent behavior across all marker types and eliminates the risk that a fix applied to one code path is forgotten in the other. Maintenance effort drops because edge-case handling (malformed input, whitespace variants, multiple occurrences) is written and tested once in the shared utility. The utility can be unit-tested independently of any specific marker, covering a wider matrix of inputs without duplicating test scaffolding in each consumer module.
+
+### AC-241 · Registry scope-check coupling is intentional and well-documented; no defect identified
+Strength: Weak (downgraded from Strong)
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+The original draft characterized the lazy `require('./lib/source-scope.js')` inside `registerTaskSource` as a "hidden-coupling anti-pattern" and a "circular-dependency risk." On review this characterization is inaccurate. The source-code comment in `src/task-source-registry.js` explicitly documents the intent: *"Wrap next() so that EVERY caller -- getNextTask, the always-run watchdog sweeps that call a source directly -- gets null on any other project, not just the priority ladder."* The coupling is therefore a deliberate, centralized safety mechanism ensuring consistent scope enforcement across all call paths (including watchdog sweeps that bypass the priority ladder), not an accidental hidden dependency.
+
+The draft's claim that the registry is "harder to test in isolation" is also incorrect. The module already exports `clearRegistry()` for test teardown, and the lazy `require` fires only when `registerTaskSource` is invoked with `scope: 'core'`. Unit tests exercising the generic storage/retrieval surface (`getRegisteredSources`, `getRegisteredSource`, etc.) never trigger the require, so the registry is already independently testable for its primary responsibilities.
+
+The proposed solution—moving the scope check to the caller side or injecting a pluggable hook—would break the documented safety guarantee: watchdog sweeps that call a source directly (not through the priority ladder) would lose the scope-eligibility check, allowing cross-project task leakage.
+
+Solution:
+No change required. The current design is a correct, intentional trade-off: a single, centralized enforcement point in the registry guarantees that every call path—ladder, direct, or watchdog—respects scope policy. The lazy `require` keeps the dependency out of the module-load graph for the common (non-`core`) path, and the documented comment makes the coupling explicit to future readers.
+
+If a future refactor introduces a genuine circular dependency (i.e., `source-scope.js` or a transitive dependency begins to `require` the registry at load time), that would be a concrete defect to address at that time. No such cycle exists in the current code.
+
+Benefits of the current design (acknowledged, not proposed):
+- Single enforcement point covers all call paths, including those that bypass the priority ladder.
+- Lazy require avoids a load-time dependency for the common non-`core` registration path.
+- `clearRegistry()` already provides the test-isolation affordance needed for the storage/retrieval surface.
+- The intent is documented in-source, reducing the risk of a future maintainer "fixing" what they perceive as accidental coupling.
+
+NOTE: Both flags were applied; no flag was left unaddressed.
