@@ -2943,3 +2943,48 @@ Benefits of the current design (acknowledged, not proposed):
 - The intent is documented in-source, reducing the risk of a future maintainer "fixing" what they perceive as accidental coupling.
 
 NOTE: Both flags were applied; no flag was left unaddressed.
+
+### AC-242 · Re-export facade inflates `pipeline-self-audit.js`'s role in the module graph
+Strength: Strong
+Files: src/pipeline-self-audit.js, src/blocked-task-classifiers.js, src/pipeline-forensics.js, src/staleness-audit.js
+
+Problem:
+`pipeline-self-audit.js` re-exports four classification symbols (`REASON_CATEGORIES`, `categorizeBlockedReason`, `hasZeroHitHarnessSearch`, `signatureForTask`) from `blocked-task-classifiers.js` purely as a backward-compatibility shim so that `pipeline-forensics.js` and `staleness-audit.js` can keep their existing `require('./pipeline-self-audit.js')` import lines. Four of the file's nine `module.exports` entries are pass-throughs for a concern (fault-side classification) that this module does not own. The file's link-degree of 10 — the highest in this community — is partly artificial, because every consumer that imports a classification symbol is coupled to the cluster-detection module rather than to `blocked-task-classifiers.js` where the logic actually lives. This obscures true ownership in the dependency graph: a developer reading `pipeline-self-audit.js` sees `signatureForTask` in its export list and reasonably assumes this module defines or curates the signature format, when in fact it is a pure delegation. The shim also means any future change to the classification API must be coordinated through two files, and the single source of truth is hidden behind a module whose primary job is something else.
+
+It is worth noting that `pipeline-self-audit.js` does have a *legitimate* internal dependency on `blocked-task-classifiers.js`: `buildAuditRawText` calls `classifyBlockedTask` to generate the `faultSideNote` field. That is a genuine consumer relationship, not a re-export. The problem is specifically the four *re-exported* symbols that this module neither defines nor uses internally.
+
+Solution:
+1. Migrate the known consumers (`pipeline-forensics.js`, `staleness-audit.js`, and any others that import the four classification symbols from `pipeline-self-audit.js`) to import directly from `blocked-task-classifiers.js`.
+2. Remove the four re-export lines from `pipeline-self-audit.js`'s `module.exports`.
+3. Narrow the existing `require('./blocked-task-classifiers.js')` destructuring to import only `classifyBlockedTask` (the symbol actually used inside `buildAuditRawText`), rather than the full set of four re-exported names. The `require` call itself stays, because the module still consumes `classifyBlockedTask` internally.
+
+After these changes the file's public API shrinks to its own five symbols (`CLUSTER_THRESHOLD`, `MAX_DEBRIEF_ACTIONS`, `findAuditClusters`, `buildAuditRawText`, `buildAuditTask`), and the module graph reflects actual ownership. The internal dependency on `blocked-task-classifiers.js` remains, but it is now a single, honest consumer edge rather than a four-symbol pass-through facade.
+
+Benefits:
+The dependency graph becomes an accurate map of who owns what: classification logic is visibly owned by `blocked-task-classifiers.js`, and `pipeline-self-audit.js` is visibly a cluster-detection module with one legitimate internal call into the classifier. Future changes to the classification API (renaming a category, adding a new fault-side) require touching only `blocked-task-classifiers.js` and, if the signature changes, `buildAuditRawText`'s single call site — not a separate re-export surface. New contributors reading `pipeline-self-audit.js` no longer encounter four symbols they must trace through a second file to understand, and the file's link-degree drops to reflect its true coupling.
+
+### AC-243 · Duplicated signature-format parsing in `pipeline-self-audit.js`
+Strength: Worth exploring
+Files: src/pipeline-self-audit.js, src/blocked-task-classifiers.js
+
+Problem:
+Both `buildAuditRawText` and `buildAuditTask` independently parse the `source::category` signature with the identical three-line sequence: find the last `::` separator, slice the source from the start, and slice the category from after the separator. The signature format is produced by `signatureForTask` in `blocked-task-classifiers.js`, but the parsing of that format is duplicated in two functions within `pipeline-self-audit.js` rather than being a single `parseSignature(sig) → { source, category }` helper. If the format ever gains a third component, changes the separator, or needs to handle a source name that itself contains `::`, both call sites must be found and updated in lockstep. The duplication is small (three lines) but it is exactly the kind of format knowledge scattered across call sites that causes silent divergence when the format evolves.
+
+Solution:
+Extract a single `parseSignature(signature)` function — either in `blocked-task-classifiers.js` next to `signatureForTask` (keeping the format definition and its inverse together), or locally in `pipeline-self-audit.js` if the parsing is considered a consumer-side concern. Call it from both `buildAuditRawText` and `buildAuditTask`. This localizes the format-parsing knowledge to one place and makes the two functions' dependency on the format explicit and singular.
+
+Benefits:
+A format change (new separator, additional component, edge-case handling) is made in exactly one location instead of two, eliminating the risk of the two call sites drifting out of sync. The relationship between `signatureForTask` (producer) and `parseSignature` (consumer) becomes visible as a matched pair, making the contract between the two modules easier to reason about and test.
+
+### AC-244 · Duplicated "ensure destination + rename + track error" pattern in `done-archive.js`
+Strength: Worth exploring
+Files: src/done-archive.js
+
+Problem:
+`archiveDoneTasks` and `archiveSpecificDoneTasks` each independently implement the same five-step "move one file into the archive bucket" sequence: check a `destDirEnsured` flag, call `fs.mkdirSync(destDir, { recursive: true })`, call `fs.renameSync(src, dest)`, catch the rename error, and push a formatted message into `result.errors`. The only difference between the two is how `src` is determined (directory-scan entry vs. explicit task-ID string). The shared "do the move" logic is a small but real duplication: if the destination scheme changes (e.g., adding a per-source subdirectory, or switching to a copy-then-delete for cross-filesystem safety), both functions must be updated identically.
+
+Solution:
+Extract a small `moveToArchive(srcPath, destDir, destDirEnsuredRef, result)` helper that encapsulates the mkdir/rename/error-track sequence, and call it from both public functions. The two public functions then differ only in how they enumerate source files, and the move mechanics live in one place.
+
+Benefits:
+A change to the archiving mechanics (destination layout, cross-filesystem handling, error-message format) is made in one helper rather than in two parallel code paths. The public functions become shorter and more readable, each focusing on its distinct responsibility (enumerating which files to archive) while delegating the shared mechanics.
