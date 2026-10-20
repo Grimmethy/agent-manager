@@ -295,6 +295,27 @@ test('a bare filename that resolves nowhere in a non-create sentence is dropped 
   assert.equal(result.suppressions[0].reason, 'unresolved-bare-filename');
 });
 
+test('a line-overshoot finding on a resolved file still fires even when the same sentence contains a create verb', () => {
+  // The create-verb guard must not blanket-mute the sentence: src/real-file.js exists
+  // (10 lines) and the citation "line 5000" is impossible regardless of the "Create"
+  // verb earlier in the sentence, so the line-overshoot finding must survive.
+  const result = detectStaleDecomposePremise(
+    citing('Create src/routes/counties.js with a handler, then wire it in src/real-file.js at line 5000.'),
+    {
+      repoRoot: '/r',
+      lineCountFn: (root, p) => (p === 'src/real-file.js' ? 10 : null),
+      resolveFn: () => ({ status: 'none' }),
+    },
+  );
+  assert.ok(result, 'the impossible line 5000 citation must still block despite the create verb');
+  assert.equal(result.stale, true);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].kind, 'line-overshoot');
+  assert.equal(result.findings[0].relPath, 'src/real-file.js');
+  assert.equal(result.findings[0].citedLine, 5000);
+  assert.equal(result.findings[0].realLineCount, 10);
+});
+
 test('a bare filename introduced by a create verb is suppressed with the create-verb reason', () => {
   const result = detectStaleDecomposePremise(
     citing('Create counties.js with a handler at line 20.'),
