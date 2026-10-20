@@ -139,6 +139,11 @@ function buildToolOutcomeEntries(ctx, calls) {
     if (c.tool === 'edit_file') {
       entry.findChars = strLen(args.find);
       entry.replaceChars = strLen(args.replace);
+      // Which tier applied the edit (brain-dump 1890: local-tool-fs-tools.js tryFallbackTiers), and on a miss which tier
+      // WOULD have applied it while the tiers are switched off (non-enumerable matchProbe -- never shown to the model).
+      const r = c.result && typeof c.result === 'object' ? c.result : {};
+      entry.matchStrategy = r.matchStrategy || (entry.outcome === 'applied' ? 'exact' : null);
+      entry.matchProbe = r.matchProbe || null;
     } else {
       entry.contentChars = strLen(args.content);
     }
@@ -190,9 +195,11 @@ function buildSummary(entries) {
       r.emptyAttempts.byEndClass[e.endClass] = (r.emptyAttempts.byEndClass[e.endClass] || 0) + 1;
     } else if (e.type === 'tool-outcome') {
       const r = rowFor(e);
-      const t = r.tools[e.tool] || (r.tools[e.tool] = { total: 0, outcomes: {}, missRate: 0 });
+      const t = r.tools[e.tool] || (r.tools[e.tool] = { total: 0, outcomes: {}, missRate: 0, strategies: {}, probes: {} });
       t.total += 1;
       t.outcomes[e.outcome] = (t.outcomes[e.outcome] || 0) + 1;
+      if (e.matchStrategy) t.strategies[e.matchStrategy] = (t.strategies[e.matchStrategy] || 0) + 1;
+      if (e.matchProbe) t.probes[e.matchProbe] = (t.probes[e.matchProbe] || 0) + 1;
     }
   }
   for (const r of rows.values()) {
