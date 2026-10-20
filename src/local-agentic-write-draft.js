@@ -27,7 +27,7 @@ const { GIT_OWNERSHIP_RULE } = require('./lib/git-ownership.js');
 const path = require('path');
 const fs = require('fs');
 const { getConfig } = require('./config.js');
-const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js');
+const { runPlanWithTools, ORIENT_TURN_LIMIT, REQUEST_TIMEOUT_MS } = require('./local-tool-client.js');
 const { resolveReadOnlySiblingRoots } = require('./accessible-roots.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
@@ -54,6 +54,25 @@ const MAX_AUTO_DECOMPOSE = Number(process.env.AGENT_MANAGER_MAX_AUTO_DECOMPOSE) 
 // comfortably inside dead-process-check.js's 1680s (28 min) zombie threshold. Env
 // override still wins.
 const LOCAL_AGENTIC_WRITE_MAX_TURNS = Number(process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS) || 35;
+
+// Time-budget line for the prompt (2026-10-19, brain-dump 1895, harness-derived: the competition harness lists every active limit
+// up front). The prompt already states the turn budget; it did not state that ONE TURN is a model call with a hard ceiling
+// (local-tool-client.js REQUEST_TIMEOUT_MS: 240 s, 900 s on a slow endpoint, LOCAL_TIMEOUT_MS overrides), past which the whole
+// call is lost as an OLLAMA_TIMEOUT. Measured over the 14 days to 2026-10-19: timeout outcomes on 9.3% of worker-3090 attempts
+// (33 of 356), 10.6% of worker-p40 (17 of 161), 0.8% of worker-rx580 (5 of 612). A prompt can only influence how long the model
+// spends in one turn, so the line gives the real number and a concrete instruction. Default OFF (AGENT_MANAGER_PROMPT_BUDGET_BLOCK);
+// the capability ledger stamps the switch on every attempt so capability-ledger.js --budget-block can compare timeout rates with it
+// on and off. Deliberately NO budget-status tool: every tool call in this loop is a whole model turn (up to that same ceiling) and
+// counts against LOCAL_AGENTIC_WRITE_MAX_TURNS, so a "free" status call would cost more than this sentence saves.
+function budgetBlockEnabled() {
+  const v = String(process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK || '').trim().toLowerCase();
+  return v === 'on' || v === '1' || v === 'true';
+}
+
+function buildTimeBudgetLine(timeoutMs = REQUEST_TIMEOUT_MS) {
+  const seconds = Math.max(1, Math.round(Number(timeoutMs) / 1000));
+  return `TIME BUDGET: each of your turns is ONE model call that is cut off after about ${seconds} seconds on this machine; a turn that thinks or writes past that is lost entirely and counts as a failed attempt, however good the answer was going to be. Keep your thinking to a few sentences, prefer calling a tool over planning at length, and split a large change into several small edit_file calls. (The number of turns is limited separately, above; each run_bash command is cut off after ~30 s.)`;
+}
 
 // RETRY_ORIENT_TURN_LIMIT (2026-09-15, brain-dump bd-1789433484128, "pipeline hardening
 // 1/5"): a retry whose prompt already carries a substantive priorAttemptAnalysisBlock (a
@@ -429,6 +448,7 @@ function buildWriteAgenticPromptBase(task, { orientTurnLimit = ORIENT_TURN_LIMIT
     'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Prefer read_file with offset/limit to page a large file and grep_codebase to locate code; a quick `run_bash` `sed -n \'3600,3700p\' path` slice is fine for a fast look, just do not burn turns re-listing the tree. Reserve run_bash otherwise for the final targeted check on files you actually changed.',
     'Files here can be thousands of lines. read_file returns a WINDOW of lines: check `totalLines` and `nextOffset` in the result and re-call with a higher `offset` to page -- never assume the first window is the whole file. grep_codebase searches this repo\'s configured dirs (or a subpath, or "." for all); it is a literal substring / all-words match, not a regex, and returns matching lines only -- read_file around a hit for context.',
     `TURN BUDGET: you have about ${LOCAL_AGENTIC_WRITE_MAX_TURNS} turns total. Spend at most the first ~${orientTurnLimit} on orientation (grep/read/list). By then you MUST have either started editing with edit_file/write_file, or concluded with a RESOLUTION: line. Do not keep exploring past that -- a rough first edit you then fix is far better than running out of turns having changed nothing. ${stillLostAdvice}`,
+    ...(budgetBlockEnabled() ? [buildTimeBudgetLine()] : []),
     '',
     `Title: ${task.title || ''}`,
     leaf ? 'This task is a CONFIRMED-ATOMIC LEAF: a prior decompose pass already split the larger feature and this is one indivisible piece. It MUST be implemented in this pass with edit_file / write_file. Do NOT answer RESOLUTION: decompose.' : '',
@@ -771,7 +791,7 @@ function modelStatsSafe(fn, args) {
 }
 
 module.exports = {
-  draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
+  draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS, budgetBlockEnabled, buildTimeBudgetLine,
   isLeafTask, leafDecomposeLocked, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
   detectExternalDependency, classifyExternalDependency, externalDependencyAdvisory, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
 };
