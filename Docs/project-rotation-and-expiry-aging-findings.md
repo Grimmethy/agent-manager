@@ -93,6 +93,8 @@ invocation is computed fresh per call and pins `AGENT_MANAGER_INSTANCES_DIR` to 
 heartbeats and GPU locks stay shared; keys the project lacks are unset, not leaked (CONFIRMED —
 src/pool-projects.js:125-136).
 
+> **Superseded 2026-10-18 (premium handling only):** the sentence above, "No premium special-casing ... the 'premium first' behavior is UNCONFIRMED/absent", was true when written and no longer is. Premium reach now exists for workers, the reviewer and the apply loop: see "Premium reach" in `Docs/idle-pool-borrowing.md`. The rest of this finding is unchanged.
+
 ## Q3. Where an "attention clock" would live
 
 Existing per-project records already in the code:
