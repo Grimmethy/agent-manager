@@ -24,3 +24,10 @@ test('ungrounded-field-new-env-var: re-admits only when every flagged name is an
   assert.equal(entry.applies({ blockedReason: 'something else entirely', implementResponse: task1890.implementResponse }), false);
   assert.equal(entry.applies({}), false);
 });
+
+test('ungrounded-field-new-env-var: also re-admits a task blocked on a name read through an injected env parameter (env.NAME)', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'ungrounded-field-new-env-var');
+  const impl = ['Summary', '', '=== DIFF ===', 'diff --git a/src/lib/x.js b/src/lib/x.js', '@@ -1 +1,2 @@', "+function on(env = process.env) { return env.AGENT_MANAGER_TRANSIENT_RETRY !== 'off'; }"].join('\n');
+  assert.equal(e.applies({ blockedReason: BLOCK('AGENT_MANAGER_TRANSIENT_RETRY'), implementResponse: impl }), true);
+  assert.equal(e.applies({ blockedReason: BLOCK('SOME_OTHER_NAME'), implementResponse: impl }), false);
+});

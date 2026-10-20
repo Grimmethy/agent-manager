@@ -513,7 +513,12 @@ function extractNewlyDeclaredIdentifiers(text) {
 // process.env.NAME / process.env['NAME'], os.environ['NAME'], os.environ.get('NAME', os.getenv('NAME', getenv('NAME',
 // and shell ${NAME:-x} / ${NAME-x} / ${NAME:=x} (default-value forms only -- a JS template ${NAME} referencing a constant
 // is not an env read and stays checked). Prose, context and removed lines never exempt anything.
-const ENV_READ_RE = /(?:process\.env\.|process\.env\[\s*['"`]|os\.environ\[\s*['"]|os\.environ\.get\(\s*['"]|(?:os\.)?getenv\(\s*['"])([A-Z][A-Z0-9]*_[A-Z0-9_]+)|\$\{([A-Z][A-Z0-9]*_[A-Z0-9_]+):?[-=]/g;
+// 2026-10-19 (brain-dump 1896's review, blocked on env.AGENT_MANAGER_TRANSIENT_RETRY): an identifier named `env` used as a property access also
+// counts -- `env.NAME`, `env['NAME']`, Python `env.get('NAME'` -- because this codebase's own idiom is an injected parameter,
+// `function f(url, env = process.env) { ... env.NAME ... }` (lanes.js isSlowEndpoint, capability-ledger.js, transient-retry.js). `\benv\.` still
+// matches process.env.NAME (a word boundary sits between '.' and 'e'); `myenv.NAME` does not match. A replay of all 41 historic ungrounded-field
+// blocks (2026-10-19) found none this widening would have exempted: it is about the live idiom, not past blocks.
+const ENV_READ_RE = /(?:\benv\.|\benv\[\s*['"`]|\benv\.get\(\s*['"]|os\.environ\[\s*['"]|os\.environ\.get\(\s*['"]|(?:os\.)?getenv\(\s*['"])([A-Z][A-Z0-9]*_[A-Z0-9_]+)|\$\{([A-Z][A-Z0-9]*_[A-Z0-9_]+):?[-=]/g;
 
 function extractEnvReadIdentifiers(text) {
   const out = new Set();
