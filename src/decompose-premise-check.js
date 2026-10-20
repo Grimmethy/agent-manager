@@ -157,6 +157,58 @@ function resolveCitedFile(repoRoot, relPath, { findFn } = {}) {
   }
 }
 
+// A bare filename (no directory prefix) mentioned in prose right before/after a line
+// reference ("in counties.js at line 20", "`x.js:42`") -- previously invisible to PATH_RE
+// (which requires a src/|python/|scripts/|lib/|docs/ root prefix), so its line ref silently
+// pinned to the nearest preceding PREFIXED path via nearestPathFor and the verdict attached
+// to the wrong file. Code-like extensions only (.js/.ts/.py/...) so prose fragments like
+// "e.g." or "num_ctx:49152" never match.
+const BARE_FILE_RE = /(?<![\w./-])([\w-]+\.(?:js|ts|jsx|tsx|py|sh|md|json|ya?ml|css|html|toml)\b)/g;
+
+// Create-introducing verbs (2026-10-08, HUB0160): task prose that names a file whose whole
+// point is to CREATE it ("Create src/foo.js ... line 20") must not be called "missing-file"
+// -- of course it doesn't exist yet. Deliberately explicit verb FORMS (not an "add\w*"
+// stem), so "address", "addendum", "writings" never count.
+const CREATE_VERB_RE = /\b(?:created?|creating|createnew|add(?:ed|ing|s)?|writ(?:e|es|ing|ten)|new|generated?|generating|scaffold(?:ed|ing|s)?)\b/gi;
+// Sentence boundaries for the guard's "same sentence" test (periods inside "src/foo.js"
+// must not split, so an immediately-preceding word char disqualifies).
+const SENTENCE_BREAK_RE = /[.!?\n;]/;
+
+// Is `pathIndex` the path a create-verb INTRODUCES? Keyed on THIS specific path token, not
+// "the sentence contains a create verb": the nearest create verb before the path (in the
+// same sentence) must have NO other path token -- prefixed or bare -- between it and the
+// path. "Create src/a.js and update src/b.js (1) ~line 42" suppresses a.js (the verb
+// introduces it) but NOT b.js (a.js sits between verb and b.js, so the verb introduces
+// a.js, not b.js) -- a genuinely-missing b.js must still be flagged. Returns the
+// introducing verb or null.
+function createVerbFor(rawText, pathIndex, allPaths) {
+  let start = 0;
+  for (let i = 0; i < pathIndex; i++) if (SENTENCE_BREAK_RE.test(rawText[i])) start = i + 1;
+  const span = rawText.slice(start, pathIndex).toLowerCase();
+  CREATE_VERB_RE.lastIndex = 0; // shared global regex -- reset before reuse
+  let lastVerb = null;
+  let vm;
+  while ((vm = CREATE_VERB_RE.exec(span))) lastVerb = vm;
+  if (!lastVerb) return null;
+  const verbStart = start + lastVerb.index;
+  for (const p of allPaths) {
+    // Any OTHER path token (prefixed or bare) between the verb and this path: the verb
+    // introduces that one, not this -- so this path is not verb-introduced.
+    if (p.index !== pathIndex && p.index >= verbStart && p.index < pathIndex) return null;
+  }
+  return lastVerb[0];
+}
+
+// The sentence a path token sits in (same-sentence context for the suppressions audit
+// trail). Never throws; falls back to the whole text.
+function sentenceAround(text, index) {
+  let a = 0;
+  for (let i = 0; i < index; i++) if (SENTENCE_BREAK_RE.test(text[i])) a = i + 1;
+  let b = text.length;
+  for (let i = index; i < text.length; i++) if (SENTENCE_BREAK_RE.test(text[i])) { b = i; break; }
+  return text.slice(a, b);
+}
+
 function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCount, resolveFn = resolveCitedFile } = {}) {
   if (!isEnabled()) return null;
   const pc = (task && task.promptContext) || {};
@@ -171,11 +223,32 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
     pathMap.set(pm[1], pm.index);
   }
   const paths = [...pathMap.entries()]
-    .map(([relPath, index]) => ({ relPath, index }))
+    .map(([relPath, index]) => ({ relPath, index, bare: false }))
     .sort((a, b) => a.index - b.index);
-  if (!paths.length) return null;
+  // Bare-filename citations (no directory prefix) -- see BARE_FILE_RE. Each is checked
+  // against the prefixed-path list at its own match position, never a DIFFERENT path's,
+  // so "e.g. src/foo.js:12" does not spawn a phantom bare "foo.js" token.
+  const bare = [];
+  let bm;
+  BARE_FILE_RE.lastIndex = 0;
+  while ((bm = BARE_FILE_RE.exec(rawText))) {
+    const name = bm[1];
+    if (!name.includes('/')) {
+      // A prefixed path already captures this span (e.g. "src/foo.js" contains the bare
+      // "foo.js"): keep ONE token for it, the prefixed one, never a phantom bare token
+      // from the same mention (overlap test on both ends of the span).
+      const covered = paths.some((p) => p.index <= bm.index + name.length && p.index + p.relPath.length >= bm.index);
+      if (!covered) bare.push({ relPath: name, index: bm.index, bare: true });
+    }
+  }
+  const allPaths = [...paths, ...bare].sort((a, b) => a.index - b.index);
+  if (!allPaths.length) return null;
 
-  const lineRefs = [...maskTimestamps(rawText).matchAll(LINE_REF_RE)].map((m) => ({ line: Number(m[1]), index: m.index }));
+  // attached: true when the ref came from the "name.ext:NN" alternative (m[0] starts with
+  // the dot) rather than the explicit "line N" keyword form -- the bare-name branch below
+  // uses this to stay silent on the config-vs-citation ambiguity the num_ctx:49152
+  // incident taught us about.
+  const lineRefs = [...maskTimestamps(rawText).matchAll(LINE_REF_RE)].map((m) => ({ line: Number(m[1]), index: m.index, attached: m[0][0] === '.' }));
   if (!lineRefs.length) return null;
 
   // Rough association: a line reference belongs to the nearest file path mentioned at or
@@ -184,22 +257,71 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
   // line refs after it).
   function nearestPathFor(refIndex) {
     let best = null;
-    for (const p of paths) {
+    for (const p of allPaths) {
       if (p.index <= refIndex && (!best || p.index > best.index)) best = p;
     }
-    return best || paths[0];
+    return best || allPaths[0];
   }
 
   const findings = [];
-  const checkedFiles = new Map(); // relPath -> lineCount | null, avoid re-reading the same file per ref
+  const suppressions = [];
+  const checkedFiles = new Map(); // relPath -> lineCount | null | 'ambiguous', avoid re-reading the same file per ref
   for (const ref of lineRefs) {
     const p = nearestPathFor(ref.index);
-    if (!checkedFiles.has(p.relPath)) {
-      let lines = lineCountFn(repoRoot, p.relPath);
+    const relPath = p.relPath;
+    if (p.bare) {
+      // Bare filename (no directory prefix): never pin to the nearest preceding PREFIXED
+      // path (that was the old nearestPathFor misattribution). Resolve it on its own
+      // merits instead: unique -> judge the resolved file; ambiguous -> cannot tell which
+      // of several real files, do not flag, record the dismissal; none -> the line ref
+      // is dropped, recorded (a create verb introducing it names the reason).
+      if (!checkedFiles.has(relPath)) {
+        let entry;
+        const r = resolveFn(repoRoot, relPath);
+        if (r && r.status === 'unique') {
+          entry = { lines: lineCountFn(repoRoot, r.relPath), resolvedPath: r.relPath };
+        } else if (r && r.status === 'ambiguous') {
+          entry = { lines: 'ambiguous', resolvedPath: null };
+        } else {
+          entry = { lines: null, resolvedPath: null };
+        }
+        checkedFiles.set(relPath, entry);
+      }
+      const { lines, resolvedPath } = checkedFiles.get(relPath);
+      if (lines === 'ambiguous') {
+        suppressions.push({ path: relPath, reason: 'ambiguous-bare-filename', sentence: sentenceAround(rawText, p.index), lineRef: ref.line });
+        continue;
+      }
+      if (lines === null) {
+        if (createVerbFor(rawText, p.index, allPaths)) {
+          suppressions.push({ path: relPath, reason: 'create-verb-introduced', sentence: sentenceAround(rawText, p.index), lineRef: ref.line });
+        } else if (!ref.attached) {
+          suppressions.push({ path: relPath, reason: 'unresolved-bare-filename', sentence: sentenceAround(rawText, p.index), lineRef: ref.line });
+        }
+        // Else (attached `name.ext:NN` on a bare name that resolves nowhere, no create
+        // verb): stay silent -- bare names were invisible to this check before HUB0161,
+        // and "ext:digits" right after a bare name is exactly the config-vs-citation pair
+        // the num_ctx:49152 incident says to treat as not-a-citation. Dropping silently
+        // here (no suppression record) is what keeps an illustrative sentence like
+        // "... (e.g. `path.js:22` still matches ...)" from producing an audit-only result
+        // where the pre-HUB0161 behavior was null.
+        continue;
+      }
+      if (ref.line > lines + LINE_OVERSHOOT_SLACK) {
+        findings.push({
+          kind: 'line-overshoot', relPath, resolvedPath: resolvedPath || undefined, citedLine: ref.line, realLineCount: lines,
+          detail: `cites line ${ref.line} of \`${relPath}\`${resolvedPath ? ` (resolved to \`${resolvedPath}\`)` : ''}, but that file is only ${lines} lines long now -- it has likely been restructured (a decompose, a split) since this citation was written`,
+        });
+      }
+      continue;
+    }
+    // Prefixed path: existing behavior (probe cited location, fall back to suffix resolve).
+    if (!checkedFiles.has(relPath)) {
+      let lines = lineCountFn(repoRoot, relPath);
       let resolvedPath = null;
       if (lines === null) {
         // Not at the cited location -- look for it under a monorepo sub-root before calling it missing.
-        const r = resolveFn(repoRoot, p.relPath);
+        const r = resolveFn(repoRoot, relPath);
         if (r && r.status === 'unique') {
           lines = lineCountFn(repoRoot, r.relPath);
           resolvedPath = r.relPath;
@@ -207,18 +329,25 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
           lines = 'ambiguous';
         }
       }
-      checkedFiles.set(p.relPath, { lines, resolvedPath });
+      checkedFiles.set(relPath, { lines, resolvedPath });
     }
-    const { lines: lineCount, resolvedPath } = checkedFiles.get(p.relPath);
+    const { lines: lineCount, resolvedPath } = checkedFiles.get(relPath);
     if (lineCount === 'ambiguous') continue; // several real files end with the cited path: cannot tell which one, so do not flag
     if (lineCount === null) {
-      findings.push({ kind: 'missing-file', relPath: p.relPath, detail: `cites \`${p.relPath}\`, but that file does not exist in the repo` });
+      // Create-verb guard, keyed on THIS path token (not "the sentence contains a create
+      // verb"): "Create src/a.js and update src/b.js (1) ~line 42" suppresses a.js but
+      // keeps the genuinely-missing b.js flagged -- see createVerbFor.
+      if (createVerbFor(rawText, p.index, allPaths)) {
+        suppressions.push({ path: relPath, reason: 'create-verb-introduced', sentence: sentenceAround(rawText, p.index), lineRef: ref.line });
+        continue;
+      }
+      findings.push({ kind: 'missing-file', relPath, detail: `cites \`${relPath}\`, but that file does not exist in the repo` });
       continue;
     }
     if (ref.line > lineCount + LINE_OVERSHOOT_SLACK) {
       findings.push({
-        kind: 'line-overshoot', relPath: p.relPath, resolvedPath: resolvedPath || undefined, citedLine: ref.line, realLineCount: lineCount,
-        detail: `cites line ${ref.line} of \`${p.relPath}\`${resolvedPath ? ` (resolved to \`${resolvedPath}\`)` : ''}, but that file is only ${lineCount} lines long now -- it has likely been restructured (a decompose, a split) since this citation was written`,
+        kind: 'line-overshoot', relPath, resolvedPath: resolvedPath || undefined, citedLine: ref.line, realLineCount: lineCount,
+        detail: `cites line ${ref.line} of \`${relPath}\`${resolvedPath ? ` (resolved to \`${resolvedPath}\`)` : ''}, but that file is only ${lineCount} lines long now -- it has likely been restructured (a decompose, a split) since this citation was written`,
       });
     }
   }
@@ -231,11 +360,29 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
     dedupSeen.add(key);
     dedupedFindings.push(f);
   }
+  // Every dismissal (create-verb-introduced / ambiguous-bare-filename /
+  // unresolved-bare-filename) is recorded once per (path, reason, lineRef) so a wrongly
+  // dropped case is findable in the audit trail.
+  const dedupedSuppressions = [];
+  const suppSeen = new Set();
+  for (const s of suppressions) {
+    const key = `${s.reason}:${s.path}:${s.lineRef}`;
+    if (suppSeen.has(key)) continue;
+    suppSeen.add(key);
+    dedupedSuppressions.push(s);
+  }
 
-  if (!dedupedFindings.length) return null;
+  if (!dedupedFindings.length) {
+    if (!dedupedSuppressions.length) return null;
+    // Dismissals only, no blocking finding: consumers that gate on the verdict must
+    // check .stale, not just truthiness (local-agentic-write-draft.js, lib/reject-
+    // retry-check.js both do).
+    return { stale: false, findings: [], suppressions: dedupedSuppressions, reason: null };
+  }
   return {
     stale: true,
     findings: dedupedFindings,
+    suppressions: dedupedSuppressions,
     reason: `This sub-task's premise may be stale (filed by an internal decompose, then the codebase moved on): ${dedupedFindings.map((f) => f.detail).join('; ')}.`,
   };
 }
