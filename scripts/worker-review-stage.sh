@@ -75,7 +75,18 @@ worker_review_stage() {
   local review_dir name file
   review_dir="${QUEUE_DIR}/review"
   [[ -d "$review_dir" && -r "$review_dir" ]] || return 1
-  name="$(ls -1tr "$review_dir" 2>/dev/null | grep -E '\.json$' | head -n1)"
+  # Premium reach (2026-10-18): a PREMIUM_ONLY borrowed tick (local-worker.sh sets it from
+  # AGENT_MANAGER_PREMIUM_ONLY_TICK on a --once child) must take a PREMIUM review item if one
+  # exists, and nothing else at all. Premium-first-then-oldest-by-mtime is the ordering
+  # review-runner.sh's own premium-reach rung uses inside review/: list newest-first, take the
+  # first premium item if any, else fall back to the oldest item (ls -1tr head -1, so mixed-
+  # source backlogs still drain oldest-first -- same fairness as the draft claim ranking).
+  if "${PREMIUM_ONLY:-false}"; then
+    name="$(ls -1rt "$review_dir" 2>/dev/null | grep -E '\.json$' | filter_premium_names "$review_dir" | head -n1)"
+    [[ -n "$name" ]] || return 1   # no premium review item -- a premium-only tick never takes regular work
+  else
+    name="$(ls -1tr "$review_dir" 2>/dev/null | grep -E '\.json$' | head -n1)"
+  fi
   [[ -n "$name" ]] || return 1
   file="${review_dir}/${name}"
   [[ -f "$file" && -s "$file" ]] || return 1   # empty == likely mid-write by another process
@@ -100,6 +111,14 @@ worker_review_stage() {
     mkdir "$d" 2>/dev/null || { printf '[worker-%s] review stage: lost the claim race for %s\n' "$instance_id" "$name" >&2; return 1; }
   fi
   printf '%s %s\n' "$$" "$instance_id" > "${d}/owner"
+  # Premium-only borrowed tick safety net: if the item's premiumPriority stopped being true
+  # between the ranked listing above and now (edited in place), leave it for a regular tick.
+  if "${PREMIUM_ONLY:-false}" && ! is_premium_file "$file"; then
+    _wrst_claim_released=false
+    rm -rf "$claim" 2>/dev/null
+    printf '[worker-%s] review stage: %s is not premium -- a premium-only tick leaves it for later\n' "$instance_id" "$name" >&2
+    return 1
+  fi
   # Guarantee the claim goes away even on an early error path below (the caller's own
   # shell may have its own EXIT trap; this one is scoped to THIS function's subshell-free
   # path via an explicit release at every return that matters -- the moves complete before

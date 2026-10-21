@@ -34,7 +34,11 @@ filter_premium_names() {
 # lane claims ANY pending task by priority -- there is no reasoning/worker split (2026-09-19).
 # restartTargetFor() (dead-process-check.js) restarts a lane using the same lane definition.
 
-source "${SCRIPT_DIR}/orc-common.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
+source "${SCRIPT_DIR}/orc-common.sh"
+# HUB0168 · 2/4: make review a claimable stage of this same tick loop. worker-review-stage.sh
+# (HUB0168 · 1/4) sources lazily, defines exactly one function (worker_review_stage) and has
+# no other side effects, so it is safe to source here once and call from the tick loop below.
+source "${SCRIPT_DIR}/worker-review-stage.sh"                                               # load-shared env, validate config — fail loudly here before doing any work so user sees clear error message vs daemon silently hanging on missing repo path.
 # Note: this source is idempotent-safe because orc-common sets only unset vars (so subsequent sources don't override caller's environment).
 
 # Re-run once per tick (Workers tab per-instance model dropdown): exports LOCAL_MODEL for this
@@ -855,6 +859,25 @@ while :; do                                                                     
 
     done                                                                         # end per-filename loop within current tick — bash doesn't auto-close the `for name in "${items[@]}"` scope; 'done' keyword terminates it same way PowerShell closes each block with } or closing brace pattern (we use bash's explicit 'done' syntax which is required).
   fi                                                                            # close if -r "$pdir" conditional check block — same structure as PowerShell's `if (( Test-Path $pending )) { ... }` where body only runs test succeeds; we mirror that with [[ ]] && {} pattern using braces around body.
+
+  # Review stage (HUB0168 · 2/4, "review as a claimable stage of the lane worker loop"): when
+  # NOTHING above did work this tick (no leftover drafting item processed AND no pending/ draft
+  # claimed -- `did_work` is still false) and no infra-shaped failure already forced a backoff,
+  # claim one review item from queue/review/ via worker_review_stage (HUB0168 · 1/4 helper). It
+  # shares everything the draft path relies on: the same acquire_single_flight_lock/
+  # release_single_flight_lock (endpoint-keyed by localOllamaLockKey, the ONE key definition
+  # src/gpu-arbiter.js also keys by, so the review serializes against this lane's drafts on the
+  # same Ollama endpoint), the same per-item atomic claim + 3 h stale-claim takeover
+  # (review-runner.sh's claim_review_item protocol), the same INFRA_FAILURE_PATTERN
+  # bounded-requeue-round retry bookkeeping, the same two-phase heartbeat (queued until the lock
+  # is held, then working with currentPass 'review'), and it honors PREMIUM_ONLY so a
+  # --once borrowed tick (AGENT_MANAGER_PREMIUM_ONLY_TICK) takes a premium review item only.
+  # Return codes: 0 did work (one review item), 1 nothing reviewable, 2 yielding (lease/RAM).
+  if ! "$did_work" && ! "$TICK_HAD_INFRA_FAILURE"; then
+    worker_review_stage >>"$LOG_FILE" 2>&1
+    _wrst_rc=$?
+    if (( _wrst_rc == 0 )); then did_work=true; fi   # a borrowed (--once) tick that reviewed an item exits 10 below, same as a drafted one
+  fi
 
   # A borrowed tick ends here: report what it did to the daemon that ran it (no sleep, no backoff, never borrows further).
   if "$ONCE"; then
