@@ -166,7 +166,19 @@ function premiumStageDirs(role, lane) {
   return [];
 }
 
-// True when a task in one of the role's stages has a top-level premiumPriority === true -- the same test as lib/task-selection.js
+// True when a parsed task a role's stage holds is work that role can actually take: a top-level premiumPriority === true, not blocked
+// (a task carries a blockedReason when a stage blocked it), not on a manual hold, and not pinnedWorker to ANOTHER lane (pinned to this
+// lane is exactly what we want; the reviewer/apply loops pass no lane, so a pin never hides their work). Shared by every role -- the
+// same rule for worker, reviewer and apply, differing only in which stage dir is looked at.
+function claimable(task, lane) {
+  return !!(task && task.premiumPriority === true)
+    && !task.blockedReason
+    && !task.held
+    && (!task.pinnedWorker || !lane || task.pinnedWorker === lane);
+}
+
+// True when a task in one of the role's stages has a top-level premiumPriority === true AND passes the claimability rule above (claimable)
+// -- the same test as lib/task-selection.js
 // hasPremiumPriorityInQueue (not required from there: that module loads the config and source registry, and this one is called from
 // bash every tick). Unreadable dirs and corrupt/partial files are skipped; never throws. A file whose text never mentions the field is not
 // parsed at all: measured on wok 2026-10-18 over 2213 worker-stage files (32 MB, 17 projects), warm cache, read+parse every file took
@@ -183,7 +195,7 @@ function hasPremium(pipelineDir, { role = 'worker', lane = null } = {}) {
         const text = fs.readFileSync(path.join(dir, e.name), 'utf8');
         if (!text.includes('"premiumPriority"')) continue;
         const task = JSON.parse(text);
-        if (task && task.premiumPriority === true) return true;
+        if (claimable(task, lane)) return true;
       } catch { /* corrupt or partial write: not a premium flag */ }
     }
   }
@@ -248,7 +260,7 @@ function poolEnvArgs(project, homeInstancesDir) {
 
 module.exports = {
   enabled, poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, markEmpty, readProjects, PROJECTS_PATH,
-  registeredProjects, premiumReachEnabled, premiumStageDirs, hasPremium, premiumProjects, markPremiumBorrowed, markPremiumEmpty,
+  registeredProjects, premiumReachEnabled, premiumStageDirs, claimable, hasPremium, premiumProjects, markPremiumBorrowed, markPremiumEmpty,
 };
 
 if (require.main === module) {

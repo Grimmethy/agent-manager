@@ -157,7 +157,7 @@ test('borrowing is tracked per role: a worker finding a project empty does not h
 
 // --- premium reach (2026-10-18): every registered project, premium work only -----------------------------------------------------------
 
-const { registeredProjects, hasPremium, premiumProjects, markPremiumBorrowed, markPremiumEmpty, premiumReachEnabled } = require('./pool-projects.js');
+const { registeredProjects, claimable, hasPremium, premiumProjects, markPremiumBorrowed, markPremiumEmpty, premiumReachEnabled } = require('./pool-projects.js');
 
 const writeTask = (pipelineDir, stage, name, task, compact = false) => {
   const dir = path.join(pipelineDir, 'queue', stage);
@@ -216,6 +216,39 @@ test('hasPremium looks only at the stages a role works from, and only at this la
   assert.equal(hasPremium(path.join(fx.root, 'missing')), false, 'a missing pipeline dir is not an error');
 });
 
+test('claimability: blocked/held tasks never count, and a pinnedWorker task only counts for the pinned lane -- the same rule for every role', () => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  const has = (role, lane) => hasPremium(pipe, { role, lane });
+  assert.equal(claimable({ premiumPriority: true }), true, 'a bare premium task is claimable');
+  assert.equal(claimable({ premiumPriority: true, blockedReason: 'gate failed' }), false, 'blocked (blockedReason) never counts');
+  assert.equal(claimable({ premiumPriority: true, held: true }), false, 'a manual hold never counts');
+  assert.equal(claimable({ premiumPriority: true, pinnedWorker: 'worker-b' }, 'worker-a'), false, 'pinned to another lane is not this lane\'s');
+  assert.equal(claimable({ premiumPriority: true, pinnedWorker: 'worker-b' }, 'worker-b'), true, 'pinned to this lane is exactly what we want');
+  assert.equal(claimable({ premiumPriority: true, pinnedWorker: 'worker-b' }), true, 'an unscoped caller (reviewer/apply) is not hidden by a pin');
+  assert.equal(claimable({ premiumPriority: false }), false);
+  writeTask(pipe, 'pending', 'blocked', { id: 'blocked', premiumPriority: true, blockedReason: 'test' });
+  assert.equal(has('worker', 'worker-a'), false, 'a blocked premium task in pending/ is not claimable for the worker');
+  writeTask(pipe, 'pending', 'held', { id: 'held', premiumPriority: true, held: true });
+  assert.equal(has('worker', 'worker-a'), false, 'a held premium task is not claimable for the worker');
+  writeTask(pipe, 'pending', 'pinned', { id: 'pinned', premiumPriority: true, pinnedWorker: 'worker-b' });
+  assert.equal(has('worker', 'worker-a'), false, 'pinned to worker-b is not claimable for worker-a');
+  assert.equal(has('worker', 'worker-b'), true, '...but it is worker-b\'s');
+  writeTask(pipe, 'review', 'rb', { id: 'rb', premiumPriority: true, blockedReason: 'x' });
+  writeTask(pipe, 'approved', 'ap', { id: 'ap', premiumPriority: true, held: true });
+  assert.equal(has('reviewer'), false, 'a reviewer is not offered a project whose only review/ premium task is blocked');
+  assert.equal(has('apply'), false, 'an apply loop is not offered a project whose only approved/ premium task is held');
+  assert.equal(has('worker', 'worker-a'), false, 'worker-a sees only blocked/held/pinned-to-worker-b premium tasks in pending/, so none are claimable');
+  assert.equal(has('worker', 'worker-b'), true, 'worker-b is offered the task pinned to it');
+  writeTask(pipe, 'review', 'rc', { id: 'rc', premiumPriority: true });
+  writeTask(pipe, 'approved', 'aq', { id: 'aq', premiumPriority: true });
+  assert.equal(has('reviewer'), true, 'the same project is claimable for the reviewer via rc');
+  assert.equal(has('apply'), true, '...and for apply via aq');
+  const a = claimable({ premiumPriority: true });
+  const b = claimable({ premiumPriority: true });
+  assert.equal(a, b, 'consistent for all three roles');
+});
+
 test('premiumProjects: premium-holding registered projects only, least-recently-premium-borrowed first, per-lane backoff, kill switch, separate from idle borrowing', () => {
   const fx = fixture([{ name: 'active' }, { name: 'a', pool: true }, { name: 'b' }, { name: 'c' }]);
   const [act, a, b, c] = fx.list;
@@ -268,6 +301,14 @@ test('CLI: --env-args resolves a non-pool project, --has-premium exits 0/1, --pr
   assert.equal(status('--has-premium', plain.pipelineDir, 'reviewer'), 1);
   assert.deepEqual(run('--premium-projects', 'worker', 'worker-x').trim().split('\n'), [plain.pipelineDir]);
   assert.equal(run('--premium-projects', 'reviewer').trim(), '');
+  writeTask(plain.pipelineDir, 'review', 'pr', { id: 'pr', premiumPriority: true });
+  writeTask(plain.pipelineDir, 'approved', 'pa2', { id: 'pa2', premiumPriority: true });
+  assert.equal(run('--premium-projects', 'reviewer').trim(), plain.pipelineDir, '--premium-projects reviewer prints the pipelineDir of a project holding claimable premium work in review/');
+  assert.equal(run('--premium-projects', 'apply').trim(), plain.pipelineDir, '--premium-projects apply prints the pipelineDir of a project holding claimable premium work in approved/');
+  fs.writeFileSync(path.join(plain.pipelineDir, 'queue', 'review', 'pr.json'), JSON.stringify({ id: 'pr', premiumPriority: true, blockedReason: 'gate' }));
+  fs.writeFileSync(path.join(plain.pipelineDir, 'queue', 'approved', 'pa2.json'), JSON.stringify({ id: 'pa2', premiumPriority: true, held: true }));
+  assert.equal(run('--premium-projects', 'reviewer').trim(), '', 'a blocked premium review task is not claimable, so nothing is printed');
+  assert.equal(run('--premium-projects', 'apply').trim(), '', 'a held premium approved task is not claimable, so nothing is printed');
   run('--mark-premium', plain.pipelineDir, 'worker', act.pipelineDir, 'worker-x');
   const log = path.join(act.pipelineDir, 'instances', 'pipeline-history.log');
   const lines = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
