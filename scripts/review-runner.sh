@@ -51,8 +51,8 @@ LOG_DIR="${LOG_DIR:-$HOME_LOGS}"                                                
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
 # Per-item claim (2026-10-18, a second review daemon on the P40): this loop lists queue/review/ and used to review every file it saw, which is fine for ONE
-# daemon and double-reviews with two (the single-flight lock below is keyed by model name, so the 3090 and the P40 reviewer do not serialize against each
-# other). A claim is an atomic `mkdir` under the instances dir; the claim is held until the NEXT item starts (or the loop/daemon ends) so it outlives the
+# daemon and double-reviews with two (the single-flight lock below is keyed by Ollama endpoint, so the 3090 and the P40 reviewer do not serialize against each
+# other, only against their own lane's worker). A claim is an atomic `mkdir` under the instances dir; the claim is held until the NEXT item starts (or the loop/daemon ends) so it outlives the
 # approve/block move that follows the review -- releasing right after the review would leave a window where the other daemon re-reviews a file that is
 # about to move. A claim whose owner pid is dead, or that is older than 3 h, is stale and taken over.
 CLAIM_DIR="${INSTANCES_DIR}/review-claims"
@@ -89,6 +89,16 @@ trap release_current_claim EXIT
 # and review-task.js call below picks it up automatically; no per-call-site change needed.
 # Reviewer is always Ornith (never Claude), unlike local-worker.sh's two lanes, so this is
 # the simpler single-model version of that script's refresh_active_model.
+# The single-flight lock key for a review: the Ollama ENDPOINT this daemon talks to (`ollama-<host>-<port>`), NOT the model name. Worker drafts lock through
+# gpu-arbiter.js keyed by that same endpoint key (localOllamaLockKey), and the lockfile name is derived from the key, so a review keyed by model name took a DIFFERENT
+# lockfile for the same GPU and never excluded a draft (2026-10-21: worker-p40 and reviewer-p40 overlapped on the P40 VM, whose llama-server was OOM-killed). The JS
+# helper is the one definition of the key; fall back to the old model key only if node cannot run it, so a failure here never blocks a review.
+review_lock_key() {
+  local key
+  key="$(node -e 'process.stdout.write(require(process.argv[1]).localOllamaLockKey())' "${PACKAGE_SRC_DIR}/lib/ollama-lock-key.js" 2>/dev/null)"
+  printf '%s' "${key:-${LOCAL_MODEL:-}}"
+}
+
 refresh_active_model() {
   local override
   override="$(get_model_override "$INSTANCE_ID")"
@@ -238,7 +248,7 @@ while :; do                                                                     
     write_heartbeat_file "$INSTANCE_ID" "queued" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
 
     # Single-flight lock (agent-manager-common.sh's acquire_single_flight_lock -- see its
-    # own header), keyed by LOCAL_MODEL -- every review now genuinely uses the local
+    # own header), keyed by the Ollama endpoint (review_lock_key, above; was LOCAL_MODEL until 2026-10-21) -- every review now genuinely uses the local
     # model, so this always needs to serialize against every other local GPU call the
     # same way local-draft.js's own withLockFn does (2026-08-25, root-caused live: two
     # different lockfiles guarding the SAME physical model/GPU never actually serialized
@@ -256,7 +266,7 @@ while :; do                                                                     
     # below already knows how to bound-retry-then-give-up on -- "timed out" matches
     # INFRA_FAILURE_PATTERN, so this task gets exactly the same requeue-round treatment
     # a genuinely transient Ollama timeout already gets, not a silent permanent hang.
-    if acquire_single_flight_lock "${LOCAL_MODEL:-}"; then
+    if acquire_single_flight_lock "$(review_lock_key)"; then
       write_heartbeat_file "$INSTANCE_ID" "working" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
       review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
       release_single_flight_lock
