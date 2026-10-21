@@ -1,5 +1,6 @@
 from flask import Blueprint, abort, jsonify, request
 
+import os
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -81,8 +82,16 @@ def api_git_unmerged_branches():
     branches = list_unmerged_branches(force=False)
     with _branch_cache_lock:
         filled = _branch_cache["at"]
+    pending = []
+    if request.args.get("projects") == "all":
+        # Every registered project, active first, each row tagged with its `project`. The default (no param) stays the active project's bare list: the verdict/merge
+        # tooling and the verify-unmerged-branches skill read it and act on the active repo only.
+        import branch_projects
+        from app import get_active_repo_root
+        branches, pending = branch_projects.combined_branches(branches, get_active_repo_root())
     resp = jsonify(branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
+    resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
     return resp
 
 
@@ -104,14 +113,26 @@ def api_git_branch_commits(branch):
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
     repo_root = Path(repo_root)
+    pipeline_dir = get_pipeline_dir()
 
     # Same "only act on what we ourselves already offered" gate api_git_merge_branch
     # uses -- never trust a caller-supplied branch string as a raw git ref beyond what
     # this process already enumerated itself.
-    branches = list_unmerged_branches(force=False)
-    match = next((b for b in branches if b["branch"] == branch), None)
-    if not match:
-        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+    other_root = request.args.get("project")
+    if other_root and os.path.realpath(other_root) != os.path.realpath(str(repo_root)):
+        # A branch of another registered project (the tab's all-projects view): same gate against THAT project's cached list, read from its own repo and queue.
+        import branch_projects
+        real, match = branch_projects.find_other_project_branch(other_root, branch)
+        if not match:
+            abort(404, description=f"'{branch}' is not a currently-listed branch of project '{other_root}'")
+        repo_root = Path(real)
+        project = next((p for p in branch_projects.registered_projects(str(repo_root)) if p["repoRoot"] == real), None)
+        pipeline_dir = Path(project["pipelineDir"]) if project else repo_root
+    else:
+        branches = list_unmerged_branches(force=False)
+        match = next((b for b in branches if b["branch"] == branch), None)
+        if not match:
+            abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 
     main_branch = match["mainBranch"]
     fmt = _COMMIT_LOG_FIELD_SEP.join(["%H", "%an", "%aI", "%s", "%b"]) + _COMMIT_LOG_RECORD_SEP
@@ -143,8 +164,7 @@ def api_git_branch_commits(branch):
     # `Task: <id>` trailer -- the commit body alone is just the final message, not the
     # plan / draft tiers / review votes / disposition the operator actually wants when
     # deciding whether to merge. Plus the owning coordinator hub, if any.
-    pd = get_pipeline_dir()
-    qdir = (pd / "queue") if pd else None
+    qdir = (pipeline_dir / "queue") if pipeline_dir else None
     commit_task_ids = []
     for c in commits:
         m = _TASK_TRAILER_RE.search(c["body"] or "")

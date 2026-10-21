@@ -2130,21 +2130,29 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         return False
 
 
-def _list_unmerged_branches_uncached(force_fetch=True):
-    repo_root = get_active_repo_root()
+def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None):
+    """The ACTIVE project's list by default. repo_root/pipeline_dir name another registered project (branch_projects.py): it always fetches (the caller owns that
+    project's timer) and leaves the active project's held-hub cache and fetch timer alone."""
+    other = repo_root is not None
+    if not other:
+        repo_root = get_active_repo_root()
+        pipeline_dir = get_pipeline_dir()
     if not repo_root:
         return []
     repo_root = Path(repo_root)
-    pipeline_dir = get_pipeline_dir()
+    if other:
+        pipeline_dir = Path(pipeline_dir) if pipeline_dir else repo_root
 
     # The fetch is the single slowest step (14-16 s measured at load 13) and moves no state a recompute depends on within a minute, so it has its own timer.
     with _branch_cache_lock:
-        fetch_due = force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
+        fetch_due = other or force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
     if fetch_due:
         _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
-        with _branch_cache_lock:
-            _branch_fetch_state["at"] = time.time()
+        if not other:
+            with _branch_cache_lock:
+                _branch_fetch_state["at"] = time.time()
     main_branch = _detect_main_branch(repo_root)
+    qdir = (pipeline_dir / "queue") if pipeline_dir else None
 
     raw = _run_git(
         ["for-each-ref", "--format=%(refname:short)%09%(committerdate:iso-strict)%09%(subject)", "refs/remotes/origin/agent/"],
@@ -2185,7 +2193,6 @@ def _list_unmerged_branches_uncached(force_fetch=True):
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
         candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
-        qdir = (pipeline_dir / "queue") if pipeline_dir else None
         hub = get_hub_data_provider().hub_for_branch(qdir, branch, branch_task_ids(_run_git, repo_root, main_branch, full_ref, task_id))
         branches.append({
             "branch": branch,
@@ -2211,11 +2218,12 @@ def _list_unmerged_branches_uncached(force_fetch=True):
         })
 
     branches, held = partition_held_hub_branches(branches)
-    with _branch_cache_lock:
-        _branch_cache["held"] = held
+    if not other:
+        with _branch_cache_lock:
+            _branch_cache["held"] = held
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
-    branch_verdicts.enrich_branches_with_verdicts(queue_dir(), repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+    branch_verdicts.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
     branches.sort(key=lambda b: b["pushedAt"])
     return branches
 
