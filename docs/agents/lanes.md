@@ -110,8 +110,10 @@ a review waiting behind it can hit the 5-minute per-call limit (seen on the firs
   reviewed and kept until the next item starts, so it outlives the approve/block move. A claim whose owner is dead, or that is older than 3 h, is taken over.
 - **What it does not do:** one review still runs its three votes on ONE GPU (the claimer's); it parallelises across tasks, not within one. The P40 is ~3x slower than
   the 3090 per token, so a task claimed by the P40 reviewer finishes later than it would have on a free 3090: the gain is throughput when the 3090 reviewer is busy, not latency.
-- **Single-flight locks** are keyed by model name; the P40's model tag differs from the 3090's, so they do not serialise against each other (that is the point). Do not give
-  two review lanes the same model tag on different GPUs unless you want them to.
+- **Single-flight locks** are keyed by the Ollama ENDPOINT (`ollama-<host>-<port>`, `localOllamaLockKey()` in `src/lib/ollama-lock-key.js`), the same key worker drafts use through
+  `gpu-arbiter.js`, so a lane's worker and its reviewer take turns on one GPU ("one role per cycle per lane") while lanes on different endpoints never wait for each other, whatever
+  model tag they run. The review daemon gets the key from `review_lock_key()` in `scripts/review-runner.sh` (it was the model name until 2026-10-21, a different lockfile for the same
+  GPU: `worker-p40` and `reviewer-p40` overlapped and the P40 VM's llama-server was OOM-killed). `scripts/review-runner-lock-key.test.js` guards it.
 - **Priority:** the arbiter class of a review outranks a draft on the same endpoint, so on the P40 a review goes before a waiting `worker-p40` draft, as on the 3090.
 - **Arbiter hold (drafts only):** `node scripts/gpu-arbiter-cli.js hold --key <endpoint key> --pid <its pid> [--cls review] [--task ID]` takes an arbiter place ticket for a process that is not a lane, released when that pid exits, on SIGTERM, or on a higher class's cancel-below; `status --key K` lists it under `reserved`, and each start/release is a `gpu-hold` line in `pipeline-history.log`. Only callers that take arbiter tickets wait behind it, which today means drafts; reviews take none (see below), and a draft lane still claims and then waits the 600 s arbiter deadline. To reserve a card, use the endpoint-scoped lease below.
 
