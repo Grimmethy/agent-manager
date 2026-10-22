@@ -68,16 +68,22 @@ function restartTargetFor(instanceId) {
     const hasEnv = Object.keys(lane.env).length > 0;
     return { script: 'local-worker.sh', args: [instanceId], pidfileName: `${instanceId}.pid`, ...(hasEnv ? { env: lane.env } : {}) };
   }
-  if (instanceId === 'reviewer') {
-    return { script: 'review-runner.sh', args: ['reviewer'], pidfileName: 'review-runner.pid' };
-  }
-  if (instanceId.startsWith('reviewer-')) {
-    // An extra review daemon on a lane that opted in (src/lanes.js `reviewer`): restarts with that lane's Ollama env, exactly as launch.sh starts it.
-    const found = reviewerLanes().find((r) => r.reviewerId === instanceId);
-    if (!found) return null;
-    const hasEnv = Object.keys(found.lane.env).length > 0;
-    return { script: 'review-runner.sh', args: [instanceId], pidfileName: `review-runner-${instanceId.slice('reviewer-'.length)}.pid`, ...(hasEnv ? { env: found.lane.env } : {}) };
-  }
+  // HUB0170 (2/4): reviewer restart logic NEUTRALIZED -- the watchdog no longer restarts
+  // review daemons. Any `reviewer` / `reviewer-<lane>` heartbeat that looks dead is now
+  // FLAGGED ONLY (returns null below, same as any id with no restart rule); the
+  // queue-watcher.sh "flag" branch logs it and moves on. Commented out (not deleted) so
+  // the intent is auditable and a future revert is trivial. Worker restart rules above
+  // are intentionally untouched.
+  // if (instanceId === 'reviewer') {
+  //   return { script: 'review-runner.sh', args: ['reviewer'], pidfileName: 'review-runner.pid' };
+  // }
+  // if (instanceId.startsWith('reviewer-')) {
+  //   // An extra review daemon on a lane that opted in (src/lanes.js `reviewer`): restarts with that lane's Ollama env, exactly as launch.sh starts it.
+  //   const found = reviewerLanes().find((r) => r.reviewerId === instanceId);
+  //   if (!found) return null;
+  //   const hasEnv = Object.keys(found.lane.env).length > 0;
+  //   return { script: 'review-runner.sh', args: [instanceId], pidfileName: `review-runner-${instanceId.slice('reviewer-'.length)}.pid`, ...(hasEnv ? { env: found.lane.env } : {}) };
+  // }
   return null; // no rule -- e.g. 'watchdog' (never restarts itself) or an unrecognized instanceId.
 }
 

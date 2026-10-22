@@ -168,7 +168,7 @@ test('restartTargetFor: an ordinary worker (worker-3090, worker-p40) never carri
   process.env.AGENT_MANAGER_P40_MODEL = 'qwen3.8-p40:27b-q4_K_M';
   try {
     assert.equal('env' in restartTargetFor('worker-3090'), false);
-    assert.equal('env' in restartTargetFor('reviewer'), false);
+    assert.equal(restartTargetFor('reviewer'), null, 'reviewer restart neutralized (HUB0170 2/4): no restart rule at all, so no env either');
   } finally {
     if (prevUrl === undefined) delete process.env.AGENT_MANAGER_P40_OLLAMA_URL; else process.env.AGENT_MANAGER_P40_OLLAMA_URL = prevUrl;
     if (prevModel === undefined) delete process.env.AGENT_MANAGER_P40_MODEL; else process.env.AGENT_MANAGER_P40_MODEL = prevModel;
@@ -489,17 +489,14 @@ test('restartTargetFor: a review daemon on an opted-in lane restarts as review-r
   const saved = { u: process.env.AGENT_MANAGER_P40_OLLAMA_URL, m: process.env.AGENT_MANAGER_P40_MODEL, r: process.env.AGENT_MANAGER_P40_REVIEWER, g: process.env.AGENT_MANAGER_LOCAL_GPU, l: process.env.AGENT_MANAGER_LANES_PATH };
   Object.assign(process.env, { AGENT_MANAGER_P40_OLLAMA_URL: 'http://p40:11434', AGENT_MANAGER_P40_MODEL: 'qwen3.8-p40:27b', AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_LANES_PATH: '/nonexistent/lanes.json' });
   try {
+    // HUB0170 (2/4): the watchdog no longer restarts review daemons -- reviewer ids of
+    // any shape (opted-in lane daemon, unknown, or the host `reviewer`) get NO restart rule.
     delete process.env.AGENT_MANAGER_P40_REVIEWER;
     assert.equal(restartTargetFor('reviewer-p40'), null, 'not opted in: no rule');
     process.env.AGENT_MANAGER_P40_REVIEWER = 'true';
-    const t = restartTargetFor('reviewer-p40');
-    assert.equal(t.script, 'review-runner.sh');
-    assert.deepEqual(t.args, ['reviewer-p40']);
-    assert.equal(t.pidfileName, 'review-runner-p40.pid');
-    assert.equal(t.env.OLLAMA_URL, 'http://p40:11434');
-    assert.equal(t.env.LOCAL_MODEL, 'qwen3.8-p40:27b');
+    assert.equal(restartTargetFor('reviewer-p40'), null, 'opted in: still no rule -- reviewer restart neutralized (HUB0170 2/4)');
     assert.equal(restartTargetFor('reviewer-nope'), null);
-    assert.deepEqual(restartTargetFor('reviewer'), { script: 'review-runner.sh', args: ['reviewer'], pidfileName: 'review-runner.pid' }, 'the host reviewer is unchanged');
+    assert.equal(restartTargetFor('reviewer'), null, 'the host reviewer is neutralized too (HUB0170 2/4)');
   } finally {
     for (const [k, v] of Object.entries({ AGENT_MANAGER_P40_OLLAMA_URL: saved.u, AGENT_MANAGER_P40_MODEL: saved.m, AGENT_MANAGER_P40_REVIEWER: saved.r, AGENT_MANAGER_LOCAL_GPU: saved.g, AGENT_MANAGER_LANES_PATH: saved.l })) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;

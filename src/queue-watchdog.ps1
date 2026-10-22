@@ -94,7 +94,10 @@ $script:LastRestartAt = @{}
 # instanceId prefix -> how to restart it. 'worker-' matches any worker-N via -like. Every
 # restart target here is a PACKAGE script (lives in $PackageSrcDir), not consumer code.
 $RESTART_MAP = @(
-    @{ Match = 'review-runner'; Script = 'review-runner.ps1'; Args = @() },
+    # HUB0170 (2/4): reviewer restart NEUTRALIZED -- a dead review-runner heartbeat is
+    # flagged only (no matching restart rule -> "DEAD-NO-RESTART-RULE"), never relaunched.
+    # Left as a comment so the intent is auditable and a future revert is trivial.
+    # @{ Match = 'review-runner'; Script = 'review-runner.ps1'; Args = @() },
     @{ Match = 'apply-runner';  Script = 'apply-runner.ps1';  Args = @() },
     @{ Match = 'worker-';       Script = 'local-worker.ps1'; Args = @('-InstanceId') }  # instanceId appended at restart time
 )
