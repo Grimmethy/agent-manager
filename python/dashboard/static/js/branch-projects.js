@@ -72,9 +72,24 @@ function branchProjectsPendingHtml(pending) {
   return `<div class="meta" data-projects-pending style="margin:0 0 10px">Still scanning ${list.length} other project${list.length === 1 ? '' : 's'} for branches: ${list.map(_bpEscape).join(', ')} -- they appear here as each finishes.</div>`;
 }
 
-// Merge/discard are active-project operations (apply lock, live sync); another project's card says how to reach them.
-function branchForeignActionNoteHtml(b) {
-  return `<div class="meta" style="margin-top:8px">Merge / discard work on the active project only -- switch to <strong>${_bpEscape(b.project.label)}</strong> in the Project tab to act on this branch.</div>`;
+// Merge/discard/verdict act on the card's OWN project: the buttons carry the project's repoRoot (empty for the active project) and the request appends
+// ?project=<repoRoot>, which the server resolves against the registry (an unknown project is a 404, never a fallback to the active one).
+function branchProjectRequestRoot(b) {
+  return branchIsActiveProject(b) ? '' : ((b.project && b.project.repoRoot) || '');
+}
+
+function branchActionUrl(branch, action, project) {
+  return `/api/git/branches/${encodeURIComponent(branch)}/${action}` + (project ? `?project=${encodeURIComponent(project)}` : '');
+}
+
+// Discard permanently deletes a remote branch and merge pushes to a project's main: a card from another project says so in the confirm.
+function branchConfirmWithProject(message, btn) {
+  const root = btn && btn.dataset && btn.dataset.project;
+  if (!root) return message;
+  const row = btn.closest && btn.closest('[data-branch-row]');
+  const chip = row && row.querySelector && row.querySelector('[data-project-chip]');
+  const label = (chip && chip.dataset && chip.dataset.projectChip) || root;
+  return `PROJECT: ${label}\n(not the active project -- this runs in ${root})\n\n${message}`;
 }
 
 // Same as fetchJson (core-ui.js) but also reads which projects the server is still scanning.
@@ -95,4 +110,4 @@ async function fetchBranchList() {
   return r.json();
 }
 
-if (typeof module !== 'undefined') module.exports = { branchIsActiveProject, branchRowKey, branchProjectHue, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchForeignActionNoteHtml };
+if (typeof module !== 'undefined') module.exports = { branchIsActiveProject, branchRowKey, branchProjectHue, branchProjectChipHtml, groupBranchesByProject, branchProjectHeaderHtml, branchListWithProjectHeadersHtml, branchProjectsPendingHtml, branchProjectRequestRoot, branchActionUrl, branchConfirmWithProject };

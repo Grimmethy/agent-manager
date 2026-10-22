@@ -64,10 +64,10 @@ function branchCardHtml(b) {
       </div>
       ${b.description ? `<div style="margin-top:6px;font-size:13px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
       <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
-      ${foreign ? branchForeignActionNoteHtml(b) : `<div class="row" style="margin-top:8px">
-        <button class="action" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
-        <button class="secondary" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
-      </div>`}
+      <div class="row" style="margin-top:8px">
+        <button class="action" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
+        <button class="secondary" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
+      </div>
     </div>
   `;
 }
@@ -100,17 +100,18 @@ function wireBranchCard(card) {
     mergeBtn.onclick = async (e) => {
       e.stopPropagation();
       const branch = mergeBtn.dataset.mergeBranch;
+      const project = mergeBtn.dataset.project || '';
       const midFlight = mergeBtn.dataset.hubMidflight === 'true';
       const confirmMsg = mergeBtn.dataset.willConflict === 'true'
         ? `"${branch}" is flagged as WILL CONFLICT with master on: ${mergeBtn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
         : midFlight
           ? `"${branch}" belongs to a coordinator hub that is NOT finished (${mergeBtn.dataset.hubStatus}).\n\nMerging now ships an incomplete decomposition -- the moved routes will 404 until the wiring task lands. Force the merge anyway?`
           : `Merge "${branch}" into master and sync the live dashboard?`;
-      if (!confirm(confirmMsg)) return;
+      if (!confirm(branchConfirmWithProject(confirmMsg, mergeBtn))) return;
       mergeBtn.disabled = true;
       mergeBtn.textContent = 'Merging...';
       try {
-        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/merge`, {
+        const resp = await fetch(branchActionUrl(branch, 'merge', project), {
           method: 'POST',
           headers: midFlight ? { 'Content-Type': 'application/json' } : {},
           body: midFlight ? JSON.stringify({ force: true }) : undefined,
@@ -143,11 +144,12 @@ function wireBranchCard(card) {
     discardBtn.onclick = async (e) => {
       e.stopPropagation();
       const branch = discardBtn.dataset.discardBranch;
-      if (!confirm(`Discard "${branch}"?\n\nThis PERMANENTLY DELETES the remote branch (not just merging it later) and archives its task as dismissed. This cannot be undone from here.`)) return;
+      const project = discardBtn.dataset.project || '';
+      if (!confirm(branchConfirmWithProject(`Discard "${branch}"?\n\nThis PERMANENTLY DELETES the remote branch (not just merging it later) and archives its task as dismissed. This cannot be undone from here.`, discardBtn))) return;
       discardBtn.disabled = true;
       discardBtn.textContent = 'Discarding...';
       try {
-        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/discard`, { method: 'POST' });
+        const resp = await fetch(branchActionUrl(branch, 'discard', project), { method: 'POST' });
         const result = await resp.json();
         if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
         await renderBranchesTab();

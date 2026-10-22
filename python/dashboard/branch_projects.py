@@ -114,6 +114,44 @@ def combined_branches(active_branches, active_root):
     return rows, pending
 
 
+def resolve_scope(project_root, active_root):
+    """What a branch action (merge, discard, verdict) must act on. None = the active project (also when `project_root` is absent or is the active root):
+    the caller keeps its existing code path. A dict {label, repoRoot, pipelineDir, repoPath, qdir} for another registered project. An unknown project raises
+    LookupError so the route answers 404: a given-but-unknown project never falls back to the active one."""
+    from pathlib import Path
+    if not project_root:
+        return None
+    real = os.path.realpath(project_root)
+    if active_root and real == os.path.realpath(active_root):
+        return None
+    for p in registered_projects(active_root):
+        if p["repoRoot"] == real and not p["active"]:
+            return {**p, "repoPath": Path(real), "qdir": Path(p["pipelineDir"]) / "queue"}
+    raise LookupError(f"'{project_root}' is not a registered project")
+
+
+def refresh_branches(scope):
+    """Recompute that project's list NOW (git fetch included) and cache it: an action must gate on the branch as it is, not on a list up to 5 minutes old."""
+    import app
+    rows = app._list_unmerged_branches_uncached(force_fetch=True, repo_root=scope["repoRoot"], pipeline_dir=scope["pipelineDir"])
+    with _lock:
+        _state["cache"][scope["repoRoot"]] = {"at": time.time(), "branches": rows, "error": None}
+    return rows
+
+
+def after_action(scope):
+    """After a merge/discard/verdict in another project: recompute its list so the card disappears (or changes) on the next poll. A failure only marks the
+    entry stale so the background refresh redoes it; the action itself already succeeded."""
+    try:
+        refresh_branches(scope)
+    except Exception as e:  # noqa: BLE001
+        print(f"[branches] refresh after action failed for {scope.get('label')} (non-fatal): {e}", file=sys.stderr)
+        with _lock:
+            entry = _state["cache"].get(scope["repoRoot"])
+            if entry:
+                entry["at"] = 0.0
+
+
 def find_other_project_branch(project_root, branch):
     """(project, branch row) for a cached branch of a NON-active project, else (None, None). The commits endpoint's "only act on what we offered" gate."""
     with _lock:
