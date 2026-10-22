@@ -355,6 +355,80 @@ test('nextBrainDumpSortTask stops offering an entry once sortAttempt hits MAX_SO
   assert.equal(nextBrainDumpSortTask(), null);
 });
 
+// --- A finished sort task must not make a still-captured entry invisible (2026-10-22) --------------
+// Measured on the live agent-manager brain dump: 17 captured entries with sortAttempt 0 whose first sort task had FINISHED (11 apply-rejected as a
+// 'noop' before rejections bumped the counter; 5 sorted, then edited, which resets status to 'captured' but not the id). Their spent id blocked
+// regeneration forever and worker-rx580 logged "no eligible task found" with 45 entries waiting.
+
+function sortFixture(entry) {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({ entries: [{ id: 'bd-1', rawText: 'x', status: 'captured', ...entry }] }));
+  const put = (sub, name) => {
+    const d = path.join(dir, 'queue', ...sub);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, `${name}.json`), '{}');
+  };
+  return { dir, put, ts: freshTaskSources(dir), stored: () => JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, 'utf8')).entries[0] };
+}
+
+test('a captured entry whose attempt-0 sort task finished in done/ is offered under the next id and the counter is advanced', () => {
+  const f = sortFixture({});
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  const task = f.ts.nextBrainDumpSortTask();
+  assert.ok(task, 'a spent done/ record must not bury a still-captured entry');
+  assert.equal(task.id, 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.stored().sortAttempt, 1, 'the stored counter follows the emitted id, so a later exhaustion bump moves on to a2');
+});
+
+test('a finished sort task in a done-archive month bucket or _archived_no_action/ also frees the next attempt', () => {
+  for (const sub of [['done', '_archived', '2026-09'], ['done', '_archived_no_action']]) {
+    const f = sortFixture({});
+    f.put(sub, 'brain-dump-sort-bd-1');
+    const task = f.ts.nextBrainDumpSortTask();
+    assert.ok(task, `${sub.join('/')} must not bury the entry`);
+    assert.equal(task.id, 'brain-dump-sort-bd-1-a1');
+  }
+});
+
+test('the walk steps past several finished attempts and stops at MAX_SORT_ATTEMPTS', () => {
+  const f = sortFixture({});
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  f.put(['done'], 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.ts.nextBrainDumpSortTask().id, 'brain-dump-sort-bd-1-a2');
+  const g = sortFixture({});
+  for (const id of ['brain-dump-sort-bd-1', 'brain-dump-sort-bd-1-a1', 'brain-dump-sort-bd-1-a2']) g.put(['done'], id);
+  assert.equal(g.ts.nextBrainDumpSortTask(), null, 'three spent attempts exhaust the entry: a task that finishes without result cannot loop');
+  assert.equal(g.stored().sortAttempt, undefined, 'an exhausted entry is not written to');
+});
+
+test('an attempt id held by a live, blocked or held task still blocks the entry (no duplicate)', () => {
+  for (const state of ['pending', 'blocked', 'needs-clarification', 'review']) {
+    const f = sortFixture({});
+    f.put(['done'], 'brain-dump-sort-bd-1');
+    f.put([state], 'brain-dump-sort-bd-1-a1');
+    assert.equal(f.ts.nextBrainDumpSortTask(), null, `a1 sitting in ${state}/ must block`);
+    assert.equal(f.stored().sortAttempt, undefined, 'nothing is written when nothing is emitted');
+  }
+});
+
+test('after the counter was advanced, an exhaustion bump lands on the next id even though the blocked task holds the previous one', () => {
+  const f = sortFixture({ sortAttempt: 2 });
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  f.put(['blocked'], 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.ts.nextBrainDumpSortTask().id, 'brain-dump-sort-bd-1-a2');
+});
+
+test('isBrainDumpEntrySortable agrees with the generator: the throttle exemption uses it, so a spent id does not leave pending/ throttled with nothing to add', () => {
+  const f = sortFixture({});
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  const entry = f.stored();
+  assert.equal(f.ts.isBrainDumpEntrySortable(entry), true);
+  assert.equal(f.ts.isBrainDumpEntrySortable({ ...entry, suppressed: true }), false);
+  assert.equal(f.ts.isBrainDumpEntrySortable({ ...entry, status: 'sorted' }), false);
+  f.put(['pending'], 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.ts.isBrainDumpEntrySortable(entry), false);
+});
+
 // --- nextBrainDumpSortTask's selfProjectLabel (2026-08-16) ------------------------------
 // Confirmed live: a real self-referential note ("brain dump entries should track an
 // interaction count") was classified actionable:false, belongsToProject:null despite
