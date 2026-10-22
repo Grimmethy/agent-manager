@@ -26,24 +26,29 @@ class ExpectedInstancesTest(unittest.TestCase):
         self.addCleanup(lambda: app._LANE_DEFS_CACHE.update(at=0.0, lanes=[]))
 
     def test_expected_ids_are_lanes_plus_reviewer_and_watchdog(self):
+        # HUB0168 2/4: review is a worker stage now, so reviewer_instance_ids() is [] and the
+        # expected set is just lanes + watchdog (no reviewer daemons).
         with mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40"]):
             with mock.patch.object(app, "worker_lane_defs", return_value=[]):
-                self.assertEqual(app._expected_instance_ids(), ["worker-3090", "worker-p40", "reviewer", "watchdog"])
+                self.assertEqual(app._expected_instance_ids(), ["worker-3090", "worker-p40", "watchdog"])
 
     def test_a_lane_that_opts_in_adds_its_review_daemon(self):
-        defs = [{"id": "worker-3090", "reviewer": True, "reviewerId": "reviewer"},
-                {"id": "worker-p40", "reviewer": True, "reviewerId": "reviewer-p40"},
+        # HUB0168 2/4: the per-lane reviewer opt-in no longer spawns a reviewer instance --
+        # review happens as a worker stage -- so the opt-in fields are inert here.
+        defs = [{"id": "worker-3090", "reviewer": True, "reviewerId": "reviewer-a"},
+                {"id": "worker-b", "reviewer": True, "reviewerId": "reviewer-b"},
                 {"id": "worker-rx580", "reviewer": False, "reviewerId": "reviewer-rx580"}]
         with mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40", "worker-rx580"]), \
              mock.patch.object(app, "worker_lane_defs", return_value=defs):
-            self.assertEqual(app.reviewer_instance_ids(), ["reviewer", "reviewer-p40"])
-            self.assertEqual(app._expected_instance_ids(), ["worker-3090", "worker-p40", "worker-rx580", "reviewer", "reviewer-p40", "watchdog"])
+            self.assertEqual(app.reviewer_instance_ids(), [])
+            self.assertEqual(app._expected_instance_ids(), ["worker-3090", "worker-p40", "worker-rx580", "watchdog"])
 
     def test_p40_reviewer_env_switch_reaches_the_dashboard_through_lanes_js(self):
         env = {**os.environ, "AGENT_MANAGER_LOCAL_GPU": "3090", "AGENT_MANAGER_P40_OLLAMA_URL": "http://p40:11434",
                "AGENT_MANAGER_P40_MODEL": "m", "AGENT_MANAGER_P40_REVIEWER": "true"}
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(app, "read_env_file", return_value={}):
-            self.assertEqual(app.reviewer_instance_ids(), ["reviewer", "reviewer-p40"])
+            # HUB0168 2/4: the P40 reviewer env switch no longer yields reviewer instances.
+            self.assertEqual(app.reviewer_instance_ids(), [])
 
     def test_worker_lane_ids_matches_the_node_lane_definition(self):
         """Parity: whatever src/lanes.js says, the dashboard says. One P40 configured -> two lanes."""

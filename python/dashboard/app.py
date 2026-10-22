@@ -779,20 +779,19 @@ def worker_lane_defs() -> list[dict]:
 
 
 def reviewer_instance_ids() -> list[str]:
-    """Every review daemon the pipeline runs: the plain `reviewer` (host lane) plus one `reviewer-<gpu>` per lane that opted in
-    (src/lanes.js `reviewer`; AGENT_MANAGER_P40_REVIEWER=true for the legacy P40 lane). Read from the same lane definitions as
-    worker_lane_ids(); falls back to just ["reviewer"] when the definitions are unavailable."""
-    ids = ["reviewer"]
-    for lane in worker_lane_defs():
-        rid = lane.get("reviewerId")
-        if lane.get("reviewer") and rid and rid not in ids:
-            ids.append(rid)
-    return ids
+    """Retired (HUB0168 2/4): review is now a WORKER STAGE, not a standalone reviewer daemon, so there are no
+    reviewer instance IDs to enumerate anymore. Kept as a no-op returning [] so existing call-sites
+    (_expected_instance_ids, _pipeline_stoppable, _pipeline_running) keep working unchanged; they all
+    expand the list into a loop/splat and are safe with an empty result. Review activity on the Workers
+    tab is sourced from the worker lanes' own review-stage heartbeats instead (routes/instances.py's
+    per-instance recent-tasks view), never from reviewer instance IDs."""
+    return []
 
 
 def _expected_instance_ids() -> list[str]:
-    """Every daemon scripts/launch.sh starts: one worker lane per GPU (worker_lane_ids()), the
-    review daemons (reviewer_instance_ids()), and the queue-watchdog. apply-task-loop is deliberately excluded -- it's a single-shot
+    """Every daemon scripts/launch.sh starts: one worker lane per GPU (worker_lane_ids()) and the
+    queue-watchdog. Review is a worker stage since HUB0168 2/4 (no reviewer daemons), so
+    reviewer_instance_ids() contributes nothing here. apply-task-loop is deliberately excluded -- it's a single-shot
     pass with no heartbeat file of its own (see launch.sh's own comment), so it never has a slot to
     be "offline" in."""
     return [*worker_lane_ids(), *reviewer_instance_ids(), "watchdog"]
