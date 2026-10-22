@@ -56,14 +56,20 @@ class TestSetPremiumPriority(PremiumPriorityTestBase):
         p = self._write("pending", "t1")
         res = self.client.post("/api/task-anywhere/t1/premium-priority")
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.get_json(), {"id": "t1", "premiumPriority": True})
+        body = res.get_json()
+        self.assertEqual(body["id"], "t1")
+        self.assertIs(body["premiumPriority"], True)
+        self.assertIn("_project", body)  # HUB0171 · 2/6: source project identity
         self.assertEqual(self._read(p)["premiumPriority"], True)
 
     def test_explicit_enabled_false_clears_the_flag(self):
         p = self._write("pending", "t1", {"premiumPriority": True})
         res = self.client.post("/api/task-anywhere/t1/premium-priority", json={"enabled": False})
         self.assertEqual(res.status_code, 200)
-        self.assertEqual(res.get_json(), {"id": "t1", "premiumPriority": False})
+        body = res.get_json()
+        self.assertEqual(body["id"], "t1")
+        self.assertIs(body["premiumPriority"], False)
+        self.assertIn("_project", body)  # HUB0171 · 2/6: source project identity
         self.assertNotIn("premiumPriority", self._read(p))
 
     def test_appends_a_history_event(self):

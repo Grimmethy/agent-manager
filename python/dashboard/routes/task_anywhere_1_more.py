@@ -2,6 +2,8 @@ from flask import Blueprint, abort, jsonify, request, session
 
 from datetime import datetime, timedelta, timezone
 import json
+import os
+from pathlib import Path
 
 # The app.py helpers these views call (QUEUE_STATES, _call_discuss, _files_touched_for, _find_live_task_file, _incoming_task_links, _outgoing_task_links, _resolve_discuss_session, _resolve_under_second_brain, _task_cost_summary, _task_input_summary, _work_log_for, queue_dir, read_brain_dump_entries, read_json_safe, second_brain_dir, write_brain_dump_entries) are
 # imported lazily inside each view: app.py imports THIS module to register the
@@ -12,42 +14,108 @@ import json
 
 task_anywhere_1_more_bp = Blueprint("task-anywhere-1-more-bp", __name__)
 
-@task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>")
-def api_task_anywhere(task_id):
-    """Workers tab click-through: an instance's currentTaskId doesn't say which queue
-    state to look in (a worker's is in drafting/, review-runner's is in review/,
-    apply-runner's is in approved/) -- rather than hardcode that mapping (fragile if a
-    new instance type is added later), just search drafting first (the common case for
-    an actively 'working' instance), then every other state in order."""
-    from app import QUEUE_STATES, _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for, queue_dir, read_json_safe
-    qdir = queue_dir()
-    if not qdir:
-        abort(404)
 
+# --- Cross-project lookup (HUB0171 · 2/6, borrowed-task 404 fix) ---------------------
+# A Workers-tab click carries only a task id. api_task_anywhere used to search the active
+# project's queue/ only, so a task that lives in ANOTHER registered project's queue/ (a
+# lane borrowed it) 404'd. The two task-anywhere endpoints below now accept an optional
+# ?project=<label|repoRoot> hint and search that project's queue/ first, then the active
+# project's, then the other registered projects'. The project the record was found in is
+# returned as _project so the UI can chip it.
+
+def _queue_dir_candidates(project_hint=None):
+    """Ordered [(project_entry, queue_dir Path)] search candidates for this file's
+    task-anywhere views. project_hint is the ?project= query value -- a project label or
+    a repoRoot (project_scope.resolve_project accepts both, 1/6).
+
+    Order: the hinted project first, then the active project -- the legacy app.queue_dir()
+    FIRST, because everything else in the app (and every existing test) resolves "active"
+    through that accessor -- then the registry's own active-flagged entry, then the other
+    registered projects. An unknown hint never 404s here: it simply drops out of the list
+    and the rest is searched (the whole point is that a borrowed task is found even when
+    the caller's hint is stale or wrong). Empty only when neither the registry nor the
+    legacy accessor yields a queue dir -- the caller 404s then, as before."""
+    candidates = []
+    seen = set()
+
+    def _add(entry, qdir):
+        if not entry or not qdir:
+            return
+        key = os.path.normpath(str(qdir))
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((entry, Path(qdir)))
+
+    # 1) The hinted project (a label or a repoRoot); an unknown hint raises ValueError
+    # in project_scope.resolve_project by design -- catch it and just drop the hint.
+    if project_hint:
+        try:
+            from project_scope import resolve_project
+            hinted = resolve_project(project_hint)
+            _add(hinted, hinted["queue_dir"])
+        except Exception:  # noqa: BLE001 -- unknown hint: fall through, never 404 here
+            pass
+
+    # 2) The active project -- the legacy accessor first (see docstring), then the
+    # registry's active entry so a registry-known project is still covered when the
+    # settings accessor is unset.
+    from app import queue_dir
+    active_qdir = queue_dir()
+    try:
+        from app import _active_project_label
+        active_label = _active_project_label()
+    except Exception:  # noqa: BLE001 -- cosmetic: the label is only for the _project chip
+        active_label = None
+    _add({
+        "label": active_label or "active",
+        "repo_root": None, "pipeline_dir": None,
+        "queue_dir": str(active_qdir) if active_qdir else None,
+        "active": True,
+    }, active_qdir)
+    try:
+        from project_scope import resolve_project
+        active = resolve_project(None)
+        _add(active, active["queue_dir"])
+    except Exception:  # noqa: BLE001 -- no active flag in the registry: nothing to add
+        pass
+
+    # 3) The other registered projects.
+    try:
+        from project_scope import all_registered_projects
+        for entry in all_registered_projects():
+            _add(entry, entry["queue_dir"])
+    except Exception:  # noqa: BLE001 -- registry unavailable: candidates above stand
+        pass
+
+    return candidates
+
+
+
+def _search_queue_dir(qdir, task_id):
+    """(data, found_state) for one queue root -- the exact search order the old
+    single-project api_task_anywhere used (drafting first -- the common case for an
+    actively 'working' instance -- then every QUEUE_STATES dir, then adhoc/, then the
+    done/_archived* trees -- so a row pointing at an archived task still opens), or
+    (None, None) when the task id is nowhere under this root."""
+    from app import QUEUE_STATES, read_json_safe
+    qdir = Path(qdir)
     drafting_root = qdir / "drafting"
     if drafting_root.is_dir():
         for candidate in drafting_root.rglob(f"{task_id}.json"):
             data = read_json_safe(candidate)
             if data:
-                return jsonify({**data, "_foundState": "drafting", "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id), "_outgoingLinks": _outgoing_task_links(task_id)})
-
-    def _payload(data, found_state):
-        return jsonify({**data, "_foundState": found_state, "_costSummary": _task_cost_summary(task_id), "_filesTouched": _files_touched_for(data), "_requestInput": _task_input_summary(data), "_workLog": _work_log_for(task_id), "_incomingLinks": _incoming_task_links(task_id), "_outgoingLinks": _outgoing_task_links(task_id)})
-
+                return data, "drafting"
     for state in QUEUE_STATES:
         data = read_json_safe(qdir / state / f"{task_id}.json")
         if data:
-            return _payload(data, state)
-
-    # A job-log / recent-tasks row can point at a task that has since been archived (by the
-    # daily done-archive pass or by hand) or that lives in adhoc/ -- none of which are in
-    # QUEUE_STATES. Check those too so the row still opens.
+            return data, state
     data = read_json_safe(qdir / "adhoc" / f"{task_id}.json")
     if data:
-        return _payload(data, "adhoc")
+        return data, "adhoc"
     data = read_json_safe(qdir / "done" / "_archived_no_action" / f"{task_id}.json")
     if data:
-        return _payload(data, "archived")
+        return data, "archived"
     dated_archive_root = qdir / "done" / "_archived"
     if dated_archive_root.is_dir():
         for month_dir in sorted(dated_archive_root.iterdir(), reverse=True):
@@ -55,9 +123,64 @@ def api_task_anywhere(task_id):
                 continue
             data = read_json_safe(month_dir / f"{task_id}.json")
             if data:
-                return _payload(data, "archived")
+                return data, "archived"
+    return None, None
 
-    abort(404, description=f"task {task_id} not found in any queue state")
+
+def _work_log_for_project(qdir, task_id):
+    """queue/worklogs/<id>.json under a SPECIFIC project's queue root -- app._work_log_for's
+    per-project counterpart (it hardcodes the active project's queue_dir()). Same per-task
+    transcript file, just read from the project the task was actually found in. None when
+    that project has no worklog for the task, so the caller can fall back to the active
+    project's copy (today's behaviour)."""
+    p = Path(qdir) / "worklogs" / f"{task_id}.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+@task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>")
+def api_task_anywhere(task_id):
+    """Workers tab click-through: an instance's currentTaskId doesn't say which queue
+    state to look in (a worker's is in drafting/, review-runner's is in review/,
+    apply-runner's is in approved/) -- rather than hardcode that mapping (fragile if a
+    new instance type is added later), just search drafting first (the common case for
+    an actively 'working' instance), then every other state in order.
+
+    Cross-project (HUB0171 · 2/6, borrowed-task 404 fix): also accepts an optional
+    ?project=<label|repoRoot> hint -- the project the instance reports the task for --
+    and searches that project's queue/ first, then the active project's, then the other
+    registered projects', so a task a lane borrowed from another project still opens.
+    The project the record was found in is returned as _project so the UI can chip it."""
+    from app import _files_touched_for, _incoming_task_links, _outgoing_task_links, _task_cost_summary, _task_input_summary, _work_log_for
+
+    project_hint = (request.args.get("project") or "").strip() or None
+    candidates = _queue_dir_candidates(project_hint)
+    if not candidates:
+        abort(404)
+
+    for entry, qdir in candidates:
+        data, found_state = _search_queue_dir(qdir, task_id)
+        if not data:
+            continue
+        # Worklog: prefer the copy under the project the task actually lives in; fall
+        # back to the active project's copy (today's behaviour) when that project has
+        # none for this task.
+        worklog = _work_log_for_project(qdir, task_id) or _work_log_for(task_id)
+        return jsonify({
+            **data,
+            "_foundState": found_state,
+            "_project": entry,
+            "_costSummary": _task_cost_summary(task_id),
+            "_filesTouched": _files_touched_for(data),
+            "_requestInput": _task_input_summary(data),
+            "_workLog": worklog,
+            "_incomingLinks": _incoming_task_links(task_id),
+            "_outgoingLinks": _outgoing_task_links(task_id),
+        })
+
+    abort(404, description=f"task {task_id} not found in any project queue")
 
 
 @task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/premium-priority", methods=["POST"])
@@ -81,14 +204,26 @@ def api_task_set_premium_priority(task_id):
     file-decompose move this feature was built for, which was cycling blocked <-> pending
     for hours) needs to be able to set this BEFORE it's back in pending/, not only once
     it happens to be there. Body: {"enabled": true|false}, defaults to true."""
-    from app import _find_live_task_file, queue_dir, read_json_safe
+    from app import _find_live_task_file, read_json_safe
     body = request.get_json(silent=True) or {}
     enabled = bool(body.get("enabled", True))
 
-    qdir = queue_dir()
-    if not qdir:
+    # Cross-project (HUB0171 · 2/6): an optional ?project=<label|repoRoot> hint scopes
+    # the search -- that project's live queue states first, then the active project's,
+    # then the other registered projects' -- and the write lands on the exact file the
+    # task was found in, whatever project that is (the flag must live where claim
+    # ranking for that project's queue reads it).
+    project_hint = (request.args.get("project") or "").strip() or None
+    candidates = _queue_dir_candidates(project_hint)
+    if not candidates:
         abort(404)
-    target = _find_live_task_file(qdir, task_id)
+    target = None
+    entry = None
+    for e, qdir in candidates:
+        target = _find_live_task_file(qdir, task_id)
+        if target:
+            entry = e
+            break
     if not target:
         abort(404, description=f"'{task_id}' not found in any live queue state")
 
@@ -105,7 +240,7 @@ def api_task_set_premium_priority(task_id):
         "detail": f"premium priority {'set' if enabled else 'cleared'} by operator override",
     })
     target.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return jsonify({"id": task_id, "premiumPriority": enabled})
+    return jsonify({"id": task_id, "premiumPriority": enabled, "_project": entry})
 
 
 @task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/hub-priority", methods=["POST"])
