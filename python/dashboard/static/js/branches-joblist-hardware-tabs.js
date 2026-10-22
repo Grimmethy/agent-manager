@@ -42,14 +42,16 @@ function branchCardHtml(b) {
       ? `<span class="badge bad" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Hub ${escapeAttr(b.hub.id)}: ${b.hub.progress.done}/${b.hub.progress.total} done${b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : ''} -- click to open the hub">⚠ hub mid-flight</span>`
       : `<span class="badge ok" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Coordinator hub complete -- click to open the hub">✓ hub complete</span>`)
     : '';
-  const foreign = !branchIsActiveProject(b);
   return `
-    <div class="worker-card" data-branch-row="${escapeAttr(branchRowKey(b))}" data-open-branch="${escapeAttr(branchRowKey(b))}" data-verdict-key="${branchVerdictKey(b)}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
+    <div class="worker-card" data-branch-row="${escapeAttr(branchRowKey(b))}" data-open-branch="${escapeAttr(branchRowKey(b))}" data-verdict-key="${branchVerdictKey(b)}" data-project-label="${escapeAttr(b.project ? b.project.label : '')}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
       ${b.project ? `<div style="margin-bottom:6px">${branchProjectChipHtml(b)}</div>` : ''}
       <div class="row">
         <span class="id">${escapeHtmlBright(b.title)}</span>
         <div class="badge-col">
-          ${foreign ? hubBadge.replace(/ data-open-hub="[^"]*"/, '').replace('cursor:pointer', 'cursor:default') : hubBadge}
+          ${hubBadge}
+          <!-- HUB0185 2/2: hub badge (data-open-hub) now renders for other projects' cards too -- openTaskAnywhere
+               accepts a ?project= hint (HUB0171 5/6) that the click handler below forwards from this card's
+               data-project-label, so the hub resolves in its OWN project's queue instead of 404ing. -->
           ${conflictBadge}
           <span class="badge warn">${b.ahead} commit${b.ahead === 1 ? '' : 's'} ahead</span>
           ${behindBadge}
@@ -91,7 +93,10 @@ function wireBranchCard(card) {
   if (hubBadge) {
     hubBadge.onclick = (e) => {
       e.stopPropagation();
-      openTaskAnywhere(hubBadge.dataset.openHub);
+      // Forward this card's project label as the hint (HUB0185 2/2): for a foreign
+      // project's card that's the label of the project whose queue/ holds the hub;
+      // empty for the active project = today's behavior exactly.
+      openTaskAnywhere(hubBadge.dataset.openHub, card.dataset.projectLabel || '');
     };
   }
 
@@ -365,12 +370,14 @@ async function renderBranchDetailModal(b) {
       return row + `</div>`;
     }).join('');
   }
-  if (!branchIsActiveProject(b)) html = html.replace(/ data-open-hub="[^"]*"/g, '');  // that hub lives in another project's queue
+  // HUB0185 2/2: no longer strip data-open-hub for other projects' branches -- the
+  // hub lives in that project's queue/, and the click handler below now forwards
+  // this branch's project label as the ?project= hint so task-anywhere finds it there.
   content.innerHTML = html;
   content.querySelectorAll('[data-open-hub]').forEach((el) => {
     el.onclick = (e) => {
       e.stopPropagation();
-      openTaskAnywhere(el.dataset.openHub);
+      openTaskAnywhere(el.dataset.openHub, (b.project && b.project.label) || '');
     };
   });
 }
@@ -1112,3 +1119,7 @@ async function refreshCycle() {
 }
 
 function escapeAttr(s) { return String(s).replace(/"/g, '&quot;'); }
+
+// Node test hook (HUB0185 2/2) -- the browser loads this file as a plain <script>, so the
+// guard only runs under Node's CommonJS wrapper (branches-joblist-hardware-tabs.test.js).
+if (typeof module !== 'undefined') module.exports = { branchCardHtml, wireBranchCard };
