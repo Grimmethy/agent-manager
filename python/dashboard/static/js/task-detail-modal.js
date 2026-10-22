@@ -1,7 +1,11 @@
 // Link to the agent-run trajectory page (routes/trajectories.py, brain-dump 1892): one helper for the task detail
 // modal and the Workers card so both point at the same page.
-function trajectoryLinkHtml(taskId) {
-  return `<a href="/trajectory/${encodeURIComponent(taskId)}" target="_blank" rel="noopener" title="Agent-run trajectories: every recorded tool-loop run of this task as a timeline">trajectories</a>`;
+function trajectoryLinkHtml(taskId, projectHint) {
+  // ?project= (HUB0171 5/6): when the modal was opened with a known project, point the
+  // trajectories page at that project's copy of the task instead of leaving the server
+  // to guess which one. Optional -- callers passing one argument behave as before.
+  const qs = (projectHint != null && projectHint !== '') ? `?project=${encodeURIComponent(projectHint)}` : '';
+  return `<a href="/trajectory/${encodeURIComponent(taskId)}${qs}" target="_blank" rel="noopener" title="Agent-run trajectories: every recorded tool-loop run of this task as a timeline">trajectories</a>`;
 }
 
 function renderDraftAttempts(task) {
@@ -213,7 +217,31 @@ function renderRelatedTasks(task) {
 function renderTaskDetailModal(task) {
   const backdrop = document.getElementById('modal-backdrop');
   const content = document.getElementById('modal-content');
-  let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}</h2>`;
+  // Project chip + ambiguity warning (HUB0171 5/6): a task id can live in more than
+  // one project's queue (borrowed tasks 404'ing in the Workers tab was the original
+  // bug). The task-anywhere route stamps `_project` -- the project the id resolved in
+  // (an object with name/id once the cross-project lookup sibling lands, a plain id
+  // string today) -- and an `ambiguous` marker when the same id exists in several
+  // projects. Surface both up top instead of leaving a human to wonder which project's
+  // copy they are actually looking at.
+  let projectChipHtml = '';
+  if (task._project) {
+    const p = (typeof task._project === 'object') ? task._project : { name: String(task._project) };
+    projectChipHtml = `<span class="project-chip" style="display:inline-block;margin-left:10px;padding:2px 10px;border:1px solid var(--border);border-radius:12px;background:var(--panel);color:var(--text);font-size:12px;vertical-align:middle" title="Project this task id resolved in">${escapeHtml(p.name || p.id || 'unknown project')}</span>`;
+  }
+  const ambiguousProjects = Array.isArray(task.ambiguousProjects) ? task.ambiguousProjects
+    : (Array.isArray(task._ambiguousProjects) ? task._ambiguousProjects : null);
+  let ambiguousWarningHtml = '';
+  if (task.ambiguous || ambiguousProjects) {
+    const shown = task._project
+      ? (typeof task._project === 'object' ? (task._project.name || task._project.id) : String(task._project))
+      : 'unknown project';
+    const others = ambiguousProjects
+      ? ` Also found in: ${ambiguousProjects.filter(p => p !== shown).map(escapeHtml).join(', ')}.`
+      : '';
+    ambiguousWarningHtml = `<div class="task-ambiguous-warning" style="margin:8px 0 4px;padding:8px 10px;border:1px solid var(--warn);border-radius:6px;background:rgba(255,170,0,0.08);color:var(--warn)">⚠ This task id exists in more than one project. Showing it as resolved in <strong>${escapeHtml(shown)}</strong>.${others}</div>`;
+  }
+  let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${task.id}${projectChipHtml}</h2>${ambiguousWarningHtml}`;
   // "Send to Chat" (2026-09-01) -- dumps this task's key context into the System Chat
   // panel as a user message (via sendTextToChat -> POST /api/chat/inject, no model call)
   // so a follow-up can be had about it. Button sits in the modal's top action area, same
@@ -359,7 +387,7 @@ function renderTaskDetailModal(task) {
   // the per-attempt history -- every earlier plan, every tier's decline reason + response,
   // every tier-3 worktree diff -- so following up on a task that failed N times no longer
   // means re-investigating from scratch.
-  if (task.id) html += `<div class="field-label">Agent-run trajectories</div><div>${trajectoryLinkHtml(task.id)}</div>`;
+  if (task.id) html += `<div class="field-label">Agent-run trajectories</div><div>${trajectoryLinkHtml(task.id, taskDetailProjectHint)}</div>`;
   html += renderDraftAttempts(task);
   html += renderWorkLog(task);
   html += renderHarnessHits(task);
@@ -421,7 +449,9 @@ function renderTaskDetailModal(task) {
       taskPremiumPriorityBtn.disabled = true;
       try {
         const nextEnabled = !premiumOn;
-        const res = await fetch(`/api/task-anywhere/${encodeURIComponent(task.id)}/premium-priority`, {
+        // ?project= (HUB0171 5/6): stamp/clear premium priority on THIS project's copy
+        // of the task id, not whichever one the server happens to find first.
+        const res = await fetch(`/api/task-anywhere/${encodeURIComponent(task.id)}/premium-priority${projectQs()}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ enabled: nextEnabled }),
@@ -454,7 +484,7 @@ function armTaskDetailAutoRefresh(task) {
     if (!backdrop || !backdrop.classList.contains('open')) { stopTaskDetailAutoRefresh(); return; }
     let fresh;
     try {
-      fresh = await fetchJson(`/api/task-anywhere/${encodeURIComponent(id)}`);
+      fresh = await fetchJson(`/api/task-anywhere/${encodeURIComponent(id)}${projectQs()}`);
     } catch (e) {
       return; // transient -- try again next tick
     }
@@ -778,9 +808,27 @@ async function openDetail(state, id) {
   renderTaskDetailModal(task);
 }
 
-async function openTaskAnywhere(taskId) {
+// Project hint (HUB0171 5/6): when a caller already knows which project a task id
+// lives in (e.g. the Workers list on a borrowed project, where a bare task-anywhere
+// lookup 404s or hits the wrong project's copy), it passes that project here. The
+// hint is carried as ?project= on every task-scoped fetch this modal makes -- the
+// task-anywhere detail lookup, the trajectories link, and the premium-priority POST
+// -- so the server resolves the id inside that project instead of guessing. The
+// module-level fallback below keeps re-renders (auto-refresh, button re-wires)
+// scoped to the same project even though the fresh task object doesn't carry it.
+let taskDetailProjectHint = null;
+
+function projectQs() {
+  if (taskDetailProjectHint == null || taskDetailProjectHint === '') return '';
+  return `?project=${encodeURIComponent(taskDetailProjectHint)}`;
+}
+
+async function openTaskAnywhere(taskId, projectHint) {
+  // Optional second arg: existing callers pass one argument and get today's
+  // behavior exactly (projectHint undefined -> no query string, hint reset to null).
+  taskDetailProjectHint = (projectHint != null && projectHint !== '') ? projectHint : null;
   try {
-    const task = await fetchJson(`/api/task-anywhere/${encodeURIComponent(taskId)}`);
+    const task = await fetchJson(`/api/task-anywhere/${encodeURIComponent(taskId)}${projectQs()}`);
     renderTaskDetailModal(task);
   } catch (e) {
     alert('Could not load task details: ' + e.message);
@@ -791,4 +839,5 @@ function closeDetail() {
   stopTaskDetailAutoRefresh();
   document.getElementById('modal-backdrop').classList.remove('open');
   deepDiveDetailCache = null; // force a fresh fetch next time any project's modal opens
+  taskDetailProjectHint = null; // don't leak a project-scoped hint into the next modal's fetches
 }
