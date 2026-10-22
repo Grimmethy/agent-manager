@@ -1655,7 +1655,9 @@ async function main() {
     try { writeTaskJson(taskPath, task); } catch (err) { process.stderr.write(`[review-task] history-persist hook: writeTaskJson failed for ${taskPath}: ${err.message}\n`); }
   });
 
-  const { repoRoot, pipelineDir, secondBrainDir, domainsPath, deepDiveCoveragePath } = getConfig();
+  const _config = getConfig();
+  const { repoRoot, pipelineDir, secondBrainDir, deepDiveCoveragePath } = _config;
+  const domainsPath = process.env.TASK_DOMAINS || process.env.AGENT_MANAGER_DOMAINS_PATH || _config.domainsPath;
   const instancesDir = sharedInstancesDir(pipelineDir);
 
   let result;
