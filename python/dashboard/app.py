@@ -592,7 +592,7 @@ def task_links_db_path() -> Path | None:
     return (d / "task-links.db") if d else None
 
 
-def _incoming_task_links(task_id: str) -> list:
+def _incoming_task_links(task_id: str, qdir=None) -> list:
     """Reverse lookup -- "everything that links TO this task", read from task-links.db's
     task_links table (task-links-client.js's recordLink() is the only writer -- nothing
     writes a links[] field onto the task's own JSON, see _outgoing_task_links below).
@@ -600,8 +600,13 @@ def _incoming_task_links(task_id: str) -> list:
     frontend's Related Tasks section can treat "no incoming links" the same whether Task
     Linking has never been used yet or genuinely has nothing pointing at this task --
     unlike _task_cost_summary's None-vs-real-data distinction, there's no meaningful third
-    state here worth telling apart."""
-    db_path = task_links_db_path()
+    state here worth telling apart.
+    qdir (HUB0171): an explicit project's queue directory -- its pipeline dir (qdir's
+    parent) then supplies task-links.db instead of the active project's, so a borrowed
+    task's detail modal shows the project that actually owns it."""
+    # HUB0171: qdir (a project's queue dir) redirects the db to that project's own
+    # pipeline dir (qdir's parent) instead of the active project's resolution.
+    db_path = Path(qdir).parent / "task-links.db" if qdir is not None else task_links_db_path()
     if not db_path or not db_path.is_file():
         return []
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -621,13 +626,17 @@ def _incoming_task_links(task_id: str) -> list:
         conn.close()
 
 
-def _outgoing_task_links(task_id: str) -> list:
+def _outgoing_task_links(task_id: str, qdir=None) -> list:
     """Forward lookup -- "everything this task links TO" -- 2026-09-08 fix: the frontend's
     renderRelatedTasks() was written expecting an inline task.links[] field that nothing
     ever wrote (recordLink() only ever wrote task_links.db); the "Links to" half of every
     task's Related Tasks section has been silently empty since Task Linking shipped. Mirrors
-    _incoming_task_links exactly, just the source_id/target_id roles swapped."""
-    db_path = task_links_db_path()
+    _incoming_task_links exactly, just the source_id/target_id roles swapped.
+    qdir (HUB0171): an explicit project's queue directory -- its pipeline dir (qdir's
+    parent) then supplies task-links.db instead of the active project's."""
+    # HUB0171: same qdir redirect as _incoming_task_links -- that project's own
+    # pipeline dir (qdir's parent), not the active project's resolution.
+    db_path = Path(qdir).parent / "task-links.db" if qdir is not None else task_links_db_path()
     if not db_path or not db_path.is_file():
         return []
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -995,7 +1004,7 @@ def _second_brain_bench_dir(run_id: str | None = None) -> Path | None:
     return (sb / "Model Benchmarks" / run_id) if run_id else (sb / "Model Benchmarks")
 
 
-def _task_cost_summary(task_id: str) -> dict | None:
+def _task_cost_summary(task_id: str, qdir=None) -> dict | None:
     """Estimated Anthropic API cost for ONE task, summed across every model_calls row
     for it -- a task can carry several real calls (plan, implement, critique, revision,
     or an agentic pass's own single call), and task.abCallId on the task JSON itself only
@@ -1005,8 +1014,12 @@ def _task_cost_summary(task_id: str) -> dict | None:
     Claude calls for this task" -- the same distinction api_models_cost_summary's own
     freeCalls count already makes at the aggregate level.
     Grimmethy, 2026-08-23: "We should include estimated cost tracking in the job page
-    itself." """
-    db_path = model_stats_db_path()
+    itself."
+    qdir (HUB0171): an explicit project's queue directory -- its pipeline dir (qdir's
+    parent) then supplies model-stats.db instead of the active project's."""
+    # HUB0171: qdir (a project's queue dir) redirects the db to that project's own
+    # pipeline dir (qdir's parent) instead of the active project's resolution.
+    db_path = Path(qdir).parent / "model-stats.db" if qdir is not None else model_stats_db_path()
     if not db_path or not db_path.is_file():
         return None
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -1054,17 +1067,27 @@ def _task_cost_summary(task_id: str) -> dict | None:
     }
 
 
-def _work_log_for(task_id: str) -> dict | None:
+def _work_log_for(task_id: str, qdir=None) -> dict | None:
     """The per-task tool-call transcript (src/work-log.js writes queue/worklogs/<id>.json)
     for a multi-turn agentic draft -- every file read, search run, command executed, and
     edit made, so the result can be audited before it's approved/merged. None when there
     is no worklog (non-agentic task, or already pruned after the task reached done/).
     draftAttempts on the task itself only keeps a stripped summary (tool + arg keys); this
-    is the full detail, lazily loaded only when a task is opened."""
-    qdir = queue_dir()
-    if not qdir:
+    is the full detail, lazily loaded only when a task is opened.
+    qdir (HUB0171): an explicit project's queue directory to read from instead of the
+    active project's -- the task detail modal for a borrowed task must show THAT
+    project's worklog, so callers now pass the task's own project queue dir."""
+    # HUB0171: qdir (a project's queue dir) is used verbatim when given; with none we
+    # fall back to the active project's own queue dir (get_pipeline_dir()/"queue" --
+    # the same path queue_dir() returns), exactly as before.
+    if qdir is not None:
+        _qdir = Path(qdir)
+    else:
+        _pipeline = get_pipeline_dir()
+        _qdir = (_pipeline / "queue") if _pipeline else None
+    if not _qdir:
         return None
-    p = qdir / "worklogs" / f"{task_id}.json"
+    p = _qdir / "worklogs" / f"{task_id}.json"
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError):
