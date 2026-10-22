@@ -299,7 +299,12 @@ function taskIdExistsInQueue(id) {
   // regenerated as a live duplicate -- the exact bug this function exists to prevent, same
   // reasoning as the _archived_no_action check just above.
   if (listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)))) return true;
-  return QUEUE_STATES.some((state) => {
+  return idInQueueStates(queueDir, id, QUEUE_STATES);
+}
+
+// Does <id>.json sit in any of these queue/<state>/ dirs (drafting has per-worker subfolders)?
+function idInQueueStates(queueDir, id, states) {
+  return states.some((state) => {
     if (state !== 'drafting') return fs.existsSync(path.join(queueDir, state, `${id}.json`));
 
     const draftingDir = path.join(queueDir, 'drafting');
@@ -314,6 +319,19 @@ function taskIdExistsInQueue(id) {
       .filter((e) => e.isDirectory())
       .some((e) => fs.existsSync(path.join(draftingDir, e.name, `${id}.json`)));
   });
+}
+
+// True when the ONLY thing holding this id is a FINISHED task (queue/done/, its dated archive buckets or _archived_no_action) -- nothing live,
+// blocked, held or coordinating carries it. A finished task is spent: it cannot be "already queued", so a caller that needs a fresh attempt may move
+// on to the next id. Anything not finished (pending, drafting, review, approved, blocked, needs-clarification, ... or a former hub id) still blocks.
+function taskIdHeldOnlyByFinishedTask(id) {
+  const { pipelineDir } = getConfig();
+  const queueDir = path.join(pipelineDir, 'queue');
+  if (formerHubIds(queueDir).has(id)) return false;
+  if (idInQueueStates(queueDir, id, QUEUE_STATES.filter((s) => s !== 'done'))) return false;
+  if (fs.existsSync(path.join(queueDir, 'done', `${id}.json`))) return true;
+  if (fs.existsSync(path.join(queueDir, 'done', '_archived_no_action', `${id}.json`))) return true;
+  return listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)));
 }
 
 // Titles of every currently in-flight (not yet finished) task, shown to brain_dump_sort's
@@ -1194,9 +1212,28 @@ function readProjectLabels() {
 // Kept in sync with apply-group-a.js's own MAX_SORT_ATTEMPTS.
 const MAX_SORT_ATTEMPTS = 3;
 
-function brainDumpSortTaskId(entry) {
-  const n = entry.sortAttempt || 0;
-  return n > 0 ? `brain-dump-sort-${entry.id}-a${n}` : `brain-dump-sort-${entry.id}`;
+function brainDumpSortTaskId(entry, attempt = entry.sortAttempt || 0) {
+  return attempt > 0 ? `brain-dump-sort-${entry.id}-a${attempt}` : `brain-dump-sort-${entry.id}`;
+}
+
+// The attempt number a still-captured entry should be sorted under next, or null when nothing may be generated for it right now.
+// Starts at entry.sortAttempt and steps past every attempt whose id is held ONLY by a finished task: a sort task that finished
+// (noop, filed, skipped as stale) and left the entry 'captured' has used up that attempt, whatever the counter says. Without this the
+// entry was invisible forever behind its own spent id -- measured 2026-10-22: 17 agent-manager entries (11 whose apply was rejected
+// before the rejection bumped sortAttempt, 5 edited after they were sorted: the dashboard edit resets status to 'captured' but not the
+// id) while the rx580 lane logged "no eligible task found". A live, blocked or held task on an attempt id still blocks the entry
+// (no duplicate), and the walk stops at MAX_SORT_ATTEMPTS so a task that finishes without result cannot loop. Pure reads; nothing is written.
+function nextFreeSortAttempt(entry) {
+  for (let n = entry.sortAttempt || 0; n < MAX_SORT_ATTEMPTS; n += 1) {
+    const id = brainDumpSortTaskId(entry, n);
+    if (!taskIdExistsInQueue(id)) return n;
+    if (!taskIdHeldOnlyByFinishedTask(id)) return null;
+  }
+  return null;
+}
+
+function isBrainDumpEntrySortable(entry) {
+  return !!entry && entry.status === 'captured' && !entry.suppressed && nextFreeSortAttempt(entry) !== null;
 }
 
 // At most this many entries are linked to existing work in one generator call (each check reads the queue: ~170 ms
@@ -1223,6 +1260,24 @@ function linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, b
   }
 }
 
+// Persists the attempt number a sort task is being emitted under when it is ahead of the stored counter (see nextFreeSortAttempt), so the
+// apply-skip / review-exhaustion bump (sortAttempt + 1) moves on to the NEXT id instead of landing back on this task's own id. Re-reads the
+// file right before writing (a concurrent dashboard edit is not lost), only touches a still-captured entry whose counter is behind, and
+// uses the atomic writer. Best-effort: a failed write only means the bump may re-use this id, which the dedupe check still blocks.
+function advanceBrainDumpSortAttempt(brainDumpPath, pipelineDir, entry, attempt) {
+  try {
+    const fresh = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+    const cur = (Array.isArray(fresh.entries) ? fresh.entries : []).find((x) => x && x.id === entry.id);
+    if (!cur || cur.status !== 'captured' || (cur.sortAttempt || 0) >= attempt) return;
+    const from = cur.sortAttempt || 0;
+    cur.sortAttempt = attempt;
+    writeBrainDumpAtomic(brainDumpPath, fresh);
+    logPipelineEvent(pipelineDir, 'brain-dump-sort-attempt-advanced', { entryId: cur.id, serial: cur.serial ?? null, from, to: attempt, reason: 'earlier sort task(s) finished without sorting the entry' });
+  } catch (e) {
+    console.error(`[task-sources] brain-dump sortAttempt advance failed (best-effort): ${e.message}`);
+  }
+}
+
 function nextBrainDumpSortTask() {
   const { brainDumpPath, secondBrainDir, pipelineDir } = getConfig();
   if (!brainDumpPath) return null;
@@ -1246,9 +1301,7 @@ function nextBrainDumpSortTask() {
   // nothing to act on, because generation itself had stopped dead. Same "skip an
   // in-queue one and keep looking" loop nextArchImportTask/nextUnusedExportTask already
   // use for their own oldest-first selection.
-  const eligible = entries.filter((e) => e && e.status === 'captured' && !e.suppressed
-    && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
-    && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+  const eligible = entries.filter(isBrainDumpEntrySortable);
   // Existing-work check (2026-10-18, see brain-dump-existing-work.js): an entry whose work is already a task -- queued,
   // done or archived -- is linked to that task instead of being sorted again (no classification spent). Bounded per call.
   let chosen = null;
@@ -1261,7 +1314,9 @@ function nextBrainDumpSortTask() {
   if (links.length) linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, 'generator');
   if (!chosen) return null;
 
-  const taskId = brainDumpSortTaskId(chosen);
+  const attempt = nextFreeSortAttempt(chosen);
+  if (attempt > (chosen.sortAttempt || 0)) advanceBrainDumpSortAttempt(brainDumpPath, pipelineDir, chosen, attempt);
+  const taskId = brainDumpSortTaskId(chosen, attempt);
 
   return {
     id: taskId,
@@ -2917,7 +2972,7 @@ function writeTask(task) {
 }
 
 module.exports = {
-  getNextTask, writeTask, taskIdExistsInQueue,
+  getNextTask, writeTask, taskIdExistsInQueue, isBrainDumpEntrySortable,
   nextTroubleLogTask, nextAdhocTask, nextDerivedTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, windowFetchedFileContent, nextProjectSearchTask,
   nextDeepDiveTask, nextBrainDumpSortTask,
@@ -3136,9 +3191,7 @@ if (require.main === module) {
     if (!brainDumpPath) return false;
     try {
       const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
-      return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured' && !e.suppressed
-        && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
-        && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+      return Array.isArray(data.entries) && data.entries.some(isBrainDumpEntrySortable);
     } catch {
       return false;
     }
