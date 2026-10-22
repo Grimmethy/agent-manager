@@ -7,6 +7,12 @@ entries from the tool-loop audit, result summary). This module serves them read-
   GET /api/task-anywhere/<task_id>/trajectories   -> {"taskId", "runs": [{name, startedAt, stage, bytes}]} newest first
   GET /trajectory/<task_id>[?run=<name>]          -> one self-contained HTML timeline (inline CSS, no JS)
 
+Both accept an optional ?project=<label|repoRoot> hint (HUB0171 · 4/6, borrowed-task fix): the
+runs are then read from that project's pipeline dir -- the 1/6 shared resolver
+(project_scope.resolve_project) maps the hint to the pipeline dir instead of the active
+project's -- so a task a lane borrowed from another project shows its own trajectories. Without
+the hint the behaviour is unchanged (active project's instances/trajectories/).
+
 Linked from the task detail modal and the Workers card (trajectoryLinkHtml in task-detail-modal.js). A
 plain AM renderer rather than the competition harness's adk_eval_core viewer, which needs its own trace
 model. Everything shown is escaped; a run name must be a bare *.json.gz file inside that task's own dir.
@@ -15,6 +21,7 @@ import gzip
 import html
 import json
 import re
+from pathlib import Path
 
 from flask import Blueprint, abort, jsonify, request
 
@@ -33,14 +40,29 @@ def _safe_segment(value, fallback):
     return seg or fallback
 
 
-def _task_dir(task_id):
-    from app import instances_dir
-    inst = instances_dir()
+def _task_dir(task_id, project=None):
+    # With a ?project= hint: read from the project that owns the task. project_scope.resolve_project
+    # (the 1/6 shared resolver) maps the hint -- a label or a repoRoot -- to that project's pipeline
+    # dir, and instances/ hangs off it exactly like app.instances_dir() derives it for the active
+    # project (get_pipeline_dir() / "instances"). Without the hint: unchanged legacy path.
+    if project:
+        try:
+            from project_scope import resolve_project
+            entry = resolve_project(project)
+        except Exception:  # noqa: BLE001 -- unknown project: no silent fallback to the active one
+            abort(404, description=f"unknown project: {project}")
+        pipeline_dir = entry.get("pipeline_dir") if entry else None
+        if not pipeline_dir:
+            abort(404, description=f"unknown project: {project}")
+        inst = Path(pipeline_dir) / "instances"
+    else:
+        from app import instances_dir
+        inst = instances_dir()
     return (inst / "trajectories" / _safe_segment(task_id, "_no-task")) if inst else None
 
 
-def _list_runs(task_id):
-    d = _task_dir(task_id)
+def _list_runs(task_id, project=None):
+    d = _task_dir(task_id, project)
     if not d or not d.is_dir():
         return []
     runs = []
@@ -52,10 +74,10 @@ def _list_runs(task_id):
     return sorted(runs, key=lambda r: r["startedAt"], reverse=True)
 
 
-def _load_run(task_id, name):
+def _load_run(task_id, name, project=None):
     if not name or "/" in name or "\\" in name or not _RUN_NAME_RE.match(name):
         abort(404, description="not a trajectory file name")
-    d = _task_dir(task_id)
+    d = _task_dir(task_id, project)
     f = d / name if d else None
     if not f or not f.is_file():
         abort(404, description=f"no trajectory '{name}' for task {task_id}")
@@ -65,7 +87,8 @@ def _load_run(task_id, name):
 
 @trajectories_bp.route("/api/task-anywhere/<task_id>/trajectories")
 def api_task_trajectories(task_id):
-    return jsonify({"taskId": task_id, "runs": _list_runs(task_id)})
+    project = (request.args.get("project") or "").strip() or None
+    return jsonify({"taskId": task_id, "runs": _list_runs(task_id, project)})
 
 
 def _e(value):
@@ -110,7 +133,7 @@ summary{cursor:pointer} .call{margin:4px 0}
 """
 
 
-def _render_page(task_id, runs, traj, current):
+def _render_page(task_id, runs, traj, current, project=None):
     out = [f"<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
            f"<title>Trajectory {_e(task_id)}</title><style>{_CSS}</style></head><body>",
            f"<h1>Agent-run trajectory</h1><div class='meta'>task <code>{_e(task_id)}</code></div>"]
@@ -118,8 +141,12 @@ def _render_page(task_id, runs, traj, current):
         out.append("<p>No trajectories recorded for this task (runs are kept for the retention window; "
                    "AGENT_MANAGER_TRAJECTORY=off disables recording).</p></body></html>")
         return "".join(out)
+    # Keep ?project= on the run links so a cross-project timeline page keeps serving every run
+    # from that project's dir -- a bare ?run= link would drop the hint and fall back to the
+    # active project's trajectories.
+    proj_q = f"&project={_e(project)}" if project else ""
     out.append("<div class='runs'>Runs: " + "".join(
-        f"<a class='{'cur' if r['name'] == current else ''}' href='?run={_e(r['name'])}'>{_e(r['startedAt'])} {_e(r['stage'])}</a>"
+        f"<a class='{'cur' if r['name'] == current else ''}' href='?run={_e(r['name'])}{proj_q}'>{_e(r['startedAt'])} {_e(r['stage'])}</a>"
         for r in runs) + "</div>")
     res = traj.get("result") or {}
     out.append(
@@ -163,11 +190,12 @@ def _render_page(task_id, runs, traj, current):
 
 @trajectories_bp.route("/trajectory/<task_id>")
 def trajectory_page(task_id):
-    runs = _list_runs(task_id)
+    project = (request.args.get("project") or "").strip() or None
+    runs = _list_runs(task_id, project)
     if not runs:
         if request.args.get("run"):
             abort(404, description=f"no trajectories for task {task_id}")
-        return _render_page(task_id, [], None, None)
+        return _render_page(task_id, [], None, None, project)
     current = request.args.get("run") or runs[0]["name"]
-    traj = _load_run(task_id, current)
-    return _render_page(task_id, runs, traj, current)
+    traj = _load_run(task_id, current, project)
+    return _render_page(task_id, runs, traj, current, project)
