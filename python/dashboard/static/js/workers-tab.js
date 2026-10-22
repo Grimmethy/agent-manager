@@ -94,10 +94,10 @@ async function toggleWorkerExpand(instanceId) {
   await renderWorkers();
 }
 
-function renderRecentTasksList(tasks) {
+function renderRecentTasksList(tasks, projectHint) {
   if (!tasks.length) return '<div class="meta">No tasks recorded for this instance yet.</div>';
   return `<ul class="recent-tasks-list">${tasks.map(t => `
-    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtml(t.taskId)}</a>
+    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}" data-project-hint="${escapeAttr(projectHint || '')}">${escapeHtml(t.taskId)}</a>
       <span class="meta">${t.outcome ? `<strong style="color:var(${t.outcome === 'approved' ? '--ok' : '--bad'})">${escapeHtml(t.outcome)}</strong> · ` : ''}${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
     </li>`).join('')}</ul>`;
 }
@@ -108,14 +108,14 @@ function renderRecentTasksList(tasks) {
 // record when the call row's own outcome column is blank) or a hard-failure log entry
 // ('failed' -- a call that never got a usable response at all, so no task-level outcome
 // exists for it yet).
-function renderRunLogList(runs) {
+function renderRunLogList(runs, projectHint) {
   if (!runs.length) return '<div class="meta">No runs recorded for this instance yet.</div>';
   return `<ul class="recent-tasks-list">${runs.map(r => {
     const failed = r.kind === 'failed';
     const pending = r.outcome === 'pending' || r.outcome === 'in-progress';
     const color = failed ? '--bad' : pending ? '--muted' : COMPLETED_TASKS_OUTCOME_OK_RE.test(r.outcome || '') ? '--ok' : '--bad';
     const label = failed ? `FAILED: ${r.outcome || 'error'}` : (r.outcome || '?');
-    return `<li><a href="#" data-open-task-anywhere="${escapeAttr(r.taskId || '')}">${escapeHtml(r.taskId || '(unknown task)')}</a>
+    return `<li><a href="#" data-open-task-anywhere="${escapeAttr(r.taskId || '')}" data-project-hint="${escapeAttr(projectHint || '')}">${escapeHtml(r.taskId || '(unknown task)')}</a>
       <span class="meta"><strong style="color:var(${color})">${escapeHtml(label)}</strong>${r.stage ? ' · ' + escapeHtml(r.stage) : ''}${r.model ? ' · ' + escapeHtml(r.model) : ''}${r.latencyMs != null ? ' · ' + (r.latencyMs / 1000).toFixed(1) + 's' : ''} · ${r.at ? fmtAge((Date.now() - new Date(r.at).getTime()) / 1000) + ' ago' : ''}</span>
       ${failed && r.detail ? `<div class="meta" style="opacity:0.75">${escapeHtml(r.detail.slice(0, 160))}</div>` : ''}
     </li>`;
@@ -132,7 +132,7 @@ const COMPLETED_TASKS_OUTCOME_OK_RE = /^(approved|merged|applied-direct|pending-
 
 function renderCompletedTasksSection() {
   const rows = completedTasksLog.map(t => `
-    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtmlBright(t.title || t.taskId)}</a>
+    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}" data-project-hint="${escapeAttr(t.projectLabel || '')}">${escapeHtmlBright(t.title || t.taskId)}</a>
       <span class="meta">${t.outcome ? `<strong style="color:var(${COMPLETED_TASKS_OUTCOME_OK_RE.test(t.outcome || '') ? '--ok' : '--bad'})">${escapeHtml(t.outcome)}</strong> · ` : ''}${t.source ? escapeHtml(t.source) + ' · ' : ''}${t.instanceId ? escapeHtml(t.instanceId) + ' · ' : ''}${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
     </li>`).join('');
   const footer = completedTasksExhausted
@@ -412,14 +412,14 @@ async function renderWorkers(isPoll) {
         pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
         ${inst.currentTaskId && inst.projectLabel ? ' · <span class="badge ' + (inst.borrowed ? 'warn' : 'idle') + '" title="' + (inst.borrowed ? 'Borrowed: this lane is idle in the active project and is working a task of ' + escapeAttr(inst.projectLabel) + ' (idle-pool borrowing)' : 'This task belongs to the active project') + '">📁 ' + escapeHtml(inst.projectLabel) + (inst.borrowed ? ' (borrowed)' : '') + '</span>' : ''}
         ${inst.currentTaskId && inst.hub ? ' · <span class="badge ok" title="This task belongs to hub ' + escapeAttr(inst.hub.label) + '" style="font-weight:700">🗂 ' + escapeHtml(hubTag(inst.hub)) + '</span>' : ''}
-        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') + ' · ' + trajectoryLinkHtml(inst.currentTaskId) : ''}
+        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '" data-project-hint="' + escapeAttr(inst.projectLabel || '') + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') + ' · ' + trajectoryLinkHtml(inst.currentTaskId) : ''}
         ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
         ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
       </div>
       ${expandedWorkerId === inst.instanceId ? `
       <div class="worker-recent-tasks">
         <div class="meta" style="margin-top:8px; font-weight:600">${inst.instanceId === 'reviewer' ? 'Last 10 reviewed tasks' : 'Recent runs (every attempt, including failures)'}</div>
-        ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
+        ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs, inst.projectLabel) : renderRecentTasksList(recentTasks.tasks || [], inst.projectLabel)) : '<div class="meta">Loading…</div>'}
       </div>` : ''}
     </div>
   `).join('')) + renderCompletedTasksSection();
@@ -462,7 +462,7 @@ async function renderWorkers(isPoll) {
     };
   });
   main.querySelectorAll('[data-open-task-anywhere]').forEach((link) => {
-    link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere); };
+    link.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openTaskAnywhere(link.dataset.openTaskAnywhere, link.dataset.projectHint || null); };
   });
   updateStaleTimers();
 }
