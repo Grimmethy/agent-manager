@@ -1019,29 +1019,55 @@ function nextDeepDiveTask() {
     return at - bt;
   });
 
-  // Collect the degree-sorted, budget-capped file list for one community (null when the
-  // community has no nodes at all in the graph -- same skip rule as the old inline code).
-  // Same degree-by-file, budget-capped selection as nextArchDiscoveryTask() -- see
-  // DEEP_DIVE_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
-  // the identical convention rather than inventing a second one.
-  const collectFiles = (proj, community) => {
+  // Per-tick graph cache (2026-10-22, generation-tick cost): every lane runs this function between tasks, and for a project with ~2,000 onboarded
+  // communities the old code re-read and re-parsed the repo's .deep-dive-graph.json (up to 7 MB) once PER COMMUNITY, then read source files, before
+  // finding out the community already had a task -- 71-77 s of idle GPU per tick (profile: 45 of 63 s in this function). The graph of one project is
+  // now parsed once per call and its nodes are indexed by community, so each community costs a Map lookup. Same degree-by-file selection as before.
+  const graphCache = new Map(); // clonePath -> { nodesByCommunity, degreeByNodeId, rankedByCommunity }
+  const graphFor = (proj) => {
+    let g = graphCache.get(proj.clonePath);
+    if (g) return g;
     const graphPath = path.join(proj.clonePath, '.deep-dive-graph.json');
     const graphData = JSON.parse(readIfExists(graphPath) || '{"nodes":[],"links":[]}');
-    const memberNodes = (graphData.nodes || []).filter((n) => n.community === community.id);
-    if (memberNodes.length === 0) return null;
-
+    const nodesByCommunity = new Map();
+    for (const n of graphData.nodes || []) {
+      const list = nodesByCommunity.get(n.community);
+      if (list) list.push(n); else nodesByCommunity.set(n.community, [n]);
+    }
     const degreeByNodeId = {};
     for (const link of graphData.links || []) {
       degreeByNodeId[link.source] = (degreeByNodeId[link.source] || 0) + 1;
       degreeByNodeId[link.target] = (degreeByNodeId[link.target] || 0) + 1;
     }
-    const degreeByFile = {};
-    for (const node of memberNodes) {
-      if (!node.source_file) continue;
-      degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (degreeByNodeId[node.id] || 0);
-    }
-    const rankedFiles = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+    g = { nodesByCommunity, degreeByNodeId, rankedByCommunity: new Map() };
+    graphCache.set(proj.clonePath, g);
+    return g;
+  };
 
+  // The degree-sorted [file, degree] list for one community, from the graph alone (no file is read); null when the community has no nodes at all in
+  // the graph -- same skip rule as the old inline code.
+  const rankedFilesFor = (proj, community) => {
+    const g = graphFor(proj);
+    if (g.rankedByCommunity.has(community.id)) return g.rankedByCommunity.get(community.id);
+    const memberNodes = g.nodesByCommunity.get(community.id) || [];
+    let ranked = null;
+    if (memberNodes.length > 0) {
+      const degreeByFile = {};
+      for (const node of memberNodes) {
+        if (!node.source_file) continue;
+        degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (g.degreeByNodeId[node.id] || 0);
+      }
+      ranked = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+    }
+    g.rankedByCommunity.set(community.id, ranked);
+    return ranked;
+  };
+
+  // Collect the budget-capped file list (contents read from disk) for a community's ranked files.
+  // Same degree-by-file, budget-capped selection as nextArchDiscoveryTask() -- see
+  // DEEP_DIVE_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
+  // the identical convention rather than inventing a second one.
+  const collectFiles = (proj, rankedFiles) => {
     const files = [];
     let budgetUsed = 0;
     for (const [sourceFile, degree] of rankedFiles) {
@@ -1062,8 +1088,15 @@ function nextDeepDiveTask() {
   // records the consumed slice so the next tick emits the next one. A community at or
   // under the cap keeps today's exact behavior: one task, the unsuffixed ID.
   for (const c of candidates) {
-    const files = collectFiles(c.proj, c.community);
-    if (files === null) continue; // community has no graph nodes -- same skip as before
+    const rankedFiles = rankedFilesFor(c.proj, c.community);
+    if (rankedFiles === null) continue; // community has no graph nodes -- same skip as before
+    // Exact cheap skip, decided BEFORE any source file is read. A community with at most DEEP_DIVE_MAX_FILES_PER_TASK ranked files can never need
+    // more than one slice (files is a subset of rankedFiles), so below it always gets the unsliced id; with no slice counter to reset
+    // (consumedSlices unset/0 -- a set counter takes the full path so its reset-and-save below still runs) a task already in the queue under that id means
+    // the loop would `continue`. Anything else (a bigger community, a slice counter, no task yet) goes through the original logic unchanged.
+    if (!c.community.consumedSlices && rankedFiles.length <= DEEP_DIVE_MAX_FILES_PER_TASK
+        && taskIdExistsInQueue(`deep-dive-${c.slug}-${c.community.id}`)) continue;
+    const files = collectFiles(c.proj, rankedFiles);
 
     const totalSlices = Math.max(1, Math.ceil(files.length / DEEP_DIVE_MAX_FILES_PER_TASK));
     let id;
