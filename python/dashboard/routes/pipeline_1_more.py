@@ -200,7 +200,7 @@ class MergeLockBusy(Exception):
 # import; by the time a helper runs, app.py is fully initialised and the import is a dict
 # lookup (and tests patch these names on `app`). ---
 
-def _validate_and_authorize_merge(repo_root, branch, force):
+def _validate_and_authorize_merge(repo_root, branch, force, scope=None):
     """Step 1: prove this branch is one THIS process itself offered, then run the two
     409 gates (unmerged hub sibling that would conflict, then a hub that is not finished).
 
@@ -213,7 +213,11 @@ def _validate_and_authorize_merge(repo_root, branch, force):
     # process already enumerated itself -- re-derive the current list (cheap: cached
     # unless stale) and require an exact match, the same "only act on what we ourselves
     # already offered" gate api_task_archive/api_task_requeue's state allowlists use.
-    branches = list_unmerged_branches(force=True)
+    if scope:
+        import branch_projects
+        branches = branch_projects.refresh_branches(scope)  # another project: gate on ITS list as it is right now
+    else:
+        branches = list_unmerged_branches(force=True)
     match = next((b for b in branches if b["branch"] == branch), None)
     if not match:
         raise LookupError(f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
@@ -253,7 +257,52 @@ def _validate_and_authorize_merge(repo_root, branch, force):
             '{"force": true} only if you have verified the branch is actually complete.'
         )
 
-    return {"match": match, "main_branch": match["mainBranch"], "repo_root": repo_root}
+    return {"match": match, "main_branch": match["mainBranch"], "repo_root": repo_root, "scope": scope}
+
+
+def _merge_conflict_error(match, main_branch, merge_err):
+    """The error to raise when `git merge` failed. match['willConflict']/['conflictFiles'] came from list_unmerged_branches's own merge-tree preview a moment
+    ago (same request, force-refreshed above) -- if it already predicted this exact outcome, say so plainly instead of surfacing raw git stderr. Confirmed live
+    2026-08-18: an add/add conflict between two independently-drafted candidate docs produced exactly this kind of opaque failure with no indication of WHICH
+    files or WHY. Returns the exception to raise (the original when the preview did not predict it)."""
+    if match.get("willConflict") and match.get("conflictFiles"):
+        files = ", ".join(match["conflictFiles"])
+        err = RuntimeError(
+            f"conflicts with {main_branch} on: {files} -- this was flagged before you clicked merge; "
+            f"resolve by hand (e.g. combine both versions) rather than retrying, retrying will fail the same way"
+        )
+        err.__cause__ = merge_err
+        return err
+    return merge_err
+
+
+def _merge_in_temp_worktree(repo_root, main_branch, match):
+    """Merge origin/<branch> into origin/<main> and push, WITHOUT touching repo_root's working tree, current branch or index: a detached worktree under the
+    system temp dir is cut from origin/<main>, the merge commit is made there and pushed as HEAD:<main>, and the worktree is removed on every path."""
+    import shutil
+    import tempfile
+    from app import _run_git, logger
+
+    tmp = tempfile.mkdtemp(prefix="am-merge-")
+    wt = os.path.join(tmp, "wt")
+    try:
+        _run_git(["worktree", "add", "--detach", wt, f"origin/{main_branch}"], repo_root)
+        try:
+            _run_git(["merge", "--no-ff", f"origin/{match['branch']}", "-m", f"Merge {match['title']} (via dashboard)"], wt)
+        except RuntimeError as merge_err:
+            subprocess.run(["git", "merge", "--abort"], cwd=wt, capture_output=True, timeout=15)
+            raise _merge_conflict_error(match, main_branch, merge_err)
+        _run_git(["push", "origin", f"HEAD:{main_branch}"], wt)
+    finally:
+        try:
+            _run_git(["worktree", "remove", "--force", wt], repo_root)
+        except RuntimeError as e:
+            logger.warning("Non-fatal: could not remove the temp merge worktree %s: %s", wt, e)
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            _run_git(["worktree", "prune"], repo_root)
+        except RuntimeError:
+            pass
 
 
 def _execute_git_merge(context):
@@ -269,9 +318,11 @@ def _execute_git_merge(context):
     match = context["match"]
     main_branch = context["main_branch"]
     branch = match["branch"]
+    scope = context.get("scope")
+    qdir = scope["qdir"] if scope else queue_dir()  # another project's merge records into THAT project's queue
 
     try:
-        lock_fd = _acquire_apply_lock()
+        lock_fd = _acquire_apply_lock()  # the one global apply lock: apply-task.sh flocks the same file for every project
     except RuntimeError as exc:
         raise MergeLockBusy(str(exc)) from exc
     try:
@@ -281,33 +332,26 @@ def _execute_git_merge(context):
         snapshot = {}
         try:
             from branch_removals import snapshot_branch
-            snapshot = snapshot_branch(_run_git, repo_root, main_branch, branch, None, queue_dir(), keep_ref=False)
+            snapshot = snapshot_branch(_run_git, repo_root, main_branch, branch, None, qdir, keep_ref=False)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Non-fatal: could not snapshot %r before merging it: %s", branch, exc)
-        _run_git(["checkout", main_branch], repo_root)
-        _run_git(["reset", "--hard", f"origin/{main_branch}"], repo_root)
-        try:
-            _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {match['title']} (via dashboard)"], repo_root)
-        except RuntimeError as merge_err:
-            subprocess.run(["git", "merge", "--abort"], cwd=str(repo_root), capture_output=True, timeout=15)
-            # match['willConflict']/['conflictFiles'] came from list_unmerged_branches's
-            # own merge-tree preview a moment ago (same request, force-refreshed above) --
-            # if it already predicted this exact outcome, say so plainly instead of
-            # surfacing raw git stderr. Confirmed live 2026-08-18: an add/add conflict
-            # between two independently-drafted candidate docs produced exactly this kind
-            # of opaque failure with no indication of WHICH files or WHY.
-            if match.get("willConflict") and match.get("conflictFiles"):
-                files = ", ".join(match["conflictFiles"])
-                raise RuntimeError(
-                    f"conflicts with {main_branch} on: {files} -- this was flagged before you clicked merge; "
-                    f"resolve by hand (e.g. combine both versions) rather than retrying, retrying will fail the same way"
-                ) from merge_err
-            raise merge_err
-        _run_git(["push", "origin", main_branch], repo_root)
+        if scope:
+            # Another project's merge never runs checkout or reset --hard in that project's own working tree (it may hold uncommitted work): it merges in a
+            # throwaway worktree cut from origin/<main> and pushes that.
+            _merge_in_temp_worktree(repo_root, main_branch, match)
+        else:
+            _run_git(["checkout", main_branch], repo_root)
+            _run_git(["reset", "--hard", f"origin/{main_branch}"], repo_root)
+            try:
+                _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {match['title']} (via dashboard)"], repo_root)
+            except RuntimeError as merge_err:
+                subprocess.run(["git", "merge", "--abort"], cwd=str(repo_root), capture_output=True, timeout=15)
+                raise _merge_conflict_error(match, main_branch, merge_err)
+            _run_git(["push", "origin", main_branch], repo_root)
         try:
             _run_git(["push", "origin", "--delete", branch], repo_root)
             from branch_removals import record_branch_removal
-            record_branch_removal(queue_dir(), branch, "merged", task_id=branch.removeprefix("agent/"),
+            record_branch_removal(qdir, branch, "merged", task_id=branch.removeprefix("agent/"),
                                   detail=f"merged into {main_branch} via the dashboard", actor="dashboard-merge",
                                   snapshot=snapshot or None)
         except RuntimeError as e:
@@ -324,19 +368,28 @@ def _apply_post_merge_side_effects(context):
     """Step 3: drop the now-stale unmerged-branch list cache and fast-forward the
     dashboard's own checkout to the new main tip (see app.py's _sync_live_checkout for
     the safety rules around a dirty PACKAGE_ROOT). Returns the live-sync result."""
-    from app import _invalidate_branch_cache, _sync_live_checkout
+    from app import PACKAGE_ROOT, _invalidate_branch_cache, _sync_live_checkout
 
+    scope = context.get("scope")
+    if scope:
+        import branch_projects
+        branch_projects.after_action(scope)
+        # Only the dashboard's OWN repo is fast-forwarded (and may restart the dashboard); another project's checkout is left exactly as it is.
+        if os.path.realpath(str(scope["repoPath"])) != os.path.realpath(str(PACKAGE_ROOT)):
+            return {"skipped": "not the dashboard's own repo"}
+        return _sync_live_checkout(context["main_branch"])
     _invalidate_branch_cache()
     return _sync_live_checkout(context["main_branch"])
 
 
-def _record_merge_in_task_file(branch, main_branch):
+def _record_merge_in_task_file(branch, main_branch, qdir=None):
     """Step 4a: stamp mergedAt + a terminal `merged` history/disposition on the task's
     queue record, in whichever done/ location it sits. No-op without a queue dir or a
     record; re-raises OSError if the write-back fails (the merge itself already succeeded,
     but losing the record is a real, reportable failure)."""
     from app import logger, queue_dir, read_json_safe
 
+    # `qdir` is another project's queue dir (a merge from that project's card); None = the active project's.
     # Stamp mergedAt on the task record once its branch is actually merged (2026-08-22,
     # Grimmethy: "some way to prioritize what order adhoc tasks get completed in. Those
     # with dependencies on new adhoc tasks are absolutely going to need to be done after
@@ -346,7 +399,7 @@ def _record_merge_in_task_file(branch, main_branch):
     # OWN branch, not merged, and every adhoc draft's git worktree starts from
     # origin/<mainBranch>. Best-effort when no record exists (already archived, or this
     # merge came from some source other than the normal apply flow).
-    qdir = queue_dir()
+    qdir = qdir or queue_dir()
     if not qdir:
         return
     task_id = branch.removeprefix("agent/")
@@ -378,7 +431,7 @@ def _record_merge_in_task_file(branch, main_branch):
             break
 
 
-def _record_merge_in_task_log(repo_root, branch, main_branch):
+def _record_merge_in_task_log(repo_root, branch, main_branch, qdir=None):
     """Step 4b: close out the LOCAL task-logs/<id>.json snapshot (src/task-log-store.js),
     not just the queue/ working copy -- that file is gitignored and gets archived/pruned,
     while task-logs/<id>.json is a durable local snapshot that survives it, and this is the
@@ -391,7 +444,7 @@ def _record_merge_in_task_log(repo_root, branch, main_branch):
     Skipped, like step 4a, when there is no queue dir."""
     from app import logger, queue_dir, read_json_safe
 
-    if not queue_dir():
+    if not (qdir or queue_dir()):
         return
     task_id = branch.removeprefix("agent/")
     task_log_path = repo_root / "task-logs" / f"{task_id}.json"
@@ -423,10 +476,19 @@ def api_git_merge_branch(branch):
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
     repo_root = Path(repo_root)
-    force = bool((request.get_json(silent=True) or {}).get("force"))
+    body = request.get_json(silent=True) or {}
+    force = bool(body.get("force"))
+    # Optional project (the card's repoRoot): act on THAT project. Absent = the active project, exactly as before; unknown = 404, never a fallback.
+    import branch_projects
+    try:
+        scope = branch_projects.resolve_scope(request.args.get("project") or body.get("project"), str(repo_root))
+    except LookupError as e:
+        abort(404, description=str(e))
+    if scope:
+        repo_root = scope["repoPath"]
 
     try:
-        context = _validate_and_authorize_merge(repo_root, branch, force)
+        context = _validate_and_authorize_merge(repo_root, branch, force, scope)
     except LookupError as e:
         abort(404, description=str(e))
     except PermissionError as e:
@@ -440,8 +502,9 @@ def api_git_merge_branch(branch):
         return jsonify({"succeeded": False, "reason": str(e)}), 500
 
     live_sync = _apply_post_merge_side_effects(context)
-    _record_merge_in_task_file(branch, context["main_branch"])
-    _record_merge_in_task_log(repo_root, branch, context["main_branch"])
+    qdir = scope["qdir"] if scope else None
+    _record_merge_in_task_file(branch, context["main_branch"], qdir)
+    _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir)
 
     return jsonify({"succeeded": True, "branch": branch, "mainBranch": context["main_branch"], "liveSync": live_sync})
 
@@ -467,9 +530,21 @@ def api_git_discard_branch(branch):
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
     repo_root = Path(repo_root)
 
+    # Optional project (the card's repoRoot): act on THAT project's repo, queue and remote. Absent = the active project, exactly as before; unknown = 404.
+    import branch_projects
+    body_in = request.get_json(silent=True)
+    body_in = body_in if isinstance(body_in, dict) else {}
+    try:
+        scope = branch_projects.resolve_scope(request.args.get("project") or body_in.get("project"), str(repo_root))
+    except LookupError as e:
+        abort(404, description=str(e))
+    if scope:
+        repo_root = scope["repoPath"]
+    qdir_for = (lambda: scope["qdir"]) if scope else queue_dir
+
     # Same "only act on what we ourselves already offered" gate api_git_merge_branch/
-    # api_task_archive/api_task_requeue all already use.
-    branches = list_unmerged_branches(force=True)
+    # api_task_archive/api_task_requeue all already use (another project: ITS list, recomputed now).
+    branches = branch_projects.refresh_branches(scope) if scope else list_unmerged_branches(force=True)
     match = next((b for b in branches if b["branch"] == branch), None)
     if not match:
         abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
@@ -487,7 +562,7 @@ def api_git_discard_branch(branch):
     snapshot, reason = {}, ""
     try:
         from branch_removals import snapshot_branch
-        snapshot = snapshot_branch(_run_git, repo_root, match.get("mainBranch") or "main", branch, match.get("headSha"), queue_dir(), keep_ref=True)
+        snapshot = snapshot_branch(_run_git, repo_root, match.get("mainBranch") or "main", branch, match.get("headSha"), qdir_for(), keep_ref=True)
         body = request.get_json(silent=True)
         reason = str(body.get("reason") or "").strip() if isinstance(body, dict) else ""
         if not reason:
@@ -508,7 +583,7 @@ def api_git_discard_branch(branch):
             if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
                 raise
         from branch_removals import record_branch_removal
-        record_branch_removal(queue_dir(), branch, "discarded", task_id=branch.removeprefix("agent/"),
+        record_branch_removal(qdir_for(), branch, "discarded", task_id=branch.removeprefix("agent/"),
                               detail="discarded via the dashboard Unmerged Branches tab", actor="dashboard-discard",
                               reason=reason or None, snapshot=snapshot or None)
         # Also drop the LOCAL copy (only reached when the remote delete succeeded or the ref was
@@ -525,7 +600,7 @@ def api_git_discard_branch(branch):
     # already-archived (a human archived it by hand first, or a duplicate click) is a
     # silent no-op, not a 409 -- the branch delete above is the part that mattered.
     task_archived = False
-    qdir = queue_dir()
+    qdir = qdir_for()
     if qdir:
         task_id = branch.removeprefix("agent/")
         done_path = qdir / "done" / f"{task_id}.json"
@@ -557,6 +632,9 @@ def api_git_discard_branch(branch):
         elif archived_path.is_file():
             task_archived = True  # already archived (e.g. by hand) -- nothing more to do
 
-    _invalidate_branch_cache()
+    if scope:
+        branch_projects.after_action(scope)
+    else:
+        _invalidate_branch_cache()
     return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch,
                     "snapshotRef": (snapshot or {}).get("snapshotRef")})

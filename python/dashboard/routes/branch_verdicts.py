@@ -19,8 +19,23 @@ def api_git_record_branch_verdict(branch):
     if not qdir:
         abort(404, description="no pipeline queue directory resolvable")
 
-    # Only branches this process itself lists are accepted -- same gate as the merge/discard endpoints.
-    match = next((b for b in list_unmerged_branches(force=False) if b["branch"] == branch), None)
+    # Optional project (the card's repoRoot, query string or body): record for THAT project's branch, in its own queue. Absent = the active project, as
+    # before; a given-but-unknown project is a 404, never a fallback to the active one.
+    import branch_projects
+    pre = request.get_json(silent=True)
+    try:
+        scope = branch_projects.resolve_scope(request.args.get("project") or (pre.get("project") if isinstance(pre, dict) else None), str(repo_root))
+    except LookupError as e:
+        abort(404, description=str(e))
+    if scope:
+        from pathlib import Path
+        qdir, repo_root = scope["qdir"], Path(scope["repoPath"])
+
+    # Only branches this process itself lists are accepted -- same gate as the merge/discard endpoints (another project: its cached list).
+    if scope:
+        real, match = branch_projects.find_other_project_branch(scope["repoRoot"], branch)
+    else:
+        match = next((b for b in list_unmerged_branches(force=False) if b["branch"] == branch), None)
     if not match:
         abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 
@@ -44,5 +59,8 @@ def api_git_record_branch_verdict(branch):
         task_ids, hub_id = bv.resolve_owner(repo_root, match.get("mainBranch") or "master", branch, _run_git, qdir,
                                             get_hub_data_provider().hub_for_branch, match.get("taskId"))
         bv.write_task_log(qdir, task_ids, hub_id or (match.get("hub") or {}).get("id"), branch, verdict, reasons, source, head_sha)
-    _invalidate_branch_cache(refetch=False)  # a verdict moves no remote ref: drop the cached cards (they carry the verdict) but skip the fetch
+    if scope:
+        branch_projects.after_action(scope)  # recompute that project's list so its card carries the verdict
+    else:
+        _invalidate_branch_cache(refetch=False)  # a verdict moves no remote ref: drop the cached cards (they carry the verdict) but skip the fetch
     return jsonify({"succeeded": True, "written": written, "headSha": head_sha, **bv.get_verdict(qdir, branch, head_sha)})

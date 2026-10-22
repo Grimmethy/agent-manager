@@ -687,8 +687,11 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   // attempt on a local-draft.js sub-task citing line 2178 against a file decompose #226
   // had already shrunk to 1327 lines. See detectStaleDecomposePremise's own header for
   // what this does and (importantly) does not catch.
+  // Gates on .stale, not just truthiness: the check can also return { stale: false,
+  // suppressions: [...] } when every dismissal is recorded but nothing blocking remains
+  // (e.g. a file the task's whole point is to create).
   const staleDecompose = detectStaleDecomposePremise(task, { repoRoot: getConfig().repoRoot });
-  if (staleDecompose) {
+  if (staleDecompose && staleDecompose.stale) {
     return {
       succeeded: true,
       blocked: true,

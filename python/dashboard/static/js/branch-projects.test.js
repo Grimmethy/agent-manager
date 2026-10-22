@@ -48,6 +48,26 @@ test('pending note lists the projects still being scanned, empty when none', () 
   assert.match(bp.branchProjectsPendingHtml(['x', 'y']), /2 other projects.*x, y/);
 });
 
-test('foreign action note names the project to switch to', () => {
-  assert.match(bp.branchForeignActionNoteHtml(mk('1', 'storyforge', false)), /switch to <strong>storyforge<\/strong>/);
+test('only another project\'s card sends a project with merge and discard', () => {
+  assert.equal(bp.branchProjectRequestRoot({ branch: 'agent/x' }), '');
+  assert.equal(bp.branchProjectRequestRoot(mk('agent/x', 'a', true)), '');
+  assert.equal(bp.branchProjectRequestRoot(mk('agent/x', 'pf', false, '/repos/pf')), '/repos/pf');
+});
+
+test('the action URL encodes the branch and appends the project only when one is given', () => {
+  assert.equal(bp.branchActionUrl('agent/a b', 'merge', ''), '/api/git/branches/agent%2Fa%20b/merge');
+  assert.equal(bp.branchActionUrl('agent/x', 'discard', '/repos/pf & co'), '/api/git/branches/agent%2Fx/discard?project=%2Frepos%2Fpf%20%26%20co');
+});
+
+test('the confirm text names the project for another project\'s card and is untouched for the active one', () => {
+  const chip = { dataset: { projectChip: 'PF-Client-Portal' } };
+  const row = { querySelector: (sel) => (sel === '[data-project-chip]' ? chip : null) };
+  const btn = { dataset: { project: '/repos/pf' }, closest: (sel) => (sel === '[data-branch-row]' ? row : null) };
+  const out = bp.branchConfirmWithProject('Discard "agent/x"?', btn);
+  assert.match(out, /^PROJECT: PF-Client-Portal\n/);
+  assert.match(out, /runs in \/repos\/pf/);
+  assert.match(out, /Discard "agent\/x"\?$/);
+  assert.equal(bp.branchConfirmWithProject('Discard "agent/x"?', { dataset: { project: '' } }), 'Discard "agent/x"?');
+  assert.equal(bp.branchConfirmWithProject('msg', null), 'msg');
+  assert.match(bp.branchConfirmWithProject('m', { dataset: { project: '/r' }, closest: () => null }), /^PROJECT: \/r\n/, 'no chip: falls back to the root');
 });

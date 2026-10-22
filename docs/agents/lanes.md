@@ -99,6 +99,10 @@ to a larger lane instead of looping on the small one. A reviewer rejection is no
 Needs known tiers on both lanes; the biggest lane never escalates. Caveat: `avoidLanes` is per task and permanent, so a task escalated off the
 8B waits for a bigger lane even if none is currently alive.
 
+## The P40 VM's memory
+
+The P40 lane's `llama-server` runs in a libvirt VM with the card passed through, so its RAM is pinned and the virtio balloon cannot hand it back to the host. The virtio-mem design, the pre-checks, the operator runbook and the rollback are in `docs/agents/p40-vm-memory.md` (tooling in `scripts/p40-vm-memory/`).
+
 ## Review daemons (2026-10-18)
 
 Reviews (the three-vote gate in `src/review-task.js`) used to run on ONE daemon on the host GPU, queueing behind the host lane's drafts; the 3090 is the busiest card, and
