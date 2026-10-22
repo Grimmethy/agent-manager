@@ -138,7 +138,7 @@ borrow_review_from_pool() {
 # a 'premium-borrow' event in the HOME pipeline history. Kill switch AGENT_MANAGER_PREMIUM_REACH=false. Same shape as local-worker.sh's.
 borrow_premium_review_from_projects() {
   [[ "${AGENT_MANAGER_PREMIUM_REACH:-true}" != "false" ]] || return 1
-  local pipes=() env_args=() pipe rc
+  local pipes=() env_args=() pipe rc reg_root reg_queue reg_domains
   if node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-premium "$PIPELINE_DIR" reviewer 2>>"$LOG_FILE"; then
     return 1   # the home review/ holds a premium task: it wins the tie, the home scan reviews it
   fi
@@ -149,10 +149,31 @@ borrow_premium_review_from_projects() {
     mapfile -t env_args < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$pipe" "$INSTANCES_DIR" 2>>"$LOG_FILE")
     (( ${#env_args[@]} > 0 )) || continue
     printf '[review-%s] home has no premium review -- borrowing a PREMIUM review tick from %s\n' "$INSTANCE_ID" "$pipe"
+    # Resolve the OWNING project's REPO_ROOT / QUEUE_DIR / TASK_DOMAINS from the project registry
+    # (projects.json, via src/pool-projects.js's own entry shape: repoRoot + pipelineDir + domainsPath)
+    # and export them for the borrowed --once child -- the child is the one that invokes review-task.js --
+    # so the review runs in that project's context. The subshell scopes the exports: they reach the child
+    # but are gone by the time we return, so the home daemon's own QUEUE_DIR (orc-common.sh, derived from
+    # the home PIPELINE_DIR) can never be clobbered by a borrowed project's paths.
+    reg_root="$(node -e 'const fs=require("fs"),path=require("path"),p=process.argv[1],PP=process.argv[2];const f=process.env.AGENT_MANAGER_PROJECTS_PATH||(path.dirname(PP)+"/projects.json");const r=(()=>{try{return JSON.parse(fs.readFileSync(f,"utf8"))}catch(e){return[]}})();const e=(Array.isArray(r)?r:[]).find((x)=>x&&x.pipelineDir&&path.resolve(x.pipelineDir)===path.resolve(p));if(!e)return;const q=path.resolve(e.pipelineDir)+"/queue";console.log(path.resolve(e.repoRoot||""));console.log(q);console.log(path.resolve(e.domainsPath||(q+"/task-domains.json")))' "$pipe" "${PACKAGE_SRC_DIR}/pool-projects.js" 2>>"$LOG_FILE")"
+    mapfile -t _reg < <(printf '%s\n' "$reg_root" | sed -n '1,3p')   # the resolver printed at most three lines, one per value
+    reg_root="${_reg[0]:-}"; reg_queue="${_reg[1]:-}"; reg_domains="${_reg[2]:-}"
     rc=0
-    env "${env_args[@]}" AGENT_MANAGER_PREMIUM_ONLY_TICK=true bash "${SCRIPT_DIR}/review-runner.sh" "$INSTANCE_ID" --once || rc=$?
+    (
+      export REPO_ROOT="$reg_root"
+      export QUEUE_DIR="$reg_queue"
+      export TASK_DOMAINS="$reg_domains"
+      env "${env_args[@]}" AGENT_MANAGER_PREMIUM_ONLY_TICK=true bash "${SCRIPT_DIR}/review-runner.sh" "$INSTANCE_ID" --once
+    ) || rc=$?
     if (( rc == 10 )); then
       node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-premium "$pipe" reviewer "$PIPELINE_DIR" >>"$LOG_FILE" 2>&1 || true
+      # Home pipeline-history event (src/pipeline-history.js schema: at/type/role) recording the premium borrow.
+      mkdir -p "${PIPELINE_DIR}/instances" 2>/dev/null || true
+      printf '{"at":"%s","type":"premium-borrow","role":"reviewer","project":"%s","pipelineDir":"%s","lane":null}\n' \
+        "$(date -u '+%FT%T.%NZ' 2>/dev/null || date -u)" \
+        "$(basename "$pipe")" \
+        "$pipe" \
+        >> "${PIPELINE_DIR}/instances/pipeline-history.log" 2>/dev/null || true
       did_work=true
       return 0
     fi
