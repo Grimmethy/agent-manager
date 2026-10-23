@@ -28,6 +28,7 @@ const path = require('path');
 const fs = require('fs');
 const { getConfig } = require('./config.js');
 const { runPlanWithTools, ORIENT_TURN_LIMIT, REQUEST_TIMEOUT_MS } = require('./local-tool-client.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { resolveReadOnlySiblingRoots } = require('./accessible-roots.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
@@ -785,6 +786,7 @@ async function draftAdhocViaLocalAgenticWrite(task, {
     if (giveUp) return giveUp;
     return verdict;
   } catch (e) {
+    if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (local-draft.js, local-worker.sh) -- never turn it into a failed attempt
     return { succeeded: false, reason: `local write-agentic draft failed: ${e.message}` };
   }
 }

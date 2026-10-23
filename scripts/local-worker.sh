@@ -495,6 +495,7 @@ fi
 # ticks for the backoff to actually lengthen; reset to 0 the moment any tick's work is
 # NOT an infra failure (a real success, a non-infra block, or a genuinely idle tick).
 CONSECUTIVE_INFRA_FAILURES=0
+ENDPOINT_DOWN_TICKS=0                                                    # consecutive ticks the lane's Ollama endpoint did not answer (see the circuit breaker in the main loop)
 
 # Borrow a tick from another suite project (docs/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
 # Walks the pool in least-recently-borrowed order; the first project that yields work ends the walk. A borrowed tick does exactly ONE item (its
@@ -610,6 +611,26 @@ while :; do                                                                     
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
+  fi
+
+  # Endpoint circuit breaker (2026-10-23, Grimmethy: the rx580 lane sat idle for 12 h after grimm hard-reset and its Ollama never came back; "this is a recurring
+  # event"). While this lane's Ollama endpoint does not answer, claim and resume NOTHING: every draft would fail identically, burn the task's infra requeue
+  # rounds and park it in blocked/ (540 failed ticks and six parked tasks that night). Wait and re-probe instead; the heartbeat says why (pass
+  # 'endpoint-unreachable'), the log says it on the first down tick and every 20th. AGENT_MANAGER_ENDPOINT_PROBE=off disables it (the sandbox tests point the
+  # endpoint at a closed port on purpose). A borrowed --once child just exits: its daemon already probed this same endpoint at the top of its own tick.
+  if [[ "${AGENT_MANAGER_ENDPOINT_PROBE:-on}" != "off" ]] && ! ollama_endpoint_reachable "${OLLAMA_URL:-http://localhost:11434}"; then
+    ENDPOINT_DOWN_TICKS=$((ENDPOINT_DOWN_TICKS + 1))
+    if (( ENDPOINT_DOWN_TICKS == 1 || ENDPOINT_DOWN_TICKS % 20 == 0 )); then
+      printf '[worker-%s] Ollama endpoint %s is not answering (tick %s of the outage) -- claiming nothing until it does.\n' "$INSTANCE_ID" "${OLLAMA_URL:-http://localhost:11434}" "$ENDPOINT_DOWN_TICKS" >&2
+    fi
+    write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "endpoint-unreachable" "$STARTED_AT"
+    if "$ONCE"; then exit 0; fi
+    sleep "${AGENT_MANAGER_ENDPOINT_DOWN_PAUSE_S:-${ORC_TICK_SECS:-30}}"          # orc-common.sh pins ORC_TICK_SECS to 30; this knob exists so the test can poll fast
+    continue
+  fi
+  if (( ENDPOINT_DOWN_TICKS > 0 )); then
+    printf '[worker-%s] Ollama endpoint %s answers again after %s tick(s); resuming.\n' "$INSTANCE_ID" "${OLLAMA_URL:-http://localhost:11434}" "$ENDPOINT_DOWN_TICKS" >&2
+    ENDPOINT_DOWN_TICKS=0
   fi
 
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).

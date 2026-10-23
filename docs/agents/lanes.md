@@ -123,7 +123,7 @@ a review waiting behind it can hit the 5-minute per-call limit (seen on the firs
 
 ## Endpoint-scoped GPU lease (2026-10-18)
 
-The Forge-family lease (`~/.local/state/agent-manager/comfyui-lease.json`, see PromptForge's `Docs/GPU_FAMILY_PROTOCOL.md`) is how anything outside the pipeline takes a
+The Forge-family lease (`~/.local/state/agent-manager/comfyui-lease.json`, see the GPU broker repo's `Docs/GPU_FAMILY_PROTOCOL.md` (`agent-manager-gpu-broker`)) is how anything outside the pipeline takes a
 card from it. While a fresh lease is held, `local-client.js` refuses to START a model call (`ForgePauseError`, "paused, not failed": no retry, no failure count), and
 `local-worker.sh` / `review-runner.sh` yield their ticks. That covers drafts, the reviewer's votes and every other `local-client.js` caller. It does **not** go through
 the gpu-arbiter: a reviewer vote takes no arbiter ticket, so an arbiter place ticket (`holdPlace`) holds off drafts only. Use the lease to reserve a card.
@@ -145,9 +145,26 @@ A lease may now be **scoped to some cards**, so a plugin that reserves one card 
 - **One file, one holder.** Do not write over a fresh lease whose `holder` is someone else. PromptForge's `lease_intact()` ends its own session when the holder changes. The
   holder must treat the file disappearing, or its `holder` changing, as preemption and get off the card.
 - **Pipeline start wins.** `scripts/launch.sh` deletes the lease on an explicit pipeline start, scoped or not. A holder that finds its lease gone must stop, not rewrite it.
-- **Still to do outside this repo:** PromptForge's `Docs/GPU_FAMILY_PROTOCOL.md` should describe `endpoints` and the holder rule. KaggleForge's runner (`server/gpu_lease.py`) is the first writer.
+- **Done outside this repo (2026-10-23):** the GPU broker repo's `Docs/GPU_FAMILY_PROTOCOL.md` describes `endpoints` and the holder rule. KaggleForge's runner (`server/gpu_lease.py`) is the first writer.
 - **Not true as written elsewhere in this file:** the "Review daemons" section says a review's arbiter class outranks a draft on the same endpoint. Reviews take no arbiter
   ticket (`review-task.js` and `local-client.js` never call the arbiter), so that priority does not exist; the lease is what holds a review off.
+
+## When a lane's endpoint is down (2026-10-23)
+
+**What the pipeline does.** `scripts/local-worker.sh` probes the lane's Ollama endpoint (`GET /api/version`, any HTTP answer counts) at the top of every tick. While it
+does not answer the lane claims and resumes nothing, writes a heartbeat with pass `endpoint-unreachable` (status `idle`), logs `Ollama endpoint ... is not answering` on the
+first down tick and every 20th, and re-probes every `AGENT_MANAGER_ENDPOINT_DOWN_PAUSE_S` (default `ORC_TICK_SECS`, which `orc-common.sh` pins to 30). It resumes by itself and
+logs `answers again`. `AGENT_MANAGER_ENDPOINT_PROBE=off` disables it. Before this (grimm hard reset, 2026-10-23) a dead endpoint made the lane resume and claim tasks that could only
+fail: 540 failed ticks in 12 h and six tasks parked in `blocked/`. Tasks parked that way earlier are requeued once by the known-fixed entry `lane-endpoint-outage-parked`
+(`src/known-fixed-failures.js`), and only when the endpoint they name answers.
+
+**Finding the cause (the RX 580 on grimm).** `~/.local/state/agent-manager/logs/worker-rx580.log`, then `curl http://100.96.112.78:11434/api/version`, `tailscale ping grimm-linux`,
+and over `ssh grimm`: `systemctl status ollama`, `systemctl --failed`, `journalctl -k -b 0 | grep ntfs`. The 2026-10-23 cause: grimm hard-reset, `/workspace` (NTFS, the models'
+disk) came back dirty, `ntfs3` refused to mount it (`volume is dirty and "force" flag is not set`), and `ollama.service` (`RequiresMountsFor=/workspace`) never started.
+
+**What is installed on grimm (outside this repo).** `/etc/fstab` mounts `/workspace` with `force` (the driver replays the journal instead of refusing; original in
+`/etc/fstab.bak-2026-10-23-before-ntfs-force`), and `ollama-ensure.timer` runs `/usr/local/sbin/ollama-ensure.sh` every 3 minutes (and 90 s after boot): if `ollama.service` is not
+active it mounts `/workspace` and starts it, logging to the journal (`journalctl -t ollama-ensure`). A real `chkdsk` from Windows is still worth doing when convenient.
 
 ## Tests
 

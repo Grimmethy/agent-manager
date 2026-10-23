@@ -16,7 +16,7 @@ const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
-const { copyNodeModules } = require('./lib/draft-sandbox.js');
+const { copyNodeModules, copyPythonVenv } = require('./lib/draft-sandbox.js');
 const { normalizeDiffOutput } = require('./group-b-worktree-diff.js');
 const { stageDraftChanges } = require('./lib/draft-side-effects.js');
 const { appendHistoryEvent } = require('./task-history.js');
@@ -313,6 +313,9 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
   // A private copy of the repo's installed node_modules, so a JS/TS draft can really run tsc / build / tests (see lib/draft-sandbox.js). Never
   // fails the worktree: without it the draft simply has no toolchain, exactly as before.
   const nodeModules = copyNodeModules(resolvedRepoRoot, worktreeDir);
+  // A Python repo's private .venv copy, so a draft can import its dependencies and really run its tests (see copyPythonVenv). Never fails the worktree.
+  const venv = copyPythonVenv(resolvedRepoRoot, worktreeDir);
+  if (venv.copied && !venv.already) console.error(`[draft-sandbox] copied .venv into ${path.basename(worktreeDir)} (${venv.sizeMb ?? '?'} MB, ${venv.ms} ms)`);
   // STDERR, never stdout: local-draft.js's stdout is a machine channel (ONE JSON result line the worker JSON.parses). These two lines were console.log
   // in #420 and made every successful PF draft read as "draft call failed" (58 wasted drafts, 4 tasks sent to needs-clarification, 2026-09-20).
   if (nodeModules.copied) console.error(`[draft-sandbox] copied node_modules into ${path.basename(worktreeDir)} (${nodeModules.sizeMb ?? '?'} MB, ${nodeModules.ms} ms)`);
