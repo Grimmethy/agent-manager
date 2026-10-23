@@ -164,6 +164,27 @@ class InternalLocalTurnTest(SafeCase):
         self.assertEqual(seen, {})
 
 
+class InternalPreemptTest(SafeCase):
+    def setUp(self):
+        super().setUp()
+        import app
+        self.client = app.app.test_client()
+        env = mock.patch.dict("os.environ", {"AGENT_MANAGER_INTERNAL_TOKEN": "t"})
+        env.start()
+        self.addCleanup(env.stop)
+        gate = mock.patch("app._chat_preempt_enabled", return_value=True)
+        gate.start()
+        self.addCleanup(gate.stop)
+
+    def test_the_route_resolves_the_body_card_and_preempts_for_that_choice(self):
+        with mock.patch("chat_card.resolve_chat_card", return_value=MOVED) as resolve, \
+                mock.patch("app._preempt_pipeline_for_chat", return_value=[{"lane": "draft"}]) as preempt:
+            res = self.client.post("/api/internal/chat/preempt", json={"card": "worker-3090"}, headers={"X-Internal-Token": "t"})
+        resolve.assert_called_once_with("worker-3090")
+        preempt.assert_called_once_with(MOVED)
+        self.assertEqual(res.get_json(), {"preempted": [{"lane": "draft"}]})
+
+
 class SetCardTest(SafeCase):
     def test_set_card_persists_and_clears(self):
         with tempfile.TemporaryDirectory() as d:

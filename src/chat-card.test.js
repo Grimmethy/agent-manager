@@ -15,7 +15,7 @@ const choose = (preferred, isHeld) => chooseChatCard({ lanes, preferred, hostUrl
 
 test('nothing held, no preference: the host lane, no move, empty env', () => {
   const r = choose('', heldSet());
-  assert.deepEqual(r, { lane: 'worker-3090', env: {}, moved: false, from: null, blocked: false, note: '' });
+  assert.deepEqual(r, { lane: 'worker-3090', local: true, lockKey: 'ollama-localhost-11434', env: {}, moved: false, from: null, blocked: false, note: '' });
 });
 
 test('manual pick that is free is used first, with the lane env but only the chat keys', () => {
@@ -32,6 +32,15 @@ test('the Forge holds the host card: chat moves to the next lane and says so', (
   assert.equal(r.moved, true);
   assert.equal(r.from, 'worker-3090');
   assert.match(r.note, /Forge is using 3090.*runs on p40/);
+});
+
+test('the choice carries the arbiter key of the card endpoint and whether it is the host lane', () => {
+  const r = choose('worker-rx580', heldSet());
+  assert.equal(r.lockKey, 'ollama-100.96.112.78-11434');
+  assert.equal(r.local, false);
+  const moved = choose('', heldSet(HOST));
+  assert.equal(moved.lockKey, 'ollama-192.168.122.29-11434');
+  assert.equal(moved.local, false);
 });
 
 test('a held manual pick falls back to the host lane first, then the rest', () => {
