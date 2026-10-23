@@ -102,6 +102,7 @@ def api_internal_chat_preempt():
     {preempted: [...]} -- an empty list if preemption is disabled
     (AGENT_MANAGER_CHAT_PREEMPT=false) or nothing was in flight."""
     _require_internal_token()
+    import chat_card
     from app import _chat_preempt_enabled, _chat_preempt_gate_state, _preempt_pipeline_for_chat, log_preempt_gate_off
     if not _chat_preempt_enabled():
         # HUB0033 2/4 -- gate OFF (see chat_preempt.py's _chat_preempt_gate_state):
@@ -112,7 +113,7 @@ def api_internal_chat_preempt():
         log_preempt_gate_off(_chat_preempt_gate_state())
         return jsonify({"preempted": []})
     try:
-        preempted = _preempt_pipeline_for_chat()
+        preempted = _preempt_pipeline_for_chat(chat_card.resolve_chat_card((request.get_json(silent=True) or {}).get("card")))
     except Exception as e:  # noqa: BLE001 -- best-effort, never fail the caller's turn on this
         return jsonify({"preempted": [], "error": str(e)})
     return jsonify({"preempted": preempted})

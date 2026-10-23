@@ -9,6 +9,7 @@
 
 const gpuGuard = require('./gpu-guard.js');
 const { getLanes } = require('./lanes.js');
+const { ollamaLockKey } = require('./lib/ollama-lock-key.js');
 
 // The only lane env keys a chat child may be given: the endpoint, the model and the per-card pins. Anything else in a lane's env stays out.
 const CARD_ENV_KEYS = ['OLLAMA_URL', 'LOCAL_MODEL', 'AGENT_MANAGER_LANE_NUM_CTX', 'AGENT_MANAGER_LANE_NUM_BATCH'];
@@ -24,7 +25,8 @@ function laneUrl(lane, hostUrl) {
 }
 
 // Pure. lanes: getLanes() shape. preferred: a lane id or ''/null. isHeld(url): is that endpoint under a fresh Forge lease.
-// -> { lane, env, moved, from, note, blocked }. lane is null only when blocked or the preferred id is unknown.
+// -> { lane, env, moved, from, note, blocked, local, lockKey }. lane is null only when blocked or the preferred id is unknown. local = the host GPU's lane;
+// lockKey = the GPU arbiter's key for the card's Ollama endpoint (what chat_preempt cancels the lane's draft by).
 function chooseChatCard({ lanes, preferred, hostUrl, isHeld }) {
   const all = (lanes || []).filter((l) => l && l.id);
   const host = all.find((l) => l.local) || null;
@@ -42,6 +44,8 @@ function chooseChatCard({ lanes, preferred, hostUrl, isHeld }) {
   const moved = free !== first;
   return {
     lane: free.id,
+    local: !!free.local,
+    lockKey: ollamaLockKey(laneUrl(free, hostUrl)),
     env: cardEnv(free),
     moved,
     from: moved ? first.id : null,
