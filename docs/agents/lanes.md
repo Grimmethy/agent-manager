@@ -123,7 +123,7 @@ a review waiting behind it can hit the 5-minute per-call limit (seen on the firs
 
 ## Endpoint-scoped GPU lease (2026-10-18)
 
-The Forge-family lease (`~/.local/state/agent-manager/comfyui-lease.json`, see PromptForge's `Docs/GPU_FAMILY_PROTOCOL.md`) is how anything outside the pipeline takes a
+The Forge-family lease (`~/.local/state/agent-manager/comfyui-lease.json`, see the GPU broker repo's `Docs/GPU_FAMILY_PROTOCOL.md` (`agent-manager-gpu-broker`)) is how anything outside the pipeline takes a
 card from it. While a fresh lease is held, `local-client.js` refuses to START a model call (`ForgePauseError`, "paused, not failed": no retry, no failure count), and
 `local-worker.sh` / `review-runner.sh` yield their ticks. That covers drafts, the reviewer's votes and every other `local-client.js` caller. It does **not** go through
 the gpu-arbiter: a reviewer vote takes no arbiter ticket, so an arbiter place ticket (`holdPlace`) holds off drafts only. Use the lease to reserve a card.
@@ -145,7 +145,7 @@ A lease may now be **scoped to some cards**, so a plugin that reserves one card 
 - **One file, one holder.** Do not write over a fresh lease whose `holder` is someone else. PromptForge's `lease_intact()` ends its own session when the holder changes. The
   holder must treat the file disappearing, or its `holder` changing, as preemption and get off the card.
 - **Pipeline start wins.** `scripts/launch.sh` deletes the lease on an explicit pipeline start, scoped or not. A holder that finds its lease gone must stop, not rewrite it.
-- **Still to do outside this repo:** PromptForge's `Docs/GPU_FAMILY_PROTOCOL.md` should describe `endpoints` and the holder rule. KaggleForge's runner (`server/gpu_lease.py`) is the first writer.
+- **Done outside this repo (2026-10-23):** the GPU broker repo's `Docs/GPU_FAMILY_PROTOCOL.md` describes `endpoints` and the holder rule. KaggleForge's runner (`server/gpu_lease.py`) is the first writer.
 - **Not true as written elsewhere in this file:** the "Review daemons" section says a review's arbiter class outranks a draft on the same endpoint. Reviews take no arbiter
   ticket (`review-task.js` and `local-client.js` never call the arbiter), so that priority does not exist; the lease is what holds a review off.
 

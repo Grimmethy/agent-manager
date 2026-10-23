@@ -35,7 +35,7 @@ if [[ -f "$COMFY_LEASE_PATH" ]]; then
 fi
 
 # Forge family exclusion: the pipeline and the Forge family (ComfyUI) never hold the GPU together
-# (promptforge Docs/GPU_FAMILY_PROTOCOL.md). Besides deleting the lease, ask PromptForge to end its session and
+# (agent-manager-gpu-broker Docs/GPU_FAMILY_PROTOCOL.md). Besides deleting the lease, ask PromptForge to end its session and
 # stop ComfyUI right now instead of waiting for its keeper to notice (~20 s). Best-effort: PromptForge may be down.
 source "${SCRIPT_DIR}/agent-manager-common.sh"
 GPU_BROKER_URL="$(gpu_broker_url)"
