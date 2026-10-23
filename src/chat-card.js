@@ -62,10 +62,37 @@ function resolveChatCard(preferred, env = process.env, deps = {}) {
   return chooseChatCard({ lanes, preferred, hostUrl, isHeld });
 }
 
-module.exports = { chooseChatCard, resolveChatCard, cardEnv, CARD_ENV_KEYS };
+// The owner's chat-card preference (GPU broker, POST /api/gpu/preferences): a broker card id such as 'rx580', which names the lane 'worker-rx580' (broker card ids
+// follow the lane names). Used only when the chat session has no card of its own. Fails open: no broker, a slow or odd answer, or a preference that is not a
+// lane here all mean "no preference" -- the broker is a lazily started plugin and chat must never wait on it.
+const BROKER_TIMEOUT_MS = 2000;
+function brokerUrl(env = process.env) {
+  return (env.GPU_BROKER_URL || env.AGENT_MANAGER_GPU_BROKER_URL || 'http://localhost:7449').replace(/\/$/, '');
+}
+
+async function chatCardPreference(env = process.env, deps = {}) {
+  try {
+    const fetchFn = deps.fetch || fetch;
+    const res = await fetchFn(`${brokerUrl(env)}/api/gpu/preferences`, { signal: AbortSignal.timeout(deps.timeoutMs || BROKER_TIMEOUT_MS) });
+    if (!res.ok) return '';
+    const card = String(((await res.json()) || {}).chatCard || '').trim();
+    const id = `worker-${card}`;
+    return (deps.getLanes || getLanes)(env).some((l) => l.id === id) ? id : '';
+  } catch {
+    return '';
+  }
+}
+
+// resolveChatCard with the owner's preference as the fallback when no card was asked for.
+async function resolveChatCardWithPreference(preferred, env = process.env, deps = {}) {
+  const asked = preferred ? String(preferred).trim() : '';
+  return resolveChatCard(asked || await chatCardPreference(env, deps), env, deps);
+}
+
+module.exports = { chooseChatCard, resolveChatCard, resolveChatCardWithPreference, chatCardPreference, brokerUrl, cardEnv, CARD_ENV_KEYS };
 
 if (require.main === module) {
   const i = process.argv.indexOf('--card');
   const preferred = i >= 0 ? process.argv[i + 1] : '';
-  process.stdout.write(`${JSON.stringify(resolveChatCard(preferred))}\n`);
+  resolveChatCardWithPreference(preferred).then((r) => process.stdout.write(`${JSON.stringify(r)}\n`));
 }
