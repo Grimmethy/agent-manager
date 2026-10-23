@@ -44,6 +44,7 @@ that the thing to remove.)
 | `tier` | no | positive number, billions of parameters. Defaults to the size parsed from `model` (`qwen3-vl:8b-instruct` -> 8); set it when the tag carries no size. Capability routing only compares tiers; a lane with an unknown tier is never reserved around |
 | `reserve` | no | `"auto"` (default: this lane is reserved for a source once the capability ledger shows it handles it), `"always"` (reserved for everything in its `taskClasses`, no evidence needed), or `false` (never reserve work for this lane) |
 | `reviewer` | no | `true` also runs a **review daemon** on this lane's GPU (`reviewer-<gpu>`, `scripts/review-runner.sh`), so its three CONFIRM/DENY votes go to this lane's Ollama instead of queueing behind the host GPU. Default `false`. The host lane always has the plain `reviewer`; the legacy P40 lane (not in the registry) opts in with `AGENT_MANAGER_P40_REVIEWER=true` in `agent-manager.env`. Needs a pipeline restart. See "Review daemons" below |
+| `provider` | no | `ollama` (default) or `cloud`. A **cloud lane** points at the cloud-providers gateway instead of a GPU and **requires** a non-empty `taskClasses`; it also requires `preempt` `never`, cannot have `reviewer: true`, and ignores `numCtx` / `numBatch`. See `docs/agents/cloud-lane.md` |
 | `slow` | no | `true` for a categorically slower endpoint (the P40 is the model case): longer per-call timeout ceiling and watchdog zombie threshold, so a slow-but-alive lane is not killed mid-call. Default `false` |
 
 ## Behaviours worth knowing
