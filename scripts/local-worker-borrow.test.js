@@ -46,6 +46,7 @@ function sandbox({ poolTask = false, nonPool = false } = {}) {
     AGENT_MANAGER_PROJECTS_PATH: projectsPath,
     AGENT_MANAGER_POOL_STATE_PATH: path.join(root, 'pool-state.json'),
     ORC_TICK_SECS: '2',
+    AGENT_MANAGER_ENDPOINT_PROBE: 'off', // these tests point the endpoint at a closed port so nothing touches a model; the breaker has its own test file
   };
   return { root, A, B, C, env, stateFile: path.join(root, 'pool-state.json'), instancesDir: path.join(A, 'instances') };
 }
@@ -582,4 +583,80 @@ test('premium reach (apply): AGENT_MANAGER_POOL_BORROW=false still applies a non
   assert.doesNotMatch(r.stdout, /applying approved tasks of borrowed project/, 'the pool pass is off');
   assert.match(r.stdout, /applying PREMIUM approved tasks of .*\/C/, r.stderr);
   assert.ok(landedIn(sb.C, 'c-premium'));
+});
+
+// --- endpoint circuit breaker (2026-10-23) -----------------------------------------------------------------------------------------------
+// grimm hard-reset, its Ollama stayed down for 12 h, and the rx580 lane kept resuming/claiming tasks that could only fail: 540 failed ticks, six tasks parked.
+// While the lane's Ollama endpoint does not answer the worker claims and resumes NOTHING, says why in its heartbeat and log, and picks up again by itself.
+const http = require('http');
+const freePort = () => new Promise((resolve) => { const s = http.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
+const breakerLane = (sb, pkg, logFile, out, url) => spawn('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x'], {
+  detached: true, stdio: ['ignore', out, out],
+  env: { ...sb.env, OLLAMA_URL: url, AGENT_MANAGER_ENDPOINT_PROBE: 'on', AGENT_MANAGER_ENDPOINT_DOWN_PAUSE_S: '1', ORC_TICK_SECS: '1', AGENT_MANAGER_POOL_BORROW: 'false', AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json') },
+});
+
+test('endpoint breaker: while the Ollama endpoint does not answer the lane claims nothing, reports endpoint-unreachable, and resumes by itself when it answers', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 300);
+  taskFile(path.join(sb.A, 'queue', 'pending'), 'h1');
+  const port = await freePort();
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const child = breakerLane(sb, pkg, logFile, out, `http://127.0.0.1:${port}`);
+  const log = () => fs.readFileSync(logFile, 'utf8');
+  let server;
+  try {
+    assert.ok(await waitFor(() => /is not answering \(tick 1 of the outage\)/.test(log()), 30000), `the outage was reported; log:\n${log().slice(-500)}`);
+    await new Promise((r) => setTimeout(r, 4000)); // several more ticks
+    assert.ok(fs.existsSync(path.join(sb.A, 'queue', 'pending', 'h1.json')), 'the task is still in pending/, never claimed');
+    assert.deepEqual(fs.readdirSync(path.join(sb.A, 'queue', 'drafting')).flatMap((d) => fs.readdirSync(path.join(sb.A, 'queue', 'drafting', d))), [], 'nothing was drafted');
+    assert.doesNotMatch(log(), /claimed |draft call failed/);
+    const hb = JSON.parse(fs.readFileSync(path.join(sb.instancesDir, 'worker-x.json'), 'utf8'));
+    assert.equal(hb.currentPass, 'endpoint-unreachable');
+    assert.equal(hb.status, 'idle');
+    // the endpoint comes back (any HTTP answer counts)
+    server = http.createServer((req, res) => { res.writeHead(404); res.end(); });
+    await new Promise((r) => server.listen(port, '127.0.0.1', r));
+    assert.ok(await waitFor(() => fs.existsSync(path.join(sb.A, 'queue', 'review', 'h1.json')), 60000), `the lane resumed and drafted the task; log:\n${log().slice(-600)}`);
+    assert.match(log(), /answers again after \d+ tick/);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+    if (server) server.close();
+  }
+});
+
+test('endpoint breaker: AGENT_MANAGER_ENDPOINT_PROBE=off keeps the old behaviour (the lane claims even with a dead endpoint)', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 300);
+  taskFile(path.join(sb.A, 'queue', 'pending'), 'h1');
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const off = spawn('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x'], {
+    detached: true, stdio: ['ignore', out, out],
+    env: { ...sb.env, OLLAMA_URL: `http://127.0.0.1:${await freePort()}`, AGENT_MANAGER_ENDPOINT_PROBE: 'off', ORC_TICK_SECS: '1', AGENT_MANAGER_POOL_BORROW: 'false', AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json') },
+  });
+  try {
+    assert.ok(await waitFor(() => fs.existsSync(path.join(sb.A, 'queue', 'review', 'h1.json')), 60000), 'with the probe off the lane drafts as before');
+    assert.doesNotMatch(fs.readFileSync(logFile, 'utf8'), /is not answering/);
+  } finally {
+    try { process.kill(-off.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+  }
+});
+
+test('ollama_endpoint_reachable: any HTTP answer is reachable, a closed port is not', async () => {
+  const port = await freePort();
+  // async spawn: the stub server lives in this process and must keep answering while bash runs
+  const run = (url) => new Promise((resolve) => {
+    const c = spawn('bash', ['-c', `source "${path.join(__dirname, 'agent-manager-common.sh')}" >/dev/null 2>&1; ollama_endpoint_reachable "${url}"`], { env: { ...process.env, AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S: '2' } });
+    c.on('close', (code) => resolve(code));
+  });
+  assert.equal(await run(`http://127.0.0.1:${port}`), 1, 'closed port');
+  const server = http.createServer((req, res) => { res.writeHead(404); res.end(); });
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  try {
+    assert.equal(await run(`http://127.0.0.1:${port}`), 0, 'a 404 answer counts as reachable');
+    assert.equal(await run(`http://127.0.0.1:${port}/`), 0, 'a trailing slash is fine');
+  } finally { server.close(); }
 });

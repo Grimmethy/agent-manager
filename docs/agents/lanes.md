@@ -149,6 +149,23 @@ A lease may now be **scoped to some cards**, so a plugin that reserves one card 
 - **Not true as written elsewhere in this file:** the "Review daemons" section says a review's arbiter class outranks a draft on the same endpoint. Reviews take no arbiter
   ticket (`review-task.js` and `local-client.js` never call the arbiter), so that priority does not exist; the lease is what holds a review off.
 
+## When a lane's endpoint is down (2026-10-23)
+
+**What the pipeline does.** `scripts/local-worker.sh` probes the lane's Ollama endpoint (`GET /api/version`, any HTTP answer counts) at the top of every tick. While it
+does not answer the lane claims and resumes nothing, writes a heartbeat with pass `endpoint-unreachable` (status `idle`), logs `Ollama endpoint ... is not answering` on the
+first down tick and every 20th, and re-probes every `AGENT_MANAGER_ENDPOINT_DOWN_PAUSE_S` (default `ORC_TICK_SECS`, which `orc-common.sh` pins to 30). It resumes by itself and
+logs `answers again`. `AGENT_MANAGER_ENDPOINT_PROBE=off` disables it. Before this (grimm hard reset, 2026-10-23) a dead endpoint made the lane resume and claim tasks that could only
+fail: 540 failed ticks in 12 h and six tasks parked in `blocked/`. Tasks parked that way earlier are requeued once by the known-fixed entry `lane-endpoint-outage-parked`
+(`src/known-fixed-failures.js`), and only when the endpoint they name answers.
+
+**Finding the cause (the RX 580 on grimm).** `~/.local/state/agent-manager/logs/worker-rx580.log`, then `curl http://100.96.112.78:11434/api/version`, `tailscale ping grimm-linux`,
+and over `ssh grimm`: `systemctl status ollama`, `systemctl --failed`, `journalctl -k -b 0 | grep ntfs`. The 2026-10-23 cause: grimm hard-reset, `/workspace` (NTFS, the models'
+disk) came back dirty, `ntfs3` refused to mount it (`volume is dirty and "force" flag is not set`), and `ollama.service` (`RequiresMountsFor=/workspace`) never started.
+
+**What is installed on grimm (outside this repo).** `/etc/fstab` mounts `/workspace` with `force` (the driver replays the journal instead of refusing; original in
+`/etc/fstab.bak-2026-10-23-before-ntfs-force`), and `ollama-ensure.timer` runs `/usr/local/sbin/ollama-ensure.sh` every 3 minutes (and 90 s after boot): if `ollama.service` is not
+active it mounts `/workspace` and starts it, logging to the journal (`journalctl -t ollama-ensure`). A real `chkdsk` from Windows is still worth doing when convenient.
+
 ## Tests
 
 `src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),
