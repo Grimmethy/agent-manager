@@ -3679,3 +3679,44 @@ test('deep_dive: a community exactly at the cap with a finished task is skipped,
   const over = deepDiveWorld([{ id: 1, files: 13, task: 'unsliced' }]);
   assert.equal(freshTaskSources(over.dir).nextDeepDiveTask().id, 'deep-dive-lead-repo-1-s0');
 });
+
+
+// isDependencySatisfied: a fully built NESTED hub (2026-10-23, chat plugin HUB0003). Its record stays in queue/coordinating/ until the stacked branch merges, so it
+// never reaches done/ and the dependents of "piece 1" waited for ever.
+function writeCoordinatingFile(dir, id, content) {
+  const d = path.join(dir, 'queue', 'coordinating'); fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, `${id}.json`), JSON.stringify(content));
+}
+const subHub = (statuses, stacked = { branch: 'agent/decompose-parent', seq: 1, total: 3 }) => ({
+  id: 'sub-hub-1', stacked, subTasks: statuses.map((status, i) => ({ id: `p${i}`, status })),
+});
+
+test('nextAdhocTask: a dependency on a nested hub whose pieces are all built on the shared stacked branch is satisfied', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeCoordinatingFile(dir, 'sub-hub-1', subHub(['pending-merge', 'pending-merge', 'merged']));
+  writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['sub-hub-1'] });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task, 'the sub-hub is built; its dependent must not wait for a merge of the whole branch');
+  assert.equal(task.id, 'adhoc-dependent-1');
+});
+
+test('nextAdhocTask: a nested hub with an open or blocked piece, no pieces, no stacked branch, or no record still holds its dependent', () => {
+  const cases = {
+    'one piece in progress': subHub(['pending-merge', 'in-progress']),
+    'one piece blocked': subHub(['pending-merge', 'blocked']),
+    'no pieces': subHub([]),
+    'no stacked branch': subHub(['pending-merge'], undefined),
+  };
+  for (const [label, rec] of Object.entries(cases)) {
+    const dir = makeAdhocFixtureRepo();
+    if (label === 'no stacked branch') delete rec.stacked;
+    writeCoordinatingFile(dir, 'sub-hub-1', rec);
+    writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['sub-hub-1'] });
+    const { nextAdhocTask } = freshTaskSources(dir);
+    assert.equal(nextAdhocTask(), null, label);
+  }
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['no-such-record'] });
+  assert.equal(freshTaskSources(dir).nextAdhocTask(), null, 'no record at all');
+});

@@ -177,9 +177,26 @@ function releaseSignalsForRecord(record) {
   return defaultReleaseSignals(record);
 }
 
+// A NESTED hub (a piece that was itself decomposed) keeps its record in queue/coordinating/ until the whole stacked branch merges, so it never reaches
+// done/ and the lookups below can never find it (2026-10-23, chat plugin HUB0003: piece 1 became sub-hub HUB0004 with all three pieces built on the shared
+// stacked branch; pieces 2-5 dependsOn it and waited for ever, 0 of 5 built). Same rule the stacked exemption in defaultReleaseSignals applies to a done/ record:
+// the code is committed on the SHARED branch, which is all the next step reads. So a coordinating record that carries a stacked.branch and whose pieces are
+// ALL finished (pending-merge, done, merged, applied-direct, or one of the no-code-coming dispositions) releases its dependents. Fail-closed: no record, no
+// stacked branch, no pieces, or one open or blocked piece is not satisfied.
+const NESTED_HUB_PIECE_DONE = new Set(['pending-merge', 'done', 'merged', 'applied-direct', 'gone', ...NO_CODE_COMING_DISPOSITIONS]);
+function nestedHubBuilt(pipelineDir, depId) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'coordinating', `${depId}.json`), 'utf8'));
+    if (!rec || !rec.stacked || !rec.stacked.branch) return false;
+    const subs = Array.isArray(rec.subTasks) ? rec.subTasks : [];
+    return subs.length > 0 && subs.every((sub) => sub && typeof sub.status === 'string' && NESTED_HUB_PIECE_DONE.has(sub.status));
+  } catch { return false; }
+}
+
 function isDependencySatisfied(pipelineDir, depId) {
   const trimmed = (depId || '').trim();
   if (!trimmed) return true; // a blank/malformed entry blocks nothing -- not this function's job to validate authoring mistakes
+  if (nestedHubBuilt(pipelineDir, trimmed)) return true;
   const candidates = [
     path.join(pipelineDir, 'queue', 'done', `${trimmed}.json`),
     path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${trimmed}.json`),
