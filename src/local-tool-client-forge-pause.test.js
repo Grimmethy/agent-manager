@@ -21,7 +21,7 @@ const LEASE = path.join(tmp, 'comfyui-lease.json');
 process.env.AGENT_MANAGER_COMFY_LEASE_PATH = LEASE;   // read by gpu-guard.js when it loads
 delete process.env.AGENT_MANAGER_FORGE_PAUSE;
 test.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
-test.afterEach(() => { fs.rmSync(LEASE, { force: true }); delete process.env.AGENT_MANAGER_FORGE_PAUSE; });
+test.afterEach(() => { fs.rmSync(LEASE, { force: true }); delete process.env.AGENT_MANAGER_FORGE_PAUSE; delete process.env.AGENT_MANAGER_CHAT_CARD_GUARD; });
 
 function writeLease(extra = {}, ageMs = 0) {
   const at = new Date(Date.now() - ageMs).toISOString();
@@ -143,6 +143,24 @@ test('the summary retry turn (the answer lacked the RESOLUTION line) also honour
 
 test('the Chat panel (source chat) is an explicit user action and still runs under a fresh lease', async () => {
   writeLease();
+  const r = await run(null, answerDirectly, { source: 'chat' });
+  assert.equal(r.error, undefined);
+  assert.equal(r.requests, 1);
+});
+
+test('a Chat turn on a card the picker chose (AGENT_MANAGER_CHAT_CARD_GUARD=1) pauses when the lease appears between turns', async () => {
+  process.env.AGENT_MANAGER_CHAT_CARD_GUARD = '1';
+  const r = await run(null, (seen, res) => {
+    if (seen.requests === 1) { writeLease(); reply(res, toolTurn); return; }
+    reply(res, finalTurn);
+  }, { source: 'chat' });
+  assert.ok(r.error && isPause(r.error), 'rejects with a Forge pause');
+  assert.equal(r.requests, 1, 'the turn after the lease was never sent');
+});
+
+test('a guarded Chat turn whose card the lease does not cover still runs', async () => {
+  process.env.AGENT_MANAGER_CHAT_CARD_GUARD = '1';
+  writeLease({ endpoints: ['http://192.168.122.29:11434'] });
   const r = await run(null, answerDirectly, { source: 'chat' });
   assert.equal(r.error, undefined);
   assert.equal(r.requests, 1);

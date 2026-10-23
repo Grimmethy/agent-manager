@@ -838,6 +838,11 @@ async function runWithoutToolsFallback(prompt, pipelineDir) {
 // the model regenerates that turn from a fresh sample. Mutates messages / toolCallLog /
 // turnStartLengths / turnStartLogLengths in place on each rollback. Returns
 // { message } once a call succeeds, or { flakeErr } when both recovery layers are spent.
+// Chat normally never pauses for the Forge (an explicit user action). A chat turn that was given a GPU card by the card picker (chat-card.js) runs
+// with AGENT_MANAGER_CHAT_CARD_GUARD=1: the card was free when chosen, so a lease that appears on it mid-conversation pauses the turn instead of
+// reloading the model the Forge just evicted.
+const forgePauseFor = (isChatCaller) => !isChatCaller || process.env.AGENT_MANAGER_CHAT_CARD_GUARD === '1';
+
 async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths, onEmptyAttempt, forgePause = false }) {
   let rollbackAttempts = 0;
   for (;;) {
@@ -1218,7 +1223,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     messages.push({ role: 'user', content });
     turnsUsed += 1;
     const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
-      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir, forgePause: !isChatCaller,
+      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir, forgePause: forgePauseFor(isChatCaller),
       toolCallLog, turnStartLengths, turnStartLogLengths,
       onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary', info),
     });
@@ -1262,7 +1267,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       });
       turnsUsed += 1;
       const retryResult = await chatTurnWithFlakeRecovery({
-        messages, tools: [], tokenFoldHeaders, onChunk, instancesDir, forgePause: !isChatCaller,
+        messages, tools: [], tokenFoldHeaders, onChunk, instancesDir, forgePause: forgePauseFor(isChatCaller),
         toolCallLog, turnStartLengths, turnStartLogLengths,
         onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary-retry', info),
       });
@@ -1385,7 +1390,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
     const sentAtLength = messages.length;
     const { message, usage, doneReason, flakeErr } = await chatTurnWithFlakeRecovery({
-      messages, tools, tokenFoldHeaders, onChunk, instancesDir, forgePause: !isChatCaller,
+      messages, tools, tokenFoldHeaders, onChunk, instancesDir, forgePause: forgePauseFor(isChatCaller),
       toolCallLog, turnStartLengths, turnStartLogLengths,
       onEmptyAttempt: (info) => logEmptyAttempt(turn, 'loop', info),
     });

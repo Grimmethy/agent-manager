@@ -199,14 +199,23 @@ def api_internal_chat_local_turn():
     _require_internal_token()
     import contextlib
 
+    import chat_card
     import single_flight_lock
     from app import instances_dir
     from local_tool_client import LocalToolClientError, stream_plan_with_tools
 
     body = request.get_json(silent=True) or {}
     inst_dir = instances_dir()
+    # Optional body.card (a lane id): the GPU card for this turn. Resolved here exactly as the in-tree chat does (chat_card.py): a card the
+    # Forge holds moves to a free one with a note chunk; every card held -> an error event, no model call.
+    card = chat_card.resolve_chat_card(body.get("card"))
 
     def generate():
+        if card.get("blocked"):
+            yield f"data: {json.dumps({'type': 'error', 'error': card.get('note') or 'no GPU card is free for chat'})}\n\n"
+            return
+        if card.get("note"):
+            yield f"data: {json.dumps({'type': 'chunk', 'text': '*(' + card['note'] + ')*' + chr(10) + chr(10)})}\n\n"
         marker_cm = single_flight_lock.priority_marker(inst_dir) if inst_dir else contextlib.nullcontext()
         with marker_cm:
             try:
@@ -221,6 +230,7 @@ def api_internal_chat_local_turn():
                     force_summary_on_cap=bool(body.get("forceSummaryOnCap")),
                     allow_amplification=bool(body.get("allowAmplification")),
                     context_log_session_id=body.get("contextLogSessionId"),
+                    card_env=card.get("env"),
                 ):
                     yield f"data: {json.dumps(event)}\n\n"
             except LocalToolClientError as e:
