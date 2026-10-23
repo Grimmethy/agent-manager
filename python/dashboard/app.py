@@ -2981,6 +2981,7 @@ from routes.branch_verdicts import branch_verdicts_bp  # noqa: E402
 from routes.plugins import plugins_bp  # noqa: E402
 from routes.task import task_bp  # noqa: E402
 from routes.shared_misc import shared_misc_bp  # noqa: E402
+from routes.cloud_meter import cloud_meter_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
 app.register_blueprint(concepts_bp)
@@ -3006,6 +3007,7 @@ app.register_blueprint(task_anywhere_1_more_bp)
 app.register_blueprint(pipeline_1_more_bp)
 app.register_blueprint(branch_verdicts_bp)
 app.register_blueprint(plugins_bp)
+app.register_blueprint(cloud_meter_bp)
 app.register_blueprint(task_bp)
 app.register_blueprint(shared_misc_bp)
 
