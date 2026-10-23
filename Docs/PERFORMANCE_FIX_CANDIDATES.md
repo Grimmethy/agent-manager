@@ -513,3 +513,26 @@ Memoize the result of `sandboxUnresolvedDependency` using a `Map` keyed by the `
 
 Benefits:
 With memoization, the scanner’s performance cost is reduced from O(n) blocking I/O operations (where n is the number of failed suites) to O(k) where k is the number of unique missing dependencies. This prevents event loop stall and improves responsiveness, especially under high failure load. The behavior remains identical — only redundant I/O is eliminated.
+
+### AC-26 · Memoize File Existence Checks to Avoid Sync I/O in Loop
+Strength: Strong
+Files: src/review-verify.js
+Snippet:
+```
+              : `covering ${f.s.label} tests (${f.s.files.join(', ')}) already fail on ${mainBranch} in the review sandbox, so the failure is not caused by the diff`);
+          }
+        }
+        for (const x of contradictedCmds) {
+          // A command whose target does not exist on the base (a test file the diff itself adds) cannot fail there: the failure is the diff's.
+          const targets = commandTargets(x.c);
+          if (targets.some((t) => !fs.existsSync(path.join(worktreeDir, t)))) { failures.push(`\`${x.c.text}\` exited ${x.entry.exitCode} but the draft claimed PASS`); continue; }
+```
+
+Problem:  
+The loop iterates over `contradictedCmds`, and for each command, it calls `fs.existsSync` synchronously for each target path. Since `fs.existsSync` blocks the Node.js event loop, each call introduces latency — especially if the loop runs hundreds or thousands of times. This is a real performance bottleneck in hot paths like CI or frequent review verification, where blocking I/O can cause noticeable delays or timeouts.
+
+Solution:  
+Precompute a `Map` of target paths to their existence status before entering the loop. For each path, check if it’s already in the map; if not, compute and cache the result. Then use the cached value to avoid redundant I/O during iteration.
+
+Benefits:  
+Eliminates repeated synchronous I/O calls, reducing event loop blocking and improving overall responsiveness. The fix is minimal, safe, and uses only existing primitives (`Map`, `fs.existsSync`, `path.join`) — no new dependencies or async patterns required. Performance scales better with larger lists of commands.
