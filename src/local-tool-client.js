@@ -18,6 +18,7 @@ const { findTaskAnywhere, QUEUE_STATES } = require('./task-anywhere.js');
 const { lineMatches } = require('./text-match.js');
 const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
+const gpuGuard = require('./gpu-guard.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { logToolLoopEvent, buildTurnEndEntry, buildEmptyAttemptEntry, buildToolOutcomeEntries } = require('./tool-loop-audit.js');
@@ -837,7 +838,7 @@ async function runWithoutToolsFallback(prompt, pipelineDir) {
 // the model regenerates that turn from a fresh sample. Mutates messages / toolCallLog /
 // turnStartLengths / turnStartLogLengths in place on each rollback. Returns
 // { message } once a call succeeds, or { flakeErr } when both recovery layers are spent.
-async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths, onEmptyAttempt }) {
+async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths, onEmptyAttempt, forgePause = false }) {
   let rollbackAttempts = 0;
   for (;;) {
     let message;
@@ -845,6 +846,12 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
     let doneReason = null;
     let attemptErr = null;
     for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
+      // Forge exclusion (2026-10-22, found in the first live GPU broker test): never START a turn while the Forge family holds the GPU. local-client.js
+      // callOnce already refuses a call under a fresh lease, but this loop only took the per-turn in-flight lock, which protects a turn that is already
+      // running, not the gap BETWEEN turns: a pass that was mid-tool when the lease appeared sent its next turn and reloaded the model the Forge session
+      // had just evicted, for the whole session. Thrown before the try and before the lock, so it is never retried as a flake or rolled back; the
+      // callers treat it as a pause (local-draft.js, local-worker.sh), not a failure. The Chat panel (forgePause false) is an explicit user action.
+      if (forgePause && gpuGuard.forgePauseEnabled() && gpuGuard.leaseHeldFor(OLLAMA_URL)) throw new gpuGuard.ForgePauseError();
       try {
         const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }));
         if (isEmptyCompletion(turnRes.message)) {
@@ -1211,7 +1218,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     messages.push({ role: 'user', content });
     turnsUsed += 1;
     const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
-      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir, forgePause: !isChatCaller,
       toolCallLog, turnStartLengths, turnStartLogLengths,
       onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary', info),
     });
@@ -1255,7 +1262,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       });
       turnsUsed += 1;
       const retryResult = await chatTurnWithFlakeRecovery({
-        messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+        messages, tools: [], tokenFoldHeaders, onChunk, instancesDir, forgePause: !isChatCaller,
         toolCallLog, turnStartLengths, turnStartLogLengths,
         onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary-retry', info),
       });
@@ -1378,7 +1385,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
     const sentAtLength = messages.length;
     const { message, usage, doneReason, flakeErr } = await chatTurnWithFlakeRecovery({
-      messages, tools, tokenFoldHeaders, onChunk, instancesDir,
+      messages, tools, tokenFoldHeaders, onChunk, instancesDir, forgePause: !isChatCaller,
       toolCallLog, turnStartLengths, turnStartLogLengths,
       onEmptyAttempt: (info) => logEmptyAttempt(turn, 'loop', info),
     });
