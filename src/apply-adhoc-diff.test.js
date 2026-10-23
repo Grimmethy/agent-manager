@@ -613,3 +613,22 @@ test('applyAdhocDiff (decompose) moves the carried diff onto the first piece and
   assert.equal(task.carriedPartialDiffChars, diff.length);
   assert.equal(readQueuedAdhocTasks(pipelineDir).filter((t) => t.priorPartialDiff === diff).length, 1);
 });
+
+test('applyAdhocDiff copies a valid prerequisiteHubs from a proposal onto that piece only, and drops an invalid value', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-prereq-1', rawDiff: '', implementResponse: 'Split.', adhocResolution: 'decompose',
+    subTaskProposals: [
+      { title: 'Piece one', rawText: 'Do the first piece.' },
+      { title: 'Piece two', rawText: 'Do the second piece.', prerequisiteHubs: ['HUB0006', 'not-a-hub'] },
+      { title: 'Piece three', rawText: 'Do the third piece.', prerequisiteHubs: ['bogus'] },
+    ],
+  };
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  const by = (t) => queued.find((q) => plain(q.title) === t);
+  assert.equal(by('Piece one').prerequisiteHubs, undefined);
+  assert.deepEqual(by('Piece two').prerequisiteHubs, ['HUB0006']);
+  assert.equal(by('Piece three').prerequisiteHubs, undefined);
+});

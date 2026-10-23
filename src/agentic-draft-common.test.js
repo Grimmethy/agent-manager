@@ -1286,3 +1286,9 @@ test('runAgenticDraftInWorktree with no prior diff behaves as before (partialDif
     assert.equal(info.partialDiff, null);
   });
 });
+
+test('parseSubTaskProposals keeps a valid prerequisiteHubs array and drops an invalid one', () => {
+  const out = parseSubTaskProposals('[{"title":"a","rawText":"x","prerequisiteHubs":["HUB0006","oops"]},{"title":"b","rawText":"y","prerequisiteHubs":"HUB0006"}]');
+  assert.deepEqual(out[0].prerequisiteHubs, ['HUB0006']);
+  assert.equal(out[1].prerequisiteHubs, undefined);
+});

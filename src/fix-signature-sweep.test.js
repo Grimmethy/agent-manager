@@ -529,3 +529,13 @@ test('a read-only design / findings task that got stuck AFTER the entry went liv
   assert.deepEqual(sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T12:00:00Z') }).requeued, []);
   assert.equal(has(dir, 'needs-clarification', 'late'), true);
 });
+
+test('first sight of an entry: prerequisiteHubs is among the coordination fields kept on the requeued task', () => {
+  const dir = pipeline();
+  put(dir, 'needs-clarification', stuck('function-length-fix-ac-4', {
+    needsClarification: { reason: 'design-decision' }, history: [at('2026-09-20T05:00:00Z'), { stage: 'exhausted', at: '2026-09-20T05:39:46Z' }],
+    prerequisiteHubs: ['HUB0006'], planResponse: 'stale',
+  }));
+  sweepKnownFixedFailures({ pipelineDir: dir, now: NOW });
+  assert.deepEqual(read(dir, 'pending', 'function-length-fix-ac-4').prerequisiteHubs, ['HUB0006']);
+});

@@ -23,6 +23,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
 const { checkLeftoverReferences, makeGrepBase } = require('./lib/leftover-references.js');
 const { writeSideFindingInbox } = require('./side-finding.js');
+const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -213,6 +214,8 @@ function parseSubTaskProposals(text) {
     .map((t) => {
       const out = { title: t.title.trim(), rawText: t.rawText.trim() };
       if (Number.isInteger(t.after) && t.after >= 0) out.after = t.after;
+      const prereq = validPrerequisiteHubs(t.prerequisiteHubs);
+      if (prereq) out.prerequisiteHubs = prereq;
       return out;
     });
   return cleaned.length ? cleaned : null;

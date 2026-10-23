@@ -3720,3 +3720,28 @@ test('nextAdhocTask: a nested hub with an open or blocked piece, no pieces, no s
   writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['no-such-record'] });
   assert.equal(freshTaskSources(dir).nextAdhocTask(), null, 'no record at all');
 });
+
+// prerequisiteHubs (hub-prerequisites.js, 2026-10-23): a piece that needs files only another open hub's unmerged branch has waits for that hub's MERGE.
+test('nextAdhocTask holds a piece whose prerequisite hub is still coordinating, and claims it once that hub has left coordinating/', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'coordinating'), { recursive: true });
+  const hubFile = path.join(dir, 'queue', 'coordinating', 'adhoc-hub6.json');
+  fs.writeFileSync(hubFile, JSON.stringify({ id: 'adhoc-hub6', hubLabel: 'HUB0006', subTasks: [] }));
+  writeAdhocFile(dir, 'piece.json', { id: 'adhoc-piece-1', title: 'Needs accounts.py from HUB0006', createdAt: new Date().toISOString(), prerequisiteHubs: ['HUB0006'] });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'held while HUB0006 is still open');
+  fs.unlinkSync(hubFile);
+  const task = freshTaskSources(dir).nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-piece-1');
+  assert.deepEqual(task.prerequisiteHubs, ['HUB0006'], 'the field survives the claim');
+});
+
+test('nextAdhocTask is unchanged for a task with no prerequisiteHubs even while hubs are open', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'coordinating'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'coordinating', 'adhoc-hub6.json'), JSON.stringify({ id: 'adhoc-hub6', hubLabel: 'HUB0006', subTasks: [] }));
+  writeAdhocFile(dir, 'plain.json', { id: 'adhoc-plain-1', title: 'Ordinary task' });
+  const task = freshTaskSources(dir).nextAdhocTask();
+  assert.equal(task && task.id, 'adhoc-plain-1');
+});

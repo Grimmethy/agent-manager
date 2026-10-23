@@ -33,6 +33,7 @@ const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
+const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');
 const derivedGate = require('./derived-gate.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
@@ -558,6 +559,8 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       const unmet = parsed.dependsOn.filter((depId) => !isDependencySatisfied(pipelineDir, depId));
       if (unmet.length > 0) continue;
     }
+    // prerequisiteHubs (hub-prerequisites.js): the piece needs files only another open hub's unmerged branch has, so it waits for that hub's MERGE.
+    if (unmetPrerequisiteHubs(pipelineDir, parsed).length > 0) continue;
     // softDependsOn (see isSoftDependencySatisfied's own comment): same skip-past
     // behavior, but satisfied once the dependency reaches queue/done/ -- no merge
     // required. A separate array from dependsOn so a coordinator can mix hard
