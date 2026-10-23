@@ -215,7 +215,7 @@ This repository already has a written exemplar of the discipline this proposal
 asks for — do the smallest, independently shippable piece first, prove it, then
 build on it: `Docs/gpu-broker-extraction-map.md`. Its `## 3. Pieces` section
 (lines 44–56) is a table with columns `# | Piece | Files | Test | Rollback | Needs`,
-and it opens with the G0 scaffold row (Docs/gpu-broker-extraction-map.md:48): a
+and it opens with the G0 scaffold row (Docs/gpu-broker-extraction-map.md:57): a
 piece that creates the container and a stub surface and changes nothing existing —
 structure only, no behavior.
 
@@ -346,8 +346,8 @@ Every `path:line` this document relies on, verified in-session:
 | `src/agentic-draft-common.js:459` | `resolveDecomposeZero` — the zero-pieces split case, redraft-eligible | §6 |
 | `src/local-tool-task-tools.js:193` | Chat's `queue_reviewed_task` — passes the premium flag with `raisedFrom: 'chat'` | §5 |
 | `python/dashboard/routes/brain_dump.py:132` | `next_serial = max(...) + 1` — captured-note ordering | §5 |
-| `Docs/gpu-broker-extraction-map.md:44` | `## 3. Pieces` heading — the "smallest first, independently shippable" template | §6, §7 |
-| `Docs/gpu-broker-extraction-map.md:48` | G0 scaffold row — structure only, no behavior; the template this design mirrors | §6, §7 |
+| `Docs/gpu-broker-extraction-map.md:53` | `## 3. Pieces` heading — the "smallest first, independently shippable" template | §6, §7 |
+| `Docs/gpu-broker-extraction-map.md:57` | G0 scaffold row — structure only, no behavior; the template this design mirrors | §6, §7 |
 | (proposed; no repo file) | `initiativeId` — the new optional top-level field on a task record linking it to an initiative | §3, §7 |
 | `src/task-sources.js:578` | `nextAdhocTask` — the adhoc claim generator the hook design would sit beside | §13, §14 |
 | `src/task-sources.js:582` | `nextDerivedTask` — the derived-task claim generator over `queue/derived/` | §13 |
@@ -360,7 +360,7 @@ Every `path:line` this document relies on, verified in-session:
 | `Docs/project-rotation-and-expiry-aging-findings.md:96` | Q3 heading — where an "attention clock" would live | §15, §16 |
 | `Docs/project-rotation-and-expiry-aging-findings.md:102` | `pool-state.json` row — "the closest thing to an attention clock today" | §15, §16, §18 |
 | `Docs/project-rotation-and-expiry-aging-findings.md:120` | Q4 heading — round-robin / time-slice scheduler recommendation on `pool-projects.js` | §15, §18 |
-| `Docs/gpu-broker-extraction-map.md:48-55` | G0–G7 pieces table (ids, Files, Needs; G5 carries `CHARACTERFORGE_ROOT`) | §11, §19 |
+| `Docs/gpu-broker-extraction-map.md:57-65` | G0–G7 pieces table (ids, Files, Needs; G5 carries `CHARACTERFORGE_ROOT`) | §11, §19 |
 
 Caveat on line numbers: the hub sequencing internals (`hubHasUnmergedEarlierSibling`,
 `SIBLING_RESOLVED_STATUSES`) and the release-signal defaults
@@ -426,7 +426,7 @@ beside `queue/` — holding the goal and its pieces:
 Field rules (each grounded):
 
 - `id` — stable piece id, author-chosen (the G0–G7 convention of
-  `Docs/gpu-broker-extraction-map.md:48-55`). This is the authoritative key;
+  `Docs/gpu-broker-extraction-map.md:57-65`). This is the authoritative key;
   everything else points at it.
 - `title` — human-readable, and the string a hook would hand to
   `queueAdhocTask` (`src/queue-adhoc-task.js:31` — the filed id is
@@ -708,9 +708,9 @@ reference.
 
 ## 19. Worked example: the GPU-broker extraction
 
-The goal from `Docs/gpu-broker-extraction-map.md` (section 3, lines 48–55 —
+The goal from `Docs/gpu-broker-extraction-map.md` (section 3, lines 57–65 —
 the G0–G7 table: ids, Files, Test, Rollback, Needs — confirmed read this
-session; G5 carries `CHARACTERFORGE_ROOT` at line 55) expressed as an initiative.
+session; G5 carried `CHARACTERFORGE_ROOT` in the 2026-10-15 map and was retired 2026-10-22) expressed as an initiative.
 
 `initiatives/gpu-broker-extraction.json`:
 
@@ -765,7 +765,7 @@ session; G5 carries `CHARACTERFORGE_ROOT` at line 55) expressed as an initiative
 ```
 
 (Notes on the mapping: `targetRepo` values come from the table's Files column —
-`Docs/gpu-broker-extraction-map.md:48-55`; G5's `CHARACTERFORGE_ROOT` from the
+`Docs/gpu-broker-extraction-map.md:57-65`; G5's `CHARACTERFORGE_ROOT` from the
 same table's G5 row. `dependsOn` carries only piece ids — the table's G0
 "decision 1, 2" and G4 "decision 3" are OPEN DECISIONS, not pieces, so they do
 not appear in `dependsOn`; G4's needs G1 and G3 as pieces. G7's "G1-G4" is
