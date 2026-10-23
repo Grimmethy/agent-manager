@@ -22,6 +22,7 @@ const { allocateHubSerial, formatHubLabel, memberId, memberTitle } = require('./
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -220,6 +221,8 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     const extra = extraCriteria.get(i);
     if (extra && extra.length) record.acceptanceCriteria = extra;
     if (parentTask && parentTask.premiumPriority) record.premiumPriority = true;
+    const prereq = validPrerequisiteHubs(sub.prerequisiteHubs); // hubs whose MERGE this piece waits for (hub-prerequisites.js)
+    if (prereq) record.prerequisiteHubs = prereq;
     fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(record, null, 2) + '\n');
     queued.push({ id: ids[i], title: record.title });
   });
