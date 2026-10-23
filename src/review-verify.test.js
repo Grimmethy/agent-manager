@@ -1280,3 +1280,40 @@ test('runSandboxed starts the command in the requested sub-directory of the work
   const inner = runSandboxed({ worktreeDir: dir, bin: 'node', args: ['-e', 'console.log(process.cwd())'], timeoutMs: 20000, pythonBin: null, mainRepoRoot: null, cwd: 'pkg/inner' });
   assert.equal(inner.output.trim(), path.join(dir, 'pkg', 'inner'));
 });
+
+// ---- Python tests under a top-level test/ directory: Python's own `test` package shadows the dotted module name ----
+
+const { pythonTestArgs } = require('./review-verify.js');
+
+test('pythonTestArgs: a single file under a top-level test/ directory runs by discovery from its own directory', () => {
+  assert.deepEqual(pythonTestArgs(['test/test_stub.py']), ['-m', 'unittest', 'discover', '-s', 'test', '-p', 'test_stub.py']);
+  assert.deepEqual(pythonTestArgs(['test/sub/test_x.py']), ['-m', 'unittest', 'discover', '-s', 'test/sub', '-p', 'test_x.py']);
+});
+
+test('pythonTestArgs: package-style and other paths keep the dotted module form', () => {
+  assert.deepEqual(pythonTestArgs(['python/dashboard/test_foo.py']), ['-m', 'unittest', 'python.dashboard.test_foo']);
+  assert.deepEqual(pythonTestArgs(['tests/test_x.py']), ['-m', 'unittest', 'tests.test_x']);
+  assert.deepEqual(pythonTestArgs(['testing/test_x.py']), ['-m', 'unittest', 'testing.test_x']);   // only the exact directory name `test` collides
+  assert.deepEqual(pythonTestArgs(['a/test_a.py', 'b/test_b.py']), ['-m', 'unittest', 'a.test_a', 'b.test_b']);
+  assert.deepEqual(pythonTestArgs([]), ['-m', 'unittest']);
+});
+
+test('pythonTestArgs: a list of several test/ files keeps the dotted form (the suites run one file per process)', () => {
+  assert.deepEqual(pythonTestArgs(['test/test_a.py', 'test/test_b.py']), ['-m', 'unittest', 'test.test_a', 'test.test_b']);
+});
+
+test('end to end: a passing test under test/ (no __init__.py) passes by discovery, and the dotted name does not', () => {
+  const { spawnSync } = require('child_process');
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'py-test-dir-'));
+  try {
+    fs.mkdirSync(path.join(repo, 'test'));
+    fs.writeFileSync(path.join(repo, 'test', 'test_ok.py'), 'import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n\nif __name__ == "__main__":\n    unittest.main()\n');
+    const run = (args) => spawnSync('python3', args, { cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1' } });
+    const byDiscovery = run(pythonTestArgs(['test/test_ok.py']));
+    assert.equal(byDiscovery.status, 0, byDiscovery.stderr);
+    assert.match(byDiscovery.stderr, /Ran 1 test/);
+    const dotted = run(['-m', 'unittest', 'test.test_ok']);   // what the gate used to run
+    assert.notEqual(dotted.status, 0);
+    assert.match(dotted.stderr, /No module named/);
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});
