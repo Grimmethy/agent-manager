@@ -81,6 +81,14 @@ get_claude_paused() {
   ' "$settings_path"
 }
 
+# gpu_broker_url -> prints the base URL of the service that answers POST /api/gpu/yield (no trailing slash). First non-empty wins:
+# AGENT_MANAGER_GPU_BROKER_URL, AGENT_MANAGER_PROMPTFORGE_URL, PROMPTFORGE_URL, then http://localhost:7430 (PromptForge's own default).
+# Shell twin of gpuBrokerUrl() in src/gpu-guard.js; scripts/gpu-broker-url.test.js pins that the two agree. Used by scripts/launch.sh.
+gpu_broker_url() {
+  local url="${AGENT_MANAGER_GPU_BROKER_URL:-${AGENT_MANAGER_PROMPTFORGE_URL:-${PROMPTFORGE_URL:-http://localhost:7430}}}"
+  printf '%s\n' "${url%/}"
+}
+
 # ComfyUI GPU lease (2026-08-30, Grimmethy: "If I run a generation, prompt forge should
 # set up the comfui if it's down" + "make sure the eviction only happens if there isn't
 # enough space to run both" + "It needs to go both ways"). PromptForge writes this file
