@@ -137,3 +137,25 @@ test('the preferred card still moves when the Forge holds it', async () => {
   assert.equal(r.lane, 'worker-3090');
   assert.equal(r.moved, true);
 });
+
+// ---- cloud lanes are not chat cards ----
+const cloudLane = { id: 'worker-cloud', gpu: 'cloud', local: false, cloud: true, provider: 'cloud', env: { OLLAMA_URL: 'http://127.0.0.1:7450', LOCAL_MODEL: 'claude-haiku-5-5' } };
+const withCloud = [...lanes, cloudLane];
+
+test('cloud lane: when every GPU card is held, chat is blocked -- it never falls back onto the paid cloud lane', () => {
+  const r = chooseChatCard({ lanes: withCloud, preferred: '', hostUrl: HOST, isHeld: heldSet(HOST, 'http://192.168.122.29:11434', 'http://100.96.112.78:11434') });
+  assert.equal(r.blocked, true);
+  assert.equal(r.lane, null);
+});
+
+test('cloud lane: asking for it as a card is an unknown card, and the card list does not name it', () => {
+  const r = chooseChatCard({ lanes: withCloud, preferred: 'worker-cloud', hostUrl: HOST, isHeld: heldSet() });
+  assert.equal(r.blocked, true);
+  assert.match(r.note, /Unknown card "worker-cloud"/);
+  assert.doesNotMatch(r.note, /Cards:.*worker-cloud/);
+});
+
+test('cloud lane: with a cloud lane configured, GPU card selection is unchanged', () => {
+  assert.deepEqual(chooseChatCard({ lanes: withCloud, preferred: '', hostUrl: HOST, isHeld: heldSet(HOST) }), choose('', heldSet(HOST)));
+  assert.deepEqual(chooseChatCard({ lanes: withCloud, preferred: 'worker-rx580', hostUrl: HOST, isHeld: heldSet() }), choose('worker-rx580', heldSet()));
+});

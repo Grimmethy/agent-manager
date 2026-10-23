@@ -295,3 +295,20 @@ test('lanes.example.json ships a disabled cloud entry that becomes a valid bound
   assert.equal(lane.cloud, true);
   assert.deepEqual(lane.taskClasses, ['adhoc']);
 });
+
+// ---- isCloudEndpoint: GPU-only logic asks "is this endpoint the cloud gateway?" ----
+const { isCloudEndpoint } = require('./lanes.js');
+
+test('isCloudEndpoint: true only for an enabled cloud lane endpoint (trailing slash ignored), false for GPU lanes, disabled entries and junk', () => {
+  const env = withRegistry([RX580, CLOUD]);
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450', env), true);
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450/', env), true);
+  assert.equal(isCloudEndpoint(' http://127.0.0.1:7450 ', env), true);
+  assert.equal(isCloudEndpoint(RX580.ollamaUrl, env), false);
+  assert.equal(isCloudEndpoint('http://localhost:11434', env), false);
+  assert.equal(isCloudEndpoint('', env), false);
+  assert.equal(isCloudEndpoint(undefined, env), false);
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450', withRegistry([{ ...CLOUD, enabled: false }])), false, 'a disabled cloud entry is no lane');
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450', withRegistry('{ not json')), false, 'a garbage registry never throws');
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450', noRegistry), false);
+});

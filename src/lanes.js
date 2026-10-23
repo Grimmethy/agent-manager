@@ -269,6 +269,14 @@ function isSlowEndpoint(url, env = process.env) {
   try { return getLanes(env).some((l) => l.slow && l.env.OLLAMA_URL === url); } catch { return false; }
 }
 
+// Is `url` the endpoint of an enabled cloud lane (provider 'cloud')? A cloud endpoint is the cloud-providers gateway, not a GPU, so the GPU-only
+// logic (Forge lease yield, host VRAM headroom, health probes by tokens/s) must skip it. Trailing slashes are ignored. Never throws: unknown = false.
+function isCloudEndpoint(url, env = process.env) {
+  if (!url) return false;
+  const norm = (u) => String(u).trim().replace(/\/+$/, '');
+  try { return getLanes(env).some((l) => l.cloud && norm(l.env.OLLAMA_URL) === norm(url)); } catch { return false; }
+}
+
 // Is this lane id a slow lane? The legacy worker-p40 id counts even when its lane is not currently configured (a stale heartbeat
 // from it must keep the long zombie threshold, exactly as before).
 function isSlowLane(id, env = process.env) {
@@ -276,7 +284,7 @@ function isSlowLane(id, env = process.env) {
   try { const l = laneById(id, env); return !!(l && l.slow); } catch { return false; }
 }
 
-module.exports = { reviewerLanes, getLanes, laneById, laneAllowsSource, isSlowEndpoint, isSlowLane, gpuSlugFromName, lanesRegistryPath };
+module.exports = { reviewerLanes, getLanes, laneById, laneAllowsSource, isSlowEndpoint, isCloudEndpoint, isSlowLane, gpuSlugFromName, lanesRegistryPath };
 
 if (require.main === module) {
   const [flag, arg] = process.argv.slice(2);
