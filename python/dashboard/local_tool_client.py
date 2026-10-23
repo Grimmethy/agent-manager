@@ -32,6 +32,17 @@ LOCAL_TOOL_CLIENT_JS = SRC_DIR / "local-tool-client.js"
 SUBPROCESS_TIMEOUT_S = 6000
 
 
+def _child_env(card_env: dict = None) -> dict:
+    """The node child's env. A Chat turn that was given a GPU card (chat_card.py) passes that card's endpoint/model/pins in `card_env`; they
+    override the inherited ones, and AGENT_MANAGER_CHAT_CARD_GUARD=1 makes the child refuse to start a turn on a card the Forge leased
+    after the card was chosen (src/local-tool-client.js). Without a card the env is exactly what it was."""
+    env = {**os.environ, "AGENT_MANAGER_PRIORITY_HOLDER": "1"}  # user-interactive: never yield the GPU to a worker lane
+    if card_env:
+        env.update({k: str(v) for k, v in card_env.items()})
+        env["AGENT_MANAGER_CHAT_CARD_GUARD"] = "1"
+    return env
+
+
 class LocalToolClientError(RuntimeError):
     """Raised when local-tool-client.js itself fails (non-zero exit, non-JSON stdout) --
     the message is that module's own stderr text."""
@@ -39,7 +50,8 @@ class LocalToolClientError(RuntimeError):
 
 def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
                          allow_write: bool = False, primary_root: str = None,
-                         extra_roots: list = None, allow_amplification: bool = False) -> dict:
+                         extra_roots: list = None, allow_amplification: bool = False,
+                         card_env: dict = None) -> dict:
     """Returns local-tool-client.js's own result shape:
     {response, toolCallLog, turnsUsed, toolsDisabled}.
 
@@ -71,7 +83,7 @@ def run_plan_with_tools(prompt: str, max_turns: int = 5, source: str = None,
             result = subprocess.run(
                 ["node", str(LOCAL_TOOL_CLIENT_JS), str(tmp_path)],
                 capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_S,
-                env={**os.environ, "AGENT_MANAGER_PRIORITY_HOLDER": "1"},  # user-interactive: never yield the GPU to a worker lane
+                env=_child_env(card_env),
             )
         except subprocess.TimeoutExpired as e:
             # 2026-08-24 -- caught live: subprocess.TimeoutExpired does NOT inherit from
@@ -101,7 +113,7 @@ def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns:
                             source: str = None, allow_write: bool = False,
                             primary_root: str = None, extra_roots: list = None,
                             force_summary_on_cap: bool = False, allow_amplification: bool = False,
-                            context_log_session_id: str = None):
+                            context_log_session_id: str = None, card_env: dict = None):
     """Generator sibling of run_plan_with_tools for the Chat panel's live-streamed replies
     (2026-08-26, Grimmethy: "vastly improve the chat system... Open WebUI" investigation --
     Open WebUI streams tokens over Socket.IO/SSE as they generate instead of blocking for
@@ -137,7 +149,7 @@ def stream_plan_with_tools(messages: list = None, prompt: str = None, max_turns:
     proc = subprocess.Popen(
         ["node", str(LOCAL_TOOL_CLIENT_JS), str(tmp_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        env={**os.environ, "AGENT_MANAGER_PRIORITY_HOLDER": "1"},  # user-interactive: never yield the GPU to a worker lane
+        env=_child_env(card_env),
     )
     try:
         final = None
