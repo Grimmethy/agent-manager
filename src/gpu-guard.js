@@ -127,7 +127,7 @@ function forgePauseEnabled() { return process.env.AGENT_MANAGER_FORGE_PAUSE !== 
 
 // Forge family exclusion (2026-10-13, Grimmethy: "we cannot run the Agent Manager pipeline and Forge pipeline
 // at the same time ... starting up one process should stop the other and clear the GPU"). PromptForge is the
-// Forge family's GPU broker (promptforge Docs/GPU_FAMILY_PROTOCOL.md): while a Forge session holds the
+// Forge family's GPU broker (agent-manager-gpu-broker Docs/GPU_FAMILY_PROTOCOL.md): while a Forge session holds the
 // comfyui-lease the pipeline yields (above). The other direction is here: with NO lease, a ComfyUI that is
 // still up is the Forge family holding VRAM + RAM the pipeline is about to need, so ask PromptForge to end its
 // session and stop ComfyUI. PromptForge refuses while a Forge job is actually running; if PromptForge is down
