@@ -631,11 +631,32 @@ function summariseSyntax(s) {
   };
 }
 
+// HUB0184 · 2/4: unified diff extractor -- the executed-verification gate used to be hard-gated to
+// adhoc implement drafts, but ANY source whose draft carries a real diff (agentic-draft-common.js
+// captures the worktree diff into task.rawDiff, source-agnostic) deserves the same covering-test
+// check. Returns the task's diff string when the gate should run, or null when it must stay off:
+// no diff at all, or an adhoc draft that did not resolve to 'implemented' (those never ran a
+// covering suite, so the pre-HUB0184 adhoc-only condition is preserved exactly).
+function extractTaskDiff(task) {
+  if (!task || typeof task !== 'object') return null;
+  if (typeof task.rawDiff !== 'string' || !task.rawDiff.trim()) return null;
+  if (resolveSourceName(task) === 'adhoc' && task.adhocResolution !== 'implemented') return null;
+  return task.rawDiff;
+}
+
 // A compact, record-safe view of a review-verify result for task.executedVerification (no raw output beyond what a redraft needs).
+// HUB0184 · 2/4: ran/result/timestamp/failedTests are the flat fields the dashboard reads; the
+// existing status/at/tests/commands shape stays put for the voters and the redraft feedback.
 function summariseExecutedVerification(ev) {
+  const at = new Date().toISOString();
+  const failedTests = (ev.tests && Array.isArray(ev.tests.failures) ? ev.tests.failures : []).slice(0, 10).map((f) => String(f).slice(0, 300));
   return {
+    ran: true,
+    result: ev.status,
+    timestamp: at,
+    failedTests,
     status: ev.status,
-    at: new Date().toISOString(),
+    at,
     reasons: (ev.reasons || []).slice(0, 6).map((r) => String(r).slice(0, 300)),
     tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10), ...(ev.tests.preexisting && ev.tests.preexisting.length ? { preexisting: ev.tests.preexisting.slice(0, 10) } : {}), ...(ev.tests.dependentsUnverified && ev.tests.dependentsUnverified.length ? { dependentsUnverified: ev.tests.dependentsUnverified.slice(0, 10) } : {}), ...(ev.tests.passedFiles && ev.tests.passedFiles.length ? { passedFiles: ev.tests.passedFiles.slice(0, 10) } : {}), ...(ev.tests.timedOutFiles && ev.tests.timedOutFiles.length ? { timedOutFiles: ev.tests.timedOutFiles.slice(0, 10) } : {}), ...(ev.tests.preexistingOnlyFiles && ev.tests.preexistingOnlyFiles.length ? { preexistingOnlyFiles: ev.tests.preexistingOnlyFiles.slice(0, 10) } : {}), ...(ev.tests.partial && ev.tests.partial.length ? { partial: ev.tests.partial.slice(0, 6).map((x) => ({ file: x.file, count: x.count, passed: x.passed, tests: (x.tests || []).slice(0, 6).map((t) => String(t).slice(0, 100)) })) } : {}) } : null,
     commands: (ev.commands || []).map((c) => ({
@@ -1376,19 +1397,18 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     console.error(`[review] edit-set syntax gate errored for ${task.id} (non-fatal, continuing): ${e && e.message}`);
   }
 
-  // Executed verification: see the block comment above summariseExecutedVerification. Adhoc implement drafts only (they carry a real rawDiff plus
-  // the acceptance results the draft claims); every other source keeps its own gates.
-  if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false'
-      && resolveSourceName(task) === 'adhoc'
-      && task.adhocResolution === 'implemented'
-      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+  // Executed verification: see the block comment above summariseExecutedVerification. HUB0184 · 2/4: any source whose
+  // draft carries a real diff (extractTaskDiff), not just adhoc implement drafts -- for an adhoc implemented draft it
+  // returns exactly the diff the old adhoc-only gate required, so that path behaves identically to before.
+  const extractedDiff = extractTaskDiff(task);
+  if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false' && extractedDiff) {
     let ev = null;
     try {
       const verify = verifyDiffFn || require('./review-verify.js').verifyDiff;
       // A stacked hub sub-task builds on its shared branch, not on master -- verify against the same base the draft used.
       const baseBranch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
       const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
-      ev = verify({ taskId: task.id, rawDiff: task.rawDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false', pipelineDir, checkReplay: process.env.AGENT_MANAGER_REVIEW_GATE_REPLAY !== 'false' });
+      ev = verify({ taskId: task.id, rawDiff: extractedDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false', pipelineDir, checkReplay: process.env.AGENT_MANAGER_REVIEW_GATE_REPLAY !== 'false' });
     } catch (e) {
       console.error(`[review] executed verification errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
     }
@@ -1687,7 +1707,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
