@@ -490,3 +490,26 @@ Replace the sequential `for` loop with `Promise.all` over an `Array.from({ lengt
 
 Benefits:
 All `n` inference requests are dispatched in the same event-loop tick and are in-flight simultaneously, reducing wall-clock from `n × T` to roughly `max(T)` (i.e., one inference round-trip plus minor scheduling overhead). With the default `n = 3` and a 2-second per-call latency, the user-visible wait drops from ~6 s to ~2 s. Even in the worst case where the backend (e.g., a single-slot local model server) serializes the requests internally, the fix eliminates the inter-call network round-trip and event-loop scheduling overhead, and it costs nothing in complexity or new dependencies.
+
+### AC-25 · Memoize sandboxUnresolvedDependency to Avoid Blocking I/O in Review Loop
+Strength: Strong
+Files: src/review-verify.js
+Snippet:
+```
+        for (const x of contradictedCmds) { x.entry.outcome = 'inconclusive'; unattributable.push(`\`${x.c.text}\` failed, but the diff could not be reversed to check it against the base`); }
+        if (result.tests && failedSuites.some((f) => !f.dependent)) result.tests.passed = null;
+      } else {
+        for (const f of failedSuites) {
+          const unresolved = f.s.label === 'js' ? sandboxUnresolvedDependency(f.missing, repoRoot) : null;
+          if (unresolved) {
+            unverifiedOrUnattributable(f, `covering ${f.s.label} tests (${f.s.files.join(', ')}) could not run: sandbox cannot resolve ${unresolved} (present on the host, missing in the review sandbox), so the failure says nothing about the diff`);
+```
+
+Problem:
+The loop over `failedSuites` calls `sandboxUnresolvedDependency` synchronously for each suite, potentially multiple times for the same dependency. Since this is a blocking I/O operation, each call halts the Node.js event loop until completion — causing delays in HTTP responses, timers, and UI updates. If 10 suites share the same missing dependency, 10 blocking calls may queue up, amplifying the delay. The scanner correctly flags this as a performance hazard.
+
+Solution:
+Memoize the result of `sandboxUnresolvedDependency` using a `Map` keyed by the `missing` dependency string. Before each call, check if the result is already cached. If not, compute and cache it. This ensures each unique dependency is resolved only once, eliminating redundant blocking I/O and keeping the loop non-blocking.
+
+Benefits:
+With memoization, the scanner’s performance cost is reduced from O(n) blocking I/O operations (where n is the number of failed suites) to O(k) where k is the number of unique missing dependencies. This prevents event loop stall and improves responsiveness, especially under high failure load. The behavior remains identical — only redundant I/O is eliminated.
