@@ -632,3 +632,29 @@ test('applyAdhocDiff copies a valid prerequisiteHubs from a proposal onto that p
   assert.deepEqual(by('Piece two').prerequisiteHubs, ['HUB0006']);
   assert.equal(by('Piece three').prerequisiteHubs, undefined);
 });
+
+test('applyAdhocDiff writes a proposal\'s files as a Files: line exactly once, never over an existing one, and a docs-only piece then passes the substance gate', () => {
+  const { adhocDiffSubstanceProblem } = require('./adhoc-diff-sanity.js');
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const codeish = 'Combine job types into expandable rows in python/dashboard/templates/index.html -- renderJobListTab(). Document the change.';
+  const task = {
+    id: 'apply-test-files-1', rawDiff: '', implementResponse: 'Split.', adhocResolution: 'decompose',
+    subTaskProposals: [
+      { title: 'Docs piece', rawText: codeish, files: ['README.md', 'VERIFY.md'] },
+      { title: 'Has own line', rawText: `${codeish}\nFiles: docs/x.md`, files: ['README.md'] },
+      { title: 'No files', rawText: codeish },
+    ],
+  };
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  const by = (t) => queued.find((q) => plain(q.title) === t);
+  const docsDiff = 'diff --git a/README.md b/README.md\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/README.md\n@@ -0,0 +1 @@\n+content\n';
+  assert.equal((by('Docs piece').promptContext.rawText.match(/^Files:/gim) || []).length, 1);
+  assert.match(by('Docs piece').promptContext.rawText, /\nFiles: README\.md, VERIFY\.md$/);
+  assert.equal((by('Has own line').promptContext.rawText.match(/^Files:/gim) || []).length, 1);
+  assert.match(by('Has own line').promptContext.rawText, /Files: docs\/x\.md$/);
+  assert.equal(by('No files').promptContext.rawText, codeish);
+  assert.equal(adhocDiffSubstanceProblem(by('Docs piece'), docsDiff), null, 'declared docs files: not docs-only');
+  assert.equal(adhocDiffSubstanceProblem(by('No files'), docsDiff).code, 'docs-only', 'without the line the keyword scan still flags it');
+});

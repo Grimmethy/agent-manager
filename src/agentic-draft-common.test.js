@@ -1292,3 +1292,10 @@ test('parseSubTaskProposals keeps a valid prerequisiteHubs array and drops an in
   assert.deepEqual(out[0].prerequisiteHubs, ['HUB0006']);
   assert.equal(out[1].prerequisiteHubs, undefined);
 });
+
+test('parseSubTaskProposals keeps a valid files array and drops an unusable one; the review rendering shows it', () => {
+  const out = parseSubTaskProposals('[{"title":"a","rawText":"x","files":["README.md"," src/a.js "]},{"title":"b","rawText":"y","files":["two words"]}]');
+  assert.deepEqual(out[0].files, ['README.md', 'src/a.js']);
+  assert.equal(out[1].files, undefined);
+  assert.match(formatSubTaskProposalsForReview(out), /1\. a\n   x\n   Files: README\.md, src\/a\.js\n2\. b\n   y$/);
+});

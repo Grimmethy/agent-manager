@@ -24,6 +24,7 @@ const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adh
 const { checkLeftoverReferences, makeGrepBase } = require('./lib/leftover-references.js');
 const { writeSideFindingInbox } = require('./side-finding.js');
 const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
+const { validProposalFiles } = require('./proposal-files.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -216,6 +217,8 @@ function parseSubTaskProposals(text) {
       if (Number.isInteger(t.after) && t.after >= 0) out.after = t.after;
       const prereq = validPrerequisiteHubs(t.prerequisiteHubs);
       if (prereq) out.prerequisiteHubs = prereq;
+      const files = validProposalFiles(t.files);
+      if (files) out.files = files;
       return out;
     });
   return cleaned.length ? cleaned : null;
@@ -240,7 +243,8 @@ function formatSubTaskProposalsForReview(subTasks) {
   return subTasks
     .map((t, i) => {
       const dep = Number.isInteger(t.after) ? ` (after piece ${t.after + 1})` : '';
-      return `${i + 1}. ${t.title}${dep}\n   ${t.rawText}`;
+      const files = Array.isArray(t.files) && t.files.length ? `\n   Files: ${t.files.join(', ')}` : '';
+      return `${i + 1}. ${t.title}${dep}\n   ${t.rawText}${files}`;
     })
     .join('\n');
 }
