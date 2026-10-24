@@ -449,6 +449,70 @@ function checkUnpinnedHunks({ worktreeDir, rawDiff, suites, run, d, deadline, py
   return res;
 }
 
+// --- not reproduced (2026-10-24, discard analysis) ----------------------------------------------------------------------------------------------------
+// Passing covering tests prove the tests pass, not that the defect exists: two 2026-10-24 brain-dump 'fixes' (a guard against an undefined use.type that classifyUse
+// already prevented; a checkReady throw-vs-return change when the CLI already refused to start) were approved with their new tests green and their production hunks
+// unpinned. The strongest evidence that a defect is real is that the tests the diff ADDS fail on the base without the production change. This reverts ALL the
+// non-test hunks together (the unpinned check reverts one at a time), re-runs only the test files the diff touches, and reports { ran, failedOnBase }.
+// Only meaningful for a change to EXISTING code: a diff that adds a new production file, adds no test, or has no production change reports { ran: false, reason }.
+// A timeout, a run that could not start, or a reverted file that no longer parses is also ran:false -- 'not reproduced' is never concluded from a skipped run.
+// Returns null when the production changes could not be put back (the caller must drop the result and anything run after it). Advisory data only.
+const REPRO_MIN_REMAINING_MS = 20000;
+
+function splitDiffFiles(diff) {
+  const out = [];
+  for (const chunk of String(diff || '').split(/^(?=diff --git )/m)) {
+    const head = chunk.match(/^diff --git a\/(\S+) b\/(\S+)/);
+    if (!head) continue;
+    out.push({ file: head[2], text: chunk.endsWith('\n') ? chunk : `${chunk}\n`, isNew: /^new file mode/m.test(chunk), isDeleted: /^deleted file mode/m.test(chunk) });
+  }
+  return out;
+}
+
+function checkFailsOnBase({ worktreeDir, rawDiff, suites, run, d, deadline, py, repoRoot }) {
+  const skip = (reason) => ({ ran: false, reason });
+  const parts = splitDiffFiles(rawDiff);
+  const testParts = parts.filter((p) => isTestFile(p.file));
+  const prodParts = parts.filter((p) => !isTestFile(p.file));
+  if (!testParts.length) return skip('the diff adds no test');
+  if (!prodParts.length) return skip('the diff has no production change');
+  if (prodParts.some((p) => p.isNew)) return skip('the diff adds a new production file, so a failure on the base is expected and says nothing');
+  if (!testParts.some((p) => p.isNew || addedTestNames(rawDiff, p.file).length)) return skip('the diff adds no new test');
+  const touched = new Set(testParts.map((p) => p.file));
+  const runnable = (suites || []).map((s) => ({ s, files: s.files.filter((f) => touched.has(f)) })).filter((x) => x.files.length);
+  if (!runnable.length) return skip('no runner for the tests the diff touches');
+  if (deadline - Date.now() < REPRO_MIN_REMAINING_MS) return skip('not enough review budget left');
+  const prodPatch = prodParts.map((p) => p.text).join('');
+  const reverted = d.unapplyDiff(worktreeDir, prodPatch);
+  if (!reverted || !reverted.applied) return skip(`could not revert the production changes (${String((reverted && reverted.reason) || 'unknown').slice(0, 120)})`);
+  let result;
+  try {
+    const exec = (bin, args, timeoutMs, cwd) => run({ worktreeDir, bin, args, timeoutMs: Math.min(timeoutMs, deadline - Date.now()), pythonBin: py, mainRepoRoot: repoRoot, ...(cwd ? { cwd } : {}) });
+    // A revert that leaves a file unparseable fails every test trivially, which would read as "reproduced".
+    for (const p of prodParts) {
+      if (p.isDeleted || !/\.(?:py|[cm]?js)$/.test(p.file)) continue;
+      const syn = p.file.endsWith('.py') ? exec('python', ['-m', 'py_compile', p.file], COMMAND_TIMEOUT_MS) : exec('node', ['--check', p.file], COMMAND_TIMEOUT_MS);
+      if (!syn || !syn.ran || syn.timedOut || syn.exitCode !== 0) { result = skip(`${p.file} does not parse with the production changes reverted`); break; }
+    }
+    if (!result) {
+      const ranFiles = []; const failures = []; let failedOnBase = false;
+      outer: for (const { s, files } of runnable) {
+        for (const file of files) {
+          const r = exec(s.bin, s.buildArgs([file]), TEST_TIMEOUT_MS, s.cwd);
+          if (!r || !r.ran || r.timedOut) { result = skip('a test run on the reverted tree could not finish'); break outer; }
+          ranFiles.push(file);
+          if (r.exitCode !== 0) { failedOnBase = true; failures.push(...s.parse(r.output)); }
+        }
+      }
+      if (!result) result = { ran: true, failedOnBase, tests: ranFiles.slice(0, 8), failures: failures.slice(0, 5).map((f) => String(f).slice(0, 160)) };
+    }
+  } finally {
+    const back = d.applyDiff(worktreeDir, prodPatch);
+    if (!back || !back.applied) return null;
+  }
+  return result;
+}
+
 // Two evidence tiers for the covering tests. PRIMARY = the test files the diff itself changes plus the co-located test of each changed
 // source file (foo.js -> foo.test.js, foo.py -> test_foo.py): they gate the verdict. DEPENDENTS = every other test that merely imports a
 // changed module (scoped-test-runner's reverse dependents): a module many tests import has a large, legitimate covering set, and one slow
@@ -543,7 +607,7 @@ function checkChangedFilesSyntax({ worktreeDir, files, rawDiff, run, py, repoRoo
   return out;
 }
 
-function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, deps = {} }) {
+function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBranch, pythonBin, budgetMs = TOTAL_BUDGET_MS, checkUnpinned = false, pipelineDir = null, checkReplay = false, checkRepro = false, deps = {} }) {
   const d = {
     prepare: prepareAdhocWorktree, applyDiff: applyPartialDiff, unapplyDiff: unapplyPartialDiff, cleanup: cleanupAdhocWorktree, run: runSandboxed,
     relink: relinkExternalDependencies, provision: copyPackageNodeModules, resolvePy: resolvePython, findTests: findTestsWithSymbolFallback, replay: (args) => require('./gate-replay.js').replayGates(args), ...deps,
@@ -803,6 +867,13 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
         if (unpinned && unpinned.total > 0) result.unpinned = unpinned;
       } catch { /* advisory: a failure here must never disturb the settled verdict */ }
     }
+    // Last, because it reverts and restores the production hunks of the whole diff: nothing else runs on the tree after it.
+    if (checkRepro && result.tests && result.tests.passed === true && suites.length) {
+      try {
+        const repro = checkFailsOnBase({ worktreeDir, rawDiff, suites, run: d.run, d, deadline, py, repoRoot });
+        if (repro) result.repro = repro;
+      } catch { /* advisory */ }
+    }
     return result;
   } catch (e) {
     return inconclusive(`verification errored (${String((e && e.message) || e).slice(0, 200)})`);
@@ -815,4 +886,5 @@ module.exports = {
   pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
+  checkFailsOnBase, splitDiffFiles,
 };

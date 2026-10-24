@@ -127,6 +127,7 @@ about," verified to still exist as of this writing.
 - `src/local-tool-client.js` — the context-budget audit log and the multi-turn tool-calling path.
 - `src/prompts.js` — prompt construction, including `decomposeMoveDirective`/`brainDumpDirective`.
 - `src/review-task.js` — majority-vote review, including the deterministic auto-approve gate for a verified mechanical move.
+- `src/review-repro.js` + `checkFailsOnBase` in `src/review-verify.js` — the review step's 'not reproduced' check (2026-10-24, discard analysis): for a brain-dump-derived adhoc task that is not a hub slice, after executed verification PASSES, the production (non-test) hunks of the diff are all reverted together and the test files the diff touches re-run; `result.repro = {ran, failedOnBase, tests, failures}` (not run when the diff adds no test, adds a new production file, or a run cannot finish). Recorded on `task.executedVerification.repro`, one `advisory` history line, a voter-prompt section. `AGENT_MANAGER_REVIEW_REPRO_CHECK`: `false` off, `block` = deterministic block when the new tests still PASS on the base, default advisory. No terminal disposition yet: collect data against chat/manual branch verdicts first.
 - `src/reject-retry-check.js` — forbidden-path re-admission after a gate bug (not the model) blocks a task.
 - `src/needs-clarification-triage.js` — the D/E/F/G buckets that churn stuck design-decision tasks.
 
