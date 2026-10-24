@@ -700,10 +700,27 @@ function fieldsOnlyInAddedTestFiles(text) {
   return new Set([...inTestStrings].filter((f) => !elsewhere.has(f)));
 }
 
+// 2026-10-24 (chat plugin HUB0003-05, vendoring dockview-core): the body of a THIRD-PARTY file the draft vendors into the repo is not the draft's claim
+// about anything -- a 540 KB minified library carries hundreds of constants and URLs (ENABLE_TRACKING, http://www.w3.org/2000/svg, ...) that no task text or
+// repo grounding can contain, and the review was hard-blocked 'ungrounded-field' / 'ungrounded-url' before any vote, with no way to pass a legitimate
+// vendoring. Drops every diff section whose file is vendored (a vendor/, vendored/, third_party/ or node_modules/ directory, or a .min.js / .min.css
+// file) from what is scanned. Narrow: only the vendored file's own section is dropped; prose, the README that records the source, and every
+// non-vendored file in the same diff are still scanned (a fabricated value in a README still flags).
+const VENDORED_FILE_RE = /(?:^|\/)(?:vendor|vendored|third_party|node_modules)\/|\.min\.(?:js|css)$/;
+
+function stripVendoredDiffSections(text) {
+  let skipping = false;
+  return String(text || '').split('\n').map((line) => {
+    const m = line.match(/^diff --git a\/\S+ b\/(\S+)/);
+    if (m) skipping = VENDORED_FILE_RE.test(m[1]);
+    return skipping ? '' : line;
+  }).join('\n');
+}
+
 function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   if (!sourceText) return [];
   const flags = [];
-  const scannableText = stripUnchangedDiffLines(draftText);
+  const scannableText = stripUnchangedDiffLines(stripVendoredDiffSections(draftText));
   const testFixtureUrls = urlsOnlyInAddedTestFiles(draftText);
   const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
   const envReads = extractEnvReadIdentifiers(draftText);
@@ -1077,6 +1094,7 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
 }
 
 module.exports = {
+  stripVendoredDiffSections,
   urlsOnlyInAddedTestFiles,
   extractEnvReadIdentifiers,
   fieldsOnlyInAddedTestFiles,
