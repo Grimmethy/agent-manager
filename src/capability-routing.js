@@ -103,6 +103,8 @@ function decideReservation({ source, thisLane, lanes, rows, ageMs, cfg, isAlive,
 function laneAliveFromHeartbeat(instancesDir, laneId, now = Date.now()) {
   try {
     const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, `${laneId}.json`), 'utf8'));
+    // A lane the operator switched off (src/worker-switch.js) heartbeats status disabled: it is up but will claim nothing, so it is never a place a task can go.
+    if (hb.status === 'disabled') return false;
     const age = now - Date.parse(hb.lastHeartbeat);
     if (!(Number.isFinite(age) && age >= 0 && age <= HEARTBEAT_FRESH_MS)) return false;
     return !laneDegraded(instancesDir, laneId, { now });

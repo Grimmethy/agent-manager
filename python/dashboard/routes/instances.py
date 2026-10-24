@@ -86,8 +86,40 @@ def api_instances():
             if key not in hub_indexes:
                 hub_indexes[key] = _hub_label_index(task_qdir)
             r["hub"] = get_hub_data_provider().hub_info_for_task(r["currentTaskId"], index=hub_indexes[key], qdir=task_qdir)
+    # Operator on/off switch (src/worker-switch.js): worker lanes carry `switchable` and `disabled` so the Workers tab can draw the toggle. A switched-off worker
+    # that is still finishing a task shows status working with disabled true ("turning off after this task"); once idle its heartbeat status is disabled.
+    from worker_switch import disabled_workers, is_switchable
+    off = disabled_workers()
+    for r in results:
+        if is_switchable(r.get("instanceId")):
+            r["switchable"] = True
+            r["disabled"] = r["instanceId"] in off
     results.sort(key=lambda r: r.get("instanceId") or "")
     return jsonify(results)
+
+
+@instances_bp.route("/api/instances/<instance_id>/enabled", methods=["POST"])
+def api_instance_set_enabled(instance_id):
+    """Operator switch for one worker lane (Workers tab toggle): body {"enabled": true|false}. Off means the worker keeps running but claims, resumes and
+    borrows nothing from its next tick (a task already in flight finishes first); on undoes it. Only worker lanes have a switch. Switching a worker OFF requires it
+    to be a defined lane (src/lanes.js), so a typo cannot leave a stray marker; switching ON is always allowed, which also clears a stale marker. This route never
+    touches the pipeline: it only writes or removes a marker file (src/worker-switch.js)."""
+    from app import worker_lane_ids
+    from worker_switch import disabled_workers, is_switchable, set_worker_enabled
+    body = request.get_json(silent=True) or {}
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        abort(400, description="body must be {\"enabled\": true|false}")
+    if not is_switchable(instance_id):
+        abort(400, description=f"'{instance_id}' is not a worker lane that can be switched")
+    if not enabled:
+        lanes = worker_lane_ids()
+        if lanes and instance_id not in lanes:
+            abort(404, description=f"'{instance_id}' is not a defined worker lane")
+    ok, error = set_worker_enabled(instance_id, enabled)
+    if not ok:
+        abort(500, description=error)
+    return jsonify({"instanceId": instance_id, "enabled": enabled, "disabled": instance_id in disabled_workers()})
 
 
 @instances_bp.route("/api/instances/<instance_id>/recent-tasks")
