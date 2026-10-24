@@ -318,7 +318,7 @@ async function renderWorkers(isPoll) {
   main.innerHTML = filterBar + (shown.length === 0
     ? '<div class="empty">No workers match this filter.</div>'
     : shown.map(inst => `
-    <div class="worker-card clickable" data-instance-id="${escapeAttr(inst.instanceId)}">
+    <div class="worker-card clickable${typeof workerCardOffClass === 'function' ? workerCardOffClass(inst) : ''}" data-instance-id="${escapeAttr(inst.instanceId)}">
       <div class="row">
         <span class="id">${inst.instanceId}</span>
         ${(() => {
@@ -408,6 +408,7 @@ async function renderWorkers(isPoll) {
           <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
           <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
+          ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst) : ''}
         </div>
       </div>
       <div class="meta">
@@ -433,6 +434,7 @@ async function renderWorkers(isPoll) {
   main.querySelectorAll('.worker-card[data-instance-id]').forEach((card) => {
     card.onclick = () => toggleWorkerExpand(card.dataset.instanceId);
   });
+  if (typeof wireWorkerSwitchButtons === 'function') wireWorkerSwitchButtons(main);
   const claudePauseToggle = main.querySelector('#claude-pause-toggle');
   if (claudePauseToggle) {
     claudePauseToggle.onchange = (e) => setClaudePaused(e.target.checked);

@@ -92,6 +92,7 @@
   .worker-model-select { margin-left: 10px; margin-right: auto; font-size: 12px; max-width: 220px; }
   .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
   .worker-card.clickable { cursor: pointer; }
+  .worker-card.worker-off { opacity: .65; }
   .recent-tasks-list { list-style: none; padding: 0; margin: 6px 0 0; }
   .recent-tasks-list li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-top: 1px solid var(--border); }
   .recent-tasks-list li:first-child { border-top: none; }
@@ -285,6 +286,7 @@
 <script src="/static/js/queue-tab.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
 <script src="/static/js/workers-tab.js"></script>
+<script src="/static/js/worker-switch-ui.js"></script>
 <script src="/static/js/cloud-spend-panel.js"></script>
 <script src="/static/js/sidebar-and-claude-panels.js"></script>
 <script src="{{ url_for('static', filename='js/analytics-and-discovery.js') }}"></script>
