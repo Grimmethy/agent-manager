@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { extractDiffCreateTargets, checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote } = require('./fact-checker.js');
+const { extractDiffCreateTargets, checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote, stripVendoredDiffSections } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
 // against a hash that genuinely exists, not just one that doesn't.
@@ -1063,4 +1063,42 @@ test('checkGroundedValues still flags the token when it is also on an added prod
   assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: '+  const x = 1;', prose: 'Mentions ONLY_IN_PROSE here.' })), ['ONLY_IN_PROSE']);
   assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: ' const CONTEXT_FIXTURE = 1;', prose: 'Uses CONTEXT_FIXTURE.' })), ['CONTEXT_FIXTURE']);
   assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: '-const REMOVED_FIXTURE = 1;', prose: 'Drops REMOVED_FIXTURE.' })), ['REMOVED_FIXTURE']);
+});
+
+// checkGroundedValues: vendored third-party files ----------------------------------------------------
+// 2026-10-24: vendoring dockview-core (a 540 KB minified library) was hard-blocked on hundreds of constants and URLs that belong to the library, not to
+// the draft. The vendored file's own section is not scanned; everything else in the same diff still is.
+
+const LIB_LINES = ['init(ENABLE_TRACKING, MEMORY_LEAK_WATCHER, "http://www.w3.org/2000/svg");'];
+
+test('a vendored library file\'s own constants and URLs are not flagged', () => {
+  for (const f of ['static/vendor/dockview.js', 'third_party/lib/x.js', 'node_modules/pkg/index.js', 'static/app.min.js', 'static/app.min.css', 'vendored/a.js']) {
+    assert.deepEqual(checkGroundedValues(diffOf([f, LIB_LINES]), SRC, null, null), [], f);
+  }
+});
+
+test('the same constants and URLs in a non-vendored file are still flagged', () => {
+  const flags = checkGroundedValues(diffOf(['static/app.js', LIB_LINES]), SRC, null, null).map((f) => f.detail).sort();
+  assert.deepEqual(flags, ['ENABLE_TRACKING', 'MEMORY_LEAK_WATCHER', 'http://www.w3.org/2000/svg']);
+  // a name that merely contains the word is not a vendor directory
+  assert.equal(checkGroundedValues(diffOf(['src/vendorize.js', LIB_LINES]), SRC, null, null).length, 3);
+  assert.equal(checkGroundedValues(diffOf(['src/vendor.js', LIB_LINES]), SRC, null, null).length, 3);
+  assert.equal(checkGroundedValues(diffOf(['src/myvendor/a.js', LIB_LINES]), SRC, null, null).length, 3, 'the directory name must be exactly vendor');
+  assert.equal(checkGroundedValues(diffOf(['src/app.min.json', LIB_LINES]), SRC, null, null).length, 3);
+});
+
+test('a vendored file does not hide a fabricated value in another file of the same diff, or in prose', () => {
+  const both = diffOf(['static/vendor/lib.js', LIB_LINES], ['README.md', ['Fetched from http://invented-host.test/x and uses FABRICATED_FIELD_X.']]);
+  assert.deepEqual(checkGroundedValues(both, SRC, null, null).map((f) => f.detail).sort(), ['FABRICATED_FIELD_X', 'http://invented-host.test/x']);
+  const prose = 'Cites http://made-up.test/a and MADE_UP_FIELD.\n\n=== DIFF ===\n' + diffOf(['static/vendor/lib.js', LIB_LINES]);
+  assert.deepEqual(checkGroundedValues(prose, SRC, null, null).map((f) => f.detail).sort(), ['MADE_UP_FIELD', 'http://made-up.test/a']);
+});
+
+test('stripVendoredDiffSections blanks only the vendored sections and keeps line positions', () => {
+  const d = diffOf(['a.js', ['one']], ['static/vendor/b.js', ['two', 'three']], ['c.js', ['four']]);
+  const out = stripVendoredDiffSections(d).split('\n');
+  assert.equal(out.length, d.split('\n').length);
+  assert.ok(out.join('\n').includes('+one') && out.join('\n').includes('+four'));
+  assert.ok(!out.join('\n').includes('+two') && !out.join('\n').includes('+three'));
+  assert.equal(stripVendoredDiffSections(undefined), '');
 });
