@@ -104,6 +104,18 @@ function resolveCommunityCoveragePath(repoRoot, pipelineDir) {
   return fallback;
 }
 
+// Generation tick observability (HUB0194): AGENT_MANAGER_GENERATION_TICK_WARN_MS is the
+// per-source duration (ms) beyond which a tick logs a "slow source" warning; the memo
+// pair lets a source that genuinely had nothing new to generate record a fingerprint
+// and skip re-generation for AGENT_MANAGER_GENERATION_MEMO_TTL_MS (default 10 min).
+// AGENT_MANAGER_GENERATION_MEMO defaults to ENABLED and is disabled only by the exact
+// string 'false', matching the 'default true, false disables' contract.
+// Resolved at require time (each worker tick is a fresh `node` process), also exposed
+// inside getConfig()'s return object for consumers that read the full config bundle.
+const AGENT_MANAGER_GENERATION_TICK_WARN_MS = Number(process.env.AGENT_MANAGER_GENERATION_TICK_WARN_MS) || 5000;
+const AGENT_MANAGER_GENERATION_MEMO = process.env.AGENT_MANAGER_GENERATION_MEMO !== 'false';
+const AGENT_MANAGER_GENERATION_MEMO_TTL_MS = Number(process.env.AGENT_MANAGER_GENERATION_MEMO_TTL_MS) || 600000;
+
 function getConfig() {
   const path = require('path');
   const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
@@ -445,6 +457,9 @@ function getConfig() {
     defaultDomain, taskSourceAllowlist, taskPriorityOverrides,
     approvalModeOverrides, defaultApprovalMode,
     taskTierOverrides,
+    AGENT_MANAGER_GENERATION_TICK_WARN_MS,
+    AGENT_MANAGER_GENERATION_MEMO,
+    AGENT_MANAGER_GENERATION_MEMO_TTL_MS,
   };
 }
 
@@ -478,4 +493,4 @@ function requireSecondBrainDir() {
   return d;
 }
 
-module.exports = { getConfig, ensureRegistered, resolveGraphPath, resolveCommunityCoveragePath, getSecondBrainDir, requireSecondBrainDir };
+module.exports = { getConfig, ensureRegistered, resolveGraphPath, resolveCommunityCoveragePath, getSecondBrainDir, requireSecondBrainDir, AGENT_MANAGER_GENERATION_TICK_WARN_MS, AGENT_MANAGER_GENERATION_MEMO, AGENT_MANAGER_GENERATION_MEMO_TTL_MS };
