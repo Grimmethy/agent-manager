@@ -363,3 +363,11 @@ test('requeueBlockedTask: a branch shared with a live sibling is KEPT -- no dele
   assert.doesNotMatch(remoteBranches(), /agent\/other-hub-branch/);
   assert.equal(lastRemoval(dir, 'agent/other-hub-branch').cause, 'superseded-by-requeue');
 });
+
+test('requeueBlockedTask: prerequisiteHubs is carried over a requeue', async () => {
+  const dir = makePipeline();
+  write(dir, 'blocked', { id: 't9', domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', prerequisiteHubs: ['HUB0006'] });
+  const result = await requeueBlockedTask(dir, dir, 't9', { state: 'blocked' });
+  assert.equal(result.ok, true);
+  assert.deepEqual(read(at(dir, 'pending', 't9.json')).prerequisiteHubs, ['HUB0006']);
+});

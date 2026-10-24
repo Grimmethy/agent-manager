@@ -105,6 +105,21 @@ class ArbiterCancelBelowArgsTest(unittest.TestCase):
         self.assertFalse(any("192.168" in str(a) or "p40" in str(a).lower() for a in seen["cmd"]), "never names the P40 endpoint")
 
 
+class ArbiterCancelBelowKeyTest(unittest.TestCase):
+    def test_a_key_replaces_local_on_the_arbiter_command_line(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        with mock.patch.object(app, "read_env_file", return_value={}), mock.patch.object(chat_preempt.subprocess, "run", side_effect=fake_run):
+            chat_preempt._arbiter_cancel_below("interactive", key="ollama-100.96.112.78-11434")
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[cmd.index("--key") + 1], "ollama-100.96.112.78-11434")
+        self.assertNotIn("--local", cmd)
+
+
 class PreemptPipelineTest(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -179,6 +194,32 @@ class PreemptPipelineTest(unittest.TestCase):
             summary = app._preempt_pipeline_for_chat()
             m.assert_called_once_with("interactive")
             self.assertIn({"lane": "draft", "action": "killed", "taskId": "t-w1", "ageSeconds": None}, summary)
+
+    # Chat on a chosen card (chat_card.py): the preempt follows the card the reply runs on.
+    HOST_CARD = {"lane": "worker-3090", "local": True, "lockKey": "ollama-localhost-11434", "blocked": False}
+    RX_CARD = {"lane": "worker-rx580", "local": False, "lockKey": "ollama-100.96.112.78-11434", "blocked": False}
+
+    def test_a_remote_card_cancels_only_that_cards_lane_by_its_key_and_spares_the_reviewer(self):
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[{"lane": "draft", "action": "killed"}]) as m:
+            rv = self._spawn()
+            self._hb("reviewer", status="working", pass_="vote", pid=rv.pid, task_id="t-rv")
+            self._task("reviewer", "t-rv", claimed_epoch=time.time() - 5)
+            summary = app._preempt_pipeline_for_chat(self.RX_CARD)
+            m.assert_called_once_with("interactive", key="ollama-100.96.112.78-11434")
+            self.assertEqual(summary, [{"lane": "draft", "action": "killed"}])
+            self.assertIsNone(rv.poll())
+
+    def test_the_host_card_takes_the_unchanged_host_path(self):
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[]) as m:
+            app._preempt_pipeline_for_chat(self.HOST_CARD)
+            m.assert_called_once_with("interactive")
+
+    def test_a_blocked_choice_or_a_remote_card_without_a_key_preempts_nothing(self):
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[{"x": 1}]) as m:
+            self.assertEqual(app._preempt_pipeline_for_chat({"lane": None, "blocked": True, "local": True}), [])
+            self.assertEqual(app._preempt_pipeline_for_chat({**self.RX_CARD, "blocked": True}), [])
+            self.assertEqual(app._preempt_pipeline_for_chat({"lane": "worker-rx580", "local": False, "blocked": False}), [])
+            m.assert_not_called()
 
     def test_reviewer_still_uses_the_legacy_age_gated_kill(self):
         with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[]):

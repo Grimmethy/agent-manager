@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const { planNodeModules, sandboxHasToolchain, copyNodeModules, dropToolchainCriteria, filterCriteriaForSandbox, externalDependencyLinks, codeBindPaths } = require('./draft-sandbox.js');
+const { planNodeModules, sandboxHasToolchain, copyNodeModules, copyPythonVenv, dropToolchainCriteria, filterCriteriaForSandbox, externalDependencyLinks, codeBindPaths } = require('./draft-sandbox.js');
 const { prepareAdhocWorktree, cleanupAdhocWorktree } = require('../agentic-draft-common.js');
 
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
@@ -259,3 +259,63 @@ test('codeBindPaths: an allowlisted entry that is a symlink OUT of the target is
     assert2.equal(fs2.existsSync(path2.join(wt, 'app', 'web', 'node_modules')), false);
   });
 }
+
+
+// --- copyPythonVenv (2026-10-23, chat plugin HUB0008-03) ------------------------------------------------------------------------------------
+// A Python repo's draft could not import flask in the sandbox (no .venv in a tracked-files-only worktree) and reported tests it had not really run.
+// A REAL venv (python3 -m venv --without-pip) with a module planted in its site-packages, so the test proves the COPY imports it from the worktree.
+
+function makePythonProject({ ignored = true, venv = true } = {}) {
+  const bare = tmp('sbx-py-origin-'); const repo = tmp('sbx-py-repo-');
+  git(['init', '--bare', '-b', 'main', bare]); git(['clone', bare, repo]);
+  git(['config', 'user.email', 't@example.com'], repo); git(['config', 'user.name', 'T'], repo);
+  fs.writeFileSync(path.join(repo, 'app.py'), 'x = 1\n');
+  if (ignored) fs.writeFileSync(path.join(repo, '.gitignore'), '.venv/\n');
+  git(['add', '.'], repo); git(['commit', '-m', 'init'], repo); git(['push', 'origin', 'main'], repo);
+  if (venv) {
+    execFileSync('python3', ['-m', 'venv', '--without-pip', path.join(repo, '.venv')], { stdio: 'pipe' });
+    const sp = execFileSync(path.join(repo, '.venv', 'bin', 'python'), ['-c', 'import sysconfig;print(sysconfig.get_paths()["purelib"])'], { encoding: 'utf8' }).trim();
+    fs.mkdirSync(sp, { recursive: true });
+    fs.writeFileSync(path.join(sp, 'flask_stand_in.py'), 'MARK = "from-the-venv"\n');
+  }
+  return repo;
+}
+const worktreeOf = (repo) => { const wt = path.join(tmp('sbx-py-wt-'), 'wt'); git(['worktree', 'add', wt, '-b', `b-${path.basename(wt)}-${Date.now()}`, 'origin/main'], repo); return wt; };
+
+test('copyPythonVenv: the worktree gets a private venv whose python imports the repo\'s installed packages', () => {
+  const repo = makePythonProject(); const wt = worktreeOf(repo);
+  assert.equal(fs.existsSync(path.join(wt, '.venv')), false, 'a fresh worktree has no venv (gitignored, untracked)');
+  const r = copyPythonVenv(repo, wt);
+  assert.equal(r.copied, true, JSON.stringify(r));
+  const out = execFileSync(path.join(wt, '.venv', 'bin', 'python'), ['-c', 'import flask_stand_in;print(flask_stand_in.MARK)'], { encoding: 'utf8', cwd: wt }).trim();
+  assert.equal(out, 'from-the-venv');
+  const where = execFileSync(path.join(wt, '.venv', 'bin', 'python'), ['-c', 'import flask_stand_in;print(flask_stand_in.__file__)'], { encoding: 'utf8', cwd: wt }).trim();
+  assert.ok(where.startsWith(fs.realpathSync(wt)) || where.startsWith(wt), `the import comes from the COPY, not the shared venv: ${where}`);
+  assert.equal(fs.lstatSync(path.join(wt, '.venv')).isSymbolicLink(), false, 'a private copy, not a link into the shared venv');
+  fs.writeFileSync(path.join(wt, '.venv', 'stray.txt'), 'a stray pip install would write here');
+  assert.equal(fs.existsSync(path.join(repo, '.venv', 'stray.txt')), false, 'nothing written in the sandbox reaches the shared venv');
+  assert.equal(copyPythonVenv(repo, wt).already, true, 'a second call is a no-op');
+});
+
+test('copyPythonVenv: not copied when the repo does not ignore .venv, has none, is over the cap, or it is switched off', () => {
+  const notIgnored = makePythonProject({ ignored: false });
+  assert.match(copyPythonVenv(notIgnored, worktreeOf(notIgnored)).reason, /not gitignored/);
+  const none = makePythonProject({ venv: false });
+  assert.match(copyPythonVenv(none, worktreeOf(none)).reason, /no \.venv/);
+  const big = makePythonProject();
+  const huge = path.join(big, '.venv', 'blob.bin'); fs.writeFileSync(huge, Buffer.alloc(3 * 1024 * 1024));
+  const capped = copyPythonVenv(big, worktreeOf(big), { env: { ...process.env, AGENT_MANAGER_DRAFT_NODE_MODULES_MAX_MB: '1' } });
+  assert.equal(capped.copied, false); assert.match(capped.reason, /cap 1 MB/);
+  const off = makePythonProject();
+  assert.match(copyPythonVenv(off, worktreeOf(off), { env: { ...process.env, AGENT_MANAGER_DRAFT_VENV: 'false' } }).reason, /AGENT_MANAGER_DRAFT_VENV=false/);
+});
+
+test('prepareAdhocWorktree gives a Python repo\'s worktree its venv (and a repo without one is unaffected)', () => {
+  const repo = makePythonProject(); const wt = path.join(tmp('sbx-py-prep-'), 'wt');
+  const prep = prepareAdhocWorktree(repo, 'main', wt, `adhoc-py-${Date.now()}`);
+  assert.equal(prep.ok, true);
+  assert.ok(fs.existsSync(path.join(wt, '.venv', 'bin', 'python')), 'the venv is there when the draft starts');
+  const plain = makeProject({ installed: false }); const wt2 = path.join(tmp('sbx-js-prep-'), 'wt');
+  assert.equal(prepareAdhocWorktree(plain, 'main', wt2, `adhoc-js-${Date.now()}`).ok, true);
+  assert.equal(fs.existsSync(path.join(wt2, '.venv')), false);
+});

@@ -108,6 +108,36 @@ function siblingRepoWasUnreachable(task, roots) {
   } catch { return false; }
 }
 
+// The lane endpoint a task's recorded failure names ("Ollama endpoint http://host:11434 is not reachable (...)" / "... did not answer within 5000ms"), or null.
+const ENDPOINT_FAILURE_RE = /Ollama endpoint (https?:\/\/[^\s"')]+) (?:is not reachable|did not answer within)/;
+
+// Does that endpoint answer HTTP right now? The REAL check, re-run when the sweep looks at a parked task: any status code counts (as scripts/agent-manager-common.sh
+// ollama_endpoint_reachable), refused / timed out / unreachable does not. Cached per URL for 60 s so a sweep over many parked tasks probes each endpoint once.
+// _setEndpointProbe lets tests replace it; it never throws (fail-closed: unknown = not answering = leave the task parked).
+const defaultEndpointProbe = (url) => {
+  try {
+    const r = require('child_process').spawnSync('curl', ['-s', '-m', '3', '-o', '/dev/null', '-w', '%{http_code}', `${url.replace(/\/+$/, '')}/api/version`], { encoding: 'utf8', timeout: 6000 });
+    const code = String(r.stdout || '').trim();
+    return r.status === 0 && code !== '' && code !== '000';
+  } catch { return false; }
+};
+let endpointProbe = defaultEndpointProbe;
+const endpointCache = new Map();
+function endpointAnswersNow(url) {
+  const hit = endpointCache.get(url);
+  if (hit && Date.now() - hit.at < 60000) return hit.ok;
+  const ok = !!endpointProbe(url);
+  endpointCache.set(url, { at: Date.now(), ok });
+  return ok;
+}
+function _setEndpointProbe(fn) { endpointProbe = fn || defaultEndpointProbe; endpointCache.clear(); }
+
+// A task parked because its lane's Ollama endpoint was down (the 2026-10-23 grimm reset parked six) AND that endpoint answers again.
+function parkedOnEndpointOutageAndEndpointBack(task) {
+  const m = ENDPOINT_FAILURE_RE.exec(failureText(task));
+  return !!m && endpointAnswersNow(m[1]);
+}
+
 const KNOWN_FIXED = [
   {
     id: 'wrong-block-whole-function-snippet',
@@ -245,6 +275,16 @@ const KNOWN_FIXED = [
       return names.every((n) => fixtures.has(n));
     },
   },
+  {
+    // 2026-10-23 (Grimmethy: the rx580 lane sat idle 12 h after grimm hard-reset; "this is a recurring event"): with the lane's Ollama endpoint down, every draft failed
+    // identically, burned the infra requeue rounds and parked the task in blocked/. scripts/local-worker.sh now claims nothing while its endpoint is down (the circuit
+    // breaker), so this cannot happen again; this requeues, once, the tasks parked before it existed, and only when the endpoint they name answers now.
+    id: 'lane-endpoint-outage-parked',
+    fixedIn: 'agent-manager (worker endpoint circuit breaker, 2026-10-23)',
+    description: 'a draft that failed only because the lane\'s Ollama endpoint was unreachable or silent (host reset, service down) parked the task after its retry rounds; the endpoint answers again',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: parkedOnEndpointOutageAndEndpointBack,
+  },
 ];
 
-module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable };
+module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable, _setEndpointProbe };

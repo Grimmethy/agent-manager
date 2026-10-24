@@ -104,3 +104,20 @@ test('runDueProbes: a leased card is not probed (a probe would reload the model 
   assert.deepEqual(out.map((r) => r.lane), ['worker-rx580']);
   assert.equal(fs.existsSync(path.join(dir, 'lane-health.worker-p40.json')), false, 'no probe state was written for the leased lane');
 });
+
+test('runDueProbes: a cloud lane is never probed (no tokens/s to judge, and each probe would be a billed call); GPU lanes still are', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-health-cloud-'));
+  const now = Date.now();
+  const hb = (id) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ status: 'idle', lastHeartbeat: new Date(now).toISOString() }));
+  hb('worker-cloud'); hb('worker-rx580');
+  const lanes = [
+    { id: 'worker-cloud', cloud: true, provider: 'cloud', model: 'claude-haiku-5-5', env: { OLLAMA_URL: 'http://127.0.0.1:7450' } },
+    { id: 'worker-rx580', model: 'small:8b', env: { OLLAMA_URL: 'http://g:11434' } },
+  ];
+  const probed = [];
+  const probe = async (a) => { probed.push(a.url); return { ok: true, tps: 20, totalMs: 500, error: null }; };
+  const out = await H.runDueProbes({ lanes, instancesDir: dir, pipelineDir: dir, env: {}, now, probe });
+  assert.deepEqual(probed, ['http://g:11434']);
+  assert.deepEqual(out.map((r) => r.lane), ['worker-rx580']);
+  assert.equal(H.laneDegraded(dir, 'worker-cloud'), false, 'a cloud lane with no samples is never degraded');
+});

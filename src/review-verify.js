@@ -392,6 +392,19 @@ function parseModifiedHunks(diff) {
   return out;
 }
 
+// The `python -m unittest` arguments for the covering Python test files. A file is named by its dotted module path (python/dashboard/test_x.py ->
+// python.dashboard.test_x), EXCEPT under a top-level `test/` directory: Python's own standard-library package `test` shadows it, so `test.test_x`
+// fails with ModuleNotFoundError and a correct change is blocked with zero model calls spent (JournalForge, SparForge, CutForge, VoiceForge, VideoForge
+// and CharacterForge all keep their tests there). Such a file runs by discovery from its own directory instead. The suites run one file per process,
+// so discovery is used only for a single-file list; a longer list keeps the dotted form.
+function pythonTestArgs(files) {
+  const list = files || [];
+  if (list.length === 1 && /^test\//.test(list[0])) {
+    return ['-m', 'unittest', 'discover', '-s', path.posix.dirname(list[0]), '-p', path.posix.basename(list[0])];
+  }
+  return ['-m', 'unittest', ...list.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'))];
+}
+
 // A hunk whose changed lines are all blank, comments, imports/requires or module.exports lines cannot change behavior a test could observe.
 function isTrivialHunk(changed) {
   return (changed || []).every((line) => {
@@ -587,7 +600,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
     const suites = [];
     const depSuites = [];
     const jsArgs = (files) => ['--test', ...files];
-    const pyArgs = (files) => ['-m', 'unittest', ...files.map((f) => f.replace(/\.py$/, '').replace(/\//g, '.'))];
+    const pyArgs = pythonTestArgs;
     // JS test files go to the runner their own package uses (lib/js-test-runner.js): node:test for plain .js, vitest for a package that declares it (.tsx!), and a
     // stated 'no runner' skip otherwise -- node cannot execute a .tsx, so running it anyway only ever produced a spurious failure.
     const jsPlan = partitionJsTests(worktreeDir, affected.js);
@@ -799,7 +812,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 }
 
 module.exports = {
-  checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
+  pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
   verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
 };

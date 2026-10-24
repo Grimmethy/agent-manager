@@ -18,7 +18,7 @@ const { appendHistoryEvent } = require('./task-history.js');
 const { KNOWN_FIXED } = require('./known-fixed-failures.js');
 
 const STATE_FILE = 'fix-signature-state.json';
-const COORDINATION_FIELDS = ['stacked', 'dependsOn', 'softDependsOn', 'atomic', 'noDecompose', 'parentHub', 'premiumPriority', 'hubPriority', 'humanQueued'];
+const COORDINATION_FIELDS = ['stacked', 'dependsOn', 'prerequisiteHubs', 'softDependsOn', 'atomic', 'noDecompose', 'parentHub', 'premiumPriority', 'hubPriority', 'humanQueued'];
 
 function enabled() { return process.env.AGENT_MANAGER_FIX_SIGNATURE_SWEEP !== 'false'; }
 

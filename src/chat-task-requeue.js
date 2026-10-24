@@ -331,7 +331,7 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
   // Coordination fields -- never part of the drafting/review/apply history this reset
   // clears, always carried over verbatim when present (see task.py's own docstring on
   // two real incidents this allowlist protects against).
-  for (const key of ['stacked', 'dependsOn', 'atomic', 'noDecompose']) {
+  for (const key of ['stacked', 'dependsOn', 'prerequisiteHubs', 'atomic', 'noDecompose']) {
     if (key in data) fresh[key] = data[key];
   }
 

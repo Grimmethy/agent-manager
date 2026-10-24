@@ -76,16 +76,25 @@ def api_task_set_premium_priority(task_id):
     pinnedWorker is still the right tool for "run THIS on THAT lane right now"; this is
     for "keep this at the front of the queue no matter which lane gets to it next."
 
+    Pass ?project=<repoRoot> (or "project" in the body) to flag a task in another registered
+    project's queue; the default is the active project.
+
     Works on a task wherever it currently sits (pending, blocked, needs-clarification,
     drafting, adhoc, ...) -- an operator flagging a task that's mid-retry-cycle (like the
     file-decompose move this feature was built for, which was cycling blocked <-> pending
     for hours) needs to be able to set this BEFORE it's back in pending/, not only once
     it happens to be there. Body: {"enabled": true|false}, defaults to true."""
-    from app import _find_live_task_file, queue_dir, read_json_safe
+    from app import _find_live_task_file, get_active_repo_root, queue_dir, read_json_safe
     body = request.get_json(silent=True) or {}
     enabled = bool(body.get("enabled", True))
 
-    qdir = queue_dir()
+    # Optional project (a registered repoRoot, query or body): look only in THAT project's queue. Absent = the active project, as before; unknown = 404, never a fallback.
+    import branch_projects
+    try:
+        scope = branch_projects.resolve_scope(request.args.get("project") or body.get("project"), get_active_repo_root())
+    except LookupError as e:
+        abort(404, description=str(e))
+    qdir = scope["qdir"] if scope else queue_dir()
     if not qdir:
         abort(404)
     target = _find_live_task_file(qdir, task_id)

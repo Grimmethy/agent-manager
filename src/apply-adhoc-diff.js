@@ -22,6 +22,9 @@ const { allocateHubSerial, formatHubLabel, memberId, memberTitle } = require('./
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
+const { ownerGateFor } = require('./owner-gates.js');
+const { validProposalFiles } = require('./proposal-files.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -198,6 +201,7 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
 
   const carriedDiff = parentTask && typeof parentTask.carriedPartialDiff === 'string' && parentTask.carriedPartialDiff.trim() ? parentTask.carriedPartialDiff : null;
   const queued = [];
+  const ownerGates = []; // pieces that wait on the owner (owner-gates.js)
   subTasks.forEach((sub, i) => {
     if (foldTargets.has(i)) return; // folded into a sibling's acceptanceCriteria instead of becoming its own no-diff-possible task
     const record = {
@@ -217,12 +221,20 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
       record.priorPartialDiff = carriedDiff;
       record.promptContext.rawText = `PRIOR WORK ALREADY APPLIED: an earlier pass of the parent task made some of this change. Those edits are applied to your worktree as uncommitted changes -- run git diff to see them, and do NOT redo them. Your job is the part below, on top of them.\n\n${sub.rawText}`;
     }
+    // The piece's declared scope as the gate-readable `Files:` line (proposal-files.js); never added when the text already has one.
+    const declared = validProposalFiles(sub.files);
+    if (declared && !/^Files:/im.test(record.promptContext.rawText)) record.promptContext.rawText += `\nFiles: ${declared.join(', ')}`;
     const extra = extraCriteria.get(i);
     if (extra && extra.length) record.acceptanceCriteria = extra;
     if (parentTask && parentTask.premiumPriority) record.premiumPriority = true;
+    const prereq = validPrerequisiteHubs(sub.prerequisiteHubs); // hubs whose MERGE this piece waits for (hub-prerequisites.js)
+    if (prereq) record.prerequisiteHubs = prereq;
     fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(record, null, 2) + '\n');
     queued.push({ id: ids[i], title: record.title });
+    const gate = ownerGateFor({ id: ids[i], title: record.title, rawText: record.promptContext.rawText });
+    if (gate) ownerGates.push(gate);
   });
+  queued.ownerGates = ownerGates;
   queued.hubSerial = hubSerial;
   queued.hubLabel = hubLabel;
   return queued;
@@ -254,6 +266,7 @@ function buildDecomposedPlan(task, pipelineDir) {
     subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
     hubSerial: queued.hubSerial,
     hubLabel: queued.hubLabel,
+    ownerGates: queued.ownerGates,
   };
 }
 

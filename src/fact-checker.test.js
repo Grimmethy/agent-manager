@@ -531,6 +531,22 @@ test('checkGroundedValues still flags a fabricated URL whose domain was never na
   assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'https://totally-invented-service.example-real-tld.com/api' }]);
 });
 
+// checkGroundedValues: dotted letter-octet placeholder host ------------------------------
+// 2026-10-22, live: a README example {"url": "http://100.x.y.z:7450"} beside a real grounded URL hard-blocked a
+// whole multi-chat draft as ungrounded-url.
+
+test('checkGroundedValues does not flag a dotted x.y.z placeholder host', () => {
+  const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
+  const draftText = 'e.g. http://100.96.112.78:7450 and http://100.x.y.z:7450 or http://x.x.x.x:7450';
+  assert.deepEqual(checkGroundedValues(draftText, sourceText), []);
+});
+
+test('checkGroundedValues still flags an invented numeric address next to a placeholder one', () => {
+  const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
+  const draftText = 'use http://100.x.y.z:7450 or http://10.231.4.9:7450';
+  assert.deepEqual(checkGroundedValues(draftText, sourceText), [{ type: 'ungrounded-url', detail: 'http://10.231.4.9:7450' }]);
+});
+
 // checkGroundedValues: real-but-elsewhere-in-the-repo exemption --------------------------
 // 2026-08-25, root-caused live via a real blocked adhoc task (a Hardware tab UI diff): the
 // draft's own comment correctly cited AGENT_MANAGER_MIN_FREE_VRAM_MB -- a real, pre-

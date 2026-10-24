@@ -81,6 +81,24 @@ get_claude_paused() {
   ' "$settings_path"
 }
 
+# gpu_broker_url -> prints the base URL of the service that answers POST /api/gpu/yield (no trailing slash). First non-empty wins:
+# AGENT_MANAGER_GPU_BROKER_URL, AGENT_MANAGER_PROMPTFORGE_URL, PROMPTFORGE_URL, then http://localhost:7430 (PromptForge's own default).
+# Shell twin of gpuBrokerUrl() in src/gpu-guard.js; scripts/gpu-broker-url.test.js pins that the two agree. Used by scripts/launch.sh.
+gpu_broker_url() {
+  local url="${AGENT_MANAGER_GPU_BROKER_URL:-${AGENT_MANAGER_PROMPTFORGE_URL:-${PROMPTFORGE_URL:-http://localhost:7430}}}"
+  printf '%s\n' "${url%/}"
+}
+
+# ollama_endpoint_reachable [endpoint_url] -> exit 0 if the Ollama endpoint answers HTTP at all within a few seconds (any status code), 1 if the
+# connection is refused, times out or the host is unreachable. A lane worker asks this once per tick (local-worker.sh) BEFORE it claims or resumes
+# anything: with the endpoint down every draft fails the same way, burns the task's retry rounds and parks it in blocked/ (2026-10-23: grimm hard-reset,
+# its Ollama stayed down for 12 h, 540 failed ticks, six tasks parked). Seconds: AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S (default 3).
+ollama_endpoint_reachable() {
+  local url="${1:-http://localhost:11434}" code
+  code="$(curl -s -m "${AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S:-3}" -o /dev/null -w '%{http_code}' "${url%/}/api/version" 2>/dev/null)" || true
+  [[ -n "$code" && "$code" != "000" ]]
+}
+
 # ComfyUI GPU lease (2026-08-30, Grimmethy: "If I run a generation, prompt forge should
 # set up the comfui if it's down" + "make sure the eviction only happens if there isn't
 # enough space to run both" + "It needs to go both ways"). PromptForge writes this file

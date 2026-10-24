@@ -37,6 +37,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { isCloudEndpoint } = require('./lanes.js');
 
 // ComfyUI GPU lease (2026-08-30). PromptForge writes this file only when starting
 // ComfyUI would collide with the resident local model on a single GPU. While it's held
@@ -99,7 +100,9 @@ function leaseCovers(lease, endpointUrl) {
 }
 
 // Is the GPU behind `endpointUrl` leased right now? Same freshness rules as comfyuiLeaseHeld; scoped leases hold only their own endpoints.
-function leaseHeldFor(endpointUrl, leasePath = COMFY_LEASE_PATH) {
+// A cloud lane's endpoint is not a GPU, so a Forge lease never holds it (it must keep working while a render owns the cards).
+function leaseHeldFor(endpointUrl, leasePath = COMFY_LEASE_PATH, env = process.env) {
+  if (isCloudEndpoint(endpointUrl, env)) return false;
   const lease = readFreshLease(leasePath);
   return lease !== null && leaseCovers(lease, endpointUrl);
 }
@@ -127,16 +130,24 @@ function forgePauseEnabled() { return process.env.AGENT_MANAGER_FORGE_PAUSE !== 
 
 // Forge family exclusion (2026-10-13, Grimmethy: "we cannot run the Agent Manager pipeline and Forge pipeline
 // at the same time ... starting up one process should stop the other and clear the GPU"). PromptForge is the
-// Forge family's GPU broker (promptforge Docs/GPU_FAMILY_PROTOCOL.md): while a Forge session holds the
+// Forge family's GPU broker (agent-manager-gpu-broker Docs/GPU_FAMILY_PROTOCOL.md): while a Forge session holds the
 // comfyui-lease the pipeline yields (above). The other direction is here: with NO lease, a ComfyUI that is
 // still up is the Forge family holding VRAM + RAM the pipeline is about to need, so ask PromptForge to end its
 // session and stop ComfyUI. PromptForge refuses while a Forge job is actually running; if PromptForge is down
 // we do nothing here and the existing starved -> /free path below still applies. Opt-in via the `forgeYield`
 // parameter (the CLI passes it; unit tests do not, so they never touch the live PromptForge).
-const PROMPTFORGE_URL = (process.env.AGENT_MANAGER_PROMPTFORGE_URL || process.env.PROMPTFORGE_URL || 'http://localhost:7430').replace(/\/$/, '');
+//
+// The URL of the service that answers /api/gpu/yield is resolved HERE and nowhere else in JS (2026-10-22, GPU broker piece G3a), so pointing
+// core at a standalone GPU broker later is one environment variable. First set wins: AGENT_MANAGER_GPU_BROKER_URL, then
+// AGENT_MANAGER_PROMPTFORGE_URL, then PROMPTFORGE_URL, then PromptForge's own default. An empty value counts as unset (same as the shell twin,
+// gpu_broker_url in scripts/agent-manager-common.sh, which scripts/launch.sh uses; scripts/gpu-broker-url.test.js pins that they agree).
+// Read per call so a test (or a restarted daemon) sees the current environment.
+function gpuBrokerUrl(env = process.env) {
+  return (env.AGENT_MANAGER_GPU_BROKER_URL || env.AGENT_MANAGER_PROMPTFORGE_URL || env.PROMPTFORGE_URL || 'http://localhost:7430').replace(/\/$/, '');
+}
 
 // Returns { acted, note }. Never throws.
-async function yieldForgeToPipeline({ comfyUrl = COMFY_URL, promptforgeUrl = PROMPTFORGE_URL, fetchJsonFn = fetchJson } = {}) {
+async function yieldForgeToPipeline({ comfyUrl = COMFY_URL, promptforgeUrl = gpuBrokerUrl(), fetchJsonFn = fetchJson } = {}) {
   try {
     const up = await fetchJsonFn(`${comfyUrl}/system_stats`, {}, 2000);
     if (!up || !up.ok) return { acted: false, note: '' };            // ComfyUI is not running: nothing to clear
@@ -230,7 +241,12 @@ async function ensureGpuHeadroomCore({
   readFreeVram = readFreeVramMb,
   fetchJsonFn = fetchJson,
   leaseHeld = comfyuiLeaseHeld,
+  isCloud = isCloudEndpoint,
 } = {}) {
+  // A cloud lane's calls go to the cloud-providers gateway: there is no GPU to keep clear for it, and freeing ComfyUI or stopping an app would be pointless.
+  if (isCloud(ollamaUrl)) {
+    return { checked: false, freeMb: null, minFreeMb, starved: false, yielded: [], freed: [], note: 'cloud endpoint -- no GPU to guard' };
+  }
   // PromptForge holds the GPU for an image generation that wouldn't fit alongside the
   // resident local model. Don't touch ComfyUI or Ollama this tick -- the local-model
   // lanes are yielding too (see comfyui_lease_held in agent-manager-common.sh). An
@@ -323,7 +339,7 @@ async function ensureGpuHeadroom(opts = {}) {
   return result;
 }
 
-module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld, yieldForgeToPipeline, ForgePauseError, FORGE_PAUSE_MESSAGE, isForgePause, forgePauseEnabled, leaseHeldFor, leaseCovers, normalizeEndpoint };
+module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld, yieldForgeToPipeline, gpuBrokerUrl, ForgePauseError, FORGE_PAUSE_MESSAGE, isForgePause, forgePauseEnabled, leaseHeldFor, leaseCovers, normalizeEndpoint };
 
 if (require.main === module) {
   ensureGpuHeadroom({ forgeYield: yieldForgeToPipeline }).then((result) => {

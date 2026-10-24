@@ -2164,12 +2164,12 @@ test('executed verification: a verifier that throws never blocks and never break
   assert.equal(task.executedVerification, undefined);
 }));
 
-test('executed verification: the kill switch, a non-adhoc source, an unimplemented draft and a missing rawDiff each skip the verifier entirely', async () => {
+test('executed verification: the kill switch, an unimplemented draft and a missing rawDiff each skip the verifier entirely (HUB0184 2/4: a non-adhoc source WITH a diff now runs it)', async () => {
   const cases = [
     ['kill switch', { env: 'false', task: {} }],
-    ['not adhoc', { env: 'true', task: { domain: 'default', source: 'trouble_log' } }],
     ['not implemented', { env: 'true', task: { adhocResolution: 'needs-human-decision' } }],
     ['no rawDiff', { env: 'true', task: { rawDiff: '' } }],
+    ['non-adhoc source, no diff', { env: 'true', task: { domain: 'default', source: 'trouble_log', rawDiff: '' } }],
   ];
   for (const [label, { env, task: overrides }] of cases) {
     const { repoRoot, domainsPath } = makeFixture();
@@ -2181,6 +2181,52 @@ test('executed verification: the kill switch, a non-adhoc source, an unimplement
     } finally { process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false'; }
     assert.equal(calls.length, 0, `${label}: the verifier must not run`);
   }
+});
+
+test('executed verification: HUB0184 2/4 -- a non-adhoc source that carries a rawDiff runs the verifier, a failed covering test blocks before any vote, and the record carries the dashboard fields', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'ev-nonadhoc', source: 'trouble_log', adhocResolution: undefined });
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+    verifyDiffFn: (a) => {
+      assert.equal(a.rawDiff, task.rawDiff, 'the verifier gets the extracted diff');
+      return { status: 'failed', reasons: ['covering js tests failed'], tests: { ran: ['src/a.test.js'], passed: false, failures: ['the helper adds'] }, commands: [] };
+    } });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.equal(task.reviewProvider, 'deterministic-executed-verification');
+  assert.equal(captured.length, 0, 'no vote is spent on a draft whose own tests fail');
+  assert.equal(task.executedVerification.ran, true);
+  assert.equal(task.executedVerification.result, 'failed');
+  assert.ok(/^\d{4}-\d{2}-\d{2}T/.test(task.executedVerification.timestamp), 'timestamp is ISO');
+  assert.deepEqual(task.executedVerification.failedTests, ['the helper adds']);
+}));
+
+test('executed verification: HUB0184 2/4 -- an inconclusive result on a non-adhoc diff stays advisory and still reaches the vote', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'ev-nonadhoc-incon', source: 'trouble_log', adhocResolution: undefined });
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+    verifyDiffFn: () => ({ status: 'inconclusive', reasons: ['nothing runnable was found'], tests: null, commands: [] }) });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1, 'inconclusive goes on to the vote exactly as the adhoc path does');
+  assert.equal(task.executedVerification.ran, true);
+  assert.equal(task.executedVerification.result, 'inconclusive');
+  assert.deepEqual(task.executedVerification.failedTests, []);
+}));
+
+test('extractTaskDiff: the adhoc gate is preserved exactly and any other source with a real diff now qualifies', () => {
+  const { extractTaskDiff } = require('./review-task.js');
+  const diff = 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n-a\n+b\n';
+  assert.equal(extractTaskDiff({ source: 'manual', adhocResolution: 'implemented', rawDiff: diff }), diff, 'adhoc implemented -- same as before');
+  assert.equal(extractTaskDiff({ domain: 'adhoc', rawDiff: diff, adhocResolution: 'implemented' }), diff, 'adhoc domain');
+  assert.equal(extractTaskDiff({ source: 'manual', rawDiff: diff, adhocResolution: 'needs-human-decision' }), null, 'adhoc not implemented -- same as before');
+  assert.equal(extractTaskDiff({ source: 'manual', rawDiff: '' }), null, 'blank diff -- same as before');
+  assert.equal(extractTaskDiff({ source: 'trouble_log', rawDiff: diff }), diff, 'non-adhoc source with a real diff now qualifies');
+  assert.equal(extractTaskDiff({ source: 'trouble_log', rawDiff: '   ' }), null, 'whitespace-only diff is not a diff');
+  assert.equal(extractTaskDiff({ source: 'trouble_log' }), null, 'no rawDiff field at all');
+  assert.equal(extractTaskDiff({}), null);
+  assert.equal(extractTaskDiff(null), null);
 });
 
 test('executed verification: the verifier is handed the task id, raw diff, claimed results, repo root, base branch and budget', withExecutedVerify(async () => {

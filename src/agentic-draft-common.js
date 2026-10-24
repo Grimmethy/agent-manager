@@ -16,13 +16,15 @@ const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
-const { copyNodeModules } = require('./lib/draft-sandbox.js');
+const { copyNodeModules, copyPythonVenv } = require('./lib/draft-sandbox.js');
 const { normalizeDiffOutput } = require('./group-b-worktree-diff.js');
 const { stageDraftChanges } = require('./lib/draft-side-effects.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
 const { checkLeftoverReferences, makeGrepBase } = require('./lib/leftover-references.js');
 const { writeSideFindingInbox } = require('./side-finding.js');
+const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
+const { validProposalFiles } = require('./proposal-files.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -213,6 +215,10 @@ function parseSubTaskProposals(text) {
     .map((t) => {
       const out = { title: t.title.trim(), rawText: t.rawText.trim() };
       if (Number.isInteger(t.after) && t.after >= 0) out.after = t.after;
+      const prereq = validPrerequisiteHubs(t.prerequisiteHubs);
+      if (prereq) out.prerequisiteHubs = prereq;
+      const files = validProposalFiles(t.files);
+      if (files) out.files = files;
       return out;
     });
   return cleaned.length ? cleaned : null;
@@ -237,7 +243,8 @@ function formatSubTaskProposalsForReview(subTasks) {
   return subTasks
     .map((t, i) => {
       const dep = Number.isInteger(t.after) ? ` (after piece ${t.after + 1})` : '';
-      return `${i + 1}. ${t.title}${dep}\n   ${t.rawText}`;
+      const files = Array.isArray(t.files) && t.files.length ? `\n   Files: ${t.files.join(', ')}` : '';
+      return `${i + 1}. ${t.title}${dep}\n   ${t.rawText}${files}`;
     })
     .join('\n');
 }
@@ -313,6 +320,9 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
   // A private copy of the repo's installed node_modules, so a JS/TS draft can really run tsc / build / tests (see lib/draft-sandbox.js). Never
   // fails the worktree: without it the draft simply has no toolchain, exactly as before.
   const nodeModules = copyNodeModules(resolvedRepoRoot, worktreeDir);
+  // A Python repo's private .venv copy, so a draft can import its dependencies and really run its tests (see copyPythonVenv). Never fails the worktree.
+  const venv = copyPythonVenv(resolvedRepoRoot, worktreeDir);
+  if (venv.copied && !venv.already) console.error(`[draft-sandbox] copied .venv into ${path.basename(worktreeDir)} (${venv.sizeMb ?? '?'} MB, ${venv.ms} ms)`);
   // STDERR, never stdout: local-draft.js's stdout is a machine channel (ONE JSON result line the worker JSON.parses). These two lines were console.log
   // in #420 and made every successful PF draft read as "draft call failed" (58 wasted drafts, 4 tasks sent to needs-clarification, 2026-09-20).
   if (nodeModules.copied) console.error(`[draft-sandbox] copied node_modules into ${path.basename(worktreeDir)} (${nodeModules.sizeMb ?? '?'} MB, ${nodeModules.ms} ms)`);

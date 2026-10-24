@@ -468,7 +468,9 @@ function checkBlastRadiusBias(text) {
 // case of copying a real value from the wrong sibling.
 const URL_RE = /https?:\/\/[^\s"'`)\]}<>]+/gi;
 const GIS_FIELD_RE = /\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b/g;
-const PLACEHOLDER_RE = /placeholder|example\.(?:com|org|net)|\bTODO\b|\bFIXME\b|\bTBD\b|XXXX?/i;
+// 2026-10-22: also a dotted host written with letter octets (100.x.y.z, x.x.x.x), the usual way a README
+// example hides a real address. Live: chat-plugin 'Multi-chat 1/6' was hard-blocked on http://100.x.y.z:7450.
+const PLACEHOLDER_RE = /placeholder|example\.(?:com|org|net)|\bTODO\b|\bFIXME\b|\bTBD\b|XXXX?|\bx\.(?:y\.z|x\.x)\b/i;
 
 // 2026-08-25, root-caused live via a real blocked task: a pure UI change legitimately
 // introduced two brand-new JS constants (JOB_TYPE_FAMILIES, JOB_TYPE_FAMILY_BY_SOURCE) as

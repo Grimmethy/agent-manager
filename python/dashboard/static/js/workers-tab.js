@@ -243,7 +243,7 @@ async function renderWorkers(isPoll) {
   // call-level data (review-task.js's majorityVote never calls recordCall, see that
   // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
   const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
-  const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
+  const [instances, workerModels, costSummary, recentTasks, cloudMeter] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
     fetchJson('/api/models/cost-summary'),
@@ -252,6 +252,8 @@ async function renderWorkers(isPoll) {
     expandedWorkerId
       ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/${expandedIsWorker ? 'run-log' : 'recent-tasks'}`)
       : Promise.resolve(null),
+    // Cloud spend panel (cloud-spend-panel.js): fail soft -- a missing or erroring meter just hides the panel.
+    fetchJson('/api/cloud-meter').catch(() => null),
   ]);
   // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
   // follow-up, Grimmethy after live-testing the override: "the only tasks I have
@@ -422,7 +424,7 @@ async function renderWorkers(isPoll) {
         ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
       </div>` : ''}
     </div>
-  `).join('')) + renderCompletedTasksSection();
+  `).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + renderCompletedTasksSection();
   window.scrollTo(0, scrollY);
   setupCompletedTasksObserver();
   if (!completedTasksLog.length && !completedTasksLoading && !completedTasksExhausted) {

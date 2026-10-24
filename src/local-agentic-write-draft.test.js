@@ -828,3 +828,31 @@ test('TIME BUDGET line: switch off (unset, off, 0, false) leaves the prompt with
     }
   });
 });
+
+// A Forge GPU pause thrown from inside the pass (local-tool-client.js refuses a turn under a fresh lease) must reach local-draft.js and local-worker.sh as a pause
+// -- no failed attempt counted, the task resumes when the lease clears -- instead of being flattened into an ordinary failed draft. The seam is the call the
+// final catch of draftAdhocViaLocalAgenticWrite wraps (runAgenticDraftInWorktree), stubbed to throw.
+test('write tier: a Forge pause thrown from the pass is rethrown, an ordinary error still returns a failed draft', async () => {
+  const { ForgePauseError, isForgePause } = require('./gpu-guard.js');
+  const adc = require('./agentic-draft-common.js');
+  const realRun = adc.runAgenticDraftInWorktree;
+  const task = () => ({ id: 'w-pause', source: 'manual', promptContext: { rawText: 'do it' } });
+  try {
+    // one call per withRepo block: withRepo restores the environment as soon as its async callback first yields
+    adc.runAgenticDraftInWorktree = async () => { throw new ForgePauseError(); };
+    await withRepo(async () => {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      await assert.rejects(draftAdhocViaLocalAgenticWrite(task()), (e) => isForgePause(e));
+    });
+    adc.runAgenticDraftInWorktree = async () => { throw new Error('boom'); };
+    await withRepo(async () => {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const failed = await draftAdhocViaLocalAgenticWrite(task());
+      assert.equal(failed.succeeded, false);
+      assert.match(failed.reason, /local write-agentic draft failed: boom/);
+    });
+  } finally {
+    adc.runAgenticDraftInWorktree = realRun;
+    delete require.cache[require.resolve('./local-agentic-write-draft.js')];
+  }
+});

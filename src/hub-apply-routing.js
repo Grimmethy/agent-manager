@@ -13,6 +13,7 @@
 // process-wide swap point instead of a per-source registry field.
 
 const { hubTitle } = require('./hub-serial.js');
+const { appendHistoryEvent } = require('./task-history.js');
 
 // Exactly today's inline logic from apply-task.js's recordApplyOutcome, unchanged.
 function applyCoordinatingOutcome(task, result) {
@@ -24,6 +25,11 @@ function applyCoordinatingOutcome(task, result) {
     task.hubSerial = result.hubSerial;
     task.hubLabel = result.hubLabel;
     task.title = hubTitle(result.hubLabel, task.title, task.promptContext && task.promptContext.candidateId);
+  }
+  // Owner-gated pieces (owner-gates.js): listed on the hub record so the owner can decide before the chain reaches them.
+  if (Array.isArray(result.ownerGates) && result.ownerGates.length) {
+    task.ownerGates = result.ownerGates;
+    appendHistoryEvent(task, 'advisory', `owner-gated pieces: ${result.ownerGates.map((g) => g.id).join(', ')}`);
   }
   // parentHub (2026-09-08): this task IS a hub's own child re-decomposing into a new hub
   // -- promptContext.decomposedFrom already points at the owning hub, zero new plumbing.
