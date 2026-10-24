@@ -178,6 +178,34 @@ function buildFabricatedSymbolCitationQuestion(task) {
   ].join('\n');
 }
 
+// Infrastructure-attribution predicate (HUB0195 · 1/4) -- the shared answer to
+// "did the model ever actually see this work?" for a blocked task. It keys ONLY on
+// signals already stamped elsewhere (no new classification approach, deliberately not
+// an entry in REASON_CATEGORIES/CLASSIFIERS -- those are keyword/structural
+// fault-side categories, and there is no 'infra-error' category to hang this on):
+//   task.infraErrorBefore === true -- the sticky flag agentic-draft-common.js's
+//     BLOCKER-TYPE: infra-error branch stamps (src/agentic-draft-common.js,
+//     "Agentic implement pass tagged BLOCKER-TYPE: infra-error -- ..."), retained
+//     across requeue so the attempt that first hit the outage stays attributable;
+//   task.infraErrorNote -- the same branch's per-attempt summary (deleted on
+//     requeue by reject-retry-check.js, so a non-empty string means the CURRENT
+//     attempt itself was infra-attributed);
+//   task.blockedReason containing 'apparent infra outage' -- scripts/local-worker.sh's
+//     draft-failure infra-outage wording ("draft call failed ... on an apparent
+//     infra outage ..."), the local-worker path that never goes through
+//     agentic-draft-common.js.
+// Pure predicate, no side effects: consumers (reject-retry-check.js's
+// stampBrainDumpSortExhausted gate, apply-group-a-brain-dump.js's
+// recoverableSortSkip gate) use it to decide whether a draft failure consumed any of
+// the task's sort-attempt budget at all.
+function isInfraError(task) {
+  if (!task || typeof task !== 'object') return false;
+  if (task.infraErrorBefore === true) return true;
+  if (typeof task.infraErrorNote === 'string' && task.infraErrorNote.length > 0) return true;
+  if (typeof task.blockedReason === 'string' && task.blockedReason.includes('apparent infra outage')) return true;
+  return false;
+}
+
 // Keyword categories over blockedReason text, same ones used by hand triaging this
 // session's blocked queue, same priority order. faultSide:'model' -- a keyword match on
 // the draft's own text/behavior -- and retryable:true for all six: no real evidence yet
@@ -381,6 +409,7 @@ module.exports = {
   hasFabricatedFilePath,
   hasFabricatedSymbolCitation,
   hasNoContextFiles,
+  isInfraError,
   signatureForTask,
   findClassifier,
 };
