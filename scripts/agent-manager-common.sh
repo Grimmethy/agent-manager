@@ -117,6 +117,18 @@ ollama_endpoint_reachable() {
 # Endpoint-scoped leases (2026-10-18): a lease may carry an `endpoints` array of Ollama URLs (a plugin reserving ONE card, e.g. a KaggleForge eval on the
 # P40). Given an endpoint_url, a scoped lease counts as held only when it lists that endpoint; an unscoped lease (no `endpoints`, PromptForge's) is held
 # for every endpoint. Called with no argument it keeps the old meaning (any fresh lease = held). The rule lives once, in src/gpu-guard.js leaseHeldFor.
+# worker_switched_off <instance_id> -> exit 0 when the operator switched this worker off (Workers tab toggle; src/worker-switch.js, marker files in a global state
+# directory), 1 otherwise. The rule lives once, in worker-switch.js, which the dashboard also uses. Any failure of node counts as NOT switched off: a broken
+# switch must never stall the pipeline.
+worker_switched_off() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || return 1
+  local switch_js
+  switch_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/worker-switch.js"
+  [[ -f "$switch_js" ]] || return 1
+  node "$switch_js" is-disabled "$id" 2>/dev/null
+}
+
 comfyui_lease_held() {
   local endpoint="${1:-}"
   local lease_path="${AGENT_MANAGER_COMFY_LEASE_PATH:-${HOME}/.local/state/agent-manager/comfyui-lease.json}"

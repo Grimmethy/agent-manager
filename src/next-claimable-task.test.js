@@ -912,3 +912,16 @@ test('lane avoidance does not hold a task for a lane that is known to be down', 
   const bigDown = (id) => id !== 'worker-3090';
   assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-rx580', { lanes: STRANDED_LANES, graceMs: 0, laneAlive: bigDown }), ['sort-avoid.json'], 'the 3090 is down, so the small lane takes it');
 });
+
+test('lane avoidance never strands a task on a switched-off lane: with the only other lane disabled the avoiding lane still claims it; with it idle the avoiding lane skips it', () => {
+  const lanes = [{ id: 'worker-3090' }, { id: 'worker-p40' }];
+  const heartbeat = (dir, id, status) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ instanceId: id, status, lastHeartbeat: new Date().toISOString() }));
+  const instancesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'switch-inst-'));
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'a-avoided', { source: 'adhoc', humanQueued: true, avoidLanes: ['worker-p40'] });
+  heartbeat(instancesDir, 'worker-3090', 'disabled');
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes, graceMs: 0, instancesDir }), ['a-avoided.json'], 'worker-3090 is switched off, so it is not somewhere else the task can go');
+  heartbeat(instancesDir, 'worker-3090', 'idle');
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes, graceMs: 0, instancesDir }), [], 'with worker-3090 alive the avoiding lane skips it, as before');
+  assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes, graceMs: 0, instancesDir }), ['a-avoided.json']);
+});

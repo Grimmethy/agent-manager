@@ -167,6 +167,17 @@ disk) came back dirty, `ntfs3` refused to mount it (`volume is dirty and "force"
 `/etc/fstab.bak-2026-10-23-before-ntfs-force`), and `ollama-ensure.timer` runs `/usr/local/sbin/ollama-ensure.sh` every 3 minutes (and 90 s after boot): if `ollama.service` is not
 active it mounts `/workspace` and starts it, logging to the journal (`journalctl -t ollama-ensure`). A real `chkdsk` from Windows is still worth doing when convenient.
 
+## Switching a worker off
+
+Any worker lane (`worker-<gpu>`, including `worker-cloud`) can be switched off by the operator and back on without restarting the pipeline. This exists mostly for the cloud lane, which draws on a subscription allowance, but it works for every lane.
+
+- **State** is one marker file per worker in a global directory: `$HOME/.local/state/agent-manager/disabled-workers/<id>` (override with `AGENT_MANAGER_DISABLED_WORKERS_DIR`). Because it is global it survives pipeline restarts and a change of active project. `src/worker-switch.js` owns the rule (`switchDir`, `isDisabled`, `setDisabled`, `listDisabled`) and has a CLI: `node src/worker-switch.js disable|enable <id>`, `is-disabled <id>` (exit 0 when off), `list`, `dir`. Only ids matching `worker-<letters or digits>` are accepted.
+- **What an off worker does.** `scripts/local-worker.sh` checks the switch first thing each tick (`worker_switched_off` in `scripts/agent-manager-common.sh`). A switched-off worker claims, resumes and borrows nothing, writes a heartbeat with status `disabled`, and sleeps (`AGENT_MANAGER_SWITCHED_OFF_PAUSE_S` overrides the pause, default the tick interval). The process stays alive, so the watchdog needs no change, and it prints one line when it goes off and one when it comes back.
+- **In-flight work finishes first.** The check is once per tick, so a task already being drafted completes; a task already in `drafting/` waits there until the worker is switched back on. An operator pin to an off worker simply waits too.
+- **A disabled lane counts as not alive** (`laneAliveFromHeartbeat` in `src/capability-routing.js`), so lane avoidance and capability reservation never steer a task to a lane that will not claim it. Turning off the only other lane therefore cannot strand a task.
+- **Fails open.** If the switch cannot be read (node missing, bad directory) the worker is treated as on: a broken switch must never stall the pipeline.
+- The dashboard route and the Workers tab button are described below once they exist (`POST /api/instances/<id>/enabled`).
+
 ## Tests
 
 `src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),
