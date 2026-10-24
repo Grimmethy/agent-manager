@@ -176,7 +176,7 @@ Any worker lane (`worker-<gpu>`, including `worker-cloud`) can be switched off b
 - **In-flight work finishes first.** The check is once per tick, so a task already being drafted completes; a task already in `drafting/` waits there until the worker is switched back on. An operator pin to an off worker simply waits too.
 - **A disabled lane counts as not alive** (`laneAliveFromHeartbeat` in `src/capability-routing.js`), so lane avoidance and capability reservation never steer a task to a lane that will not claim it. Turning off the only other lane therefore cannot strand a task.
 - **Fails open.** If the switch cannot be read (node missing, bad directory) the worker is treated as on: a broken switch must never stall the pipeline.
-- The dashboard route and the Workers tab button are described below once they exist (`POST /api/instances/<id>/enabled`).
+- **Dashboard API.** `GET /api/instances` marks every worker lane with `switchable: true` and `disabled: true|false` (reviewers and the watchdog carry neither key); a worker switched off while it is still finishing a task shows its real status with `disabled: true`, and once idle its status is `disabled`. `POST /api/instances/<id>/enabled` with `{"enabled": true|false}` switches one worker (`python/dashboard/worker_switch.py` shells out to the node CLI so the rule lives once): 400 for a bad body or a non-worker id, 404 when switching OFF an id that is not a defined lane, always allowed when switching ON (clears a stale marker). The route only writes or removes the marker; it never starts, stops or restarts the pipeline. The Workers tab button is the next step.
 
 ## Tests
 
