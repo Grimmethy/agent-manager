@@ -23,6 +23,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
+const { ownerGateFor } = require('./owner-gates.js');
 const { validProposalFiles } = require('./proposal-files.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
@@ -200,6 +201,7 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
 
   const carriedDiff = parentTask && typeof parentTask.carriedPartialDiff === 'string' && parentTask.carriedPartialDiff.trim() ? parentTask.carriedPartialDiff : null;
   const queued = [];
+  const ownerGates = []; // pieces that wait on the owner (owner-gates.js)
   subTasks.forEach((sub, i) => {
     if (foldTargets.has(i)) return; // folded into a sibling's acceptanceCriteria instead of becoming its own no-diff-possible task
     const record = {
@@ -229,7 +231,10 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
     if (prereq) record.prerequisiteHubs = prereq;
     fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(record, null, 2) + '\n');
     queued.push({ id: ids[i], title: record.title });
+    const gate = ownerGateFor({ id: ids[i], title: record.title, rawText: record.promptContext.rawText });
+    if (gate) ownerGates.push(gate);
   });
+  queued.ownerGates = ownerGates;
   queued.hubSerial = hubSerial;
   queued.hubLabel = hubLabel;
   return queued;
@@ -261,6 +266,7 @@ function buildDecomposedPlan(task, pipelineDir) {
     subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
     hubSerial: queued.hubSerial,
     hubLabel: queued.hubLabel,
+    ownerGates: queued.ownerGates,
   };
 }
 

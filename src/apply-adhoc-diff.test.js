@@ -658,3 +658,24 @@ test('applyAdhocDiff writes a proposal\'s files as a Files: line exactly once, n
   assert.equal(adhocDiffSubstanceProblem(by('Docs piece'), docsDiff), null, 'declared docs files: not docs-only');
   assert.equal(adhocDiffSubstanceProblem(by('No files'), docsDiff).code, 'docs-only', 'without the line the keyword scan still flags it');
 });
+
+test('applyAdhocDiff lists owner-gated pieces in the result, and none when no piece is gated', () => {
+  const repoDir = makeRepo();
+  const mk = (id, proposals) => ({ id, rawDiff: '', implementResponse: 'Split.', adhocResolution: 'decompose', subTaskProposals: proposals });
+  const gated = applyAdhocDiff({
+    task: mk('apply-test-gates-1', [
+      { title: 'Plain piece', rawText: 'Do the plain thing.' },
+      { title: 'Vendor the library', rawText: 'Download it. This step needs owner approval before any download.' },
+    ]),
+    repoRoot: repoDir, pipelineDir: fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-')),
+  });
+  assert.equal(gated.ownerGates.length, 1);
+  assert.equal(gated.ownerGates[0].why, 'owner approval');
+  assert.match(gated.ownerGates[0].id, /vendor-the-library/);
+  assert.match(gated.ownerGates[0].title, /Vendor the library/);
+  const none = applyAdhocDiff({
+    task: mk('apply-test-gates-2', [{ title: 'One', rawText: 'Do one.' }, { title: 'Two', rawText: 'Do two.' }]),
+    repoRoot: repoDir, pipelineDir: fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-')),
+  });
+  assert.deepEqual(none.ownerGates, []);
+});
