@@ -34,7 +34,7 @@ const { injectContextLogInstruction, extractContextLog, writeContextLogInbox } =
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
-const { listProjects } = require('./chat-projects.js');
+const { listProjects, pipelineFor } = require('./chat-projects.js');
 const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask,
 } = require('./chat-task-requeue.js');
@@ -81,7 +81,7 @@ const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api
 // (a comment even said "unknown exact line count when char-truncated"). Now only WHOLE lines that fit are returned, returnedThrough is the last of them, and the caller's
 const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
 const { isSecretLookingPath } = require('./accessible-roots.js');
-const { taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS } = require('./local-tool-task-tools.js');
+const { searchTasksAllProjects, taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS } = require('./local-tool-task-tools.js');
 
 // nextOffset = returnedThrough + 1, so paging visits every line exactly once. A first line that alone exceeds the ceiling is shown as a prefix and paging continues with the NEXT line.
 // -> { slice, truncated, returnedThrough }
@@ -246,6 +246,9 @@ const WRITE_TOOLS = [
 // (grep/tests/git log-diff-show-status), but mounted genuinely read-only (readOnly:true,
 // see runBashTool) -- a filesystem-level guarantee, not a request the model can choose
 // to ignore the way "please use queue_reviewed_task" alone would have been.
+// The optional `project` argument every chat task tool takes (label or repo root from list_projects); omitted = the process's own project.
+const PROJECT_ARG = { type: 'string', description: 'Label or repo root of the project whose task queue to use (from list_projects); omit for agent-manager itself.' };
+
 const CHAT_TOOLS = [
   {
     type: 'function',
@@ -303,6 +306,7 @@ const CHAT_TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          project: PROJECT_ARG,
           answer: { type: 'string', description: 'The human\'s decision/free text, to be folded into the task as the resolving answer.' },
         },
         required: ['taskId', 'answer'],
@@ -318,6 +322,7 @@ const CHAT_TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          project: PROJECT_ARG,
           paths: { type: 'array', items: { type: 'string' }, description: 'The file path(s) the human picked. Omit or leave empty to proceed with no prefetched path.' },
         },
         required: ['taskId'],
@@ -333,6 +338,7 @@ const CHAT_TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          project: PROJECT_ARG,
         },
         required: ['taskId'],
       },
@@ -347,6 +353,7 @@ const CHAT_TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          project: PROJECT_ARG,
           state: { type: 'string', enum: ['blocked', 'done', 'archived'], description: 'The task\'s current location -- where it is stuck today.' },
           force: { type: 'boolean', description: 'Set true only after telling the human about a repeatedBlocker match and they want to retry anyway.' },
         },
@@ -468,6 +475,7 @@ const TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The exact task id.' },
+          project: PROJECT_ARG,
           section: { type: 'string', description: 'Optional: one of "plan", "implement", "history", "blockedReason" to pull just that piece of the task\'s full content instead of the summary.' },
           offset: { type: 'integer', description: 'With "section": first line to return (1-indexed). Default 1.' },
           limit: { type: 'integer', description: 'With "section": how many lines to return. Default 400, max 800.' },
@@ -487,6 +495,7 @@ const TOOLS = [
           query: { type: 'string', description: 'Literal substring, or several words (a task matches if its title/id contains every word).' },
           state: { type: 'string', description: 'Optional: scope the search to one location -- a QUEUE_STATES name (pending, review, approved, blocked, done, needs-clarification, awaiting-confirm, coordinating), "adhoc", "drafting" (every worker lane), or "drafting:<lane>" for one lane. Omit to search everywhere live.' },
           includeArchived: { type: 'boolean', description: 'Also search done/_archived*/ (every dated month) -- slower, only needed for an old/completed task search.' },
+          project: { type: 'string', description: 'Label or repo root of the project whose queue to search (from list_projects), or "all" to search every registered project (each hit is tagged with its project); omit for agent-manager itself.' },
         },
         required: ['query'],
       },
@@ -525,8 +534,16 @@ function buildToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
     read_file: (args) => readFileTool(allowedRoots, { path: args.path, offset: args.offset, limit: args.limit, readOnlyRoots }),
     list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path, readOnlyRoots }),
     list_roots: () => listRootsTool(allowedRoots, readOnlyRoots),
-    read_task: (args) => readTaskTool(pipelineDir, { taskId: args.taskId, section: args.section, offset: args.offset, limit: args.limit }),
-    search_tasks: (args) => searchTasksTool(pipelineDir, { query: args.query, state: args.state, includeArchived: args.includeArchived }),
+    read_task: (args) => {
+      const t = pipelineFor(args.project, { pipelineDir });
+      return t.error ? { error: t.error } : readTaskTool(t.pipelineDir, { taskId: args.taskId, section: args.section, offset: args.offset, limit: args.limit });
+    },
+    search_tasks: (args) => {
+      const search = { query: args.query, state: args.state, includeArchived: args.includeArchived };
+      if (typeof args.project === 'string' && args.project.trim().toLowerCase() === 'all') return searchTasksAllProjects(search);
+      const t = pipelineFor(args.project, { pipelineDir });
+      return t.error ? { error: t.error } : searchTasksTool(t.pipelineDir, search);
+    },
   };
 }
 
@@ -575,14 +592,19 @@ function buildWriteToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
 // even a malformed/hallucinated tool_calls entry naming them would find no handler and
 // fall through to executeToolCalls' "unknown tool" error, same as any other typo).
 function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
+  const withProject = (args, run) => {
+    const t = pipelineFor(args.project, { pipelineDir, repoRoot });
+    return t.error ? { ok: false, error: t.error } : run(t);
+  };
   return {
     run_bash: (args) => runBashTool(allowedRoots, { command: args.command, readOnly: true }),
     list_projects: () => ({ projects: listProjects({ activeRepoRoot: repoRoot }) }),
     queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description, project: args.project }),
-    answer_task_clarification: (args) => answerNeedsClarification(pipelineDir, args.taskId, args.answer),
-    resolve_task_clarification: (args) => resolveNeedsClarification(pipelineDir, args.taskId, args.paths),
-    mark_task_clarification_done: (args) => markNeedsClarificationDone(pipelineDir, args.taskId),
-    requeue_blocked_task: (args) => requeueBlockedTask(pipelineDir, repoRoot, args.taskId, { state: args.state, force: !!args.force }),
+    // Each unstick tool acts on the queue of its `project` argument (the process's own when omitted); an unknown project is a clean { ok: false, error }.
+    answer_task_clarification: (args) => withProject(args, (t) => answerNeedsClarification(t.pipelineDir, args.taskId, args.answer)),
+    resolve_task_clarification: (args) => withProject(args, (t) => resolveNeedsClarification(t.pipelineDir, args.taskId, args.paths)),
+    mark_task_clarification_done: (args) => withProject(args, (t) => markNeedsClarificationDone(t.pipelineDir, args.taskId)),
+    requeue_blocked_task: (args) => withProject(args, (t) => requeueBlockedTask(t.pipelineDir, t.repoRoot, args.taskId, { state: args.state, force: !!args.force })),
   };
 }
 
