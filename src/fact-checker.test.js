@@ -1130,3 +1130,39 @@ test('stripVendoredDiffSections blanks only the vendored sections and keeps line
   assert.ok(!out.join('\n').includes('+two') && !out.join('\n').includes('+three'));
   assert.equal(stripVendoredDiffSections(undefined), '');
 });
+
+// stripUnchangedDiffLines: the diff block ends at the first line that cannot belong to a hunk (CHANGE_REVIEW AC-83) -----------------
+// A fabricated URL in prose AFTER the diff used to ride along as "still inside the diff" and was never scanned. A blank line INSIDE a hunk is a
+// context line whose trailing space was stripped (common in model-written diffs) and must not end the block, or the unchanged context URLs after it
+// are flagged (the false positive 69f0a4b fixed).
+
+const FABRICATED_URL = 'https://totally-invented-service.example-real-tld.com/api';
+const SOURCE_WITHOUT_URLS = 'Plain grounding text with no URLs in it.';
+
+test('a fabricated URL in prose AFTER a diff block is flagged', () => {
+  const draft = ['Summary.', '', 'diff --git a/src/a.js b/src/a.js', '@@ -1,2 +1,3 @@', ' const a = 1;', '+const b = 2;', '', `Afterwards call ${FABRICATED_URL} to confirm.`].join('\n');
+  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS), [{ type: 'ungrounded-url', detail: FABRICATED_URL }]);
+});
+
+test('a bullet, a tab-indented line or plain prose after the diff also ends the block, so a URL in it is flagged', () => {
+  for (const after of [`* see ${FABRICATED_URL}`, `\tsee ${FABRICATED_URL}`, `Note: ${FABRICATED_URL}`]) {
+    const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1 +1,2 @@', ' const a = 1;', '+const b = 2;', after].join('\n');
+    const flags = checkGroundedValues(draft, SOURCE_WITHOUT_URLS);
+    assert.deepEqual(flags.map((f) => f.detail), [FABRICATED_URL], after);
+  }
+});
+
+test('a stripped-space blank context line inside a hunk does not end the block: later unchanged context URLs are not flagged', () => {
+  const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1,4 +1,5 @@', ' const first = "https://old.zzctx1.io/a";', '', ' const second = "https://old.zzctx2.io/b";', '+const added = 1;'].join('\n');
+  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS), []);
+});
+
+test('removed and context URLs inside the diff are still never flagged, and an added URL still is', () => {
+  const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1,3 +1,3 @@', ' const keep = "https://ctx.zzctx3.io/c";', '-const gone = "https://removed.zzrem.io/d";', `+const fresh = "${FABRICATED_URL}";`].join('\n');
+  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS).map((f) => f.detail), [FABRICATED_URL]);
+});
+
+test('once prose ends the diff block, later lines are prose too: an indented URL line after a prose line is flagged', () => {
+  const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1 +1,2 @@', ' const a = 1;', '+const b = 2;', 'That is the change.', `  details at ${FABRICATED_URL}`].join('\n');
+  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS).map((f) => f.detail), [FABRICATED_URL]);
+});
