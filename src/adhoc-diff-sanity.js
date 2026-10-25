@@ -352,7 +352,25 @@ function extractDeclaredTargets(task, planText = '') {
   // SAME plan broadly forbade all of src/ -- including the one file the plan had just
   // named as its edit target two paragraphs earlier.
   for (const p of leadingInClauseTargets(plan)) add(p);
+  // 6. An imperative edit verb whose OBJECT is a backticked concrete file path, in a non-restriction sentence of the rawText body
+  // (2026-10-25, adhoc-clear-pidfile-...-1792936771585, blocked on `diff touches server/core/comfy_proc.py (matches forbidden "comfy_proc.py")`):
+  // "In the gpu-broker repo, modify `server/core/comfy_proc.py`'s `_clear_pidfile()` ..." names its target, but it is not the "In `<path>`," leading
+  // shape rules 4/5 accept, so the same task's own scope sentence ("Do not change anything else in comfy_proc.py ...") forbade the file it had just been
+  // told to edit. Kept narrow like rule 4: the path must be the verb's direct object (optionally after "the file"), so a path that is merely cited in
+  // a sentence that happens to contain a verb is still not a target.
+  for (const p of verbObjectTargets(rawText)) add(p);
   return [...out];
+}
+
+// Rule 6 of extractDeclaredTargets: "<modify|edit|change|update|rewrite|replace|fix> [the file] `<path>`" in a sentence that is not itself a restriction.
+function verbObjectTargets(text) {
+  const out = [];
+  for (const frag of String(text || '').split(/(?<=[.!?:;])\s+|\n+/)) {
+    // IMPERATIVE_PROHIBITION_RE too: RESTRICTION_SENTENCE_RE needs `edit\w+`, so "Never edit `x`" is not caught by it, and a prohibited file must not become a target.
+    if (RESTRICTION_SENTENCE_RE.test(frag) || IMPERATIVE_PROHIBITION_RE.test(frag)) continue;
+    for (const m of frag.matchAll(/\b(?:modify|edit|change|update|rewrite|replace|fix)\s+(?:the\s+file\s+)?`([\w./@-]+\.\w+)`(?!\()/gi)) out.push(m[1]);
+  }
+  return out;
 }
 
 // Shared by extractDeclaredTargets' rules 4 and 5 -- a leading "In `<path>` (aside)?,
