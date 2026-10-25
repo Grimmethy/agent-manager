@@ -29,9 +29,8 @@ test('a path under archive/ -> suspect even when it exists', () => {
   assert.match(r.reasons.join(' '), /retired code under archive\//);
 });
 
-test('a hub sequencing note (pending-merge, dependency-ordering hazard, absent on the shared branch) -> suspect', () => {
+test('a hub sequencing note (dependency-ordering hazard, absent on the shared branch) -> suspect', () => {
   for (const text of [
-    'the hub marks pieces 1/13 and 12/13 as "pending-merge" so this piece cannot be built',
     'This is a dependency-ordering hazard, not a code defect.',
     'Prerequisite modules are absent on the shared branch',
   ]) {
@@ -39,6 +38,12 @@ test('a hub sequencing note (pending-merge, dependency-ordering hazard, absent o
     assert.equal(r.verdict, 'suspect', text);
     assert.match(r.reasons.join(' '), /sequencing note/);
   }
+});
+
+test('pending-merge next to a hub id is not a sequencing note: a real fix for a merged piece stays ok', () => {
+  const r = checkEntryTargets('the HUB0007 piece is pending-merge; fix the usage fields before building on it', { exists: all });
+  assert.equal(r.verdict, 'ok');
+  assert.doesNotMatch(r.reasons.join(' '), /sequencing note/);
 });
 
 test('no cited paths and ordinary text -> ok; symbols and property names are not paths', () => {

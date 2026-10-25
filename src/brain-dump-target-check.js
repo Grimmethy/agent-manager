@@ -6,8 +6,9 @@
 // An entry is 'suspect' (not queued as a task) when
 //   (a) it cites repo paths and EVERY one is missing from the matched project's repo (one missing path alone is not enough: files can be new);
 //   (b) a cited path has an `archive/` segment (retired code: TaxHarvest's client-deliverables flow lives under TaxHarvest/archive/);
-//   (c) it describes a stacked-hub piece as 'pending-merge' / a dependency-ordering hazard: a sequencing note about unmerged siblings, not a
-//       code defect (the 'Prerequisite modules absent' entry led to a branch that copied three modules the hub stack already held).
+//   (c) it uses one of the explicit hub-sequencing phrasings ('dependency-ordering hazard', 'absent on the shared branch'): a sequencing note about
+//       unmerged siblings, not a code defect (the 'Prerequisite modules absent' entry led to a branch that copied three modules the hub stack already held).
+//       A bare 'pending-merge' next to a hub id is NOT enough: a replay over brain-dump adhoc verdicts flagged a merged HUB0007 usage-fields fix that way.
 // Fail open: when the repo cannot be listed (no git, unreadable) a path counts as present, so uncertainty never blocks an entry.
 //
 // Kill switch: AGENT_MANAGER_BRAIN_DUMP_TARGET_CHECK=false.
@@ -19,7 +20,6 @@ const { execFileSync } = require('child_process');
 // Backticked tokens that look like repo paths: a known source/doc extension, optional :line or :line-line suffix.
 const PATH_RE = /`([A-Za-z0-9_][A-Za-z0-9_.\-/]*\.(?:js|mjs|cjs|ts|tsx|jsx|py|md|json|sh|ps1|html|css|ya?ml|toml|txt))(?::\d+(?:-\d+)?)?`/g;
 const HUB_SEQUENCING_RES = [
-  /\bpending-merge\b[^.]*\b(?:hub|HUB\d{2,})\b|\b(?:hub|HUB\d{2,})\b[^.]*\bpending-merge\b/i,
   /dependency-ordering hazard/i,
   /\babsent on the shared branch\b/i,
 ];
@@ -67,7 +67,7 @@ function checkEntryTargets(entryText, { repoRoot, exists } = {}) {
     const archived = cited.filter((p) => /(^|\/)archive\//.test(p));
     if (archived.length) reasons.push(`cites retired code under archive/ (${archived.slice(0, 3).join(', ')})`);
   }
-  if (HUB_SEQUENCING_RES.some((re) => re.test(text))) reasons.push("describes a stacked hub piece as pending-merge / a dependency-ordering hazard: a sequencing note, not a code defect");
+  if (HUB_SEQUENCING_RES.some((re) => re.test(text))) reasons.push("describes a stacked hub piece as a dependency-ordering hazard / absent on the shared branch: a sequencing note, not a code defect");
   return { verdict: reasons.length ? 'suspect' : 'ok', reasons, cited };
 }
 
