@@ -243,7 +243,7 @@ async function renderWorkers(isPoll) {
   // call-level data (review-task.js's majorityVote never calls recordCall, see that
   // route's own docstring) so it keeps the existing terminal-state recent-tasks view.
   const expandedIsWorker = !!(expandedWorkerId && expandedWorkerId.startsWith('worker'));
-  const [instances, workerModels, costSummary, recentTasks] = await Promise.all([
+  const [instances, workerModels, costSummary, recentTasks, cloudMeter] = await Promise.all([
     fetchJson('/api/instances'),
     fetchJson('/api/worker-models'),
     fetchJson('/api/models/cost-summary'),
@@ -252,6 +252,8 @@ async function renderWorkers(isPoll) {
     expandedWorkerId
       ? fetchJson(`/api/instances/${encodeURIComponent(expandedWorkerId)}/${expandedIsWorker ? 'run-log' : 'recent-tasks'}`)
       : Promise.resolve(null),
+    // Cloud spend panel (cloud-spend-panel.js): fail soft -- a missing or erroring meter just hides the panel.
+    fetchJson('/api/cloud-meter').catch(() => null),
   ]);
   // Candidate list for each worker's own "assign task" override dropdown (2026-09-07
   // follow-up, Grimmethy after live-testing the override: "the only tasks I have
@@ -316,7 +318,7 @@ async function renderWorkers(isPoll) {
   main.innerHTML = filterBar + (shown.length === 0
     ? '<div class="empty">No workers match this filter.</div>'
     : shown.map(inst => `
-    <div class="worker-card clickable" data-instance-id="${escapeAttr(inst.instanceId)}">
+    <div class="worker-card clickable${typeof workerCardOffClass === 'function' ? workerCardOffClass(inst) : ''}" data-instance-id="${escapeAttr(inst.instanceId)}">
       <div class="row">
         <span class="id">${inst.instanceId}</span>
         ${(() => {
@@ -406,13 +408,14 @@ async function renderWorkers(isPoll) {
           <span class="badge ${statusBadgeClass(inst.status, inst.stale)}">${inst.stale ? 'STALE' : inst.status}</span>
           ${inst.stale ? `<span class="stale-timer" id="stale-timer-${inst.instanceId}"></span>` : ''}
           <span class="state-timer" id="state-timer-${inst.instanceId}">${inst.stateAgeSeconds != null ? 'in this state ' + fmtDuration(inst.stateAgeSeconds) : ''}</span>
+          ${typeof buildWorkerSwitchHtml === 'function' ? buildWorkerSwitchHtml(inst) : ''}
         </div>
       </div>
       <div class="meta">
         pid ${inst.pid ?? '-'} · model ${inst.model || '-'} · heartbeat ${fmtAge(inst.heartbeatAgeSeconds)} ago
         ${inst.currentTaskId && inst.projectLabel ? ' · <span class="badge ' + (inst.borrowed ? 'warn' : 'idle') + '" title="' + (inst.borrowed ? 'Borrowed: this lane is idle in the active project and is working a task of ' + escapeAttr(inst.projectLabel) + ' (idle-pool borrowing)' : 'This task belongs to the active project') + '">📁 ' + escapeHtml(inst.projectLabel) + (inst.borrowed ? ' (borrowed)' : '') + '</span>' : ''}
         ${inst.currentTaskId && inst.hub ? ' · <span class="badge ok" title="This task belongs to hub ' + escapeAttr(inst.hub.label) + '" style="font-weight:700">🗂 ' + escapeHtml(hubTag(inst.hub)) + '</span>' : ''}
-        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') : ''}
+        ${inst.currentTaskId ? ' · working on <strong><a href="#" data-open-task-anywhere="' + escapeAttr(inst.currentTaskId) + '">' + escapeHtml(inst.currentTaskId) + '</a></strong>' + (inst.currentPass ? ' (' + escapeHtml(inst.currentPass) + ')' : '') + ' · ' + trajectoryLinkHtml(inst.currentTaskId) : ''}
         ${pendingWorkerAssign[inst.instanceId] ? ' · <strong>📌 pinned, waiting for ' + escapeAttr(inst.instanceId) + ' to pick it up…</strong>' : ''}
         ${costByInstance[inst.instanceId] ? ' · ' + fmtUsd(costByInstance[inst.instanceId]) + ' est. API cost' : ''}
       </div>
@@ -422,7 +425,7 @@ async function renderWorkers(isPoll) {
         ${recentTasks ? (recentTasks.runs ? renderRunLogList(recentTasks.runs) : renderRecentTasksList(recentTasks.tasks || [])) : '<div class="meta">Loading…</div>'}
       </div>` : ''}
     </div>
-  `).join('')) + renderCompletedTasksSection();
+  `).join('')) + (typeof renderCloudSpendSection === 'function' ? renderCloudSpendSection(cloudMeter) : '') + renderCompletedTasksSection();
   window.scrollTo(0, scrollY);
   setupCompletedTasksObserver();
   if (!completedTasksLog.length && !completedTasksLoading && !completedTasksExhausted) {
@@ -431,6 +434,7 @@ async function renderWorkers(isPoll) {
   main.querySelectorAll('.worker-card[data-instance-id]').forEach((card) => {
     card.onclick = () => toggleWorkerExpand(card.dataset.instanceId);
   });
+  if (typeof wireWorkerSwitchButtons === 'function') wireWorkerSwitchButtons(main);
   const claudePauseToggle = main.querySelector('#claude-pause-toggle');
   if (claudePauseToggle) {
     claudePauseToggle.onchange = (e) => setClaudePaused(e.target.checked);

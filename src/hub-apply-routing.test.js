@@ -63,3 +63,17 @@ test('setHubApplyRouting swaps the live implementation; a falsy argument restore
   setHubApplyRouting(null);
   assert.equal(getHubApplyRouting(), DEFAULT_HUB_APPLY_ROUTING);
 });
+
+test('applyCoordinatingOutcome stamps ownerGates and one advisory history event when the result has gated pieces, and nothing when it has none', () => {
+  const gates = [{ id: 'HUB0001-02-x', title: 'Vendor it', why: 'owner approval' }, { id: 'HUB0001-03-y', title: 'Pick one', why: 'design decision' }];
+  const task = { history: [] };
+  applyCoordinatingOutcome(task, { subTasks: [{ id: 'a' }], ownerGates: gates });
+  assert.deepEqual(task.ownerGates, gates);
+  assert.equal(task.history.at(-1).stage, 'advisory');
+  assert.match(task.history.at(-1).detail, /owner-gated pieces: HUB0001-02-x, HUB0001-03-y/);
+  const plain = { history: [] };
+  applyCoordinatingOutcome(plain, { subTasks: [{ id: 'a' }], ownerGates: [] });
+  applyCoordinatingOutcome(plain, { subTasks: [{ id: 'a' }] });
+  assert.equal('ownerGates' in plain, false);
+  assert.deepEqual(plain.history, []);
+});

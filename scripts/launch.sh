@@ -35,11 +35,12 @@ if [[ -f "$COMFY_LEASE_PATH" ]]; then
 fi
 
 # Forge family exclusion: the pipeline and the Forge family (ComfyUI) never hold the GPU together
-# (promptforge Docs/GPU_FAMILY_PROTOCOL.md). Besides deleting the lease, ask PromptForge to end its session and
+# (agent-manager-gpu-broker Docs/GPU_FAMILY_PROTOCOL.md). Besides deleting the lease, ask PromptForge to end its session and
 # stop ComfyUI right now instead of waiting for its keeper to notice (~20 s). Best-effort: PromptForge may be down.
-PROMPTFORGE_URL="${AGENT_MANAGER_PROMPTFORGE_URL:-${PROMPTFORGE_URL:-http://localhost:7430}}"
+source "${SCRIPT_DIR}/agent-manager-common.sh"
+GPU_BROKER_URL="$(gpu_broker_url)"
 if command -v curl >/dev/null 2>&1; then
-  yield_out="$(curl -s -m 30 -X POST "${PROMPTFORGE_URL%/}/api/gpu/yield" 2>/dev/null || true)"
+  yield_out="$(curl -s -m 30 -X POST "${GPU_BROKER_URL}/api/gpu/yield" 2>/dev/null || true)"
   [[ -n "$yield_out" ]] && echo "[launch] Forge GPU yield: $yield_out"
 fi
 

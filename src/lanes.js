@@ -38,6 +38,11 @@
 //   numCtx      optional whole number 2048..131072: the ONE context window (num_ctx) this lane's calls use, for a card that cannot hold the
 //               pipeline's default pin (49152, sized for the 24 GB cards). Becomes AGENT_MANAGER_LANE_NUM_CTX in the lane's env
 //               (gpu-capacity.js reads it). Measured on an 8 GB RX 580 with qwen3-vl:8b: 49152 -> 10.6 tok/s at 80% GPU, 16384 -> 26.2 tok/s at 100%.
+//   provider    optional 'ollama' (default, today's behaviour) | 'cloud'. A 'cloud' lane's ollamaUrl is the cloud-providers gateway (an
+//               Ollama-compatible endpoint that forwards to a cloud model), not a GPU. It is EXPLICIT and BOUNDED: it REQUIRES a non-empty
+//               taskClasses allowlist (an entry without one is dropped, so a cloud lane can never claim "anything"), preempt must be 'never',
+//               and it cannot run a reviewer daemon. numCtx/numBatch are ignored (they describe a GPU). A cloud lane carries provider:'cloud'
+//               and cloud:true on its lane object; ollama lanes keep their exact shape (those keys are absent, read them as false).
 //   taskClasses optional allowlist of task SOURCE names (brain_dump_sort, change_review, ...). Absent = the lane claims any
 //               task (today's behaviour for the host and P40 lanes). Present = the claim loop (next-claimable-task.js) only
 //               offers this lane tasks of those sources, so a small GPU can be given only the work that fits it. A task
@@ -55,6 +60,7 @@ const { tierFromModel } = require('./capability-ledger.js');
 const REPO = path.resolve(__dirname, '..');
 const LANE_ID_RE = /^worker-[a-z0-9]+$/;
 const PREEMPT_MODES = ['always', 'age-gated', 'never'];
+const PROVIDERS = ['ollama', 'cloud'];
 
 let detectedGpu; // cached per process
 const warned = new Set();
@@ -129,20 +135,26 @@ function laneFromEntry(raw, index) {
   if (!validHttpUrl(raw.ollamaUrl)) { warnOnce(`${where} (${id}) needs an http(s) "ollamaUrl"; skipped`); return null; }
   const model = typeof raw.model === 'string' ? raw.model.trim() : '';
   if (!model) { warnOnce(`${where} (${id}) needs a "model"; skipped`); return null; }
+  const provider = raw.provider === undefined ? 'ollama' : raw.provider;
+  if (!PROVIDERS.includes(provider)) { warnOnce(`${where} (${id}) provider must be one of ${PROVIDERS.join('|')}; skipped`); return null; }
+  const cloud = provider === 'cloud';
+  if (cloud && (raw.taskClasses === undefined || raw.taskClasses === null)) { warnOnce(`${where} (${id}) is a cloud lane and needs a taskClasses allowlist; skipped`); return null; }
   if (raw.slow !== undefined && typeof raw.slow !== 'boolean') { warnOnce(`${where} (${id}) slow must be true or false; skipped`); return null; }
   let numCtx = null;
-  if (raw.numCtx !== undefined && raw.numCtx !== null) {
+  if (!cloud && raw.numCtx !== undefined && raw.numCtx !== null) {
     if (!Number.isInteger(raw.numCtx) || raw.numCtx < 2048 || raw.numCtx > 131072) { warnOnce(`${where} (${id}) numCtx must be a whole number between 2048 and 131072; skipped`); return null; }
     numCtx = raw.numCtx;
   }
   let numBatch = null;
-  if (raw.numBatch !== undefined && raw.numBatch !== null) {
+  if (!cloud && raw.numBatch !== undefined && raw.numBatch !== null) {
     if (!Number.isInteger(raw.numBatch) || raw.numBatch < 32 || raw.numBatch > 8192) { warnOnce(`${where} (${id}) numBatch must be a whole number between 32 and 8192; skipped`); return null; }
     numBatch = raw.numBatch;
   }
   if (raw.reviewer !== undefined && typeof raw.reviewer !== 'boolean') { warnOnce(`${where} (${id}) reviewer must be true or false; skipped`); return null; }
+  if (cloud && raw.reviewer === true) { warnOnce(`${where} (${id}) a cloud lane cannot run a reviewer daemon; skipped`); return null; }
   const preempt = raw.preempt === undefined ? 'never' : raw.preempt;
   if (!PREEMPT_MODES.includes(preempt)) { warnOnce(`${where} (${id}) preempt must be one of ${PREEMPT_MODES.join('|')}; skipped`); return null; }
+  if (cloud && preempt !== 'never') { warnOnce(`${where} (${id}) a cloud lane must use preempt "never"; skipped`); return null; }
   let tier = tierFromModel(model);
   if (raw.tier !== undefined && raw.tier !== null) {
     if (typeof raw.tier !== 'number' || !(raw.tier > 0)) { warnOnce(`${where} (${id}) tier must be a positive number (billions of parameters); skipped`); return null; }
@@ -176,6 +188,7 @@ function laneFromEntry(raw, index) {
     model,
     tier,
     reserve,
+    ...(cloud ? { provider: 'cloud', cloud: true } : {}),
   };
 }
 
@@ -256,6 +269,14 @@ function isSlowEndpoint(url, env = process.env) {
   try { return getLanes(env).some((l) => l.slow && l.env.OLLAMA_URL === url); } catch { return false; }
 }
 
+// Is `url` the endpoint of an enabled cloud lane (provider 'cloud')? A cloud endpoint is the cloud-providers gateway, not a GPU, so the GPU-only
+// logic (Forge lease yield, host VRAM headroom, health probes by tokens/s) must skip it. Trailing slashes are ignored. Never throws: unknown = false.
+function isCloudEndpoint(url, env = process.env) {
+  if (!url) return false;
+  const norm = (u) => String(u).trim().replace(/\/+$/, '');
+  try { return getLanes(env).some((l) => l.cloud && norm(l.env.OLLAMA_URL) === norm(url)); } catch { return false; }
+}
+
 // Is this lane id a slow lane? The legacy worker-p40 id counts even when its lane is not currently configured (a stale heartbeat
 // from it must keep the long zombie threshold, exactly as before).
 function isSlowLane(id, env = process.env) {
@@ -263,7 +284,7 @@ function isSlowLane(id, env = process.env) {
   try { const l = laneById(id, env); return !!(l && l.slow); } catch { return false; }
 }
 
-module.exports = { reviewerLanes, getLanes, laneById, laneAllowsSource, isSlowEndpoint, isSlowLane, gpuSlugFromName, lanesRegistryPath };
+module.exports = { reviewerLanes, getLanes, laneById, laneAllowsSource, isSlowEndpoint, isCloudEndpoint, isSlowLane, gpuSlugFromName, lanesRegistryPath };
 
 if (require.main === module) {
   const [flag, arg] = process.argv.slice(2);

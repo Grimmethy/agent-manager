@@ -123,6 +123,8 @@ async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.en
   if (!cfg.enabled) return out;
   const hostUrl = env.AGENT_MANAGER_HOST_OLLAMA_URL || env.OLLAMA_URL || 'http://localhost:11434';
   for (const lane of lanes || []) {
+    // A cloud lane has no tokens/s to judge (the gateway reports no eval_duration, so every probe would read as a failure) and each probe would be a billed call.
+    if (lane.cloud) continue;
     const url = (lane.env && lane.env.OLLAMA_URL) || hostUrl;
     const model = lane.model || (lane.env && lane.env.LOCAL_MODEL);
     if (!model || !laneIdleNow(instancesDir, lane.id, now)) continue;

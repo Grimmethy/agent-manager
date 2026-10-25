@@ -188,6 +188,7 @@ const { getRegisteredSource } = require('./task-source-registry.js');
 const { REASON_CATEGORIES } = require('./blocked-task-classifiers.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { surfaceDecomposeDesignQuestion } = require('./decompose-question-surface.js');
+const { detectTruncatedImplementResponse, TRUNCATION_GATE_VERSION } = require('./validate-implement-truncation.js');
 
 // Read env inside the sweep, not at module load -- keeps tests able to toggle it and
 // matches auto-confirm-review.js's discipline.
@@ -543,10 +544,18 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     // that (pre-PR-#230) never mentioned it. Regenerate implementResponse from the real
     // sub-tasks and file straight to queue/review/ for a real vote -- see the top-of-file
     // header comment for the full incident.
+    //
+    // TERMINAL SALVAGE PATH (widened gate): Bucket K no longer requires
+    // task.adhocResolution === 'decompose' -- a viable subTaskProposals list (>= 2
+    // well-formed entries, none already echoed in implementResponse) is the only
+    // viability signal. It stays bounded by its own per-bucket counter:
+    // a task that burned its one generic requeue shot on an
+    // unrelated signature gets exactly one last in-place repair attempt here before
+    // falling back to the normal leave-for-human path.
     {
       const id0 = task.id || name.replace(/\.json$/, '');
       const subTasks = Array.isArray(task.subTaskProposals) ? task.subTaskProposals : [];
-      const isDecompose = task.adhocResolution === 'decompose' && subTasks.length >= 2;
+      const isDecompose = Array.isArray(task.subTaskProposals) && subTasks.length >= 2 && subTasks.every((s) => s && typeof s === 'object');
       const hasEvidence = isDecompose && subTasks.some((s) => s && s.title
         && String(task.implementResponse || '').includes(String(s.title).slice(0, 30)));
       if (isDecompose && !hasEvidence && bucketAttempts(task, 'K') < MAX_REQUEUES) {
@@ -1207,14 +1216,24 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
     // found to be buggy), not just this one incident.
     {
       const id0 = task.id || name.replace(/\.json$/, '');
-      if (task.reviewProvider === 'deterministic-truncation-guard' && bucketAttempts(task, 'J') < MAX_REQUEUES) {
+      // Paired re-admission for a gate FIX (2026-10-18, AGENTS.md third principle): a task whose legacy J retry was spent while the gate was
+      // still wrong (it re-blocked the same correct response) gets ONE more retry per TRUNCATION_GATE_VERSION -- and only when the CURRENT
+      // gate no longer flags its stored implementResponse, so exactly what the old rule stranded comes back and a still-flagged task stays.
+      const isTruncationBlock = task.reviewProvider === 'deterministic-truncation-guard';
+      const legacyJ = isTruncationBlock && bucketAttempts(task, 'J') < MAX_REQUEUES;
+      const versionKey = `J@${TRUNCATION_GATE_VERSION}`;
+      const versionedJ = isTruncationBlock && !legacyJ && bucketAttempts(task, versionKey) < MAX_REQUEUES
+        && typeof task.implementResponse === 'string' && task.implementResponse.trim() !== ''
+        && !detectTruncatedImplementResponse(task.implementResponse, task.source).truncated;
+      if (legacyJ || versionedJ) {
+        const jKey = legacyJ ? 'J' : versionKey;
         const adhocPath = path.join(adhocDir, `${id0}.json`);
         if (fs.existsSync(adhocPath)) {
           log(`${id0}: bucket J but ${id0}.json already in adhoc/ -- already handled, skipping`);
         } else {
           summary.checked += 1;
-          const attempt = bucketAttempts(task, 'J') + 1;
-          log(`${id0}: bucket J (deterministic-truncation-guard false-block signature) -> requeue ${attempt}/${MAX_REQUEUES}, now fixed in validate-implement-truncation.js`);
+          const attempt = bucketAttempts(task, jKey) + 1;
+          log(`${id0}: bucket J (deterministic-truncation-guard false-block signature${legacyJ ? '' : `; gate ${TRUNCATION_GATE_VERSION} now passes the stored response`}) -> requeue ${attempt}/${MAX_REQUEUES} [${jKey}], now fixed in validate-implement-truncation.js`);
           summary.requeued += 1;
           if (!DRY_RUN) {
             for (const f of REQUEUE_STRIP_FIELDS) delete task[f];
@@ -1222,9 +1241,9 @@ async function needsClarificationTriage({ pipelineDir, repoRoot, majorityVote })
             delete task.ncTriageDecision;
             delete task.ncTriageReviewedAt;
             delete task.reviewProvider;
-            bumpBucketAttempts(task, 'J');
+            bumpBucketAttempts(task, jKey);
             appendHistoryEvent(task, 'requeued',
-              `needs-clarification-triage: deterministic-truncation-guard false-block signature (a since-fixed review gate rejected an already-correct implementResponse) -- clean-state retry ${attempt}/${MAX_REQUEUES}`);
+              `needs-clarification-triage: deterministic-truncation-guard false-block signature (a since-fixed review gate rejected an already-correct implementResponse) -- clean-state retry ${attempt}/${MAX_REQUEUES}${legacyJ ? '' : ` under gate version ${TRUNCATION_GATE_VERSION} (the current gate passes the stored response)`}`);
             try {
               await classifyRequeue(task, { reasonHint: 'bucket-J: deterministic-truncation-guard false-block signature', requeueWriter: 'needs-clarification-triage', repoRoot });
             } catch { /* classification must never block the real requeue */ }

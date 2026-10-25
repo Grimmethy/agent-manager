@@ -114,7 +114,7 @@ test('replayGates: a gate that newly flags merged work is measured against the b
   assert.ok(Math.abs(c.rateMerged - 0.2) < 1e-9);
   const v = replayVerdict(r);
   assert.equal(v.block, true);
-  assert.match(v.reasons[0], /checkDraftQuality .*would flag 6 of 30 already-merged tasks \(20\.0%/);
+  assert.match(v.reasons[0], /checkDraftQuality .*newly flags 6 of 30 already-merged tasks \(20\.0%, limit 2\.0%\); in all it would flag 6 of 30 \(20\.0%\); the base flags 0/);
 });
 
 test('replayGates: a gate that flags no merged work passes, even though it flags unmerged work', () => {
@@ -131,9 +131,11 @@ test('replayVerdict: a flag rate under the limit, a base that already flagged th
   assert.equal(replayVerdict(mk({})).block, false, 'under the 2% limit');
   assert.equal(replayVerdict(mk({ rateMerged: 0.1, newlyFlaggedMergedCount: 0 })).block, false, 'nothing is NEWLY flagged');
   assert.equal(replayVerdict(mk({ rateMerged: 0.5, mergedTotal: 10 })).block, false, 'corpus too small to mean anything');
-  assert.equal(replayVerdict(mk({ rateMerged: 0.1, blocking: false })).block, false, 'a reported-only family never blocks');
-  assert.equal(replayVerdict(mk({ rateMerged: 0.1 })).block, true);
-  assert.equal(replayVerdict(mk({ rateMerged: 0.1 }), { maxRate: 0.2 }).block, false, 'the limit is configurable');
+  assert.equal(replayVerdict(mk({ rateMerged: 0.1, newlyFlaggedMergedCount: 10, blocking: false })).block, false, 'a reported-only family never blocks');
+  // 2026-10-19 rule change (intended): the limit applies to what the change NEWLY flags, not the gate's absolute rate.
+  assert.equal(replayVerdict(mk({ rateMerged: 0.1 })).block, false, '1 of 100 newly flagged is under the limit even though the gate flags 10% in all');
+  assert.equal(replayVerdict(mk({ rateMerged: 0.1, newlyFlaggedMergedCount: 10 })).block, true, '10 of 100 newly flagged is over it');
+  assert.equal(replayVerdict(mk({ rateMerged: 0.1, newlyFlaggedMergedCount: 10 }), { maxRate: 0.2 }).block, false, 'the limit is configurable');
 });
 
 test('replayGates: no corpus, an unknown signature and a throwing gate are reported without blocking', () => {
@@ -206,4 +208,15 @@ test('the corpus total size is capped (newest first) so the sandbox input file s
     assert.ok(c.total < 63, `capped corpus: ${c.total}`);
     assert.ok(c.total >= 1);
   } finally { delete process.env.AGENT_MANAGER_GATE_REPLAY_MAX_CHARS; }
+});
+
+// 2026-10-19 incident: a pure exemption to checkGroundedValues LOWERED its merged flags 225 -> 218 of 409 and was blocked on one new flag
+// (that did not reproduce outside the sandbox), because the old rule compared the gate's absolute 53% rate to the 2% limit.
+test('replayVerdict: a change to an already-noisy gate that lowers its flags with one stray new flag does not block; one that adds many does', () => {
+  const c = (newCount, after) => ({ candidates: [{ name: 'checkGroundedValues', file: 'src/fact-checker.js', blocking: true, mergedTotal: 409, before: { flaggedMerged: 225 },
+    after: { flaggedMerged: after }, rateMerged: after / 409, newlyFlaggedMergedCount: newCount, newlyFlaggedMerged: [{ id: 'function-length-x' }] }] });
+  assert.equal(replayVerdict(c(1, 218)).block, false);
+  const over = replayVerdict(c(10, 235));
+  assert.equal(over.block, true);
+  assert.match(over.reasons[0], /newly flags 10 of 409 already-merged tasks \(2\.4%, limit 2\.0%\); in all it would flag 235 of 409 \(57\.5%\); the base flags 225/);
 });

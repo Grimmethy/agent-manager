@@ -495,6 +495,8 @@ fi
 # ticks for the backoff to actually lengthen; reset to 0 the moment any tick's work is
 # NOT an infra failure (a real success, a non-infra block, or a genuinely idle tick).
 CONSECUTIVE_INFRA_FAILURES=0
+SWITCHED_OFF_TICKS=0                                                     # consecutive ticks this worker has been switched off by the operator (worker_switched_off); only used to print one line on each transition
+ENDPOINT_DOWN_TICKS=0                                                    # consecutive ticks the lane's Ollama endpoint did not answer (see the circuit breaker in the main loop)
 
 # Borrow a tick from another suite project (docs/idle-pool-borrowing.md). Called only when this lane's OWN project had nothing to do this tick.
 # Walks the pool in least-recently-borrowed order; the first project that yields work ends the walk. A borrowed tick does exactly ONE item (its
@@ -597,6 +599,25 @@ borrow_premium_from_projects() {
 while :; do                                                                     # `while :; do` is bash idiom for 'true/forever' loop — equivalent of PowerShell's `while ($true)` syntax we're matching here. Bash doesn't have boolean literals natively so ':' (the POSIX-no-op command that always returns 0=success) serves as the true condition in loops like this one; identical semantic meaning in practice to while-true block we use elsewhere.
   did_work=false                                                                 # tracks whether this tick actually processed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment). Reset fresh every tick.
   TICK_HAD_INFRA_FAILURE=false                                                   # set by process_drafting_file (a global, not a subshell -- it's called directly) when this tick's draft call failed on an apparent infra outage. Drives the backoff decision below, separate from did_work.
+
+  # Operator switch (Workers tab toggle, src/worker-switch.js). A worker switched off claims, resumes and borrows NOTHING, but stays alive and heartbeats status
+  # "disabled", so the watchdog leaves it alone and the claim loop treats the lane as not alive (capability-routing.js laneAliveFromHeartbeat), never as a place
+  # a task can be steered to. Checked FIRST each tick: a task already in drafting/ waits there until the worker is switched back on, and a task that is mid-flight
+  # when the switch flips finishes first (the check is once per tick).
+  if worker_switched_off "$INSTANCE_ID"; then
+    if (( SWITCHED_OFF_TICKS == 0 )); then
+      printf '[worker-%s] switched off by the operator (Workers tab) -- claiming nothing until it is switched back on.\n' "$INSTANCE_ID" >&2
+    fi
+    SWITCHED_OFF_TICKS=$((SWITCHED_OFF_TICKS + 1))
+    write_heartbeat_file "$INSTANCE_ID" "disabled" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"
+    if "$ONCE"; then exit 0; fi
+    sleep "${AGENT_MANAGER_SWITCHED_OFF_PAUSE_S:-${ORC_TICK_SECS:-30}}"     # orc-common.sh pins ORC_TICK_SECS to 30; this knob exists so a test can poll fast
+    continue
+  fi
+  if (( SWITCHED_OFF_TICKS > 0 )); then
+    printf '[worker-%s] switched back on after %s tick(s) off; resuming.\n' "$INSTANCE_ID" "$SWITCHED_OFF_TICKS" >&2
+    SWITCHED_OFF_TICKS=0
+  fi
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work -- see the function's own comment above the loop.
   printf '[worker-%s] tick at %s — searching for new drafts...\n' "$INSTANCE_ID" "$(date -u '+%FT%T.%NZ' 2>/dev/null)"    # status message at top of each iteration — same information PowerShell's Write-Verbose emits but using printf for format-safety (avoids issues if variable contents include '%' characters which would be interpreted as string-formatting directives by `echo -e` on some systems, breaking log output).
   write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "" "$STARTED_AT"   # so the dashboard's Workers tab sees this instance exists even on a tick that claims nothing -- previously never called anywhere in this script, which is why no workers ever showed up regardless of whether the process was alive.
@@ -610,6 +631,26 @@ while :; do                                                                     
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
+  fi
+
+  # Endpoint circuit breaker (2026-10-23, Grimmethy: the rx580 lane sat idle for 12 h after grimm hard-reset and its Ollama never came back; "this is a recurring
+  # event"). While this lane's Ollama endpoint does not answer, claim and resume NOTHING: every draft would fail identically, burn the task's infra requeue
+  # rounds and park it in blocked/ (540 failed ticks and six parked tasks that night). Wait and re-probe instead; the heartbeat says why (pass
+  # 'endpoint-unreachable'), the log says it on the first down tick and every 20th. AGENT_MANAGER_ENDPOINT_PROBE=off disables it (the sandbox tests point the
+  # endpoint at a closed port on purpose). A borrowed --once child just exits: its daemon already probed this same endpoint at the top of its own tick.
+  if [[ "${AGENT_MANAGER_ENDPOINT_PROBE:-on}" != "off" ]] && ! ollama_endpoint_reachable "${OLLAMA_URL:-http://localhost:11434}"; then
+    ENDPOINT_DOWN_TICKS=$((ENDPOINT_DOWN_TICKS + 1))
+    if (( ENDPOINT_DOWN_TICKS == 1 || ENDPOINT_DOWN_TICKS % 20 == 0 )); then
+      printf '[worker-%s] Ollama endpoint %s is not answering (tick %s of the outage) -- claiming nothing until it does.\n' "$INSTANCE_ID" "${OLLAMA_URL:-http://localhost:11434}" "$ENDPOINT_DOWN_TICKS" >&2
+    fi
+    write_heartbeat_file "$INSTANCE_ID" "idle" "$HEARTBEAT_MODEL" "" "endpoint-unreachable" "$STARTED_AT"
+    if "$ONCE"; then exit 0; fi
+    sleep "${AGENT_MANAGER_ENDPOINT_DOWN_PAUSE_S:-${ORC_TICK_SECS:-30}}"          # orc-common.sh pins ORC_TICK_SECS to 30; this knob exists so the test can poll fast
+    continue
+  fi
+  if (( ENDPOINT_DOWN_TICKS > 0 )); then
+    printf '[worker-%s] Ollama endpoint %s answers again after %s tick(s); resuming.\n' "$INSTANCE_ID" "${OLLAMA_URL:-http://localhost:11434}" "$ENDPOINT_DOWN_TICKS" >&2
+    ENDPOINT_DOWN_TICKS=0
   fi
 
   # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).

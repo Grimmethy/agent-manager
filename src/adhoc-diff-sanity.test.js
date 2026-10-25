@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
-  extractDeclaredTargets,
+  extractDeclaredTargets, planImportBindingProblem,
 } = require('./adhoc-diff-sanity.js');
 
 // Stubs arch-import-fetch.js's fetchForQueries for the duration of fn(), via require-cache
@@ -658,4 +658,116 @@ test('reading verbs: without a read-only statement a doc task\'s reading sentenc
   assert.equal(taskWantsCodeChange(adhocTask(head + 'Read the retry handling in src/a.js.')), false);
   assert.equal(taskWantsCodeChange(adhocTask(head + 'Read the retry handling in src/a.js and add an endpoint in src/a.js.')), true);
   assert.equal(taskWantsCodeChange(adhocTask(head + 'Read the retry handling in src/a.js. Also delete the lease in src/a.js.')), true);
+});
+
+// --- planImportBindingProblem (HUB0159 · 1/3) ---------------------------------
+// A binding token only counts INSIDE a fenced code block; a verbatim anchor is the
+// complete require('...') / import ... from '...' statement the implementer can find.
+
+test('planImportBindingProblem: no import-binding step at all passes', () => {
+  const t = adhoc(
+    'Wire the new helper into the plan pass.',
+    '1. Edit src/local-draft.js to call the new helper. No new bindings needed.',
+  );
+  assert.equal(planImportBindingProblem(t, 'Done.'), null);
+});
+
+test('planImportBindingProblem: one import step WITH a verbatim fenced anchor passes', () => {
+  const t = adhoc(
+    'Wire planImportBindingProblem into runPlanPass.',
+    [
+      '# PLAN',
+      '1. Add the import binding, verbatim, after the existing bindings:',
+      '```js',
+      "const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');",
+      '```',
+    ].join('\n'),
+  );
+  assert.equal(planImportBindingProblem(t, 'Done.'), null);
+});
+
+test('planImportBindingProblem: one import step with NO verbatim anchor is flagged (the protected case)', () => {
+  // Exactly one fenced import step, but the binding is only shown in shorthand --
+  // no quoted module specifier, so the implementer has nothing verbatim to find. This
+  // genuine finding must NOT be swallowed by the no-import-step or prose-only branches.
+  const t = adhoc(
+    'Wire the new binding into the plan pass.',
+    [
+      '# PLAN',
+      '1. Add a require for the new module near the other bindings:',
+      '```js',
+      'require(planImportBindingProblem) // wire it in',
+      '```',
+    ].join('\n'),
+  );
+  const p = planImportBindingProblem(t, '');
+  assert.equal(p.code, 'missing-verbatim-find-anchor');
+  assert.ok(typeof p.reason === 'string' && p.reason.length > 0, 'reason must be a non-empty string');
+  assert.match(p.retryFeedback, /verbatim/i);
+});
+
+test('planImportBindingProblem: two import steps are flagged too-many', () => {
+  const t = adhoc(
+    'Wire both bindings into the plan pass.',
+    [
+      '# PLAN',
+      '1.',
+      '```js',
+      "const a = require('./a.js');",
+      '```',
+      '2.',
+      '```js',
+      "const b = require('./b.js');",
+      '```',
+    ].join('\n'),
+  );
+  const p = planImportBindingProblem(t, '');
+  assert.equal(p.code, 'too-many-import-binding-steps');
+  assert.ok(typeof p.reason === 'string' && p.reason.length > 0);
+});
+
+test('planImportBindingProblem: a prose-only mention of require( is NOT an import step (false-positive guard)', () => {
+  // The binding is talked about in plain prose -- even quoted -- but never shown inside a
+  // fenced code block, so per the tightened heuristic it is not an import-binding step.
+  const t = adhoc(
+    'Wire it in.',
+    'Step 1: the plan should mention adding "a require(\'./adhoc-diff-sanity.js\')" line -- in prose only, no snippet.',
+  );
+  assert.equal(planImportBindingProblem(t, "the summary also only says the plan will add a require('./x.js') line"), null);
+});
+
+// 2026-10-25 (adhoc-clear-pidfile-...-1792936771585, blocked on `diff touches server/core/comfy_proc.py (matches forbidden "comfy_proc.py")`):
+// "In the <repo> repo, modify `<path>`'s `fn()`" names the target but is not the "In `<path>`," shape, so the task's own "Do not change anything else in
+// <file>" sentence forbade the file it had just been told to edit. extractDeclaredTargets rule 6: a verb whose direct object is a backticked file path.
+const CLEAR_PIDFILE_TEXT = [
+  'In the gpu-broker repo, modify `server/core/comfy_proc.py`\'s `_clear_pidfile()` (defined at line ~318): catch FileNotFoundError separately and silently.',
+  'Do not change anything else in comfy_proc.py, gpu_session.py, or any other production code.',
+].join('\n');
+
+test('extractDeclaredTargets: "modify `<path>`" names the target even when the sentence starts with "In the <repo> repo,"', () => {
+  const t = adhoc(CLEAR_PIDFILE_TEXT);
+  assert.ok(extractDeclaredTargets(t).includes('server/core/comfy_proc.py'));
+  assert.deepEqual(extractForbiddenPaths(CLEAR_PIDFILE_TEXT), ['comfy_proc.py', 'gpu_session.py']);
+});
+
+test('forbidden-path: the file a task says to modify is not forbidden by its own "do not change anything else in <file>" sentence; the sibling still is', () => {
+  const t = adhoc(CLEAR_PIDFILE_TEXT);
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('server/core/comfy_proc.py')), null);
+  const p = adhocDiffSubstanceProblem(t, editDiff('server/core/comfy_proc.py') + editDiff('server/core/gpu_session.py'));
+  assert.equal(p && p.code, 'forbidden-path');
+  assert.match(p.detail || p.message || JSON.stringify(p), /gpu_session\.py/);
+});
+
+test('extractDeclaredTargets: rule 6 stays narrow -- a restricted file, a merely cited path and a call are not targets', () => {
+  const targets = extractDeclaredTargets(adhoc([
+    'Do not modify `src/b.js`.',
+    'Never edit `src/c.js` or `src/d.js`.',
+    'Prepend a note stating the rule is enforced by `scripts/check-doc-link.sh`.',
+    'Then fix res.json() handling, and update the docs if needed.',
+    'Mention the stale text in `Docs/cited.md` carefully.',
+    'Replace `Docs/a.md` with the new wording.',
+  ].join('\n')));
+  for (const bad of ['src/b.js', 'src/c.js', 'src/d.js', 'scripts/check-doc-link.sh']) assert.ok(!targets.includes(bad), bad);
+  assert.ok(!targets.includes('Docs/cited.md'));
+  assert.ok(targets.includes('Docs/a.md'));
 });

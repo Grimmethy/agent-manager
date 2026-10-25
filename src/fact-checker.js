@@ -468,7 +468,9 @@ function checkBlastRadiusBias(text) {
 // case of copying a real value from the wrong sibling.
 const URL_RE = /https?:\/\/[^\s"'`)\]}<>]+/gi;
 const GIS_FIELD_RE = /\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b/g;
-const PLACEHOLDER_RE = /placeholder|example\.(?:com|org|net)|\bTODO\b|\bFIXME\b|\bTBD\b|XXXX?/i;
+// 2026-10-22: also a dotted host written with letter octets (100.x.y.z, x.x.x.x), the usual way a README
+// example hides a real address. Live: chat-plugin 'Multi-chat 1/6' was hard-blocked on http://100.x.y.z:7450.
+const PLACEHOLDER_RE = /placeholder|example\.(?:com|org|net)|\bTODO\b|\bFIXME\b|\bTBD\b|XXXX?|\bx\.(?:y\.z|x\.x)\b/i;
 
 // 2026-08-25, root-caused live via a real blocked task: a pure UI change legitimately
 // introduced two brand-new JS constants (JOB_TYPE_FAMILIES, JOB_TYPE_FAMILY_BY_SOURCE) as
@@ -503,6 +505,32 @@ const NEW_DECLARATION_RE = /^\+\s*(?:(?:const|let|var)\s+)?([A-Z][A-Z0-9]*_[A-Z0
 
 function extractNewlyDeclaredIdentifiers(text) {
   return new Set([...text.matchAll(NEW_DECLARATION_RE)].map((m) => m[1]));
+}
+
+// 2026-10-18, root-caused live (brain-dump 1890's review, this pipeline): a draft that adds an env switch -- read as
+// process.env.AGENT_MANAGER_EDIT_FILE_TIERS on an added line of an EXISTING file -- was hard-blocked 'ungrounded-field'
+// before any vote. Same class as the newly-declared exemption above: the draft's own diff is what introduces the name, so
+// no pre-change grounding can contain it. But an environment variable is introduced by being READ, never by a `NAME =`
+// line, so NEW_DECLARATION_RE can never exempt it. Exempts a token an ADDED diff line reads from the environment:
+// process.env.NAME / process.env['NAME'], os.environ['NAME'], os.environ.get('NAME', os.getenv('NAME', getenv('NAME',
+// and shell ${NAME:-x} / ${NAME-x} / ${NAME:=x} (default-value forms only -- a JS template ${NAME} referencing a constant
+// is not an env read and stays checked). Prose, context and removed lines never exempt anything.
+// 2026-10-19 (brain-dump 1896's review, blocked on env.AGENT_MANAGER_TRANSIENT_RETRY): an identifier named `env` used as a property access also
+// counts -- `env.NAME`, `env['NAME']`, Python `env.get('NAME'` -- because this codebase's own idiom is an injected parameter,
+// `function f(url, env = process.env) { ... env.NAME ... }` (lanes.js isSlowEndpoint, capability-ledger.js, transient-retry.js). `\benv\.` still
+// matches process.env.NAME (a word boundary sits between '.' and 'e'); `myenv.NAME` does not match. A replay of all 41 historic ungrounded-field
+// blocks (2026-10-19) found none this widening would have exempted: it is about the live idiom, not past blocks.
+const ENV_READ_RE = /(?:\benv\.|\benv\[\s*['"`]|\benv\.get\(\s*['"]|os\.environ\[\s*['"]|os\.environ\.get\(\s*['"]|(?:os\.)?getenv\(\s*['"])([A-Z][A-Z0-9]*_[A-Z0-9_]+)|\$\{([A-Z][A-Z0-9]*_[A-Z0-9_]+):?[-=]/g;
+
+function extractEnvReadIdentifiers(text) {
+  const out = new Set();
+  let inDiff = false;
+  for (const line of String(text || '').split('\n')) {
+    if (DIFF_META_RE.test(line)) { inDiff = true; continue; }
+    if (!inDiff || !line.startsWith('+') || line.startsWith('+++')) continue;
+    for (const m of line.matchAll(ENV_READ_RE)) out.add(m[1] || m[2]);
+  }
+  return out;
 }
 
 // 2026-09-08, root-caused live via a real blocked adhoc task (the analytics-and-discovery.js
@@ -651,12 +679,57 @@ function urlsOnlyInAddedTestFiles(text) {
   return new Set([...inTest].filter((u) => !inProd.has(u)));
 }
 
+// 2026-10-19, root-caused live (brain-dump 1891's review): an ALL_CAPS dummy string in an ADDED unit test ('SENTINEL_THOUGHT', a stand-in for
+// model thinking text) was hard-blocked 'ungrounded-field', although urlsOnlyInAddedTestFiles above already exempts a URL that lives only in
+// the draft's own test data. Same reason, narrower on purpose: the token must sit INSIDE A STRING LITERAL on an added line of at least one
+// test file and appear on no added line of a non-test file -- and nowhere outside a string literal in a test file either. A bare identifier
+// in test code (`x = INVENTED_FIELD_NAME`) is a reference to a symbol that should exist, so it stays checked (test 'an ungrounded ALLCAPS
+// field in a test file is still flagged'); prose neither exempts nor un-exempts anything. Replayed over every historic ungrounded-field
+// block (41 blocks, 28 tasks, 2026-10-19) it would have exempted two names -- FOO_BAR_BAZ and RETRY_BACKOFF_CAP, both string fixtures in
+// tests of the checkers themselves -- and kept the other 39. (1889's similar sentinel passed only because its lowercase suffix defeated
+// GIS_FIELD_RE's trailing \b, by accident.)
+const STRING_LITERAL_RE = /(['"`])(?:\\.|(?!\1)[^\\])*\1/g;
+
+function fieldsOnlyInAddedTestFiles(text) {
+  const inTestStrings = new Set();
+  const elsewhere = new Set();
+  let file = null;
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^diff --git a\/\S+ b\/(\S+)/);
+    if (m) { file = m[1]; continue; }
+    if (!file || !line.startsWith('+') || line.startsWith('+++')) continue;
+    if (!TEST_FILE_RE.test(file)) { for (const f of line.match(GIS_FIELD_RE) || []) elsewhere.add(f); continue; }
+    for (const lit of line.match(STRING_LITERAL_RE) || []) for (const f of lit.match(GIS_FIELD_RE) || []) inTestStrings.add(f);
+    for (const f of line.replace(STRING_LITERAL_RE, ' ').match(GIS_FIELD_RE) || []) elsewhere.add(f);
+  }
+  return new Set([...inTestStrings].filter((f) => !elsewhere.has(f)));
+}
+
+// 2026-10-24 (chat plugin HUB0003-05, vendoring dockview-core): the body of a THIRD-PARTY file the draft vendors into the repo is not the draft's claim
+// about anything -- a 540 KB minified library carries hundreds of constants and URLs (ENABLE_TRACKING, http://www.w3.org/2000/svg, ...) that no task text or
+// repo grounding can contain, and the review was hard-blocked 'ungrounded-field' / 'ungrounded-url' before any vote, with no way to pass a legitimate
+// vendoring. Drops every diff section whose file is vendored (a vendor/, vendored/, third_party/ or node_modules/ directory, or a .min.js / .min.css
+// file) from what is scanned. Narrow: only the vendored file's own section is dropped; prose, the README that records the source, and every
+// non-vendored file in the same diff are still scanned (a fabricated value in a README still flags).
+const VENDORED_FILE_RE = /(?:^|\/)(?:vendor|vendored|third_party|node_modules)\/|\.min\.(?:js|css)$/;
+
+function stripVendoredDiffSections(text) {
+  let skipping = false;
+  return String(text || '').split('\n').map((line) => {
+    const m = line.match(/^diff --git a\/\S+ b\/(\S+)/);
+    if (m) skipping = VENDORED_FILE_RE.test(m[1]);
+    return skipping ? '' : line;
+  }).join('\n');
+}
+
 function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   if (!sourceText) return [];
   const flags = [];
-  const scannableText = stripUnchangedDiffLines(draftText);
+  const scannableText = stripUnchangedDiffLines(stripVendoredDiffSections(draftText));
   const testFixtureUrls = urlsOnlyInAddedTestFiles(draftText);
   const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
+  const envReads = extractEnvReadIdentifiers(draftText);
+  const testFixtureFields = fieldsOnlyInAddedTestFiles(draftText);
   const echoMarkers = extractEchoMarkers(draftText);
 
   const urls = [...new Set(scannableText.match(URL_RE) || [])];
@@ -674,6 +747,8 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   for (const field of fields) {
     if (PLACEHOLDER_RE.test(field)) continue;
     if (newlyDeclared.has(field)) continue;
+    if (envReads.has(field)) continue;
+    if (testFixtureFields.has(field)) continue;
     if (echoMarkers.has(field)) continue;
     if (sourceText.includes(field)) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
@@ -1024,7 +1099,10 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
 }
 
 module.exports = {
+  stripVendoredDiffSections,
   urlsOnlyInAddedTestFiles,
+  extractEnvReadIdentifiers,
+  fieldsOnlyInAddedTestFiles,
   checkDraft,
   checkFilePaths,
   checkRelationships,

@@ -506,9 +506,19 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(executedSection);
     lines.push('');
   }
+  const reproSection = require('./review-repro.js').formatReproSection(task.executedVerification && task.executedVerification.repro);
+  if (reproSection) {
+    lines.push(reproSection);
+    lines.push('');
+  }
   const inertSection = formatInertAdditionsSection(task.inertAdditions);
   if (inertSection) {
     lines.push(inertSection);
+    lines.push('');
+  }
+  const overlapSection = require('./review-content-overlap.js').formatContentOverlapSection(task.contentOverlap);
+  if (overlapSection) {
+    lines.push(overlapSection);
     lines.push('');
   }
   const inertTargetSection = require('./lib/inert-target.js').formatInertTargetSection(task.inertTarget);
@@ -631,11 +641,32 @@ function summariseSyntax(s) {
   };
 }
 
+// HUB0184 · 2/4: unified diff extractor -- the executed-verification gate used to be hard-gated to
+// adhoc implement drafts, but ANY source whose draft carries a real diff (agentic-draft-common.js
+// captures the worktree diff into task.rawDiff, source-agnostic) deserves the same covering-test
+// check. Returns the task's diff string when the gate should run, or null when it must stay off:
+// no diff at all, or an adhoc draft that did not resolve to 'implemented' (those never ran a
+// covering suite, so the pre-HUB0184 adhoc-only condition is preserved exactly).
+function extractTaskDiff(task) {
+  if (!task || typeof task !== 'object') return null;
+  if (typeof task.rawDiff !== 'string' || !task.rawDiff.trim()) return null;
+  if (resolveSourceName(task) === 'adhoc' && task.adhocResolution !== 'implemented') return null;
+  return task.rawDiff;
+}
+
 // A compact, record-safe view of a review-verify result for task.executedVerification (no raw output beyond what a redraft needs).
+// HUB0184 · 2/4: ran/result/timestamp/failedTests are the flat fields the dashboard reads; the
+// existing status/at/tests/commands shape stays put for the voters and the redraft feedback.
 function summariseExecutedVerification(ev) {
+  const at = new Date().toISOString();
+  const failedTests = (ev.tests && Array.isArray(ev.tests.failures) ? ev.tests.failures : []).slice(0, 10).map((f) => String(f).slice(0, 300));
   return {
+    ran: true,
+    result: ev.status,
+    timestamp: at,
+    failedTests,
     status: ev.status,
-    at: new Date().toISOString(),
+    at,
     reasons: (ev.reasons || []).slice(0, 6).map((r) => String(r).slice(0, 300)),
     tests: ev.tests ? { ran: ev.tests.ran || [], passed: ev.tests.passed, failures: (ev.tests.failures || []).slice(0, 10), ...(ev.tests.preexisting && ev.tests.preexisting.length ? { preexisting: ev.tests.preexisting.slice(0, 10) } : {}), ...(ev.tests.dependentsUnverified && ev.tests.dependentsUnverified.length ? { dependentsUnverified: ev.tests.dependentsUnverified.slice(0, 10) } : {}), ...(ev.tests.passedFiles && ev.tests.passedFiles.length ? { passedFiles: ev.tests.passedFiles.slice(0, 10) } : {}), ...(ev.tests.timedOutFiles && ev.tests.timedOutFiles.length ? { timedOutFiles: ev.tests.timedOutFiles.slice(0, 10) } : {}), ...(ev.tests.preexistingOnlyFiles && ev.tests.preexistingOnlyFiles.length ? { preexistingOnlyFiles: ev.tests.preexistingOnlyFiles.slice(0, 10) } : {}), ...(ev.tests.partial && ev.tests.partial.length ? { partial: ev.tests.partial.slice(0, 6).map((x) => ({ file: x.file, count: x.count, passed: x.passed, tests: (x.tests || []).slice(0, 6).map((t) => String(t).slice(0, 100)) })) } : {}) } : null,
     commands: (ev.commands || []).map((c) => ({
@@ -784,6 +815,7 @@ function summariseGateReplay(replay) {
       name: String(c.name || '').slice(0, 80), file: String(c.file || '').slice(0, 120), family: String(c.family || '').slice(0, 20), blocking: !!c.blocking, total: n(c.total), mergedTotal: n(c.mergedTotal),
       beforeFlaggedMerged: c.before ? n(c.before.flaggedMerged) : null, afterFlaggedMerged: c.after ? n(c.after.flaggedMerged) : 0, afterFlagged: c.after ? n(c.after.flagged) : 0,
       rateMerged: Number.isFinite(c.rateMerged) ? c.rateMerged : null, newCount: n(c.newlyFlaggedMergedCount),
+      newRateMerged: n(c.mergedTotal) ? n(c.newlyFlaggedMergedCount) / n(c.mergedTotal) : null,
       examples: (Array.isArray(c.newlyFlaggedMerged) ? c.newlyFlaggedMerged : []).slice(0, 3).map((x) => ({ id: String((x && x.id) || '').slice(0, 70), detail: String((x && x.detail) || '').slice(0, 100) })),
     })),
     skipped: skipped.slice(0, GATE_REPLAY_MAX_ITEMS).map((x) => ({ name: String((x && x.name) || '').slice(0, 80), reason: String((x && x.reason) || '').slice(0, 160) })),
@@ -797,7 +829,8 @@ function formatGateReplaySection(gr) {
     const pct = c.rateMerged == null ? 'n/a' : `${(c.rateMerged * 100).toFixed(1)}%`;
     out.push(`The diff adds or changes the gate ${c.name} (${c.file}). Run over the real corpus (${c.total} finished tasks, ${c.mergedTotal} of them merged), it flags ${c.afterFlaggedMerged} merged task(s) = ${pct}`
       + `${c.beforeFlaggedMerged == null ? ' (it is a new gate)' : `; the base version flags ${c.beforeFlaggedMerged}`}; ${c.newCount} merged task(s) are newly flagged${c.examples.length ? `, e.g. ${c.examples.map((x) => `${x.id}${x.detail ? ` (${x.detail})` : ''}`).join('; ')}` : ''}.`);
-    if (c.blocking) out.push(`Work that already merged should not be flagged by a new gate; the limit here is ${(gr.maxRate * 100).toFixed(1)}%. ${gr.block ? 'THIS GATE IS OVER THE LIMIT: treat it as a false-positive defect unless the task text says the merged tasks listed were wrong to merge.' : 'This gate is within the limit.'}`);
+    if (c.blocking) out.push(`Work that already merged should not be newly flagged by this change; the limit applies to merged tasks the change newly flags`
+      + `${c.newRateMerged == null ? '' : ` (${(c.newRateMerged * 100).toFixed(1)}% here)`} and is ${(gr.maxRate * 100).toFixed(1)}%. ${gr.block ? 'THIS GATE IS OVER THE LIMIT: treat it as a false-positive defect unless the task text says the merged tasks listed were wrong to merge.' : 'This gate is within the limit.'}`);
     else out.push('This corpus has no "must not flag" population, so the count is reported for information only.');
   }
   for (const x of gr.skipped || []) out.push(`No real-data replay was possible for ${x.name}: ${x.reason}. Ask what real inputs the draft tested it against.`);
@@ -851,7 +884,7 @@ function formatSkipPathSection(sp) {
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported (via
  * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
  */
-async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null, findUndefinedFn = null } = {}) {
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null, findUndefinedFn = null, findOverlapFn = null } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
@@ -1374,24 +1407,27 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     console.error(`[review] edit-set syntax gate errored for ${task.id} (non-fatal, continuing): ${e && e.message}`);
   }
 
-  // Executed verification: see the block comment above summariseExecutedVerification. Adhoc implement drafts only (they carry a real rawDiff plus
-  // the acceptance results the draft claims); every other source keeps its own gates.
-  if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false'
-      && resolveSourceName(task) === 'adhoc'
-      && task.adhocResolution === 'implemented'
-      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+  // Executed verification: see the block comment above summariseExecutedVerification. HUB0184 · 2/4: any source whose
+  // draft carries a real diff (extractTaskDiff), not just adhoc implement drafts -- for an adhoc implemented draft it
+  // returns exactly the diff the old adhoc-only gate required, so that path behaves identically to before.
+  const extractedDiff = extractTaskDiff(task);
+  if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false' && extractedDiff) {
     let ev = null;
     try {
-      const verify = verifyDiffFn || require('./review-verify.js').verifyDiff;
+      const verifyBase = verifyDiffFn || require('./review-verify.js').verifyDiff;
+      // 'Not reproduced' check (review-repro.js): only brain-dump-derived adhoc tasks that are not a hub slice.
+      const verify = require('./review-repro.js').wantsRepro(task, { hubChild: isHubChildTask(task) }) ? (a) => verifyBase({ ...a, checkRepro: true }) : verifyBase;
       // A stacked hub sub-task builds on its shared branch, not on master -- verify against the same base the draft used.
       const baseBranch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
       const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
-      ev = verify({ taskId: task.id, rawDiff: task.rawDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false', pipelineDir, checkReplay: process.env.AGENT_MANAGER_REVIEW_GATE_REPLAY !== 'false' });
+      ev = verify({ taskId: task.id, rawDiff: extractedDiff, acceptanceResults: task.acceptanceResults || [], repoRoot, mainBranch: baseBranch, budgetMs: budget > 0 ? budget : EXECUTED_VERIFY_BUDGET_MS, checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false', pipelineDir, checkReplay: process.env.AGENT_MANAGER_REVIEW_GATE_REPLAY !== 'false' });
     } catch (e) {
       console.error(`[review] executed verification errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
     }
     if (ev && ev.status) {
       task.executedVerification = summariseExecutedVerification(ev);
+      const reproLib = require('./review-repro.js');
+      reproLib.recordRepro(task, ev, appendHistoryEvent);
       const ranTests = ev.tests && ev.tests.ran ? ev.tests.ran.length : 0;
       const confirmed = (ev.commands || []).filter((c) => c.outcome === 'confirmed').length;
       appendHistoryEvent(task, 'advisory', `executed verification: ${ev.status} (${ranTests} covering test file(s), ${confirmed} claimed check(s) re-run and confirmed${ev.unpinned && Array.isArray(ev.unpinned.hunks) && ev.unpinned.hunks.length ? `, ${ev.unpinned.hunks.length} unpinned hunk(s)` : ''}${ev.status === 'inconclusive' && ev.reasons && ev.reasons[0] ? `; ${String(ev.reasons[0]).slice(0, 160)}` : ''})`);
@@ -1412,6 +1448,13 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
             return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
           }
         }
+      }
+      const reproBlock = reproLib.blockReason(task.executedVerification.repro);
+      if (reproBlock) {
+        task.reviewProvider = 'deterministic-repro-check';
+        recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reproBlock });
+        appendHistoryEvent(task, 'blocked', reproBlock);
+        return { succeeded: true, verdict: 'blocked', blockedReason: reproBlock, blockedStage: 'review', factCheckVerdict };
       }
       if (ev.status === 'failed') {
         const reason = executedVerificationBlockReason(ev);
@@ -1443,6 +1486,38 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       }
     } catch (e) {
       console.error(`[review] inert-addition check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+  }
+
+  // Content overlap (see formatContentOverlapSection): the diff duplicates what another unmerged branch or the base already has. Advisory by default; 'block' blocks.
+  const overlapMode = process.env.AGENT_MANAGER_REVIEW_OVERLAP_CHECK;
+  if (overlapMode !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    try {
+      const overlapLib = require('./review-content-overlap.js');
+      const find = findOverlapFn || overlapLib.findContentOverlap;
+      const branch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
+      const baseRef = resolveInertBaseRef(repoRoot, branch) || (findOverlapFn ? branch : null);
+      if (baseRef) {
+        const r = find({ rawDiff: task.rawDiff, repoRoot, baseRef, ownRefs: [`origin/agent/${task.id}`] });
+        if (r && Array.isArray(r.overlaps)) {
+          task.contentOverlap = overlapLib.summariseContentOverlap(r);
+          if (r.overlaps.length) {
+            appendHistoryEvent(task, 'advisory', `content-overlap check: ${task.contentOverlap.total} overlap(s) (${task.contentOverlap.overlaps.slice(0, 3).map((o) => `${o.file} <- ${o.ref}`).join('; ')})`);
+            if (overlapMode === 'block') {
+              const reason = overlapLib.contentOverlapBlockReason(task.contentOverlap);
+              task.reviewProvider = 'deterministic-content-overlap';
+              recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+              appendHistoryEvent(task, 'blocked', reason);
+              return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`[review] content-overlap check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
     }
   }
 
@@ -1685,7 +1760,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();

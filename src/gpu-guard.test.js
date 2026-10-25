@@ -415,3 +415,92 @@ test('leaseHeldFor: missing or malformed file -> not held (fails open)', () => {
 test('comfyuiLeaseHeld keeps its whole-pipeline meaning for a scoped lease (ensureGpuHeadroom and the Forge paths see "some lease is held")', () => {
   withLeaseFile(freshLease({ endpoints: [P40] }), (p) => assert.equal(comfyuiLeaseHeld(p), true));
 });
+
+// ---- GPU broker piece G3a: ONE resolution of the URL that answers /api/gpu/yield ----
+
+const { gpuBrokerUrl } = require('./gpu-guard.js');
+
+test('gpuBrokerUrl: with no environment set the URL is http://localhost:7430 (today\'s default)', () => {
+  assert.equal(gpuBrokerUrl({}), 'http://localhost:7430');
+});
+
+test('gpuBrokerUrl: precedence is GPU_BROKER_URL, then PROMPTFORGE_URL (AM-prefixed), then PROMPTFORGE_URL', () => {
+  const all = { AGENT_MANAGER_GPU_BROKER_URL: 'http://broker:1', AGENT_MANAGER_PROMPTFORGE_URL: 'http://am-pf:2', PROMPTFORGE_URL: 'http://pf:3' };
+  assert.equal(gpuBrokerUrl(all), 'http://broker:1');
+  assert.equal(gpuBrokerUrl({ ...all, AGENT_MANAGER_GPU_BROKER_URL: undefined }), 'http://am-pf:2');
+  assert.equal(gpuBrokerUrl({ PROMPTFORGE_URL: 'http://pf:3' }), 'http://pf:3');
+});
+
+test('gpuBrokerUrl: an empty value counts as unset and one trailing slash is dropped', () => {
+  assert.equal(gpuBrokerUrl({ AGENT_MANAGER_GPU_BROKER_URL: '', PROMPTFORGE_URL: 'http://pf:3/' }), 'http://pf:3');
+});
+
+test('yieldForgeToPipeline: with no promptforgeUrl given it POSTs to the resolved broker URL, read at call time', async () => {
+  const saved = process.env.AGENT_MANAGER_GPU_BROKER_URL;
+  process.env.AGENT_MANAGER_GPU_BROKER_URL = 'http://broker-under-test:9999/';
+  try {
+    const posted = [];
+    await yieldForgeToPipeline({
+      fetchJsonFn: async (u, o) => {
+        if (u.endsWith('/system_stats')) return { ok: true, body: {} };
+        posted.push([u, o && o.method]);
+        return { ok: true, body: { yielded: true, reason: 'x' } };
+      },
+    });
+    assert.deepEqual(posted, [['http://broker-under-test:9999/api/gpu/yield', 'POST']]);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_GPU_BROKER_URL; else process.env.AGENT_MANAGER_GPU_BROKER_URL = saved;
+  }
+});
+
+// ---- cloud endpoints: there is no GPU behind a cloud lane's gateway ----
+function cloudRegistryEnv() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gpu-guard-lanes-'));
+  const file = path.join(dir, 'lanes.json');
+  fs.writeFileSync(file, JSON.stringify([
+    { gpu: 'rx580', ollamaUrl: 'http://100.96.112.78:11434', model: 'qwen3-vl:8b-instruct' },
+    { gpu: 'cloud', provider: 'cloud', ollamaUrl: 'http://127.0.0.1:7450', model: 'claude-haiku-5-5', taskClasses: ['adhoc'] },
+  ]));
+  return { AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_LANES_PATH: file };
+}
+
+test('leaseHeldFor: an unscoped Forge lease holds every GPU endpoint but never a cloud lane endpoint', () => {
+  const now = new Date().toISOString();
+  const env = cloudRegistryEnv();
+  withLeaseFile({ holder: 'promptforge', acquiredAt: now, refreshedAt: now }, (p) => {
+    assert.equal(leaseHeldFor('http://100.96.112.78:11434', p, env), true, 'a GPU lane endpoint is held');
+    assert.equal(leaseHeldFor('http://localhost:11434', p, env), true, 'the host endpoint is held');
+    assert.equal(leaseHeldFor('http://127.0.0.1:7450', p, env), false, 'the cloud endpoint is never held');
+    assert.equal(leaseHeldFor('http://127.0.0.1:7450/', p, env), false, 'trailing slash too');
+    assert.equal(leaseHeldFor(undefined, p, env), true, 'no endpoint given keeps the old meaning: any fresh lease');
+  });
+});
+
+test('ensureGpuHeadroom: for a cloud endpoint it does nothing -- no VRAM read, no /free, no TheAgent call', async () => {
+  let touched = false;
+  const result = await ensureGpuHeadroom({
+    ollamaUrl: 'http://127.0.0.1:7450',
+    isCloud: (url) => url === 'http://127.0.0.1:7450',
+    readFreeVram: () => { touched = true; return 10; },
+    fetchJsonFn: async () => { touched = true; return { ok: true }; },
+  });
+  assert.equal(touched, false, 'a cloud lane must never free ComfyUI or stop an app');
+  assert.equal(result.checked, false);
+  assert.equal(result.starved, false);
+  assert.deepEqual(result.freed, []);
+  assert.deepEqual(result.yielded, []);
+  assert.match(result.note, /cloud endpoint/);
+});
+
+test('ensureGpuHeadroom: a GPU endpoint is unchanged by the cloud bypass (still reads VRAM)', async () => {
+  let read = false;
+  const result = await ensureGpuHeadroom({
+    ollamaUrl: 'http://100.96.112.78:11434',
+    isCloud: () => false,
+    readFreeVram: () => { read = true; return 20000; },
+    fetchJsonFn: async () => { throw new Error('should not be called'); },
+  });
+  assert.equal(read, true);
+  assert.equal(result.checked, true);
+  assert.equal(result.starved, false);
+});
