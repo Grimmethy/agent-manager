@@ -57,7 +57,7 @@ function freshShape(task, entry, from, nowIso) {
   return fresh;
 }
 
-function sweepKnownFixedFailures({ pipelineDir, entries = KNOWN_FIXED, now = new Date(), dryRun = false } = {}) {
+async function sweepKnownFixedFailures({ pipelineDir, entries = KNOWN_FIXED, now = new Date(), dryRun = false } = {}) {
   const summary = { checked: 0, requeued: [], skipped: 0, newEntries: [] };
   if (!enabled() || !pipelineDir) return summary;
   const queueDir = path.join(pipelineDir, 'queue');
@@ -72,7 +72,7 @@ function sweepKnownFixedFailures({ pipelineDir, entries = KNOWN_FIXED, now = new
     for (const dir of entry.dirs || ['blocked', 'needs-clarification']) {
       const stateDir = path.join(queueDir, dir);
       let names;
-      try { names = fs.readdirSync(stateDir).filter((f) => f.endsWith('.json')); } catch { continue; }
+      try { names = (await fs.promises.readdir(stateDir)).filter((f) => f.endsWith('.json')); } catch { continue; }
       for (const name of names) {
         const filePath = path.join(stateDir, name);
         const task = readJson(filePath);
@@ -114,6 +114,8 @@ if (require.main === module) {
   const { getConfig } = require('./config.js');
   const { pipelineDir } = getConfig();
   const dryRun = process.argv.includes('--dry-run');
-  const s = sweepKnownFixedFailures({ pipelineDir, dryRun });
-  process.stdout.write(`checked=${s.checked} requeued=${s.requeued.length}${s.requeued.length ? ` [${s.requeued.map((r) => `${r.id}<-${r.entry}`).join(', ')}]` : ''} skipped=${s.skipped}${s.newEntries.length ? ` newEntries=[${s.newEntries.join(',')}]` : ''}${dryRun ? ' (dry run)' : ''}\n`);
+  (async () => {
+    const s = await sweepKnownFixedFailures({ pipelineDir, dryRun });
+    process.stdout.write(`checked=${s.checked} requeued=${s.requeued.length}${s.requeued.length ? ` [${s.requeued.map((r) => `${r.id}<-${r.entry}`).join(', ')}]` : ''} skipped=${s.skipped}${s.newEntries.length ? ` newEntries=[${s.newEntries.join(',')}]` : ''}${dryRun ? ' (dry run)' : ''}\n`);
+  })().catch((e) => { console.error(e); process.exit(1); });
 }
