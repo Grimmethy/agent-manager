@@ -79,7 +79,7 @@ const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api
 // Bound a window of lines to MAX_READ_FILE_CHARS WITHOUT lying about what came back. 2026-09-21 (change-review-fix-ac-50, found clearing needs-clarification): the char ceiling used
 // to cut the joined slice mid-line while nextOffset was still endLine + 1, so every line between the cut and endLine was never shown yet the model was told to page PAST them
 // (a comment even said "unknown exact line count when char-truncated"). Now only WHOLE lines that fit are returned, returnedThrough is the last of them, and the caller's
-const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
+const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, LIST_DIR_MAX_ENTRIES, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
 const { isSecretLookingPath } = require('./accessible-roots.js');
 const { searchTasksAllProjects, taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS } = require('./local-tool-task-tools.js');
 
@@ -464,11 +464,13 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'list_directory',
-      description: 'List the files and subdirectories directly inside a given path (one level, not recursive). Path is relative to the primary repo root, OR an absolute path inside any accessible repo (see list_roots).',
+      description: 'List the files and subdirectories directly inside a given path (one level, not recursive). Path is relative to the primary repo root, OR an absolute path inside any accessible repo (see list_roots). Entries are sorted by name and a call returns at most 200: a larger directory comes back with truncated:true, totalEntries and a note -- page with `offset` or narrow with `prefix`.',
       parameters: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Directory path relative to the primary repo root (e.g. "src"), or an absolute path inside another accessible repo. Omit or use "." for the primary repo root.' },
+          prefix: { type: 'string', description: 'Optional: only entries whose name starts with this.' },
+          offset: { type: 'integer', description: 'Optional: first entry to return, for paging past the 200-entry cap (use the returned nextOffset; see totalEntries and truncated).' },
         },
         required: [],
       },
@@ -548,7 +550,7 @@ function buildToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
       return hits;
     },
     read_file: (args) => readFileTool(allowedRoots, { path: args.path, offset: args.offset, limit: args.limit, readOnlyRoots }),
-    list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path, readOnlyRoots }),
+    list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path, prefix: args.prefix, offset: args.offset, readOnlyRoots }),
     list_roots: () => listRootsTool(allowedRoots, readOnlyRoots),
     read_task: (args) => {
       const t = pipelineFor(args.project, { pipelineDir });
@@ -1576,7 +1578,7 @@ function installStdoutEpipeGuard(label, stream = process.stdout) {
 }
 
 module.exports = {
-  runPlanWithTools, readFileTool, listDirectoryTool, listRootsTool,
+  runPlanWithTools, readFileTool, listDirectoryTool, listRootsTool, LIST_DIR_MAX_ENTRIES,
   resolveInsideRepo, resolveInsideRoots, TOOLS,
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS, CHAT_TOOLS,
   buildToolHandlers, buildWriteToolHandlers, buildChatToolHandlers,
