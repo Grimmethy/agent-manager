@@ -9,6 +9,7 @@ const { findTaskAnywhere, QUEUE_STATES } = require('./task-anywhere.js');
 const { lineMatches } = require('./text-match.js');
 const { getConfig } = require('./config.js');
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
+const { listProjects, resolveProject, projectForText } = require('./chat-projects.js');
 const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
 
 const READ_TASK_SECTIONS = { plan: 'planResponse', implement: 'implementResponse', blockedReason: 'blockedReason', history: 'history' };
@@ -178,11 +179,29 @@ function searchTasksTool(pipelineDir, { query, state, includeArchived } = {}) {
   return { results };
 }
 
-function queueReviewedTaskTool(pipelineDir, { title, description }) {
+function realDir(p) {
+  try { return fs.realpathSync(p); } catch { return path.resolve(String(p)); }
+}
+
+// `project` (label or repo root, from list_projects) files the task into THAT project's queue with its task-domains.json. Omitted: today's target (the
+// pipelineDir argument), but a text whose absolute paths all belong to ONE other registered project is refused instead of landing in the wrong queue
+// (2026-10-25: two tasks about the chat plugin repo went into agent-manager's own queue). `opts` is for tests: { projects, defaultDomainsPath }.
+function queueReviewedTaskTool(pipelineDir, { title, description, project }, opts = {}) {
   if (typeof title !== 'string' || !title.trim()) return { error: 'queue_reviewed_task requires a non-empty "title" argument' };
   if (typeof description !== 'string' || !description.trim()) return { error: 'queue_reviewed_task requires a non-empty "description" argument' };
   if (isGitWriteRequest({ title, description })) return { error: GIT_WRITE_REQUEST_REFUSAL };
-  const { domainsPath } = getConfig();
+  const projects = opts.projects || listProjects();
+  let target = { pipelineDir, domainsPath: null, label: null }; // domainsPath null = the process default, looked up only when a task is really queued
+  if (typeof project === 'string' && project.trim()) {
+    const resolved = resolveProject(project, projects);
+    if (resolved.error) return { error: resolved.error };
+    target = { pipelineDir: resolved.project.pipelineDir, domainsPath: resolved.project.domainsPath, label: resolved.project.label };
+  } else {
+    const owner = projectForText(`${title}\n${description}`, projects);
+    if (owner && realDir(owner.pipelineDir) !== realDir(pipelineDir)) {
+      return { error: `this task is about the project "${owner.label}" (paths under ${owner.repoRoot}) but would be queued to a different project's queue; call again with project: "${owner.label}"` };
+    }
+  }
   try {
     // premiumPriority: true (2026-09-16, Grimmethy: "any tasks that chat is working on
     // directly should be labelled premium priority") -- every task Chat itself queues
@@ -190,10 +209,11 @@ function queueReviewedTaskTool(pipelineDir, { title, description }) {
     // now, not a background-priority idea to triage eventually. See
     // queueAdhocTask()'s own header for what this field does.
     const { record } = queueAdhocTask(
-      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true },
-      { pipelineDir, domainsPath },
+      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true, ...(target.label ? { project: target.label } : {}) },
+      { pipelineDir: target.pipelineDir, domainsPath: target.domainsPath || opts.defaultDomainsPath || getConfig().domainsPath },
     );
-    return { queuedTaskId: record.id, message: `Queued as ${record.id} (premium priority) -- it will go through the normal review pipeline (see the Adhoc Tasks tab).` };
+    const where = target.label ? ` in project "${target.label}"` : '';
+    return { queuedTaskId: record.id, ...(target.label ? { project: target.label } : {}), message: `Queued as ${record.id}${where} (premium priority) -- it will go through the normal review pipeline (see the Adhoc Tasks tab).` };
   } catch (e) {
     return { error: `failed to queue task: ${e.message}` };
   }

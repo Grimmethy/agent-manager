@@ -279,6 +279,7 @@ const CHAT_TOOLS = [
         properties: {
           title: { type: 'string', description: 'Short title for the queued task, e.g. "Add re-admission path for symbol-still-referenced decompose rejections".' },
           description: { type: 'string', description: 'What should be built/changed and why -- include enough detail (files, the specific behavior, acceptance criteria) for the pipeline to act on without further back-and-forth.' },
+          project: { type: 'string', description: 'Label or repo root of the project this task is for (from list_projects); omit only for agent-manager itself. A task about another project\'s files is refused without it.' },
         },
         required: ['title', 'description'],
       },
@@ -577,7 +578,7 @@ function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
   return {
     run_bash: (args) => runBashTool(allowedRoots, { command: args.command, readOnly: true }),
     list_projects: () => ({ projects: listProjects({ activeRepoRoot: repoRoot }) }),
-    queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description }),
+    queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description, project: args.project }),
     answer_task_clarification: (args) => answerNeedsClarification(pipelineDir, args.taskId, args.answer),
     resolve_task_clarification: (args) => resolveNeedsClarification(pipelineDir, args.taskId, args.paths),
     mark_task_clarification_done: (args) => markNeedsClarificationDone(pipelineDir, args.taskId),
