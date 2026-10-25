@@ -34,6 +34,7 @@ const { injectContextLogInstruction, extractContextLog, writeContextLogInbox } =
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
+const { listProjects } = require('./chat-projects.js');
 const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask,
 } = require('./chat-task-requeue.js');
@@ -246,6 +247,14 @@ const WRITE_TOOLS = [
 // see runBashTool) -- a filesystem-level guarantee, not a request the model can choose
 // to ignore the way "please use queue_reviewed_task" alone would have been.
 const CHAT_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'list_projects',
+      description: 'List every registered project with its label, repo root, pipeline dir, whether it is pooled and whether it is the active one -- call this before queue_reviewed_task or any task tool and pass the label as `project`.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
   {
     type: 'function',
     function: {
@@ -567,6 +576,7 @@ function buildWriteToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
 function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
   return {
     run_bash: (args) => runBashTool(allowedRoots, { command: args.command, readOnly: true }),
+    list_projects: () => ({ projects: listProjects({ activeRepoRoot: repoRoot }) }),
     queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description }),
     answer_task_clarification: (args) => answerNeedsClarification(pipelineDir, args.taskId, args.answer),
     resolve_task_clarification: (args) => resolveNeedsClarification(pipelineDir, args.taskId, args.paths),

@@ -510,17 +510,17 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the six chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the seven chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'mark_task_clarification_done', 'queue_reviewed_task',
+      'answer_task_clarification', 'list_projects', 'mark_task_clarification_done', 'queue_reviewed_task',
       'requeue_blocked_task', 'resolve_task_clarification', 'run_bash',
     ]);
   });
 });
 
-test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all six chat tools', () => {
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all seven chat tools', () => {
   withFixtureRepo((mod, dir) => {
     const handlers = mod.buildChatToolHandlers([dir], dir, dir);
     assert.equal(handlers.write_file, undefined);
@@ -530,6 +530,26 @@ test('buildChatToolHandlers has no write_file/edit_file handler even if called d
       'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task',
     ]) {
       assert.equal(typeof handlers[name], 'function', `expected a handler for ${name}`);
+    }
+  });
+});
+
+test('the list_projects chat tool returns the registry with the active project marked', () => {
+  withFixtureRepo((mod, dir) => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const reg = path.join(dir, 'projects-fixture.json');
+    fs.writeFileSync(reg, JSON.stringify([
+      { label: 'alpha', repoRoot: dir, pipelineDir: dir, pool: true },
+      { label: 'beta', repoRoot: path.join(dir, 'beta') },
+    ]));
+    const prev = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH;
+    process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = reg;
+    try {
+      const out = mod.buildChatToolHandlers([dir], dir, dir).list_projects({});
+      assert.deepEqual(out.projects.map((p) => [p.label, p.pool, p.active]), [['alpha', true, true], ['beta', false, false]]);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH; else process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = prev;
     }
   });
 });
