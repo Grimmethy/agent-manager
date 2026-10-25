@@ -506,9 +506,19 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(executedSection);
     lines.push('');
   }
+  const reproSection = require('./review-repro.js').formatReproSection(task.executedVerification && task.executedVerification.repro);
+  if (reproSection) {
+    lines.push(reproSection);
+    lines.push('');
+  }
   const inertSection = formatInertAdditionsSection(task.inertAdditions);
   if (inertSection) {
     lines.push(inertSection);
+    lines.push('');
+  }
+  const overlapSection = require('./review-content-overlap.js').formatContentOverlapSection(task.contentOverlap);
+  if (overlapSection) {
+    lines.push(overlapSection);
     lines.push('');
   }
   const inertTargetSection = require('./lib/inert-target.js').formatInertTargetSection(task.inertTarget);
@@ -874,7 +884,7 @@ function formatSkipPathSection(sp) {
  * The actual review logic, independent of the CLI/stdout wrapper below -- exported (via
  * the reviewTask wrapper) so tests can call it directly with a fake localMajorityVote.
  */
-async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null, findUndefinedFn = null } = {}) {
+async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsPath, instancesDir, deepDiveCoveragePath, localMajorityVote = null, recordModelOutcome = defaultRecordModelOutcome, verifyDiffFn = null, findInertFn = null, findSkipPathsFn = null, findUndefinedFn = null, findOverlapFn = null } = {}) {
   // Resolved here rather than as a static default param, same reasoning as
   // local-draft.js's draftTask() -- the right backend depends on the task's reasoning
   // tier, only known once the task object is in hand. Passing the whole task (not just
@@ -1404,7 +1414,9 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false' && extractedDiff) {
     let ev = null;
     try {
-      const verify = verifyDiffFn || require('./review-verify.js').verifyDiff;
+      const verifyBase = verifyDiffFn || require('./review-verify.js').verifyDiff;
+      // 'Not reproduced' check (review-repro.js): only brain-dump-derived adhoc tasks that are not a hub slice.
+      const verify = require('./review-repro.js').wantsRepro(task, { hubChild: isHubChildTask(task) }) ? (a) => verifyBase({ ...a, checkRepro: true }) : verifyBase;
       // A stacked hub sub-task builds on its shared branch, not on master -- verify against the same base the draft used.
       const baseBranch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
       const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
@@ -1414,6 +1426,8 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
     if (ev && ev.status) {
       task.executedVerification = summariseExecutedVerification(ev);
+      const reproLib = require('./review-repro.js');
+      reproLib.recordRepro(task, ev, appendHistoryEvent);
       const ranTests = ev.tests && ev.tests.ran ? ev.tests.ran.length : 0;
       const confirmed = (ev.commands || []).filter((c) => c.outcome === 'confirmed').length;
       appendHistoryEvent(task, 'advisory', `executed verification: ${ev.status} (${ranTests} covering test file(s), ${confirmed} claimed check(s) re-run and confirmed${ev.unpinned && Array.isArray(ev.unpinned.hunks) && ev.unpinned.hunks.length ? `, ${ev.unpinned.hunks.length} unpinned hunk(s)` : ''}${ev.status === 'inconclusive' && ev.reasons && ev.reasons[0] ? `; ${String(ev.reasons[0]).slice(0, 160)}` : ''})`);
@@ -1434,6 +1448,13 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
             return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
           }
         }
+      }
+      const reproBlock = reproLib.blockReason(task.executedVerification.repro);
+      if (reproBlock) {
+        task.reviewProvider = 'deterministic-repro-check';
+        recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reproBlock });
+        appendHistoryEvent(task, 'blocked', reproBlock);
+        return { succeeded: true, verdict: 'blocked', blockedReason: reproBlock, blockedStage: 'review', factCheckVerdict };
       }
       if (ev.status === 'failed') {
         const reason = executedVerificationBlockReason(ev);
@@ -1465,6 +1486,38 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
       }
     } catch (e) {
       console.error(`[review] inert-addition check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
+    }
+  }
+
+  // Content overlap (see formatContentOverlapSection): the diff duplicates what another unmerged branch or the base already has. Advisory by default; 'block' blocks.
+  const overlapMode = process.env.AGENT_MANAGER_REVIEW_OVERLAP_CHECK;
+  if (overlapMode !== 'false'
+      && resolveSourceName(task) === 'adhoc'
+      && task.adhocResolution === 'implemented'
+      && typeof task.rawDiff === 'string' && task.rawDiff.trim()) {
+    try {
+      const overlapLib = require('./review-content-overlap.js');
+      const find = findOverlapFn || overlapLib.findContentOverlap;
+      const branch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
+      const baseRef = resolveInertBaseRef(repoRoot, branch) || (findOverlapFn ? branch : null);
+      if (baseRef) {
+        const r = find({ rawDiff: task.rawDiff, repoRoot, baseRef, ownRefs: [`origin/agent/${task.id}`] });
+        if (r && Array.isArray(r.overlaps)) {
+          task.contentOverlap = overlapLib.summariseContentOverlap(r);
+          if (r.overlaps.length) {
+            appendHistoryEvent(task, 'advisory', `content-overlap check: ${task.contentOverlap.total} overlap(s) (${task.contentOverlap.overlaps.slice(0, 3).map((o) => `${o.file} <- ${o.ref}`).join('; ')})`);
+            if (overlapMode === 'block') {
+              const reason = overlapLib.contentOverlapBlockReason(task.contentOverlap);
+              task.reviewProvider = 'deterministic-content-overlap';
+              recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+              appendHistoryEvent(task, 'blocked', reason);
+              return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`[review] content-overlap check errored for ${task.id} (non-fatal, continuing to the vote): ${e && e.message}`);
     }
   }
 

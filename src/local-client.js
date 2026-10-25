@@ -440,6 +440,11 @@ const PER_CALL_TIMEOUT_CEILING_MS = 300_000;
 const P40_PER_CALL_TIMEOUT_CEILING_MS = 900_000;
 const ENV_TIMEOUT_MS_OVERRIDE = Number(process.env.LOCAL_TIMEOUT_MS || process.env.ORNITH_TIMEOUT_MS) || null;
 
+// The per-call ceiling this endpoint's calls run under: one place, so the timeout above and the truncation escalation below cannot drift apart.
+function perCallCeilingMs() {
+  return IS_SLOW_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : PER_CALL_TIMEOUT_CEILING_MS;
+}
+
 function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model }) {
   if (ENV_TIMEOUT_MS_OVERRIDE) return ENV_TIMEOUT_MS_OVERRIDE;
   const tokensPerSecond = localThroughput.getTokensPerSecond(instancesDir, OLLAMA_URL, model);
@@ -447,7 +452,7 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model
     promptTokens,
     numPredict,
     tokensPerSecond,
-    ceilingMs: IS_SLOW_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : PER_CALL_TIMEOUT_CEILING_MS,
+    ceilingMs: perCallCeilingMs(),
     hardCeilingMs: IS_SLOW_ENDPOINT ? P40_PER_CALL_TIMEOUT_CEILING_MS : undefined,
   });
 }
@@ -498,6 +503,16 @@ function resolveRequestTimeoutMs({ promptTokens, numPredict, instancesDir, model
 // approach was already paying either way.
 const TRUNCATION_RETRY_MULTIPLIER = 2;
 const TRUNCATION_RETRY_NUM_PREDICT_CEILING = 8000;
+
+// 2026-10-24 (rx580 lane, 66 truncated plan calls in one day, every one stopped at its numPredict with a ~1k-token prompt): the escalation above
+// doubled 1400 -> 2800 -> 5600, but at the lane's ~16 tok/s a 5600-token generation takes ~350 s and the per-call ceiling is 300 s, so attempts 3-5
+// were all OLLAMA_TIMEOUT and a doomed task held the lane ~20 min before ending 'Plan pass degenerate: truncated' (same class as the P40 incident in
+// gpu-capacity.js resolveTimeoutMs). The largest numPredict that can finish inside the ceiling at a MEASURED rate: 90% of the ceiling, less prefill
+// at the 150 tok/s floor gpu-capacity.js uses, times tokens/s. Pure; 0 when the budget is spent before generation could start.
+function maxNumPredictThatFits({ promptTokens = 0, tokensPerSecond, ceilingMs }) {
+  const generationSeconds = (ceilingMs * 0.9) / 1000 - promptTokens / 150;
+  return Math.max(0, Math.floor(generationSeconds * tokensPerSecond));
+}
 
 // How many HARD failures (timeout, connection refused, HTTP 5xx -- anything that makes callOnce() throw) one call() may absorb. Kept
 // separate from `maxRetries`, which now bounds only attempts that returned a response: 2026-10-16, a plan call on the P40 hit an HTTP 500,
@@ -587,7 +602,19 @@ async function call(opts, maxRetries = 2) {
         Math.round(callOpts.numPredict * TRUNCATION_RETRY_MULTIPLIER),
         TRUNCATION_RETRY_NUM_PREDICT_CEILING,
       );
-      if (escalated > callOpts.numPredict) callOpts = { ...callOpts, numPredict: escalated };
+      let retryable = true;
+      if (escalated > callOpts.numPredict) {
+        let nextNumPredict = escalated;
+        // Only against a rate this endpoint+model has actually recorded: DEFAULT_TPS is a guess for a cold machine and must not shrink the ladder.
+        const measuredTps = localThroughput.getTokensPerSecond(resolveInstancesDir(), OLLAMA_URL, opts.model || MODEL);
+        if (measuredTps !== localThroughput.DEFAULT_TPS) {
+          const fits = maxNumPredictThatFits({ promptTokens: result.prompt_eval_count || 0, tokensPerSecond: measuredTps, ceilingMs: perCallCeilingMs() });
+          nextNumPredict = Math.min(escalated, fits);
+          // Nothing bigger can finish in time: another call would only time out, so hand back the truncated result now.
+          if (nextNumPredict <= callOpts.numPredict) retryable = false;
+        }
+        if (retryable) callOpts = { ...callOpts, numPredict: nextNumPredict };
+      }
       // 2026-09-14, root-caused against a real blocked backlog (21 tasks, every one
       // truncated with ZERO visible characters -- confirmed via model_calls: eval_count
       // present, response empty): doneReason:'length' with no real content at all means
@@ -606,6 +633,7 @@ async function call(opts, maxRetries = 2) {
       if (callOpts.think && !(result.response || '').trim()) {
         callOpts = { ...callOpts, think: false };
       }
+      if (!retryable) break;
     }
   }
   // Only propagate the hard error if NO attempt ever got a real response, degenerate or
@@ -708,7 +736,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, maxNumPredictThatFits, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

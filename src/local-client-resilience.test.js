@@ -700,3 +700,56 @@ test('the degenerate and hard-failure audit entries record whether think was on 
     }
   );
 });
+
+// 2026-10-24 (rx580 lane): the escalation ladder asked for a numPredict that cannot finish inside the per-call ceiling at the lane's measured rate
+// (5600 tokens ~350 s at 16 tok/s vs the 300 s ceiling), so attempts 3-5 were OLLAMA_TIMEOUT and a doomed plan held the lane ~20 min. These pin the
+// clamp: only against a RECORDED rate, never shrinking the unmeasured ladder the two tests above pin.
+async function withMeasuredRate(base, tokensPerSecond, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-clamp-'));
+  const saved = { root: process.env.AGENT_MANAGER_REPO_ROOT, inst: process.env.AGENT_MANAGER_INSTANCES_DIR };
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_INSTANCES_DIR = path.join(dir, 'instances');
+  fs.mkdirSync(process.env.AGENT_MANAGER_INSTANCES_DIR, { recursive: true });
+  try {
+    require('./local-throughput.js').recordSample(process.env.AGENT_MANAGER_INSTANCES_DIR, { evalCount: tokensPerSecond * 10, evalDurationNs: 10e9, endpoint: base, model: 'test-model' });
+    return await fn();
+  } finally {
+    if (saved.root === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = saved.root;
+    if (saved.inst === undefined) delete process.env.AGENT_MANAGER_INSTANCES_DIR; else process.env.AGENT_MANAGER_INSTANCES_DIR = saved.inst;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function alwaysTruncatedServer(capturedNumPredicts) {
+  return (req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw);
+      capturedNumPredicts.push(body.options.num_predict);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ response: 'a plan that never ends because', done: true, done_reason: 'length', eval_count: body.options.num_predict, prompt_eval_count: 1000 }));
+    });
+  };
+}
+
+test('call() clamps a truncated retry to what fits the per-call ceiling at the measured rate, then stops instead of re-issuing a call that cannot finish', async () => {
+  const capturedNumPredicts = [];
+  await withServer(alwaysTruncatedServer(capturedNumPredicts), async (base) => {
+    const { call } = freshLocalClient(base); // first: it clears AGENT_MANAGER_REPO_ROOT, which withMeasuredRate then sets for the call
+    await withMeasuredRate(base, 16, async () => {
+      const result = await call({ prompt: 'x', think: false, numPredict: 1400 }, 4);
+      assert.equal(result.degenerate, 'truncated');
+      // fit = floor((300 * 0.9 - 1000 / 150) * 16) = 4213: the 5600 the plain ladder asked for is never requested, and nothing is re-issued after the clamp stops growing
+      assert.deepEqual(capturedNumPredicts, [1400, 2800, 4213]);
+    });
+  });
+});
+
+test('maxNumPredictThatFits: 90% of the ceiling less prefill at 150 tok/s, times the measured rate', () => {
+  const { maxNumPredictThatFits } = freshLocalClient('http://127.0.0.1:1');
+  assert.equal(maxNumPredictThatFits({ promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 300_000 }), 4213);
+  assert.equal(maxNumPredictThatFits({ promptTokens: 0, tokensPerSecond: 11, ceilingMs: 300_000 }), 2970);
+  assert.ok(maxNumPredictThatFits({ promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 900_000 }) > 8000, 'the slow-endpoint ceiling leaves the 8000 cap in charge');
+  assert.equal(maxNumPredictThatFits({ promptTokens: 60_000, tokensPerSecond: 16, ceilingMs: 300_000 }), 0, 'a prompt whose prefill alone spends the budget fits nothing');
+});
