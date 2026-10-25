@@ -26,6 +26,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');   // fs + path only: safe to load from the bash-called CLI
 
 const PROJECTS_PATH = process.env.AGENT_MANAGER_PROJECTS_PATH || path.join(__dirname, '..', 'projects.json');
 
@@ -166,6 +167,69 @@ function premiumStageDirs(role, lane) {
   return [];
 }
 
+// A premium task only wins the tie for its project (hasPremium) when a lane could actually claim it. 2026-10-25: six premium stacked hub children in the
+// home queue's adhoc/ were each held by an unmet dependsOn (their dependency sat in needs-clarification, blocked, coordinating or adhoc for 66-69 h), yet
+// hasPremium counted them, so every lane answered "home has premium work", never borrowed another repo's premium task, and last did so on 2026-10-22.
+// These helpers mirror the gates nextAdhocLikeTask (task-sources.js) applies to adhoc/ and derived/ candidates, WITHOUT loading config, the source
+// registry or git (hasPremium is called from bash on every tick). Deliberate gaps, all in the fail-closed direction or the old behaviour: no git
+// reconcile fallback (a done record that is neither stamped nor stacked reads as unreleased), no per-source dependencyRelease override, and not
+// hubOrder.siblingHolds or the derived hold (a premium task held only by those still counts, as before).
+const NO_CODE_COMING_DISPOSITIONS = new Set(['noop', 'dismissed', 'filed', 'abandoned', 'superseded', 'aged-out']);
+const NESTED_HUB_PIECE_DONE = new Set(['pending-merge', 'done', 'merged', 'applied-direct', 'gone', ...NO_CODE_COMING_DISPOSITIONS]);
+const GATED_PREMIUM_STAGES = new Set(['adhoc', 'derived']);   // the only stages whose claim path gates on dependsOn/softDependsOn/prerequisiteHubs
+
+function readJsonSafe(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+
+// task-sources.js nestedHubBuilt: a coordinating record with a stacked branch whose pieces are all finished releases its dependents.
+function nestedHubBuilt(pipelineDir, depId) {
+  const rec = readJsonSafe(path.join(pipelineDir, 'queue', 'coordinating', `${depId}.json`));
+  if (!rec || !rec.stacked || !rec.stacked.branch) return false;
+  const subs = Array.isArray(rec.subTasks) ? rec.subTasks : [];
+  return subs.length > 0 && subs.every((sub) => sub && typeof sub.status === 'string' && NESTED_HUB_PIECE_DONE.has(sub.status));
+}
+
+const DONE_DIRS = [['done'], ['done', '_archived_no_action']];
+function doneRecord(pipelineDir, depId) {
+  for (const parts of DONE_DIRS) {
+    const rec = readJsonSafe(path.join(pipelineDir, 'queue', ...parts, `${depId}.json`));
+    if (rec) return rec;
+  }
+  return null;
+}
+
+// task-sources.js isDependencySatisfied + defaultReleaseSignals (minus the git fallback and the per-source override).
+function dependencyReleased(pipelineDir, depId) {
+  const id = String(depId || '').trim();
+  if (!id) return true;   // a blank or malformed entry blocks nothing
+  if (nestedHubBuilt(pipelineDir, id)) return true;
+  for (const parts of DONE_DIRS) {
+    const rec = readJsonSafe(path.join(pipelineDir, 'queue', ...parts, `${id}.json`));
+    if (!rec) continue;
+    if (rec.mergedAt || rec.terminalDisposition === 'applied-direct') return true;
+    if (NO_CODE_COMING_DISPOSITIONS.has(rec.terminalDisposition)) return true;
+    if (rec.stacked && rec.stacked.branch) return true;   // a stacked child reaching done/ is committed on the shared branch
+  }
+  return false;
+}
+
+// task-sources.js isSoftDependencySatisfied: reaching done/ at all is the signal.
+function softDependencyReleased(pipelineDir, depId) {
+  const id = String(depId || '').trim();
+  return !id || !!doneRecord(pipelineDir, id);
+}
+
+// False when a lane could not claim this adhoc/derived premium task right now. Any unexpected error counts the task (the pre-fix behaviour).
+function premiumTaskClaimable(pipelineDir, task) {
+  try {
+    if (Array.isArray(task.dependsOn) && task.dependsOn.some((id) => !dependencyReleased(pipelineDir, id))) return false;
+    if (Array.isArray(task.softDependsOn) && task.softDependsOn.some((id) => !softDependencyReleased(pipelineDir, id))) return false;
+    if (unmetPrerequisiteHubs(pipelineDir, task).length > 0) return false;
+  } catch { return true; }
+  return true;
+}
+
 // True when a task in one of the role's stages has a top-level premiumPriority === true -- the same test as lib/task-selection.js
 // hasPremiumPriorityInQueue (not required from there: that module loads the config and source registry, and this one is called from
 // bash every tick). Unreadable dirs and corrupt/partial files are skipped; never throws. A file whose text never mentions the field is not
@@ -183,7 +247,10 @@ function hasPremium(pipelineDir, { role = 'worker', lane = null } = {}) {
         const text = fs.readFileSync(path.join(dir, e.name), 'utf8');
         if (!text.includes('"premiumPriority"')) continue;
         const task = JSON.parse(text);
-        if (task && task.premiumPriority === true) return true;
+        if (task && task.premiumPriority === true) {
+          if (GATED_PREMIUM_STAGES.has(stage) && !premiumTaskClaimable(pipelineDir, task)) continue;   // gated premium work does not hold the tie
+          return true;
+        }
       } catch { /* corrupt or partial write: not a premium flag */ }
     }
   }
@@ -248,7 +315,7 @@ function poolEnvArgs(project, homeInstancesDir) {
 
 module.exports = {
   enabled, poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, markEmpty, readProjects, PROJECTS_PATH,
-  registeredProjects, premiumReachEnabled, premiumStageDirs, hasPremium, premiumProjects, markPremiumBorrowed, markPremiumEmpty,
+  registeredProjects, premiumReachEnabled, premiumStageDirs, hasPremium, premiumTaskClaimable, dependencyReleased, premiumProjects, markPremiumBorrowed, markPremiumEmpty,
 };
 
 if (require.main === module) {
