@@ -651,8 +651,12 @@ function stripUnchangedDiffLines(text) {
   return text.split('\n').map((line) => {
     if (DIFF_META_RE.test(line)) { inDiff = true; return ''; }
     if (!inDiff) return line; // prose (or a plain-text draft with no diff at all)
+    if (line === '') return ''; // a blank line inside a hunk is a context line whose trailing space was stripped (common in model-written diffs): not prose, and not the end of the block
+    if (line.startsWith(' ')) return ''; // context line -- pre-existing, never a new claim
+    if (line.startsWith('-')) return ''; // removed line -- pre-existing, never a new claim
     if (line.startsWith('+')) return line; // real addition -- a genuine new claim
-    return ''; // removed or unchanged context -- pre-existing, never a new claim
+    inDiff = false; // not a valid diff line (prose, bullet, indented text, etc.) -- exit diff block
+    return line;
   }).join('\n');
 }
 
