@@ -1025,6 +1025,34 @@ test('checkGroundedValues still flags a name only in prose, only on a context or
   assert.deepEqual(flagged(envDraft(['+const t = `${TEMPLATE_CONST_NAME}`;'])), ['TEMPLATE_CONST_NAME']);
 });
 
+// checkGroundedValues: env var read through an injected `env` parameter -----------------------------------------
+// 2026-10-19, root-caused live: brain-dump 1896's review was blocked on env.AGENT_MANAGER_TRANSIENT_RETRY, read inside
+// `function retryEnabled(env = process.env)` -- the codebase's own idiom. See ENV_READ_RE in fact-checker.js.
+
+test('checkGroundedValues does not flag an env var read through an injected env parameter (JS dot, JS bracket, Python get), prose also naming it', () => {
+  const { checkGroundedValues, extractEnvReadIdentifiers } = require('./fact-checker.js');
+  for (const line of [
+    "+function retryEnabled(env = process.env) { return String(env.AGENT_MANAGER_NEW_SWITCH || '') !== 'off'; }",
+    "+  const on = env['AGENT_MANAGER_NEW_SWITCH'] === 'on';",
+    '+  const on = env["AGENT_MANAGER_NEW_SWITCH"];',
+    "+    v = env.get('AGENT_MANAGER_NEW_SWITCH', '')",
+  ]) {
+    const draft = envDraft([line], { prose: 'Set AGENT_MANAGER_NEW_SWITCH=off to disable it.' });
+    assert.deepEqual(checkGroundedValues(draft, 'grounding that predates the switch'), [], line);
+    assert.ok(extractEnvReadIdentifiers(draft).has('AGENT_MANAGER_NEW_SWITCH'), line);
+  }
+});
+
+test('checkGroundedValues still flags a name that only looks env-like: myenv.NAME, prose, context or removed lines, a JS template constant', () => {
+  const { checkGroundedValues } = require('./fact-checker.js');
+  const flagged = (draft) => checkGroundedValues(draft, 'unrelated grounding').map((f) => f.detail);
+  assert.deepEqual(flagged(envDraft(['+const v = myenv.NOT_AN_ENV_READ;'])), ['NOT_AN_ENV_READ']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Uses PROSE_ONLY_SWITCH.' })), ['PROSE_ONLY_SWITCH']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Uses CONTEXT_ENV_NAME.', context: [' const c = env.CONTEXT_ENV_NAME;'] })), ['CONTEXT_ENV_NAME']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Drops REMOVED_ENV_NAME.', context: ['-const c = env.REMOVED_ENV_NAME;'] })), ['REMOVED_ENV_NAME']);
+  assert.deepEqual(flagged(envDraft(['+const t = `${TEMPLATE_CONSTANT_NAME}`;'])), ['TEMPLATE_CONSTANT_NAME']);
+});
+
 // checkGroundedValues: fixture token only in an added test file ---------------------------------------
 // 2026-10-19, root-caused live: brain-dump 1891's review was blocked on SENTINEL_THOUGHT, a dummy string in its new unit test. The
 // gate already exempts a URL that lives only in the draft's own added test files (urlsOnlyInAddedTestFiles); fields had no such rule.
