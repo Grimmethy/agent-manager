@@ -36,7 +36,7 @@ const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptB
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
 const { listProjects, pipelineFor } = require('./chat-projects.js');
 const {
-  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask,
+  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
 } = require('./chat-task-requeue.js');
 const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
 
@@ -361,6 +361,22 @@ const CHAT_TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'withdraw_task',
+      description: 'Retire a task that is waiting in adhoc/ or pending/ and is not being worked on anywhere -- it moves to the archive (done/_archived_no_action/) stamped terminalDisposition "abandoned" with your reason in its history. Use it after confirming with the human that the queued task is no longer wanted (for example it was filed into the wrong queue). It refuses tasks that are in flight (drafting, review, approved, coordinating) and every stuck or finished state, and it is reversible with requeue_blocked_task (state "archived").',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'The id of the waiting task to retire.' },
+          reason: { type: 'string', description: 'Why this task is being withdrawn -- recorded in the task history. Required, non-empty.' },
+          project: PROJECT_ARG,
+        },
+        required: ['taskId', 'reason'],
+      },
+    },
+  },
 ];
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -605,6 +621,7 @@ function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
     resolve_task_clarification: (args) => withProject(args, (t) => resolveNeedsClarification(t.pipelineDir, args.taskId, args.paths)),
     mark_task_clarification_done: (args) => withProject(args, (t) => markNeedsClarificationDone(t.pipelineDir, args.taskId)),
     requeue_blocked_task: (args) => withProject(args, (t) => requeueBlockedTask(t.pipelineDir, t.repoRoot, args.taskId, { state: args.state, force: !!args.force })),
+    withdraw_task: (args) => withProject(args, (t) => withdrawTask(t.pipelineDir, args.taskId, args.reason)),
   };
 }
 
