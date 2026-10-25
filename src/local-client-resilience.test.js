@@ -753,3 +753,90 @@ test('maxNumPredictThatFits: 90% of the ceiling less prefill at 150 tok/s, times
   assert.ok(maxNumPredictThatFits({ promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 900_000 }) > 8000, 'the slow-endpoint ceiling leaves the 8000 cap in charge');
   assert.equal(maxNumPredictThatFits({ promptTokens: 60_000, tokensPerSecond: 16, ceilingMs: 300_000 }), 0, 'a prompt whose prefill alone spends the budget fits nothing');
 });
+
+// 2026-10-24 (rx580, change_review): the retry clamp above limits only ESCALATED budgets; a >10000-char change_review diff asks for a 6000-token plan
+// on the FIRST call, ~375 s at 16 tok/s against the 300 s ceiling, so it timed out every time (one task: 8 cycles, ~2 h). callOnce now caps the
+// num_predict it sends. With the cap in place a truncation of that first call leaves the retry clamp nothing bigger than the fit to escalate to, so
+// the ladder stops after one call. freshLocalClient always sets ORNITH_TIMEOUT_MS (a deliberate timeout, which skips the cap), so these build a
+// client with both timeout overrides removed BEFORE require, as an operator-default environment would be.
+function freshLocalClientDefaultTimeout(baseUrl, env = {}) {
+  process.env.OLLAMA_URL = baseUrl;
+  process.env.LOCAL_MODEL = 'test-model';
+  delete process.env.ORNITH_TIMEOUT_MS;
+  delete process.env.LOCAL_TIMEOUT_MS;
+  Object.assign(process.env, env);
+  process.env.AGENT_MANAGER_REPO_ROOT = '';
+  delete require.cache[require.resolve('./local-client.js')];
+  try { return require('./local-client.js'); } finally { delete process.env.LOCAL_TIMEOUT_MS; }
+}
+
+function recordingServer(sent) {
+  return (req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      sent.push(JSON.parse(raw).options.num_predict);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(generateResponse('a complete plan.'));
+    });
+  };
+}
+
+test('callOnce caps the num_predict it sends to what fits the per-call ceiling at the recorded rate', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    await withMeasuredRate(base, 16, () => client.callOnce({ prompt: 'x', think: false, numPredict: 6000 }));
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0] < 6000 && sent[0] > 4000, `expected a cap near 4300 for 16 tok/s and a 300 s ceiling, got ${sent[0]}`);
+    // the sent value is exactly the helper's fit for some small prompt-token estimate (the dated line, the injected side-finding instruction and the prompt)
+    const matches = Array.from({ length: 2000 }, (_, p) => client.maxNumPredictThatFits({ promptTokens: p, tokensPerSecond: 16, ceilingMs: 300_000 }));
+    assert.ok(matches.includes(sent[0]), 'the cap must be the maxNumPredictThatFits value, not an unrelated number');
+  });
+});
+
+test('callOnce sends the requested num_predict unchanged when no rate has been recorded', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    await client.callOnce({ prompt: 'x', think: false, numPredict: 6000 });
+    assert.deepEqual(sent, [6000]);
+  });
+});
+
+test('callOnce leaves num_predict alone when the caller passed an explicit timeoutMs', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    await withMeasuredRate(base, 16, () => client.callOnce({ prompt: 'x', think: false, numPredict: 6000, timeoutMs: 20_000 }));
+    assert.deepEqual(sent, [6000]);
+  });
+});
+
+test('callOnce leaves num_predict alone when an operator LOCAL_TIMEOUT_MS override is set', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base, { LOCAL_TIMEOUT_MS: '20000' });
+    await withMeasuredRate(base, 16, () => client.callOnce({ prompt: 'x', think: false, numPredict: 6000 }));
+    assert.deepEqual(sent, [6000]);
+  });
+});
+
+test('capNumPredictToFit: unchanged when it fits, capped when it does not, unchanged below the 1024 floor', () => {
+  const { capNumPredictToFit } = freshLocalClient('http://127.0.0.1:1');
+  assert.equal(capNumPredictToFit({ numPredict: 1400, promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 300_000 }), 1400);
+  assert.equal(capNumPredictToFit({ numPredict: 6000, promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 300_000 }), 4213);
+  // a prompt whose prefill leaves under 1024 tokens of budget at 16 tok/s: capping would give a uselessly short output, so the request stands
+  assert.equal(capNumPredictToFit({ numPredict: 6000, promptTokens: 38_000, tokensPerSecond: 16, ceilingMs: 300_000 }), 6000);
+});
+
+test('call(): a truncation of the capped first call ends the ladder after that one call, not three timeouts', async () => {
+  const sent = [];
+  await withServer(alwaysTruncatedServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    const result = await withMeasuredRate(base, 16, () => client.call({ prompt: 'x', think: false, numPredict: 6000 }, 2));
+    assert.equal(result.degenerate, 'truncated');
+    assert.equal(sent.length, 1, 'nothing bigger than the fit exists to escalate to');
+    assert.ok(sent[0] < 6000, 'and that one call carried the capped budget');
+  });
+});
