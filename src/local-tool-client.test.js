@@ -147,6 +147,87 @@ test('listDirectoryTool lists real files/subdirectories with their kind, one lev
   });
 });
 
+function fillDir(dir, rel, count) {
+  fs.mkdirSync(path.join(dir, rel), { recursive: true });
+  for (let i = 0; i < count; i++) fs.writeFileSync(path.join(dir, rel, `${i % 2 ? 'a' : 'b'}-${String(i).padStart(4, '0')}.txt`), '');
+}
+
+test('listDirectoryTool caps a big directory at LIST_DIR_MAX_ENTRIES, sorted by name, with truncated, totalEntries, nextOffset and a note', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'big', 500);
+    const r = mod.listDirectoryTool({ path: 'big' });
+    assert.equal(mod.LIST_DIR_MAX_ENTRIES, 200);
+    assert.equal(r.entries.length, 200);
+    assert.equal(r.truncated, true);
+    assert.equal(r.totalEntries, 500);
+    assert.equal(r.nextOffset, 200);
+    assert.match(r.note, /offset=200/);
+    assert.match(r.note, /prefix=/);
+    assert.match(r.note, /grep_codebase/);
+    const names = r.entries.map((e) => e.name);
+    assert.deepEqual(names, [...names].sort());
+    assert.equal(names[0], 'a-0001.txt');
+  });
+});
+
+test('listDirectoryTool pages with offset and the last page is not truncated', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'big', 500);
+    const all = mod.listDirectoryTool({ path: 'big' }).entries.map((e) => e.name);
+    const second = mod.listDirectoryTool({ path: 'big', offset: 200 });
+    assert.equal(second.entries.length, 200);
+    assert.equal(second.truncated, true);
+    assert.equal(second.totalEntries, 500);
+    assert.ok(!all.includes(second.entries[0].name), 'the second page starts after the first');
+    const last = mod.listDirectoryTool({ path: 'big', offset: 400 });
+    assert.equal(last.entries.length, 100);
+    assert.equal(last.truncated, false);
+    assert.equal(last.nextOffset, null);
+    assert.equal(last.note, undefined);
+  });
+});
+
+test('listDirectoryTool prefix keeps only matching names and totalEntries counts them', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'big', 500);
+    const r = mod.listDirectoryTool({ path: 'big', prefix: 'a-' });
+    assert.equal(r.totalEntries, 250);
+    assert.equal(r.entries.length, 200);
+    assert.ok(r.entries.every((e) => e.name.startsWith('a-')));
+    assert.equal(r.truncated, true);
+    const small = mod.listDirectoryTool({ path: 'big', prefix: 'b-00' });
+    assert.equal(small.truncated, false);
+    assert.equal(small.totalEntries, small.entries.length);
+  });
+});
+
+test('listDirectoryTool leaves a small directory complete, untruncated and without a note; a bad offset counts as 0', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'small', 5);
+    for (const offset of [undefined, -3, 'x', NaN]) {
+      const r = mod.listDirectoryTool({ path: 'small', offset });
+      assert.equal(r.entries.length, 5);
+      assert.equal(r.truncated, false);
+      assert.equal(r.totalEntries, 5);
+      assert.equal(r.note, undefined);
+    }
+  });
+});
+
+test('the list_directory tool definition offers prefix and offset and the handler forwards them', () => {
+  withFixtureRepo((mod, dir) => {
+    const def = mod.TOOLS.find((t) => t.function.name === 'list_directory').function;
+    assert.ok(def.parameters.properties.prefix && def.parameters.properties.offset);
+    assert.match(def.description, /200/);
+    fillDir(dir, 'big', 300);
+    const handlers = mod.buildToolHandlers([dir], dir);
+    const r = handlers.list_directory({ path: 'big', prefix: 'a-', offset: 100 });
+    assert.equal(r.totalEntries, 150);
+    assert.equal(r.entries.length, 50);
+    assert.equal(r.truncated, false);
+  });
+});
+
 test('listDirectoryTool defaults to the repo root when no path is given', () => {
   withFixtureRepo((mod, dir) => {
     fs.writeFileSync(path.join(dir, 'top.txt'), '');
@@ -510,26 +591,46 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the six chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the nine chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'mark_task_clarification_done', 'queue_reviewed_task',
-      'requeue_blocked_task', 'resolve_task_clarification', 'run_bash',
+      'answer_task_clarification', 'list_projects', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
+      'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
 });
 
-test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all six chat tools', () => {
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all nine chat tools', () => {
   withFixtureRepo((mod, dir) => {
     const handlers = mod.buildChatToolHandlers([dir], dir, dir);
     assert.equal(handlers.write_file, undefined);
     assert.equal(handlers.edit_file, undefined);
     for (const name of [
       'run_bash', 'queue_reviewed_task', 'answer_task_clarification',
-      'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task',
+      'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'withdraw_task', 'propose_command',
     ]) {
       assert.equal(typeof handlers[name], 'function', `expected a handler for ${name}`);
+    }
+  });
+});
+
+test('the list_projects chat tool returns the registry with the active project marked', () => {
+  withFixtureRepo((mod, dir) => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const reg = path.join(dir, 'projects-fixture.json');
+    fs.writeFileSync(reg, JSON.stringify([
+      { label: 'alpha', repoRoot: dir, pipelineDir: dir, pool: true },
+      { label: 'beta', repoRoot: path.join(dir, 'beta') },
+    ]));
+    const prev = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH;
+    process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = reg;
+    try {
+      const out = mod.buildChatToolHandlers([dir], dir, dir).list_projects({});
+      assert.deepEqual(out.projects.map((p) => [p.label, p.pool, p.active]), [['alpha', true, true], ['beta', false, false]]);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH; else process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = prev;
     }
   });
 });
@@ -2306,4 +2407,140 @@ test('empty-attempt audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes nothing and 
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT; else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
   }
+});
+
+test('withdraw_task handler retires a real adhoc task to done/_archived_no_action/ and its definition requires taskId and reason', async () => {
+  await withFixtureRepo(async (mod, dir) => {
+    writeQueueTask(dir, 'adhoc', 't-w', { title: 'wrong queue' });
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = await handlers.withdraw_task({ taskId: 't-w', reason: 'filed into the wrong queue' });
+    assert.equal(result.ok, true);
+    const moved = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 't-w.json'), 'utf8'));
+    assert.equal(moved.terminalDisposition, 'abandoned');
+    const def = mod.CHAT_TOOLS.find((t) => t.function.name === 'withdraw_task').function;
+    assert.deepEqual(def.parameters.required, ['taskId', 'reason']);
+    assert.ok(def.parameters.properties.project);
+    assert.match(def.description, /requeue_blocked_task/);
+  });
+});
+
+// --- Tool-call digest on the context-overflow summary, and the cap on one tool result (2026-10-25) --------------------
+
+test('buildToolLogDigest: name, clipped args, ok flag and a one-line outcome; errors keep their text; junk is skipped; non-arrays give []', () => {
+  withFixtureRepo((mod) => {
+    const d = mod.buildToolLogDigest([
+      { tool: 'withdraw_task', args: { taskId: 'x' }, result: { ok: true, id: 'x' } },
+      { tool: 'read_file', args: { path: '/nope' }, result: { error: 'denied' } },
+      null, 7,
+    ]);
+    assert.equal(d.length, 2);
+    assert.deepEqual(d[0], { name: 'withdraw_task', args: '{"taskId":"x"}', ok: true, summary: `${JSON.stringify({ ok: true, id: 'x' }).length} chars returned` });
+    assert.deepEqual([d[1].name, d[1].ok, d[1].summary], ['read_file', false, 'denied']);
+    assert.deepEqual(mod.buildToolLogDigest(undefined), []);
+    assert.deepEqual(mod.buildToolLogDigest('nope'), []);
+  });
+});
+
+test('buildToolLogDigest hides secrets: secret-named argument keys, inline token/password/api key values and Bearer tokens, in args and in error text', () => {
+  withFixtureRepo((mod) => {
+    const d = mod.buildToolLogDigest([
+      { tool: 'a', args: { token: 'sk-SECRET', password: 'hunter2', path: '/x' }, result: 'ok' },
+      { tool: 'run_bash', args: { command: 'curl -H "Authorization: Bearer abc123" https://h/?api_key=deadbeef' }, result: { error: 'failed with password=hunter2' } },
+    ]);
+    const text = JSON.stringify(d);
+    for (const secret of ['sk-SECRET', 'hunter2', 'abc123', 'deadbeef']) assert.ok(!text.includes(secret), `${secret} must not appear`);
+    assert.ok(text.includes('[hidden]'));
+    assert.ok(d[0].args.includes('/x'), 'non-secret arguments stay');
+  });
+});
+
+test('buildToolLogDigest clips long text to TOOL_DIGEST_MAX_TEXT and caps the list at TOOL_DIGEST_MAX_TOOLS', () => {
+  withFixtureRepo((mod) => {
+    const d = mod.buildToolLogDigest(Array.from({ length: 80 }, () => ({ tool: 't', args: { command: 'x'.repeat(500) }, result: { error: 'e'.repeat(500) } })));
+    assert.equal(d.length, mod.TOOL_DIGEST_MAX_TOOLS);
+    assert.ok(d[0].args.length <= mod.TOOL_DIGEST_MAX_TEXT && d[0].args.endsWith('…'));
+    assert.ok(d[0].summary.length <= mod.TOOL_DIGEST_MAX_TEXT);
+  });
+});
+
+const listTurn = { role: 'assistant', content: 'looking', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+const growTurn = { role: 'assistant', content: 'y'.repeat(CTX * 2), tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+
+test('a context-overflow forced summary quotes a digest of the tool calls already made and tells the model to report them (chat and pipeline callers)', async () => {
+  for (const source of ['chat', undefined]) {
+    await withMockedChat([listTurn, growTurn, growTurn, { role: 'assistant', content: 'Here is what I did.\n\nRESOLUTION: needs-human-decision\nout of room.' }], async (mod, _dir, { sentBodies }) => {
+      const result = await mod.runPlanWithTools({ prompt: 'investigate', maxTurns: 50, ...(source ? { source } : {}) });
+      assert.equal(result.forcedSummaryReason, 'context');
+      const last = sentBodies[sentBodies.length - 1];
+      const text = last.messages[last.messages.length - 1].content;
+      assert.match(text, /ALREADY completed/);
+      assert.match(text, /report their results to the user instead of saying you lost context/);
+      assert.match(text, /1\. list_directory \{"path":"\."\} -> ok: \d+ chars returned/);
+      assert.deepEqual(last.tools, []);
+    });
+  }
+});
+
+test('the digest is only added on the context path: a turn-cap forced summary and a context summary with no tool calls carry none', async () => {
+  await withMockedChat([listTurn, { role: 'assistant', content: 'RESOLUTION: needs-human-decision\nx' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'go', maxTurns: 1, forceSummaryOnCap: true });
+    const last = sentBodies[sentBodies.length - 1];
+    assert.doesNotMatch(last.messages[last.messages.length - 1].content, /ALREADY completed/);
+  });
+  await withMockedChat([{ role: 'assistant', content: 'RESOLUTION: needs-human-decision\nx' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'x'.repeat(CTX * 4), maxTurns: 50 });
+    const last = sentBodies[sentBodies.length - 1];
+    assert.doesNotMatch(last.messages[last.messages.length - 1].content, /ALREADY completed/);
+  });
+});
+
+test('one oversized tool result is cut to MAX_TOOL_RESULT_CHARS in the conversation, with a note, while toolCallLog keeps the whole result', async () => {
+  await withMockedChat([listTurn, { role: 'assistant', content: 'done' }], async (mod, dir, { sentBodies }) => {
+    for (let i = 0; i < 300; i++) fs.writeFileSync(path.join(dir, `a-fairly-long-file-name-to-make-the-listing-big-${String(i).padStart(4, '0')}.txt`), '');
+    const result = await mod.runPlanWithTools({ prompt: 'list it', maxTurns: 5 });
+    const full = result.toolCallLog[0].result;
+    assert.ok(JSON.stringify(full).length > mod.MAX_TOOL_RESULT_CHARS, 'the audit copy is whole');
+    assert.equal(full.entries.length, mod.LIST_DIR_MAX_ENTRIES);
+    const secondCall = sentBodies[sentBodies.length - 1];
+    const toolMsg = secondCall.messages.find((m) => m.role === 'tool');
+    assert.ok(toolMsg.content.length <= mod.MAX_TOOL_RESULT_CHARS);
+    assert.match(toolMsg.content, /truncated: this tool result was \d+ characters/);
+  });
+});
+
+test('capToolResultForHistory leaves a small result exactly as JSON.stringify makes it', () => {
+  withFixtureRepo((mod) => {
+    assert.equal(mod.capToolResultForHistory({ a: 1 }), '{"a":1}');
+    assert.equal(mod.capToolResultForHistory(undefined), undefined);
+  });
+});
+
+test('a chat turn that calls propose_command returns the accepted proposals on its result (and a refused call adds none)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'propose-command-turn-'));
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  const file = path.join(root, 'allow.json');
+  const argv = ['python3', '-m', 'inventory', 'sales', 'email'];
+  fs.writeFileSync(file, JSON.stringify({ commands: [{ repo, argv }] }));
+  const prev = process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH;
+  process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH = file;
+  const call = (a) => ({ role: 'assistant', content: 'proposing', tool_calls: [{ function: { name: 'propose_command', arguments: a } }] });
+  try {
+    await withMockedChat([call({ repo, argv, why: 'ingest' }), call({ repo, argv: ['rm', '-rf', '/'], why: 'bad' }), { role: 'assistant', content: 'Waiting for your confirmation.' }], async (mod) => {
+      const result = await mod.runPlanWithTools({ prompt: 'ingest the sales', source: 'chat', allowWrite: true, maxTurns: 6 });
+      assert.equal(result.commandProposals.length, 1);
+      assert.equal(result.commandProposals[0].why, 'ingest');
+      assert.deepEqual(result.commandProposals[0].argv, argv);
+      assert.equal(result.toolCallLog[1].result.ok, false);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH; else process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH = prev;
+  }
+});
+
+test('a turn with no proposals has no commandProposals field', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'just an answer' }], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'hi', source: 'chat', allowWrite: true });
+    assert.equal(result.commandProposals, undefined);
+  });
 });

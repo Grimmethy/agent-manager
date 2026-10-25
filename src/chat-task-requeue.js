@@ -28,6 +28,7 @@ const { execFileSync } = require('child_process');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { recordBranchRemoval } = require('./branch-removal-ledger.js');
 const { liveSiblingsOnBranch } = require('./lib/shared-branch.js');
+const { findTaskAnywhere } = require('./task-anywhere.js');
 
 function readJsonSafe(fullPath) {
   try {
@@ -340,7 +341,43 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
   return { ok: true, id: taskId };
 }
 
+// Retires a task that is waiting in adhoc/ or pending/ and is not being worked on (2026-10-25: Chat filed two tasks into the wrong queue and could not retire
+// them -- its four tools only act on stuck tasks, and the dashboard's archive route refuses pending ones too). The record is stamped exactly as the dashboard's
+// manual archive stamps a give-up (python/dashboard/app.py _stamp_manual_archive: terminalDisposition 'abandoned', manualArchive {at, from, reason}) with a
+// 'withdrawn' history entry, then moved to done/_archived_no_action/, never deleted: requeueBlockedTask(state: 'archived') brings it back. Every other location
+// is refused with its name and the file is left untouched (pulling a record out from under a worker or reviewer corrupts it). No classifyRequeue: this is a
+// give-up, not a requeue.
+function withdrawTask(pipelineDir, taskId, reason) {
+  if (typeof taskId !== 'string' || !taskId.trim()) return { ok: false, error: 'taskId is required' };
+  const why = typeof reason === 'string' ? reason.trim() : '';
+  if (!why) return { ok: false, error: 'reason is required and must be non-empty' };
+  let from = 'adhoc';
+  let found = findAt(pipelineDir, 'adhoc', taskId);
+  if (!found) { from = 'pending'; found = findAt(pipelineDir, 'pending', taskId); }
+  if (!found) {
+    const where = findTaskAnywhere(pipelineDir, taskId);
+    if (!where) return notFoundError(taskId, 'adhoc or pending');
+    const place = where.foundState === 'archived' ? 'the archive' : `${where.foundState}/`;
+    return {
+      ok: false,
+      error: `Task '${taskId}' is in ${place}, not in adhoc/ or pending/ -- withdraw_task only retires tasks that are waiting and not being worked on. `
+        + 'Use requeue_blocked_task or the other task tools for stuck tasks; in-flight work cannot be withdrawn.',
+    };
+  }
+  const { path: srcPath, data } = found;
+  const destPath = path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${taskId}.json`);
+  if (fs.existsSync(destPath)) return collisionError(taskId, 'done/_archived_no_action');
+
+  const at = nowIso();
+  data.history = Array.isArray(data.history) ? data.history : [];
+  data.history.push({ stage: 'withdrawn', at, detail: why });
+  if (!data.terminalDisposition) data.terminalDisposition = 'abandoned';
+  data.manualArchive = { at, from, reason: why };
+  writeAndUnlink(destPath, data, srcPath);
+  return { ok: true, id: taskId, from };
+}
+
 module.exports = {
-  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask,
+  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
   repeatedBlockerMatch, // exported for direct unit testing
 };

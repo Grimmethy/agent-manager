@@ -94,6 +94,24 @@ def api_internal_chat_roots():
     return jsonify({"roots": _chat_roots()})
 
 
+@internal_chat_bp.route("/api/internal/chat/run-command", methods=["POST"])
+def api_internal_chat_run_command():
+    """Runs ONE owner-confirmed, allowlisted command for the chat plugin (owner decision A, 2026-10-25: the restricted host-side runner; design in the
+    agent-manager-chat-plugin repo's docs/write-command-allowlist-design.md). Body: {argv, repo, proposalId, confirmedAt, sessionId?}. The plugin holds the
+    persisted confirmation; chat_command_runner re-validates the allowlist, the kill switch and the confirmation's age itself and returns
+    { ok, exitCode, stdout, stderr, durationMs } for a command that ran or { ok: false, refused: reason } for one that did not (HTTP 200 either way)."""
+    _require_internal_token()
+    import chat_command_runner
+    from app import get_pipeline_dir
+
+    body = request.get_json(silent=True) or {}
+    result = chat_command_runner.run_approved(
+        body.get("argv"), body.get("repo"), body.get("proposalId"), body.get("confirmedAt"), body.get("sessionId"),
+        pipeline_dir=get_pipeline_dir(),
+    )
+    return jsonify(result)
+
+
 @internal_chat_bp.route("/api/internal/chat/preempt", methods=["POST"])
 def api_internal_chat_preempt():
     """Wraps _preempt_pipeline_for_chat() -- kills the worker lanes' in-flight draft

@@ -506,6 +506,11 @@ function buildVerdictPrompt(task, factCheck, groundingText) {
     lines.push(executedSection);
     lines.push('');
   }
+  const reproSection = require('./review-repro.js').formatReproSection(task.executedVerification && task.executedVerification.repro);
+  if (reproSection) {
+    lines.push(reproSection);
+    lines.push('');
+  }
   const inertSection = formatInertAdditionsSection(task.inertAdditions);
   if (inertSection) {
     lines.push(inertSection);
@@ -1409,7 +1414,9 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
   if (process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY !== 'false' && extractedDiff) {
     let ev = null;
     try {
-      const verify = verifyDiffFn || require('./review-verify.js').verifyDiff;
+      const verifyBase = verifyDiffFn || require('./review-verify.js').verifyDiff;
+      // 'Not reproduced' check (review-repro.js): only brain-dump-derived adhoc tasks that are not a hub slice.
+      const verify = require('./review-repro.js').wantsRepro(task, { hubChild: isHubChildTask(task) }) ? (a) => verifyBase({ ...a, checkRepro: true }) : verifyBase;
       // A stacked hub sub-task builds on its shared branch, not on master -- verify against the same base the draft used.
       const baseBranch = resolveGroundingRef(task, repoRoot) || require('./git-runner.js').detectDefaultBranch(repoRoot);
       const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
@@ -1419,6 +1426,8 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     }
     if (ev && ev.status) {
       task.executedVerification = summariseExecutedVerification(ev);
+      const reproLib = require('./review-repro.js');
+      reproLib.recordRepro(task, ev, appendHistoryEvent);
       const ranTests = ev.tests && ev.tests.ran ? ev.tests.ran.length : 0;
       const confirmed = (ev.commands || []).filter((c) => c.outcome === 'confirmed').length;
       appendHistoryEvent(task, 'advisory', `executed verification: ${ev.status} (${ranTests} covering test file(s), ${confirmed} claimed check(s) re-run and confirmed${ev.unpinned && Array.isArray(ev.unpinned.hunks) && ev.unpinned.hunks.length ? `, ${ev.unpinned.hunks.length} unpinned hunk(s)` : ''}${ev.status === 'inconclusive' && ev.reasons && ev.reasons[0] ? `; ${String(ev.reasons[0]).slice(0, 160)}` : ''})`);
@@ -1439,6 +1448,13 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
             return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
           }
         }
+      }
+      const reproBlock = reproLib.blockReason(task.executedVerification.repro);
+      if (reproBlock) {
+        task.reviewProvider = 'deterministic-repro-check';
+        recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reproBlock });
+        appendHistoryEvent(task, 'blocked', reproBlock);
+        return { succeeded: true, verdict: 'blocked', blockedReason: reproBlock, blockedStage: 'review', factCheckVerdict };
       }
       if (ev.status === 'failed') {
         const reason = executedVerificationBlockReason(ev);

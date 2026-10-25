@@ -61,7 +61,10 @@
   nav button:hover { background: var(--panel); }
   nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
   nav .count { color: var(--muted); font-variant-numeric: tabular-nums; }
-  main { flex: 1; padding: 20px; }
+  /* min-width:0 lets main shrink below its content (a flex item's default min-width:auto kept it at its widest child, so nav + main + the 380px
+     sidebar summed past the window and the whole page scrolled sideways, clipping the sidebar's right edge); overflow-x:auto scrolls wide content
+     inside main instead of widening the page. */
+  main { flex: 1; min-width: 0; overflow-x: auto; padding: 20px; }
   table { width: 100%; border-collapse: collapse; }
   th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 2px solid var(--border); }
   td { padding: 9px 10px; border-bottom: 2px solid var(--border); vertical-align: top; }
