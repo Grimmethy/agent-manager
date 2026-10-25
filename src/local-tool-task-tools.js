@@ -186,6 +186,27 @@ function realDir(p) {
 // `project` (label or repo root, from list_projects) files the task into THAT project's queue with its task-domains.json. Omitted: today's target (the
 // pipelineDir argument), but a text whose absolute paths all belong to ONE other registered project is refused instead of landing in the wrong queue
 // (2026-10-25: two tasks about the chat plugin repo went into agent-manager's own queue). `opts` is for tests: { projects, defaultDomainsPath }.
+// search_tasks with project "all": every registered project's queue (one search per distinct pipeline dir), each hit tagged with its project label,
+// at most MAX_SEARCH_TASK_RESULTS in total. `opts.projects` is for tests.
+function searchTasksAllProjects(args, opts = {}) {
+  const projects = opts.projects || listProjects();
+  const seen = new Set();
+  const results = [];
+  for (const project of projects) {
+    if (results.length >= MAX_SEARCH_TASK_RESULTS) break;
+    const dir = realDir(project.pipelineDir);
+    if (seen.has(dir)) continue;
+    seen.add(dir);
+    const found = searchTasksTool(project.pipelineDir, args);
+    if (found.error) return found;
+    for (const hit of found.results) {
+      if (results.length >= MAX_SEARCH_TASK_RESULTS) break;
+      results.push({ ...hit, project: project.label });
+    }
+  }
+  return { results };
+}
+
 function queueReviewedTaskTool(pipelineDir, { title, description, project }, opts = {}) {
   if (typeof title !== 'string' || !title.trim()) return { error: 'queue_reviewed_task requires a non-empty "title" argument' };
   if (typeof description !== 'string' || !description.trim()) return { error: 'queue_reviewed_task requires a non-empty "description" argument' };
@@ -219,4 +240,4 @@ function queueReviewedTaskTool(pipelineDir, { title, description, project }, opt
   }
 }
 
-module.exports = { taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS };
+module.exports = { searchTasksAllProjects, taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS };

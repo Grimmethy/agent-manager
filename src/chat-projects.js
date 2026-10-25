@@ -80,4 +80,13 @@ function projectForText(text, projects) {
   return owners.size === 1 ? [...owners][0] : null;
 }
 
-module.exports = { listProjects, resolveProject, projectForText };
+// { pipelineDir, repoRoot, label } for a task tool's optional `project` argument: `defaults` (the process's own) when it is omitted, else that registered
+// project's; { error } for an unknown name. `projects` is for tests.
+function pipelineFor(project, defaults, projects) {
+  if (typeof project !== 'string' || !project.trim()) return { pipelineDir: defaults.pipelineDir, repoRoot: defaults.repoRoot, label: null };
+  const resolved = resolveProject(project, projects || listProjects());
+  if (resolved.error) return { error: resolved.error };
+  return { pipelineDir: resolved.project.pipelineDir, repoRoot: resolved.project.repoRoot, label: resolved.project.label };
+}
+
+module.exports = { listProjects, resolveProject, projectForText, pipelineFor };
