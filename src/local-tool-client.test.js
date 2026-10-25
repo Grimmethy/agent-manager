@@ -2423,3 +2423,94 @@ test('withdraw_task handler retires a real adhoc task to done/_archived_no_actio
     assert.match(def.description, /requeue_blocked_task/);
   });
 });
+
+// --- Tool-call digest on the context-overflow summary, and the cap on one tool result (2026-10-25) --------------------
+
+test('buildToolLogDigest: name, clipped args, ok flag and a one-line outcome; errors keep their text; junk is skipped; non-arrays give []', () => {
+  withFixtureRepo((mod) => {
+    const d = mod.buildToolLogDigest([
+      { tool: 'withdraw_task', args: { taskId: 'x' }, result: { ok: true, id: 'x' } },
+      { tool: 'read_file', args: { path: '/nope' }, result: { error: 'denied' } },
+      null, 7,
+    ]);
+    assert.equal(d.length, 2);
+    assert.deepEqual(d[0], { name: 'withdraw_task', args: '{"taskId":"x"}', ok: true, summary: `${JSON.stringify({ ok: true, id: 'x' }).length} chars returned` });
+    assert.deepEqual([d[1].name, d[1].ok, d[1].summary], ['read_file', false, 'denied']);
+    assert.deepEqual(mod.buildToolLogDigest(undefined), []);
+    assert.deepEqual(mod.buildToolLogDigest('nope'), []);
+  });
+});
+
+test('buildToolLogDigest hides secrets: secret-named argument keys, inline token/password/api key values and Bearer tokens, in args and in error text', () => {
+  withFixtureRepo((mod) => {
+    const d = mod.buildToolLogDigest([
+      { tool: 'a', args: { token: 'sk-SECRET', password: 'hunter2', path: '/x' }, result: 'ok' },
+      { tool: 'run_bash', args: { command: 'curl -H "Authorization: Bearer abc123" https://h/?api_key=deadbeef' }, result: { error: 'failed with password=hunter2' } },
+    ]);
+    const text = JSON.stringify(d);
+    for (const secret of ['sk-SECRET', 'hunter2', 'abc123', 'deadbeef']) assert.ok(!text.includes(secret), `${secret} must not appear`);
+    assert.ok(text.includes('[hidden]'));
+    assert.ok(d[0].args.includes('/x'), 'non-secret arguments stay');
+  });
+});
+
+test('buildToolLogDigest clips long text to TOOL_DIGEST_MAX_TEXT and caps the list at TOOL_DIGEST_MAX_TOOLS', () => {
+  withFixtureRepo((mod) => {
+    const d = mod.buildToolLogDigest(Array.from({ length: 80 }, () => ({ tool: 't', args: { command: 'x'.repeat(500) }, result: { error: 'e'.repeat(500) } })));
+    assert.equal(d.length, mod.TOOL_DIGEST_MAX_TOOLS);
+    assert.ok(d[0].args.length <= mod.TOOL_DIGEST_MAX_TEXT && d[0].args.endsWith('…'));
+    assert.ok(d[0].summary.length <= mod.TOOL_DIGEST_MAX_TEXT);
+  });
+});
+
+const listTurn = { role: 'assistant', content: 'looking', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+const growTurn = { role: 'assistant', content: 'y'.repeat(CTX * 2), tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+
+test('a context-overflow forced summary quotes a digest of the tool calls already made and tells the model to report them (chat and pipeline callers)', async () => {
+  for (const source of ['chat', undefined]) {
+    await withMockedChat([listTurn, growTurn, growTurn, { role: 'assistant', content: 'Here is what I did.\n\nRESOLUTION: needs-human-decision\nout of room.' }], async (mod, _dir, { sentBodies }) => {
+      const result = await mod.runPlanWithTools({ prompt: 'investigate', maxTurns: 50, ...(source ? { source } : {}) });
+      assert.equal(result.forcedSummaryReason, 'context');
+      const last = sentBodies[sentBodies.length - 1];
+      const text = last.messages[last.messages.length - 1].content;
+      assert.match(text, /ALREADY completed/);
+      assert.match(text, /report their results to the user instead of saying you lost context/);
+      assert.match(text, /1\. list_directory \{"path":"\."\} -> ok: \d+ chars returned/);
+      assert.deepEqual(last.tools, []);
+    });
+  }
+});
+
+test('the digest is only added on the context path: a turn-cap forced summary and a context summary with no tool calls carry none', async () => {
+  await withMockedChat([listTurn, { role: 'assistant', content: 'RESOLUTION: needs-human-decision\nx' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'go', maxTurns: 1, forceSummaryOnCap: true });
+    const last = sentBodies[sentBodies.length - 1];
+    assert.doesNotMatch(last.messages[last.messages.length - 1].content, /ALREADY completed/);
+  });
+  await withMockedChat([{ role: 'assistant', content: 'RESOLUTION: needs-human-decision\nx' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'x'.repeat(CTX * 4), maxTurns: 50 });
+    const last = sentBodies[sentBodies.length - 1];
+    assert.doesNotMatch(last.messages[last.messages.length - 1].content, /ALREADY completed/);
+  });
+});
+
+test('one oversized tool result is cut to MAX_TOOL_RESULT_CHARS in the conversation, with a note, while toolCallLog keeps the whole result', async () => {
+  await withMockedChat([listTurn, { role: 'assistant', content: 'done' }], async (mod, dir, { sentBodies }) => {
+    for (let i = 0; i < 300; i++) fs.writeFileSync(path.join(dir, `a-fairly-long-file-name-to-make-the-listing-big-${String(i).padStart(4, '0')}.txt`), '');
+    const result = await mod.runPlanWithTools({ prompt: 'list it', maxTurns: 5 });
+    const full = result.toolCallLog[0].result;
+    assert.ok(JSON.stringify(full).length > mod.MAX_TOOL_RESULT_CHARS, 'the audit copy is whole');
+    assert.equal(full.entries.length, mod.LIST_DIR_MAX_ENTRIES);
+    const secondCall = sentBodies[sentBodies.length - 1];
+    const toolMsg = secondCall.messages.find((m) => m.role === 'tool');
+    assert.ok(toolMsg.content.length <= mod.MAX_TOOL_RESULT_CHARS);
+    assert.match(toolMsg.content, /truncated: this tool result was \d+ characters/);
+  });
+});
+
+test('capToolResultForHistory leaves a small result exactly as JSON.stringify makes it', () => {
+  withFixtureRepo((mod) => {
+    assert.equal(mod.capToolResultForHistory({ a: 1 }), '{"a":1}');
+    assert.equal(mod.capToolResultForHistory(undefined), undefined);
+  });
+});

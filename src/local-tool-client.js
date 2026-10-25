@@ -978,6 +978,74 @@ function flakeDegradeResult(lastMessage, toolCallLog, turnsUsed, onChunk) {
 // possible model call). `await`ing a plain non-Promise return value resolves it
 // immediately, so every existing SYNCHRONOUS handler here is unaffected -- this widened
 // signature, not a behavior change for anything already calling this function.
+// --- Tool-call digest and the cap on one tool result (2026-10-25) ----------------------------------------------------
+// A chat turn ran out of context, and its forced summary answered that it had lost the thread -- although two successful tool calls were already in toolCallLog.
+// buildToolLogDigest is the scrubbed, compact view of that log (the same rules as tool_log.py in the agent-manager-chat-plugin-am repo, ported here so core does not
+// import across repos); the 'context' forced summary quotes it. capToolResultForHistory keeps ONE huge result (a 457k-character directory listing) from filling the
+// window: only the copy in the message history is cut, the full result stays in toolCallLog and the trajectory.
+const TOOL_DIGEST_MAX_TOOLS = 50;
+const TOOL_DIGEST_MAX_TEXT = 200;
+const TOOL_DIGEST_MAX_CHARS = 6000;
+const MAX_TOOL_RESULT_CHARS = 8000;
+const DIGEST_SECRET_KEY = /token|key|secret|password/i;
+const DIGEST_SECRET_INLINE = /\b(token|secret|password|api[_-]?key)(\s*[=:]\s*)\S+/gi;
+const DIGEST_BEARER = /\bbearer\s+\S+/gi;
+
+function digestScrub(text) {
+  return String(text).replace(DIGEST_SECRET_INLINE, (_m, k, sep) => `${k}${sep}[hidden]`).replace(DIGEST_BEARER, 'Bearer [hidden]');
+}
+
+function digestClip(text, max) {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}\u2026`;
+}
+
+function digestArgsText(args, maxText) {
+  let shown = args;
+  if (args && typeof args === 'object' && !Array.isArray(args)) {
+    shown = {};
+    for (const [k, v] of Object.entries(args)) shown[k] = DIGEST_SECRET_KEY.test(k) ? '[hidden]' : v;
+  }
+  let text;
+  try { text = typeof shown === 'string' ? shown : JSON.stringify(shown); } catch { text = String(shown); }
+  return digestClip(digestScrub(text === undefined ? '' : text), maxText);
+}
+
+function digestOutcome(result, maxText) {
+  if (result && typeof result === 'object' && (result.error || result.ok === false)) {
+    return { ok: false, summary: digestClip(digestScrub(String(result.error || 'failed')), maxText) };
+  }
+  let size = 0;
+  try { size = typeof result === 'string' ? result.length : JSON.stringify(result === undefined ? null : result).length; } catch { /* unserializable: size stays 0 */ }
+  return { ok: true, summary: `${size} chars returned` };
+}
+
+// [{ name, args, ok, summary }] for the first maxTools entries of a toolCallLog; anything that is not an array gives [].
+function buildToolLogDigest(toolCallLog, { maxTools = TOOL_DIGEST_MAX_TOOLS, maxText = TOOL_DIGEST_MAX_TEXT } = {}) {
+  if (!Array.isArray(toolCallLog)) return [];
+  const out = [];
+  for (const call of toolCallLog) {
+    if (!call || typeof call !== 'object') continue;
+    const { ok, summary } = digestOutcome(call.result, maxText);
+    out.push({ name: String(call.tool || 'tool').slice(0, 60), args: digestArgsText(call.args, maxText), ok, summary });
+    if (out.length >= maxTools) break;
+  }
+  return out;
+}
+
+// One line per call, the whole block clipped to TOOL_DIGEST_MAX_CHARS so the digest cannot itself balloon.
+function renderToolLogDigest(digest) {
+  const lines = digest.map((d, i) => `${i + 1}. ${d.name} ${d.args} -> ${d.ok ? 'ok' : 'FAILED'}: ${d.summary}`);
+  return digestClip(lines.join('\n'), TOOL_DIGEST_MAX_CHARS);
+}
+
+// The message-history copy of a tool result: JSON text, cut to MAX_TOOL_RESULT_CHARS (note included) when longer.
+function capToolResultForHistory(result) {
+  const text = JSON.stringify(result);
+  if (typeof text !== 'string' || text.length <= MAX_TOOL_RESULT_CHARS) return text;
+  const note = `...[truncated: this tool result was ${text.length} characters; only the first part is kept in the conversation. Ask for less (a narrower path, prefix, offset or grep) and retry]`;
+  return text.slice(0, MAX_TOOL_RESULT_CHARS - note.length) + note;
+}
+
 async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, toolCallLog) {
   messages.push(assistantMessage);
   for (const toolCall of toolCalls) {
@@ -1002,7 +1070,7 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
       }
     }
     toolCallLog.push({ tool: name, args, result });
-    messages.push({ role: 'tool', content: JSON.stringify(result) });
+    messages.push({ role: 'tool', content: capToolResultForHistory(result) }); // the full result stays in toolCallLog above
   }
 }
 
@@ -1272,7 +1340,11 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     const content = isChatCaller
       ? `${leadIn} Using only what you have already learned, give your best complete answer now -- a real, substantive reply, not a placeholder or a single word.${budgetWarning}`
       : `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires.${budgetWarning} If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`;
-    messages.push({ role: 'user', content });
+    // 'context' only: the earlier tool results may no longer be in the model's window, so hand it a compact digest of what it already did and tell it to report that.
+    const digestBlock = reason === 'context' && toolCallLog.length
+      ? `\n\nHere is a compact log of the ${toolCallLog.length} tool call(s) you ALREADY completed this run. You have already made these tool calls; report their results to the user instead of saying you lost context or did not finish:\n${renderToolLogDigest(buildToolLogDigest(toolCallLog))}`
+      : '';
+    messages.push({ role: 'user', content: content + digestBlock });
     turnsUsed += 1;
     const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
       messages, tools: [], tokenFoldHeaders, onChunk, instancesDir, forgePause: forgePauseFor(isChatCaller),
@@ -1579,6 +1651,7 @@ function installStdoutEpipeGuard(label, stream = process.stdout) {
 
 module.exports = {
   runPlanWithTools, readFileTool, listDirectoryTool, listRootsTool, LIST_DIR_MAX_ENTRIES,
+  buildToolLogDigest, capToolResultForHistory, TOOL_DIGEST_MAX_TOOLS, TOOL_DIGEST_MAX_TEXT, TOOL_DIGEST_MAX_CHARS, MAX_TOOL_RESULT_CHARS,
   resolveInsideRepo, resolveInsideRoots, TOOLS,
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS, CHAT_TOOLS,
   buildToolHandlers, buildWriteToolHandlers, buildChatToolHandlers,
