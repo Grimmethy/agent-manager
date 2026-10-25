@@ -194,15 +194,36 @@ function buildFabricatedSymbolCitationQuestion(task) {
 //     draft-failure infra-outage wording ("draft call failed ... on an apparent
 //     infra outage ..."), the local-worker path that never goes through
 //     agentic-draft-common.js.
+// HUB0196 · 1/3 additions -- explicit infra-attribution signals on the task itself:
+//   task.category === 'infra-error' -- the 'infra-error' category the shared
+//     sort-budget contract stamps on infra-skip/infra-cap-hit events;
+//   task.blockedReason naming the infra layer by name: a Node errno
+//     (ECONNRESET/ECONNREFUSED/ETIMEDOUT/EAI_AGAIN/ENOTFOUND/EPIPE), an HTTP 5xx
+//     status, or pool exhaustion.
 // Pure predicate, no side effects: consumers (reject-retry-check.js's
 // stampBrainDumpSortExhausted gate, apply-group-a-brain-dump.js's
 // recoverableSortSkip gate) use it to decide whether a draft failure consumed any of
 // the task's sort-attempt budget at all.
+// Infra-layer failure wordings recognized in a blockedReason (HUB0196 · 1/3).
+// Deliberately does NOT match a bare 'timeout' word: the HUB0195 tests pin a
+// timeout-worded blockedReason WITHOUT stamped infra signals as NOT infra-attributed
+// (only the exact local-worker "apparent infra outage" wording counts there), so this
+// list stays to wordings that name the infra layer itself.
+const INFRA_BLOCKED_REASON_PATTERNS = [
+  /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE/,
+  /\b5\d\d\b/,
+  /pool[ -_]?exhaust/i,
+];
+
 function isInfraError(task) {
   if (!task || typeof task !== 'object') return false;
+  if (task.category === 'infra-error') return true;
   if (task.infraErrorBefore === true) return true;
   if (typeof task.infraErrorNote === 'string' && task.infraErrorNote.length > 0) return true;
-  if (typeof task.blockedReason === 'string' && task.blockedReason.includes('apparent infra outage')) return true;
+  if (typeof task.blockedReason === 'string') {
+    if (task.blockedReason.includes('apparent infra outage')) return true;
+    if (INFRA_BLOCKED_REASON_PATTERNS.some((re) => re.test(task.blockedReason))) return true;
+  }
   return false;
 }
 
