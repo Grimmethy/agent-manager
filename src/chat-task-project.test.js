@@ -95,9 +95,24 @@ test('the unstick tools without project still use the default queue, and an unkn
 test('every task tool definition offers the project argument', () => world(({ mod }) => {
   const named = (list) => Object.fromEntries(list.map((t) => [t.function.name, t.function.parameters.properties]));
   const chat = named(mod.CHAT_TOOLS), base = named(mod.TOOLS);
-  for (const n of ['answer_task_clarification', 'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'queue_reviewed_task']) {
+  for (const n of ['answer_task_clarification', 'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'queue_reviewed_task', 'withdraw_task']) {
     assert.ok(chat[n].project, `${n} has a project argument`);
   }
   assert.ok(base.read_task.project && base.search_tasks.project);
   assert.match(base.search_tasks.project.description, /"all"/);
+}));
+
+test('withdraw_task honours the project argument and refuses an unknown project without moving anything', () => world(async ({ mod, core, plugin, put, exists }) => {
+  put(plugin, 'pending', 'wp-1', { title: 'in the plugin queue' });
+  put(core, 'pending', 'wp-1', { title: 'same id in the default queue' });
+  const h = mod.buildChatToolHandlers([core.repoRoot], core.pipelineDir, core.repoRoot);
+  const bad = await h.withdraw_task({ taskId: 'wp-1', reason: 'r', project: 'nope' });
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /unknown project "nope"/);
+  assert.equal(exists(plugin, 'pending', 'wp-1'), true);
+  assert.equal(exists(core, 'pending', 'wp-1'), true);
+  assert.equal((await h.withdraw_task({ taskId: 'wp-1', reason: 'wrong queue', project: 'plugin' })).ok, true);
+  assert.equal(exists(plugin, 'pending', 'wp-1'), false);
+  assert.equal(exists(plugin, 'done/_archived_no_action', 'wp-1'), true);
+  assert.equal(exists(core, 'pending', 'wp-1'), true, 'the default queue copy is untouched');
 }));

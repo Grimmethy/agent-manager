@@ -510,24 +510,24 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the seven chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the eight chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
       'answer_task_clarification', 'list_projects', 'mark_task_clarification_done', 'queue_reviewed_task',
-      'requeue_blocked_task', 'resolve_task_clarification', 'run_bash',
+      'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
 });
 
-test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all seven chat tools', () => {
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all eight chat tools', () => {
   withFixtureRepo((mod, dir) => {
     const handlers = mod.buildChatToolHandlers([dir], dir, dir);
     assert.equal(handlers.write_file, undefined);
     assert.equal(handlers.edit_file, undefined);
     for (const name of [
       'run_bash', 'queue_reviewed_task', 'answer_task_clarification',
-      'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task',
+      'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'withdraw_task',
     ]) {
       assert.equal(typeof handlers[name], 'function', `expected a handler for ${name}`);
     }
@@ -2326,4 +2326,19 @@ test('empty-attempt audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes nothing and 
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT; else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
   }
+});
+
+test('withdraw_task handler retires a real adhoc task to done/_archived_no_action/ and its definition requires taskId and reason', async () => {
+  await withFixtureRepo(async (mod, dir) => {
+    writeQueueTask(dir, 'adhoc', 't-w', { title: 'wrong queue' });
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = await handlers.withdraw_task({ taskId: 't-w', reason: 'filed into the wrong queue' });
+    assert.equal(result.ok, true);
+    const moved = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 't-w.json'), 'utf8'));
+    assert.equal(moved.terminalDisposition, 'abandoned');
+    const def = mod.CHAT_TOOLS.find((t) => t.function.name === 'withdraw_task').function;
+    assert.deepEqual(def.parameters.required, ['taskId', 'reason']);
+    assert.ok(def.parameters.properties.project);
+    assert.match(def.description, /requeue_blocked_task/);
+  });
 });
