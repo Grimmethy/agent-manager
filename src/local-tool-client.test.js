@@ -591,24 +591,24 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the eight chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the nine chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'list_projects', 'mark_task_clarification_done', 'queue_reviewed_task',
+      'answer_task_clarification', 'list_projects', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
       'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
 });
 
-test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all eight chat tools', () => {
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all nine chat tools', () => {
   withFixtureRepo((mod, dir) => {
     const handlers = mod.buildChatToolHandlers([dir], dir, dir);
     assert.equal(handlers.write_file, undefined);
     assert.equal(handlers.edit_file, undefined);
     for (const name of [
       'run_bash', 'queue_reviewed_task', 'answer_task_clarification',
-      'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'withdraw_task',
+      'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'withdraw_task', 'propose_command',
     ]) {
       assert.equal(typeof handlers[name], 'function', `expected a handler for ${name}`);
     }
@@ -2512,5 +2512,35 @@ test('capToolResultForHistory leaves a small result exactly as JSON.stringify ma
   withFixtureRepo((mod) => {
     assert.equal(mod.capToolResultForHistory({ a: 1 }), '{"a":1}');
     assert.equal(mod.capToolResultForHistory(undefined), undefined);
+  });
+});
+
+test('a chat turn that calls propose_command returns the accepted proposals on its result (and a refused call adds none)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'propose-command-turn-'));
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  const file = path.join(root, 'allow.json');
+  const argv = ['python3', '-m', 'inventory', 'sales', 'email'];
+  fs.writeFileSync(file, JSON.stringify({ commands: [{ repo, argv }] }));
+  const prev = process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH;
+  process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH = file;
+  const call = (a) => ({ role: 'assistant', content: 'proposing', tool_calls: [{ function: { name: 'propose_command', arguments: a } }] });
+  try {
+    await withMockedChat([call({ repo, argv, why: 'ingest' }), call({ repo, argv: ['rm', '-rf', '/'], why: 'bad' }), { role: 'assistant', content: 'Waiting for your confirmation.' }], async (mod) => {
+      const result = await mod.runPlanWithTools({ prompt: 'ingest the sales', source: 'chat', allowWrite: true, maxTurns: 6 });
+      assert.equal(result.commandProposals.length, 1);
+      assert.equal(result.commandProposals[0].why, 'ingest');
+      assert.deepEqual(result.commandProposals[0].argv, argv);
+      assert.equal(result.toolCallLog[1].result.ok, false);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH; else process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH = prev;
+  }
+});
+
+test('a turn with no proposals has no commandProposals field', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'just an answer' }], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'hi', source: 'chat', allowWrite: true });
+    assert.equal(result.commandProposals, undefined);
   });
 });
