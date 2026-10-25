@@ -20,6 +20,10 @@ const CHAT_BASH_TIMEOUT_MS = 30_000;
 
 const MAX_BASH_OUTPUT_CHARS = 8000;
 
+// list_directory returns at most this many entries per call (2026-10-25: one call on a 3876-entry archive folder returned ~457k characters and overflowed the
+// model's context window); the result says how to page (offset) or narrow (prefix).
+const LIST_DIR_MAX_ENTRIES = 200;
+
 const APPLY_LOCK_PATH = path.join(os.homedir(), '.local', 'state', 'agent-manager', 'locks', 'apply-task.lock');
 
 const APPLY_LOCK_CHILD_FD = 3;
@@ -157,10 +161,27 @@ function listDirectoryTool(a, b) {
   if (siblingRead) entries = entries.filter((e) => !isSecretLookingPath(e.name));
   // Names and kind only -- deliberately not a recursive full-tree dump (see this file's
   // own header: keep this simple, list_directory is one shallow level per call).
-  return {
+  // Sorted by name (code-unit order) so the page order is stable; an optional `prefix` keeps only names that start with it; one page is at most
+  // LIST_DIR_MAX_ENTRIES entries from `offset`, and `truncated` / `nextOffset` / `note` say how to get the rest.
+  const prefix = typeof args.prefix === 'string' ? args.prefix : '';
+  const offset = Number.isFinite(Number(args.offset)) && Number(args.offset) > 0 ? Math.trunc(Number(args.offset)) : 0;
+  const all = entries
+    .filter((e) => !prefix || e.name.startsWith(prefix))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const page = all.slice(offset, offset + LIST_DIR_MAX_ENTRIES);
+  const truncated = all.length > offset + page.length;
+  const result = {
     path: target,
-    entries: entries.map((e) => ({ name: e.name, type: e.isDirectory() ? 'directory' : 'file' })),
+    entries: page.map((e) => ({ name: e.name, type: e.isDirectory() ? 'directory' : 'file' })),
+    totalEntries: all.length,
+    truncated,
+    nextOffset: truncated ? offset + page.length : null,
   };
+  if (truncated) {
+    result.note = `Listing capped at ${LIST_DIR_MAX_ENTRIES} entries (${all.length} match). Pass offset=${offset + page.length} to read the next page, prefix=<start of a name> to narrow it, `
+      + 'or use grep_codebase or a more specific path.';
+  }
+  return result;
 }
 
 function listRootsTool(a, readOnlyRoots = []) {
@@ -428,4 +449,4 @@ function runBashTool(a, b) {
   }
 }
 
-module.exports = { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, editTiersEnabled, tryFallbackTiers, unescapeJsonText, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS };
+module.exports = { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, editTiersEnabled, tryFallbackTiers, unescapeJsonText, withApplyLock, runBashTool, LIST_DIR_MAX_ENTRIES, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS };

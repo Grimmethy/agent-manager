@@ -147,6 +147,87 @@ test('listDirectoryTool lists real files/subdirectories with their kind, one lev
   });
 });
 
+function fillDir(dir, rel, count) {
+  fs.mkdirSync(path.join(dir, rel), { recursive: true });
+  for (let i = 0; i < count; i++) fs.writeFileSync(path.join(dir, rel, `${i % 2 ? 'a' : 'b'}-${String(i).padStart(4, '0')}.txt`), '');
+}
+
+test('listDirectoryTool caps a big directory at LIST_DIR_MAX_ENTRIES, sorted by name, with truncated, totalEntries, nextOffset and a note', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'big', 500);
+    const r = mod.listDirectoryTool({ path: 'big' });
+    assert.equal(mod.LIST_DIR_MAX_ENTRIES, 200);
+    assert.equal(r.entries.length, 200);
+    assert.equal(r.truncated, true);
+    assert.equal(r.totalEntries, 500);
+    assert.equal(r.nextOffset, 200);
+    assert.match(r.note, /offset=200/);
+    assert.match(r.note, /prefix=/);
+    assert.match(r.note, /grep_codebase/);
+    const names = r.entries.map((e) => e.name);
+    assert.deepEqual(names, [...names].sort());
+    assert.equal(names[0], 'a-0001.txt');
+  });
+});
+
+test('listDirectoryTool pages with offset and the last page is not truncated', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'big', 500);
+    const all = mod.listDirectoryTool({ path: 'big' }).entries.map((e) => e.name);
+    const second = mod.listDirectoryTool({ path: 'big', offset: 200 });
+    assert.equal(second.entries.length, 200);
+    assert.equal(second.truncated, true);
+    assert.equal(second.totalEntries, 500);
+    assert.ok(!all.includes(second.entries[0].name), 'the second page starts after the first');
+    const last = mod.listDirectoryTool({ path: 'big', offset: 400 });
+    assert.equal(last.entries.length, 100);
+    assert.equal(last.truncated, false);
+    assert.equal(last.nextOffset, null);
+    assert.equal(last.note, undefined);
+  });
+});
+
+test('listDirectoryTool prefix keeps only matching names and totalEntries counts them', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'big', 500);
+    const r = mod.listDirectoryTool({ path: 'big', prefix: 'a-' });
+    assert.equal(r.totalEntries, 250);
+    assert.equal(r.entries.length, 200);
+    assert.ok(r.entries.every((e) => e.name.startsWith('a-')));
+    assert.equal(r.truncated, true);
+    const small = mod.listDirectoryTool({ path: 'big', prefix: 'b-00' });
+    assert.equal(small.truncated, false);
+    assert.equal(small.totalEntries, small.entries.length);
+  });
+});
+
+test('listDirectoryTool leaves a small directory complete, untruncated and without a note; a bad offset counts as 0', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'small', 5);
+    for (const offset of [undefined, -3, 'x', NaN]) {
+      const r = mod.listDirectoryTool({ path: 'small', offset });
+      assert.equal(r.entries.length, 5);
+      assert.equal(r.truncated, false);
+      assert.equal(r.totalEntries, 5);
+      assert.equal(r.note, undefined);
+    }
+  });
+});
+
+test('the list_directory tool definition offers prefix and offset and the handler forwards them', () => {
+  withFixtureRepo((mod, dir) => {
+    const def = mod.TOOLS.find((t) => t.function.name === 'list_directory').function;
+    assert.ok(def.parameters.properties.prefix && def.parameters.properties.offset);
+    assert.match(def.description, /200/);
+    fillDir(dir, 'big', 300);
+    const handlers = mod.buildToolHandlers([dir], dir);
+    const r = handlers.list_directory({ path: 'big', prefix: 'a-', offset: 100 });
+    assert.equal(r.totalEntries, 150);
+    assert.equal(r.entries.length, 50);
+    assert.equal(r.truncated, false);
+  });
+});
+
 test('listDirectoryTool defaults to the repo root when no path is given', () => {
   withFixtureRepo((mod, dir) => {
     fs.writeFileSync(path.join(dir, 'top.txt'), '');
