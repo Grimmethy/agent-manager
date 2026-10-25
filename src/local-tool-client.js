@@ -35,6 +35,7 @@ const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
 const { listProjects, pipelineFor } = require('./chat-projects.js');
+const { proposeCommand, proposalsFromToolLog } = require('./chat-command-allowlist.js');
 const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
 } = require('./chat-task-requeue.js');
@@ -377,6 +378,22 @@ const CHAT_TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'propose_command',
+      description: 'Propose ONE exact command for the owner to approve and run (for example an ingest that writes to a database). You cannot run it: this only records a proposal when the command is on the owner\'s allowlist; the owner then presses Confirm in the chat pane and a restricted runner executes it. Give the repo, the argv as a list with one string per word (no shell, no pipes, no variations) and one sentence on why. After a successful call tell the owner what it will do and wait; never say it ran. An unlisted command is refused and the refusal lists what is allowed for that repo.',
+      parameters: {
+        type: 'object',
+        properties: {
+          repo: { type: 'string', description: 'Absolute path of the repo the command runs in.' },
+          argv: { type: 'array', items: { type: 'string' }, description: 'The exact command as a list, e.g. ["python3", "-m", "inventory", "sales", "email"].' },
+          why: { type: 'string', description: 'One sentence telling the owner what the command is for.' },
+        },
+        required: ['repo', 'argv', 'why'],
+      },
+    },
+  },
 ];
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -624,6 +641,7 @@ function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
     mark_task_clarification_done: (args) => withProject(args, (t) => markNeedsClarificationDone(t.pipelineDir, args.taskId)),
     requeue_blocked_task: (args) => withProject(args, (t) => requeueBlockedTask(t.pipelineDir, t.repoRoot, args.taskId, { state: args.state, force: !!args.force })),
     withdraw_task: (args) => withProject(args, (t) => withdrawTask(t.pipelineDir, args.taskId, args.reason)),
+    propose_command: (args) => proposeCommand({ repo: args.repo, argv: args.argv, why: args.why }, { pipelineDir }),
   };
 }
 
@@ -1238,6 +1256,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   // single spot, same convention the done_reason:"length" marker uses in this file.
   const withUsage = (r) => {
     const merged = { ...r, ...usageAcc };
+    // Commands the chat proposed this turn (propose_command) ride on the result so the plugin can show them for the owner's confirmation.
+    const proposals = proposalsFromToolLog(toolCallLog);
+    if (proposals.length) merged.commandProposals = proposals;
     if (allowSideFindings && merged.response && merged.response.includes('SIDE-FINDING:')) {
       const { cleanText, findings } = extractSideFindings(merged.response);
       merged.response = cleanText;
