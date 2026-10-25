@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const { execFileSync } = require('child_process');
-const { extractDiffCreateTargets, checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote } = require('./fact-checker.js');
+const { extractDiffCreateTargets, checkFilePaths, extractFilePaths, checkDraft, resolveAgainstRepo, findByBasename, extractCreateModeTargets, checkCommitClaims, extractClaimedCommits, checkGroundedValues, checkFileLineCitations, checkRevertsAPriorFix, checkCompletionClaimsInNote, stripVendoredDiffSections } = require('./fact-checker.js');
 
 // Real git repo fixture with exactly one real commit -- needed to test checkCommitClaims
 // against a hash that genuinely exists, not just one that doesn't.
@@ -531,6 +531,22 @@ test('checkGroundedValues still flags a fabricated URL whose domain was never na
   assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'https://totally-invented-service.example-real-tld.com/api' }]);
 });
 
+// checkGroundedValues: dotted letter-octet placeholder host ------------------------------
+// 2026-10-22, live: a README example {"url": "http://100.x.y.z:7450"} beside a real grounded URL hard-blocked a
+// whole multi-chat draft as ungrounded-url.
+
+test('checkGroundedValues does not flag a dotted x.y.z placeholder host', () => {
+  const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
+  const draftText = 'e.g. http://100.96.112.78:7450 and http://100.x.y.z:7450 or http://x.x.x.x:7450';
+  assert.deepEqual(checkGroundedValues(draftText, sourceText), []);
+});
+
+test('checkGroundedValues still flags an invented numeric address next to a placeholder one', () => {
+  const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
+  const draftText = 'use http://100.x.y.z:7450 or http://10.231.4.9:7450';
+  assert.deepEqual(checkGroundedValues(draftText, sourceText), [{ type: 'ungrounded-url', detail: 'http://10.231.4.9:7450' }]);
+});
+
 // checkGroundedValues: real-but-elsewhere-in-the-repo exemption --------------------------
 // 2026-08-25, root-caused live via a real blocked adhoc task (a Hardware tab UI diff): the
 // draft's own comment correctly cited AGENT_MANAGER_MIN_FREE_VRAM_MB -- a real, pre-
@@ -972,4 +988,181 @@ test('test-file recognition covers tests/ dirs, *.test.js/ts, *.spec.*, test_*.p
 test('an ungrounded ALLCAPS field in a test file is still flagged (only URLs are exempt)', () => {
   const d = diffOf(['pkg/tests/test_cache.py', ['x = INVENTED_FIELD_NAME']]);
   assert.deepEqual(checkGroundedValues(d, SRC, null, null).map((f) => f.type), ['ungrounded-field']);
+});
+
+// checkGroundedValues: env var the draft's own diff reads -------------------------------------
+// 2026-10-18, root-caused live: brain-dump 1890's review was hard-blocked on AGENT_MANAGER_EDIT_FILE_TIERS, an env switch
+// the draft itself introduced by READING it (process.env.X) on an added line of an existing file -- the newly-declared
+// exemption only knows `NAME =` lines. See extractEnvReadIdentifiers in fact-checker.js.
+
+function envDraft(addedLines, { prose = 'Added a switch.', context = [] } = {}) {
+  return [prose, '', '=== DIFF ===', 'diff --git a/src/a.js b/src/a.js', '@@ -1,2 +1,3 @@', ...context, ...addedLines].join('\n');
+}
+
+test('checkGroundedValues does not flag an env var read on an added line (JS, Python, shell forms)', () => {
+  const { checkGroundedValues, extractEnvReadIdentifiers } = require('./fact-checker.js');
+  const cases = [
+    "+const on = process.env.AGENT_MANAGER_EDIT_FILE_TIERS === 'on';",
+    "+const v = process.env['AGENT_MANAGER_EDIT_FILE_TIERS'];",
+    "+v = os.environ['AGENT_MANAGER_EDIT_FILE_TIERS']",
+    "+v = os.environ.get('AGENT_MANAGER_EDIT_FILE_TIERS', '')",
+    "+v = os.getenv(\"AGENT_MANAGER_EDIT_FILE_TIERS\")",
+    '+tiers="${AGENT_MANAGER_EDIT_FILE_TIERS:-off}"',
+  ];
+  for (const line of cases) {
+    const draft = envDraft([line], { prose: 'Set AGENT_MANAGER_EDIT_FILE_TIERS=on to enable it.' });
+    assert.deepEqual(checkGroundedValues(draft, 'grounding that predates the switch'), [], line);
+    assert.ok(extractEnvReadIdentifiers(draft).has('AGENT_MANAGER_EDIT_FILE_TIERS'), line);
+  }
+});
+
+test('checkGroundedValues still flags a name only in prose, only on a context or removed line, or as a JS template constant', () => {
+  const { checkGroundedValues } = require('./fact-checker.js');
+  const flagged = (draft) => checkGroundedValues(draft, 'unrelated grounding').map((f) => f.detail);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Set INVENTED_SWITCH_NAME=on.' })), ['INVENTED_SWITCH_NAME']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Uses CONTEXT_SWITCH.', context: [' const c = process.env.CONTEXT_SWITCH;'] })), ['CONTEXT_SWITCH']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Drops REMOVED_SWITCH.', context: ['-const c = process.env.REMOVED_SWITCH;'] })), ['REMOVED_SWITCH']);
+  assert.deepEqual(flagged(envDraft(['+const t = `${TEMPLATE_CONST_NAME}`;'])), ['TEMPLATE_CONST_NAME']);
+});
+
+// checkGroundedValues: env var read through an injected `env` parameter -----------------------------------------
+// 2026-10-19, root-caused live: brain-dump 1896's review was blocked on env.AGENT_MANAGER_TRANSIENT_RETRY, read inside
+// `function retryEnabled(env = process.env)` -- the codebase's own idiom. See ENV_READ_RE in fact-checker.js.
+
+test('checkGroundedValues does not flag an env var read through an injected env parameter (JS dot, JS bracket, Python get), prose also naming it', () => {
+  const { checkGroundedValues, extractEnvReadIdentifiers } = require('./fact-checker.js');
+  for (const line of [
+    "+function retryEnabled(env = process.env) { return String(env.AGENT_MANAGER_NEW_SWITCH || '') !== 'off'; }",
+    "+  const on = env['AGENT_MANAGER_NEW_SWITCH'] === 'on';",
+    '+  const on = env["AGENT_MANAGER_NEW_SWITCH"];',
+    "+    v = env.get('AGENT_MANAGER_NEW_SWITCH', '')",
+  ]) {
+    const draft = envDraft([line], { prose: 'Set AGENT_MANAGER_NEW_SWITCH=off to disable it.' });
+    assert.deepEqual(checkGroundedValues(draft, 'grounding that predates the switch'), [], line);
+    assert.ok(extractEnvReadIdentifiers(draft).has('AGENT_MANAGER_NEW_SWITCH'), line);
+  }
+});
+
+test('checkGroundedValues still flags a name that only looks env-like: myenv.NAME, prose, context or removed lines, a JS template constant', () => {
+  const { checkGroundedValues } = require('./fact-checker.js');
+  const flagged = (draft) => checkGroundedValues(draft, 'unrelated grounding').map((f) => f.detail);
+  assert.deepEqual(flagged(envDraft(['+const v = myenv.NOT_AN_ENV_READ;'])), ['NOT_AN_ENV_READ']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Uses PROSE_ONLY_SWITCH.' })), ['PROSE_ONLY_SWITCH']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Uses CONTEXT_ENV_NAME.', context: [' const c = env.CONTEXT_ENV_NAME;'] })), ['CONTEXT_ENV_NAME']);
+  assert.deepEqual(flagged(envDraft(['+const x = 1;'], { prose: 'Drops REMOVED_ENV_NAME.', context: ['-const c = env.REMOVED_ENV_NAME;'] })), ['REMOVED_ENV_NAME']);
+  assert.deepEqual(flagged(envDraft(['+const t = `${TEMPLATE_CONSTANT_NAME}`;'])), ['TEMPLATE_CONSTANT_NAME']);
+});
+
+// checkGroundedValues: fixture token only in an added test file ---------------------------------------
+// 2026-10-19, root-caused live: brain-dump 1891's review was blocked on SENTINEL_THOUGHT, a dummy string in its new unit test. The
+// gate already exempts a URL that lives only in the draft's own added test files (urlsOnlyInAddedTestFiles); fields had no such rule.
+
+function twoFileDraft({ testPath, testLine, prodLine = null, prose = 'Added a test.' }) {
+  const out = [prose, '', '=== DIFF ===', `diff --git a/${testPath} b/${testPath}`, '@@ -1,1 +1,2 @@', ' const a = 1;', testLine];
+  if (prodLine) out.push('diff --git a/src/thing.js b/src/thing.js', '@@ -1,1 +1,2 @@', ' const b = 2;', prodLine);
+  return out.join('\n');
+}
+
+test('checkGroundedValues does not flag an ALL_CAPS token inside a string literal on an added test-file line, even if prose mentions it (js, py, ts paths)', () => {
+  const { checkGroundedValues, fieldsOnlyInAddedTestFiles } = require('./fact-checker.js');
+  for (const [testPath, name, testLine] of [
+    ['src/audit.test.js', 'SENTINEL_THOUGHT', "+  const text = 'SENTINEL_THOUGHT '.repeat(500);"],
+    ['python/dashboard/test_viewer.py', 'FIXTURE_ROW_KEY', '+    row = {"FIXTURE_ROW_KEY": 1}'],
+    ['tests/unit/thing.spec.ts', 'TS_FIXTURE_NAME', '+  expect(f(`TS_FIXTURE_NAME`)).toBe(1);'],
+  ]) {
+    const draft = twoFileDraft({ testPath, testLine, prose: `The test uses ${name} as a stand-in.` });
+    assert.deepEqual(checkGroundedValues(draft, 'grounding that predates the test'), [], testPath);
+    assert.ok(fieldsOnlyInAddedTestFiles(draft).has(name), testPath);
+  }
+});
+
+test('checkGroundedValues keeps flagging a bare identifier in test code, a token also used bare next to its string, and a comment-only mention', () => {
+  const { checkGroundedValues } = require('./fact-checker.js');
+  const flagged = (draft) => checkGroundedValues(draft, 'unrelated grounding').map((f) => f.detail);
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'pkg/tests/test_cache.py', testLine: '+x = INVENTED_FIELD_NAME' })), ['INVENTED_FIELD_NAME'], 'bare reference: a symbol that should exist');
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: "+  use(BARE_AND_STRING, 'BARE_AND_STRING');" })), ['BARE_AND_STRING'], 'also used bare on the same line');
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: '+  // checks COMMENT_ONLY_NAME' })), ['COMMENT_ONLY_NAME'], 'a comment is not test data');
+});
+
+test('checkGroundedValues still flags the token when it is also on an added production line, only in prose, or only on a context or removed test line', () => {
+  const { checkGroundedValues } = require('./fact-checker.js');
+  const flagged = (draft) => checkGroundedValues(draft, 'unrelated grounding').map((f) => f.detail);
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: "+  const x = 'FIXTURE_TOKEN';", prodLine: "+const y = 'FIXTURE_TOKEN';" })), ['FIXTURE_TOKEN'], 'a production line uses it too');
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: '+  const x = 1;', prose: 'Mentions ONLY_IN_PROSE here.' })), ['ONLY_IN_PROSE']);
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: ' const CONTEXT_FIXTURE = 1;', prose: 'Uses CONTEXT_FIXTURE.' })), ['CONTEXT_FIXTURE']);
+  assert.deepEqual(flagged(twoFileDraft({ testPath: 'src/a.test.js', testLine: '-const REMOVED_FIXTURE = 1;', prose: 'Drops REMOVED_FIXTURE.' })), ['REMOVED_FIXTURE']);
+});
+
+// checkGroundedValues: vendored third-party files ----------------------------------------------------
+// 2026-10-24: vendoring dockview-core (a 540 KB minified library) was hard-blocked on hundreds of constants and URLs that belong to the library, not to
+// the draft. The vendored file's own section is not scanned; everything else in the same diff still is.
+
+const LIB_LINES = ['init(ENABLE_TRACKING, MEMORY_LEAK_WATCHER, "http://www.w3.org/2000/svg");'];
+
+test('a vendored library file\'s own constants and URLs are not flagged', () => {
+  for (const f of ['static/vendor/dockview.js', 'third_party/lib/x.js', 'node_modules/pkg/index.js', 'static/app.min.js', 'static/app.min.css', 'vendored/a.js']) {
+    assert.deepEqual(checkGroundedValues(diffOf([f, LIB_LINES]), SRC, null, null), [], f);
+  }
+});
+
+test('the same constants and URLs in a non-vendored file are still flagged', () => {
+  const flags = checkGroundedValues(diffOf(['static/app.js', LIB_LINES]), SRC, null, null).map((f) => f.detail).sort();
+  assert.deepEqual(flags, ['ENABLE_TRACKING', 'MEMORY_LEAK_WATCHER', 'http://www.w3.org/2000/svg']);
+  // a name that merely contains the word is not a vendor directory
+  assert.equal(checkGroundedValues(diffOf(['src/vendorize.js', LIB_LINES]), SRC, null, null).length, 3);
+  assert.equal(checkGroundedValues(diffOf(['src/vendor.js', LIB_LINES]), SRC, null, null).length, 3);
+  assert.equal(checkGroundedValues(diffOf(['src/myvendor/a.js', LIB_LINES]), SRC, null, null).length, 3, 'the directory name must be exactly vendor');
+  assert.equal(checkGroundedValues(diffOf(['src/app.min.json', LIB_LINES]), SRC, null, null).length, 3);
+});
+
+test('a vendored file does not hide a fabricated value in another file of the same diff, or in prose', () => {
+  const both = diffOf(['static/vendor/lib.js', LIB_LINES], ['README.md', ['Fetched from http://invented-host.test/x and uses FABRICATED_FIELD_X.']]);
+  assert.deepEqual(checkGroundedValues(both, SRC, null, null).map((f) => f.detail).sort(), ['FABRICATED_FIELD_X', 'http://invented-host.test/x']);
+  const prose = 'Cites http://made-up.test/a and MADE_UP_FIELD.\n\n=== DIFF ===\n' + diffOf(['static/vendor/lib.js', LIB_LINES]);
+  assert.deepEqual(checkGroundedValues(prose, SRC, null, null).map((f) => f.detail).sort(), ['MADE_UP_FIELD', 'http://made-up.test/a']);
+});
+
+test('stripVendoredDiffSections blanks only the vendored sections and keeps line positions', () => {
+  const d = diffOf(['a.js', ['one']], ['static/vendor/b.js', ['two', 'three']], ['c.js', ['four']]);
+  const out = stripVendoredDiffSections(d).split('\n');
+  assert.equal(out.length, d.split('\n').length);
+  assert.ok(out.join('\n').includes('+one') && out.join('\n').includes('+four'));
+  assert.ok(!out.join('\n').includes('+two') && !out.join('\n').includes('+three'));
+  assert.equal(stripVendoredDiffSections(undefined), '');
+});
+
+// stripUnchangedDiffLines: the diff block ends at the first line that cannot belong to a hunk (CHANGE_REVIEW AC-83) -----------------
+// A fabricated URL in prose AFTER the diff used to ride along as "still inside the diff" and was never scanned. A blank line INSIDE a hunk is a
+// context line whose trailing space was stripped (common in model-written diffs) and must not end the block, or the unchanged context URLs after it
+// are flagged (the false positive 69f0a4b fixed).
+
+const FABRICATED_URL = 'https://totally-invented-service.example-real-tld.com/api';
+const SOURCE_WITHOUT_URLS = 'Plain grounding text with no URLs in it.';
+
+test('a fabricated URL in prose AFTER a diff block is flagged', () => {
+  const draft = ['Summary.', '', 'diff --git a/src/a.js b/src/a.js', '@@ -1,2 +1,3 @@', ' const a = 1;', '+const b = 2;', '', `Afterwards call ${FABRICATED_URL} to confirm.`].join('\n');
+  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS), [{ type: 'ungrounded-url', detail: FABRICATED_URL }]);
+});
+
+test('a bullet, a tab-indented line or plain prose after the diff also ends the block, so a URL in it is flagged', () => {
+  for (const after of [`* see ${FABRICATED_URL}`, `\tsee ${FABRICATED_URL}`, `Note: ${FABRICATED_URL}`]) {
+    const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1 +1,2 @@', ' const a = 1;', '+const b = 2;', after].join('\n');
+    const flags = checkGroundedValues(draft, SOURCE_WITHOUT_URLS);
+    assert.deepEqual(flags.map((f) => f.detail), [FABRICATED_URL], after);
+  }
+});
+
+test('a stripped-space blank context line inside a hunk does not end the block: later unchanged context URLs are not flagged', () => {
+  const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1,4 +1,5 @@', ' const first = "https://old.zzctx1.io/a";', '', ' const second = "https://old.zzctx2.io/b";', '+const added = 1;'].join('\n');
+  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS), []);
+});
+
+test('removed and context URLs inside the diff are still never flagged, and an added URL still is', () => {
+  const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1,3 +1,3 @@', ' const keep = "https://ctx.zzctx3.io/c";', '-const gone = "https://removed.zzrem.io/d";', `+const fresh = "${FABRICATED_URL}";`].join('\n');
+  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS).map((f) => f.detail), [FABRICATED_URL]);
+});
+
+test('once prose ends the diff block, later lines are prose too: an indented URL line after a prose line is flagged', () => {
+  const draft = ['diff --git a/src/a.js b/src/a.js', '@@ -1 +1,2 @@', ' const a = 1;', '+const b = 2;', 'That is the change.', `  details at ${FABRICATED_URL}`].join('\n');
+  assert.deepEqual(checkGroundedValues(draft, SOURCE_WITHOUT_URLS).map((f) => f.detail), [FABRICATED_URL]);
 });

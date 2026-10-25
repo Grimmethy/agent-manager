@@ -1,0 +1,38 @@
+# GPU-broker extraction map — PromptForge verification
+
+Date: 2026-10-22 · Playbook step 2 (read-only verification pass) · Companions: `gpu-broker-verification-core.md`, `gpu-broker-verification-videoforge.md`
+Map: `Docs/gpu-broker-extraction-map.md` (PR #561), sections 1, 3 (G1, G2, G4), 5. Code read (unmodified):
+`/media/model-cache/github/promptforge-manual` at `2e5f9f3` — `server/core/{gpu_session,comfy_proc,comfy}.py`, `server/app.py`,
+`Docs/GPU_FAMILY_PROTOCOL.md`, `tests/test_{gpu_session,gpu_claim,foreign_lease}.py`; plus `kaggleforge/server/gpu_lease.py`.
+Executed: `.venv/bin/python -m unittest tests.test_gpu_session tests.test_gpu_claim tests.test_foreign_lease` → 44 tests, OK.
+Paths below are relative to `server/core/` unless they start with `server/`, `tests/` or `Docs/`.
+
+## Per-claim findings
+
+| # | Map claim | Verdict | Evidence | Correction |
+|---|---|---|---|---|
+| 1 | §1: `gpu_session.py` "(345 lines)" with `begin/touch/end/yield_to_pipeline`, 20 s keeper, lease write, listener lookup + stop, in-flight call detection, RAM check | CONFIRMED (functions) / WRONG (size) | `gpu_session.py:194,293,304,330` (the four calls), `:46,:366-389` (keeper), `:155` (lease), `:108,:128` (listener, stop), `:73-95` (model-locks), `:278-290` (RAM); file is 389 lines | "389 lines (concurrent-start and keeper-first fixes added 44)" |
+| 2 | §1: HTTP API at `server/app.py:134-165` | CONFIRMED | routes `server/app.py:134,139,150,158,163` | none |
+| 3 | §1: protocol doc `Docs/GPU_FAMILY_PROTOCOL.md`, tunables `FORGE_SESSION_*` | CONFIRMED (doc) / WRONG (tunables) | doc is 76 lines; only two of six tunables share that prefix, `gpu_session.py:44-50` | "`FORGE_SESSION_IDLE_S`, `FORGE_SESSION_MAX_S`, `FORGE_KEEPER_TICK_S`, `FORGE_LOCK_WAIT_S`, `FORGE_EVICT_WAIT_S`, `FORGE_START_WAIT_S`" |
+| 4 | §1: "a PromptForge job begins a session itself; this is where the 120 s ComfyUI wait lives" (`comfy.py`) | WRONG (the wait) / CONFIRMED (auto session) | `comfy.py:386` `gpu_session.begin("promptforge", ...)` in `_run`; probe `comfy.py:50`; `touch` `comfy.py:464`. No 120 s anywhere in `comfy.py`. The wait is `COMFY_START_TIMEOUT_S`, `comfy_proc.py:63`, used `:472,:484`; commit d2677e1 (2026-10-15 22:08) changed its default 120 → 300 | "the ComfyUI wait is `comfy_proc.COMFY_START_TIMEOUT_S` (300 s); a second job waits up to `FORGE_START_WAIT_S` 600 s (`gpu_session.py:50,:265-275`, commit 202c3bf, 2026-10-16)". The cold-start failure in §0 of the map was fixed on this side |
+| 5 | §1: lease file, "same path and schema" | CONFIRMED (path) / WRONG (one schema) | path `comfy_proc.py:53-56`. `gpu_session.write_lease` writes `holder, family, owner, acquiredAt, refreshedAt, jobId, sessionStartedAt` (`gpu_session.py:159-160`); `comfy_proc.lease_acquire` writes a second, smaller shape `holder, acquiredAt, refreshedAt, jobId` (`comfy_proc.py:371-390`). Neither writes `endpoints` | "two writers in PromptForge, neither endpoint-scoped" |
+| 6 | §1/§2: lease writers are PromptForge only | WRONG | `kaggleforge/server/gpu_lease.py` (226 lines) writes its own lease with `holder: "kaggleforge"` and `endpoints`; PromptForge refuses to start while that lease is fresh, `comfy_proc.py:346-368`, `gpu_session.py:218-220`, `Docs/GPU_FAMILY_PROTOCOL.md` "one holder at a time" | add KaggleForge as a lease writer; a broker needs the one-holder rule, which lives in `comfy_proc.foreign_lease`, not `gpu_session` |
+| 7 | §3 G1: "move `gpu_session.py` and its tests" | WRONG (scope) | `gpu_session.py:40` imports `comfy_proc`, which supplies `COMFY_URL`, `COMFY_LEASE_PATH`, `comfy_up`, `ollama_models_on_gpu`, `evict_ollama_models`, `ensure_comfyui_ready`, `gpu_inventory`, `mem_available_mb`, `foreign_lease`, `lease_release`, `stop_comfyui` (`gpu_session.py:102,:110,:132,:188-190,:218,:243-254,:279,:319`) | G1 must move the process/lease/Ollama half of `comfy_proc.py` too (config `:37-74`, probes and eviction `:87-232`, spawn/stop `:233-322`, lease `:325-430`, readiness `:431-497`, RAM `:498-509`) |
+| 8 | §3 G1 test: "`tests/test_gpu_session.py`" | CONFIRMED (file) / WRONG (only file) | `tests/test_gpu_session.py` 318 lines; also `tests/test_gpu_claim.py` 131 and `tests/test_foreign_lease.py` 87, which does `from test_gpu_session import Base` (`tests/test_foreign_lease.py:15`) | all three move together; 44 tests pass here |
+| 9 | §3 G4: "`acquire` only returns when :8188 answers; the lease is written BEFORE the stop" | CONFIRMED as already true here | `POST /api/gpu/acquire` is synchronous (`server/app.py:139-147`); `begin` writes the lease first (`gpu_session.py:222`), starts the keeper before the slow part (`:236`), then waits for in-flight calls (`:239-242`), evicts (`:243-250`), starts ComfyUI (`:252-254`), checks RAM (`:255`) and only then marks ready (`:261`) | G4's `to: forge` is largely `begin()`. What it would still add is pausing/restarting the pipeline lanes; the hand-run stop-the-pipeline-first step is not needed on this path |
+
+## §5 open questions (PromptForge scope)
+
+- **Is `instances/.model-locks` read anywhere else, or only by the session core?** Only here in PromptForge: `LOCKS_DIR` `gpu_session.py:51-52`, read by `inflight_pipeline_calls` `:73-95` (no other `model-locks` reader in `server/`). Whether core or other repos read it: core verification.
+- **Does `/free` reclaim stay?** Not PromptForge code; nothing in `server/` calls ComfyUI `/free`. UNCONFIRMED here, see the core verification (row 11).
+- **Which functions in `gpu_session.py` are broker logic vs PromptForge-specific?** All broker logic except the activity probe: `_activity_probe` `:59`, injected by `comfy.py:50` (`_any_active_job`, `comfy.py:45`). Hard-coded to PromptForge: the holder string `"promptforge"` at `gpu_session.py:159,:175`, `comfy_proc.py:350,:380,:396,:426`, and the owner string `"promptforge"` in `comfy.py:386,:464`. A broker has to parameterize or keep the literal.
+- **Per-device awareness?** Partly, and not where it matters. ComfyUI pins a card: `COMFY_CUDA_DEVICE` `comfy_proc.py:68`, `spawn_comfyui` sets `CUDA_VISIBLE_DEVICES` for a non-zero device `:266-270`, `models_to_evict(device)` `:510`. But `begin()` evicts every model of the one Ollama at `OLLAMA_URL` (`comfy_proc.py:38`, `gpu_session.py:243-246`), writes a lease with no `endpoints`, so every AM lane (3090, P40, RX 580) pauses whatever card ComfyUI uses, and `status()` reports only the first GPU (`gpu_session.py:190`). AM already honours `endpoints` (`Docs/GPU_FAMILY_PROTOCOL.md`, "`endpoints`"), so the broker should write the Ollama URL(s) of ComfyUI's card there. PromptForge has no reference to the P40 or the RX 580 (grep of `server/` and `Docs/`: none).
+- **Other callers of the start path?** `server/app.py:171` (`/api/comfy/start`) calls `comfy_proc.ensure_comfyui_ready()` directly with no session, so a manual start takes a lease only on the eviction path (`comfy_proc.py:456`). G1/G2 must decide whether that route goes through the broker.
+
+## G1/G2 change summary (PromptForge)
+
+- Move `gpu_session.py`, the process/lease/Ollama half of `comfy_proc.py`, and the three test files together (rows 7-8).
+- Keep in PromptForge: `comfy.py` job queue and uploads, `_any_active_job`, the placement orchestrators' callers `server/app.py:171`.
+- Repoint exactly three call sites in PromptForge: `comfy.py:386` (`begin`), `comfy.py:464` (`touch`), `comfy.py:456` (reads `last_end_reason`).
+- Add `endpoints` to the lease the broker writes (row 6 and the per-device answer), and keep `holder`/`family`/`owner`/`acquiredAt`/`refreshedAt` as they are so AM's reader needs no change.
+- Fold rows 1, 3, 4, 5, 6, 7, 8 back into `gpu-broker-extraction-map.md`.

@@ -250,6 +250,13 @@ while :; do
     conflict_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-conflict-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-conflict-readmit-sweep.log")"
     printf '[watchdog] branch-conflict-readmit-sweep: %s\n' "$conflict_readmit_result" >&2
 
+    # Branch-defect re-admission (2026-10-24): the paired sweep for a defect verdict. A single-task agent/* branch whose task carries a CURRENT chat/manual
+    # needs-work verdict (priorVerdict.sha == the branch head, seen on two runs >= 10 min apart) gets ONE redraft with the reviewer's reasons; a second
+    # needs-work after that is left for a human. Same exclusions as the conflict sweep (hub children, stacked, shared branches, human-prioritised tasks).
+    # AGENT_MANAGER_DEFECT_READMIT=off|dry-run|on (default dry-run). See branch-defect-readmit-sweep.js.
+    defect_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-defect-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-defect-readmit-sweep.log")"
+    printf '[watchdog] branch-defect-readmit-sweep: %s\n' "$defect_readmit_result" >&2
+
     # Expiry sweep (2026-09-24, change_review flood): retires a QUEUED task whose subject went stale while it waited, for any source that
     # declares an `expiry` hook on its registration (change_review: a review of a commit older than its recency window). Source-agnostic --
     # core names no plugin source. archive -> done/_archived_no_action/ stamped terminalDisposition 'aged-out'; a task already holding an

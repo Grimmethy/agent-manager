@@ -186,3 +186,38 @@ test('readToolLoopAudit skips malformed lines and honours since/type; CLI --json
   assert.deepEqual(rows[0].endClass, { length: 1 });
   assert.equal(rows[0].tools.edit_file.missRate, 1);
 });
+
+// --- empty-attempt (brain-dump 1891) -------------------------------------------------------
+
+test('buildEmptyAttemptEntry: a blank sample keeps done_reason, thinking size, token counts and the attempt number -- no text', () => {
+  const ctx = { source: 'manual', taskId: 't1', stage: 'agentic-write', lane: 'worker-p40', model: 'm', turn: 4, phase: 'loop' };
+  const e = audit.buildEmptyAttemptEntry(ctx, {
+    attempt: 2, message: { role: 'assistant', content: '', thinking: 'sentinel thought '.repeat(500) }, usage: { prompt_eval_count: 40000, eval_count: 3000 }, doneReason: 'length',
+  });
+  assert.equal(e.attempt, 2);
+  assert.equal(e.endClass, 'length');
+  assert.equal(e.doneReason, 'length');
+  assert.equal(e.contentChars, 0);
+  assert.equal(e.thinkingChars, 'sentinel thought '.length * 500);
+  assert.equal(e.promptEvalCount, 40000);
+  assert.ok(!JSON.stringify(e).includes('sentinel thought'), 'sizes only');
+  assert.equal(audit.buildEmptyAttemptEntry(ctx, { attempt: 1, message: { content: '' }, doneReason: null }).endClass, 'unknown');
+  assert.equal(audit.buildEmptyAttemptEntry(ctx, { attempt: 1, message: { content: '' }, doneReason: 'stop' }).endClass, 'stop');
+});
+
+test('buildSummary counts empty attempts per lane/model by end class, even for a lane with no other lines', () => {
+  const rows = audit.buildSummary([
+    { type: 'turn-end', lane: 'worker-p40', model: 'm', endClass: 'tool-calls', doneReason: 'stop' },
+    { type: 'empty-attempt', lane: 'worker-p40', model: 'm', endClass: 'length', attempt: 1 },
+    { type: 'empty-attempt', lane: 'worker-p40', model: 'm', endClass: 'length', attempt: 2 },
+    { type: 'empty-attempt', lane: 'worker-p40', model: 'm', endClass: 'stop', attempt: 1 },
+    { type: 'empty-attempt', lane: 'worker-3090', model: 'm2', endClass: 'unknown', attempt: 1 },
+  ]);
+  const p40 = rows.find((r) => r.lane === 'worker-p40');
+  assert.deepEqual(p40.emptyAttempts, { total: 3, byEndClass: { length: 2, stop: 1 } });
+  assert.equal(p40.turns, 1, 'blank samples are not turns');
+  const o = rows.find((r) => r.lane === 'worker-3090');
+  assert.deepEqual(o.emptyAttempts, { total: 1, byEndClass: { unknown: 1 } });
+  assert.equal(o.turns, 0);
+  assert.deepEqual(audit.buildSummary([{ type: 'turn-end', lane: 'a', model: 'b', endClass: 'stop', doneReason: 'stop' }])[0].emptyAttempts, { total: 0, byEndClass: {} });
+});

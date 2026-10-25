@@ -251,6 +251,29 @@ class BrainDumpWriteRoutesTest(unittest.TestCase):
         rec = json.loads(queued[0].read_text(encoding="utf-8"))
         self.assertEqual(rec["promptContext"]["brainDumpEntryId"], "bd-p")
 
+    # 2026-10-17: _coerce_serial's float branch did int(val) unguarded, so NaN raised
+    # ValueError and Infinity raised OverflowError despite the "never raises" contract.
+    # json.loads accepts the NaN/Infinity literals, so a hand-edited brain-dump.json with
+    # one of them would 500 /api/brain-dump/capture.
+    def test_coerce_serial_nan_returns_zero(self):
+        self.assertEqual(app._coerce_serial(float('nan')), 0)
+
+    def test_coerce_serial_inf_returns_zero(self):
+        self.assertEqual(app._coerce_serial(float('inf')), 0)
+
+    def test_capture_with_nan_serial_in_seed_returns_200_and_next_serial(self):
+        # json.dumps emits NaN as a bare JSON literal; json.loads reads it back as
+        # float('nan'), exercising the full _assign_brain_dump_serials -> _coerce_serial
+        # path. Next serial must come from the finite entry (7) only: 8.
+        entries = [
+            {"id": "bd-nan", "serial": float('nan'), "rawText": "junk", "status": "sorted"},
+            {"id": "bd-ok", "serial": 7, "rawText": "real", "status": "sorted"},
+        ]
+        self.brain_dump.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+        resp = self.client.post("/api/brain-dump/capture", json={"text": "after nan"})
+        self.assertEqual(resp.status_code, 200, resp.get_data(as_text=True))
+        self.assertEqual(resp.get_json()["serial"], 8)
+
 
 if __name__ == "__main__":
     unittest.main()

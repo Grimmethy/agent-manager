@@ -86,6 +86,37 @@ function copyNodeModules(repoRoot, worktreeDir, { run = execFileSync, env = proc
   }
 }
 
+// A Python project's virtual environment (2026-10-23, chat plugin HUB0008-03). The sandbox worktree holds tracked files only and `.venv` is gitignored, so a Python
+// draft could not import flask: it wrote an `app` stub to get its tests to import, reported "29 tests OK", and review rejected the claim against the real
+// `ModuleNotFoundError: No module named 'flask'` in the grounding (the piece was escalated twice). Same shape as copyNodeModules: a PRIVATE COPY (a stray
+// `pip install` must not write through into the shared venv), only when the repo ignores `.venv`, under the same size cap, never a partial copy. A copied venv
+// works for `.venv/bin/python -m ...` and imports (CPython finds pyvenv.cfg next to the interpreter symlink); its console-script shebangs still point at the
+// original, which is fine for `python -m unittest`. AGENT_MANAGER_DRAFT_VENV=false switches it off. Never throws: { copied, ms?, sizeMb?, reason? }.
+function copyPythonVenv(repoRoot, worktreeDir, { run = execFileSync, env = process.env } = {}) {
+  if (String(env.AGENT_MANAGER_DRAFT_VENV || '').trim().toLowerCase() === 'false') return { copied: false, reason: 'AGENT_MANAGER_DRAFT_VENV=false' };
+  const src = path.join(repoRoot || '', '.venv');
+  try { if (!fs.statSync(path.join(src, 'bin', 'python')).isFile() && !fs.lstatSync(path.join(src, 'bin', 'python')).isSymbolicLink()) return { copied: false, reason: 'no .venv/bin/python' }; }
+  catch { return { copied: false, reason: 'the repo has no .venv with a python' }; }
+  const dest = path.join(worktreeDir, '.venv');
+  if (isNonEmptyDir(dest)) return { copied: true, already: true };
+  const started = Date.now();
+  let sizeMb = null;
+  try {
+    try {
+      const kb = Number(String(run('du', ['-sk', fs.realpathSync(src)], { encoding: 'utf8', timeout: DU_TIMEOUT_MS })).split(/\s+/)[0]);
+      if (Number.isFinite(kb)) sizeMb = Math.round(kb / 1024);
+    } catch { /* unknown size: copy under the copy timeout */ }
+    if (sizeMb != null && sizeMb > maxMb(env)) return { copied: false, reason: `.venv is ${sizeMb} MB (cap ${maxMb(env)} MB)`, sizeMb };
+    try { run('git', ['check-ignore', '-q', '.venv/bin/python'], { cwd: worktreeDir, stdio: 'ignore' }); }
+    catch { return { copied: false, reason: '.venv is not gitignored in this repo' }; }
+    run('cp', ['-a', '--reflink=auto', fs.realpathSync(src), dest], { timeout: COPY_TIMEOUT_MS, stdio: 'ignore' });
+    return { copied: true, ms: Date.now() - started, sizeMb };
+  } catch (e) {
+    try { fs.rmSync(dest, { recursive: true, force: true }); } catch { /* best-effort */ }
+    return { copied: false, reason: `copy failed: ${String((e && e.message) || e).slice(0, 200)}` };
+  }
+}
+
 // A NESTED package's node_modules (TaxHarvest/frontend/node_modules). copyNodeModules above only knows <repoRoot>/node_modules, so a monorepo's packages had no
 // dependencies in the review sandbox and their tests could not run. Copied on demand (the review does it only for a package with covering tests to run): a
 // per-draft copy of a 400 MB frontend tree would be paid by every task. Same safety rules as copyNodeModules: gitignored, under the size cap, private copy,
@@ -189,4 +220,4 @@ function filterCriteriaForSandbox({ criteria, source, repoRoot, env = process.en
   return dropToolchainCriteria(list);
 }
 
-module.exports = { planNodeModules, sandboxHasToolchain, copyNodeModules, copyPackageNodeModules, dropToolchainCriteria, filterCriteriaForSandbox, isJsProject, externalDependencyLinks, codeBindPaths, CODE_ENTRIES, TOOLCHAIN_CRITERION_RE };
+module.exports = { planNodeModules, sandboxHasToolchain, copyNodeModules, copyPythonVenv, copyPackageNodeModules, dropToolchainCriteria, filterCriteriaForSandbox, isJsProject, externalDependencyLinks, codeBindPaths, CODE_ENTRIES, TOOLCHAIN_CRITERION_RE };

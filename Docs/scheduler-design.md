@@ -87,8 +87,8 @@ Formula (kept small and explainable):
 1. GPU/VRAM + host RAM: mem-guard 2 GB floor on a 20 GB box (src/mem-guard.js:28, :4)
    `[confirmed]`; per-task VRAM demand vs lane headroom.
 2. Forge-vs-pipeline exclusivity + GPU broker: broker is planned as
-   `agent-manager-gpu-broker`, next free port after StageForge's 7444
-   (Docs/gpu-broker-extraction-map.md:62) `[confirmed]`; scheduler consumes broker
+   `agent-manager-gpu-broker`, port 7449
+   (Docs/gpu-broker-extraction-map.md:71) `[confirmed]`; scheduler consumes broker
    decisions rather than re-implementing allocation `[unconfirmed]` until broker lands.
 3. P40 heat budget: owner-stated limit on sustained P40 work `[unconfirmed]` (no code).
 4. One active project vs rotation; apply stage is per-project (idle-pool borrowing only
@@ -138,7 +138,7 @@ Shown on the dashboard as a "Scheduler Decisions" tab reading the log directory 
 ## 8. Repo + plugin plan
 
 - Repo: `agent-manager-scheduler`; plugin name `scheduler`. Port: next free **after**
-  StageForge 7444 **and** the planned gpu-broker (Docs/gpu-broker-extraction-map.md:62
+  StageForge 7444 **and** the planned gpu-broker (Docs/gpu-broker-extraction-map.md:71
   `[confirmed]`) — recommend reserving 7446 `[unconfirmed]` pending broker allocation.
 - Registers as a plugin the same way other plugins do: `config.ensureRegistered()`
   requires each enabled plugin's `register.js` (src/config.js:452 `[confirmed]`).

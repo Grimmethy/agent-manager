@@ -68,3 +68,48 @@ test('ledger entry carries the attempt throughput, and the scorecard reports the
   const rows = L.buildScorecard([{ source: 's', model: 'm:8b', outcome: 'ok', tps: 20 }, { source: 's', model: 'm:8b', outcome: 'ok', tps: 30 }, { source: 's', model: 'm:8b', outcome: 'timeout' }]);
   assert.equal(rows[0].tpsP50, 30);
 });
+
+// --- budget block comparison (2026-10-19, brain-dump 1895) ---------------------------------------------------
+
+test('ledger entry carries budgetBlock from the switch in the attempt env', () => {
+  const attempt = { at: '2026-10-19T00:00:00Z', finishedAt: '2026-10-19T00:01:00Z', outcome: 'succeeded' };
+  const mk = (v) => L.buildEntry(attempt, { source: 's', taskId: 't', env: { LOCAL_MODEL: 'm:27b', AGENT_MANAGER_INSTANCE_ID: 'worker-x', ...(v === undefined ? {} : { AGENT_MANAGER_PROMPT_BUDGET_BLOCK: v }) } });
+  assert.equal(mk(undefined).budgetBlock, false);
+  assert.equal(mk('off').budgetBlock, false);
+  for (const v of ['on', '1', 'true', 'ON']) assert.equal(mk(v).budgetBlock, true, v);
+});
+
+test('budgetBlockComparison: per lane on vs off timeout/ok rates and median wall; legacy lines without the field are ignored', () => {
+  const e = (lane, budgetBlock, outcome, wallMs) => ({ lane, budgetBlock, outcome, wallMs });
+  const rows = L.budgetBlockComparison([
+    e('worker-3090', false, 'timeout', 100000), e('worker-3090', false, 'ok', 50000), e('worker-3090', false, 'ok', 70000), e('worker-3090', false, 'timeout', 200000),
+    e('worker-3090', true, 'ok', 40000), e('worker-3090', true, 'ok', 60000), e('worker-3090', true, 'timeout', 150000),
+    { lane: 'worker-3090', outcome: 'timeout', wallMs: 1 },
+    e('worker-p40', true, 'ok', 90000),
+    null,
+  ]);
+  assert.equal(rows.length, 2);
+  const r = rows.find((x) => x.lane === 'worker-3090');
+  assert.deepEqual([r.off.n, r.off.timeout, r.off.ok], [4, 2, 2]);
+  assert.equal(r.off.timeoutRate, 0.5);
+  assert.deepEqual([r.on.n, r.on.timeout, r.on.ok], [3, 1, 2]);
+  assert.ok(Math.abs(r.on.timeoutRate - 1 / 3) < 1e-9);
+  assert.equal(r.on.p50WallMs, 60000);
+  const p = rows.find((x) => x.lane === 'worker-p40');
+  assert.deepEqual([p.off.n, p.on.n], [0, 1]);
+  assert.equal(p.off.timeoutRate, null);
+});
+
+test('readBudgetBlockComparison reads the ledger lines recordAttempt wrote, and the CLI --budget-block --json prints them', () => {
+  const { execFileSync } = require('child_process');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ledger-budget-'));
+  const att = (outcome) => ({ at: new Date().toISOString(), finishedAt: new Date().toISOString(), outcome, source: 's' });
+  const envOn = { LOCAL_MODEL: 'm:27b', AGENT_MANAGER_INSTANCE_ID: 'worker-3090', AGENT_MANAGER_PROMPT_BUDGET_BLOCK: 'on' };
+  const envOff = { LOCAL_MODEL: 'm:27b', AGENT_MANAGER_INSTANCE_ID: 'worker-3090' };
+  L.recordAttempt(dir, att('succeeded'), { source: 's', taskId: 'a', env: envOn });
+  L.recordAttempt(dir, att('error'), { source: 's', taskId: 'b', env: envOff });
+  const rows = L.readBudgetBlockComparison(dir);
+  assert.deepEqual([rows[0].on.n, rows[0].off.n, rows[0].on.ok, rows[0].off.ok], [1, 1, 1, 0]);
+  const out = execFileSync(process.execPath, [path.join(__dirname, 'capability-ledger.js'), '7', '--budget-block', '--json'], { env: { ...process.env, AGENT_MANAGER_PIPELINE_DIR: dir }, encoding: 'utf8' });
+  assert.equal(JSON.parse(out)[0].lane, 'worker-3090');
+});

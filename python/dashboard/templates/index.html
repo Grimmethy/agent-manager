@@ -61,7 +61,10 @@
   nav button:hover { background: var(--panel); }
   nav button.active { background: var(--panel); border-left: 3px solid var(--accent); color: var(--accent); }
   nav .count { color: var(--muted); font-variant-numeric: tabular-nums; }
-  main { flex: 1; padding: 20px; }
+  /* min-width:0 lets main shrink below its content (a flex item's default min-width:auto kept it at its widest child, so nav + main + the 380px
+     sidebar summed past the window and the whole page scrolled sideways, clipping the sidebar's right edge); overflow-x:auto scrolls wide content
+     inside main instead of widening the page. */
+  main { flex: 1; min-width: 0; overflow-x: auto; padding: 20px; }
   table { width: 100%; border-collapse: collapse; }
   th { text-align: left; padding: 8px 10px; color: var(--muted); font-weight: 500; font-size: 12px; border-bottom: 2px solid var(--border); }
   td { padding: 9px 10px; border-bottom: 2px solid var(--border); vertical-align: top; }
@@ -92,6 +95,7 @@
   .worker-model-select { margin-left: 10px; margin-right: auto; font-size: 12px; max-width: 220px; }
   .worker-card .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
   .worker-card.clickable { cursor: pointer; }
+  .worker-card.worker-off { opacity: .65; }
   .recent-tasks-list { list-style: none; padding: 0; margin: 6px 0 0; }
   .recent-tasks-list li { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-top: 1px solid var(--border); }
   .recent-tasks-list li:first-child { border-top: none; }
@@ -285,12 +289,15 @@
 <script src="/static/js/queue-tab.js"></script>
 <script src="/static/js/plugins-tab.js"></script>
 <script src="/static/js/workers-tab.js"></script>
+<script src="/static/js/worker-switch-ui.js"></script>
+<script src="/static/js/cloud-spend-panel.js"></script>
 <script src="/static/js/sidebar-and-claude-panels.js"></script>
 <script src="{{ url_for('static', filename='js/analytics-and-discovery.js') }}"></script>
 <script src="/static/js/models-tab.js"></script>
 <script src="/static/js/concepts-and-adhoc-tab.js"></script>
 <script src="/static/js/task-detail-modal.js"></script>
 <script src="/static/js/branch-verdicts.js"></script>
+<script src="/static/js/branch-projects.js"></script>
 <script src="/static/js/branches-joblist-hardware-tabs.js"></script>
 <script src="/static/js/project-tab.js"></script>
 <script src="/static/js/brain-dump-and-second-brain.js"></script>
