@@ -613,3 +613,69 @@ test('applyAdhocDiff (decompose) moves the carried diff onto the first piece and
   assert.equal(task.carriedPartialDiffChars, diff.length);
   assert.equal(readQueuedAdhocTasks(pipelineDir).filter((t) => t.priorPartialDiff === diff).length, 1);
 });
+
+test('applyAdhocDiff copies a valid prerequisiteHubs from a proposal onto that piece only, and drops an invalid value', () => {
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const task = {
+    id: 'apply-test-prereq-1', rawDiff: '', implementResponse: 'Split.', adhocResolution: 'decompose',
+    subTaskProposals: [
+      { title: 'Piece one', rawText: 'Do the first piece.' },
+      { title: 'Piece two', rawText: 'Do the second piece.', prerequisiteHubs: ['HUB0006', 'not-a-hub'] },
+      { title: 'Piece three', rawText: 'Do the third piece.', prerequisiteHubs: ['bogus'] },
+    ],
+  };
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  const by = (t) => queued.find((q) => plain(q.title) === t);
+  assert.equal(by('Piece one').prerequisiteHubs, undefined);
+  assert.deepEqual(by('Piece two').prerequisiteHubs, ['HUB0006']);
+  assert.equal(by('Piece three').prerequisiteHubs, undefined);
+});
+
+test('applyAdhocDiff writes a proposal\'s files as a Files: line exactly once, never over an existing one, and a docs-only piece then passes the substance gate', () => {
+  const { adhocDiffSubstanceProblem } = require('./adhoc-diff-sanity.js');
+  const repoDir = makeRepo();
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-'));
+  const codeish = 'Combine job types into expandable rows in python/dashboard/templates/index.html -- renderJobListTab(). Document the change.';
+  const task = {
+    id: 'apply-test-files-1', rawDiff: '', implementResponse: 'Split.', adhocResolution: 'decompose',
+    subTaskProposals: [
+      { title: 'Docs piece', rawText: codeish, files: ['README.md', 'VERIFY.md'] },
+      { title: 'Has own line', rawText: `${codeish}\nFiles: docs/x.md`, files: ['README.md'] },
+      { title: 'No files', rawText: codeish },
+    ],
+  };
+  applyAdhocDiff({ task, repoRoot: repoDir, pipelineDir });
+  const queued = readQueuedAdhocTasks(pipelineDir);
+  const by = (t) => queued.find((q) => plain(q.title) === t);
+  const docsDiff = 'diff --git a/README.md b/README.md\nnew file mode 100644\nindex 0000000..abc1234\n--- /dev/null\n+++ b/README.md\n@@ -0,0 +1 @@\n+content\n';
+  assert.equal((by('Docs piece').promptContext.rawText.match(/^Files:/gim) || []).length, 1);
+  assert.match(by('Docs piece').promptContext.rawText, /\nFiles: README\.md, VERIFY\.md$/);
+  assert.equal((by('Has own line').promptContext.rawText.match(/^Files:/gim) || []).length, 1);
+  assert.match(by('Has own line').promptContext.rawText, /Files: docs\/x\.md$/);
+  assert.equal(by('No files').promptContext.rawText, codeish);
+  assert.equal(adhocDiffSubstanceProblem(by('Docs piece'), docsDiff), null, 'declared docs files: not docs-only');
+  assert.equal(adhocDiffSubstanceProblem(by('No files'), docsDiff).code, 'docs-only', 'without the line the keyword scan still flags it');
+});
+
+test('applyAdhocDiff lists owner-gated pieces in the result, and none when no piece is gated', () => {
+  const repoDir = makeRepo();
+  const mk = (id, proposals) => ({ id, rawDiff: '', implementResponse: 'Split.', adhocResolution: 'decompose', subTaskProposals: proposals });
+  const gated = applyAdhocDiff({
+    task: mk('apply-test-gates-1', [
+      { title: 'Plain piece', rawText: 'Do the plain thing.' },
+      { title: 'Vendor the library', rawText: 'Download it. This step needs owner approval before any download.' },
+    ]),
+    repoRoot: repoDir, pipelineDir: fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-')),
+  });
+  assert.equal(gated.ownerGates.length, 1);
+  assert.equal(gated.ownerGates[0].why, 'owner approval');
+  assert.match(gated.ownerGates[0].id, /vendor-the-library/);
+  assert.match(gated.ownerGates[0].title, /Vendor the library/);
+  const none = applyAdhocDiff({
+    task: mk('apply-test-gates-2', [{ title: 'One', rawText: 'Do one.' }, { title: 'Two', rawText: 'Do two.' }]),
+    repoRoot: repoDir, pipelineDir: fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-pipeline-')),
+  });
+  assert.deepEqual(none.ownerGates, []);
+});

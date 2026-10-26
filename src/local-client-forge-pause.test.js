@@ -123,3 +123,34 @@ test('kill switch AGENT_MANAGER_FORGE_PAUSE=off: a fresh lease no longer pauses 
     assert.equal(requests, before + 1);
   } finally { delete process.env.AGENT_MANAGER_FORGE_PAUSE; }
 });
+
+// ---- endpoint-scoped lease: only a call to a leased card is paused ----------------------------------------------------------------------------
+const writeScopedLease = (endpoints) => {
+  const t = new Date().toISOString();
+  fs.writeFileSync(LEASE, JSON.stringify({ holder: 'kaggleforge', family: 'forge', endpoints, acquiredAt: t, refreshedAt: t }));
+};
+
+test('a lease scoped to ANOTHER card does not pause this lane: call() proceeds and sends its request', async () => {
+  writeScopedLease(['http://192.168.122.29:11434']);
+  const before = requests;
+  const r = await client.call({ prompt: 'hi' });
+  assert.match(r.response, /APPROVE/);
+  assert.equal(requests, before + 1);
+});
+
+test('a lease scoped to THIS card (written as localhost, the lane uses 127.0.0.1) pauses it: ForgePauseError, no request', async () => {
+  writeScopedLease([`http://localhost:${server.address().port}`]);
+  const before = requests;
+  await assert.rejects(() => client.call({ prompt: 'hi' }), (e) => guard.isForgePause(e));
+  assert.equal(requests, before, 'no request reached the card');
+});
+
+test('a scoped lease also pauses majorityVote (the reviewer path) for the leased card, and not for another', async () => {
+  const classify = (t) => ({ verdict: 'approve' });
+  writeScopedLease([`http://127.0.0.1:${server.address().port}`]);
+  await assert.rejects(() => client.majorityVote({ prompt: 'x', classify, n: 3 }), (e) => guard.isForgePause(e));
+  writeScopedLease(['http://192.168.122.29:11434']);
+  const before = requests;
+  await client.majorityVote({ prompt: 'x', classify, n: 3 });
+  assert.ok(requests > before, 'votes were cast');
+});

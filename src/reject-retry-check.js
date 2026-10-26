@@ -35,6 +35,8 @@ const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.j
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { acquire, release, taskMoveLockKey } = require('./single-flight-lock.js');
 const { sharedInstancesDir } = require('./instances-dir.js');
+const { recordAvoidedLane, describeTopTierFailure } = require('./premium-rotation.js');
+const { writeSideFindingInbox } = require('./side-finding.js');
 
 // Task-move lock (2026-09-27): every requeue/escalation below used to be a plain,
 // unguarded write-then-unlink -- no atomic rename, no check for whether a file for this
@@ -238,7 +240,7 @@ function buildExhaustedFulfillmentQuestion(task) {
 // usually already moot by the time they exhaust (a later window supersedes it), not
 // something a human needs to individually triage -- see this session's own manual
 // retirement of 24 exhausted pipeline_debrief tasks for exactly that reasoning.
-const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief']);
+const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief', 'capability_debrief']);
 
 function isReviewVerdictAdvisoryProseSource(source) {
   return isAdvisoryProseSource(source) && !REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED.has(source);
@@ -474,7 +476,7 @@ function buildFeedbackString(ctx) {
   }
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, repoRoot: repoRootOverride, recordModelOutcome = defaultRecordModelOutcome }) {
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, repoRoot: repoRootOverride, lanes: lanesOverride = null, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
   // only matters for tests that don't bother passing pipelineDir explicitly (it was never
@@ -932,6 +934,22 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         delete task.planResponse;
         delete task.implementResponse;
         appendHistoryEvent(task, 'requeued', 'plan-pass degenerate -- cleared stale plan state for a fresh plan pass');
+        // Steer the task away from the lane it degenerated on while another lane exists (premium-rotation.js): the P40 lane
+        // kept re-claiming the same task and blocking it on a truncated plan, starving every task behind it.
+        // Tier rule (premium-rotation.js recordAvoidedLane): only a lane with a bigger lane above it is recorded. A degenerate plan on the BIGGEST lane records
+        // nothing (a block there would leave the task nowhere to go -- the stranded extend-the-doc premium task, 2026-10-17) and files a systemic side finding.
+        let lanes = [];
+        try { lanes = lanesOverride || require('./lanes.js').getLanes(); } catch (_) { lanes = []; }
+        const avoided = recordAvoidedLane(task, lanes.length, process.env, lanes);
+        if (avoided) {
+          appendHistoryEvent(task, 'lane-avoided', `plan degenerated on ${avoided}; other lanes get first claim`);
+        } else {
+          const finding = describeTopTierFailure(task, lanes);
+          if (finding) {
+            writeSideFindingInbox(finding, { source: 'lane_avoidance', taskId: task.id, stage: 'plan', pipelineDir });
+            appendHistoryEvent(task, 'advisory', `plan degenerated on the biggest lane; no lane avoidance recorded (nowhere bigger to go) -- filed a systemic side finding instead: ${finding.title}`);
+          }
+        }
       } else if (implementDegenerateBlock) {
         // The plan completed and is kept; only the unusable (empty / truncated) implement output is dropped.
         delete task.implementResponse;

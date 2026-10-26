@@ -51,7 +51,7 @@ const {
 require('./task-sources.js');
 try { require('./config.js').ensureRegistered(); } catch { /* no live config (e.g. a unit test) -- fine, nothing to register */ }
 
-const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief']);
+const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief', 'capability_debrief']);
 const DIRS = ['blocked', 'needs-clarification'];
 
 const enabled = () => process.env.AGENT_MANAGER_GROUNDING_RECHECK !== 'false';
@@ -72,7 +72,7 @@ async function sweepGroundingRecheck({
   pipelineDir, approvedDir, needsClarificationDir, adhocDir, derivedDir, pendingDir,
   now = new Date(), dryRun = false,
 } = {}) {
-  const summary = { checked: 0, recovered: [], requeued: [], exhausted: [], errors: 0 };
+  const summary = { checked: 0, recovered: [], requeued: [], blocked: [], exhausted: [], errors: 0 };
   if (!enabled() || !pipelineDir) return summary;
   const queueDir = path.join(pipelineDir, 'queue');
   const approvedDirResolved = approvedDir || path.join(queueDir, 'approved');
@@ -143,6 +143,78 @@ async function sweepGroundingRecheck({
       const stillUngrounded = grounding && (grounding.verdict === 'ungrounded' || grounding.verdict === 'invalid-premise');
 
       if (!stillUngrounded) {
+        // HUB0184 · 3/4 guard: never auto-approve a diff that has NEVER been executed. The
+        // review gate (review-task.js) runs the draft's diff in a scratch worktree and blocks
+        // on `ev.status === 'failed'`; this sweep's recovery path predates that gate and would
+        // otherwise release a rawDiff-bearing task straight to approved/ on a grounding-check
+        // pass alone -- approving work whose own tests were never run. So: if the task carries
+        // a real diff (review-task.js's extractTaskDiff, source-agnostic) that has never been
+        // executed (task.executedVerification.ran was stamped only by summariseExecutedVerification,
+        // i.e. only after a real verifyDiff run), run the same verification inline under the same
+        // budget the review gate uses, and let its result decide:
+        //   'failed'  -> block the task (same deterministic-block shape as the review gate),
+        //   ran, other status (passed/inconclusive) -> fall through to the normal auto-approve,
+        //   could not run at all -> leave the task in review (unchanged) rather than approving.
+        let neverExecutedDiff = null;
+        try {
+          const diff = require('./review-task.js').extractTaskDiff(task);
+          const ran = task.executedVerification && task.executedVerification.ran === true;
+          if (diff && !ran) neverExecutedDiff = diff;
+        } catch { /* review-task.js unavailable (no live config) -- see below: the sweep still approves on the grounding check alone */ }
+        if (neverExecutedDiff) {
+          let ev = null;
+          try {
+            const rt = require('./review-task.js');
+            const cfg = require('./config.js').getConfig();
+            const repoRoot = cfg && cfg.repoRoot;
+            if (repoRoot) {
+              const baseBranch = require('./git-runner.js').detectDefaultBranch(repoRoot);
+              const budget = parseInt(process.env.AGENT_MANAGER_REVIEW_VERIFY_BUDGET_MS, 10);
+              ev = require('./review-verify.js').verifyDiff({
+                taskId: task.id, rawDiff: neverExecutedDiff,
+                acceptanceResults: task.acceptanceResults || [],
+                repoRoot, mainBranch: baseBranch,
+                budgetMs: budget > 0 ? budget : rt.EXECUTED_VERIFY_BUDGET_MS,
+                checkUnpinned: process.env.AGENT_MANAGER_REVIEW_UNPINNED_CHECK !== 'false',
+                pipelineDir, checkReplay: process.env.AGENT_MANAGER_REVIEW_GATE_REPLAY !== 'false',
+              });
+            }
+          } catch (e) {
+            console.error(`[grounding-recheck-sweep] inline executed verification errored for ${task.id} (leaving in review): ${e && e.message}`);
+            ev = null;
+          }
+          if (!ev || !ev.status) {
+            // Verification could not be run here (no repoRoot, verify threw) -- the safe move is
+            // to NOT approve an unexecuted diff. Leave the task exactly where it is (still
+            // reviewInconclusive, so a later run -- or the normal review gate -- gets the chance
+            // to execute it); only the history note changes.
+            appendHistoryEvent(task, 'review', 'grounding-recheck-sweep: grounding gate now passes, but this diff has never been executed and inline verification could not run -- left in review rather than auto-approved');
+            if (!dryRun) fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+            summary.blocked.push({ id: task.id, from: dir, disposition: 'left-in-review' });
+            continue;
+          }
+          const rt = require('./review-task.js');
+          task.executedVerification = rt.summariseExecutedVerification(ev);
+          if (ev.status === 'failed') {
+            // Same verdict the review gate would have handed down: a deterministically FAILED
+            // diff is a block, not an approve. Clear reviewInconclusive so the rejection is a
+            // REAL one reject-retry-check.js can classify/escalate (the same tracking the
+            // redraft path below uses), and bump localRejectCount so the next genuine failure
+            // is counted, not invisible.
+            const reason = rt.executedVerificationBlockReason(ev);
+            task.blockedReason = reason;
+            task.blockedStage = 'review';
+            task.reviewProvider = 'deterministic-executed-verification';
+            task.localRejectCount = (Number(task.localRejectCount) || 0) + 1;
+            delete task.reviewInconclusive;
+            appendHistoryEvent(task, 'blocked', `grounding-recheck-sweep: grounded on re-check, but inline executed verification FAILED the never-executed diff -- blocked instead of auto-approved: ${reason}`);
+            if (!dryRun) fs.writeFileSync(filePath, JSON.stringify(task, null, 2));
+            summary.blocked.push({ id: task.id, from: dir, disposition: 'verification-failed' });
+            continue;
+          }
+          appendHistoryEvent(task, 'advisory', `grounding-recheck-sweep: inline executed verification ran the never-executed diff before approving -- status ${ev.status}`);
+        }
+
         // RECOVERED -- mirrors reject-retry-check.js's deterministicReviewRecoveryCheck release shape.
         task.reviewedAt = nowIso;
         task.reviewProvider = 'grounding-recheck-sweep';
@@ -194,6 +266,6 @@ if (require.main === module) {
   const cfg = getConfig();
   const dryRun = process.argv.includes('--dry-run');
   sweepGroundingRecheck({ pipelineDir: cfg.pipelineDir, dryRun }).then((s) => {
-    process.stdout.write(`checked=${s.checked} recovered=${s.recovered.length}${s.recovered.length ? ` [${s.recovered.map((r) => r.id).join(', ')}]` : ''} requeued=${s.requeued.length}${s.requeued.length ? ` [${s.requeued.map((r) => r.id).join(', ')}]` : ''} exhausted=${s.exhausted.length} errors=${s.errors}${dryRun ? ' (dry run)' : ''}\n`);
+    process.stdout.write(`checked=${s.checked} recovered=${s.recovered.length}${s.recovered.length ? ` [${s.recovered.map((r) => r.id).join(', ')}]` : ''} requeued=${s.requeued.length}${s.requeued.length ? ` [${s.requeued.map((r) => r.id).join(', ')}]` : ''} guarded=${s.blocked.length}${s.blocked.length ? ` [${s.blocked.map((r) => r.id).join(', ')}]` : ''} exhausted=${s.exhausted.length} errors=${s.errors}${dryRun ? ' (dry run)' : ''}\n`);
   }).catch((e) => { console.error('[grounding-recheck-sweep]', (e && e.stack) || e); process.exit(1); });
 }

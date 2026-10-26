@@ -7,7 +7,7 @@ const { sharedInstancesDir } = require('../instances-dir.js');
 const { buildPlanGrounding } = require('../plan-grounding.js');
 const { appendHistoryEvent, setHistoryPersistHook } = require('../task-history.js');
 const {
-  beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordOrient, recordPlanCritique, recordTier, finalizeDraftAttempt,
+  beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordOrient, recordPlanCritique, recordFactCheck, factCheckRecordInput, recordTier, finalizeDraftAttempt,
 } = require('../draft-attempt-record.js');
 const { appendTierWorkLog, pruneWorkLogs } = require('../work-log.js');
 const { providerFor, labelFor, resolveModelProfile } = require('../model-provider.js');
@@ -20,6 +20,7 @@ const { checkDraft } = require('../fact-checker.js');
 const { resolveSourceName, getRegisteredSource } = require('../task-source-registry.js');
 const { isClaudePaused } = require('../claude-pause.js');
 const { writeHeartbeatFile } = require('../heartbeat.js');
+const { loadTaskImages } = require('./task-images.js');
 const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./draft-lifecycle.js');
 
 function resolveDraftContext(task, { localCall, withLockFn }) {
@@ -40,8 +41,13 @@ function resolveDraftContext(task, { localCall, withLockFn }) {
   // as it always has; wrapping it here would silently change what a test believes it's
   // calling.
   const modelProfile = resolveModelProfile(task);
-  const profileOverrides = modelProfile
-    ? { model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict }
+  // Vision tasks (lib/task-images.js): promptContext.imagePaths -> base64 `images` on every local call of the task.
+  const taskImages = loadTaskImages(task && task.promptContext);
+  const profileOverrides = (modelProfile || taskImages.length)
+    ? {
+      ...(modelProfile ? { model: modelProfile.model, numCtx: modelProfile.numCtx, numPredict: modelProfile.numPredict } : {}),
+      ...(taskImages.length ? { images: taskImages } : {}),
+    }
     : null;
   const baseLocalCall = localCall || providerFor(task).call;
   const profileWrappedCall = profileOverrides && !localCall
@@ -388,6 +394,10 @@ async function draftAdhocBranch(task, {
       // checkDraft returns { flags: [{ type, detail }, ...], ... } -- attach exactly the
       // flags array (guaranteed to be an array even when empty) per the pre-filter contract.
       task.preFilterFlags = Array.isArray(factCheck && factCheck.flags) ? factCheck.flags : [];
+      // Durable copy on this attempt's record (draft-attempt-record.js): task.preFilterFlags
+      // is overwritten on every run, so a blocked task's fact-check verdict would otherwise
+      // vanish. recordFactCheck tolerates an undefined attempt and keeps the record's [] default.
+      recordFactCheck(attempt, factCheckRecordInput(factCheck));
     }
   } catch (err) {
     console.warn('[local-draft] pre-filter fact-check failed (non-fatal):', err?.message ?? err);

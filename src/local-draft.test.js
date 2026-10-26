@@ -3760,6 +3760,27 @@ test('draft attempt record: a degenerate plan pass records the reason instead of
   });
 });
 
+test('lane escalation: a degenerate attempt on a small-tier lane stamps avoidLanes so a bigger lane takes the retry', async () => {
+  const lanesFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'esc-lanes-')), 'lanes.json');
+  fs.writeFileSync(lanesFile, JSON.stringify([{ gpu: 'rx580', ollamaUrl: 'http://g:11434', model: 'small:8b' }]));
+  const saved = {};
+  const set = { AGENT_MANAGER_LANES_PATH: lanesFile, AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_HOST_LOCAL_MODEL: 'big:27b', AGENT_MANAGER_INSTANCE_ID: 'worker-rx580' };
+  for (const k of Object.keys(set)) { saved[k] = process.env[k]; process.env[k] = set[k]; }
+  try {
+    await withFixtureRepo(async (draftTask) => {
+      const task = {
+        id: 'esc-degen', domain: 'default', source: 'product_spec', title: 'seed',
+        promptContext: { requestText: 'seed', currentSpec: '', specExists: false, specRelPath: 'Docs/PRODUCT_SPEC.md', specMode: 'greenfield' },
+      };
+      await draftTask(task, { localCall: async () => ({ response: '', degenerate: 'empty', attempts: 3 }), withLockFn: async (d, fn) => fn() });
+      assert.deepEqual(task.avoidLanes, ['worker-rx580']);
+      assert.ok(task.history.some((h) => h.stage === 'lane-escalated'));
+    });
+  } finally {
+    for (const k of Object.keys(set)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+});
+
 // --- Fix (2026-08-31, bra-1788142124203): plan-pass substance gate + prior-plan reuse ---
 
 test('runPlanPass (adhoc): a thin first plan is re-rolled once, and a substantive re-roll is kept', async () => {
@@ -3799,6 +3820,98 @@ test('runPlanPass (adhoc): the plan re-roll samples at RETRY_TEMPERATURE, not th
     // temps[0] = thin first plan, temps[1] = the re-roll, temps[2] = the preliminary decompose check.
     assert.equal(temps[0], 0.4, 'the first attempt stays at the normal temperature');
     assert.equal(temps[1], RETRY_TEMPERATURE, 'the re-roll (a genuine same-prompt retry) must diversify');
+  });
+});
+
+// --- HUB0159 · 3/3: plan-pass import-binding cap (planImportBindingProblem) acceptance tests ---
+// The heuristic (src/adhoc-diff-sanity.js's planImportBindingProblem) counts import-binding
+// steps ONLY inside fenced code blocks; >=2 such steps is 'too-many-import-binding-steps',
+// and one step without a verbatim require('...') / import ... from '...' anchor is
+// 'missing-verbatim-find-anchor'. runPlanPass (src/local-draft.js) re-plans ONCE at
+// RETRY_TEMPERATURE on a flagged plan, then always accepts the second roll (emitting
+// 'plan-accepted-after-rejection' when that roll ALSO trips the cap) -- a legitimate plan
+// is never dropped forever. Both plans below are substantive (>=2 numbered steps, >=200
+// chars) so the ordinary thin-plan gate stays out of the way.
+const BINDING_PLAN_TWO_STEPS = [
+  '1. Add the new module src/lib/import-binding-check.js holding the check logic:',
+  '   ```js',
+  "   const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');",
+  '   ```',
+  '2. Wire it into runPlanPass in src/local-draft.js:',
+  '   ```js',
+  "   const { appendHistoryEvent } = require('./task-history.js');",
+  '   ```',
+  '3. Run a targeted check on the two changed files and hand back the resulting diff for review.',
+].join('\n');
+const BINDING_PLAN_ONE_STEP = [
+  '1. Add the single binding the feature needs in src/local-draft.js:',
+  '   ```js',
+  "   const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');",
+  '   ```',
+  '2. Use it in runPlanPass to flag wiring plans and re-roll exactly once at retry temperature.',
+  '3. Run a targeted check on the changed files and hand back the resulting diff for review.',
+].join('\n');
+
+test('runPlanPass (adhoc): an over-cap plan is rejected, and the re-planned one-step plan is kept', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-binding-rej', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      return { response: n === 1 ? BINDING_PLAN_TWO_STEPS : BINDING_PLAN_ONE_STEP, degenerate: null, attempts: 1 };
+    };
+    const res = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    // call 1 = over-cap first plan, call 2 = the one binding re-roll, call 3 = the
+    // preliminary decompose check (non-JSON -> null -> falls to the declined tier).
+    assert.equal(n, 3, 'over-cap first plan + exactly one binding re-roll + the preliminary decompose check');
+    const rejected = (task.history || []).find((e) => e.stage === 'plan-rejected');
+    assert.ok(rejected, 'a plan-rejected history event must exist for the over-cap plan');
+    assert.match(rejected.detail, /too-many-import-binding-steps/);
+    assert.equal(task.planResponse, BINDING_PLAN_ONE_STEP, 'the accepted plan must be the re-planned one');
+    // The re-planned plan passes the cap, so NO acceptance-after-rejection may fire.
+    assert.ok(!(task.history || []).some((e) => e.stage === 'plan-accepted-after-rejection'));
+    // Rejection must be re-plan, not a plan-level hard fail: the block (if any) comes from
+    // the deliberately-declined tier stub, never from the import-binding cap.
+    assert.ok(!(res && res.blockedReason && /import-binding/.test(String(res.blockedReason))));
+  });
+});
+
+test('runPlanPass (adhoc): a single-binding plan with a verbatim anchor passes with no rejection', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-binding-ok', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      return { response: BINDING_PLAN_ONE_STEP, degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    assert.ok(!(task.history || []).some((e) => e.stage === 'plan-rejected'), 'no plan-rejected event for a compliant plan');
+    assert.ok(!(task.history || []).some((e) => e.stage === 'plan-accepted-after-rejection'));
+    assert.equal(n, 2, 'first plan (accepted on the spot) + the preliminary decompose check -- no re-roll');
+    assert.equal(task.planResponse, BINDING_PLAN_ONE_STEP, 'the compliant single-binding plan is accepted as-is');
+  });
+});
+
+test('runPlanPass (adhoc): a legitimate multi-binding plan is accepted on the second attempt, never dropped', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-binding-acc', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      return { response: BINDING_PLAN_TWO_STEPS, degenerate: null, attempts: 1 };
+    };
+    const res = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    // The SAME over-cap plan comes back on the re-roll: the guard must ACCEPT it (recorded)
+    // rather than loop or drop the task -- the wrongly-dropped legitimate-plan case this
+    // history event exists to make findable.
+    assert.equal(n, 3, 'over-cap first plan + exactly one binding re-roll + the preliminary decompose check');
+    const rejected = (task.history || []).find((e) => e.stage === 'plan-rejected');
+    assert.ok(rejected && /too-many-import-binding-steps/.test(rejected.detail));
+    const accepted = (task.history || []).find((e) => e.stage === 'plan-accepted-after-rejection');
+    assert.ok(accepted, 'a plan-accepted-after-rejection event must record the second-attempt acceptance');
+    assert.equal(task.planResponse, BINDING_PLAN_TWO_STEPS, 'the second-attempt plan is the accepted plan, not dropped');
+    // The cap must be re-plan-once + accept, never a plan-level hard block.
+    assert.ok(!(res && res.blockedReason && /import-binding/.test(String(res.blockedReason))));
   });
 });
 
@@ -4223,4 +4336,141 @@ test('test-framework prompt line: a task that concerns tests gets the repo\'s re
     assert.match(withTestConventions(testy, 'BASE PROMPT'), /^BASE PROMPT\n\nTEST CONVENTIONS[\s\S]*tests use node:test/);
     assert.equal(withTestConventions({ title: 'Rename a helper', promptContext: { rawText: 'no relation', files: ['src/a.js'] } }, 'BASE PROMPT'), 'BASE PROMPT');
   } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev; tf.clearCache(); }
+});
+
+// 2026-10-16: an adhoc task requeued as an agentic continuation (isAgenticContinuation, priorPartialDiff) already holds its plan, orient notes and
+// acceptance criteria, yet the plan pass re-ran on every attempt and kept ending in 'Plan pass degenerate: truncated' (the extend-the-merged-doc
+// task: six blocked attempts). A continuation whose own earlier attempt wrote a plan with a CRITERIA: block now reuses it: no orient pass, no plan call.
+const CONTINUATION_PLAN = [
+  'PLAN',
+  '1. Read the current state of the working tree and confirm which of the edits from the earlier pass are already applied.',
+  '2. Finish the remaining edits in the one file the task names, building on what is already there without redoing it.',
+  '3. Run the targeted check on what changed and hand back the resulting diff for review.',
+  'CRITERIA:',
+  '- The remaining sections exist in the one file the task names',
+  '- No other file is touched',
+].join('\n');
+
+function continuationHarness(taskOverrides) {
+  const stages = [];
+  let orientCalls = 0;
+  const localCall = async (opts) => { stages.push(opts.stage || 'other'); return { response: PLAN_STUB, degenerate: null, attempts: 1 }; };
+  const runOrientPassFn = async () => { orientCalls += 1; return { skipped: true, notes: '' }; };
+  const task = {
+    id: 'adhoc-continuation-test', domain: 'adhoc', source: 'manual', title: 'test', promptContext: { rawText: 'extend the doc' },
+    isAgenticContinuation: true, priorPartialDiff: 'diff --git a/x b/x\n', agenticContinuationCount: 1,
+    lastGoodPlan: CONTINUATION_PLAN, orientNotes: 'earlier orient report', oriented: true,
+    ...taskOverrides,
+  };
+  const deps = {
+    localCall, runOrientPassFn,
+    draftAdhocViaLocalAgenticWriteFn: async (t) => { t.adhocResolution = 'no-changes-needed'; t.implementResponse = 'RESOLUTION: no-changes-needed\n\nnothing to do'; return { succeeded: true, blocked: false }; },
+  };
+  return { task, deps, stages, orientCount: () => orientCalls };
+}
+
+test('an agentic continuation with its own prior plan makes no orient pass and no plan call, and keeps the plan and its acceptance criteria', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const h = continuationHarness({});
+    await draftTask(h.task, h.deps);
+    assert.equal(h.stages.filter((s) => s === 'plan').length, 0, 'no plan model call');
+    assert.equal(h.orientCount(), 0, 'no orient pass');
+    assert.equal(h.task.planResponse, CONTINUATION_PLAN);
+    assert.deepEqual(h.task.acceptanceCriteria, ['The remaining sections exist in the one file the task names', 'No other file is touched']);
+    assert.equal(h.task.acceptanceCriteriaSource, 'plan-derived');
+    assert.ok(h.task.history.some((e) => e.stage === 'plan-done' && /reused the prior plan for an agentic continuation/.test(e.detail)));
+  });
+});
+
+test('a continuation whose prior plan is thin still runs the plan pass', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const h = continuationHarness({ lastGoodPlan: '1. Do it.' });
+    await draftTask(h.task, h.deps);
+    assert.ok(h.stages.filter((s) => s === 'plan').length >= 1, 'a thin plan is not reused');
+  });
+});
+
+test('a continuation whose prior plan has no CRITERIA: block still runs the plan pass', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const h = continuationHarness({ lastGoodPlan: CONTINUATION_PLAN.split('CRITERIA:')[0] });
+    await draftTask(h.task, h.deps);
+    assert.ok(h.stages.filter((s) => s === 'plan').length >= 1, 'no acceptance criteria derivable -> plan as before');
+  });
+});
+
+test('a task that is not an agentic continuation still runs the plan pass even when it has a lastGoodPlan', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const h = continuationHarness({ isAgenticContinuation: undefined, priorPartialDiff: undefined });
+    await draftTask(h.task, h.deps);
+    assert.ok(h.stages.filter((s) => s === 'plan').length >= 1);
+  });
+});
+
+test('reusePriorPlanForContinuation never short-circuits the plan-critique re-plan (_planCritiqueRevised)', async () => {
+  await withFixtureRepo(async () => {
+    const { reusePriorPlanForContinuation } = require('./local-draft.js');
+    const task = { id: 'adhoc-x', domain: 'adhoc', source: 'manual', promptContext: { rawText: 'x' }, isAgenticContinuation: true, lastGoodPlan: CONTINUATION_PLAN, _planCritiqueRevised: true };
+    assert.equal(reusePriorPlanForContinuation(task, null), false);
+    assert.equal(task.planResponse, undefined);
+  });
+});
+
+// archImportImplementPrompt now asks for the exact line "no real file to adapt" when no listed file fits. The implement pass must treat
+// that as a terminal no-op (empty implementResponse, so the emptyApproval source auto-approves), not as a candidate to critique or requeue.
+async function runArchImportWithImplementAnswer(implementAnswer) {
+  let out;
+  const prevCoreRoot = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  const prevGrep = process.env.AGENT_MANAGER_GREP_DIRS;
+  try {
+    await withFixtureRepo(async (draftTask, dir) => {
+      process.env.AGENT_MANAGER_CORE_REPO_ROOT = dir;
+      process.env.AGENT_MANAGER_GREP_DIRS = 'src';
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'realfile.js'), 'function stubProbeSymbol() {}\n');
+      const calls = [];
+      const localCall = async (prompt) => {
+        calls.push(prompt);
+        return { response: calls.length === 1 ? 'QUERY: stubProbeSymbol' : implementAnswer, degenerate: null, attempts: 1 };
+      };
+      const task = { id: 'arch-import-stub', domain: 'default', source: 'arch_import', title: 't', promptContext: { sourceProject: 'other-repo', rating: 'Strong', itemTitle: 'x', itemRationale: 'y' } };
+      const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+      out = { task, result, calls: calls.length };
+    });
+  } finally {
+    if (prevCoreRoot === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = prevCoreRoot;
+    if (prevGrep === undefined) delete process.env.AGENT_MANAGER_GREP_DIRS; else process.env.AGENT_MANAGER_GREP_DIRS = prevGrep;
+  }
+  return out;
+}
+
+test('arch_import: the "no real file to adapt" stub is a terminal no-op with an empty implementResponse', async () => {
+  for (const answer of ['no real file to adapt', '  No real file to adapt.\n']) {
+    const { task, result, calls } = await runArchImportWithImplementAnswer(answer);
+    assert.equal(task.promptContext.harnessHits.length > 0, true, 'the fixture must give the plan real harness hits, else the zero-hit skip would fire instead');
+    assert.equal(calls, 2, 'plan and implement only: no critique or revision call after the stub');
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(task.implementResponse, '');
+    assert.ok((task.history || []).some((e) => e.stage === 'implement-done' && /no real file to adapt/.test(e.detail || e.message || JSON.stringify(e))));
+  }
+});
+
+test('arch_import: a response that merely mentions the stub phrase is not treated as the stub', async () => {
+  const answer = 'Candidate: reuse stubProbeSymbol in src/realfile.js. There is no real file to adapt elsewhere.';
+  const { task } = await runArchImportWithImplementAnswer(answer);
+  assert.notEqual(task.implementResponse, '');
+});
+
+test('a source that does not opt in via skipImplementWhenNoHarnessHits keeps a "no real file to adapt" answer untouched', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    registerTaskSource('stub_probe_no_optin', { priority: 80, next: () => null, emptyApproval: true });
+    updateTaskSource('stub_probe_no_optin', { buildPlanPrompt: p.archImportPlanPrompt, buildImplementPrompt: p.archImportImplementPrompt });
+    let n = 0;
+    const localCall = async () => ({ response: ++n === 1 ? 'a plan' : 'no real file to adapt', degenerate: null, attempts: 1 });
+    const task = { id: 'stub-no-optin', domain: 'default', source: 'stub_probe_no_optin', title: 't', promptContext: {} };
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() }).catch(() => {});
+    assert.equal(task.implementResponse, 'no real file to adapt');
+  });
 });

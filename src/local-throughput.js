@@ -53,7 +53,20 @@ function statePath(instancesDir, endpoint, model) {
 // evalCount/evalDurationNs come straight off Ollama's /api/generate response
 // (eval_count, eval_duration) -- the model's own report of how many tokens it generated and
 // how long that took, no separate measurement needed.
+// In-process accumulator for the capability ledger: every real call this process makes since the last takeAttemptThroughput(). Timed-out calls
+// report no tokens, so they add nothing; src/lane-health.js is the signal for a lane that is slow enough to time out.
+const attemptAcc = { evalCount: 0, evalNs: 0 };
+function noteAttemptSample({ evalCount, evalDurationNs } = {}) {
+  if (evalCount > 0 && evalDurationNs > 0) { attemptAcc.evalCount += evalCount; attemptAcc.evalNs += evalDurationNs; }
+}
+function takeAttemptThroughput() {
+  const out = attemptAcc.evalNs > 0 ? { tokens: attemptAcc.evalCount, tps: Math.round((attemptAcc.evalCount / (attemptAcc.evalNs / 1e9)) * 100) / 100 } : null;
+  attemptAcc.evalCount = 0; attemptAcc.evalNs = 0;
+  return out;
+}
+
 function recordSample(instancesDir, { evalCount, evalDurationNs, endpoint, model } = {}) {
+  noteAttemptSample({ evalCount, evalDurationNs });
   if (!instancesDir || !(evalCount > 0) || !(evalDurationNs > 0)) return;
   const tps = evalCount / (evalDurationNs / 1e9);
   if (!Number.isFinite(tps) || tps <= 0) return;
@@ -91,4 +104,4 @@ function getTokensPerSecond(instancesDir, endpoint, model) {
   return DEFAULT_TPS;
 }
 
-module.exports = { recordSample, getTokensPerSecond, DEFAULT_TPS };
+module.exports = { recordSample, getTokensPerSecond, noteAttemptSample, takeAttemptThroughput, DEFAULT_TPS };

@@ -196,7 +196,8 @@ function mainPartition() {
       const t = JSON.parse(fs.readFileSync(p, 'utf8'));
       const reg = getRegisteredSource(resolveSourceName(t));
       if (reg && reg.directToMain === true) direct.push(p); else other.push(p);
-    } catch {
+    } catch (err) {
+      process.stderr.write(`mainPartition: "${p}" defaulting to other: ${err.message}\n`);
       other.push(p);
     }
   }

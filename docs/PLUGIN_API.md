@@ -19,7 +19,10 @@ plugin. `grep -rn "require(.*hygiene\|require.*agent-manager-hygiene" src/` must
 
 | `agent-manager/src/…` | Exports a plugin may use | Notes |
 |---|---|---|
-| `task-source-registry.js` | `registerTaskSource`, `updateTaskSource`, `getRegisteredSource`, `getRegisteredSources`, `clearRegistry` | the wiring seam. `clearRegistry` / `getRegisteredSource(s)` are for the plugin's own tests. |
+| `task-source-registry.js` | `registerTaskSource`, `updateTaskSource`, `getRegisteredSource`, `getRegisteredSources`, `clearRegistry`, `variantParentOf`, `getVariantsOf` | the wiring seam. `clearRegistry` / `getRegisteredSource(s)` are for the plugin's own tests. |
+| `task-source-registry.js` (`variantOf`) | registration field `variantOf: '<parent source>'` | Task-atomization hook 1 (`docs/design-notes/task-atomization-plugin.md`). Marks a source as a smaller-scoped variant of another; metadata only (shape-validated, the parent need not be registered yet). Surfaced in `--dump-topology` and, with `node src/capability-ledger.js --json --with-variants`, on scorecard rows so dashboards group a variant with its parent. `variantParentOf(name)` resolves to the root, `getVariantsOf(parent)` lists the variants. |
+| **`dry-run.js`** | `dryRunDraft(task, { laneId, model, timeoutMs, resetHarness, allowWrite })`, `freshTaskForReplay` | Task-atomization hook 2. Replays one recorded task through the REAL draft entry point (`src/local-draft.js`, as `local-worker.sh` runs it) against a lane's endpoint/model/context, in a child process with a scrubbed task copy and scratch pipeline dir + model-stats db, so no ledger, pipeline-history, work-log, side-finding, queue or model_calls writes survive. The repo is read, never written; a source registered with `writesRepo: true` is refused unless `allowWrite`. Returns `{ ok, result, task, durationMs, lane }`. The watchdog's orphan sweep leaves these processes alone (`AGENT_MANAGER_DRY_RUN=1`). CLI: `node src/dry-run.js <task.json> --lane <id>`. |
+| **`capability-ledger.js`**, **`lanes.js`** | `readScorecard`, `buildScorecard`, `annotateVariants`; `getLanes`, `laneById`; CLI `node src/lanes.js --json` | Task-atomization hook 3: the documented read surface for measurement. `lanes.js --json` lists every lane's `id, gpu, model, tier, numCtx, numBatch, slow, local, preempt, taskClasses, reserve, endpoint` (no launch env). The scorecard rows are `{ source, model, tier, lanes, n, ok, okRate, lower, p50WallMs, p95WallMs, tpsP50, failStreak, outcomes }`. |
 | `config.js` | `getConfig`, `resolveGraphPath` | the plugin passes `getConfig` into each module's `register(deps)`. It never calls `ensureRegistered` — core does. |
 | `task-sources.js` | `taskIdExistsInQueue`, `taskPriority` | `taskIdExistsInQueue` is a general queue primitive; `taskPriority` reads the priority-override map. Injected via `register(deps)`. `nextCandidateFulfillmentTask` / `windowFetchedFileContent` are still re-exported here for back-compat but the SDK path below is canonical. |
 | **`sdk/candidate-fulfillment.js`** | `nextCandidateFulfillmentTask`, `windowFetchedFileContent`, plus all of `candidate-docs.js` re-exported | **SDK helpers (ADR-0022 Stage D).** The candidate-fulfillment lifecycle in one module: read an `### AC-NNN` doc, pick the oldest actionable Strong candidate, ground it in real windowed file content. Core ships and documents this but registers nothing with it — `backlog_fulfillment` and the plugin's `arch_review` / `*_fix` are all consumers. `windowFetchedFileContent` returns `{ text, confidence, anchorCount, usedSnippetFuzzyMatch }` (not a bare string, since 2026-09-05's context-trim fix) — `confidence` is `'strong'`/`'weak'`/`'none'` depending on how reliable the anchor was, and a `'weak'`/`'none'` result has a `[LOW-CONFIDENCE GROUNDING]` note prepended to `text` for the model. `usedSnippetFuzzyMatch` tells a caller whether the candidate's frozen `Snippet:` field still matches current file content — the staleness signal `context-trim-sweep.js` re-checks on every retry. Also lower-level grounding helpers (`findFuzzyMatch`, `windowAroundIndex`, `snippetFromSection`, `quotedSymbolsFromSection`, `MAX_FETCHED_FILE_CHARS`, `MAX_ARCH_REVIEW_TASK_CHARS`) for a plugin's own grounding tests. |
@@ -40,6 +43,7 @@ plugin. `grep -rn "require(.*hygiene\|require.*agent-manager-hygiene" src/` must
 | `agentic-draft-common.js` | `parseSubTaskProposals` | the shared sub-task-array parser; `agent-manager-hub-tasks`'s `decompose-pass.js` uses it to parse a model's decompose JSON into the same shape `queueSubTasks` (core kernel) expects. |
 | `local-client.js` | `call` | the local-model client; `agent-manager-hub-tasks`'s `decompose-pass.js` default-calls it (overridable per-invocation for tests). |
 | `claude-client.js` | `call` | the Claude-CLI client; `agent-manager-hub-tasks`'s `decompose-pass.js` calls it only when `AGENT_MANAGER_CLAUDE_DECOMPOSE=true`. |
+| `gpu-guard.js` | `leaseHeldFor(endpointUrl, leasePath?)`, `leaseCovers(lease, endpointUrl)`, `normalizeEndpoint(url)` | The pipeline's own readers of the GPU lease file (see **Reserving a GPU and showing the job** below), for a JS plugin that wants to check its lease exactly as the lanes will. `leasePath` defaults to the lease file resolved at load time. Writers in other languages follow the file contract instead. |
 
 ## No source-name literals in core
 
@@ -58,6 +62,7 @@ Registration fields added for the last holdouts (each opts a source into one cor
 | `preValidateCitedPaths: true` | `review-task.js` | Prose drafts that cite files/lines as evidence: block a fabricated cited path before any review call (`project_search`, `arch_import`). |
 | `requireCodeShapeInCandidate: true` | `review-task.js` | A draft that is an `### AC-NNN` candidate must show a fenced code block or diff hunk; prose-only verdicts (false positive / uncertain) still pass (`function_length_review`). |
 | `groundedPromptFiles: true` | `needs-clarification-triage.js` bucket L | `promptContext.files` is a verified list of real grounded paths, so a fabricated-file-path near-miss can be auto-repaired against it (`arch_discovery`). |
+| `promptContext.imagePaths: [absolute png/jpg/webp paths]` (a task field, not a registration field) | `lib/draft-context.js` -> `lib/task-images.js` -> `local-client.js` | Vision tasks: up to 4 images (10 MB each) are read and sent as Ollama's `images` on every local call of the task; an unreadable image throws (blocks the draft) instead of answering from text alone. Pair with `registerModelProfile('<name>', { backend: 'local', model: '<vision tag>', think: false })` + `modelProfile: '<name>'` on the source to pick the vision model (2026-10-15). |
 | `noAutoRetry: true` | `reject-retry-check.js` | Opts a source out of the blind-redraft-and-retry sweep entirely (2026-09-28) -- a blocked task from this source is left exactly as-is (never auto-requeued for a fresh draft-started cycle, never counted toward `MAX_LOCAL_REJECT_RETRIES`/`exhausted`). For a source whose redraft is a genuine multi-minute plan+implement+critique cycle run at batch scale (`wiki_transcript_extract`/`wiki_page_promote`), the operator may prefer "one attempt and done, move to the next item" over spending that time re-attempting one that already failed. |
 | `genuineVerdict: { idPrefix? }` | `lib/inert-target.js` (derived-premise sweep) | This source's `done/` records (id/filename starting `idPrefix`) whose `implementResponse` carries a vetted `### AC-N` + `Strength: Strong` candidate count as a GENUINE verdict, letting the sweep RETIRE a derived finding about an unreferenced symbol instead of just holding it (the dead-code triage, `unused_export`). Core resolves a record's source through `registerSourceAlias`, so a source whose tasks stamp another `source` string just registers the alias. |
 
@@ -213,6 +218,54 @@ existing hardcoded tab (Hub Tasks, or the PromptForge/AdForge/ScriptForge iframe
 companions) onto this mechanism is separate follow-up work, tracked in
 `Docs/hub-tasks-extraction-plan.md`.
 
+## Reserving a GPU and showing the job (optional)
+
+For a plugin that runs its own GPU work beside the pipeline (first one: KaggleForge's eval runner, a Python process). Both
+halves are **file contracts**, not `require()`s, so a writer in any language can follow them.
+
+### Reserve the card with the lease file
+
+The pipeline gives a card up while a fresh **lease** covers it. The file is
+`~/.local/state/agent-manager/comfyui-lease.json` (`AGENT_MANAGER_COMFY_LEASE_PATH` overrides it; the name is historical,
+PromptForge's ComfyUI was the first holder):
+
+```json
+{ "holder": "kaggleforge", "family": "forge", "owner": "KAG-gemma-dev-0009", "endpoints": ["http://192.168.122.29:11434"],
+  "acquiredAt": "2026-10-18T09:00:00Z", "refreshedAt": "2026-10-18T09:00:20Z" }
+```
+
+- **`endpoints`** (optional): the Ollama URLs of the cards you take. Absent or empty means the whole pipeline. Matching is
+  `host:port`; `localhost`, `127.0.0.1` and `::1` are one host; a missing port means 11434. Take only the cards you use, so the
+  lanes on the others keep running.
+- **Freshness:** the lease counts while `refreshedAt` is at most 90 s old **and** `acquiredAt` at most 900 s old
+  (`AGENT_MANAGER_COMFY_LEASE_TTL_S` / `_MAX_S`). Rewrite **both** timestamps about every 20 s for as long as you hold the card;
+  stop renewing and the lease lapses on its own, so a crashed holder frees the card without help.
+- **One holder.** Never overwrite a fresh lease whose `holder` is someone else; wait for it to lapse or be released. While you
+  hold it, treat the file disappearing or its `holder` changing as preemption: get off the card, do not rewrite it.
+- **Pipeline start wins.** An explicit pipeline start deletes the lease, scoped or not. Same rule: stop, do not rewrite.
+- **Release** by deleting the file (only if `holder` is still yours).
+- **While it is held** the lanes and reviewers on a covered card skip their ticks, `local-client.js` refuses to start a model call
+  there (`ForgePauseError`: paused, not failed -- no retry, no failure counted), and the lane health probe leaves the card alone.
+  `AGENT_MANAGER_FORGE_PAUSE=off` disables the pause (kill switch).
+- JS plugins can check a lease with `gpu-guard.js` `leaseHeldFor` (contract table above). `src/plugin-api.test.js` parses the
+  example above and checks it against `leaseHeldFor`, so this section and the code cannot drift apart unnoticed.
+
+Do **not** use `scripts/gpu-arbiter-cli.js hold` to reserve a card: an arbiter place ticket only holds off callers that take
+arbiter tickets, which today means drafts; reviews take none. The operator view of the same mechanism is
+`docs/agents/lanes.md` ("Endpoint-scoped GPU lease").
+
+### Show the job on the Workers tab
+
+Write `instances/worker-<name>.json` in the pipeline dir (e.g. `worker-kaggle-p40`) on every state change and about every
+20 s: `instanceId`, `pid`, `status` (`working` / `idle`), `currentTaskId`, `currentPass` (free text, e.g. `eval 4/12`), `model`,
+`lastHeartbeat`, `stateSince`, and **`"assignable": false`**. Remove it, or set `idle`, when the job ends.
+
+- **You get:** a Workers card with the task id resolved to its project/hub labels, and the run-log expander (the `worker-` prefix).
+- **`assignable: false` keeps you out of** the assign dropdown and the assign-task / assignable-tasks routes (they refuse with a
+  404; without the flag, assign-task would kill your process to "pick up" a pinned task), lane capacity in the generation
+  throttle, and the review stagger. Only the boolean `false` opts out.
+- **The watchdog** has no restart rule for an id that is not a defined lane: a stale heartbeat is flagged, never restarted or killed.
+
 ## Known warts
 
 - **Deep imports, no `exports` map.** A plugin reaching past this contract into a private
@@ -221,6 +274,8 @@ companions) onto this mechanism is separate follow-up work, tracked in
 
 ## Cross-repo / cross-language artifacts
 
+- The GPU lease file and a plugin's Workers-tab heartbeat are cross-process contracts any language can write; see
+  **Reserving a GPU and showing the job** above.
 - `community-coverage.json` + the graph are produced by **this repo's** `python/graph_build.py`
   (dashboard "Build Graph" button, `queue-watcher.sh --check-due`). The plugin's
   `arch_discovery` consumes them read-only via `getConfig().communityCoveragePath` /

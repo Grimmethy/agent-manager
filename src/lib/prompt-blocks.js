@@ -2,8 +2,6 @@
 
 // prompt-blocks.js -- extracted from src/prompts.js ([[hub-task-integration]] node-module decompose).
 
-require('../task-sources.js');
-
 function statedAcceptanceBlock(task) {
   const ctx = (task && task.promptContext) || {};
   const raw = ctx.acceptanceCriteria;
