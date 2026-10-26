@@ -252,3 +252,80 @@ test('beginDraftAttempt stamps the lane (AGENT_MANAGER_INSTANCE_ID) so a plan-de
     if (prev === undefined) delete process.env.AGENT_MANAGER_INSTANCE_ID; else process.env.AGENT_MANAGER_INSTANCE_ID = prev;
   }
 });
+
+// HUB0136 3/3: the symbol-not-found-in-cited-file warning must reach the durable attempt record. checkDraft returns it in `symbolWarnings`, NOT in `flags`
+// (it is warning-only and must never block), and it carries identifier / citedFile where other flags carry symbol / file. These tests feed a REAL checkDraft result.
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
+const { checkDraft } = require('./fact-checker.js');
+const { beginDraftAttempt: begin, recordFactCheck, factCheckRecordInput } = require('./draft-attempt-record.js');
+
+function repoWithRealFile() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'attempt-record-'));
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'real-file.js'), '// real');
+  return dir;
+}
+const GHOST_DRAFT = 'The `ghostSymbol` helper lives at src/real-file.js:1';
+const GHOST_SOURCE = 'grounding: src/real-file.js:1';
+
+test('a real checkDraft result: the symbol warning is in symbolWarnings, not flags, and factCheckRecordInput carries both', () => {
+  const fc = checkDraft(GHOST_DRAFT, repoWithRealFile(), GHOST_SOURCE, ['src']);
+  assert.equal(fc.symbolWarnings.length, 1);
+  assert.ok(!fc.flags.some((f) => f.type === 'symbol-not-found-in-cited-file'), 'a warning-only entry must not become a blocking flag');
+  const input = factCheckRecordInput(fc);
+  assert.equal(input.filter((f) => f.type === 'symbol-not-found-in-cited-file').length, 1);
+});
+
+test('recording a real checkDraft result keeps the symbol warning with its symbol, file and a readable detail', () => {
+  const fc = checkDraft(GHOST_DRAFT, repoWithRealFile(), GHOST_SOURCE, ['src']);
+  const attempt = begin({});
+  recordFactCheck(attempt, factCheckRecordInput(fc));
+  const w = attempt.factCheckWarnings.find((x) => x.type === 'symbol-not-found-in-cited-file');
+  assert.ok(w, 'the warning reached the attempt record');
+  assert.equal(w.symbol, 'ghostSymbol');
+  assert.equal(w.file, 'src/real-file.js');
+  assert.match(w.detail, /ghostSymbol.*not found.*src\/real-file\.js/);
+});
+
+test('blocking flags and the warning are both recorded, and the other flag shapes are unchanged', () => {
+  const attempt = begin({});
+  recordFactCheck(attempt, factCheckRecordInput({
+    flags: [{ type: 'ungrounded-url', detail: 'https://x.example/' }, { type: 'x', symbol: 's', file: 'f.js' }],
+    symbolWarnings: [{ type: 'symbol-not-found-in-cited-file', identifier: 'foo', citedFile: 'a.js', severity: 'warning' }],
+  }));
+  assert.deepEqual(attempt.factCheckWarnings.map((w) => w.type), ['ungrounded-url', 'x', 'symbol-not-found-in-cited-file']);
+  assert.deepEqual(attempt.factCheckWarnings[1], { type: 'x', symbol: 's', file: 'f.js' });
+});
+
+test('factCheckRecordInput tolerates missing or odd input', () => {
+  assert.deepEqual(factCheckRecordInput(undefined), []);
+  assert.deepEqual(factCheckRecordInput({ flags: 'no', symbolWarnings: null }), []);
+  assert.deepEqual(factCheckRecordInput({ flags: [{ type: 'a' }] }), [{ type: 'a' }]);
+});
+
+test('the call shape local-draft really uses (checkDraft with NO sourceText) still produces the symbol warning, and nothing is stripped', () => {
+  const fc = checkDraft(GHOST_DRAFT, repoWithRealFile(), undefined, ['src']);
+  assert.equal(fc.symbolWarnings.length, 1, 'draft-context.js passes no sourceText; the warning must not depend on it');
+  assert.equal(fc.symbolWarnings[0].identifier, 'ghostSymbol');
+  assert.deepEqual(fc.strippedFileLineCitations, [], 'with no grounding material nothing may be stripped');
+  assert.ok(!fc.flags.some((f) => f.type === 'symbol-not-found-in-cited-file'));
+});
+
+test('collapseOldAttempts keeps factCheckWarnings and the truncated count on a collapsed attempt', () => {
+  const task = {};
+  for (let i = 0; i < MAX_FULL_ATTEMPTS + 1; i++) {
+    const a = beginDraftAttempt(task);
+    const flags = Array.from({ length: i === 0 ? 40 : 1 }, (_, k) => ({ type: 'ungrounded-url', detail: `u${k}` }));
+    recordFactCheck(a, flags);
+    finalizeDraftAttempt(task, a, { succeeded: true, blocked: true, blockedReason: `r${i}` });
+  }
+  const first = task.draftAttempts[0];
+  assert.equal(first.collapsed, true);
+  assert.equal(first.factCheckWarnings.length, 30, 'the per-attempt cap still applies');
+  assert.equal(first.factCheckWarningsTruncated, 40);
+  assert.equal(task.draftAttempts[1].collapsed, undefined);
+  assert.equal(task.draftAttempts[1].factCheckWarnings.length, 1);
+  assert.equal(task.draftAttempts[1].factCheckWarningsTruncated, undefined);
+});
