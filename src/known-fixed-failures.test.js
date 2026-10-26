@@ -84,3 +84,39 @@ test('lane-endpoint-outage-parked: probes each endpoint once per sweep, and the 
     assert.equal(e.applies(task), false, 'closed port is not answering');
   } finally { _setEndpointProbe(null); }
 });
+
+// --- forbidden-path-exemption-and-created-targets (2026-10-26) -----------------------------------------------------------------------------
+test('forbidden-path-exemption-and-created-targets: re-admits a parked task only when the current gate no longer forbids the path its block named', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'forbidden-path-exemption-and-created-targets');
+  assert.ok(e, 'entry registered');
+  assert.deepEqual(e.dirs, ['blocked', 'needs-clarification']);
+  const block = (p) => `Agentic implement pass produced a diff that is not a real implementation -- diff touches ${p} (matches forbidden "${p}") -- the task explicitly says not to`;
+  // HUB0040 2/3: the plan's "other than x" sentence named the one file that may change
+  const t40 = {
+    blockedReason: block('src/decompose-premise-check.js'),
+    promptContext: { rawText: 'In src/decompose-premise-check.js, locate the PATH_RE capture loop. Replace the raw captured path value.' },
+    planResponse: '- Does not touch any file other than `src/decompose-premise-check.js`.',
+  };
+  assert.equal(e.applies(t40), true);
+  // HUB0125 1/2: the file the task says to create is named by its own "do not also modify" sentence
+  const t125 = {
+    blockedReason: block('docs/audit-batch-write-bypass-2026-10-02.md'),
+    promptContext: { rawText: 'Create docs/audit-batch-write-bypass-2026-10-02.md. It must contain a markdown table.' },
+    planResponse: 'The deliverable is exactly one file. Do not also modify `docs/audit-batch-write-bypass-2026-10-02.md` as a side effect.',
+  };
+  assert.equal(e.applies(t125), true);
+  // a genuine restriction on the named file still forbids it, so the task stays parked
+  const real = { blockedReason: block('src/a.js'), promptContext: { rawText: 'Edit src/b.js. Do not touch src/a.js.' }, planResponse: '' };
+  assert.equal(e.applies(real), false);
+  assert.equal(e.applies({ blockedReason: 'something else' }), false);
+  assert.equal(e.applies({}), false);
+});
+
+test('docs-only gate entries re-admit a documentation task whose declared edit targets are all docs (taskWantsCodeChange agrees with the gate)', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'docs-only-gate-read-only-deliverable');
+  const reason = 'diff only touches documentation (docs/local-delegation.md) -- the task asks for a code change';
+  const task = { blockedReason: reason, promptContext: { rawText: 'Edit `docs/local-delegation.md` to add a subsection explaining `OLLAMA_KV_CACHE_TYPE`. Add a note about src/gpu-vram.js.' }, planResponse: 'Edit `docs/local-delegation.md`.' };
+  assert.equal(e.applies(task), true);
+  const wantsCode = { blockedReason: reason, promptContext: { rawText: 'Create docs/audit/paths.md listing the routes. Then update the timeout handling in src/local-tool-client.js.' } };
+  assert.equal(e.applies(wantsCode), false);
+});

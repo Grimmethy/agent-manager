@@ -285,6 +285,27 @@ const KNOWN_FIXED = [
     dirs: ['blocked', 'needs-clarification'],
     applies: parkedOnEndpointOutageAndEndpointBack,
   },
+  {
+    // 2026-10-26: the forbidden-path gate read "Does not touch any file other than `x`" as forbidding x, and a file the task itself says to create was forbidden by its own
+    // "exactly one new file" scope sentences (HUB0040 2/3, HUB0125 1/2). The gate now exempts both; this re-admits a parked task only when the CURRENT gate no longer forbids
+    // the path its block named.
+    id: 'forbidden-path-exemption-and-created-targets',
+    fixedIn: 'agent-manager (adhoc-diff-sanity: exception clauses exempt, created files are declared targets, 2026-10-26)',
+    description: 'adhoc-diff-sanity blocked a diff for touching a path that the task\'s own text exempts ("other than x") or says to create',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const named = [...failureText(task).matchAll(/matches forbidden "([^"]+)"/g)].map((m) => m[1]);
+      if (!named.length) return false;
+      try {
+        const g = require('./adhoc-diff-sanity.js');
+        const rawText = (task.promptContext && task.promptContext.rawText) || task.title || '';
+        const planText = task.planResponse || task.lastGoodPlan || '';
+        const targets = g.extractDeclaredTargets(task, planText);
+        const forbidden = g.extractForbiddenPaths(`${rawText}\n${planText}`).filter((f) => !targets.some((t) => g.pathsRefEqual(f, t)));
+        return named.every((n) => !forbidden.some((f) => f === n));
+      } catch { return false; }
+    },
+  },
 ];
 
 module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable, _setEndpointProbe };
