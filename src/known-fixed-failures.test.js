@@ -120,3 +120,69 @@ test('docs-only gate entries re-admit a documentation task whose declared edit t
   const wantsCode = { blockedReason: reason, promptContext: { rawText: 'Create docs/audit/paths.md listing the routes. Then update the timeout handling in src/local-tool-client.js.' } };
   assert.equal(e.applies(wantsCode), false);
 });
+
+// --- stacked-sibling-missing-from-tree (2026-10-26) --------------------------------------------------------------------------------------------
+// Real git, nothing faked: a bare "origin" with main and a stacked branch that is ahead of main, and a clone as the repo root.
+function stackedFixture({ withBranch, commits = 1 }) {
+  const { execFileSync } = require('child_process');
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kff-stacked-'));
+  const git = (cwd, ...a) => execFileSync('git', ['-c', 'user.email=t@example.com', '-c', 'user.name=t', ...a], { cwd, encoding: 'utf8' });
+  git(tmp, 'init', '-q', '--bare', '-b', 'main', 'origin.git');
+  git(tmp, 'clone', '-q', 'origin.git', 'work');
+  const work = path.join(tmp, 'work');
+  fs.writeFileSync(path.join(work, 'a.txt'), 'base\n');
+  git(work, 'add', '.');
+  git(work, 'commit', '-q', '-m', 'base');
+  git(work, 'push', '-q', 'origin', 'HEAD:main');
+  if (withBranch) {
+    git(work, 'checkout', '-q', '-b', 'agent/stack');
+    if (commits > 0) {
+      fs.writeFileSync(path.join(work, 'guard.txt'), 'sibling code\n');
+      git(work, 'add', '.');
+      git(work, 'commit', '-q', '-m', 'sibling 1/2');
+    }
+    git(work, 'push', '-q', 'origin', 'agent/stack');
+  }
+  git(tmp, 'clone', '-q', 'origin.git', 'root');
+  return path.join(tmp, 'root');
+}
+
+test('stacked-sibling-missing-from-tree: re-admits only a stacked piece whose failure names the unmerged sibling AND whose shared branch exists with commits', () => {
+  const e = KNOWN_FIXED.find((x) => x.id === 'stacked-sibling-missing-from-tree');
+  assert.ok(e, 'entry registered');
+  assert.deepEqual(e.dirs, ['blocked', 'needs-clarification']);
+  const prev = process.env.AGENT_MANAGER_REPO_ROOT;
+  try {
+    const root = stackedFixture({ withBranch: true });
+    process.env.AGENT_MANAGER_REPO_ROOT = root;
+    const failure = 'The 1/2 sibling (HUB0123 · 1/2 · Add the guard) has not been merged into the working tree. Test 1 cannot pass without that code path.';
+    const task = { blockedReason: failure, stacked: { branch: 'agent/stack', seq: 2, total: 2 } };
+    assert.equal(e.applies(task), true);
+    assert.equal(e.applies({ priorRejectionFeedback: ['the guard from sibling HUB0123 · 1/2 is not yet merged'], stacked: task.stacked }), true, 'feedback text counts too');
+    assert.equal(e.applies({ blockedReason: failure }), false, 'not a stacked piece');
+    assert.equal(e.applies({ blockedReason: 'something else entirely', stacked: task.stacked }), false, 'a different failure');
+    assert.equal(e.applies({ blockedReason: failure, stacked: { branch: 'agent/does-not-exist', seq: 2, total: 2 } }), false, 'the shared branch is missing');
+    const emptyRoot = stackedFixture({ withBranch: false });
+    process.env.AGENT_MANAGER_REPO_ROOT = emptyRoot;
+    assert.equal(e.applies(task), false, 'no such branch in this repo');
+    process.env.AGENT_MANAGER_REPO_ROOT = stackedFixture({ withBranch: true, commits: 0 });
+    assert.equal(e.applies(task), false, 'the shared branch exists but carries no commits beyond main, so there is no sibling code to find');
+    assert.equal(e.applies({}), false);
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = prev;
+  }
+});
+
+test('stacked-sibling-missing-from-tree: the failure pattern matches the wordings seen on the parked pieces and not an ordinary test failure', () => {
+  const { SIBLING_NOT_IN_TREE_RE: re } = require('./known-fixed-failures.js');
+  for (const t of [
+    'The 1/2 sibling (HUB0123 · 1/2) has not been merged into the working tree.',
+    'fails because the `decompose-loop-premise-invalid` guard from sibling HUB0123 · 1/2 is not yet merged',
+    'the sibling piece is not yet present in the tree',
+    'the sibling piece is not merged',
+  ]) assert.equal(re.test(t), true, t);
+  for (const t of ['expected 2 but got 1', 'the sibling merged cleanly and the tests pass', 'The draft claims `# pass 97` but the real output shows `# pass 96`']) assert.equal(re.test(t), false, t);
+});
