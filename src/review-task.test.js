@@ -3053,3 +3053,38 @@ test('waitForLocalAvailability: an assignable:false working heartbeat does not d
   await waitForLocalAvailability(dir, 3, 0.3);
   assert.ok(Date.now() - t0 >= 250, `a working lane still delays (took ${Date.now() - t0} ms)`);
 });
+
+// --- hit-count gate wiring: reviewTask must hand the gate the draft diff so it counts the post-draft file, not the checkout ----------------
+test('hit-count gate: reviewTask counts the draft post-image (a correct draft reaches the vote) and blocks a draft whose post-image count is wrong', async () => {
+  const hitDiff = (added) => [
+    'diff --git a/src/heartbeat.js b/src/heartbeat.js',
+    '--- a/src/heartbeat.js',
+    '+++ b/src/heartbeat.js',
+    `@@ -1 +1,${1 + added.length} @@`,
+    ' writeAtomicSync(x);',
+    ...added.map((l) => `+${l}`),
+    '',
+  ].join('\n');
+  for (const [name, added, blocks] of [['correct', ['writeAtomicSync(y);'], false], ['wrong', ['writeAtomicSync(y);', 'writeAtomicSync(z);'], true]]) {
+    const { repoRoot, domainsPath } = makeFixture();
+    fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoRoot, 'src', 'heartbeat.js'), 'writeAtomicSync(x);\n');
+    const criterion = '`grep -n writeAtomicSync src/heartbeat.js` returns exactly 2 hits';
+    const task = adhocImplementedTask({
+      id: `hit-count-${name}`, acceptanceCriteria: [criterion],
+      acceptanceResults: [{ criterion, check: criterion, result: 'PASS', pass: true }],
+      rawDiff: hitDiff(added),
+    });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, verifyDiffFn: () => ({ status: 'passed', reasons: [], tests: null, commands: [] }) });
+    if (blocks) {
+      assert.equal(result.verdict, 'blocked', name);
+      assert.equal(task.reviewProvider, 'deterministic-hit-count');
+      assert.match(result.blockedReason, /actual 3, expected 2/);
+      assert.equal(captured.length, 0, 'no vote is spent on it');
+    } else {
+      assert.notEqual(task.reviewProvider, 'deterministic-hit-count', 'the pre-draft file has 1 hit; counting it would falsely block this correct draft');
+      assert.equal(captured.length, 1, 'a correct draft reaches the vote');
+    }
+  }
+});

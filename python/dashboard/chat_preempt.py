@@ -312,6 +312,34 @@ def _arbiter_cancel_below(cls: str = "interactive", key: str = None) -> list:
         return []
 
 
+def _arbiter_busy_rows(summary: list) -> list:
+    """Rows for a holder that is STILL on the chat's own GPU after the preempt: the arbiter's `status --local` names a holder that the cancel did not
+    kill (2026-10-25: a chat turn waited ~12 minutes behind worker-3090 while the event said only 'freed reviewer', so nothing told the operator the
+    GPU was not free). Row shape {lane: <holder class>, action: 'busy', taskId, phase, ageSeconds: None}. Best-effort like the cancel: any failure -> []."""
+    from app import ENV_FILE_PATH, PACKAGE_ROOT, read_env_file
+    import json
+    cli = PACKAGE_ROOT / "scripts" / "gpu-arbiter-cli.js"
+    if not cli.is_file():
+        return []
+    try:
+        cp = subprocess.run(
+            ["node", str(cli), "status", "--local"],
+            capture_output=True, text=True, timeout=15,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        holder = (json.loads((cp.stdout or "{}").strip() or "{}") or {}).get("holder")
+        if not holder:
+            return []
+        killed = {r.get("taskId") for r in (summary or []) if r.get("action") == "killed" and r.get("taskId")}
+        if holder.get("taskId") and holder.get("taskId") in killed:
+            return []
+        return [{"lane": holder.get("cls"), "action": "busy", "taskId": holder.get("taskId"),
+                 "phase": holder.get("phase"), "ageSeconds": None}]
+    except Exception as e:  # noqa: BLE001 -- best-effort, never block a chat turn
+        print(f"[chat-preempt] arbiter status failed (non-fatal): {e}", file=sys.stderr, flush=True)
+        return []
+
+
 def _preempt_pipeline_for_chat(card: dict = None) -> list:
     """Free the local model for a chat turn. `card` is chat_card.resolve_chat_card's choice for this turn: a blocked choice preempts nothing, a
     choice on another card cancels only that card's lane draft (by its arbiter key) and leaves the host lane running, and the host card (or no
@@ -427,4 +455,5 @@ def _preempt_pipeline_for_chat(card: dict = None) -> list:
                       file=sys.stderr, flush=True)
         except Exception as e:  # noqa: BLE001 -- best-effort, never block the chat turn
             print(f"[chat-preempt] {lane}: skipped ({e})", file=sys.stderr, flush=True)
+    summary.extend(_arbiter_busy_rows(summary))
     return summary

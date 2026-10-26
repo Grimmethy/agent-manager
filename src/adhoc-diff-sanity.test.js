@@ -735,3 +735,39 @@ test('planImportBindingProblem: a prose-only mention of require( is NOT an impor
   );
   assert.equal(planImportBindingProblem(t, "the summary also only says the plan will add a require('./x.js') line"), null);
 });
+
+// 2026-10-25 (adhoc-clear-pidfile-...-1792936771585, blocked on `diff touches server/core/comfy_proc.py (matches forbidden "comfy_proc.py")`):
+// "In the <repo> repo, modify `<path>`'s `fn()`" names the target but is not the "In `<path>`," shape, so the task's own "Do not change anything else in
+// <file>" sentence forbade the file it had just been told to edit. extractDeclaredTargets rule 6: a verb whose direct object is a backticked file path.
+const CLEAR_PIDFILE_TEXT = [
+  'In the gpu-broker repo, modify `server/core/comfy_proc.py`\'s `_clear_pidfile()` (defined at line ~318): catch FileNotFoundError separately and silently.',
+  'Do not change anything else in comfy_proc.py, gpu_session.py, or any other production code.',
+].join('\n');
+
+test('extractDeclaredTargets: "modify `<path>`" names the target even when the sentence starts with "In the <repo> repo,"', () => {
+  const t = adhoc(CLEAR_PIDFILE_TEXT);
+  assert.ok(extractDeclaredTargets(t).includes('server/core/comfy_proc.py'));
+  assert.deepEqual(extractForbiddenPaths(CLEAR_PIDFILE_TEXT), ['comfy_proc.py', 'gpu_session.py']);
+});
+
+test('forbidden-path: the file a task says to modify is not forbidden by its own "do not change anything else in <file>" sentence; the sibling still is', () => {
+  const t = adhoc(CLEAR_PIDFILE_TEXT);
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('server/core/comfy_proc.py')), null);
+  const p = adhocDiffSubstanceProblem(t, editDiff('server/core/comfy_proc.py') + editDiff('server/core/gpu_session.py'));
+  assert.equal(p && p.code, 'forbidden-path');
+  assert.match(p.detail || p.message || JSON.stringify(p), /gpu_session\.py/);
+});
+
+test('extractDeclaredTargets: rule 6 stays narrow -- a restricted file, a merely cited path and a call are not targets', () => {
+  const targets = extractDeclaredTargets(adhoc([
+    'Do not modify `src/b.js`.',
+    'Never edit `src/c.js` or `src/d.js`.',
+    'Prepend a note stating the rule is enforced by `scripts/check-doc-link.sh`.',
+    'Then fix res.json() handling, and update the docs if needed.',
+    'Mention the stale text in `Docs/cited.md` carefully.',
+    'Replace `Docs/a.md` with the new wording.',
+  ].join('\n')));
+  for (const bad of ['src/b.js', 'src/c.js', 'src/d.js', 'scripts/check-doc-link.sh']) assert.ok(!targets.includes(bad), bad);
+  assert.ok(!targets.includes('Docs/cited.md'));
+  assert.ok(targets.includes('Docs/a.md'));
+});
