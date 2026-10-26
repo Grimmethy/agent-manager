@@ -86,6 +86,24 @@ function docsOnlyGateNoLongerBlocks(task) {
   try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
 }
 
+// The recorded failure says the piece's own sibling (the earlier part it builds on) was "not merged" into the tree the draft or the review's executed verification
+// worked in. Stacked children now draft and verify on their shared branch (agentic-draft-common.js and review-task.js both use resolveGroundingRef), so the failure can
+// recur only if that branch is missing; re-admit only when the stacked branch exists on origin now and carries commits beyond the default branch. Fail closed.
+const SIBLING_NOT_IN_TREE_RE = /sibling[^\n]{0,120}(?:not (?:yet )?merged|has not been merged|not (?:yet )?(?:present|landed|in the (?:working )?tree))|(?:not|never) (?:yet )?merged into the working tree|(?:guard|code|change)[^\n]{0,60}from (?:the )?(?:sibling|1\/\d)[^\n]{0,40}not (?:yet )?merged/i;
+function siblingNowReachableOnStackedBranch(task) {
+  if (!task || !task.stacked || !task.stacked.branch || !SIBLING_NOT_IN_TREE_RE.test(failureText(task))) return false;
+  try {
+    const { resolveGroundingRef } = require('./stacked-grounding.js');
+    const { execFileSync } = require('child_process');
+    const root = require('./config.js').getConfig().repoRoot;
+    const branch = resolveGroundingRef(task, root);
+    if (!branch) return false;
+    const base = require('./git-runner.js').detectDefaultBranch(root);
+    const ahead = execFileSync('git', ['rev-list', '--count', `origin/${base}..origin/${branch}`], { cwd: root, encoding: 'utf8', timeout: 30000 }).trim();
+    return Number(ahead) > 0;
+  } catch { return false; }
+}
+
 // The recorded failure says a sibling repo could not be reached from the implement pass AND the task really does name a registered sibling repo (an absolute path
 // inside one of `roots`, by default the read-only root list the implement pass itself now gets). Fail closed: no roots, no raw text or a throw is "no".
 const SIBLING_PATH_RE = /\/media\/model-cache\/github\/[A-Za-z0-9._-]+(?:\/[^\s'"`),;]*)?/g;
@@ -306,6 +324,15 @@ const KNOWN_FIXED = [
       } catch { return false; }
     },
   },
+  {
+    // 2026-10-26: a stacked test piece (HUB0123 2/2) was parked after drafts and reviews ran in a tree WITHOUT its sibling's code ("the 1/2 guard is not yet merged"; the
+    // sibling was on the shared branch the whole time). Drafting and the review's executed verification now use the stacked branch as their base; the failed attempts predate that.
+    id: 'stacked-sibling-missing-from-tree',
+    fixedIn: 'agent-manager (stacked children draft and verify on their shared branch: stacked-grounding.js / review-task.js baseBranch, 2026-10)',
+    description: 'a stacked hub piece failed because its sibling piece\'s code was absent from the tree the draft or the executed verification used, although the sibling is on the shared stacked branch',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: siblingNowReachableOnStackedBranch,
+  },
 ];
 
-module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable, _setEndpointProbe };
+module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable, SIBLING_NOT_IN_TREE_RE, _setEndpointProbe };
