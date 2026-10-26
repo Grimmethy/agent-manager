@@ -4414,3 +4414,63 @@ test('reusePriorPlanForContinuation never short-circuits the plan-critique re-pl
     assert.equal(task.planResponse, undefined);
   });
 });
+
+// archImportImplementPrompt now asks for the exact line "no real file to adapt" when no listed file fits. The implement pass must treat
+// that as a terminal no-op (empty implementResponse, so the emptyApproval source auto-approves), not as a candidate to critique or requeue.
+async function runArchImportWithImplementAnswer(implementAnswer) {
+  let out;
+  const prevCoreRoot = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  const prevGrep = process.env.AGENT_MANAGER_GREP_DIRS;
+  try {
+    await withFixtureRepo(async (draftTask, dir) => {
+      process.env.AGENT_MANAGER_CORE_REPO_ROOT = dir;
+      process.env.AGENT_MANAGER_GREP_DIRS = 'src';
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'realfile.js'), 'function stubProbeSymbol() {}\n');
+      const calls = [];
+      const localCall = async (prompt) => {
+        calls.push(prompt);
+        return { response: calls.length === 1 ? 'QUERY: stubProbeSymbol' : implementAnswer, degenerate: null, attempts: 1 };
+      };
+      const task = { id: 'arch-import-stub', domain: 'default', source: 'arch_import', title: 't', promptContext: { sourceProject: 'other-repo', rating: 'Strong', itemTitle: 'x', itemRationale: 'y' } };
+      const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+      out = { task, result, calls: calls.length };
+    });
+  } finally {
+    if (prevCoreRoot === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = prevCoreRoot;
+    if (prevGrep === undefined) delete process.env.AGENT_MANAGER_GREP_DIRS; else process.env.AGENT_MANAGER_GREP_DIRS = prevGrep;
+  }
+  return out;
+}
+
+test('arch_import: the "no real file to adapt" stub is a terminal no-op with an empty implementResponse', async () => {
+  for (const answer of ['no real file to adapt', '  No real file to adapt.\n']) {
+    const { task, result, calls } = await runArchImportWithImplementAnswer(answer);
+    assert.equal(task.promptContext.harnessHits.length > 0, true, 'the fixture must give the plan real harness hits, else the zero-hit skip would fire instead');
+    assert.equal(calls, 2, 'plan and implement only: no critique or revision call after the stub');
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(task.implementResponse, '');
+    assert.ok((task.history || []).some((e) => e.stage === 'implement-done' && /no real file to adapt/.test(e.detail || e.message || JSON.stringify(e))));
+  }
+});
+
+test('arch_import: a response that merely mentions the stub phrase is not treated as the stub', async () => {
+  const answer = 'Candidate: reuse stubProbeSymbol in src/realfile.js. There is no real file to adapt elsewhere.';
+  const { task } = await runArchImportWithImplementAnswer(answer);
+  assert.notEqual(task.implementResponse, '');
+});
+
+test('a source that does not opt in via skipImplementWhenNoHarnessHits keeps a "no real file to adapt" answer untouched', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    registerTaskSource('stub_probe_no_optin', { priority: 80, next: () => null, emptyApproval: true });
+    updateTaskSource('stub_probe_no_optin', { buildPlanPrompt: p.archImportPlanPrompt, buildImplementPrompt: p.archImportImplementPrompt });
+    let n = 0;
+    const localCall = async () => ({ response: ++n === 1 ? 'a plan' : 'no real file to adapt', degenerate: null, attempts: 1 });
+    const task = { id: 'stub-no-optin', domain: 'default', source: 'stub_probe_no_optin', title: 't', promptContext: {} };
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() }).catch(() => {});
+    assert.equal(task.implementResponse, 'no real file to adapt');
+  });
+});

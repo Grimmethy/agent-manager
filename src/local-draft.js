@@ -1216,6 +1216,8 @@ async function finalizeCandidateFulfillment(task, {
 // draftModel, ...) and emits its own history events. Returns { done: true, result } when
 // a terminal outcome was reached (deterministic empty, degenerate block, or a candidate
 // split), else { done: false } so draftTask continues to critique + revision.
+const NO_REAL_FILE_STUB_RE = /^\s*no real file to adapt\.?\s*$/i;
+
 async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
 
@@ -1295,6 +1297,19 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
       implLatencyMs = retryLatencyMs;
       task.implementResponse = retryResult.response;
     }
+  }
+
+  // Terminal no-op stub: archImportImplementPrompt tells the model to answer exactly "no real file to adapt" when no file in the
+  // harness Real matches list fits (the old "output the empty string" instruction was routinely ignored in favour of an invented
+  // file). Resolve it like the zero-hit skip above -- implementResponse '' so the emptyApproval source auto-approves -- before
+  // post-implement checks, critique or requeue can treat a compliant answer as a fabrication. Only sources that opt in via
+  // skipImplementWhenNoHarnessHits (arch_import) get this; any other response text is left untouched.
+  if (skipImplementOnNoHits && NO_REAL_FILE_STUB_RE.test(String(task.implementResponse || ''))) {
+    task.implementResponse = '';
+    recordImplement(attempt, { note: 'model answered the "no real file to adapt" stub' });
+    appendHistoryEvent(task, 'implement-done', 'model answered "no real file to adapt" -- terminal no-op, empty implementResponse, no critique or requeue');
+    concludeDraft(task);
+    return { done: true, result: { succeeded: true, blocked: false } };
   }
 
   // A source can register a `postImplementCheck(task, implementResponse, {call,
