@@ -13,6 +13,7 @@ const path = require('path');
 const { postJson } = require('./ollama-http.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
 const { DEFAULT_PINNED_NUM_CTX } = require('./gpu-capacity.js');
+const gpuGuard = require('./gpu-guard.js');
 
 const MAX_SAMPLES = 50;
 const FRESH_MS = 30 * 60 * 1000; // a verdict older than this is not trusted either way
@@ -116,15 +117,19 @@ function laneIdleNow(instancesDir, laneId, now) {
 }
 
 // Probe every lane that is idle and due. `lanes` come from lanes.js (the host lane has env {} and is served by process OLLAMA_URL / LOCAL_MODEL).
-async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.env, now = Date.now(), probe = probeEndpoint } = {}) {
+async function runDueProbes({ lanes, instancesDir, pipelineDir, env = process.env, now = Date.now(), probe = probeEndpoint, leaseHeldFor = gpuGuard.leaseHeldFor } = {}) {
   const cfg = healthConfig(env);
   const out = [];
   if (!cfg.enabled) return out;
   const hostUrl = env.AGENT_MANAGER_HOST_OLLAMA_URL || env.OLLAMA_URL || 'http://localhost:11434';
   for (const lane of lanes || []) {
+    // A cloud lane has no tokens/s to judge (the gateway reports no eval_duration, so every probe would read as a failure) and each probe would be a billed call.
+    if (lane.cloud) continue;
     const url = (lane.env && lane.env.OLLAMA_URL) || hostUrl;
     const model = lane.model || (lane.env && lane.env.LOCAL_MODEL);
     if (!model || !laneIdleNow(instancesDir, lane.id, now)) continue;
+    // A leased card belongs to its lease holder for now (a KaggleForge eval, a Forge session): a probe is a model call, and it would reload the model the holder evicted.
+    if (leaseHeldFor(url)) continue;
     const { samples, probingSince } = readState(instancesDir, lane.id);
     const last = samples.length ? samples[samples.length - 1] : null;
     if (last && now - Date.parse(last.at) < cfg.intervalMs) continue;

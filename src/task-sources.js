@@ -21,6 +21,9 @@ const { registerTaskSource, getRegisteredSources, getRegisteredSource, resolveSo
 const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
+const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
+const { writeJsonAtomicSync: writeBrainDumpAtomic } = require('./atomic-write.js');
 const { rotationDemoted } = require('./premium-rotation.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
@@ -30,6 +33,7 @@ const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
+const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');
 const derivedGate = require('./derived-gate.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
@@ -174,9 +178,26 @@ function releaseSignalsForRecord(record) {
   return defaultReleaseSignals(record);
 }
 
+// A NESTED hub (a piece that was itself decomposed) keeps its record in queue/coordinating/ until the whole stacked branch merges, so it never reaches
+// done/ and the lookups below can never find it (2026-10-23, chat plugin HUB0003: piece 1 became sub-hub HUB0004 with all three pieces built on the shared
+// stacked branch; pieces 2-5 dependsOn it and waited for ever, 0 of 5 built). Same rule the stacked exemption in defaultReleaseSignals applies to a done/ record:
+// the code is committed on the SHARED branch, which is all the next step reads. So a coordinating record that carries a stacked.branch and whose pieces are
+// ALL finished (pending-merge, done, merged, applied-direct, or one of the no-code-coming dispositions) releases its dependents. Fail-closed: no record, no
+// stacked branch, no pieces, or one open or blocked piece is not satisfied.
+const NESTED_HUB_PIECE_DONE = new Set(['pending-merge', 'done', 'merged', 'applied-direct', 'gone', ...NO_CODE_COMING_DISPOSITIONS]);
+function nestedHubBuilt(pipelineDir, depId) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'coordinating', `${depId}.json`), 'utf8'));
+    if (!rec || !rec.stacked || !rec.stacked.branch) return false;
+    const subs = Array.isArray(rec.subTasks) ? rec.subTasks : [];
+    return subs.length > 0 && subs.every((sub) => sub && typeof sub.status === 'string' && NESTED_HUB_PIECE_DONE.has(sub.status));
+  } catch { return false; }
+}
+
 function isDependencySatisfied(pipelineDir, depId) {
   const trimmed = (depId || '').trim();
   if (!trimmed) return true; // a blank/malformed entry blocks nothing -- not this function's job to validate authoring mistakes
+  if (nestedHubBuilt(pipelineDir, trimmed)) return true;
   const candidates = [
     path.join(pipelineDir, 'queue', 'done', `${trimmed}.json`),
     path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${trimmed}.json`),
@@ -296,7 +317,12 @@ function taskIdExistsInQueue(id) {
   // regenerated as a live duplicate -- the exact bug this function exists to prevent, same
   // reasoning as the _archived_no_action check just above.
   if (listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)))) return true;
-  return QUEUE_STATES.some((state) => {
+  return idInQueueStates(queueDir, id, QUEUE_STATES);
+}
+
+// Does <id>.json sit in any of these queue/<state>/ dirs (drafting has per-worker subfolders)?
+function idInQueueStates(queueDir, id, states) {
+  return states.some((state) => {
     if (state !== 'drafting') return fs.existsSync(path.join(queueDir, state, `${id}.json`));
 
     const draftingDir = path.join(queueDir, 'drafting');
@@ -311,6 +337,19 @@ function taskIdExistsInQueue(id) {
       .filter((e) => e.isDirectory())
       .some((e) => fs.existsSync(path.join(draftingDir, e.name, `${id}.json`)));
   });
+}
+
+// True when the ONLY thing holding this id is a FINISHED task (queue/done/, its dated archive buckets or _archived_no_action) -- nothing live,
+// blocked, held or coordinating carries it. A finished task is spent: it cannot be "already queued", so a caller that needs a fresh attempt may move
+// on to the next id. Anything not finished (pending, drafting, review, approved, blocked, needs-clarification, ... or a former hub id) still blocks.
+function taskIdHeldOnlyByFinishedTask(id) {
+  const { pipelineDir } = getConfig();
+  const queueDir = path.join(pipelineDir, 'queue');
+  if (formerHubIds(queueDir).has(id)) return false;
+  if (idInQueueStates(queueDir, id, QUEUE_STATES.filter((s) => s !== 'done'))) return false;
+  if (fs.existsSync(path.join(queueDir, 'done', `${id}.json`))) return true;
+  if (fs.existsSync(path.join(queueDir, 'done', '_archived_no_action', `${id}.json`))) return true;
+  return listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)));
 }
 
 // Titles of every currently in-flight (not yet finished) task, shown to brain_dump_sort's
@@ -520,6 +559,8 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       const unmet = parsed.dependsOn.filter((depId) => !isDependencySatisfied(pipelineDir, depId));
       if (unmet.length > 0) continue;
     }
+    // prerequisiteHubs (hub-prerequisites.js): the piece needs files only another open hub's unmerged branch has, so it waits for that hub's MERGE.
+    if (unmetPrerequisiteHubs(pipelineDir, parsed).length > 0) continue;
     // softDependsOn (see isSoftDependencySatisfied's own comment): same skip-past
     // behavior, but satisfied once the dependency reaches queue/done/ -- no merge
     // required. A separate array from dependsOn so a coordinator can mix hard
@@ -998,29 +1039,55 @@ function nextDeepDiveTask() {
     return at - bt;
   });
 
-  // Collect the degree-sorted, budget-capped file list for one community (null when the
-  // community has no nodes at all in the graph -- same skip rule as the old inline code).
-  // Same degree-by-file, budget-capped selection as nextArchDiscoveryTask() -- see
-  // DEEP_DIVE_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
-  // the identical convention rather than inventing a second one.
-  const collectFiles = (proj, community) => {
+  // Per-tick graph cache (2026-10-22, generation-tick cost): every lane runs this function between tasks, and for a project with ~2,000 onboarded
+  // communities the old code re-read and re-parsed the repo's .deep-dive-graph.json (up to 7 MB) once PER COMMUNITY, then read source files, before
+  // finding out the community already had a task -- 71-77 s of idle GPU per tick (profile: 45 of 63 s in this function). The graph of one project is
+  // now parsed once per call and its nodes are indexed by community, so each community costs a Map lookup. Same degree-by-file selection as before.
+  const graphCache = new Map(); // clonePath -> { nodesByCommunity, degreeByNodeId, rankedByCommunity }
+  const graphFor = (proj) => {
+    let g = graphCache.get(proj.clonePath);
+    if (g) return g;
     const graphPath = path.join(proj.clonePath, '.deep-dive-graph.json');
     const graphData = JSON.parse(readIfExists(graphPath) || '{"nodes":[],"links":[]}');
-    const memberNodes = (graphData.nodes || []).filter((n) => n.community === community.id);
-    if (memberNodes.length === 0) return null;
-
+    const nodesByCommunity = new Map();
+    for (const n of graphData.nodes || []) {
+      const list = nodesByCommunity.get(n.community);
+      if (list) list.push(n); else nodesByCommunity.set(n.community, [n]);
+    }
     const degreeByNodeId = {};
     for (const link of graphData.links || []) {
       degreeByNodeId[link.source] = (degreeByNodeId[link.source] || 0) + 1;
       degreeByNodeId[link.target] = (degreeByNodeId[link.target] || 0) + 1;
     }
-    const degreeByFile = {};
-    for (const node of memberNodes) {
-      if (!node.source_file) continue;
-      degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (degreeByNodeId[node.id] || 0);
-    }
-    const rankedFiles = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+    g = { nodesByCommunity, degreeByNodeId, rankedByCommunity: new Map() };
+    graphCache.set(proj.clonePath, g);
+    return g;
+  };
 
+  // The degree-sorted [file, degree] list for one community, from the graph alone (no file is read); null when the community has no nodes at all in
+  // the graph -- same skip rule as the old inline code.
+  const rankedFilesFor = (proj, community) => {
+    const g = graphFor(proj);
+    if (g.rankedByCommunity.has(community.id)) return g.rankedByCommunity.get(community.id);
+    const memberNodes = g.nodesByCommunity.get(community.id) || [];
+    let ranked = null;
+    if (memberNodes.length > 0) {
+      const degreeByFile = {};
+      for (const node of memberNodes) {
+        if (!node.source_file) continue;
+        degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (g.degreeByNodeId[node.id] || 0);
+      }
+      ranked = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+    }
+    g.rankedByCommunity.set(community.id, ranked);
+    return ranked;
+  };
+
+  // Collect the budget-capped file list (contents read from disk) for a community's ranked files.
+  // Same degree-by-file, budget-capped selection as nextArchDiscoveryTask() -- see
+  // DEEP_DIVE_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
+  // the identical convention rather than inventing a second one.
+  const collectFiles = (proj, rankedFiles) => {
     const files = [];
     let budgetUsed = 0;
     for (const [sourceFile, degree] of rankedFiles) {
@@ -1041,8 +1108,15 @@ function nextDeepDiveTask() {
   // records the consumed slice so the next tick emits the next one. A community at or
   // under the cap keeps today's exact behavior: one task, the unsuffixed ID.
   for (const c of candidates) {
-    const files = collectFiles(c.proj, c.community);
-    if (files === null) continue; // community has no graph nodes -- same skip as before
+    const rankedFiles = rankedFilesFor(c.proj, c.community);
+    if (rankedFiles === null) continue; // community has no graph nodes -- same skip as before
+    // Exact cheap skip, decided BEFORE any source file is read. A community with at most DEEP_DIVE_MAX_FILES_PER_TASK ranked files can never need
+    // more than one slice (files is a subset of rankedFiles), so below it always gets the unsliced id; with no slice counter to reset
+    // (consumedSlices unset/0 -- a set counter takes the full path so its reset-and-save below still runs) a task already in the queue under that id means
+    // the loop would `continue`. Anything else (a bigger community, a slice counter, no task yet) goes through the original logic unchanged.
+    if (!c.community.consumedSlices && rankedFiles.length <= DEEP_DIVE_MAX_FILES_PER_TASK
+        && taskIdExistsInQueue(`deep-dive-${c.slug}-${c.community.id}`)) continue;
+    const files = collectFiles(c.proj, rankedFiles);
 
     const totalSlices = Math.max(1, Math.ceil(files.length / DEEP_DIVE_MAX_FILES_PER_TASK));
     let id;
@@ -1191,9 +1265,70 @@ function readProjectLabels() {
 // Kept in sync with apply-group-a.js's own MAX_SORT_ATTEMPTS.
 const MAX_SORT_ATTEMPTS = 3;
 
-function brainDumpSortTaskId(entry) {
-  const n = entry.sortAttempt || 0;
-  return n > 0 ? `brain-dump-sort-${entry.id}-a${n}` : `brain-dump-sort-${entry.id}`;
+function brainDumpSortTaskId(entry, attempt = entry.sortAttempt || 0) {
+  return attempt > 0 ? `brain-dump-sort-${entry.id}-a${attempt}` : `brain-dump-sort-${entry.id}`;
+}
+
+// The attempt number a still-captured entry should be sorted under next, or null when nothing may be generated for it right now.
+// Starts at entry.sortAttempt and steps past every attempt whose id is held ONLY by a finished task: a sort task that finished
+// (noop, filed, skipped as stale) and left the entry 'captured' has used up that attempt, whatever the counter says. Without this the
+// entry was invisible forever behind its own spent id -- measured 2026-10-22: 17 agent-manager entries (11 whose apply was rejected
+// before the rejection bumped sortAttempt, 5 edited after they were sorted: the dashboard edit resets status to 'captured' but not the
+// id) while the rx580 lane logged "no eligible task found". A live, blocked or held task on an attempt id still blocks the entry
+// (no duplicate), and the walk stops at MAX_SORT_ATTEMPTS so a task that finishes without result cannot loop. Pure reads; nothing is written.
+function nextFreeSortAttempt(entry) {
+  for (let n = entry.sortAttempt || 0; n < MAX_SORT_ATTEMPTS; n += 1) {
+    const id = brainDumpSortTaskId(entry, n);
+    if (!taskIdExistsInQueue(id)) return n;
+    if (!taskIdHeldOnlyByFinishedTask(id)) return null;
+  }
+  return null;
+}
+
+function isBrainDumpEntrySortable(entry) {
+  return !!entry && entry.status === 'captured' && !entry.suppressed && nextFreeSortAttempt(entry) !== null;
+}
+
+// At most this many entries are linked to existing work in one generator call (each check reads the queue: ~170 ms
+// typical, ~3.4 s worst measured live), so one call stays bounded; the rest are reached on later ticks.
+const MAX_EXISTING_WORK_LINKS_PER_CALL = 5;
+
+// Re-reads brain-dump.json right before writing so an edit made since nextBrainDumpSortTask read it (a dashboard capture,
+// the apply stage) is not lost, and only links an entry that is still 'captured'.
+function linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, by) {
+  try {
+    const fresh = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+    const list = Array.isArray(fresh.entries) ? fresh.entries : [];
+    let changed = 0;
+    for (const { entry, found } of links) {
+      const cur = list.find((x) => x && x.id === entry.id);
+      if (!cur || cur.status !== 'captured') continue;
+      linkEntryToExistingWork(cur, found, by);
+      changed += 1;
+      logPipelineEvent(pipelineDir, 'brain-dump-existing-work', { entryId: cur.id, serial: cur.serial ?? null, taskId: found.taskId, state: found.state, how: found.how, by });
+    }
+    if (changed) writeBrainDumpAtomic(brainDumpPath, fresh);
+  } catch (e) {
+    console.error(`[task-sources] brain-dump existing-work link failed (best-effort): ${e.message}`);
+  }
+}
+
+// Persists the attempt number a sort task is being emitted under when it is ahead of the stored counter (see nextFreeSortAttempt), so the
+// apply-skip / review-exhaustion bump (sortAttempt + 1) moves on to the NEXT id instead of landing back on this task's own id. Re-reads the
+// file right before writing (a concurrent dashboard edit is not lost), only touches a still-captured entry whose counter is behind, and
+// uses the atomic writer. Best-effort: a failed write only means the bump may re-use this id, which the dedupe check still blocks.
+function advanceBrainDumpSortAttempt(brainDumpPath, pipelineDir, entry, attempt) {
+  try {
+    const fresh = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+    const cur = (Array.isArray(fresh.entries) ? fresh.entries : []).find((x) => x && x.id === entry.id);
+    if (!cur || cur.status !== 'captured' || (cur.sortAttempt || 0) >= attempt) return;
+    const from = cur.sortAttempt || 0;
+    cur.sortAttempt = attempt;
+    writeBrainDumpAtomic(brainDumpPath, fresh);
+    logPipelineEvent(pipelineDir, 'brain-dump-sort-attempt-advanced', { entryId: cur.id, serial: cur.serial ?? null, from, to: attempt, reason: 'earlier sort task(s) finished without sorting the entry' });
+  } catch (e) {
+    console.error(`[task-sources] brain-dump sortAttempt advance failed (best-effort): ${e.message}`);
+  }
 }
 
 function nextBrainDumpSortTask() {
@@ -1219,12 +1354,22 @@ function nextBrainDumpSortTask() {
   // nothing to act on, because generation itself had stopped dead. Same "skip an
   // in-queue one and keep looking" loop nextArchImportTask/nextUnusedExportTask already
   // use for their own oldest-first selection.
-  const chosen = entries.find((e) => e && e.status === 'captured' && !e.suppressed
-    && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
-    && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+  const eligible = entries.filter(isBrainDumpEntrySortable);
+  // Existing-work check (2026-10-18, see brain-dump-existing-work.js): an entry whose work is already a task -- queued,
+  // done or archived -- is linked to that task instead of being sorted again (no classification spent). Bounded per call.
+  let chosen = null;
+  const links = [];
+  for (const e of eligible) {
+    const found = links.length < MAX_EXISTING_WORK_LINKS_PER_CALL ? findExistingWorkForEntry([pipelineDir], e) : null;
+    if (!found) { chosen = e; break; }
+    links.push({ entry: e, found });
+  }
+  if (links.length) linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, 'generator');
   if (!chosen) return null;
 
-  const taskId = brainDumpSortTaskId(chosen);
+  const attempt = nextFreeSortAttempt(chosen);
+  if (attempt > (chosen.sortAttempt || 0)) advanceBrainDumpSortAttempt(brainDumpPath, pipelineDir, chosen, attempt);
+  const taskId = brainDumpSortTaskId(chosen, attempt);
 
   return {
     id: taskId,
@@ -2231,16 +2376,50 @@ function nextStalenessAuditTask() {
   // adhoc tasks still show 35 blocked? It hasn't gone down" -- plain candidates[0] let
   // whichever domain held the globally-oldest task monopolize every tick; see
   // pickFairCandidate's own header in staleness-audit.js).
-  const picked = pickFairCandidate(candidates, coverage);
-  const task = buildStalenessAuditTask(picked, defaultDomain);
-  if (taskIdExistsInQueue(task.id)) return null;
+  //
+  // Walk the fair ranking, candidate by candidate (2026-09-09, HUB0158):
+  // buildStalenessAuditTask() returns NULL for a candidate whose title has no concrete
+  // file:line ref (staleness-audit.js's titleHasFileLineRef gate) -- and that null used
+  // to flow straight into taskIdExistsInQueue(task.id) below, throwing a TypeError on
+  // EVERY tick while the same candidate got re-picked forever. A candidate that build
+  // declines is marked skipped in the same coverage file markStalenessAuditReported()
+  // writes (findStalenessCandidates() suppresses on exactly that key, for the same
+  // cooldown as a normal report), then the walk moves to the next fair candidate.
+  // pickFairCandidate() re-sorts the same remaining set each round, so repeated
+  // extraction yields its full ranking without duplicating that sort here.
+  const remaining = candidates.slice();
+  while (remaining.length > 0) {
+    const picked = pickFairCandidate(remaining, coverage);
+    remaining.splice(remaining.indexOf(picked), 1);
 
-  // Coverage written by markStalenessAuditReported(), AFTER writeTask() actually
-  // persists this task -- not here. Same discipline nextPipelineSelfAuditTask() follows
-  // and the same reason: every next() function here is a pure read with no queue-write
-  // side effect (see getNextTask()'s own comment), so a tier mismatch discarding this
-  // task must not have already marked it reported.
-  return task;
+    const task = buildStalenessAuditTask(picked, defaultDomain);
+    if (task === null) {
+      // Synthesize the exact shape markStalenessAuditReported() reads (promptContext.
+      // originalTaskId/.originalDomain) so the skip lands in the same coverage file with
+      // the same reportedAt/domain fields -- plus a reason recording WHY it was skipped.
+      // No queue write is lost by stamping coverage here (unlike the "report after
+      // writeTask()" discipline below, which exists because a REAL task may still be
+      // discarded by a tier mismatch): nothing gets persisted for a skipped candidate.
+      markStalenessAuditReported({
+        id: null,
+        promptContext: {
+          originalTaskId: picked.task && picked.task.id,
+          originalDomain: (picked.task && picked.task.domain) || null,
+        },
+        skippedReason: 'title has no file:line ref',
+      });
+      continue;
+    }
+    if (taskIdExistsInQueue(task.id)) continue;
+
+    // Coverage written by markStalenessAuditReported(), AFTER writeTask() actually
+    // persists this task -- not here. Same discipline nextPipelineSelfAuditTask() follows
+    // and the same reason: every next() function here is a pure read with no queue-write
+    // side effect (see getNextTask()'s own comment), so a tier mismatch discarding this
+    // task must not have already marked it reported.
+    return task;
+  }
+  return null;
 }
 
 // Called once from the CLI, only after writeTask() has actually persisted a
@@ -2258,11 +2437,16 @@ function markStalenessAuditReported(task) {
   // domain: the FLAGGED task's own domain (promptContext.originalDomain), not this
   // staleness-audit task's own domain (always defaultDomain) -- read by
   // pickFairCandidate() to track per-domain report throughput.
-  coverage[originalTaskId] = {
+  const entry = {
     reportedAt: new Date().toISOString(),
     taskId: task.id,
     domain: (task.promptContext && task.promptContext.originalDomain) || null,
   };
+  // set only on the skip path nextStalenessAuditTask() takes when buildStalenessAuditTask()
+  // declined the candidate (no file:line ref in the title) -- no real task was ever filed
+  // for it, hence taskId above is null and this is the only record of WHY it was skipped.
+  if (task.skippedReason) entry.reason = task.skippedReason;
+  coverage[originalTaskId] = entry;
   fs.mkdirSync(path.dirname(stalenessAuditCoveragePath), { recursive: true });
   fs.writeFileSync(stalenessAuditCoveragePath, JSON.stringify(coverage, null, 2));
 }
@@ -2864,7 +3048,7 @@ function writeTask(task) {
 }
 
 module.exports = {
-  getNextTask, writeTask, taskIdExistsInQueue,
+  getNextTask, writeTask, taskIdExistsInQueue, isBrainDumpEntrySortable,
   nextTroubleLogTask, nextAdhocTask, nextDerivedTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, windowFetchedFileContent, nextProjectSearchTask,
   nextDeepDiveTask, nextBrainDumpSortTask,
@@ -2996,6 +3180,7 @@ if (require.main === module) {
         candidateFulfillment: !!source.candidateFulfillment,
         emptyApproval: !!source.emptyApproval,
         advisoryProse: !!source.advisoryProse,
+        variantOf: source.variantOf || null,
         hasCustomApply: typeof source.apply === 'function',
         directToMain: source.directToMain === true,
         hasCandidatesPath: typeof source.candidatesPath === 'function',
@@ -3082,9 +3267,7 @@ if (require.main === module) {
     if (!brainDumpPath) return false;
     try {
       const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
-      return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured' && !e.suppressed
-        && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
-        && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+      return Array.isArray(data.entries) && data.entries.some(isBrainDumpEntrySortable);
     } catch {
       return false;
     }

@@ -147,6 +147,87 @@ test('listDirectoryTool lists real files/subdirectories with their kind, one lev
   });
 });
 
+function fillDir(dir, rel, count) {
+  fs.mkdirSync(path.join(dir, rel), { recursive: true });
+  for (let i = 0; i < count; i++) fs.writeFileSync(path.join(dir, rel, `${i % 2 ? 'a' : 'b'}-${String(i).padStart(4, '0')}.txt`), '');
+}
+
+test('listDirectoryTool caps a big directory at LIST_DIR_MAX_ENTRIES, sorted by name, with truncated, totalEntries, nextOffset and a note', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'big', 500);
+    const r = mod.listDirectoryTool({ path: 'big' });
+    assert.equal(mod.LIST_DIR_MAX_ENTRIES, 200);
+    assert.equal(r.entries.length, 200);
+    assert.equal(r.truncated, true);
+    assert.equal(r.totalEntries, 500);
+    assert.equal(r.nextOffset, 200);
+    assert.match(r.note, /offset=200/);
+    assert.match(r.note, /prefix=/);
+    assert.match(r.note, /grep_codebase/);
+    const names = r.entries.map((e) => e.name);
+    assert.deepEqual(names, [...names].sort());
+    assert.equal(names[0], 'a-0001.txt');
+  });
+});
+
+test('listDirectoryTool pages with offset and the last page is not truncated', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'big', 500);
+    const all = mod.listDirectoryTool({ path: 'big' }).entries.map((e) => e.name);
+    const second = mod.listDirectoryTool({ path: 'big', offset: 200 });
+    assert.equal(second.entries.length, 200);
+    assert.equal(second.truncated, true);
+    assert.equal(second.totalEntries, 500);
+    assert.ok(!all.includes(second.entries[0].name), 'the second page starts after the first');
+    const last = mod.listDirectoryTool({ path: 'big', offset: 400 });
+    assert.equal(last.entries.length, 100);
+    assert.equal(last.truncated, false);
+    assert.equal(last.nextOffset, null);
+    assert.equal(last.note, undefined);
+  });
+});
+
+test('listDirectoryTool prefix keeps only matching names and totalEntries counts them', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'big', 500);
+    const r = mod.listDirectoryTool({ path: 'big', prefix: 'a-' });
+    assert.equal(r.totalEntries, 250);
+    assert.equal(r.entries.length, 200);
+    assert.ok(r.entries.every((e) => e.name.startsWith('a-')));
+    assert.equal(r.truncated, true);
+    const small = mod.listDirectoryTool({ path: 'big', prefix: 'b-00' });
+    assert.equal(small.truncated, false);
+    assert.equal(small.totalEntries, small.entries.length);
+  });
+});
+
+test('listDirectoryTool leaves a small directory complete, untruncated and without a note; a bad offset counts as 0', () => {
+  withFixtureRepo((mod, dir) => {
+    fillDir(dir, 'small', 5);
+    for (const offset of [undefined, -3, 'x', NaN]) {
+      const r = mod.listDirectoryTool({ path: 'small', offset });
+      assert.equal(r.entries.length, 5);
+      assert.equal(r.truncated, false);
+      assert.equal(r.totalEntries, 5);
+      assert.equal(r.note, undefined);
+    }
+  });
+});
+
+test('the list_directory tool definition offers prefix and offset and the handler forwards them', () => {
+  withFixtureRepo((mod, dir) => {
+    const def = mod.TOOLS.find((t) => t.function.name === 'list_directory').function;
+    assert.ok(def.parameters.properties.prefix && def.parameters.properties.offset);
+    assert.match(def.description, /200/);
+    fillDir(dir, 'big', 300);
+    const handlers = mod.buildToolHandlers([dir], dir);
+    const r = handlers.list_directory({ path: 'big', prefix: 'a-', offset: 100 });
+    assert.equal(r.totalEntries, 150);
+    assert.equal(r.entries.length, 50);
+    assert.equal(r.truncated, false);
+  });
+});
+
 test('listDirectoryTool defaults to the repo root when no path is given', () => {
   withFixtureRepo((mod, dir) => {
     fs.writeFileSync(path.join(dir, 'top.txt'), '');
@@ -510,26 +591,46 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the six chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the nine chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'mark_task_clarification_done', 'queue_reviewed_task',
-      'requeue_blocked_task', 'resolve_task_clarification', 'run_bash',
+      'answer_task_clarification', 'list_projects', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
+      'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
 });
 
-test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all six chat tools', () => {
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all nine chat tools', () => {
   withFixtureRepo((mod, dir) => {
     const handlers = mod.buildChatToolHandlers([dir], dir, dir);
     assert.equal(handlers.write_file, undefined);
     assert.equal(handlers.edit_file, undefined);
     for (const name of [
       'run_bash', 'queue_reviewed_task', 'answer_task_clarification',
-      'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task',
+      'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'withdraw_task', 'propose_command',
     ]) {
       assert.equal(typeof handlers[name], 'function', `expected a handler for ${name}`);
+    }
+  });
+});
+
+test('the list_projects chat tool returns the registry with the active project marked', () => {
+  withFixtureRepo((mod, dir) => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const reg = path.join(dir, 'projects-fixture.json');
+    fs.writeFileSync(reg, JSON.stringify([
+      { label: 'alpha', repoRoot: dir, pipelineDir: dir, pool: true },
+      { label: 'beta', repoRoot: path.join(dir, 'beta') },
+    ]));
+    const prev = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH;
+    process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = reg;
+    try {
+      const out = mod.buildChatToolHandlers([dir], dir, dir).list_projects({});
+      assert.deepEqual(out.projects.map((p) => [p.label, p.pool, p.active]), [['alpha', true, true], ['beta', false, false]]);
+    } finally {
+      if (prev === undefined) delete process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH; else process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = prev;
     }
   });
 });
@@ -742,9 +843,10 @@ function withMockedChat(scriptedTurns, fn, { killSwitch = null, localCallRespons
       sentBodies.push(body);
       const turn = queue.length ? queue.shift() : {};
       // A scripted turn may carry `_usage: { prompt_eval_count, eval_count }` to exercise
-      // token accounting -- lift it onto the response envelope where Ollama really puts it.
-      const { _usage, ...message } = turn || {};
-      return { message, ...(_usage || {}) };
+      // token accounting, and `_done_reason` for the turn's stop reason -- lift both onto
+      // the response envelope where Ollama really puts them.
+      const { _usage, _done_reason, ...message } = turn || {};
+      return { message, ...(_usage || {}), ...(_done_reason !== undefined ? { done_reason: _done_reason } : {}) };
     },
     postJsonStream: async () => { throw new Error('streaming path not exercised in this test'); },
   });
@@ -2086,5 +2188,359 @@ test('without readOnlyRoots the handlers behave exactly as before: a sibling pat
     assert.match(h.read_file({ path: path.join(sib, 'server/core/gpu.py') }).error, /not inside any accessible repo/);
     const w = mod.buildWriteToolHandlers([dir], dir);
     assert.match(w.write_file({ path: path.join(sib, 'x.txt'), content: 'x' }).error, /not inside any accessible repo/);
+  });
+});
+
+// --- tool-loop audit (2026-10-18, brain-dump 1889) --------------------------------------
+// runPlanWithTools writes one 'turn-end' line per turn and one 'tool-outcome' line per
+// edit_file/write_file call to instances/tool-loop-audit.log (see tool-loop-audit.js),
+// never to pipeline-history.log, and the non-streaming branch now carries done_reason.
+
+function readAuditLines(dir) {
+  const p = path.join(dir, 'instances', 'tool-loop-audit.log');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+function readHistoryLines(dir) {
+  const p = path.join(dir, 'instances', 'pipeline-history.log');
+  if (!fs.existsSync(p)) return [];
+  return fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+test('tool-loop audit: a multi-turn write run logs one turn-end per turn and one tool-outcome per edit/write call, only in tool-loop-audit.log', async () => {
+  const SENTINEL_PATH = 'secret-dir-7f3a/notes.txt';
+  const SENTINEL_TEXT = 'SENTINEL_PRIVATE_TEXT_91c2';
+  const prevAudit = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  try {
+    await withMockedChat([
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: SENTINEL_TEXT, replace: 'x' } } }] },
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [
+        { function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'beta', replace: 'x' } } },
+        { function: { name: 'write_file', arguments: { path: SENTINEL_PATH, content: SENTINEL_TEXT } } },
+      ] },
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'alpha', replace: 'ALPHA' } } }] },
+      { role: 'assistant', content: 'done', _done_reason: 'stop', _usage: { prompt_eval_count: 120, eval_count: 7 } },
+    ], async (mod, dir) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'alpha\nbeta\nbeta\n');
+      const result = await mod.runPlanWithTools({ prompt: 'fix it', allowWrite: true, source: 'manual', taskId: 'audit-t1', stage: 'agentic-write', maxTurns: 6 });
+      assert.equal(result.response, 'done');
+      assert.equal(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), 'ALPHA\nbeta\nbeta\n', 'the real edit_file handler ran');
+
+      const lines = readAuditLines(dir);
+      const turnEnds = lines.filter((e) => e.type === 'turn-end');
+      assert.deepEqual(turnEnds.map((e) => e.endClass), ['tool-calls', 'tool-calls', 'tool-calls', 'stop']);
+      assert.deepEqual(turnEnds.map((e) => e.turn), [0, 1, 2, 3]);
+      assert.ok(turnEnds.every((e) => e.taskId === 'audit-t1' && e.stage === 'agentic-write' && e.source === 'manual' && e.phase === 'loop'));
+      assert.deepEqual(turnEnds[1].toolNames, ['edit_file', 'write_file']);
+      assert.equal(turnEnds[3].promptEvalCount, 120);
+      const outcomes = lines.filter((e) => e.type === 'tool-outcome');
+      assert.deepEqual(outcomes.map((e) => `${e.tool}:${e.outcome}`), ['edit_file:not-found', 'edit_file:ambiguous', 'write_file:applied', 'edit_file:applied']);
+      assert.deepEqual(outcomes.map((e) => e.turn), [0, 1, 1, 2]);
+
+      const historyTypes = readHistoryLines(dir).map((e) => e.type);
+      assert.ok(!historyTypes.includes('turn-end') && !historyTypes.includes('tool-outcome'), 'nothing per-turn lands in pipeline-history.log');
+
+      const raw = fs.readFileSync(path.join(dir, 'instances', 'tool-loop-audit.log'), 'utf8');
+      assert.ok(!raw.includes('secret-dir-7f3a') && !raw.includes('SENTINEL_PRIVATE_TEXT') && !raw.includes('a.txt'), 'no paths or text in the audit log');
+
+      // Read side over the log this real loop run just wrote.
+      const out = execFileSync(process.execPath, [path.join(__dirname, 'tool-loop-audit.js'), '7', '--json'], {
+        env: { ...process.env, AGENT_MANAGER_PIPELINE_DIR: dir }, encoding: 'utf8',
+      });
+      const rows = JSON.parse(out);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].turns, 4);
+      assert.equal(rows[0].tools.edit_file.total, 3);
+      assert.equal(rows[0].tools.edit_file.outcomes.applied, 1);
+      assert.equal(rows[0].tools.write_file.missRate, 0);
+    });
+  } finally {
+    if (prevAudit === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+    else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prevAudit;
+  }
+});
+
+test('tool-loop audit: a non-streaming turn with done_reason "length" now fires the existing context-budget truncated event', async () => {
+  await withMockedChat([
+    { role: 'assistant', content: 'I was in the middle of', _done_reason: 'length', _usage: { prompt_eval_count: 900, eval_count: 300 } },
+  ], async (mod, dir) => {
+    await mod.runPlanWithTools({ prompt: 'go', taskId: 'audit-t2', stage: 'plan' });
+    const truncated = readHistoryLines(dir).filter((e) => e.type === 'context-budget' && e.event === 'truncated');
+    assert.equal(truncated.length, 1);
+    assert.equal(truncated[0].taskId, 'audit-t2');
+    const turnEnds = readAuditLines(dir).filter((e) => e.type === 'turn-end');
+    assert.equal(turnEnds.length, 1);
+    assert.equal(turnEnds[0].doneReason, 'length');
+    assert.equal(turnEnds[0].endClass, 'length');
+  });
+});
+
+test('tool-loop audit: a turn whose reply carries no done_reason is logged with doneReason null and endClass unknown', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'here is the answer' }], async (mod, dir) => {
+    await mod.runPlanWithTools({ prompt: 'hi', taskId: 'audit-t3' });
+    const [e] = readAuditLines(dir);
+    assert.equal(e.type, 'turn-end');
+    assert.ok(Object.prototype.hasOwnProperty.call(e, 'doneReason'), 'doneReason is present, not omitted');
+    assert.equal(e.doneReason, null);
+    assert.equal(e.endClass, 'unknown');
+  });
+});
+
+test('tool-loop audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes no audit file and the loop result is unchanged', async () => {
+  const prev = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = 'off';
+  try {
+    await withMockedChat([{ role: 'assistant', content: 'here is the answer', _done_reason: 'stop' }], async (mod, dir) => {
+      const result = await mod.runPlanWithTools({ prompt: 'hi' });
+      assert.equal(result.response, 'here is the answer');
+      assert.equal(fs.existsSync(path.join(dir, 'instances', 'tool-loop-audit.log')), false);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+    else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
+  }
+});
+
+test('tool-loop audit: executeToolCalls keeps its 5-parameter declaration (outcomes are classified from toolCallLog in the loop instead)', () => {
+  // executeToolCalls is module-private, so its arity is checked on the source declaration.
+  const src = fs.readFileSync(path.join(__dirname, 'local-tool-client.js'), 'utf8');
+  const m = src.match(/async function executeToolCalls\(([^)]*)\)/);
+  assert.ok(m, 'executeToolCalls declaration found');
+  assert.deepEqual(m[1].split(',').map((s) => s.trim()), ['assistantMessage', 'toolCalls', 'toolHandlers', 'messages', 'toolCallLog']);
+});
+
+// --- trajectory export (2026-10-18, brain-dump 1892 part 1) --------------------------------
+test('trajectory: a multi-turn write run leaves one gzip trajectory with the messages, turns and tool-call arguments', async () => {
+  const prev = process.env.AGENT_MANAGER_TRAJECTORY;
+  delete process.env.AGENT_MANAGER_TRAJECTORY;
+  try {
+    await withMockedChat([
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'edit_file', arguments: { path: 'a.txt', find: 'alpha', replace: 'ALPHA' } } }] },
+      { role: 'assistant', content: '', _done_reason: 'stop', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] },
+      { role: 'assistant', content: 'all done', _done_reason: 'stop', _usage: { prompt_eval_count: 300, eval_count: 12 } },
+    ], async (mod, dir) => {
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'alpha\n');
+      const result = await mod.runPlanWithTools({ prompt: 'fix it', allowWrite: true, source: 'manual', taskId: 'traj-t1', stage: 'agentic-write', maxTurns: 5 });
+      assert.equal(result.response, 'all done');
+      const { listTrajectories, readTrajectory } = require('./trajectory.js');
+      const rows = listTrajectories(dir, 'traj-t1');
+      assert.equal(rows.length, 1, 'exactly one trajectory for the run');
+      const t = readTrajectory(rows[0].file);
+      assert.equal(t.taskId, 'traj-t1');
+      assert.equal(t.stage, 'agentic-write');
+      assert.equal(t.source, 'manual');
+      assert.deepEqual(t.turns.map((x) => x.endClass), ['tool-calls', 'tool-calls', 'stop']);
+      assert.equal(t.result.turnsUsed, 3);
+      assert.equal(t.result.responseChars, 'all done'.length);
+      const assistantWithEdit = t.messages.find((m) => m.tool_calls && m.tool_calls[0].name === 'edit_file');
+      assert.deepEqual(JSON.parse(assistantWithEdit.tool_calls[0].arguments), { path: 'a.txt', find: 'alpha', replace: 'ALPHA' });
+      assert.ok(t.messages.some((m) => m.role === 'tool' && /"edited":true/.test(m.content)), 'the tool result is kept');
+      const finalMsg = t.messages[t.messages.length - 1];
+      assert.equal(finalMsg.content, 'all done');
+      assert.equal(finalMsg.final, true, 'the final answer is appended (the loop returns it without pushing it)');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TRAJECTORY; else process.env.AGENT_MANAGER_TRAJECTORY = prev;
+  }
+});
+
+// --- empty-attempt audit (2026-10-19, brain-dump 1891) -----------------------------------------
+// A blank sample (no content, no tool calls -- what a thought cut off at the token limit looks like) is resampled inside
+// chatTurnWithFlakeRecovery; each one now leaves an 'empty-attempt' line in the tool-loop audit. Behaviour is unchanged.
+
+function readAudit(dir) {
+  const p = path.join(dir, 'instances', 'tool-loop-audit.log');
+  return fs.existsSync(p) ? fs.readFileSync(p, 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)) : [];
+}
+
+test('empty-attempt audit: blank samples are logged with done_reason and thinking size, and the run result is unchanged', async () => {
+  const prev = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  try {
+    const blankCut = { role: 'assistant', content: '', thinking: 'x'.repeat(4000), _done_reason: 'length', _usage: { prompt_eval_count: 900, eval_count: 700 } };
+    const blankStop = { role: 'assistant', content: '', _done_reason: 'stop' };
+    await withMockedChat([blankCut, blankStop, { role: 'assistant', content: 'real answer', _done_reason: 'stop' }], async (mod, dir) => {
+      const result = await mod.runPlanWithTools({ prompt: 'say something', maxTurns: 5, taskId: 'empty-t1', stage: 'plan' });
+      assert.equal(result.response, 'real answer');
+      assert.equal(result.turnsUsed, 1, 'same turn count as without the audit');
+      const lines = readAudit(dir);
+      const empties = lines.filter((e) => e.type === 'empty-attempt');
+      assert.deepEqual(empties.map((e) => [e.attempt, e.endClass, e.doneReason, e.thinkingChars, e.phase, e.turn]),
+        [[1, 'length', 'length', 4000, 'loop', 0], [2, 'stop', 'stop', null, 'loop', 0]]);
+      assert.equal(empties[0].promptEvalCount, 900);
+      assert.equal(lines.filter((e) => e.type === 'turn-end').length, 1, 'the turn itself is still one turn-end line');
+      assert.ok(!JSON.stringify(lines).includes('xxxxxxxx'), 'no model text in the log');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT; else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
+  }
+});
+
+test('empty-attempt audit: a first turn that never recovers still rejects as before, with all three blank attempts logged', async () => {
+  const prev = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  try {
+    const empty = { role: 'assistant', content: '', _done_reason: 'length' };
+    await withMockedChat([empty, empty, empty], async (mod, dir) => {
+      await assert.rejects(() => mod.runPlanWithTools({ prompt: 'say something', maxTurns: 5, taskId: 'empty-t2' }), /empty completion/i);
+      const lines = readAudit(dir);
+      assert.deepEqual(lines.filter((e) => e.type === 'empty-attempt').map((e) => e.attempt), [1, 2, 3]);
+      assert.equal(lines.filter((e) => e.type === 'turn-end').length, 0, 'no turn completed');
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT; else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
+  }
+});
+
+test('empty-attempt audit: AGENT_MANAGER_TOOL_LOOP_AUDIT=off writes nothing and the resample behaviour is identical', async () => {
+  const prev = process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT;
+  process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = 'off';
+  try {
+    const empty = { role: 'assistant', content: '', _done_reason: 'length' };
+    await withMockedChat([empty, { role: 'assistant', content: 'real answer' }], async (mod, dir) => {
+      const result = await mod.runPlanWithTools({ prompt: 'x', maxTurns: 5 });
+      assert.equal(result.response, 'real answer');
+      assert.equal(fs.existsSync(path.join(dir, 'instances', 'tool-loop-audit.log')), false);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT; else process.env.AGENT_MANAGER_TOOL_LOOP_AUDIT = prev;
+  }
+});
+
+test('withdraw_task handler retires a real adhoc task to done/_archived_no_action/ and its definition requires taskId and reason', async () => {
+  await withFixtureRepo(async (mod, dir) => {
+    writeQueueTask(dir, 'adhoc', 't-w', { title: 'wrong queue' });
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = await handlers.withdraw_task({ taskId: 't-w', reason: 'filed into the wrong queue' });
+    assert.equal(result.ok, true);
+    const moved = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'done', '_archived_no_action', 't-w.json'), 'utf8'));
+    assert.equal(moved.terminalDisposition, 'abandoned');
+    const def = mod.CHAT_TOOLS.find((t) => t.function.name === 'withdraw_task').function;
+    assert.deepEqual(def.parameters.required, ['taskId', 'reason']);
+    assert.ok(def.parameters.properties.project);
+    assert.match(def.description, /requeue_blocked_task/);
+  });
+});
+
+// --- Tool-call digest on the context-overflow summary, and the cap on one tool result (2026-10-25) --------------------
+
+test('buildToolLogDigest: name, clipped args, ok flag and a one-line outcome; errors keep their text; junk is skipped; non-arrays give []', () => {
+  withFixtureRepo((mod) => {
+    const d = mod.buildToolLogDigest([
+      { tool: 'withdraw_task', args: { taskId: 'x' }, result: { ok: true, id: 'x' } },
+      { tool: 'read_file', args: { path: '/nope' }, result: { error: 'denied' } },
+      null, 7,
+    ]);
+    assert.equal(d.length, 2);
+    assert.deepEqual(d[0], { name: 'withdraw_task', args: '{"taskId":"x"}', ok: true, summary: `${JSON.stringify({ ok: true, id: 'x' }).length} chars returned` });
+    assert.deepEqual([d[1].name, d[1].ok, d[1].summary], ['read_file', false, 'denied']);
+    assert.deepEqual(mod.buildToolLogDigest(undefined), []);
+    assert.deepEqual(mod.buildToolLogDigest('nope'), []);
+  });
+});
+
+test('buildToolLogDigest hides secrets: secret-named argument keys, inline token/password/api key values and Bearer tokens, in args and in error text', () => {
+  withFixtureRepo((mod) => {
+    const d = mod.buildToolLogDigest([
+      { tool: 'a', args: { token: 'sk-SECRET', password: 'hunter2', path: '/x' }, result: 'ok' },
+      { tool: 'run_bash', args: { command: 'curl -H "Authorization: Bearer abc123" https://h/?api_key=deadbeef' }, result: { error: 'failed with password=hunter2' } },
+    ]);
+    const text = JSON.stringify(d);
+    for (const secret of ['sk-SECRET', 'hunter2', 'abc123', 'deadbeef']) assert.ok(!text.includes(secret), `${secret} must not appear`);
+    assert.ok(text.includes('[hidden]'));
+    assert.ok(d[0].args.includes('/x'), 'non-secret arguments stay');
+  });
+});
+
+test('buildToolLogDigest clips long text to TOOL_DIGEST_MAX_TEXT and caps the list at TOOL_DIGEST_MAX_TOOLS', () => {
+  withFixtureRepo((mod) => {
+    const d = mod.buildToolLogDigest(Array.from({ length: 80 }, () => ({ tool: 't', args: { command: 'x'.repeat(500) }, result: { error: 'e'.repeat(500) } })));
+    assert.equal(d.length, mod.TOOL_DIGEST_MAX_TOOLS);
+    assert.ok(d[0].args.length <= mod.TOOL_DIGEST_MAX_TEXT && d[0].args.endsWith('…'));
+    assert.ok(d[0].summary.length <= mod.TOOL_DIGEST_MAX_TEXT);
+  });
+});
+
+const listTurn = { role: 'assistant', content: 'looking', tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+const growTurn = { role: 'assistant', content: 'y'.repeat(CTX * 2), tool_calls: [{ function: { name: 'list_directory', arguments: { path: '.' } } }] };
+
+test('a context-overflow forced summary quotes a digest of the tool calls already made and tells the model to report them (chat and pipeline callers)', async () => {
+  for (const source of ['chat', undefined]) {
+    await withMockedChat([listTurn, growTurn, growTurn, { role: 'assistant', content: 'Here is what I did.\n\nRESOLUTION: needs-human-decision\nout of room.' }], async (mod, _dir, { sentBodies }) => {
+      const result = await mod.runPlanWithTools({ prompt: 'investigate', maxTurns: 50, ...(source ? { source } : {}) });
+      assert.equal(result.forcedSummaryReason, 'context');
+      const last = sentBodies[sentBodies.length - 1];
+      const text = last.messages[last.messages.length - 1].content;
+      assert.match(text, /ALREADY completed/);
+      assert.match(text, /report their results to the user instead of saying you lost context/);
+      assert.match(text, /1\. list_directory \{"path":"\."\} -> ok: \d+ chars returned/);
+      assert.deepEqual(last.tools, []);
+    });
+  }
+});
+
+test('the digest is only added on the context path: a turn-cap forced summary and a context summary with no tool calls carry none', async () => {
+  await withMockedChat([listTurn, { role: 'assistant', content: 'RESOLUTION: needs-human-decision\nx' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'go', maxTurns: 1, forceSummaryOnCap: true });
+    const last = sentBodies[sentBodies.length - 1];
+    assert.doesNotMatch(last.messages[last.messages.length - 1].content, /ALREADY completed/);
+  });
+  await withMockedChat([{ role: 'assistant', content: 'RESOLUTION: needs-human-decision\nx' }], async (mod, _dir, { sentBodies }) => {
+    await mod.runPlanWithTools({ prompt: 'x'.repeat(CTX * 4), maxTurns: 50 });
+    const last = sentBodies[sentBodies.length - 1];
+    assert.doesNotMatch(last.messages[last.messages.length - 1].content, /ALREADY completed/);
+  });
+});
+
+test('one oversized tool result is cut to MAX_TOOL_RESULT_CHARS in the conversation, with a note, while toolCallLog keeps the whole result', async () => {
+  await withMockedChat([listTurn, { role: 'assistant', content: 'done' }], async (mod, dir, { sentBodies }) => {
+    for (let i = 0; i < 300; i++) fs.writeFileSync(path.join(dir, `a-fairly-long-file-name-to-make-the-listing-big-${String(i).padStart(4, '0')}.txt`), '');
+    const result = await mod.runPlanWithTools({ prompt: 'list it', maxTurns: 5 });
+    const full = result.toolCallLog[0].result;
+    assert.ok(JSON.stringify(full).length > mod.MAX_TOOL_RESULT_CHARS, 'the audit copy is whole');
+    assert.equal(full.entries.length, mod.LIST_DIR_MAX_ENTRIES);
+    const secondCall = sentBodies[sentBodies.length - 1];
+    const toolMsg = secondCall.messages.find((m) => m.role === 'tool');
+    assert.ok(toolMsg.content.length <= mod.MAX_TOOL_RESULT_CHARS);
+    assert.match(toolMsg.content, /truncated: this tool result was \d+ characters/);
+  });
+});
+
+test('capToolResultForHistory leaves a small result exactly as JSON.stringify makes it', () => {
+  withFixtureRepo((mod) => {
+    assert.equal(mod.capToolResultForHistory({ a: 1 }), '{"a":1}');
+    assert.equal(mod.capToolResultForHistory(undefined), undefined);
+  });
+});
+
+test('a chat turn that calls propose_command returns the accepted proposals on its result (and a refused call adds none)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'propose-command-turn-'));
+  const repo = path.join(root, 'repo');
+  fs.mkdirSync(repo);
+  const file = path.join(root, 'allow.json');
+  const argv = ['python3', '-m', 'inventory', 'sales', 'email'];
+  fs.writeFileSync(file, JSON.stringify({ commands: [{ repo, argv }] }));
+  const prev = process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH;
+  process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH = file;
+  const call = (a) => ({ role: 'assistant', content: 'proposing', tool_calls: [{ function: { name: 'propose_command', arguments: a } }] });
+  try {
+    await withMockedChat([call({ repo, argv, why: 'ingest' }), call({ repo, argv: ['rm', '-rf', '/'], why: 'bad' }), { role: 'assistant', content: 'Waiting for your confirmation.' }], async (mod) => {
+      const result = await mod.runPlanWithTools({ prompt: 'ingest the sales', source: 'chat', allowWrite: true, maxTurns: 6 });
+      assert.equal(result.commandProposals.length, 1);
+      assert.equal(result.commandProposals[0].why, 'ingest');
+      assert.deepEqual(result.commandProposals[0].argv, argv);
+      assert.equal(result.toolCallLog[1].result.ok, false);
+    });
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH; else process.env.AGENT_MANAGER_CHAT_COMMAND_ALLOWLIST_PATH = prev;
+  }
+});
+
+test('a turn with no proposals has no commandProposals field', async () => {
+  await withMockedChat([{ role: 'assistant', content: 'just an answer' }], async (mod) => {
+    const result = await mod.runPlanWithTools({ prompt: 'hi', source: 'chat', allowWrite: true });
+    assert.equal(result.commandProposals, undefined);
   });
 });

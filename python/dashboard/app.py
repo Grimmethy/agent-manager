@@ -17,6 +17,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -777,12 +778,24 @@ def worker_lane_defs() -> list[dict]:
     return list(_LANE_DEFS_CACHE["lanes"])
 
 
+def reviewer_instance_ids() -> list[str]:
+    """Every review daemon the pipeline runs: the plain `reviewer` (host lane) plus one `reviewer-<gpu>` per lane that opted in
+    (src/lanes.js `reviewer`; AGENT_MANAGER_P40_REVIEWER=true for the legacy P40 lane). Read from the same lane definitions as
+    worker_lane_ids(); falls back to just ["reviewer"] when the definitions are unavailable."""
+    ids = ["reviewer"]
+    for lane in worker_lane_defs():
+        rid = lane.get("reviewerId")
+        if lane.get("reviewer") and rid and rid not in ids:
+            ids.append(rid)
+    return ids
+
+
 def _expected_instance_ids() -> list[str]:
     """Every daemon scripts/launch.sh starts: one worker lane per GPU (worker_lane_ids()), the
-    reviewer, and the queue-watchdog. apply-task-loop is deliberately excluded -- it's a single-shot
+    review daemons (reviewer_instance_ids()), and the queue-watchdog. apply-task-loop is deliberately excluded -- it's a single-shot
     pass with no heartbeat file of its own (see launch.sh's own comment), so it never has a slot to
     be "offline" in."""
-    return [*worker_lane_ids(), "reviewer", "watchdog"]
+    return [*worker_lane_ids(), *reviewer_instance_ids(), "watchdog"]
 
 
 def _is_live_worker_instance(instance_id: str) -> bool:
@@ -798,11 +811,34 @@ def _is_live_worker_instance(instance_id: str) -> bool:
     lane actually IS, not what launch.sh would have started under some other env -- is
     both simpler and correct. _expected_instance_ids() itself is unaffected: its one
     remaining caller (api_instances' offline-placeholder logic) has a different, correct
-    use for "would launch.sh have started this," not "is this assignable right now."""
+    use for "would launch.sh have started this," not "is this assignable right now."
+
+    2026-10-18 (brain-dump 1903, owner decision): a heartbeat may carry `"assignable": false`.
+    A process that writes a worker-* heartbeat so it shows on the Workers tab (with the run-log
+    expander) but does NOT claim from pending/ -- the first one is an external eval runner,
+    worker-kaggle-p40 -- opts out that way. It must never be offered or pinned a task: the
+    assign-task route would kill its process to make it "pick up" the pinned task. Only the
+    boolean false opts out; a missing field, null or true keep the old behaviour. See
+    _worker_lane_refusal for the reason text the routes return."""
+    return _worker_lane_refusal(instance_id) is None
+
+
+def _worker_lane_refusal(instance_id: str) -> str | None:
+    """Why `instance_id` is NOT an assignable worker lane, or None when it is (the single
+    rule behind _is_live_worker_instance, returned as text so the assign routes can tell the
+    operator why they refused)."""
+    not_a_lane = f"'{instance_id}' is not a worker lane that claims tasks from pending/"
     if not instance_id.startswith("worker"):
-        return False
+        return not_a_lane
     inst_dir = instances_dir()
-    return bool(inst_dir and (inst_dir / f"{instance_id}.json").is_file())
+    hb_path = (inst_dir / f"{instance_id}.json") if inst_dir else None
+    if not (hb_path and hb_path.is_file()):
+        return not_a_lane
+    hb = read_json_safe(hb_path) or {}
+    if hb.get("assignable") is False:
+        return (f"'{instance_id}' opts out of task assignment (assignable: false in its heartbeat) "
+                "-- it shows on the Workers tab but does not claim from pending/")
+    return None
 
 
 def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
@@ -1345,6 +1381,8 @@ def _coerce_serial(val) -> int:
     if isinstance(val, int):
         return val if val >= 0 else 0
     if isinstance(val, float):
+        if not math.isfinite(val):
+            return 0  # NaN/Infinity: int() would raise ValueError/OverflowError
         iv = int(val)
         return iv if iv >= 0 else 0
     if isinstance(val, str):
@@ -1726,7 +1764,7 @@ def _pipeline_stoppable() -> bool:
         return True
     inst_dir = instances_dir()
     if inst_dir and inst_dir.is_dir():
-        for name in (*worker_lane_ids(), "reviewer", "watchdog"):
+        for name in (*worker_lane_ids(), *reviewer_instance_ids(), "watchdog"):
             data = read_json_safe(inst_dir / f"{name}.json")
             if data and data.get("pid") and _pid_alive(data["pid"]):
                 return True
@@ -1770,7 +1808,7 @@ def _pipeline_running() -> bool:
                     return True
 
     # Stale, unparseable, or ownerless heartbeat -- believe a live process over a timestamp.
-    for name in (*lane_ids, "reviewer"):
+    for name in (*lane_ids, *reviewer_instance_ids()):
         d = read_json_safe(inst_dir / f"{name}.json")
         if d and any(d.get(k) and _pid_alive(d[k]) for k in ("daemonPid", "pid")):
             return True
@@ -2092,21 +2130,29 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         return False
 
 
-def _list_unmerged_branches_uncached(force_fetch=True):
-    repo_root = get_active_repo_root()
+def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None):
+    """The ACTIVE project's list by default. repo_root/pipeline_dir name another registered project (branch_projects.py): it always fetches (the caller owns that
+    project's timer) and leaves the active project's held-hub cache and fetch timer alone."""
+    other = repo_root is not None
+    if not other:
+        repo_root = get_active_repo_root()
+        pipeline_dir = get_pipeline_dir()
     if not repo_root:
         return []
     repo_root = Path(repo_root)
-    pipeline_dir = get_pipeline_dir()
+    if other:
+        pipeline_dir = Path(pipeline_dir) if pipeline_dir else repo_root
 
     # The fetch is the single slowest step (14-16 s measured at load 13) and moves no state a recompute depends on within a minute, so it has its own timer.
     with _branch_cache_lock:
-        fetch_due = force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
+        fetch_due = other or force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
     if fetch_due:
         _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
-        with _branch_cache_lock:
-            _branch_fetch_state["at"] = time.time()
+        if not other:
+            with _branch_cache_lock:
+                _branch_fetch_state["at"] = time.time()
     main_branch = _detect_main_branch(repo_root)
+    qdir = (pipeline_dir / "queue") if pipeline_dir else None
 
     raw = _run_git(
         ["for-each-ref", "--format=%(refname:short)%09%(committerdate:iso-strict)%09%(subject)", "refs/remotes/origin/agent/"],
@@ -2147,7 +2193,6 @@ def _list_unmerged_branches_uncached(force_fetch=True):
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
         candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
-        qdir = (pipeline_dir / "queue") if pipeline_dir else None
         hub = get_hub_data_provider().hub_for_branch(qdir, branch, branch_task_ids(_run_git, repo_root, main_branch, full_ref, task_id))
         branches.append({
             "branch": branch,
@@ -2173,11 +2218,12 @@ def _list_unmerged_branches_uncached(force_fetch=True):
         })
 
     branches, held = partition_held_hub_branches(branches)
-    with _branch_cache_lock:
-        _branch_cache["held"] = held
+    if not other:
+        with _branch_cache_lock:
+            _branch_cache["held"] = held
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
-    branch_verdicts.enrich_branches_with_verdicts(queue_dir(), repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+    branch_verdicts.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
     branches.sort(key=lambda b: b["pushedAt"])
     return branches
 
@@ -2914,6 +2960,7 @@ from routes.concepts import concepts_bp  # noqa: E402
 from routes.second_brain import second_brain_bp  # noqa: E402
 from routes.brain_dump import brain_dump_bp  # noqa: E402
 from routes.benchmark import benchmark_bp  # noqa: E402
+from routes.trajectories import trajectories_bp  # noqa: E402
 from routes.capability import capability_bp  # noqa: E402
 from routes.embedded_tools import embedded_tools_bp  # noqa: E402
 from routes.hardware import hardware_bp  # noqa: E402
@@ -2934,12 +2981,14 @@ from routes.branch_verdicts import branch_verdicts_bp  # noqa: E402
 from routes.plugins import plugins_bp  # noqa: E402
 from routes.task import task_bp  # noqa: E402
 from routes.shared_misc import shared_misc_bp  # noqa: E402
+from routes.cloud_meter import cloud_meter_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
 app.register_blueprint(concepts_bp)
 app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
 app.register_blueprint(benchmark_bp)
+app.register_blueprint(trajectories_bp)
 app.register_blueprint(capability_bp)
 app.register_blueprint(embedded_tools_bp)
 app.register_blueprint(hardware_bp)
@@ -2958,6 +3007,7 @@ app.register_blueprint(task_anywhere_1_more_bp)
 app.register_blueprint(pipeline_1_more_bp)
 app.register_blueprint(branch_verdicts_bp)
 app.register_blueprint(plugins_bp)
+app.register_blueprint(cloud_meter_bp)
 app.register_blueprint(task_bp)
 app.register_blueprint(shared_misc_bp)
 

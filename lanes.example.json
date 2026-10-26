@@ -8,5 +8,14 @@
     "slow": false,
     "numCtx": 16384,
     "enabled": true
+  },
+  {
+    "gpu": "cloud",
+    "provider": "cloud",
+    "ollamaUrl": "http://127.0.0.1:7450",
+    "model": "claude-haiku-5-5",
+    "taskClasses": ["adhoc"],
+    "preempt": "never",
+    "enabled": false
   }
 ]

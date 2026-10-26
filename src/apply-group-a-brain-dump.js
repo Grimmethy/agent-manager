@@ -7,6 +7,9 @@ const path = require('path');
 const { resolveAnchors, extractKeywords } = require('./path-prefetch.js');
 const { resolveGraphPath, getSecondBrainDir } = require('./config.js');
 const { writeAtomicSync, writeJsonAtomicSync } = require('./atomic-write.js');
+const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
+const { checkEntryTargets, isEnabled: targetCheckEnabled } = require('./brain-dump-target-check.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
 const { normalizeTokens, jaccardSimilarity } = require('./text-similarity.js');
 const {
   CANONICAL_TOP_LEVEL,
@@ -537,11 +540,57 @@ function filePassiveNote(ctx) {
   return { file: fullPath };
 }
 
+// The pipeline dirs to search for an entry's existing work: this pipeline, plus the project the classifier named (its own
+// queue is where a new task would go).
+function existingWorkDirs(pipelineDir, result) {
+  const dirs = [];
+  try { dirs.push(pipelineDir || require('./config.js').getConfig().pipelineDir); } catch { if (pipelineDir) dirs.push(pipelineDir); }
+  const label = result && result.belongsToProject;
+  if (label) {
+    const p = readProjectRegistry().find((x) => x.label === label);
+    if (p && p.pipelineDir) dirs.push(p.pipelineDir);
+  }
+  return dirs.filter(Boolean);
+}
+
+// Pre-queue target check (brain-dump-target-check.js): an entry whose cited paths are all missing from the matched project's repo, that cites archive/ code, or
+// that is only a hub sequencing note is NOT turned into an adhoc task. It stays in Brain Dump (status unchanged, not suppressed, not actioned) with
+// entry.targetCheck = { verdict, reasons, at }; sortAttempt is parked at the budget so brain_dump_sort does not pick it again, and an owner can force it through by
+// setting entry.targetCheckOverride = true (and clearing sortAttempt). AGENT_MANAGER_BRAIN_DUMP_TARGET_CHECK=false skips the check.
+const TARGET_CHECK_PARKED_ATTEMPTS = 3; // = MAX_SORT_ATTEMPTS in apply-group-a.js / task-sources.js
+function targetCheckSkip({ data, entry, brainDumpPath }, matchedProject, pipelineDir) {
+  if (!targetCheckEnabled() || entry.targetCheckOverride === true) return null;
+  const check = checkEntryTargets(entry.rawText, { repoRoot: matchedProject.repoRoot });
+  if (check.verdict !== 'suspect') return null;
+  entry.targetCheck = { verdict: check.verdict, reasons: check.reasons, at: new Date().toISOString() };
+  entry.sortAttempt = Math.max(entry.sortAttempt || 0, TARGET_CHECK_PARKED_ATTEMPTS);
+  fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+  writeJsonAtomicSync(brainDumpPath, data);
+  try { logPipelineEvent(pipelineDir, 'brain-dump-target-check', { entryId: entry.id, serial: entry.serial ?? null, project: matchedProject.label, reasons: check.reasons }); } catch { /* best-effort log */ }
+  return { skipped: true, targetCheck: true, reason: `brain-dump entry not queued: ${check.reasons.join('; ')} (entry.targetCheck stamped; set targetCheckOverride to force it)` };
+}
+
 function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir }) {
   const loaded = loadAndClassifyEntry({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir });
   if (loaded.done) return loaded.done;
   const { ctx } = loaded;
   const { result, data, entry } = ctx;
+
+  // Existing-work re-check (2026-10-18, brain-dump-existing-work.js): work for this entry can appear between drafting
+  // this sort and applying it (an operator carrying the entry by hand, the dashboard's prioritize). Link instead of queueing.
+  const existing = findExistingWorkForEntry(existingWorkDirs(pipelineDir, result), entry);
+  if (existing) {
+    linkEntryToExistingWork(entry, existing, 'apply');
+    fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
+    writeJsonAtomicSync(brainDumpPath, data);
+    logPipelineEvent(existing.pipelineDir, 'brain-dump-existing-work', { entryId: entry.id, serial: entry.serial ?? null, taskId: existing.taskId, state: existing.state, how: existing.how, by: 'apply' });
+    return {
+      skipped: true,
+      existingWork: true,
+      linkedTo: existing.taskId,
+      reason: `work for this brain-dump entry already exists: ${existing.taskId} (${existing.state}, matched by ${existing.how}) -- not queueing another task`,
+    };
+  }
 
   // Brain Dump #1 follow-up (2026-08-17): a note can be actionable WITHOUT being a code
   // change -- "investigate X, document findings" needs real web research, not a diff
@@ -567,7 +616,11 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
       `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`);
   }
 
-  if (matchedProject) return queueProjectTask(ctx, matchedProject);
+  if (matchedProject) {
+    const blocked = targetCheckSkip(ctx, matchedProject, pipelineDir);
+    if (blocked) return blocked;
+    return queueProjectTask(ctx, matchedProject);
+  }
 
   return filePassiveNote(ctx);
 }

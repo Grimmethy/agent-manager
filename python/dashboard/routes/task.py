@@ -587,6 +587,8 @@ def api_task_requeue(state, task_id):
         fresh["stacked"] = data["stacked"]
     if "dependsOn" in data:
         fresh["dependsOn"] = data["dependsOn"]
+    if "prerequisiteHubs" in data:
+        fresh["prerequisiteHubs"] = data["prerequisiteHubs"]
     if "atomic" in data:
         fresh["atomic"] = data["atomic"]
     if "noDecompose" in data:

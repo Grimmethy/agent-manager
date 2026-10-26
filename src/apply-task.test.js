@@ -1643,3 +1643,19 @@ test('recordApplyOutcome does NOT stamp noop for a real branch apply whose name 
   assert.equal(task.terminalDisposition, undefined);
   assert.deepEqual(task.history.map((h) => h.stage), ['applied']);
 });
+
+test('applyTask forwards a decompose parent\'s ownerGates in its coordinating result', () => {
+  const gitRunner = createFakeGitRunner();
+  const task = {
+    id: 'gates-parent-1', domain: 'adhoc', source: 'manual', title: 'Parent', adhocResolution: 'decompose', rawDiff: '', implementResponse: 'Split.',
+    subTaskProposals: [
+      { title: 'Plain', rawText: 'Do the plain thing.' },
+      { title: 'Gated', rawText: 'Needs owner approval to proceed.' },
+    ],
+  };
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-task-gates-pipeline-'));
+  const result = applyTask(task, { repoRoot: REPO_ROOT, pipelineDir, gitRunner });
+  assert.equal(result.coordinating, true);
+  assert.equal(result.ownerGates.length, 1);
+  assert.equal(result.ownerGates[0].why, 'owner approval');
+});

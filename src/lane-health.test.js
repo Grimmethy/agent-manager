@@ -4,6 +4,8 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+// hermetic: the default lease check reads this file (a real KaggleForge/Forge lease on the machine must not change these tests)
+process.env.AGENT_MANAGER_COMFY_LEASE_PATH = path.join(os.tmpdir(), 'lane-health-test-no-such-lease.json');
 const H = require('./lane-health.js');
 
 const CFG = H.healthConfig({});
@@ -83,4 +85,39 @@ test('the probe request matches the lane\'s own calls (same num_ctx / num_batch 
   assert.equal(args.numCtx, 16384);
   assert.equal(args.numBatch, 1024);
   assert.equal(args.keepAlive, '30m');
+});
+
+test('runDueProbes: a leased card is not probed (a probe would reload the model the lease holder evicted); the other lanes still are', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-health-lease-'));
+  const now = Date.now();
+  const hb = (id) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ status: 'idle', lastHeartbeat: new Date(now).toISOString() }));
+  hb('worker-p40'); hb('worker-rx580');
+  const lanes = [
+    { id: 'worker-p40', model: 'q:27b', env: { OLLAMA_URL: 'http://192.168.122.29:11434' } },
+    { id: 'worker-rx580', model: 'small:8b', env: { OLLAMA_URL: 'http://g:11434' } },
+  ];
+  const probed = [];
+  const probe = async (a) => { probed.push(a.url); return { ok: true, tps: 20, totalMs: 500, error: null }; };
+  const leaseHeldFor = (url) => url === 'http://192.168.122.29:11434';
+  const out = await H.runDueProbes({ lanes, instancesDir: dir, pipelineDir: dir, env: {}, now, probe, leaseHeldFor });
+  assert.deepEqual(probed, ['http://g:11434'], 'only the un-leased card was probed');
+  assert.deepEqual(out.map((r) => r.lane), ['worker-rx580']);
+  assert.equal(fs.existsSync(path.join(dir, 'lane-health.worker-p40.json')), false, 'no probe state was written for the leased lane');
+});
+
+test('runDueProbes: a cloud lane is never probed (no tokens/s to judge, and each probe would be a billed call); GPU lanes still are', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-health-cloud-'));
+  const now = Date.now();
+  const hb = (id) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({ status: 'idle', lastHeartbeat: new Date(now).toISOString() }));
+  hb('worker-cloud'); hb('worker-rx580');
+  const lanes = [
+    { id: 'worker-cloud', cloud: true, provider: 'cloud', model: 'claude-haiku-5-5', env: { OLLAMA_URL: 'http://127.0.0.1:7450' } },
+    { id: 'worker-rx580', model: 'small:8b', env: { OLLAMA_URL: 'http://g:11434' } },
+  ];
+  const probed = [];
+  const probe = async (a) => { probed.push(a.url); return { ok: true, tps: 20, totalMs: 500, error: null }; };
+  const out = await H.runDueProbes({ lanes, instancesDir: dir, pipelineDir: dir, env: {}, now, probe });
+  assert.deepEqual(probed, ['http://g:11434']);
+  assert.deepEqual(out.map((r) => r.lane), ['worker-rx580']);
+  assert.equal(H.laneDegraded(dir, 'worker-cloud'), false, 'a cloud lane with no samples is never degraded');
 });

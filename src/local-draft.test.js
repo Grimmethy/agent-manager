@@ -3823,6 +3823,98 @@ test('runPlanPass (adhoc): the plan re-roll samples at RETRY_TEMPERATURE, not th
   });
 });
 
+// --- HUB0159 · 3/3: plan-pass import-binding cap (planImportBindingProblem) acceptance tests ---
+// The heuristic (src/adhoc-diff-sanity.js's planImportBindingProblem) counts import-binding
+// steps ONLY inside fenced code blocks; >=2 such steps is 'too-many-import-binding-steps',
+// and one step without a verbatim require('...') / import ... from '...' anchor is
+// 'missing-verbatim-find-anchor'. runPlanPass (src/local-draft.js) re-plans ONCE at
+// RETRY_TEMPERATURE on a flagged plan, then always accepts the second roll (emitting
+// 'plan-accepted-after-rejection' when that roll ALSO trips the cap) -- a legitimate plan
+// is never dropped forever. Both plans below are substantive (>=2 numbered steps, >=200
+// chars) so the ordinary thin-plan gate stays out of the way.
+const BINDING_PLAN_TWO_STEPS = [
+  '1. Add the new module src/lib/import-binding-check.js holding the check logic:',
+  '   ```js',
+  "   const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');",
+  '   ```',
+  '2. Wire it into runPlanPass in src/local-draft.js:',
+  '   ```js',
+  "   const { appendHistoryEvent } = require('./task-history.js');",
+  '   ```',
+  '3. Run a targeted check on the two changed files and hand back the resulting diff for review.',
+].join('\n');
+const BINDING_PLAN_ONE_STEP = [
+  '1. Add the single binding the feature needs in src/local-draft.js:',
+  '   ```js',
+  "   const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');",
+  '   ```',
+  '2. Use it in runPlanPass to flag wiring plans and re-roll exactly once at retry temperature.',
+  '3. Run a targeted check on the changed files and hand back the resulting diff for review.',
+].join('\n');
+
+test('runPlanPass (adhoc): an over-cap plan is rejected, and the re-planned one-step plan is kept', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-binding-rej', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      return { response: n === 1 ? BINDING_PLAN_TWO_STEPS : BINDING_PLAN_ONE_STEP, degenerate: null, attempts: 1 };
+    };
+    const res = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    // call 1 = over-cap first plan, call 2 = the one binding re-roll, call 3 = the
+    // preliminary decompose check (non-JSON -> null -> falls to the declined tier).
+    assert.equal(n, 3, 'over-cap first plan + exactly one binding re-roll + the preliminary decompose check');
+    const rejected = (task.history || []).find((e) => e.stage === 'plan-rejected');
+    assert.ok(rejected, 'a plan-rejected history event must exist for the over-cap plan');
+    assert.match(rejected.detail, /too-many-import-binding-steps/);
+    assert.equal(task.planResponse, BINDING_PLAN_ONE_STEP, 'the accepted plan must be the re-planned one');
+    // The re-planned plan passes the cap, so NO acceptance-after-rejection may fire.
+    assert.ok(!(task.history || []).some((e) => e.stage === 'plan-accepted-after-rejection'));
+    // Rejection must be re-plan, not a plan-level hard fail: the block (if any) comes from
+    // the deliberately-declined tier stub, never from the import-binding cap.
+    assert.ok(!(res && res.blockedReason && /import-binding/.test(String(res.blockedReason))));
+  });
+});
+
+test('runPlanPass (adhoc): a single-binding plan with a verbatim anchor passes with no rejection', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-binding-ok', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      return { response: BINDING_PLAN_ONE_STEP, degenerate: null, attempts: 1 };
+    };
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    assert.ok(!(task.history || []).some((e) => e.stage === 'plan-rejected'), 'no plan-rejected event for a compliant plan');
+    assert.ok(!(task.history || []).some((e) => e.stage === 'plan-accepted-after-rejection'));
+    assert.equal(n, 2, 'first plan (accepted on the spot) + the preliminary decompose check -- no re-roll');
+    assert.equal(task.planResponse, BINDING_PLAN_ONE_STEP, 'the compliant single-binding plan is accepted as-is');
+  });
+});
+
+test('runPlanPass (adhoc): a legitimate multi-binding plan is accepted on the second attempt, never dropped', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const task = { id: 'adhoc-binding-acc', domain: 'adhoc', source: 'manual', title: 't', promptContext: { rawText: 'do the thing' } };
+    let n = 0;
+    const localCall = async () => {
+      n += 1;
+      return { response: BINDING_PLAN_TWO_STEPS, degenerate: null, attempts: 1 };
+    };
+    const res = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn(), ...declineLocalTiers() });
+    // The SAME over-cap plan comes back on the re-roll: the guard must ACCEPT it (recorded)
+    // rather than loop or drop the task -- the wrongly-dropped legitimate-plan case this
+    // history event exists to make findable.
+    assert.equal(n, 3, 'over-cap first plan + exactly one binding re-roll + the preliminary decompose check');
+    const rejected = (task.history || []).find((e) => e.stage === 'plan-rejected');
+    assert.ok(rejected && /too-many-import-binding-steps/.test(rejected.detail));
+    const accepted = (task.history || []).find((e) => e.stage === 'plan-accepted-after-rejection');
+    assert.ok(accepted, 'a plan-accepted-after-rejection event must record the second-attempt acceptance');
+    assert.equal(task.planResponse, BINDING_PLAN_TWO_STEPS, 'the second-attempt plan is the accepted plan, not dropped');
+    // The cap must be re-plan-once + accept, never a plan-level hard block.
+    assert.ok(!(res && res.blockedReason && /import-binding/.test(String(res.blockedReason))));
+  });
+});
+
 test('runPlanPass (adhoc): two thin rolls fall back to a prior attempt\'s plan verbatim', async () => {
   await withFixtureRepo(async (draftTask) => {
     const priorPlan = [
@@ -4320,5 +4412,65 @@ test('reusePriorPlanForContinuation never short-circuits the plan-critique re-pl
     const task = { id: 'adhoc-x', domain: 'adhoc', source: 'manual', promptContext: { rawText: 'x' }, isAgenticContinuation: true, lastGoodPlan: CONTINUATION_PLAN, _planCritiqueRevised: true };
     assert.equal(reusePriorPlanForContinuation(task, null), false);
     assert.equal(task.planResponse, undefined);
+  });
+});
+
+// archImportImplementPrompt now asks for the exact line "no real file to adapt" when no listed file fits. The implement pass must treat
+// that as a terminal no-op (empty implementResponse, so the emptyApproval source auto-approves), not as a candidate to critique or requeue.
+async function runArchImportWithImplementAnswer(implementAnswer) {
+  let out;
+  const prevCoreRoot = process.env.AGENT_MANAGER_CORE_REPO_ROOT;
+  const prevGrep = process.env.AGENT_MANAGER_GREP_DIRS;
+  try {
+    await withFixtureRepo(async (draftTask, dir) => {
+      process.env.AGENT_MANAGER_CORE_REPO_ROOT = dir;
+      process.env.AGENT_MANAGER_GREP_DIRS = 'src';
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src', 'realfile.js'), 'function stubProbeSymbol() {}\n');
+      const calls = [];
+      const localCall = async (prompt) => {
+        calls.push(prompt);
+        return { response: calls.length === 1 ? 'QUERY: stubProbeSymbol' : implementAnswer, degenerate: null, attempts: 1 };
+      };
+      const task = { id: 'arch-import-stub', domain: 'default', source: 'arch_import', title: 't', promptContext: { sourceProject: 'other-repo', rating: 'Strong', itemTitle: 'x', itemRationale: 'y' } };
+      const result = await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() });
+      out = { task, result, calls: calls.length };
+    });
+  } finally {
+    if (prevCoreRoot === undefined) delete process.env.AGENT_MANAGER_CORE_REPO_ROOT; else process.env.AGENT_MANAGER_CORE_REPO_ROOT = prevCoreRoot;
+    if (prevGrep === undefined) delete process.env.AGENT_MANAGER_GREP_DIRS; else process.env.AGENT_MANAGER_GREP_DIRS = prevGrep;
+  }
+  return out;
+}
+
+test('arch_import: the "no real file to adapt" stub is a terminal no-op with an empty implementResponse', async () => {
+  for (const answer of ['no real file to adapt', '  No real file to adapt.\n']) {
+    const { task, result, calls } = await runArchImportWithImplementAnswer(answer);
+    assert.equal(task.promptContext.harnessHits.length > 0, true, 'the fixture must give the plan real harness hits, else the zero-hit skip would fire instead');
+    assert.equal(calls, 2, 'plan and implement only: no critique or revision call after the stub');
+    assert.equal(result.succeeded, true);
+    assert.equal(result.blocked, false);
+    assert.equal(task.implementResponse, '');
+    assert.ok((task.history || []).some((e) => e.stage === 'implement-done' && /no real file to adapt/.test(e.detail || e.message || JSON.stringify(e))));
+  }
+});
+
+test('arch_import: a response that merely mentions the stub phrase is not treated as the stub', async () => {
+  const answer = 'Candidate: reuse stubProbeSymbol in src/realfile.js. There is no real file to adapt elsewhere.';
+  const { task } = await runArchImportWithImplementAnswer(answer);
+  assert.notEqual(task.implementResponse, '');
+});
+
+test('a source that does not opt in via skipImplementWhenNoHarnessHits keeps a "no real file to adapt" answer untouched', async () => {
+  await withFixtureRepo(async (draftTask) => {
+    const { registerTaskSource, updateTaskSource } = require('./task-source-registry.js');
+    const p = require('./prompts.js');
+    registerTaskSource('stub_probe_no_optin', { priority: 80, next: () => null, emptyApproval: true });
+    updateTaskSource('stub_probe_no_optin', { buildPlanPrompt: p.archImportPlanPrompt, buildImplementPrompt: p.archImportImplementPrompt });
+    let n = 0;
+    const localCall = async () => ({ response: ++n === 1 ? 'a plan' : 'no real file to adapt', degenerate: null, attempts: 1 });
+    const task = { id: 'stub-no-optin', domain: 'default', source: 'stub_probe_no_optin', title: 't', promptContext: {} };
+    await draftTask(task, { localCall, withLockFn: async (d, fn) => fn() }).catch(() => {});
+    assert.equal(task.implementResponse, 'no real file to adapt');
   });
 });

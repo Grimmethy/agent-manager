@@ -18,8 +18,11 @@ const { findTaskAnywhere, QUEUE_STATES } = require('./task-anywhere.js');
 const { lineMatches } = require('./text-match.js');
 const { getConfig } = require('./config.js');
 const { postJson, postJsonStream } = require('./ollama-http.js');
+const gpuGuard = require('./gpu-guard.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { logToolLoopEvent, buildTurnEndEntry, buildEmptyAttemptEntry, buildToolOutcomeEntries } = require('./tool-loop-audit.js');
+const { buildTrajectory, writeTrajectory } = require('./trajectory.js');
 const { withLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
 const { localOllamaLockKey } = require('./lib/ollama-lock-key.js');
@@ -31,8 +34,10 @@ const { injectContextLogInstruction, extractContextLog, writeContextLogInbox } =
 const { runAmplificationSweep } = require('./incident-amplification.js');
 const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptBuildTally } = require('./concepts.js');
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
+const { listProjects, pipelineFor } = require('./chat-projects.js');
+const { proposeCommand, proposalsFromToolLog } = require('./chat-command-allowlist.js');
 const {
-  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask,
+  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
 } = require('./chat-task-requeue.js');
 const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api/generate path uses
 
@@ -75,9 +80,9 @@ const { KEEP_ALIVE } = require('./local-client.js'); // same keep_alive the /api
 // Bound a window of lines to MAX_READ_FILE_CHARS WITHOUT lying about what came back. 2026-09-21 (change-review-fix-ac-50, found clearing needs-clarification): the char ceiling used
 // to cut the joined slice mid-line while nextOffset was still endLine + 1, so every line between the cut and endLine was never shown yet the model was told to page PAST them
 // (a comment even said "unknown exact line count when char-truncated"). Now only WHOLE lines that fit are returned, returnedThrough is the last of them, and the caller's
-const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
+const { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, LIST_DIR_MAX_ENTRIES, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS } = require('./local-tool-fs-tools.js');
 const { isSecretLookingPath } = require('./accessible-roots.js');
-const { taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS } = require('./local-tool-task-tools.js');
+const { searchTasksAllProjects, taskSummary, formatTaskHistory, windowSectionText, readTaskTool, candidateTaskFiles, archivedTaskFiles, searchTasksTool, queueReviewedTaskTool, READ_TASK_SECTIONS, MAX_SEARCH_TASK_RESULTS } = require('./local-tool-task-tools.js');
 
 // nextOffset = returnedThrough + 1, so paging visits every line exactly once. A first line that alone exceeds the ceiling is shown as a prefix and paging continues with the NEXT line.
 // -> { slice, truncated, returnedThrough }
@@ -242,7 +247,18 @@ const WRITE_TOOLS = [
 // (grep/tests/git log-diff-show-status), but mounted genuinely read-only (readOnly:true,
 // see runBashTool) -- a filesystem-level guarantee, not a request the model can choose
 // to ignore the way "please use queue_reviewed_task" alone would have been.
+// The optional `project` argument every chat task tool takes (label or repo root from list_projects); omitted = the process's own project.
+const PROJECT_ARG = { type: 'string', description: 'Label or repo root of the project whose task queue to use (from list_projects); omit for agent-manager itself.' };
+
 const CHAT_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'list_projects',
+      description: 'List every registered project with its label, repo root, pipeline dir, whether it is pooled and whether it is the active one -- call this before queue_reviewed_task or any task tool and pass the label as `project`.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
   {
     type: 'function',
     function: {
@@ -267,6 +283,7 @@ const CHAT_TOOLS = [
         properties: {
           title: { type: 'string', description: 'Short title for the queued task, e.g. "Add re-admission path for symbol-still-referenced decompose rejections".' },
           description: { type: 'string', description: 'What should be built/changed and why -- include enough detail (files, the specific behavior, acceptance criteria) for the pipeline to act on without further back-and-forth.' },
+          project: { type: 'string', description: 'Label or repo root of the project this task is for (from list_projects); omit only for agent-manager itself. A task about another project\'s files is refused without it.' },
         },
         required: ['title', 'description'],
       },
@@ -290,6 +307,7 @@ const CHAT_TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          project: PROJECT_ARG,
           answer: { type: 'string', description: 'The human\'s decision/free text, to be folded into the task as the resolving answer.' },
         },
         required: ['taskId', 'answer'],
@@ -305,6 +323,7 @@ const CHAT_TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          project: PROJECT_ARG,
           paths: { type: 'array', items: { type: 'string' }, description: 'The file path(s) the human picked. Omit or leave empty to proceed with no prefetched path.' },
         },
         required: ['taskId'],
@@ -320,6 +339,7 @@ const CHAT_TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          project: PROJECT_ARG,
         },
         required: ['taskId'],
       },
@@ -334,10 +354,43 @@ const CHAT_TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The stuck task\'s id.' },
+          project: PROJECT_ARG,
           state: { type: 'string', enum: ['blocked', 'done', 'archived'], description: 'The task\'s current location -- where it is stuck today.' },
           force: { type: 'boolean', description: 'Set true only after telling the human about a repeatedBlocker match and they want to retry anyway.' },
         },
         required: ['taskId', 'state'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'withdraw_task',
+      description: 'Retire a task that is waiting in adhoc/ or pending/ and is not being worked on anywhere -- it moves to the archive (done/_archived_no_action/) stamped terminalDisposition "abandoned" with your reason in its history. Use it after confirming with the human that the queued task is no longer wanted (for example it was filed into the wrong queue). It refuses tasks that are in flight (drafting, review, approved, coordinating) and every stuck or finished state, and it is reversible with requeue_blocked_task (state "archived").',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string', description: 'The id of the waiting task to retire.' },
+          reason: { type: 'string', description: 'Why this task is being withdrawn -- recorded in the task history. Required, non-empty.' },
+          project: PROJECT_ARG,
+        },
+        required: ['taskId', 'reason'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'propose_command',
+      description: 'Propose ONE exact command for the owner to approve and run (for example an ingest that writes to a database). You cannot run it: this only records a proposal when the command is on the owner\'s allowlist; the owner then presses Confirm in the chat pane and a restricted runner executes it. Give the repo, the argv as a list with one string per word (no shell, no pipes, no variations) and one sentence on why. After a successful call tell the owner what it will do and wait; never say it ran. An unlisted command is refused and the refusal lists what is allowed for that repo.',
+      parameters: {
+        type: 'object',
+        properties: {
+          repo: { type: 'string', description: 'Absolute path of the repo the command runs in.' },
+          argv: { type: 'array', items: { type: 'string' }, description: 'The exact command as a list, e.g. ["python3", "-m", "inventory", "sales", "email"].' },
+          why: { type: 'string', description: 'One sentence telling the owner what the command is for.' },
+        },
+        required: ['repo', 'argv', 'why'],
       },
     },
   },
@@ -428,11 +481,13 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'list_directory',
-      description: 'List the files and subdirectories directly inside a given path (one level, not recursive). Path is relative to the primary repo root, OR an absolute path inside any accessible repo (see list_roots).',
+      description: 'List the files and subdirectories directly inside a given path (one level, not recursive). Path is relative to the primary repo root, OR an absolute path inside any accessible repo (see list_roots). Entries are sorted by name and a call returns at most 200: a larger directory comes back with truncated:true, totalEntries and a note -- page with `offset` or narrow with `prefix`.',
       parameters: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Directory path relative to the primary repo root (e.g. "src"), or an absolute path inside another accessible repo. Omit or use "." for the primary repo root.' },
+          prefix: { type: 'string', description: 'Optional: only entries whose name starts with this.' },
+          offset: { type: 'integer', description: 'Optional: first entry to return, for paging past the 200-entry cap (use the returned nextOffset; see totalEntries and truncated).' },
         },
         required: [],
       },
@@ -455,6 +510,7 @@ const TOOLS = [
         type: 'object',
         properties: {
           taskId: { type: 'string', description: 'The exact task id.' },
+          project: PROJECT_ARG,
           section: { type: 'string', description: 'Optional: one of "plan", "implement", "history", "blockedReason" to pull just that piece of the task\'s full content instead of the summary.' },
           offset: { type: 'integer', description: 'With "section": first line to return (1-indexed). Default 1.' },
           limit: { type: 'integer', description: 'With "section": how many lines to return. Default 400, max 800.' },
@@ -474,6 +530,7 @@ const TOOLS = [
           query: { type: 'string', description: 'Literal substring, or several words (a task matches if its title/id contains every word).' },
           state: { type: 'string', description: 'Optional: scope the search to one location -- a QUEUE_STATES name (pending, review, approved, blocked, done, needs-clarification, awaiting-confirm, coordinating), "adhoc", "drafting" (every worker lane), or "drafting:<lane>" for one lane. Omit to search everywhere live.' },
           includeArchived: { type: 'boolean', description: 'Also search done/_archived*/ (every dated month) -- slower, only needed for an old/completed task search.' },
+          project: { type: 'string', description: 'Label or repo root of the project whose queue to search (from list_projects), or "all" to search every registered project (each hit is tagged with its project); omit for agent-manager itself.' },
         },
         required: ['query'],
       },
@@ -510,10 +567,18 @@ function buildToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
       return hits;
     },
     read_file: (args) => readFileTool(allowedRoots, { path: args.path, offset: args.offset, limit: args.limit, readOnlyRoots }),
-    list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path, readOnlyRoots }),
+    list_directory: (args) => listDirectoryTool(allowedRoots, { path: args.path, prefix: args.prefix, offset: args.offset, readOnlyRoots }),
     list_roots: () => listRootsTool(allowedRoots, readOnlyRoots),
-    read_task: (args) => readTaskTool(pipelineDir, { taskId: args.taskId, section: args.section, offset: args.offset, limit: args.limit }),
-    search_tasks: (args) => searchTasksTool(pipelineDir, { query: args.query, state: args.state, includeArchived: args.includeArchived }),
+    read_task: (args) => {
+      const t = pipelineFor(args.project, { pipelineDir });
+      return t.error ? { error: t.error } : readTaskTool(t.pipelineDir, { taskId: args.taskId, section: args.section, offset: args.offset, limit: args.limit });
+    },
+    search_tasks: (args) => {
+      const search = { query: args.query, state: args.state, includeArchived: args.includeArchived };
+      if (typeof args.project === 'string' && args.project.trim().toLowerCase() === 'all') return searchTasksAllProjects(search);
+      const t = pipelineFor(args.project, { pipelineDir });
+      return t.error ? { error: t.error } : searchTasksTool(t.pipelineDir, search);
+    },
   };
 }
 
@@ -562,13 +627,21 @@ function buildWriteToolHandlers(allowedRoots, pipelineDir, readOnlyRoots = []) {
 // even a malformed/hallucinated tool_calls entry naming them would find no handler and
 // fall through to executeToolCalls' "unknown tool" error, same as any other typo).
 function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
+  const withProject = (args, run) => {
+    const t = pipelineFor(args.project, { pipelineDir, repoRoot });
+    return t.error ? { ok: false, error: t.error } : run(t);
+  };
   return {
     run_bash: (args) => runBashTool(allowedRoots, { command: args.command, readOnly: true }),
-    queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description }),
-    answer_task_clarification: (args) => answerNeedsClarification(pipelineDir, args.taskId, args.answer),
-    resolve_task_clarification: (args) => resolveNeedsClarification(pipelineDir, args.taskId, args.paths),
-    mark_task_clarification_done: (args) => markNeedsClarificationDone(pipelineDir, args.taskId),
-    requeue_blocked_task: (args) => requeueBlockedTask(pipelineDir, repoRoot, args.taskId, { state: args.state, force: !!args.force }),
+    list_projects: () => ({ projects: listProjects({ activeRepoRoot: repoRoot }) }),
+    queue_reviewed_task: (args) => queueReviewedTaskTool(pipelineDir, { title: args.title, description: args.description, project: args.project }),
+    // Each unstick tool acts on the queue of its `project` argument (the process's own when omitted); an unknown project is a clean { ok: false, error }.
+    answer_task_clarification: (args) => withProject(args, (t) => answerNeedsClarification(t.pipelineDir, args.taskId, args.answer)),
+    resolve_task_clarification: (args) => withProject(args, (t) => resolveNeedsClarification(t.pipelineDir, args.taskId, args.paths)),
+    mark_task_clarification_done: (args) => withProject(args, (t) => markNeedsClarificationDone(t.pipelineDir, args.taskId)),
+    requeue_blocked_task: (args) => withProject(args, (t) => requeueBlockedTask(t.pipelineDir, t.repoRoot, args.taskId, { state: args.state, force: !!args.force })),
+    withdraw_task: (args) => withProject(args, (t) => withdrawTask(t.pipelineDir, args.taskId, args.reason)),
+    propose_command: (args) => proposeCommand({ repo: args.repo, argv: args.argv, why: args.why }, { pipelineDir }),
   };
 }
 
@@ -624,7 +697,10 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
     const res = await postJson(`${OLLAMA_URL}/api/chat`, {
       model: MODEL, messages, tools, stream: false, keep_alive: KEEP_ALIVE, options: CHAT_OPTIONS,
     }, REQUEST_TIMEOUT_MS, tokenFoldHeaders);
-    return { message: res.message || {}, usage: pickUsage(res) };
+    // doneReason here too (2026-10-18, brain-dump 1889): every pipeline draft takes this
+    // non-streaming branch, and without it the 'truncated' audit events below could only
+    // ever fire for Chat. Consumed by logging only -- no branch acts on it.
+    return { message: res.message || {}, usage: pickUsage(res), doneReason: res.done_reason || null };
   }
   let contentAcc = '';
   let toolCalls = null;
@@ -832,7 +908,12 @@ async function runWithoutToolsFallback(prompt, pipelineDir) {
 // the model regenerates that turn from a fresh sample. Mutates messages / toolCallLog /
 // turnStartLengths / turnStartLogLengths in place on each rollback. Returns
 // { message } once a call succeeds, or { flakeErr } when both recovery layers are spent.
-async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths }) {
+// Chat normally never pauses for the Forge (an explicit user action). A chat turn that was given a GPU card by the card picker (chat-card.js) runs
+// with AGENT_MANAGER_CHAT_CARD_GUARD=1: the card was free when chosen, so a lease that appears on it mid-conversation pauses the turn instead of
+// reloading the model the Forge just evicted.
+const forgePauseFor = (isChatCaller) => !isChatCaller || process.env.AGENT_MANAGER_CHAT_CARD_GUARD === '1';
+
+async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, onChunk, instancesDir, toolCallLog, turnStartLengths, turnStartLogLengths, onEmptyAttempt, forgePause = false }) {
   let rollbackAttempts = 0;
   for (;;) {
     let message;
@@ -840,9 +921,17 @@ async function chatTurnWithFlakeRecovery({ messages, tools, tokenFoldHeaders, on
     let doneReason = null;
     let attemptErr = null;
     for (let attempt = 0; attempt < CHAT_FLAKE_MAX_ATTEMPTS; attempt++) {
+      // Forge exclusion (2026-10-22, found in the first live GPU broker test): never START a turn while the Forge family holds the GPU. local-client.js
+      // callOnce already refuses a call under a fresh lease, but this loop only took the per-turn in-flight lock, which protects a turn that is already
+      // running, not the gap BETWEEN turns: a pass that was mid-tool when the lease appeared sent its next turn and reloaded the model the Forge session
+      // had just evicted, for the whole session. Thrown before the try and before the lock, so it is never retried as a flake or rolled back; the
+      // callers treat it as a pause (local-draft.js, local-worker.sh), not a failure. The Chat panel (forgePause false) is an explicit user action.
+      if (forgePause && gpuGuard.forgePauseEnabled() && gpuGuard.leaseHeldFor(OLLAMA_URL)) throw new gpuGuard.ForgePauseError();
       try {
         const turnRes = await turnLock(instancesDir, () => postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }));
         if (isEmptyCompletion(turnRes.message)) {
+          // Audit-only (brain-dump 1891): record the blank sample (done_reason, thinking size) before it is resampled.
+          if (onEmptyAttempt) { try { onEmptyAttempt({ attempt: attempt + 1, message: turnRes.message, usage: turnRes.usage, doneReason: turnRes.doneReason }); } catch { /* best-effort */ } }
           attemptErr = new Error('local model returned an empty completion (no content, no tool calls)');
           continue;
         }
@@ -907,6 +996,74 @@ function flakeDegradeResult(lastMessage, toolCallLog, turnsUsed, onChunk) {
 // possible model call). `await`ing a plain non-Promise return value resolves it
 // immediately, so every existing SYNCHRONOUS handler here is unaffected -- this widened
 // signature, not a behavior change for anything already calling this function.
+// --- Tool-call digest and the cap on one tool result (2026-10-25) ----------------------------------------------------
+// A chat turn ran out of context, and its forced summary answered that it had lost the thread -- although two successful tool calls were already in toolCallLog.
+// buildToolLogDigest is the scrubbed, compact view of that log (the same rules as tool_log.py in the agent-manager-chat-plugin-am repo, ported here so core does not
+// import across repos); the 'context' forced summary quotes it. capToolResultForHistory keeps ONE huge result (a 457k-character directory listing) from filling the
+// window: only the copy in the message history is cut, the full result stays in toolCallLog and the trajectory.
+const TOOL_DIGEST_MAX_TOOLS = 50;
+const TOOL_DIGEST_MAX_TEXT = 200;
+const TOOL_DIGEST_MAX_CHARS = 6000;
+const MAX_TOOL_RESULT_CHARS = 8000;
+const DIGEST_SECRET_KEY = /token|key|secret|password/i;
+const DIGEST_SECRET_INLINE = /\b(token|secret|password|api[_-]?key)(\s*[=:]\s*)\S+/gi;
+const DIGEST_BEARER = /\bbearer\s+\S+/gi;
+
+function digestScrub(text) {
+  return String(text).replace(DIGEST_SECRET_INLINE, (_m, k, sep) => `${k}${sep}[hidden]`).replace(DIGEST_BEARER, 'Bearer [hidden]');
+}
+
+function digestClip(text, max) {
+  return text.length <= max ? text : `${text.slice(0, max - 1)}\u2026`;
+}
+
+function digestArgsText(args, maxText) {
+  let shown = args;
+  if (args && typeof args === 'object' && !Array.isArray(args)) {
+    shown = {};
+    for (const [k, v] of Object.entries(args)) shown[k] = DIGEST_SECRET_KEY.test(k) ? '[hidden]' : v;
+  }
+  let text;
+  try { text = typeof shown === 'string' ? shown : JSON.stringify(shown); } catch { text = String(shown); }
+  return digestClip(digestScrub(text === undefined ? '' : text), maxText);
+}
+
+function digestOutcome(result, maxText) {
+  if (result && typeof result === 'object' && (result.error || result.ok === false)) {
+    return { ok: false, summary: digestClip(digestScrub(String(result.error || 'failed')), maxText) };
+  }
+  let size = 0;
+  try { size = typeof result === 'string' ? result.length : JSON.stringify(result === undefined ? null : result).length; } catch { /* unserializable: size stays 0 */ }
+  return { ok: true, summary: `${size} chars returned` };
+}
+
+// [{ name, args, ok, summary }] for the first maxTools entries of a toolCallLog; anything that is not an array gives [].
+function buildToolLogDigest(toolCallLog, { maxTools = TOOL_DIGEST_MAX_TOOLS, maxText = TOOL_DIGEST_MAX_TEXT } = {}) {
+  if (!Array.isArray(toolCallLog)) return [];
+  const out = [];
+  for (const call of toolCallLog) {
+    if (!call || typeof call !== 'object') continue;
+    const { ok, summary } = digestOutcome(call.result, maxText);
+    out.push({ name: String(call.tool || 'tool').slice(0, 60), args: digestArgsText(call.args, maxText), ok, summary });
+    if (out.length >= maxTools) break;
+  }
+  return out;
+}
+
+// One line per call, the whole block clipped to TOOL_DIGEST_MAX_CHARS so the digest cannot itself balloon.
+function renderToolLogDigest(digest) {
+  const lines = digest.map((d, i) => `${i + 1}. ${d.name} ${d.args} -> ${d.ok ? 'ok' : 'FAILED'}: ${d.summary}`);
+  return digestClip(lines.join('\n'), TOOL_DIGEST_MAX_CHARS);
+}
+
+// The message-history copy of a tool result: JSON text, cut to MAX_TOOL_RESULT_CHARS (note included) when longer.
+function capToolResultForHistory(result) {
+  const text = JSON.stringify(result);
+  if (typeof text !== 'string' || text.length <= MAX_TOOL_RESULT_CHARS) return text;
+  const note = `...[truncated: this tool result was ${text.length} characters; only the first part is kept in the conversation. Ask for less (a narrower path, prefix, offset or grep) and retry]`;
+  return text.slice(0, MAX_TOOL_RESULT_CHARS - note.length) + note;
+}
+
 async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messages, toolCallLog) {
   messages.push(assistantMessage);
   for (const toolCall of toolCalls) {
@@ -931,7 +1088,7 @@ async function executeToolCalls(assistantMessage, toolCalls, toolHandlers, messa
       }
     }
     toolCallLog.push({ tool: name, args, result });
-    messages.push({ role: 'tool', content: JSON.stringify(result) });
+    messages.push({ role: 'tool', content: capToolResultForHistory(result) }); // the full result stays in toolCallLog above
   }
 }
 
@@ -1047,6 +1204,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
   }
   const toolCallLog = [];
   let turnsUsed = 0;
+  // Trajectory record (trajectory.js, brain-dump 1892): run start + every turn's end entry, written once from withUsage.
+  const trajectoryStartedMs = Date.now();
+  const trajectoryTurns = [];
   let lastMessage = null;
 
   // Ollama token accounting, summed across every turn (incl. flake-retried and
@@ -1065,12 +1225,40 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     usageAcc.eval_duration += Number(u.eval_duration) || 0;
     require('./local-throughput.js').noteAttemptSample({ evalCount: Number(u.eval_count) || 0, evalDurationNs: Number(u.eval_duration) || 0 });
   };
+  // Tool-loop audit (see tool-loop-audit.js's own header): one 'turn-end' line per model
+  // turn and one 'tool-outcome' line per edit_file/write_file call, in their own log.
+  // Log-only -- nothing below reads these back. A flaked turn has no message to describe
+  // and is skipped (the flake is recorded by its own path).
+  const auditCtx = (turn, phase) => ({
+    source, taskId, stage, lane: process.env.AGENT_MANAGER_INSTANCE_ID || null, model: MODEL || null, turn, phase,
+  });
+  const logTurnEnd = (turn, phase, turnRes) => {
+    try {
+      if (!turnRes || turnRes.flakeErr || !turnRes.message) return;
+      const entry = buildTurnEndEntry(auditCtx(turn, phase), turnRes);
+      trajectoryTurns.push(entry);
+      logToolLoopEvent(pipelineDir, 'turn-end', entry);
+    } catch { /* best-effort -- see logToolLoopEvent */ }
+  };
+  const logEmptyAttempt = (turn, phase, info) => {
+    try { logToolLoopEvent(pipelineDir, 'empty-attempt', buildEmptyAttemptEntry(auditCtx(turn, phase), info)); } catch { /* best-effort */ }
+  };
+  const logToolOutcomes = (turn, calls) => {
+    try {
+      for (const entry of buildToolOutcomeEntries(auditCtx(turn, 'loop'), calls)) {
+        logToolLoopEvent(pipelineDir, 'tool-outcome', entry);
+      }
+    } catch { /* best-effort -- see logToolLoopEvent */ }
+  };
   // Same extraction as local-client.js's call()/claude-client.js's call() -- see
   // side-finding.js's own header. Hooked into this one shared wrapper so every return
   // path (normal finish, forced-summary, maxTurns-exhausted fallback) is covered from a
   // single spot, same convention the done_reason:"length" marker uses in this file.
   const withUsage = (r) => {
     const merged = { ...r, ...usageAcc };
+    // Commands the chat proposed this turn (propose_command) ride on the result so the plugin can show them for the owner's confirmation.
+    const proposals = proposalsFromToolLog(toolCallLog);
+    if (proposals.length) merged.commandProposals = proposals;
     if (allowSideFindings && merged.response && merged.response.includes('SIDE-FINDING:')) {
       const { cleanText, findings } = extractSideFindings(merged.response);
       merged.response = cleanText;
@@ -1102,6 +1290,13 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       merged.response = cleanText;
       if (entry) writeContextLogInbox(entry, { sessionId: contextLogSessionId, pipelineDir });
     }
+    // Every return path passes here, so this is the one place the run's trajectory is complete. Best-effort (writeTrajectory never throws).
+    try {
+      writeTrajectory(pipelineDir, buildTrajectory({
+        meta: { taskId, stage, source, lane: process.env.AGENT_MANAGER_INSTANCE_ID || null, model: MODEL || null, startedMs: trajectoryStartedMs, endedMs: Date.now() },
+        messages, turns: trajectoryTurns, result: merged,
+      }));
+    } catch { /* best-effort -- see trajectory.js */ }
     return merged;
   };
 
@@ -1166,13 +1361,19 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
     const content = isChatCaller
       ? `${leadIn} Using only what you have already learned, give your best complete answer now -- a real, substantive reply, not a placeholder or a single word.${budgetWarning}`
       : `${leadIn} Using only what you have already learned, give your best final answer now and end with exactly one RESOLUTION: line plus the follow-up its format requires.${budgetWarning} If you never got far enough to implement or decide, use RESOLUTION: decompose (followed by the sub-task JSON array) or RESOLUTION: needs-human-decision (followed by the open question).`;
-    messages.push({ role: 'user', content });
+    // 'context' only: the earlier tool results may no longer be in the model's window, so hand it a compact digest of what it already did and tell it to report that.
+    const digestBlock = reason === 'context' && toolCallLog.length
+      ? `\n\nHere is a compact log of the ${toolCallLog.length} tool call(s) you ALREADY completed this run. You have already made these tool calls; report their results to the user instead of saying you lost context or did not finish:\n${renderToolLogDigest(buildToolLogDigest(toolCallLog))}`
+      : '';
+    messages.push({ role: 'user', content: content + digestBlock });
     turnsUsed += 1;
     const { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake } = await chatTurnWithFlakeRecovery({
-      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+      messages, tools: [], tokenFoldHeaders, onChunk, instancesDir, forgePause: forgePauseFor(isChatCaller),
       toolCallLog, turnStartLengths, turnStartLogLengths,
+      onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary', info),
     });
     addUsage(summaryUsage);
+    logTurnEnd(turnsUsed, 'forced-summary', { message: summaryMsg, usage: summaryUsage, doneReason: summaryDoneReason, flakeErr: summaryFlake });
     // The forced-summary turn itself can, in principle, also get clipped -- worth its own
     // audit entry (see logContextAudit's own header) since RESERVED_RESPONSE_TOKENS is
     // exactly the margin betting this never happens.
@@ -1211,10 +1412,12 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       });
       turnsUsed += 1;
       const retryResult = await chatTurnWithFlakeRecovery({
-        messages, tools: [], tokenFoldHeaders, onChunk, instancesDir,
+        messages, tools: [], tokenFoldHeaders, onChunk, instancesDir, forgePause: forgePauseFor(isChatCaller),
         toolCallLog, turnStartLengths, turnStartLogLengths,
+        onEmptyAttempt: (info) => logEmptyAttempt(turnsUsed, 'forced-summary-retry', info),
       });
       addUsage(retryResult.usage);
+      logTurnEnd(turnsUsed, 'forced-summary-retry', retryResult);
       const retryContent = (!retryResult.flakeErr && retryResult.message && retryResult.message.content) ? retryResult.message.content : '';
       if (HAS_RESOLUTION_RE.test(retryContent)) {
         summaryContent = retryContent;
@@ -1332,8 +1535,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
 
     const sentAtLength = messages.length;
     const { message, usage, doneReason, flakeErr } = await chatTurnWithFlakeRecovery({
-      messages, tools, tokenFoldHeaders, onChunk, instancesDir,
+      messages, tools, tokenFoldHeaders, onChunk, instancesDir, forgePause: forgePauseFor(isChatCaller),
       toolCallLog, turnStartLengths, turnStartLogLengths,
+      onEmptyAttempt: (info) => logEmptyAttempt(turn, 'loop', info),
     });
     addUsage(usage);
     // Real anchor for estimateContextTokens (see its own header) -- prompt_eval_count is
@@ -1355,6 +1559,7 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
         ceiling: PINNED_NUM_CTX,
       });
     }
+    logTurnEnd(turn, 'loop', { message, usage, doneReason, flakeErr });
     if (flakeErr) {
       // Rollback exhausted too (or there was no prior turn to roll back -- a first-turn
       // failure is a genuinely different, unexplained case). Graceful-degrade if the
@@ -1424,7 +1629,9 @@ async function runPlanWithTools({ prompt, messages: reqMessages, maxTurns = 5, s
       }
       return withUsage({ response: content, toolCallLog, turnsUsed, toolsDisabled: false });
     }
+    const toolLogStart = toolCallLog.length;
     await executeToolCalls(message, toolCalls, toolHandlers, messages, toolCallLog);
+    logToolOutcomes(turn, toolCallLog.slice(toolLogStart));
   }
 
   // maxTurns reached without a final (no-tool-calls) response -- deliberate forced stop,
@@ -1464,7 +1671,8 @@ function installStdoutEpipeGuard(label, stream = process.stdout) {
 }
 
 module.exports = {
-  runPlanWithTools, readFileTool, listDirectoryTool, listRootsTool,
+  runPlanWithTools, readFileTool, listDirectoryTool, listRootsTool, LIST_DIR_MAX_ENTRIES,
+  buildToolLogDigest, capToolResultForHistory, TOOL_DIGEST_MAX_TOOLS, TOOL_DIGEST_MAX_TEXT, TOOL_DIGEST_MAX_CHARS, MAX_TOOL_RESULT_CHARS,
   resolveInsideRepo, resolveInsideRoots, TOOLS,
   writeFileTool, editFileTool, runBashTool, WRITE_TOOLS, CHAT_TOOLS,
   buildToolHandlers, buildWriteToolHandlers, buildChatToolHandlers,

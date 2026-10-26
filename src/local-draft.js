@@ -58,6 +58,7 @@ const { providerFor, labelFor, resolveModelProfile } = require('./model-provider
 const { isForgePause } = require('./gpu-guard.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { missingFileCheck } = require('./draft-file-guard.js');
+const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');
 const { planTargetGuard } = require('./plan-target-guard.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
@@ -899,6 +900,36 @@ async function runPlanPass(task, {
   const stillThin = handled.stillThin;
   const seededFromPrior = handled.seededFromPrior;
 
+  // Import-binding cap (HUB0159 · 2/3): a plan whose wiring step shows no verbatim
+  // require/import line -- or that spreads bindings across multiple steps -- is a
+  // wiring plan, not a feature plan. Exactly ONE re-plan: re-roll at RETRY_TEMPERATURE
+  // and take that roll; if the second roll ALSO trips the cap, accept it. The guard on
+  // task._importBindingReplanned (set BEFORE the re-roll) means a legitimate plan is
+  // accepted on the second attempt and never dropped forever, and no second re-plan can
+  // ever happen even if runPlanPass re-enters for the same task. When the check finds
+  // no problem (null -- including every non-adhoc source), control falls through to the
+  // acceptance-criteria step below with no side effects.
+  const bindingProblem = planImportBindingProblem(task);
+  if (bindingProblem && !task._importBindingReplanned) {
+    task._importBindingReplanned = true;
+    appendHistoryEvent(task, 'plan-rejected', `import-binding cap: ${bindingProblem.code}`);
+    const startedAt = new Date().toISOString();
+    const startMs = Date.now();
+    const reRoll = await callPlan(RETRY_TEMPERATURE);
+    if (recordModelCall) {
+      recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reRoll, source: task.source, stage: 'plan' });
+    }
+    // A degenerate re-roll carries no usable plan -- keep the previous one.
+    if (!reRoll.degenerate) {
+      task.planResponse = reRoll.response;
+      // Keep the seed source (lastGoodPlan) consistent with the plan we now accept.
+      if (!planIsThin(reRoll.response)) task.lastGoodPlan = reRoll.response;
+    }
+    if (planImportBindingProblem(task)) {
+      appendHistoryEvent(task, 'plan-accepted-after-rejection', `import-binding cap: ${bindingProblem.code}`);
+    }
+  }
+
   // Acceptance criteria (2026-09-04): a "definition of done" the implement + review are
   // held to. From promptContext.acceptanceCriteria if the caller gave one, else the
   // trailing CRITERIA: block the plan pass was asked to write. Kill switch
@@ -1185,6 +1216,8 @@ async function finalizeCandidateFulfillment(task, {
 // draftModel, ...) and emits its own history events. Returns { done: true, result } when
 // a terminal outcome was reached (deterministic empty, degenerate block, or a candidate
 // split), else { done: false } so draftTask continues to critique + revision.
+const NO_REAL_FILE_STUB_RE = /^\s*no real file to adapt\.?\s*$/i;
+
 async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
 
@@ -1264,6 +1297,19 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
       implLatencyMs = retryLatencyMs;
       task.implementResponse = retryResult.response;
     }
+  }
+
+  // Terminal no-op stub: archImportImplementPrompt tells the model to answer exactly "no real file to adapt" when no file in the
+  // harness Real matches list fits (the old "output the empty string" instruction was routinely ignored in favour of an invented
+  // file). Resolve it like the zero-hit skip above -- implementResponse '' so the emptyApproval source auto-approves -- before
+  // post-implement checks, critique or requeue can treat a compliant answer as a fabrication. Only sources that opt in via
+  // skipImplementWhenNoHarnessHits (arch_import) get this; any other response text is left untouched.
+  if (skipImplementOnNoHits && NO_REAL_FILE_STUB_RE.test(String(task.implementResponse || ''))) {
+    task.implementResponse = '';
+    recordImplement(attempt, { note: 'model answered the "no real file to adapt" stub' });
+    appendHistoryEvent(task, 'implement-done', 'model answered "no real file to adapt" -- terminal no-op, empty implementResponse, no critique or requeue');
+    concludeDraft(task);
+    return { done: true, result: { succeeded: true, blocked: false } };
   }
 
   // A source can register a `postImplementCheck(task, implementResponse, {call,
@@ -1574,7 +1620,7 @@ async function draftTask(task, deps = {}) {
     try {
       const lanes = require('./lanes.js').getLanes();
       if (require('./capability-routing.js').escalationLane(attempt, lanes)) {
-        const avoided = recordAvoidedLane(task, lanes.length);
+        const avoided = recordAvoidedLane(task, lanes.length, process.env, lanes);
         if (avoided) appendHistoryEvent(task, 'lane-escalated', `${attempt.reason || attempt.blockedReason || attempt.outcome} on ${avoided}; a larger lane gets the retry`);
       }
     } catch (_) { /* escalation is best-effort */ }

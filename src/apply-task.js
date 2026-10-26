@@ -394,7 +394,7 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     if (artifact && artifact.coordinating) {
       abandonBranch();
       closeOriginatingBrainDumpEntry(task, brainDumpPath, artifact.reason);
-      return { coordinating: true, subTasks: artifact.subTasks, reason: artifact.reason, hubSerial: artifact.hubSerial, hubLabel: artifact.hubLabel };
+      return { coordinating: true, subTasks: artifact.subTasks, reason: artifact.reason, hubSerial: artifact.hubSerial, hubLabel: artifact.hubLabel, ownerGates: artifact.ownerGates };
     }
 
     // A Group A `apply` can also return { succeeded:false, needsConfirmation:true } to

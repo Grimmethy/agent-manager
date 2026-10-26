@@ -30,6 +30,14 @@ function registerTaskSource(name, config) {
     const { sourceEligibleHere } = require('./lib/source-scope.js');
     config = { ...config, next: (...args) => (sourceEligibleHere({ scope: 'core' }) ? inner(...args) : null) };
   }
+  // `variantOf` (task-atomization plugin, docs/design-notes/task-atomization-plugin.md): this source is a smaller-scoped VARIANT of another source -- the
+  // same kind of work shaped for a smaller model. Metadata only: the scorecard / dashboards group a variant with its parent. Validated shape-wise here;
+  // the parent need not be registered yet (plugins load in any order).
+  if (config && config.variantOf !== undefined && config.variantOf !== null) {
+    if (typeof config.variantOf !== 'string' || !config.variantOf.trim() || config.variantOf === name) {
+      throw new Error(`Task source "${name}": variantOf must name a different source (got ${JSON.stringify(config.variantOf)})`);
+    }
+  }
   registry[name] = { name, ...config };
 }
 
@@ -116,4 +124,20 @@ function updateTaskSource(name, partialConfig) {
   Object.assign(registry[name], partialConfig);
 }
 
-module.exports = { registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias };
+/** The parent source `name` is a variant of, or null. Follows chains (a variant of a variant) to the root; cycle-safe. */
+function variantParentOf(name) {
+  let cur = name;
+  const seen = new Set();
+  while (registry[cur] && registry[cur].variantOf && !seen.has(cur)) {
+    seen.add(cur);
+    cur = registry[cur].variantOf;
+  }
+  return cur === name ? null : cur;
+}
+
+/** Names of the sources registered as (direct or indirect) variants of `parent`. */
+function getVariantsOf(parent) {
+  return Object.keys(registry).filter((n) => variantParentOf(n) === parent);
+}
+
+module.exports = { variantParentOf, getVariantsOf, registerTaskSource, getRegisteredSources, getRegisteredSource, clearRegistry, updateTaskSource, resolveSourceName, registerSourceAlias };

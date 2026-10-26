@@ -37,6 +37,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { isCloudEndpoint } = require('./lanes.js');
 
 // ComfyUI GPU lease (2026-08-30). PromptForge writes this file only when starting
 // ComfyUI would collide with the resident local model on a single GPU. While it's held
@@ -51,19 +52,59 @@ const COMFY_LEASE_TTL_S = Number(process.env.AGENT_MANAGER_COMFY_LEASE_TTL_S) ||
 // no matter how fresh its refreshedAt looks.
 const COMFY_LEASE_MAX_S = Number(process.env.AGENT_MANAGER_COMFY_LEASE_MAX_S) || 900;
 
-function comfyuiLeaseHeld(leasePath = COMFY_LEASE_PATH) {
+// The lease body when it is fresh (refreshed within the TTL, acquired within the MAX ceiling), else null. Fails open: no file, unreadable or
+// malformed -> null.
+function readFreshLease(leasePath = COMFY_LEASE_PATH) {
   try {
     const d = JSON.parse(fs.readFileSync(leasePath, 'utf8'));
     const now = Date.now();
     const refreshed = Date.parse(d.refreshedAt);
     const acquired = Date.parse(d.acquiredAt);
-    if (!Number.isFinite(refreshed) || !Number.isFinite(acquired)) return false;
+    if (!Number.isFinite(refreshed) || !Number.isFinite(acquired)) return null;
     return (now - refreshed) <= COMFY_LEASE_TTL_S * 1000
-      && (now - acquired) <= COMFY_LEASE_MAX_S * 1000;
+      && (now - acquired) <= COMFY_LEASE_MAX_S * 1000 ? d : null;
   } catch (e) {
     // No file / unreadable / malformed -- not held. Fail open.
-    return false;
+    return null;
   }
+}
+
+// Any fresh lease = held, whatever it covers (the whole-pipeline meaning every existing caller relies on).
+function comfyuiLeaseHeld(leasePath = COMFY_LEASE_PATH) {
+  return readFreshLease(leasePath) !== null;
+}
+
+// Endpoint-scoped lease (2026-10-18): the lease may carry an optional `endpoints` array of Ollama URLs. Absent or empty = the whole pipeline (PromptForge's
+// leases, unchanged). Present = only calls to those endpoints are held off, so a plugin that reserves ONE card (a KaggleForge eval on the P40 or the
+// 3090) does not pause the lanes on the other cards. An endpoint is compared as host:port; localhost, 127.0.0.1 and ::1 are one host, and a missing
+// port means Ollama's 11434.
+function normalizeEndpoint(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return null;
+  try {
+    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`);
+    let host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (host === '127.0.0.1' || host === '::1') host = 'localhost';
+    return `${host}:${u.port || '11434'}`;
+  } catch (e) {
+    return null;
+  }
+}
+
+function leaseCovers(lease, endpointUrl) {
+  const list = lease && lease.endpoints;
+  if (!Array.isArray(list) || list.length === 0) return true;   // unscoped: the whole pipeline
+  const want = normalizeEndpoint(endpointUrl);
+  if (!want) return true;                                       // cannot tell which card this caller uses: stay held (the safe side)
+  return list.some((e) => normalizeEndpoint(e) === want);
+}
+
+// Is the GPU behind `endpointUrl` leased right now? Same freshness rules as comfyuiLeaseHeld; scoped leases hold only their own endpoints.
+// A cloud lane's endpoint is not a GPU, so a Forge lease never holds it (it must keep working while a render owns the cards).
+function leaseHeldFor(endpointUrl, leasePath = COMFY_LEASE_PATH, env = process.env) {
+  if (isCloudEndpoint(endpointUrl, env)) return false;
+  const lease = readFreshLease(leasePath);
+  return lease !== null && leaseCovers(lease, endpointUrl);
 }
 
 // A local-model call that would START while the Forge family holds the GPU is refused with this error (2026-10-14).
@@ -89,16 +130,24 @@ function forgePauseEnabled() { return process.env.AGENT_MANAGER_FORGE_PAUSE !== 
 
 // Forge family exclusion (2026-10-13, Grimmethy: "we cannot run the Agent Manager pipeline and Forge pipeline
 // at the same time ... starting up one process should stop the other and clear the GPU"). PromptForge is the
-// Forge family's GPU broker (promptforge Docs/GPU_FAMILY_PROTOCOL.md): while a Forge session holds the
+// Forge family's GPU broker (agent-manager-gpu-broker Docs/GPU_FAMILY_PROTOCOL.md): while a Forge session holds the
 // comfyui-lease the pipeline yields (above). The other direction is here: with NO lease, a ComfyUI that is
 // still up is the Forge family holding VRAM + RAM the pipeline is about to need, so ask PromptForge to end its
 // session and stop ComfyUI. PromptForge refuses while a Forge job is actually running; if PromptForge is down
 // we do nothing here and the existing starved -> /free path below still applies. Opt-in via the `forgeYield`
 // parameter (the CLI passes it; unit tests do not, so they never touch the live PromptForge).
-const PROMPTFORGE_URL = (process.env.AGENT_MANAGER_PROMPTFORGE_URL || process.env.PROMPTFORGE_URL || 'http://localhost:7430').replace(/\/$/, '');
+//
+// The URL of the service that answers /api/gpu/yield is resolved HERE and nowhere else in JS (2026-10-22, GPU broker piece G3a), so pointing
+// core at a standalone GPU broker later is one environment variable. First set wins: AGENT_MANAGER_GPU_BROKER_URL, then
+// AGENT_MANAGER_PROMPTFORGE_URL, then PROMPTFORGE_URL, then PromptForge's own default. An empty value counts as unset (same as the shell twin,
+// gpu_broker_url in scripts/agent-manager-common.sh, which scripts/launch.sh uses; scripts/gpu-broker-url.test.js pins that they agree).
+// Read per call so a test (or a restarted daemon) sees the current environment.
+function gpuBrokerUrl(env = process.env) {
+  return (env.AGENT_MANAGER_GPU_BROKER_URL || env.AGENT_MANAGER_PROMPTFORGE_URL || env.PROMPTFORGE_URL || 'http://localhost:7430').replace(/\/$/, '');
+}
 
 // Returns { acted, note }. Never throws.
-async function yieldForgeToPipeline({ comfyUrl = COMFY_URL, promptforgeUrl = PROMPTFORGE_URL, fetchJsonFn = fetchJson } = {}) {
+async function yieldForgeToPipeline({ comfyUrl = COMFY_URL, promptforgeUrl = gpuBrokerUrl(), fetchJsonFn = fetchJson } = {}) {
   try {
     const up = await fetchJsonFn(`${comfyUrl}/system_stats`, {}, 2000);
     if (!up || !up.ok) return { acted: false, note: '' };            // ComfyUI is not running: nothing to clear
@@ -192,7 +241,12 @@ async function ensureGpuHeadroomCore({
   readFreeVram = readFreeVramMb,
   fetchJsonFn = fetchJson,
   leaseHeld = comfyuiLeaseHeld,
+  isCloud = isCloudEndpoint,
 } = {}) {
+  // A cloud lane's calls go to the cloud-providers gateway: there is no GPU to keep clear for it, and freeing ComfyUI or stopping an app would be pointless.
+  if (isCloud(ollamaUrl)) {
+    return { checked: false, freeMb: null, minFreeMb, starved: false, yielded: [], freed: [], note: 'cloud endpoint -- no GPU to guard' };
+  }
   // PromptForge holds the GPU for an image generation that wouldn't fit alongside the
   // resident local model. Don't touch ComfyUI or Ollama this tick -- the local-model
   // lanes are yielding too (see comfyui_lease_held in agent-manager-common.sh). An
@@ -285,7 +339,7 @@ async function ensureGpuHeadroom(opts = {}) {
   return result;
 }
 
-module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld, yieldForgeToPipeline, ForgePauseError, FORGE_PAUSE_MESSAGE, isForgePause, forgePauseEnabled };
+module.exports = { ensureGpuHeadroom, readFreeVramMb, comfyuiLeaseHeld, yieldForgeToPipeline, gpuBrokerUrl, ForgePauseError, FORGE_PAUSE_MESSAGE, isForgePause, forgePauseEnabled, leaseHeldFor, leaseCovers, normalizeEndpoint };
 
 if (require.main === module) {
   ensureGpuHeadroom({ forgeYield: yieldForgeToPipeline }).then((result) => {

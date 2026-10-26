@@ -45,6 +45,9 @@ function buildEntry(attempt, ctx = {}) {
     outcome: classifyOutcome(attempt),
     attemptNo: attempt ? attempt.attemptNo || null : null,
     wallMs: Number.isFinite(start) && Number.isFinite(end) && end >= start ? end - start : null,
+    // Whether the prompt's TIME BUDGET line was on for this attempt (AGENT_MANAGER_PROMPT_BUDGET_BLOCK, brain-dump 1895), so
+    // budgetBlockComparison can read its effect on timeouts instead of guessing from before/after dates.
+    budgetBlock: ['on', '1', 'true'].includes(String(env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK || '').trim().toLowerCase()),
     tps: ctx.throughput ? ctx.throughput.tps : null,
     evalTokens: ctx.throughput ? ctx.throughput.tokens : null,
     reason: attempt && (attempt.blockedReason || attempt.reason) ? String(attempt.blockedReason || attempt.reason).slice(0, 200) : null,
@@ -100,17 +103,71 @@ function buildScorecard(entries) {
   }).sort((a, b) => a.source.localeCompare(b.source) || (a.tier ?? 1e9) - (b.tier ?? 1e9) || a.model.localeCompare(b.model));
 }
 
+// Adds `variantOf` (the root parent source, or null) to each row, given a `parentOf(sourceName)` lookup; rows keep their own (source, model) identity.
+function annotateVariants(rows, parentOf) {
+  return rows.map((r) => ({ ...r, variantOf: (typeof parentOf === 'function' && parentOf(r.source)) || null }));
+}
+
+// Per lane: attempts with the prompt budget block on vs off -- n, ok, timeout counts and rates, median wall time. Only entries that carry the
+// budgetBlock field count (older lines are neither on nor off), so the comparison is never padded with attempts that predate the switch.
+function budgetBlockComparison(entries) {
+  const lanes = new Map();
+  for (const e of entries || []) {
+    if (!e || typeof e.budgetBlock !== 'boolean') continue;
+    const lane = e.lane || '-';
+    const row = lanes.get(lane) || { lane, on: { n: 0, ok: 0, timeout: 0, walls: [] }, off: { n: 0, ok: 0, timeout: 0, walls: [] } };
+    const side = e.budgetBlock ? row.on : row.off;
+    side.n += 1;
+    if (e.outcome === 'ok') side.ok += 1;
+    if (e.outcome === 'timeout') side.timeout += 1;
+    if (Number.isFinite(e.wallMs)) side.walls.push(e.wallMs);
+    lanes.set(lane, row);
+  }
+  const fin = (s) => {
+    const walls = s.walls.sort((a, b) => a - b);
+    return { n: s.n, ok: s.ok, timeout: s.timeout, okRate: s.n ? s.ok / s.n : null, timeoutRate: s.n ? s.timeout / s.n : null, p50WallMs: percentile(walls, 0.5) };
+  };
+  return [...lanes.values()].map((r) => ({ lane: r.lane, on: fin(r.on), off: fin(r.off) })).sort((a, b) => a.lane.localeCompare(b.lane));
+}
+
+function readBudgetBlockComparison(pipelineDir, { windowDays = DEFAULT_WINDOW_DAYS, now = Date.now() } = {}) {
+  const since = new Date(now - windowDays * 86400000).toISOString();
+  return budgetBlockComparison(readPipelineHistory(pipelineDir, { type: LEDGER_TYPE, since }));
+}
+
 function readScorecard(pipelineDir, { windowDays = DEFAULT_WINDOW_DAYS, now = Date.now() } = {}) {
   const since = new Date(now - windowDays * 86400000).toISOString();
   return buildScorecard(readPipelineHistory(pipelineDir, { type: LEDGER_TYPE, since }));
 }
 
-module.exports = { LEDGER_TYPE, tierFromModel, classifyOutcome, buildEntry, recordAttempt, wilsonLower, buildScorecard, readScorecard };
+module.exports = { annotateVariants, LEDGER_TYPE, tierFromModel, classifyOutcome, buildEntry, recordAttempt, wilsonLower, buildScorecard, readScorecard, budgetBlockComparison, readBudgetBlockComparison };
 
 if (require.main === module) {
   const dir = process.env.AGENT_MANAGER_PIPELINE_DIR || process.env.AGENT_MANAGER_REPO_ROOT || process.cwd();
   const days = Number(process.argv[2]) || DEFAULT_WINDOW_DAYS;
-  const rows = readScorecard(dir, { windowDays: days });
+  if (process.argv.includes('--budget-block')) {
+    const cmp = readBudgetBlockComparison(dir, { windowDays: days });
+    if (process.argv.includes('--json')) console.log(JSON.stringify(cmp, null, 2));
+    else {
+      const pct = (x) => (x == null ? '-' : `${(x * 100).toFixed(1)}%`);
+      console.log('lane'.padEnd(16) + 'block'.padEnd(6) + 'n'.padStart(5) + '  timeout%  ok%  p50s');
+      for (const r of cmp) {
+        for (const k of ['off', 'on']) {
+          const s = r[k];
+          console.log(r.lane.padEnd(16) + k.padEnd(6) + String(s.n).padStart(5) + `  ${pct(s.timeoutRate).padStart(8)}  ${pct(s.okRate).padStart(4)}  ${s.p50WallMs == null ? '-' : Math.round(s.p50WallMs / 1000)}`);
+        }
+      }
+    }
+    process.exit(0);
+  }
+  let rows = readScorecard(dir, { windowDays: days });
+  // --with-variants loads the source registry (heavy: needs AGENT_MANAGER_REPO_ROOT) to tag each row with its variantOf parent.
+  if (process.argv.includes('--with-variants')) {
+    try {
+      require('./task-sources.js');
+      rows = annotateVariants(rows, require('./task-source-registry.js').variantParentOf);
+    } catch (e) { console.error(`--with-variants: registry unavailable (${e.message}); rows left unannotated`); }
+  }
   if (process.argv.includes('--json')) console.log(JSON.stringify(rows, null, 2));
   else {
     console.log(`source`.padEnd(30) + `model`.padEnd(26) + `n`.padStart(4) + `  ok%  lower  p50s`);

@@ -28,7 +28,7 @@ test('gpuSlugFromName: last digit-bearing token, lowercased', () => {
 
 test('local lane is named for AGENT_MANAGER_LOCAL_GPU; no P40 vars, no registry -> exactly one lane', () => {
   const lanes = getLanes({ ...noRegistry, AGENT_MANAGER_LOCAL_GPU: '3090' });
-  assert.deepEqual(lanes, [{ id: 'worker-3090', gpu: '3090', env: {}, local: true, slow: false, numCtx: null, numBatch: null, preempt: 'always', taskClasses: null, model: null, tier: null, reserve: 'auto' }]);
+  assert.deepEqual(lanes, [{ id: 'worker-3090', gpu: '3090', env: {}, local: true, slow: false, numCtx: null, numBatch: null, reviewer: true, reviewerId: 'reviewer', preempt: 'always', taskClasses: null, model: null, tier: null, reserve: 'auto' }]);
 });
 
 test('both P40 vars set -> second lane worker-p40 carrying its own Ollama env, never preempted', () => {
@@ -57,7 +57,7 @@ test('registry: one entry adds a lane with the full env, defaults id/preempt, cl
   const lanes = getLanes(withRegistry([RX580]));
   assert.deepEqual(lanes.map((l) => l.id), ['worker-3090', 'worker-rx580']);
   assert.deepEqual(lanes[1], {
-    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, numCtx: null, numBatch: null, preempt: 'never', taskClasses: null, model: 'qwen3-vl:8b-instruct', tier: 8, reserve: 'auto',
+    id: 'worker-rx580', gpu: 'rx580', local: false, slow: false, numCtx: null, numBatch: null, reviewer: false, reviewerId: 'reviewer-rx580', preempt: 'never', taskClasses: null, model: 'qwen3-vl:8b-instruct', tier: 8, reserve: 'auto',
     env: { OLLAMA_URL: 'http://100.96.112.78:11434', LOCAL_MODEL: 'qwen3-vl:8b-instruct', AGENT_MANAGER_GPU_YIELD_APPS: '' },
   });
 });
@@ -199,4 +199,116 @@ test('numBatch: validated, exported as AGENT_MANAGER_LANE_NUM_BATCH in that lane
   assert.equal(lanes[0].env.AGENT_MANAGER_LANE_NUM_BATCH, undefined);
   assert.equal(getLanes(withRegistry([RX580]))[1].env.AGENT_MANAGER_LANE_NUM_BATCH, undefined);
   for (const bad of [1, 16, 9000, 1.5, '1024']) assert.equal(getLanes(withRegistry([{ ...RX580, numBatch: bad }])).length, 1, `numBatch ${bad} fails closed`);
+});
+
+test('review daemons: the host lane always has `reviewer`; the P40 opts in by env, a registry lane by `reviewer: true`; bad values fail closed', () => {
+  const { reviewerLanes } = require('./lanes.js');
+  const p40 = { AGENT_MANAGER_P40_OLLAMA_URL: 'http://p40:11434', AGENT_MANAGER_P40_MODEL: 'qwen3.8-p40:27b' };
+  assert.deepEqual(reviewerLanes({ ...withRegistry([]), ...p40 }).map((r) => r.reviewerId), ['reviewer'], 'P40 does not review by default');
+  assert.deepEqual(reviewerLanes({ ...withRegistry([]), ...p40, AGENT_MANAGER_P40_REVIEWER: 'true' }).map((r) => r.reviewerId), ['reviewer', 'reviewer-p40']);
+  assert.deepEqual(reviewerLanes({ ...withRegistry([]), ...p40, AGENT_MANAGER_P40_REVIEWER: 'no' }).map((r) => r.reviewerId), ['reviewer']);
+  assert.deepEqual(reviewerLanes(withRegistry([{ ...RX580, reviewer: true }])).map((r) => r.reviewerId), ['reviewer', 'reviewer-rx580']);
+  assert.equal(getLanes(withRegistry([{ ...RX580, reviewer: 'yes' }])).length, 1, 'a non-boolean reviewer fails closed');
+});
+
+test('node src/lanes.js --reviewers lists "<reviewerId> <workerLaneId>" for the extra review daemons only', () => {
+  const { execFileSync } = require('child_process');
+  const out = execFileSync(process.execPath, [path.join(__dirname, 'lanes.js'), '--reviewers'], {
+    env: { ...process.env, AGENT_MANAGER_LANES_PATH: '/nonexistent/lanes.json', AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_P40_OLLAMA_URL: 'http://p40:11434', AGENT_MANAGER_P40_MODEL: 'm', AGENT_MANAGER_P40_REVIEWER: 'true' }, encoding: 'utf8',
+  });
+  assert.equal(out.trim(), 'reviewer-p40 worker-p40');
+});
+
+// ---- provider: 'cloud' lanes (the cloud-providers gateway), explicit and bounded ----
+const CLOUD = { gpu: 'cloud', provider: 'cloud', ollamaUrl: 'http://127.0.0.1:7450', model: 'claude-haiku-5-5', taskClasses: ['adhoc'] };
+const idsOf = (entries) => getLanes(withRegistry(entries)).map((l) => l.id);
+
+test('cloud: an entry with a taskClasses allowlist becomes a bounded lane carrying provider and cloud', () => {
+  const lane = getLanes(withRegistry([CLOUD]))[1];
+  assert.equal(lane.id, 'worker-cloud');
+  assert.equal(lane.cloud, true);
+  assert.equal(lane.provider, 'cloud');
+  assert.deepEqual(lane.taskClasses, ['adhoc']);
+  assert.equal(lane.preempt, 'never');
+  assert.equal(lane.reviewer, false);
+  assert.equal(lane.numCtx, null);
+  assert.deepEqual(lane.env, { OLLAMA_URL: 'http://127.0.0.1:7450', LOCAL_MODEL: 'claude-haiku-5-5', AGENT_MANAGER_GPU_YIELD_APPS: '' });
+});
+
+test('cloud: fail closed -- no allowlist (absent, null, empty or not an array) drops the lane, siblings survive', () => {
+  const { taskClasses, ...bare } = CLOUD;
+  assert.deepEqual(idsOf([bare]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...CLOUD, taskClasses: null }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...CLOUD, taskClasses: [] }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...CLOUD, taskClasses: 'adhoc' }]), ['worker-3090']);
+  assert.deepEqual(idsOf([bare, RX580]), ['worker-3090', 'worker-rx580']);
+});
+
+test('cloud: preempt other than never, a reviewer daemon, or an unknown provider drops the entry', () => {
+  assert.deepEqual(idsOf([{ ...CLOUD, preempt: 'always' }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...CLOUD, preempt: 'age-gated' }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...CLOUD, preempt: 'never' }]), ['worker-3090', 'worker-cloud']);
+  assert.deepEqual(idsOf([{ ...CLOUD, reviewer: true }]), ['worker-3090']);
+  assert.deepEqual(idsOf([{ ...CLOUD, provider: 'openai' }]), ['worker-3090']);
+});
+
+test('cloud: numCtx and numBatch describe a GPU, so they are ignored (even invalid values) and never reach the env', () => {
+  const lane = getLanes(withRegistry([{ ...CLOUD, numCtx: 100, numBatch: 5 }]))[1];
+  assert.equal(lane.id, 'worker-cloud');
+  assert.equal(lane.numCtx, null);
+  assert.equal(lane.numBatch, null);
+  assert.deepEqual(Object.keys(lane.env).sort(), ['AGENT_MANAGER_GPU_YIELD_APPS', 'LOCAL_MODEL', 'OLLAMA_URL']);
+});
+
+test('cloud: laneAllowsSource honours the allowlist (adhoc yes, hygiene scans and unknown sources no)', () => {
+  const lane = getLanes(withRegistry([CLOUD, RX580]))[1];
+  assert.equal(laneAllowsSource(lane, 'adhoc'), true);
+  assert.equal(laneAllowsSource(lane, 'function_length_review'), false);
+  assert.equal(laneAllowsSource(lane, 'observability_review'), false);
+  assert.equal(laneAllowsSource(lane, undefined), false);
+  assert.equal(laneAllowsSource(getLanes(withRegistry([CLOUD, RX580]))[2], 'function_length_review'), true, 'the rx580 lane (no allowlist) is unaffected');
+});
+
+test('ollama lanes are unchanged: an explicit provider ollama equals the default, and no lane gains cloud keys', () => {
+  const plain = getLanes(withRegistry([RX580]));
+  const explicit = getLanes(withRegistry([{ ...RX580, provider: 'ollama' }]));
+  assert.deepEqual(explicit, plain);
+  for (const lane of getLanes(withRegistry([RX580, CLOUD])).filter((l) => l.id !== 'worker-cloud')) {
+    assert.equal('cloud' in lane, false, `${lane.id} must not gain a cloud key`);
+    assert.equal('provider' in lane, false, `${lane.id} must not gain a provider key`);
+  }
+});
+
+test('cloud: a cloud lane and an ollama lane coexist in registry order', () => {
+  assert.deepEqual(idsOf([RX580, CLOUD]), ['worker-3090', 'worker-rx580', 'worker-cloud']);
+});
+
+test('lanes.example.json ships a disabled cloud entry that becomes a valid bounded lane once enabled', () => {
+  const entries = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'lanes.example.json'), 'utf8'));
+  const example = entries.find((e) => e.provider === 'cloud');
+  assert.ok(example, 'example has a cloud entry');
+  assert.equal(example.enabled, false);
+  assert.deepEqual(example.taskClasses, ['adhoc']);
+  assert.equal(idsOf(entries).includes('worker-cloud'), false, 'disabled: no lane');
+  const enabled = entries.map((e) => (e.provider === 'cloud' ? { ...e, enabled: true } : e));
+  const lane = getLanes(withRegistry(enabled)).find((l) => l.id === 'worker-cloud');
+  assert.equal(lane.cloud, true);
+  assert.deepEqual(lane.taskClasses, ['adhoc']);
+});
+
+// ---- isCloudEndpoint: GPU-only logic asks "is this endpoint the cloud gateway?" ----
+const { isCloudEndpoint } = require('./lanes.js');
+
+test('isCloudEndpoint: true only for an enabled cloud lane endpoint (trailing slash ignored), false for GPU lanes, disabled entries and junk', () => {
+  const env = withRegistry([RX580, CLOUD]);
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450', env), true);
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450/', env), true);
+  assert.equal(isCloudEndpoint(' http://127.0.0.1:7450 ', env), true);
+  assert.equal(isCloudEndpoint(RX580.ollamaUrl, env), false);
+  assert.equal(isCloudEndpoint('http://localhost:11434', env), false);
+  assert.equal(isCloudEndpoint('', env), false);
+  assert.equal(isCloudEndpoint(undefined, env), false);
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450', withRegistry([{ ...CLOUD, enabled: false }])), false, 'a disabled cloud entry is no lane');
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450', withRegistry('{ not json')), false, 'a garbage registry never throws');
+  assert.equal(isCloudEndpoint('http://127.0.0.1:7450', noRegistry), false);
 });

@@ -102,3 +102,14 @@ test('a degraded lane is neither a reservation holder nor a probe target', () =>
   assert.equal(R.probeSelected(base), true);
   assert.equal(R.probeSelected({ ...base, degraded: true }), false);
 });
+
+test('a lane the operator switched off (heartbeat status disabled) is never alive, while idle and working lanes still are', () => {
+  const fsm = require('fs'); const pth = require('path');
+  const dir = fsm.mkdtempSync(pth.join(require('os').tmpdir(), 'route-disabled-'));
+  const now = Date.now();
+  const beat = (status) => fsm.writeFileSync(pth.join(dir, 'worker-cloud.json'), JSON.stringify({ status, lastHeartbeat: new Date(now).toISOString() }));
+  for (const status of ['idle', 'working', 'queued']) { beat(status); assert.equal(R.laneAliveFromHeartbeat(dir, 'worker-cloud', now), true, status); }
+  beat('disabled');
+  assert.equal(R.laneAliveFromHeartbeat(dir, 'worker-cloud', now), false);
+  assert.equal(R.laneIdleFromHeartbeat(dir, 'worker-cloud', now), false, 'a disabled lane is not idle either, so nothing is reserved for it');
+});
