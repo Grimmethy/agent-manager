@@ -163,6 +163,7 @@ finding from here before re-deriving it from scratch.
 | Hand-resolving a needs-clarification task without bypassing the pipeline's review/apply gates | `docs/agents/manual-nc-resolution.md` |
 | Reviewing an unmerged branch (hub membership, sibling sub-tasks) | `docs/agents/unmerged-branch-review.md` |
 | Enabling and operating the cloud lane (Claude Haiku through the cloud-providers gateway: billing, spend cap, what it skips) | `docs/agents/cloud-lane.md` |
+| Designing a scheduled / employee-style agent, a daily list, or a held-outbound rule (and which repo owns each pattern) | `docs/agents/business-agent-patterns.md` |
 
 ## Known gaps
 
