@@ -515,7 +515,12 @@ function extractNewlyDeclaredIdentifiers(text) {
 // process.env.NAME / process.env['NAME'], os.environ['NAME'], os.environ.get('NAME', os.getenv('NAME', getenv('NAME',
 // and shell ${NAME:-x} / ${NAME-x} / ${NAME:=x} (default-value forms only -- a JS template ${NAME} referencing a constant
 // is not an env read and stays checked). Prose, context and removed lines never exempt anything.
-const ENV_READ_RE = /(?:process\.env\.|process\.env\[\s*['"`]|os\.environ\[\s*['"]|os\.environ\.get\(\s*['"]|(?:os\.)?getenv\(\s*['"])([A-Z][A-Z0-9]*_[A-Z0-9_]+)|\$\{([A-Z][A-Z0-9]*_[A-Z0-9_]+):?[-=]/g;
+// 2026-10-19 (brain-dump 1896's review, blocked on env.AGENT_MANAGER_TRANSIENT_RETRY): an identifier named `env` used as a property access also
+// counts -- `env.NAME`, `env['NAME']`, Python `env.get('NAME'` -- because this codebase's own idiom is an injected parameter,
+// `function f(url, env = process.env) { ... env.NAME ... }` (lanes.js isSlowEndpoint, capability-ledger.js, transient-retry.js). `\benv\.` still
+// matches process.env.NAME (a word boundary sits between '.' and 'e'); `myenv.NAME` does not match. A replay of all 41 historic ungrounded-field
+// blocks (2026-10-19) found none this widening would have exempted: it is about the live idiom, not past blocks.
+const ENV_READ_RE = /(?:\benv\.|\benv\[\s*['"`]|\benv\.get\(\s*['"]|os\.environ\[\s*['"]|os\.environ\.get\(\s*['"]|(?:os\.)?getenv\(\s*['"])([A-Z][A-Z0-9]*_[A-Z0-9_]+)|\$\{([A-Z][A-Z0-9]*_[A-Z0-9_]+):?[-=]/g;
 
 function extractEnvReadIdentifiers(text) {
   const out = new Set();
@@ -646,8 +651,12 @@ function stripUnchangedDiffLines(text) {
   return text.split('\n').map((line) => {
     if (DIFF_META_RE.test(line)) { inDiff = true; return ''; }
     if (!inDiff) return line; // prose (or a plain-text draft with no diff at all)
+    if (line === '') return ''; // a blank line inside a hunk is a context line whose trailing space was stripped (common in model-written diffs): not prose, and not the end of the block
+    if (line.startsWith(' ')) return ''; // context line -- pre-existing, never a new claim
+    if (line.startsWith('-')) return ''; // removed line -- pre-existing, never a new claim
     if (line.startsWith('+')) return line; // real addition -- a genuine new claim
-    return ''; // removed or unchanged context -- pre-existing, never a new claim
+    inDiff = false; // not a valid diff line (prose, bullet, indented text, etc.) -- exit diff block
+    return line;
   }).join('\n');
 }
 
@@ -766,15 +775,78 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
 // words ("com", "net", "org") can never read as "a path".
 const FILE_LINE_CITATION_RE = /(?<![A-Za-z0-9_.\-/:])[A-Za-z0-9_\-./]+\.(?:js|jsx|ts|tsx|mjs|cjs|py|json|md|csv|sh|yml|yaml|html|css|toml|txt|lock|cfg|ini|env|xml|sql)\b:[0-9]+/g;
 
-function checkFileLineCitations(draftText, sourceText) {
-  if (!sourceText) return { unconfirmedCitations: [] }; // no grounding material -> nothing to strip
+function checkFileLineCitations(draftText, sourceText, repoRoot = null, extraRoots = []) {
+  const warnings = [];
   const unconfirmedCitations = [];
-  for (const line of draftText.split('\n')) {
-    const tokens = (line.match(FILE_LINE_CITATION_RE) || []).filter((t) => !t.includes('://')); // skip URL host:port
-    if (tokens.length === 0) continue;
-    if (tokens.some((t) => !sourceText.includes(t))) unconfirmedCitations.push(line);
+  // No grounding material -> nothing to strip, but the symbol-presence warning below reads the REPO (not sourceText), and local-draft's pre-filter calls
+  // checkDraft WITHOUT a sourceText: returning here used to switch the whole HUB0136 warning off on the one path that persists it.
+  if (sourceText) {
+    for (const line of draftText.split('\n')) {
+      const tokens = (line.match(FILE_LINE_CITATION_RE) || []).filter((t) => !t.includes('://')); // skip URL host:port
+      if (tokens.length === 0) continue;
+      if (tokens.some((t) => !sourceText.includes(t))) unconfirmedCitations.push(line);
+    }
   }
-  return { unconfirmedCitations };
+
+  // Symbol-presence warning (HUB0136 1/3): a backtick-quoted identifier cited on the same
+  // line as a file:line citation should actually exist in the cited file's content -- a
+  // draft that cites "src/foo.js:42" and names `barBaz` as living there is making a
+  // checkable claim the file-existence check above can't see (the file IS real, only the
+  // named symbol is not in it). A miss pushes a WARNING-ONLY entry (severity: 'warning')
+  // -- it never strips a line, throws, or flips any pass/fail status, by design.
+  // Fail-open, same convention as preValidateCitedPaths: no repoRoot, an unresolvable
+  // path, an unreadable file, or an identifier not sitting on a citation line all mean
+  // "could not check", which produces NO warning (a warning that fires on environment
+  // hiccups would be noise).
+  if (repoRoot) {
+    // Lazy require (NOT a top-level import): task-anchor-files.js requires
+    // ./fact-checker.js at its own top level (resolveAgainstRepoDetailed), so a top-level
+    // require here would be a circular load. Same in-function require convention
+    // existsLiterallyInRepo uses for ./stacked-grounding.js above.
+    let backtickIdentifiers;
+    try {
+      ({ backtickIdentifiers } = require('./task-anchor-files.js'));
+    } catch {
+      backtickIdentifiers = null; // could not load the helper -> fail-open, no warnings
+    }
+    if (typeof backtickIdentifiers === 'function') {
+      const citedPaths = [...new Set(
+        (draftText.match(FILE_LINE_CITATION_RE) || [])
+          .filter((t) => !t.includes('://'))
+          .map((t) => t.slice(0, t.lastIndexOf(':'))),
+      )];
+      const fileContents = new Map();
+      for (const claimedPath of citedPaths) {
+        try {
+          const { resolvedPath } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
+          if (resolvedPath) fileContents.set(claimedPath, fs.readFileSync(resolvedPath, 'utf8'));
+        } catch { /* unreadable/unresolvable -> fail-open, no warning */ }
+      }
+      const lines = draftText.split('\n');
+      for (const identifier of backtickIdentifiers(draftText)) {
+        // File-path identifiers are not symbols: they carry a separator, end in a real
+        // file extension, or ARE one of the draft's own cited paths.
+        if (identifier.includes('/') || identifier.includes('\\')) continue;
+        if (/\.(?:js|jsx|ts|tsx|mjs|cjs|py|json|md|csv|sh|yml|yaml|html|css|toml|txt|lock|cfg|ini|env|xml|sql)$/.test(identifier)) continue;
+        if (citedPaths.includes(identifier)) continue;
+        // The cited file = the file:line citation on the SAME line as the identifier
+        // (an identifier far from any citation has no cited file to check against).
+        let citedFile = null;
+        for (const line of lines) {
+          if (!line.includes('`' + identifier)) continue;
+          const token = (line.match(FILE_LINE_CITATION_RE) || []).find((t) => !t.includes('://'));
+          if (token) { citedFile = token.slice(0, token.lastIndexOf(':')); break; }
+        }
+        if (citedFile === null || !fileContents.has(citedFile)) continue;
+        const fileContent = fileContents.get(citedFile);
+        if (!fileContent.includes(identifier)) {
+          warnings.push({ type: 'symbol-not-found-in-cited-file', identifier, citedFile, severity: 'warning' });
+        }
+      }
+    }
+  }
+
+  return { unconfirmedCitations, warnings };
 }
 
 // Pre-fact-check gate for project_search / arch_import (2026-09-08 brain-dump request):
@@ -926,7 +998,7 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
   const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
   const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot, ref);
-  const { unconfirmedCitations } = checkFileLineCitations(draftText, sourceText);
+  const { unconfirmedCitations, warnings: symbolWarnings } = checkFileLineCitations(draftText, sourceText, repoRoot, extraRoots);
   let cleanedText = draftText;
   let strippedFileLineCitations = [];
   if (unconfirmedCitations.length > 0) {
@@ -989,7 +1061,7 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
   flags.push(...groundedFlags);
   flags.push(...revertChecks);
 
-  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks, revertChecks, cleanedText, strippedFileLineCitations };
+  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks, revertChecks, cleanedText, strippedFileLineCitations, symbolWarnings };
 }
 
 // "Already done" claim check (2026-09-08, decomposed from adhoc-brain-dump-bd-1789456618325):

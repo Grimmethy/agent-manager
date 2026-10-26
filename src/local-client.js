@@ -321,6 +321,21 @@ async function callOnce({ prompt, images, think = true, temperature = 0.4, numCt
   const datedPrompt = `${currentDateLine()}\n\n${effectivePrompt}`;
   const promptTokens = estimateTokens(datedPrompt);
 
+  // 2026-10-24 (rx580, change_review): the plan budget for a >10000-char diff is 6000-8000 tokens from the FIRST call; at ~16 tok/s that is
+  // ~375 s against the 300 s ceiling, so it timed out every time the model used it (one task ran 8 cycles, ~2 h). The retry clamp below only
+  // limits ESCALATED budgets, so cap the one actually sent. Skipped when the caller or operator chose the timeout on purpose, and when no
+  // rate has been recorded for this endpoint+model (DEFAULT_TPS is a guess for a cold machine).
+  if (!timeoutMs && !ENV_TIMEOUT_MS_OVERRIDE) {
+    const recordedTps = localThroughput.getTokensPerSecond(resolveInstancesDir(), OLLAMA_URL, model || MODEL);
+    if (recordedTps !== localThroughput.DEFAULT_TPS) {
+      const capped = capNumPredictToFit({ numPredict, promptTokens, tokensPerSecond: recordedTps, ceilingMs: perCallCeilingMs() });
+      if (capped !== numPredict) {
+        console.warn(`[local-client] num_predict capped to fit the per-call ceiling | requested=${numPredict} sent=${capped} rate=${Math.round(recordedTps * 10) / 10}tok/s promptTokens=${promptTokens} source=${source || 'none'}`);
+        numPredict = capped;
+      }
+    }
+  }
+
   const resolvedNumCtx = numCtx || gpuCapacity.resolveNumCtx({ estimatedTokens: promptTokens, numPredict });
 
   const options = { num_ctx: resolvedNumCtx, num_predict: numPredict, temperature };
@@ -521,6 +536,15 @@ function maxNumPredictThatFits({ promptTokens = 0, tokensPerSecond, ceilingMs })
 // Equal to maxRetries + 1, i.e. exactly the attempts a call that never gets any response has always made.
 function hardFailureAllowance(maxRetries) {
   return maxRetries + 1;
+}
+
+// A numPredict the call can actually finish inside the per-call ceiling at a recorded rate: unchanged when it already fits, and unchanged when
+// the fit would drop below this floor (a prompt whose prefill alone spends most of the budget -- a uselessly short output is worse than a long wait).
+const MIN_CAPPED_NUM_PREDICT = 1024;
+function capNumPredictToFit({ numPredict, promptTokens = 0, tokensPerSecond, ceilingMs }) {
+  const fit = maxNumPredictThatFits({ promptTokens, tokensPerSecond, ceilingMs });
+  if (numPredict <= fit || fit < MIN_CAPPED_NUM_PREDICT) return numPredict;
+  return fit;
 }
 
 async function call(opts, maxRetries = 2) {
@@ -736,7 +760,7 @@ async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperat
   };
 }
 
-module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, maxNumPredictThatFits, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
+module.exports = { call, callOnce, hardFailureAllowance, majorityVote, detectDegenerate, logDegenerateAudit, logHardFailureAudit, KEEP_ALIVE, maxNumPredictThatFits, capNumPredictToFit, PER_CALL_TIMEOUT_CEILING_MS, P40_PER_CALL_TIMEOUT_CEILING_MS, IS_P40_ENDPOINT, IS_SLOW_ENDPOINT, postGenerate, isThinkUnsupportedError, THINK_UNSUPPORTED, resolveRequestTimeoutMs, computeLoadContext, CPU_CONTENTION_LOAD_RATIO_THRESHOLD };
 
 // CLI: node local-client.js <request.json>
 // request.json: { prompt, think, temperature, numCtx, numPredict, repeatPenalty, maxRetries,

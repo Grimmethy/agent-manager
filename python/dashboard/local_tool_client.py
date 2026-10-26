@@ -32,11 +32,30 @@ LOCAL_TOOL_CLIENT_JS = SRC_DIR / "local-tool-client.js"
 SUBPROCESS_TIMEOUT_S = 6000
 
 
+def _lane_instances_dir() -> "str | None":
+    """The instances dir the worker lanes and reviewers use: the ACTIVE project's, which is what app.instances_dir() resolves (the env FILE wins
+    over os.environ there, because os.environ goes stale after a reload -- see app._active_project_setting). Lazy import, same as chat_preempt.py,
+    because app imports this module. None when it cannot be resolved."""
+    try:
+        from app import instances_dir
+        d = instances_dir()
+        return str(d) if d else None
+    except Exception:  # noqa: BLE001 -- best-effort: an unresolved dir just leaves the env as it was
+        return None
+
+
 def _child_env(card_env: dict = None) -> dict:
     """The node child's env. A Chat turn that was given a GPU card (chat_card.py) passes that card's endpoint/model/pins in `card_env`; they
     override the inherited ones, and AGENT_MANAGER_CHAT_CARD_GUARD=1 makes the child refuse to start a turn on a card the Forge leased
-    after the card was chosen (src/local-tool-client.js). Without a card the env is exactly what it was."""
+    after the card was chosen (src/local-tool-client.js). Without a card the env is exactly what it was, plus AGENT_MANAGER_INSTANCES_DIR pinned
+    to the lanes' dir (unless already set): the dashboard runs with core's AGENT_MANAGER_PIPELINE_DIR while the lanes run with the active
+    project's, so without the pin the chat's 'interactive' GPU ticket and a worker's 'draft' ticket land in different dirs and never contend
+    (2026-10-25: a chat turn waited ~12 minutes behind worker-3090 and its preempt could not see the worker)."""
     env = {**os.environ, "AGENT_MANAGER_PRIORITY_HOLDER": "1"}  # user-interactive: never yield the GPU to a worker lane
+    if not env.get("AGENT_MANAGER_INSTANCES_DIR"):
+        lane_dir = _lane_instances_dir()
+        if lane_dir:
+            env["AGENT_MANAGER_INSTANCES_DIR"] = lane_dir
     if card_env:
         env.update({k: str(v) for k, v in card_env.items()})
         env["AGENT_MANAGER_CHAT_CARD_GUARD"] = "1"

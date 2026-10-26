@@ -41,13 +41,13 @@ test('each entry matches exactly its own failure class', () => {
   assert.equal(byId['revision-commentary-replaced-draft'].applies(stuck('c', { priorRejectionFeedback: ['some unrelated rejection'] })), false);
 });
 
-test('first sight of an entry: a task that failed BEFORE it is requeued to pending/ with its coordination fields kept and a history event', () => {
+test('first sight of an entry: a task that failed BEFORE it is requeued to pending/ with its coordination fields kept and a history event', async () => {
   const dir = pipeline();
   put(dir, 'needs-clarification', stuck('function-length-fix-ac-3', {
     needsClarification: { reason: 'design-decision' }, history: [at('2026-09-20T05:00:00Z'), { stage: 'exhausted', at: '2026-09-20T05:39:46Z' }],
     stacked: { branch: 'agent/x', seq: 2, total: 3 }, dependsOn: ['p1'], atomic: true, premiumPriority: true, planResponse: 'stale', implementResponse: 'stale', blockedReason: 'stale',
   }));
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW });
   assert.deepEqual(s.requeued, [{ id: 'function-length-fix-ac-3', entry: 'wrong-block-whole-function-snippet', from: 'needs-clarification' }]);
   assert.equal(has(dir, 'needs-clarification', 'function-length-fix-ac-3'), false);
   const fresh = read(dir, 'pending', 'function-length-fix-ac-3');
@@ -65,32 +65,32 @@ test('first sight of an entry: a task that failed BEFORE it is requeued to pendi
   assert.ok(fresh.history.some((h) => h.stage === 'exhausted'), 'the log is appended to, never replaced');
 });
 
-test('a task that failed AFTER the sweep first saw the entry is NOT requeued (the fix did not cure it), and a requeued task is never requeued twice', () => {
+test('a task that failed AFTER the sweep first saw the entry is NOT requeued (the fix did not cure it), and a requeued task is never requeued twice', async () => {
   const dir = pipeline();
   put(dir, 'blocked', stuck('early', { history: [at('2026-09-20T05:00:00Z')] }));
-  assert.equal(sweepKnownFixedFailures({ pipelineDir: dir, now: NOW }).requeued.length, 1, 'first run stamps firstSeen = NOW and drains the earlier failure');
+  assert.equal((await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW })).requeued.length, 1, 'first run stamps firstSeen = NOW and drains the earlier failure');
   put(dir, 'blocked', stuck('late', { history: [at('2026-09-20T09:00:00Z')] }));    // failed at 09:00, after firstSeen 07:00
-  const later = sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-09-20T10:00:00Z') });
+  const later = await sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-09-20T10:00:00Z') });
   assert.deepEqual(later.requeued, []);
   assert.equal(has(dir, 'blocked', 'late'), true);
   // and one that was already requeued for this fix and failed again before firstSeen is still skipped
   put(dir, 'blocked', stuck('again', { history: [at('2026-09-20T05:00:00Z')], requeuedForFixes: ['wrong-block-whole-function-snippet'] }));
-  assert.deepEqual(sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-09-20T11:00:00Z') }).requeued, []);
+  assert.deepEqual((await sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-09-20T11:00:00Z') })).requeued, []);
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'queue', STATE_FILE), 'utf8')).firstSeen['wrong-block-whole-function-snippet'], NOW.toISOString());
 });
 
-test('adhoc-shaped tasks go back to the lane that claims them; derived tasks to derived/', () => {
+test('adhoc-shaped tasks go back to the lane that claims them; derived tasks to derived/', async () => {
   const dir = pipeline();
   put(dir, 'blocked', stuck('adhoc-x', { domain: 'adhoc', source: 'manual' }));
   put(dir, 'blocked', stuck('derived-x', { domain: 'adhoc', source: 'derived_task' }));
   put(dir, 'blocked', stuck('plain-x'));
-  sweepKnownFixedFailures({ pipelineDir: dir, now: NOW });
+  await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW });
   assert.equal(has(dir, 'adhoc', 'adhoc-x'), true);
   assert.equal(has(dir, 'derived', 'derived-x'), true);
   assert.equal(has(dir, 'pending', 'plain-x'), true);
 });
 
-test('never requeued: an applied task (real branch), a genuine design question, a reviewInconclusive flake, a non-matching task, or one with a pending copy', () => {
+test('never requeued: an applied task (real branch), a genuine design question, a reviewInconclusive flake, a non-matching task, or one with a pending copy', async () => {
   const dir = pipeline();
   put(dir, 'blocked', stuck('applied-one', { history: [at('2026-09-20T05:00:00Z'), { stage: 'applied', at: '2026-09-20T04:00:00Z', detail: 'agent/x' }] }));
   put(dir, 'needs-clarification', stuck('real-question', { needsClarification: { reason: 'design-decision' }, history: [at('2026-09-20T05:00:00Z')] })); // no 'exhausted'
@@ -98,22 +98,22 @@ test('never requeued: an applied task (real branch), a genuine design question, 
   put(dir, 'blocked', stuck('unrelated', { priorRejectionFeedback: ['something else entirely'] }));
   put(dir, 'blocked', stuck('dupe'));
   put(dir, 'pending', { id: 'dupe', status: 'pending' });
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW });
   assert.deepEqual(s.requeued, []);
   for (const id of ['applied-one', 'flake', 'unrelated', 'dupe']) assert.equal(has(dir, 'blocked', id), true, id);
   assert.equal(has(dir, 'needs-clarification', 'real-question'), true);
 });
 
-test('dry run and the kill switch move nothing', () => {
+test('dry run and the kill switch move nothing', async () => {
   const dir = pipeline();
   put(dir, 'blocked', stuck('t'));
-  const dry = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, dryRun: true });
+  const dry = await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, dryRun: true });
   assert.equal(dry.requeued.length, 1);
   assert.equal(has(dir, 'blocked', 't'), true);
   assert.equal(fs.existsSync(path.join(dir, 'queue', STATE_FILE)), false, 'a dry run does not even record firstSeen');
   process.env.AGENT_MANAGER_FIX_SIGNATURE_SWEEP = 'false';
   try {
-    assert.deepEqual(sweepKnownFixedFailures({ pipelineDir: dir, now: NOW }).requeued, []);
+    assert.deepEqual((await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW })).requeued, []);
   } finally { delete process.env.AGENT_MANAGER_FIX_SIGNATURE_SWEEP; }
   assert.equal(has(dir, 'blocked', 't'), true);
 });
@@ -144,24 +144,24 @@ test('draft-sandbox-stdout-line matches the sandbox-polluted failure and NOT a g
   assert.equal(e.applies(exhaustedNc('d', '[draft-sandbox] copied node_modules (196 MB)')), false, 'the sandbox line alone (no failed-draft text) is not enough');
 });
 
-test('draft-sandbox-stdout-line drains a retry-exhausted needs-clarification task back to derived/, keeping a real design question in place', () => {
+test('draft-sandbox-stdout-line drains a retry-exhausted needs-clarification task back to derived/, keeping a real design question in place', async () => {
   const dir = pipeline();
   put(dir, 'needs-clarification', exhaustedNc('victim', SANDBOX_FAIL));
   put(dir, 'needs-clarification', { ...exhaustedNc('real-question', SANDBOX_FAIL), history: [at('2026-09-20T05:00:00Z')] }); // never exhausted: a human's call
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['draft-sandbox-stdout-line']] });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['draft-sandbox-stdout-line']] });
   assert.deepEqual(s.requeued.map((r) => r.id), ['victim']);
   assert.equal(has(dir, 'derived', 'victim'), true);
   assert.deepEqual(read(dir, 'derived', 'victim').requeuedForFixes, ['draft-sandbox-stdout-line']);
   assert.equal(has(dir, 'needs-clarification', 'real-question'), true);
 });
 
-test('a stale origin copy in derived/ does not block draining a derived task; a same-name file in pending/ still does', () => {
+test('a stale origin copy in derived/ does not block draining a derived task; a same-name file in pending/ still does', async () => {
   const dir = pipeline();
   put(dir, 'needs-clarification', exhaustedNc('victim', SANDBOX_FAIL));
   put(dir, 'derived', { id: 'victim', source: 'derived_task', history: [{ stage: 'created', at: '2026-09-19T00:00:00Z' }] }); // the leftover origin record
   put(dir, 'needs-clarification', { ...exhaustedNc('has-pending', SANDBOX_FAIL), domain: 'default', source: 'trouble_log' }); // a normal task: its destination is pending/
   put(dir, 'pending', { id: 'has-pending', status: 'pending' });
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['draft-sandbox-stdout-line']] });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['draft-sandbox-stdout-line']] });
   assert.deepEqual(s.requeued.map((r) => r.id), ['victim']);
   const fresh = read(dir, 'derived', 'victim');
   assert.ok(fresh.history.some((h) => h.stage === 'exhausted'), 'the stale copy was replaced by the fuller stuck record (its history is kept)');
@@ -179,10 +179,10 @@ test('implement-degenerate-invisible-block matches a blocked task with the degen
   assert.equal(e.applies(t({ blockedReason: 'draft call failed 3 times' })), false);
 });
 
-test('implement-degenerate-invisible-block drains the stuck task back to pending/', () => {
+test('implement-degenerate-invisible-block drains the stuck task back to pending/', async () => {
   const dir = pipeline();
   put(dir, 'blocked', stuck('victim', { domain: 'default', source: 'function_length_fix', status: 'pending', blockedReason: 'Implement pass degenerate: empty', history: [{ stage: 'blocked', at: '2026-09-20T05:00:00Z' }] }));
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['implement-degenerate-invisible-block']] });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['implement-degenerate-invisible-block']] });
   assert.deepEqual(s.requeued.map((r) => r.id), ['victim']);
   assert.equal(has(dir, 'pending', 'victim'), true);
 });
@@ -203,24 +203,24 @@ test('docs-only-gate-negated-paths matches a documentation task whose text only 
   assert.equal(e.applies(stuck('other', { domain: 'adhoc', source: 'manual', promptContext: { rawText: 'Append to AGENTS.md.' }, needsClarification: { reason: 'design-decision', openQuestions: 'The draft cites a file that does not exist.' } })), false, 'a different failure');
 });
 
-test('docs-only-gate-negated-paths drains the retry-exhausted documentation task and leaves the real-code one', () => {
+test('docs-only-gate-negated-paths drains the retry-exhausted documentation task and leaves the real-code one', async () => {
   const dir = pipeline();
   put(dir, 'needs-clarification', docsTask('doc', 'Append a new section to AGENTS.md. Do NOT modify any file under src/.'));
   put(dir, 'needs-clarification', docsTask('code', 'Append a note to AGENTS.md and change the timeout in src/foo.js.'));
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['docs-only-gate-negated-paths']] });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['docs-only-gate-negated-paths']] });
   assert.deepEqual(s.requeued.map((r) => r.id), ['doc']);
   assert.equal(has(dir, 'adhoc', 'doc'), true);
   assert.equal(has(dir, 'needs-clarification', 'code'), true);
 });
 
-test('docs-only-gate-negated-paths also drains the two real GPU broker verification tasks (read-only documentation deliverable) and leaves a real code task', () => {
+test('docs-only-gate-negated-paths also drains the two real GPU broker verification tasks (read-only documentation deliverable) and leaves a real code task', async () => {
   const dir = pipeline();
   const PF = "Context: Docs/gpu-broker-extraction-map.md (merged, PR #561) maps pulling the Forge/pipeline GPU lease out of PromptForge into a standalone gpu-broker plugin (docs/agents/repo-extraction-playbook.md). Owner rule 2026-10-13: the pipeline's Ollama model and the Forge family never hold the GPU together. Premium, owner request 2026-10-15; this is one of three small read-only verification tasks replacing a single task that was too big. PromptForge: verify the map against /media/model-cache/github/promptforge-manual (server/core/gpu_session.py, comfy.py, comfy_proc.py, server/app.py routes /api/gpu/*, Docs/GPU_FAMILY_PROTOCOL.md, tests/test_gpu_session.py). Questions: where is the 120 s ComfyUI wait and how does an automatic job session call begin; which functions in gpu_session.py are broker logic vs PromptForge-specific; which tests would move with G1; per-device awareness (is anything GPU-index specific). RULES: read-only on the code; write ONLY the one findings file named below (a NEW file, nothing else changed). For every row/claim of the map that touches your area, state CONFIRMED / WRONG / UNCONFIRMED with path:line evidence, quote the corrected text for anything WRONG, and answer the section-5 open questions that fall in your area. Keep it under 120 lines. FILE TO WRITE: Docs/gpu-broker-verification-promptforge.md (in the agent-manager repo).";
   const CORE = "Create the NEW file Docs/gpu-broker-verification-core.md (\u2264120 lines, nothing else touched) verifying Docs/gpu-broker-extraction-map.md section 1/5 against core code. Use this evidence: launch.sh:31-42 lease-delete+yield CONFIRMED; comfyui_lease_held agent-manager-common.sh:98, local-worker.sh:525, review-runner.sh:91 CONFIRMED; gpu-guard.js 54/77/101 CONFIRMED; local-client.js:266 (map says 264 \u2014 quote corrected); stop route pipeline_1_more.py:68 \u2192 app.py _stop_pipeline \u2192 stop.sh --keep-dashboard --keep-plugins, stop.sh:125 skips plugin-*.pid, so G5's 'stop kills plugins today' is WRONG/stale (fixed 2026-10-14, see test_stop_pipeline_keeps_plugins.py); /free reclaim gpu-guard.js:214-217 self-contained, no broker needed; .model-locks writer model-inflight-lock.js:37 + reader chat_preempt.py:164-168,265,394; /api/gpu callers only launch.sh:42, gpu-guard.js:105; pause/resume needs drain status endpoint (.model-locks/gpu-arbiter) + Ollama eviction (KEEP_ALIVE 30m) + resume via app.py:2760. Re-verify each line number with grep before writing, tag every row CONFIRMED/WRONG/UNCONFIRMED with path:line, answer the four section-5 questions, then run `wc -l` (\u2264120) and `git status` (only this new file).";
   put(dir, 'needs-clarification', docsTask('verify-pf', PF));
   put(dir, 'needs-clarification', docsTask('verify-core', CORE));
   put(dir, 'needs-clarification', docsTask('code', 'Create docs/x.md and change the timeout in src/foo.js.'));
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['docs-only-gate-negated-paths']] });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['docs-only-gate-negated-paths']] });
   assert.deepEqual(s.requeued.map((r) => r.id).sort(), ['verify-core', 'verify-pf']);
   assert.equal(has(dir, 'needs-clarification', 'code'), true);
 });
@@ -249,7 +249,7 @@ test('docs-only-gate-read-only-deliverable applies to both real verification tas
   assert.equal(e.applies(verifyTask('code', 'Create docs/x.md and change the timeout in src/foo.js.', '2026-10-16T00:00:00Z')), false);
 });
 
-test('live state: with the old docs-only entry already first-seen in September, the NEW entry requeues the two real tasks and the old entry alone requeues nothing', () => {
+test('live state: with the old docs-only entry already first-seen in September, the NEW entry requeues the two real tasks and the old entry alone requeues nothing', async () => {
   const build = () => {
     const dir = pipeline();
     seedState(dir, { 'docs-only-gate-negated-paths': OLD_DOCS_ENTRY_FIRST_SEEN });
@@ -259,7 +259,7 @@ test('live state: with the old docs-only entry already first-seen in September, 
     return dir;
   };
   const dir = build();
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: SWEEP_NOW });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: SWEEP_NOW });
   assert.deepEqual(s.requeued.map((r) => `${r.id}<-${r.entry}`).sort(), [`verify-core<-${NEW_ENTRY}`, `verify-pf<-${NEW_ENTRY}`]);
   assert.equal(has(dir, 'adhoc', 'verify-pf'), true);
   assert.equal(has(dir, 'adhoc', 'verify-core'), true);
@@ -267,19 +267,19 @@ test('live state: with the old docs-only entry already first-seen in September, 
   assert.equal(readState(dir).firstSeen[NEW_ENTRY], SWEEP_NOW.toISOString());
   assert.ok(read(dir, 'adhoc', 'verify-pf').requeuedForFixes.includes(NEW_ENTRY));
   const old = build();
-  const sOld = sweepKnownFixedFailures({ pipelineDir: old, now: SWEEP_NOW, entries: [byId['docs-only-gate-negated-paths']] });
+  const sOld = await sweepKnownFixedFailures({ pipelineDir: old, now: SWEEP_NOW, entries: [byId['docs-only-gate-negated-paths']] });
   assert.deepEqual(sOld.requeued, [], 'this is what the owner saw: the old entry skips both as failed-after-the-fix');
   assert.equal(has(old, 'needs-clarification', 'verify-pf'), true);
 });
 
-test('once only: a task stuck after the new entry was first seen is left alone, and a requeued task is not requeued again for the same entry', () => {
+test('once only: a task stuck after the new entry was first seen is left alone, and a requeued task is not requeued again for the same entry', async () => {
   const dir = pipeline();
   seedState(dir, { 'docs-only-gate-negated-paths': OLD_DOCS_ENTRY_FIRST_SEEN, [NEW_ENTRY]: SWEEP_NOW.toISOString() });
   put(dir, 'needs-clarification', verifyTask('late', READONLY_PF_TEXT, '2026-10-16T02:00:00Z'));
   const again = verifyTask('again', READONLY_CORE_TEXT, '2026-10-16T00:30:00Z');
   again.requeuedForFixes = [NEW_ENTRY];
   put(dir, 'needs-clarification', again);
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T03:00:00Z') });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T03:00:00Z') });
   assert.deepEqual(s.requeued, []);
   assert.equal(has(dir, 'needs-clarification', 'late'), true, 'failed after the entry went live');
   assert.equal(has(dir, 'needs-clarification', 'again'), true, 'already requeued for this entry once');
@@ -396,14 +396,14 @@ test('context-only-file-falsely-parked matches a task whose ONLY none-anchored f
   assert.equal(e.applies(differentReason), false, 'not an unreliable-grounding escalation at all');
 });
 
-test('context-only-file-falsely-parked drains the victim to pending/', () => {
+test('context-only-file-falsely-parked drains the victim to pending/', async () => {
   const dir = pipeline();
   put(dir, 'needs-clarification', stuck('ac-44', {
     history: [{ stage: 'blocked', at: '2026-09-20T05:00:00Z' }, { stage: 'needs-clarification', at: '2026-09-20T05:00:01Z' }],
     promptContext: { fetchedFiles: [{ path: 'src/local-draft.js', anchorConfidence: 'strong' }, { path: 'src/gpu-guard.js', anchorConfidence: 'none', context: true }] },
     needsClarification: { reason: 'unreliable-grounding', openQuestions: "The grounding-fetch could not find a reliable anchor for this candidate's cited code in src/gpu-guard.js." },
   }));
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['context-only-file-falsely-parked']] });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW, entries: [byId['context-only-file-falsely-parked']] });
   assert.deepEqual(s.requeued.map((r) => r.id), ['ac-44']);
   assert.equal(has(dir, 'pending', 'ac-44'), true);
   assert.equal(has(dir, 'needs-clarification', 'ac-44'), false);
@@ -452,12 +452,12 @@ test('implement-pass-sibling-repos-readable is wired to the real read-only root 
   assert.equal(out, 'true,false');
 });
 
-test('live state: with every older entry already first-seen, the NEW entry requeues the stuck VideoForge task once and the requeued record drops the false retire flag', () => {
+test('live state: with every older entry already first-seen, the NEW entry requeues the stuck VideoForge task once and the requeued record drops the false retire flag', async () => {
   const dir = pipeline();
   fs.writeFileSync(path.join(dir, 'queue', STATE_FILE), JSON.stringify(LIVE_FIRST_SEEN()));
   put(dir, 'needs-clarification', vfTask('adhoc-vf', { stalenessFlag: { reason: 'duplicate-of', disposition: 'retire', confidence: 'medium' } }));
   const now = new Date('2026-10-16T09:00:00Z');
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now, entries: withRoots(VF_ROOTS) });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now, entries: withRoots(VF_ROOTS) });
   assert.deepEqual(s.requeued, [{ id: 'adhoc-vf', entry: SIBLING_ENTRY, from: 'needs-clarification' }]);
   assert.deepEqual(s.newEntries, [SIBLING_ENTRY]);
   const fresh = read(dir, 'adhoc', 'adhoc-vf');
@@ -466,16 +466,16 @@ test('live state: with every older entry already first-seen, the NEW entry reque
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'queue', STATE_FILE), 'utf8')).firstSeen[SIBLING_ENTRY], now.toISOString());
   // once only: nothing more on a second pass, and a task that got stuck AFTER the new first sighting stays put
   put(dir, 'needs-clarification', vfTask('adhoc-vf-late', { history: [at('2026-10-16T10:00:00Z'), { stage: 'exhausted', at: '2026-10-16T10:00:00Z' }] }));
-  const again = sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T11:00:00Z'), entries: withRoots(VF_ROOTS) });
+  const again = await sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T11:00:00Z'), entries: withRoots(VF_ROOTS) });
   assert.deepEqual(again.requeued, []);
   assert.equal(has(dir, 'needs-clarification', 'adhoc-vf-late'), true);
 });
 
-test('mutation check: without the new entry the same live state requeues nothing (the failure the owner saw)', () => {
+test('mutation check: without the new entry the same live state requeues nothing (the failure the owner saw)', async () => {
   const dir = pipeline();
   fs.writeFileSync(path.join(dir, 'queue', STATE_FILE), JSON.stringify(LIVE_FIRST_SEEN()));
   put(dir, 'needs-clarification', vfTask('adhoc-vf'));
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T09:00:00Z'), entries: KNOWN_FIXED.filter((e) => e.id !== SIBLING_ENTRY) });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T09:00:00Z'), entries: KNOWN_FIXED.filter((e) => e.id !== SIBLING_ENTRY) });
   assert.deepEqual(s.requeued, []);
   assert.equal(has(dir, 'needs-clarification', 'adhoc-vf'), true);
 });
@@ -506,36 +506,55 @@ test('read-only design / findings tasks (initiative record, tuning-loops catalog
   assert.equal(byId[DG_ENTRY].applies(dgTask('code', 'Create docs/x.md and change the timeout in src/foo.js.', 'code task', IR_OPEN_QUESTIONS)), false);
 });
 
-test('live state: with the older docs-only entries already first-seen, the sweep requeues both stuck design / findings tasks once and keeps their premium priority', () => {
+test('live state: with the older docs-only entries already first-seen, the sweep requeues both stuck design / findings tasks once and keeps their premium priority', async () => {
   const dir = pipeline();
   // every other entry already first-seen (so only the two docs-only ids could requeue), the two docs-only ids at their real first-seen times
   const others = Object.fromEntries(KNOWN_FIXED.filter((e) => !['docs-only-gate-negated-paths', DG_ENTRY].includes(e.id)).map((e) => [e.id, '2026-10-16T03:18:45.000Z']));
   fs.writeFileSync(path.join(dir, 'queue', STATE_FILE), JSON.stringify({ firstSeen: { ...others, ...dgLiveState().firstSeen } }));
   for (const t of dgPair()) put(dir, 'needs-clarification', t);
-  const s = sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T12:00:00Z') });
+  const s = await sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T12:00:00Z') });
   assert.deepEqual(s.requeued.map((r) => [r.id, r.entry]).sort(), [['adhoc-initiative-record', DG_ENTRY], ['adhoc-tuning-loops', DG_ENTRY]]);
   for (const id of ['adhoc-initiative-record', 'adhoc-tuning-loops']) {
     assert.equal(has(dir, 'needs-clarification', id), false, id);
     assert.deepEqual(read(dir, 'adhoc', id).requeuedForFixes, [DG_ENTRY], id);
     assert.equal(read(dir, 'adhoc', id).premiumPriority, true, 'premium priority is kept');
   }
-  assert.deepEqual(sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T13:00:00Z') }).requeued, [], 'once only');
+  assert.deepEqual((await sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T13:00:00Z') })).requeued, [], 'once only');
 });
 
-test('a read-only design / findings task that got stuck AFTER the entry went live is left for a human', () => {
+test('a read-only design / findings task that got stuck AFTER the entry went live is left for a human', async () => {
   const dir = pipeline();
   fs.writeFileSync(path.join(dir, 'queue', STATE_FILE), JSON.stringify(dgLiveState()));
   put(dir, 'needs-clarification', dgTask('late', IR_RAW_TEXT, IR_TITLE, IR_OPEN_QUESTIONS, { history: [at('2026-10-16T05:00:00Z'), { stage: 'exhausted', at: '2026-10-16T05:00:01Z' }] }));
-  assert.deepEqual(sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T12:00:00Z') }).requeued, []);
+  assert.deepEqual((await sweepKnownFixedFailures({ pipelineDir: dir, now: new Date('2026-10-16T12:00:00Z') })).requeued, []);
   assert.equal(has(dir, 'needs-clarification', 'late'), true);
 });
 
-test('first sight of an entry: prerequisiteHubs is among the coordination fields kept on the requeued task', () => {
+test('first sight of an entry: prerequisiteHubs is among the coordination fields kept on the requeued task', async () => {
   const dir = pipeline();
   put(dir, 'needs-clarification', stuck('function-length-fix-ac-4', {
     needsClarification: { reason: 'design-decision' }, history: [at('2026-09-20T05:00:00Z'), { stage: 'exhausted', at: '2026-09-20T05:39:46Z' }],
     prerequisiteHubs: ['HUB0006'], planResponse: 'stale',
   }));
-  sweepKnownFixedFailures({ pipelineDir: dir, now: NOW });
+  await sweepKnownFixedFailures({ pipelineDir: dir, now: NOW });
   assert.deepEqual(read(dir, 'pending', 'function-length-fix-ac-4').prerequisiteHubs, ['HUB0006']);
+});
+
+// AC-16: the sweep reads the queue dirs with fs.promises, so it returns a Promise. The CLI must await it: an un-awaited call would stringify a
+// Promise and print `{}` instead of the summary line the queue watcher logs.
+test('the CLI awaits the async sweep and prints its summary line', () => {
+  const { execFileSync } = require('child_process');
+  const dir = pipeline();
+  put(dir, 'blocked', stuck('cli-t'));
+  const out = execFileSync(process.execPath, [path.join(__dirname, 'fix-signature-sweep.js'), '--dry-run'], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      AGENT_MANAGER_REPO_ROOT: dir,
+      AGENT_MANAGER_PIPELINE_DIR: dir,
+      AGENT_MANAGER_DOMAINS_PATH: path.join(__dirname, '..', 'task-domains.json'),
+    },
+  });
+  assert.match(out, /^checked=\d+ requeued=1 \[cli-t<-wrong-block-whole-function-snippet\] skipped=0/);
+  assert.match(out, /\(dry run\)\s*$/);
 });

@@ -166,6 +166,30 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
       return { succeeded: true, doneMarker: `filed -> ${result.file}` };
     }
 
+    // brain_dump_disposition closes an originating brain-dump entry once its downstream
+    // work is resolved (HUB0119 · 3/4). Its target (brain-dump.json under brainDumpPath)
+    // is outside repoRoot, same non-git shape as brain_dump_sort above. Reads the entry
+    // id + evidence from task.decision (falling back to task.payload). A missing entryId
+    // is a safe no-op -- there is genuinely nothing to close, so {skipped:true, reason}
+    // rather than a failure. closeBrainDumpEntryResolved (apply-group-a-brain-dump.js)
+    // already stamps entry.status 'actioned' + resolvedNote/resolvedAt on success and
+    // returns {skipped:true, reason} for its own missing/unreadable-entry cases.
+    if (task.domain === 'brain_dump_disposition') {
+      const { entryId, evidenceText } = (task.decision || task.payload) || {};
+      if (!entryId) {
+        return { skipped: true, reason: 'brain_dump_disposition: missing entryId -- nothing to close' };
+      }
+      const result = closeBrainDumpEntryResolved({
+        brainDumpPath,
+        brainDumpEntryId: entryId,
+        note: evidenceText,
+      });
+      if (result && result.skipped) {
+        return { skipped: true, reason: result.reason };
+      }
+      return { succeeded: true, doneMarker: `closed brain-dump entry ${entryId}` };
+    }
+
     // project_search's target (UsefulProjectIndex/INDEX.md) lives OUTSIDE any project's
     // repo root by design (see ADR-0018) -- a non-git write, same shape as the secondbrain
     // path above, not the git-branch-diff flow below.

@@ -120,6 +120,42 @@ class ArbiterCancelBelowKeyTest(unittest.TestCase):
         self.assertNotIn("--local", cmd)
 
 
+class ArbiterBusyRowsTest(unittest.TestCase):
+    """A holder that survives the preempt is reported as a 'busy' row, so the chat can say the GPU was not freed."""
+
+    def _status(self, payload, returncode=0):
+        def fake_run(cmd, **kw):
+            self.cmd = cmd
+            return subprocess.CompletedProcess(cmd, returncode, stdout=json.dumps(payload), stderr="")
+        return mock.patch.object(chat_preempt.subprocess, "run", side_effect=fake_run)
+
+    def _rows(self, payload, summary=()):
+        with mock.patch.object(app, "read_env_file", return_value={}), self._status(payload):
+            return chat_preempt._arbiter_busy_rows(list(summary))
+
+    HOLDER = {"cls": "draft", "pid": 4242, "taskId": "t-w1", "phase": "orient", "model": "m", "startedAt": "x"}
+
+    def test_a_surviving_holder_becomes_a_busy_row(self):
+        rows = self._rows({"holder": self.HOLDER, "waiting": [], "reserved": []})
+        self.assertEqual(rows, [{"lane": "draft", "action": "busy", "taskId": "t-w1", "phase": "orient", "ageSeconds": None}])
+        self.assertIn("status", self.cmd)
+        self.assertIn("--local", self.cmd)
+
+    def test_a_holder_the_cancel_killed_is_not_reported(self):
+        rows = self._rows({"holder": self.HOLDER}, summary=[{"lane": "draft", "action": "killed", "taskId": "t-w1"}])
+        self.assertEqual(rows, [])
+
+    def test_no_holder_or_a_failing_status_call_adds_nothing(self):
+        self.assertEqual(self._rows({"holder": None, "waiting": [], "reserved": []}), [])
+        with mock.patch.object(app, "read_env_file", return_value={}), \
+                mock.patch.object(chat_preempt.subprocess, "run", side_effect=OSError("no node")):
+            self.assertEqual(chat_preempt._arbiter_busy_rows([]), [])
+        with mock.patch.object(app, "read_env_file", return_value={}), \
+                mock.patch.object(chat_preempt.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 1, stdout="not json", stderr="")):
+            self.assertEqual(chat_preempt._arbiter_busy_rows([]), [])
+
+
 class PreemptPipelineTest(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -136,6 +172,8 @@ class PreemptPipelineTest(unittest.TestCase):
             mock.patch.object(app, "instances_dir", return_value=self.inst),
             mock.patch.object(app, "queue_dir", return_value=self.queue),
             mock.patch.object(app, "read_env_file", return_value={}),
+            # Keep every case off the real arbiter status call; ArbiterBusyRowsTest and the busy-row cases below re-patch it.
+            mock.patch.object(chat_preempt, "_arbiter_busy_rows", return_value=[]),
         ]
         for p in self._patches:
             p.start()
@@ -194,6 +232,14 @@ class PreemptPipelineTest(unittest.TestCase):
             summary = app._preempt_pipeline_for_chat()
             m.assert_called_once_with("interactive")
             self.assertIn({"lane": "draft", "action": "killed", "taskId": "t-w1", "ageSeconds": None}, summary)
+
+    def test_a_surviving_holder_is_appended_after_the_arbiter_and_reviewer_rows(self):
+        busy = [{"lane": "draft", "action": "busy", "taskId": "t-w1", "phase": "orient", "ageSeconds": None}]
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[]), \
+                mock.patch.object(chat_preempt, "_arbiter_busy_rows", return_value=busy) as m:
+            summary = app._preempt_pipeline_for_chat()
+            m.assert_called_once()
+            self.assertEqual(summary[-1], busy[0])
 
     # Chat on a chosen card (chat_card.py): the preempt follows the card the reply runs on.
     HOST_CARD = {"lane": "worker-3090", "local": True, "lockKey": "ollama-localhost-11434", "blocked": False}

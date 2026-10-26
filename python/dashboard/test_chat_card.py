@@ -4,9 +4,11 @@ Every node/model call is mocked: nothing here reads the real lease or reaches an
 Run: .venv/bin/python -m unittest test_chat_card -v   (from python/dashboard)
 """
 import json
+import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -63,7 +65,43 @@ class ResolveChatCardTest(SafeCase):
                 self.assertFalse(chat_card.resolve_chat_card("")["blocked"])
 
 
+def _fake_app(instances_dir):
+    """A stand-in for the dashboard's `app` module: _lane_instances_dir imports instances_dir from it lazily."""
+    return types.SimpleNamespace(instances_dir=instances_dir)
+
+
 class ChildEnvTest(SafeCase):
+    def setUp(self):
+        super().setUp()
+        # Keep every case off the real `app` import and off a developer's own pin; individual cases re-patch these.
+        p = mock.patch.dict(sys.modules, {"app": _fake_app(lambda: None)})
+        p.start()
+        self.addCleanup(p.stop)
+        e = mock.patch.dict("os.environ")
+        e.start()
+        self.addCleanup(e.stop)
+        os.environ.pop("AGENT_MANAGER_INSTANCES_DIR", None)
+
+    def test_the_lanes_instances_dir_is_pinned_when_nothing_pins_it(self):
+        with mock.patch.dict(sys.modules, {"app": _fake_app(lambda: Path("/x/instances"))}):
+            env = local_tool_client._child_env(None)
+        self.assertEqual(env["AGENT_MANAGER_INSTANCES_DIR"], "/x/instances")
+
+    def test_an_existing_instances_dir_pin_wins(self):
+        os.environ["AGENT_MANAGER_INSTANCES_DIR"] = "/pinned/instances"
+        with mock.patch.dict(sys.modules, {"app": _fake_app(lambda: Path("/x/instances"))}):
+            env = local_tool_client._child_env(None)
+        self.assertEqual(env["AGENT_MANAGER_INSTANCES_DIR"], "/pinned/instances")
+
+    def test_an_unresolvable_instances_dir_leaves_the_env_unchanged(self):
+        def boom():
+            raise RuntimeError("no active project")
+        for resolver in (boom, lambda: None):
+            with mock.patch.dict(sys.modules, {"app": _fake_app(resolver)}):
+                env = local_tool_client._child_env(None)
+            self.assertNotIn("AGENT_MANAGER_INSTANCES_DIR", env)
+            self.assertEqual(env["AGENT_MANAGER_PRIORITY_HOLDER"], "1")
+
     def test_without_a_card_the_env_is_unchanged_apart_from_priority(self):
         env = local_tool_client._child_env(None)
         self.assertEqual(env["AGENT_MANAGER_PRIORITY_HOLDER"], "1")
