@@ -185,7 +185,10 @@ function stampBrainDumpSortExhausted(task, brainDumpPath) {
       entry.infraSortAttempts.push({ ts, endpoint, blockedReason, category: 'infra-error' });
       entry.infraSortAttemptCount = (entry.infraSortAttemptCount || 0) + 1;
       const capHit = entry.infraSortAttemptCount > MAX_INFRA_SORT_ATTEMPTS;
-      if (capHit) entry.infraSortExhausted = true;
+      // Explicit boolean so the field is well-defined even on the non-cap-hit path
+      // (an infra-skip leaves it false, not undefined -- consumers can rely on
+      // entry.infraSortExhausted === true as the sole eligibility gate either way).
+      entry.infraSortExhausted = capHit;
       const sortAttemptAfter = entry.sortAttempt || 0; // unchanged: before === after
       data.sortBudgetEvents.push({
         ts,
@@ -1071,7 +1074,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
+module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, stampBrainDumpSortExhausted, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
 
 if (require.main === module) {
   main();
