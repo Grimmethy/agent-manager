@@ -21,7 +21,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
-const { BRAIN_DUMP_DISPOSITION_RE } = require('../src/apply-adhoc-diff.js');
+const { BRAIN_DUMP_DISPOSITION_RE, queueSubTasks } = require('../src/apply-adhoc-diff.js');
 
 // src/apply-task.js calls config.ensureRegistered() at load time, which requires
 // AGENT_MANAGER_REPO_ROOT to be set (same convention src/apply-group-a.test.js and
@@ -56,6 +56,33 @@ test('BRAIN_DUMP_DISPOSITION_RE matches a brain-dump disposition title', () => {
   assert.ok(BRAIN_DUMP_DISPOSITION_RE.test(title), `expected match for: ${title}`);
   const m = BRAIN_DUMP_DISPOSITION_RE.exec(title);
   assert.equal(m[1], '1789585157691'); // group 1 is the digits, per apply-adhoc-diff.js's own exec use
+});
+
+test('BRAIN_DUMP_DISPOSITION_RE matches the wordings the hub was filed for and returns the entry id', () => {
+  for (const title of [
+    `Mark brain-dump entry ${ENTRY_ID} resolved with this evidence`,
+    `Record verification on brain dump ${ENTRY_ID}`,
+    `Close ${ENTRY_ID} as actioned`,
+    `Please dismiss the entry ${ENTRY_ID}`,
+  ]) {
+    const m = BRAIN_DUMP_DISPOSITION_RE.exec(title);
+    assert.ok(m, `expected match for: ${title}`);
+    assert.equal(m[1], '1789585157691');
+  }
+  // the verb may start a later line of a multi-line rawText, but only at a line start
+  assert.ok(BRAIN_DUMP_DISPOSITION_RE.test(`Context line.\nClose ${ENTRY_ID} as actioned`));
+});
+
+test('BRAIN_DUMP_DISPOSITION_RE does not match real code work that merely mentions an entry', () => {
+  for (const title of [
+    `File the fix for the bug reported in ${ENTRY_ID} in src/x.js`,
+    `Route the GPU lease through the arbiter; see ${ENTRY_ID}`,
+    `Fix the crash described in ${ENTRY_ID}`,
+    `Add a retry to apply-task.js (follow-up from ${ENTRY_ID} close)`,
+    `Add a retry so the sweep can close ${ENTRY_ID} once the fix lands`, // verb mid-sentence, not a disposition request
+  ]) {
+    assert.equal(BRAIN_DUMP_DISPOSITION_RE.test(title), false, `must not match: ${title}`);
+  }
 });
 
 test('BRAIN_DUMP_DISPOSITION_RE does not match an unrelated title', () => {
@@ -107,4 +134,24 @@ test('applyTask brain_dump_disposition returns {skipped:true} and leaves the dum
   assert.equal(entries[0].status, 'captured'); // untouched -- nothing was closed
   assert.equal(entries[0].resolvedNote, undefined);
   assert.equal(entries[0].resolvedAt, undefined);
+});
+
+// HUB0119 follow-up: the disposition routing must send a real disposition to brain_dump_disposition and leave code work that merely mentions an entry on the adhoc path.
+test('queueSubTasks routes a brain-dump disposition to brain_dump_disposition and keeps code work that mentions an entry as adhoc', () => {
+  const pipelineDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-adhoc-diff-disposition-'));
+  const subTasks = [
+    { title: 'Mark brain-dump entry bd-1789585157691 resolved with this evidence', rawText: 'Evidence: merged in commit abc123.' },
+    { title: 'Fix the crash reported in bd-1789585157692', rawText: 'File the fix for the bug reported in bd-1789585157692 in src/apply-task.js and add a test.' },
+  ];
+
+  queueSubTasks(subTasks, pipelineDir, 'parent-disposition', {});
+
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  const records = fs.readdirSync(adhocDir).filter((f) => f.endsWith('.json')).map((f) => JSON.parse(fs.readFileSync(path.join(adhocDir, f), 'utf8')));
+  const disposition = records.filter((r) => r.domain === 'brain_dump_disposition');
+  assert.equal(disposition.length, 1);
+  assert.equal(disposition[0].payload.entryId, '1789585157691');
+  const work = records.filter((r) => r.domain === 'adhoc');
+  assert.equal(work.length, 1, 'the code-work proposal stays an adhoc task');
+  assert.match(work[0].title, /Fix the crash reported/);
 });

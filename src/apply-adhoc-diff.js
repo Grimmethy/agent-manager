@@ -136,7 +136,13 @@ const VERIFICATION_LEAD_RE = /^(run|confirm|verify|check|validate|ensure|audit|t
 // entry format ("bd-" + 13-digit ms epoch, cf. `adhoc-brain-dump-<id>-<ts>` in
 // apply-group-a-brain-dump.js -- 6+ digits would also accept unrelated hex strings).
 // Capture group 1 is the entryId.
-const BRAIN_DUMP_DISPOSITION_RE = /\b(?:file|route|classify|archive|reject|approve|triage)\b[^.\n]{0,60}?\bbd-(\d{13})\b/i;
+// 2026-10-26 follow-up (verified by executing the old pattern): the first version (a disposition verb followed by ANY text within 60 characters
+// of the id) missed the very wording the hub was filed for ('Mark brain-dump entry bd-... resolved with this evidence', 'Record verification on
+// brain dump bd-...', 'Close bd-... as actioned') and matched real code work ('File the fix for the bug reported in bd-... in src/x.js',
+// 'Route the GPU lease through arbiter; see bd-...'), which then reached closeBrainDumpEntryResolved with no code change. Now the proposal must
+// START a line with the disposition verb and reach the id through nothing but filler words (the, this, entry, brain-dump, on, for, of, as,
+// verification, evidence, note), so any other noun between the verb and the id means it is work, not a disposition.
+const BRAIN_DUMP_DISPOSITION_RE = /^\s*(?:please\s+)?(?:file|route|classify|archive|reject|approve|triage|mark|record|close|resolve|dismiss)\b(?:\s+(?:the|this|a|an|on|for|of|as|brain-dump|brain\s+dump|entry|note|verification|evidence))*\s+bd-(\d{13})\b/im;
 
 function isVerificationOnlySubTask(sub) {
   const title = String((sub && sub.title) || '').trim();
