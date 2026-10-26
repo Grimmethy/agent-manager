@@ -1195,6 +1195,77 @@ test('reviewTask STILL hard-blocks the same stacked task citing a genuinely fabr
     'a value fabricated everywhere, including on the stacked branch, must still be caught -- proves this is not a blanket loosening of the gate');
 });
 
+// Pull the exact deterministic fact-check object (flags + per-path fileChecks) that
+// buildVerdictPrompt hands the reviewer model out of the captured vote prompt, so these
+// tests assert on the real per-file existence verdict -- not just the derived
+// factCheckVerdict label, which a badly-derived flag set could still obscure.
+function factCheckFromPrompt(prompt) {
+  const idx = prompt.indexOf('--- Deterministic fact-check pre-filter (necessary, NOT sufficient) ---');
+  assert.ok(idx !== -1, 'the verdict prompt must carry the deterministic fact-check section');
+  return JSON.parse(prompt.slice(idx).split('\n', 2)[1]);
+}
+
+// HUB0109 3/3 stacked regression: a seq-2 task cites a file its predecessor committed
+// to the shared stacked branch. That file does NOT exist in the working-tree checkout
+// (main), so a working-tree-only existence check flags the sibling's real file as
+// fabricated. With the branch ref threaded through checkDraft -> checkFilePaths it must
+// resolve against the stacked branch's real tip (exists: true) and stay 'pass'.
+test('stacked seq-2: a file that exists only on the predecessor branch is NOT flagged missing-file', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeGitFixtureWithStackedBranch();
+  assert.equal(fs.existsSync(path.join(repoRoot, 'src', 'sibling.js')), false,
+    'precondition: the cited file must be ABSENT from the working-tree checkout (main)');
+  const task = {
+    id: 'stacked-missing-file-regression', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Follow on from the sibling move task on this stacked branch: src/sibling.js already defines SIBLING_ONLY_FIELD there, so wire the existing call site through it and drop the duplicated setup, with enough detail here to clear the length floor.',
+    promptContext: { body: 'unrelated grounding material' },
+    stacked: { branch: 'agent/stacked-family', seq: 2, total: 2 },
+  };
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(captured.length, 1, 'must reach the real review vote, not a false hard-block');
+  const factCheck = factCheckFromPrompt(captured[0]);
+  const siblingEntry = (factCheck.fileChecks || []).find((f) => f.claimedPath === 'src/sibling.js');
+  assert.ok(siblingEntry, 'the cited sibling-branch file must appear in fileChecks at all');
+  assert.equal(siblingEntry.exists, true,
+    'a file the predecessor really committed to the stacked branch must resolve exists:true via the branch ref');
+  assert.equal(
+    (factCheck.flags || []).some((f) => f.type === 'missing-file' && f.detail === 'src/sibling.js'),
+    false, 'a sibling-only real file must NOT produce a missing-file flag');
+  assert.equal(result.factCheckVerdict, 'pass', 'no missing-file flag => fact-check verdict stays pass');
+});
+
+// HUB0109 3/3 control: the SAME fact-check machinery on a NON-stacked task must still
+// flag a file that exists nowhere -- the ref threading must be inert (ref null) here,
+// not a blanket loosening of the existence check.
+test('non-stacked: a file that does not exist on master IS still flagged missing-file', async () => {
+  const { repoRoot, secondBrainDir, domainsPath } = makeFixture();
+  assert.equal(fs.existsSync(path.join(repoRoot, 'notes', 'ghost.md')), false,
+    'precondition: notes/ghost.md must not exist on disk');
+  const task = {
+    id: 'non-stacked-missing-file-regression', domain: 'default', source: 'manual',
+    title: 'test', planResponse: 'plan',
+    implementResponse: 'Move the duplicated helper out of the two call sites and into notes/ghost.md as the single new home both will import from going forward, with enough detail here to clear the length floor.',
+    promptContext: { body: 'unrelated grounding material' },
+  };
+  assert.ok(!task.stacked, 'control precondition: this task is NOT stacked, so no branch ref applies');
+  const captured = [];
+  const result = await reviewTask(task, {
+    repoRoot, secondBrainDir, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+  });
+  assert.equal(captured.length, 1, 'flags are advisory to the vote -- the draft still reaches the reviewer');
+  const factCheck = factCheckFromPrompt(captured[0]);
+  const ghostEntry = (factCheck.fileChecks || []).find((f) => f.claimedPath === 'notes/ghost.md');
+  assert.ok(ghostEntry, 'the cited nonexistent file must appear in fileChecks');
+  assert.equal(ghostEntry.exists, false, 'a file absent from the working tree (and nowhere else) must resolve exists:false');
+  assert.ok(
+    (factCheck.flags || []).some((f) => f.type === 'missing-file' && f.detail === 'notes/ghost.md'),
+    'the missing-file flag must still be raised for a genuinely absent file');
+  assert.equal(result.factCheckVerdict, 'flagged', 'a real missing-file flag must flip the verdict label to flagged');
+});
+
 // 2026-09-08, Second Brain [[dspy-deterministic-prompt-tuning]] research applied: this
 // gate's own header comment calls itself "high-precision, almost never a false positive,"
 // but this session found 4 confirmed false positives against that exact claim, discovered
@@ -1972,6 +2043,7 @@ test('gate replay: the numbers reach the voters and the task record, and by defa
   assert.match(prompt, /Gate replay over tasks that already ran/);
   assert.match(prompt, /checkDraftQuality .*flags 93 merged task\(s\) = 27\.8%/);
   assert.match(prompt, /THIS GATE IS OVER THE LIMIT/);
+  assert.match(prompt, /the limit applies to merged tasks the change newly flags \(27\.8% here\)/);
   assert.match(prompt, /No real-data replay was possible for checkOdd/);
   assert.ok(task.history.some((h) => h.stage === 'advisory' && /gate replay: checkDraftQuality flags 93\/335/.test(h.detail || '')));
 }));
@@ -1986,7 +2058,7 @@ test('gate replay: with AGENT_MANAGER_GATE_REPLAY_BLOCK=true an over-limit gate 
     assert.equal(result.verdict, 'blocked');
     assert.equal(result.blockedStage, 'review');
     assert.equal(task.reviewProvider, 'deterministic-gate-replay');
-    assert.match(result.blockedReason, /would flag 93 of 335 already-merged tasks \(27\.8%, limit 2\.0%\)/);
+    assert.match(result.blockedReason, /newly flags 93 of 335 already-merged tasks \(27\.8%, limit 2\.0%\)/);
     assert.match(result.blockedReason, /HUB0060-01|already-merged/);
     assert.equal(captured.length, 0, 'no vote is spent');
     // a within-limit gate is never blocked, switch on or not
@@ -1999,7 +2071,7 @@ test('gate replay: with AGENT_MANAGER_GATE_REPLAY_BLOCK=true an over-limit gate 
   } finally { delete process.env.AGENT_MANAGER_GATE_REPLAY_BLOCK; }
 }));
 
-const POLICY_DIFF = 'diff --git a/src/single-flight-lock.js b/src/single-flight-lock.js\n--- a/src/single-flight-lock.js\n+++ b/src/single-flight-lock.js\n@@ -1 +1 @@\n-const DISCUSS_PRIORITY_MAX_WAIT_MS = 120000;\n+const DISCUSS_PRIORITY_SAFETY_VALVE_MS = 900000;\n';
+const POLICY_DIFF = 'diff --git a/src/single-flight-lock.js b/src/single-flight-lock.js\n--- a/src/single-flight-lock.js\n+++ b/src/single-flight-lock.js\n@@ -1 +1 @@\n-const DISCUSS_PRIORITY_MAX_WAIT_SEC = 120;\n+const DISCUSS_PRIORITY_SAFETY_VALVE_MS = 900000;\n';
 const withPolicyEnv = (routing, fn) => async () => {
   if (routing) process.env.AGENT_MANAGER_POLICY_CHANGE_ROUTING = 'true'; else delete process.env.AGENT_MANAGER_POLICY_CHANGE_ROUTING;
   try { await fn(); } finally { delete process.env.AGENT_MANAGER_POLICY_CHANGE_ROUTING; }
@@ -2092,12 +2164,12 @@ test('executed verification: a verifier that throws never blocks and never break
   assert.equal(task.executedVerification, undefined);
 }));
 
-test('executed verification: the kill switch, a non-adhoc source, an unimplemented draft and a missing rawDiff each skip the verifier entirely', async () => {
+test('executed verification: the kill switch, an unimplemented draft and a missing rawDiff each skip the verifier entirely (HUB0184 2/4: a non-adhoc source WITH a diff now runs it)', async () => {
   const cases = [
     ['kill switch', { env: 'false', task: {} }],
-    ['not adhoc', { env: 'true', task: { domain: 'default', source: 'trouble_log' } }],
     ['not implemented', { env: 'true', task: { adhocResolution: 'needs-human-decision' } }],
     ['no rawDiff', { env: 'true', task: { rawDiff: '' } }],
+    ['non-adhoc source, no diff', { env: 'true', task: { domain: 'default', source: 'trouble_log', rawDiff: '' } }],
   ];
   for (const [label, { env, task: overrides }] of cases) {
     const { repoRoot, domainsPath } = makeFixture();
@@ -2109,6 +2181,52 @@ test('executed verification: the kill switch, a non-adhoc source, an unimplement
     } finally { process.env.AGENT_MANAGER_REVIEW_EXECUTED_VERIFY = 'false'; }
     assert.equal(calls.length, 0, `${label}: the verifier must not run`);
   }
+});
+
+test('executed verification: HUB0184 2/4 -- a non-adhoc source that carries a rawDiff runs the verifier, a failed covering test blocks before any vote, and the record carries the dashboard fields', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'ev-nonadhoc', source: 'trouble_log', adhocResolution: undefined });
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+    verifyDiffFn: (a) => {
+      assert.equal(a.rawDiff, task.rawDiff, 'the verifier gets the extracted diff');
+      return { status: 'failed', reasons: ['covering js tests failed'], tests: { ran: ['src/a.test.js'], passed: false, failures: ['the helper adds'] }, commands: [] };
+    } });
+  assert.equal(result.verdict, 'blocked');
+  assert.equal(result.blockedStage, 'review');
+  assert.equal(task.reviewProvider, 'deterministic-executed-verification');
+  assert.equal(captured.length, 0, 'no vote is spent on a draft whose own tests fail');
+  assert.equal(task.executedVerification.ran, true);
+  assert.equal(task.executedVerification.result, 'failed');
+  assert.ok(/^\d{4}-\d{2}-\d{2}T/.test(task.executedVerification.timestamp), 'timestamp is ISO');
+  assert.deepEqual(task.executedVerification.failedTests, ['the helper adds']);
+}));
+
+test('executed verification: HUB0184 2/4 -- an inconclusive result on a non-adhoc diff stays advisory and still reaches the vote', withExecutedVerify(async () => {
+  const { repoRoot, domainsPath } = makeFixture();
+  const task = adhocImplementedTask({ id: 'ev-nonadhoc-incon', source: 'trouble_log', adhocResolution: undefined });
+  const captured = [];
+  const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {},
+    verifyDiffFn: () => ({ status: 'inconclusive', reasons: ['nothing runnable was found'], tests: null, commands: [] }) });
+  assert.equal(result.verdict, 'approved');
+  assert.equal(captured.length, 1, 'inconclusive goes on to the vote exactly as the adhoc path does');
+  assert.equal(task.executedVerification.ran, true);
+  assert.equal(task.executedVerification.result, 'inconclusive');
+  assert.deepEqual(task.executedVerification.failedTests, []);
+}));
+
+test('extractTaskDiff: the adhoc gate is preserved exactly and any other source with a real diff now qualifies', () => {
+  const { extractTaskDiff } = require('./review-task.js');
+  const diff = 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n-a\n+b\n';
+  assert.equal(extractTaskDiff({ source: 'manual', adhocResolution: 'implemented', rawDiff: diff }), diff, 'adhoc implemented -- same as before');
+  assert.equal(extractTaskDiff({ domain: 'adhoc', rawDiff: diff, adhocResolution: 'implemented' }), diff, 'adhoc domain');
+  assert.equal(extractTaskDiff({ source: 'manual', rawDiff: diff, adhocResolution: 'needs-human-decision' }), null, 'adhoc not implemented -- same as before');
+  assert.equal(extractTaskDiff({ source: 'manual', rawDiff: '' }), null, 'blank diff -- same as before');
+  assert.equal(extractTaskDiff({ source: 'trouble_log', rawDiff: diff }), diff, 'non-adhoc source with a real diff now qualifies');
+  assert.equal(extractTaskDiff({ source: 'trouble_log', rawDiff: '   ' }), null, 'whitespace-only diff is not a diff');
+  assert.equal(extractTaskDiff({ source: 'trouble_log' }), null, 'no rawDiff field at all');
+  assert.equal(extractTaskDiff({}), null);
+  assert.equal(extractTaskDiff(null), null);
 });
 
 test('executed verification: the verifier is handed the task id, raw diff, claimed results, repo root, base branch and budget', withExecutedVerify(async () => {
@@ -2915,4 +3033,58 @@ test('reviewTask: the edit-set syntax gate leaves adhoc diffs alone and honours 
     await reviewTask(off, { repoRoot, domainsPath, localMajorityVote: fakeApprove([]), recordModelOutcome: () => {} });
     assert.equal(off.editSetSyntax, undefined);
   } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE; else process.env.AGENT_MANAGER_EDIT_SYNTAX_GATE = prev; }
+});
+
+// 2026-10-18 (brain-dump 1905): waitForLocalAvailability skips a fresh 'working' heartbeat that opts
+// out with assignable:false (an external runner, not an AM draft) but still waits for a real lane.
+test('waitForLocalAvailability: an assignable:false working heartbeat does not delay review; a working lane still does', async () => {
+  const { waitForLocalAvailability } = require('./review-task.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-wait-'));
+  const hb = (id, extra) => fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify({
+    instanceId: id, pid: process.pid, status: 'working', lastHeartbeat: new Date().toISOString(), ...extra }));
+
+  hb('worker-kaggle-p40', { assignable: false });
+  let t0 = Date.now();
+  await waitForLocalAvailability(dir, 3, 0.3);
+  assert.ok(Date.now() - t0 < 150, `opted-out heartbeat must not delay (took ${Date.now() - t0} ms)`);
+
+  hb('worker-3090', {});
+  t0 = Date.now();
+  await waitForLocalAvailability(dir, 3, 0.3);
+  assert.ok(Date.now() - t0 >= 250, `a working lane still delays (took ${Date.now() - t0} ms)`);
+});
+
+// --- hit-count gate wiring: reviewTask must hand the gate the draft diff so it counts the post-draft file, not the checkout ----------------
+test('hit-count gate: reviewTask counts the draft post-image (a correct draft reaches the vote) and blocks a draft whose post-image count is wrong', async () => {
+  const hitDiff = (added) => [
+    'diff --git a/src/heartbeat.js b/src/heartbeat.js',
+    '--- a/src/heartbeat.js',
+    '+++ b/src/heartbeat.js',
+    `@@ -1 +1,${1 + added.length} @@`,
+    ' writeAtomicSync(x);',
+    ...added.map((l) => `+${l}`),
+    '',
+  ].join('\n');
+  for (const [name, added, blocks] of [['correct', ['writeAtomicSync(y);'], false], ['wrong', ['writeAtomicSync(y);', 'writeAtomicSync(z);'], true]]) {
+    const { repoRoot, domainsPath } = makeFixture();
+    fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(repoRoot, 'src', 'heartbeat.js'), 'writeAtomicSync(x);\n');
+    const criterion = '`grep -n writeAtomicSync src/heartbeat.js` returns exactly 2 hits';
+    const task = adhocImplementedTask({
+      id: `hit-count-${name}`, acceptanceCriteria: [criterion],
+      acceptanceResults: [{ criterion, check: criterion, result: 'PASS', pass: true }],
+      rawDiff: hitDiff(added),
+    });
+    const captured = [];
+    const result = await reviewTask(task, { repoRoot, domainsPath, localMajorityVote: fakeApprove(captured), recordModelOutcome: () => {}, verifyDiffFn: () => ({ status: 'passed', reasons: [], tests: null, commands: [] }) });
+    if (blocks) {
+      assert.equal(result.verdict, 'blocked', name);
+      assert.equal(task.reviewProvider, 'deterministic-hit-count');
+      assert.match(result.blockedReason, /actual 3, expected 2/);
+      assert.equal(captured.length, 0, 'no vote is spent on it');
+    } else {
+      assert.notEqual(task.reviewProvider, 'deterministic-hit-count', 'the pre-draft file has 1 hit; counting it would falsely block this correct draft');
+      assert.equal(captured.length, 1, 'a correct draft reaches the vote');
+    }
+  }
 });

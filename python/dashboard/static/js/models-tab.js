@@ -13,7 +13,7 @@ async function renderModelsTab() {
   // FINAL position after that flash had already been visible). Fetching everything first
   // and writing main.innerHTML exactly once eliminates the intermediate empty states
   // entirely, so there is nothing left to flash.
-  const [models, usageRows, costSummary, settingsPanel, usagePanel, benchModels, benchCases, benchStatus, benchRuns] = await Promise.all([
+  const [models, usageRows, costSummary, settingsPanel, usagePanel, benchModels, benchCases, benchStatus, benchRuns, capabilityRows] = await Promise.all([
     fetchJson('/api/models'),
     fetchJson('/api/models/usage'),
     fetchJson('/api/models/cost-summary'),
@@ -23,6 +23,7 @@ async function renderModelsTab() {
     benchmarkCasesCache || fetchJson('/api/benchmark/cases').then(r => { benchmarkCasesCache = r; return r; }),
     fetchJson('/api/benchmark/status'),
     fetchJson('/api/benchmark/runs'),
+    fetchJson('/api/capability').catch(() => []),
   ]);
   if (benchmarkSelectedModels.size === 0 && benchmarkSelectedCases.size === 0) {
     benchModels.forEach(m => benchmarkSelectedModels.add(m));
@@ -125,7 +126,7 @@ async function renderModelsTab() {
   // didn't ask for, even though the write itself no longer has an empty intermediate state.
   const scrollY = window.scrollY;
   main.innerHTML = settingsPanel + usagePanel + costWidget + '<div class="field-label">Implement-Pass Quality</div>' + implementTable + usageTable
-    + benchmarkPanelHtml;
+    + buildCapabilityPanelHtml(capabilityRows) + benchmarkPanelHtml;
   wireClaudeSettingsPanel();
   main.querySelectorAll('th.sortable').forEach(th => {
     th.onclick = () => {
@@ -448,4 +449,20 @@ function wireBenchmarkPanel(models, cases) {
       }
     };
   });
+}
+
+// Task fit by model (capability ledger, docs/design-notes/capability-routing-and-benchmarking.md): one row per (source, model) from real pipeline attempts
+// over the trailing 14 days. "lower" is the Wilson lower bound on the success rate, so a 3/3 row reads weaker than a 30/30 one.
+function buildCapabilityPanelHtml(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return '<div class="field-label">Task Fit by Model</div><div class="empty">No attempts recorded yet. Rows appear as lanes finish draft attempts.</div>';
+  }
+  const body = rows.map(r => {
+    const p50 = r.p50WallMs == null ? '-' : Math.round(r.p50WallMs / 1000) + 's';
+    const outcomes = Object.entries(r.outcomes || {}).map(([k, v]) => escapeHtml(k) + ' ' + v).join(', ');
+    return '<tr><td>' + escapeHtml(r.source) + '</td><td>' + escapeHtml(r.model) + '</td><td>' + r.n + '</td><td>'
+      + Math.round(r.okRate * 100) + '%</td><td>' + r.lower.toFixed(2) + '</td><td>' + p50 + '</td><td>' + outcomes + '</td></tr>';
+  }).join('');
+  return '<div class="field-label">Task Fit by Model</div><table><thead><tr><th>Source</th><th>Model</th><th>Attempts</th><th>OK</th><th>Lower bound</th><th>p50</th><th>Outcomes</th></tr></thead><tbody>'
+    + body + '</tbody></table>';
 }

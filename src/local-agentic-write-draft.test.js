@@ -560,6 +560,99 @@ test('write tier: backstop runs the deterministic split when a decomposeBlockCou
   });
 });
 
+// First-miss repair (2026-10-15): the FIRST "decompose, no usable JSON" pass is split in the same draft attempt instead of being
+// requeued for a whole second agentic pass. decomposeBlockCount is 1 here because resolveDecomposeZero (agentic-draft-common.js) has
+// already counted the miss when the verdict reaches runGiveUpSplit.
+const NO_JSON_MISS = 'Agentic implement pass said RESOLUTION: decompose but no valid JSON array of {title, rawText} sub-tasks followed it';
+const NUMBERED_PLAN = 'PLAN\n1. Create the helper in src/a.js.\n2. Wire it into src/b.js.\n3. Add tests.\n\nCRITERIA:\n- done';
+
+async function firstMissRun(taskOverrides, { runner, env } = {}) {
+  return withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    const prevEnv = process.env.AGENT_MANAGER_DECOMPOSE_REPAIR;
+    if (env === 'off') process.env.AGENT_MANAGER_DECOMPOSE_REPAIR = 'off'; else delete process.env.AGENT_MANAGER_DECOMPOSE_REPAIR;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: true, blockedReason: NO_JSON_MISS });
+    setDecomposePassRunner(runner === undefined ? null : runner);
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'fm', source: 'manual', title: 'Parent', decomposeBlockCount: 1, promptContext: { rawText: 'big multi-part thing' }, ...taskOverrides };
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+      return { res, task };
+    } finally {
+      adc.runAgenticDraftInWorktree = realRun;
+      setDecomposePassRunner(null);
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_REPAIR; else process.env.AGENT_MANAGER_DECOMPOSE_REPAIR = prevEnv;
+    }
+  });
+}
+
+const TWO_PIECES = { runDecomposePass: async () => ({ subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] }) };
+
+test('write tier: a FIRST no-JSON decompose miss runs the single-call split in the same attempt (no requeue)', async () => {
+  const { res, task } = await firstMissRun({}, { runner: TWO_PIECES });
+  assert.equal(res.resolution, 'decompose');
+  assert.equal(task.adhocResolution, 'decompose');
+  assert.equal(task.subTaskProposals.length, 2);
+  assert.equal(task.autoDecomposeCount, 1);
+  assert.equal(task.autoDecomposeSource, undefined, 'the decompose pass, not the mechanical split, produced these');
+});
+
+test('write tier: first miss where the decompose pass returns nothing falls back to the plan\'s numbered steps', async () => {
+  const { res, task } = await firstMissRun({ planResponse: NUMBERED_PLAN }, { runner: { runDecomposePass: async () => null } });
+  assert.equal(res.resolution, 'decompose');
+  assert.equal(task.subTaskProposals.length, 3);
+  assert.equal(task.subTaskProposals[1].after, 0);
+  assert.equal(task.autoDecomposeSource, 'plan-steps');
+  assert.match(task.implementResponse, /split mechanically from the plan's numbered steps/);
+});
+
+test('write tier: first miss with the decompose plugin absent also uses the plan steps', async () => {
+  const { res, task } = await firstMissRun({ lastGoodPlan: NUMBERED_PLAN }, { runner: null });
+  assert.equal(res.resolution, 'decompose');
+  assert.equal(task.autoDecomposeSource, 'plan-steps');
+});
+
+test('write tier: first miss with no usable plan keeps the blocked verdict', async () => {
+  const { res, task } = await firstMissRun({}, { runner: { runDecomposePass: async () => null } });
+  assert.equal(res.blocked, true);
+  assert.equal(res.blockedReason, NO_JSON_MISS);
+  assert.equal(task.adhocResolution, undefined);
+  assert.equal(task.subTaskProposals, undefined);
+});
+
+test('write tier: a first miss that was chosen as a partial-edit continuation is NOT split', async () => {
+  const { res, task } = await firstMissRun({ isAgenticContinuation: true, planResponse: NUMBERED_PLAN }, { runner: TWO_PIECES });
+  assert.equal(res.blocked, true);
+  assert.equal(task.subTaskProposals, undefined);
+});
+
+test('write tier: AGENT_MANAGER_DECOMPOSE_REPAIR=off restores the two-miss behaviour at the first miss', async () => {
+  const { res, task } = await firstMissRun({ planResponse: NUMBERED_PLAN }, { runner: TWO_PIECES, env: 'off' });
+  assert.equal(res.blocked, true);
+  assert.equal(task.subTaskProposals, undefined);
+  assert.equal(task.autoDecomposeCount, undefined);
+});
+
+test('write tier: a different block reason at decomposeBlockCount 1 is NOT split', async () => {
+  const { res } = await withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: true, blockedReason: 'Agentic pass re-scoped this to a single sharper sub-task; requeued once for a focused implement pass' });
+    setDecomposePassRunner(TWO_PIECES);
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'dr', source: 'manual', decomposeBlockCount: 1, planResponse: NUMBERED_PLAN, promptContext: { rawText: 'x' } };
+      return { res: await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) }) };
+    } finally { adc.runAgenticDraftInWorktree = realRun; setDecomposePassRunner(null); }
+  });
+  assert.equal(res.blocked, true);
+});
+
 test('write tier: turn cap default is 35, env override still wins', async () => {
   await withRepo(async () => {
     const prev = process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS;
@@ -588,4 +681,178 @@ test('partialDiffFallbackPrompt: an applied prior diff leaves the prompt unchang
   assert.match(out, /^P\n\nCORRECTION:/);
   assert.match(out, /do NOT hold for this run|does NOT hold for this run/);
   assert.match(out, /diff --git a\/x b\/x/);
+});
+
+// --- read-only sibling repos (2026-10-16) ---------------------------------------------------------------------------------------------------------
+// The GPU broker verification tasks needed to read videoforge / promptforge-manual, but the pass's only tool root was its worktree.
+test('write tier: the implement pass hands the registered plugin repos to the tool loop as READ-ONLY roots, never the live checkout, apply clone or worktree', async () => {
+  // Own temp repo (not withRepo): withRepo removes its dir as soon as an async body first yields, and the draft resolves roots after its awaits.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'law-ro-core-'));
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  const sibling = fs.mkdtempSync(path.join(os.tmpdir(), 'law-sibling-'));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), 'law-worktree-'));
+  const manifest = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'law-manifest-')), 'plugins.json');
+  fs.writeFileSync(manifest, JSON.stringify([
+    { name: 'sib', registerPath: path.join(sibling, 'register.js'), enabled: true },
+    { name: 'wt', registerPath: path.join(worktree, 'register.js'), enabled: true },
+  ]));
+  // Pin the apply clone to its own dir: a harness that points AGENT_MANAGER_APPLY_REPO_ROOT at the tmpdir (the review sandbox does) would otherwise contain the sibling, and a repo inside the apply clone is rightly excluded.
+  const applyClone = fs.mkdtempSync(path.join(os.tmpdir(), 'law-apply-'));
+  const keys = ['AGENT_MANAGER_REPO_ROOT', 'AGENT_MANAGER_PIPELINE_DIR', 'LOCAL_MODEL', 'AGENT_MANAGER_LOCAL_AGENTIC_WRITE', 'AGENT_MANAGER_PLUGINS_MANIFEST', 'AGENT_MANAGER_CORE_REPO_ROOT', 'AGENT_MANAGER_APPLY_REPO_ROOT'];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  Object.assign(process.env, { AGENT_MANAGER_REPO_ROOT: dir, AGENT_MANAGER_PIPELINE_DIR: dir, LOCAL_MODEL: 'qwen-test', AGENT_MANAGER_PLUGINS_MANIFEST: manifest, AGENT_MANAGER_CORE_REPO_ROOT: dir, AGENT_MANAGER_APPLY_REPO_ROOT: applyClone });
+  delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE;
+  for (const m of ['./plugins-manifest.js', './accessible-roots.js', './agentic-draft-common.js']) delete require.cache[require.resolve(m)];
+  const adc = require('./agentic-draft-common.js');
+  const realRun = adc.runAgenticDraftInWorktree;
+  adc.runAgenticDraftInWorktree = async (_t, { runInWorktree }) => { await runInWorktree(worktree, {}); return { succeeded: true, blocked: false, response: 'RESOLUTION: implemented' }; };
+  try {
+    const { draftAdhocViaLocalAgenticWrite } = freshModule();
+    const calls = [];
+    const task = { id: 'ro-sib', source: 'manual', title: 'verify', promptContext: { rawText: 'read the sibling repo and write the findings doc' } };
+    await draftAdhocViaLocalAgenticWrite(task, { runPlan: async (opts) => { calls.push(opts); return { response: 'RESOLUTION: implemented' }; } });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].primaryRoot, worktree);
+    assert.deepEqual(calls[0].readOnlyRoots, [fs.realpathSync(sibling)]);
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(dir)), 'the live checkout is not exposed');
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(worktree)), 'the worktree is not listed twice');
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(applyClone)), 'the apply clone is not exposed');
+    assert.equal(calls[0].extraRoots, undefined, 'extraRoots keeps its Chat-only meaning');
+  } finally {
+    adc.runAgenticDraftInWorktree = realRun;
+    for (const k of keys) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; }
+    for (const m of ['./plugins-manifest.js', './accessible-roots.js']) delete require.cache[require.resolve(m)];
+    for (const d of [dir, sibling, worktree, applyClone, path.dirname(manifest)]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('write tier: the implement prompt says other registered repos are readable read-only and not to conclude a repo is absent', () => {
+  withRepo(() => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const prompt = buildWriteAgenticPrompt({ id: 'p', title: 't', promptContext: { rawText: 'verify against videoforge' } });
+    assert.match(prompt, /Other registered repos on this machine \(plugins and projects\) are READ-ONLY/);
+    assert.match(prompt, /never conclude a repo is absent from this machine without calling list_roots first/);
+    assert.match(prompt, /Do not cat \.env, key, token or credential files/);
+  });
+});
+
+// task-shape.js: the post-exhaustion / repeated-decompose backstop must not split a one-file-fix on a model "decompose" answer, but a REAL turn-budget exhaustion
+// (evidence the shape guess was wrong) still may -- same as a confirmed-atomic leaf.
+async function backstopRun(taskOverrides, { shapeEnv } = {}) {
+  return withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    const prevEnv = process.env.AGENT_MANAGER_TASK_SHAPE;
+    if (shapeEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = shapeEnv;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: false, needsClarification: true, response: 'ran out of turns' });
+    let splitCalls = 0;
+    setDecomposePassRunner({ runDecomposePass: async () => { splitCalls += 1; return { subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] }; } });
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'shape-bk', source: 'manual', title: 'Fix clamp', decomposeBlockCount: 2, needsClarification: { reason: 'x' }, promptContext: { rawText: 'In src/foo.js fix clamp and add a case to src/foo.test.js.' }, ...taskOverrides };
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+      return { res, task, splitCalls };
+    } finally {
+      adc.runAgenticDraftInWorktree = realRun;
+      setDecomposePassRunner(null);
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = prevEnv;
+    }
+  });
+}
+
+test('task-shape backstop: a one-file-fix that keeps answering "decompose" is NOT split', async () => {
+  const { res, task, splitCalls } = await backstopRun({});
+  assert.equal(task.shape.class, 'one-file-fix');
+  assert.equal(splitCalls, 0, 'the decompose pass is never asked');
+  assert.notEqual(res.resolution, 'decompose');
+  assert.equal(task.autoDecomposeCount, undefined);
+});
+
+test('task-shape backstop: a one-file-fix that really exhausted its turn budget may still be split', async () => {
+  const { res, splitCalls } = await backstopRun({ turnBudgetExhausted: true });
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
+});
+
+test('task-shape backstop: with AGENT_MANAGER_TASK_SHAPE=off the same task is split exactly as before', async () => {
+  const { res, task, splitCalls } = await backstopRun({}, { shapeEnv: 'off' });
+  assert.equal(task.shape, undefined);
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
+});
+
+// --- TIME BUDGET prompt line (2026-10-19, brain-dump 1895) -------------------------------------------------
+// Behind AGENT_MANAGER_PROMPT_BUDGET_BLOCK (default off): states the lane's per-call ceiling and the keep-turns-short instruction.
+
+function withBudgetSwitch(value, fn) {
+  const prev = process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK;
+  if (value === undefined) delete process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK; else process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK = value;
+  try { return fn(); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK; else process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK = prev; }
+}
+
+test('TIME BUDGET line: buildTimeBudgetLine states the ceiling in seconds for 240 s, 900 s (slow endpoint) and a custom value', () => {
+  const { buildTimeBudgetLine } = freshModule();
+  assert.match(buildTimeBudgetLine(240000), /cut off after about 240 seconds/);
+  assert.match(buildTimeBudgetLine(900000), /cut off after about 900 seconds/);
+  assert.match(buildTimeBudgetLine(90000), /cut off after about 90 seconds/);
+  const line = buildTimeBudgetLine(240000);
+  assert.match(line, /Keep your thinking to a few sentences/);
+  assert.match(line, /several small edit_file calls/);
+  assert.match(line, /~30 s/);
+});
+
+test('TIME BUDGET line: with the switch on the prompt gains exactly that line, after the TURN BUDGET line, using the lane ceiling', async () => {
+  await withRepo(async () => {
+    const task = { title: 'T', promptContext: { rawText: 'the ask' } };
+    const { REQUEST_TIMEOUT_MS } = require('./local-tool-client.js');
+    const off = withBudgetSwitch(undefined, () => freshModule().buildWriteAgenticPrompt(task));
+    for (const v of ['on', '1', 'true', 'ON']) {
+      const m = freshModule();
+      const on = withBudgetSwitch(v, () => m.buildWriteAgenticPrompt(task));
+      assert.ok(on.includes(`cut off after about ${Math.round(REQUEST_TIMEOUT_MS / 1000)} seconds`), v);
+      assert.equal(on.replace(`${m.buildTimeBudgetLine()}\n`, ''), off, `${v}: the only difference is the inserted line`);
+      assert.ok(on.indexOf('TURN BUDGET:') < on.indexOf('TIME BUDGET:') && on.indexOf('TIME BUDGET:') < on.indexOf('Title: T'), 'placed between the turn budget and the task');
+    }
+  });
+});
+
+test('TIME BUDGET line: switch off (unset, off, 0, false) leaves the prompt without it', async () => {
+  await withRepo(async () => {
+    const task = { title: 'T', promptContext: { rawText: 'the ask' } };
+    for (const v of [undefined, 'off', '0', 'false', '']) {
+      const p = withBudgetSwitch(v, () => freshModule().buildWriteAgenticPrompt(task));
+      assert.ok(!p.includes('TIME BUDGET'), String(v));
+      assert.match(p, /TURN BUDGET: you have about/);
+    }
+  });
+});
+
+// A Forge GPU pause thrown from inside the pass (local-tool-client.js refuses a turn under a fresh lease) must reach local-draft.js and local-worker.sh as a pause
+// -- no failed attempt counted, the task resumes when the lease clears -- instead of being flattened into an ordinary failed draft. The seam is the call the
+// final catch of draftAdhocViaLocalAgenticWrite wraps (runAgenticDraftInWorktree), stubbed to throw.
+test('write tier: a Forge pause thrown from the pass is rethrown, an ordinary error still returns a failed draft', async () => {
+  const { ForgePauseError, isForgePause } = require('./gpu-guard.js');
+  const adc = require('./agentic-draft-common.js');
+  const realRun = adc.runAgenticDraftInWorktree;
+  const task = () => ({ id: 'w-pause', source: 'manual', promptContext: { rawText: 'do it' } });
+  try {
+    // one call per withRepo block: withRepo restores the environment as soon as its async callback first yields
+    adc.runAgenticDraftInWorktree = async () => { throw new ForgePauseError(); };
+    await withRepo(async () => {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      await assert.rejects(draftAdhocViaLocalAgenticWrite(task()), (e) => isForgePause(e));
+    });
+    adc.runAgenticDraftInWorktree = async () => { throw new Error('boom'); };
+    await withRepo(async () => {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const failed = await draftAdhocViaLocalAgenticWrite(task());
+      assert.equal(failed.succeeded, false);
+      assert.match(failed.reason, /local write-agentic draft failed: boom/);
+    });
+  } finally {
+    adc.runAgenticDraftInWorktree = realRun;
+    delete require.cache[require.resolve('./local-agentic-write-draft.js')];
+  }
 });

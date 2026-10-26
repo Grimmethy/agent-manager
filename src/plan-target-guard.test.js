@@ -169,3 +169,37 @@ test('planTargetGuard no longer blocks a title that is a call expression (res.js
   const task = { title: '`res.json()` on a non-JSON 200 response throws inside the try', promptContext: { rawText: 'In `real.js` line 3 the body may be HTML.' } };
   assert.equal(planTargetGuard(task, 'Edit `src/real.js` to wrap `await res.json()` in a try.', repo, ['src']).blocked, false);
 });
+
+// --- 2026-10-15: design-doc tasks ("write ONE file, Docs/x.md") were blocked because only the FIRST mention of the target was examined ---------------------------
+
+test('isDeclaredCreateTarget: any mention can carry the create signal, not just the first', () => {
+  const plan = 'The orient report lists `Docs/x.md` among the cited paths. The plan names exactly one file to create -- `Docs/x.md` -- and nothing more.';
+  assert.equal(isDeclaredCreateTarget(plan, 'Docs/x.md'), true, 'only the SECOND mention follows a create verb');
+});
+
+test('isDeclaredCreateTarget: the real tuning-loops shape -- first mention follows "write ONE file," -- is a create target', () => {
+  const plan = 'The SCOPE RULE is explicit: "write ONE file, `Docs/x.md`, and change nothing else." Draft it in six sections.';
+  assert.equal(isDeclaredCreateTarget(plan, 'Docs/x.md'), true);
+});
+
+test('the TASK text "write ONE file, <path>" alone exempts the target, with a plan that never says create', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Design doc', promptContext: { rawText: 'SCOPE RULE: one task. TASK: write ONE file, Docs/x.md, and change nothing else.' } };
+  const plan = 'Draft `Docs/x.md` with six sections.';
+  assert.equal(isDeclaredCreateTarget(plan, 'Docs/x.md'), false, 'the plan alone gives no signal');
+  assert.equal(isDeclaredCreateTarget(plan, 'Docs/x.md', `${task.title}\n${task.promptContext.rawText}`), true, 'the task text carries the signal');
+  assert.equal(planTargetGuard(task, plan, repo, ['src']).blocked, false);
+});
+
+test('a bare "write to <path>" is NOT a create signal: a fabricated edit target is still blocked', () => {
+  const repo = tmpRepo();
+  const task = { title: 'Edit src/phantom.js', promptContext: { rawText: 'Write to src/phantom.js the new guard.' } };
+  const r = planTargetGuard(task, 'We will write to `src/phantom.js` the new guard.', repo, ['src']);
+  assert.equal(r.blocked, true);
+  assert.deepEqual(r.missing, ['src/phantom.js']);
+});
+
+test('a create verb more than 80 chars before a later mention does not exempt that mention', () => {
+  const plan = `Create the notes first. ${'padding '.repeat(20)} Then edit \`src/new.js\` carefully, and again \`src/new.js\`.`;
+  assert.equal(isDeclaredCreateTarget(plan, 'src/new.js'), false);
+});

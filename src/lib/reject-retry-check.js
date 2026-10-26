@@ -151,7 +151,10 @@ function stalePremiseGateNoLongerFires(task, { repoRoot, detectFn } = {}) {
   if (!repoRoot) return false;
   try {
     const detect = detectFn || require('../decompose-premise-check.js').detectStaleDecomposePremise;
-    return detect(task, { repoRoot }) === null;
+    const r = detect(task, { repoRoot });
+    // "No longer fires" == no blocking finding: null OR the { stale: false, suppressions }
+    // audit-only shape (dismissals recorded, nothing blocking remains).
+    return r === null || !r.stale;
   } catch {
     return false;
   }

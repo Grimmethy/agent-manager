@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Load shared env + require AGENT_MANAGER_REPO_ROOT, MODEL_URL (same check
 # applied to every daemon; logs [common] ERROR and exits if missing).
 source "${SCRIPT_DIR}/orc-common.sh"
+source "${SCRIPT_DIR}/lib/start-singleton-bg.sh"
 
 readonly INSTANCE_ID="${1:-watchdog}"    # same naming as PowerShell's $env:InstanceID per-daemon.
 
@@ -30,6 +31,8 @@ trap 'printf "[watchdog] SIGTERM/SIGINT received -- exiting after current tick.\
 # this daemon restarts something.
 PID_DIR="${HOME}/.local/state/agent-manager/pids"
 mkdir -p "$PID_DIR" 2>/dev/null
+# Shared with python/dashboard/app.py (proactive_sweep_lock_path): whoever starts the proactive decompose sweep takes this lock first.
+PROACTIVE_LOCK="${PID_DIR}/proactive-file-decompose.lock"
 
 # HOME_LOGS: temp dir for watchdog status logs (same shape PS pipeline-doctor.ps1 uses).
 HOME_LOGS="$(mktemp -d)"
@@ -153,6 +156,10 @@ while :; do
       printf '[watchdog] restarted %s (was pid %s, %s) -- new pid %s via %s\n' "$action_instance" "$action_pid" "$action_reason" "$new_pid" "$action_script" >&2
     done < <(node "${PACKAGE_SRC_DIR}/dead-process-check.js" 2>>"${HOME_LOGS}/dead-process-check.log")
 
+    # Lane health probe (src/lane-health.js): one tiny generation per idle lane every ~10 min, so a lane that is up but crawling (2026-10-17: RX 580 memory
+    # clock stuck at 300 MHz, 0.6 tok/s) is flagged as degraded instead of looking like a task that is too big. Self-throttled and run in the background (a probe of a crawling lane can take its full timeout); kill switch AGENT_MANAGER_LANE_HEALTH=off.
+    ( node "${PACKAGE_SRC_DIR}/lane-health.js" >/dev/null 2>>"${HOME_LOGS}/lane-health.log" || true ) &
+
     # Reject-retry-requeue: a task genuinely rejected by review (blockedStage:'review') gets
     # one more redraft attempt, up to reject-retry-check.js's own retry cap -- port of
     # queue-watchdog.ps1's Invoke-RejectRetryCheck (that script's OTHER job, dead-process
@@ -242,6 +249,13 @@ while :; do
     # AGENT_MANAGER_CONFLICT_READMIT=off|dry-run|on (default dry-run). See branch-conflict-readmit-sweep.js.
     conflict_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-conflict-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-conflict-readmit-sweep.log")"
     printf '[watchdog] branch-conflict-readmit-sweep: %s\n' "$conflict_readmit_result" >&2
+
+    # Branch-defect re-admission (2026-10-24): the paired sweep for a defect verdict. A single-task agent/* branch whose task carries a CURRENT chat/manual
+    # needs-work verdict (priorVerdict.sha == the branch head, seen on two runs >= 10 min apart) gets ONE redraft with the reviewer's reasons; a second
+    # needs-work after that is left for a human. Same exclusions as the conflict sweep (hub children, stacked, shared branches, human-prioritised tasks).
+    # AGENT_MANAGER_DEFECT_READMIT=off|dry-run|on (default dry-run). See branch-defect-readmit-sweep.js.
+    defect_readmit_result="$(node "${PACKAGE_SRC_DIR}/branch-defect-readmit-sweep.js" 2>>"${HOME_LOGS}/branch-defect-readmit-sweep.log")"
+    printf '[watchdog] branch-defect-readmit-sweep: %s\n' "$defect_readmit_result" >&2
 
     # Expiry sweep (2026-09-24, change_review flood): retires a QUEUED task whose subject went stale while it waited, for any source that
     # declares an `expiry` hook on its registration (change_review: a review of a commit older than its recency window). Source-agnostic --
@@ -455,9 +469,11 @@ while :; do
     # gated to once per 24h internally (isDue/markChecked); runs the file-length-scan
     # result from THIS same tick, so it always sees fresh flags. Disable with
     # AGENT_MANAGER_PROACTIVE_FILE_DECOMPOSE=false.
+    # Run DETACHED and single-instance (2026-10-17): one run is 15+ minutes of model calls, and running it inline held every other sweep in this tick behind it (the coordinator
+    # sweep went ~16 minutes without a pass). The dashboard's --force start takes the same lock (python/dashboard/app.py proactive_sweep_argv), so the two can no longer overlap.
+    # The sweep's own summary line now goes to its log instead of this tick's output.
     if [[ -n "$_hygiene_src" ]] && [[ -f "${_hygiene_src}/proactive-file-decompose-sweep.js" ]]; then
-      proactive_decompose_result="$(node "${_hygiene_src}/proactive-file-decompose-sweep.js" 2>>"${HOME_LOGS}/proactive-file-decompose-sweep.log")"
-      printf '[watchdog] proactive-file-decompose-sweep: %s\n' "$proactive_decompose_result" >&2
+      start_singleton_bg "$PROACTIVE_LOCK" "${HOME_LOGS}/proactive-file-decompose-sweep.log" node "${_hygiene_src}/proactive-file-decompose-sweep.js"
     fi
 
     # merged-work-sweep (2026-09-18): wires verify-merged-work.js -- built 2026-09-16,

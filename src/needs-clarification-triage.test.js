@@ -1017,6 +1017,35 @@ test('bucket D being exhausted does NOT block bucket K from firing on the same t
   assert.match(moved.implementResponse, /Add the allowlist constant/);
 });
 
+// 2026-10-02, widened gate (re-landed WITHOUT the dead flat-counter condition from the
+// reviewed draft): a task whose adhocResolution is only 'draft' (never promoted to
+// 'decompose') but which ALREADY carries a real, valid subTaskProposals decomposition --
+// with ncTriageAttempts 0 (the flat, pre-2026-09-16 counter master no longer increments)
+// and an implementResponse that names none of the sub-task titles -- must still be
+// rescued by bucket K. Same signature as tk1, one gate-step earlier in the adhoc
+// lifecycle; ncTriageAttempts 0 proves the gate does not depend on that field at all.
+test('bucket K: fires for adhocResolution "draft" with a real decomposition sitting unused (widened gate)', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, baseTask('tk8', {
+    adhocResolution: 'draft',
+    subTaskProposals: REAL_SUB_TASKS,
+    // Deliberately names NO sub-task title (contrast tk2, which shows the real titles
+    // and is left alone) -- the blind signature this bucket repairs.
+    implementResponse: 'Implement pass drafted a fix for the widget but the response body is otherwise generic.',
+    needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
+    ncTriageAttempts: 0,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tk8.json')));
+  const moved = read(at(dir, 'review', 'tk8.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.equal(moved.ncTriageBucketAttempts.K, 1, 'bucket K consumed its OWN budget, not the flat ncTriageAttempts');
+  assert.match(moved.implementResponse, /Add the allowlist constant/);
+  assert.match(moved.implementResponse, /Wire the allowlist into the check/);
+});
+
 // --- Ghost-in-the-Machine: bucket C retry-exhausted -> ghost debt (2026-09-09) ---------
 
 const sfInbox = (dir) => {
@@ -1580,4 +1609,48 @@ test('bucket Q: a field flag, a URL in production code, a capped task and an alr
   const summary = await needsClarificationTriage(args(dir, throwingVote));
   for (const id of ['url-field', 'url-prod', 'url-capped', 'url-inreview']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), `${id} stays`);
   assert.equal(summary.requeued, 0);
+});
+
+// --- Bucket J paired re-admission (2026-10-18): one more retry per truncation-gate version, only when the current gate passes ----------
+const { TRUNCATION_GATE_VERSION } = require('./validate-implement-truncation.js');
+const COMPLETE_DIFF_RESPONSE = ['RESOLUTION: implemented', '', '=== DIFF ===', '--- a/x.sh', '+++ b/x.sh', '@@ -1,2 +1,2 @@',
+  '-a', '+b', '   # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"', ''].join('\n');
+const STILL_TRUNCATED_RESPONSE = 'All checks pass. Final line: return "Topology';
+
+test('bucket J: an EXHAUSTED task the fixed gate now passes is requeued once under the gate-version key, and not again', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj6', {
+    reviewProvider: 'deterministic-truncation-guard',
+    blockedReason: 'truncated output',
+    ncTriageDecision: 'leave-for-human',
+    ncTriageBucketAttempts: { J: 1 },
+    implementResponse: COMPLETE_DIFF_RESPONSE,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 1);
+  const moved = read(at(dir, 'adhoc', 'tj6.json'));
+  assert.equal(moved.ncTriageBucketAttempts.J, 1, 'the legacy counter is untouched');
+  assert.equal(moved.ncTriageBucketAttempts[`J@${TRUNCATION_GATE_VERSION}`], 1);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && h.detail.includes(`gate version ${TRUNCATION_GATE_VERSION}`)));
+  // The same task blocked again by the same gate version: no second versioned retry.
+  fs.unlinkSync(at(dir, 'adhoc', 'tj6.json'));
+  held(dir, { ...moved, reviewProvider: 'deterministic-truncation-guard', blockedReason: 'truncated output', implementResponse: COMPLETE_DIFF_RESPONSE, ncTriageDecision: 'leave-for-human' });
+  const s2 = await needsClarificationTriage(args(dir));
+  assert.equal(s2.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tj6.json')));
+});
+
+test('bucket J: an EXHAUSTED task whose stored response the current gate still flags stays where it is', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj7', {
+    reviewProvider: 'deterministic-truncation-guard',
+    blockedReason: 'truncated output',
+    ncTriageDecision: 'leave-for-human',
+    ncTriageBucketAttempts: { J: 1 },
+    implementResponse: STILL_TRUNCATED_RESPONSE,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tj7.json')));
+  assert.equal(read(at(dir, 'needs-clarification', 'tj7.json')).ncTriageBucketAttempts[`J@${TRUNCATION_GATE_VERSION}`], undefined);
 });

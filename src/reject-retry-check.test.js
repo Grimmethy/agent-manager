@@ -1292,6 +1292,50 @@ test('rejectRetryCheck requeues a plan-degenerate block under the retry cap, eve
   assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /plan-pass degenerate/.test(h.detail || '')));
 });
 
+test('rejectRetryCheck: a plan-degenerate block records the lane it happened on in avoidLanes when two lanes exist', () => {
+  const lanes = require('./lanes.js');
+  const prev = { url: process.env.AGENT_MANAGER_P40_OLLAMA_URL, model: process.env.AGENT_MANAGER_P40_MODEL };
+  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.0.2.1:11434';
+  process.env.AGENT_MANAGER_P40_MODEL = 'qwen-p40-test';
+  try {
+    assert.ok(lanes.getLanes().length >= 2, 'precondition: the P40 env creates a second lane');
+    const { blockedDir, pendingDir } = setupDirs();
+    writeBlockedTask(blockedDir, 'task-lane', {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      planResponse: 'a truncated, unusable plan',
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-p40', finishedAt: new Date().toISOString() }],
+    });
+    rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+    const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-lane.json'), 'utf8'));
+    assert.deepEqual(requeued.avoidLanes, ['worker-p40']);
+    assert.ok(requeued.history.some((h) => h.stage === 'lane-avoided' && /worker-p40/.test(h.detail || '')));
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_P40_OLLAMA_URL', prev.url], ['AGENT_MANAGER_P40_MODEL', prev.model]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test('rejectRetryCheck: a plan-degenerate block does NOT record avoidLanes on a single-lane setup', () => {
+  const prev = { url: process.env.AGENT_MANAGER_P40_OLLAMA_URL, model: process.env.AGENT_MANAGER_P40_MODEL };
+  delete process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  delete process.env.AGENT_MANAGER_P40_MODEL;
+  try {
+    const { blockedDir, pendingDir } = setupDirs();
+    writeBlockedTask(blockedDir, 'task-single', {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-3090', finishedAt: new Date().toISOString() }],
+    });
+    rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+    const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-single.json'), 'utf8'));
+    assert.equal(requeued.avoidLanes, undefined);
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_P40_OLLAMA_URL', prev.url], ['AGENT_MANAGER_P40_MODEL', prev.model]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
 test('rejectRetryCheck exhausts a non-adhoc plan-degenerate block at the retry cap without escalating', () => {
   const { blockedDir, pendingDir } = setupDirs();
   writeBlockedTask(blockedDir, 'task-1', {
@@ -1740,4 +1784,48 @@ test('a too-few split block is NOT re-admitted when the draft retry already ran,
     assert.equal(rejectRetryCheck({ ...d, recordModelOutcome: () => {} }).requeued, 0, id);
     assert.ok(fs.existsSync(path.join(d.blockedDir, `${id}.json`)));
   }
+});
+
+test('rejectRetryCheck: a plan-degenerate block on the BIGGEST lane records no avoidLanes and files one deterministic systemic side finding', () => {
+  const lanes = [
+    { id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', tier: 27, taskClasses: null },
+    { id: 'worker-rx580', model: 'qwen3-vl:8b-instruct', tier: 8, taskClasses: ['brain_dump_sort'] },
+  ];
+  const { root, blockedDir, pendingDir } = setupDirs();
+  for (const id of ['top-a', 'top-b']) {
+    writeBlockedTask(blockedDir, id, {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      planResponse: 'a truncated, unusable plan',
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-3090', finishedAt: new Date().toISOString() }],
+    });
+  }
+  rejectRetryCheck({ blockedDir, pendingDir, pipelineDir: root, lanes, recordModelOutcome: () => {} });
+  const a = JSON.parse(fs.readFileSync(path.join(pendingDir, 'top-a.json'), 'utf8'));
+  assert.equal(a.avoidLanes, undefined, 'the biggest lane must never be recorded');
+  assert.ok(a.history.some((h) => h.stage === 'advisory' && /filed a systemic side finding/.test(h.detail || '')));
+  assert.ok(!a.history.some((h) => h.stage === 'lane-avoided'));
+  const inbox = path.join(root, 'queue', 'side-findings-inbox');
+  const files = fs.readdirSync(inbox).filter((f) => f.endsWith('.json'));
+  assert.equal(files.length, 2, 'one inbox entry per blocked task...');
+  const recs = files.map((f) => JSON.parse(fs.readFileSync(path.join(inbox, f), 'utf8')));
+  assert.equal(recs[0].title, recs[1].title, '...with identical text, so the side-finding sweep merges them into one entry');
+  assert.equal(recs[0].body, recs[1].body);
+  assert.deepEqual(recs.map((r) => r.taskId).sort(), ['top-a', 'top-b'], 'the task id lives in the metadata, not the text');
+  assert.equal(recs[0].source, 'lane_avoidance');
+});
+
+test('rejectRetryCheck: the same block on a lower-tier lane records avoidLanes and files no side finding', () => {
+  const lanes = [
+    { id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', tier: 27, taskClasses: null },
+    { id: 'worker-rx580', model: 'qwen3-vl:8b-instruct', tier: 8, taskClasses: ['brain_dump_sort'] },
+  ];
+  const { root, blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'low-a', {
+    status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+    draftAttempts: [{ outcome: 'blocked', lane: 'worker-rx580', finishedAt: new Date().toISOString() }],
+  });
+  rejectRetryCheck({ blockedDir, pendingDir, pipelineDir: root, lanes, recordModelOutcome: () => {} });
+  const a = JSON.parse(fs.readFileSync(path.join(pendingDir, 'low-a.json'), 'utf8'));
+  assert.deepEqual(a.avoidLanes, ['worker-rx580']);
+  assert.ok(!fs.existsSync(path.join(root, 'queue', 'side-findings-inbox')) || fs.readdirSync(path.join(root, 'queue', 'side-findings-inbox')).length === 0);
 });

@@ -113,7 +113,7 @@ def api_brain_dump_capture():
     """Dumb, synchronous append -- no LLM in the write path, same philosophy as
     queue-adhoc-task.js's manual task injection. The brain_dump_sort Ornith worker source
     picks unsorted ("captured") entries up from here asynchronously."""
-    from app import brain_dump_path, read_brain_dump_entries, slugify_for_id, write_brain_dump_entries
+    from app import _coerce_serial, brain_dump_path, read_brain_dump_entries, slugify_for_id, write_brain_dump_entries
     body = request.get_json(silent=True) or {}
     text = (body.get("text") or "").strip()
     if not text:
@@ -129,7 +129,7 @@ def api_brain_dump_capture():
     # a hand-edited brain-dump.json survives in the list), so this filters the same way
     # _assign_brain_dump_serials's own max() does, rather than crashing on e.get(...).
     entries = read_brain_dump_entries()
-    next_serial = max((e.get("serial") or 0) for e in entries if isinstance(e, dict)) + 1 if entries else 1
+    next_serial = max((_coerce_serial(e.get("serial")) for e in entries if isinstance(e, dict)), default=0) + 1
 
     entry_id = f"bd-{int(datetime.now(timezone.utc).timestamp() * 1000)}-{slugify_for_id(text)}"
     entry = {

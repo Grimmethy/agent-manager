@@ -596,3 +596,247 @@ test('majorityVote() does NOT file a SIDE-FINDING even when a vote response carr
     }
   );
 });
+
+// 2026-10-16: a hard failure (timeout / HTTP 5xx / connection refused) used to consume one of call()'s attempts. A plan call on the P40 hit an HTTP 500,
+// then a 427 s timeout, and its first real response (truncated at numPredict 1400) came on attempt 3 -- the loop was over, so the truncation escalation
+// (numPredict x2, think off) never ran and the task was recorded as 'Plan pass degenerate: truncated'. Hard failures now have their own allowance.
+function truncatedEmpty(body) {
+  return JSON.stringify({ response: '', done: true, done_reason: 'length', eval_count: body.options.num_predict });
+}
+
+test('hardFailureAllowance(maxRetries) equals the attempts a call that never gets a response has always made', () => {
+  const { hardFailureAllowance } = freshLocalClient('http://127.0.0.1:1');
+  assert.equal(hardFailureAllowance(2), 3);
+  assert.equal(hardFailureAllowance(1), 2);
+  assert.equal(hardFailureAllowance(0), 1);
+});
+
+test('call() still escalates numPredict and drops think when the first REAL response (a zero-content truncation) arrives after two hard failures', async () => {
+  const seen = [];
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        const body = JSON.parse(raw);
+        seen.push({ numPredict: body.options.num_predict, think: body.think });
+        if (seen.length <= 2) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end('{"error":"runner stopped"}'); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(seen.length === 3 ? truncatedEmpty(body) : generateResponse('a real plan, landed after the outage and the escalation.'));
+      });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: true, numPredict: 1400 }, 2);
+      assert.equal(result.degenerate, null, 'the call must recover, not end as "truncated" with a retry never taken');
+      assert.deepEqual(seen, [
+        { numPredict: 1400, think: true }, { numPredict: 1400, think: true }, { numPredict: 1400, think: true },
+        { numPredict: 2800, think: false },
+      ]);
+      assert.equal(result.attempts, 4, 'attempts counts every call made, hard failures included');
+    }
+  );
+});
+
+test('call() that only ever hard-fails still re-throws after exactly maxRetries + 1 attempts', async () => {
+  let requests = 0;
+  await withServer(
+    (req, res) => { requests += 1; req.on('data', () => {}); req.on('end', () => { res.writeHead(503); res.end('{}'); }); },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      await assert.rejects(() => call({ prompt: 'x', think: false }, 2), /503/);
+      assert.equal(requests, 3);
+    }
+  );
+});
+
+test('call() whose every response is truncated still stops after maxRetries + 1 responses (the response budget is unchanged)', async () => {
+  let requests = 0;
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => { requests += 1; res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(truncatedEmpty(JSON.parse(raw))); });
+    },
+    async (base) => {
+      const { call } = freshLocalClient(base);
+      const result = await call({ prompt: 'x', think: true, numPredict: 1400 }, 2);
+      assert.equal(result.degenerate, 'truncated');
+      assert.equal(requests, 3);
+    }
+  );
+});
+
+test('the degenerate and hard-failure audit entries record whether think was on for that attempt', async () => {
+  let n = 0;
+  await withServer(
+    (req, res) => {
+      let raw = '';
+      req.on('data', (c) => { raw += c; });
+      req.on('end', () => {
+        const body = JSON.parse(raw);
+        n += 1;
+        if (n === 1) { res.writeHead(503, { 'Content-Type': 'application/json' }); res.end('{}'); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(n <= 3 ? truncatedEmpty(body) : generateResponse('a real, complete response.'));
+      });
+    },
+    async (base) => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'local-client-think-audit-test-'));
+      process.env.OLLAMA_URL = base;
+      process.env.LOCAL_MODEL = 'test-model';
+      process.env.ORNITH_TIMEOUT_MS = '5000';
+      process.env.AGENT_MANAGER_REPO_ROOT = dir;
+      process.env.AGENT_MANAGER_PIPELINE_DIR = dir;
+      delete require.cache[require.resolve('./local-client.js')];
+      const { call } = require('./local-client.js');
+      const result = await call({ prompt: 'x', think: true, numPredict: 1400, source: 'manual', taskId: 't-think', stage: 'plan' }, 2);
+      assert.equal(result.degenerate, null);
+      const lines = fs.readFileSync(path.join(dir, 'instances', 'pipeline-history.log'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
+      const hard = lines.filter((l) => l.type === 'hard-failure');
+      const degenerate = lines.filter((l) => l.type === 'degenerate');
+      assert.deepEqual(hard.map((l) => l.think), [true]);
+      assert.deepEqual(degenerate.map((l) => l.think), [true, false], 'the first truncation asked for reasoning; the retry after a zero-content truncation did not');
+    }
+  );
+});
+
+// 2026-10-24 (rx580 lane): the escalation ladder asked for a numPredict that cannot finish inside the per-call ceiling at the lane's measured rate
+// (5600 tokens ~350 s at 16 tok/s vs the 300 s ceiling), so attempts 3-5 were OLLAMA_TIMEOUT and a doomed plan held the lane ~20 min. These pin the
+// clamp: only against a RECORDED rate, never shrinking the unmeasured ladder the two tests above pin.
+async function withMeasuredRate(base, tokensPerSecond, fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-clamp-'));
+  const saved = { root: process.env.AGENT_MANAGER_REPO_ROOT, inst: process.env.AGENT_MANAGER_INSTANCES_DIR };
+  process.env.AGENT_MANAGER_REPO_ROOT = dir;
+  process.env.AGENT_MANAGER_INSTANCES_DIR = path.join(dir, 'instances');
+  fs.mkdirSync(process.env.AGENT_MANAGER_INSTANCES_DIR, { recursive: true });
+  try {
+    require('./local-throughput.js').recordSample(process.env.AGENT_MANAGER_INSTANCES_DIR, { evalCount: tokensPerSecond * 10, evalDurationNs: 10e9, endpoint: base, model: 'test-model' });
+    return await fn();
+  } finally {
+    if (saved.root === undefined) delete process.env.AGENT_MANAGER_REPO_ROOT; else process.env.AGENT_MANAGER_REPO_ROOT = saved.root;
+    if (saved.inst === undefined) delete process.env.AGENT_MANAGER_INSTANCES_DIR; else process.env.AGENT_MANAGER_INSTANCES_DIR = saved.inst;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function alwaysTruncatedServer(capturedNumPredicts) {
+  return (req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      const body = JSON.parse(raw);
+      capturedNumPredicts.push(body.options.num_predict);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ response: 'a plan that never ends because', done: true, done_reason: 'length', eval_count: body.options.num_predict, prompt_eval_count: 1000 }));
+    });
+  };
+}
+
+test('call() clamps a truncated retry to what fits the per-call ceiling at the measured rate, then stops instead of re-issuing a call that cannot finish', async () => {
+  const capturedNumPredicts = [];
+  await withServer(alwaysTruncatedServer(capturedNumPredicts), async (base) => {
+    const { call } = freshLocalClient(base); // first: it clears AGENT_MANAGER_REPO_ROOT, which withMeasuredRate then sets for the call
+    await withMeasuredRate(base, 16, async () => {
+      const result = await call({ prompt: 'x', think: false, numPredict: 1400 }, 4);
+      assert.equal(result.degenerate, 'truncated');
+      // fit = floor((300 * 0.9 - 1000 / 150) * 16) = 4213: the 5600 the plain ladder asked for is never requested, and nothing is re-issued after the clamp stops growing
+      assert.deepEqual(capturedNumPredicts, [1400, 2800, 4213]);
+    });
+  });
+});
+
+test('maxNumPredictThatFits: 90% of the ceiling less prefill at 150 tok/s, times the measured rate', () => {
+  const { maxNumPredictThatFits } = freshLocalClient('http://127.0.0.1:1');
+  assert.equal(maxNumPredictThatFits({ promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 300_000 }), 4213);
+  assert.equal(maxNumPredictThatFits({ promptTokens: 0, tokensPerSecond: 11, ceilingMs: 300_000 }), 2970);
+  assert.ok(maxNumPredictThatFits({ promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 900_000 }) > 8000, 'the slow-endpoint ceiling leaves the 8000 cap in charge');
+  assert.equal(maxNumPredictThatFits({ promptTokens: 60_000, tokensPerSecond: 16, ceilingMs: 300_000 }), 0, 'a prompt whose prefill alone spends the budget fits nothing');
+});
+
+// 2026-10-24 (rx580, change_review): the retry clamp above limits only ESCALATED budgets; a >10000-char change_review diff asks for a 6000-token plan
+// on the FIRST call, ~375 s at 16 tok/s against the 300 s ceiling, so it timed out every time (one task: 8 cycles, ~2 h). callOnce now caps the
+// num_predict it sends. With the cap in place a truncation of that first call leaves the retry clamp nothing bigger than the fit to escalate to, so
+// the ladder stops after one call. freshLocalClient always sets ORNITH_TIMEOUT_MS (a deliberate timeout, which skips the cap), so these build a
+// client with both timeout overrides removed BEFORE require, as an operator-default environment would be.
+function freshLocalClientDefaultTimeout(baseUrl, env = {}) {
+  process.env.OLLAMA_URL = baseUrl;
+  process.env.LOCAL_MODEL = 'test-model';
+  delete process.env.ORNITH_TIMEOUT_MS;
+  delete process.env.LOCAL_TIMEOUT_MS;
+  Object.assign(process.env, env);
+  process.env.AGENT_MANAGER_REPO_ROOT = '';
+  delete require.cache[require.resolve('./local-client.js')];
+  try { return require('./local-client.js'); } finally { delete process.env.LOCAL_TIMEOUT_MS; }
+}
+
+function recordingServer(sent) {
+  return (req, res) => {
+    let raw = '';
+    req.on('data', (c) => { raw += c; });
+    req.on('end', () => {
+      sent.push(JSON.parse(raw).options.num_predict);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(generateResponse('a complete plan.'));
+    });
+  };
+}
+
+test('callOnce caps the num_predict it sends to what fits the per-call ceiling at the recorded rate', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    await withMeasuredRate(base, 16, () => client.callOnce({ prompt: 'x', think: false, numPredict: 6000 }));
+    assert.equal(sent.length, 1);
+    assert.ok(sent[0] < 6000 && sent[0] > 4000, `expected a cap near 4300 for 16 tok/s and a 300 s ceiling, got ${sent[0]}`);
+    // the sent value is exactly the helper's fit for some small prompt-token estimate (the dated line, the injected side-finding instruction and the prompt)
+    const matches = Array.from({ length: 2000 }, (_, p) => client.maxNumPredictThatFits({ promptTokens: p, tokensPerSecond: 16, ceilingMs: 300_000 }));
+    assert.ok(matches.includes(sent[0]), 'the cap must be the maxNumPredictThatFits value, not an unrelated number');
+  });
+});
+
+test('callOnce sends the requested num_predict unchanged when no rate has been recorded', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    await client.callOnce({ prompt: 'x', think: false, numPredict: 6000 });
+    assert.deepEqual(sent, [6000]);
+  });
+});
+
+test('callOnce leaves num_predict alone when the caller passed an explicit timeoutMs', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    await withMeasuredRate(base, 16, () => client.callOnce({ prompt: 'x', think: false, numPredict: 6000, timeoutMs: 20_000 }));
+    assert.deepEqual(sent, [6000]);
+  });
+});
+
+test('callOnce leaves num_predict alone when an operator LOCAL_TIMEOUT_MS override is set', async () => {
+  const sent = [];
+  await withServer(recordingServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base, { LOCAL_TIMEOUT_MS: '20000' });
+    await withMeasuredRate(base, 16, () => client.callOnce({ prompt: 'x', think: false, numPredict: 6000 }));
+    assert.deepEqual(sent, [6000]);
+  });
+});
+
+test('capNumPredictToFit: unchanged when it fits, capped when it does not, unchanged below the 1024 floor', () => {
+  const { capNumPredictToFit } = freshLocalClient('http://127.0.0.1:1');
+  assert.equal(capNumPredictToFit({ numPredict: 1400, promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 300_000 }), 1400);
+  assert.equal(capNumPredictToFit({ numPredict: 6000, promptTokens: 1000, tokensPerSecond: 16, ceilingMs: 300_000 }), 4213);
+  // a prompt whose prefill leaves under 1024 tokens of budget at 16 tok/s: capping would give a uselessly short output, so the request stands
+  assert.equal(capNumPredictToFit({ numPredict: 6000, promptTokens: 38_000, tokensPerSecond: 16, ceilingMs: 300_000 }), 6000);
+});
+
+test('call(): a truncation of the capped first call ends the ladder after that one call, not three timeouts', async () => {
+  const sent = [];
+  await withServer(alwaysTruncatedServer(sent), async (base) => {
+    const client = freshLocalClientDefaultTimeout(base);
+    const result = await withMeasuredRate(base, 16, () => client.call({ prompt: 'x', think: false, numPredict: 6000 }, 2));
+    assert.equal(result.degenerate, 'truncated');
+    assert.equal(sent.length, 1, 'nothing bigger than the fit exists to escalate to');
+    assert.ok(sent[0] < 6000, 'and that one call carried the capped budget');
+  });
+});

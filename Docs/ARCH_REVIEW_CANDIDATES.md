@@ -826,3 +826,31 @@ In the module.exports block, delete the five helper names (findFuzzyMatch, windo
 
 Benefits:
 The SDK's public export surface now matches its documented API exactly. The load-time dependency on ./lib/fuzzy-matching.js is eliminated entirely, and the dependency on ./lib/file-grounding.js is reduced to only the one function actually used (windowFetchedFileContent). This decouples the read/fulfill path from the grounding-helper modules, reducing the blast radius of future changes to those lib files and making the module's import graph reflect its true responsibilities.
+
+### AC-85 · Remove dead `require('../task-sources.js')` from prompt-assembly.js
+Strength: Strong
+Split-Depth: 1
+Files: src/lib/prompt-assembly.js
+
+Problem:
+The file contains a bare, unassigned side-effect require: `require('../task-sources.js');` sitting between the header comment and the `assemblePrompt` function. No symbol from `task-sources.js` is destructured, assigned, or referenced anywhere in this file — the sole exported function `assemblePrompt` only uses its two parameters and the spread/join operators. The require is redundant because `src/prompts.js`, which is the module that actually consumes `assemblePrompt`, already loads `./task-sources.js` directly (its own `require('./task-sources.js')` line). Leaving the dead require in place adds a needless edge to the module graph and a small circular-require risk for no functional benefit.
+
+Solution:
+Delete the single line `require('../task-sources.js');` (and the one blank line immediately preceding it, to avoid leaving a double blank between the header comment and the function). No other line in the file is touched. The file's `'use strict'` directive, header comment, `assemblePrompt` function body, and `module.exports` remain byte-identical.
+
+Benefits:
+Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies (none beyond built-ins) explicit. Zero behavioural change: `assemblePrompt` is a pure function of its two array arguments and never touches any `task-sources.js` symbol.
+
+### AC-86 · Remove dead `require('../task-sources.js')` from prompt-blocks.js
+Strength: Strong
+Split-Depth: 1
+Files: src/lib/prompt-blocks.js
+
+Problem:
+The file contains a bare, unassigned side-effect require: `require('../task-sources.js');` sitting between the header comment and the first function (`statedAcceptanceBlock`). None of the five exported functions (`statedAcceptanceBlock`, `fixedLiteralsBlock`, `priorRejectionBlock`, `priorVerdictBlock`, `strictCiteConstraintBlock`) reference any symbol originating from `task-sources.js`; they operate purely on their `task` argument and local constants like `PRIOR_VERDICT_MAX_CHARS`. The require is redundant because `src/prompts.js`, the module that destructures and calls all five of these functions, already loads `./task-sources.js` directly. The dead require adds a needless module-graph edge and a small circular-require risk without providing any value to this file.
+
+Solution:
+Delete the single line `require('../task-sources.js');` (and the one blank line immediately preceding it, to avoid leaving a double blank between the header comment and the first function). No other line in the file is touched. The `'use strict'` directive, header comment, all five function bodies, the `PRIOR_VERDICT_MAX_CHARS` constant, and the `module.exports` statement remain byte-identical.
+
+Benefits:
+Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies (none beyond built-ins) explicit. Zero behavioural change: all five block functions are pure functions of their `task` argument and never touch any `task-sources.js` symbol.

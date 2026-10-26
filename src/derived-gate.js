@@ -23,7 +23,7 @@ const GENERATED_DOC_RE = /(_CANDIDATES\.md$|PRODUCT_SPEC(_OUTLINE)?\.md$|TROUBLE
 
 // Sources that only READ code: they can hold nothing back.
 const READ_ONLY_SOURCES = new Set([
-  'change_review', 'pipeline_health_audit', 'pipeline_self_audit', 'pipeline_debrief', 'pipeline_forensics', 'pipeline_forensics_fix',
+  'change_review', 'pipeline_health_audit', 'pipeline_self_audit', 'pipeline_debrief', 'capability_debrief', 'pipeline_forensics', 'pipeline_forensics_fix',
   'brain_dump_sort', 'staleness_audit', 'research_task',
 ]);
 const OPEN_DIRS = ['adhoc', 'pending', 'review', 'approved', 'awaiting-confirm', 'derived'];
