@@ -854,3 +854,47 @@ Delete the single line `require('../task-sources.js');` (and the one blank line 
 
 Benefits:
 Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies (none beyond built-ins) explicit. Zero behavioural change: all five block functions are pure functions of their `task` argument and never touch any `task-sources.js` symbol.
+
+### AC-94 · Extract pre-dispatch gate registry into its own module
+Strength: Strong
+Split-Depth: 1
+Files: src/pre-dispatch-gate-registry.js
+
+Problem:
+The gate registry (Map-based, rule-keyed: registerPreDispatchGate, getPreDispatchGate, clearPreDispatchGateRegistry) and its two built-in detectors (gateSequentialAwaitInLoop, gateSyncIoInLoop) plus the SYNC_IO_BOUND_THRESHOLD constant are currently bundled inside src/deterministic-recheck-registry.js alongside the unrelated source-keyed recheck registry. They have different keying schemes (rule-ID strings vs. source-name strings), different lifecycles (gates are consulted before dispatch; rechecks are consulted after a staleness flag), and the gate registry's module-load side effect (registering two default detectors) is what forced a try/catch workaround in the test file. Keeping them in one module means any consumer that only needs the recheck API is also pulled into the gate registry's side-effect surface.
+
+Solution:
+Create src/pre-dispatch-gate-registry.js containing: the preDispatchGateRegistry Map, registerPreDispatchGate, getPreDispatchGate, clearPreDispatchGateRegistry, gateSequentialAwaitInLoop, gateSyncIoInLoop, SYNC_IO_BOUND_THRESHOLD, and the two registerPreDispatchGate calls that wire up the default detectors. IMPORTANT -- gateSyncIoInLoop is not self-contained. On master the contiguous block of module-private definitions it relies on, immediately above and including it (src/deterministic-recheck-registry.js, from the `const SYNC_IO_BOUND_THRESHOLD = 10;` declaration through the end of gateSyncIoInLoop, about lines 152-224), must move with it: SYNC_IO_BOUND_THRESHOLD, SYNC_IO_LOOP_PATTERN, SYNC_IO_BOUND_PATTERN, SYNC_IO_ARRAY_BOUND_PATTERN, SYNC_IO_ARRAY_ELEMENT_RE, SYNC_IO_STARTUP_NAME, SYNC_IO_STARTUP_SCOPE_PATTERN, SYNC_IO_HOT_PATH_PATTERN, SYNC_IO_QUOTED_RE and the helper function syncIoBoundedBound. Moving only the registry, the two detectors and SYNC_IO_BOUND_THRESHOLD leaves gateSyncIoInLoop calling undefined names. Verify by running `node --test src/sync-io-in-loop-gate.test.js` (and any test that requires deterministic-recheck-registry.js) after the move. The module must have no external require calls (hot-path constraint). Export all of the above via module.exports.
+
+Benefits:
+The gate registry becomes an independently importable unit with its own lifecycle. Consumers that only need recheck functions no longer transitively load gate-registry code or its side effects. The module-load detector registration is now explicit to the gate module rather than a hidden side effect of importing the recheck registry.
+
+### AC-95 · Trim deterministic-recheck-registry.js to recheck-only and add re-export shim
+Strength: Strong
+Split-Depth: 1
+Files: src/deterministic-recheck-registry.js
+Depends-On: AC-94
+
+Problem:
+After the gate registry is extracted (candidate 0), src/deterministic-recheck-registry.js still contains the gate-registry implementation, both detector functions, the SYNC_IO_BOUND_THRESHOLD constant, and the two registerPreDispatchGate calls. Any consumer that imports the recheck API is still loading gate-registry code. Additionally, if any existing consumer (other than the test file) imports gate functions from this path, removing them outright would break that consumer.
+
+Solution:
+Remove from src/deterministic-recheck-registry.js: the preDispatchGateRegistry Map, registerPreDispatchGate, getPreDispatchGate, clearPreDispatchGateRegistry, gateSequentialAwaitInLoop, gateSyncIoInLoop, SYNC_IO_BOUND_THRESHOLD, and the two registerPreDispatchGate calls. Keep only the object-based recheck registry (registry, registerDeterministicRecheck, getDeterministicRecheck, getRecheckSources, clearDeterministicRecheckRegistry). Add a re-export shim: const { registerPreDispatchGate, getPreDispatchGate, clearPreDispatchGateRegistry, gateSequentialAwaitInLoop, gateSyncIoInLoop, SYNC_IO_BOUND_THRESHOLD } = require('./pre-dispatch-gate-registry.js'); and include those names in module.exports so existing importers of gate functions from this path continue to work. The re-export is an internal require of a sibling module and does not violate the no-external-require constraint (which prohibits requires of plugin/maintenance code on the hot path).
+
+Benefits:
+The recheck module is now minimal and side-effect-free at load time (no detector registration). The documented plugin API (registerDeterministicRecheck, getDeterministicRecheck, getRecheckSources, clearDeterministicRecheckRegistry) is unchanged. Backward compatibility for any gate-function importer is preserved via the shim.
+
+### AC-96 · Remove try/catch workaround in pipeline-forensics.test.js
+Strength: Strong
+Split-Depth: 1
+Files: src/pipeline-forensics.test.js
+Depends-On: AC-95
+
+Problem:
+In the freshTaskSources() helper, the call to clearDeterministicRecheckRegistry() is wrapped in try { ... } catch { /* optional */ }. This workaround existed because the gate registry's module-load side effects (registering default detectors) were in the same module, and a failure in that side-effect path could cause clearDeterministicRecheckRegistry to throw or the module to be in a partially-initialised state. Now that the gate registry lives in src/pre-dispatch-gate-registry.js (candidate 0) and the recheck module is side-effect-free (candidate 1), the try/catch masks a real error for no reason and hides any genuine failure of the recheck registry's clear function.
+
+Solution:
+In the freshTaskSources() function, replace the line  try { clearDeterministicRecheckRegistry(); } catch { /* optional */ }  with the direct call  clearDeterministicRecheckRegistry();  . The existing import  const { clearDeterministicRecheckRegistry } = require('./deterministic-recheck-registry.js');  remains unchanged because that function is still exported from the same path. No new import from pre-dispatch-gate-registry.js is needed in this test file (it does not import any gate functions).
+
+Benefits:
+The test no longer silently swallows a real error from clearDeterministicRecheckRegistry. If the recheck registry's clear function ever throws (e.g. a future refactoring bug), the test will fail loudly instead of passing with a partially-cleared registry. The test code is simpler and the workaround's original rationale no longer applies.
