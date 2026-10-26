@@ -771,3 +771,47 @@ test('extractDeclaredTargets: rule 6 stays narrow -- a restricted file, a merely
   assert.ok(!targets.includes('Docs/cited.md'));
   assert.ok(targets.includes('Docs/a.md'));
 });
+
+// --- three false blocks found on stalled hub pieces (2026-10-26) ---------------------------------------------------------------------------------
+// HUB0040 2/3: "Does not touch any file other than `x`" names the file that MAY change; it was extracted as forbidden.
+test('forbidden-path: "does not touch any file other than <x>" exempts x instead of forbidding it', () => {
+  const raw = 'In src/decompose-premise-check.js, locate the PATH_RE capture loop. Replace the raw captured path value with resolveExistingPath(raw, repoRoot, lineCountFn).';
+  const plan = 'Target file: `src/decompose-premise-check.js`.\n- Does not touch any file other than `src/decompose-premise-check.js`.';
+  const t = adhoc(raw, plan);
+  assert.deepEqual(extractForbiddenPaths(`${raw}\n${plan}`), []);
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('src/decompose-premise-check.js'), 'wired it'), null);
+  // a real restriction in the same text is still forbidden, and an "except" exemption only covers what follows it
+  assert.deepEqual(extractForbiddenPaths('Do not touch src/a.js. Do not modify anything except src/b.js.'), ['src/a.js']);
+  assert.equal(adhocDiffSubstanceProblem(adhoc('Edit src/b.js. Do not touch src/a.js.'), editDiff('src/a.js'), '').code, 'forbidden-path');
+});
+
+// HUB0125 1/2: the task creates one doc; its own scope sentences name that file and the neighbouring docs/audit/ directory.
+test('forbidden-path: a file the task says to create is not forbidden by its own "exactly one new file" scope sentences', () => {
+  const raw = 'Create docs/audit-batch-write-bypass-2026-10-02.md. It must contain a markdown table with the exact columns file, function, write target.';
+  const plan = 'The deliverable is exactly one file, `docs/audit-batch-write-bypass-2026-10-02.md`, created in the working tree.\n'
+    + 'No other file is created, edited, moved, or deleted. Do not touch `docs/audit/` and do not also modify `docs/audit-batch-write-bypass-2026-10-02.md` as a side effect.';
+  const t = adhoc(raw, plan);
+  assert.ok(extractDeclaredTargets(t, plan).includes('docs/audit-batch-write-bypass-2026-10-02.md'));
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md'), 'created the audit doc'), null);
+  // the neighbouring directory the task forbids is still forbidden
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md') + editDiff('docs/audit/local-provider-dispatch-paths.md'), '').code, 'forbidden-path');
+});
+
+// HUB0117 3/4: a documentation task that cites code paths as evidence.
+test('docs-only: every declared edit target is documentation -> a docs diff is the deliverable, however many code paths the text cites', () => {
+  const raw = 'Edit `docs/local-delegation.md` to add a subsection explaining `OLLAMA_KV_CACHE_TYPE`. State that it is not yet enabled, and point to `agent-manager.env.example` for the configuration knob. Add a note about src/gpu-vram.js.';
+  const t = adhoc(raw, 'Edit `docs/local-delegation.md`.');
+  assert.ok(extractDeclaredTargets(t, 'Edit `docs/local-delegation.md`.').includes('docs/local-delegation.md'));
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('docs/local-delegation.md'), 'documented it'), null);
+  // a created doc alone does not exempt a task that also asks for a code edit in another sentence (the existing rule)
+  assert.equal(adhocDiffSubstanceProblem(adhoc('Create docs/audit/paths.md listing the routes. Then update the timeout handling in src/local-tool-client.js.'), createDiff('docs/audit/paths.md'), '').code, 'docs-only');
+});
+
+test('extractDeclaredTargets: a file named as the deliverable or created in the PLAN is a declared target; a merely cited or restricted file is not', () => {
+  const t = adhoc('Write the research note (the deliverable).');
+  const plan = 'The deliverable is the note file `notes/hub0002-bits-ai-research-note.txt`.\n3. Create the deliverable as a single plain-text file at `notes/hub0002-bits-ai-research-note.txt`.\n4. Create `scratch/extra.txt` first.';
+  assert.ok(extractDeclaredTargets(t, 'The deliverable is the note file `notes/a.txt`.').includes('notes/a.txt'), 'deliverable-is sentence');
+  assert.ok(extractDeclaredTargets(t, '3. Create the deliverable as a single plain-text file at `notes/b.txt` (create the directory if needed).').includes('notes/b.txt'), 'plan "create ... file at" sentence');
+  assert.ok(extractDeclaredTargets(t, plan).includes('scratch/extra.txt'));
+  assert.ok(!extractDeclaredTargets(adhoc('Read src/a.js for context. Do not create src/b.js.'), '').some((p) => /src\/[ab]\.js/.test(p)), 'cited or prohibited files are not targets');
+});

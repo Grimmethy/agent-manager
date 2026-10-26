@@ -232,6 +232,8 @@ function isVerificationReport(sentence) {
   return VERIFICATION_MARKER_RE.test(sentence) && !IMPERATIVE_PROHIBITION_RE.test(sentence);
 }
 
+const EXCEPTION_MARKER_RE = /\b(?:other than|except(?: for)?|apart from|aside from|besides)\b/i;
+
 function extractForbiddenPaths(text) {
   const out = new Set();
   const add = (raw) => {
@@ -241,9 +243,13 @@ function extractForbiddenPaths(text) {
     out.add(s);
   };
   const sentences = String(text || '').split(/(?<=[.!?:])\s+|\n+/);
-  for (const sen of sentences) {
+  for (let sen of sentences) {
     if (!RESTRICTION_SENTENCE_RE.test(sen)) continue;
     if (isVerificationReport(sen)) continue;
+    // "Does not touch any file other than `x`" / "nothing except x" names the ONE file that may change: what follows the exception marker is the exemption, never a prohibition
+    // (HUB0040 2/3 was blocked on `matches forbidden "src/decompose-premise-check.js"`, the file it was told to edit).
+    const exemption = EXCEPTION_MARKER_RE.exec(sen);
+    if (exemption) sen = sen.slice(0, exemption.index);
     for (const p of sen.matchAll(/\b(?:src|python|scripts|lib|tests?|docs|node_modules)\/[\w./@-]*[\w]/gi)) add(p[0]);
     for (const p of sen.matchAll(/[\w./@-]+\.(?:js|jsx|ts|tsx|py|sh|go|rb|rs|java|html|css|json|ya?ml)\b/gi)) add(p[0]);
     // (?!\/[A-Za-z0-9_-]) after the capture group (2026-09-15, root-caused live): without
@@ -275,7 +281,8 @@ function pathHitsForbidden(changedPath, forbidden) {
     if (f.endsWith('/')) return cp === f.slice(0, -1) || cp.startsWith(f);
     if (cp === f) return true;
     // path with no extension ("src/apply-adhoc-diff") -> match "src/apply-adhoc-diff.js"
-    if (f.includes('/') && !/\.\w+$/.test(f)) return cp === f || cp.startsWith(`${f}.`);
+    // ... or, when the restriction names a directory without the trailing slash ("Do not touch `docs/audit/`" is extracted as "docs/audit"), anything under it
+    if (f.includes('/') && !/\.\w+$/.test(f)) return cp === f || cp.startsWith(`${f}.`) || cp.startsWith(`${f}/`);
     // a bare filename restriction matches by basename
     if (!f.includes('/')) return base === f || base.startsWith(`${f}.`);
     return false;
@@ -292,7 +299,7 @@ function pathHitsForbidden(changedPath, forbidden) {
 // target carefully, not a prohibition on touching it at all. extractForbiddenPaths'
 // output is filtered against this set so the forbidden-path gate only ever fires for a
 // path that is NOT one of the task's declared targets.
-function extractDeclaredTargets(task, planText = '') {
+function extractDeclaredTargets(task, planText = '', { includeCreated = true } = {}) {
   const out = new Set();
   const add = (raw) => {
     const s = String(raw || '').trim().replace(/^[`'"(]+|[`'".,;)]+$/g, '').replace(/^\.\//, '');
@@ -359,7 +366,28 @@ function extractDeclaredTargets(task, planText = '') {
   // told to edit. Kept narrow like rule 4: the path must be the verb's direct object (optionally after "the file"), so a path that is merely cited in
   // a sentence that happens to contain a verb is still not a target.
   for (const p of verbObjectTargets(rawText)) add(p);
+  // 7. A file the task or its own plan says to CREATE / WRITE, or calls its deliverable ("Create docs/audit-x.md.", "Create the deliverable as a single plain-text file at `notes/x.txt`",
+  // "The deliverable is the note file `notes/x.txt`"): a new file is a declared target exactly like an edited one. Without this a documentation task whose scope sentences mention that
+  // same file ("the diff must be exactly one new file ...", "do not also modify it") had it forbidden (HUB0125 1/2) and was judged docs-only (HUB0002 2/2).
+  if (includeCreated) {
+    for (const p of createTargets(rawText)) add(p);
+    for (const p of createTargets(plan)) add(p);
+  }
   return [...out];
+}
+
+// Rule 7 of extractDeclaredTargets: "create|write|generate [the|a ... file] [at] <path>" or "deliverable is ... <path>" in a sentence that is not itself a restriction.
+function createTargets(text) {
+  const out = [];
+  const PATH = '`?([\\w./@-]+\\.\\w+)`?(?!\\()';
+  for (const frag of String(text || '').split(/(?<=[.!?;])\s+|\n+/)) {
+    if (RESTRICTION_SENTENCE_RE.test(frag) || IMPERATIVE_PROHIBITION_RE.test(frag)) continue;
+    const a = new RegExp(`^[\\s\\d.)*>#-]*(?:create|write|generate|author)\\s+(?:the\\s+|a\\s+|an\\s+|new\\s+|single\\s+|plain-text\\s+|deliverable\\s+|as\\s+)*(?:file\\s+)?(?:at\\s+|named\\s+)?${PATH}`, 'i').exec(frag);
+    if (a) out.push(a[1]);
+    const b = new RegExp(`\\bdeliverable\\s+is\\s+(?:exactly\\s+)?(?:the\\s+|one\\s+)?(?:\\w+\\s+){0,3}?(?:file\\s+)?${PATH}`, 'i').exec(frag);
+    if (b) out.push(b[1]);
+  }
+  return out;
 }
 
 // Rule 6 of extractDeclaredTargets: "<modify|edit|change|update|rewrite|replace|fix> [the file] `<path>`" in a sentence that is not itself a restriction.
@@ -488,9 +516,15 @@ function taskWantsCodeFromText(rawText, combined) {
 }
 
 // Task-level form of the same decision (for the known-fixed-failures registry): the gate's verdict on `task` with a docs-only diff, without needing a diff.
+function declaredEditTargetsAllDocs(task, planText = '') {
+  const editTargets = extractDeclaredTargets(task, planText, { includeCreated: false });
+  return editTargets.length > 0 && editTargets.every((t) => isDocPath(t));
+}
+
 function taskWantsCodeChange(task) {
   const rawText = (task && task.promptContext && task.promptContext.rawText) || (task && task.title) || '';
   const planText = (task && (task.planResponse || task.lastGoodPlan)) || '';
+  if (declaredEditTargetsAllDocs(task, planText)) return false;
   return taskWantsCodeFromText(rawText, `${rawText}\n${planText}`);
 }
 
@@ -537,7 +571,11 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // free-text keyword scan can't distinguish an edit target from a cited-as-evidence
   // path. Only falls back to CODE_SIGNAL_RE's blind scan when no Files: line exists.
   const nonDoc = files.filter((f) => !isDocPath(f.path));
-  if (nonDoc.length === 0) {
+  // A task whose own declared edit targets are ALL documentation (its Files: line, a path in its title, or a file it says to create) is a documentation task no matter how many code paths
+  // its text cites as evidence (HUB0117 3/4: "Edit `docs/local-delegation.md` ... point to `agent-manager.env.example`").
+  // (Files this task says to CREATE are left out here: "Create docs/x.md ... Then update src/y.js" must still read as asking for code.)
+  const docOnlyTargets = declaredEditTargetsAllDocs(task, planText);
+  if (nonDoc.length === 0 && !docOnlyTargets) {
     if (taskWantsCodeFromText(rawText, combined)) {
       return {
         code: 'docs-only',
