@@ -1756,7 +1756,71 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // measured in the live worker log: brain_dump_sort calls at numCtx=8192 paid loadMs=55-70s, and the next normal call reloaded again (104s).
 // It now takes the one pinned context (gpu-capacity.js PINNED_NUM_CTX) like everything else.
 registerModelProfile('brain-dump-cheap-local', { backend: 'local', think: false });
-registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping', strictOutputOnly: true });
+// --- Fingerprint (HUB0194 3/5, shared contract subtask 2): a deterministic string derived from exactly the
+// input files each source reads, so the generation memo store (sibling subtask 1) can skip re-running a
+// source whose inputs have not changed. Sync; returns null when a required input file is missing -- a source
+// whose fingerprint() is null is never memoed (subtask 0/2 contract: "deterministic string or null").
+//
+// Deliberately EXCLUDED: the queue/done/ dir, the _archived_no_action and dated-month archive buckets, and
+// every other artifact whose mtime or id-set changes on every task completion -- a fingerprint that moved on
+// every completion would defeat memoization entirely. Only LIVE queue states (QUEUE_STATES minus 'done',
+// including drafting's per-worker subfolders -- the same shapes idInQueueStates above probes) are enumerated.
+function statFingerprintPart(p) {
+  try {
+    const s = fs.statSync(p);
+    return `${s.mtimeMs}:${s.size}`;
+  } catch {
+    return null; // missing/unreadable -- caller treats null as "never memo"
+  }
+}
+
+// Sorted task ids in the LIVE queue states whose id starts with any of the given prefixes.
+function queuedIdsByPrefixes(queueDir, prefixes) {
+  const ids = new Set();
+  for (const state of QUEUE_STATES.filter((s) => s !== 'done')) {
+    const dir = path.join(queueDir, state);
+    const scan = (d) => {
+      let entries;
+      try { entries = fs.readdirSync(d); } catch { return; }
+      for (const f of entries) {
+        if (f.endsWith('.json') && prefixes.some((p) => f.startsWith(p))) ids.add(f.slice(0, -'.json'.length));
+      }
+    };
+    scan(dir);
+    if (state === 'drafting') {
+      let lanes;
+      try { lanes = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+      for (const e of lanes) if (e.isDirectory()) scan(path.join(dir, e.name));
+    }
+  }
+  return [...ids].sort();
+}
+
+// Exactly the two input files nextDeepDiveTask() reads (line 956: coverage ledger + project_search index):
+// their mtime+size, plus the sorted set of live deep-dive-* task ids (id shape deep-dive-<slug>-<communityId>-s<N>).
+function deepDiveFingerprint() {
+  const { deepDiveCoveragePath, projectSearchIndexPath, pipelineDir } = getConfig();
+  if (!deepDiveCoveragePath || !projectSearchIndexPath) return null;
+  const cov = statFingerprintPart(deepDiveCoveragePath);
+  const idx = statFingerprintPart(projectSearchIndexPath);
+  if (cov === null || idx === null) return null;
+  const ids = queuedIdsByPrefixes(path.join(pipelineDir, 'queue'), ['deep-dive-']);
+  return `deep_dive|cov=${cov}|idx=${idx}|q=${ids.join(',')}`;
+}
+
+// Exactly the input file nextBrainDumpSortTask() reads (line 1335: brainDumpPath) plus the sorted set of live
+// brain-dump task ids it checks via taskIdExistsInQueue (entry ids like bd-1784964943302, per the line 1352
+// comment; the brain-dump-sort- shape is matched too so either naming scheme is covered).
+function brainDumpSortFingerprint() {
+  const { brainDumpPath, pipelineDir } = getConfig();
+  if (!brainDumpPath) return null;
+  const bd = statFingerprintPart(brainDumpPath);
+  if (bd === null) return null;
+  const ids = queuedIdsByPrefixes(path.join(pipelineDir, 'queue'), ['bd-', 'brain-dump-sort-']);
+  return `brain_dump_sort|bd=${bd}|q=${ids.join(',')}`;
+}
+
+registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping', strictOutputOnly: true, fingerprint: brainDumpSortFingerprint });
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
 // drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
@@ -2538,7 +2602,7 @@ function nextSecondBrainOpportunitiesTask() {
 // shape -- a write-up fabricating a specific class/function/architecture detail
 // contradicting the real community file content it was given. See
 // deep-dive-grounding-check.js's own header for the incident.
-registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, skipImplementWhenNoRealFiles: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE, reportClass: 'benefit', postImplementCheck: runDeepDiveGroundingCheck });
+registerTaskSource('deep_dive', { priority: taskPriority('deep_dive', 82), next: nextDeepDiveTask, emptyApproval: true, skipImplementWhenNoRealFiles: true, reviewGuidance: DEEP_DIVE_REVIEW_GUIDANCE, reportClass: 'benefit', postImplementCheck: runDeepDiveGroundingCheck, fingerprint: deepDiveFingerprint });
 registerTaskSource('project_search', { priority: taskPriority('project_search', 85), next: nextProjectSearchTask, emptyApproval: true, preValidateCitedPaths: true, reviewGuidance: PROJECT_SEARCH_REVIEW_GUIDANCE, reportClass: 'benefit', harnessSearch: 'projectSearch' });
 // No `apply` key -- domain:defaultDomain (see buildAuditTask, moved off domain:'adhoc'
 // 2026-08-20 to run on the local model instead of requiring Claude) means this
