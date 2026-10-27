@@ -222,6 +222,49 @@ function relinkExternalDependencies(repoRoot, worktreeDir) {
   return relinked;
 }
 
+// Platform-aware safe symlink helper for toolchain sharing. On Windows uses junction links (target first, then linkPath) with EACCES retry; on Unix uses
+// the standard target-first ordering. Logs every attempt. Returns true on success; throws a descriptive Error on failure (never silently swallows).
+function createSymlinkSafe(target, linkPath) {
+  const platform = os.platform();
+  const log = (msg) => {
+    try { console.error(`[toolchain-symlink] ${msg}`); } catch { /* ignore logging failures */ }
+  };
+  try {
+    if (platform === 'win32') {
+      // Windows junction: linkPath first, then target, mode 'junction'
+      try {
+        fs.symlinkSync(linkPath, target, 'junction');
+        log(`created junction: ${linkPath} -> ${target}`);
+        return true;
+      } catch (err) {
+        if (err.code === 'EACCES') {
+          log(`EACCES on junction creation (${linkPath} -> ${target}), retrying without junction mode`);
+          try {
+            fs.symlinkSync(linkPath, target);
+            log(`created symlink (fallback): ${linkPath} -> ${target}`);
+            return true;
+          } catch (fallbackErr) {
+            throw new Error(`Failed to create symlink ${linkPath} -> ${target}: ${fallbackErr.message}`);
+          }
+        }
+        throw new Error(`Failed to create junction ${linkPath} -> ${target}: ${err.message}`);
+      }
+    } else {
+      // Unix: target first, then linkPath
+      try {
+        fs.symlinkSync(target, linkPath);
+        log(`created symlink: ${target} -> ${linkPath}`);
+        return true;
+      } catch (err) {
+        throw new Error(`Failed to create symlink ${target} -> ${linkPath}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    if (err.message.startsWith('Failed to create')) throw err;
+    throw new Error(`createSymlinkSafe failed for ${target} -> ${linkPath}: ${err.message}`);
+  }
+}
+
 // A failing suite that died on `Cannot find module '<spec>'` is the SANDBOX's doing, not the diff's, when <spec> is a bare specifier that RESOLVES on the
 // host (from the repo root) -- the module exists, the sandbox just cannot see it. A relative path, a node: builtin, or a specifier that does not resolve on
 // the host either is the diff's own mistake and stays a failure. Returns the first such specifier, or null.
@@ -884,7 +927,7 @@ function verifyDiff({ taskId, rawDiff, acceptanceResults = [], repoRoot, mainBra
 
 module.exports = {
   pythonTestArgs, checkChangedFilesSyntax, splitCoveringTiers, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback,
-  verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths,
+  verifyDiff, addedTestNames, relinkExternalDependencies, sandboxUnresolvedDependency, unapplyPartialDiff, parseModifiedHunks, isTrivialHunk, isTestFile, checkUnpinnedHunks, MAX_UNPINNED_HUNKS, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, runSandboxed, worktreePaths, createSymlinkSafe,
   COMMAND_TIMEOUT_MS, TEST_TIMEOUT_MS, TOTAL_BUDGET_MS, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS,
   checkFailsOnBase, splitDiffFiles,
 };
