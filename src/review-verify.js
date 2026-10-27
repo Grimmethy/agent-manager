@@ -222,46 +222,30 @@ function relinkExternalDependencies(repoRoot, worktreeDir) {
   return relinked;
 }
 
-// Platform-aware safe symlink helper for toolchain sharing. On Windows uses junction links (target first, then linkPath) with EACCES retry; on Unix uses
-// the standard target-first ordering. Logs every attempt. Returns true on success; throws a descriptive Error on failure (never silently swallows).
-function createSymlinkSafe(target, linkPath) {
-  const platform = os.platform();
-  const log = (msg) => {
-    try { console.error(`[toolchain-symlink] ${msg}`); } catch { /* ignore logging failures */ }
-  };
+// Platform-aware safe symlink helper for toolchain sharing. Uses fs.promises.symlink with 'dir' type hint. Handles EEXIST (unlink+retry), EPERM/EACCES (permission denied), and EXDEV (cross-device) with descriptive errors. Returns true on success.
+async function createSymlinkSafe(target, linkPath) {
   try {
-    if (platform === 'win32') {
-      // Windows junction: linkPath first, then target, mode 'junction'
+    await fs.promises.symlink(target, linkPath, 'dir');
+    return true;
+  } catch (err) {
+    if (err.code === 'EEXIST') {
       try {
-        fs.symlinkSync(linkPath, target, 'junction');
-        log(`created junction: ${linkPath} -> ${target}`);
+        await fs.promises.unlink(linkPath);
+        await fs.promises.symlink(target, linkPath, 'dir');
         return true;
-      } catch (err) {
-        if (err.code === 'EACCES') {
-          log(`EACCES on junction creation (${linkPath} -> ${target}), retrying without junction mode`);
-          try {
-            fs.symlinkSync(linkPath, target);
-            log(`created symlink (fallback): ${linkPath} -> ${target}`);
-            return true;
-          } catch (fallbackErr) {
-            throw new Error(`Failed to create symlink ${linkPath} -> ${target}: ${fallbackErr.message}`);
-          }
-        }
-        throw new Error(`Failed to create junction ${linkPath} -> ${target}: ${err.message}`);
-      }
-    } else {
-      // Unix: target first, then linkPath
-      try {
-        fs.symlinkSync(target, linkPath);
-        log(`created symlink: ${target} -> ${linkPath}`);
-        return true;
-      } catch (err) {
-        throw new Error(`Failed to create symlink ${target} -> ${linkPath}: ${err.message}`);
+      } catch (retryErr) {
+        throw new Error(`Failed to create symlink ${target} -> ${linkPath} (EEXIST retry): ${retryErr.message}`);
       }
     }
-  } catch (err) {
-    if (err.message.startsWith('Failed to create')) throw err;
-    throw new Error(`createSymlinkSafe failed for ${target} -> ${linkPath}: ${err.message}`);
+    if (err.code === 'EPERM' || err.code === 'EACCES') {
+      console.warn(`Permission denied creating symlink ${target} -> ${linkPath}: ${err.message}`);
+      throw new Error(`Permission denied creating symlink ${target} -> ${linkPath}: ${err.message}`);
+    }
+    if (err.code === 'EXDEV') {
+      console.warn(`Cross-device symlink not supported: ${target} -> ${linkPath}`);
+      throw new Error(`Cross-device symlink not supported: ${target} -> ${linkPath}`);
+    }
+    throw new Error(`Failed to create symlink ${target} -> ${linkPath}: ${err.message}`);
   }
 }
 
