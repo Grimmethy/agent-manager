@@ -83,3 +83,9 @@ the project entry. This is the fallback documented in the implementation of
 In this example, when `TaxHarvest-Cowork` lacks its own `node_modules`, the
 pipeline symlinks `/home/user/repos/taxharvest-parent/node_modules` into the
 scratch worktree so verification can run against the shared dependency tree.
+
+## Related
+
+- HUB0235 · 2/4 · Add `createSymlinkSafe` helper in `src/review-verify.js`
+- HUB0235 · 3/4 · Integrate `toolchainDir` symlink logic into `verifyDiff`
+- HUB0235 · 4/4 · Add `node:test` cases for toolchain directory
