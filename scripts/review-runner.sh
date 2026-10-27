@@ -99,10 +99,9 @@ review_lock_key() {
   printf '%s' "${key:-${LOCAL_MODEL:-}}"
 }
 
+capture_base_local_model
 refresh_active_model() {
-  local override
-  override="$(get_model_override "$INSTANCE_ID")"
-  [[ -n "$override" ]] && LOCAL_MODEL="$override"
+  LOCAL_MODEL="$(effective_local_model "$INSTANCE_ID")"       # the dashboard override, else the launch model: removing an override puts the reviewer back
   export LOCAL_MODEL
 }
 

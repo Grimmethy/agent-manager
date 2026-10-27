@@ -39,17 +39,13 @@ source "${SCRIPT_DIR}/orc-common.sh"                                            
 
 # Re-run once per tick (Workers tab per-instance model dropdown): exports LOCAL_MODEL for this
 # tick from dashboard-settings.json's workerModelOverrides when the dashboard has set one for THIS
-# instanceId (a bare model name; a legacy "ollama:" prefix is tolerated), else leaves whatever
-# agent-manager.env / the lane's own env set at launch untouched. Every node call downstream this
-# tick (local-draft.js, ...) inherits the exported value.
+# instanceId (a bare model name; a legacy "ollama:" prefix is tolerated), else the model this
+# process was launched with (effective_local_model / capture_base_local_model in
+# agent-manager-common.sh), so removing an override puts the lane back. Every node call downstream
+# this tick (local-draft.js, ...) inherits the exported value.
+capture_base_local_model
 refresh_active_model() {
-  local override
-  override="$(get_model_override "$INSTANCE_ID")"
-  case "$override" in
-    claude:*) : ;;
-    ollama:*) LOCAL_MODEL="${override#ollama:}" ;;
-    ?*) LOCAL_MODEL="$override" ;;
-  esac
+  LOCAL_MODEL="$(effective_local_model "$INSTANCE_ID")"
   export LOCAL_MODEL
   HEARTBEAT_MODEL="${LOCAL_MODEL:-}"
 }
