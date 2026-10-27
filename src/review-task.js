@@ -95,7 +95,11 @@ function writeTaskJson(taskPath, task) {
 function getDomainConfig(domainsPath, domain) {
   const domains = JSON.parse(fs.readFileSync(domainsPath, 'utf8'));
   const cfg = domains[domain];
-  if (!cfg) throw new Error(`Unknown task domain: ${domain} (valid: ${Object.keys(domains).join(', ')})`);
+  if (!cfg) {
+    // The pipeline's own domains file is missing a standard domain (2026-10-26): say which file and how to fix it. review-runner.sh matches on
+    // the 'Unknown task domain:' prefix and treats this as a config problem, not a failed review.
+    throw new Error(`Unknown task domain: ${domain} (valid: ${Object.keys(domains).join(', ')}) in ${domainsPath} -- run scripts/ensure-task-domains.sh <that pipeline dir> to add the standard domains`);
+  }
   return cfg;
 }
 
@@ -1784,7 +1788,7 @@ function decideInconclusiveOutcome(sourceName, voteResult) {
   return { passThrough: false };
 }
 
-module.exports = { EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
+module.exports = { getDomainConfig, EXECUTED_VERIFY_BUDGET_MS, reviewTask, extractTaskDiff, waitForLocalAvailability, buildVerdictPrompt, formatExecutedVerificationSection, summariseExecutedVerification, formatInertAdditionsSection, summariseInertAdditions, isHubChildTask, formatSkipPathSection, summariseSkipPaths, formatGateReplaySection, summariseGateReplay, formatPolicyChangeSection, executedVerificationBlockReason, formatUndefinedRemovalSection, summariseUndefinedRemoval, undefinedRemovalBlockReason, editsOfImplementResponse, NON_IMPL_PATTERNS, verifyDeterministicScriptExtractDraft, verifyDeterministicOnePassDecomposeDraft, decideInconclusiveOutcome, renderImplementResponseForReview };
 
 if (require.main === module) {
   main();
