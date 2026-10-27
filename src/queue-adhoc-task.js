@@ -28,7 +28,7 @@ function defaultTaskDomain(validDomains) {
 // instead of executing it directly -- can queue a real adhoc task without shelling out
 // to this script. Throws on an invalid domain rather than the CLI's own
 // print-and-exit(1), since a library call has no business calling process.exit.
-function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, project }, { pipelineDir, domainsPath }) {
+function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, project, generatedForRepoRoot }, { pipelineDir, domainsPath }) {
   if (!title) throw new Error('queueAdhocTask: title is required');
   if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
 
@@ -67,6 +67,10 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     ...(cleanDependsOn && cleanDependsOn.length ? { dependsOn: cleanDependsOn } : {}),
     // The registered project this task was filed for (Chat's queue_reviewed_task passes it); informational.
     ...(project ? { project } : {}),
+    // generatedForRepoRoot (2026-10-23, owner: "what could we upgrade permanently") --
+    // stamped by the --scratch hand-carry path so the task's later blocked/needs-clarification
+    // transitions know which repo to sync into without a post-hoc fix.
+    ...(generatedForRepoRoot ? { generatedForRepoRoot } : {}),
   };
   const filePath = path.join(adhocDir, `${id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + '\n');
@@ -76,7 +80,7 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i++) {
-    if ((argv[i] === '--title' || argv[i] === '--prompt-context-file' || argv[i] === '--domain' || argv[i] === '--depends-on') && argv[i + 1]) {
+    if ((argv[i] === '--title' || argv[i] === '--prompt-context-file' || argv[i] === '--domain' || argv[i] === '--depends-on' || argv[i] === '--scratch' || argv[i] === '--repo-root') && argv[i + 1]) {
       args[argv[i]] = argv[++i];
     }
   }
@@ -88,7 +92,7 @@ if (require.main === module) {
   const parsed = parseArgs(rawArgs);
 
   if (!parsed['--title'] || !parsed['--prompt-context-file']) {
-    console.error('Usage: node queue-adhoc-task.js --title <text> --prompt-context-file <path> [--domain <name>] [--depends-on id1,id2]');
+    console.error('Usage: node queue-adhoc-task.js --title <text> --prompt-context-file <path> [--domain <name>] [--depends-on id1,id2] [--scratch <dir>] [--repo-root <path>]');
     process.exit(1);
   }
 
@@ -101,24 +105,74 @@ if (require.main === module) {
     process.exit(1);
   }
 
-  const { pipelineDir, domainsPath } = getConfig();
-  // dependsOn (2026-08-22): other adhoc task ids this one must not be drafted before --
-  // see task-sources.js's nextAdhocTask()/isDependencySatisfied() for the enforcement
-  // (satisfied only once a dependency is actually MERGED, not just done, since a fresh
-  // draft's git worktree starts from origin/<mainBranch> and won't see an unmerged fix).
-  const dependsOn = parsed['--depends-on']
-    ? parsed['--depends-on'].split(',').map((s) => s.trim()).filter(Boolean)
-    : undefined;
+  if (parsed['--scratch']) {
+    // --scratch: hand-carry a task into a scratch directory instead of the live pipeline.
+    // Required companion: --repo-root (so the stamped generatedForRepoRoot knows where the
+    // project actually lives). Without it we'd write a task with no repo context, which is
+    // exactly the bug this flag exists to prevent.
+    if (!parsed['--repo-root']) {
+      console.error('Usage: node queue-adhoc-task.js --scratch <dir> --repo-root <path> --title <text> --prompt-context-file <path>');
+      process.exit(1);
+    }
 
-  try {
-    const { filePath } = queueAdhocTask(
-      { title: parsed['--title'], promptContext, domain: parsed['--domain'], dependsOn },
-      { pipelineDir, domainsPath },
-    );
-    console.log(`queued adhoc task: ${filePath}`);
-  } catch (e) {
-    console.error(e.message);
-    process.exit(1);
+    const { domainsPath: liveDomainsPath } = getConfig();
+    const scratchDir = path.resolve(parsed['--scratch']);
+    // scratchPipelineDir is the base pipeline dir; queueAdhocTask() appends /queue/adhoc itself.
+    const scratchPipelineDir = scratchDir;
+    const scratchDomainsPath = path.join(scratchDir, 'task-domains.json');
+
+    // Copy task-domains.json into the scratch dir only when absent -- a subsequent scratch
+    // run with the file already present must not clobber a possibly-customized copy.
+    if (!fs.existsSync(scratchDomainsPath)) {
+      fs.copyFileSync(liveDomainsPath, scratchDomainsPath);
+    }
+
+    // Point the pipeline at the scratch dir for the duration of this call. This ensures
+    // any nested code that resolves paths via getConfig() (e.g. task-sources.js loaders)
+    // sees the scratch layout, not the live one. The live queue is never touched.
+    const oldPipelineDir = process.env.AGENT_MANAGER_PIPELINE_DIR;
+    const oldDomainsPath = process.env.AGENT_MANAGER_DOMAINS_PATH;
+    process.env.AGENT_MANAGER_PIPELINE_DIR = scratchPipelineDir;
+    process.env.AGENT_MANAGER_DOMAINS_PATH = scratchDomainsPath;
+
+    try {
+      const { pipelineDir, domainsPath } = getConfig();
+      const { filePath } = queueAdhocTask(
+        { title: parsed['--title'], promptContext, domain: 'adhoc', generatedForRepoRoot: parsed['--repo-root'], dependsOn: parsed['--depends-on']
+            ? parsed['--depends-on'].split(',').map((s) => s.trim()).filter(Boolean)
+            : undefined },
+        { pipelineDir, domainsPath },
+      );
+      console.log(`queued adhoc task: ${filePath}`);
+    } catch (e) {
+      console.error(e.message);
+      process.exit(1);
+    } finally {
+      if (oldPipelineDir === undefined) delete process.env.AGENT_MANAGER_PIPELINE_DIR;
+      else process.env.AGENT_MANAGER_PIPELINE_DIR = oldPipelineDir;
+      if (oldDomainsPath === undefined) delete process.env.AGENT_MANAGER_DOMAINS_PATH;
+      else process.env.AGENT_MANAGER_DOMAINS_PATH = oldDomainsPath;
+    }
+  } else {
+    // dependsOn (2026-08-22): other adhoc task ids this one must not be drafted before --
+    // see task-sources.js's nextAdhocTask()/isDependencySatisfied() for the enforcement
+    // (satisfied only once a dependency is actually MERGED, not just done, since a fresh
+    // draft's git worktree starts from origin/<mainBranch> and won't see an unmerged fix).
+    const { pipelineDir, domainsPath } = getConfig();
+    const dependsOn = parsed['--depends-on']
+      ? parsed['--depends-on'].split(',').map((s) => s.trim()).filter(Boolean)
+      : undefined;
+
+    try {
+      const { filePath } = queueAdhocTask(
+        { title: parsed['--title'], promptContext, domain: parsed['--domain'], dependsOn },
+        { pipelineDir, domainsPath },
+      );
+      console.log(`queued adhoc task: ${filePath}`);
+    } catch (e) {
+      console.error(e.message);
+      process.exit(1);
+    }
   }
 }
 
