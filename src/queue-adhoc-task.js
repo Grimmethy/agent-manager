@@ -5,9 +5,38 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
+const { listProjects } = require('./chat-projects.js');
 
 function slugify(str) {
   return str.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').replace(/[^a-z0-9]+/g, '-');
+}
+
+// (2026-10-27, HUB0213-0: Grimmethy: "the queue should not drop a task into a project
+// that does not exist in projects.json; instead hold it so sweepHeldForProject() can route
+// it later when the project is registered"). Pure apart from reading the registry; never
+// throws -- returns false when the registry is unreadable or the project is missing.
+//
+// `repoRoot` may be a symlink or alias path -- we resolve it to its realpath before
+// comparing against the registry (which may list either the canonical path or an alias).
+// Both sides are realpath'd so a caller passing a symlink still matches a registry entry
+// that lists the canonical path (and vice versa).
+function isProjectRegistered(projectName, repoRoot) {
+  if (typeof projectName !== 'string' || !projectName.trim()) return false;
+  if (typeof repoRoot !== 'string' || !repoRoot) return false;
+  const list = listProjects();
+  const normalised = projectName.trim().toLowerCase();
+  let callerReal;
+  try { callerReal = require('fs').realpathSync(repoRoot); } catch { callerReal = null; }
+  return list.some((p) => {
+    const labelMatch = typeof p.label === 'string' && p.label.toLowerCase() === normalised;
+    let entryReal = null;
+    try { entryReal = require('fs').realpathSync(p.repoRoot); } catch { entryReal = null; }
+    const rootMatch = entryReal !== null && callerReal !== null && entryReal === callerReal;
+    // Fallback: if realpath failed on one side, do a raw string compare so a registry
+    // entry that lists the path literally still matches a caller passing the same path.
+    const rawMatch = labelMatch && p.repoRoot === repoRoot;
+    return (rootMatch && labelMatch) || rawMatch;
+  });
 }
 
 // Port of app.py's default_task_domain() (2026-09-06): picking the first key in
@@ -28,7 +57,14 @@ function defaultTaskDomain(validDomains) {
 // instead of executing it directly -- can queue a real adhoc task without shelling out
 // to this script. Throws on an invalid domain rather than the CLI's own
 // print-and-exit(1), since a library call has no business calling process.exit.
-function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, project }, { pipelineDir, domainsPath }) {
+//
+// `targetProject` (2026-10-27, HUB0213-0: Grimmethy: "the queue should not drop a task
+// into a project that does not exist in projects.json; instead hold it so sweepHeldForProject()
+// can route it later when the project is registered"). When provided with both `name` and
+// `repoRoot`, the task is held under <pipelineDir>/queue/held-for-project/<slugified-name>/
+// when isProjectRegistered() returns false (or either field is missing); otherwise it goes
+// to the normal adhoc queue with `targetProject` stamped on the record for downstream routing.
+function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, project, targetProject }, { pipelineDir, domainsPath }) {
   if (!title) throw new Error('queueAdhocTask: title is required');
   if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
 
@@ -39,8 +75,19 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
   }
 
   const id = `adhoc-${slugify(title)}-${Date.now()}`;
-  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
-  fs.mkdirSync(adhocDir, { recursive: true });
+
+  // Held-task routing (2026-10-27, HUB0213-0): when the caller named a target project
+  // that is not in projects.json, do NOT write to the live adhoc queue -- write to
+  // held-for-project/<slugified-name>/<id>.json instead so sweepHeldForProject() can
+  // route it once the project becomes registered.
+  const needsHold = targetProject && (
+    !targetProject.name || !targetProject.repoRoot ||
+    !isProjectRegistered(targetProject.name, targetProject.repoRoot)
+  );
+  const targetDir = needsHold
+    ? path.join(pipelineDir, 'queue', 'held-for-project', slugify(targetProject.name || 'unregistered'))
+    : path.join(pipelineDir, 'queue', 'adhoc');
+  fs.mkdirSync(targetDir, { recursive: true });
 
   const cleanDependsOn = Array.isArray(dependsOn) ? dependsOn.filter(Boolean) : undefined;
   const record = {
@@ -67,8 +114,14 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     ...(cleanDependsOn && cleanDependsOn.length ? { dependsOn: cleanDependsOn } : {}),
     // The registered project this task was filed for (Chat's queue_reviewed_task passes it); informational.
     ...(project ? { project } : {}),
+    // The target project this task was filed for (HUB0213-0: stamped even when held so
+    // sweepHeldForProject() / nextAdhocTask() can route it to the right project queue).
+    ...(targetProject ? { targetProject } : {}),
+    // Whether this task is held pending project registration (2026-10-27, HUB0213-0);
+    // downstream routing reads this to know the task is not in the live adhoc queue yet.
+    ...(needsHold ? { heldForProject: true } : {}),
   };
-  const filePath = path.join(adhocDir, `${id}.json`);
+  const filePath = path.join(targetDir, `${id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + '\n');
   return { record, filePath };
 }
@@ -122,4 +175,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { queueAdhocTask, slugify, defaultTaskDomain };
+module.exports = { queueAdhocTask, isProjectRegistered, slugify, defaultTaskDomain };
