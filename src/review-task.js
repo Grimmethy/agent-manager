@@ -96,9 +96,30 @@ function getDomainConfig(domainsPath, domain) {
   const domains = JSON.parse(fs.readFileSync(domainsPath, 'utf8'));
   const cfg = domains[domain];
   if (!cfg) {
-    // The pipeline's own domains file is missing a standard domain (2026-10-26): say which file and how to fix it. review-runner.sh matches on
-    // the 'Unknown task domain:' prefix and treats this as a config problem, not a failed review.
-    throw new Error(`Unknown task domain: ${domain} (valid: ${Object.keys(domains).join(', ')}) in ${domainsPath} -- run scripts/ensure-task-domains.sh <that pipeline dir> to add the standard domains`);
+    // Self-heal: if the domain is a standard one (derived from task-source-registry.js),
+    // add it to the pipeline's task-domains.json and continue. This prevents tasks from
+    // being permanently blocked due to a missing key.
+    const { isStandardDomain, getDomainShape } = require('./task-domains-registry.js');
+    if (isStandardDomain(domain)) {
+      const shape = getDomainShape(domain);
+      domains[domain] = shape;
+      // Atomic write: write to tmp, then rename.
+      const tmp = `${domainsPath}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify(domains, null, 2) + '\n');
+      fs.renameSync(tmp, domainsPath);
+      // Log the self-heal action.
+      try {
+        const { logPipelineEvent } = require('./pipeline-history.js');
+        logPipelineEvent(path.dirname(domainsPath), 'task-domain-self-heal', {
+          domain,
+          shape,
+          at: new Date().toISOString(),
+        });
+      } catch { /* pipeline-history may not be available in all contexts */ }
+      return shape;
+    }
+    // Genuinely unknown domain: block with a clear message naming the file to edit.
+    throw new Error(`Unknown task domain: ${domain} (valid: ${Object.keys(domains).join(', ')}) in ${domainsPath} -- add "${domain}" to ${domainsPath} or run scripts/ensure-task-domains.sh <that pipeline dir>`);
   }
   return cfg;
 }
