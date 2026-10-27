@@ -601,6 +601,47 @@ test('tiersOfCurrentAttempt: keeps tiers finished at or after the latest draft-s
   assert.deepEqual(tiersOfCurrentAttempt(undefined, history), []);
 });
 
+test('tiersOfCurrentAttempt: falls back to implement-started when no draft-started exists', () => {
+  const tiers = [{ at: '2026-10-23T10:00:00Z', n: 'old' }, { at: '2026-10-23T14:00:00Z', n: 'current' }];
+  const history = [{ stage: 'implement-started', at: '2026-10-23T13:00:00Z' }];
+  assert.deepEqual(tiersOfCurrentAttempt(tiers, history).map((t) => t.n), ['current']);
+});
+
+test('tiersOfCurrentAttempt: two-attempt log uses only second attempt results', () => {
+  const worklog = {
+    history: [
+      { stage: 'draft-started', at: '2026-10-25T10:00:00Z' },
+      { stage: 'implement-started', at: '2026-10-25T11:00:00Z' },
+      { stage: 'draft-started', at: '2026-10-26T10:00:00Z' },
+      { stage: 'implement-started', at: '2026-10-26T11:00:00Z' },
+    ],
+    tiers: [
+      { at: '2026-10-25T10:30:00Z', resultPreview: 'first attempt result' },
+      { at: '2026-10-25T11:30:00Z', resultPreview: 'first attempt result 2' },
+      { at: '2026-10-26T11:00:30Z', resultPreview: 'second attempt result' },
+      { at: '2026-10-26T11:30:00Z', resultPreview: 'second attempt result 2' },
+    ],
+  };
+  const result = tiersOfCurrentAttempt(worklog.tiers, worklog.history);
+  assert.equal(result.length, 2);
+  assert.equal(result[0].resultPreview, 'second attempt result');
+  assert.equal(result[1].resultPreview, 'second attempt result 2');
+});
+
+test('tiersOfCurrentAttempt: marker-less log returns all tiers (backward compat)', () => {
+  const worklog = {
+    history: [],
+    tiers: [
+      { at: '2026-10-20T10:00:00Z', resultPreview: 'old result 1' },
+      { at: '2026-10-21T10:00:00Z', resultPreview: 'old result 2' },
+      { at: '2026-10-22T10:00:00Z', resultPreview: 'old result 3' },
+    ],
+  };
+  const result = tiersOfCurrentAttempt(worklog.tiers, worklog.history);
+  assert.equal(result.length, 3);
+  assert.deepEqual(result.map(t => t.resultPreview), ['old result 1', 'old result 2', 'old result 3']);
+});
+
 test('CLI end-to-end: a stale attempt\'s worklog output is not grounding, the current attempt\'s is', () => {
   const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'grounding-stale-worklog-'));
   fs.mkdirSync(path.join(repoRoot, 'queue', 'worklogs'), { recursive: true });

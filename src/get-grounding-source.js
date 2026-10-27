@@ -58,12 +58,12 @@ const LIVE_FETCH_MAX_CHARS_PER_FILE = 4000;
 const { extractRequestObjectTokens } = require('./request-object-tokens.js');
 const MAX_HITS_PER_OBJECT = 4;
 
-// The worklog tiers that belong to the task's current draft attempt: those whose `at` is not before the latest 'draft-started' history event. Pure.
+// The worklog tiers that belong to the task's current draft attempt: those whose `at` is not before the latest 'draft-started' history event (or 'implement-started' if no draft-started). Pure.
 function tiersOfCurrentAttempt(tiers, history) {
   const list = Array.isArray(tiers) ? tiers : [];
   let started = NaN;
   for (const h of Array.isArray(history) ? history : []) {
-    if (h && h.stage === 'draft-started') { const t = Date.parse(h.at); if (Number.isFinite(t) && !(t < started)) started = t; }
+    if (h && (h.stage === 'draft-started' || h.stage === 'implement-started')) { const t = Date.parse(h.at); if (Number.isFinite(t) && !(t < started)) started = t; }
   }
   if (!Number.isFinite(started)) return list;
   return list.filter((tier) => { const t = Date.parse(tier && tier.at); return !Number.isFinite(t) || t >= started - 1000; });
