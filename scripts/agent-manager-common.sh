@@ -64,6 +64,27 @@ get_model_override() {
   ' "$settings_path" "$instance_id"
 }
 
+# The model this process was LAUNCHED with, remembered across ticks and inherited by the --once children a daemon spawns (they see the daemon's
+# exported LOCAL_MODEL, which may by then be a dashboard override, so LOCAL_MODEL itself cannot be the base). Set once, from whatever LOCAL_MODEL is at
+# the first call; `-` (not `:-`) keeps a value that is set but empty. 2026-10-27: clearing a worker-model override left the lane on the overridden
+# model because nothing remembered the launch value to go back to (a failed ornith:35b trial kept requesting a model that took ~8 min to load).
+capture_base_local_model() {
+  export AGENT_MANAGER_BASE_LOCAL_MODEL="${AGENT_MANAGER_BASE_LOCAL_MODEL-${LOCAL_MODEL:-}}"
+}
+
+# The model this instance should use THIS tick: its dashboard override when one is set (a legacy "ollama:" prefix is tolerated), else the launch-time
+# model. A "claude:" override is a Claude lane choice, not a local model, so the local model stays the launch one. Prints the name (nothing when both
+# are empty); callers assign it to LOCAL_MODEL so that REMOVING an override puts the lane back instead of leaving the last override in place.
+effective_local_model() {
+  local override
+  override="$(get_model_override "$1")"
+  case "$override" in
+    ollama:*) printf '%s' "${override#ollama:}" ;;
+    claude:*|'') printf '%s' "${AGENT_MANAGER_BASE_LOCAL_MODEL-}" ;;
+    *) printf '%s' "$override" ;;
+  esac
+}
+
 # Manual "pause Claude" kill switch (2026-08-25 -- see src/claude-pause.js's own header
 # for the full rationale: a checkbox in the Workers tab, distinct from budget-monitor.js's
 # real rate-limit detection, so a human can proactively stop Claude spend before actually
