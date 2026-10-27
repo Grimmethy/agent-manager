@@ -725,7 +725,18 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
     // its generation/context ceiling mid-response and got cut off. See below.
     if (obj.done) { usage = pickUsage(obj); doneReason = obj.done_reason || null; }
   });
-  if (streamError) throw new Error(streamError);
+  if (streamError) {
+    if (contentAcc) {
+      // Preserve partial streamed content on stream error instead of discarding it.
+      // See: task "Preserve partial streamed response on stream error in postChatTurn".
+      return {
+        message: { role: 'assistant', content: contentAcc + `\n\n*[Stream error: ${streamError}]*` },
+        usage,
+        doneReason: 'stream-error',
+      };
+    }
+    throw new Error(streamError);
+  }
   // 2026-09-05, Grimmethy: "I'd very much like to see that done_reason: 'length' show up
   // in the chat itself... handy debug tool" -- found live via the Chat panel's own
   // transcript: two real turns ended mid-word ("...and see whatI was mid-invest") with NO
