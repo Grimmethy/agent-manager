@@ -499,7 +499,44 @@ function listAssignableTasks(queueDir, instanceId) {
   return out;
 }
 
-module.exports = { pickClaimableTasks, pickNextPendingTask, preferredLaneIsIdle, lanePreferenceGraceMs, listAssignableTasks, effectivePriority, rankPriorityOfTask, BOT_ADHOC_PRIORITY_PENALTY };
+// nextAdhocTask (2026-10-27, HUB0213-2: Grimmethy: "the project queue needs to be able to claim
+// its own adhoc tasks by targetProject.name matching the pipeline's own name"). Reads every JSON
+// file in <pipelineDir>/queue/adhoc/ and returns the first task whose targetProject.name matches
+// pipelineName (case-insensitive, trimmed). Returns null if no match is found or the adhoc dir
+// is unreadable. Skips tasks without a targetProject field or where targetProject.name is missing/empty.
+//
+// Used by a project's own claim loop to pick up adhoc tasks filed specifically for it (via
+// queue-adhoc-task.js with targetProject.name set), rather than every adhoc task in the shared
+// queue. Complements pickNextPendingTask which handles the general pending queue.
+function nextAdhocTask(pipelineDir, pipelineName) {
+  if (typeof pipelineDir !== 'string' || !pipelineDir) return null;
+  if (typeof pipelineName !== 'string' || !pipelineName.trim()) return null;
+  const adhocDir = path.join(pipelineDir, 'queue', 'adhoc');
+  let entries;
+  try {
+    entries = fs.readdirSync(adhocDir);
+  } catch {
+    return null;
+  }
+  const normalised = pipelineName.trim().toLowerCase();
+  for (const name of entries) {
+    if (!name.endsWith('.json')) continue;
+    const full = path.join(adhocDir, name);
+    let task;
+    try {
+      task = JSON.parse(fs.readFileSync(full, 'utf8'));
+    } catch {
+      continue; // corrupt/partial write -- skip
+    }
+    if (!task || !task.targetProject || typeof task.targetProject.name !== 'string') continue;
+    if (task.targetProject.name.trim().toLowerCase() === normalised) {
+      return task;
+    }
+  }
+  return null;
+}
+
+module.exports = { pickClaimableTasks, pickNextPendingTask, preferredLaneIsIdle, lanePreferenceGraceMs, listAssignableTasks, effectivePriority, rankPriorityOfTask, nextAdhocTask, BOT_ADHOC_PRIORITY_PENALTY };
 
 // --- CLI --------------------------------------------------------------------------
 // Two modes:
