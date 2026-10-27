@@ -179,8 +179,23 @@ Any worker lane (`worker-<gpu>`, including `worker-cloud`) can be switched off b
 - **Dashboard API.** `GET /api/instances` marks every worker lane with `switchable: true` and `disabled: true|false` (reviewers and the watchdog carry neither key); a worker switched off while it is still finishing a task shows its real status with `disabled: true`, and once idle its status is `disabled`. `POST /api/instances/<id>/enabled` with `{"enabled": true|false}` switches one worker (`python/dashboard/worker_switch.py` shells out to the node CLI so the rule lives once): 400 for a bad body or a non-worker id, 404 when switching OFF an id that is not a defined lane, always allowed when switching ON (clears a stale marker). The route only writes or removes the marker; it never starts, stops or restarts the pipeline.
 - **Workers tab button.** Every worker card has a **Turn off** / **Turn on** button (`python/dashboard/static/js/worker-switch-ui.js`; reviewers and the watchdog have none). Off dims the card. A worker that is still on a task shows **turning off after this task** and finishes it; an idle one shows **turning off…** until its next tick (seconds), then its status badge reads `disabled`. **Turn on** takes effect within about one tick, and the worker logs that it is back on. The button appears after the dashboard restarts onto code that has it (the Werkzeug reloader does that on its own when the Python files change). Failures show a toast with the server's reason.
 
+## Model overrides, model swaps and the health probe (2026-10-27)
+
+The Workers tab (and `POST /api/worker-models/<instance>`) can override the model one instance uses; it applies from that instance's next tick, no restart.
+- **Clearing an override restores the launch-time model.** `scripts/local-worker.sh` and `scripts/review-runner.sh` remember the model they were launched with
+  in `AGENT_MANAGER_BASE_LOCAL_MODEL` (set once, inherited by the `--once` children a daemon spawns) and set `LOCAL_MODEL` from `effective_local_model`
+  (`agent-manager-common.sh`) every tick. Before, a removed override left the last one exported and the lane kept asking for the overridden model.
+- **The lane registry follows the override.** `getLanes()` (process environment only) replaces a lane's `model` and `tier` with its override
+  (`registeredModel` keeps the registered one), so the health probe, capability routing and tier lookups judge the model that is really running.
+- **A model swap is not a dead lane.** Cold loads from the HDD are slow: `ornith:35b` took 467-492 s (`load_duration`), the dense 27B about 107 s, against a 90 s
+  probe timeout (`AGENT_MANAGER_LANE_HEALTH_TIMEOUT_SECS`) and a 300 s Ollama request timeout. `src/lane-health.js` therefore never probes over a different
+  resident model (it would evict it), and a probe that fails while its model is not resident afterwards is recorded as inconclusive (no sample, no degraded
+  verdict, retried after the normal interval). A failure with the model resident, or with the endpoint unreachable, still degrades the lane.
+- **Two big models cannot share the 3090.** A trial of another model needs the worker AND the host `reviewer` on it (they share one Ollama), the chat and Forge
+  sessions off the card (both evict it), and the old model unloaded explicitly (`keep_alive: 0`): `OLLAMA_KEEP_ALIVE=-1` pins it.
+
 ## Tests
 
-`src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),
+`src/worker-model-override.test.js`, `scripts/model-override-reset.test.js` (override read, effective model, restore on clear), `src/lanes.test.js` (registry parsing, validation, fail-closed, id/endpoint collisions, CLI), `src/next-claimable-task.test.js` (allowlist),
 `scripts/gpu-arbiter-cli-endpoint.test.js` (remote-lane guard), `scripts/gpu-arbiter-cli.test.js` (hold lifecycle), `src/gpu-guard.test.js` + `scripts/comfyui-lease-endpoint.test.js` (endpoint-scoped lease, shell/JS parity), `python/dashboard/test_chat_preempt.py` + `test_expected_instances.py`
 (dashboard parity and preemption sets).
