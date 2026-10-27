@@ -24,6 +24,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getConfig } = require('./config.js');
+const { appendHistoryEvent } = require('./task-history.js');
 
 const ARG_VALUE_CAP = 4000;        // per individual arg value (grep queries, edit bodies, bash commands)
 const RESULT_PREVIEW_CAP = 2000;   // per tool-call result preview
@@ -103,8 +104,27 @@ function appendTierWorkLog(task, { tier, turnsUsed, toolCallLog, finalMessage } 
     if (!doc || typeof doc !== 'object' || !Array.isArray(doc.tiers)) doc = { taskId: task.id, tiers: [] };
     doc.taskId = task.id;
     doc.updatedAt = new Date().toISOString();
+    // attemptStart scopes a tier to its DRAFT ATTEMPT (2026-10-26, stale-worklog task): it is
+    // the task's latest 'draft-started' history event -- the same key get-grounding-source.js's
+    // tiersOfCurrentAttempt() already treats as "an attempt began" -- so a worklog carrying
+    // several attempts can be filtered to just the current one by marker alone. Fallbacks keep
+    // the value stable within a requeue's attempt: a prior tier's own marker, else the entry's
+    // write time. A log written before this field existed carries no marker at all, and the
+    // grounding side (tiersOfLatestMarkedAttempt) keeps EVERY unmarked entry -- today's behaviour.
+    let attemptStart = null;
+    for (const h of Array.isArray(task.history) ? task.history : []) {
+      if (h && h.stage === 'draft-started') {
+        const t = Date.parse(h.at);
+        if (Number.isFinite(t)) attemptStart = new Date(t).toISOString();
+      }
+    }
+    if (!attemptStart) {
+      const prior = (doc.tiers || []).filter((t) => t && t.attemptStart).pop();
+      attemptStart = prior ? prior.attemptStart : new Date().toISOString();
+    }
     doc.tiers.push({
       tier: tier || 'unknown',
+      attemptStart,
       at: new Date().toISOString(),
       turnsUsed: turnsUsed != null ? turnsUsed : null,
       callCount: toolCallLog.length,
@@ -126,6 +146,71 @@ function appendTierWorkLog(task, { tier, turnsUsed, toolCallLog, finalMessage } 
     fs.writeFileSync(tmp, out);
     fs.renameSync(tmp, p);
   } catch { /* best-effort: never break a draft over a worklog */ }
+}
+
+// One structured audit event per archive, readable out of any log capture: task id,
+// both filenames, the moment it happened. This is what makes a WRONGLY-archived log
+// discoverable after the fact (2026-10-26, stale-worklog task) -- the rename itself
+// leaves no trace anywhere else.
+function auditWorklogArchive({ taskId, from, to, at, reason }) {
+  const ev = { event: 'worklog-archived', taskId: String(taskId ?? ''), from: from ?? null, to: to ?? null, at, reason: reason ?? null };
+  try { console.log(JSON.stringify(ev)); } catch { /* audit must never throw */ }
+  return ev;
+}
+
+// Archive the task's LIVE worklog as <id>.attempt-N.json in the SAME worklogs/ dir
+// (N = highest existing attempt number for this task + 1, so repeated requeues stack:
+// attempt-1, attempt-2, ...). The file is RENAMED, never deleted -- the audit trail and
+// the dashboard's archived-attempt view both keep working. Best-effort like everything
+// else here: no live log (non-agentic task) or a failed rename is a no-op, never an error.
+function archiveWorkLog(taskId, { pipelineDir, reason } = {}) {
+  if (!taskId) return null;
+  try {
+    const dir = worklogDir(pipelineDir);
+    const live = worklogPath(taskId, pipelineDir);
+    if (!fs.existsSync(live)) return null; // nothing to archive -- no error.
+    const escaped = String(taskId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`^${escaped}\\.attempt-(\\d+)\\.json$`);
+    let maxN = 0;
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        const m = f.match(re);
+        if (m) maxN = Math.max(maxN, Number(m[1]));
+      }
+    } catch { /* dir missing is covered by the existsSync(live) check above */ }
+    const n = maxN + 1;
+    const archived = path.join(dir, `${taskId}.attempt-${n}.json`);
+    let doc = null;
+    try { doc = JSON.parse(fs.readFileSync(live, 'utf8')); } catch { /* keep the bytes as-is on rename */ }
+    if (doc && typeof doc === 'object') {
+      doc.archivedAt = new Date().toISOString();
+      doc.archiveReason = reason || null;
+      fs.writeFileSync(live, JSON.stringify(doc, null, 2));
+    }
+    fs.renameSync(live, archived);
+    const at = new Date().toISOString();
+    auditWorklogArchive({ taskId, from: live, to: archived, at, reason });
+    return { taskId, from: live, to: archived, n, at, reason: reason || null };
+  } catch (err) {
+    console.warn(`[work-log] archiveWorkLog failed for ${taskId}: ${err.message}`);
+    return null;
+  }
+}
+
+// Requeue-for-redraft / decompose-parent entry points call this: archive the just-finished
+// attempt's worklog (rename, readable, same dir) AND record a structured history event on
+// the task itself when the task object is at hand -- the two surfaces of the same audit
+// event. Passing no `task` (callers that only know the id) still archives and logs the
+// console event.
+function archiveTaskWorkLog(task, pipelineDir, reason) {
+  const res = archiveWorkLog(task && task.id ? task.id : task, { pipelineDir, reason });
+  if (res && task && typeof task === 'object') {
+    try {
+      appendHistoryEvent(task, 'worklog-archived',
+        `attempt ${res.n} worklog archived to ${path.basename(res.to)} (reason: ${res.reason || 'requeue'}); ${res.tiers ?? ''}`.trim());
+    } catch { /* history must never break a requeue */ }
+  }
+  return res;
 }
 
 function readWorkLog(taskId, pipelineDir) {
@@ -174,8 +259,17 @@ function pruneWorkLogs(pipelineDir) {
     let pruned = 0;
     for (const f of files) {
       if (!f.endsWith('.json') || f.includes('.tmp-')) continue;
-      const id = f.slice(0, -5);
-      if (!liveSet.has(id)) {
+      // Derive the base task id: strip .attempt-<N> if present, then strip .json.
+      // A worklog file is either <id>.json or <id>.attempt-<N>.json; both must be
+      // cleaned up when the task is no longer live.
+      let baseId;
+      const attemptMatch = f.match(/^(.+)\\.attempt-\\d+\\.json$/);
+      if (attemptMatch) {
+        baseId = attemptMatch[1];
+      } else {
+        baseId = f.slice(0, -5);
+      }
+      if (!liveSet.has(baseId)) {
         try { fs.unlinkSync(path.join(dir, f)); pruned += 1; } catch (err) { if (err.code !== 'ENOENT') console.error(`pruneWorkLogs: unlink failed for ${path.join(dir, f)} [${err.code}]: ${err.message}`); }
       }
     }
@@ -183,7 +277,7 @@ function pruneWorkLogs(pipelineDir) {
   } catch (err) { console.error(`pruneWorkLogs: unexpected error: ${err.message}`, err.stack); return { pruned: 0 }; }
 }
 
-module.exports = { appendTierWorkLog, readWorkLog, pruneWorkLogs, worklogDir, worklogPath };
+module.exports = { appendTierWorkLog, readWorkLog, pruneWorkLogs, worklogDir, worklogPath, archiveWorkLog, archiveTaskWorkLog };
 
 // CLI: node work-log.js --prune   (used by scripts/apply-task.sh once per tick)
 if (require.main === module) {

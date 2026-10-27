@@ -12,7 +12,7 @@ const path = require('path');
 process.env.AGENT_MANAGER_REPO_ROOT = path.join(os.tmpdir(), 'work-log-test');
 process.env.AGENT_MANAGER_PIPELINE_DIR = process.env.AGENT_MANAGER_REPO_ROOT;
 
-const { appendTierWorkLog, readWorkLog, pruneWorkLogs, worklogPath } = require('./work-log.js');
+const { appendTierWorkLog, readWorkLog, pruneWorkLogs, worklogDir, worklogPath, archiveWorkLog, archiveTaskWorkLog } = require('./work-log.js');
 
 const PIPELINE_DIR = process.env.AGENT_MANAGER_PIPELINE_DIR;
 
@@ -105,4 +105,68 @@ test('pruneWorkLogs keeps logs for live + done/ tasks, deletes gone + archived o
   assert.equal(readWorkLog('gone', PIPELINE_DIR), null);
   assert.equal(readWorkLog('archived-task', PIPELINE_DIR), null);
   assert.equal(readWorkLog('no-action-task', PIPELINE_DIR), null);
+});
+
+test('archiveWorkLog renames live worklog to .attempt-1.json and stays readable', () => {
+  appendTierWorkLog({ id: 'archive-1' }, { tier: 't', toolCallLog: log }, PIPELINE_DIR);
+  const res = archiveWorkLog('archive-1', { pipelineDir: PIPELINE_DIR });
+  assert.ok(res, 'archive returned a result object');
+  assert.equal(res.n, 1, 'first archive is attempt-1');
+  assert.ok(res.to.endsWith('.attempt-1.json'), 'archived file ends with .attempt-1.json');
+  assert.ok(fs.existsSync(res.to), 'archived file exists on disk');
+  const archived = readWorkLog('archive-1', PIPELINE_DIR);
+  assert.equal(archived, null, 'live worklog no longer exists after archive');
+  // The archived file is still readable via the worklogPath with the attempt suffix
+  const archivedPath = path.join(worklogDir(PIPELINE_DIR), 'archive-1.attempt-1.json');
+  const content = JSON.parse(fs.readFileSync(archivedPath, 'utf8'));
+  assert.equal(content.taskId, 'archive-1');
+  assert.ok(content.archivedAt, 'archived file has archivedAt timestamp');
+});
+
+test('archiveWorkLog stacks second archive to .attempt-2.json', () => {
+  appendTierWorkLog({ id: 'archive-2' }, { tier: 't', toolCallLog: log }, PIPELINE_DIR);
+  archiveWorkLog('archive-2', { pipelineDir: PIPELINE_DIR });
+  // Create a new live worklog for the same task (simulating a requeue)
+  appendTierWorkLog({ id: 'archive-2' }, { tier: 't', toolCallLog: log }, PIPELINE_DIR);
+  const res2 = archiveWorkLog('archive-2', { pipelineDir: PIPELINE_DIR });
+  assert.ok(res2, 'second archive returned a result object');
+  assert.equal(res2.n, 2, 'second archive is attempt-2');
+  assert.ok(res2.to.endsWith('.attempt-2.json'), 'second archived file ends with .attempt-2.json');
+  assert.ok(fs.existsSync(res2.to), 'second archived file exists on disk');
+  // Both archived files should exist
+  assert.ok(fs.existsSync(path.join(worklogDir(PIPELINE_DIR), 'archive-2.attempt-1.json')));
+  assert.ok(fs.existsSync(path.join(worklogDir(PIPELINE_DIR), 'archive-2.attempt-2.json')));
+});
+
+test('archiveWorkLog returns null when no live log exists', () => {
+  const res = archiveWorkLog('no-such-task', { pipelineDir: PIPELINE_DIR });
+  assert.equal(res, null, 'archive returns null when no live log exists');
+});
+
+test('archiveTaskWorkLog does not affect another task\'s log', () => {
+  // Create two tasks with separate worklogs
+  appendTierWorkLog({ id: 'task-a' }, { tier: 't', toolCallLog: log }, PIPELINE_DIR);
+  appendTierWorkLog({ id: 'task-b' }, { tier: 't', toolCallLog: log }, PIPELINE_DIR);
+  // Archive only task-a
+  archiveTaskWorkLog({ id: 'task-a' }, PIPELINE_DIR, 'requeue');
+  // task-b's worklog should still be live
+  assert.ok(readWorkLog('task-b', PIPELINE_DIR), 'task-b worklog still exists');
+  assert.ok(fs.existsSync(path.join(worklogDir(PIPELINE_DIR), 'task-a.attempt-1.json')), 'task-a was archived');
+});
+
+test('pruneWorkLogs deletes both live and .attempt-* for a dead id', () => {
+  // Create a live worklog and an archived one for the same task
+  appendTierWorkLog({ id: 'dead-task' }, { tier: 't', toolCallLog: log }, PIPELINE_DIR);
+  archiveWorkLog('dead-task', { pipelineDir: PIPELINE_DIR });
+  // Create another attempt
+  appendTierWorkLog({ id: 'dead-task' }, { tier: 't', toolCallLog: log }, PIPELINE_DIR);
+  archiveWorkLog('dead-task', { pipelineDir: PIPELINE_DIR });
+  // Verify all files exist
+  assert.ok(fs.existsSync(path.join(worklogDir(PIPELINE_DIR), 'dead-task.attempt-1.json')));
+  assert.ok(fs.existsSync(path.join(worklogDir(PIPELINE_DIR), 'dead-task.attempt-2.json')));
+  // Now simulate the task being gone (no task file in any live queue dir)
+  const { pruned } = pruneWorkLogs(PIPELINE_DIR);
+  assert.equal(pruned, 2, 'both archived files are pruned');
+  assert.equal(fs.existsSync(path.join(worklogDir(PIPELINE_DIR), 'dead-task.attempt-1.json')), false, 'attempt-1 deleted');
+  assert.equal(fs.existsSync(path.join(worklogDir(PIPELINE_DIR), 'dead-task.attempt-2.json')), false, 'attempt-2 deleted');
 });
