@@ -57,6 +57,20 @@ function createLogger() {
         process.stderr.write(` ${JSON.stringify(args)}`);
       }
       process.stderr.write('\n');
+    },
+    error(msg, ...args) {
+      process.stderr.write(`[ERROR] ${msg}`);
+      if (args.length > 0) {
+        process.stderr.write(` ${JSON.stringify(args)}`);
+      }
+      process.stderr.write('\n');
+    },
+    debug(msg, ...args) {
+      process.stderr.write(`[DEBUG] ${msg}`);
+      if (args.length > 0) {
+        process.stderr.write(` ${JSON.stringify(args)}`);
+      }
+      process.stderr.write('\n');
     }
   };
 }
