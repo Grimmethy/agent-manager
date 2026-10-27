@@ -211,7 +211,9 @@ function buildFabricatedSymbolCitationQuestion(task) {
 // list stays to wordings that name the infra layer itself.
 const INFRA_BLOCKED_REASON_PATTERNS = [
   /ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE/,
-  /\b5\d\d\b/,
+  // HTTP-context 5xx: requires HTTP/status framing so a bare number like
+  // "src/foo.js:512" or "520 lines" never reads as infra (HUB0195 fix).
+  /(?:HTTP\/[\d.]+\s+|HTTP\s+|status\s+(?:code\s+)?|status\s*:\s*)\d{3}|Service\s+Unavailable|Bad\s+Gateway|Gateway\s+Timeout/i,
   /pool[ -_]?exhaust/i,
 ];
 
