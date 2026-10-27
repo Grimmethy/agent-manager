@@ -515,6 +515,62 @@ def get_active_repo_root() -> str | None:
     return _active_project_setting("AGENT_MANAGER_REPO_ROOT")
 
 
+def _set_premium_priority(task_id: str, enabled: bool) -> dict:
+    """Core logic for flipping task.premiumPriority on/off. Shared between the
+    single-task route (POST /api/task-anywhere/<id>/premium-priority) and the bulk
+    endpoint (POST /api/tasks/premium-priority).
+
+    Returns a result dict with exactly one of:
+      - {"ok": True, "id": <task_id>, "premiumPriority": <bool>}  (success)
+      - {"ok": False, "notFound": True, "id": <task_id>}         (task not in any queue)
+      - {"ok": False, "error": <string>, "id": <task_id>}        (read/write failure)
+
+    Side effects: mutates the task JSON in place (sets or removes the
+    premiumPriority key) and appends an advisory history event.
+
+    Accepts an optional project override (a registered repoRoot) so the operator
+    can flag a task in another project's queue; absent = the active project.
+    """
+    from app import _find_live_task_file, get_active_repo_root, queue_dir, read_json_safe
+    import branch_projects
+
+    try:
+        scope = branch_projects.resolve_scope(
+            request.args.get("project") or (request.get_json(silent=True) or {}).get("project"),
+            get_active_repo_root(),
+        )
+    except LookupError as e:
+        return {"ok": False, "notFound": True, "id": task_id, "error": str(e)}
+
+    qdir = scope["qdir"] if scope else queue_dir()
+    if not qdir:
+        return {"ok": False, "notFound": True, "id": task_id, "error": "no queue directory"}
+
+    target = _find_live_task_file(qdir, task_id)
+    if not target:
+        return {"ok": False, "notFound": True, "id": task_id}
+
+    data = read_json_safe(target)
+    if not data:
+        return {"ok": False, "error": "could not read the task file", "id": task_id}
+
+    if enabled:
+        data["premiumPriority"] = True
+    else:
+        data.pop("premiumPriority", None)
+    data.setdefault("history", []).append({
+        "stage": "advisory",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "detail": f"premium priority {'set' if enabled else 'cleared'} by operator override",
+    })
+    try:
+        target.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": f"write failed: {exc}", "id": task_id}
+
+    return {"ok": True, "id": task_id, "premiumPriority": enabled}
+
+
 def get_active_grep_dirs() -> str | None:
     """The one other setting Ornith's harness-mediated retrieval needs (discuss_sessions.py's
     _local_harness_context) -- grep-codebase-tool.js/arch-import-fetch.js's own repoRoot-

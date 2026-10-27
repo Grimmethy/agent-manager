@@ -62,59 +62,53 @@ def api_task_anywhere(task_id):
 
 @task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/premium-priority", methods=["POST"])
 def api_task_set_premium_priority(task_id):
-    """Persistent, cross-retry claim-priority override (2026-09-07, Grimmethy: "I'll need
-    a way in app to be able to set that premium priority slot for any specific task. I am
-    getting tired of manually selecting it for the worker queue every pass.").
-
-    Sets/clears task.premiumPriority -- next-claimable-task.js's effectivePriority() sorts
-    a premiumPriority task ahead of EVERY other pending item regardless of source, and
-    (unlike the Workers tab's assign-task pinnedWorker, which local-draft.js deletes the
-    instant the task is claimed -- a deliberate one-shot override) this is never
-    auto-cleared: it survives every retry/requeue cycle until the operator turns it off
-    here again, or the task reaches a terminal state and stops being read by claim
-    ranking at all. This is what actually closes "manually selecting it every pass" --
-    pinnedWorker is still the right tool for "run THIS on THAT lane right now"; this is
-    for "keep this at the front of the queue no matter which lane gets to it next."
-
-    Pass ?project=<repoRoot> (or "project" in the body) to flag a task in another registered
-    project's queue; the default is the active project.
-
-    Works on a task wherever it currently sits (pending, blocked, needs-clarification,
-    drafting, adhoc, ...) -- an operator flagging a task that's mid-retry-cycle (like the
-    file-decompose move this feature was built for, which was cycling blocked <-> pending
-    for hours) needs to be able to set this BEFORE it's back in pending/, not only once
-    it happens to be there. Body: {"enabled": true|false}, defaults to true."""
-    from app import _find_live_task_file, get_active_repo_root, queue_dir, read_json_safe
+    """Persistent, cross-retry claim-priority override. Delegates to the shared
+    _set_premium_priority helper in app.py; this route is the thin wrapper that
+    translates the helper's result dict into the single-task HTTP contract (200/404/500)."""
+    from app import _set_premium_priority
     body = request.get_json(silent=True) or {}
     enabled = bool(body.get("enabled", True))
-
-    # Optional project (a registered repoRoot, query or body): look only in THAT project's queue. Absent = the active project, as before; unknown = 404, never a fallback.
-    import branch_projects
-    try:
-        scope = branch_projects.resolve_scope(request.args.get("project") or body.get("project"), get_active_repo_root())
-    except LookupError as e:
-        abort(404, description=str(e))
-    qdir = scope["qdir"] if scope else queue_dir()
-    if not qdir:
-        abort(404)
-    target = _find_live_task_file(qdir, task_id)
-    if not target:
+    result = _set_premium_priority(task_id, enabled)
+    if result.get("ok"):
+        return jsonify({"id": task_id, "premiumPriority": result["premiumPriority"]})
+    if result.get("notFound"):
         abort(404, description=f"'{task_id}' not found in any live queue state")
+    abort(500, description=result.get("error", "premium priority set failed"))
 
-    data = read_json_safe(target)
-    if not data:
-        abort(500, description="could not read the task file")
 
-    if enabled:
-        data["premiumPriority"] = True
-    else:
-        data.pop("premiumPriority", None)
-    data.setdefault("history", []).append({
-        "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
-        "detail": f"premium priority {'set' if enabled else 'cleared'} by operator override",
-    })
-    target.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    return jsonify({"id": task_id, "premiumPriority": enabled})
+@task_anywhere_1_more_bp.route("/api/tasks/premium-priority", methods=["POST"])
+def api_tasks_set_premium_priority_bulk():
+    """Bulk counterpart to the single-task premium-priority route. Accepts a list of
+    task ids and flips premiumPriority on or off for each; returns per-task results
+    plus an aggregate summary so callers don't have to re-count.
+
+    Body: {"ids": [str, ...], "enabled": bool} -- enabled defaults to true.
+    Returns: {"results": [{ok, notFound?, error?, id}, ...], "summary": {ok: N, notFound: N, error: N}}
+    """
+    from app import _set_premium_priority
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids") or []
+    if not isinstance(ids, list):
+        return jsonify({"error": "ids must be an array"}), 400
+    enabled = bool(body.get("enabled", True))
+
+    results = []
+    summary = {"ok": 0, "notFound": 0, "error": 0}
+    for task_id in ids:
+        if not isinstance(task_id, str):
+            results.append({"ok": False, "error": "id must be a string", "id": task_id})
+            summary["error"] += 1
+            continue
+        result = _set_premium_priority(task_id, enabled)
+        results.append(result)
+        if result.get("ok"):
+            summary["ok"] += 1
+        elif result.get("notFound"):
+            summary["notFound"] += 1
+        else:
+            summary["error"] += 1
+
+    return jsonify({"results": results, "summary": summary})
 
 
 @task_anywhere_1_more_bp.route("/api/task-anywhere/<task_id>/hub-priority", methods=["POST"])
