@@ -244,3 +244,93 @@ test('applyBrainDumpSort target check: targetCheckOverride and the kill switch b
     assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1, 'kill switch queues the task');
   } finally { delete process.env.AGENT_MANAGER_BRAIN_DUMP_TARGET_CHECK; fx.restore(); }
 });
+
+// HUB0195 3/4: infra attribution gate on recoverableSortSkip.
+// When the skip reason is infrastructure-attributed (detected via blockedReason or
+// reason-string markers like "timeout", "ECONNRESET", "502"), the entry's sortAttempt
+// budget must NOT be burned -- it goes to infraSortAttempts / infraSortAttemptCount
+// instead, with a sortBudgetEvents log and a sortExhausted stamp at the cap.
+// Content skips must still increment sortAttempt exactly as before.
+test('recoverableSortSkip: infra skip does NOT burn sortAttempt, uses infra counters instead', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-infra-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const brainDumpPath = writeBrainDump(dir, [
+    { id: 'bd-infra', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'infra test', status: 'captured' },
+  ]);
+
+  // Task with a blockedReason that signals infra failure.
+  const task = {
+    blockedReason: 'upstream service returned 502 Bad Gateway -- network timeout',
+    promptContext: { brainDumpEntryId: 'bd-infra', rawText: 'infra test', existingQueuedTitles: [] },
+  };
+  // A classification that will fail the secondBrainPath validation (no tracked labels
+  // in a fresh sandbox), which routes through recoverableSortSkip with the reason
+  // string carrying the infra marker.
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'NonTracked/x.md', actionable: true, belongsToProject: 'nonexistent' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: path.join(dir, 'pipeline') });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.recoverable, true);
+  const entry = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  // Infra skip: sortAttempt must NOT be burned.
+  assert.equal(entry.sortAttempt, undefined, 'sortAttempt must not be incremented on infra skip');
+  // Infra counters advance.
+  assert.equal(entry.infraSortAttempts, 1);
+  assert.equal(entry.infraSortAttemptCount, 1);
+  // Event logged.
+  assert.ok(Array.isArray(entry.sortBudgetEvents));
+  assert.equal(entry.sortBudgetEvents.length, 1);
+  assert.equal(entry.sortBudgetEvents[0].type, 'infraSortSkip');
+  // Not exhausted yet (cap is 3).
+  assert.equal(entry.sortExhausted, undefined);
+});
+
+test('recoverableSortSkip: content skip still burns sortAttempt as before', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-content-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const brainDumpPath = writeBrainDump(dir, [
+    { id: 'bd-content', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'content test', status: 'captured' },
+  ]);
+
+  // Task with NO blockedReason -- a normal content skip.
+  const task = {
+    promptContext: { brainDumpEntryId: 'bd-content', rawText: 'content test', existingQueuedTitles: [] },
+  };
+  // Same path that will fail validation, but this time the reason string has no infra
+  // marker, so it falls through to the content-skip branch.
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'NonTracked/x.md', actionable: true, belongsToProject: 'nonexistent' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: path.join(dir, 'pipeline') });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.recoverable, true);
+  const entry = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  // Content skip: sortAttempt must increment exactly as before.
+  assert.equal(entry.sortAttempt, 1, 'sortAttempt must be incremented on content skip');
+  // No infra counters touched.
+  assert.equal(entry.infraSortAttempts, undefined);
+  assert.equal(entry.infraSortAttemptCount, undefined);
+});
+
+test('recoverableSortSkip: infra exhaustion stamps sortExhausted at the cap', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-infra-exhaust-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const entry = { id: 'bd-exhaust', capturedAt: '2026-07-22T00:00:00.000Z', rawText: 'exhaust test', status: 'captured', infraSortAttempts: 2 };
+  const brainDumpPath = writeBrainDump(dir, [entry]);
+
+  const task = {
+    blockedReason: 'connection refused -- ECONNRESET on upstream',
+    promptContext: { brainDumpEntryId: 'bd-exhaust', rawText: 'exhaust test', existingQueuedTitles: [] },
+  };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'NonTracked/x.md', actionable: true, belongsToProject: 'nonexistent' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: path.join(dir, 'pipeline') });
+
+  assert.equal(result.skipped, true);
+  const updated = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  assert.equal(updated.infraSortAttempts, 3);
+  assert.equal(updated.sortExhausted, true, 'sortExhausted must be stamped when infra counter hits the cap');
+  assert.equal(updated.sortBudgetEvents.length, 2, 'infraSortSkip + infraSortExhausted events');
+  assert.equal(updated.sortBudgetEvents[1].type, 'infraSortExhausted');
+});
