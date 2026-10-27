@@ -121,3 +121,69 @@ test('runDueProbes: a cloud lane is never probed (no tokens/s to judge, and each
   assert.deepEqual(out.map((r) => r.lane), ['worker-rx580']);
   assert.equal(H.laneDegraded(dir, 'worker-cloud'), false, 'a cloud lane with no samples is never degraded');
 });
+
+// --- 2026-10-27: a dashboard model override must be what the probe judges, and a model swap must not read as a dead lane ------------------------------
+function laneFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-health-swap-'));
+  const now = Date.now();
+  fs.writeFileSync(path.join(dir, 'worker-3090.json'), JSON.stringify({ status: 'idle', lastHeartbeat: new Date(now).toISOString() }));
+  const lanes = [{ id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', env: {} }];
+  const state = () => JSON.parse(fs.readFileSync(path.join(dir, 'lane-health.worker-3090.json'), 'utf8'));
+  return { dir, now, lanes, state };
+}
+const run = (fx, extra) => H.runDueProbes({ lanes: fx.lanes, instancesDir: fx.dir, pipelineDir: fx.dir, env: {}, now: fx.now, ...extra });
+
+test('runDueProbes probes the override model, not the registered one', async () => {
+  const fx = laneFixture();
+  const asked = [];
+  const probe = async (a) => { asked.push(a.model); return { ok: true, tps: 99, totalMs: 500, error: null }; };
+  const r = await run(fx, { probe, resident: async () => ['ornith:35b'], overrides: { 'worker-3090': 'ornith:35b' } });
+  assert.deepEqual(asked, ['ornith:35b']);
+  assert.equal(r[0].ok, true);
+});
+
+test('a probe never goes over a different resident model (it would evict it and outwait its own timeout)', async () => {
+  const fx = laneFixture();
+  let probed = false;
+  const r = await run(fx, { probe: async () => { probed = true; return { ok: true, tps: 30, totalMs: 1, error: null }; }, resident: async () => ['ornith:35b'], overrides: {} });
+  assert.equal(probed, false);
+  assert.match(r[0].skipped, /different model is resident/);
+  assert.equal(fs.existsSync(path.join(fx.dir, 'lane-health.worker-3090.json')), false, 'no sample, no state written');
+});
+
+test('a probe that timed out while its model was not resident is inconclusive: no failed sample, no degraded verdict, retried after the interval', async () => {
+  const fx = laneFixture();
+  const timeout = async () => ({ ok: false, tps: 0, totalMs: 90000, error: 'Ollama request timed out after 90000ms' });
+  const r = await run(fx, { probe: timeout, resident: async () => ['ornith:35b'], overrides: { 'worker-3090': 'qwen3.8:27b-q4_K_M' }, });
+  // before = a different model resident -> skipped; now the load-in-progress case: nothing resident before, still not resident after the timeout
+  assert.match(r[0].skipped, /different model/);
+  const seq = [[], []]; // resident() before the probe and after it: nothing, nothing (the model never became resident within the timeout)
+  const r2 = await run(fx, { probe: timeout, resident: async () => seq.shift() });
+  assert.equal(r2[0].inconclusive, true);
+  assert.equal(H.readSamples(fx.dir, 'worker-3090').length, 0, 'no failed sample was recorded');
+  assert.equal(H.laneDegraded(fx.dir, 'worker-3090', { now: fx.now }), false);
+  assert.ok(fx.state().lastInconclusiveAt, 'the retry is throttled');
+  assert.equal((await run(fx, { probe: timeout, resident: async () => [], now: fx.now + 1000 })).length, 0, 'throttled by the interval after an inconclusive probe');
+});
+
+test('a probe that fails while its model IS resident, or while the endpoint cannot be asked, is still a real failure', async () => {
+  const timeout = async () => ({ ok: false, tps: 0, totalMs: 90000, error: 'Ollama request timed out after 90000ms' });
+  const fx = laneFixture();
+  const seq = [['qwen3.8:27b-q4_K_M'], ['qwen3.8:27b-q4_K_M']];
+  const r = await run(fx, { probe: timeout, resident: async () => seq.shift(), overrides: {} });
+  assert.equal(r[0].ok, false);
+  assert.equal(r[0].degraded, true);
+  assert.equal(H.readSamples(fx.dir, 'worker-3090').length, 1);
+  const fx2 = laneFixture();
+  const r2 = await run(fx2, { probe: timeout, resident: async () => null, overrides: {} });
+  assert.equal(r2[0].ok, false, 'endpoint unreachable stays a failure');
+  assert.equal(r2[0].degraded, true);
+});
+
+test('residentModels lists the names Ollama reports and returns null when it cannot be asked', async () => {
+  const ok2 = await H.residentModels('http://x/', { fetchFn: async () => ({ ok: true, json: async () => ({ models: [{ name: 'a:1' }, { model: 'b:2' }] }) }) });
+  assert.deepEqual(ok2, ['a:1', 'b:2']);
+  assert.deepEqual(await H.residentModels('http://x', { fetchFn: async () => ({ ok: true, json: async () => ({}) }) }), []);
+  assert.equal(await H.residentModels('http://x', { fetchFn: async () => { throw new Error('down'); } }), null);
+  assert.equal(await H.residentModels('http://x', { fetchFn: async () => ({ ok: false }) }), null);
+});
