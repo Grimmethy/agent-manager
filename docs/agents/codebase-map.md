@@ -152,6 +152,12 @@ about," verified to still exist as of this writing.
 - `src/concepts.js` — the Concept Chart registry (`createConcept`, `recordConceptResearch`, `getConceptTimeline`), backed by concepts.json (gitignored pipeline-generated state, present on a live host, not in the repo — same category as `queue/`).
 - `SecondBrain/Research/*.md` — the human-readable writeup a concept's row points at.
 
+## CLI tools
+
+One-line entries for scripts that are entry points in their own right, not just called from elsewhere.
+
+- `scripts/mutation-check.js` — deterministic mutation-testing CLI: apply each mutation from a JSON manifest to a source file, run a test command, and report which mutations survived; every file is restored byte-for-byte before the next mutation runs. Tests at `scripts/mutation-check.test.js`. See [docs/agents/mutation-check.md](docs/agents/mutation-check.md).
+
 ## Recurring work processes
 
 Not "where is the code" but "how do we do this again" — the other kind of thing worth
