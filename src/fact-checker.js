@@ -18,10 +18,15 @@ const fs = require('fs');
 const path = require('path');
 const { lineRangeOf, extractChangedSpan, normalizeCode } = require('./lib/fact-checker-text-utils.js');
 const { extractDomainRoot } = require('./lib/fact-checker-url-utils.js');
+const { isArchivedDirName } = require('./lib/archived-dirs.js');
 
 // (?!\s*:\s*\d) rejects a match where a ":NNN" line-number suffix follows, so
 // "foo.js:310" is not silently truncated to the bare path "foo.js".
-const PATH_EXT_RE = /[A-Za-z0-9_.\-/\\]+\.(?:js|jsx|ts|tsx|py|json|md|csv)\b(?!\s*:\s*\d)/g;
+// (?!\() rejects a match immediately followed by "(": that is a method call, not a file --
+// `res.json({ ok: true })`, `r.json()`, `resp.json()` in the code a draft quotes in its `find` text were read as a cited
+// file "res.json" that does not exist and blocked the draft pre-critique. No whitespace is allowed before the paren, so
+// prose like "see foo.js (the helper)" still matches.
+const PATH_EXT_RE = /[A-Za-z0-9_.\-/\\]+\.(?:js|jsx|ts|tsx|py|json|md|csv)\b(?!\s*:\s*\d)(?!\()/g;
 const RELATIONSHIP_RE = /`([^`]+)`\s+(?:imports?|calls?|reads?\s+from|uses?)\s+`?([A-Za-z0-9_.]+)`?/gi;
 
 function extractFilePaths(text) {
@@ -139,7 +144,7 @@ function findByBasename(root, basename, maxResults = 10) {
     for (const entry of entries) {
       if (found.length >= maxResults) return;
       if (entry.isDirectory()) {
-        if (WALK_SKIP_DIRS.has(entry.name)) continue;
+        if (WALK_SKIP_DIRS.has(entry.name) || isArchivedDirName(entry.name)) continue;
         walk(path.join(dir, entry.name));
       } else if (entry.isFile() && entry.name === basename) {
         found.push(path.join(dir, entry.name));
@@ -201,8 +206,32 @@ function resolveAgainstRepo(repoRoot, candidatePath, extraRoots = []) {
   return resolveAgainstRepoDetailed(repoRoot, candidatePath, extraRoots).resolvedPath;
 }
 
-function checkFilePaths(text, repoRoot, extraRoots = []) {
+function checkFilePaths(text, repoRoot, extraRoots = [], ref) {
   return extractFilePaths(text).map((claimedPath) => {
+    // 2026-09-16, PF HUB0109-1/3: `ref` (from resolveGroundingRef -- null for any non-stacked
+    // task, so this whole branch is inert there and the check below runs exactly as before)
+    // resolves existence against the stacked branch's real TIP via the git object database
+    // instead of the shared working tree. A file a sibling task committed to the shared
+    // stacked branch does not exist in the working-tree checkout (usually main), so a
+    // working-tree-only check would flag the sibling's real file as fabricated. Mirrors the
+    // ref treatment existsLiterallyInRepo already uses, and resolveAtRef's own tiers
+    // (exact / extraRoot-prefix / unique basename): it returns the resolved repo-relative
+    // path or null, never throws, and its null result does NOT void the working-tree
+    // verdict below -- an unreadable ref degrades to exactly the pre-ref behavior.
+    if (ref) {
+      try {
+        const { resolveAtRef } = require('./stacked-grounding.js');
+        const hit = resolveAtRef(repoRoot, ref, claimedPath, extraRoots);
+        if (hit) {
+          const normalized = String(claimedPath).replace(/\\/g, '/').replace(/^\.?\//, '');
+          const roots = (extraRoots || []).map((r) => String(r).replace(/\\/g, '/').replace(/\/$/, '') + '/');
+          const resolvedVia = hit === normalized ? 'exact' : (roots.some((r) => hit.startsWith(r)) ? 'prefix' : 'basename');
+          return { claimedPath, exists: true, resolvedPath: path.join(repoRoot, hit), resolvedVia };
+        }
+      } catch (e) {
+        // could not confirm against the stacked ref -- fall through to the working-tree check below.
+      }
+    }
     const { resolvedPath, resolvedVia } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
     return { claimedPath, exists: !!resolvedPath, resolvedPath, resolvedVia };
   });
@@ -439,7 +468,9 @@ function checkBlastRadiusBias(text) {
 // case of copying a real value from the wrong sibling.
 const URL_RE = /https?:\/\/[^\s"'`)\]}<>]+/gi;
 const GIS_FIELD_RE = /\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b/g;
-const PLACEHOLDER_RE = /placeholder|example\.(?:com|org|net)|\bTODO\b|\bFIXME\b|\bTBD\b|XXXX?/i;
+// 2026-10-22: also a dotted host written with letter octets (100.x.y.z, x.x.x.x), the usual way a README
+// example hides a real address. Live: chat-plugin 'Multi-chat 1/6' was hard-blocked on http://100.x.y.z:7450.
+const PLACEHOLDER_RE = /placeholder|example\.(?:com|org|net)|\bTODO\b|\bFIXME\b|\bTBD\b|XXXX?|\bx\.(?:y\.z|x\.x)\b/i;
 
 // 2026-08-25, root-caused live via a real blocked task: a pure UI change legitimately
 // introduced two brand-new JS constants (JOB_TYPE_FAMILIES, JOB_TYPE_FAMILY_BY_SOURCE) as
@@ -474,6 +505,32 @@ const NEW_DECLARATION_RE = /^\+\s*(?:(?:const|let|var)\s+)?([A-Z][A-Z0-9]*_[A-Z0
 
 function extractNewlyDeclaredIdentifiers(text) {
   return new Set([...text.matchAll(NEW_DECLARATION_RE)].map((m) => m[1]));
+}
+
+// 2026-10-18, root-caused live (brain-dump 1890's review, this pipeline): a draft that adds an env switch -- read as
+// process.env.AGENT_MANAGER_EDIT_FILE_TIERS on an added line of an EXISTING file -- was hard-blocked 'ungrounded-field'
+// before any vote. Same class as the newly-declared exemption above: the draft's own diff is what introduces the name, so
+// no pre-change grounding can contain it. But an environment variable is introduced by being READ, never by a `NAME =`
+// line, so NEW_DECLARATION_RE can never exempt it. Exempts a token an ADDED diff line reads from the environment:
+// process.env.NAME / process.env['NAME'], os.environ['NAME'], os.environ.get('NAME', os.getenv('NAME', getenv('NAME',
+// and shell ${NAME:-x} / ${NAME-x} / ${NAME:=x} (default-value forms only -- a JS template ${NAME} referencing a constant
+// is not an env read and stays checked). Prose, context and removed lines never exempt anything.
+// 2026-10-19 (brain-dump 1896's review, blocked on env.AGENT_MANAGER_TRANSIENT_RETRY): an identifier named `env` used as a property access also
+// counts -- `env.NAME`, `env['NAME']`, Python `env.get('NAME'` -- because this codebase's own idiom is an injected parameter,
+// `function f(url, env = process.env) { ... env.NAME ... }` (lanes.js isSlowEndpoint, capability-ledger.js, transient-retry.js). `\benv\.` still
+// matches process.env.NAME (a word boundary sits between '.' and 'e'); `myenv.NAME` does not match. A replay of all 41 historic ungrounded-field
+// blocks (2026-10-19) found none this widening would have exempted: it is about the live idiom, not past blocks.
+const ENV_READ_RE = /(?:\benv\.|\benv\[\s*['"`]|\benv\.get\(\s*['"]|os\.environ\[\s*['"]|os\.environ\.get\(\s*['"]|(?:os\.)?getenv\(\s*['"])([A-Z][A-Z0-9]*_[A-Z0-9_]+)|\$\{([A-Z][A-Z0-9]*_[A-Z0-9_]+):?[-=]/g;
+
+function extractEnvReadIdentifiers(text) {
+  const out = new Set();
+  let inDiff = false;
+  for (const line of String(text || '').split('\n')) {
+    if (DIFF_META_RE.test(line)) { inDiff = true; continue; }
+    if (!inDiff || !line.startsWith('+') || line.startsWith('+++')) continue;
+    for (const m of line.matchAll(ENV_READ_RE)) out.add(m[1] || m[2]);
+  }
+  return out;
 }
 
 // 2026-09-08, root-caused live via a real blocked adhoc task (the analytics-and-discovery.js
@@ -594,22 +651,96 @@ function stripUnchangedDiffLines(text) {
   return text.split('\n').map((line) => {
     if (DIFF_META_RE.test(line)) { inDiff = true; return ''; }
     if (!inDiff) return line; // prose (or a plain-text draft with no diff at all)
+    if (line === '') return ''; // a blank line inside a hunk is a context line whose trailing space was stripped (common in model-written diffs): not prose, and not the end of the block
+    if (line.startsWith(' ')) return ''; // context line -- pre-existing, never a new claim
+    if (line.startsWith('-')) return ''; // removed line -- pre-existing, never a new claim
     if (line.startsWith('+')) return line; // real addition -- a genuine new claim
-    return ''; // removed or unchanged context -- pre-existing, never a new claim
+    inDiff = false; // not a valid diff line (prose, bullet, indented text, etc.) -- exit diff block
+    return line;
+  }).join('\n');
+}
+
+// 2026-10-08 (TaxHarvest http_get_bytes cache task): the draft's NEW test file used `http://ex.com/report/a.pdf` as an input fixture and the URL got flagged
+// ungrounded-url, escalating a correct draft to needs-clarification. A URL string that exists only as a literal in a test file the diff itself adds is
+// the draft's own test data, not a claim about anything in the repo -- the same reason a newly-declared constant is exempt above. Narrow: the URL must
+// appear on an added line of at least one test file AND on no added line of a non-test file (so a URL a production file also relies on is still checked),
+// and prose never exempts anything (a URL only ever cited in prose is still a claim).
+const TEST_FILE_RE = /(?:^|\/)(?:tests?|__tests__|specs?)\/|\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]+\.py$|_test\.py$/;
+
+function urlsOnlyInAddedTestFiles(text) {
+  const inTest = new Set();
+  const inProd = new Set();
+  let file = null;
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^diff --git a\/\S+ b\/(\S+)/);
+    if (m) { file = m[1]; continue; }
+    if (!file || !line.startsWith('+') || line.startsWith('+++')) continue;
+    for (const raw of line.match(URL_RE) || []) {
+      const url = raw.replace(/[.,;:]+$/, '');
+      (TEST_FILE_RE.test(file) ? inTest : inProd).add(url);
+    }
+  }
+  return new Set([...inTest].filter((u) => !inProd.has(u)));
+}
+
+// 2026-10-19, root-caused live (brain-dump 1891's review): an ALL_CAPS dummy string in an ADDED unit test ('SENTINEL_THOUGHT', a stand-in for
+// model thinking text) was hard-blocked 'ungrounded-field', although urlsOnlyInAddedTestFiles above already exempts a URL that lives only in
+// the draft's own test data. Same reason, narrower on purpose: the token must sit INSIDE A STRING LITERAL on an added line of at least one
+// test file and appear on no added line of a non-test file -- and nowhere outside a string literal in a test file either. A bare identifier
+// in test code (`x = INVENTED_FIELD_NAME`) is a reference to a symbol that should exist, so it stays checked (test 'an ungrounded ALLCAPS
+// field in a test file is still flagged'); prose neither exempts nor un-exempts anything. Replayed over every historic ungrounded-field
+// block (41 blocks, 28 tasks, 2026-10-19) it would have exempted two names -- FOO_BAR_BAZ and RETRY_BACKOFF_CAP, both string fixtures in
+// tests of the checkers themselves -- and kept the other 39. (1889's similar sentinel passed only because its lowercase suffix defeated
+// GIS_FIELD_RE's trailing \b, by accident.)
+const STRING_LITERAL_RE = /(['"`])(?:\\.|(?!\1)[^\\])*\1/g;
+
+function fieldsOnlyInAddedTestFiles(text) {
+  const inTestStrings = new Set();
+  const elsewhere = new Set();
+  let file = null;
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^diff --git a\/\S+ b\/(\S+)/);
+    if (m) { file = m[1]; continue; }
+    if (!file || !line.startsWith('+') || line.startsWith('+++')) continue;
+    if (!TEST_FILE_RE.test(file)) { for (const f of line.match(GIS_FIELD_RE) || []) elsewhere.add(f); continue; }
+    for (const lit of line.match(STRING_LITERAL_RE) || []) for (const f of lit.match(GIS_FIELD_RE) || []) inTestStrings.add(f);
+    for (const f of line.replace(STRING_LITERAL_RE, ' ').match(GIS_FIELD_RE) || []) elsewhere.add(f);
+  }
+  return new Set([...inTestStrings].filter((f) => !elsewhere.has(f)));
+}
+
+// 2026-10-24 (chat plugin HUB0003-05, vendoring dockview-core): the body of a THIRD-PARTY file the draft vendors into the repo is not the draft's claim
+// about anything -- a 540 KB minified library carries hundreds of constants and URLs (ENABLE_TRACKING, http://www.w3.org/2000/svg, ...) that no task text or
+// repo grounding can contain, and the review was hard-blocked 'ungrounded-field' / 'ungrounded-url' before any vote, with no way to pass a legitimate
+// vendoring. Drops every diff section whose file is vendored (a vendor/, vendored/, third_party/ or node_modules/ directory, or a .min.js / .min.css
+// file) from what is scanned. Narrow: only the vendored file's own section is dropped; prose, the README that records the source, and every
+// non-vendored file in the same diff are still scanned (a fabricated value in a README still flags).
+const VENDORED_FILE_RE = /(?:^|\/)(?:vendor|vendored|third_party|node_modules)\/|\.min\.(?:js|css)$/;
+
+function stripVendoredDiffSections(text) {
+  let skipping = false;
+  return String(text || '').split('\n').map((line) => {
+    const m = line.match(/^diff --git a\/\S+ b\/(\S+)/);
+    if (m) skipping = VENDORED_FILE_RE.test(m[1]);
+    return skipping ? '' : line;
   }).join('\n');
 }
 
 function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   if (!sourceText) return [];
   const flags = [];
-  const scannableText = stripUnchangedDiffLines(draftText);
+  const scannableText = stripUnchangedDiffLines(stripVendoredDiffSections(draftText));
+  const testFixtureUrls = urlsOnlyInAddedTestFiles(draftText);
   const newlyDeclared = extractNewlyDeclaredIdentifiers(draftText);
+  const envReads = extractEnvReadIdentifiers(draftText);
+  const testFixtureFields = fieldsOnlyInAddedTestFiles(draftText);
   const echoMarkers = extractEchoMarkers(draftText);
 
   const urls = [...new Set(scannableText.match(URL_RE) || [])];
   for (const raw of urls) {
     const url = raw.replace(/[.,;:]+$/, ''); // strip trailing sentence punctuation
     if (PLACEHOLDER_RE.test(url)) continue;
+    if (testFixtureUrls.has(url)) continue;
     if (sourceText.includes(url)) continue;
     if (isNamedServiceUrl(url, sourceText)) continue;
     if (existsLiterallyInRepo(url, repoRoot, ref)) continue;
@@ -620,6 +751,8 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
   for (const field of fields) {
     if (PLACEHOLDER_RE.test(field)) continue;
     if (newlyDeclared.has(field)) continue;
+    if (envReads.has(field)) continue;
+    if (testFixtureFields.has(field)) continue;
     if (echoMarkers.has(field)) continue;
     if (sourceText.includes(field)) continue;
     if (existsLiterallyInRepo(field, repoRoot, ref)) continue;
@@ -642,15 +775,78 @@ function checkGroundedValues(draftText, sourceText, repoRoot, ref) {
 // words ("com", "net", "org") can never read as "a path".
 const FILE_LINE_CITATION_RE = /(?<![A-Za-z0-9_.\-/:])[A-Za-z0-9_\-./]+\.(?:js|jsx|ts|tsx|mjs|cjs|py|json|md|csv|sh|yml|yaml|html|css|toml|txt|lock|cfg|ini|env|xml|sql)\b:[0-9]+/g;
 
-function checkFileLineCitations(draftText, sourceText) {
-  if (!sourceText) return { unconfirmedCitations: [] }; // no grounding material -> nothing to strip
+function checkFileLineCitations(draftText, sourceText, repoRoot = null, extraRoots = []) {
+  const warnings = [];
   const unconfirmedCitations = [];
-  for (const line of draftText.split('\n')) {
-    const tokens = (line.match(FILE_LINE_CITATION_RE) || []).filter((t) => !t.includes('://')); // skip URL host:port
-    if (tokens.length === 0) continue;
-    if (tokens.some((t) => !sourceText.includes(t))) unconfirmedCitations.push(line);
+  // No grounding material -> nothing to strip, but the symbol-presence warning below reads the REPO (not sourceText), and local-draft's pre-filter calls
+  // checkDraft WITHOUT a sourceText: returning here used to switch the whole HUB0136 warning off on the one path that persists it.
+  if (sourceText) {
+    for (const line of draftText.split('\n')) {
+      const tokens = (line.match(FILE_LINE_CITATION_RE) || []).filter((t) => !t.includes('://')); // skip URL host:port
+      if (tokens.length === 0) continue;
+      if (tokens.some((t) => !sourceText.includes(t))) unconfirmedCitations.push(line);
+    }
   }
-  return { unconfirmedCitations };
+
+  // Symbol-presence warning (HUB0136 1/3): a backtick-quoted identifier cited on the same
+  // line as a file:line citation should actually exist in the cited file's content -- a
+  // draft that cites "src/foo.js:42" and names `barBaz` as living there is making a
+  // checkable claim the file-existence check above can't see (the file IS real, only the
+  // named symbol is not in it). A miss pushes a WARNING-ONLY entry (severity: 'warning')
+  // -- it never strips a line, throws, or flips any pass/fail status, by design.
+  // Fail-open, same convention as preValidateCitedPaths: no repoRoot, an unresolvable
+  // path, an unreadable file, or an identifier not sitting on a citation line all mean
+  // "could not check", which produces NO warning (a warning that fires on environment
+  // hiccups would be noise).
+  if (repoRoot) {
+    // Lazy require (NOT a top-level import): task-anchor-files.js requires
+    // ./fact-checker.js at its own top level (resolveAgainstRepoDetailed), so a top-level
+    // require here would be a circular load. Same in-function require convention
+    // existsLiterallyInRepo uses for ./stacked-grounding.js above.
+    let backtickIdentifiers;
+    try {
+      ({ backtickIdentifiers } = require('./task-anchor-files.js'));
+    } catch {
+      backtickIdentifiers = null; // could not load the helper -> fail-open, no warnings
+    }
+    if (typeof backtickIdentifiers === 'function') {
+      const citedPaths = [...new Set(
+        (draftText.match(FILE_LINE_CITATION_RE) || [])
+          .filter((t) => !t.includes('://'))
+          .map((t) => t.slice(0, t.lastIndexOf(':'))),
+      )];
+      const fileContents = new Map();
+      for (const claimedPath of citedPaths) {
+        try {
+          const { resolvedPath } = resolveAgainstRepoDetailed(repoRoot, claimedPath, extraRoots);
+          if (resolvedPath) fileContents.set(claimedPath, fs.readFileSync(resolvedPath, 'utf8'));
+        } catch { /* unreadable/unresolvable -> fail-open, no warning */ }
+      }
+      const lines = draftText.split('\n');
+      for (const identifier of backtickIdentifiers(draftText)) {
+        // File-path identifiers are not symbols: they carry a separator, end in a real
+        // file extension, or ARE one of the draft's own cited paths.
+        if (identifier.includes('/') || identifier.includes('\\')) continue;
+        if (/\.(?:js|jsx|ts|tsx|mjs|cjs|py|json|md|csv|sh|yml|yaml|html|css|toml|txt|lock|cfg|ini|env|xml|sql)$/.test(identifier)) continue;
+        if (citedPaths.includes(identifier)) continue;
+        // The cited file = the file:line citation on the SAME line as the identifier
+        // (an identifier far from any citation has no cited file to check against).
+        let citedFile = null;
+        for (const line of lines) {
+          if (!line.includes('`' + identifier)) continue;
+          const token = (line.match(FILE_LINE_CITATION_RE) || []).find((t) => !t.includes('://'));
+          if (token) { citedFile = token.slice(0, token.lastIndexOf(':')); break; }
+        }
+        if (citedFile === null || !fileContents.has(citedFile)) continue;
+        const fileContent = fileContents.get(citedFile);
+        if (!fileContent.includes(identifier)) {
+          warnings.push({ type: 'symbol-not-found-in-cited-file', identifier, citedFile, severity: 'warning' });
+        }
+      }
+    }
+  }
+
+  return { unconfirmedCitations, warnings };
 }
 
 // Pre-fact-check gate for project_search / arch_import (2026-09-08 brain-dump request):
@@ -798,11 +994,11 @@ function checkCitationsAgainstHarnessFiles(draftText, harnessFiles) {
 // draft is correct. `sourceText` (optional) is the material the local model was actually given for
 // this task; when provided, the grounded-value check runs against it.
 function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
-  const rawFileChecks = checkFilePaths(draftText, repoRoot, extraRoots);
+  const rawFileChecks = checkFilePaths(draftText, repoRoot, extraRoots, ref);
   const relationshipChecks = checkRelationships(draftText, repoRoot, extraRoots);
   const blastRadiusFlag = checkBlastRadiusBias(draftText);
   const groundedFlags = checkGroundedValues(draftText, sourceText, repoRoot, ref);
-  const { unconfirmedCitations } = checkFileLineCitations(draftText, sourceText);
+  const { unconfirmedCitations, warnings: symbolWarnings } = checkFileLineCitations(draftText, sourceText, repoRoot, extraRoots);
   let cleanedText = draftText;
   let strippedFileLineCitations = [];
   if (unconfirmedCitations.length > 0) {
@@ -865,7 +1061,7 @@ function checkDraft(draftText, repoRoot, sourceText, extraRoots = [], ref) {
   flags.push(...groundedFlags);
   flags.push(...revertChecks);
 
-  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks, revertChecks, cleanedText, strippedFileLineCitations };
+  return { flags, fileChecks, relationshipChecks, blastRadiusFlag, groundedFlags, commitChecks, revertChecks, cleanedText, strippedFileLineCitations, symbolWarnings };
 }
 
 // "Already done" claim check (2026-09-08, decomposed from adhoc-brain-dump-bd-1789456618325):
@@ -970,6 +1166,10 @@ function checkCompletionClaimsInNote(noteText, repoRoot) {
 }
 
 module.exports = {
+  stripVendoredDiffSections,
+  urlsOnlyInAddedTestFiles,
+  extractEnvReadIdentifiers,
+  fieldsOnlyInAddedTestFiles,
   checkDraft,
   checkFilePaths,
   checkRelationships,

@@ -9,7 +9,7 @@ const { execFileSync } = require('child_process');
 
 const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone,
-  requeueBlockedTask, repeatedBlockerMatch,
+  requeueBlockedTask, repeatedBlockerMatch, withdrawTask,
 } = require('./chat-task-requeue.js');
 
 function makePipeline() {
@@ -323,4 +323,157 @@ test('requeueBlockedTask: a successful superseded-branch delete is recorded in t
   write(dir, 'blocked', { id: 't15', domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', history: [{ stage: 'applied', at: 'y', detail: 'agent/t15-never-pushed' }] });
   assert.equal((await requeueBlockedTask(dir, dir, 't15', { state: 'blocked' })).ok, true);
   assert.equal(lastRemoval(dir, 'agent/t15-never-pushed'), null);
+});
+
+// 2026-10-08: a requeue (via Chat) keeps a branch other live work sits on (lib/shared-branch.js); HUB0018-01 was lost to the old behaviour.
+test('requeueBlockedTask: a branch shared with a live sibling is KEPT -- no delete, no ledger entry, no abandonment, a branch-kept event; a terminal sibling does not protect it', async () => {
+  const { lastRemoval } = require('./branch-removal-ledger.js');
+  const dir = makePipeline();
+  const bare = fs.mkdtempSync(path.join(require('os').tmpdir(), 'rq-bare-'));
+  execFileSync('git', ['init', '-q', '--bare', '-b', 'main', bare]);
+  execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: dir });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'README.md'), 'x\n');
+  execFileSync('git', ['add', 'README.md'], { cwd: dir });
+  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: dir });
+  execFileSync('git', ['remote', 'add', 'origin', bare], { cwd: dir });
+  execFileSync('git', ['push', '-q', 'origin', 'main'], { cwd: dir });
+  const remoteBranches = () => execFileSync('git', ['ls-remote', '--heads', bare], { encoding: 'utf8' });
+  const applied = (b) => [{ stage: 'applied', at: 'y', detail: b }];
+
+  execFileSync('git', ['push', '-q', 'origin', 'main:agent/shared-hub-branch'], { cwd: dir });
+  write(dir, 'blocked', { id: 'child', domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', stacked: { branch: 'agent/shared-hub-branch', seq: 2, total: 2 }, history: applied('agent/shared-hub-branch') });
+  fs.mkdirSync(at(dir, 'done'), { recursive: true });
+  fs.writeFileSync(at(dir, 'done', 'sibling.json'), JSON.stringify({ id: 'sibling', stacked: { branch: 'agent/shared-hub-branch', seq: 1, total: 2 }, history: applied('agent/shared-hub-branch') }));
+  assert.equal((await requeueBlockedTask(dir, dir, 'child', { state: 'blocked' })).ok, true);
+  assert.match(remoteBranches(), /agent\/shared-hub-branch/, 'the shared branch survives');
+  assert.equal(lastRemoval(dir, 'agent/shared-hub-branch'), null, 'nothing was removed, so nothing is recorded');
+  const pending = JSON.parse(fs.readFileSync(at(dir, 'pending', 'child.json'), 'utf8'));
+  const stages = pending.history.map((h) => h.stage);
+  assert.ok(stages.includes('branch-kept'));
+  assert.ok(!stages.includes('abandoned'));
+  assert.match(pending.history.find((h) => h.stage === 'branch-kept').detail, /shared with sibling/);
+
+  // the sibling is already merged: nothing live depends on the branch, so it is deleted as before
+  execFileSync('git', ['push', '-q', 'origin', 'main:agent/other-hub-branch'], { cwd: dir });
+  write(dir, 'blocked', { id: 'child2', domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', stacked: { branch: 'agent/other-hub-branch', seq: 2, total: 2 }, history: applied('agent/other-hub-branch') });
+  fs.writeFileSync(at(dir, 'done', 'merged-sibling.json'), JSON.stringify({ id: 'merged-sibling', terminalDisposition: 'merged', stacked: { branch: 'agent/other-hub-branch' }, history: applied('agent/other-hub-branch') }));
+  assert.equal((await requeueBlockedTask(dir, dir, 'child2', { state: 'blocked' })).ok, true);
+  assert.doesNotMatch(remoteBranches(), /agent\/other-hub-branch/);
+  assert.equal(lastRemoval(dir, 'agent/other-hub-branch').cause, 'superseded-by-requeue');
+});
+
+test('requeueBlockedTask: prerequisiteHubs is carried over a requeue', async () => {
+  const dir = makePipeline();
+  write(dir, 'blocked', { id: 't9', domain: 'core', source: 'adhoc', title: 'x', promptContext: {}, createdAt: 'x', prerequisiteHubs: ['HUB0006'] });
+  const result = await requeueBlockedTask(dir, dir, 't9', { state: 'blocked' });
+  assert.equal(result.ok, true);
+  assert.deepEqual(read(at(dir, 'pending', 't9.json')).prerequisiteHubs, ['HUB0006']);
+});
+
+// --- withdrawTask -----------------------------------------------------------------------
+
+const task = (id, extra = {}) => ({ id, title: `title ${id}`, promptContext: { rawText: 'ask' }, history: [{ stage: 'created', at: 'x' }], ...extra });
+
+test('withdrawTask: a task in adhoc/ moves to done/_archived_no_action/ with its fields intact plus the stamps', () => {
+  const dir = makePipeline();
+  write(dir, 'adhoc', task('w1', { premiumPriority: true }));
+  const result = withdrawTask(dir, 'w1', '  filed into the wrong queue  ');
+  assert.deepEqual(result, { ok: true, id: 'w1', from: 'adhoc' });
+  assert.equal(exists(at(dir, 'adhoc', 'w1.json')), false);
+  const moved = read(at(dir, 'done', '_archived_no_action', 'w1.json'));
+  assert.equal(moved.title, 'title w1');
+  assert.deepEqual(moved.promptContext, { rawText: 'ask' });
+  assert.equal(moved.premiumPriority, true);
+  assert.equal(moved.terminalDisposition, 'abandoned');
+  assert.equal(moved.manualArchive.from, 'adhoc');
+  assert.equal(moved.manualArchive.reason, 'filed into the wrong queue');
+  assert.match(moved.manualArchive.at, /^\d{4}-\d\d-\d\dT/);
+  const last = moved.history[moved.history.length - 1];
+  assert.equal(last.stage, 'withdrawn');
+  assert.equal(last.detail, 'filed into the wrong queue');
+  assert.equal(moved.history[0].stage, 'created');
+});
+
+test('withdrawTask: a task in pending/ moves the same way and reports from: pending', () => {
+  const dir = makePipeline();
+  write(dir, 'pending', task('w2'));
+  assert.deepEqual(withdrawTask(dir, 'w2', 'superseded'), { ok: true, id: 'w2', from: 'pending' });
+  assert.equal(exists(at(dir, 'pending', 'w2.json')), false);
+  assert.equal(read(at(dir, 'done', '_archived_no_action', 'w2.json')).manualArchive.from, 'pending');
+});
+
+test('withdrawTask: an existing terminalDisposition is never overwritten; a record without history gets one', () => {
+  const dir = makePipeline();
+  write(dir, 'pending', { id: 'w3', title: 't', terminalDisposition: 'noop' });
+  assert.equal(withdrawTask(dir, 'w3', 'dup').ok, true);
+  const moved = read(at(dir, 'done', '_archived_no_action', 'w3.json'));
+  assert.equal(moved.terminalDisposition, 'noop');
+  assert.equal(moved.history.length, 1);
+});
+
+test('withdrawTask: in-flight and stuck states are refused by name and the source file is left byte for byte untouched', () => {
+  const dir = makePipeline();
+  const cases = [['review'], ['approved'], ['coordinating'], ['needs-clarification'], ['blocked'], ['done'], ['awaiting-confirm'], ['derived'], ['drafting', 'worker-p40']];
+  for (const seg of cases) {
+    const id = `x-${seg.join('-')}`;
+    const folder = path.join(dir, 'queue', ...seg);
+    fs.mkdirSync(folder, { recursive: true });
+    const file = path.join(folder, `${id}.json`);
+    fs.writeFileSync(file, JSON.stringify(task(id)));
+    const before = fs.readFileSync(file);
+    const result = withdrawTask(dir, id, 'no longer wanted');
+    assert.equal(result.ok, false, seg.join('/'));
+    assert.match(result.error, new RegExp(seg[0]), `names ${seg[0]}`);
+    assert.deepEqual(fs.readFileSync(file), before, `${seg.join('/')} untouched`);
+    assert.equal(exists(at(dir, 'done', '_archived_no_action', `${id}.json`)), false);
+  }
+});
+
+test('withdrawTask: an already archived task is refused as archived and nothing moves', () => {
+  const dir = makePipeline();
+  write(dir, 'done/_archived_no_action', task('w4'));
+  const result = withdrawTask(dir, 'w4', 'again');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /the archive/);
+});
+
+test('withdrawTask: missing or blank taskId or reason is refused before any file is touched; an unknown id is a clean error', () => {
+  const dir = makePipeline();
+  write(dir, 'adhoc', task('w5'));
+  for (const reason of ['', '   ', undefined, null, 7]) {
+    assert.deepEqual(withdrawTask(dir, 'w5', reason), { ok: false, error: 'reason is required and must be non-empty' });
+  }
+  assert.deepEqual(withdrawTask(dir, '', 'r'), { ok: false, error: 'taskId is required' });
+  assert.equal(exists(at(dir, 'adhoc', 'w5.json')), true);
+  const missing = withdrawTask(dir, 'nope', 'r');
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /read_task/);
+});
+
+test('withdrawTask: a collision in the archive refuses and leaves the source where it was', () => {
+  const dir = makePipeline();
+  write(dir, 'adhoc', task('w6'));
+  write(dir, 'done/_archived_no_action', task('w6', { title: 'older copy' }));
+  const result = withdrawTask(dir, 'w6', 'x');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /_archived_no_action/);
+  assert.equal(exists(at(dir, 'adhoc', 'w6.json')), true);
+  assert.equal(read(at(dir, 'done', '_archived_no_action', 'w6.json')).title, 'older copy');
+});
+
+test('withdrawTask: reversible -- requeueBlockedTask(state archived) brings it back to pending/ as a fresh record with the withdrawn entry kept', async () => {
+  const dir = makePipeline();
+  write(dir, 'adhoc', task('w7', { domain: 'default', source: 'manual', createdAt: '2026-10-25T00:00:00Z' }));
+  assert.equal(withdrawTask(dir, 'w7', 'oops').ok, true);
+  const result = await requeueBlockedTask(dir, null, 'w7', { state: 'archived' });
+  assert.equal(result.ok, true);
+  assert.equal(exists(at(dir, 'done', '_archived_no_action', 'w7.json')), false);
+  const back = read(at(dir, 'pending', 'w7.json'));
+  assert.equal(back.status, 'pending');
+  assert.equal(back.terminalDisposition, undefined, 'the abandoned stamp does not survive the requeue');
+  assert.equal(back.manualArchive, undefined);
+  const stages = back.history.map((h) => h.stage);
+  assert.deepEqual(stages, ['created', 'withdrawn', 'requeued']);
 });

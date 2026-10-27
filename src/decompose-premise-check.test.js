@@ -2,7 +2,10 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { detectStaleDecomposePremise } = require('./decompose-premise-check.js');
+const { detectStaleDecomposePremise, resolveCitedFile, SUFFIX_MATCH_CAP } = require('./decompose-premise-check.js');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 // --- detectStaleDecomposePremise (2026-09-15, brain-dump bd-1789433484305, "pipeline
 // hardening 3/5") -- root-caused live against the real sub-task that cited src/local-
@@ -163,4 +166,164 @@ test('kill switch: AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK=false disables the chec
     if (prev === undefined) delete process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK;
     else process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK = prev;
   }
+});
+
+// --- monorepo sub-roots (2026-10-07): a sub-task cites `src/routes/x.js` but the file lives at
+// `<sub-root>/src/routes/x.js`. The cited path alone is not a real location, so the check used to
+// call a real file missing and block HUB0007-02 / HUB0008-01 / HUB0012-02 on the TaxHarvest
+// pipeline as a "stale premise". These tests use a REAL temp tree (no lineCountFn injection). ---
+
+function monorepo(files) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'premise-suffix-'));
+  for (const [rel, lines] of Object.entries(files)) {
+    const abs = path.join(root, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, Array.from({ length: lines }, (_, i) => `// line ${i + 1}`).join('\n'));
+  }
+  return root;
+}
+const citing = (text) => ({ promptContext: { decomposedFrom: 'parent-1', rawText: text } });
+
+test('a cited file that exists only under a monorepo sub-root is NOT flagged missing', () => {
+  const root = monorepo({ 'sub/backend/src/routes/x.js': 400 });
+  assert.equal(detectStaleDecomposePremise(citing('In src/routes/x.js near line 120, reduce the handler.'), { repoRoot: root }), null);
+});
+
+test('a real overshoot is still reported through the suffix-resolved file, naming where it resolved', () => {
+  const root = monorepo({ 'sub/backend/src/routes/x.js': 100 });
+  const result = detectStaleDecomposePremise(citing('In src/routes/x.js at line 5000, reduce the handler.'), { repoRoot: root });
+  assert.ok(result, 'a line far past the resolved file must still be flagged');
+  assert.equal(result.findings[0].kind, 'line-overshoot');
+  assert.equal(result.findings[0].relPath, 'src/routes/x.js');
+  assert.equal(result.findings[0].resolvedPath, 'sub/backend/src/routes/x.js');
+  assert.equal(result.findings[0].realLineCount, 100);
+  assert.match(result.findings[0].detail, /resolved to `sub\/backend\/src\/routes\/x\.js`/);
+});
+
+test('a cited path that ends two different real files is ambiguous and is NOT flagged', () => {
+  const root = monorepo({ 'a/src/routes/x.js': 10, 'b/src/routes/x.js': 10 });
+  assert.equal(detectStaleDecomposePremise(citing('In src/routes/x.js at line 900, fix it.'), { repoRoot: root }), null);
+});
+
+test('a cited file that exists nowhere is still reported as missing-file', () => {
+  const root = monorepo({ 'sub/backend/src/routes/other.js': 10 });
+  const result = detectStaleDecomposePremise(citing('In src/routes/gone.js at line 20, fix it.'), { repoRoot: root });
+  assert.ok(result);
+  assert.equal(result.findings[0].kind, 'missing-file');
+});
+
+test('a file that only shares the BASENAME (not the cited path suffix) is not a match', () => {
+  const root = monorepo({ 'other/x.js': 400 });
+  const result = detectStaleDecomposePremise(citing('In src/routes/x.js at line 20, fix it.'), { repoRoot: root });
+  assert.ok(result, 'other/x.js is a different file; the cited src/routes/x.js really is missing');
+  assert.equal(result.findings[0].kind, 'missing-file');
+});
+
+test('resolveCitedFile: wide cap, normalised input, never throws', () => {
+  const calls = [];
+  const findFn = (root, base, cap) => { calls.push([base, cap]); return [path.join(root, 'sub', 'src', 'routes', 'x.js')]; };
+  assert.deepEqual(resolveCitedFile('/r', './src/routes/x.js', { findFn }), { status: 'unique', relPath: 'sub/src/routes/x.js' });
+  assert.deepEqual(calls[0], ['x.js', SUFFIX_MATCH_CAP]);
+  assert.ok(SUFFIX_MATCH_CAP > 10, 'must exceed findByBasename\'s default cap of 10');
+  assert.deepEqual(resolveCitedFile('/r', 'src/routes/x.js', { findFn: () => { throw new Error('disk gone'); } }), { status: 'none' });
+  assert.deepEqual(resolveCitedFile('/nonexistent-root-for-premise-test', 'src/a.js'), { status: 'none' });
+});
+
+// --- create-verb guard + bare-filename attribution (HUB0161, 2026-10-08) ---
+
+test('a create-verb-introduced file is suppressed while a genuinely-missing file in the same sentence is still flagged', () => {
+  const text = 'Create src/routes/counties.js at ~line 10. Then update src/routes/legacy.js (1) ~line 42.';
+  const result = detectStaleDecomposePremise(citing(text), {
+    repoRoot: '/r',
+    lineCountFn: () => null,
+    resolveFn: () => ({ status: 'none' }),
+  });
+  assert.ok(result, 'the genuinely-missing legacy.js must still block');
+  assert.equal(result.stale, true);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'src/routes/legacy.js');
+  const s = result.suppressions.find((x) => x.path === 'src/routes/counties.js');
+  assert.ok(s, 'the create-verb-introduced counties.js must appear in the suppressions audit trail');
+  assert.equal(s.reason, 'create-verb-introduced');
+  assert.equal(s.lineRef, 10);
+  assert.ok(typeof s.sentence === 'string' && s.sentence.length > 0);
+});
+
+test('a bare filename that resolves uniquely is judged via the resolved file', () => {
+  const result = detectStaleDecomposePremise(
+    citing('In counties.js at line 900, fix the handler.'),
+    {
+      repoRoot: '/r',
+      lineCountFn: (root, p) => (p === 'src/routes/counties.js' ? 100 : null),
+      resolveFn: () => ({ status: 'unique', relPath: 'src/routes/counties.js' }),
+    },
+  );
+  assert.ok(result);
+  assert.equal(result.findings[0].kind, 'line-overshoot');
+  assert.equal(result.findings[0].relPath, 'counties.js');
+  assert.equal(result.findings[0].resolvedPath, 'src/routes/counties.js');
+  assert.equal(result.findings[0].realLineCount, 100);
+});
+
+test('a bare filename that resolves to several real files is not flagged and is recorded as ambiguous', () => {
+  const result = detectStaleDecomposePremise(
+    citing('In counties.js at line 900, fix the handler.'),
+    {
+      repoRoot: '/r',
+      lineCountFn: () => 100,
+      resolveFn: () => ({ status: 'ambiguous', matches: ['a/counties.js', 'b/counties.js'] }),
+    },
+  );
+  assert.ok(result, 'dismissals only must still return an audit-only result');
+  assert.equal(result.stale, false);
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.suppressions.length, 1);
+  assert.equal(result.suppressions[0].path, 'counties.js');
+  assert.equal(result.suppressions[0].reason, 'ambiguous-bare-filename');
+});
+
+test('a bare filename that resolves nowhere in a non-create sentence is dropped and recorded, not flagged', () => {
+  const result = detectStaleDecomposePremise(
+    citing('In counties.js at line 900, fix the handler.'),
+    { repoRoot: '/r', lineCountFn: () => null, resolveFn: () => ({ status: 'none' }) },
+  );
+  assert.ok(result);
+  assert.equal(result.stale, false);
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.suppressions[0].path, 'counties.js');
+  assert.equal(result.suppressions[0].reason, 'unresolved-bare-filename');
+});
+
+test('a line-overshoot finding on a resolved file still fires even when the same sentence contains a create verb', () => {
+  // The create-verb guard must not blanket-mute the sentence: src/real-file.js exists
+  // (10 lines) and the citation "line 5000" is impossible regardless of the "Create"
+  // verb earlier in the sentence, so the line-overshoot finding must survive.
+  const result = detectStaleDecomposePremise(
+    citing('Create src/routes/counties.js with a handler, then wire it in src/real-file.js at line 5000.'),
+    {
+      repoRoot: '/r',
+      lineCountFn: (root, p) => (p === 'src/real-file.js' ? 10 : null),
+      resolveFn: () => ({ status: 'none' }),
+    },
+  );
+  assert.ok(result, 'the impossible line 5000 citation must still block despite the create verb');
+  assert.equal(result.stale, true);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].kind, 'line-overshoot');
+  assert.equal(result.findings[0].relPath, 'src/real-file.js');
+  assert.equal(result.findings[0].citedLine, 5000);
+  assert.equal(result.findings[0].realLineCount, 10);
+});
+
+test('a bare filename introduced by a create verb is suppressed with the create-verb reason', () => {
+  const result = detectStaleDecomposePremise(
+    citing('Create counties.js with a handler at line 20.'),
+    { repoRoot: '/r', lineCountFn: () => null, resolveFn: () => ({ status: 'none' }) },
+  );
+  assert.ok(result);
+  assert.equal(result.stale, false);
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.suppressions[0].path, 'counties.js');
+  assert.equal(result.suppressions[0].reason, 'create-verb-introduced');
 });

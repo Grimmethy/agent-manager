@@ -12,7 +12,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const { planNodeModules, sandboxHasToolchain, copyNodeModules, dropToolchainCriteria, filterCriteriaForSandbox } = require('./draft-sandbox.js');
+const { planNodeModules, sandboxHasToolchain, copyNodeModules, copyPythonVenv, dropToolchainCriteria, filterCriteriaForSandbox, externalDependencyLinks, codeBindPaths } = require('./draft-sandbox.js');
 const { prepareAdhocWorktree, cleanupAdhocWorktree } = require('../agentic-draft-common.js');
 
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: 'pipe' });
@@ -163,4 +163,159 @@ test('prepareAdhocWorktree writes NOTHING to stdout, for a copy and for the "no 
     assert.match(err.join('\n'), /\[draft-sandbox\]/, `installed=${installed}: the note is on stderr`);
     cleanupAdhocWorktree(repo, wt, `throwaway/adhoc-stdout-${installed}`);
   }
+});
+
+// --- brain-dump #1745: dependency links to a sibling checkout (agent-manager-hygiene -> ../agent-manager) -----------------------
+
+test('externalDependencyLinks: finds a relative link to a sibling dir and a scoped one; skips links inside node_modules, dangling links and plain dirs', () => {
+  const root = tmp('sbx-links-');
+  const repo = path.join(root, 'repo'); const nm = path.join(repo, 'node_modules');
+  fs.mkdirSync(nm, { recursive: true });
+  fs.mkdirSync(path.join(root, 'sibling')); fs.mkdirSync(path.join(root, 'scoped-sibling'));
+  fs.symlinkSync('../../sibling', path.join(nm, 'dep'));                       // relative link out of the repo
+  fs.mkdirSync(path.join(nm, '@scope'));
+  fs.symlinkSync('../../../scoped-sibling', path.join(nm, '@scope', 'pkg'));    // scoped
+  fs.mkdirSync(path.join(nm, 'real')); fs.symlinkSync('./real', path.join(nm, 'alias'));      // inside node_modules: not external
+  fs.symlinkSync('../../nowhere', path.join(nm, 'dangling'));                  // dangling
+  fs.mkdirSync(path.join(nm, 'plain'));                                        // plain dir
+  fs.mkdirSync(path.join(nm, '.bin')); fs.symlinkSync('../real', path.join(nm, '.bin', 'x'));
+  const found = externalDependencyLinks(repo);
+  assert.deepEqual(found.map((l) => l.name).sort(), ['@scope/pkg', 'dep']);
+  assert.equal(found.find((l) => l.name === 'dep').target, fs.realpathSync(path.join(root, 'sibling')));
+  assert.deepEqual(externalDependencyLinks(path.join(root, 'no-such-repo')), []);
+  assert.deepEqual(externalDependencyLinks(root), [], 'a repo with no node_modules');
+});
+
+test('codeBindPaths: returns only allowlisted CODE entries of the target, never an env file, queue data, brain dump or .git', () => {
+  const t = tmp('sbx-target-');
+  for (const d of ['src', 'lib', 'queue', '.git', 'node_modules', 'docs']) fs.mkdirSync(path.join(t, d));
+  for (const f of ['package.json', 'agent-manager.env', '.env', 'brain-dump.json', 'index.js', 'notes.md']) fs.writeFileSync(path.join(t, f), 'x');
+  const real = fs.realpathSync(t);
+  const got = codeBindPaths(t).map((p) => path.relative(real, p)).sort();
+  assert.deepEqual(got, ['index.js', 'lib', 'node_modules', 'package.json', 'src']);
+  for (const never of ['agent-manager.env', '.env', 'queue', 'brain-dump.json', '.git', 'docs', 'notes.md']) assert.ok(!got.includes(never), never);
+  assert.deepEqual(codeBindPaths(path.join(t, 'missing')), []);
+});
+
+test('codeBindPaths: an allowlisted entry that is a symlink OUT of the target is dropped', () => {
+  const t = tmp('sbx-target-link-'); const outside = tmp('sbx-outside-');
+  fs.writeFileSync(path.join(outside, 'secret.txt'), 's');
+  fs.symlinkSync(outside, path.join(t, 'src'));
+  fs.mkdirSync(path.join(t, 'lib'));
+  assert.deepEqual(codeBindPaths(t).map((p) => path.basename(p)), ['lib']);
+});
+
+// --- copyPackageNodeModules (2026-10-08): a NESTED package's node_modules, on demand ---------------------------------------------------------------------------
+// TaxHarvest/frontend/node_modules was invisible to the review sandbox (copyNodeModules only knows <repoRoot>/node_modules), so frontend tests could never run.
+{
+  const fs2 = require('node:fs');
+  const os2 = require('node:os');
+  const path2 = require('node:path');
+  const test2 = require('node:test');
+  const assert2 = require('node:assert/strict');
+  const { copyPackageNodeModules } = require('./draft-sandbox.js');
+
+  const mk = () => {
+    const repo = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'cpkg-repo-'));
+    const wt = fs2.mkdtempSync(path2.join(os2.tmpdir(), 'cpkg-wt-'));
+    fs2.mkdirSync(path2.join(repo, 'app', 'web', 'node_modules', 'vitest'), { recursive: true });
+    fs2.writeFileSync(path2.join(repo, 'app', 'web', 'node_modules', 'vitest', 'vitest.mjs'), '//');
+    return { repo, wt };
+  };
+  // A fake `run`: du reports `kb`, git check-ignore passes or throws, cp really copies.
+  const runner = ({ kb = 2048, ignored = true } = {}) => (cmd, args) => {
+    if (cmd === 'du') return `${kb}\t${args[1]}\n`;
+    if (cmd === 'git') { if (!ignored) throw new Error('not ignored'); return ''; }
+    if (cmd === 'cp') { fs2.cpSync(args[args.length - 2], args[args.length - 1], { recursive: true }); return ''; }
+    throw new Error(`unexpected ${cmd}`);
+  };
+
+  test2('copyPackageNodeModules copies <repo>/<pkg>/node_modules to the same place in the worktree, once', () => {
+    const { repo, wt } = mk();
+    const r = copyPackageNodeModules(repo, wt, 'app/web', { run: runner() });
+    assert2.equal(r.copied, true);
+    assert2.equal(r.sizeMb, 2);
+    assert2.ok(fs2.existsSync(path2.join(wt, 'app', 'web', 'node_modules', 'vitest', 'vitest.mjs')));
+    assert2.equal(copyPackageNodeModules(repo, wt, 'app/web', { run: runner() }).already, true, 'a second call is a no-op');
+  });
+
+  test2('copyPackageNodeModules reports why it did not copy: not installed, too large, not gitignored, switched off', () => {
+    const { repo, wt } = mk();
+    assert2.match(copyPackageNodeModules(repo, wt, 'app/api', { run: runner() }).reason, /app\/api\/node_modules is not installed in the repo \(run npm ci in app\/api\)/);
+    const big = copyPackageNodeModules(repo, wt, 'app/web', { run: runner({ kb: 900 * 1024 }) });
+    assert2.equal(big.copied, false);
+    assert2.match(big.reason, /900 MB \(cap 800 MB\)/);
+    assert2.equal(fs2.existsSync(path2.join(wt, 'app', 'web', 'node_modules')), false, 'nothing partial is left behind');
+    assert2.match(copyPackageNodeModules(repo, wt, 'app/web', { run: runner({ ignored: false }) }).reason, /not gitignored/);
+    assert2.match(copyPackageNodeModules(repo, wt, 'app/web', { run: runner(), env: { AGENT_MANAGER_DRAFT_NODE_MODULES: 'false' } }).reason, /AGENT_MANAGER_DRAFT_NODE_MODULES=false/);
+  });
+
+  test2('copyPackageNodeModules never leaves a partial copy when cp fails, and never throws', () => {
+    const { repo, wt } = mk();
+    const failingCp = (cmd, args) => { if (cmd === 'cp') { fs2.mkdirSync(args[args.length - 1], { recursive: true }); throw new Error('disk full'); } return cmd === 'du' ? '10\tx' : ''; };
+    const r = copyPackageNodeModules(repo, wt, 'app/web', { run: failingCp });
+    assert2.equal(r.copied, false);
+    assert2.match(r.reason, /copy failed: disk full/);
+    assert2.equal(fs2.existsSync(path2.join(wt, 'app', 'web', 'node_modules')), false);
+  });
+}
+
+
+// --- copyPythonVenv (2026-10-23, chat plugin HUB0008-03) ------------------------------------------------------------------------------------
+// A Python repo's draft could not import flask in the sandbox (no .venv in a tracked-files-only worktree) and reported tests it had not really run.
+// A REAL venv (python3 -m venv --without-pip) with a module planted in its site-packages, so the test proves the COPY imports it from the worktree.
+
+function makePythonProject({ ignored = true, venv = true } = {}) {
+  const bare = tmp('sbx-py-origin-'); const repo = tmp('sbx-py-repo-');
+  git(['init', '--bare', '-b', 'main', bare]); git(['clone', bare, repo]);
+  git(['config', 'user.email', 't@example.com'], repo); git(['config', 'user.name', 'T'], repo);
+  fs.writeFileSync(path.join(repo, 'app.py'), 'x = 1\n');
+  if (ignored) fs.writeFileSync(path.join(repo, '.gitignore'), '.venv/\n');
+  git(['add', '.'], repo); git(['commit', '-m', 'init'], repo); git(['push', 'origin', 'main'], repo);
+  if (venv) {
+    execFileSync('python3', ['-m', 'venv', '--without-pip', path.join(repo, '.venv')], { stdio: 'pipe' });
+    const sp = execFileSync(path.join(repo, '.venv', 'bin', 'python'), ['-c', 'import sysconfig;print(sysconfig.get_paths()["purelib"])'], { encoding: 'utf8' }).trim();
+    fs.mkdirSync(sp, { recursive: true });
+    fs.writeFileSync(path.join(sp, 'flask_stand_in.py'), 'MARK = "from-the-venv"\n');
+  }
+  return repo;
+}
+const worktreeOf = (repo) => { const wt = path.join(tmp('sbx-py-wt-'), 'wt'); git(['worktree', 'add', wt, '-b', `b-${path.basename(wt)}-${Date.now()}`, 'origin/main'], repo); return wt; };
+
+test('copyPythonVenv: the worktree gets a private venv whose python imports the repo\'s installed packages', () => {
+  const repo = makePythonProject(); const wt = worktreeOf(repo);
+  assert.equal(fs.existsSync(path.join(wt, '.venv')), false, 'a fresh worktree has no venv (gitignored, untracked)');
+  const r = copyPythonVenv(repo, wt);
+  assert.equal(r.copied, true, JSON.stringify(r));
+  const out = execFileSync(path.join(wt, '.venv', 'bin', 'python'), ['-c', 'import flask_stand_in;print(flask_stand_in.MARK)'], { encoding: 'utf8', cwd: wt }).trim();
+  assert.equal(out, 'from-the-venv');
+  const where = execFileSync(path.join(wt, '.venv', 'bin', 'python'), ['-c', 'import flask_stand_in;print(flask_stand_in.__file__)'], { encoding: 'utf8', cwd: wt }).trim();
+  assert.ok(where.startsWith(fs.realpathSync(wt)) || where.startsWith(wt), `the import comes from the COPY, not the shared venv: ${where}`);
+  assert.equal(fs.lstatSync(path.join(wt, '.venv')).isSymbolicLink(), false, 'a private copy, not a link into the shared venv');
+  fs.writeFileSync(path.join(wt, '.venv', 'stray.txt'), 'a stray pip install would write here');
+  assert.equal(fs.existsSync(path.join(repo, '.venv', 'stray.txt')), false, 'nothing written in the sandbox reaches the shared venv');
+  assert.equal(copyPythonVenv(repo, wt).already, true, 'a second call is a no-op');
+});
+
+test('copyPythonVenv: not copied when the repo does not ignore .venv, has none, is over the cap, or it is switched off', () => {
+  const notIgnored = makePythonProject({ ignored: false });
+  assert.match(copyPythonVenv(notIgnored, worktreeOf(notIgnored)).reason, /not gitignored/);
+  const none = makePythonProject({ venv: false });
+  assert.match(copyPythonVenv(none, worktreeOf(none)).reason, /no \.venv/);
+  const big = makePythonProject();
+  const huge = path.join(big, '.venv', 'blob.bin'); fs.writeFileSync(huge, Buffer.alloc(3 * 1024 * 1024));
+  const capped = copyPythonVenv(big, worktreeOf(big), { env: { ...process.env, AGENT_MANAGER_DRAFT_NODE_MODULES_MAX_MB: '1' } });
+  assert.equal(capped.copied, false); assert.match(capped.reason, /cap 1 MB/);
+  const off = makePythonProject();
+  assert.match(copyPythonVenv(off, worktreeOf(off), { env: { ...process.env, AGENT_MANAGER_DRAFT_VENV: 'false' } }).reason, /AGENT_MANAGER_DRAFT_VENV=false/);
+});
+
+test('prepareAdhocWorktree gives a Python repo\'s worktree its venv (and a repo without one is unaffected)', () => {
+  const repo = makePythonProject(); const wt = path.join(tmp('sbx-py-prep-'), 'wt');
+  const prep = prepareAdhocWorktree(repo, 'main', wt, `adhoc-py-${Date.now()}`);
+  assert.equal(prep.ok, true);
+  assert.ok(fs.existsSync(path.join(wt, '.venv', 'bin', 'python')), 'the venv is there when the draft starts');
+  const plain = makeProject({ installed: false }); const wt2 = path.join(tmp('sbx-js-prep-'), 'wt');
+  assert.equal(prepareAdhocWorktree(plain, 'main', wt2, `adhoc-js-${Date.now()}`).ok, true);
+  assert.equal(fs.existsSync(path.join(wt2, '.venv')), false);
 });

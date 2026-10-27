@@ -16,12 +16,15 @@ const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
-const { copyNodeModules } = require('./lib/draft-sandbox.js');
+const { copyNodeModules, copyPythonVenv } = require('./lib/draft-sandbox.js');
 const { normalizeDiffOutput } = require('./group-b-worktree-diff.js');
 const { stageDraftChanges } = require('./lib/draft-side-effects.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
+const { checkLeftoverReferences, makeGrepBase } = require('./lib/leftover-references.js');
 const { writeSideFindingInbox } = require('./side-finding.js');
+const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
+const { validProposalFiles } = require('./proposal-files.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -212,6 +215,10 @@ function parseSubTaskProposals(text) {
     .map((t) => {
       const out = { title: t.title.trim(), rawText: t.rawText.trim() };
       if (Number.isInteger(t.after) && t.after >= 0) out.after = t.after;
+      const prereq = validPrerequisiteHubs(t.prerequisiteHubs);
+      if (prereq) out.prerequisiteHubs = prereq;
+      const files = validProposalFiles(t.files);
+      if (files) out.files = files;
       return out;
     });
   return cleaned.length ? cleaned : null;
@@ -236,7 +243,8 @@ function formatSubTaskProposalsForReview(subTasks) {
   return subTasks
     .map((t, i) => {
       const dep = Number.isInteger(t.after) ? ` (after piece ${t.after + 1})` : '';
-      return `${i + 1}. ${t.title}${dep}\n   ${t.rawText}`;
+      const files = Array.isArray(t.files) && t.files.length ? `\n   Files: ${t.files.join(', ')}` : '';
+      return `${i + 1}. ${t.title}${dep}\n   ${t.rawText}${files}`;
     })
     .join('\n');
 }
@@ -312,6 +320,9 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
   // A private copy of the repo's installed node_modules, so a JS/TS draft can really run tsc / build / tests (see lib/draft-sandbox.js). Never
   // fails the worktree: without it the draft simply has no toolchain, exactly as before.
   const nodeModules = copyNodeModules(resolvedRepoRoot, worktreeDir);
+  // A Python repo's private .venv copy, so a draft can import its dependencies and really run its tests (see copyPythonVenv). Never fails the worktree.
+  const venv = copyPythonVenv(resolvedRepoRoot, worktreeDir);
+  if (venv.copied && !venv.already) console.error(`[draft-sandbox] copied .venv into ${path.basename(worktreeDir)} (${venv.sizeMb ?? '?'} MB, ${venv.ms} ms)`);
   // STDERR, never stdout: local-draft.js's stdout is a machine channel (ONE JSON result line the worker JSON.parses). These two lines were console.log
   // in #420 and made every successful PF draft read as "draft call failed" (58 wasted drafts, 4 tasks sent to needs-clarification, 2026-09-20).
   if (nodeModules.copied) console.error(`[draft-sandbox] copied node_modules into ${path.basename(worktreeDir)} (${nodeModules.sizeMb ?? '?'} MB, ${nodeModules.ms} ms)`);
@@ -811,6 +822,60 @@ function resolveAgenticDraft(task, { result, worktreeDir, modelLabel, retriedFor
   // -- root-caused via three needs-clarification tasks that each burned their retry budget
   // getting a doc / stub / off-limits diff rejected in review.
   if (resolution === 'implemented' && trimmedDiff) {
+    // Did the diff remove / rename a name the tree still uses? Runs before the substance gate: it is the cheaper, more specific
+    // finding (it names the file and line of the missed use). A second block on the SAME names downgrades to an advisory so a
+    // false positive can never strand the task. See src/lib/leftover-references.js.
+    const leftover = checkLeftoverReferences({
+      diff: trimmedDiff,
+      grepBase: makeGrepBase(runGit, worktreeDir),
+      priorNames: task.leftoverRefBlocked,
+    });
+    if (leftover.action === 'advisory') {
+      appendHistoryEvent(task, 'advisory', leftover.advisoryText);
+      delete task.leftoverRefBlocked;
+    } else if (leftover.action === 'block') {
+      task.retryableDraftBlock = true;
+      task.leftoverRefBlocked = leftover.names;
+      task.adhocDiffSubstanceFeedback = leftover.retryFeedback;
+      return {
+        succeeded: true,
+        blocked: true,
+        blockedReason: `Agentic implement pass produced a diff that is not a real implementation -- ${leftover.reason}`,
+        ...meta,
+        capturedDiff: trimmedDiff,
+      };
+    }
+    // Test-framework gate (lib/test-framework.js): a NEW test file must use a framework its package can run. Same shape and safety net as the leftover-
+    // reference gate above: a retryable block with the exact fix, and the same files blocked twice downgrade to an advisory.
+    try {
+      const tfw = require('./lib/test-framework.js');
+      const tfMode = tfw.gateMode();
+      if (tfMode !== 'off') {
+        const { files, packageText } = tfw.inspectDiff(trimmedDiff);
+        const tfFlags = files.length ? tfw.checkNewTestFiles({ repoRoot: worktreeDir, files, packageText }) : [];
+        if (tfFlags.length) {
+          const names = tfFlags.map((f) => f.file).sort();
+          const repeat = Array.isArray(task.testFrameworkBlocked) && task.testFrameworkBlocked.join('|') === names.join('|');
+          const feedback = tfw.feedbackFor(tfFlags);
+          if (tfMode === 'advisory' || repeat) {
+            appendHistoryEvent(task, 'advisory', `test-framework gate (${repeat ? 'same files blocked before, not blocking again' : 'advisory mode'}): ${feedback}`.slice(0, 600));
+            delete task.testFrameworkBlocked;
+          } else {
+            task.retryableDraftBlock = true;
+            task.testFrameworkBlocked = names;
+            task.adhocDiffSubstanceFeedback = `Your diff adds a test file that can never run. ${feedback}`;
+            return {
+              succeeded: true,
+              blocked: true,
+              blockedReason: `Agentic implement pass produced a diff that is not a real implementation -- test framework not usable: ${feedback}`.slice(0, 700),
+              ...meta,
+              capturedDiff: trimmedDiff,
+            };
+          }
+        }
+      }
+    } catch (err) { console.warn('[agentic-draft] test-framework gate failed (advisory):', (err && err.message) || err); }
+
     const substance = adhocDiffSubstanceProblem(task, trimmedDiff, summary);
     if (substance) {
       task.retryableDraftBlock = true;

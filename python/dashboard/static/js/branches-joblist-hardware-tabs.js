@@ -2,6 +2,11 @@
 // render and the background poll below so click handlers always resolve against
 // whatever's actually on screen, not a stale closure from whichever fetch built it.
 let currentBranches = [];
+let currentHeldHubs = [];
+
+async function fetchHeldHubs() {
+  try { return await fetchJson('/api/git/held-hub-branches', { timeoutMs: 30000 }); } catch (e) { return []; }
+}
 let branchesPollTimer = null;
 
 function branchCardHtml(b) {
@@ -37,12 +42,14 @@ function branchCardHtml(b) {
       ? `<span class="badge bad" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Hub ${escapeAttr(b.hub.id)}: ${b.hub.progress.done}/${b.hub.progress.total} done${b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : ''} -- click to open the hub">⚠ hub mid-flight</span>`
       : `<span class="badge ok" data-open-hub="${escapeAttr(b.hub.id)}" style="cursor:pointer" title="Coordinator hub complete -- click to open the hub">✓ hub complete</span>`)
     : '';
+  const foreign = !branchIsActiveProject(b);
   return `
-    <div class="worker-card" data-branch-row="${escapeAttr(b.branch)}" data-open-branch="${escapeAttr(b.branch)}" data-verdict-key="${branchVerdictKey(b)}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
+    <div class="worker-card" data-branch-row="${escapeAttr(branchRowKey(b))}" data-open-branch="${escapeAttr(branchRowKey(b))}" data-verdict-key="${branchVerdictKey(b)}" style="cursor:pointer;${branchVerdictBorderStyle(b)}">
+      ${b.project ? `<div style="margin-bottom:6px">${branchProjectChipHtml(b)}</div>` : ''}
       <div class="row">
         <span class="id">${escapeHtmlBright(b.title)}</span>
         <div class="badge-col">
-          ${hubBadge}
+          ${foreign ? hubBadge.replace(/ data-open-hub="[^"]*"/, '').replace('cursor:pointer', 'cursor:default') : hubBadge}
           ${conflictBadge}
           <span class="badge warn">${b.ahead} commit${b.ahead === 1 ? '' : 's'} ahead</span>
           ${behindBadge}
@@ -58,8 +65,8 @@ function branchCardHtml(b) {
       ${b.description ? `<div style="margin-top:6px;font-size:13px;color:var(--text)">${escapeHtml(b.description)}</div>` : ''}
       <div class="meta" style="font-family:monospace;font-size:11px;margin-top:4px">${escapeHtml(b.branch)}</div>
       <div class="row" style="margin-top:8px">
-        <button class="action" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
-        <button class="secondary" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
+        <button class="action" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-merge-branch="${escapeAttr(b.branch)}" data-will-conflict="${b.willConflict === true}" data-conflict-files="${escapeAttr((b.conflictFiles || []).join(', '))}" data-hub-midflight="${hubMidFlight === true}" data-hub-status="${escapeAttr(b.hub ? b.hub.progress.done + '/' + b.hub.progress.total + ' done' + (b.hub.integrationGate.status ? ', gate ' + b.hub.integrationGate.status : '') : '')}">Merge to ${escapeHtml(b.mainBranch)}</button>
+        <button class="secondary" data-project="${escapeAttr(branchProjectRequestRoot(b))}" data-discard-branch="${escapeAttr(b.branch)}" title="Permanently delete this remote branch and archive its task -- for a branch you've decided NOT to merge.">Discard</button>
       </div>
     </div>
   `;
@@ -76,7 +83,7 @@ function wireBranchCard(card) {
     // DIFFERENT task's detail (the hub, not this branch), so it must win over the
     // row's own "open this branch's detail" click.
     if (e.target.closest('[data-merge-branch]') || e.target.closest('[data-discard-branch]') || e.target.closest('[data-open-hub]')) return;
-    const b = currentBranches.find((x) => x.branch === card.dataset.openBranch);
+    const b = currentBranches.find((x) => branchRowKey(x) === card.dataset.openBranch);
     if (b) renderBranchDetailModal(b);
   };
 
@@ -93,17 +100,18 @@ function wireBranchCard(card) {
     mergeBtn.onclick = async (e) => {
       e.stopPropagation();
       const branch = mergeBtn.dataset.mergeBranch;
+      const project = mergeBtn.dataset.project || '';
       const midFlight = mergeBtn.dataset.hubMidflight === 'true';
       const confirmMsg = mergeBtn.dataset.willConflict === 'true'
         ? `"${branch}" is flagged as WILL CONFLICT with master on: ${mergeBtn.dataset.conflictFiles}.\n\nThe merge will very likely fail and need manual resolution. Attempt it anyway?`
         : midFlight
           ? `"${branch}" belongs to a coordinator hub that is NOT finished (${mergeBtn.dataset.hubStatus}).\n\nMerging now ships an incomplete decomposition -- the moved routes will 404 until the wiring task lands. Force the merge anyway?`
           : `Merge "${branch}" into master and sync the live dashboard?`;
-      if (!confirm(confirmMsg)) return;
+      if (!confirm(branchConfirmWithProject(confirmMsg, mergeBtn))) return;
       mergeBtn.disabled = true;
       mergeBtn.textContent = 'Merging...';
       try {
-        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/merge`, {
+        const resp = await fetch(branchActionUrl(branch, 'merge', project), {
           method: 'POST',
           headers: midFlight ? { 'Content-Type': 'application/json' } : {},
           body: midFlight ? JSON.stringify({ force: true }) : undefined,
@@ -136,11 +144,12 @@ function wireBranchCard(card) {
     discardBtn.onclick = async (e) => {
       e.stopPropagation();
       const branch = discardBtn.dataset.discardBranch;
-      if (!confirm(`Discard "${branch}"?\n\nThis PERMANENTLY DELETES the remote branch (not just merging it later) and archives its task as dismissed. This cannot be undone from here.`)) return;
+      const project = discardBtn.dataset.project || '';
+      if (!confirm(branchConfirmWithProject(`Discard "${branch}"?\n\nThis PERMANENTLY DELETES the remote branch (not just merging it later) and archives its task as dismissed. This cannot be undone from here.`, discardBtn))) return;
       discardBtn.disabled = true;
       discardBtn.textContent = 'Discarding...';
       try {
-        const resp = await fetch(`/api/git/branches/${encodeURIComponent(branch)}/discard`, { method: 'POST' });
+        const resp = await fetch(branchActionUrl(branch, 'discard', project), { method: 'POST' });
         const result = await resp.json();
         if (!resp.ok || !result.succeeded) throw new Error(result.reason || `HTTP ${resp.status}`);
         await renderBranchesTab();
@@ -169,13 +178,14 @@ async function renderBranchesTab() {
     // out after 8s" instead of the list. 30s matches the server's own per-subprocess
     // timeout (_run_git/_check_merge_conflict both use 30s) as the floor for how long a
     // single one of those git calls is allowed to legitimately take.
-    branches = await fetchJson('/api/git/unmerged-branches', { timeoutMs: 30000 });
+    branches = await fetchBranchList();
   } catch (e) {
     main.innerHTML = `<div class="empty">Error loading branches: ${escapeHtml(e.message)}</div>`;
     return;
   }
   currentBranches = branches;
-  if (branches.length === 0) {
+  currentHeldHubs = await fetchHeldHubs();
+  if (branches.length === 0 && currentHeldHubs.length === 0) {
     main.innerHTML = '<div class="empty">Nothing pushed-but-unmerged -- the live copy is caught up.</div>';
     return;
   }
@@ -211,7 +221,7 @@ async function refreshBranchesTab() {
   if (activeTab !== 'branches') return;
   let branches;
   try {
-    branches = await fetchJson('/api/git/unmerged-branches', { timeoutMs: 30000 });
+    branches = await fetchBranchList();
   } catch (e) {
     console.warn('[branches] background refresh failed (non-fatal, keeping current list):', e.message);
     return;
@@ -234,24 +244,38 @@ async function refreshBranchesTab() {
     return;
   }
 
-  const seen = new Set();
-  for (const b of filterBranchesByVerdict(branches, branchVerdictFilter)) {
-    seen.add(b.branch);
-    const existing = main.querySelector(`[data-branch-row="${CSS.escape(b.branch)}"]`);
-    // Already on screen -- leave it (see header comment), unless its verdict bucket changed: then swap the card so the border/badge update.
-    if (existing && existing.dataset.verdictKey === branchVerdictKey(b)) continue;
-    if (existing) existing.remove();
-    const wrapper = document.createElement('div');
-    wrapper.innerHTML = branchCardHtml(b);
-    const card = wrapper.firstElementChild;
-    main.appendChild(card);
-    wireBranchCard(card);
+  const shown = filterBranchesByVerdict(branches, branchVerdictFilter);
+  const onScreen = new Set([...main.querySelectorAll('[data-branch-row]')].map((c) => c.dataset.branchRow));
+  const wanted = new Set(shown.map(branchRowKey));
+  const membershipChanged = onScreen.size !== wanted.size || [...wanted].some((k) => !onScreen.has(k));
+  const pendingNow = main.querySelector('[data-projects-pending]') !== null;
+  if (membershipChanged || pendingNow !== (branchProjectsPending.length > 0)) {
+    // A card appeared or went away (or the "still scanning" note changed): rebuild, keeping the scroll position. Project headers sit between the cards, so
+    // appending a lone card (the old behaviour) would land it under the wrong project.
+    const y = window.scrollY;
+    currentBranches = branches;
+    currentHeldHubs = await fetchHeldHubs();
+    renderBranchListInto(main, branches);
+    window.scrollTo(0, y);
+    return;
   }
-  main.querySelectorAll('[data-branch-row]').forEach((card) => {
-    if (!seen.has(card.dataset.branchRow)) card.remove();
-  });
+  for (const b of shown) {
+    const existing = main.querySelector(`[data-branch-row="${CSS.escape(branchRowKey(b))}"]`);
+    // Already on screen -- leave it (see header comment), unless its verdict bucket changed: then swap the card so the border/badge update.
+    if (existing && existing.dataset.verdictKey !== branchVerdictKey(b)) {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = branchCardHtml(b);
+      const card = wrapper.firstElementChild;
+      existing.replaceWith(card);
+      wireBranchCard(card);
+    }
+  }
   currentBranches = branches;
   refreshBranchVerdictFilterBar(main, branches);
+  currentHeldHubs = await fetchHeldHubs();
+  const heldEl = main.querySelector('[data-held-hubs]');
+  if (heldEl) heldEl.outerHTML = heldHubsHtml(currentHeldHubs);
+  else main.insertAdjacentHTML('beforeend', heldHubsHtml(currentHeldHubs));
 }
 
 async function renderBranchDetailModal(b) {
@@ -264,12 +288,13 @@ async function renderBranchDetailModal(b) {
     // Same reasoning as renderBranchesTab's own fetchJson call above -- this hits
     // list_unmerged_branches(force=False) too (to resolve the hub), so it can be slow
     // for the same reason on a cold cache.
-    data = await fetchJson(`/api/git/branches/${encodeURIComponent(b.branch)}/commits`, { timeoutMs: 30000 });
+    data = await fetchJson(`/api/git/branches/${encodeURIComponent(b.branch)}/commits${branchIsActiveProject(b) ? '' : '?project=' + encodeURIComponent(b.project.repoRoot)}`, { timeoutMs: 30000 });
   } catch (e) {
     content.innerHTML = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2><div class="meta" style="color:var(--bad)">Error loading history: ${escapeHtml(e.message)}</div>`;
     return;
   }
   let html = `<button class="close" onclick="closeDetail()">&times;</button><h2>${escapeHtmlBright(b.title)}</h2>`;
+  if (b.project) html += `<div style="margin:4px 0">${branchProjectChipHtml(b)}</div>`;
   html += `<div class="meta" style="font-family:monospace;font-size:11px">${escapeHtml(b.branch)} → ${escapeHtml(b.mainBranch)}</div>`;
   if (b.domain) html += `<div class="field-label">Domain / Source</div><div>${escapeHtml(b.domain)} / ${escapeHtml(b.source || '')}</div>`;
   if (b.description) html += `<div class="field-label">What this changes</div><div>${escapeHtml(b.description)}</div>`;
@@ -340,6 +365,7 @@ async function renderBranchDetailModal(b) {
       return row + `</div>`;
     }).join('');
   }
+  if (!branchIsActiveProject(b)) html = html.replace(/ data-open-hub="[^"]*"/g, '');  // that hub lives in another project's queue
   content.innerHTML = html;
   content.querySelectorAll('[data-open-hub]').forEach((el) => {
     el.onclick = (e) => {
@@ -356,6 +382,7 @@ async function renderJobListTab() {
   try {
     jobTypes = await fetchJson('/api/job-types');
   } catch (e) {
+    console.error('renderJobListTab: failed to fetch /api/job-types', e);
     jobTypes = null;
   }
   // 2026-08-26, Grimmethy: "After looking at pipeline map I've realized that it really
@@ -369,6 +396,7 @@ async function renderJobListTab() {
   try {
     pipelineMap = await fetchJson('/api/pipeline-map');
   } catch (e) {
+    console.error('[pipeline-map] fetch failed:', e);
     pipelineMap = null;
   }
   const activeByName = {};

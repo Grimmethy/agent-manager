@@ -33,21 +33,68 @@ def deep_dive_analysis_dir() -> Path | None:
     return (idx.parent / "analysis") if idx else None
 
 
+def parse_strong_leads(index_text: str) -> list[dict]:
+    """Python port of task-sources.js's parseStrongLeadsFromIndex() (kept in sync by hand, same reasoning as
+    project_search_index_path(): this dashboard is Python, the pipeline is Node). A table row is a Strong lead
+    only when INDEX.md's `## Notes` has a matching `### <name>` subsection. Beyond what the Node side needs
+    (name, url, relevantTo) this also keeps the description and the reason ("why it matters here") so the tab
+    can show WHICH project each lead was scouted for and why.
+
+    "Relevant to" is `<projectTag> -- <reason>`; the pipeline only works a lead for the project whose directory
+    name equals projectTag exactly (nextDeepDiveTask), so that tag is what ties a scouted repo to its project."""
+    if not index_text:
+        return []
+    notes_idx = index_text.find("## Notes")
+    notes_text = index_text[notes_idx:] if notes_idx != -1 else ""
+    strong = {m.group(1).strip() for m in re.finditer(r"^### (.+)$", notes_text, re.MULTILINE)}
+    seen, leads = set(), []
+    for line in index_text.split("\n"):
+        m = re.match(r"^\|\s*\[([^\]]+)\]\(([^)]+)\)\s*\|(.*)$", line)
+        if not m:
+            continue
+        name = m.group(1).strip()
+        if name not in strong or name in seen:
+            continue
+        seen.add(name)
+        cells = [c.strip() for c in m.group(3).split("|")]
+        description = cells[1] if len(cells) > 1 else ""
+        relevant = cells[2] if len(cells) > 2 else ""
+        tag, _, reason = relevant.partition(" -- ")
+        leads.append({"name": name, "url": m.group(2).strip(), "description": description,
+                      "relevantTo": tag.strip() or None, "reason": reason.strip()})
+    return leads
+
+
 @deep_dive_bp.route("/api/deep-dive/projects")
 def api_deep_dive_projects():
-    """List tab for deep_dive (ADR-0019): every project-search lead that's been cloned
-    and community-graphed so far, with a quick reviewed/total + action-item count so the
-    list itself shows progress without opening each one."""
-    from app import read_json_safe
+    """List tab for deep_dive (ADR-0019): every project-search lead for the ACTIVE project, with a quick
+    reviewed/total + action-item count so the list itself shows progress without opening each one.
+
+    Each row carries `relevantTo` (the project it was scouted for), `reason` (why it matters there) and a
+    `status`: `cloned` (onboarded, has communities), `queued` (a Strong lead tagged for the active project that
+    the next worker tick will clone) or, only with `?scope=all`, `other-project` (tagged for a different project:
+    this pipeline will not touch it). Without scope=all the list is exactly what this project's pipeline works on."""
+    from app import get_active_repo_root, project_search_index_path, read_json_safe
     cov_path = deep_dive_coverage_path()
     coverage = (read_json_safe(cov_path) if cov_path else None) or {}
     projects = coverage.get("projects", {})
+
+    idx_path = project_search_index_path()
+    try:
+        leads = parse_strong_leads(idx_path.read_text(encoding="utf-8")) if idx_path and idx_path.is_file() else []
+    except OSError:
+        leads = []
+    by_slug = {_slugify_for_id(l["name"]): l for l in leads}
+    repo_root = get_active_repo_root()
+    active_tag = Path(repo_root).name if repo_root else None
+    show_all = request.args.get("scope") == "all"
 
     results = []
     for slug, proj in projects.items():
         communities = proj.get("communities") or []
         reviewed = sum(1 for c in communities if c.get("lastReviewedAt"))
         total_items = sum((c.get("actionItemCount") or 0) for c in communities if c.get("actionItemCount") is not None)
+        lead = by_slug.get(slug) or {}
         results.append({
             "slug": slug,
             "sourceUrl": proj.get("sourceUrl"),
@@ -56,10 +103,26 @@ def api_deep_dive_projects():
             "reviewedCount": reviewed,
             "totalActionItems": total_items,
             "hotlist": bool(proj.get("hotlist")),
+            "status": "cloned",
+            "relevantTo": lead.get("relevantTo"),
+            "reason": lead.get("reason") or "",
+            "description": lead.get("description") or "",
         })
-    # Hotlisted projects first (matches nextDeepDiveTask()'s own priority ordering in
-    # task-sources.js -- see the hotlist sort there), alphabetical within each tier.
-    results.sort(key=lambda r: (not r["hotlist"], r["slug"]))
+    for slug, lead in by_slug.items():
+        if slug in projects:
+            continue
+        mine = lead["relevantTo"] == active_tag
+        if not mine and not show_all:
+            continue
+        results.append({
+            "slug": slug, "sourceUrl": lead["url"], "clonedAt": None, "communityCount": 0, "reviewedCount": 0,
+            "totalActionItems": 0, "hotlist": False, "status": "queued" if mine else "other-project",
+            "relevantTo": lead["relevantTo"], "reason": lead["reason"], "description": lead["description"],
+        })
+    # Hotlisted first (matches nextDeepDiveTask()'s own ordering in task-sources.js), then cloned before queued
+    # before other projects' leads, alphabetical within each tier.
+    tier = {"cloned": 0, "queued": 1, "other-project": 2}
+    results.sort(key=lambda r: (not r["hotlist"], tier[r["status"]], r["slug"]))
     return jsonify(results)
 
 

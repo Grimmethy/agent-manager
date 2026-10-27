@@ -30,7 +30,12 @@ Default label vocabulary (`needs-triage`, `needs-info`, `ready-for-agent`, `read
 
 ### Domain docs
 
-Single-context — one `CONTEXT.md` (to be created) and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context — one `CONTEXT.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Skills
+
+`act-as-local-agent` and `verify-unmerged-branches` ship in `docs/agents/skills/` (`.claude/` is
+gitignored). Run `scripts/install-skills.sh` once to link them into `~/.claude/skills`.
 
 ### Codebase map
 
@@ -40,6 +45,20 @@ lives in the source tree. It's grown incrementally, not exhaustive, so it won't 
 have the answer — but it's the cheapest lookup and the whole point is to check it before
 falling back to a slower search. If it doesn't have what you need, add a row once you
 find it — that's the whole maintenance model; nothing else keeps it fresh.
+
+This check is **injected, not just advised**: `python/dashboard/codebase_map_digest.py`
+builds a compact digest (the lookup rule, every table's row labels, the "Recurring work
+processes" table). The in-app Chat panel puts it in the local system prompt and the Claude
+provider's first-turn preamble (`chat_sessions.py`). For Claude Code sessions run in this
+repo, register it as a SessionStart hook in `~/.claude/settings.json` (`.claude/` is
+gitignored here, so it can't ship in-repo):
+
+```json
+"hooks": {"SessionStart": [{"matcher": "startup|clear|compact", "hooks": [{
+  "type": "command", "command": "python3 <your agent-manager checkout>/python/dashboard/codebase_map_digest.py"}]}]}
+```
+
+It no-ops silently when the cwd isn't inside a repo that has the map.
 
 ### Reviewing an unmerged branch
 

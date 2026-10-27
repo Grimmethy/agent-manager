@@ -33,7 +33,9 @@ import time
 import uuid
 from pathlib import Path
 
+import chat_card
 import claude_client
+import codebase_map_digest
 import local_tool_client
 import model_stats_client
 import ollama_client
@@ -115,6 +117,9 @@ def _new_session(roots: list, instances_dir, provider: str, model: str, effort: 
         # registry (app.py), NOT here -- an open file object isn't JSON-serializable and
         # wouldn't survive a process restart meaningfully anyway.
         "reserved": False,
+        # The GPU card (a lane id such as worker-3090) the owner picked for this session's local replies; None = the host lane. Each message
+        # re-resolves it (chat_card.py): if the Forge holds the picked card the reply moves to a free one.
+        "card": None,
     }
 
 
@@ -177,7 +182,7 @@ def _read_agents_md(session: dict) -> str:
     roots = session.get("roots") or [session["repoRoot"]]
     try:
         content = (Path(roots[0]) / "AGENTS.md").read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return ""
     if not content:
         return ""
@@ -193,6 +198,14 @@ def _agents_md_blurb(agents_md: str) -> str:
         "(e.g. what's safe to hand-edit vs. what needs a real mechanism) that a generic "
         "coding assistant would not otherwise know.\n\n" + agents_md
     )
+
+
+def _codebase_map_digest(session: dict) -> str:
+    """Digest of the primary repo's docs/agents/codebase-map.md ("" if it has none) --
+    same injection the Claude Code SessionStart hook does, so the in-app chat checks the
+    map before grepping too. See codebase_map_digest.py."""
+    roots = session.get("roots") or [session["repoRoot"]]
+    return codebase_map_digest.build_digest(roots[0])
 
 
 def _send_claude(session: dict, message: str) -> str:
@@ -212,6 +225,9 @@ def _send_claude(session: dict, message: str) -> str:
         agents_md = _read_agents_md(session)
         if agents_md:
             preamble_parts.append(_agents_md_blurb(agents_md))
+        map_digest = _codebase_map_digest(session)
+        if map_digest:
+            preamble_parts.append(map_digest)
         if preamble_parts:
             message = "\n\n---\n\n".join(preamble_parts) + "\n\n---\n\n" + message
     result = claude_client.generate(
@@ -287,6 +303,9 @@ def _local_system_prompt(session: dict) -> str:
     agents_md = _read_agents_md(session)
     if agents_md:
         prompt += "\n\n---\n\n" + _agents_md_blurb(agents_md)
+    map_digest = _codebase_map_digest(session)
+    if map_digest:
+        prompt += "\n\n---\n\n" + map_digest
     return prompt
 
 
@@ -314,17 +333,23 @@ def _stream_local(session: dict, message: str):
     started = time.time()
     messages = _build_local_messages(session, message)
     roots = session.get("roots") or [session["repoRoot"]]
+    card = chat_card.resolve_chat_card(session.get("card"))
+    if card.get("blocked"):
+        yield card.get("note") or "No GPU card is free for chat right now."
+        return
+    if card.get("note"):
+        yield f"*({card['note']})*\n\n"
     result = None
     for event in local_tool_client.stream_plan_with_tools(
         messages=messages, max_turns=CHAT_LOCAL_MAX_TURNS, source="chat", allow_write=True,
         primary_root=roots[0], extra_roots=roots[1:], force_summary_on_cap=True,
-        allow_amplification=True,
+        allow_amplification=True, card_env=card.get("env"),
     ):
         if event.get("type") == "chunk":
             yield event["text"]
         elif event.get("type") == "final":
             result = event
-    model_stats_client.record_call("chat-session", ollama_client.MODEL, int((time.time() - started) * 1000),
+    model_stats_client.record_call("chat-session", (card.get("env") or {}).get("LOCAL_MODEL") or ollama_client.MODEL, int((time.time() - started) * 1000),
                                     stage="chat", result=result or {}, source="chat")
     # 2026-09-05, Grimmethy: force_summary_on_cap=True is now passed above, so both a
     # turn-cap hit AND a context-budget hit (see local-tool-client.js's own
@@ -433,6 +458,19 @@ def set_reserved(storage_dir: Path, session_id: str, reserved: bool):
     if not session:
         return None
     session["reserved"] = reserved
+    sessions[session_id] = session
+    _write_sessions(storage_dir, sessions)
+    return session
+
+
+def set_card(storage_dir: Path, session_id: str, card):
+    """Persist the owner's card pick for this session (a lane id, or None/'' for the host lane). Validation is the resolver's job at send time:
+    an unknown id is reported to the user on the next message instead of being silently dropped here."""
+    sessions = _read_sessions(storage_dir)
+    session = sessions.get(session_id)
+    if not session:
+        return None
+    session["card"] = (str(card).strip() or None) if card else None
     sessions[session_id] = session
     _write_sessions(storage_dir, sessions)
     return session

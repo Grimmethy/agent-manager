@@ -1017,6 +1017,35 @@ test('bucket D being exhausted does NOT block bucket K from firing on the same t
   assert.match(moved.implementResponse, /Add the allowlist constant/);
 });
 
+// 2026-10-02, widened gate (re-landed WITHOUT the dead flat-counter condition from the
+// reviewed draft): a task whose adhocResolution is only 'draft' (never promoted to
+// 'decompose') but which ALREADY carries a real, valid subTaskProposals decomposition --
+// with ncTriageAttempts 0 (the flat, pre-2026-09-16 counter master no longer increments)
+// and an implementResponse that names none of the sub-task titles -- must still be
+// rescued by bucket K. Same signature as tk1, one gate-step earlier in the adhoc
+// lifecycle; ncTriageAttempts 0 proves the gate does not depend on that field at all.
+test('bucket K: fires for adhocResolution "draft" with a real decomposition sitting unused (widened gate)', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, baseTask('tk8', {
+    adhocResolution: 'draft',
+    subTaskProposals: REAL_SUB_TASKS,
+    // Deliberately names NO sub-task title (contrast tk2, which shows the real titles
+    // and is left alone) -- the blind signature this bucket repairs.
+    implementResponse: 'Implement pass drafted a fix for the widget but the response body is otherwise generic.',
+    needsClarification: { reason: 'design-decision', openQuestions: 'The IMPLEMENT draft contains no actual sub-task JSON array...' },
+    ncTriageAttempts: 0,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.deepEqual([s.checked, s.requeued, s.leftForHuman], [1, 1, 0]);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'tk8.json')));
+  const moved = read(at(dir, 'review', 'tk8.json'));
+  assert.equal(moved.status, 'needs-review');
+  assert.equal(moved.ncTriageBucketAttempts.K, 1, 'bucket K consumed its OWN budget, not the flat ncTriageAttempts');
+  assert.match(moved.implementResponse, /Add the allowlist constant/);
+  assert.match(moved.implementResponse, /Wire the allowlist into the check/);
+});
+
 // --- Ghost-in-the-Machine: bucket C retry-exhausted -> ghost debt (2026-09-09) ---------
 
 const sfInbox = (dir) => {
@@ -1379,4 +1408,249 @@ test('Test 3: original triage action still applied after sweep', async () => {
   assert.equal(s.leftForHuman, 1);
   assert.ok(exists(at(dir, 'needs-clarification', 't3-orig.json')));
   assert.equal(read(at(dir, 'needs-clarification', 't3-orig.json')).ncTriageDecision, 'leave-for-human');
+});
+
+// --- Bucket N: stranded pre-dispatch gate archive verdicts (2026-10-07; 39 TaxHarvest performance_review tasks) ---
+
+function gateStranded(id, over = {}) {
+  return {
+    id, domain: 'default', source: 'performance_review', status: 'blocked',
+    promptContext: { rule: 'sequential-await-in-loop', file: 'backend/x.js', snippet: 'for (const r of rows) {\n  total += r.amount;\n}' },
+    preDispatchGate: { ruleId: 'sequential-await-in-loop', verdict: 'archive', reason: 'No await expression found in flagged snippet' },
+    blockedStage: 'review', blockedReason: 'The draft is empty (zero characters)',
+    localRejectCount: 2, priorRejectionFeedback: ['The draft is empty'], localVotes: [{ verdict: 'REJECT' }], reviewProvider: 'local',
+    needsClarification: { reason: 'empty-degenerate-draft', openQuestions: 'The automated handler could not render a verdict that passed review after 3 attempts' },
+    ncTriageDecision: 'leave-for-human', ncTriageReviewedAt: '2026-10-04T16:09:53Z',
+    history: [{ stage: 'exhausted', at: '2026-10-04T16:09:48Z' }, { stage: 'needs-clarification', at: '2026-10-04T16:09:48Z' }],
+    ...over,
+  };
+}
+
+test('bucket N: a stranded gate-archive task gets its FALSE POSITIVE draft rebuilt and is filed to review/, whatever its escalation reason', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, gateStranded('gate-1'));
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'gate-1.json')));
+  const out = read(at(dir, 'review', 'gate-1.json'));
+  assert.equal(out.status, 'needs-review');
+  assert.match(out.implementResponse, /^FALSE POSITIVE\n\n/);
+  assert.match(out.implementResponse, /No await expression found/);
+  assert.equal(out.critiqueOutcome, 'no-issues');
+  for (const f of ['needsClarification', 'blockedReason', 'blockedStage', 'localRejectCount', 'priorRejectionFeedback', 'localVotes', 'reviewProvider', 'ncTriageDecision', 'ncTriageReviewedAt']) {
+    assert.equal(out[f], undefined, `${f} cleared`);
+  }
+  assert.equal(out.ncTriageBucketAttempts.N, 1);
+  assert.equal(out.preDispatchGate.verdict, 'archive', 'the stamp stays as the audit trail');
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /stranded pre-dispatch gate archive verdict/.test(h.detail)));
+});
+
+test('bucket N: bounded to one attempt, a task without an archive stamp is untouched, dry-run writes nothing, already-in-review is skipped', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, gateStranded('gate-capped', { ncTriageBucketAttempts: { N: 1 } }));
+  held(dir, gateStranded('gate-nostamp', { preDispatchGate: undefined }));
+  held(dir, gateStranded('gate-investigate', { preDispatchGate: { ruleId: 'sequential-await-in-loop', verdict: 'investigate', reason: 'Sequential await inside a loop-bound iteration' } }));
+  held(dir, gateStranded('gate-inreview'));
+  fs.writeFileSync(at(dir, 'review', 'gate-inreview.json'), '{}');
+  let summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 0);
+  for (const id of ['gate-capped', 'gate-nostamp', 'gate-investigate', 'gate-inreview']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), id);
+  assert.ok(!exists(at(dir, 'review', 'gate-capped.json')) && !exists(at(dir, 'review', 'gate-nostamp.json')) && !exists(at(dir, 'review', 'gate-investigate.json')));
+
+  const dry = makePipeline();
+  fs.mkdirSync(at(dry, 'review'), { recursive: true });
+  held(dry, gateStranded('gate-dry'));
+  const prev = process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN;
+  process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = '1';
+  try { summary = await needsClarificationTriage(args(dry, throwingVote)); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; else process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = prev; }
+  assert.equal(summary.dryRun, true);
+  assert.ok(exists(at(dry, 'needs-clarification', 'gate-dry.json')) && !exists(at(dry, 'review', 'gate-dry.json')));
+});
+
+// --- Bucket O: valid short change sets blocked by the deterministic non-implementation length gate (2026-10-07; 9 deadcode_fix tasks) ---
+
+const DELETE_RESP = '{"mode": "delete", "file": "TaxHarvest/frontend/src/components/ui/form.tsx"}';
+function gateBlocked(id, over = {}) {
+  return {
+    id, domain: 'default', source: 'deadcode_fix', status: 'blocked',
+    promptContext: { candidateId: 'AC-101', files: ['TaxHarvest/frontend/src/components/ui/form.tsx'] },
+    implementResponse: DELETE_RESP, rawDiff: 'keep-me', adhocResolution: undefined,
+    reviewProvider: 'deterministic-non-implementation', blockedStage: 'review',
+    blockedReason: 'Deterministic gate: implementResponse is a bare tool-call request or meta-commentary, not a real implementation attempt',
+    localRejectCount: 2, priorRejectionFeedback: ['Deterministic gate: bare tool-call request'],
+    needsClarification: { reason: 'design-decision', openQuestions: 'The automated handler could not get this candidate past review/apply after 3 attempts' },
+    ncTriageDecision: 'leave-for-human', ncTriageReviewedAt: '2026-10-07T01:00:00Z',
+    history: [{ stage: 'exhausted', at: '2026-10-07T00:59:00Z' }, { stage: 'needs-clarification', at: '2026-10-07T00:59:30Z' }],
+    ...over,
+  };
+}
+
+test('bucket O: a stranded valid change set blocked by the length gate is filed to review/ with its draft kept exactly as written', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, gateBlocked('chg-1'));
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'chg-1.json')));
+  const out = read(at(dir, 'review', 'chg-1.json'));
+  assert.equal(out.status, 'needs-review');
+  assert.equal(out.implementResponse, DELETE_RESP, 'the draft is untouched');
+  assert.equal(out.rawDiff, 'keep-me');
+  for (const f of ['needsClarification', 'blockedReason', 'blockedStage', 'localRejectCount', 'priorRejectionFeedback', 'reviewProvider', 'ncTriageDecision', 'ncTriageReviewedAt']) {
+    assert.equal(out[f], undefined, `${f} cleared`);
+  }
+  assert.equal(out.ncTriageBucketAttempts.O, 1);
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /structurally valid change set/.test(h.detail)));
+});
+
+test('bucket O: bounded to one attempt; a non-structured response, another reviewProvider, already-in-review and dry-run are all left alone', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, gateBlocked('chg-capped', { ncTriageBucketAttempts: { O: 1 } }));
+  held(dir, gateBlocked('chg-prose', { implementResponse: 'Let me check the file first.' }));
+  held(dir, gateBlocked('chg-read', { implementResponse: '{"mode": "read", "file": "a.js"}' }));
+  held(dir, gateBlocked('chg-otherprovider', { reviewProvider: 'local' }));
+  held(dir, gateBlocked('chg-inreview'));
+  fs.writeFileSync(at(dir, 'review', 'chg-inreview.json'), '{}');
+  let summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 0);
+  for (const id of ['chg-capped', 'chg-prose', 'chg-read', 'chg-otherprovider', 'chg-inreview']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), id);
+
+  const dry = makePipeline();
+  fs.mkdirSync(at(dry, 'review'), { recursive: true });
+  held(dry, gateBlocked('chg-dry'));
+  const prev = process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN;
+  process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = '1';
+  try { summary = await needsClarificationTriage(args(dry, throwingVote)); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN; else process.env.AGENT_MANAGER_NC_TRIAGE_DRY_RUN = prev; }
+  assert.equal(summary.dryRun, true);
+  assert.ok(exists(at(dry, 'needs-clarification', 'chg-dry.json')) && !exists(at(dry, 'review', 'chg-dry.json')));
+});
+
+// --- Buckets P and Q: deterministic gates that read an illustrative token as a claim (2026-10-08; 4 TaxHarvest tasks) ---
+
+function planGuardBlocked(id, over = {}) {
+  return {
+    id, domain: 'adhoc', source: 'derived_task', status: 'blocked',
+    title: '`res.json()` on a non-JSON 200 response throws inside the try', promptContext: { rawText: 'In `real.js` line 3 the body may be HTML.' },
+    planResponse: 'Edit `src/real.js` to wrap `await res.json()` in a try.', implementResponse: 'stale',
+    blockedStage: 'pre-implement', blockedReason: 'plan cites missing-file target(s): res.json', localRejectCount: 1,
+    needsClarification: { reason: 'fabricated-file-path', openQuestions: 'plan cites missing-file target(s): res.json' },
+    history: [{ stage: 'exhausted', at: '2026-10-07T00:59:00Z' }], ...over,
+  };
+}
+
+test('bucket P: a task the plan-target guard blocked on an illustrative token (res.json()) is requeued to adhoc/ clean; one capped attempt', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'adhoc'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'real.js'), '//\n'); // the sweep's repoRoot is this dir: the plan's real target must exist
+  held(dir, planGuardBlocked('plan-1'));
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'plan-1.json')));
+  const out = read(at(dir, 'adhoc', 'plan-1.json'));
+  assert.equal(out.ncTriageBucketAttempts.P, 1);
+  assert.equal(out.blockedReason, undefined);
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /plan-target guard blocked this on an illustrative token/.test(h.detail)));
+});
+
+test('bucket P: a genuinely fabricated target, a capped task and an already-in-adhoc task are left alone', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'adhoc'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'real.js'), '//\n'); // so the capped / in-adhoc tasks WOULD be re-admitted but for their guard
+  held(dir, planGuardBlocked('plan-fab', { title: 'Edit src/invented.js to add a guard', planResponse: 'Edit `src/invented.js` to add a guard.', blockedReason: 'plan cites missing-file target(s): src/invented.js', needsClarification: { reason: 'fabricated-file-path', openQuestions: 'plan cites missing-file target(s): src/invented.js' } }));
+  held(dir, planGuardBlocked('plan-capped', { ncTriageBucketAttempts: { P: 1 } }));
+  held(dir, planGuardBlocked('plan-inadhoc'));
+  fs.writeFileSync(at(dir, 'adhoc', 'plan-inadhoc.json'), '{}');
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  for (const id of ['plan-fab', 'plan-capped', 'plan-inadhoc']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), `${id} stays`);
+  assert.ok(!exists(at(dir, 'adhoc', 'plan-fab.json')));
+  assert.equal(summary.requeued, 0);
+});
+
+const FIXTURE_DIFF = 'diff --git a/pkg/tests/test_x.py b/pkg/tests/test_x.py\nnew file mode 100644\n--- /dev/null\n+++ b/pkg/tests/test_x.py\n@@ -0,0 +1 @@\n+url = "http://ex.com/a.pdf"';
+function urlGateBlocked(id, over = {}) {
+  return {
+    id, domain: 'adhoc', source: 'derived_task', status: 'blocked', promptContext: { rawText: 'x' },
+    implementResponse: FIXTURE_DIFF, rawDiff: 'keep-me', blockedStage: 'review', reviewProvider: 'deterministic-ungrounded',
+    blockedReason: 'Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ungrounded-url: http://ex.com/a.pdf. This fact-check flag is high-precision.',
+    localRejectCount: 3, priorRejectionFeedback: ['older: ungrounded-field: OLD_FLAG'],
+    needsClarification: { reason: 'fabricated-ungrounded-claim', openQuestions: '1. ungrounded-field: OLD_FLAG' },
+    history: [{ stage: 'exhausted', at: '2026-10-07T00:59:00Z' }], ...over,
+  };
+}
+
+test('bucket Q: ungrounded-url flags that are fixture URLs in an added test file -> filed to review/ with the draft kept exactly as written', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, urlGateBlocked('url-1'));
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  assert.equal(summary.requeued, 1);
+  assert.ok(!exists(at(dir, 'needs-clarification', 'url-1.json')));
+  const out = read(at(dir, 'review', 'url-1.json'));
+  assert.equal(out.status, 'needs-review');
+  assert.equal(out.implementResponse, FIXTURE_DIFF);
+  assert.equal(out.rawDiff, 'keep-me');
+  for (const f of ['needsClarification', 'blockedReason', 'blockedStage', 'localRejectCount', 'priorRejectionFeedback', 'reviewProvider']) assert.equal(out[f], undefined, `${f} cleared`);
+  assert.equal(out.ncTriageBucketAttempts.Q, 1);
+});
+
+test('bucket Q: a field flag, a URL in production code, a capped task and an already-in-review task stay', async () => {
+  const dir = makePipeline();
+  fs.mkdirSync(at(dir, 'review'), { recursive: true });
+  held(dir, urlGateBlocked('url-field', { blockedReason: 'Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ungrounded-url: http://ex.com/a.pdf; ungrounded-field: SOME_FIELD. x' }));
+  held(dir, urlGateBlocked('url-prod', { implementResponse: FIXTURE_DIFF.replace('pkg/tests/test_x.py', 'pkg/cache.py').replace('pkg/tests/test_x.py', 'pkg/cache.py') }));
+  held(dir, urlGateBlocked('url-capped', { ncTriageBucketAttempts: { Q: 1 } }));
+  held(dir, urlGateBlocked('url-inreview'));
+  fs.writeFileSync(at(dir, 'review', 'url-inreview.json'), '{}');
+  const summary = await needsClarificationTriage(args(dir, throwingVote));
+  for (const id of ['url-field', 'url-prod', 'url-capped', 'url-inreview']) assert.ok(exists(at(dir, 'needs-clarification', `${id}.json`)), `${id} stays`);
+  assert.equal(summary.requeued, 0);
+});
+
+// --- Bucket J paired re-admission (2026-10-18): one more retry per truncation-gate version, only when the current gate passes ----------
+const { TRUNCATION_GATE_VERSION } = require('./validate-implement-truncation.js');
+const COMPLETE_DIFF_RESPONSE = ['RESOLUTION: implemented', '', '=== DIFF ===', '--- a/x.sh', '+++ b/x.sh', '@@ -1,2 +1,2 @@',
+  '-a', '+b', '   # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"', ''].join('\n');
+const STILL_TRUNCATED_RESPONSE = 'All checks pass. Final line: return "Topology';
+
+test('bucket J: an EXHAUSTED task the fixed gate now passes is requeued once under the gate-version key, and not again', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj6', {
+    reviewProvider: 'deterministic-truncation-guard',
+    blockedReason: 'truncated output',
+    ncTriageDecision: 'leave-for-human',
+    ncTriageBucketAttempts: { J: 1 },
+    implementResponse: COMPLETE_DIFF_RESPONSE,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 1);
+  const moved = read(at(dir, 'adhoc', 'tj6.json'));
+  assert.equal(moved.ncTriageBucketAttempts.J, 1, 'the legacy counter is untouched');
+  assert.equal(moved.ncTriageBucketAttempts[`J@${TRUNCATION_GATE_VERSION}`], 1);
+  assert.ok(moved.history.some((h) => h.stage === 'requeued' && h.detail.includes(`gate version ${TRUNCATION_GATE_VERSION}`)));
+  // The same task blocked again by the same gate version: no second versioned retry.
+  fs.unlinkSync(at(dir, 'adhoc', 'tj6.json'));
+  held(dir, { ...moved, reviewProvider: 'deterministic-truncation-guard', blockedReason: 'truncated output', implementResponse: COMPLETE_DIFF_RESPONSE, ncTriageDecision: 'leave-for-human' });
+  const s2 = await needsClarificationTriage(args(dir));
+  assert.equal(s2.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tj6.json')));
+});
+
+test('bucket J: an EXHAUSTED task whose stored response the current gate still flags stays where it is', async () => {
+  const dir = makePipeline();
+  held(dir, baseTask('tj7', {
+    reviewProvider: 'deterministic-truncation-guard',
+    blockedReason: 'truncated output',
+    ncTriageDecision: 'leave-for-human',
+    ncTriageBucketAttempts: { J: 1 },
+    implementResponse: STILL_TRUNCATED_RESPONSE,
+  }));
+  const s = await needsClarificationTriage(args(dir));
+  assert.equal(s.requeued, 0);
+  assert.ok(exists(at(dir, 'needs-clarification', 'tj7.json')));
+  assert.equal(read(at(dir, 'needs-clarification', 'tj7.json')).ncTriageBucketAttempts[`J@${TRUNCATION_GATE_VERSION}`], undefined);
 });

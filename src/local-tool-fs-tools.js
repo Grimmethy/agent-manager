@@ -8,6 +8,7 @@ const fs = require('fs');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { wrapWithSandbox } = require('./sandbox.js');
+const { isSecretLookingPath } = require('./accessible-roots.js');
 
 const MAX_READ_FILE_CHARS = 8000;
 
@@ -18,6 +19,10 @@ const READ_FILE_MAX_LINES = 800;
 const CHAT_BASH_TIMEOUT_MS = 30_000;
 
 const MAX_BASH_OUTPUT_CHARS = 8000;
+
+// list_directory returns at most this many entries per call (2026-10-25: one call on a 3876-entry archive folder returned ~457k characters and overflowed the
+// model's context window); the result says how to page (offset) or narrow (prefix).
+const LIST_DIR_MAX_ENTRIES = 200;
 
 const APPLY_LOCK_PATH = path.join(os.homedir(), '.local', 'state', 'agent-manager', 'locks', 'apply-task.lock');
 
@@ -77,6 +82,12 @@ function boundWindow(lines, off, endLine) {
   };
 }
 
+// readOnlyRoots (the implement pass's sibling repos): the optional list of roots in `allowedRoots` that are read-only. Absent for every other caller.
+function inReadOnlyRoot(readOnlyRoots, full) {
+  if (!Array.isArray(readOnlyRoots) || !readOnlyRoots.length) return false;
+  return readOnlyRoots.some((r) => { const root = path.resolve(r); return full === root || full.startsWith(root + path.sep); });
+}
+
 function readFileTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const relPath = args.path;
@@ -88,6 +99,9 @@ function readFileTool(a, b) {
     return { error: `path is not inside any accessible repo, refusing to read: ${relPath}` };
   }
   const { full } = resolved;
+  if (inReadOnlyRoot(args.readOnlyRoots, full) && isSecretLookingPath(full)) {
+    return { error: `refusing to read a credential-looking file in a read-only sibling repo: ${relPath}` };
+  }
   let raw;
   try {
     raw = fs.readFileSync(full, 'utf8');
@@ -134,25 +148,49 @@ function listDirectoryTool(a, b) {
     return { error: `path is not inside any accessible repo, refusing to list: ${target}` };
   }
   const { full } = resolved;
+  const siblingRead = inReadOnlyRoot(args.readOnlyRoots, full);
+  if (siblingRead && isSecretLookingPath(full)) {
+    return { error: `refusing to list a credential-looking path in a read-only sibling repo: ${target}` };
+  }
   let entries;
   try {
     entries = fs.readdirSync(full, { withFileTypes: true });
   } catch (e) {
     return { error: `could not list ${target}: ${e.message}` };
   }
+  if (siblingRead) entries = entries.filter((e) => !isSecretLookingPath(e.name));
   // Names and kind only -- deliberately not a recursive full-tree dump (see this file's
   // own header: keep this simple, list_directory is one shallow level per call).
-  return {
+  // Sorted by name (code-unit order) so the page order is stable; an optional `prefix` keeps only names that start with it; one page is at most
+  // LIST_DIR_MAX_ENTRIES entries from `offset`, and `truncated` / `nextOffset` / `note` say how to get the rest.
+  const prefix = typeof args.prefix === 'string' ? args.prefix : '';
+  const offset = Number.isFinite(Number(args.offset)) && Number(args.offset) > 0 ? Math.trunc(Number(args.offset)) : 0;
+  const all = entries
+    .filter((e) => !prefix || e.name.startsWith(prefix))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  const page = all.slice(offset, offset + LIST_DIR_MAX_ENTRIES);
+  const truncated = all.length > offset + page.length;
+  const result = {
     path: target,
-    entries: entries.map((e) => ({ name: e.name, type: e.isDirectory() ? 'directory' : 'file' })),
+    entries: page.map((e) => ({ name: e.name, type: e.isDirectory() ? 'directory' : 'file' })),
+    totalEntries: all.length,
+    truncated,
+    nextOffset: truncated ? offset + page.length : null,
   };
+  if (truncated) {
+    result.note = `Listing capped at ${LIST_DIR_MAX_ENTRIES} entries (${all.length} match). Pass offset=${offset + page.length} to read the next page, prefix=<start of a name> to narrow it, `
+      + 'or use grep_codebase or a more specific path.';
+  }
+  return result;
 }
 
-function listRootsTool(a) {
+function listRootsTool(a, readOnlyRoots = []) {
   const roots = Array.isArray(a) ? a : [getConfig().repoRoot];
   return {
     primary: roots[0],
-    roots: roots.map((r, i) => ({ path: r, name: path.basename(r), primary: i === 0 })),
+    roots: roots.map((r, i) => (readOnlyRoots.includes(r)
+      ? { path: r, name: path.basename(r), primary: false, readOnly: true }
+      : { path: r, name: path.basename(r), primary: i === 0 })),
   };
 }
 
@@ -165,6 +203,10 @@ function capBashOutput(text) {
   };
 }
 
+function readOnlySiblingHit(readOnlyRoots, relPath) {
+  return path.isAbsolute(relPath) && inReadOnlyRoot(readOnlyRoots, path.resolve(relPath));
+}
+
 function writeFileTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const { path: relPath, content } = args;
@@ -173,6 +215,7 @@ function writeFileTool(a, b) {
   }
   const resolved = resolveInsideRoots(allowedRoots, relPath);
   if (!resolved) {
+    if (readOnlySiblingHit(args.readOnlyRoots, relPath)) return { error: `${relPath} is in a read-only sibling repo, refusing to write it. Writes are limited to this task's own checkout.` };
     return { error: `path is not inside any accessible repo, refusing to write: ${relPath}` };
   }
   const { full } = resolved;
@@ -186,6 +229,100 @@ function writeFileTool(a, b) {
   return { path: relPath, written: true };
 }
 
+// Tiered edit_file matching (2026-10-18, brain-dump 1890, harness-derived): when the exact `find` misses,
+// try the fallback tiers the competition harness uses (adk_eval_core/editing/edit.py) -- a line-window match
+// that ignores trailing whitespace, then indentation (the replacement is re-indented to the file's own
+// indentation), then the same on JSON-unescaped text (models that send `\n` / `\"` literally). The harness's
+// regex tier is not ported. Every tier keeps the uniqueness rule: more than one hit is not applied.
+//
+// AGENT_MANAGER_EDIT_FILE_TIERS=on (or 1/true) enables applying a fallback; default OFF. Off, an exact miss still
+// runs the tiers as a SHADOW PROBE: the would-be strategy is attached to the error result as a non-enumerable
+// `matchProbe`, which the tool-loop audit records but JSON.stringify (what the model sees) leaves out. Measured
+// when this was written (tool-loop audit, 2026-10-18): 3 of 54 edit_file calls missed, cause unknown -- the probe
+// counts are what should decide switching the tiers on.
+function editTiersEnabled() {
+  const v = String(process.env.AGENT_MANAGER_EDIT_FILE_TIERS || '').trim().toLowerCase();
+  return v === 'on' || v === '1' || v === 'true';
+}
+
+function splitKeepEnds(text) {
+  const out = [];
+  const re = /[^\n]*\n|[^\n]+$/g;
+  let m;
+  while ((m = re.exec(text)) !== null) { if (m[0] === '') break; out.push(m[0]); }
+  return out;
+}
+
+const stripEol = (l) => l.replace(/\r?\n$/, '');
+const leadingWs = (l) => /^[ \t]*/.exec(l)[0];
+const minIndent = (lines) => {
+  const ns = lines.filter((l) => l.trim());
+  return ns.length ? Math.min(...ns.map((l) => leadingWs(l).length)) : 0;
+};
+
+// The unique line window `find` matches once whitespace is relaxed, or { count > 1 } / null.
+function flexibleMatch(content, find) {
+  const findLines = find.replace(/\r?\n$/, '').split(/\r?\n/);
+  if (!findLines.some((l) => l.trim())) return null;
+  const lines = splitKeepEnds(content);
+  const n = findLines.length;
+  for (const [strategy, norm] of [['flexible-rstrip', (l) => l.replace(/\s+$/, '')], ['flexible-strip', (l) => l.trim()]]) {
+    const want = findLines.map(norm);
+    const hits = [];
+    for (let i = 0; i + n <= lines.length; i += 1) {
+      let ok = true;
+      for (let k = 0; k < n; k += 1) if (norm(stripEol(lines[i + k])) !== want[k]) { ok = false; break; }
+      if (ok) { hits.push(i); i += n - 1; }
+    }
+    if (hits.length) return { strategy, count: hits.length, startLine: hits[0], lines, n, findLines };
+  }
+  return null;
+}
+
+// Replacement text for the matched window, re-indented to the window's own indentation (plus the replacement's
+// indent relative to `find`), with the window's line ending and trailing newline.
+function reindentReplacement(window, findLines, replace) {
+  const eol = window.some((l) => l.endsWith('\r\n')) ? '\r\n' : '\n';
+  const newLines = replace.replace(/\r?\n$/, '').split(/\r?\n/);
+  if (replace === '') return '';
+  const base = leadingWs(window.find((l) => l.trim() && leadingWs(l).length === minIndent(window.map(stripEol))) || window[0]);
+  const delta = Math.max(0, minIndent(newLines) - minIndent(findLines));
+  const ref = minIndent(newLines);
+  const body = newLines.map((l) => (l.trim() ? base + ' '.repeat(delta) + l.slice(ref) : '')).join(eol);
+  const last = window[window.length - 1];
+  return last.endsWith('\n') ? body + eol : body;
+}
+
+function applyFlexible(content, find, replace) {
+  const m = flexibleMatch(content, find);
+  if (!m) return null;
+  if (m.count > 1) return { ambiguous: m.count, strategy: m.strategy };
+  const window = m.lines.slice(m.startLine, m.startLine + m.n);
+  const before = m.lines.slice(0, m.startLine).join('');
+  const after = m.lines.slice(m.startLine + m.n).join('');
+  return { updated: before + reindentReplacement(window, m.findLines, replace) + after, strategy: m.strategy };
+}
+
+// `s` with one JSON string-escape layer removed, only when it carries literal escapes and no real newline.
+function unescapeJsonText(s) {
+  if (typeof s !== 'string' || s.includes('\n') || !/\\[nt"\\]/.test(s)) return null;
+  try { return JSON.parse(`"${s.replace(/(^|[^\\])"/g, '$1\\"')}"`); } catch { return null; }
+}
+
+// The first fallback tier that hits: { updated, strategy } (unique), { ambiguous, strategy }, or null.
+function tryFallbackTiers(content, find, replace) {
+  const flex = applyFlexible(content, find, replace);
+  if (flex) return flex;
+  const uFind = unescapeJsonText(find);
+  if (uFind === null) return null;
+  const uReplace = unescapeJsonText(replace || '') ?? (replace || '');
+  const exactHits = content.split(uFind).length - 1;
+  if (exactHits === 1) return { updated: content.replace(uFind, () => uReplace), strategy: 'unescaped' };
+  if (exactHits > 1) return { ambiguous: exactHits, strategy: 'unescaped' };
+  const uFlex = applyFlexible(content, uFind, uReplace);
+  return uFlex ? { ...uFlex, strategy: `unescaped+${uFlex.strategy}` } : null;
+}
+
 function editFileTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const { path: relPath, find, replace } = args;
@@ -197,6 +334,7 @@ function editFileTool(a, b) {
   }
   const resolved = resolveInsideRoots(allowedRoots, relPath);
   if (!resolved) {
+    if (readOnlySiblingHit(args.readOnlyRoots, relPath)) return { error: `${relPath} is in a read-only sibling repo, refusing to edit it. Writes are limited to this task's own checkout.` };
     return { error: `path is not inside any accessible repo, refusing to edit: ${relPath}` };
   }
   const { full } = resolved;
@@ -207,7 +345,19 @@ function editFileTool(a, b) {
     return { error: `could not read ${relPath}: ${e.message}` };
   }
   if (!content.includes(find)) {
-    return { error: `"find" text not found verbatim in ${relPath} -- no change made. Re-read the file and match it exactly.` };
+    const fallback = tryFallbackTiers(content, find, replace);
+    if (fallback && fallback.updated != null && editTiersEnabled()) {
+      try {
+        fs.writeFileSync(full, fallback.updated);
+      } catch (e) {
+        return { error: `could not write ${relPath}: ${e.message}` };
+      }
+      return { path: relPath, edited: true, matchStrategy: fallback.strategy };
+    }
+    const miss = { error: `"find" text not found verbatim in ${relPath} -- no change made. Re-read the file and match it exactly.` };
+    // Shadow probe (see the tier block's header): audit-only, invisible to JSON.stringify and so to the model.
+    if (fallback) Object.defineProperty(miss, 'matchProbe', { value: fallback.updated != null ? fallback.strategy : `${fallback.strategy}-ambiguous`, enumerable: false });
+    return miss;
   }
   const occurrences = content.split(find).length - 1;
   if (occurrences > 1) {
@@ -240,6 +390,7 @@ function withApplyLock(fn) {
 function runBashTool(a, b) {
   const { roots: allowedRoots, args } = rootsAndArgs(a, b);
   const { command, readOnly } = args;
+  const siblingRoots = readOnly ? [] : (Array.isArray(args.readOnlyRoots) ? args.readOnlyRoots : []).map((r) => { try { return fs.realpathSync(r); } catch { return null; } }).filter(Boolean);
   if (typeof command !== 'string' || !command.trim()) {
     return { error: 'run_bash requires a non-empty "command" argument' };
   }
@@ -269,7 +420,7 @@ function runBashTool(a, b) {
     // local-agentic-write-draft.js) -- unaffected, readOnly is never set there.
     readOnlyBinds: readOnly
       ? ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl', ...realRoots]
-      : ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl'],
+      : ['/usr', '/bin', '/lib', '/lib64', '/etc/resolv.conf', '/etc/ssl', ...siblingRoots],
     writableBinds: readOnly ? [] : realRoots,
   });
   if (!wrapped.available) {
@@ -298,4 +449,4 @@ function runBashTool(a, b) {
   }
 }
 
-module.exports = { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, withApplyLock, runBashTool, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS };
+module.exports = { resolveInsideRepo, resolveInsideRoots, rootsAndArgs, boundWindow, readFileTool, listDirectoryTool, listRootsTool, capBashOutput, writeFileTool, editFileTool, editTiersEnabled, tryFallbackTiers, unescapeJsonText, withApplyLock, runBashTool, LIST_DIR_MAX_ENTRIES, MAX_READ_FILE_CHARS, READ_FILE_DEFAULT_LINES, READ_FILE_MAX_LINES, APPLY_LOCK_PATH, APPLY_LOCK_CHILD_FD, RISKY_GIT_COMMAND_RE, CHAT_BASH_TIMEOUT_MS, MAX_BASH_OUTPUT_CHARS };

@@ -27,6 +27,8 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { recordBranchRemoval } = require('./branch-removal-ledger.js');
+const { liveSiblingsOnBranch } = require('./lib/shared-branch.js');
+const { findTaskAnywhere } = require('./task-anywhere.js');
 
 function readJsonSafe(fullPath) {
   try {
@@ -279,7 +281,16 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
     for (const ev of [...(data.history || [])].reverse()) {
       if (ev && ev.stage === 'applied' && ev.detail) { appliedBranch = ev.detail; break; }
     }
-    if (appliedBranch && repoRoot) {
+    // A branch other live work sits on (a hub's shared branch) is KEPT: deleting it destroyed the siblings' approved, unmerged commits (HUB0018-01,
+    // 2026-10-07; see lib/shared-branch.js). A failing sibling check also keeps it -- a stale pushed branch is the cheap mistake. The redraft stacks on top.
+    const shared = appliedBranch ? liveSiblingsOnBranch({ pipelineDir, branch: appliedBranch, selfId: data.id }) : { siblings: [] };
+    if (appliedBranch && (shared.error || shared.siblings.length)) {
+      data.history = data.history || [];
+      data.history.push({
+        stage: 'branch-kept', at: nowIso(),
+        detail: `requeue (via Chat) kept ${appliedBranch}: ${shared.error ? `sibling check failed (${shared.error})` : `shared with ${shared.siblings.map((x) => x.id).join(', ')}`}; the redraft stacks on it`,
+      });
+    } else if (appliedBranch && repoRoot) {
       try {
         execFileSync('git', ['push', 'origin', '--delete', appliedBranch], { cwd: repoRoot, stdio: 'pipe' });
         recordBranchRemoval(pipelineDir, { branch: appliedBranch, taskId: data.id, cause: 'superseded-by-requeue', detail: `requeued from ${state}/`, actor: 'chat-requeue' });
@@ -321,7 +332,7 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
   // Coordination fields -- never part of the drafting/review/apply history this reset
   // clears, always carried over verbatim when present (see task.py's own docstring on
   // two real incidents this allowlist protects against).
-  for (const key of ['stacked', 'dependsOn', 'atomic', 'noDecompose']) {
+  for (const key of ['stacked', 'dependsOn', 'prerequisiteHubs', 'atomic', 'noDecompose']) {
     if (key in data) fresh[key] = data[key];
   }
 
@@ -330,7 +341,43 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
   return { ok: true, id: taskId };
 }
 
+// Retires a task that is waiting in adhoc/ or pending/ and is not being worked on (2026-10-25: Chat filed two tasks into the wrong queue and could not retire
+// them -- its four tools only act on stuck tasks, and the dashboard's archive route refuses pending ones too). The record is stamped exactly as the dashboard's
+// manual archive stamps a give-up (python/dashboard/app.py _stamp_manual_archive: terminalDisposition 'abandoned', manualArchive {at, from, reason}) with a
+// 'withdrawn' history entry, then moved to done/_archived_no_action/, never deleted: requeueBlockedTask(state: 'archived') brings it back. Every other location
+// is refused with its name and the file is left untouched (pulling a record out from under a worker or reviewer corrupts it). No classifyRequeue: this is a
+// give-up, not a requeue.
+function withdrawTask(pipelineDir, taskId, reason) {
+  if (typeof taskId !== 'string' || !taskId.trim()) return { ok: false, error: 'taskId is required' };
+  const why = typeof reason === 'string' ? reason.trim() : '';
+  if (!why) return { ok: false, error: 'reason is required and must be non-empty' };
+  let from = 'adhoc';
+  let found = findAt(pipelineDir, 'adhoc', taskId);
+  if (!found) { from = 'pending'; found = findAt(pipelineDir, 'pending', taskId); }
+  if (!found) {
+    const where = findTaskAnywhere(pipelineDir, taskId);
+    if (!where) return notFoundError(taskId, 'adhoc or pending');
+    const place = where.foundState === 'archived' ? 'the archive' : `${where.foundState}/`;
+    return {
+      ok: false,
+      error: `Task '${taskId}' is in ${place}, not in adhoc/ or pending/ -- withdraw_task only retires tasks that are waiting and not being worked on. `
+        + 'Use requeue_blocked_task or the other task tools for stuck tasks; in-flight work cannot be withdrawn.',
+    };
+  }
+  const { path: srcPath, data } = found;
+  const destPath = path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${taskId}.json`);
+  if (fs.existsSync(destPath)) return collisionError(taskId, 'done/_archived_no_action');
+
+  const at = nowIso();
+  data.history = Array.isArray(data.history) ? data.history : [];
+  data.history.push({ stage: 'withdrawn', at, detail: why });
+  if (!data.terminalDisposition) data.terminalDisposition = 'abandoned';
+  data.manualArchive = { at, from, reason: why };
+  writeAndUnlink(destPath, data, srcPath);
+  return { ok: true, id: taskId, from };
+}
+
 module.exports = {
-  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask,
+  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
   repeatedBlockerMatch, // exported for direct unit testing
 };

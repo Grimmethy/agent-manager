@@ -52,7 +52,7 @@ function applyBrainDumpSort(args) {
   }
   return result;
 }
-const { parseProjectSearchFindings, applyProjectSearchFindings, parseDeepDiveItems, applyDeepDiveFindings, applyForensicsReport, parseDebriefNowWhatItems, applyDebriefReport } = require('./apply-group-a-report-appenders.js');
+const { parseProjectSearchFindings, applyProjectSearchFindings, parseDeepDiveItems, applyDeepDiveFindings, applyForensicsReport, parseDebriefNowWhatItems, applyDebriefReport, applyCapabilityDebriefReport } = require('./apply-group-a-report-appenders.js');
 
 // brain_dump_sort entries get MAX_SORT_ATTEMPTS classification passes before the entry is
 // left 'captured' for a human -- kept in sync with task-sources.js's own constant.
@@ -496,6 +496,7 @@ module.exports = {
   containsHedging,
   applyForensicsReport,
   applyDebriefReport,
+  applyCapabilityDebriefReport,
   parseDebriefNowWhatItems,
   parseBrainDumpSortResult,
   validateSecondBrainPath,

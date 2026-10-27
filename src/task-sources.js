@@ -21,14 +21,19 @@ const { registerTaskSource, getRegisteredSources, getRegisteredSource, resolveSo
 const { reasoningTierFor } = require('./model-provider.js');
 const { registerModelProfile } = require('./model-profile-registry.js');
 const { getConfig } = require('./config.js');
+const { findExistingWorkForEntry, linkEntryToExistingWork } = require('./brain-dump-existing-work.js');
+const { logPipelineEvent } = require('./pipeline-history.js');
+const { writeJsonAtomicSync: writeBrainDumpAtomic } = require('./atomic-write.js');
+const { rotationDemoted } = require('./premium-rotation.js');
 const { listArchivedMonthDirs } = require('./done-archive.js');
 const { nextCandidateFulfillmentTask, windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
-const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport, applySecondBrainOpportunities } = require('./apply-group-a.js');
+const { applyArchDiscoveryCandidates, applyForensicsReport, applyDebriefReport, applyCapabilityDebriefReport, applySecondBrainOpportunities } = require('./apply-group-a.js');
 const { applyProductSpecOutline, OUTLINE_DOC_TITLE } = require('./product-spec-assembly.js');
 const { applyAdhocDiff } = require('./apply-adhoc-diff.js');
 const { isOnline } = require('./connectivity-check.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { DEFAULT_HUB_ORDER } = require('./hub-priority.js');
+const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');
 const derivedGate = require('./derived-gate.js');
 const { findAuditClusters, buildAuditTask } = require('./pipeline-self-audit.js');
 const pipelineForensics = require('./pipeline-forensics.js');
@@ -173,9 +178,26 @@ function releaseSignalsForRecord(record) {
   return defaultReleaseSignals(record);
 }
 
+// A NESTED hub (a piece that was itself decomposed) keeps its record in queue/coordinating/ until the whole stacked branch merges, so it never reaches
+// done/ and the lookups below can never find it (2026-10-23, chat plugin HUB0003: piece 1 became sub-hub HUB0004 with all three pieces built on the shared
+// stacked branch; pieces 2-5 dependsOn it and waited for ever, 0 of 5 built). Same rule the stacked exemption in defaultReleaseSignals applies to a done/ record:
+// the code is committed on the SHARED branch, which is all the next step reads. So a coordinating record that carries a stacked.branch and whose pieces are
+// ALL finished (pending-merge, done, merged, applied-direct, or one of the no-code-coming dispositions) releases its dependents. Fail-closed: no record, no
+// stacked branch, no pieces, or one open or blocked piece is not satisfied.
+const NESTED_HUB_PIECE_DONE = new Set(['pending-merge', 'done', 'merged', 'applied-direct', 'gone', ...NO_CODE_COMING_DISPOSITIONS]);
+function nestedHubBuilt(pipelineDir, depId) {
+  try {
+    const rec = JSON.parse(fs.readFileSync(path.join(pipelineDir, 'queue', 'coordinating', `${depId}.json`), 'utf8'));
+    if (!rec || !rec.stacked || !rec.stacked.branch) return false;
+    const subs = Array.isArray(rec.subTasks) ? rec.subTasks : [];
+    return subs.length > 0 && subs.every((sub) => sub && typeof sub.status === 'string' && NESTED_HUB_PIECE_DONE.has(sub.status));
+  } catch { return false; }
+}
+
 function isDependencySatisfied(pipelineDir, depId) {
   const trimmed = (depId || '').trim();
   if (!trimmed) return true; // a blank/malformed entry blocks nothing -- not this function's job to validate authoring mistakes
+  if (nestedHubBuilt(pipelineDir, trimmed)) return true;
   const candidates = [
     path.join(pipelineDir, 'queue', 'done', `${trimmed}.json`),
     path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${trimmed}.json`),
@@ -295,7 +317,12 @@ function taskIdExistsInQueue(id) {
   // regenerated as a live duplicate -- the exact bug this function exists to prevent, same
   // reasoning as the _archived_no_action check just above.
   if (listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)))) return true;
-  return QUEUE_STATES.some((state) => {
+  return idInQueueStates(queueDir, id, QUEUE_STATES);
+}
+
+// Does <id>.json sit in any of these queue/<state>/ dirs (drafting has per-worker subfolders)?
+function idInQueueStates(queueDir, id, states) {
+  return states.some((state) => {
     if (state !== 'drafting') return fs.existsSync(path.join(queueDir, state, `${id}.json`));
 
     const draftingDir = path.join(queueDir, 'drafting');
@@ -310,6 +337,19 @@ function taskIdExistsInQueue(id) {
       .filter((e) => e.isDirectory())
       .some((e) => fs.existsSync(path.join(draftingDir, e.name, `${id}.json`)));
   });
+}
+
+// True when the ONLY thing holding this id is a FINISHED task (queue/done/, its dated archive buckets or _archived_no_action) -- nothing live,
+// blocked, held or coordinating carries it. A finished task is spent: it cannot be "already queued", so a caller that needs a fresh attempt may move
+// on to the next id. Anything not finished (pending, drafting, review, approved, blocked, needs-clarification, ... or a former hub id) still blocks.
+function taskIdHeldOnlyByFinishedTask(id) {
+  const { pipelineDir } = getConfig();
+  const queueDir = path.join(pipelineDir, 'queue');
+  if (formerHubIds(queueDir).has(id)) return false;
+  if (idInQueueStates(queueDir, id, QUEUE_STATES.filter((s) => s !== 'done'))) return false;
+  if (fs.existsSync(path.join(queueDir, 'done', `${id}.json`))) return true;
+  if (fs.existsSync(path.join(queueDir, 'done', '_archived_no_action', `${id}.json`))) return true;
+  return listArchivedMonthDirs(pipelineDir).some((dir) => fs.existsSync(path.join(dir, `${id}.json`)));
 }
 
 // Titles of every currently in-flight (not yet finished) task, shown to brain_dump_sort's
@@ -485,10 +525,13 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       const { isHubWork, hubKey } = parsed
         ? hubOrder.orderCandidate(pipelineDir, parsed, hubKeyCache)
         : { isHubWork: false, hubKey: { isHubChild: false } };
-      return { full, mtime, parsed, isPremium: !!(parsed && parsed.premiumPriority), isHubWork, hubKey };
+      const isPremium = !!(parsed && parsed.premiumPriority);
+      // A premium task that keeps getting blocked rotates behind fresh premium work (premium-rotation.js).
+      return { full, mtime, parsed, isPremium, demoted: isPremium && rotationDemoted(parsed), isHubWork, hubKey };
     })
     .sort((a, b) => {
       if (a.isPremium !== b.isPremium) return a.isPremium ? -1 : 1;
+      if (a.demoted !== b.demoted) return a.demoted ? 1 : -1;
       if (a.isHubWork !== b.isHubWork) return a.isHubWork ? -1 : 1;
       if (a.isHubWork && b.isHubWork) {
         const byHub = hubOrder.compareKeys(a.hubKey, b.hubKey);
@@ -516,6 +559,8 @@ function nextAdhocLikeTask({ dir, sourceOverride }) {
       const unmet = parsed.dependsOn.filter((depId) => !isDependencySatisfied(pipelineDir, depId));
       if (unmet.length > 0) continue;
     }
+    // prerequisiteHubs (hub-prerequisites.js): the piece needs files only another open hub's unmerged branch has, so it waits for that hub's MERGE.
+    if (unmetPrerequisiteHubs(pipelineDir, parsed).length > 0) continue;
     // softDependsOn (see isSoftDependencySatisfied's own comment): same skip-past
     // behavior, but satisfied once the dependency reaches queue/done/ -- no merge
     // required. A separate array from dependsOn so a coordinator can mix hard
@@ -994,29 +1039,55 @@ function nextDeepDiveTask() {
     return at - bt;
   });
 
-  // Collect the degree-sorted, budget-capped file list for one community (null when the
-  // community has no nodes at all in the graph -- same skip rule as the old inline code).
-  // Same degree-by-file, budget-capped selection as nextArchDiscoveryTask() -- see
-  // DEEP_DIVE_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
-  // the identical convention rather than inventing a second one.
-  const collectFiles = (proj, community) => {
+  // Per-tick graph cache (2026-10-22, generation-tick cost): every lane runs this function between tasks, and for a project with ~2,000 onboarded
+  // communities the old code re-read and re-parsed the repo's .deep-dive-graph.json (up to 7 MB) once PER COMMUNITY, then read source files, before
+  // finding out the community already had a task -- 71-77 s of idle GPU per tick (profile: 45 of 63 s in this function). The graph of one project is
+  // now parsed once per call and its nodes are indexed by community, so each community costs a Map lookup. Same degree-by-file selection as before.
+  const graphCache = new Map(); // clonePath -> { nodesByCommunity, degreeByNodeId, rankedByCommunity }
+  const graphFor = (proj) => {
+    let g = graphCache.get(proj.clonePath);
+    if (g) return g;
     const graphPath = path.join(proj.clonePath, '.deep-dive-graph.json');
     const graphData = JSON.parse(readIfExists(graphPath) || '{"nodes":[],"links":[]}');
-    const memberNodes = (graphData.nodes || []).filter((n) => n.community === community.id);
-    if (memberNodes.length === 0) return null;
-
+    const nodesByCommunity = new Map();
+    for (const n of graphData.nodes || []) {
+      const list = nodesByCommunity.get(n.community);
+      if (list) list.push(n); else nodesByCommunity.set(n.community, [n]);
+    }
     const degreeByNodeId = {};
     for (const link of graphData.links || []) {
       degreeByNodeId[link.source] = (degreeByNodeId[link.source] || 0) + 1;
       degreeByNodeId[link.target] = (degreeByNodeId[link.target] || 0) + 1;
     }
-    const degreeByFile = {};
-    for (const node of memberNodes) {
-      if (!node.source_file) continue;
-      degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (degreeByNodeId[node.id] || 0);
-    }
-    const rankedFiles = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+    g = { nodesByCommunity, degreeByNodeId, rankedByCommunity: new Map() };
+    graphCache.set(proj.clonePath, g);
+    return g;
+  };
 
+  // The degree-sorted [file, degree] list for one community, from the graph alone (no file is read); null when the community has no nodes at all in
+  // the graph -- same skip rule as the old inline code.
+  const rankedFilesFor = (proj, community) => {
+    const g = graphFor(proj);
+    if (g.rankedByCommunity.has(community.id)) return g.rankedByCommunity.get(community.id);
+    const memberNodes = g.nodesByCommunity.get(community.id) || [];
+    let ranked = null;
+    if (memberNodes.length > 0) {
+      const degreeByFile = {};
+      for (const node of memberNodes) {
+        if (!node.source_file) continue;
+        degreeByFile[node.source_file] = (degreeByFile[node.source_file] || 0) + (g.degreeByNodeId[node.id] || 0);
+      }
+      ranked = Object.entries(degreeByFile).sort((a, b) => b[1] - a[1]);
+    }
+    g.rankedByCommunity.set(community.id, ranked);
+    return ranked;
+  };
+
+  // Collect the budget-capped file list (contents read from disk) for a community's ranked files.
+  // Same degree-by-file, budget-capped selection as nextArchDiscoveryTask() -- see
+  // DEEP_DIVE_CONTEXT_BUDGET_CHARS's own comment for the reasoning; deep_dive reuses
+  // the identical convention rather than inventing a second one.
+  const collectFiles = (proj, rankedFiles) => {
     const files = [];
     let budgetUsed = 0;
     for (const [sourceFile, degree] of rankedFiles) {
@@ -1037,8 +1108,15 @@ function nextDeepDiveTask() {
   // records the consumed slice so the next tick emits the next one. A community at or
   // under the cap keeps today's exact behavior: one task, the unsuffixed ID.
   for (const c of candidates) {
-    const files = collectFiles(c.proj, c.community);
-    if (files === null) continue; // community has no graph nodes -- same skip as before
+    const rankedFiles = rankedFilesFor(c.proj, c.community);
+    if (rankedFiles === null) continue; // community has no graph nodes -- same skip as before
+    // Exact cheap skip, decided BEFORE any source file is read. A community with at most DEEP_DIVE_MAX_FILES_PER_TASK ranked files can never need
+    // more than one slice (files is a subset of rankedFiles), so below it always gets the unsliced id; with no slice counter to reset
+    // (consumedSlices unset/0 -- a set counter takes the full path so its reset-and-save below still runs) a task already in the queue under that id means
+    // the loop would `continue`. Anything else (a bigger community, a slice counter, no task yet) goes through the original logic unchanged.
+    if (!c.community.consumedSlices && rankedFiles.length <= DEEP_DIVE_MAX_FILES_PER_TASK
+        && taskIdExistsInQueue(`deep-dive-${c.slug}-${c.community.id}`)) continue;
+    const files = collectFiles(c.proj, rankedFiles);
 
     const totalSlices = Math.max(1, Math.ceil(files.length / DEEP_DIVE_MAX_FILES_PER_TASK));
     let id;
@@ -1187,9 +1265,70 @@ function readProjectLabels() {
 // Kept in sync with apply-group-a.js's own MAX_SORT_ATTEMPTS.
 const MAX_SORT_ATTEMPTS = 3;
 
-function brainDumpSortTaskId(entry) {
-  const n = entry.sortAttempt || 0;
-  return n > 0 ? `brain-dump-sort-${entry.id}-a${n}` : `brain-dump-sort-${entry.id}`;
+function brainDumpSortTaskId(entry, attempt = entry.sortAttempt || 0) {
+  return attempt > 0 ? `brain-dump-sort-${entry.id}-a${attempt}` : `brain-dump-sort-${entry.id}`;
+}
+
+// The attempt number a still-captured entry should be sorted under next, or null when nothing may be generated for it right now.
+// Starts at entry.sortAttempt and steps past every attempt whose id is held ONLY by a finished task: a sort task that finished
+// (noop, filed, skipped as stale) and left the entry 'captured' has used up that attempt, whatever the counter says. Without this the
+// entry was invisible forever behind its own spent id -- measured 2026-10-22: 17 agent-manager entries (11 whose apply was rejected
+// before the rejection bumped sortAttempt, 5 edited after they were sorted: the dashboard edit resets status to 'captured' but not the
+// id) while the rx580 lane logged "no eligible task found". A live, blocked or held task on an attempt id still blocks the entry
+// (no duplicate), and the walk stops at MAX_SORT_ATTEMPTS so a task that finishes without result cannot loop. Pure reads; nothing is written.
+function nextFreeSortAttempt(entry) {
+  for (let n = entry.sortAttempt || 0; n < MAX_SORT_ATTEMPTS; n += 1) {
+    const id = brainDumpSortTaskId(entry, n);
+    if (!taskIdExistsInQueue(id)) return n;
+    if (!taskIdHeldOnlyByFinishedTask(id)) return null;
+  }
+  return null;
+}
+
+function isBrainDumpEntrySortable(entry) {
+  return !!entry && entry.status === 'captured' && !entry.suppressed && nextFreeSortAttempt(entry) !== null;
+}
+
+// At most this many entries are linked to existing work in one generator call (each check reads the queue: ~170 ms
+// typical, ~3.4 s worst measured live), so one call stays bounded; the rest are reached on later ticks.
+const MAX_EXISTING_WORK_LINKS_PER_CALL = 5;
+
+// Re-reads brain-dump.json right before writing so an edit made since nextBrainDumpSortTask read it (a dashboard capture,
+// the apply stage) is not lost, and only links an entry that is still 'captured'.
+function linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, by) {
+  try {
+    const fresh = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+    const list = Array.isArray(fresh.entries) ? fresh.entries : [];
+    let changed = 0;
+    for (const { entry, found } of links) {
+      const cur = list.find((x) => x && x.id === entry.id);
+      if (!cur || cur.status !== 'captured') continue;
+      linkEntryToExistingWork(cur, found, by);
+      changed += 1;
+      logPipelineEvent(pipelineDir, 'brain-dump-existing-work', { entryId: cur.id, serial: cur.serial ?? null, taskId: found.taskId, state: found.state, how: found.how, by });
+    }
+    if (changed) writeBrainDumpAtomic(brainDumpPath, fresh);
+  } catch (e) {
+    console.error(`[task-sources] brain-dump existing-work link failed (best-effort): ${e.message}`);
+  }
+}
+
+// Persists the attempt number a sort task is being emitted under when it is ahead of the stored counter (see nextFreeSortAttempt), so the
+// apply-skip / review-exhaustion bump (sortAttempt + 1) moves on to the NEXT id instead of landing back on this task's own id. Re-reads the
+// file right before writing (a concurrent dashboard edit is not lost), only touches a still-captured entry whose counter is behind, and
+// uses the atomic writer. Best-effort: a failed write only means the bump may re-use this id, which the dedupe check still blocks.
+function advanceBrainDumpSortAttempt(brainDumpPath, pipelineDir, entry, attempt) {
+  try {
+    const fresh = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+    const cur = (Array.isArray(fresh.entries) ? fresh.entries : []).find((x) => x && x.id === entry.id);
+    if (!cur || cur.status !== 'captured' || (cur.sortAttempt || 0) >= attempt) return;
+    const from = cur.sortAttempt || 0;
+    cur.sortAttempt = attempt;
+    writeBrainDumpAtomic(brainDumpPath, fresh);
+    logPipelineEvent(pipelineDir, 'brain-dump-sort-attempt-advanced', { entryId: cur.id, serial: cur.serial ?? null, from, to: attempt, reason: 'earlier sort task(s) finished without sorting the entry' });
+  } catch (e) {
+    console.error(`[task-sources] brain-dump sortAttempt advance failed (best-effort): ${e.message}`);
+  }
 }
 
 function nextBrainDumpSortTask() {
@@ -1215,12 +1354,22 @@ function nextBrainDumpSortTask() {
   // nothing to act on, because generation itself had stopped dead. Same "skip an
   // in-queue one and keep looking" loop nextArchImportTask/nextUnusedExportTask already
   // use for their own oldest-first selection.
-  const chosen = entries.find((e) => e && e.status === 'captured' && !e.suppressed
-    && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
-    && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+  const eligible = entries.filter(isBrainDumpEntrySortable);
+  // Existing-work check (2026-10-18, see brain-dump-existing-work.js): an entry whose work is already a task -- queued,
+  // done or archived -- is linked to that task instead of being sorted again (no classification spent). Bounded per call.
+  let chosen = null;
+  const links = [];
+  for (const e of eligible) {
+    const found = links.length < MAX_EXISTING_WORK_LINKS_PER_CALL ? findExistingWorkForEntry([pipelineDir], e) : null;
+    if (!found) { chosen = e; break; }
+    links.push({ entry: e, found });
+  }
+  if (links.length) linkBrainDumpEntriesToExistingWork(brainDumpPath, pipelineDir, links, 'generator');
   if (!chosen) return null;
 
-  const taskId = brainDumpSortTaskId(chosen);
+  const attempt = nextFreeSortAttempt(chosen);
+  if (attempt > (chosen.sortAttempt || 0)) advanceBrainDumpSortAttempt(brainDumpPath, pipelineDir, chosen, attempt);
+  const taskId = brainDumpSortTaskId(chosen, attempt);
 
   return {
     id: taskId,
@@ -1492,6 +1641,9 @@ const PIPELINE_FORENSICS_COMPLETENESS_QUESTION = 'Does it contain a ranked ROOT 
 const PIPELINE_DEBRIEF_REVIEW_GUIDANCE = 'This is a pipeline_debrief task: the implement draft is DELIBERATELY an advisory prose report -- a DETERMINISM AUDIT (WHAT / SO WHAT / NOW WHAT) over a WINDOW of pipeline tasks that already SHIPPED, finding model calls spent deciding something a deterministic check/transform/lookup/existing-gate could have decided -- not code or a diff. There is nothing to implement here. Judge it on: (1) does WHAT give a per-task/cluster model-call profile grounded in the evidence (real stages, call counts, attempt counts -- not invented)? (2) does SO WHAT flag SPECIFIC model calls as mechanically decidable, each with a cited task id + history stage + model_calls row, rather than a generic platitude? (3) does the ALREADY-DETERMINISTIC CHECK actually check the AVAILABLE FILES content for an existing gate/normalizer before proposing one -- classifying each as not-wired-here / stale / genuinely absent -- rather than skip it? (4) is NOW WHAT at most 2-3 concrete, bounded items, each naming a stage + an exact deterministic mechanism + rough calls-saved, citing a real src/ file from AVAILABLE FILES when one genuinely fits (not an invented module name, not a wish list)? If AVAILABLE FILES was empty, or none of the listed files actually fit the recommendation, omitting the Files: line and recommending in prose is the CORRECT, REQUIRED behavior per the drafting instructions -- do NOT reject a draft for doing this; only reject if a real, relevant file WAS available and the draft skipped citing it anyway. "NO CONFIDENT INEFFICIENCY" is a valid, correct outcome when the evidence genuinely shows none -- do NOT reject it under the hedging rule. Reject only if: it invents a file/symbol not in the evidence, it contradicts the evidence (claims a task/history entry says something the record does not), it skips the ALREADY-DETERMINISTIC CHECK when AVAILABLE FILES were provided, it re-proposes something already present in the fetched file content, or NOW WHAT is vague/unbounded AND a real, relevant file from AVAILABLE FILES existed but was not cited.';
 const PIPELINE_DEBRIEF_COMPLETENESS_QUESTION = 'Does it contain all four sections (WHAT, SO WHAT, ALREADY-DETERMINISTIC CHECK, NOW WHAT) or a justified NO CONFIDENT INEFFICIENCY, with SO WHAT flagging specific model calls as mechanically decidable (cited) and NOW WHAT (if present) bounded to 2-3 items each naming a stage + deterministic mechanism + a real src/ file when one genuinely fits (omitting the Files: line in prose is correct and complete when AVAILABLE FILES was empty or none fit) -- all grounded in the real evidence rather than invented?';
 
+const CAPABILITY_DEBRIEF_REVIEW_GUIDANCE = 'This is a capability_debrief task: the implement draft is DELIBERATELY an advisory prose report, not code or a diff. A deterministic scan found a task source that keeps FAILING on a small-tier model lane (timeouts, degenerate output, errors) while a larger lane finishes the same work, and the report must say why and propose smaller scoped work so the task fits a smaller model. Judge it on: (1) does CAUSE name exactly one of the four cause classes (prompt/context too large, several jobs in one call, a mechanically decidable call, needs reasoning depth the tier lacks) and ground it in the evidence (numCtx, prompt size, stage, wall time, the paired larger-lane result) rather than assert it? (2) does EVIDENCE cite specific tasks, attempts and numbers that appear in the bundle? (3) is NOW WHAT at most 2-3 concrete, bounded proposals, each naming the exact stage or prompt to split, trim or make deterministic and how the scorecard would show it worked, citing only files from AVAILABLE FILES? "NOT SHRINKABLE AT THIS TIER -- <reason>" is a valid, correct outcome when the evidence supports it -- do NOT reject it. Reject only if it invents a file/symbol/metric not in the evidence, contradicts the evidence, blames the task when the bundle flags the lane as degraded, or proposes something vague or unbounded.';
+const CAPABILITY_DEBRIEF_COMPLETENESS_QUESTION = 'Does it contain CAUSE (one named class, grounded), EVIDENCE (cited from the bundle) and either a NOW WHAT of at most 2-3 bounded proposals or a justified NOT SHRINKABLE AT THIS TIER line?';
+
 const DOC_DRIFT_FIX_REVIEW_GUIDANCE = 'This is a doc_drift_fix task: a deterministic scan (drift-scan.js) found a static doc list out of sync with a live registry, and the evidence already gives the drafter every fact it needs -- the exact missing/stale names, the REAL priority number for each missing one (never guessed), the real current table rows to insert after, and any stale row\'s exact text to remove. Judge it as a small, mechanical edit, not a judgment call: (1) does it add ONE new row for every name in missingFromStatic, with the EXACT given priority number, and nothing else; (2) does it remove ONLY the exact stale rows given, verbatim; (3) does each new row\'s description come from the real fetched code shown (the harness hits/files), not invented behavior; (4) does it leave every OTHER row and all other content in the file completely untouched. Reject a draft that touches any row not named in missingFromStatic/staleInStatic, that uses a priority number different from the one given, that invents a description not grounded in the real fetched code, or that reformats/reorders existing rows beyond the specific add/remove asked for. An empty draft, or a "FALSE POSITIVE" claim, is NOT a valid "nothing to do" here -- the evidence already guarantees a real, fixable gap exists (drift-scan.js only flags a pair when it found a genuine difference); reject either and let it redraft.';
 const DOC_DRIFT_FIX_COMPLETENESS_QUESTION = 'Does the diff add exactly the rows named in missingFromStatic (with the given priority, grounded description) and remove exactly the rows named in staleInStatic, touching nothing else in the file?';
 const PIPELINE_FORENSICS_FIX_REVIEW_GUIDANCE = 'This task implements a human-CONFIRMED pipeline-fix candidate produced by a pipeline_forensics root-cause study (its full ranked report is in the candidate body). The change edits THIS pipeline\'s own src/. Judge it as a normal code change: does the diff actually do what the candidate\'s Solution describes, does it stay within the candidate\'s Files: line, and does it include (or make trivially checkable) the acceptance check the candidate named? Reject a diff that re-implements the ORIGINAL failed feature instead of fixing the pipeline mechanism, that is scoped far wider than the candidate, or that lands with no test/acceptance evidence for a behavioural change. An empty draft is NOT a valid "nothing to do" here -- it means the fix could not be produced.';
@@ -1605,6 +1757,29 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // It now takes the one pinned context (gpu-capacity.js PINNED_NUM_CTX) like everything else.
 registerModelProfile('brain-dump-cheap-local', { backend: 'local', think: false });
 registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping', strictOutputOnly: true });
+// brain_dump_disposition (2026-09-16, HUB0119 1/4): the domain for the structured
+// disposition decision on a brain-dump entry that must NOT become code work -- the
+// counterpart of brain_dump_sort's requiresCode/requiresResearch routing. Registered here
+// so this file is the single source of truth for the domain string (same
+// domain===source convention brain_dump_sort uses above, which is what
+// resolveSourceName()/_ensure_task_domains key off). strictOutputOnly:true mirrors
+// brain_dump_sort exactly (structured decision output, no rawDiff); requiresWorktree:false
+// is consumed by the apply-task.js branch (sibling HUB0119 3/4) so a disposition never
+// spins up a git worktree. No auto-generator: next() returns null because tasks in this
+// domain are produced by the apply-adhoc-diff.js routing (sibling 2/4), not by a source
+// scanner. deterministicReviewValidate is intentionally null for now -- its consumers
+// (review-task.js, reject-retry-check.js) guard with `typeof === 'function'` and safely
+// fall through to the ordinary review path until sibling 2/4 supplies the real validator.
+registerTaskSource('brain_dump_disposition', {
+  priority: taskPriority('brain_dump_disposition', 43),
+  next: () => null,
+  modelProfile: 'brain-dump-cheap-local',
+  deterministicReview: true,
+  deterministicReviewValidate: null,
+  reportClass: 'housekeeping',
+  strictOutputOnly: true,
+  requiresWorktree: false,
+});
 // Priority 45 -- right after brain_dump_sort (42) generates the held task in the first
 // place, ahead of every other job type. A held task blocks real work from ever being
 // drafted at all, so resolving it (or at least trying to) deserves to jump the queue,
@@ -2035,6 +2210,47 @@ function nextPipelineDebriefTask() {
   };
 }
 
+// capability_debrief (design note section 5a, docs/design-notes/capability-routing-and-benchmarking.md): a failure cluster in the capability ledger (a source
+// keeps failing on a small-tier lane while a larger lane finishes the same work) becomes ONE task for a larger local model to explain the failure and propose
+// smaller scoped work. One task per cluster until it is debriefed; clusters on a lane the health probe flagged are skipped as hardware suspects.
+function nextCapabilityDebriefTask() {
+  const { pipelineDir, defaultDomain } = getConfig();
+  const bundleLib = require('./capability-debrief-bundle.js');
+  const { sharedInstancesDir } = require('./instances-dir.js');
+  const laneHealth = require('./lane-health.js');
+  const instancesDir = sharedInstancesDir(pipelineDir);
+  const dbPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH || path.join(pipelineDir, 'model-stats.db');
+
+  let entries;
+  try { entries = bundleLib.readLedgerEntries(pipelineDir); } catch { return null; }
+  const clusters = bundleLib.pendingClusters(
+    bundleLib.collectFailureClusters(entries, { isDegraded: (lane, from, to) => laneHealth.laneDegradedBetween(instancesDir, lane, from, to) }),
+    instancesDir,
+  );
+  for (const cluster of clusters) {
+    const key = bundleLib.clusterKey(cluster);
+    // Deterministic id (no Date.now()): two workers ticking together must compute the same id so taskIdExistsInQueue() sees the collision.
+    const id = `capability-debrief-${crypto.createHash('sha1').update(key).digest('hex').slice(0, 12)}`;
+    if (taskIdExistsInQueue(id)) continue;
+    const bundle = bundleLib.buildCapabilityDebriefBundle({ pipelineDir, dbPath, cluster, entries });
+    return {
+      id,
+      domain: defaultDomain,
+      source: 'capability_debrief',
+      title: `Capability debrief: ${cluster.source} on ${cluster.model} (${cluster.failures} x ${cluster.signature.split(':')[0]})`.slice(0, 140),
+      promptContext: {
+        evidenceText: bundle.evidenceText,
+        clusterKey: key,
+        clusterSource: cluster.source,
+        clusterModel: cluster.model,
+        taskIds: bundle.subjectIds,
+        contrastIds: bundle.contrastIds,
+      },
+    };
+  }
+  return null;
+}
+
 // Called once from the CLI, only after writeTask() persists a pipeline_debrief task --
 // advances the cursor PAST this window (windowEnd) so the next call never re-selects any of
 // these same done/ tasks, same "record coverage only after the write actually landed" lesson
@@ -2160,16 +2376,50 @@ function nextStalenessAuditTask() {
   // adhoc tasks still show 35 blocked? It hasn't gone down" -- plain candidates[0] let
   // whichever domain held the globally-oldest task monopolize every tick; see
   // pickFairCandidate's own header in staleness-audit.js).
-  const picked = pickFairCandidate(candidates, coverage);
-  const task = buildStalenessAuditTask(picked, defaultDomain);
-  if (taskIdExistsInQueue(task.id)) return null;
+  //
+  // Walk the fair ranking, candidate by candidate (2026-09-09, HUB0158):
+  // buildStalenessAuditTask() returns NULL for a candidate whose title has no concrete
+  // file:line ref (staleness-audit.js's titleHasFileLineRef gate) -- and that null used
+  // to flow straight into taskIdExistsInQueue(task.id) below, throwing a TypeError on
+  // EVERY tick while the same candidate got re-picked forever. A candidate that build
+  // declines is marked skipped in the same coverage file markStalenessAuditReported()
+  // writes (findStalenessCandidates() suppresses on exactly that key, for the same
+  // cooldown as a normal report), then the walk moves to the next fair candidate.
+  // pickFairCandidate() re-sorts the same remaining set each round, so repeated
+  // extraction yields its full ranking without duplicating that sort here.
+  const remaining = candidates.slice();
+  while (remaining.length > 0) {
+    const picked = pickFairCandidate(remaining, coverage);
+    remaining.splice(remaining.indexOf(picked), 1);
 
-  // Coverage written by markStalenessAuditReported(), AFTER writeTask() actually
-  // persists this task -- not here. Same discipline nextPipelineSelfAuditTask() follows
-  // and the same reason: every next() function here is a pure read with no queue-write
-  // side effect (see getNextTask()'s own comment), so a tier mismatch discarding this
-  // task must not have already marked it reported.
-  return task;
+    const task = buildStalenessAuditTask(picked, defaultDomain);
+    if (task === null) {
+      // Synthesize the exact shape markStalenessAuditReported() reads (promptContext.
+      // originalTaskId/.originalDomain) so the skip lands in the same coverage file with
+      // the same reportedAt/domain fields -- plus a reason recording WHY it was skipped.
+      // No queue write is lost by stamping coverage here (unlike the "report after
+      // writeTask()" discipline below, which exists because a REAL task may still be
+      // discarded by a tier mismatch): nothing gets persisted for a skipped candidate.
+      markStalenessAuditReported({
+        id: null,
+        promptContext: {
+          originalTaskId: picked.task && picked.task.id,
+          originalDomain: (picked.task && picked.task.domain) || null,
+        },
+        skippedReason: 'title has no file:line ref',
+      });
+      continue;
+    }
+    if (taskIdExistsInQueue(task.id)) continue;
+
+    // Coverage written by markStalenessAuditReported(), AFTER writeTask() actually
+    // persists this task -- not here. Same discipline nextPipelineSelfAuditTask() follows
+    // and the same reason: every next() function here is a pure read with no queue-write
+    // side effect (see getNextTask()'s own comment), so a tier mismatch discarding this
+    // task must not have already marked it reported.
+    return task;
+  }
+  return null;
 }
 
 // Called once from the CLI, only after writeTask() has actually persisted a
@@ -2187,11 +2437,16 @@ function markStalenessAuditReported(task) {
   // domain: the FLAGGED task's own domain (promptContext.originalDomain), not this
   // staleness-audit task's own domain (always defaultDomain) -- read by
   // pickFairCandidate() to track per-domain report throughput.
-  coverage[originalTaskId] = {
+  const entry = {
     reportedAt: new Date().toISOString(),
     taskId: task.id,
     domain: (task.promptContext && task.promptContext.originalDomain) || null,
   };
+  // set only on the skip path nextStalenessAuditTask() takes when buildStalenessAuditTask()
+  // declined the candidate (no file:line ref in the title) -- no real task was ever filed
+  // for it, hence taskId above is null and this is the only record of WHY it was skipped.
+  if (task.skippedReason) entry.reason = task.skippedReason;
+  coverage[originalTaskId] = entry;
   fs.mkdirSync(path.dirname(stalenessAuditCoveragePath), { recursive: true });
   fs.writeFileSync(stalenessAuditCoveragePath, JSON.stringify(coverage, null, 2));
 }
@@ -2359,6 +2614,20 @@ registerTaskSource('pipeline_forensics', { scope: 'core',
 // source in the file by design: a debrief window only ever grows (debrief-bundle.js's own
 // MIN_WINDOW_TASKS floor gates it, not a clock), so ranking it last has zero crowd-out cost
 // and never starves a task that would otherwise fix something actually broken.
+// capability_debrief (2026-10-17): priority 96, one below pipeline_debrief -- the least urgent source in the file. `probe: false` keeps the capability
+// probing (capability-routing.js) from ever handing it to a small lane: explaining why a task does not fit a small model is a larger model's job.
+registerTaskSource('capability_debrief', { scope: 'core',
+  priority: taskPriority('capability_debrief', 96),
+  next: nextCapabilityDebriefTask,
+  apply: applyCapabilityDebriefReport,
+  advisoryProse: true,
+  probe: false,
+  harnessSearch: 'archImport',
+  reasoningTier: 'low',
+  reportClass: 'housekeeping',
+  reviewGuidance: CAPABILITY_DEBRIEF_REVIEW_GUIDANCE,
+  reviewCompletenessQuestion: CAPABILITY_DEBRIEF_COMPLETENESS_QUESTION,
+});
 registerTaskSource('pipeline_debrief', { scope: 'core',
   priority: taskPriority('pipeline_debrief', 95),
   next: nextPipelineDebriefTask,
@@ -2779,7 +3048,7 @@ function writeTask(task) {
 }
 
 module.exports = {
-  getNextTask, writeTask, taskIdExistsInQueue,
+  getNextTask, writeTask, taskIdExistsInQueue, isBrainDumpEntrySortable,
   nextTroubleLogTask, nextAdhocTask, nextDerivedTask, nextSecondBrainTask,
   nextCandidateFulfillmentTask, windowFetchedFileContent, nextProjectSearchTask,
   nextDeepDiveTask, nextBrainDumpSortTask,
@@ -2789,7 +3058,7 @@ module.exports = {
   listSecondBrainTopLevel,
   nextPipelineSelfAuditTask, markPipelineSelfAuditReported,
   nextPipelineForensicsTask, markPipelineForensicsReported,
-  nextPipelineDebriefTask, markPipelineDebriefReported,
+  nextPipelineDebriefTask, nextCapabilityDebriefTask, markPipelineDebriefReported,
   nextDriftFixTask, markDriftFixReported,
   nextPipelineHealthAuditTask, markPipelineHealthAuditChecked,
   nextUiVisibilityAuditTask, markUiVisibilityAuditChecked,
@@ -2911,6 +3180,7 @@ if (require.main === module) {
         candidateFulfillment: !!source.candidateFulfillment,
         emptyApproval: !!source.emptyApproval,
         advisoryProse: !!source.advisoryProse,
+        variantOf: source.variantOf || null,
         hasCustomApply: typeof source.apply === 'function',
         directToMain: source.directToMain === true,
         hasCandidatesPath: typeof source.candidatesPath === 'function',
@@ -2997,9 +3267,7 @@ if (require.main === module) {
     if (!brainDumpPath) return false;
     try {
       const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
-      return Array.isArray(data.entries) && data.entries.some((e) => e && e.status === 'captured' && !e.suppressed
-        && (e.sortAttempt || 0) < MAX_SORT_ATTEMPTS
-        && !taskIdExistsInQueue(brainDumpSortTaskId(e)));
+      return Array.isArray(data.entries) && data.entries.some(isBrainDumpEntrySortable);
     } catch {
       return false;
     }
@@ -3092,6 +3360,10 @@ if (require.main === module) {
       if (task.source === 'pipeline_self_audit') markPipelineSelfAuditReported(task);
       if (task.source === 'pipeline_forensics') markPipelineForensicsReported(task);
       if (task.source === 'pipeline_debrief') markPipelineDebriefReported(task);
+      if (task.source === 'capability_debrief') {
+        // Mark the cluster at generation time (a denied/archived report must not regenerate forever); the apply pass refines the verdict.
+        try { require('./capability-debrief-bundle.js').markDebriefedByKey(require('./instances-dir.js').sharedInstancesDir(getConfig().pipelineDir), task.promptContext.clusterKey, { verdict: 'queued', taskId: task.id }); } catch (_) { /* best-effort */ }
+      }
       if (task.source === 'doc_drift_fix') markDriftFixReported(task);
       if (task.source === 'pipeline_health_audit') markPipelineHealthAuditChecked();
       if (task.source === 'ui_visibility_audit') markUiVisibilityAuditChecked();

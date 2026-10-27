@@ -87,6 +87,42 @@ class PipelineRunningTest(unittest.TestCase):
             self.assertTrue(app._pipeline_running())
             self.assertTrue(app._pipeline_stoppable())
 
+    def test_fresh_working_heartbeat_with_dead_owner_is_not_running(self):
+        # The 2026-10-08 incident: pipeline stopped mid-draft; the last heartbeat said "working"
+        # and stayed "fresh" for WORKING_STALE_SECONDS, so start was refused for ~20 min.
+        _hb(self.inst, "worker-3090", status="working", age_seconds=30, pid=2_000_000_000)
+        self.assertFalse(app._pipeline_running())
+
+    def test_fresh_heartbeat_dead_child_pid_but_live_daemon_is_running(self):
+        # `pid` is the per-call child (gone between calls); `daemonPid` is the lane's loop.
+        _hb(self.inst, "worker-3090", status="working", age_seconds=30, pid=2_000_000_000)
+        hb = json.loads((self.inst / "worker-3090.json").read_text())
+        hb["daemonPid"] = os.getpid()
+        (self.inst / "worker-3090.json").write_text(json.dumps(hb), encoding="utf-8")
+        self.assertTrue(app._pipeline_running())
+
+    def test_fresh_heartbeat_dead_daemon_but_a_stray_live_child_still_counts_as_running(self):
+        _hb(self.inst, "worker-3090", status="working", age_seconds=30, pid=os.getpid())
+        hb = json.loads((self.inst / "worker-3090.json").read_text())
+        hb["daemonPid"] = 2_000_000_000
+        (self.inst / "worker-3090.json").write_text(json.dumps(hb), encoding="utf-8")
+        # the fallback loop still sees a live `pid`, so this is "running" -- a stray live child
+        # is a real process the Stop button must be able to kill.
+        self.assertTrue(app._pipeline_running())
+
+    def test_fresh_heartbeat_with_no_recorded_pid_keeps_trusting_the_timestamp(self):
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        (self.inst / "worker-3090.json").write_text(json.dumps({
+            "instanceId": "worker-3090", "status": "working", "lastHeartbeat": ts}), encoding="utf-8")
+        self.assertTrue(app._pipeline_running())
+
+    def test_fresh_heartbeat_dead_owner_but_a_daemon_process_exists_is_running(self):
+        # mid-restart: old heartbeat's owner is dead, the replacement daemon is up but has not
+        # written yet -- the process scan keeps this from reading as "stopped".
+        _hb(self.inst, "worker-3090", status="working", age_seconds=30, pid=2_000_000_000)
+        with mock.patch.object(app, "_pipeline_daemon_pids", return_value=[os.getpid()]):
+            self.assertTrue(app._pipeline_running())
+
     def test_status_endpoint_exposes_stoppable(self):
         _hb(self.inst, "worker-3090", status="queued",
             age_seconds=app.OTHER_STALE_SECONDS + 300, pid=os.getpid())

@@ -38,7 +38,25 @@ const MIN_NUM_CTX = 2048;
 // 65536 (~20.55 GB) is inside the budget by the same formula but only ~1.6% under it and
 // past the last measured anchor -- re-measure with the card idle and raise it only then.
 // The P40 lane's card is the same 24 GB, so it gets the same value.
-const PINNED_NUM_CTX = 49152;
+const DEFAULT_PINNED_NUM_CTX = 49152;
+
+// 2026-10-17 (grimm's RX 580, 8 GB): a lane whose card cannot hold the 24 GB cards' pinned context declares its own in the lanes registry
+// (src/lanes.js `numCtx` -> AGENT_MANAGER_LANE_NUM_CTX in THAT lane's env only). Still ONE stable value per lane process, so the "never vary
+// num_ctx between calls" rule above holds. Measured on qwen3-vl:8b / RX 580 / Vulkan with a q8 KV cache: 49152 -> 10.6 tok/s, 80% on the GPU;
+// 16384 -> 26.2 tok/s, 100% on the GPU (f16 KV: 8.0 tok/s at 49152). Ignored unless a whole number >= MIN_NUM_CTX.
+function laneNumCtx(env = process.env) {
+  const n = Number(env.AGENT_MANAGER_LANE_NUM_CTX);
+  return Number.isInteger(n) && n >= MIN_NUM_CTX ? n : null;
+}
+const PINNED_NUM_CTX = laneNumCtx() || DEFAULT_PINNED_NUM_CTX;
+
+// 2026-10-17 (grimm's RX 580): a lane can also declare num_batch (lanes registry `numBatch` -> AGENT_MANAGER_LANE_NUM_BATCH, that lane's env only). Measured on
+// qwen3-vl:8b / RX 580 / Vulkan / q8 KV / 4392-token prompt: the default batch processed the prompt at 26 tok/s (169 s before the first token); num_batch 1024
+// -> 178 tok/s (26 s), generation unchanged at 25 tok/s; 2048 kept the 178 tok/s but halved generation to 13 tok/s; 256 -> 34 tok/s. null = Ollama's default.
+function laneNumBatch(env = process.env) {
+  const n = Number(env.AGENT_MANAGER_LANE_NUM_BATCH);
+  return Number.isInteger(n) && n >= 32 && n <= 8192 ? n : null;
+}
 
 // Kept so existing callers keep working: there is no longer a separate, larger tier.
 const EXTENDED_NUM_CTX = PINNED_NUM_CTX;
@@ -167,6 +185,9 @@ module.exports = {
   SAFETY_MARGIN_FRACTION,
   MIN_NUM_CTX,
   PINNED_NUM_CTX,
+  DEFAULT_PINNED_NUM_CTX,
+  laneNumCtx,
+  laneNumBatch,
   EXTENDED_NUM_CTX,
   HARD_TIMEOUT_CEILING_MS,
   MIN_TIMEOUT_MS,

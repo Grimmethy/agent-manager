@@ -18,6 +18,7 @@ async function loadProjectHistory() {
     const data = await fetchJson('/api/projects/history');
     projectHistory = data.projects || [];
   } catch (e) {
+    console.error('loadProjectHistory failed to fetch project history', e);
     projectHistory = [];
   }
   const list = document.getElementById('project-history-list');
@@ -237,6 +238,12 @@ function mergePluginTabs(plugins, manifestTabsEnabled) {
       if (!isValidPluginTab(p.tab)) continue;
       const tab = p.tab;
       const row = { key: tab.key, label: tab.label, description: tab.description, pluginName: p.name, pluginScript: tab.script };
+      // A plugin whose entry has a `process` block owns a server core can start; renderPluginTab()
+      // ensures it is running before the tab's own renderer runs (see ensurePluginTabStarted).
+      if (p.process && typeof p.process === 'object' && p.process.command) {
+        row.startCommand = [p.process.command, ...(Array.isArray(p.process.args) ? p.process.args : [])].join(' ');
+        row.processLog = `~/.local/state/agent-manager/logs/plugin-${p.name}.log`;
+      }
       const replaces = tab.replaces;
       let replaced = false;
       if (replaces) {
@@ -350,9 +357,43 @@ function loadPluginTabScript(tab) {
   return promise;
 }
 
+// Core-owned lazy start (2026-10-12, found when the CharacterForge tab showed a blank
+// "refused to connect" iframe because its script never asked for its server to be started):
+// before a tab whose plugin has a `process` block renders, POST the idempotent
+// /api/plugins/<name>/ensure-started route. Per plugin: success is remembered for the page's
+// life (so the 5s re-render makes no further request), one request is in flight at a time, and
+// a failure or healthy:false (the route only waits ~5s, a cold venv can take longer) writes an
+// error panel and is retried by the next render. -> 'ready' | 'pending' | 'failed'.
+const pluginTabStarted = {};
+const pluginTabStarting = {};
+
+async function ensurePluginTabStarted(tab, main) {
+  if (!tab.startCommand || pluginTabStarted[tab.pluginName]) return 'ready';
+  if (pluginTabStarting[tab.pluginName]) return 'pending';
+  const hasContent = main.querySelector && (main.querySelector('iframe') || main.querySelector('[data-plugin-start-error]'));
+  if (!hasContent) main.innerHTML = `<div class="empty">Starting ${escapeHtml(tab.label)}...</div>`;
+  pluginTabStarting[tab.pluginName] = true;
+  let why = '';
+  try {
+    const r = await fetch(`/api/plugins/${encodeURIComponent(tab.pluginName)}/ensure-started`, { method: 'POST' });
+    const body = await r.json().catch(() => ({}));
+    if (r.ok && body.healthy) { pluginTabStarted[tab.pluginName] = true; return 'ready'; }
+    why = body.description || (r.ok ? 'it did not report healthy within its start window (it may still be starting; this retries on the next refresh)' : `HTTP ${r.status}`);
+  } catch (e) {
+    why = e.message;
+  } finally {
+    delete pluginTabStarting[tab.pluginName];
+  }
+  main.innerHTML = `<div class="empty" data-plugin-start-error>Could not start the "${escapeHtml(tab.label)}" server (plugin ${escapeHtml(tab.pluginName)}): ${escapeHtml(why)}<br>Start command: <code>${escapeHtml(tab.startCommand)}</code><br>Log: <code>${escapeHtml(tab.processLog)}</code></div>`;
+  return 'failed';
+}
+
 async function renderPluginTab(tab) {
   const main = document.getElementById('main');
   try {
+    if (tab.startCommand) {   // no await for a plugin without a process block: the script load below must stay synchronous
+      if ((await ensurePluginTabStarted(tab, main)) !== 'ready') return;
+    }
     if (!pluginTabRenderers[tab.key]) {
       main.innerHTML = `<div class="empty">Loading ${escapeHtml(tab.label)}...</div>`;
       await loadPluginTabScript(tab);
@@ -367,10 +408,28 @@ async function renderPluginTab(tab) {
   }
 }
 
+// The tab list in display order. On a phone-sized screen the Forges group goes FIRST (the owner uses it most from the phone and should not have
+// to scroll the strip for it, 2026-10-14); everything else keeps its order, and a wide screen is untouched. Returns a new array.
+function navOrder(tabs, narrow) {
+  if (!narrow) return tabs.slice();
+  const forges = tabs.filter((t) => t.group === 'Forges');
+  return forges.length ? [...forges, ...tabs.filter((t) => t.group !== 'Forges')] : tabs.slice();
+}
+
+const NARROW_QUERY = '(max-width: 860px)';   // the same breakpoint the stylesheet's phone layout uses
+function isNarrowScreen() {
+  return typeof window !== 'undefined' && !!window.matchMedia && window.matchMedia(NARROW_QUERY).matches;
+}
+// Rotating a phone (or resizing a window) across the breakpoint changes the order, so the strip is rebuilt.
+if (typeof window !== 'undefined' && window.matchMedia) {
+  const mq = window.matchMedia(NARROW_QUERY);
+  if (mq.addEventListener) mq.addEventListener('change', () => { if (typeof renderNav === 'function' && document.getElementById('nav')) renderNav(); });
+}
+
 function renderNav() {
   const nav = document.getElementById('nav');
   nav.innerHTML = '';
-  for (const tab of TABS) {
+  for (const tab of navOrder(TABS, isNarrowScreen())) {
     if (tab.group) {
       const expanded = isGroupExpanded(tab.group);
       const header = document.createElement('button');
@@ -515,4 +574,4 @@ function adhocStateLabel(state) {
 // (`module` is undefined there, so this is a no-op in production) -- the guard exists
 // solely so safeSourceNames is requireable from a Node test, the first test coverage
 // this file has ever had.
-if (typeof module !== 'undefined') module.exports = { safeSourceNames, bumpRenderGeneration, renderStaleCheck, runRefreshGuarded, _resetRenderStateForTest };
+if (typeof module !== 'undefined') module.exports = { navOrder, safeSourceNames, bumpRenderGeneration, renderStaleCheck, runRefreshGuarded, _resetRenderStateForTest };

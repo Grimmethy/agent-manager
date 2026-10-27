@@ -62,6 +62,27 @@ function refreshCandidateFetchedFiles(task) {
       console.warn('[local-draft] declared-file refresh failed (advisory):', err.message);
     }
   }
+  // Context files the candidate's prose names (a relative require/import specifier, an any-directory path): a task created before citedContextFiles existed -- or requeued from
+  // its stored snapshot -- never had them fetched. Same helper and windowing as creation; idempotent, declared files never become context, advisory on any error.
+  try {
+    const { citedContextFiles } = require('../candidate-path-grounding.js');
+    const declared = (Array.isArray(pc.files) ? pc.files : []).map((e) => (typeof e === 'string' ? e : (e && e.path) || '')).filter(Boolean);
+    const have = new Set((Array.isArray(pc.fetchedFiles) ? pc.fetchedFiles : []).map((f) => f && f.path).filter(Boolean));
+    const contextCount = (Array.isArray(pc.fetchedFiles) ? pc.fetchedFiles : []).filter((f) => f && f.context).length;
+    const wanted = citedContextFiles({ section, declaredFiles: declared, repoRoot: resolvedRoot, max: 3 }).filter((p) => !have.has(p)).slice(0, Math.max(0, 3 - contextCount));
+    const added = [];
+    for (const rel of wanted) {
+      try {
+        const windowed = windowFetchedFileContent(fs.readFileSync(path.resolve(resolvedRoot, rel), 'utf8'), section);
+        if (!Array.isArray(pc.fetchedFiles)) pc.fetchedFiles = [];
+        pc.fetchedFiles.push({ path: rel, content: windowed.text, anchorConfidence: windowed.confidence, context: true });
+        added.push(rel);
+      } catch (err) { console.warn('[local-draft] could not fetch context file:', rel, err.message); }
+    }
+    if (added.length) appendHistoryEvent(task, 'context-refreshed', `fetched ${added.length} context file(s) the candidate's prose names: ${added.join(', ')}`);
+  } catch (err) {
+    console.warn('[local-draft] context-file refresh failed (advisory):', err.message);
+  }
   if (!Array.isArray(pc.fetchedFiles) || pc.fetchedFiles.length === 0) return;
   const relocated = [];
   pc.fetchedFiles = pc.fetchedFiles.map((f) => {

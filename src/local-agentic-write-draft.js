@@ -27,15 +27,21 @@ const { GIT_OWNERSHIP_RULE } = require('./lib/git-ownership.js');
 const path = require('path');
 const fs = require('fs');
 const { getConfig } = require('./config.js');
-const { runPlanWithTools, ORIENT_TURN_LIMIT } = require('./local-tool-client.js');
+const { runPlanWithTools, ORIENT_TURN_LIMIT, REQUEST_TIMEOUT_MS } = require('./local-tool-client.js');
+const { isForgePause } = require('./gpu-guard.js');
+const { resolveReadOnlySiblingRoots } = require('./accessible-roots.js');
 const { recordCall: defaultRecordModelCall } = require('./model-stats-client.js');
 const { runAgenticDraftInWorktree, priorRejectionBlock, formatSubTaskProposalsForReview } = require('./agentic-draft-common.js');
+const { priorVerdictBlock } = require('./lib/prompt-blocks.js');
 const { detectContradictoryLiteralAcceptance } = require('./acceptance-criteria.js');
 const { detectStaleDecomposePremise } = require('./decompose-premise-check.js');
 const { runDecomposePassIfAvailable } = require('./decompose-pass-route.js');
+const { deterministicPlanSplit, repairEnabled } = require('./plan-step-split.js');
 const { oversizedFiles } = require('./file-length-flags-reader.js');
 const { anchorFilesPromptBlock } = require('./task-anchor-files.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
+const { appendHistoryEvent } = require('./task-history.js');
+const { stampTaskShape, shapeBlocksDecompose, preliminaryDecomposeDecision } = require('./task-shape.js');
 
 // A leaf that blows a full tier-3 budget with zero edits is auto-decomposed as a backstop
 // (the preliminary check in local-draft.js should catch most of these first). Bounded: a
@@ -49,6 +55,25 @@ const MAX_AUTO_DECOMPOSE = Number(process.env.AGENT_MANAGER_MAX_AUTO_DECOMPOSE) 
 // comfortably inside dead-process-check.js's 1680s (28 min) zombie threshold. Env
 // override still wins.
 const LOCAL_AGENTIC_WRITE_MAX_TURNS = Number(process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE_MAX_TURNS) || 35;
+
+// Time-budget line for the prompt (2026-10-19, brain-dump 1895, harness-derived: the competition harness lists every active limit
+// up front). The prompt already states the turn budget; it did not state that ONE TURN is a model call with a hard ceiling
+// (local-tool-client.js REQUEST_TIMEOUT_MS: 240 s, 900 s on a slow endpoint, LOCAL_TIMEOUT_MS overrides), past which the whole
+// call is lost as an OLLAMA_TIMEOUT. Measured over the 14 days to 2026-10-19: timeout outcomes on 9.3% of worker-3090 attempts
+// (33 of 356), 10.6% of worker-p40 (17 of 161), 0.8% of worker-rx580 (5 of 612). A prompt can only influence how long the model
+// spends in one turn, so the line gives the real number and a concrete instruction. Default OFF (AGENT_MANAGER_PROMPT_BUDGET_BLOCK);
+// the capability ledger stamps the switch on every attempt so capability-ledger.js --budget-block can compare timeout rates with it
+// on and off. Deliberately NO budget-status tool: every tool call in this loop is a whole model turn (up to that same ceiling) and
+// counts against LOCAL_AGENTIC_WRITE_MAX_TURNS, so a "free" status call would cost more than this sentence saves.
+function budgetBlockEnabled() {
+  const v = String(process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK || '').trim().toLowerCase();
+  return v === 'on' || v === '1' || v === 'true';
+}
+
+function buildTimeBudgetLine(timeoutMs = REQUEST_TIMEOUT_MS) {
+  const seconds = Math.max(1, Math.round(Number(timeoutMs) / 1000));
+  return `TIME BUDGET: each of your turns is ONE model call that is cut off after about ${seconds} seconds on this machine; a turn that thinks or writes past that is lost entirely and counts as a failed attempt, however good the answer was going to be. Keep your thinking to a few sentences, prefer calling a tool over planning at length, and split a large change into several small edit_file calls. (The number of turns is limited separately, above; each run_bash command is cut off after ~30 s.)`;
+}
 
 // RETRY_ORIENT_TURN_LIMIT (2026-09-15, brain-dump bd-1789433484128, "pipeline hardening
 // 1/5"): a retry whose prompt already carries a substantive priorAttemptAnalysisBlock (a
@@ -92,10 +117,10 @@ function isEnabled() {
 // exactly the ambiguous case a Literal type would forbid, so it's now qualified the same
 // way "api[\s_-]?keys?" already was (never a bare "key").
 const EXTERNAL_DEP_MARKERS = [
-  { label: 'creating a new repo', re: /\b(create|init)\s+(a\s+)?(new\s+)?(git\s+)?repo(sitory)?\b/i },
-  { label: 'hosting/deploying/publishing', re: /\b(host|deploy|publish)\s+(at|to)\s+\S/i },
-  { label: 'a git remote operation', re: /\bgit\s+(remote|push|clone)\b/i },
-  { label: 'credentials/API keys/tokens/secrets', re: /\b(credentials?|api[\s_-]?keys?|secrets?|(?:api|auth(?:entication)?|access|bearer|session|oauth|personal[\s_-]access)[\s_-]?tokens?)\b/i },
+  { label: 'creating a new repo', severity: 'hard', re: /\b(create|init)\s+(a\s+)?(new\s+)?(git\s+)?repo(sitory)?\b/i },
+  { label: 'hosting/deploying/publishing', severity: 'hard', re: /\b(host|deploy|publish)\s+(at|to)\s+\S/i },
+  { label: 'a git remote operation', severity: 'hard', re: /\bgit\s+(remote|push|clone)\b/i },
+  { label: 'credentials/API keys/tokens/secrets', severity: 'soft', re: /\b(credentials?|api[\s_-]?keys?|secrets?|(?:api|auth(?:entication)?|access|bearer|session|oauth|personal[\s_-]access)[\s_-]?tokens?)\b/i },
   // 2026-09-11 (screaminggoatclubmt, from two real blocked hub-children -- adhoc-add-
   // node-test-coverage-for-scopecomplexitygate-1789097760618-2 and adhoc-exclude-turn-
   // limit-exhaustion-from-the-retry-loop-1788877276899-1): the bare `\bnetwork\b`/
@@ -115,7 +140,7 @@ const EXTERNAL_DEP_MARKERS = [
   // no longer matches. The negation guard is applied to every marker, not just this one,
   // since a task text saying "this does NOT need git push" or "no credentials required"
   // would be the identical false-positive shape for any of them.
-  { label: 'a network/third-party service call', re: /\b(network|internet)\s+(access|call|request|connectivity|connection|outage|dependency)\b|\bexternal\s+api\b|\bthird[\s_-]?party\s+service\b/i },
+  { label: 'a network/third-party service call', severity: 'soft', re: /\b(network|internet)\s+(access|call|request|connectivity|connection|outage|dependency)\b|\bexternal\s+api\b|\bthird[\s_-]?party\s+service\b/i },
 ];
 
 // Negation cues that, appearing shortly before a marker match, mean the surrounding text
@@ -136,15 +161,52 @@ function isNegatedMatch(text, matchIndex) {
 // task.promptContext.rawText are the real "ask" text (see buildWriteAgenticPrompt's own
 // `Title: ${task.title}` / `ctx.rawText` usage just below), task.planResponse /
 // task.lastGoodPlan is the real plan-pass output (see local-draft.js's draftPlan()).
-function detectExternalDependency(task) {
+// 2026-10-07 (blocked class B: HUB0018-01, bd-1791098464493 updateItem, bd-1791128943154
+// Promise.allSettled, bd-1791200686856 ensureDriveToken -- all ordinary code edits, third
+// patch of this same heuristic): the regexes match WORDS, so identifiers and prose that
+// merely mention a credential (credential.idToken, an existing "auth token" variable, "the
+// network call itself failed", access_token inside a pasted snippet) blocked real code
+// tasks before any model call. Three changes: (1) code fences/inline code spans are stripped
+// before matching -- an identifier in code is a reference to existing code, not a request;
+// (2) the plan echo is no longer scanned, only the task's own ask (title + rawText) -- the
+// plan just repeats whatever the ask said, so it could only add false positives; (3) markers
+// carry a severity: 'hard' ones (new repo, hosting, git remote) describe an operation the
+// sandbox truly cannot perform and always block; 'soft' ones (credentials, network) are
+// ambiguous vocabulary and only ADVISE by default. AGENT_MANAGER_EXTERNAL_DEP_MODE =
+// block (hard+soft block) | advisory (default) | off.
+function externalDepMode() {
+  const m = String(process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE || 'advisory').trim().toLowerCase();
+  return m === 'block' || m === 'off' ? m : 'advisory';
+}
+
+function stripCodeForGate(text) {
+  return String(text || '').replace(/```[\s\S]*?(?:```|$)/g, ' ').replace(/`[^`\n]*`/g, ' ');
+}
+
+// Pure classifier: the first non-negated marker hit in the task's own ask, or null.
+function classifyExternalDependency(task) {
   const ctx = (task && task.promptContext) || {};
-  const text = [task && task.title, ctx.rawText, task && (task.planResponse || task.lastGoodPlan)]
-    .filter(Boolean).join(' ');
+  const text = stripCodeForGate([task && task.title, ctx.rawText].filter(Boolean).join(' '));
   for (const marker of EXTERNAL_DEP_MARKERS) {
     const match = marker.re.exec(text);
-    if (match && !isNegatedMatch(text, match.index)) return marker.label;
+    if (match && !isNegatedMatch(text, match.index)) return { label: marker.label, severity: marker.severity };
   }
   return null;
+}
+
+// The BLOCKING decision under the current mode: a label, or null (nothing to block on).
+function detectExternalDependency(task, { mode = externalDepMode() } = {}) {
+  if (mode === 'off') return null;
+  const hit = classifyExternalDependency(task);
+  if (!hit) return null;
+  return hit.severity === 'hard' || mode === 'block' ? hit.label : null;
+}
+
+// The advisory label: a soft hit that did not block (advisory mode only).
+function externalDependencyAdvisory(task, { mode = externalDepMode() } = {}) {
+  if (mode !== 'advisory') return null;
+  const hit = classifyExternalDependency(task);
+  return hit && hit.severity === 'soft' ? hit.label : null;
 }
 
 // A task whose target is a file the file-length-scan watchdog already flagged as
@@ -288,7 +350,8 @@ function isLeafTask(task) {
 // auto-decomposed once -- in those cases let it split again. MAX_AUTO_DECOMPOSE + review
 // still bound runaway splitting.
 function leafDecomposeLocked(task) {
-  return isLeafTask(task)
+  // A one-file-fix (task-shape.js) is treated like a confirmed-atomic leaf: decompose is off the table until it has burned a full turn budget.
+  return (isLeafTask(task) || shapeBlocksDecompose(task))
     && !(task && task.autoDecomposeCount)
     && !(task && task.turnBudgetExhaustedBefore)
     && !(task && Number(task.decomposeBlockCount) > 0);
@@ -347,7 +410,18 @@ function preFilterFlagsBlock(task) {
 // number is ACTUALLY enforced this pass (runPlanWithTools' nudge timing uses the same
 // value, passed by the caller below), not always the cold-start default, or the model's
 // own instructions would contradict when the nudge really fires.
-function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } = {}) {
+function externalDepAdvisoryBlock(task) {
+  const label = externalDependencyAdvisory(task);
+  return label ? `Note: the task text mentions ${label}. Confirm this is an ordinary code edit before treating it as an external operation; if it truly needs a resource the sandbox cannot reach, answer RESOLUTION: needs-human-decision and name it.` : '';
+}
+
+// The project's real test conventions (lib/test-framework.js) ride along on every write prompt for a task that concerns tests. Never throws.
+function buildWriteAgenticPrompt(task, opts = {}) {
+  const prompt = buildWriteAgenticPromptBase(task, opts);
+  try { return require('./lib/implement-critique.js').withTestConventions(task, prompt); } catch { return prompt; }
+}
+
+function buildWriteAgenticPromptBase(task, { orientTurnLimit = ORIENT_TURN_LIMIT } = {}) {
   const ctx = task.promptContext || {};
   const leaf = leafDecomposeLocked(task);
   // decomposeDirective (2026-09-10, agentic-draft-common.js's resolveAgenticDraft): the
@@ -371,9 +445,11 @@ function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } =
   return [
     'You are implementing a real fix for a task submitted directly by a human, working inside a real git checkout of this repository on a fresh throwaway branch. You have real read/edit/write and shell (run_bash) tools against this checkout -- use them. run_bash commands are sandboxed and time out after ~30 seconds each, so run TARGETED checks (e.g. `python3 -m py_compile <the .py files you changed>`, a single relevant test module) rather than a whole test suite.',
     GIT_OWNERSHIP_RULE,
+    'Other registered repos on this machine (plugins and projects) are READ-ONLY and readable at their absolute paths: call list_roots to see them, then read_file / list_directory / grep_codebase (with root) or a read-only run_bash. You cannot write there, and you must never conclude a repo is absent from this machine without calling list_roots first. Do not cat .env, key, token or credential files in those repos.',
     'Use grep_codebase / read_file / list_directory for exploration -- they are faster and cheaper than shelling out, and your turn budget is limited. Prefer read_file with offset/limit to page a large file and grep_codebase to locate code; a quick `run_bash` `sed -n \'3600,3700p\' path` slice is fine for a fast look, just do not burn turns re-listing the tree. Reserve run_bash otherwise for the final targeted check on files you actually changed.',
     'Files here can be thousands of lines. read_file returns a WINDOW of lines: check `totalLines` and `nextOffset` in the result and re-call with a higher `offset` to page -- never assume the first window is the whole file. grep_codebase searches this repo\'s configured dirs (or a subpath, or "." for all); it is a literal substring / all-words match, not a regex, and returns matching lines only -- read_file around a hit for context.',
     `TURN BUDGET: you have about ${LOCAL_AGENTIC_WRITE_MAX_TURNS} turns total. Spend at most the first ~${orientTurnLimit} on orientation (grep/read/list). By then you MUST have either started editing with edit_file/write_file, or concluded with a RESOLUTION: line. Do not keep exploring past that -- a rough first edit you then fix is far better than running out of turns having changed nothing. ${stillLostAdvice}`,
+    ...(budgetBlockEnabled() ? [buildTimeBudgetLine()] : []),
     '',
     `Title: ${task.title || ''}`,
     leaf ? 'This task is a CONFIRMED-ATOMIC LEAF: a prior decompose pass already split the larger feature and this is one indivisible piece. It MUST be implemented in this pass with edit_file / write_file. Do NOT answer RESOLUTION: decompose.' : '',
@@ -384,6 +460,8 @@ function buildWriteAgenticPrompt(task, { orientTurnLimit = ORIENT_TURN_LIMIT } =
     anchorFilesPromptBlock(task),
     hubStatusGroundingBlock(task),
     priorRejectionBlock(task),
+    priorVerdictBlock(task),
+    externalDepAdvisoryBlock(task),
     blindPlanBlock(task),
     priorInvestigationBlock(task),
     acceptanceCriteriaBlock(task),
@@ -472,30 +550,52 @@ function partialDiffFallbackPrompt(prompt, task, info) {
   return `${prompt}\n\nCORRECTION: any note above saying a prior pass's edits are already applied does NOT hold for this run -- they could not be applied automatically. Re-apply them yourself, from this diff, then finish the remaining work:\n\n${task.priorPartialDiff.slice(0, 6000)}\n`;
 }
 
+// The block reason agentic-draft-common.js's resolveDecomposeZero gives a pass that said "decompose" and produced no
+// usable sub-task JSON. Matched here (not a flag) so only that exact first-miss shape triggers the early split.
+const NO_JSON_DECOMPOSE_MISS_RE = /no valid JSON array of \{title, rawText\} sub-tasks/;
+
 async function runGiveUpSplit(task, verdict) {
   const autoN = Number(task.autoDecomposeCount) || 0;
   const repeatedDecompose = (Number(task.decomposeBlockCount) || 0) >= 2;
+  // First-miss repair (2026-10-15): the FIRST "decompose, no usable JSON" pass (no partial-edit continuation chosen) used to
+  // be requeued for a whole second agentic pass (~5 min) plus the requeue wait (~17 min observed) before this split ran.
+  // Run the same single-call split now. AGENT_MANAGER_DECOMPOSE_REPAIR=off restores the old two-miss behaviour.
+  const noJsonMiss = repairEnabled()
+    && (Number(task.decomposeBlockCount) || 0) >= 1
+    && !task.isAgenticContinuation
+    && NO_JSON_DECOMPOSE_MISS_RE.test(String((verdict && verdict.blockedReason) || ''));
   const gaveUp = verdict.blocked || verdict.needsClarification;
   // A file-decompose child is already a single verbatim move -- splitting it again just
   // produces a hub of one sub-task and loops. If it can't land, it needs a human, not
   // another decompose pass.
-  if (task.atomic || !gaveUp || !(task.turnBudgetExhausted || repeatedDecompose) || autoN >= MAX_AUTO_DECOMPOSE) {
+  if (task.atomic || (shapeBlocksDecompose(task) && !task.turnBudgetExhausted) || !gaveUp || !(task.turnBudgetExhausted || repeatedDecompose || noJsonMiss) || autoN >= MAX_AUTO_DECOMPOSE) {
     return null;
   }
   const mode = task.turnBudgetExhausted ? 'post-exhaustion' : 'repeated-decompose';
-  const split = await runDecomposePassIfAvailable(task, {
+  let split = await runDecomposePassIfAvailable(task, {
     mode,
     priorAttemptBlock: priorAttemptAnalysisBlock(task),
   });
+  // Deterministic fallback for the "said decompose, gave nothing" shapes: split the task's own numbered plan steps when the
+  // single-call pass produced nothing usable. Never for a turn-budget exhaustion (that path is unchanged).
+  let splitSource = 'decompose-pass';
+  if ((!split || split.subTasks.length < 2) && !task.turnBudgetExhausted && (repeatedDecompose || noJsonMiss) && repairEnabled()) {
+    const mechanical = deterministicPlanSplit(task);
+    if (mechanical) { split = mechanical; splitSource = 'plan-steps'; }
+  }
   if (!split || split.subTasks.length < 2) return null;
 
   task.autoDecomposeCount = autoN + 1;
+  if (splitSource === 'plan-steps') task.autoDecomposeSource = 'plan-steps';
   task.adhocResolution = 'decompose';
   task.subTaskProposals = split.subTasks;
   task.rawDiff = '';
   const why = task.turnBudgetExhausted
     ? 'a turn-budget-exhausted implement pass'
-    : 'two implement passes that both chose RESOLUTION: decompose without usable pieces';
+    : (repeatedDecompose
+      ? 'two implement passes that both chose RESOLUTION: decompose without usable pieces'
+      : 'an implement pass that chose RESOLUTION: decompose without usable pieces')
+      + (splitSource === 'plan-steps' ? ', split mechanically from the plan\'s numbered steps' : '');
   task.implementResponse = `Auto-decomposed after ${why} (${split.subTasks.length} pieces).\n\n${verdict.blockedReason || ''}\n\n${formatSubTaskProposalsForReview(split.subTasks)}`;
   delete task.turnBudgetExhausted;
   delete task.retryableDraftBlock;
@@ -588,8 +688,11 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   // attempt on a local-draft.js sub-task citing line 2178 against a file decompose #226
   // had already shrunk to 1327 lines. See detectStaleDecomposePremise's own header for
   // what this does and (importantly) does not catch.
+  // Gates on .stale, not just truthiness: the check can also return { stale: false,
+  // suppressions: [...] } when every dismissal is recorded but nothing blocking remains
+  // (e.g. a file the task's whole point is to create).
   const staleDecompose = detectStaleDecomposePremise(task, { repoRoot: getConfig().repoRoot });
-  if (staleDecompose) {
+  if (staleDecompose && staleDecompose.stale) {
     return {
       succeeded: true,
       blocked: true,
@@ -607,12 +710,17 @@ async function draftAdhocViaLocalAgenticWrite(task, {
   // burning the full LOCAL_AGENTIC_WRITE_MAX_TURNS budget on read-only orientation and only
   // landing in the post-exhaustion backstop below. Default-on kill switch, mirroring
   // isEnabled(): opt out by setting the env var in the check below to the string 'false'.
+  // Shape (task-shape.js): classified once per pass, before any decompose decision, and recorded on the task as task.shape = { class, reasons }.
+  stampTaskShape(task);
   if (process.env.AGENT_MANAGER_SCOPE_GATE !== 'false') {
-    const gate = scopeComplexityGate(task);
+    const gateVerdict = scopeComplexityGate(task);
+    const decision = preliminaryDecomposeDecision(task, gateVerdict);
+    if (decision.suppressedDetail) appendHistoryEvent(task, 'advisory', decision.suppressedDetail);
+    const gate = decision.decompose ? gateVerdict : null;
     if (gate && gate.shouldDecompose) {
       const split = await runDecomposePassIfAvailable(task, {
         mode: 'preliminary',
-        priorAttemptBlock: gate.reason,
+        priorAttemptBlock: decision.priorAttemptBlock,
       });
       // >= 2 subTasks -> this is a real decompose, return the same shape the post-exhaustion
       // backstop uses. A null split or a 0/1-subTask split means the split wasn't usable, so
@@ -645,6 +753,8 @@ async function draftAdhocViaLocalAgenticWrite(task, {
       stage: 'agentic-write',
       allowWrite: true,
       primaryRoot: worktreeDir,
+      // Registered plugin/project repos, READ-ONLY (2026-10-16): cross-repo verification tasks need real path:line evidence from them; writes stay in worktreeDir.
+      readOnlyRoots: resolveReadOnlySiblingRoots({ repoRoot: getConfig().repoRoot, worktreeDir, applyRepoRoot: getConfig().applyRepoRoot }),
       // On a cap-exhausted run, spend one more no-tools turn forcing a RESOLUTION line
       // so resolveAgenticDraft has something to route on instead of a hard block.
       forceSummaryOnCap: true,
@@ -676,6 +786,7 @@ async function draftAdhocViaLocalAgenticWrite(task, {
     if (giveUp) return giveUp;
     return verdict;
   } catch (e) {
+    if (isForgePause(e)) throw e;   // the Forge family holds the GPU: pause the whole draft (local-draft.js, local-worker.sh) -- never turn it into a failed attempt
     return { succeeded: false, reason: `local write-agentic draft failed: ${e.message}` };
   }
 }
@@ -685,7 +796,7 @@ function modelStatsSafe(fn, args) {
 }
 
 module.exports = {
-  draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS,
-  isLeafTask, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
-  detectExternalDependency, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
+  draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS, budgetBlockEnabled, buildTimeBudgetLine,
+  isLeafTask, leafDecomposeLocked, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
+  detectExternalDependency, classifyExternalDependency, externalDependencyAdvisory, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
 };
