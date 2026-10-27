@@ -348,11 +348,19 @@ function buildStalenessEvidenceText(candidate, now = Date.now()) {
   return lines.join('\n');
 }
 
+// Gate: a staleness-audit task is only meaningful when the original title
+// names a concrete file:line so the audit can target real code.
+function titleHasFileLineRef(title) {
+  if (!title) return false;
+  return /\S+:\d+/.test(title);
+}
+
 // domain must be the consumer's real defaultDomain (task-sources.js's getConfig() value),
 // passed in rather than hardcoded here -- same convention buildAuditTask (pipeline-self-
 // audit.js) already follows.
 function buildStalenessAuditTask(candidate, domain) {
   const { task, reasons, lastActivityTs: lastTs } = candidate;
+  if (!titleHasFileLineRef(task.title)) return null;
   const id = `staleness-audit-${task.id}-${Date.now()}`;
   return {
     id,
@@ -450,5 +458,6 @@ module.exports = {
   SELF_AUDIT_SOURCES,
   buildStalenessEvidenceText,
   buildStalenessAuditTask,
+  titleHasFileLineRef,
   pickFairCandidate,
 };

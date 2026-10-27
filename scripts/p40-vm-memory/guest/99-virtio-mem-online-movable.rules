@@ -1,0 +1,3 @@
+# Online memory added by virtio-mem as MOVABLE so the guest can migrate its pages away and unplug the blocks again.
+# Installed into the VM's root by scripts/p40-vm-memory/offline-apply-udev.sh (VM shut off), or by hand as root.
+SUBSYSTEM=="memory", ACTION=="add", ATTR{state}=="offline", ATTR{state}="online_movable"

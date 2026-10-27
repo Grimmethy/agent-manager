@@ -28,6 +28,15 @@ function waitExit(cp) {
   });
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Resolve once a holder child has actually acquired (it writes 'ready' right after arb.acquire). A fixed
+// sleep(300) here was a race: under full-suite load the child starts late, so the waiter's measured wait
+// fell short of the assertion's floor (observed: 413ms < 500ms).
+function ready(cp) {
+  return new Promise((res, rej) => {
+    cp.stdout.once('data', () => res());
+    cp.once('exit', () => rej(new Error('holder exited before acquiring')));
+  });
+}
 
 test('withGpu: acquire, run, release -- ticket dir empties afterward', async () => {
   const inst = tmpInst();
@@ -49,9 +58,10 @@ test('priority: a draft acquire waits while an interactive ticket is live, proce
   // interactive holder in a child, holds for 1.2s
   const holder = child(`
     const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'interactive', model: 'm', taskId: 'chat' });
+    process.stdout.write('ready');
     setTimeout(() => { h.release(); process.exit(0); }, 1200);
   `);
-  await sleep(300); // let it acquire
+  await ready(holder);
 
   const start = Date.now();
   const draft = child(`
@@ -153,6 +163,27 @@ test('status: reports the holder and the waiting queue', async () => {
   await Promise.all([waitExit(holder), waitExit(waiter)]);
 });
 
+test('status: lists a place ticket under reserved (with ownerPid) -- holder and waiting unchanged', () => {
+  const inst = tmpInst();
+  const place = arb.holdPlace(inst, { cls: 'review', model: 'm', lockKey: 'ollama-h-1', taskId: 'job-1', phase: 'reservation', ownerPid: process.pid });
+  try {
+    const st = arb.status(inst, 'ollama-h-1');
+    assert.equal(st.holder, null);
+    assert.deepEqual(st.waiting, []);
+    assert.equal(st.reserved.length, 1);
+    const r = st.reserved[0];
+    assert.equal(r.cls, 'review');
+    assert.equal(r.pid, process.pid);
+    assert.equal(r.ownerPid, process.pid);
+    assert.equal(r.taskId, 'job-1');
+    assert.equal(r.phase, 'reservation');
+    assert.equal(arb.status(inst, 'some-other-key').reserved.length, 0, 'keyed like every other ticket');
+  } finally {
+    place.release();
+  }
+  assert.deepEqual(arb.status(inst, 'ollama-h-1').reserved, [], 'gone once released');
+});
+
 test('liveTickets sweeps a ticket whose pid is dead', async () => {
   const inst = tmpInst();
   const dir = arb.ticketsDir(inst, 'm');
@@ -180,9 +211,10 @@ test('lockKey: two different models serialize against each other when they share
   const inst = tmpInst();
   const holder = child(`
     const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'draft', model: 'model-a', lockKey: 'shared-endpoint', taskId: 'w1' });
-    setTimeout(() => { h.release(); process.exit(0); }, 900);
+    process.stdout.write('ready');
+    setTimeout(() => { h.release(); process.exit(0); }, 1500);
   `);
-  await sleep(300); // let it acquire
+  await ready(holder);
 
   const waiter = child(`
     const s = Date.now();
@@ -199,9 +231,10 @@ test('lockKey: two different models do NOT serialize when each keeps its own def
   const inst = tmpInst();
   const holder = child(`
     const h = arb.acquire(${JSON.stringify(inst)}, { cls: 'draft', model: 'model-a', taskId: 'w1' });
+    process.stdout.write('ready');
     setTimeout(() => { h.release(); process.exit(0); }, 900);
   `);
-  await sleep(300);
+  await ready(holder);
 
   const other = child(`
     const s = Date.now();

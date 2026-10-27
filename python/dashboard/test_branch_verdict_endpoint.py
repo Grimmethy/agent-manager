@@ -97,5 +97,25 @@ class Endpoint(unittest.TestCase):
             self.assertIn("merge", events[0]["detail"])
 
 
+    def test_chat_needs_work_through_the_endpoint_stamps_prior_verdict_on_the_task_but_not_the_hub(self):
+        for d in ("done", "coordinating"):
+            (self.q / d).mkdir(exist_ok=True)
+        (self.q / "done" / "HUB0064-01-x.json").write_text(json.dumps(
+            {"id": "HUB0064-01-x", "history": [], "promptContext": {"rawText": "ask"}}))
+        (self.q / "coordinating" / "hub-x.json").write_text(json.dumps(
+            {"id": "hub-x", "title": "hub", "promptContext": {"rawText": "hub ask"}, "subTasks": [{"id": "HUB0064-01-x", "status": "done"}]}))
+        branch = {"branch": "agent/decompose-hub-x", "taskId": "decompose-hub-x", "headSha": "sha-D", "hub": None, "mainBranch": "master"}
+        with mock.patch.object(self.app, "list_unmerged_branches", return_value=[branch]), \
+                mock.patch.object(self.app, "_run_git", return_value="body\n\nTask: HUB0064-01-x (adhoc/manual)\n"):
+            r = self.post({"verdict": "needs-work", "reasons": ["keep the return type `any`"], "source": "chat", "sha": "sha-D"},
+                          branch=branch["branch"])
+        self.assertEqual(r.status_code, 200)
+        pv = json.loads((self.q / "done" / "HUB0064-01-x.json").read_text())["promptContext"]["priorVerdict"]
+        self.assertEqual(pv["reasons"], ["keep the return type `any`"])
+        self.assertEqual(pv["sha"], "sha-D")
+        self.assertEqual(pv["branch"], "agent/decompose-hub-x")
+        self.assertNotIn("priorVerdict", json.loads((self.q / "coordinating" / "hub-x.json").read_text())["promptContext"])
+
+
 if __name__ == "__main__":
     unittest.main()

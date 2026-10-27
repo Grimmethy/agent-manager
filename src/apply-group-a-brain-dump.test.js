@@ -145,3 +145,102 @@ test('possibleDuplicateOf guard: a claimed title that IS in the real candidate l
   assert.equal(isValidDuplicateMatch('Add authentication to the Agent Manager dashboard session persistence', realTitles), true,
     'a truncated/extended form of a real title still matches, so a real duplicate is not lost to the guard');
 });
+
+// 2026-10-18: work for the entry appeared AFTER its sort was drafted -> link, do not queue (brain-dump-existing-work.js).
+test('applyBrainDumpSort: existing work for the entry -> skipped existingWork result, entry linked, nothing queued or filed', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-brain-dump-existing-'));
+  const secondBrainDir = path.join(dir, 'secondbrain');
+  fs.mkdirSync(secondBrainDir, { recursive: true });
+  const entry = brainDumpEntry({ id: 'bd-7', serial: 1905, capturedAt: '2026-10-18T03:00:00.000Z' });
+  const brainDumpPath = writeBrainDump(dir, [entry]);
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'adhoc-by-hand.json'), JSON.stringify({ id: 'adhoc-by-hand', promptContext: { raisedFrom: 'brain-dump-1905' } }));
+  const task = { promptContext: { brainDumpEntryId: 'bd-7', rawText: 'original' } };
+  const implementResponse = JSON.stringify({ category: 'idea', secondBrainPath: 'Ideas/x.md' });
+
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir, pipelineDir: dir });
+
+  assert.equal(result.skipped, true);
+  assert.equal(result.existingWork, true);
+  assert.equal(result.linkedTo, 'adhoc-by-hand');
+  assert.match(result.reason, /already exists: adhoc-by-hand \(done, matched by raisedFrom\)/);
+  const saved = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0];
+  assert.equal(saved.status, 'actioned');
+  assert.equal(saved.queuedTaskId, 'adhoc-by-hand');
+  assert.equal(saved.linkedExistingWork.by, 'apply');
+  assert.deepEqual(fs.readdirSync(secondBrainDir), [], 'no note filed');
+  assert.equal(fs.existsSync(path.join(dir, 'queue', 'adhoc')), false, 'no adhoc task queued');
+  const hist = fs.readFileSync(path.join(dir, 'instances', 'pipeline-history.log'), 'utf8');
+  assert.match(hist, /"type":"brain-dump-existing-work".*"by":"apply"/);
+});
+
+// 2026-10-24: brain-dump target check (brain-dump-target-check.js) wired into applyBrainDumpSort before the adhoc task is queued.
+function targetCheckFixture(prefix) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const repoRoot = path.join(dir, 'repo'); const pipelineDir = path.join(dir, 'pipeline');
+  fs.mkdirSync(path.join(repoRoot, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(repoRoot, 'src', 'real.js'), '// stub\n');
+  // A real (sandbox) git repo: the check lists tracked files, and fails OPEN when it cannot.
+  const git = (...args) => require('child_process').execFileSync('git', ['-C', repoRoot, '-c', 'user.name=t', '-c', 'user.email=t@example.invalid', ...args], { stdio: 'ignore' });
+  git('init', '-q'); git('add', '-A'); git('commit', '-q', '-m', 'init');
+  fs.mkdirSync(path.join(pipelineDir, 'queue'), { recursive: true });
+  const domainsPath = path.join(pipelineDir, 'task-domains.json');
+  fs.writeFileSync(domainsPath, JSON.stringify({ adhoc: {}, default: {} }));
+  const registryPath = path.join(dir, 'projects.json');
+  fs.writeFileSync(registryPath, JSON.stringify([{ repoRoot, pipelineDir, domainsPath, label: 'fixture-project' }]));
+  const prev = process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH;
+  process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = registryPath;
+  const restore = () => { if (prev === undefined) delete process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH; else process.env.AGENT_MANAGER_PROJECTS_REGISTRY_PATH = prev; };
+  return { dir, repoRoot, pipelineDir, restore };
+}
+
+function sortWith(fx, entryOverrides) {
+  const rawText = entryOverrides.rawText;
+  const brainDumpPath = writeBrainDump(fx.dir, [brainDumpEntry({ id: 'bd-tc', ...entryOverrides })]);
+  const task = { promptContext: { brainDumpEntryId: 'bd-tc', rawText } };
+  const implementResponse = JSON.stringify({ category: 'task', secondBrainPath: 'Ideas/x.md', actionable: true, belongsToProject: 'fixture-project' });
+  const result = applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrainDir: path.join(fx.dir, 'sb'), pipelineDir: fx.pipelineDir });
+  return { result, entry: JSON.parse(fs.readFileSync(brainDumpPath, 'utf8')).entries[0] };
+}
+
+test('applyBrainDumpSort target check: an entry citing only missing paths queues no task, is parked and stamped', () => {
+  const fx = targetCheckFixture('apply-bd-targetcheck-');
+  try {
+    const { result, entry } = sortWith(fx, { rawText: 'The `drive_links.py` and `turn_cancel.py` modules do not exist' });
+    assert.equal(result.skipped, true);
+    assert.equal(result.targetCheck, true);
+    assert.match(result.reason, /every cited path is missing/);
+    assert.equal(fs.existsSync(path.join(fx.pipelineDir, 'queue', 'adhoc')), false, 'no adhoc task queued');
+    assert.equal(entry.status, 'captured');
+    assert.ok(!entry.suppressed);
+    assert.equal(entry.targetCheck.verdict, 'suspect');
+    assert.ok(entry.sortAttempt >= 3, 'parked so brain_dump_sort does not pick it again');
+    const hist = fs.readFileSync(path.join(fx.pipelineDir, 'instances', 'pipeline-history.log'), 'utf8');
+    assert.match(hist, /"type":"brain-dump-target-check"/);
+  } finally { fx.restore(); }
+});
+
+test('applyBrainDumpSort target check: an entry citing a real path still queues an adhoc task', () => {
+  const fx = targetCheckFixture('apply-bd-targetcheck-ok-');
+  try {
+    const { result, entry } = sortWith(fx, { rawText: 'Fix a defect in `src/real.js` and `src/new-helper.js`' });
+    assert.equal(result.targetCheck, undefined);
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1);
+    assert.equal(entry.targetCheck, undefined);
+  } finally { fx.restore(); }
+});
+
+test('applyBrainDumpSort target check: targetCheckOverride and the kill switch both let a suspect entry through', () => {
+  const text = 'The `gone-one.py` and `gone-two.py` modules do not exist';
+  let fx = targetCheckFixture('apply-bd-targetcheck-ovr-');
+  try {
+    sortWith(fx, { rawText: text, targetCheckOverride: true });
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1, 'override queues the task');
+  } finally { fx.restore(); }
+  fx = targetCheckFixture('apply-bd-targetcheck-off-');
+  process.env.AGENT_MANAGER_BRAIN_DUMP_TARGET_CHECK = 'false';
+  try {
+    sortWith(fx, { rawText: text });
+    assert.equal(fs.readdirSync(path.join(fx.pipelineDir, 'queue', 'adhoc')).length, 1, 'kill switch queues the task');
+  } finally { delete process.env.AGENT_MANAGER_BRAIN_DUMP_TARGET_CHECK; fx.restore(); }
+});

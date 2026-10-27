@@ -13,6 +13,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
+const { healGeneratedDirt } = require('./lib/apply-clone-dirt.js');
 
 const GIT_ENV = {
   ...process.env,
@@ -68,15 +69,41 @@ function annotateGitTimeout(err, args, timeoutMs) {
  */
 function createRealGitRunner(repoRoot) {
   const mainBranch = detectDefaultBranch(repoRoot);
-  function run(args) {
+  function run(args, extra = {}) {
     try {
-      return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS });
+      return execFileSync('git', args, { cwd: repoRoot, stdio: 'pipe', encoding: 'utf8', env: GIT_ENV, timeout: GIT_TIMEOUT_MS, ...extra });
     } catch (e) {
       throw annotateGitTimeout(e, args, GIT_TIMEOUT_MS);
     }
   }
   function isAncestor(a, b) {
     try { run(['merge-base', '--is-ancestor', a, b]); return true; } catch { return false; }
+  }
+  // True only when a diverged local branch adds NOTHING its remote counterpart lacks -- it is a duplicate of origin's content (typically the same commits under
+  // different SHAs after the stale-main rebase rewrote one side), so a rescue branch would only be a stale snapshot of the rolling branch. Seen 2026-10-04/05 on
+  // TaxHarvest: 12 rescue branches in ~6 h, every one a near-copy of agent/triage-queue. Two signals, either suffices: (a) `git cherry <remote> <name>` lists no '+'
+  // line AND lists every local-unique commit (each has a patch-equivalent upstream; merges are invisible to cherry, so a count mismatch falls through to (b)), or (b) measured from the two branches' FORK POINT (merge-base, so shared history is not
+  // counted), the lines local ADDS are a NON-EMPTY subset of the lines the remote branch adds (the rule python/dashboard/branch_verdicts.py
+  // _check_redundant_snapshot applies to these branches, there measured from main). Any doubt -- a git failure, no common ancestor -- returns false and the caller
+  // rescues exactly as before: a wrong 'redundant' drops work, a wrong 'not redundant' costs one extra branch. Known limit: the line-set test looks only at added
+  // lines, so a local commit that duplicates added lines AND deletes lines origin kept would be judged redundant; the rolling candidate-doc branches this exists
+  // for only append.
+  function localAddsNothingOver(remote, name) {
+    try {
+      // `git cherry` skips merge commits, so "no '+' line" only proves a duplicate when it accounts for EVERY local-unique commit (a merge with its own edits would otherwise pass).
+      const cherry = run(['cherry', remote, name]).split('\n').filter(Boolean);
+      const uniqueCommits = Number(run(['rev-list', '--count', `${remote}..${name}`]).trim());
+      if (cherry.length === uniqueCommits && !cherry.some((l) => l.startsWith('+'))) return true;
+      const fork = run(['merge-base', name, remote]).trim();
+      if (!fork) return false;
+      const added = (ref) => new Set(run(['diff', '--unified=0', fork, ref]).split('\n')
+        .filter((l) => l.startsWith('+') && !l.startsWith('+++') && l.slice(1).trim()).map((l) => l.slice(1)));
+      const mine = added(name);
+      if (mine.size === 0) return false;                                  // nothing added since the fork: a deletions-only change is never "a duplicate"
+      const theirs = added(remote);
+      for (const line of mine) if (!theirs.has(line)) return false;
+      return true;
+    } catch { return false; }
   }
   // A DEDICATED apply clone is the one AGENT_MANAGER_APPLY_REPO_ROOT names (never the shared
   // interactive checkout, never any other repo). Nothing legitimate is ever left uncommitted in it, so
@@ -210,6 +237,10 @@ function createRealGitRunner(repoRoot) {
       return quarantineStash();
     },
     assertCleanTree: () => {
+      // Compiled-cache dirt (tracked __pycache__/*.pyc rewritten by any Python run) is restored first; see lib/apply-clone-dirt.js.
+      const healed = healGeneratedDirt(run);
+      if (healed.restored.length) console.error(`[git-runner] restored ${healed.restored.length} generated file(s) in ${repoRoot}: ${healed.restored.slice(0, 5).join(', ')}`);
+      else if (healed.wouldRestore.length) console.error(`[git-runner] (dry-run) would restore ${healed.wouldRestore.length} generated file(s) in ${repoRoot}: ${healed.wouldRestore.slice(0, 5).join(', ')}`);
       const lines = run(['status', '--porcelain', '--untracked-files=no']).split('\n').filter(Boolean);
       if (!lines.length) return;
       const files = lines.map((l) => l.slice(3)).slice(0, 8).join(', ');
@@ -311,6 +342,11 @@ function createRealGitRunner(repoRoot) {
             // tip and let the pipeline continue. A human can still recover the rescue
             // branch's content later; nothing downstream has to wait on them noticing
             // first.
+            if (localAddsNothingOver(remote, name)) {
+              console.error(`[git-runner] prepareStackedBranch: local ${name} had diverged from ${remote} but adds nothing origin lacks (a duplicate of origin's content) -- resetting without a rescue branch`);
+              run(['checkout', '-B', name, remote]);
+              return;
+            }
             const rescue = `${name}-rescued-${new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)}`;
             try { run(['branch', rescue, name]); } catch { /* best-effort: proceed even if the rescue branch itself couldn't be created */ }
             try { run(['push', '-u', 'origin', rescue]); } catch { /* best-effort: the local rescue branch still exists even if the push fails */ }
@@ -319,7 +355,7 @@ function createRealGitRunner(repoRoot) {
             return;
           }
         }
-        // A ROLLING branch (e.g. TRIAGE_BRANCH) is never explicitly rebased on its own --
+        // A ROLLING branch (e.g. TRIAGE_BRANCH) is never explicitly rebased on its own (it is brought up to main by the MERGE below) --
         // apply-main-batch.js's own header says so plainly ("based on whatever main was
         // when it was first created and is never rebased"). Every branch of the logic
         // above only ever compares LOCAL to REMOTE; none of it ever asks whether the
@@ -333,16 +369,33 @@ function createRealGitRunner(repoRoot) {
         // explicitly retracted as a false positive after the fact.
         try { run(['fetch', 'origin', mainBranch]); } catch { /* best-effort, matches fetchMain elsewhere */ }
         if (!isAncestor(`origin/${mainBranch}`, remote)) {
+          // MERGE main in first; the rebase is only the fallback (brain dump bd-1791228522460, 2026-10-05). The rebase this used to do EVERY time rewrote only the LOCAL branch and nothing pushed the
+          // rewrite, so origin never contained main and this block re-fired on EVERY tick: a tick with a batch had its plain push rejected (non-fast-forward) and
+          // retryPushAfterRebase rebased the commits back onto the old origin tip; a tick with nothing to commit left the rewrite unpushed and the next tick saw
+          // two-sided divergence (the `-rescued-` branches, 18 in ~11 h on TaxHarvest; the reflog of the local branch shows the pattern). A merge only ADVANCES the
+          // branch: the push is a fast-forward, no SHA is rewritten, and main is an ancestor of origin after the first tick. Local ends strictly ahead of origin by one
+          // merge commit, which the 'trust local' path above already handles on the next call.
           run(['checkout', '-B', name, remote]);
           try {
-            run(['rebase', `origin/${mainBranch}`]);
-          } catch (e) {
-            try { run(['rebase', '--abort']); } catch { /* best-effort */ }
-            throw new Error(
-              `prepareStackedBranch: ${remote} is based on a stale point of ${mainBranch} (main has moved on since this rolling branch was last built) and rebasing its still-unmerged commits onto the current tip failed -- needs a human to reconcile, not an automatic sync: ${e.message}`,
-            );
+            run(['merge', '--no-edit', `origin/${mainBranch}`]);
+            return;
+          } catch (mergeErr) {
+            try { run(['merge', '--abort']); } catch { /* best-effort */ }
+            // A single three-way merge can conflict where the commit-by-commit rebase would not: the rolling branch may already carry changes that main later received
+            // under other SHAs (the rebase drops those as already applied; replayed on real TaxHarvest refs the merge conflicted on adjacent removals in
+            // frontend/src/api/properties.ts where the rebase succeeded). Falling back to the rebase keeps that case working exactly as it did before; only a conflict
+            // BOTH ways needs a human. (The rebase path still rewrites only the local branch -- the old loop -- but is now the rare path, not every tick.)
+            try {
+              run(['rebase', `origin/${mainBranch}`]);
+              console.error(`[git-runner] prepareStackedBranch: merging ${mainBranch} into ${name} conflicted; rebased onto ${mainBranch} instead (the rebase drops commits main already carries): ${String(mergeErr && mergeErr.message).split('\n')[0].slice(0, 160)}`);
+              return;
+            } catch (e) {
+              try { run(['rebase', '--abort']); } catch { /* best-effort */ }
+              throw new Error(
+                `prepareStackedBranch: ${remote} is based on a stale point of ${mainBranch} (main has moved on since this rolling branch was last built) and neither merging the current ${mainBranch} into it nor rebasing its still-unmerged commits onto it worked -- needs a human to reconcile, not an automatic sync: ${e.message}`,
+              );
+            }
           }
-          return;
         }
         run(['checkout', '-B', name, remote]); // local missing, or ⊆ origin (stale/behind/identical); remote itself is current
         return;
@@ -367,6 +420,9 @@ function createRealGitRunner(repoRoot) {
       try { run(['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}`]); } catch { return false; }
       return !isAncestor(remote, `origin/${mainBranch}`);
     },
+    // Drops candidate blocks main already retracted from the CURRENT branch's Docs/*_CANDIDATES.md and commits the removal (its own commit, pushed
+    // with the next batch). Paired repair for the merge driver's old ignore-deletions bug -- see src/lib/prune-retracted-candidates.js. Never throws.
+    pruneRetractedCandidates: () => require('./lib/prune-retracted-candidates.js').pruneRetractedCandidates({ repoRoot, git: run, mainRef: `origin/${mainBranch}` }),
     add: (files) => run(['add', ...files]),
     commit: (messageFilePath) => run(['commit', '-F', messageFilePath]),
     push: (branchName) => run(['push', '-u', 'origin', branchName]),
@@ -500,6 +556,7 @@ function createFakeGitRunner(opts = {}) {
       const isAncestor = opts.isAncestorFn || (() => false);
       return !isAncestor(`origin/${name}`, `origin/${opts.mainBranch || 'main'}`);
     },
+    pruneRetractedCandidates: () => { record('pruneRetractedCandidates'); return { pruned: [], committed: false }; },
     add: (files) => record('add', files),
     commit: (messageFilePath) => record('commit', messageFilePath),
     push: (branchName) => record('push', branchName),

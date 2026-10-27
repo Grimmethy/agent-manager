@@ -1,3 +1,9 @@
+// Link to the agent-run trajectory page (routes/trajectories.py, brain-dump 1892): one helper for the task detail
+// modal and the Workers card so both point at the same page.
+function trajectoryLinkHtml(taskId) {
+  return `<a href="/trajectory/${encodeURIComponent(taskId)}" target="_blank" rel="noopener" title="Agent-run trajectories: every recorded tool-loop run of this task as a timeline">trajectories</a>`;
+}
+
 function renderDraftAttempts(task) {
   const attempts = Array.isArray(task.draftAttempts) ? task.draftAttempts : [];
   if (!attempts.length) return '';
@@ -353,6 +359,7 @@ function renderTaskDetailModal(task) {
   // the per-attempt history -- every earlier plan, every tier's decline reason + response,
   // every tier-3 worktree diff -- so following up on a task that failed N times no longer
   // means re-investigating from scratch.
+  if (task.id) html += `<div class="field-label">Agent-run trajectories</div><div>${trajectoryLinkHtml(task.id)}</div>`;
   html += renderDraftAttempts(task);
   html += renderWorkLog(task);
   html += renderHarnessHits(task);

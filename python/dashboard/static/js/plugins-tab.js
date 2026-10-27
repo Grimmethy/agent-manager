@@ -1,19 +1,12 @@
 // Plugins tab: renderPluginsTab and the pipeline-flag badges. Moved verbatim out of core-ui.js (2026-10-01); a plain global <script>, loaded by index.html right after core-ui.js.
 // No require()/module.exports: the browser loads this with a plain <script src> tag, so every name below is a shared global.
 
-async function renderPluginsTab() {
-  const main = document.getElementById('main');
-  let data;
-  try {
-    data = await fetchJson('/api/plugins');
-  } catch (e) {
-    main.innerHTML = `<div class="empty">Could not load plugins: ${escapeHtml(e.message)}</div>`;
-    return;
-  }
-  const slotted = plugins => plugins.filter((p) => p.slot);
-  const unslotted = plugins => plugins.filter((p) => !p.slot);
-  const allPlugins = data.plugins || [];
-  const rows = unslotted(allPlugins).map((p) => {
+// Pure HTML builders for the plugins tab: plain string in/out, no DOM, no fetch, no
+// event wiring -- each one extractable from renderPluginsTab so it can be unit-tested
+// in isolation (HUB0150 · 1/3). The rendered HTML they return is byte-identical to
+// the markup they replaced inline.
+function buildUnslottedRows(plugins) {
+  return plugins.filter((p) => !p.slot).map((p) => {
     const enabled = p.enabled !== false;
     return `
       <div style="display:flex; align-items:flex-start; gap:12px; padding:12px 14px; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
@@ -27,13 +20,12 @@ async function renderPluginsTab() {
         </div>
       </div>`;
   }).join('');
+}
 
-  // Slotted plugins (e.g. "hardware-tab") are mutually exclusive -- a radio group, not
-  // independent checkboxes, since exactly one (or none) actually runs at a time and
-  // switching genuinely starts/stops the underlying process (see /api/plugins/select-slot).
+function buildSlotSections(slottedPlugins) {
   const slotGroups = {};
-  slotted(allPlugins).forEach((p) => { (slotGroups[p.slot] = slotGroups[p.slot] || []).push(p); });
-  const slotSections = Object.entries(slotGroups).map(([slot, members]) => {
+  slottedPlugins.forEach((p) => { (slotGroups[p.slot] = slotGroups[p.slot] || []).push(p); });
+  return Object.entries(slotGroups).map(([slot, members]) => {
     const radioName = `slot-${slot}`;
     const noneChecked = !members.some((m) => m.active) ? 'checked' : '';
     const options = [`
@@ -60,29 +52,24 @@ async function renderPluginsTab() {
         <div class="meta slot-status" style="margin-top:6px;"></div>
       </div>`;
   }).join('');
+}
 
-  main.innerHTML = `
-    <h2 style="margin-top:0;">Plugins</h2>
-    ${slotSections}
-    <div class="meta" style="margin-bottom:14px;">
-      Only enabled plugins register their task sources. A change here restarts the pipeline if it is running so an
-      in-flight draft for a now-disabled source can't stall. Manifest: <span style="font-family:monospace;">${escapeHtml(data.manifestPath || 'plugins.json')}</span>
-    </div>
-    <div id="plugins-list">${rows || '<div class="empty">No plugins registered yet -- add one below.</div>'}</div>
-
-    <h3 style="margin-top:22px;">Add a plugin</h3>
+function buildAddPluginForm() {
+  return `<h3 style="margin-top:22px;">Add a plugin</h3>
     <div style="display:flex; flex-direction:column; gap:8px; max-width:640px;">
       <input type="text" id="plugin-add-path" placeholder="Absolute path to the plugin's register.js (e.g. /media/model-cache/github/agent-manager-imagegen/register.js)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
       <input type="text" id="plugin-add-name" placeholder="Name (optional -- defaults to the plugin folder name)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
       <input type="text" id="plugin-add-desc" placeholder="Description (optional)" style="padding:8px; background:var(--bg); border:1px solid var(--border); border-radius:6px; color:var(--text);">
       <button class="action" id="plugin-add-btn" style="align-self:flex-start;">Add plugin</button>
       <div id="plugin-add-msg" class="meta"></div>
-    </div>
+    </div>`;
+}
 
-    <h3 style="margin-top:22px;">Available plugins</h3>
-    <div id="marketplace-note" class="meta" style="margin-bottom:10px;"></div>
-    <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
-
+// Event-handler wiring for the plugins tab: each takes the rendered #main element and
+// attaches its handlers, extractable from renderPluginsTab so any one can be tested with
+// a minimal main element (HUB0150 · 2/3). Handlers are byte-identical to the inline
+// versions they replaced -- same selectors, fetch URLs, JSON bodies, and re-render calls.
+function wireSlotRadios(main) {
   main.querySelectorAll('.slot-radio').forEach((radio) => {
     radio.onchange = async () => {
       const slot = radio.dataset.slot;
@@ -109,7 +96,9 @@ async function renderPluginsTab() {
       }
     };
   });
+}
 
+function wirePluginToggles(main) {
   main.querySelectorAll('.plugin-toggle').forEach((cb) => {
     cb.onchange = async () => {
       cb.disabled = true;
@@ -130,7 +119,9 @@ async function renderPluginsTab() {
       }
     };
   });
+}
 
+function wireAddPluginForm(main) {
   const addBtn = main.querySelector('#plugin-add-btn');
   addBtn.onclick = async () => {
     const msg = main.querySelector('#plugin-add-msg');
@@ -156,10 +147,14 @@ async function renderPluginsTab() {
       addBtn.disabled = false;
     }
   };
+}
 
-  // Marketplace: fetch catalog entries annotated with install status and render
-  // Install / Update / Installed controls per entry. 402/403 surface via showToast.
-  (async () => {
+// Marketplace fetch/render for the plugins tab (HUB0150 · 3/3): fetches the catalog,
+// renders the catalog-error note into #marketplace-note and the per-entry Install/Update/
+// Installed cards into #marketplace-list, surfacing 402/403 via showToast. Extracted
+// verbatim from renderPluginsTab's inline IIFE so it is independently testable by mocking
+// fetchJson; the DOM output and handler wiring are byte-identical to what it replaced.
+async function renderMarketplace(main) {
     const listEl = main.querySelector('#marketplace-list');
     const noteEl = main.querySelector('#marketplace-note');
     let mkt;
@@ -239,7 +234,49 @@ async function renderPluginsTab() {
         }
       };
     });
-  })();
+}
+
+async function renderPluginsTab() {
+  const main = document.getElementById('main');
+  let data;
+  try {
+    data = await fetchJson('/api/plugins');
+  } catch (e) {
+    main.innerHTML = `<div class="empty">Could not load plugins: ${escapeHtml(e.message)}</div>`;
+    return;
+  }
+  const slotted = plugins => plugins.filter((p) => p.slot);
+  const allPlugins = data.plugins || [];
+  const rows = buildUnslottedRows(allPlugins);
+
+  // Slotted plugins (e.g. "hardware-tab") are mutually exclusive -- a radio group, not
+  // independent checkboxes, since exactly one (or none) actually runs at a time and
+  // switching genuinely starts/stops the underlying process (see /api/plugins/select-slot).
+  const slotSections = buildSlotSections(slotted(allPlugins));
+
+  main.innerHTML = `
+    <h2 style="margin-top:0;">Plugins</h2>
+    ${slotSections}
+    <div class="meta" style="margin-bottom:14px;">
+      Only enabled plugins register their task sources. A change here restarts the pipeline if it is running so an
+      in-flight draft for a now-disabled source can't stall. Manifest: <span style="font-family:monospace;">${escapeHtml(data.manifestPath || 'plugins.json')}</span>
+    </div>
+    <div id="plugins-list">${rows || '<div class="empty">No plugins registered yet -- add one below.</div>'}</div>
+
+    ${buildAddPluginForm()}
+
+    <h3 style="margin-top:22px;">Available plugins</h3>
+    <div id="marketplace-note" class="meta" style="margin-bottom:10px;"></div>
+    <div id="marketplace-list"><div class="meta">Loading...</div></div>`;
+
+  wireSlotRadios(main);
+  wirePluginToggles(main);
+  wireAddPluginForm(main);
+
+  // Marketplace: fetch catalog entries annotated with install status and render
+  // Install / Update / Installed controls per entry. 402/403 surface via showToast.
+  // Runs after main.innerHTML is written above so #marketplace-list/#marketplace-note exist.
+  await renderMarketplace(main);
 }
 
 function pipelineFlagBadges(s) {

@@ -28,7 +28,7 @@ function defaultTaskDomain(validDomains) {
 // instead of executing it directly -- can queue a real adhoc task without shelling out
 // to this script. Throws on an invalid domain rather than the CLI's own
 // print-and-exit(1), since a library call has no business calling process.exit.
-function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority }, { pipelineDir, domainsPath }) {
+function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriority, project }, { pipelineDir, domainsPath }) {
   if (!title) throw new Error('queueAdhocTask: title is required');
   if (!promptContext) throw new Error('queueAdhocTask: promptContext is required');
 
@@ -65,6 +65,8 @@ function queueAdhocTask({ title, promptContext, domain, dependsOn, premiumPriori
     // Chat-queued task; automating it here closes that gap.
     ...(premiumPriority ? { premiumPriority: true } : {}),
     ...(cleanDependsOn && cleanDependsOn.length ? { dependsOn: cleanDependsOn } : {}),
+    // The registered project this task was filed for (Chat's queue_reviewed_task passes it); informational.
+    ...(project ? { project } : {}),
   };
   const filePath = path.join(adhocDir, `${id}.json`);
   fs.writeFileSync(filePath, JSON.stringify(record, null, 2) + '\n');

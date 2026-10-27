@@ -76,7 +76,7 @@ function archiveStaleCandidate({ pipelineDir, taskId, domain, sourceName, titleT
   fs.writeFileSync(path.join(dir, `${taskId}.json`), JSON.stringify(record, null, 2));
 }
 
-function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
+function nextCandidateFulfillmentTask(candidatesPath, sourceName, opts = {}) {
   // lazy (see module header) -- task-sources.js is fully loaded by the time any
   // next() poll calls this.
   const { taskIdExistsInQueue, isDependencySatisfied } = require('../../task-sources.js');
@@ -188,9 +188,8 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     // into fetchedFiles (NOT into `files` -- those stay the candidate's declared edit
     // targets, which the review/decompose gates count against), so the drafter can ground
     // a cross-file change instead of editing blind or refusing.
-    const contextFiles = [...new Set(
-      [...section.matchAll(/(?<![\w/.-])((?:src|python|scripts|lib)\/[\w./-]+\.(?:js|ts|py|mjs|cjs))\b/g)].map((m) => m[1]),
-    )].filter((p) => !filesArray.includes(p)).slice(0, 3);
+    // Files the prose names (src/-style paths, relative require/import specifiers, any-directory paths); see citedContextFiles. Declared files never repeat as context.
+    const contextFiles = require('../../candidate-path-grounding.js').citedContextFiles({ section, declaredFiles: filesArray, repoRoot: getConfig().repoRoot, max: 3 });
 
     // Grounding fix (2026-08-21, confirmed live: observability-fix-ac-5 fabricated a
     // plausible-but-wrong `find` string -- "catch { return []; }" -- that matched nothing
@@ -221,9 +220,9 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
         return null; // doesn't exist / unreadable -- not an error, see comment above
       }
     };
-    const declaredFetched = filesArray.map((p) => readWindowed(p, false)).filter(Boolean);
-    const contextFetched = contextFiles.map((p) => readWindowed(p, true)).filter(Boolean);
-    const fetchedFiles = [...declaredFetched, ...contextFetched];
+    let declaredFetched = filesArray.map((p) => readWindowed(p, false)).filter(Boolean);
+    let contextFetched = contextFiles.map((p) => readWindowed(p, true)).filter(Boolean);
+    let fetchedFiles = [...declaredFetched, ...contextFetched];
 
     // Pre-draft premise recheck (see this file's own header comment above
     // staleSignatureReason/archiveStaleCandidate for the full incident): either check
@@ -283,6 +282,25 @@ function nextCandidateFulfillmentTask(candidatesPath, sourceName) {
     const groundingConfidence = declaredFetched.length > 0 && declaredFetched.every((f) => f.anchorConfidence === 'none')
       ? 'none'
       : null;
+
+    // Pre-filing gate hook (2026-09-24): optional caller-supplied gate that can
+    // archive a candidate (pre-filing citation validation, etc.) or correct its
+    // file list before the task is returned.
+    if (opts.preFilingGate) {
+      const gateResult = opts.preFilingGate({ sourceName, section, files: filesArray, repoRoot });
+      if (gateResult && gateResult.archiveReason) {
+        archiveStaleCandidate({
+          pipelineDir, taskId, domain: defaultDomain, sourceName, titleText, candidateId, section,
+          reason: gateResult.archiveReason,
+        });
+        continue;
+      }
+      if (gateResult && gateResult.files) {
+        filesArray = gateResult.files;
+        declaredFetched = filesArray.map((p) => readWindowed(p, false)).filter(Boolean);
+        fetchedFiles = [...declaredFetched, ...contextFetched];
+      }
+    }
 
     return {
       id: taskId,

@@ -10,6 +10,15 @@ const os = require('os');
 const path = require('path');
 
 const { sweepDerivedPremise } = require('./derived-premise-sweep.js');
+const { registerTaskSource, registerSourceAlias, getRegisteredSource } = require('./task-source-registry.js');
+
+// Core names no dead-code source: a source opts its done/ records into the "genuine verdict" index via its
+// registration (`genuineVerdict`). Stand-in shaped like the dead-code triage plugin source (tasks stamp
+// source: 'deadcode_triage', registered under another name).
+if (!getRegisteredSource('triage_stand_in')) {
+  registerTaskSource('triage_stand_in', { priority: 90, next: () => null, genuineVerdict: { idPrefix: 'deadcode-' } });
+  registerSourceAlias('deadcode_triage', 'triage_stand_in');
+}
 
 const NOW = Date.parse('2026-09-21T12:00:00Z');
 const iso = (h) => new Date(NOW - h * 3600 * 1000).toISOString();
@@ -112,4 +121,202 @@ test('REPORTS held derived tasks; dry run and the kill switch move nothing; an e
   put(dir, 'done/_archived_no_action', { id: 'dead', terminalDisposition: 'abandoned' });
   assert.deepEqual(run(dir, onlyExists).archived, [], 'an archived copy already exists: nothing is overwritten');
   assert.equal(has(dir, 'derived', 'dead'), true);
+});
+
+// ---- target-unreferenced (lib/inert-target.js), 2026-10-08 ----------------------------------------------------------------------------------------
+const RS = 'TaxHarvest/backend/src/services/runStore.js';
+const GENUINE = '### AC-017 · Remove unused `_patchRun`\n\nStrength: Strong\nFiles: x\n\nProblem: p';
+const writeFlags = (dir, flags) => fs.writeFileSync(path.join(dir, 'queue', 'dead-code-flags.json'), JSON.stringify(flags));
+const putTriage = (dir, symbol, resp = GENUINE) => put(dir, 'done', { id: `deadcode-${symbol}`, source: 'deadcode_triage', promptContext: { symbol, definedIn: RS }, implementResponse: resp });
+const patchRunTask = (id = 'patchrun-1', over = {}) => dt(id, 'In `runStore.js`, `_patchRun` (lines 38-43) unconditionally deletes p.status when the run is Stopped.', { title: "`_patchRun` silently drops status changes when run is already 'Stopped'", ...over });
+const inertEnv = (v) => { const prev = process.env.AGENT_MANAGER_DERIVED_INERT_TARGET; if (v === undefined) delete process.env.AGENT_MANAGER_DERIVED_INERT_TARGET; else process.env.AGENT_MANAGER_DERIVED_INERT_TARGET = v; return () => { if (prev === undefined) delete process.env.AGENT_MANAGER_DERIVED_INERT_TARGET; else process.env.AGENT_MANAGER_DERIVED_INERT_TARGET = prev; }; };
+const sweep = (dir) => run(dir);
+
+test('INERT TARGET: flagged unreferenced + a GENUINE triage verdict -> retired as target-unreferenced, with the symbol recorded', () => {
+  const restore = inertEnv(undefined);
+  try {
+    const dir = pipeline();
+    fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+    writeFlags(dir, [{ symbol: '_patchRun', definedIn: RS, callSites: [] }]);
+    putTriage(dir, '_patchRun');
+    put(dir, 'derived', patchRunTask());
+    const s = sweep(dir);
+    assert.deepEqual(s.archived, [{ id: 'patchrun-1', rule: 'target-unreferenced', from: 'derived' }]);
+    assert.equal(has(dir, 'derived', 'patchrun-1'), false);
+    const rec = readArchived(dir, 'patchrun-1');
+    assert.equal(rec.autoRetired.rule, 'target-unreferenced');
+    assert.equal(rec.autoRetired.symbol, '_patchRun');
+    assert.equal(rec.autoRetired.definedIn, RS);
+    assert.equal(rec.terminalDisposition, 'abandoned');
+  } finally { restore(); }
+});
+
+test('INERT TARGET: flagged but NO genuine verdict -> stamped and held (derived/), not retired; a second sweep does not re-stamp', () => {
+  const restore = inertEnv(undefined);
+  try {
+    const dir = pipeline();
+    fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+    writeFlags(dir, [{ symbol: '_patchRun', definedIn: RS, callSites: [] }]);
+    putTriage(dir, '_patchRun', 'FALSE POSITIVE -- loaded through a route table the search cannot see.');
+    put(dir, 'derived', patchRunTask());
+    const s = sweep(dir);
+    assert.deepEqual(s.archived, []);
+    assert.equal(s.inertHeld.length, 1);
+    const rec = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'derived', 'patchrun-1.json'), 'utf8'));
+    assert.equal(rec.inertTarget.symbol, '_patchRun');
+    assert.equal(rec.inertTarget.held, true);
+    assert.match(rec.history.at(-1).detail, /no call sites.*no GENUINE triage verdict/);
+    const again = sweep(dir);
+    assert.equal(again.inertHeld.length, 0, 'already stamped');
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'derived', 'patchrun-1.json'), 'utf8')).history.filter((h) => h.stage === 'advisory').length, 1);
+  } finally { restore(); }
+});
+
+test('INERT TARGET: a pending task is stamped but not held (a lane may already claim it); a stacked or human-queued one is left alone', () => {
+  const restore = inertEnv(undefined);
+  try {
+    const dir = pipeline();
+    writeFlags(dir, [{ symbol: '_patchRun', definedIn: RS, callSites: [] }]);
+    put(dir, 'pending', patchRunTask('p-pending'));
+    put(dir, 'derived', patchRunTask('p-stacked', { stacked: { branch: 'agent/x' } }));
+    put(dir, 'derived', patchRunTask('p-human', { humanQueued: true }));
+    const s = sweep(dir);
+    assert.deepEqual(s.inertHeld.map((x) => x.id), ['p-pending']);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'pending', 'p-pending.json'), 'utf8')).inertTarget.held, false);
+    assert.equal(has(dir, 'derived', 'p-stacked'), true);
+    assert.equal(has(dir, 'derived', 'p-human'), true);
+  } finally { restore(); }
+});
+
+test('INERT TARGET: a called symbol, a missing flags file, a corrupt flags file and mode=off change nothing', () => {
+  const restore = inertEnv(undefined);
+  try {
+    const dir = pipeline();
+    put(dir, 'derived', patchRunTask('no-flags'));
+    assert.deepEqual(sweep(dir).archived, [], 'no flags file');
+    fs.writeFileSync(path.join(dir, 'queue', 'dead-code-flags.json'), '{corrupt');
+    assert.deepEqual(sweep(dir).archived, [], 'corrupt flags file');
+    writeFlags(dir, [{ symbol: '_patchRun', definedIn: RS, callSites: [{ file: 'a.js', line: 4 }] }]);
+    const s = sweep(dir);
+    assert.deepEqual([s.archived, s.inertHeld], [[], []], 'the symbol has a caller');
+    writeFlags(dir, [{ symbol: '_patchRun', definedIn: RS, callSites: [] }]);
+    fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+    putTriage(dir, '_patchRun');
+    inertEnv('off');
+    const off = sweep(dir);
+    assert.deepEqual([off.archived, off.inertHeld], [[], []], 'mode off');
+    assert.equal(has(dir, 'derived', 'no-flags'), true);
+  } finally { restore(); }
+});
+
+test('INERT TARGET: mode=hold never retires even with a genuine verdict', () => {
+  const restore = inertEnv('hold');
+  try {
+    const dir = pipeline();
+    fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+    writeFlags(dir, [{ symbol: '_patchRun', definedIn: RS, callSites: [] }]);
+    putTriage(dir, '_patchRun');
+    put(dir, 'derived', patchRunTask());
+    const s = sweep(dir);
+    assert.deepEqual(s.archived, []);
+    assert.equal(s.inertHeld.length, 1);
+  } finally { restore(); }
+});
+
+test('INERT TARGET re-admission: a stamped task is released and a retired one restored (once) when the scanner finds a caller', () => {
+  const restore = inertEnv(undefined);
+  try {
+    const dir = pipeline();
+    fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+    // held task whose symbol gains a caller
+    put(dir, 'derived', patchRunTask('held-1', { inertTarget: { symbol: '_patchRun', definedIn: RS, at: iso(2), held: true } }));
+    // retired task whose symbol gains a caller
+    put(dir, 'done/_archived_no_action', patchRunTask('retired-1', { terminalDisposition: 'abandoned', autoRetired: { rule: 'target-unreferenced', detail: 'x', at: iso(3), symbol: '_patchRun', definedIn: RS } }));
+    // retired for a DIFFERENT rule: never restored by this sweep
+    put(dir, 'done/_archived_no_action', patchRunTask('other-rule', { terminalDisposition: 'abandoned', autoRetired: { rule: 'all-cited-files-missing', detail: 'x', at: iso(3), symbol: '_patchRun', definedIn: RS } }));
+    // already restored once and retired again: never ping-pong
+    put(dir, 'done/_archived_no_action', patchRunTask('already-readmitted', { terminalDisposition: 'abandoned', inertTargetReadmitted: true, autoRetired: { rule: 'target-unreferenced', detail: 'x', at: iso(3), symbol: '_patchRun', definedIn: RS } }));
+    // retired, and its symbol is STILL unreferenced: stays retired
+    put(dir, 'done/_archived_no_action', patchRunTask('still-dead', { terminalDisposition: 'abandoned', autoRetired: { rule: 'target-unreferenced', detail: 'x', at: iso(3), symbol: 'stillDead', definedIn: RS } }));
+    writeFlags(dir, [{ symbol: '_patchRun', definedIn: RS, callSites: [{ file: 'worker.js', line: 9 }] }, { symbol: 'stillDead', definedIn: RS, callSites: [] }]);
+    const s = sweep(dir);
+    assert.deepEqual(s.inertReleased.map((x) => x.id), ['held-1']);
+    assert.deepEqual(s.inertReadmitted, ['retired-1']);
+    const held = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'derived', 'held-1.json'), 'utf8'));
+    assert.equal(held.inertTarget, undefined);
+    assert.equal(has(dir, 'derived', 'retired-1'), true);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'retired-1.json')), false);
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'other-rule.json')), true, 'retired for a different rule');
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'already-readmitted.json')), true, 'restored once already');
+    assert.equal(fs.existsSync(path.join(dir, 'queue', 'done', '_archived_no_action', 'still-dead.json')), true, 'its symbol still has no caller');
+    assert.equal(has(dir, 'derived', 'still-dead'), false);
+    const back = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'derived', 'retired-1.json'), 'utf8'));
+    assert.equal(back.inertTargetReadmitted, true);
+    assert.equal(back.autoRetired, undefined);
+    assert.equal(back.terminalDisposition, undefined);
+    assert.equal(back.history.at(-1).stage, 'readmitted');
+  } finally { restore(); }
+});
+
+test('INERT TARGET: a held task is held by isHeld, within the hold cap only', () => {
+  const gate = require('./derived-gate.js');
+  const stamped = { id: 'h', title: 'x', createdAt: iso(1), promptContext: { rawText: 'about `runStore.js`' }, inertTarget: { symbol: '_patchRun', definedIn: RS, held: true } };
+  assert.deepEqual(gate.isHeld(stamped, [], { now: NOW }), { held: true, by: ['inert-target'] });
+  assert.equal(gate.isHeld({ ...stamped, createdAt: iso(48) }, [], { now: NOW }).held, false, 'past the 24h hold cap it runs anyway');
+  assert.equal(gate.isHeld({ ...stamped, humanQueued: true }, [], { now: NOW }).held, false);
+  assert.equal(gate.isHeld({ ...stamped, inertTarget: { ...stamped.inertTarget, held: false } }, [], { now: NOW }).held, false);
+});
+
+// --- inert leftovers (2026-10-08): a derived/ record whose id already exists elsewhere is a stale copy, moved aside ------------------------------------------------------
+// 144 of 146 records in TaxHarvest's derived/ were copies of tasks that had moved on (done / archived); they were never drafted, but they made a retired area look like 23 live tasks.
+const aged = (dir, state, id, hoursOld = 2) => { const f = path.join(dir, 'queue', state, `${id}.json`); const t = new Date(NOW - hoursOld * 3600 * 1000); fs.utimesSync(f, t, t); };
+const supersededCopy = (dir, id) => JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'derived', '_superseded', `${id}.json`), 'utf8'));
+
+test('LEFTOVERS: a derived/ copy of a task that already exists in done/, the archive, a queue dir or a lane is moved to derived/_superseded/ with a stamp; the real record is untouched', () => {
+  const dir = pipeline();
+  const spots = [['done', 'in-done'], ['done/_archived_no_action', 'in-archive'], ['pending', 'in-pending'], ['blocked', 'in-blocked'], ['needs-clarification', 'in-nc'], ['drafting/worker-1', 'in-lane']];
+  for (const [state, id] of spots) {
+    put(dir, 'derived', dt(id, 'Problem in `src/exists.ts`')); aged(dir, 'derived', id);
+    fs.writeFileSync(path.join(dir, 'queue', ...state.split('/'), `${id}.json`), JSON.stringify({ id, source: 'derived_task', marker: 'real' }));
+  }
+  const s = run(dir);
+  assert.deepEqual(s.leftoversSuperseded.map((x) => x.id).sort(), spots.map(([, id]) => id).sort());
+  for (const [state, id] of spots) {
+    assert.equal(has(dir, 'derived', id), false, `${id} left derived/`);
+    const rec = supersededCopy(dir, id);
+    assert.equal(rec.supersededBy.state, state);
+    assert.equal(rec.history.at(-1).stage, 'superseded');
+    assert.match(rec.history.at(-1).detail, /already exists in /);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'queue', ...state.split('/'), `${id}.json`), 'utf8')).marker, 'real', 'the real record is untouched');
+  }
+});
+
+test('LEFTOVERS: a genuinely unclaimed derived task, a young copy (promotion may still be in progress) and an existing superseded copy are all left alone', () => {
+  const dir = pipeline();
+  put(dir, 'derived', dt('unclaimed', 'Problem in `src/exists.ts`')); aged(dir, 'derived', 'unclaimed');
+  put(dir, 'derived', dt('young', 'Problem in `src/exists.ts`')); put(dir, 'done', { id: 'young', source: 'derived_task' });   // mtime is "now" (real clock) -> younger than 10 min
+  put(dir, 'derived', dt('dupe', 'Problem in `src/exists.ts`')); aged(dir, 'derived', 'dupe'); put(dir, 'done', { id: 'dupe', source: 'derived_task' });
+  fs.mkdirSync(path.join(dir, 'queue', 'derived', '_superseded'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'derived', '_superseded', 'dupe.json'), JSON.stringify({ id: 'dupe', marker: 'older superseded copy' }));
+  const s = run(dir);
+  assert.deepEqual(s.leftoversSuperseded, []);
+  for (const id of ['unclaimed', 'young', 'dupe']) assert.equal(has(dir, 'derived', id), true, id);
+  assert.equal(supersededCopy(dir, 'dupe').marker, 'older superseded copy', 'never overwritten');
+});
+
+test('LEFTOVERS: dry-run reports without moving; AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP=off disables it; the _superseded dir is invisible to the sweep itself', () => {
+  const dir = pipeline();
+  put(dir, 'derived', dt('l1', 'Problem in `src/exists.ts`')); aged(dir, 'derived', 'l1'); put(dir, 'done', { id: 'l1', source: 'derived_task' });
+  const dry = run(dir, { dryRun: true });
+  assert.deepEqual(dry.leftoversSuperseded.map((x) => x.id), ['l1']);
+  assert.equal(has(dir, 'derived', 'l1'), true, 'dry run moves nothing');
+  const prev = process.env.AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP;
+  process.env.AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP = 'off';
+  try {
+    assert.deepEqual(run(dir).leftoversSuperseded, []);
+    assert.equal(has(dir, 'derived', 'l1'), true);
+  } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP; else process.env.AGENT_MANAGER_DERIVED_LEFTOVER_CLEANUP = prev; }
+  const real = run(dir);
+  assert.deepEqual(real.leftoversSuperseded.map((x) => x.id), ['l1']);
+  assert.equal(run(dir).leftoversSuperseded.length, 0, 'a second sweep finds nothing: the moved copy is not re-scanned');
 });

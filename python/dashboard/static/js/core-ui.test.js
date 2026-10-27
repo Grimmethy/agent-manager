@@ -181,3 +181,52 @@ test('real refresh(): the 5s timer firing while a cycle (including its render) i
   resolve('/api/adhoc-tasks', { tasks: [] });
   await next;
 });
+
+// --- Forges first on a phone (2026-10-14): the owner uses the Forges group most from the phone and does not want to scroll the tab strip for it.
+// navOrder(tabs, narrow) is the pure ordering step renderNav() uses; the second group renders the REAL renderNav into a fake #nav.
+
+const { navOrder } = require('./core-ui.js');
+
+const NAV_TABS = [
+  { key: 'project', label: 'Project' }, { key: 'workers', label: 'Workers' },
+  { group: 'Forges', children: [{ key: 'promptforge', label: 'PromptForge' }, { key: 'stageforge', label: 'StageForge' }] },
+  { key: 'branches', label: 'Branches' },
+  { group: 'Job Status', children: [{ key: 'pending', label: 'Pending' }] },
+];
+const names = tabs => tabs.map(t => t.group || t.key);
+
+test('navOrder: on a narrow screen the Forges group comes first and everything else keeps its order', () => {
+  assert.deepEqual(names(navOrder(NAV_TABS, true)), ['Forges', 'project', 'workers', 'branches', 'Job Status']);
+});
+
+test('navOrder: on a wide screen the order is untouched', () => {
+  assert.deepEqual(names(navOrder(NAV_TABS, false)), ['project', 'workers', 'Forges', 'branches', 'Job Status']);
+});
+
+test('navOrder: no Forges group (no plugin declares one) leaves the list alone, and the input is never mutated', () => {
+  const noForges = NAV_TABS.filter(t => t.group !== 'Forges');
+  assert.deepEqual(names(navOrder(noForges, true)), names(noForges));
+  const before = JSON.stringify(NAV_TABS);
+  navOrder(NAV_TABS, true);
+  assert.equal(JSON.stringify(NAV_TABS), before);
+});
+
+test('real renderNav on a phone puts the Forges header first, followed by its tabs, then the rest', () => {
+  const buttons = [];
+  const mkBtn = () => ({ className: '', style: {}, innerHTML: '', title: '', onclick: null });
+  const nav = { innerHTML: '', appendChild(b) { buttons.push(b); } };
+  const ctx = vm.createContext({
+    console, localStorage: { getItem: () => null, setItem() {} },
+    document: { getElementById: id => (id === 'nav' ? nav : null), createElement: mkBtn },
+    window: { matchMedia: q => ({ matches: /max-width:\s*860px/.test(q), addEventListener() {} }) },
+    counts: {}, activeTab: 'project', severityForTab: () => '', TAB_COUNT_SEVERITY_THRESHOLDS: {}, switchToTab() {},
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'core-ui.js'), 'utf8'), ctx);
+  vm.runInContext('TABS = ' + JSON.stringify(NAV_TABS), ctx);   // TABS is a `let` in the script: a property on the context would not reach it
+  ctx.renderNav();
+  const text = b => b.innerHTML.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  assert.match(text(buttons[0]), /Forges/);
+  assert.match(text(buttons[1]), /PromptForge/);
+  assert.match(text(buttons[2]), /StageForge/);
+  assert.match(text(buttons[3]), /Project/);
+});

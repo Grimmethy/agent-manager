@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
-  runGroundingCheck, checkFabricatedSymbols, parseGroundingVerdict,
+  runGroundingCheck, checkFabricatedSymbols, parseGroundingVerdict, checkTypeFidelity,
 } = require('./deep-dive-grounding-check.js');
 
 // Real incident shape: the draft cites `TextFileConverter`/`ConversionError`, but the
@@ -230,4 +230,119 @@ test('checkFabricatedSymbols still flags a fabricated file name that merely star
   for (const name of ['util.py', 'events.js', 'stream.ts']) {
     assert.equal(checkFabricatedSymbols(task(), `See \`${name}\`.`).length, 1, name);
   }
+});
+
+// --- checkTypeFidelity: a REAL symbol cited with the wrong declared kind ---------------
+// The #28/#36/#35 failure shape: checkFabricatedSymbols passes because the name is real,
+// but the draft describes it as the wrong kind of thing (a TypedDict as a "class").
+
+const TYPEDICT_FILE = {
+  path: 'haystack/config.py',
+  content: [
+    'from typing import TypedDict',
+    'class MyConfig(TypedDict):',
+    '    name: str',
+    '',
+    'def helper():',
+    '    return {"ok": True}',
+  ].join('\n'),
+};
+
+const typedDictTask = (over = {}) => ({
+  source: 'deep_dive',
+  promptContext: { projectName: 'deepset-ai/haystack', communityName: 'config', files: [TYPEDICT_FILE], ...over.promptContext },
+  ...over,
+});
+
+test('checkTypeFidelity flags a TypedDict described as a "class"', () => {
+  const r = checkTypeFidelity(typedDictTask(), 'The `MyConfig` class holds the pipeline settings.');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].kind, 'type-mismatch');
+  assert.match(r[0].detail, /`MyConfig`/);
+  assert.match(r[0].detail, /TypedDict/);
+});
+
+test('checkTypeFidelity flags a TypedDict assigned via MyConfig = TypedDict(...)', () => {
+  const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'MyConfig = TypedDict("MyConfig", {"x": int})' }] } });
+  assert.equal(checkTypeFidelity(t, 'The `MyConfig` class is the entry point.').length, 1);
+});
+
+test('checkTypeFidelity does not flag a real class correctly described as a class', () => {
+  const t = typedDictTask({ promptContext: { files: [{ path: 'c.py', content: 'class RealClass:\n    pass' }] } });
+  assert.deepEqual(checkTypeFidelity(t, 'The `RealClass` class converts inputs.'), []);
+});
+
+test('checkTypeFidelity does not flag a symbol absent from the source (that is checkFabricatedSymbols\' job)', () => {
+  const r = checkTypeFidelity(typedDictTask(), 'The `GhostClass` class is undocumented.');
+  assert.deepEqual(r, []);
+});
+
+test('checkTypeFidelity flags a function (def helper) described as a "class"', () => {
+  const r = checkTypeFidelity(typedDictTask(), 'A `helper` class is invoked per file.');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].kind, 'type-mismatch');
+  assert.match(r[0].detail, /`helper`/);
+  assert.match(r[0].detail, /function/);
+});
+
+test('checkTypeFidelity does not flag a function correctly described as a function', () => {
+  assert.deepEqual(checkTypeFidelity(typedDictTask(), 'The `helper` function returns a status dict.'), []);
+});
+
+test('checkTypeFidelity does not flag a symbol whose window contains BOTH words (draft is accurate)', () => {
+  const r = checkTypeFidelity(typedDictTask(), '`MyConfig` is a class in the typing sense -- specifically a TypedDict.');
+  assert.deepEqual(r, []);
+});
+
+test('checkTypeFidelity does not flag a bare citation with no kind word nearby', () => {
+  assert.deepEqual(checkTypeFidelity(typedDictTask(), 'See `MyConfig` for the field list.'), []);
+});
+
+test('checkTypeFidelity returns nothing when the task has no real files', () => {
+  assert.deepEqual(checkTypeFidelity(typedDictTask({ promptContext: { files: [] } }), 'The `MyConfig` class...'), []);
+});
+
+test('runGroundingCheck catches a TypedDict-as-class mislabel deterministically, no model call', async () => {
+  let calls = 0;
+  const call = async () => { calls += 1; return { response: 'GROUNDED' }; };
+  const r = await runGroundingCheck(typedDictTask(), 'The `MyConfig` class holds the pipeline settings.', { call });
+  assert.equal(r.verdict, 'ungrounded');
+  assert.equal(calls, 0, 'the type-fidelity check must short-circuit before any model call');
+  assert.equal(r.ungrounded.length, 1);
+  assert.deepEqual(r.ungrounded.map((f) => f.kind), ['type-mismatch']);
+});
+
+// --- Clause-narrowing regression (the +-120-char window defect) --------------------------
+// Source declares BOTH `def parse` (function) and `class Foo`. The old flat window around
+// `parse` swallowed "class" from the same sentence and flagged parse as a class -- a false
+// positive in a perfectly accurate sentence. Cutting the window at the other symbol
+// mention (no . ; , between them here) fixes it without dropping the true positive.
+
+const PARSE_FOO_FILE = {
+  path: 'mod.py',
+  content: [
+    'class Foo:',
+    '    pass',
+    '',
+    'def parse(self):',
+    '    return self',
+  ].join('\n'),
+};
+
+const parseFooTask = (over = {}) => ({
+  source: 'deep_dive',
+  promptContext: { projectName: 'acme/widget', communityName: 'core', files: [PARSE_FOO_FILE], ...over.promptContext },
+  ...over,
+});
+
+test('checkTypeFidelity does not flag `parse` (a real function) in "the `parse` function is called by the `Foo` class"', () => {
+  assert.deepEqual(checkTypeFidelity(parseFooTask(), 'the `parse` function is called by the `Foo` class'), []);
+});
+
+test('checkTypeFidelity still flags a real function TRULY called a class in the same sentence shape', () => {
+  const r = checkTypeFidelity(parseFooTask(), 'the `parse` class is called by the `Foo` class');
+  assert.equal(r.length, 1);
+  assert.equal(r[0].kind, 'type-mismatch');
+  assert.match(r[0].detail, /`parse`/);
+  assert.match(r[0].detail, /function/);
 });

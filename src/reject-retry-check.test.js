@@ -1292,6 +1292,50 @@ test('rejectRetryCheck requeues a plan-degenerate block under the retry cap, eve
   assert.ok(requeued.history.some((h) => h.stage === 'requeued' && /plan-pass degenerate/.test(h.detail || '')));
 });
 
+test('rejectRetryCheck: a plan-degenerate block records the lane it happened on in avoidLanes when two lanes exist', () => {
+  const lanes = require('./lanes.js');
+  const prev = { url: process.env.AGENT_MANAGER_P40_OLLAMA_URL, model: process.env.AGENT_MANAGER_P40_MODEL };
+  process.env.AGENT_MANAGER_P40_OLLAMA_URL = 'http://192.0.2.1:11434';
+  process.env.AGENT_MANAGER_P40_MODEL = 'qwen-p40-test';
+  try {
+    assert.ok(lanes.getLanes().length >= 2, 'precondition: the P40 env creates a second lane');
+    const { blockedDir, pendingDir } = setupDirs();
+    writeBlockedTask(blockedDir, 'task-lane', {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      planResponse: 'a truncated, unusable plan',
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-p40', finishedAt: new Date().toISOString() }],
+    });
+    rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+    const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-lane.json'), 'utf8'));
+    assert.deepEqual(requeued.avoidLanes, ['worker-p40']);
+    assert.ok(requeued.history.some((h) => h.stage === 'lane-avoided' && /worker-p40/.test(h.detail || '')));
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_P40_OLLAMA_URL', prev.url], ['AGENT_MANAGER_P40_MODEL', prev.model]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test('rejectRetryCheck: a plan-degenerate block does NOT record avoidLanes on a single-lane setup', () => {
+  const prev = { url: process.env.AGENT_MANAGER_P40_OLLAMA_URL, model: process.env.AGENT_MANAGER_P40_MODEL };
+  delete process.env.AGENT_MANAGER_P40_OLLAMA_URL;
+  delete process.env.AGENT_MANAGER_P40_MODEL;
+  try {
+    const { blockedDir, pendingDir } = setupDirs();
+    writeBlockedTask(blockedDir, 'task-single', {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-3090', finishedAt: new Date().toISOString() }],
+    });
+    rejectRetryCheck({ blockedDir, pendingDir, recordModelOutcome: () => {} });
+    const requeued = JSON.parse(fs.readFileSync(path.join(pendingDir, 'task-single.json'), 'utf8'));
+    assert.equal(requeued.avoidLanes, undefined);
+  } finally {
+    for (const [k, v] of [['AGENT_MANAGER_P40_OLLAMA_URL', prev.url], ['AGENT_MANAGER_P40_MODEL', prev.model]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
 test('rejectRetryCheck exhausts a non-adhoc plan-degenerate block at the retry cap without escalating', () => {
   const { blockedDir, pendingDir } = setupDirs();
   writeBlockedTask(blockedDir, 'task-1', {
@@ -1553,4 +1597,235 @@ test('rejectRetryCheck requeues a plan-degenerate block at localRejectCount 1 (o
   assert.equal(requeued.localRejectCount, 2);
   assert.equal(requeued.planResponse, undefined, 'the stale degenerate plan must not survive the requeue');
   assert.ok(requeued.priorRejectionFeedback.some((f) => /degenerate/.test(f)), 'the degenerate reason is carried as prior feedback for the next redraft');
+});
+
+// --- stale-premise gate false positive (2026-10-07): "sub-task premise may be stale" blocked
+// hub sub-tasks whose cited file exists under a monorepo sub-root (HUB0007-02, HUB0008-01,
+// HUB0012-02 on TaxHarvest). Nothing re-admitted them: no blockedStage, no needsClarification, so
+// every gate here skipped them. Re-admitted clean-slate exactly once when the gate no longer fires. ---
+
+const STALE_PREMISE_REASON = "sub-task premise may be stale: This sub-task's premise may be stale (filed by an internal decompose, then the codebase moved on): cites `src/routes/x.js`, but that file does not exist in the repo.";
+
+function staleMonorepo(files) {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'stale-premise-repo-'));
+  for (const [rel, lines] of Object.entries(files)) {
+    const abs = path.join(repo, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, Array.from({ length: lines }, (_, i) => `// ${i + 1}`).join('\n'));
+  }
+  return repo;
+}
+
+function stalePremiseTask(extra = {}) {
+  return {
+    id: 'HUB0007-02-reduce-handler', domain: 'adhoc', source: 'manual', status: 'pending',
+    title: 'HUB0007 · 2/2 · Reduce handler',
+    promptContext: { decomposedFrom: 'parent-1', rawText: 'In src/routes/x.js near line 120, reduce the handler.' },
+    blockedReason: STALE_PREMISE_REASON,
+    localRejectCount: 1, priorRejectionFeedback: ['an earlier note'],
+    history: [{ stage: 'blocked', at: '2026-10-05T01:31:00Z', detail: STALE_PREMISE_REASON }],
+    ...extra,
+  };
+}
+
+test('a stale-premise block whose cited file really exists under a sub-root is re-admitted once, clean slate', () => {
+  const d = setupAdhocDirs();
+  const repoRoot = staleMonorepo({ 'sub/backend/src/routes/x.js': 400 });
+  fs.writeFileSync(path.join(d.blockedDir, 'stale-1.json'), JSON.stringify(stalePremiseTask()));
+
+  const summary = rejectRetryCheck({ ...d, repoRoot, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(d.adhocDir, 'stale-1.json')), 'back in queue/adhoc/');
+  assert.ok(!fs.existsSync(path.join(d.blockedDir, 'stale-1.json')));
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'stale-1.json'), 'utf8'));
+  assert.equal(out.blockedReason, undefined, 'the gate\'s false verdict is cleared');
+  assert.equal(out.localRejectCount, undefined, 'retry budget reset');
+  assert.equal(out.priorRejectionFeedback, undefined);
+  assert.equal(out.stalePremiseReadmitted, true, 'stamped so it happens at most once');
+  assert.equal(out.status, 'pending');
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /stale-premise verdict/.test(h.detail)));
+});
+
+test('a stale-premise block that STILL holds (the file really is missing) is left alone', () => {
+  const d = setupAdhocDirs();
+  const repoRoot = staleMonorepo({ 'sub/backend/src/routes/other.js': 400 });
+  fs.writeFileSync(path.join(d.blockedDir, 'stale-2.json'), JSON.stringify(stalePremiseTask({ id: 'stale-2' })));
+
+  const summary = rejectRetryCheck({ ...d, repoRoot, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(d.blockedDir, 'stale-2.json')), 'still parked in blocked/');
+  assert.ok(!fs.existsSync(path.join(d.adhocDir, 'stale-2.json')));
+});
+
+test('the stale-premise re-admission fires at most once (stalePremiseReadmitted stamp)', () => {
+  const d = setupAdhocDirs();
+  const repoRoot = staleMonorepo({ 'sub/backend/src/routes/x.js': 400 });
+  fs.writeFileSync(path.join(d.blockedDir, 'stale-3.json'), JSON.stringify(stalePremiseTask({ id: 'stale-3', stalePremiseReadmitted: true })));
+
+  const summary = rejectRetryCheck({ ...d, repoRoot, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0, 'not re-admitted a second time');
+  assert.ok(!fs.existsSync(path.join(d.adhocDir, 'stale-3.json')));
+});
+
+test('a block with any OTHER reason is never treated as a stale-premise re-admission', () => {
+  const d = setupAdhocDirs();
+  const repoRoot = staleMonorepo({ 'sub/backend/src/routes/x.js': 400 });
+  fs.writeFileSync(path.join(d.blockedDir, 'stale-4.json'), JSON.stringify(stalePremiseTask({ id: 'stale-4', blockedReason: 'task requires something else entirely' })));
+
+  const summary = rejectRetryCheck({ ...d, repoRoot, recordModelOutcome: () => {} });
+
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(d.blockedDir, 'stale-4.json')));
+});
+
+test('stalePremiseGateNoLongerFires answers false without a repoRoot or when detection throws', () => {
+  const { stalePremiseGateNoLongerFires } = require('./lib/reject-retry-check.js');
+  assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), {}), false, 'no repoRoot -> never re-admit on doubt');
+  assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), { repoRoot: '/r', detectFn: () => { throw new Error('boom'); } }), false);
+  assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), { repoRoot: '/r', detectFn: () => null }), true);
+  assert.equal(stalePremiseGateNoLongerFires(stalePremiseTask(), { repoRoot: '/r', detectFn: () => ({ stale: true }) }), false);
+});
+
+
+// --- external-dependency gate false positive (2026-10-07, class B): "task requires external-state
+// operation" blocked ordinary code edits on credential/network words in prose or code spans. No
+// blockedStage / needsClarification, so nothing re-admitted them. One clean-slate re-admit when the
+// gate no longer blocks; a genuine hard-marker block is left alone. ---
+
+const EXT_REASON = (label) => `task requires external-state operation (${label}) that the local sandbox cannot perform -- needs a human to provision the resource first.`;
+
+function extDepTask(extra = {}) {
+  return {
+    id: 'ext-1', domain: 'adhoc', source: 'manual', status: 'blocked',
+    title: 'Fix ensureDriveToken',
+    promptContext: { rawText: 'In `credential.idToken` handling the `access_token` variable is stale.' },
+    blockedReason: EXT_REASON('credentials/API keys/tokens/secrets'),
+    localRejectCount: 1, priorRejectionFeedback: ['an earlier note'],
+    history: [{ stage: 'blocked', at: '2026-10-07T01:00:00Z', detail: 'external-state' }],
+    ...extra,
+  };
+}
+
+test('an external-dependency block the fixed gate no longer produces is re-admitted once, clean slate', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'ext-1.json'), JSON.stringify(extDepTask()));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 1);
+  assert.ok(fs.existsSync(path.join(d.adhocDir, 'ext-1.json')));
+  const out = JSON.parse(fs.readFileSync(path.join(d.adhocDir, 'ext-1.json'), 'utf8'));
+  assert.equal(out.blockedReason, undefined);
+  assert.equal(out.localRejectCount, undefined);
+  assert.equal(out.externalDepReadmitted, true);
+  assert.equal(out.status, 'pending');
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /external-dependency gate/.test(h.detail)));
+});
+
+test('a genuine hard-marker external-dependency block is NOT re-admitted', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'ext-2.json'), JSON.stringify(extDepTask({ id: 'ext-2', title: 'Create a new repo for the plugin', promptContext: { rawText: 'we need a fresh repo' }, blockedReason: EXT_REASON('creating a new repo') })));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 0);
+  assert.ok(fs.existsSync(path.join(d.blockedDir, 'ext-2.json')));
+});
+
+test('the external-dependency re-admission fires at most once (externalDepReadmitted stamp)', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'ext-3.json'), JSON.stringify(extDepTask({ id: 'ext-3', externalDepReadmitted: true })));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 0);
+});
+
+test('a soft-marker external-dependency block is re-admitted in the default advisory mode but NOT while block mode still blocks it', () => {
+  const soft = (id) => extDepTask({ id, title: 'Add the API key to config', promptContext: { rawText: 'add the API key to config' } });
+  const prev = process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE;
+  try {
+    process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE = 'block';
+    let d = setupAdhocDirs();
+    fs.writeFileSync(path.join(d.blockedDir, 'ext-4.json'), JSON.stringify(soft('ext-4')));
+    assert.equal(rejectRetryCheck({ ...d, recordModelOutcome: () => {} }).requeued, 0, 'block mode still blocks a soft marker: not re-admitted');
+    assert.ok(fs.existsSync(path.join(d.blockedDir, 'ext-4.json')));
+    delete process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE;
+    d = setupAdhocDirs();
+    fs.writeFileSync(path.join(d.blockedDir, 'ext-5.json'), JSON.stringify(soft('ext-5')));
+    assert.equal(rejectRetryCheck({ ...d, recordModelOutcome: () => {} }).requeued, 1, 'advisory mode no longer blocks it: re-admitted once');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE; else process.env.AGENT_MANAGER_EXTERNAL_DEP_MODE = prev;
+  }
+});
+
+// --- one-child candidate split (2026-10-07, class C): blocked BEFORE the in-draft retry existed -> re-admitted once so the retry runs ---
+const SPLIT_REASON = 'Implement pass said mode "split" but only 1 of 1 proposed sub-candidate(s) had a real title/problem/solution -- at least 2 well-formed sub-candidates are required';
+function splitTask(extra = {}) {
+  return { id: 'sp-1', domain: 'default', source: 'arch_review', status: 'pending', title: 'AC-180', promptContext: { candidateId: 'AC-180' }, blockedReason: SPLIT_REASON, localRejectCount: 1, history: [{ stage: 'blocked', at: '2026-10-06T22:07:27Z', detail: SPLIT_REASON }], ...extra };
+}
+
+test('a too-few-sub-candidates split block from before the retry existed is re-admitted once, clean slate', () => {
+  const d = setupAdhocDirs();
+  fs.writeFileSync(path.join(d.blockedDir, 'sp-1.json'), JSON.stringify(splitTask()));
+  const summary = rejectRetryCheck({ ...d, recordModelOutcome: () => {} });
+  assert.equal(summary.requeued, 1);
+  const dest = ['pendingDir', 'adhocDir'].map((k) => path.join(d[k], 'sp-1.json')).find((f) => fs.existsSync(f));
+  assert.ok(dest, 'back in a live queue dir');
+  const out = JSON.parse(fs.readFileSync(dest, 'utf8'));
+  assert.equal(out.blockedReason, undefined);
+  assert.equal(out.localRejectCount, undefined);
+  assert.equal(out.splitTooFewReadmitted, true);
+  assert.equal(out.splitTooFewRetried, undefined, 'the draft retry flag is left unset so the draft gets its retry');
+  assert.ok(out.history.some((h) => h.stage === 'requeued' && /fewer than 2 usable sub-candidates/.test(h.detail)));
+});
+
+test('a too-few split block is NOT re-admitted when the draft retry already ran, or when it was already re-admitted once', () => {
+  for (const [id, extra] of [['sp-2', { splitTooFewRetried: true }], ['sp-3', { splitTooFewReadmitted: true }]]) {
+    const d = setupAdhocDirs();
+    fs.writeFileSync(path.join(d.blockedDir, `${id}.json`), JSON.stringify(splitTask({ id, ...extra })));
+    assert.equal(rejectRetryCheck({ ...d, recordModelOutcome: () => {} }).requeued, 0, id);
+    assert.ok(fs.existsSync(path.join(d.blockedDir, `${id}.json`)));
+  }
+});
+
+test('rejectRetryCheck: a plan-degenerate block on the BIGGEST lane records no avoidLanes and files one deterministic systemic side finding', () => {
+  const lanes = [
+    { id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', tier: 27, taskClasses: null },
+    { id: 'worker-rx580', model: 'qwen3-vl:8b-instruct', tier: 8, taskClasses: ['brain_dump_sort'] },
+  ];
+  const { root, blockedDir, pendingDir } = setupDirs();
+  for (const id of ['top-a', 'top-b']) {
+    writeBlockedTask(blockedDir, id, {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      planResponse: 'a truncated, unusable plan',
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-3090', finishedAt: new Date().toISOString() }],
+    });
+  }
+  rejectRetryCheck({ blockedDir, pendingDir, pipelineDir: root, lanes, recordModelOutcome: () => {} });
+  const a = JSON.parse(fs.readFileSync(path.join(pendingDir, 'top-a.json'), 'utf8'));
+  assert.equal(a.avoidLanes, undefined, 'the biggest lane must never be recorded');
+  assert.ok(a.history.some((h) => h.stage === 'advisory' && /filed a systemic side finding/.test(h.detail || '')));
+  assert.ok(!a.history.some((h) => h.stage === 'lane-avoided'));
+  const inbox = path.join(root, 'queue', 'side-findings-inbox');
+  const files = fs.readdirSync(inbox).filter((f) => f.endsWith('.json'));
+  assert.equal(files.length, 2, 'one inbox entry per blocked task...');
+  const recs = files.map((f) => JSON.parse(fs.readFileSync(path.join(inbox, f), 'utf8')));
+  assert.equal(recs[0].title, recs[1].title, '...with identical text, so the side-finding sweep merges them into one entry');
+  assert.equal(recs[0].body, recs[1].body);
+  assert.deepEqual(recs.map((r) => r.taskId).sort(), ['top-a', 'top-b'], 'the task id lives in the metadata, not the text');
+  assert.equal(recs[0].source, 'lane_avoidance');
+});
+
+test('rejectRetryCheck: the same block on a lower-tier lane records avoidLanes and files no side finding', () => {
+  const lanes = [
+    { id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', tier: 27, taskClasses: null },
+    { id: 'worker-rx580', model: 'qwen3-vl:8b-instruct', tier: 8, taskClasses: ['brain_dump_sort'] },
+  ];
+  const { root, blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'low-a', {
+    status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+    draftAttempts: [{ outcome: 'blocked', lane: 'worker-rx580', finishedAt: new Date().toISOString() }],
+  });
+  rejectRetryCheck({ blockedDir, pendingDir, pipelineDir: root, lanes, recordModelOutcome: () => {} });
+  const a = JSON.parse(fs.readFileSync(path.join(pendingDir, 'low-a.json'), 'utf8'));
+  assert.deepEqual(a.avoidLanes, ['worker-rx580']);
+  assert.ok(!fs.existsSync(path.join(root, 'queue', 'side-findings-inbox')) || fs.readdirSync(path.join(root, 'queue', 'side-findings-inbox')).length === 0);
 });

@@ -34,7 +34,18 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { resolveDisposition, buildShipContext, STABLE_TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
+const { resolveDisposition, buildShipContext, STABLE_TERMINAL_STAGES, TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
+
+// The stage of the last terminal event in a record's history (null when there is none). Not the literal tail: a later non-terminal event (triage-note,
+// branch-verdict) must not hide the terminal one, or every such record gets a duplicate terminal event appended.
+function lastTerminalStage(history) {
+  if (!Array.isArray(history)) return null;
+  for (let i = history.length - 1; i >= 0; i -= 1) {
+    const stage = history[i] && history[i].stage;
+    if (TERMINAL_STAGES.has(stage)) return stage;
+  }
+  return null;
+}
 const { runAmplificationSweep } = require('./incident-amplification.js');
 
 // Incident Amplification's automatic trigger (2026-09-08, Grimmethy: "this system should
@@ -232,6 +243,8 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } 
     if (record === null) { summary.errors += 1; continue; }
     summary.scanned += 1;
 
+    // Taken BEFORE resolveDisposition: its rule 7 appends an `apply` event to this record in memory, which would otherwise be mistaken for the tail below.
+    const terminalBefore = lastTerminalStage(record.history);
     let outcome;
     try {
       outcome = resolveDisposition(record, { repoRoot, ctx, allowReopenFrom, pipelineDir });
@@ -253,11 +266,10 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } 
       continue;
     }
 
-    const tail = record.history[record.history.length - 1];
-    // Nothing to append when the resolved stage already IS the tail: the pending-merge
-    // re-check, and (under --reclassify) a noop record that stays noop because its verdict
-    // was inconclusive, not a false positive.
-    const tailUnchanged = tail && tail.stage === outcome.stage;
+    // Nothing to append or write when the resolved stage already IS the record's current terminal stage: the pending-merge re-check, and (under
+    // --reclassify) a noop record that stays noop because its verdict was inconclusive, not a false positive. Compared against the terminal stage
+    // captured before resolving, so neither an event appended after it nor the resolver's own in-memory `apply` event makes it look changed.
+    const tailUnchanged = terminalBefore === outcome.stage;
     if (!tailUnchanged && !dryRun) {
       appendHistoryEvent(record, outcome.stage, outcome.detail);
       record.terminalDisposition = outcome.stage;
@@ -294,6 +306,19 @@ function reconcile({ pipelineDir, repoRoot, argv = [], fetchFn, commitCountFn } 
       state.resolvedIds.add(id); state.pendingIds.delete(id);
       if (outcome.stage === 'abandoned') abandonedList.push(`${record.id} -- ${outcome.detail}`);
     }
+  }
+
+  // Re-check `abandoned` (a stable stage that never self-healed): correct the ones whose work is on <main>, restore hub siblings a requeue destroyed.
+  // Bounded and throttled (abandoned-recheck.js); never fatal to the sweep.
+  if (!dryRun && repoRoot && ctx) {
+    try {
+      const rc = require('./abandoned-recheck.js').recheckAbandoned({ pipelineDir, repoRoot, ctx });
+      summary.abandonedRechecked = rc.rechecked;
+      summary.abandonedCorrected = rc.corrected.length;
+      summary.siblingsRestored = rc.restored.length;
+      for (const c of rc.corrected) console.error(`[task-log-reconcile] abandoned-recheck: ${c.id} abandoned -> ${c.to}`);
+      for (const r of rc.restored) console.error(`[task-log-reconcile] shared-branch-restore: ${r.id} re-applying onto ${r.branch} (destroyed by the requeue of ${r.removedBy})`);
+    } catch (e) { console.error(`[task-log-reconcile] abandoned-recheck failed (ignored): ${e.message}`); }
   }
 
   if (!dryRun) saveState(pipelineDir, state);

@@ -159,16 +159,62 @@ function dedupeDocViews(candidatesPath, workingTreeText) {
   return views;
 }
 
-// `dedupe` (opt-in, default off): drop a candidate whose file + function (lib/candidate-dedupe.js) is already in
+// The text one candidate occupies in a Docs/*_CANDIDATES.md doc, minus the leading blank-line separator. Pure: the
+// caller allocates `id` and resolves `dependsOnId` (the id of an EARLIER candidate in the same batch, or null).
+// Shared by applyArchDiscoveryCandidates and candidate-size-gate.js so the gate measures exactly what gets written.
+function renderCandidateSection(c, id, { snippet = null, dependsOnId = null } = {}) {
+  const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
+  // Split-Depth: N -- a one-level pre-split marker; nextCandidateFulfillmentTask (SDK)
+  // refuses to pre-split a candidate at depth >= 1 (hard recursion stop).
+  if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
+  if (c.source) lines.push(`Source: ${c.source}`);
+  if (c.files) lines.push(`Files: ${normalizeCandidateFiles(c.files)}`);
+  if (c.symbol) lines.push(`Symbol: ${c.symbol}`);
+  // dependsOnIndex -> a real Depends-On: AC-NNN line (2026-09-05, see
+  // prompts.js's candidateSplitInstructions for the incident): only resolvable once ids are
+  // actually being assigned in the same pass, so the caller passes the resolved id in. Only valid
+  // within a single split batch -- parseCandidateSplit's own remapping guarantees the index
+  // refers to an EARLIER candidate in THIS SAME call.
+  if (dependsOnId) lines.push(`Depends-On: ${dependsOnId}`);
+  // Fenced, not backtick-inline -- the real snippet is often multi-line and may itself
+  // contain backticks (template literals are common in this codebase), so a fence is
+  // the only delimiter that can't collide with the content it's wrapping.
+  if (snippet) lines.push('Snippet:', '```', snippet, '```');
+  lines.push('', c.body);
+  return lines.join('\n') + '\n';
+}
+
+// `symbol` (optional): see the comment at the top of the function body. `dedupe` (opt-in, default off): drop a candidate whose file + function (lib/candidate-dedupe.js) is already in
 // the doc on any view above, or earlier in this same call. Left off for candidate splits (sibling
 // candidates legitimately share Files:) and hand-authored docs. Kill switch: AGENT_MANAGER_CANDIDATE_DEDUPE=false.
 // All candidates dropped -> nothing is written and { skipped, duplicateOf, reason } comes back; the reason contains
 // "skipped" so task-disposition.js's NOOP_RE closes the task as a noop.
-function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null, dedupe = false }) {
+// `requireStrength` (2026-10-04): opt-in, default null = every candidate is accepted as before. A verdict-style source whose prompt
+// only ever asks for a Strong block (dead-code triage: a FALSE POSITIVE / UNCERTAIN verdict must write NO block) passes 'Strong'
+// so a block the model wrote anyway ("Strength: Not actionable (false positive)", deadcode-getparser) is not filed as a candidate.
+// Exact trimmed match, because fulfillment (sdk/lib/candidate-lifecycle.js) acts only on exactly 'Strong'. Not enforced in
+// parseArchDiscoveryCandidates: arch_import/arch_review legitimately file 'Worth exploring' and 'Speculative'.
+function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTitle = '# Architecture Review Candidates', snippet = null, dedupe = false, symbol = null, requireStrength = null }) {
   let candidates = parseArchDiscoveryCandidates(implementResponse);
   if (candidates.length === 0) {
     return { skipped: true, reason: 'no candidates in implement response -- nothing to apply' };
   }
+  let droppedNonStrong = 0;
+  if (typeof requireStrength === 'string' && requireStrength.trim()) {
+    const required = requireStrength.trim();
+    const kept = candidates.filter((c) => String(c.strength).trim() === required);
+    droppedNonStrong = candidates.length - kept.length;
+    if (kept.length === 0) {
+      const found = [...new Set(candidates.map((c) => String(c.strength).trim()))].join(', ');
+      return { skipped: true, reason: `skipped: ${droppedNonStrong} candidate(s) not Strength: ${required} (${found}) -- nothing appended` };
+    }
+    candidates = kept;
+  }
+  // `symbol` (2026-10-03): the function/identifier the SOURCE knows the candidate is about (e.g. function_length_review
+  // reads it off its scanner finding), written as a deterministic `Symbol:` line and used as the dedupe key ahead of any
+  // title parsing -- the model's title formatting (backticks or not) no longer decides whether a duplicate is caught.
+  // Only applied to a single-candidate batch: with several candidates one symbol cannot be attributed to any one of them.
+  if (symbol && candidates.length === 1) candidates[0].symbol = String(symbol).trim();
 
   let text = fs.existsSync(candidatesPath) ? fs.readFileSync(candidatesPath, 'utf8') : `${docTitle}\n`;
 
@@ -205,35 +251,16 @@ function applyArchDiscoveryCandidates({ implementResponse, candidatesPath, docTi
   const candidateIds = [];
   candidates.forEach((c) => {
     const id = `AC-${Math.max(nextAvailableCandidateId(text), idFloor + 1)}`;
-    const lines = [`### ${id} · ${c.title}`, `Strength: ${c.strength}`];
-    // Split-Depth: N -- a one-level pre-split marker; nextCandidateFulfillmentTask (SDK)
-    // refuses to pre-split a candidate at depth >= 1 (hard recursion stop).
-    if (c.splitDepth) lines.push(`Split-Depth: ${c.splitDepth}`);
-    if (c.source) lines.push(`Source: ${c.source}`);
-    if (c.files) lines.push(`Files: ${normalizeCandidateFiles(c.files)}`);
-    // dependsOnIndex -> a real Depends-On: AC-NNN line (2026-09-05, see
-    // prompts.js's candidateSplitInstructions for the incident): only resolvable NOW,
-    // once ids are actually being assigned in this same pass. Only valid within a single
-    // split batch (candidates all arrive together, in original order, from
-    // apply-task.js's applyCandidateSplit) -- candidateIds[c.dependsOnIndex] is only
-    // populated when that index refers to an EARLIER candidate in THIS SAME call, which
-    // parseCandidateSplit's own remapping already guarantees.
-    if (Number.isInteger(c.dependsOnIndex) && candidateIds[c.dependsOnIndex]) {
-      lines.push(`Depends-On: ${candidateIds[c.dependsOnIndex]}`);
-    }
-    // Fenced, not backtick-inline -- the real snippet is often multi-line and may itself
-    // contain backticks (template literals are common in this codebase), so a fence is
-    // the only delimiter that can't collide with the content it's wrapping.
-    if (snippet) lines.push('Snippet:', '```', snippet, '```');
-    lines.push('', c.body);
-    text += '\n' + lines.join('\n') + '\n';
+    const dependsOnId = Number.isInteger(c.dependsOnIndex) ? candidateIds[c.dependsOnIndex] : null;
+    const section = renderCandidateSection(c, id, { snippet, dependsOnId });
+    text += '\n' + section;
     candidateIds.push(id);
   });
 
   fs.mkdirSync(path.dirname(candidatesPath), { recursive: true });
   writeAtomicSync(candidatesPath, text);
 
-  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}) };
+  return { file: candidatesPath, candidateCount: candidates.length, candidateIds, ...(duplicatesSkipped.length ? { duplicatesSkipped: duplicatesSkipped.length } : {}), ...(droppedNonStrong ? { droppedNonStrong } : {}) };
 }
 
 module.exports = {
@@ -241,4 +268,5 @@ module.exports = {
   parseArchDiscoveryCandidates,
   nextAvailableCandidateId,
   applyArchDiscoveryCandidates,
+  renderCandidateSection,
 };

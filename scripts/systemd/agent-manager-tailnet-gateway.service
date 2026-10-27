@@ -1,0 +1,21 @@
+# Agent Manager tailnet gateway as a systemd USER service (see docs/agents/tailnet-gateway.md).
+#   mkdir -p ~/.config/systemd/user && cp scripts/systemd/agent-manager-tailnet-gateway.service ~/.config/systemd/user/
+#   (edit WorkingDirectory/ExecStart if the checkout is elsewhere, and set the owner login below)
+#   systemctl --user daemon-reload && systemctl --user enable --now agent-manager-tailnet-gateway
+#   journalctl --user -u agent-manager-tailnet-gateway -f
+[Unit]
+Description=Agent Manager tailnet gateway (owner-only access to the dashboard and plugins over Tailscale)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/media/model-cache/github/agent-manager
+Environment=AGENT_MANAGER_TAILNET_OWNERS=grimmethy@gmail.com
+ExecStart=/usr/bin/env node scripts/tailnet-gateway.js
+# tailscaled may not be up yet at boot, in which case the gateway exits (it refuses to guess an address): retry until it is
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

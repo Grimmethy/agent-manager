@@ -7,6 +7,7 @@ process kept answering health checks.
 Run: .venv/bin/python -m unittest test_plugin_process_manager -v
 """
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -235,6 +236,55 @@ class StopTest(TmpStateDirTest):
 
     def test_stop_on_an_already_gone_process_is_a_harmless_no_op(self):
         self.assertTrue(ppm.stop("never-started-plugin"))
+
+
+def _wait_for_state(pid: int, state: str, timeout: float = 3.0) -> bool:
+    """True once /proc/<pid>/stat reports `state` (e.g. 'Z' for a zombie)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            raw = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return False
+        if raw.rsplit(")", 1)[1].split()[0] == state:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+@unittest.skipUnless(Path("/proc/self/stat").exists(), "needs /proc")
+class ZombieLivenessTest(TmpStateDirTest):
+    """2026-10-24: a plugin that exited but was never reaped stays a zombie of the dashboard; os.kill(pid, 0)
+    succeeds for it, so is_running() said True and ensure-started never relaunched the chat plugin."""
+
+    def _zombie(self, key="zombie-plugin"):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        self.assertTrue(_wait_for_state(child.pid, "Z"), "child did not become a zombie")
+        ppm.PID_DIR.mkdir(parents=True, exist_ok=True)
+        ppm._pidfile(key).write_text(str(child.pid))
+        return key, child
+
+    def test_zombie_is_not_running_and_gets_reaped(self):
+        key, child = self._zombie()
+        self.assertFalse(ppm.is_running(key))
+        self.assertFalse(Path(f"/proc/{child.pid}").exists(), "the zombie was not reaped")
+
+    def test_stop_of_a_zombie_returns_true_quickly(self):
+        key, child = self._zombie()
+        started = time.time()
+        self.assertTrue(ppm.stop(key, wait_s=3.0))
+        self.assertLess(time.time() - started, 1.0)
+        self.assertFalse(ppm._pidfile(key).exists())
+
+    def test_a_live_child_still_reports_running(self):
+        child = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        ppm.PID_DIR.mkdir(parents=True, exist_ok=True)
+        ppm._pidfile("live-plugin").write_text(str(child.pid))
+        self.assertTrue(ppm.is_running("live-plugin"))
+
+    def test_missing_pidfile_is_not_running(self):
+        self.assertFalse(ppm.is_running("no-such-plugin"))
 
 
 if __name__ == "__main__":

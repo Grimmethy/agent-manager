@@ -36,7 +36,7 @@ function isFixCandidate({ title, body }) {
   return false;
 }
 
-function routeNowWhatItem({ title, body, taskId, pipelineDir }) {
+function routeNowWhatItem({ title, body, taskId, pipelineDir, raisedBySource = 'pipeline_debrief' }) {
   try {
     const t = String(title || '').trim();
     const b = String(body || '').trim();
@@ -49,7 +49,7 @@ function routeNowWhatItem({ title, body, taskId, pipelineDir }) {
       source: 'now_what',
       title: (t || b).slice(0, 120),
       body: b,
-      raisedBy: { source: 'pipeline_debrief', taskId, stage: 'now-what' },
+      raisedBy: { source: raisedBySource, taskId, stage: 'now-what' },
       promptContext: { rawText: b, debriefTaskId: taskId },
     };
 

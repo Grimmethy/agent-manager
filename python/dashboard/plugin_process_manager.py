@@ -46,16 +46,41 @@ def _read_pid(name: str) -> int | None:
         return None
 
 
+def _is_zombie(pid: int) -> bool:
+    """True when /proc/<pid>/stat says the process has exited but not been waited on (state Z) or is dead (X).
+    Where /proc is unreadable (non-Linux, or the pid vanished) this is False and the caller keeps the signal-0 answer."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        return raw.rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    except (OSError, IndexError):
+        return False
+
+
+def _reap(pid: int) -> None:
+    """Collect an exited child of this process so it does not stay a zombie. Never raises: not our child
+    (ChildProcessError) or already collected is fine."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+
+
 def is_running(name: str) -> bool:
-    """Same signal-0 liveness check as launch.sh's is_running() (`kill -0`)."""
+    """Same signal-0 liveness check as launch.sh's is_running() (`kill -0`), except that a zombie counts as NOT running.
+    2026-10-24: a plugin that exited was never wait()ed on by the dashboard that spawned it, so it stayed `<defunct>`;
+    os.kill(pid, 0) succeeds for a zombie, so ensure-started kept answering alreadyRunning and never relaunched it.
+    A zombie child of this process is reaped here."""
     pid = _read_pid(name)
     if pid is None:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    if _is_zombie(pid):
+        _reap(pid)
+        return False
+    return True
 
 
 def _port_from_url(url: str) -> int | None:

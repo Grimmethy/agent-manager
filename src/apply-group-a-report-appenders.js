@@ -335,4 +335,40 @@ function applyDebriefReport({ implementResponse, task }) {
   };
 }
 
-module.exports = { parseProjectSearchFindings, applyProjectSearchFindings, parseDeepDiveItems, applyDeepDiveFindings, applyForensicsReport, parseDebriefNowWhatItems, applyDebriefReport };
+// capability_debrief (design note section 5a): a larger local model's report on why a source keeps failing on a small lane and how to shrink it.
+// Pass 1 holds the report in awaiting-confirm/ for a human (the same gate as pipeline_debrief; the dashboard stamps debriefReportConfirmedAt). Pass 2
+// files each NOW WHAT proposal as an adhoc fix-candidate (routeNowWhatItem) or a side-finding, and records the cluster as debriefed. A justified
+// `NOT SHRINKABLE AT THIS TIER -- <reason>` closes as a recorded no-op (the cluster is marked debriefed so it is not retried).
+function applyCapabilityDebriefReport({ implementResponse, task }) {
+  const { writeSideFindingInbox } = require('./side-finding.js');
+  const { routeNowWhatItem } = require('./now-what-route.js');
+  const { getConfig } = require('./config.js');
+  const { sharedInstancesDir } = require('./instances-dir.js');
+  const { markDebriefedByKey } = require('./capability-debrief-bundle.js');
+  const text = (implementResponse || '').trim();
+  const key = task && task.promptContext && task.promptContext.clusterKey;
+  const mark = (extra) => { if (key) { try { markDebriefedByKey(sharedInstancesDir(getConfig().pipelineDir), key, extra); } catch (_) { /* best-effort */ } } };
+
+  if (!text) return { skipped: true, reason: 'capability debrief report came back empty; nothing to hold or file' };
+  const nullOutcome = classifyNullOutcome('capability_debrief', text);
+  if (nullOutcome) {
+    mark({ verdict: 'not-shrinkable', reason: nullOutcome.justification.slice(0, 300) });
+    return { skipped: true, reason: `not shrinkable at this tier (recorded, not retried): ${nullOutcome.justification.slice(0, 200)}` };
+  }
+  if (!task || !task.debriefReportConfirmedAt) {
+    return { succeeded: false, needsConfirmation: true, reason: 'capability debrief report -- held in queue/awaiting-confirm/ for human review before its proposals are filed' };
+  }
+  const { pipelineDir } = getConfig();
+  const items = parseDebriefNowWhatItems(text);
+  let routed = 0;
+  let filed = 0;
+  for (const item of items) {
+    const routedPath = routeNowWhatItem({ title: item.title, body: item.body, taskId: task.id, pipelineDir, raisedBySource: 'capability_debrief' });
+    if (routedPath) routed += 1;
+    else { writeSideFindingInbox(item, { source: 'capability_debrief', taskId: task.id, stage: 'now-what', pipelineDir }); filed += 1; }
+  }
+  mark({ verdict: 'proposals-filed', routed, filed });
+  return { skipped: true, reason: `capability debrief confirmed: ${routed} proposal(s) queued as fix-candidates, ${filed} filed as side-findings` };
+}
+
+module.exports = { applyCapabilityDebriefReport, parseProjectSearchFindings, applyProjectSearchFindings, parseDeepDiveItems, applyDeepDiveFindings, applyForensicsReport, parseDebriefNowWhatItems, applyDebriefReport };

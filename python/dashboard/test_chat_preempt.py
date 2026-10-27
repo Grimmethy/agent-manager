@@ -66,12 +66,24 @@ class PreemptDecisionTest(unittest.TestCase):
             self.assertFalse(app._is_preemptable_child_pass(p), repr(p))
 
     def test_lane_sets_are_the_local_gpu_lane_plus_age_gated_reviewer_never_the_p40(self):
-        with mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40"]):
+        defs = [{"id": "worker-3090", "preempt": "always"}, {"id": "worker-p40", "preempt": "never"}]
+        with mock.patch.object(app, "worker_lane_defs", return_value=defs):
             self.assertEqual(app._preempt_lane_sets(), (("worker-3090",), ("reviewer",)))
 
     def test_a_p40_only_layout_preempts_no_worker_lane(self):
-        with mock.patch.object(app, "worker_lane_ids", return_value=["worker-p40"]):
+        with mock.patch.object(app, "worker_lane_defs", return_value=[{"id": "worker-p40", "preempt": "never"}]):
             self.assertEqual(app._preempt_lane_sets(), ((), ("reviewer",)))
+
+    def test_a_registry_lane_is_never_preempted_unless_it_opts_in_to_age_gating(self):
+        defs = [{"id": "worker-3090", "preempt": "always"}, {"id": "worker-rx580", "preempt": "never"},
+                {"id": "worker-a770", "preempt": "age-gated"}]
+        with mock.patch.object(app, "worker_lane_defs", return_value=defs):
+            self.assertEqual(app._preempt_lane_sets(), (("worker-3090",), ("reviewer", "worker-a770")))
+
+    def test_unreadable_lane_definitions_fall_back_to_the_old_everything_but_the_p40_rule(self):
+        with mock.patch.object(app, "worker_lane_defs", return_value=[]), \
+                mock.patch.object(app, "worker_lane_ids", return_value=["worker-3090", "worker-p40", "worker-rx580"]):
+            self.assertEqual(app._preempt_lane_sets(), (("worker-3090", "worker-rx580"), ("reviewer",)))
 
 
 class ArbiterCancelBelowArgsTest(unittest.TestCase):
@@ -93,6 +105,57 @@ class ArbiterCancelBelowArgsTest(unittest.TestCase):
         self.assertFalse(any("192.168" in str(a) or "p40" in str(a).lower() for a in seen["cmd"]), "never names the P40 endpoint")
 
 
+class ArbiterCancelBelowKeyTest(unittest.TestCase):
+    def test_a_key_replaces_local_on_the_arbiter_command_line(self):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        with mock.patch.object(app, "read_env_file", return_value={}), mock.patch.object(chat_preempt.subprocess, "run", side_effect=fake_run):
+            chat_preempt._arbiter_cancel_below("interactive", key="ollama-100.96.112.78-11434")
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[cmd.index("--key") + 1], "ollama-100.96.112.78-11434")
+        self.assertNotIn("--local", cmd)
+
+
+class ArbiterBusyRowsTest(unittest.TestCase):
+    """A holder that survives the preempt is reported as a 'busy' row, so the chat can say the GPU was not freed."""
+
+    def _status(self, payload, returncode=0):
+        def fake_run(cmd, **kw):
+            self.cmd = cmd
+            return subprocess.CompletedProcess(cmd, returncode, stdout=json.dumps(payload), stderr="")
+        return mock.patch.object(chat_preempt.subprocess, "run", side_effect=fake_run)
+
+    def _rows(self, payload, summary=()):
+        with mock.patch.object(app, "read_env_file", return_value={}), self._status(payload):
+            return chat_preempt._arbiter_busy_rows(list(summary))
+
+    HOLDER = {"cls": "draft", "pid": 4242, "taskId": "t-w1", "phase": "orient", "model": "m", "startedAt": "x"}
+
+    def test_a_surviving_holder_becomes_a_busy_row(self):
+        rows = self._rows({"holder": self.HOLDER, "waiting": [], "reserved": []})
+        self.assertEqual(rows, [{"lane": "draft", "action": "busy", "taskId": "t-w1", "phase": "orient", "ageSeconds": None}])
+        self.assertIn("status", self.cmd)
+        self.assertIn("--local", self.cmd)
+
+    def test_a_holder_the_cancel_killed_is_not_reported(self):
+        rows = self._rows({"holder": self.HOLDER}, summary=[{"lane": "draft", "action": "killed", "taskId": "t-w1"}])
+        self.assertEqual(rows, [])
+
+    def test_no_holder_or_a_failing_status_call_adds_nothing(self):
+        self.assertEqual(self._rows({"holder": None, "waiting": [], "reserved": []}), [])
+        with mock.patch.object(app, "read_env_file", return_value={}), \
+                mock.patch.object(chat_preempt.subprocess, "run", side_effect=OSError("no node")):
+            self.assertEqual(chat_preempt._arbiter_busy_rows([]), [])
+        with mock.patch.object(app, "read_env_file", return_value={}), \
+                mock.patch.object(chat_preempt.subprocess, "run",
+                                  return_value=subprocess.CompletedProcess([], 1, stdout="not json", stderr="")):
+            self.assertEqual(chat_preempt._arbiter_busy_rows([]), [])
+
+
 class PreemptPipelineTest(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -109,6 +172,8 @@ class PreemptPipelineTest(unittest.TestCase):
             mock.patch.object(app, "instances_dir", return_value=self.inst),
             mock.patch.object(app, "queue_dir", return_value=self.queue),
             mock.patch.object(app, "read_env_file", return_value={}),
+            # Keep every case off the real arbiter status call; ArbiterBusyRowsTest and the busy-row cases below re-patch it.
+            mock.patch.object(chat_preempt, "_arbiter_busy_rows", return_value=[]),
         ]
         for p in self._patches:
             p.start()
@@ -167,6 +232,40 @@ class PreemptPipelineTest(unittest.TestCase):
             summary = app._preempt_pipeline_for_chat()
             m.assert_called_once_with("interactive")
             self.assertIn({"lane": "draft", "action": "killed", "taskId": "t-w1", "ageSeconds": None}, summary)
+
+    def test_a_surviving_holder_is_appended_after_the_arbiter_and_reviewer_rows(self):
+        busy = [{"lane": "draft", "action": "busy", "taskId": "t-w1", "phase": "orient", "ageSeconds": None}]
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[]), \
+                mock.patch.object(chat_preempt, "_arbiter_busy_rows", return_value=busy) as m:
+            summary = app._preempt_pipeline_for_chat()
+            m.assert_called_once()
+            self.assertEqual(summary[-1], busy[0])
+
+    # Chat on a chosen card (chat_card.py): the preempt follows the card the reply runs on.
+    HOST_CARD = {"lane": "worker-3090", "local": True, "lockKey": "ollama-localhost-11434", "blocked": False}
+    RX_CARD = {"lane": "worker-rx580", "local": False, "lockKey": "ollama-100.96.112.78-11434", "blocked": False}
+
+    def test_a_remote_card_cancels_only_that_cards_lane_by_its_key_and_spares_the_reviewer(self):
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[{"lane": "draft", "action": "killed"}]) as m:
+            rv = self._spawn()
+            self._hb("reviewer", status="working", pass_="vote", pid=rv.pid, task_id="t-rv")
+            self._task("reviewer", "t-rv", claimed_epoch=time.time() - 5)
+            summary = app._preempt_pipeline_for_chat(self.RX_CARD)
+            m.assert_called_once_with("interactive", key="ollama-100.96.112.78-11434")
+            self.assertEqual(summary, [{"lane": "draft", "action": "killed"}])
+            self.assertIsNone(rv.poll())
+
+    def test_the_host_card_takes_the_unchanged_host_path(self):
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[]) as m:
+            app._preempt_pipeline_for_chat(self.HOST_CARD)
+            m.assert_called_once_with("interactive")
+
+    def test_a_blocked_choice_or_a_remote_card_without_a_key_preempts_nothing(self):
+        with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[{"x": 1}]) as m:
+            self.assertEqual(app._preempt_pipeline_for_chat({"lane": None, "blocked": True, "local": True}), [])
+            self.assertEqual(app._preempt_pipeline_for_chat({**self.RX_CARD, "blocked": True}), [])
+            self.assertEqual(app._preempt_pipeline_for_chat({"lane": "worker-rx580", "local": False, "blocked": False}), [])
+            m.assert_not_called()
 
     def test_reviewer_still_uses_the_legacy_age_gated_kill(self):
         with mock.patch.object(chat_preempt, "_arbiter_cancel_below", return_value=[]):

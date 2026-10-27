@@ -21,12 +21,42 @@
 // stage MUST be one of task-disposition.js's TERMINAL_STAGES:
 //   'merged', 'applied-direct', 'filed', 'dismissed', 'noop', 'pending-merge', 'abandoned', 'superseded'
 
+// Advisory report sources -- the four sources whose drafter prompts carry an explicit
+// honest-null contract (src/advisory-null-outcome.js: pipeline_forensics
+// `NO CLEAR ROOT CAUSE --`, pipeline_debrief `NO CONFIDENT INEFFICIENCY --`,
+// capability_debrief `NOT SHRINKABLE AT THIS TIER --`, pipeline_health_audit
+// `FALSE POSITIVE --`). A well-formed applied report from any of these is a completed
+// inspection whose record (finding or null) is archival material -- distinct from a
+// genuine "nothing to do" apply.
+const ADVISORY_REPORT_SOURCES = new Set([
+  'pipeline_forensics',
+  'pipeline_debrief',
+  'capability_debrief',
+  'pipeline_health_audit',
+]);
+
+// 2026-09-27: advisory-report applies used to hit the unclassifiable default and be
+// stamped 'noop' with an 'outcome=unclassified' detail, conflating "inspection
+// completed (null result included)" with "nothing to do" in pipeline metrics. They
+// now take the in-contract 'filed' stage (the same stage debrief archival already
+// uses) -- a value already in task-disposition.js's TERMINAL_STAGES, so no new stage
+// or disposition-side vocabulary change is needed.
+function classifyAdvisoryReport(ctx) {
+  const source = ctx && ctx.task && typeof ctx.task.source === 'string' ? ctx.task.source : null;
+  if (!source || !ADVISORY_REPORT_SOURCES.has(source)) return null;
+  return {
+    stage: 'filed',
+    detail: `outcome=filed (advisory report, source=${source}): ${ctx.detail || '(no detail)'}`.slice(0, 200),
+  };
+}
+
 // Ordered rule array -- first non-null return wins.
 // Each rule: (ctx) => { stage, detail } | null
 //
 // Add domain-specific classification rules here as new apply-outcome patterns are
 // discovered. Rules earlier in the array take priority (more specific before general).
 const RULES = [
+  classifyAdvisoryReport,
   // Example (not active yet):
   // (ctx) => {
   //   if (/wrote .*\.md/.test(ctx.detail)) return { stage: 'filed', detail: `outcome=filed: ${ctx.detail}`.slice(0, 200) };

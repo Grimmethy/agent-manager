@@ -177,3 +177,60 @@ test('non-advisory source whose final token has an odd number of unescaped doubl
     { truncated: true, reason: 'truncated output' },
   );
 });
+
+// --- COMPLETE-DIFF EXEMPTION (2026-10-18): a diff that is complete per its hunk headers is never "truncated output" ---------------------
+const { diffIsComplete, TRUNCATION_GATE_VERSION } = require('./validate-implement-truncation.js');
+
+const groupA = (diffLines) => ['RESOLUTION: implemented', '', 'Acceptance:', '1. done -- ran the tests -- PASS', '', '=== DIFF ===', ...diffLines, ''].join('\n');
+// Real shape 1 (premium reach 3/5, 2026-10-18): the diff's last context line is an unchanged comment ending in a quoted phrase.
+const QUOTED_LAST_TOKEN = [
+  'diff --git a/scripts/review-runner.sh b/scripts/review-runner.sh',
+  '--- a/scripts/review-runner.sh',
+  '+++ b/scripts/review-runner.sh',
+  '@@ -148,4 +148,4 @@ while :; do',
+  '-  done < <(ls -1tr "$review_dir" 2>/dev/null)',
+  '+  done < <(if "$PREMIUM_ONLY"; then ls -1tr "$review_dir" | filter_premium_names "$review_dir"; else ls -1tr "$review_dir"; fi)',
+  ' ',
+  '   # Iterate each item currently sitting in review/, oldest-first BY FILE MTIME (fixed',
+  '   # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"',
+];
+// Real shape 2 (HUB0073-01): the diff ends on the close of a quoted comment opened one line earlier -- odd quotes on the last LINE too.
+const MULTILINE_QUOTED_COMMENT = [
+  'diff --git a/scripts/start-pipeline.sh b/scripts/start-pipeline.sh',
+  '--- a/scripts/start-pipeline.sh',
+  '+++ b/scripts/start-pipeline.sh',
+  '@@ -10,3 +10,4 @@',
+  ' write_env() {',
+  '+  mirror_env "$@"',
+  '     # 2026-09-30 (Grimmethy: "the project dropdown should list every repo',
+  '     # [in the Project tab] -- we should be able to select from any of the projects"):',
+];
+
+test('complete diff whose last context line ends in a quoted phrase is NOT flagged (real 2026-10-18 false block)', () => {
+  assert.deepEqual(detectTruncatedImplementResponse(groupA(QUOTED_LAST_TOKEN)), { truncated: false, reason: null });
+});
+
+test('complete diff ending on the close of a multi-line quoted comment is NOT flagged (real HUB0073-01 false block)', () => {
+  assert.deepEqual(detectTruncatedImplementResponse(groupA(MULTILINE_QUOTED_COMMENT), 'manual'), { truncated: false, reason: null });
+});
+
+test('the same diff with its last hunk one line short IS still flagged (a cut-off diff falls through to the quote rule)', () => {
+  // Cut mid-line inside the quoted phrase: the hunk is one line short, so the exemption does not apply and the existing last-token rule
+  // decides (it flags `"we`). A cut whose last token holds no quote was never flagged by that rule and still is not -- unchanged behaviour.
+  const cut = groupA(QUOTED_LAST_TOKEN.slice(0, -2).concat(['   # 2026-08-20, Grimmethy: "we']));
+  assert.equal(diffIsComplete(cut), false, 'one line short of the declared counts');
+  assert.deepEqual(detectTruncatedImplementResponse(cut), { truncated: true, reason: 'truncated output' });
+});
+
+test('diffIsComplete: omitted counts mean 1, multiple files and hunks, "\\ No newline", and a diff with no hunk header', () => {
+  assert.equal(diffIsComplete(groupA(['--- a/x', '+++ b/x', '@@ -5 +5 @@', '-a', '+b'])), true);
+  assert.equal(diffIsComplete(groupA(['--- a/x', '+++ b/x', '@@ -1,2 +1,2 @@', ' k', '-a', '+b', '\\ No newline at end of file',
+    'diff --git a/y b/y', '--- a/y', '+++ b/y', '@@ -3,1 +3,2 @@', ' z', '+w'])), true);
+  assert.equal(diffIsComplete(groupA(['diff --git a/src/config.js b/src/config.js', '+function x() { throw new Error("SECOND_BRAIN_DIR'])), false, 'no hunk header');
+  assert.equal(diffIsComplete('no diff here "at all'), false);
+});
+
+test('TRUNCATION_GATE_VERSION is exported for the bucket J re-admission', () => {
+  assert.equal(typeof TRUNCATION_GATE_VERSION, 'string');
+  assert.ok(TRUNCATION_GATE_VERSION.length > 0);
+});

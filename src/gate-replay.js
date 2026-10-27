@@ -247,13 +247,24 @@ function replayGates({ rawDiff, worktreeDir, pipelineDir, mainBranch, run, timeo
 }
 
 // Block only when a blocking-family gate newly flags merged work above the rate limit on a corpus big enough to mean something.
+// The limit applies to what the CHANGE adds: merged tasks the after side flags and the base did not (2026-10-19). It used to be
+// the gate's absolute rate, so a gate already above the limit (checkGroundedValues: 225 of 409 merged at base) was blocked by any
+// single new flag -- a pure exemption that LOWERED its flags to 218 was rejected on one new flag that did not even reproduce
+// outside the sandbox. For a new gate (no base) every flag is new, so that case is unchanged.
+function newlyFlaggedRate(c) {
+  return c.mergedTotal ? (c.newlyFlaggedMergedCount || 0) / c.mergedTotal : 0;
+}
+
 function replayVerdict(replay, { maxRate = DEFAULT_MAX_FP_RATE } = {}) {
   const reasons = [];
+  const pct = (x) => `${(x * 100).toFixed(1)}%`;
   for (const c of (replay && replay.candidates) || []) {
     if (!c.blocking || c.rateMerged == null || c.mergedTotal < MIN_MERGED_FOR_BLOCK) continue;
-    if (c.newlyFlaggedMergedCount > 0 && c.rateMerged > maxRate) {
-      reasons.push(`${c.name} (${c.file}) would flag ${c.after.flaggedMerged} of ${c.mergedTotal} already-merged tasks (${(c.rateMerged * 100).toFixed(1)}%, limit ${(maxRate * 100).toFixed(1)}%)`
-        + `${c.before ? `; the base flags ${c.before.flaggedMerged}` : ''}; e.g. ${c.newlyFlaggedMerged.map((x) => x.id).slice(0, 3).join(', ')}`);
+    const newRate = newlyFlaggedRate(c);
+    if (c.newlyFlaggedMergedCount > 0 && newRate > maxRate) {
+      reasons.push(`${c.name} (${c.file}) newly flags ${c.newlyFlaggedMergedCount} of ${c.mergedTotal} already-merged tasks (${pct(newRate)}, limit ${pct(maxRate)})`
+        + `; in all it would flag ${c.after.flaggedMerged} of ${c.mergedTotal} (${pct(c.rateMerged)})`
+        + `${c.before ? `; the base flags ${c.before.flaggedMerged}` : ' (a new gate)'}; e.g. ${c.newlyFlaggedMerged.map((x) => x.id).slice(0, 3).join(', ')}`);
     }
   }
   return { block: reasons.length > 0, reasons };
@@ -264,4 +275,4 @@ function gateReplayMaxRate() {
   return Number.isFinite(v) && v >= 0 && v <= 1 ? v : DEFAULT_MAX_FP_RATE;
 }
 
-module.exports = { findGateCandidates, inferFamily, replayGates, replayVerdict, gateReplayMaxRate, CORPORA, GATE_NAME_RE, DEFAULT_MAX_FP_RATE, MIN_MERGED_FOR_BLOCK };
+module.exports = { findGateCandidates, inferFamily, replayGates, replayVerdict, newlyFlaggedRate, gateReplayMaxRate, CORPORA, GATE_NAME_RE, DEFAULT_MAX_FP_RATE, MIN_MERGED_FOR_BLOCK };

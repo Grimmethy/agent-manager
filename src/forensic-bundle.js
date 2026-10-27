@@ -30,7 +30,7 @@ const { listArchivedMonthDirs } = require('./done-archive.js');
 
 const DEFAULT_BUDGET_CHARS = 28000;
 const MAX_SUBJECTS = 4;
-const MAX_WINNERS = 3;
+const MAX_WINNERS = 5;
 const MAX_FULL_ATTEMPTS = 4;      // newest N draftAttempts rendered in full per task
 const TIER_RESPONSE_CAP = 3000;   // the model's own per-tier final analysis -- highest signal
 const WORKLOG_PREVIEW_CAP = 1800; // per task, across the last tier's tool calls
@@ -304,7 +304,6 @@ function selectWinners(pipelineDir, subjectRecords) {
       // bare same-source match, which for adhoc tasks (nearly all source==='manual') is
       // weak on its own.
       const score = (ctxParent && parents.has(ctxParent)) ? 2 : ((task.source && sources.has(task.source)) ? 1 : 0);
-      if (!score) continue;
       // Only tasks that actually produced/shipped something count as a contrast "win".
       const shipped = !!task.mergedAt
         || (Array.isArray(task.history) && task.history.some((h) => h.stage === 'applied' || h.stage === 'approved'))
@@ -314,7 +313,12 @@ function selectWinners(pipelineDir, subjectRecords) {
     }
   }
   candidates.sort((a, b) => (b.score - a.score) || (Number(b.merged) - Number(a.merged)) || String(b.at).localeCompare(String(a.at)));
-  return candidates.slice(0, MAX_WINNERS).map((c) => ({ task: c.task, state: c.state }));
+  // Score-0 (no shared source / parent) shipped tasks are a FALLBACK tier: used only when no
+  // same-source or same-parent winner exists, so the contrast set is never empty just because
+  // the failing class never shipped a matched sibling. Matched winners always sort first.
+  let pool = candidates.filter((c) => c.score > 0);
+  if (!pool.length) pool = candidates;
+  return pool.slice(0, MAX_WINNERS).map((c) => ({ task: c.task, state: c.state }));
 }
 
 // --- assembly ----------------------------------------------------------------------
@@ -454,6 +458,8 @@ function buildForensicBundle({ pipelineDir, dbPath, subject, now = new Date(), b
     signature,
     subjectIds,
     winnerIds,
+    winnerTasks: winnerRecords.map((r) => ({ id: r.task.id, source: r.task.source || 'unknown', state: r.state })),
+    winnerContrastAvailable: winnerRecords.length >= 1,
     loserIds: subjectIds, // alias — the failing set, named for the prompt's contrast instruction
     stats: {
       subjectCount: subjectRecords.length,

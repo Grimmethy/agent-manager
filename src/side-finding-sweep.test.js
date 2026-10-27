@@ -35,6 +35,7 @@ test('a new finding with no existing similar entry creates a fresh captured entr
   const entry = data.entries[0];
   assert.match(entry.id, /^bd-\d+-/);
   assert.equal(entry.serial, 1);
+  assert.equal(typeof entry.serial, 'number');
   assert.equal(entry.status, 'captured');
   assert.equal(entry.count, 1);
   assert.deepEqual(entry.seenIn, ['arch-review-ac-1']);
@@ -135,6 +136,7 @@ test('serial numbering continues from the existing max, matching the dashboard\'
   const data = readBrainDump(dir);
   const newEntry = data.entries.find((e) => e.serial === 8);
   assert.ok(newEntry, 'new entry must continue the serial sequence, not restart at 1');
+  assert.equal(typeof newEntry.serial, 'number');
 });
 
 test('inbox files are deleted after a real (non-dry-run) sweep, but never during a dry run', async () => {

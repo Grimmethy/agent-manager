@@ -13,7 +13,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const SCRIPT = path.join(__dirname, 'local-worker.sh');
 
-function sandbox({ poolTask = false } = {}) {
+function sandbox({ poolTask = false, nonPool = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'worker-borrow-'));
   const mk = (...p) => { const d = path.join(root, ...p); fs.mkdirSync(d, { recursive: true }); return d; };
   const A = mk('A'); const B = mk('B'); mk('repoA'); mk('repoB'); mk('home');
@@ -25,6 +25,16 @@ function sandbox({ poolTask = false } = {}) {
     { repoRoot: path.join(root, 'repoA'), pipelineDir: A, domainsPath: path.join(A, 'task-domains.json'), label: 'A' },
     { repoRoot: path.join(root, 'repoB'), pipelineDir: B, domainsPath: path.join(B, 'task-domains.json'), label: 'B', pool: true },
   ]));
+  // Premium reach: an optional registered project C that is NOT in the pool (premium tasks reach every registered project).
+  let C = null;
+  if (nonPool) {
+    C = mk('C'); mk('repoC');
+    for (const d of ['pending', 'adhoc', 'drafting', 'review', 'blocked', 'done']) mk('C', 'queue', d);
+    fs.writeFileSync(path.join(C, 'task-domains.json'), '{}');
+    const list = JSON.parse(fs.readFileSync(projectsPath, 'utf8'));
+    list.push({ repoRoot: path.join(root, 'repoC'), pipelineDir: C, domainsPath: path.join(C, 'task-domains.json'), label: 'C' });
+    fs.writeFileSync(projectsPath, JSON.stringify(list));
+  }
   if (poolTask) {
     fs.writeFileSync(path.join(B, 'queue', 'pending', 'borrow-me.json'), JSON.stringify({ id: 'borrow-me', domain: 'default', source: 'trouble_log', title: 't', promptContext: {} }));
   }
@@ -36,8 +46,9 @@ function sandbox({ poolTask = false } = {}) {
     AGENT_MANAGER_PROJECTS_PATH: projectsPath,
     AGENT_MANAGER_POOL_STATE_PATH: path.join(root, 'pool-state.json'),
     ORC_TICK_SECS: '2',
+    AGENT_MANAGER_ENDPOINT_PROBE: 'off', // these tests point the endpoint at a closed port so nothing touches a model; the breaker has its own test file
   };
-  return { root, A, B, env, stateFile: path.join(root, 'pool-state.json'), instancesDir: path.join(A, 'instances') };
+  return { root, A, B, C, env, stateFile: path.join(root, 'pool-state.json'), instancesDir: path.join(A, 'instances') };
 }
 
 const waitFor = async (fn, ms = 60000) => {
@@ -272,4 +283,380 @@ test('the worker takes the JSON result line even when a stray line precedes it o
     try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
     fs.closeSync(out);
   }
+});
+
+// --- the claim loop re-ranks after every processed item (2026-10-15) -----------------------------------------------------------------------------
+// The `items` list is taken ONCE per tick and generation/ranking only run at the top of a tick, so a lane that drained its whole snapshot
+// first (worker-3090: 59 claims in one tick, ~6h) never saw a premium task that arrived meanwhile. Ending the tick after each processed item
+// makes the next tick re-run generation + ranking. The stub draft succeeds without a model, so the infra-failure break cannot mask this one.
+function ownProjectLane(sb, pkg, logFile, out) {
+  return spawn('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x'], {
+    detached: true, stdio: ['ignore', out, out],
+    env: { ...sb.env, ORC_TICK_SECS: '60', AGENT_MANAGER_POOL_BORROW: 'false', AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json') },
+  });
+}
+const ownClaims = (logFile) => [...fs.readFileSync(logFile, 'utf8').matchAll(/\] claimed \S+\/queue\/pending\/([\w-]+)\.json/g)].map((m) => m[1]);
+
+test('a lane ends its tick after each processed item: a new `tick at` line separates two claims taken from the same pending/ listing', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 1500);
+  const pending = path.join(sb.A, 'queue', 'pending');
+  taskFile(pending, 'o1'); taskFile(pending, 'o2');
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const child = ownProjectLane(sb, pkg, logFile, out);
+  try {
+    assert.ok(await waitFor(() => ownClaims(logFile).length >= 2, 60000), 'both tasks were claimed');
+    const log = fs.readFileSync(logFile, 'utf8');
+    const firstClaim = log.indexOf('claimed ');
+    const secondClaim = log.indexOf('claimed ', firstClaim + 1);
+    assert.match(log.slice(firstClaim, secondClaim), /tick at /, `the second claim must come from a NEW tick; log between the claims:\n${log.slice(firstClaim, secondClaim)}`);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+  }
+});
+
+test('a premium task that lands in pending/ while the first item is being processed is claimed BEFORE the older ordinary task still waiting', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 4000);
+  const pending = path.join(sb.A, 'queue', 'pending');
+  taskFile(pending, 'o1'); taskFile(pending, 'o2');
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const child = ownProjectLane(sb, pkg, logFile, out);
+  try {
+    assert.ok(await waitFor(() => ownClaims(logFile).length >= 1, 60000), 'the first task was claimed');
+    fs.writeFileSync(path.join(pending, 'prem.json'), JSON.stringify({ id: 'prem', domain: 'default', source: 'trouble_log', title: 'prem', promptContext: {}, premiumPriority: true }));
+    assert.ok(await waitFor(() => ownClaims(logFile).length >= 2, 60000), 'a second task was claimed');
+    const order = ownClaims(logFile);
+    assert.equal(order[1], 'prem', `the premium arrival is claimed second, ahead of the ordinary task that was already waiting; order: ${order.join(',')}`);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+  }
+});
+
+// --- premium reach (2026-10-18): another project's premium task before home REGULAR work; home premium wins the tie --------------------
+
+const task = (id, premium) => JSON.stringify({ id, domain: 'default', source: 'trouble_log', title: id, promptContext: {}, ...(premium ? { premiumPriority: true } : {}) });
+const put = (dir, id, premium) => fs.writeFileSync(path.join(dir, 'queue', 'pending', `${id}.json`), task(id, premium));
+const homeEnv = (sb, extra = {}) => ({ ...sb.env, AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json'), ...extra });
+const premiumEvents = (sb) => { try { return fs.readFileSync(path.join(sb.A, 'instances', 'pipeline-history.log'), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((e) => e.type === 'premium-borrow'); } catch { return []; } };
+const claimedIn = (dir, id) => fs.existsSync(path.join(dir, 'queue', 'drafting', 'worker-x', `${id}.json`)) || !fs.existsSync(path.join(dir, 'queue', 'pending', `${id}.json`));
+const spawnLane = (env) => spawn('bash', [SCRIPT, 'worker-x'], { detached: true, stdio: 'ignore', env });
+const stop = (child) => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ } };
+
+test('premium reach: a lane with REGULAR home work takes a NON-pool project\'s premium task first, and records a premium-borrow event at home', async () => {
+  const sb = sandbox({ nonPool: true });
+  put(sb.A, 'home-regular', false);
+  put(sb.C, 'c-premium', true);
+  const child = spawnLane(homeEnv(sb));
+  try {
+    const events = await waitFor(() => (premiumEvents(sb).length >= 2 ? premiumEvents(sb) : null), 90000);
+    assert.ok(events, 'premium-borrow events were written to the HOME pipeline history');
+    assert.ok(claimedIn(sb.C, 'c-premium'), 'the non-pool project\'s premium task was claimed in its own project');
+    assert.ok(fs.existsSync(path.join(sb.A, 'queue', 'pending', 'home-regular.json')), 'the home REGULAR task waited');
+    assert.ok(!fs.existsSync(path.join(sb.A, 'queue', 'drafting', 'worker-x')), 'nothing was claimed at home');
+    assert.equal(events[0].role, 'worker');
+    assert.equal(events[0].lane, 'worker-x');
+    assert.equal(events[0].project, 'C');
+  } finally { stop(child); }
+});
+
+test('premium reach: the home project\'s premium task wins the tie -- no other project is visited', async () => {
+  const sb = sandbox({ nonPool: true });
+  put(sb.A, 'a-premium', true);
+  put(sb.C, 'c-premium', true);
+  const child = spawnLane(homeEnv(sb));
+  try {
+    const got = await waitFor(() => claimedIn(sb.A, 'a-premium'), 60000);
+    assert.ok(got, 'the home premium task was claimed');
+    await new Promise((r) => setTimeout(r, 8000)); // a few more ticks: home still holds premium work (its drafting/worker-x)
+    assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'pending', 'c-premium.json')), 'the other project\'s premium task is untouched');
+    assert.deepEqual(premiumEvents(sb), [], 'no premium borrow happened');
+  } finally { stop(child); }
+});
+
+test('premium reach: a premium-only borrowed tick never takes the other project\'s REGULAR work', async () => {
+  const sb = sandbox({ nonPool: true });
+  put(sb.A, 'home-regular', false);
+  put(sb.C, 'c-regular', false);
+  put(sb.C, 'c-premium', true);
+  const child = spawnLane(homeEnv(sb));
+  try {
+    const events = await waitFor(() => (premiumEvents(sb).length >= 2 ? premiumEvents(sb) : null), 90000);
+    assert.ok(events, 'premium ticks were borrowed from C');
+    assert.ok(claimedIn(sb.C, 'c-premium'), 'C\'s premium task was claimed');
+    assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'pending', 'c-regular.json')), 'C\'s regular task was left alone');
+    assert.ok(!fs.existsSync(path.join(sb.C, 'queue', 'drafting', 'worker-x', 'c-regular.json')));
+  } finally { stop(child); }
+});
+
+test('premium reach: AGENT_MANAGER_PREMIUM_REACH=false keeps the lane on its home work', async () => {
+  const sb = sandbox({ nonPool: true });
+  put(sb.A, 'home-regular', false);
+  put(sb.C, 'c-premium', true);
+  const child = spawnLane(homeEnv(sb, { AGENT_MANAGER_PREMIUM_REACH: 'false' }));
+  try {
+    const got = await waitFor(() => claimedIn(sb.A, 'home-regular'), 60000);
+    assert.ok(got, 'the home task was claimed');
+    await new Promise((r) => setTimeout(r, 6000));
+    assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'pending', 'c-premium.json')), 'the other project\'s premium task is untouched');
+    assert.deepEqual(premiumEvents(sb), []);
+  } finally { stop(child); }
+});
+
+test('premium reach: the premium-only claim filter -- C\'s premium task is pinned to ANOTHER lane, so its REGULAR pending task is not taken; C is backed off and the lane does its home work', async () => {
+  const sb = sandbox({ nonPool: true });
+  put(sb.A, 'home-regular', false);
+  put(sb.C, 'c-regular', false);
+  fs.writeFileSync(path.join(sb.C, 'queue', 'pending', 'c-premium-pinned.json'), JSON.stringify({ ...JSON.parse(task('c-premium-pinned', true)), pinnedWorker: 'worker-other' }));
+  const child = spawnLane(homeEnv(sb));
+  try {
+    const got = await waitFor(() => claimedIn(sb.A, 'home-regular'), 60000);
+    assert.ok(got, 'with nothing premium it could take in C, the lane went on to its home work');
+    assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'pending', 'c-regular.json')), 'C\'s regular task was not taken by the premium-only tick');
+    assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'pending', 'c-premium-pinned.json')), 'the task pinned to another lane stays for that lane');
+    assert.deepEqual(premiumEvents(sb), [], 'a premium tick that took nothing is not recorded as a borrow');
+    const state = JSON.parse(fs.readFileSync(sb.stateFile, 'utf8'));
+    assert.ok(Object.keys(state.emptyUntil || {}).some((k) => k.startsWith('premium-worker:worker-x|')), 'C was backed off for this lane');
+  } finally { stop(child); }
+});
+
+test('premium reach: a premium task waiting in another project\'s adhoc/ is generated by the borrowed tick\'s seeding and claimed there, while that project\'s regular task waits', async () => {
+  const sb = sandbox({ nonPool: true });
+  put(sb.A, 'home-regular', false);
+  put(sb.C, 'c-regular', false);
+  fs.writeFileSync(path.join(sb.C, 'queue', 'adhoc', 'c-premium-adhoc.json'), task('c-premium-adhoc', true));
+  const child = spawnLane(homeEnv(sb));
+  try {
+    const events = await waitFor(() => (premiumEvents(sb).length >= 1 ? premiumEvents(sb) : null), 90000);
+    assert.ok(events, 'a premium tick was borrowed from C');
+    assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'drafting', 'worker-x', 'c-premium-adhoc.json')), 'seeded from adhoc/ and claimed in C (premium generation runs ahead of the source allowlist)');
+    assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'pending', 'c-regular.json')), 'C\'s regular task waited');
+    assert.ok(fs.existsSync(path.join(sb.A, 'queue', 'pending', 'home-regular.json')), 'the home regular task waited');
+  } finally { stop(child); }
+});
+
+test('premium reach: a premium-only borrowed tick does not resume the other project\'s REGULAR leftover; it takes the premium task', async () => {
+  const sb = sandbox({ nonPool: true });
+  put(sb.A, 'home-regular', false);
+  fs.mkdirSync(path.join(sb.C, 'queue', 'drafting', 'worker-x'), { recursive: true });
+  fs.writeFileSync(path.join(sb.C, 'queue', 'drafting', 'worker-x', 'c-leftover.json'), task('c-leftover', false));
+  put(sb.C, 'c-premium', true);
+  const child = spawnLane(homeEnv(sb));
+  try {
+    const events = await waitFor(() => (premiumEvents(sb).length >= 1 ? premiumEvents(sb) : null), 90000);
+    assert.ok(events, 'a premium tick was borrowed from C');
+    assert.ok(claimedIn(sb.C, 'c-premium'), 'C\'s premium task was claimed');
+    const log = fs.readFileSync(path.join(sb.root, 'home', '.local', 'state', 'agent-manager', 'logs', 'local-worker-worker-x.log'), 'utf8');
+    assert.ok(!/resuming leftover drafting item: c-leftover\.json/.test(log), 'the regular leftover was never resumed by a premium tick');
+  } finally { stop(child); }
+});
+
+// --- premium reach, reviewer (2026-10-18): another project's premium review before home REGULAR reviews; home premium wins the tie ----------
+
+const reviewItem = (dir, id, premium, mtimeSecsAgo = 0) => {
+  const p = path.join(dir, 'queue', 'review', `${id}.json`);
+  fs.writeFileSync(p, JSON.stringify({ id, domain: 'default', source: 'trouble_log', title: id, status: 'needs-review', promptContext: {}, planResponse: 'p', implementResponse: 'i', ...(premium ? { premiumPriority: true } : {}) }));
+  if (mtimeSecsAgo) { const t = new Date(Date.now() - mtimeSecsAgo * 1000); fs.utimesSync(p, t, t); }
+};
+// The reviewer's "reviewing <file>" lines go to stderr; capture the daemon's (and its borrowed children's) output in the sandbox.
+const spawnReviewer = (sb, extra = {}) => {
+  const out = path.join(sb.root, 'reviewer.out');
+  const fd = fs.openSync(out, 'a');
+  const child = spawn('bash', [path.join(__dirname, 'review-runner.sh'), 'review-x'], { detached: true, stdio: ['ignore', fd, fd], env: homeEnv(sb, extra) });
+  fs.closeSync(fd);
+  return { child, reviewed: () => { try { return [...fs.readFileSync(out, 'utf8').matchAll(/\] reviewing (\S+\.json)/g)].map((m) => m[1]); } catch { return []; } } };
+};
+
+test('premium reach (reviewer): a reviewer with a REGULAR home review reviews a NON-pool project\'s premium review first, and records a premium-borrow event at home', async () => {
+  const sb = sandbox({ nonPool: true });
+  reviewItem(sb.A, 'a-regular', false, 600);
+  reviewItem(sb.C, 'c-premium', true);
+  const { child, reviewed } = spawnReviewer(sb);
+  try {
+    const events = await waitFor(() => (premiumEvents(sb).some((e) => e.role === 'reviewer') ? premiumEvents(sb) : null), 120000);
+    assert.ok(events, 'a reviewer premium-borrow event was written to the HOME pipeline history');
+    assert.equal(reviewed()[0], 'c-premium.json', 'the first item reviewed was C\'s premium item, not the older home regular one');
+    const ev = events.find((e) => e.role === 'reviewer');
+    assert.equal(ev.project, 'C');
+  } finally { stop(child); }
+});
+
+test('premium reach (reviewer): a premium review at home wins the tie -- no other project is visited', async () => {
+  const sb = sandbox({ nonPool: true });
+  reviewItem(sb.A, 'a-premium', true);
+  reviewItem(sb.C, 'c-premium', true);
+  const { child, reviewed } = spawnReviewer(sb);
+  try {
+    const got = await waitFor(() => reviewed().includes('a-premium.json'), 90000);
+    assert.ok(got, 'the home premium review was reviewed');
+    await new Promise((r) => setTimeout(r, 6000));
+    assert.ok(!reviewed().includes('c-premium.json'), 'the other project\'s premium review was not touched');
+    assert.deepEqual(premiumEvents(sb), []);
+  } finally { stop(child); }
+});
+
+test('premium reach (reviewer): a premium-only borrowed review tick reviews only the premium item, never the other project\'s OLDER regular review item', async () => {
+  const sb = sandbox({ nonPool: true });
+  reviewItem(sb.A, 'a-regular', false, 600);
+  reviewItem(sb.C, 'c-regular-older', false, 900);
+  reviewItem(sb.C, 'c-premium', true);
+  const { child, reviewed } = spawnReviewer(sb);
+  try {
+    const events = await waitFor(() => (premiumEvents(sb).filter((e) => e.role === 'reviewer').length >= 2 ? premiumEvents(sb) : null), 180000);
+    assert.ok(events, 'premium review ticks were borrowed from C');
+    assert.ok(reviewed().includes('c-premium.json'));
+    assert.ok(!reviewed().includes('c-regular-older.json'), 'C\'s older regular review item was never reviewed by a premium tick');
+  } finally { stop(child); }
+});
+
+test('premium reach (reviewer): AGENT_MANAGER_PREMIUM_REACH=false keeps the reviewer on its home review/', async () => {
+  const sb = sandbox({ nonPool: true });
+  reviewItem(sb.A, 'a-regular', false);
+  reviewItem(sb.C, 'c-premium', true);
+  const { child, reviewed } = spawnReviewer(sb, { AGENT_MANAGER_PREMIUM_REACH: 'false' });
+  try {
+    const got = await waitFor(() => reviewed().includes('a-regular.json'), 90000);
+    assert.ok(got, 'the home review item was reviewed');
+    await new Promise((r) => setTimeout(r, 6000));
+    assert.ok(!reviewed().includes('c-premium.json'), 'the other project\'s premium review was not touched');
+    assert.deepEqual(premiumEvents(sb), []);
+  } finally { stop(child); }
+});
+
+// --- premium reach, apply (2026-10-18): premium approved tasks of every registered project, never a non-pool project's regular ones -----
+
+const approvedTask = (dir, id, premium) => {
+  fs.mkdirSync(path.join(dir, 'queue', 'approved'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'approved', `${id}.json`), JSON.stringify({ id, domain: 'default', source: 'trouble_log', title: id, status: 'approved', promptContext: {}, ...(premium ? { premiumPriority: true } : {}) }));
+};
+const landedIn = (dir, id) => ['done', 'blocked', 'awaiting-confirm', 'coordinating'].some((d) => fs.existsSync(path.join(dir, 'queue', d, `${id}.json`)));
+const runApplyLoop = (sb, pkg, extra = {}) => spawnSync('bash', [path.join(pkg, 'scripts', 'apply-loop.sh'), '--once'], { encoding: 'utf8', timeout: 180000, env: { ...process.env, HOME: path.join(sb.root, 'home'), ORC_TICK_SECS: '1', ...extra } });
+
+test('premium reach (apply): a NON-pool project\'s premium approved task is applied in ITS queue, its regular approved task waits, and the pass is a premium-borrow event at home', () => {
+  const sb = sandbox({ nonPool: true });
+  const pkg = packageWithEnvFile(sb);
+  fs.mkdirSync(path.join(sb.A, 'queue', 'approved'), { recursive: true });
+  approvedTask(sb.C, 'c-premium', true);
+  approvedTask(sb.C, 'c-regular', false);
+  const r = runApplyLoop(sb, pkg);
+  assert.match(r.stdout, /applying PREMIUM approved tasks of .*\/C/, r.stderr);
+  assert.ok(landedIn(sb.C, 'c-premium'), 'the premium task was applied inside C\'s own queue');
+  assert.ok(!landedIn(sb.A, 'c-premium'), 'and not filed into the active project');
+  assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'approved', 'c-regular.json')), 'C\'s regular approved task waits for C to be selected');
+  const ev = premiumEvents(sb).find((e) => e.role === 'apply');
+  assert.ok(ev, 'premium-borrow {role apply} in the active project\'s history');
+  assert.equal(ev.project, 'C');
+});
+
+test('premium reach (apply): a POOL project\'s premium approved task is applied once, by the pool pass -- no second premium pass for it', () => {
+  const sb = sandbox({ nonPool: true });
+  const pkg = packageWithEnvFile(sb);
+  fs.mkdirSync(path.join(sb.A, 'queue', 'approved'), { recursive: true });
+  approvedTask(sb.B, 'b-premium', true);
+  const r = runApplyLoop(sb, pkg);
+  assert.match(r.stdout, /applying approved tasks of borrowed project .*\/B/, r.stderr);
+  assert.doesNotMatch(r.stdout, /applying PREMIUM approved tasks of .*\/B/);
+  assert.ok(landedIn(sb.B, 'b-premium'));
+  assert.equal(premiumEvents(sb).filter((e) => e.role === 'apply').length, 0);
+});
+
+test('premium reach (apply): AGENT_MANAGER_PREMIUM_REACH=false skips the premium pass', () => {
+  const sb = sandbox({ nonPool: true });
+  const pkg = packageWithEnvFile(sb);
+  fs.mkdirSync(path.join(sb.A, 'queue', 'approved'), { recursive: true });
+  approvedTask(sb.C, 'c-premium', true);
+  const r = runApplyLoop(sb, pkg, { AGENT_MANAGER_PREMIUM_REACH: 'false' });
+  assert.doesNotMatch(r.stdout, /PREMIUM/);
+  assert.ok(fs.existsSync(path.join(sb.C, 'queue', 'approved', 'c-premium.json')), 'untouched');
+});
+
+test('premium reach (apply): AGENT_MANAGER_POOL_BORROW=false still applies a non-pool project\'s premium task (premium reach is independent)', () => {
+  const sb = sandbox({ nonPool: true });
+  const pkg = packageWithEnvFile(sb);
+  fs.mkdirSync(path.join(sb.A, 'queue', 'approved'), { recursive: true });
+  approvedTask(sb.C, 'c-premium', true);
+  const r = runApplyLoop(sb, pkg, { AGENT_MANAGER_POOL_BORROW: 'false' });
+  assert.doesNotMatch(r.stdout, /applying approved tasks of borrowed project/, 'the pool pass is off');
+  assert.match(r.stdout, /applying PREMIUM approved tasks of .*\/C/, r.stderr);
+  assert.ok(landedIn(sb.C, 'c-premium'));
+});
+
+// --- endpoint circuit breaker (2026-10-23) -----------------------------------------------------------------------------------------------
+// grimm hard-reset, its Ollama stayed down for 12 h, and the rx580 lane kept resuming/claiming tasks that could only fail: 540 failed ticks, six tasks parked.
+// While the lane's Ollama endpoint does not answer the worker claims and resumes NOTHING, says why in its heartbeat and log, and picks up again by itself.
+const http = require('http');
+const freePort = () => new Promise((resolve) => { const s = http.createServer(); s.listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => resolve(p)); }); });
+const breakerLane = (sb, pkg, logFile, out, url) => spawn('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x'], {
+  detached: true, stdio: ['ignore', out, out],
+  env: { ...sb.env, OLLAMA_URL: url, AGENT_MANAGER_ENDPOINT_PROBE: 'on', AGENT_MANAGER_ENDPOINT_DOWN_PAUSE_S: '1', ORC_TICK_SECS: '1', AGENT_MANAGER_POOL_BORROW: 'false', AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json') },
+});
+
+test('endpoint breaker: while the Ollama endpoint does not answer the lane claims nothing, reports endpoint-unreachable, and resumes by itself when it answers', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 300);
+  taskFile(path.join(sb.A, 'queue', 'pending'), 'h1');
+  const port = await freePort();
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const child = breakerLane(sb, pkg, logFile, out, `http://127.0.0.1:${port}`);
+  const log = () => fs.readFileSync(logFile, 'utf8');
+  let server;
+  try {
+    assert.ok(await waitFor(() => /is not answering \(tick 1 of the outage\)/.test(log()), 30000), `the outage was reported; log:\n${log().slice(-500)}`);
+    await new Promise((r) => setTimeout(r, 4000)); // several more ticks
+    assert.ok(fs.existsSync(path.join(sb.A, 'queue', 'pending', 'h1.json')), 'the task is still in pending/, never claimed');
+    assert.deepEqual(fs.readdirSync(path.join(sb.A, 'queue', 'drafting')).flatMap((d) => fs.readdirSync(path.join(sb.A, 'queue', 'drafting', d))), [], 'nothing was drafted');
+    assert.doesNotMatch(log(), /claimed |draft call failed/);
+    const hb = JSON.parse(fs.readFileSync(path.join(sb.instancesDir, 'worker-x.json'), 'utf8'));
+    assert.equal(hb.currentPass, 'endpoint-unreachable');
+    assert.equal(hb.status, 'idle');
+    // the endpoint comes back (any HTTP answer counts)
+    server = http.createServer((req, res) => { res.writeHead(404); res.end(); });
+    await new Promise((r) => server.listen(port, '127.0.0.1', r));
+    assert.ok(await waitFor(() => fs.existsSync(path.join(sb.A, 'queue', 'review', 'h1.json')), 60000), `the lane resumed and drafted the task; log:\n${log().slice(-600)}`);
+    assert.match(log(), /answers again after \d+ tick/);
+  } finally {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+    if (server) server.close();
+  }
+});
+
+test('endpoint breaker: AGENT_MANAGER_ENDPOINT_PROBE=off keeps the old behaviour (the lane claims even with a dead endpoint)', async () => {
+  const sb = sandbox();
+  const pkg = packageWithStubDraft(sb, 300);
+  taskFile(path.join(sb.A, 'queue', 'pending'), 'h1');
+  const logFile = path.join(sb.root, 'lane.log');
+  const out = fs.openSync(logFile, 'w');
+  const off = spawn('bash', [path.join(pkg, 'scripts', 'local-worker.sh'), 'worker-x'], {
+    detached: true, stdio: ['ignore', out, out],
+    env: { ...sb.env, OLLAMA_URL: `http://127.0.0.1:${await freePort()}`, AGENT_MANAGER_ENDPOINT_PROBE: 'off', ORC_TICK_SECS: '1', AGENT_MANAGER_POOL_BORROW: 'false', AGENT_MANAGER_REPO_ROOT: path.join(sb.root, 'repoA'), AGENT_MANAGER_PIPELINE_DIR: sb.A, AGENT_MANAGER_DOMAINS_PATH: path.join(sb.A, 'task-domains.json') },
+  });
+  try {
+    assert.ok(await waitFor(() => fs.existsSync(path.join(sb.A, 'queue', 'review', 'h1.json')), 60000), 'with the probe off the lane drafts as before');
+    assert.doesNotMatch(fs.readFileSync(logFile, 'utf8'), /is not answering/);
+  } finally {
+    try { process.kill(-off.pid, 'SIGKILL'); } catch { /* already gone */ }
+    fs.closeSync(out);
+  }
+});
+
+test('ollama_endpoint_reachable: any HTTP answer is reachable, a closed port is not', async () => {
+  const port = await freePort();
+  // async spawn: the stub server lives in this process and must keep answering while bash runs
+  const run = (url) => new Promise((resolve) => {
+    const c = spawn('bash', ['-c', `source "${path.join(__dirname, 'agent-manager-common.sh')}" >/dev/null 2>&1; ollama_endpoint_reachable "${url}"`], { env: { ...process.env, AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S: '2' } });
+    c.on('close', (code) => resolve(code));
+  });
+  assert.equal(await run(`http://127.0.0.1:${port}`), 1, 'closed port');
+  const server = http.createServer((req, res) => { res.writeHead(404); res.end(); });
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  try {
+    assert.equal(await run(`http://127.0.0.1:${port}`), 0, 'a 404 answer counts as reachable');
+    assert.equal(await run(`http://127.0.0.1:${port}/`), 0, 'a trailing slash is fine');
+  } finally { server.close(); }
 });

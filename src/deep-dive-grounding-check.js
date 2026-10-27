@@ -30,6 +30,7 @@
 // Kill switch: AGENT_MANAGER_DEEP_DIVE_GROUNDING_CHECK=false.
 
 const { call: localCall } = require('./local-client.js');
+const { isForgePause } = require('./gpu-guard.js');
 const { builtinModules } = require('module');
 
 // 2026 'Cheap Verifiers, Large Blind Spots' caveat: Check 2 (this cheap model) is a better-than-nothing second layer, NOT a substitute for Check 1's deterministic match -- its blind spot is largest in this cheap/cheap config. See src/deterministic-recheck-registry.js header.
@@ -148,6 +149,104 @@ function checkFabricatedSymbols(task, implementResponse) {
   return contradictions;
 }
 
+// --- Type-fidelity check (deterministic): a REAL symbol cited with the wrong declared kind ---
+// The gap checkFabricatedSymbols cannot close by construction: it only flags names ABSENT
+// from the real files. A symbol that genuinely exists but as a different KIND -- e.g. the
+// real source says `class MyConfig(TypedDict)` and the draft calls it "the `MyConfig`
+// class" -- passes the substring test but is the exact architecture-fabrication shape the
+// #28/#36/#35 rejections caught at review (each retry = a full re-draft). Flag ONLY when
+// both the source-declared kind and the draft-claimed kind are positively detected and
+// they disagree; any detection miss is null -> no flag (same conservative rule as Check 1's
+// deliberate non-matching of lowercase/generic terms).
+function escapeRe(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// What the REAL source actually declares this symbol as, or null if it cannot be detected
+// (null = "not a judgment call" -> checkTypeFidelity never flags on a null side).
+function detectActualKind(symbol, sourceText) {
+  const esc = escapeRe(symbol);
+  // Most specific first: a class X(TypedDict) or X = TypedDict(...) is still a "class"
+  // syntactically, but describing it as a plain class is precisely the mislabel we want.
+  if (new RegExp(`class\\s+${esc}\\s*\\(\\s*TypedDict\\b`).test(sourceText) ||
+      new RegExp(`${esc}\\s*=\\s*TypedDict\\s*\\(`).test(sourceText)) return 'TypedDict';
+  if (new RegExp(`class\\s+${esc}\\s*\\(\\s*Enum\\b`).test(sourceText) ||
+      new RegExp(`${esc}\\s*=\\s*Enum\\s*\\(`).test(sourceText)) return 'Enum';
+  if (new RegExp(`\\bclass\\s+${esc}\\b`).test(sourceText)) return 'class';
+  if (new RegExp(`\\bdef\\s+${esc}\\s*\\(`).test(sourceText)) return 'function';
+  return null;
+}
+
+// What the DRAFT claims this symbol is, from the symbol's OWN clause around each
+// backtick-quoted occurrence of it -- NOT a flat ±120-char window, which with source
+// `def parse` + `class Foo` would pull "class" (belonging to `Foo`) into `parse`'s
+// window and flag parse as a class in the perfectly accurate sentence "the `parse`
+// function is called by the `Foo` class". The clause is cut at the nearest sentence/
+// clause boundary (a . ; , or newline) or other backtick-quoted symbol mention on either
+// side. Returns null when no kind word is claimed in any clause (a bare citation claims
+// nothing).
+function clauseAround(text, start, end) {
+  const before = text.slice(0, start);
+  const after = text.slice(end);
+  // Left edge: just after the latest boundary (a . ; , or newline, or the closing
+  // backtick of an earlier backtick-quoted mention) -- or the start of the text.
+  let left = -1;
+  for (const ch of ['.', ';', ',', '\n']) left = Math.max(left, before.lastIndexOf(ch));
+  for (const o of before.matchAll(/`[^`\n]*`/g)) left = Math.max(left, o.index + o[0].length);
+  // Right edge: just before the next boundary, or the opening backtick of a later
+  // backtick-quoted mention -- or the end of the text. (Boundary positions below are
+  // relative to `after`, so add `end` to convert them to positions in `text`.)
+  let right = Infinity;
+  const bm = /[.,;\n]/.exec(after);
+  if (bm) right = Math.min(right, end + bm.index);
+  for (const o of after.matchAll(/`[^`\n]*`/g)) right = Math.min(right, end + o.index);
+  return text.slice(left + 1, right === Infinity ? text.length : right);
+}
+
+function detectClaimedKind(symbol, draftText) {
+  const occ = new RegExp('`' + escapeRe(symbol) + '`', 'g');
+  let m;
+  while ((m = occ.exec(draftText))) {
+    const clause = clauseAround(draftText, m.index, m.index + m[0].length);
+    if (/\bTypedDict\b/.test(clause)) return 'TypedDict';
+    if (/\bEnum\b/.test(clause)) return 'Enum';
+    if (/\bclass\b/.test(clause)) return 'class';
+    if (/\b(function|method)s?\b/.test(clause)) return 'function';
+  }
+  return null;
+}
+
+// Any backtick-quoted identifier (not just CLASS_SHAPED_SYMBOL_RE's PascalCase shape -- a
+// mislabelled `def helper` is lowercase, and the "claim + reality" double-detection rule
+// keeps a lone generic word like `pipeline` from ever flagging). Dotted/slash paths are
+// excluded on purpose: those are import/file citations, not kind claims.
+const TYPE_FIDELITY_SYMBOL_RE = /`([A-Za-z_][A-Za-z0-9_]*)`/g;
+
+function checkTypeFidelity(task, text) {
+  const files = realFilesOf(task);
+  if (!files.length) return [];
+  const sourceText = files.map((f) => f.content).join('\n');
+  const seen = new Set();
+  const mismatches = [];
+  let m;
+  TYPE_FIDELITY_SYMBOL_RE.lastIndex = 0;
+  while ((m = TYPE_FIDELITY_SYMBOL_RE.exec(text))) {
+    const symbol = m[1];
+    if (seen.has(symbol)) continue;
+    seen.add(symbol);
+    const actual = detectActualKind(symbol, sourceText);
+    if (!actual) continue; // absent or undetectable -- checkFabricatedSymbols' lane, or no call
+    const claimed = detectClaimedKind(symbol, text);
+    if (claimed && claimed !== actual) {
+      mismatches.push({
+        kind: 'type-mismatch',
+        detail: `the draft calls \`${symbol}\` a ${claimed}, but the real fetched source declares it as a ${actual}`,
+      });
+    }
+  }
+  return mismatches;
+}
+
 // --- Check 2: cheap-model fallback for a contradiction Check 1 cannot catch -------------
 function buildGroundingCheckPrompt(task, implementResponse) {
   const files = realFilesOf(task);
@@ -189,6 +288,11 @@ async function runGroundingCheck(task, implementResponse = (task && (task.implem
   const fabricated = checkFabricatedSymbols(task, text);
   if (fabricated.length) return { verdict: 'ungrounded', reason: fabricated[0].detail, ungrounded: fabricated };
 
+  // Check 1.5 (deterministic, free): a REAL symbol cited with the wrong declared kind.
+  // Same short-circuit shape as Check 1 -- never pays for the Check 2 model call on a hit.
+  const typeMismatches = checkTypeFidelity(task, text);
+  if (typeMismatches.length) return { verdict: 'ungrounded', reason: typeMismatches[0].detail, ungrounded: typeMismatches };
+
   if (!realFilesOf(task).length) return { verdict: 'ok' }; // nothing real to ground a model check against either
 
   const prompt = buildGroundingCheckPrompt(task, text);
@@ -200,6 +304,7 @@ async function runGroundingCheck(task, implementResponse = (task && (task.implem
   try {
     result = maybeLockedOn ? await maybeLockedOn(GROUNDING_CHECK_MODEL, fn, 'deep-dive-grounding') : await fn();
   } catch (e) {
+    if (isForgePause(e)) throw e;   // the Forge family holds the GPU: do not turn the pause into "grounded" (the draft would skip its check)
     return { verdict: 'ok', error: String((e && e.message) || e).slice(0, 160) }; // advisory -- never blocks on a model-call failure
   }
   if (result && result.degenerate) return { verdict: 'ok' };
@@ -210,6 +315,9 @@ async function runGroundingCheck(task, implementResponse = (task && (task.implem
 module.exports = {
   runGroundingCheck,
   checkFabricatedSymbols,
+  checkTypeFidelity,
+  detectActualKind,
+  detectClaimedKind,
   buildGroundingCheckPrompt,
   parseGroundingVerdict,
   realFilesOf,

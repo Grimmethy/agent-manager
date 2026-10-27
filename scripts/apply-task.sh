@@ -72,7 +72,7 @@ source "${SCRIPT_DIR}/agent-manager-common.sh"
 # against not being caught on that one tick.
 move_task_file_locked() {
   local tid="$1" src="$2" dst="$3"
-  if acquire_single_flight_lock "move.${tid}"; then
+  if acquire_single_flight_lock "move.${tid}" "skip"; then
     mv "$src" "$dst"
     release_single_flight_lock
   else
@@ -121,6 +121,15 @@ fi
 shopt -s nullglob
 files=("$APPROVED_DIR"/*.json)
 shopt -u nullglob
+
+# Premium-only borrowed pass (2026-10-18, premium reach -- src/pool-projects.js header): apply-loop.sh runs this under a registered project
+# that is NOT in the pool only for its premium approved tasks, so that project's regular approved work is never applied while another project
+# is selected. Keeps the order; the empty check below then reports "nothing to do".
+if [[ "${AGENT_MANAGER_APPLY_PREMIUM_ONLY:-}" == "true" && -n "${AGENT_MANAGER_BORROWING_FROM:-}" && ${#files[@]} -gt 0 ]]; then
+  _all_count=${#files[@]}
+  mapfile -t files < <(printf '%s\n' "${files[@]}" | node -e 'const fs=require("fs");for(const p of fs.readFileSync(0,"utf8").split("\n")){if(!p)continue;try{if(JSON.parse(fs.readFileSync(p,"utf8")).premiumPriority===true)console.log(p)}catch(e){}}' 2>/dev/null)
+  printf '[apply-task] premium-only pass: %s of %s approved task(s) are premium\n' "${#files[@]}" "$_all_count"
+fi
 
 if [[ ${#files[@]} -eq 0 ]]; then
   printf '[apply-task] nothing to do: no approved tasks in %s.\n' "$APPROVED_DIR"

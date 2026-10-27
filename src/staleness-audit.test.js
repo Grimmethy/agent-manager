@@ -7,6 +7,7 @@ const {
   lastActivityTs, isStaleByAge, isFabricationRepeat, hasExhaustedRetries, findStalenessCandidates,
   buildStalenessEvidenceText, buildStalenessAuditTask, DEFAULT_STALENESS_THRESHOLD_DAYS,
   candidateFilePaths, findFilesTouchedSince, pickFairCandidate, invalidPremiseSignal,
+  titleHasFileLineRef,
 } = require('./staleness-audit.js');
 const os = require('os');
 const path = require('path');
@@ -229,7 +230,7 @@ test('buildStalenessEvidenceText includes the original task id, reasons, and raw
 });
 
 test('buildStalenessAuditTask produces a task on the given domain with the evidence embedded', () => {
-  const task = makeTask({ id: 'stale-1', title: 'Investigate the widget bug' });
+  const task = makeTask({ id: 'stale-1', title: 'Investigate the widget bug in src/widget.js:42' });
   const candidate = { task, reasons: ['stale-age'], lastActivityTs: Date.now() };
   const result = buildStalenessAuditTask(candidate, 'default');
   assert.equal(result.domain, 'default');
@@ -246,10 +247,10 @@ test('buildStalenessAuditTask produces a task on the given domain with the evide
 // rendered in the UI). These structured fields let the dashboard show it directly.
 test('buildStalenessAuditTask exposes the original task\'s dates as structured, dashboard-renderable fields', () => {
   const lastActivityTs = Date.parse('2026-01-05T00:00:00.000Z');
-  const task = makeTask({ id: 'stale-1', title: 'Investigate the widget bug', createdAt: '2025-12-01T00:00:00.000Z' });
+  const task = makeTask({ id: 'stale-1', title: 'Investigate the widget bug in src/widget.js:42', createdAt: '2025-12-01T00:00:00.000Z' });
   const candidate = { task, reasons: ['stale-age'], lastActivityTs };
   const result = buildStalenessAuditTask(candidate, 'default');
-  assert.equal(result.promptContext.originalTitle, 'Investigate the widget bug');
+  assert.equal(result.promptContext.originalTitle, 'Investigate the widget bug in src/widget.js:42');
   assert.equal(result.promptContext.originalCreatedAt, '2025-12-01T00:00:00.000Z');
   assert.equal(result.promptContext.originalLastActivityAt, '2026-01-05T00:00:00.000Z');
 });
@@ -261,7 +262,7 @@ test('buildStalenessAuditTask exposes the original task\'s dates as structured, 
 test('buildStalenessAuditTask stamps the original task\'s source/rule/file for staleness-fastpath.js\'s deterministic recheck', () => {
   const task = makeTask({
     id: 'observability-x-silent-catch-block-worker-js-3',
-    title: 'Observability triage: silent-catch-block',
+    title: 'Observability triage: silent-catch-block in src/worker.js:3',
     source: 'observability_review',
     promptContext: { rule: 'silent-catch-block', file: 'worker.js', line: 3 },
   });
@@ -273,7 +274,7 @@ test('buildStalenessAuditTask stamps the original task\'s source/rule/file for s
 });
 
 test('buildStalenessAuditTask leaves originalRule/originalFile null for a task with no rule/file promptContext (e.g. adhoc)', () => {
-  const task = makeTask({ id: 'adhoc-x-1', title: 'do a thing', source: 'adhoc', promptContext: { rawText: 'do a thing' } });
+  const task = makeTask({ id: 'adhoc-x-1', title: 'do a thing in src/thing.js:7', source: 'adhoc', promptContext: { rawText: 'do a thing' } });
   const candidate = { task, reasons: ['stale-age'], lastActivityTs: Date.now() };
   const result = buildStalenessAuditTask(candidate, 'default');
   assert.equal(result.promptContext.originalSource, 'adhoc');
@@ -457,4 +458,29 @@ test('invalidPremiseSignal does not fire when a task names a mix of real and mis
   });
   const result = invalidPremiseSignal(dir, task);
   assert.deepEqual(result, { hit: false, evidence: [] });
+});
+
+// titleHasFileLineRef: the gate a staleness audit is only filed when the original title
+// names a concrete file:line, so the audit can target real code instead of an abstract
+// request it could never verify against the repo.
+test('titleHasFileLineRef returns true for a title with a file:line reference', () => {
+  assert.equal(titleHasFileLineRef('src/job-type-counters.js:18'), true);
+});
+
+test('titleHasFileLineRef returns false for an abstract title', () => {
+  assert.equal(titleHasFileLineRef('AC-34 - Add a metrics counter'), false);
+});
+
+test('titleHasFileLineRef returns false for null or empty title', () => {
+  assert.equal(titleHasFileLineRef(null), false);
+  assert.equal(titleHasFileLineRef(''), false);
+});
+
+test('buildStalenessAuditTask returns null for an abstract title', () => {
+  const candidate = {
+    task: { id: 't-abstract', title: 'AC-34 - Add a metrics counter', source: 'manual' },
+    reasons: ['stale-age'],
+    lastActivityTs: null,
+  };
+  assert.equal(buildStalenessAuditTask(candidate, 'default'), null);
 });

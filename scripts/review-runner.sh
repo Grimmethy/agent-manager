@@ -12,6 +12,16 @@ export AGENT_MANAGER_INSTANCE_ID="$INSTANCE_ID"                                 
 ONCE=false
 [[ "${2:-}" == "--once" ]] && ONCE=true
 if ! "$ONCE"; then export AGENT_MANAGER_DAEMON_PID="$$"; fi
+# Premium-only borrowed review tick (2026-10-18, premium reach -- src/pool-projects.js header): the daemon runs a --once child with
+# AGENT_MANAGER_PREMIUM_ONLY_TICK=true when ANOTHER registered project holds a premium review and the home review/ holds none. Such a child
+# reviews premium items only, so it never takes that project's regular reviews. Ignored without --once.
+PREMIUM_ONLY=false
+if "$ONCE" && [[ "${AGENT_MANAGER_PREMIUM_ONLY_TICK:-}" == "true" ]]; then PREMIUM_ONLY=true; fi
+# Reads file names (one per line) on stdin and prints, in the same order, those in dir $1 whose task has a top-level premiumPriority === true
+# (the same helper as local-worker.sh's; one node process for the whole listing).
+filter_premium_names() {
+  node -e 'const fs=require("fs"),path=require("path"),d=process.argv[1];for(const n of fs.readFileSync(0,"utf8").split("\n")){if(!n)continue;try{if(JSON.parse(fs.readFileSync(path.join(d,n),"utf8")).premiumPriority===true)console.log(n)}catch(e){}}' "$1" 2>/dev/null
+}
 
 # Refuse to start if a live process already holds this instanceId -- see local-worker.sh's
 # identical call and agent-manager-common.sh's check_instance_liveness for the full rationale.
@@ -40,11 +50,55 @@ LOG_DIR="${LOG_DIR:-$HOME_LOGS}"                                                
 # Infinite polling loop same structure as all daemon scripts: bash 'while : do ... sleep' pattern matches what PowerShell does via while(true){ ... Start-Sleep -Seconds TICK } form in each .ps1 file.
 STARTED_AT="$(date -u '+%FT%T.%NZ' 2>/dev/null)"
 
+# Per-item claim (2026-10-18, a second review daemon on the P40): this loop lists queue/review/ and used to review every file it saw, which is fine for ONE
+# daemon and double-reviews with two (the single-flight lock below is keyed by Ollama endpoint, so the 3090 and the P40 reviewer do not serialize against each
+# other, only against their own lane's worker). A claim is an atomic `mkdir` under the instances dir; the claim is held until the NEXT item starts (or the loop/daemon ends) so it outlives the
+# approve/block move that follows the review -- releasing right after the review would leave a window where the other daemon re-reviews a file that is
+# about to move. A claim whose owner pid is dead, or that is older than 3 h, is stale and taken over.
+CLAIM_DIR="${INSTANCES_DIR}/review-claims"
+CURRENT_CLAIM=""
+release_current_claim() {
+  [[ -n "$CURRENT_CLAIM" ]] && rm -rf "${CLAIM_DIR}/${CURRENT_CLAIM}.d"
+  CURRENT_CLAIM=""
+}
+claim_review_item() {
+  local name="$1" d="${CLAIM_DIR}/${1}.d" owner_pid age
+  mkdir -p "$CLAIM_DIR" 2>/dev/null
+  if mkdir "$d" 2>/dev/null; then
+    printf '%s %s\n' "$$" "$INSTANCE_ID" > "${d}/owner"
+    CURRENT_CLAIM="$name"
+    return 0
+  fi
+  owner_pid="$(awk '{print $1}' "${d}/owner" 2>/dev/null)"
+  age=$(( $(date +%s) - $(stat -c %Y "$d" 2>/dev/null || echo 0) ))
+  if [[ -n "$owner_pid" ]] && kill -0 "$owner_pid" 2>/dev/null && (( age < 10800 )); then
+    return 1   # another live daemon is reviewing it
+  fi
+  rm -rf "$d"
+  if mkdir "$d" 2>/dev/null; then
+    printf '%s %s\n' "$$" "$INSTANCE_ID" > "${d}/owner"
+    CURRENT_CLAIM="$name"
+    return 0
+  fi
+  return 1
+}
+trap release_current_claim EXIT
+
 # Re-read a dashboard model-override for THIS instanceId once per tick (Workers tab
 # dropdown, 2026-08-18) -- exports LOCAL_MODEL for this tick so every write_heartbeat_file
 # and review-task.js call below picks it up automatically; no per-call-site change needed.
 # Reviewer is always Ornith (never Claude), unlike local-worker.sh's two lanes, so this is
 # the simpler single-model version of that script's refresh_active_model.
+# The single-flight lock key for a review: the Ollama ENDPOINT this daemon talks to (`ollama-<host>-<port>`), NOT the model name. Worker drafts lock through
+# gpu-arbiter.js keyed by that same endpoint key (localOllamaLockKey), and the lockfile name is derived from the key, so a review keyed by model name took a DIFFERENT
+# lockfile for the same GPU and never excluded a draft (2026-10-21: worker-p40 and reviewer-p40 overlapped on the P40 VM, whose llama-server was OOM-killed). The JS
+# helper is the one definition of the key; fall back to the old model key only if node cannot run it, so a failure here never blocks a review.
+review_lock_key() {
+  local key
+  key="$(node -e 'process.stdout.write(require(process.argv[1]).localOllamaLockKey())' "${PACKAGE_SRC_DIR}/lib/ollama-lock-key.js" 2>/dev/null)"
+  printf '%s' "${key:-${LOCAL_MODEL:-}}"
+}
+
 refresh_active_model() {
   local override
   override="$(get_model_override "$INSTANCE_ID")"
@@ -77,6 +131,37 @@ borrow_review_from_pool() {
   return 0
 }
 
+# Premium reach (2026-10-18, Grimmethy: "premium priority tasks happen regardless of what project repo is currently selected (currently
+# selected repo still wins the tie)"). Called by the daemon BEFORE its home review scan: when the home review/ holds no premium task and
+# another registered project (pooled or not) does, run ONE premium-only --once review tick there (least-recently-premium-borrowed first) and
+# return 0; the caller then ends this tick. A project whose tick reviewed nothing is backed off for the reviewer role. Every premium borrow is
+# a 'premium-borrow' event in the HOME pipeline history. Kill switch AGENT_MANAGER_PREMIUM_REACH=false. Same shape as local-worker.sh's.
+borrow_premium_review_from_projects() {
+  [[ "${AGENT_MANAGER_PREMIUM_REACH:-true}" != "false" ]] || return 1
+  local pipes=() env_args=() pipe rc
+  if node "${PACKAGE_SRC_DIR}/pool-projects.js" --has-premium "$PIPELINE_DIR" reviewer 2>>"$LOG_FILE"; then
+    return 1   # the home review/ holds a premium task: it wins the tie, the home scan reviews it
+  fi
+  mapfile -t pipes < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --premium-projects reviewer 2>>"$LOG_FILE")
+  for pipe in "${pipes[@]}"; do
+    [[ -n "$pipe" ]] || continue
+    env_args=()
+    mapfile -t env_args < <(node "${PACKAGE_SRC_DIR}/pool-projects.js" --env-args "$pipe" "$INSTANCES_DIR" 2>>"$LOG_FILE")
+    (( ${#env_args[@]} > 0 )) || continue
+    printf '[review-%s] home has no premium review -- borrowing a PREMIUM review tick from %s\n' "$INSTANCE_ID" "$pipe"
+    rc=0
+    env "${env_args[@]}" AGENT_MANAGER_PREMIUM_ONLY_TICK=true bash "${SCRIPT_DIR}/review-runner.sh" "$INSTANCE_ID" --once || rc=$?
+    if (( rc == 10 )); then
+      node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-premium "$pipe" reviewer "$PIPELINE_DIR" >>"$LOG_FILE" 2>&1 || true
+      did_work=true
+      return 0
+    fi
+    if (( rc != 0 )); then printf '[review-%s] premium review tick from %s exited %s (treated as empty)\n' "$INSTANCE_ID" "$pipe" "$rc" >&2; fi
+    node "${PACKAGE_SRC_DIR}/pool-projects.js" --mark-premium-empty "$pipe" reviewer >>"$LOG_FILE" 2>&1 || true
+  done
+  return 1
+}
+
 while :; do                                                                     # infinite iteration until script exits (or is SIGTERM'd by system). Bash doesn't have Python-style 'while True:' so uses ':' no-op as condition which always returns 0=success so loop body executes forever; same semantic effect of PowerShell's `$true` boolean we use above.
   refresh_active_model                                                          # pick up a dashboard model-override change (or its removal) before this tick does any real work.
   printf '[review-%s] tick: scanning queue/review/ for items to review...\n' "$INSTANCE_ID"    # status message echoing what the loop is doing — same info PowerShell logs via `Write-Verbose "Scanning $draftingPath..."`. Using printf not echo so format strings like '%d' don't get interpreted as %d literally (bash's echo sometimes enables escape sequences depending on shell; more portable via printf).
@@ -88,8 +173,16 @@ while :; do                                                                     
 
   # ComfyUI GPU lease (agent-manager-common.sh's comfyui_lease_held) -- PromptForge owns
   # the GPU for an image generation this tick.
-  if comfyui_lease_held; then
+  if comfyui_lease_held "${OLLAMA_URL:-http://localhost:11434}"; then
     printf '[review-%s] yielding this tick -- PromptForge holds the GPU (comfyui-lease).\n' "$INSTANCE_ID" >&2
+    if "$ONCE"; then exit 0; fi
+    sleep "${ORC_TICK_SECS:-30}"
+    continue
+  fi
+
+  # Yield this tick while host RAM is exhausted (mem-guard.js; asks ComfyUI to unload first).
+  if mem_pressure_high; then
+    printf '[review-%s] yielding this tick -- host RAM pressure (see mem-guard in the log).\n' "$INSTANCE_ID" >&2
     if "$ONCE"; then exit 0; fi
     sleep "${ORC_TICK_SECS:-30}"
     continue
@@ -102,11 +195,14 @@ while :; do                                                                     
   node "${PACKAGE_SRC_DIR}/gpu-guard.js" >>"$LOG_FILE" 2>&1 || true
 
   did_work=false                                                                 # tracks whether this tick actually reviewed anything -- drives the idle-only backoff at the bottom of the loop (see its own comment).
+
+  # Premium reach: another project's premium review goes before this reviewer's home REGULAR reviews (home premium still wins -- see the function).
+  if ! "$ONCE" && borrow_premium_review_from_projects; then sleep 1; continue; fi
   items=()
   while IFS= read -r name; do
     [[ "$name" == *.json ]]                                                    || continue        # only process JSON files, same filter as local-worker.sh's own claim loop (and same class of bug fixed there: a bare `!` would silently skip every real task file).
     items+=("$name")
-  done < <(ls -1tr "$review_dir" 2>/dev/null)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
+  done < <(if "$PREMIUM_ONLY"; then ls -1tr "$review_dir" 2>/dev/null | filter_premium_names "$review_dir"; else ls -1tr "$review_dir" 2>/dev/null; fi)   # -t: sort by mtime; -r: reverse (oldest first) -- see this loop's own comment below for why lexical order was wrong.
 
   # Iterate each item currently sitting in review/, oldest-first BY FILE MTIME (fixed
   # 2026-08-20, Grimmethy: "we need to build this sort of analysis into the daily report"
@@ -126,9 +222,12 @@ while :; do                                                                     
   # 30; done` loop has no equivalent fast-repeat path, so processing the whole snapshot
   # per tick is what keeps a backlog from taking N*30s longer than it needs to).
   for name in "${items[@]}"; do
+    release_current_claim                                                      # the previous item's approve/block move is done by now -- see claim_review_item
     file="${review_dir}/${name}"
     [[ -f "$file" && -s "$file" ]]                                             || continue        # skip non-file / empty (likely mid-write by another process) — same safety check local-worker.sh's claim loop uses.
 
+    claim_review_item "$name" || continue                                      # another review daemon has it
+    [[ -f "$file" && -s "$file" ]]                                             || continue        # it moved between our listing and our claim
     task_id="$(node -e 'try{const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));console.log(o.id||"")}catch(e){}' "$file" 2>/dev/null)"
 
     # 2026-08-27, Grimmethy: "Review should never be gated behind claude. Please allow
@@ -149,7 +248,7 @@ while :; do                                                                     
     write_heartbeat_file "$INSTANCE_ID" "queued" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
 
     # Single-flight lock (agent-manager-common.sh's acquire_single_flight_lock -- see its
-    # own header), keyed by LOCAL_MODEL -- every review now genuinely uses the local
+    # own header), keyed by the Ollama endpoint (review_lock_key, above; was LOCAL_MODEL until 2026-10-21) -- every review now genuinely uses the local
     # model, so this always needs to serialize against every other local GPU call the
     # same way local-draft.js's own withLockFn does (2026-08-25, root-caused live: two
     # different lockfiles guarding the SAME physical model/GPU never actually serialized
@@ -167,7 +266,7 @@ while :; do                                                                     
     # below already knows how to bound-retry-then-give-up on -- "timed out" matches
     # INFRA_FAILURE_PATTERN, so this task gets exactly the same requeue-round treatment
     # a genuinely transient Ollama timeout already gets, not a silent permanent hang.
-    if acquire_single_flight_lock "${LOCAL_MODEL:-}"; then
+    if acquire_single_flight_lock "$(review_lock_key)"; then
       write_heartbeat_file "$INSTANCE_ID" "working" "${LOCAL_MODEL:-}" "$task_id" "review" "$STARTED_AT"
       review_result="$(node "${PACKAGE_SRC_DIR}/review-task.js" "$file" 2>>"$LOG_FILE")"
       release_single_flight_lock
@@ -186,6 +285,13 @@ while :; do                                                                     
       mkdir -p "${QUEUE_DIR}/blocked" >/dev/null 2>&1
       mv -n "$file" "${QUEUE_DIR}/blocked/${name}"
       printf '[review-%s] blocked %s: %s\n' "$INSTANCE_ID" "$task_id" "$review_result" >&2
+    elif grep -qE "the Forge family holds the GPU" <<< "$review_result"; then
+      # Forge GPU session (2026-10-14): local-client.js refused to START a model call because PromptForge holds the GPU (comfyui-lease)
+      # -- src/gpu-guard.js ForgePauseError / FORGE_PAUSE_MESSAGE. Not a failure and not an outage but a deliberate, open-ended pause
+      # (a Forge session lasts 20 min idle to 4 h), so: NO reviewFailureCount increment, NO infra-requeue round, NO block. The review
+      # stays in review/ and is picked up again once the lease clears; the next ticks yield at the top while it holds. Mirrors the
+      # matching branch in local-worker.sh; the pattern is the FORGE_PAUSE_MESSAGE text, pinned by src/local-client-forge-pause.test.js.
+      printf '[review-%s] review paused for a Forge GPU session -- not counted as a failure; %s stays in review/\n' "$INSTANCE_ID" "$task_id" >&2
     else
       # Review call itself failed (unknown domain, Ollama unreachable, etc.) -- leave the
       # file in review/ rather than lose it; it's picked up again next tick. Matches
@@ -272,6 +378,7 @@ while :; do                                                                     
     did_work=true
     if "$ONCE"; then break; fi   # a borrowed tick reviews ONE item, then the reviewer re-checks its home review/ before borrowing again
   done
+  release_current_claim                                                         # the last item of this tick is done too
 
   # Idle-only backoff: only pay the full poll interval when this tick genuinely found
   # nothing to review. Previously slept the full ORC_TICK_SECS (30s) unconditionally at the

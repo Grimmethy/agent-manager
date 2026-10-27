@@ -34,6 +34,7 @@
 // genuinely separate model back in explicitly.
 const fs = require('fs');
 const path = require('path');
+const { isForgePause } = require('./gpu-guard.js');
 
 const PREMISE_CHECK_MODEL = process.env.AGENT_MANAGER_CANDIDATE_PREMISE_MODEL;
 const PREMISE_CHECK_NUM_CTX = 8192;
@@ -262,6 +263,7 @@ async function runPremiseCheck(task, { call, maybeLockedOn, repoRoots } = {}) {
   try {
     result = maybeLockedOn ? await maybeLockedOn(PREMISE_CHECK_MODEL, fn, 'candidate-premise') : await fn();
   } catch (e) {
+    if (isForgePause(e)) throw e;   // the Forge family holds the GPU: do not turn the pause into "premise ok" (the draft would skip its check)
     return { verdict: 'ok', error: String((e && e.message) || e).slice(0, 160) }; // advisory -- never blocks on a model-call failure
   }
   if (result && result.degenerate) return { verdict: 'ok' };
