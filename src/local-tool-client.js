@@ -220,12 +220,13 @@ const WRITE_TOOLS = [
     type: 'function',
     function: {
       name: 'queue_reviewed_task',
-      description: 'File a task describing a code CHANGE (which files, what behavior) for the reviewed pipeline to implement. It goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as an unmerged branch for a human. Never queue a git operation (commit, merge, push, branch, PR): the pipeline cannot perform them, and this tool refuses them.',
+      description: 'File a task describing a code CHANGE (which files, what behavior) for the reviewed pipeline to implement. It goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as an unmerged branch for a human. Never queue a git operation (commit, merge, push, branch, PR): the pipeline cannot perform them, and this tool refuses them. Optional `dependsOn` (array of task ids) lets you order a batch: a task with dependsOn will not be drafted until every listed dependency is merged. The tool returns the new task id, which a later call can reference in its own dependsOn.',
       parameters: {
         type: 'object',
         properties: {
           title: { type: 'string', description: 'Short title for the queued task, e.g. "Merge agent/observability-fix-ac-57 into master".' },
           description: { type: 'string', description: 'What should be done and why -- include enough detail (branch names, the specific change, any known risks like a merge conflict) for the pipeline to act on without further back-and-forth.' },
+          dependsOn: { type: 'array', items: { type: 'string' }, description: 'Task ids this new task depends on -- it will not be drafted until every dependency is merged. Unknown ids are rejected with a clear error. Omit for independent tasks.' },
         },
         required: ['title', 'description'],
       },
@@ -277,13 +278,14 @@ const CHAT_TOOLS = [
     type: 'function',
     function: {
       name: 'queue_reviewed_task',
-      description: 'File a real task for the pipeline to implement -- the ONLY way to make a real code change from Chat (you have no direct write access). Use this for anything from a one-line fix to a whole new mechanism: investigate and design the change as normal, then call this tool with enough detail for the pipeline to implement it without further back-and-forth. The task goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as a real unmerged branch for a human to review -- never applied directly. Describe the CHANGE wanted (files, behavior), never a git operation: do not ask for a commit, merge, push, branch or PR -- the pipeline commits by itself and a human merges from the Unmerged Branches tab, and this tool refuses git-operation requests.',
+      description: 'File a real task for the pipeline to implement -- the ONLY way to make a real code change from Chat (you have no direct write access). Use this for anything from a one-line fix to a whole new mechanism: investigate and design the change as normal, then call this tool with enough detail for the pipeline to implement it without further back-and-forth. The task goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as a real unmerged branch for a human to review -- never applied directly. Describe the CHANGE wanted (files, behavior), never a git operation: do not ask for a commit, merge, push, branch or PR -- the pipeline commits by itself and a human merges from the Unmerged Branches tab, and this tool refuses git-operation requests. Optional `dependsOn` (array of task ids) orders a batch: a task with dependsOn will not be drafted until every listed dependency is merged. The tool returns the new task id so a later call can reference it in its own dependsOn.',
       parameters: {
         type: 'object',
         properties: {
           title: { type: 'string', description: 'Short title for the queued task, e.g. "Add re-admission path for symbol-still-referenced decompose rejections".' },
           description: { type: 'string', description: 'What should be built/changed and why -- include enough detail (files, the specific behavior, acceptance criteria) for the pipeline to act on without further back-and-forth.' },
           project: { type: 'string', description: 'Label or repo root of the project this task is for (from list_projects); omit only for agent-manager itself. A task about another project\'s files is refused without it.' },
+          dependsOn: { type: 'array', items: { type: 'string' }, description: 'Task ids this new task depends on -- it will not be drafted until every dependency is merged. Unknown ids are rejected with a clear error. Omit for independent tasks. Useful for ordering an ordered batch (C1, C2, C3...) so C2 waits for C1 to merge before it is drafted.' },
         },
         required: ['title', 'description'],
       },
