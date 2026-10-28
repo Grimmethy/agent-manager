@@ -506,7 +506,31 @@ def api_git_merge_branch(branch):
     _record_merge_in_task_file(branch, context["main_branch"], qdir)
     _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir)
 
-    return jsonify({"succeeded": True, "branch": branch, "mainBranch": context["main_branch"], "liveSync": live_sync})
+    # Check which plugins are behind after merge (if the merged repo is a plugin's repo).
+    # Mirrors the pattern in routes/plugins.py: iterate manifest, call behind_checkout,
+    # set restartNeeded field on each plugin entry.
+    restart_needed = []
+    try:
+        from app import _read_plugins_manifest
+        import plugin_process_manager
+        manifest = _read_plugins_manifest()
+        pm = plugin_process_manager.PluginProcessManager()
+        for p in manifest:
+            if p.get("slot") or p.get("processName"):
+                behind_info = pm.behind_checkout(p)
+                p["restartNeeded"] = bool(behind_info.get("behind"))
+                if behind_info.get("behind"):
+                    restart_needed.append(p.get("name") or p.get("slot") or str(p))
+    except Exception:
+        logger.warning("Non-fatal: could not check plugin behind-status after merge", exc_info=True)
+
+    return jsonify({
+        "succeeded": True,
+        "branch": branch,
+        "mainBranch": context["main_branch"],
+        "liveSync": live_sync,
+        "restartNeeded": restart_needed,
+    })
 
 
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/discard", methods=["POST"])

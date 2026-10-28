@@ -17,6 +17,8 @@ plugins_bp = Blueprint("plugins-bp", __name__)
 def api_plugins():
     from app import PLUGINS_MANIFEST_PATH, _manifest_tabs_enabled, _read_plugins_manifest
     manifest = _read_plugins_manifest()
+    behind_plugins = []
+    pm = plugin_process_manager.PluginProcessManager()
     for p in manifest:
         # A processName-bearing entry (e.g. the 4 wikiforge-* tabs sharing one real
         # node server.js) needs live status just as much as a slotted one -- process_key()
@@ -24,10 +26,15 @@ def api_plugins():
         # under, not necessarily this entry's own name (2026-09-28).
         if p.get("slot") or p.get("processName"):
             p["running"] = plugin_process_manager.is_running(plugin_process_manager.process_key(p))
+        behind_info = pm.behind_checkout(p)
+        p["restartNeeded"] = bool(behind_info.get("behind"))
+        if behind_info.get("behind"):
+            behind_plugins.append(p.get("name") or p.get("slot") or str(p))
     return jsonify({
         "plugins": manifest,
         "manifestPath": str(PLUGINS_MANIFEST_PATH),
         "manifestTabsEnabled": _manifest_tabs_enabled(),
+        "behindPlugins": behind_plugins,
     })
 
 
