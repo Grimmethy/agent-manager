@@ -1,0 +1,56 @@
+# GameDesignForge GDD Schema
+# Defines the structure for Game Design Documents produced by GameDesignForge.
+# GDDs are consumed by GameForge to inform implementation, asset generation,
+# and system design decisions.
+
+gdd:
+  title:
+    type: string
+    required: true
+    description: >
+      The title of the Game Design Document (e.g. "Aetheria: Chronicles of the
+      Shattered Sky").
+  premise:
+    type: string
+    required: true
+    description: >
+      One-paragraph elevator pitch summarizing the game's core concept, setting,
+      and unique hook.
+  target_audience:
+    type: string
+    required: true
+    description: >
+      Description of the intended player audience — demographics, experience
+      level, genre preferences, and platform expectations.
+  core_loop:
+    type: string
+    required: true
+    description: >
+      Narrative description of the primary gameplay loop: what the player does
+      repeatedly, what drives progression, and what provides short- and
+      long-term motivation.
+  forge_selection:
+    type: array
+    required: true
+    items:
+      type: string
+    description: >
+      List of forge names or paths to include when assembling the GDD. Each
+      entry refers to a downstream forge (e.g. "mechanics-forge",
+      "world-forge", "model-forge") whose schema and content should be pulled
+      into the final document.
+
+# Example:
+# gdd:
+#   title: "Aetheria: Chronicles of the Shattered Sky"
+#   premise: "Aetheria is a sky-bound fantasy RPG where players rebuild a
+#     fragmented world by mastering elemental forges..."
+#   target_audience: "Core RPG fans aged 16-35, comfortable with complex
+#     progression systems and narrative-heavy gameplay."
+#   core_loop: "Explore sky-islands, harvest elemental shards, refine them at
+#     the appropriate forge, and use crafted components to restore broken
+#     world-sectors. Each cycle unlocks new forges and deeper lore."
+#   forge_selection:
+#     - "mechanics-forge"
+#     - "world-forge"
+#     - "model-forge"
