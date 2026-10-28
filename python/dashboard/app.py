@@ -2232,6 +2232,17 @@ def _store_branch_list(branches):
     with _branch_cache_lock:
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
+    # Apply any pending verdicts for branches that are now in the listing
+    try:
+        import branch_verdicts_pending as bvp
+        import branch_verdicts as bv
+        qdir = queue_dir()
+        if qdir:
+            repo_root = get_active_repo_root()
+            if repo_root:
+                bvp.apply_pending_verdicts(qdir, repo_root, list_unmerged_branches, _run_git, bv)
+    except Exception as exc:
+        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
 
 
 def _refresh_branch_list_in_background():

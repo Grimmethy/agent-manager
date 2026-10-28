@@ -37,7 +37,17 @@ def api_git_record_branch_verdict(branch):
     else:
         match = next((b for b in list_unmerged_branches(force=False) if b["branch"] == branch), None)
     if not match:
-        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+        # Check if the branch exists on origin (held hub branch or listing hasn't caught up yet)
+        try:
+            _run_git(["rev-parse", "--verify", f"origin/{branch}"], repo_root)
+            # Branch exists on origin, store as pending
+            import branch_verdicts_pending as bvp
+            head_sha = _run_git(["rev-parse", f"origin/{branch}"], repo_root).strip()
+            bvp.store_pending_verdict(qdir, branch, head_sha, verdict, reasons, source)
+            return jsonify({"succeeded": True, "pending": True, "headSha": head_sha}), 200
+        except (RuntimeError, OSError):
+            # Branch doesn't exist on origin, 404 as before
+            abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
