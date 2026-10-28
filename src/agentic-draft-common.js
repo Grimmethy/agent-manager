@@ -113,6 +113,48 @@ function fileSelfDeclaredPartialScopeFollowUp(task, summary) {
 const MAX_AGENTIC_CONTINUATIONS = Number(process.env.AGENT_MANAGER_MAX_AGENTIC_CONTINUATIONS) || 2;
 const RERUN_NOT_A_QUESTION_RE = /\bno (?:open |real |actual )?(?:design )?(?:question|decision)\b|\b(?:ran |run )out of turns\b|\bexhausted (?:my|its|the|this) turn(?: budget)?\b|\bre-?run (?:this|the|it|me)\b|\bfresh pass (?:can|could|will) (?:complete|finish)\b|\bwhat (?:did |does )not(?: yet)? land\b/i;
 
+// 2026-10-28 (HUB0008-03): when the agentic pass's final text contains the piece's own
+// stop instruction being followed (a sentence naming 'needs-clarification' or beginning
+// 'STOP', or a line starting 'PREREQUISITE'), treat the block as a prerequisite stop:
+// do not spend redraft retries, move the task to needs-clarification at once with
+// blockedReason set to that sentence (trimmed to 600 chars), and add a history event
+// 'prerequisite-stop' carrying it. The agentic implement pass had stopped on its own
+// prerequisite check (e.g. "accounts hub (HUB0006) must be merged to master first")
+// but the record only showed 'Agentic implement pass tagged BLOCKER-TYPE: infra-error'
+// -- a generic infra-error line -- and was retried twice for nothing, then escalated
+// with 'escalated to a human after exhausting redraft retries' (reject-retry-check.js)
+// with no sign of the real reason. The BLOCKER-TYPE line is written by the local model
+// (BLOCKER_TYPE_RE below: design-question | budget-exhausted | infra-error).
+//
+// A sentence that merely mentions 'needs-clarification' inside quoted task text is NOT
+// a stop -- strip quoted sections first to avoid false positives.
+//
+// Returns the detected sentence (trimmed to 600 chars) or null if no stop detected.
+// Caller (resolveNeedsHuman) is responsible for the side effects: setting blockedStage,
+// blockedReason, and appending the history event.
+function detectPrerequisiteStop(text) {
+  if (!text || typeof text !== 'string') return null;
+
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Check for lines starting with 'STOP' or 'PREREQUISITE' (case-insensitive)
+    if (/^(?:STOP|PREREQUISITE)\b/i.test(trimmed)) {
+      return trimmed.slice(0, 600);
+    }
+
+    // Check for 'needs-clarification' outside quotes
+    // Remove quoted sections first to avoid false positives
+    const unquoted = trimmed.replace(/"[^"]*"/g, '').replace(/'[^']*'/g, '');
+    if (/needs-clarification\b/i.test(unquoted)) {
+      return trimmed.slice(0, 600);
+    }
+  }
+
+  return null;
+}
+
 // 2026-09-08, root-caused live (autodecomp-...-04-system-and-project-js): the model's own
 // summary said plainly "not a design question -- a pass-budget overrun," but it neither
 // matched RERUN_NOT_A_QUESTION_RE's wording (worded "not a design question," not "no
@@ -580,6 +622,31 @@ function resolveNeedsHuman(ctx) {
   const resolution = 'needs-human-decision';
   const capturedDiff = bestEffortDiff();
   const continuations = Number(task.agenticContinuationCount) || 0;
+
+  // 2026-10-28 (HUB0008-03): prerequisite-stop check. If the model's own text
+  // contains a stop instruction (a sentence naming 'needs-clarification' or beginning
+  // 'STOP', or a line starting 'PREREQUISITE'), treat it as a prerequisite stop and
+  // escalate immediately without retrying. This is checked BEFORE BLOCKER_TYPE_RE so
+  // it takes priority -- the model was already telling us the real reason it stopped,
+  // we just weren't listening. reject-retry-check.js bounds retries by MAX_LOCAL_REJECT_RETRIES;
+  // a prerequisite stop bypasses that entirely because retrying would just reproduce
+  // the same stop (the prerequisite hasn't been satisfied).
+  const prereqStop = detectPrerequisiteStop(summary);
+  if (prereqStop) {
+    task.blockedStage = 'needs-clarification';
+    task.blockedReason = prereqStop;
+    appendHistoryEvent(task, 'prerequisite-stop', { reason: prereqStop });
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedStage: 'needs-clarification',
+      blockedReason: prereqStop,
+      ...meta,
+      capturedDiff: undefined,
+      needsClarification: true,
+    };
+  }
+
   const blockerTypeMatch = BLOCKER_TYPE_RE.exec(summary);
   const blockerType = blockerTypeMatch ? blockerTypeMatch[1].toLowerCase() : null;
 
@@ -1004,4 +1071,5 @@ module.exports = {
   summariseInvestigation,
   BLOCKER_TYPE_RE,
   SELF_DECLARED_PARTIAL_SCOPE_RE, fileSelfDeclaredPartialScopeFollowUp,
+  detectPrerequisiteStop,
 };
