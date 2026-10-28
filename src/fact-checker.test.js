@@ -624,6 +624,41 @@ test('checkGroundedValues does not flag a URL that exists literally elsewhere in
   assert.deepEqual(flags, []);
 });
 
+// checkGroundedValues: IP literal URLs are never exempt as "named service" -----------
+// 2026-10-22: extractDomainRoot on an IPv4 host returns the third octet (e.g. '112'
+// from 100.96.112.78), which appears incidentally in any other IP, version string,
+// port, etc. in source text -- so an invented IP sharing that octet would previously
+// slip through the high-precision named-service gate. Fix: extractDomainRoot returns
+// null for any IP literal hostname, so isNamedServiceUrl never exempts it.
+
+test('checkGroundedValues flags an invented IP that shares an octet with a grounded IP', () => {
+  const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
+  const draftText = 'use http://100.96.112.99:7450 (invented, same third-octet)';
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'http://100.96.112.99:7450' }]);
+});
+
+test('checkGroundedValues does not flag an exact-grounded IP literal (substring match confirms it)', () => {
+  const sourceText = 'AGENT_URL=http://100.96.112.78:7450';
+  const draftText = 'use http://100.96.112.78:7450 (exact match)';
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
+test('checkGroundedValues flags an invented IPv6 literal', () => {
+  const sourceText = 'See https://real-internal-docs.example.test/page';
+  const draftText = 'also http://[2001:db8::1]:8080 (made up)';
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, [{ type: 'ungrounded-url', detail: 'http://[2001:db8::1' }]);
+});
+
+test('checkGroundedValues still exempts a named domain (ntfy.sh) grounded by name in source', () => {
+  const sourceText = 'Default to ntfy for notifications: https://ntfy.sh/docs/publish/';
+  const draftText = 'Use https://ntfy.sh/abc123 for the webhook endpoint.';
+  const flags = checkGroundedValues(draftText, sourceText);
+  assert.deepEqual(flags, []);
+});
+
 // --- resolvedVia / imprecise-file-path (2026-08-30): a real file cited with a missing or
 // wrong directory prefix is a citation nit, not fabrication. -----------------------------
 const { resolveAgainstRepoDetailed } = require('./fact-checker.js');
