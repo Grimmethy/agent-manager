@@ -66,7 +66,48 @@ Registration fields added for the last holdouts (each opts a source into one cor
 | `noAutoRetry: true` | `reject-retry-check.js` | Opts a source out of the blind-redraft-and-retry sweep entirely (2026-09-28) -- a blocked task from this source is left exactly as-is (never auto-requeued for a fresh draft-started cycle, never counted toward `MAX_LOCAL_REJECT_RETRIES`/`exhausted`). For a source whose redraft is a genuine multi-minute plan+implement+critique cycle run at batch scale (`wiki_transcript_extract`/`wiki_page_promote`), the operator may prefer "one attempt and done, move to the next item" over spending that time re-attempting one that already failed. |
 | `genuineVerdict: { idPrefix? }` | `lib/inert-target.js` (derived-premise sweep) | This source's `done/` records (id/filename starting `idPrefix`) whose `implementResponse` carries a vetted `### AC-N` + `Strength: Strong` candidate count as a GENUINE verdict, letting the sweep RETIRE a derived finding about an unreferenced symbol instead of just holding it (the dead-code triage, `unused_export`). Core resolves a record's source through `registerSourceAlias`, so a source whose tasks stamp another `source` string just registers the alias. |
 
-A source that needs a mandatory, source-specific instruction in its implement prompt (e.g. `function_length_review`'s two-outcome verdict constraint) puts it in its own `buildImplementPrompt`; core's dispatcher no longer special-cases any source name.
+A source that needs a mandatory, source-specific instruction in its implement prompt (e.g. `function_length_review`'s two-outcome verdict constraint) puts it in its own `buildImple
+
+## plugins.json is host-local
+
+`plugins.json` (repo root) is gitignored — it is **host-local configuration**, not part of the plugin contract. A rebuilt host starts with no plugins registered, no dashboard tabs, no GPU broker card page. The broker's tab entry exists on this host because it was added by hand; on a fresh host it would be silently lost.
+
+**What ships with the plugin, what lives on the host:**
+
+| Lives in the plugin repo | Lives in agent-manager's `plugins.json` (host-local) |
+|---|---|
+| `register.js` (calls `registerTaskSource`) | The `name`/`tab` entry that wires the plugin into the dashboard |
+| `ui/<tab>.js` (the tab script) | The `script` path that points at it |
+| `README.md` (documents the tab entry) | The `group` that places the tab in the Forges section |
+
+**Worked example — GPU broker (the only plugin with a tab in the Forges group):**
+
+The broker's `README.md` documents its exact entry verbatim:
+
+```
+tab: {key: 'gpu-broker', label: '🎛 GPU Cards', kind: 'script', script: 'ui/gpu-broker-tab.js', group: 'Forges'}
+```
+
+`plugins.example.json` (in this repo, also gitignored) lists this entry without machine-specific env values — it is the source of truth for "what entries should exist on a fresh host". Validate it with:
+
+```bash
+/media/model-cache/github/agent-manager/.venv/bin/python -m unittest python.dashboard.test_plugins_example_validation -v
+```
+
+The test asserts every entry passes `_validate_plugin_tab()` (the same validation the dashboard uses at `/api/plugins`) and that no entry contains machine-specific values like `/media/` paths or `127.0.0.1` URLs.
+
+**Provisioning checklist for a new host:**
+
+1. `git clone` agent-manager (skip the GPU broker repo until step 4)
+2. `git clone` each plugin repo to a known location (e.g. `/media/model-cache/github/`)
+3. Copy `plugins.example.json` to `plugins.json`: `cp plugins.example.json plugins.json`
+4. For each plugin in the example, verify the entry matches the plugin's README; edit `plugins.json` if the README documents a different shape
+5. For each plugin, set `AGENT_MANAGER_REGISTER_PATH` to include its `register.js` (comma-separated, see `src/config.js`'s `ensureRegistered()`)
+6. Start the broker (or whichever plugin has a long-lived server): `cd /media/model-cache/github/agent-manager-gpu-broker && python server/app.py &`
+7. Open the dashboard; the Forges group should list the broker tab
+8. Click the tab — if it 404s, the `script` path in `plugins.json` does not match the plugin's actual `ui/` layout; fix the entry
+
+A plugin that ships a tab **must document its exact `plugins.json` entry in its own README** — see the broker's `README.md` for the pattern. Core never invents entries; the operator copies from the example and verifies against the README.mentPrompt`; core's dispatcher no longer special-cases any source name.
 
 Known, deliberate exceptions:
 
