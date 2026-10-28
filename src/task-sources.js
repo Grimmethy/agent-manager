@@ -1757,6 +1757,22 @@ registerTaskSource('secondbrain', { priority: taskPriority('secondbrain', 40), n
 // It now takes the one pinned context (gpu-capacity.js PINNED_NUM_CTX) like everything else.
 registerModelProfile('brain-dump-cheap-local', { backend: 'local', think: false });
 registerTaskSource('brain_dump_sort', { priority: taskPriority('brain_dump_sort', 42), next: nextBrainDumpSortTask, modelProfile: 'brain-dump-cheap-local', deterministicReview: true, deterministicReviewValidate: brainDumpSortReviewValidate, reportClass: 'housekeeping', strictOutputOnly: true });
+// brain_dump_resolution_check (2026-10-26): per-entry 'already fixed on master?' check.
+// Evidence pack built BEFORE model call (capped ~3000 chars), deterministic validator
+// downgrades 'yes' if evidence not grounded in pack. Never closes or edits entry text.
+// Uses qwen3-vl:8b-instruct on rx580 lane (16384 numCtx). Registered here so this file
+// is the single source of truth for the domain string.
+const { next: nextBrainDumpResolutionCheck, apply: applyBrainDumpResolutionCheck, validate: validateBrainDumpResolutionCheck, localCall: localCallBrainDumpResolutionCheck } = require('./brain-dump-resolution-check.js');
+registerTaskSource('brain_dump_resolution_check', {
+  priority: taskPriority('brain_dump_resolution_check', 44),
+  next: nextBrainDumpResolutionCheck,
+  apply: applyBrainDumpResolutionCheck,
+  modelProfile: 'qwen3-vl:8b-instruct',
+  deterministicReview: true,
+  deterministicReviewValidate: validateBrainDumpResolutionCheck,
+  reportClass: 'housekeeping',
+  strictOutputOnly: true,
+});
 // brain_dump_disposition (2026-09-16, HUB0119 1/4): the domain for the structured
 // disposition decision on a brain-dump entry that must NOT become code work -- the
 // counterpart of brain_dump_sort's requiresCode/requiresResearch routing. Registered here
