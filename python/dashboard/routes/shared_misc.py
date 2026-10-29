@@ -123,11 +123,18 @@ def api_tasks_completed():
     (2026-09-08, Grimmethy: "an in-app representation of that all tasks completed log
     under the workers... only loads the most recent 25 tasks until I scroll to the
     bottom"). Cursor-paginated via _scan_recently_completed_tasks -- see that function's
-    own header for why this reads real task history rather than model_calls."""
+    own header for why this reads real task history rather than model_calls.
+
+    Accepts optional ?projects=all query parameter. When provided, scans every
+    registered project's done/ directory and merges results sorted by mtime desc
+    with tie-breaking by project name then task id. Each row includes a project
+    field with {label, repoRoot} structure. When omitted, scans only the active
+    project (legacy behavior, byte-identical to the original implementation)."""
     from app import _scan_recently_completed_tasks
     limit = min(max(request.args.get("limit", 25, type=int) or 25, 1), 100)
     before = request.args.get("before")
-    rows, next_cursor = _scan_recently_completed_tasks(limit, before_iso=before)
+    projects = request.args.get("projects")
+    rows, next_cursor = _scan_recently_completed_tasks(limit, before_iso=before, projects=projects)
     return jsonify({"tasks": rows, "nextCursor": next_cursor})
 
 

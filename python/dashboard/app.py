@@ -844,7 +844,7 @@ def _worker_lane_refusal(instance_id: str) -> str | None:
     return None
 
 
-def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
+def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False, projects=None):
     """Scans queue/done/'s own top level (mtime-sorted, most-recent-first; NOT the dated
     queue/done/_archived/<YYYY-MM>/ or _archived_no_action/ buckets -- those hold work
     already aged out of the "recent" window this is for) for completed tasks, reading
@@ -876,7 +876,15 @@ def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
     above a previously-fetched page.
     `reviewed_only` keeps only tasks whose own history actually shows an 'approved' or
     'blocked' review-stage event (the reviewer card's own definition of "reviewed",
-    mirrored from the model_calls branch below)."""
+    mirrored from the model_calls branch below).
+    `projects` is None (default) for single-project legacy behavior, or "all" to scan
+    every registered project's done/ directory and merge results sorted by mtime desc
+    with tie-breaking by project name then task id. Multi-project scans use in-process
+    memoization keyed by done/ directory mtime to avoid rescanning unchanged directories."""
+    if projects == "all":
+        return _scan_recently_completed_tasks_multi(limit, before_iso=before_iso)
+
+    # Single-project path (legacy, unchanged behavior)
     qdir = queue_dir()
     if not qdir:
         return [], None
@@ -929,6 +937,120 @@ def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
             next_cursor = mtime_iso
             break
     return results, next_cursor
+
+
+# In-process memoization cache for multi-project scan.
+# Key: (repo_root, pipeline_dir) -> {"mtime": float, "rows": list, "error": str|None}
+# Value is stamped with the done/ directory's mtime so we can detect when it changes.
+_multi_scan_cache = {}
+_multi_scan_cache_lock = threading.Lock()
+
+
+def _scan_recently_completed_tasks_multi(limit, before_iso=None):
+    """Multi-project scan: iterate every registered project, collect completed tasks
+    from each done/ directory, merge and sort by mtime desc with tie-breaking by
+    project name then task id. Uses in-process memoization keyed by done/ directory
+    mtime to avoid rescanning unchanged directories.
+    """
+    from branch_projects import registered_projects
+
+    active_root = get_active_repo_root()
+    projects = registered_projects(active_root)
+
+    all_tasks = []
+    for project in projects:
+        repo_root = project["repoRoot"]
+        pipeline_dir = project["pipelineDir"]
+        qdir = Path(pipeline_dir) / "queue"
+        done_dir = qdir / "done"
+
+        if not done_dir.is_dir():
+            continue
+
+        # Check memoization cache: has this done/ directory been scanned recently?
+        project_key = (repo_root, pipeline_dir)
+        cached = None
+        with _multi_scan_cache_lock:
+            entry = _multi_scan_cache.get(project_key)
+            if entry:
+                try:
+                    current_mtime = done_dir.stat().st_mtime
+                except OSError:
+                    current_mtime = None
+                if current_mtime == entry["mtime"]:
+                    cached = entry["rows"]
+
+        if cached is not None:
+            # Cache hit: reuse previously scanned rows
+            all_tasks.extend(cached)
+            continue
+
+        # Cache miss: scan this project's done/ directory
+        project_tasks = []
+        project_label = project["label"]
+        for f in done_dir.glob("*.json"):
+            try:
+                stat = f.stat()
+                mtime = stat.st_mtime
+                data = read_json_safe(f)
+                if not data:
+                    continue
+                task_id = data.get("id", f.stem)
+                # Skip tasks that are still in progress (not yet moved to done/)
+                if data.get("status") not in ("done", None):
+                    continue
+                # Build a summary row
+                summary = task_summary(data, f.stem)
+                summary["completedAt"] = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+                summary["taskId"] = task_id
+                summary["_mtime"] = mtime
+                summary["project"] = {"label": project_label, "repoRoot": repo_root}
+                project_tasks.append(summary)
+            except (OSError, json.JSONDecodeError):
+                continue
+
+        # Cache the result keyed by done/ directory mtime
+        try:
+            done_mtime = done_dir.stat().st_mtime
+        except OSError:
+            done_mtime = None
+
+        with _multi_scan_cache_lock:
+            _multi_scan_cache[project_key] = {
+                "mtime": done_mtime,
+                "rows": project_tasks,
+            }
+
+        all_tasks.extend(project_tasks)
+
+    # Sort by mtime descending, tie-break by project name then task id
+    all_tasks.sort(key=lambda t: (-t["_mtime"], t.get("project", {}).get("label", "").lower(), t.get("taskId", "")))
+
+    # Apply before cursor filtering
+    if before_iso:
+        try:
+            before_ts = round(datetime.fromisoformat(before_iso.replace("Z", "+00:00")).timestamp(), 6)
+        except ValueError:
+            before_ts = None
+
+        if before_ts is not None:
+            all_tasks = [t for t in all_tasks if t["_mtime"] < before_ts]
+
+    # Apply limit
+    if limit and len(all_tasks) > limit:
+        all_tasks = all_tasks[:limit]
+
+    # Determine next cursor
+    next_cursor = None
+    if all_tasks and len(all_tasks) >= limit:
+        last_task = all_tasks[-1]
+        next_cursor = last_task.get("completedAt")
+
+    # Clean up internal fields before returning
+    for task in all_tasks:
+        task.pop("_mtime", None)
+
+    return all_tasks, next_cursor
 
 
 def _relocate_task_to_pending(qdir: Path, task_id: str, target_instance_id: str) -> dict:
