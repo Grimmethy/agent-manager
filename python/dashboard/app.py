@@ -42,6 +42,7 @@ from werkzeug.exceptions import HTTPException
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import graph_build  # noqa: E402
 from app_proactive_sweep import proactive_sweep_argv, proactive_sweep_lock_path  # noqa: E402
+from response_compression import compress_response  # noqa: E402
 import visualize_graph  # noqa: E402
 
 import plugin_process_manager
@@ -230,6 +231,8 @@ app = Flask(__name__)
 # here ever restarted the process. Independent of the reloader below (this one's Jinja2's
 # own cache, not Werkzeug's process-restart-on-.py-change).
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+# gzip for text responses (page, static scripts, JSON, plugin proxy) -- see response_compression.py.
+app.after_request(compress_response)
 
 
 @app.errorhandler(HTTPException)
