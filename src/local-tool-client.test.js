@@ -591,17 +591,17 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the nine chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the eleven chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'list_projects', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
-      'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
+      'answer_task_clarification', 'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
+      'record_branch_verdict', 'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
 });
 
-test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all nine chat tools', () => {
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all eleven chat tools', () => {
   withFixtureRepo((mod, dir) => {
     const handlers = mod.buildChatToolHandlers([dir], dir, dir);
     assert.equal(handlers.write_file, undefined);
@@ -609,6 +609,7 @@ test('buildChatToolHandlers has no write_file/edit_file handler even if called d
     for (const name of [
       'run_bash', 'queue_reviewed_task', 'answer_task_clarification',
       'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'withdraw_task', 'propose_command',
+      'list_unverified_branches', 'record_branch_verdict',
     ]) {
       assert.equal(typeof handlers[name], 'function', `expected a handler for ${name}`);
     }
