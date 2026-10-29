@@ -322,7 +322,59 @@ function formatSymbolWarnings(fabricated) {
   return [`symbol(s) ${names.join(', ')} not found by literal text search in the file(s) this candidate cites`];
 }
 
+// --- context files named in a candidate's prose (brain dump bd-1791177888894, 2026-10-05) ---------------------------------------------------------
+// The `Files:` line is the edit target list, but a change often needs another module in view to be drafted correctly: TaxHarvest arch-review-ac-47 ("replace the STATUS_*
+// destructuring with `const { STATUS } = require('./agent-task-statuses')`") was shown only agent-task-db-v2.js, came back as an empty edit array ("I cannot inspect the
+// agent-task-statuses module") and, on the retry, guessed uppercase keys that the module does not have. The old derivation only recognised paths starting src/ python/ scripts/
+// or lib/, so TaxHarvest paths and relative module specifiers were never fetched. Returns the repo-relative files the prose names, in this order: (a) the old src|python|scripts|lib
+// paths, (b) relative require/import specifiers resolved EXACTLY against each declared file's directory (never by basename: `./index` must not pick an arbitrary index.js),
+// (c) any other path with a directory prefix. Each must exist as a regular file inside repoRoot, must not be a declared file, a test/fixture/vendor/build file, and at most `max`
+// are returned. Never throws; a miss is skipped silently (prose may name hypothetical or other-repo paths).
+const CONTEXT_PREFIX_RE = /(?<![\w/.-])((?:src|python|scripts|lib)\/[\w./-]+\.(?:js|ts|py|mjs|cjs))\b/g;
+const CONTEXT_SPECIFIER_RE = /(?:\brequire\(\s*|\bfrom\s+|\bimport\(\s*)['"`](\.{1,2}\/[^'"`\s)]+)['"`]/g;
+const CONTEXT_PATH_RE = /(?<![\w/.-])([A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+\.(?:jsx?|tsx?|py|mjs|cjs))(?![\w/-])/g;
+const CONTEXT_SKIP_RE = /(?:^|\/)(?:node_modules|dist|build|coverage|\.git|fixtures?|__tests__|tests?)\/|\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]*\.py$|_test\.py$|\.min\.[cm]?js$|\.d\.ts$/;
+const SPECIFIER_INDEX_FILES = PROBE_EXTENSIONS.map((e) => `/index${e}`);
+
+function citedContextFiles({ section, declaredFiles = [], repoRoot, max = 3 } = {}) {
+  const out = [];
+  try {
+    if (!section || !repoRoot || !(max > 0)) return out;
+    const root = path.resolve(repoRoot);
+    const norm = (p) => String(p || '').replace(/\\/g, '/').replace(/^\.\//, '');
+    const declared = (Array.isArray(declaredFiles) ? declaredFiles : []).filter((f) => typeof f === 'string' && f).map(norm);
+    const isRegular = (abs) => { try { return fs.statSync(abs).isFile(); } catch { return false; } };
+    const within = (abs) => abs.startsWith(root + path.sep);
+    const text = String(section);
+    const add = (rel) => {
+      const r = norm(rel);
+      if (out.length >= max || !r || declared.includes(r) || out.includes(r) || CONTEXT_SKIP_RE.test(r)) return;
+      const abs = path.resolve(root, r);
+      if (within(abs) && isRegular(abs)) out.push(r);
+    };
+    for (const m of text.matchAll(CONTEXT_PREFIX_RE)) add(m[1]);
+    for (const m of text.matchAll(CONTEXT_SPECIFIER_RE)) {
+      const spec = m[1];
+      for (const d of declared) {
+        const base = path.posix.normalize(path.posix.join(path.posix.dirname(d), spec));
+        const hit = [base, ...PROBE_EXTENSIONS.map((e) => base + e), ...SPECIFIER_INDEX_FILES.map((e) => base + e)].find((c) => {
+          const abs = path.resolve(root, c);
+          return within(abs) && isRegular(abs);
+        });
+        if (hit) { add(hit); break; }
+      }
+    }
+    for (const m of text.matchAll(CONTEXT_PATH_RE)) {
+      if (out.length >= max) break;
+      const r = resolveCitedFile(root, m[1]);
+      if (r.exists && r.isFile && r.resolvedVia === 'exact' && r.relPath) add(r.relPath);
+    }
+  } catch { /* advisory: no context beats a crash */ }
+  return out;
+}
+
 module.exports = {
+  citedContextFiles,
   resolveCitedFile,
   resolveCitedFileAtMain,
   parseFabricatedPaths,

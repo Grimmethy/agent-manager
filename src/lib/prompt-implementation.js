@@ -88,7 +88,7 @@ function brainDumpSortImplementPrompt(task, planText) {
     '',
     '{',
     '  "secondBrainPath": "<one of the allowed top-level folders>/<descriptive-name>.md",',
-    '  "tags": ["short", "lowercase", "keywords"],',
+    '  "tags": 3 to 6 lowercase keywords taken from THIS note, as JSON strings (never generic words like "keywords" or "tags"),',
     '  "actionable": true or false -- true only if this genuinely needs someone to DO something, not just remember it,',
     '  "rationale": "one sentence explaining the destination",',
     '  "belongsToProject": "exact project label from the tracked list above, or null if this note is not a concrete feature/bug for one of those projects -- null even if a tracked project\'s name appears in the note\'s own title, when the note actually describes a new standalone plugin/product idea rather than an edit to that project\'s existing files (see your plan\'s CRITICAL distinction above). This is a PROJECT LABEL, NOT a second-brain folder name -- do not output a vault folder like \'Projects\', \'Notes\', \'Inbox\', or \'Ideas\' here, even though \'Projects\' also happens to be a valid secondBrainPath folder above; that is a completely different field with a different vocabulary.",',

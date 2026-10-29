@@ -5,7 +5,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { candidateKey, entriesIn, findDuplicateCandidate } = require('./candidate-dedupe.js');
+const { candidateKey, entriesIn, findDuplicateCandidate, fallbackTitleIdentifier } = require('./candidate-dedupe.js');
 
 const doc = (entries) => '# Candidates\n\n' + entries.map(([id, title, files]) =>
   [`### ${id} · ${title}`, 'Strength: Strong', files ? `Files: ${files}` : '', '', 'Problem:', 'p'].filter((l, i) => l !== '' || i > 2).join('\n')
@@ -53,4 +53,39 @@ test('multi-file Files: lines match regardless of order and formatting', () => {
     candidateKey(cand('Fix `f`', './src/b.js, src/a.js')),
     candidateKey(cand('Fix `f()`', 'src/a.js src/b.js')),
   );
+});
+
+// --- 2026-10-03: the key no longer depends on the model backticking the symbol (AC-199 re-appended AC-52) ---
+
+test('unbackticked verb-led titles dedupe on file + symbol (AC-199 vs AC-52 shape)', () => {
+  const file = 'python/dashboard/static/js/branches-joblist-hardware-tabs.js';
+  const text = doc([['AC-52', 'Decompose renderHardwareTab into per-section renderers', file]]);
+  const hit = findDuplicateCandidate(cand('Decompose renderHardwareTab into per-section builders', file), [{ ref: 'master', text }]);
+  assert.deepEqual(hit, { duplicateOf: 'AC-52', ref: 'master' });
+});
+
+test('same symbol in a different file is not a duplicate: a moved or same-named function is never matched on the symbol alone (AC-198 shape)', () => {
+  const text = doc([['AC-10', 'Decompose applyBrainDumpSort guard-and-classify monolith', 'src/apply-group-a.js']]);
+  assert.equal(findDuplicateCandidate(cand('Decompose applyBrainDumpSort into named helpers', 'src/apply-group-a-brain-dump.js'), [{ ref: 'master', text }]), null);
+});
+
+test('fallback only fires when the first word after the verb is itself identifier-like: prose titles stay keyless', () => {
+  assert.equal(fallbackTitleIdentifier('Consolidate the retry logic'), '');
+  assert.equal(fallbackTitleIdentifier('Extract repeated directory-traversal blocks in api_adhoc_task'), '');
+  assert.equal(fallbackTitleIdentifier('Swallowed fetch error in loadProjectHistory'), '');
+  assert.equal(fallbackTitleIdentifier('Decompose the api_queue_state graph logic'), 'api_queue_state');
+  assert.equal(fallbackTitleIdentifier('Decompose renderHardwareTab into builders'), 'renderhardwaretab');
+  assert.equal(candidateKey(cand('Consolidate the retry logic', 'src/a.js')), null);
+});
+
+test('an explicit symbol wins over the title, whatever the title says', () => {
+  const k = (title, symbol) => candidateKey({ title, files: 'src/a.js', symbol });
+  assert.equal(k('Decompose `foo`', 'bar'), k('no identifier here', 'bar()'));
+  assert.notEqual(k('Decompose `foo`', 'bar'), k('Decompose `foo`', undefined));
+});
+
+test('entriesIn reads a Symbol: line, so an entry whose title has no identifier is still keyed', () => {
+  const text = '# C\n\n### AC-7 \u00b7 Tidy the retry logic\nStrength: Strong\nFiles: src/a.js\nSymbol: realFn\n\nProblem:\np\n';
+  assert.deepEqual(entriesIn(text), [{ id: 'AC-7', key: 'src/a.js::realfn' }]);
+  assert.deepEqual(findDuplicateCandidate({ title: 'Something unrelated', files: 'src/a.js', symbol: 'realFn' }, [{ ref: 'master', text }]), { duplicateOf: 'AC-7', ref: 'master' });
 });

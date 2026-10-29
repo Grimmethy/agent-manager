@@ -79,6 +79,83 @@ function citedCodeMovedAndRelocatable(task) {
   } catch { return false; }
 }
 
+// Shared by the two docs-only-gate entries: the recorded failure is the docs-only block AND the current gate would no longer read the task as asking for code.
+function docsOnlyGateNoLongerBlocks(task) {
+  const t = failureText(task);
+  if (!/only (?:touches|created\/edited) documentation/.test(t) || !/code change/.test(t)) return false;
+  try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
+}
+
+// The recorded failure says the piece's own sibling (the earlier part it builds on) was "not merged" into the tree the draft or the review's executed verification
+// worked in. Stacked children now draft and verify on their shared branch (agentic-draft-common.js and review-task.js both use resolveGroundingRef), so the failure can
+// recur only if that branch is missing; re-admit only when the stacked branch exists on origin now and carries commits beyond the default branch. Fail closed.
+const SIBLING_NOT_IN_TREE_RE = /sibling[^\n]{0,120}(?:not (?:yet )?merged|has not been merged|not (?:yet )?(?:present|landed|in the (?:working )?tree))|(?:not|never) (?:yet )?merged into the working tree|(?:guard|code|change)[^\n]{0,60}from (?:the )?(?:sibling|1\/\d)[^\n]{0,40}not (?:yet )?merged/i;
+function siblingNowReachableOnStackedBranch(task) {
+  if (!task || !task.stacked || !task.stacked.branch || !SIBLING_NOT_IN_TREE_RE.test(failureText(task))) return false;
+  try {
+    const { resolveGroundingRef } = require('./stacked-grounding.js');
+    const { execFileSync } = require('child_process');
+    const root = require('./config.js').getConfig().repoRoot;
+    const branch = resolveGroundingRef(task, root);
+    if (!branch) return false;
+    const base = require('./git-runner.js').detectDefaultBranch(root);
+    const ahead = execFileSync('git', ['rev-list', '--count', `origin/${base}..origin/${branch}`], { cwd: root, encoding: 'utf8', timeout: 30000 }).trim();
+    return Number(ahead) > 0;
+  } catch { return false; }
+}
+
+// The recorded failure says a sibling repo could not be reached from the implement pass AND the task really does name a registered sibling repo (an absolute path
+// inside one of `roots`, by default the read-only root list the implement pass itself now gets). Fail closed: no roots, no raw text or a throw is "no".
+const SIBLING_PATH_RE = /\/media\/model-cache\/github\/[A-Za-z0-9._-]+(?:\/[^\s'"`),;]*)?/g;
+function siblingRepoWasUnreachable(task, roots) {
+  const t = failureText(task);
+  const unreachable = /not inside any accessible repo|exactly one accessible repo/i.test(t)
+    || (/No such file or directory/i.test(t) && /\/media\/model-cache\/github\/[A-Za-z0-9._-]+/.test(t));
+  if (!unreachable) return false;
+  try {
+    const path = require('path');
+    const fs = require('fs');
+    const real = (p) => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+    let list = roots;
+    if (!list) {
+      const core = process.env.AGENT_MANAGER_CORE_REPO_ROOT || require('./config.js').getConfig().repoRoot;
+      list = require('./accessible-roots.js').resolveReadOnlySiblingRoots({ repoRoot: core });
+    }
+    const named = String(task && task.promptContext && task.promptContext.rawText || '').match(SIBLING_PATH_RE) || [];
+    return named.some((p) => list.some((r) => { const rr = real(r); const pp = real(p); return pp === rr || pp.startsWith(rr + path.sep); }));
+  } catch { return false; }
+}
+
+// The lane endpoint a task's recorded failure names ("Ollama endpoint http://host:11434 is not reachable (...)" / "... did not answer within 5000ms"), or null.
+const ENDPOINT_FAILURE_RE = /Ollama endpoint (https?:\/\/[^\s"')]+) (?:is not reachable|did not answer within)/;
+
+// Does that endpoint answer HTTP right now? The REAL check, re-run when the sweep looks at a parked task: any status code counts (as scripts/agent-manager-common.sh
+// ollama_endpoint_reachable), refused / timed out / unreachable does not. Cached per URL for 60 s so a sweep over many parked tasks probes each endpoint once.
+// _setEndpointProbe lets tests replace it; it never throws (fail-closed: unknown = not answering = leave the task parked).
+const defaultEndpointProbe = (url) => {
+  try {
+    const r = require('child_process').spawnSync('curl', ['-s', '-m', '3', '-o', '/dev/null', '-w', '%{http_code}', `${url.replace(/\/+$/, '')}/api/version`], { encoding: 'utf8', timeout: 6000 });
+    const code = String(r.stdout || '').trim();
+    return r.status === 0 && code !== '' && code !== '000';
+  } catch { return false; }
+};
+let endpointProbe = defaultEndpointProbe;
+const endpointCache = new Map();
+function endpointAnswersNow(url) {
+  const hit = endpointCache.get(url);
+  if (hit && Date.now() - hit.at < 60000) return hit.ok;
+  const ok = !!endpointProbe(url);
+  endpointCache.set(url, { at: Date.now(), ok });
+  return ok;
+}
+function _setEndpointProbe(fn) { endpointProbe = fn || defaultEndpointProbe; endpointCache.clear(); }
+
+// A task parked because its lane's Ollama endpoint was down (the 2026-10-23 grimm reset parked six) AND that endpoint answers again.
+function parkedOnEndpointOutageAndEndpointBack(task) {
+  const m = ENDPOINT_FAILURE_RE.exec(failureText(task));
+  return !!m && endpointAnswersNow(m[1]);
+}
+
 const KNOWN_FIXED = [
   {
     id: 'wrong-block-whole-function-snippet',
@@ -122,11 +199,24 @@ const KNOWN_FIXED = [
     description: 'adhoc-diff-sanity blocked a CORRECT docs-only diff ("the task asks for a code change") because the task text mentioned code paths only to say they are NOT to be edited, or because the model plan described what the document will cite',
     dirs: ['blocked', 'needs-clarification'],
     // The failure text AND a structural precondition: the fixed gate would no longer read this task as asking for code (a task that really wants code stays put).
-    applies: (task) => {
-      const t = failureText(task);
-      if (!/only (?:touches|created\/edited) documentation/.test(t) || !/code change/.test(t)) return false;
-      try { return !require('./adhoc-diff-sanity.js').taskWantsCodeChange(task); } catch { return false; }
-    },
+    applies: docsOnlyGateNoLongerBlocks,
+  },
+  {
+    // A NEW id for the 2026-10-15 follow-up fix: the sweep stamps firstSeen once per id and skips tasks that got stuck after it, so the 2026-09-21 entry above could never drain
+    // the tasks the later fix unblocks (the PromptForge and core GPU broker verification tasks, stuck 2026-10-15/16, were skipped as "failed after the fix").
+    id: 'docs-only-gate-read-only-deliverable',
+    fixedIn: 'agent-manager (docs-only gate: read-only documentation tasks and edit verbs inside identifiers, 5ac1dee7, 2026-10-15)',
+    description: 'adhoc-diff-sanity blocked a CORRECT docs-only diff ("the task asks for a code change") for a task that states a documentation deliverable and says its code is read-only, because verbs and phrases in code-citing sentences ("would move", "lease-delete+yield", "a NEW file") were read as requests',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: docsOnlyGateNoLongerBlocks,
+  },
+  {
+    id: 'implement-pass-sibling-repos-readable',
+    fixedIn: 'agent-manager (implement pass reads registered plugin/project repos read-only, merged 028e586f, 2026-10-16)',
+    description: 'The agentic implement pass could see only its own worktree, so a read-only cross-repo verification task (GPU broker verify videoforge/promptforge) found "/media/model-cache/github/<repo> does not exist" or "path is not inside any accessible repo" and concluded the repo was not on this machine. It now gets every registered plugin repo as a read-only root.',
+    dirs: ['blocked', 'needs-clarification'],
+    // The failure text says a sibling repo was unreachable AND the task names a path inside one of the roots the implement pass now receives (a task about a repo that really is not registered stays put).
+    applies: (task) => siblingRepoWasUnreachable(task),
   },
   {
     id: 'stale-snippet-partial-anchor',
@@ -170,6 +260,79 @@ const KNOWN_FIXED = [
       return !hasUnreliableGrounding(task);
     },
   },
+  {
+    // 2026-10-18: the review fact-checker's ungrounded-field gate flagged an environment variable the draft's own diff
+    // introduces (read as process.env.X / os.environ / getenv / shell ${X:-}) -- e.g. AGENT_MANAGER_EDIT_FILE_TIERS on
+    // brain-dump 1890. fact-checker.js now exempts those names; this re-runs that same extraction on the parked task's
+    // own diff and re-admits it only when EVERY flagged name is such an env read (one genuinely invented name keeps it parked).
+    id: 'ungrounded-field-new-env-var',
+    fixedIn: 'agent-manager (fact-checker: an env var read by the draft\'s own diff is not ungrounded, 2026-10-18)',
+    description: 'an ungrounded-field block on a name the draft itself introduces as an environment variable it reads',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const names = [...failureText(task).matchAll(/ungrounded-field: ([A-Z][A-Z0-9]*_[A-Z0-9_]+)/g)].map((m) => m[1]);
+      if (!names.length) return false;
+      const { extractEnvReadIdentifiers } = require('./fact-checker.js');
+      const reads = extractEnvReadIdentifiers((task && (task.implementResponse || task.rawDiff)) || '');
+      return names.every((n) => reads.has(n));
+    },
+  },
+  {
+    // 2026-10-19: the same gate flagged an ALL_CAPS dummy string that exists only in a test file the draft itself adds (brain-dump 1891's
+    // SENTINEL_THOUGHT). fact-checker.js now exempts those, as it already did for URLs; this re-runs that same extraction on the parked
+    // task's own diff and re-admits it only when EVERY flagged name qualifies (a name production code also uses stays flagged).
+    id: 'ungrounded-field-test-fixture',
+    fixedIn: 'agent-manager (fact-checker: a fixture token only in the draft\'s own added test files is not ungrounded, 2026-10-19)',
+    description: 'an ungrounded-field block on an ALL_CAPS name that appears only on added lines of test files in the draft\'s own diff',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const names = [...failureText(task).matchAll(/ungrounded-field: ([A-Z][A-Z0-9]*_[A-Z0-9_]+)/g)].map((m) => m[1]);
+      if (!names.length) return false;
+      const { fieldsOnlyInAddedTestFiles } = require('./fact-checker.js');
+      const fixtures = fieldsOnlyInAddedTestFiles((task && (task.implementResponse || task.rawDiff)) || '');
+      return names.every((n) => fixtures.has(n));
+    },
+  },
+  {
+    // 2026-10-23 (Grimmethy: the rx580 lane sat idle 12 h after grimm hard-reset; "this is a recurring event"): with the lane's Ollama endpoint down, every draft failed
+    // identically, burned the infra requeue rounds and parked the task in blocked/. scripts/local-worker.sh now claims nothing while its endpoint is down (the circuit
+    // breaker), so this cannot happen again; this requeues, once, the tasks parked before it existed, and only when the endpoint they name answers now.
+    id: 'lane-endpoint-outage-parked',
+    fixedIn: 'agent-manager (worker endpoint circuit breaker, 2026-10-23)',
+    description: 'a draft that failed only because the lane\'s Ollama endpoint was unreachable or silent (host reset, service down) parked the task after its retry rounds; the endpoint answers again',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: parkedOnEndpointOutageAndEndpointBack,
+  },
+  {
+    // 2026-10-26: the forbidden-path gate read "Does not touch any file other than `x`" as forbidding x, and a file the task itself says to create was forbidden by its own
+    // "exactly one new file" scope sentences (HUB0040 2/3, HUB0125 1/2). The gate now exempts both; this re-admits a parked task only when the CURRENT gate no longer forbids
+    // the path its block named.
+    id: 'forbidden-path-exemption-and-created-targets',
+    fixedIn: 'agent-manager (adhoc-diff-sanity: exception clauses exempt, created files are declared targets, 2026-10-26)',
+    description: 'adhoc-diff-sanity blocked a diff for touching a path that the task\'s own text exempts ("other than x") or says to create',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const named = [...failureText(task).matchAll(/matches forbidden "([^"]+)"/g)].map((m) => m[1]);
+      if (!named.length) return false;
+      try {
+        const g = require('./adhoc-diff-sanity.js');
+        const rawText = (task.promptContext && task.promptContext.rawText) || task.title || '';
+        const planText = task.planResponse || task.lastGoodPlan || '';
+        const targets = g.extractDeclaredTargets(task, planText);
+        const forbidden = g.extractForbiddenPaths(`${rawText}\n${planText}`).filter((f) => !targets.some((t) => g.pathsRefEqual(f, t)));
+        return named.every((n) => !forbidden.some((f) => f === n));
+      } catch { return false; }
+    },
+  },
+  {
+    // 2026-10-26: a stacked test piece (HUB0123 2/2) was parked after drafts and reviews ran in a tree WITHOUT its sibling's code ("the 1/2 guard is not yet merged"; the
+    // sibling was on the shared branch the whole time). Drafting and the review's executed verification now use the stacked branch as their base; the failed attempts predate that.
+    id: 'stacked-sibling-missing-from-tree',
+    fixedIn: 'agent-manager (stacked children draft and verify on their shared branch: stacked-grounding.js / review-task.js baseBranch, 2026-10)',
+    description: 'a stacked hub piece failed because its sibling piece\'s code was absent from the tree the draft or the executed verification used, although the sibling is on the shared stacked branch',
+    dirs: ['blocked', 'needs-clarification'],
+    applies: siblingNowReachableOnStackedBranch,
+  },
 ];
 
-module.exports = { KNOWN_FIXED, failureText };
+module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable, SIBLING_NOT_IN_TREE_RE, _setEndpointProbe };

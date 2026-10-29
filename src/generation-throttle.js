@@ -9,6 +9,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { isNonAssignableHeartbeat } = require('./heartbeat.js');
 
 function pidAlive(pid) {
   try {
@@ -21,7 +22,8 @@ function pidAlive(pid) {
 
 // Live worker lanes, per heartbeat files whose pid is still alive. Never below 1: an
 // unreadable/empty instances dir must fall back to one-in-flight rather than opening generation
-// without bound.
+// without bound. A worker-* heartbeat with assignable:false (an external runner that never
+// claims, heartbeat.js isNonAssignableHeartbeat) is not a lane and does not raise the bound.
 function liveLaneCount(instancesDir) {
   let count = 0;
   try {
@@ -29,6 +31,7 @@ function liveLaneCount(instancesDir) {
       if (!f.startsWith('worker-') || !f.endsWith('.json')) continue;
       try {
         const hb = JSON.parse(fs.readFileSync(path.join(instancesDir, f), 'utf8'));
+        if (isNonAssignableHeartbeat(hb)) continue;
         if (hb.pid && pidAlive(hb.pid)) count += 1;
       } catch {
         // unreadable heartbeat -- not counted

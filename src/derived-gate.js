@@ -23,7 +23,7 @@ const GENERATED_DOC_RE = /(_CANDIDATES\.md$|PRODUCT_SPEC(_OUTLINE)?\.md$|TROUBLE
 
 // Sources that only READ code: they can hold nothing back.
 const READ_ONLY_SOURCES = new Set([
-  'change_review', 'pipeline_health_audit', 'pipeline_self_audit', 'pipeline_debrief', 'pipeline_forensics', 'pipeline_forensics_fix',
+  'change_review', 'pipeline_health_audit', 'pipeline_self_audit', 'pipeline_debrief', 'capability_debrief', 'pipeline_forensics', 'pipeline_forensics_fix',
   'brain_dump_sort', 'staleness_audit', 'research_task',
 ]);
 const OPEN_DIRS = ['adhoc', 'pending', 'review', 'approved', 'awaiting-confirm', 'derived'];
@@ -111,6 +111,8 @@ function isHeld(candidate, index, { now = Date.now() } = {}) {
   if (!files.length) return { held: false, by: [] };
   const created = createdAtMs(candidate);
   if (created && now - created > maxHoldMs()) return { held: false, by: [] };
+  // The finding's target is unreferenced per the dead-code scanner but has no GENUINE triage verdict yet (derived-premise-sweep.js stamped it): wait for the verdict.
+  if (candidate.inertTarget && candidate.inertTarget.held) return { held: true, by: ['inert-target'] };
   const by = [];
   for (const x of index) {
     if (x.id === candidate.id || !filesOverlap(files, x.files)) continue;

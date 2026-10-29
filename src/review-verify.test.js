@@ -8,7 +8,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback } = require('./review-verify.js');
+const { splitCoveringTiers, resolveTestTimeoutMs, DEFAULT_TEST_TIMEOUT_MS, TEST_TIMEOUT_MS } = require('./review-verify.js');
+const { addedTestNames, verifyDiff, extractChangedFiles, extractRunnableCommands, classifyCommand, tokenize, worktreePaths, extractChangedSymbols, findSymbolCoveringTests, findTestsWithSymbolFallback, relinkExternalDependencies, sandboxUnresolvedDependency } = require('./review-verify.js');
 const { wrapWithSandbox } = require('./sandbox.js');
 
 const DIFF = 'diff --git a/src/a.js b/src/a.js\n--- a/src/a.js\n+++ b/src/a.js\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/src/a.test.js b/src/a.test.js\nnew file mode 100644\n--- /dev/null\n+++ b/src/a.test.js\n@@ -0,0 +1 @@\n+z\n';
@@ -65,6 +66,8 @@ function fakeDeps(over = {}) {
       cleanup: () => { calls.cleanup += 1; fs.rmSync(worktreePaths('t1').worktreeDir, { recursive: true, force: true }); },
       findTests: () => ({ js: [], py: [] }),
       run: (a) => { calls.run.push(a); return { ran: true, exitCode: 0, timedOut: false, output: '' }; },
+      // The changed-file syntax step has its own runner so these legacy cases (which script and count `run` calls for the tests) stay unaffected.
+      syntaxRun: () => ({ ran: true, exitCode: 0, timedOut: false, output: '' }),
       ...over,
     },
   };
@@ -119,6 +122,27 @@ test('a timeout is inconclusive even when the draft claimed PASS (PR #454 rule)'
   const r = verifyDiff({ ...base, acceptanceResults: AR('`node --test src/a.test.js`'), deps: f.deps });
   assert.equal(r.status, 'inconclusive');
   assert.equal(r.commands[0].outcome, 'inconclusive');
+});
+
+test('the covering-test timeout fits a ~3 min suite by default and AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS overrides it', () => {
+  assert.ok(DEFAULT_TEST_TIMEOUT_MS >= 200000, 'default must exceed the slowest covering suite (local-draft.test.js ~3 min)');
+  assert.equal(TEST_TIMEOUT_MS, resolveTestTimeoutMs({}));
+  assert.equal(resolveTestTimeoutMs({}), DEFAULT_TEST_TIMEOUT_MS);
+  assert.equal(resolveTestTimeoutMs({ AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS: '45000' }), 45000);
+  assert.equal(resolveTestTimeoutMs({ AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS: 'junk' }), DEFAULT_TEST_TIMEOUT_MS);
+  assert.equal(resolveTestTimeoutMs({ AGENT_MANAGER_REVIEW_TEST_TIMEOUT_MS: '0' }), DEFAULT_TEST_TIMEOUT_MS);
+});
+
+test('a covering-suite timeout is inconclusive and names the unverified files', () => {
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/a.test.js', 'src/b.test.js'], py: [] }),   // neither is changed/co-located by the diff, so both stay primary
+    run: () => ({ ran: true, exitCode: null, timedOut: true, output: '' }),
+    prepare: baseTree(['src/a.js', 'src/a.test.js', 'src/b.test.js']),
+  });
+  const r = verifyDiff({ ...base, rawDiff: 'diff --git a/src/other.js b/src/other.js\n--- a/src/other.js\n+++ b/src/other.js\n@@ -1 +1 @@\n-x\n+y\n', deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.timedOutFiles, ['src/a.test.js', 'src/b.test.js']);
+  assert.match(r.reasons.join(' '), /2 file\(s\) unverified.*src\/a\.test\.js, src\/b\.test\.js/);
 });
 
 test('covering tests that fail make the result failed and carry the parsed failure names', () => {
@@ -701,4 +725,595 @@ test('the replay runs inside the sandbox runner with the remaining budget, never
   assert.ok(call.timeoutMs <= 60000, `timeout ${call.timeoutMs} is capped by the total budget`);
   const starved = fakeDeps({ replay: () => { throw new Error('must not run with <8s left'); } });
   assert.doesNotThrow(() => verifyDiff({ ...base, pipelineDir: '/pipe', checkReplay: true, budgetMs: 5000, deps: starved.deps }));
+});
+
+// --- brain-dump #1745: a dependency that is a link to a sibling checkout (agent-manager-hygiene -> ../agent-manager) ------------
+
+// <root>/work (a git repo with an installed node_modules whose `dep` is a RELATIVE link to <root>/sibling-dep) and the sibling itself: code (src/x.js,
+// package.json) plus things a test must never see (dep.env, queue/data.txt).
+function makeRepoWithSiblingDep() {
+  const r = makeRepo();
+  const sibling = path.join(r.root, 'sibling-dep');
+  fs.mkdirSync(path.join(sibling, 'src'), { recursive: true }); fs.mkdirSync(path.join(sibling, 'queue'));
+  fs.writeFileSync(path.join(sibling, 'package.json'), '{"name":"dep","version":"1.0.0"}\n');
+  fs.writeFileSync(path.join(sibling, 'src', 'x.js'), "module.exports = { answer: 42 };\n");
+  fs.writeFileSync(path.join(sibling, 'dep.env'), 'TOKEN=super-secret\n');
+  fs.writeFileSync(path.join(sibling, 'queue', 'data.txt'), 'task data\n');
+  fs.writeFileSync(path.join(r.work, 'package.json'), '{"name":"host"}\n');
+  fs.mkdirSync(path.join(r.work, 'node_modules'));
+  fs.symlinkSync('../../sibling-dep', path.join(r.work, 'node_modules', 'dep'));   // relative, like hygiene's agent-manager link
+  r.git(['add', '-A'], r.work); r.git(['commit', '-m', 'package.json'], r.work); r.git(['push', 'origin', 'master'], r.work);
+  return { ...r, sibling };
+}
+
+test('relinkExternalDependencies: a dangling relative link in the worktree COPY becomes an absolute link that resolves; the host and plain dirs are untouched', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relink-'));
+  const host = path.join(root, 'host'); const sibling = path.join(root, 'sib');
+  for (const d of [path.join(host, 'node_modules'), sibling]) fs.mkdirSync(d, { recursive: true });
+  fs.symlinkSync('../../sib', path.join(host, 'node_modules', 'dep'));
+  fs.writeFileSync(path.join(sibling, 'f.txt'), 'hello');
+  const copyParent = fs.mkdtempSync(path.join(os.tmpdir(), 'relink-wt-'));
+  const copyWt = path.join(copyParent, 'wt'); fs.mkdirSync(path.join(copyWt, 'node_modules'), { recursive: true });
+  fs.symlinkSync('../../sib', path.join(copyWt, 'node_modules', 'dep'));  // dangling: <copyParent>/sib does not exist
+  fs.mkdirSync(path.join(copyWt, 'node_modules', 'plain'));
+  assert.equal(fs.existsSync(path.join(copyWt, 'node_modules', 'dep', 'f.txt')), false, 'dangling before');
+  assert.deepEqual(relinkExternalDependencies(host, copyWt), ['dep']);
+  assert.equal(fs.readFileSync(path.join(copyWt, 'node_modules', 'dep', 'f.txt'), 'utf8'), 'hello', 'resolves after');
+  assert.equal(path.isAbsolute(fs.readlinkSync(path.join(copyWt, 'node_modules', 'dep'))), true);
+  assert.equal(fs.readlinkSync(path.join(host, 'node_modules', 'dep')), '../../sib', 'the host link is untouched');
+  assert.equal(fs.lstatSync(path.join(copyWt, 'node_modules', 'plain')).isDirectory(), true);
+});
+
+test('relinkExternalDependencies: never touches anything when the worktree\'s node_modules is itself a link out of the worktree', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'relink-out-'));
+  const host = path.join(root, 'host'); const sibling = path.join(root, 'sib'); const wt = path.join(root, 'wt');
+  fs.mkdirSync(path.join(host, 'node_modules'), { recursive: true }); fs.mkdirSync(sibling); fs.mkdirSync(wt);
+  fs.symlinkSync('../../sib', path.join(host, 'node_modules', 'dep'));
+  fs.symlinkSync(path.join(host, 'node_modules'), path.join(wt, 'node_modules'));   // shared tree: unlinking inside it would damage the host
+  assert.deepEqual(relinkExternalDependencies(host, wt), []);
+  assert.equal(fs.readlinkSync(path.join(host, 'node_modules', 'dep')), '../../sib');
+  assert.deepEqual(relinkExternalDependencies(path.join(root, 'none'), path.join(root, 'none-wt')), [], 'advisory: errors are swallowed');
+});
+
+test('sandboxUnresolvedDependency: only a bare specifier that RESOLVES on the host counts as the sandbox\'s fault', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'unresolved-'));
+  fs.mkdirSync(path.join(root, 'node_modules', 'dep', 'src'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"host"}');
+  fs.writeFileSync(path.join(root, 'node_modules', 'dep', 'package.json'), '{"name":"dep","main":"src/x.js"}');
+  fs.writeFileSync(path.join(root, 'node_modules', 'dep', 'src', 'x.js'), 'module.exports = 1;');
+  assert.equal(sandboxUnresolvedDependency(['dep/src/x.js'], root), 'dep/src/x.js');
+  assert.equal(sandboxUnresolvedDependency(['./local.js', 'dep/src/x.js'], root), 'dep/src/x.js', 'relative ones are skipped');
+  assert.equal(sandboxUnresolvedDependency(['not-installed-anywhere'], root), null, 'missing on the host too: the diff\'s fault');
+  assert.equal(sandboxUnresolvedDependency(['dep/src/nope.js'], root), null, 'the package exists but this file does not: the diff\'s fault');
+  assert.equal(sandboxUnresolvedDependency(['./x', '../y', '/abs/z', 'node:fs'], root), null);
+  assert.equal(sandboxUnresolvedDependency([], root), null);
+});
+
+function missingModuleRun(spec) {
+  return scriptedRun([{ exitCode: 1, output: `not ok 1 - needs the dep\nError: Cannot find module '${spec}'\n`, missingModules: [spec] }, { exitCode: 1, output: 'not ok 1 - other old failure\n' }]);
+}
+
+test('classification: a suite that died on a host-resolvable module is inconclusive and names the dependency, never a block', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cls-'));
+  fs.mkdirSync(path.join(root, 'node_modules', 'dep'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"h"}'); fs.writeFileSync(path.join(root, 'node_modules', 'dep', 'package.json'), '{"name":"dep","main":"i.js"}'); fs.writeFileSync(path.join(root, 'node_modules', 'dep', 'i.js'), '');
+  const f = diffDeps({ prepare: baseTree(['src/a.js']), run: missingModuleRun('dep') });   // a.test.js only in the diff: without this rule the failure would stand
+  const r = verifyDiff({ ...base, repoRoot: root, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons.join(' '), /sandbox cannot resolve dep \(present on the host, missing in the review sandbox\)/);
+});
+
+test('classification: a module missing on the host as well, and a relative-path module-not-found, are still failures', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'cls2-'));
+  fs.mkdirSync(path.join(root, 'node_modules'), { recursive: true }); fs.writeFileSync(path.join(root, 'package.json'), '{"name":"h"}');
+  for (const spec of ['uninstalled-package', './not-there.js']) {
+    const f = diffDeps({ prepare: baseTree(['src/a.js']), run: missingModuleRun(spec) });
+    const r = verifyDiff({ ...base, repoRoot: root, deps: f.deps });
+    assert.equal(r.status, 'failed', spec);
+  }
+});
+
+test('integration: a hygiene-style repo (node_modules/dep is a RELATIVE link to a sibling checkout) verifies as passed inside the real sandbox', { skip: !HAVE_BWRAP }, () => {
+  const { root, work, git } = makeRepoWithSiblingDep();
+  try {
+    const body = "const test = require('node:test'); const assert = require('node:assert/strict');\ntest('loads the sibling dependency', () => assert.equal(require('dep/src/x.js').answer, 42));\n";
+    const r = verifyDiff({ taskId: 'int-dep', rawDiff: diffAddingTest(work, git, body), repoRoot: work, mainBranch: 'master', acceptanceResults: AR('`node --test src/add.test.js`') });
+    assert.equal(r.status, 'passed', JSON.stringify(r));
+    assert.equal(r.tests.passed, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test('integration: the sibling\'s secret-looking file and queue data are NOT readable from inside the sandbox, though its code is', { skip: !HAVE_BWRAP }, () => {
+  const { root, work, git, sibling } = makeRepoWithSiblingDep();
+  try {
+    const secret = JSON.stringify(path.join(fs.realpathSync(sibling), 'dep.env')); const queued = JSON.stringify(path.join(fs.realpathSync(sibling), 'queue', 'data.txt'));
+    const body = "const test = require('node:test'); const assert = require('node:assert/strict'); const fs = require('fs');\n"
+      + "test('code is loadable', () => assert.equal(require('dep/src/x.js').answer, 42));\n"
+      + `test('env file is invisible', () => assert.throws(() => fs.readFileSync(${secret}, 'utf8'), { code: 'ENOENT' }));\n`
+      + `test('queue data is invisible', () => assert.throws(() => fs.readFileSync(${queued}, 'utf8'), { code: 'ENOENT' }));\n`;
+    const r = verifyDiff({ taskId: 'int-dep-secret', rawDiff: diffAddingTest(work, git, body), repoRoot: work, mainBranch: 'master', acceptanceResults: AR('`node --test src/add.test.js`') });
+    assert.equal(r.status, 'passed', JSON.stringify(r));
+    assert.equal(r.tests.passed, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+// --- two evidence tiers: primary (changed + co-located tests) gate the verdict; dependents (mere importers) only report -------------------
+test('splitCoveringTiers: changed and co-located tests are primary, mere importers are dependents; no primary keeps everything primary', () => {
+  const affected = { js: ['src/x.test.js', 'src/y.test.js', 'src/z.test.js'], py: ['python/d/test_m.py', 'python/d/test_other.py'] };
+  let t = splitCoveringTiers(['src/x.js', 'src/x.test.js', 'python/d/m.py'], affected);
+  assert.deepEqual(t.primary, { js: ['src/x.test.js'], py: ['python/d/test_m.py'] });
+  assert.deepEqual(t.dependents, { js: ['src/y.test.js', 'src/z.test.js'], py: ['python/d/test_other.py'] });
+  t = splitCoveringTiers(['src/x.js'], affected);                       // co-located x.test.js, no changed test file
+  assert.deepEqual(t.primary.js, ['src/x.test.js']);
+  t = splitCoveringTiers(['src/lib/util.js'], { js: ['src/a.test.js', 'src/b.test.js'], py: [] });   // no name-matched test: all stay primary
+  assert.deepEqual(t.primary.js, ['src/a.test.js', 'src/b.test.js']);
+  assert.deepEqual(t.dependents.js, []);
+});
+
+const TIER_FILES = ['src/a.js', 'src/a.test.js', 'src/dep.test.js'];
+test('a dependent test file that times out is reported unverified and does NOT make the result inconclusive', () => {
+  const run = scriptedRun([passing, { exitCode: null, timedOut: true }]);   // primary passes, dependents time out
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.equal(r.tests.passed, true);
+  assert.deepEqual(r.tests.dependentsUnverified, ['src/dep.test.js']);
+  assert.deepEqual(run.calls.map((c) => c.args.filter((a) => a.endsWith('.test.js'))), [['src/a.test.js'], ['src/dep.test.js']], 'primary and dependents run as separate suites');
+});
+
+test('a dependent test file that FAILS with the diff but passes on the base still fails the result', () => {
+  const run = scriptedRun([passing, failing('dep breaks'), passing]);   // primary ok, dependent fails, dependent passes on the base
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.tests.passed, false);
+  assert.deepEqual(r.tests.failures, ['dep breaks']);
+});
+
+test('a PRIMARY timeout is still inconclusive even when the dependents pass', () => {
+  const run = scriptedRun([{ exitCode: null, timedOut: true }, passing]);
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.timedOutFiles, ['src/a.test.js']);
+});
+
+test('a dependent file that also fails on the base in the sandbox is unverified, not a reason to void a passing primary tier', () => {
+  const run = scriptedRun([passing, failing('env only'), failing('env only')]);   // primary ok; dependent fails with the diff AND on the base
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js', 'src/dep.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.equal(r.tests.passed, true);
+  assert.deepEqual(r.tests.dependentsUnverified, ['src/dep.test.js']);
+});
+
+test('a primary file that also fails on the base in the sandbox still makes the result inconclusive', () => {
+  const run = scriptedRun([failing('env only'), failing('env only')]);
+  const f = fakeDeps({ findTests: () => ({ js: ['src/a.test.js'], py: [] }), prepare: baseTree(TIER_FILES), run });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+});
+
+// --- changed-file syntax gate (2026-10-07: AC-271's split import reached pending-merge, then the redraft repeated it) ----------------------
+// A stateful stub: `applied` follows applyDiff/unapplyDiff so a check can behave differently with the diff and on the base. Files named in
+// `newFiles` exist only while the diff is applied; the others exist throughout.
+function synDeps({ tree = ['src/a.js', 'src/a.test.js'], contents = {}, appliedContents = {}, newFiles = [], failWith = () => false, unapplyOk = true, reapplyOk = true, over = {} } = {}) {
+  const st = { applied: false, applyCalls: 0, unapplyCalls: 0, synRuns: [] };
+  const dir = () => worktreePaths('t1').worktreeDir;
+  const f = fakeDeps({
+    prepare: () => {
+      fs.rmSync(dir(), { recursive: true, force: true });
+      for (const t of tree) { fs.mkdirSync(path.dirname(path.join(dir(), t)), { recursive: true }); fs.writeFileSync(path.join(dir(), t), contents[t] != null ? contents[t] : '// base\n'); }
+      return { ok: true };
+    },
+    applyDiff: () => {
+      st.applyCalls += 1;
+      if (st.applyCalls > 1 && !reapplyOk) return { applied: false, reason: 'conflict' };
+      st.applied = true;
+      for (const n of newFiles) { fs.mkdirSync(path.dirname(path.join(dir(), n)), { recursive: true }); fs.writeFileSync(path.join(dir(), n), '// new\n'); }
+      for (const [n, c] of Object.entries(appliedContents)) fs.writeFileSync(path.join(dir(), n), c);
+      return { applied: true };
+    },
+    unapplyDiff: () => {
+      st.unapplyCalls += 1;
+      if (!unapplyOk) return { applied: false, reason: 'cannot reverse' };
+      st.applied = false;
+      for (const n of newFiles) fs.rmSync(path.join(dir(), n), { force: true });
+      for (const n of Object.keys(appliedContents)) fs.writeFileSync(path.join(dir(), n), contents[n] != null ? contents[n] : '// base\n');
+      return { applied: true };
+    },
+    syntaxRun: (a) => {
+      st.synRuns.push({ bin: a.bin, file: a.args[a.args.length - 1], applied: st.applied });
+      const file = a.args[a.args.length - 1];
+      const fail = failWith({ file, applied: st.applied });
+      return fail ? { ran: true, exitCode: 1, timedOut: false, output: typeof fail === 'string' ? fail : `${file}:12\n  x = ;\n\nSyntaxError: Unexpected token ';'` } : { ran: true, exitCode: 0, timedOut: false, output: '' };
+    },
+    findTests: () => ({ js: ['src/a.test.js'], py: [] }),
+    ...over,
+  });
+  return { f, st };
+}
+
+test('syntax gate: a changed file that parses on the base but not with the diff FAILS the result before any test is run, naming the file and line', () => {
+  const { f, st } = synDeps({ failWith: ({ file, applied }) => applied && file === 'src/a.js' });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.match(r.reasons[0], /syntax error in a file the diff changes -- src\/a\.js:12 SyntaxError: Unexpected token/);
+  assert.deepEqual(r.syntax.failed, ['src/a.js']);
+  assert.equal(f.calls.run.length, 0, 'no covering test is spent on a file that does not parse');
+  assert.equal(r.tests, null);
+  assert.equal(st.unapplyCalls, 1);
+  assert.equal(st.applied, true, 'the diff was put back');
+  assert.equal(f.calls.cleanup, 1);
+});
+
+test('syntax gate: a file that already fails on the base is pre-existing and does not fail the result', () => {
+  const { f } = synDeps({ failWith: ({ file }) => file === 'src/a.js' });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.notEqual(r.status, 'failed');
+  assert.deepEqual(r.syntax.preexisting, ['src/a.js']);
+  assert.deepEqual(r.syntax.failed, []);
+  assert.ok(f.calls.run.length > 0, 'the tests still ran');
+});
+
+test('syntax gate: a NEW file that does not parse has no base to compare with, so the failure stands', () => {
+  const { f } = synDeps({ tree: ['src/a.test.js'], newFiles: ['src/a.js'], failWith: ({ file, applied }) => applied && file === 'src/a.js' });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(r.syntax.failed, ['src/a.js']);
+});
+
+test('syntax gate: a file the diff removed, a TypeScript file and an unknown extension are skipped with a reason and never fail the result', () => {
+  const diff = DIFF + 'diff --git a/src/gone.js b/src/gone.js\n--- a/src/gone.js\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\ndiff --git a/web/App.tsx b/web/App.tsx\n--- a/web/App.tsx\n+++ b/web/App.tsx\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/run.sh b/run.sh\n--- a/run.sh\n+++ b/run.sh\n@@ -1 +1 @@\n-a\n+b\n';
+  const { f } = synDeps({ tree: ['src/a.js', 'src/a.test.js', 'web/App.tsx', 'run.sh'] });
+  const r = verifyDiff({ ...base, rawDiff: diff, deps: f.deps });
+  assert.notEqual(r.status, 'failed');
+  const why = Object.fromEntries(r.syntax.skipped.map((x) => [x.file, x.reason]));
+  assert.match(why['src/gone.js'], /absent/);
+  assert.match(why['web/App.tsx'], /no \.tsx parser/);
+  assert.match(why['run.sh'], /no syntax checker/);
+  assert.deepEqual(r.syntax.checked.sort(), ['src/a.js', 'src/a.test.js']);
+});
+
+test('syntax gate: python files are skipped (not failed) when no interpreter can be found, and checked with the resolved one otherwise', () => {
+  const diff = 'diff --git a/svc/x.py b/svc/x.py\n--- a/svc/x.py\n+++ b/svc/x.py\n@@ -1 +1 @@\n-a\n+b\n';
+  let a = synDeps({ tree: ['svc/x.py'], over: { resolvePy: () => null, findTests: () => ({ js: [], py: [] }) } });
+  let r = verifyDiff({ ...base, rawDiff: diff, deps: a.f.deps });
+  assert.notEqual(r.status, 'failed');
+  assert.match(r.syntax.skipped[0].reason, /no python interpreter/);
+  assert.equal(a.st.synRuns.length, 0);
+  a = synDeps({ tree: ['svc/x.py'], failWith: ({ applied }) => applied && 'File "svc/x.py", line 3\nSyntaxError: invalid syntax', over: { resolvePy: () => '/usr/bin/python3', findTests: () => ({ js: [], py: [] }) } });
+  r = verifyDiff({ ...base, rawDiff: diff, deps: a.f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(a.st.synRuns[0].bin, 'python');
+  assert.match(r.reasons[0], /svc\/x\.py:3 SyntaxError: invalid syntax/);
+});
+
+test('syntax gate: node module-format messages are skipped, not failures', () => {
+  const { f } = synDeps({ failWith: ({ applied }) => applied && 'SyntaxError: Cannot use import statement outside a module' });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.notEqual(r.status, 'failed');
+  assert.ok(r.syntax.skipped.some((x) => /module-format/.test(x.reason)));
+});
+
+test('syntax gate: when the diff cannot be reversed, or cannot be put back, the result is inconclusive and nothing else runs', () => {
+  let x = synDeps({ failWith: ({ applied }) => applied, unapplyOk: false });
+  let r = verifyDiff({ ...base, deps: x.f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons[0], /could not be un-applied/);
+  assert.equal(x.f.calls.run.length, 0);
+  x = synDeps({ failWith: ({ file, applied }) => applied && file === 'src/a.js', reapplyOk: false });
+  r = verifyDiff({ ...base, deps: x.f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons[0], /could not be re-applied/);
+  assert.equal(x.f.calls.run.length, 0);
+});
+
+test('syntax gate: a clean diff never reverses the diff, and a .json file is parsed in process', () => {
+  const diff = DIFF + 'diff --git a/cfg/x.json b/cfg/x.json\n--- a/cfg/x.json\n+++ b/cfg/x.json\n@@ -1 +1 @@\n-{}\n+{"a":1}\n';
+  const tree = ['src/a.js', 'src/a.test.js', 'cfg/x.json'];
+  let x = synDeps({ tree, contents: { 'cfg/x.json': '{"a":1}' } });
+  let r = verifyDiff({ ...base, rawDiff: diff, deps: x.f.deps });
+  assert.notEqual(r.status, 'failed');
+  assert.equal(x.st.unapplyCalls, 0, 'an all-clean run never touches the worktree');
+  assert.ok(r.syntax.checked.includes('cfg/x.json'));
+  x = synDeps({ tree, contents: { 'cfg/x.json': '{"a":1}' }, appliedContents: { 'cfg/x.json': '{"a":' } });
+  r = verifyDiff({ ...base, rawDiff: diff, deps: x.f.deps });
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(r.syntax.failed, ['cfg/x.json']);
+  assert.match(r.reasons[0], /cfg\/x\.json/);
+});
+
+test('an unresolved python interpreter is reported as such, not as an unavailable sandbox', () => {
+  const diff = 'diff --git a/svc/x.py b/svc/x.py\n--- a/svc/x.py\n+++ b/svc/x.py\n@@ -1 +1 @@\n-a\n+b\n';
+  const f = fakeDeps({ prepare: baseTree(['svc/x.py', 'svc/test_x.py']), resolvePy: () => null, findTests: () => ({ js: [], py: ['svc/test_x.py'] }), run: () => ({ ran: false, reason: 'no python interpreter available' }) });
+  const r = verifyDiff({ ...base, rawDiff: diff, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.match(r.reasons.join(' '), /no python interpreter available/);
+  assert.doesNotMatch(r.reasons.join(' '), /bwrap/);
+});
+
+// --- per-file covering runs (2026-10-08) ------------------------------------------------------------------------------------------------
+// src/local-draft.test.js alone takes ~9 minutes, past the review's 210s cap. All covering files used to run in ONE `node --test a b c d`, so its timeout
+// discarded the three fast files' passes too and the reviewers rejected on "unverified". Each file now runs in its own process.
+
+const OTHER = 'diff --git a/src/other.js b/src/other.js\n--- a/src/other.js\n+++ b/src/other.js\n@@ -1 +1 @@\n-x\n+y\n';
+const filesOf = (a) => a.args.filter((x) => /\.test\.js$/.test(x));
+
+test('per-file: a slow file times out ALONE -- the other covering file still reports a real pass, and each run gets exactly one file', () => {
+  const calls = [];
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/a.test.js', 'src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/a.js', 'src/a.test.js', 'src/b.test.js']),
+    run: (a) => { calls.push(a); return /b\.test\.js/.test(a.args.join(' ')) ? { ran: true, exitCode: null, timedOut: true, output: '' } : { ran: true, exitCode: 0, timedOut: false, output: '' }; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: OTHER, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.passedFiles, ['src/a.test.js']);
+  assert.deepEqual(r.tests.timedOutFiles, ['src/b.test.js']);
+  assert.ok(calls.every((c) => filesOf(c).length === 1), 'one file per process');
+  assert.match(r.reasons.join(' '), /1 file\(s\) unverified.*src\/b\.test\.js/);
+});
+
+test('per-file: the cheapest (smallest) covering file runs first, so a huge one cannot starve the rest of the budget', () => {
+  const order = [];
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/huge.test.js', 'src/tiny.test.js'], py: [] }),
+    prepare: () => {
+      const dir = worktreePaths('t1').worktreeDir;
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'src/huge.test.js'), '// big\n'.repeat(500));
+      fs.writeFileSync(path.join(dir, 'src/tiny.test.js'), '// t\n');
+      return { ok: true };
+    },
+    run: (a) => { order.push(filesOf(a)[0]); return { ran: true, exitCode: 0, timedOut: false, output: '' }; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: OTHER, deps: f.deps });
+  assert.deepEqual(order, ['src/tiny.test.js', 'src/huge.test.js']);
+  assert.equal(r.status, 'passed');
+  assert.deepEqual(r.tests.passedFiles, ['src/tiny.test.js', 'src/huge.test.js']);
+});
+
+test('addedTestNames: the test()/it()/describe() cases a diff adds to ONE file, unescaped and de-duplicated', () => {
+  const diff = [
+    'diff --git a/src/x.test.js b/src/x.test.js', '--- a/src/x.test.js', '+++ b/src/x.test.js', '@@ -1 +1,4 @@',
+    "+test('first one: it\\'s fine', () => {});", '+  it("second", () => {});', '+test(`third`, () => {});', "+test('first one: it\\'s fine', () => {});",
+    " test('untouched context', () => {});",
+    'diff --git a/src/y.test.js b/src/y.test.js', '--- a/src/y.test.js', '+++ b/src/y.test.js', '@@ -1 +1 @@', "+test('belongs to y', () => {});",
+  ].join('\n');
+  assert.deepEqual(addedTestNames(diff, 'src/x.test.js'), ["first one: it's fine", 'second', 'third']);
+  assert.deepEqual(addedTestNames(diff, 'src/y.test.js'), ['belongs to y']);
+  assert.deepEqual(addedTestNames(diff, 'src/none.test.js'), []);
+});
+
+const ADDS = 'diff --git a/src/b.js b/src/b.js\n--- a/src/b.js\n+++ b/src/b.js\n@@ -1 +1 @@\n-x\n+y\ndiff --git a/src/b.test.js b/src/b.test.js\n--- a/src/b.test.js\n+++ b/src/b.test.js\n@@ -1 +1,2 @@\n+test(\'the gate blocks (a.b)\', () => {});\n';
+
+test('narrowed-first: the tests a diff adds to a file run on their own first; if the whole file then cannot finish, they remain as PARTIAL evidence', () => {
+  const calls = [];
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/b.js', 'src/b.test.js']),
+    run: (a) => { calls.push(a); return a.args.includes('--test-name-pattern') ? { ran: true, exitCode: 0, timedOut: false, output: '' } : { ran: true, exitCode: null, timedOut: true, output: '' }; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: ADDS, deps: f.deps });
+  const narrowed = calls.find((c) => c.args.includes('--test-name-pattern'));
+  assert.ok(narrowed, 'a narrowed run happened');
+  assert.equal(narrowed.args[narrowed.args.indexOf('--test-name-pattern') + 1], 'the gate blocks \\(a\\.b\\)', 'the pattern is regex-escaped');
+  assert.equal(calls.indexOf(narrowed), 0, 'and it ran BEFORE the whole file');
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.timedOutFiles, ['src/b.test.js']);
+  assert.deepEqual(r.tests.partial, [{ file: 'src/b.test.js', tests: ['the gate blocks (a.b)'], count: 1, passed: true }]);
+  assert.deepEqual(r.tests.passedFiles, []);
+});
+
+test('narrowed-first: a diff-added test that FAILS is a real failure (the base has no such test, so the control run cannot excuse it)', () => {
+  let onBase = false;   // the control run happens after the diff is reversed; there the added test does not exist, so the pattern matches nothing and exits 0
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/b.js', 'src/b.test.js']),
+    unapplyDiff: () => { onBase = true; return { applied: true }; },
+    run: (a) => (a.args.includes('--test-name-pattern') && !onBase ? { ran: true, exitCode: 1, timedOut: false, output: 'not ok 1 - the gate blocks (a.b)\n' } : { ran: true, exitCode: 0, timedOut: false, output: '' }),
+  });
+  const r = verifyDiff({ ...base, rawDiff: ADDS, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.tests.partial[0].passed, false);
+});
+
+test('differential: a failure whose base run TIMED OUT says so -- it is not reported as "already fails on master"', () => {
+  const f = diffDeps({ run: scriptedRun([failing('x'), { exitCode: null, timedOut: true }]) });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  const text = r.reasons.join(' ');
+  assert.match(text, /could not finish on master either \(timed out\)/);
+  assert.doesNotMatch(text, /already fail on/);
+});
+
+test('differential: a failure that really also fails on the base keeps the "already fail" wording', () => {
+  const f = diffDeps({ run: scriptedRun([failing('x'), failing('x')]) });
+  const r = verifyDiff({ ...base, deps: f.deps });
+  assert.match(r.reasons.join(' '), /already fail on master in the review sandbox/);
+});
+
+test('differential: a file whose only failures also fail on the base is reported as such (status stays inconclusive), while a clean sibling file still reports its pass', () => {
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/a.test.js', 'src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/a.js', 'src/a.test.js', 'src/b.test.js']),
+    run: (a) => (/b\.test\.js/.test(a.args.join(' ')) ? { ran: true, exitCode: 1, timedOut: false, output: 'not ok 1 - greps the live repo\n' } : { ran: true, exitCode: 0, timedOut: false, output: '' }),
+  });
+  const r = verifyDiff({ ...base, rawDiff: OTHER, deps: f.deps });
+  assert.equal(r.status, 'inconclusive');
+  assert.deepEqual(r.tests.preexistingOnlyFiles, ['src/b.test.js']);
+  assert.deepEqual(r.tests.passedFiles, ['src/a.test.js']);
+  assert.deepEqual(r.tests.preexisting, ['greps the live repo']);
+});
+
+test('per-file: a real failure in one file is not erased by another file timing out -- the result is failed and tests.passed stays false', () => {
+  let onBase = false;
+  const f = fakeDeps({
+    findTests: () => ({ js: ['src/a.test.js', 'src/b.test.js'], py: [] }),
+    prepare: baseTree(['src/a.js', 'src/a.test.js', 'src/b.test.js']),
+    unapplyDiff: () => { onBase = true; return { applied: true }; },
+    run: (a) => {
+      const text = a.args.join(' ');
+      if (/b\.test\.js/.test(text)) return { ran: true, exitCode: null, timedOut: true, output: '' };
+      return onBase ? { ran: true, exitCode: 0, timedOut: false, output: '' } : { ran: true, exitCode: 1, timedOut: false, output: 'not ok 1 - the new regression\n' };
+    },
+  });
+  const r = verifyDiff({ ...base, rawDiff: OTHER, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.equal(r.tests.passed, false);
+  assert.deepEqual(r.tests.timedOutFiles, ['src/b.test.js']);
+});
+
+// --- vitest routing (2026-10-08): .tsx tests run through vitest from their own package -------------------------------------------------------------------------
+// `node --test` cannot execute a .tsx (ERR_UNKNOWN_FILE_EXTENSION), so a frontend test could never be verified. The runner now comes from the package that owns the file.
+const TSX_DIFF = 'diff --git a/web/src/Toast.tsx b/web/src/Toast.tsx\n--- a/web/src/Toast.tsx\n+++ b/web/src/Toast.tsx\n@@ -1 +1 @@\n-a\n+b\n';
+function vitestTree({ declareVitest = true, extra = {} } = {}) {
+  return () => {
+    const dir = worktreePaths('t1').worktreeDir;
+    fs.rmSync(dir, { recursive: true, force: true });
+    const files = { 'web/package.json': JSON.stringify(declareVitest ? { devDependencies: { vitest: '^3.2.7' } } : {}), 'web/src/Toast.tsx': '// base\n', 'web/src/Toast.test.tsx': '// base\n', ...extra };
+    for (const [f, text] of Object.entries(files)) { fs.mkdirSync(path.dirname(path.join(dir, f)), { recursive: true }); fs.writeFileSync(path.join(dir, f), text); }
+    return { ok: true };
+  };
+}
+const ok = { ran: true, exitCode: 0, timedOut: false, output: '' };
+
+test('vitest routing: a .tsx covering test runs through vitest from its package dir, with package-relative paths; node --test is not used for it', () => {
+  const calls = [];
+  const f = fakeDeps({
+    prepare: vitestTree(),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx'], py: [] }),
+    provision: (root, wt, pkg) => { calls.push(['provision', pkg]); return { copied: true }; },
+    run: (a) => { calls.push(['run', a.bin, a.cwd, a.args]); return ok; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  assert.deepEqual(calls.filter((c) => c[0] === 'provision'), [['provision', 'web']]);
+  const run = calls.find((c) => c[0] === 'run' && c[3].includes('run'));
+  assert.equal(run[1], 'node');
+  assert.equal(run[2], 'web', 'vitest starts in its own package dir');
+  assert.deepEqual(run[3], ['node_modules/vitest/vitest.mjs', 'run', '--reporter=default', 'src/Toast.test.tsx']);
+  assert.ok(!calls.some((c) => c[0] === 'run' && c[3].includes('--test')), 'no node --test run for a .tsx');
+  assert.deepEqual(r.tests.passedFiles, ['web/src/Toast.test.tsx']);
+});
+
+test('vitest routing: a failing .tsx test is a real failure named from vitest\'s output, once the base passes', () => {
+  let onBase = false;
+  const f = fakeDeps({
+    prepare: vitestTree(),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx'], py: [] }),
+    provision: () => ({ copied: true }),
+    unapplyDiff: () => { onBase = true; return { applied: true }; },
+    run: () => (onBase ? ok : { ran: true, exitCode: 1, timedOut: false, output: ' FAIL  src/Toast.test.tsx > Toast > auto-dismisses after the duration\nAssertionError\n' }),
+  });
+  const r = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: f.deps });
+  assert.equal(r.status, 'failed');
+  assert.deepEqual(r.tests.failures, ['src/Toast.test.tsx > Toast > auto-dismisses after the duration']);
+});
+
+test('vitest routing: node_modules that cannot be provided, or a package with no runner, is reported as noRunner with the reason -- never as a failure of the diff', () => {
+  const noModules = fakeDeps({
+    prepare: vitestTree(),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx'], py: [] }),
+    provision: () => ({ copied: false, reason: 'web/node_modules is not installed in the repo (run npm ci in web)' }),
+    run: () => { throw new Error('nothing should run'); },
+  });
+  const a = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: noModules.deps });
+  assert.notEqual(a.status, 'failed');
+  assert.match(a.noRunner[0].reason, /vitest cannot run: web\/node_modules is not installed/);
+  assert.equal(a.noRunner[0].file, 'web/src/Toast.test.tsx');
+
+  const noRunner = fakeDeps({
+    prepare: vitestTree({ declareVitest: false }),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx'], py: [] }),
+    run: () => { throw new Error('nothing should run'); },
+  });
+  const b = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: noRunner.deps });
+  assert.notEqual(b.status, 'failed');
+  assert.match(b.noRunner[0].reason, /node:test cannot run \.tsx and web declares no test runner \(vitest\)/);
+});
+
+test('vitest routing: plain .js tests are untouched (node --test), and tests the diff adds to a .tsx test file run first through vitest -t', () => {
+  const calls = [];
+  const diff = 'diff --git a/web/src/Toast.tsx b/web/src/Toast.tsx\n--- a/web/src/Toast.tsx\n+++ b/web/src/Toast.tsx\n@@ -1 +1 @@\n-a\n+b\n'
+    + 'diff --git a/web/src/Toast.test.tsx b/web/src/Toast.test.tsx\n--- a/web/src/Toast.test.tsx\n+++ b/web/src/Toast.test.tsx\n@@ -1 +1,2 @@\n+  it(\'shows the message\', () => {});\n';
+  const f = fakeDeps({
+    prepare: vitestTree({ extra: { 'tools/a.test.js': '// base\n' } }),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx', 'tools/a.test.js'], py: [] }),
+    provision: () => ({ copied: true }),
+    run: (a) => { calls.push(a); return ok; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: diff, deps: f.deps });
+  assert.equal(r.status, 'passed');
+  const narrowed = calls.find((c) => c.args.includes('-t'));
+  assert.ok(narrowed, 'a narrowed vitest run happened');
+  assert.equal(narrowed.cwd, 'web');
+  assert.equal(narrowed.args[narrowed.args.indexOf('-t') + 1], 'shows the message');
+  assert.ok(narrowed.args.includes('--passWithNoTests'), 'the control run on the base (no such test) must exit 0');
+  assert.ok(calls.some((c) => c.args[0] === '--test' && c.args.includes('tools/a.test.js') && !c.cwd), 'the .js test still runs through node --test, from the repo root');
+});
+
+test('vitest routing: a .tsx test that merely imports the changed module (dependents tier) also runs through vitest, from its package', () => {
+  const calls = [];
+  const f = fakeDeps({
+    prepare: vitestTree({ extra: { 'web/src/Other.test.tsx': '// imports Toast\n' } }),
+    findTests: () => ({ js: ['web/src/Toast.test.tsx', 'web/src/Other.test.tsx'], py: [] }),    // Toast.test.tsx is co-located (primary); Other.test.tsx only imports it: the dependents tier
+    provision: () => ({ copied: true }),
+    run: (a) => { calls.push(a); return ok; },
+  });
+  const r = verifyDiff({ ...base, rawDiff: TSX_DIFF, deps: f.deps });
+  const dep = calls.find((c) => c.args.includes('run') && c.args.some((x) => /Other\.test\.tsx$/.test(x)));
+  assert.ok(dep, 'the dependent test was run through vitest');
+  assert.equal(dep.cwd, 'web');
+  assert.ok((r.tests && r.tests.dependents || []).includes('web/src/Other.test.tsx'));
+});
+
+test('runSandboxed starts the command in the requested sub-directory of the worktree (cwd), and in the worktree root without one', (t) => {
+  const { runSandboxed } = require('./review-verify.js');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rv-cwd-'));
+  fs.mkdirSync(path.join(dir, 'pkg', 'inner'), { recursive: true });
+  const probe = runSandboxed({ worktreeDir: dir, bin: 'node', args: ['-e', 'console.log(process.cwd())'], timeoutMs: 20000, pythonBin: null, mainRepoRoot: null });
+  if (!probe.ran) { t.skip(`no sandbox here: ${probe.reason}`); return; }
+  assert.equal(probe.output.trim(), dir);
+  const inner = runSandboxed({ worktreeDir: dir, bin: 'node', args: ['-e', 'console.log(process.cwd())'], timeoutMs: 20000, pythonBin: null, mainRepoRoot: null, cwd: 'pkg/inner' });
+  assert.equal(inner.output.trim(), path.join(dir, 'pkg', 'inner'));
+});
+
+// ---- Python tests under a top-level test/ directory: Python's own `test` package shadows the dotted module name ----
+
+const { pythonTestArgs } = require('./review-verify.js');
+
+test('pythonTestArgs: a single file under a top-level test/ directory runs by discovery from its own directory', () => {
+  assert.deepEqual(pythonTestArgs(['test/test_stub.py']), ['-m', 'unittest', 'discover', '-s', 'test', '-p', 'test_stub.py']);
+  assert.deepEqual(pythonTestArgs(['test/sub/test_x.py']), ['-m', 'unittest', 'discover', '-s', 'test/sub', '-p', 'test_x.py']);
+});
+
+test('pythonTestArgs: package-style and other paths keep the dotted module form', () => {
+  assert.deepEqual(pythonTestArgs(['python/dashboard/test_foo.py']), ['-m', 'unittest', 'python.dashboard.test_foo']);
+  assert.deepEqual(pythonTestArgs(['tests/test_x.py']), ['-m', 'unittest', 'tests.test_x']);
+  assert.deepEqual(pythonTestArgs(['testing/test_x.py']), ['-m', 'unittest', 'testing.test_x']);   // only the exact directory name `test` collides
+  assert.deepEqual(pythonTestArgs(['a/test_a.py', 'b/test_b.py']), ['-m', 'unittest', 'a.test_a', 'b.test_b']);
+  assert.deepEqual(pythonTestArgs([]), ['-m', 'unittest']);
+});
+
+test('pythonTestArgs: a list of several test/ files keeps the dotted form (the suites run one file per process)', () => {
+  assert.deepEqual(pythonTestArgs(['test/test_a.py', 'test/test_b.py']), ['-m', 'unittest', 'test.test_a', 'test.test_b']);
+});
+
+test('end to end: a passing test under test/ (no __init__.py) passes by discovery, and the dotted name does not', () => {
+  const { spawnSync } = require('child_process');
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'py-test-dir-'));
+  try {
+    fs.mkdirSync(path.join(repo, 'test'));
+    fs.writeFileSync(path.join(repo, 'test', 'test_ok.py'), 'import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n\nif __name__ == "__main__":\n    unittest.main()\n');
+    const run = (args) => spawnSync('python3', args, { cwd: repo, encoding: 'utf8', env: { PATH: process.env.PATH, PYTHONDONTWRITEBYTECODE: '1' } });
+    const byDiscovery = run(pythonTestArgs(['test/test_ok.py']));
+    assert.equal(byDiscovery.status, 0, byDiscovery.stderr);
+    assert.match(byDiscovery.stderr, /Ran 1 test/);
+    const dotted = run(['-m', 'unittest', 'test.test_ok']);   // what the gate used to run
+    assert.notEqual(dotted.status, 0);
+    assert.match(dotted.stderr, /No module named/);
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });

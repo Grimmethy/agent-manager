@@ -34,6 +34,14 @@ _Avoid_: orphaned claim
 **Instance**:
 One running process identified by an `instanceId` (a worker lane named for its GPU such as `worker-3090` or `worker-p40`, `reviewer`, `queue-watchdog`), which owns exactly one heartbeat file.
 
+**Lane**:
+One worker process pinned to one GPU endpoint, named for the GPU (`worker-3090`, `worker-p40`, `worker-rx580`). Lanes are data, not code: the host lane, the legacy P40 lane and every entry of the lanes registry file (`lanes.json`, see `docs/agents/lanes.md`) are turned into lane definitions by `src/lanes.js`, the single definition `launch.sh`, the watchdog's restart rule, the claim loop and the dashboard all read. A lane may declare a `taskClasses` allowlist (only those task sources are offered to it), `preempt` (whether an interactive chat turn may kill its call) and `slow` (longer timeouts for a categorically slower endpoint) and `numCtx` (the lane's one pinned context window, for cards smaller than the 24 GB ones).
+_Avoid_: worker type, tier (the old reasoning/worker split is gone)
+
+**Cloud lane**:
+A lane whose endpoint is the cloud-providers gateway (an Ollama-compatible service on `127.0.0.1:7450` that forwards to Claude Haiku) instead of a GPU: a `lanes.json` entry with `"provider": "cloud"` and a mandatory `taskClasses` allowlist, conventionally `["adhoc"]`. It exists only for extra throughput on adhoc tasks. It is explicit and bounded: it is never an overflow path for tasks that fail locally, hygiene scan sources stay off it, it never changes claim order or throttles local lanes, and the GPU-only logic (Forge lease yield, host VRAM headroom, lane-health probes, chat cards) skips it. Billing is the API key by default; the subscription adapter is owner-confirmed. See `docs/agents/cloud-lane.md`.
+_Avoid_: overflow lane, fallback lane, the old `AGENT_MANAGER_CLAUDE_SOURCES` per-source provider switch
+
 **Heartbeat**:
 The JSON file an instance writes on every status change (`pid`, `status`, `currentTaskId`, `currentPass`, `lastHeartbeat`) — the system's only source of truth for whether an instance is alive and what it's doing.
 

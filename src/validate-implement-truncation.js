@@ -54,6 +54,47 @@ const FENCED_JSON_RE = /```(?:json)?\s*\n([\s\S]*?)\n?```/i;
 // response's trailing JSON parse cleanly even though the line above it isn't JSON itself.
 const RESOLUTION_PREFIX_RE = /^RESOLUTION:\s*\S+\s*\n+/i;
 
+// COMPLETE-DIFF EXEMPTION (2026-10-18). A Group A implementResponse ends with its unified diff, so rule 4's "last token" is whatever the
+// diff's last CONTEXT line ends with -- code the draft never wrote. Two real false blocks: a premium-reach task whose diff ended on an
+// unchanged comment `... "we need to build this sort of analysis into the daily report"` (last token `report"`), and HUB0073-01, whose diff
+// ended on the close of a quoted comment opened a line earlier (`... projects"):`) -- so a last-LINE quote count would be wrong too. For a
+// diff the real truncation test is structural: a cut-off diff leaves its last hunk short of the line counts its `@@ -a,b +c,d @@` header
+// declares. diffIsComplete() checks exactly that; a complete diff is never "truncated output". Bump TRUNCATION_GATE_VERSION whenever this
+// gate's rules change: needs-clarification-triage.js bucket J re-admits a task once per version when the current gate passes it.
+const TRUNCATION_GATE_VERSION = '2026-10-18-complete-diff';
+const DIFF_MARKER = '=== DIFF ===';
+const HUNK_RE = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/;
+
+function diffIsComplete(text) {
+  const at = typeof text === 'string' ? text.indexOf(DIFF_MARKER) : -1;
+  if (at < 0) return false;
+  const lines = text.slice(at + DIFF_MARKER.length).split('\n');
+  while (lines.length && lines[lines.length - 1] === '') lines.pop();   // the diff's own trailing newline(s)
+  let hunks = 0;
+  let left = null;                                                       // { old, new } still owed by the current hunk
+  for (const line of lines) {
+    const h = HUNK_RE.exec(line);
+    if (h) {
+      if (left && (left.old > 0 || left.new > 0)) return false;          // the previous hunk ended early
+      left = { old: h[1] === undefined ? 1 : Number(h[1]), new: h[2] === undefined ? 1 : Number(h[2]) };
+      hunks += 1;
+      continue;
+    }
+    // Once a hunk has all its declared lines, what follows until the next @@ is file headers (`diff --git`, `--- a/`, `+++ b/`, `index`, ...)
+    // and is skipped; truncation only ever REMOVES lines from the end, so over-long hunks are not this gate's concern. Known limit: a cut that
+    // lands exactly between two hunks or files leaves a diff that looks complete (the old token rule caught that only by chance).
+    if (!left || (left.old === 0 && left.new === 0)) { left = null; continue; }
+    if (line.startsWith('\\')) continue;                                   // "\ No newline at end of file"
+    const c = line[0];
+    if (c === ' ' || line === '') { left.old -= 1; left.new -= 1; }      // context (an empty line is an empty context line)
+    else if (c === '-') left.old -= 1;
+    else if (c === '+') left.new -= 1;
+    else return false;                                                   // not a diff line inside a hunk
+    if (left.old < 0 || left.new < 0) return false;
+  }
+  return hunks > 0 && (!left || (left.old === 0 && left.new === 0));
+}
+
 /**
  * Detect whether `rawText` looks like a truncated model output.
  *
@@ -81,6 +122,12 @@ function detectTruncatedImplementResponse(rawText, source) {
     if (entry && entry.advisoryProse) {
       return { truncated: false, reason: null };
     }
+  }
+
+  // 2b. A diff that is complete per its hunk headers is not truncated (see COMPLETE-DIFF EXEMPTION above). Anything else falls through to
+  //     the rules below unchanged.
+  if (diffIsComplete(rawText)) {
+    return { truncated: false, reason: null };
   }
 
   const trimmed = rawText.trim();
@@ -112,4 +159,4 @@ function detectTruncatedImplementResponse(rawText, source) {
   return { truncated: false, reason: null };
 }
 
-module.exports = { detectTruncatedImplementResponse };
+module.exports = { detectTruncatedImplementResponse, diffIsComplete, TRUNCATION_GATE_VERSION };

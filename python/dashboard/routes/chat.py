@@ -153,7 +153,8 @@ def api_chat_message(session_id):
         # logged via log_preempt_gate_off so it is no longer silent.
         if _chat_preempt_enabled():
             try:
-                preempted = _preempt_pipeline_for_chat()
+                import chat_card
+                preempted = _preempt_pipeline_for_chat(chat_card.resolve_chat_card(existing.get("card")))
             except Exception as e:  # noqa: BLE001 -- never block a chat turn on this
                 print(f"[chat-preempt] failed (non-fatal): {e}", file=sys.stderr, flush=True)
         else:

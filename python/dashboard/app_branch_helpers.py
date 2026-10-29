@@ -347,6 +347,8 @@ def _summarize_hub(data, state):
         "title": data.get("title"),
         "mode": data.get("mode"),
         "branch": data.get("branch"),
+        "source": data.get("source"),
+        "domain": data.get("domain"),
         "state": state,
         # done = merged/closed; built = done + finished-but-awaiting-merge (see coordinator-sweep.js childPhase)
         "progress": {"done": done_n, "built": built_n, "total": len(subs)},
@@ -360,3 +362,53 @@ def _summarize_hub(data, state):
         # integration gate has passed or was skipped. A hub already in done/ shipped.
         "readyToMerge": bool(state == "done" or (all_children_built and gate_clear)),
     }
+
+
+# Hold unfinished hub children out of the Unmerged Branches pool (yellow hardening 8/8, 2026-10-02). A child of a model-decomposed hub is often the
+# first half of a feature: a helper nothing calls, or a test for code that is not there yet. Alone it can only ever be verified as "hold".
+# Its branch is still pushed (apply-task.js pushes every branch so no work lives only on one disk); it is just not LISTED until the hub is
+# readyToMerge, so the whole hub reaches verification together. Only hubs whose children a model decomposed are held: function-length,
+# change-review and other deterministic-source hubs, and any hub that owns a branch of its own, are listed as before.
+HOLDABLE_HUB_SOURCES = ("manual", "derived_task")
+
+
+def hold_unfinished_hub_children_enabled():
+    return os.environ.get("AGENT_MANAGER_HOLD_UNFINISHED_HUB_CHILDREN", "true").strip().lower() != "false"
+
+
+def hub_child_is_held(hub):
+    if not hub or not hold_unfinished_hub_children_enabled():
+        return False
+    if hub.get("state") != "coordinating" or hub.get("readyToMerge") or hub.get("branch"):
+        return False
+    return hub.get("domain") == "adhoc" and hub.get("source") in HOLDABLE_HUB_SOURCES
+
+
+def partition_held_hub_branches(branches):
+    """(listed, held_groups). held_groups has one entry per held hub: its id, title, progress, the pieces not built yet and the held branches."""
+    listed, groups = [], {}
+    for b in branches:
+        hub = b.get("hub")
+        if not hub_child_is_held(hub):
+            listed.append(b)
+            continue
+        g = groups.setdefault(hub["id"], {
+            "hubId": hub["id"],
+            "title": hub.get("title"),
+            "progress": hub.get("progress"),
+            "waitingOn": [st["id"] for st in (hub.get("subTasks") or []) if st.get("phase") == "open"],
+            "branches": [],
+        })
+        g["branches"].append(b["branch"])
+    return listed, list(groups.values())
+
+
+def branch_task_ids(run_git, repo_root, main_branch, full_ref, task_id):
+    """The branch name's own id plus the `Task:` trailer ids on its commits. The branch NAME is not the sub-task id for a hub child
+    (agent/decompose-<hub> carries HUB0113-01-...), so the trailers are what let the listing find the owning hub -- the same join
+    branch_verdicts.resolve_owner uses. Without them a hub child had no hub in the listing and could not be held."""
+    try:
+        trailers = _TASK_TRAILER_RE.findall(run_git(["log", f"origin/{main_branch}..{full_ref}", "--format=%b"], repo_root))
+    except (RuntimeError, subprocess.SubprocessError, OSError):
+        trailers = []
+    return list(dict.fromkeys([task_id, *trailers]))

@@ -12,8 +12,8 @@
 // precisely than "no samples were written," which is exactly what gap-detection reports.
 //
 // Each sample: { at, instances: { <instanceId>: { pid, status, lastHeartbeat, ageSec,
-// stale } } }. `stale` reuses dead-process-check.js's own STALE_HEARTBEAT_SECONDS/
-// WORKER_ZOMBIE_THRESHOLD_SECONDS reasoning (worker-only: alive-but-unresponsive past the
+// stale } } }. `stale` uses the shared thresholds from ./heartbeat-thresholds.js
+// (single source of truth; worker-only: alive-but-unresponsive past the
 // zombie threshold counts as down; a non-worker instance uses the tighter stale
 // threshold) so "down" means the same thing here as it does to the daemon that actually
 // restarts things.
@@ -21,8 +21,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const STALE_HEARTBEAT_SECONDS = 300;
-const WORKER_ZOMBIE_THRESHOLD_SECONDS = 1200;
+const { STALE_HEARTBEAT_SECONDS, WORKER_ZOMBIE_THRESHOLD_SECONDS } = require('./heartbeat-thresholds.js');
 const MAX_LOG_AGE_DAYS = 35; // bounds the file indefinitely; see pruneOldSamples()
 
 function isProcessAlive(pid) {

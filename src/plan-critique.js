@@ -15,6 +15,7 @@
 
 const { taskIdentifiers } = require('./task-anchor-files.js');
 const { call: localCall } = require('./local-client.js');
+const { isForgePause } = require('./gpu-guard.js');
 
 const GAP_TAGS = ['MISSING_REQUIREMENT', 'UNVERIFIED_PATH', 'SCOPE_TOO_BIG', 'NO_VERIFICATION'];
 const MAX_GAPS = 5;
@@ -119,6 +120,7 @@ async function runPlanCritique(task, { call = localCall, maybeLockedOn } = {}) {
   try {
     result = maybeLockedOn ? await maybeLockedOn(CRITIQUE_MODEL, fn, 'plan-critique') : await fn();
   } catch (e) {
+    if (isForgePause(e)) throw e;   // the Forge family holds the GPU: do not turn the pause into "no gaps" (the draft would skip its critique)
     // Critique is advisory -- a failed run just means no re-plan.
     return { verdict: 'ok', gaps: [], viaModel: true, error: String(e && e.message || e).slice(0, 160) };
   }

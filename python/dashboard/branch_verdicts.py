@@ -282,10 +282,49 @@ def resolve_owner(repo_root, main_branch, branch, run_git, queue_dir=None, hub_l
     return task_ids, hub_id
 
 
-def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source):
+# A chat/manual needs-work verdict is the one thing a redraft should be told about, so it is also stamped onto
+# the owning TASK's promptContext (which both requeue paths carry over verbatim). Caps keep a long verdict from
+# swamping the prompt; src/lib/prompt-blocks.js priorVerdictBlock applies its own total cap on top.
+_PRIOR_VERDICT_MAX_REASONS = 8
+# 1500 = priorVerdictBlock's own total cap: the actionable part of a reason is usually at its END (the real
+# arch-review-ac-50 verdict was 887 chars and named the fix last), so a tighter per-entry cut would drop it.
+_PRIOR_VERDICT_REASON_CHARS = 1500
+
+
+def apply_prior_verdict(rec, branch, verdict, reasons, source, sha=None):
+    """Mutates a TASK record's promptContext.priorVerdict from a recorded verdict; returns True if it changed.
+
+    chat/manual + needs-work sets it (latest wins); chat/manual + merge clears it (the redraft was accepted);
+    every other combination -- deterministic checks, discard (its reasons are about redundancy, not a defect in
+    the change) -- leaves it alone. Never called for a hub record. A record whose promptContext is not a dict
+    is skipped rather than overwritten."""
+    if source not in ("chat", "manual"):
+        return False
+    ctx = rec.get("promptContext")
+    if not isinstance(ctx, dict):
+        return False
+    if verdict == "needs-work":
+        ctx["priorVerdict"] = {
+            "verdict": verdict,
+            "reasons": [str(r)[:_PRIOR_VERDICT_REASON_CHARS] for r in list(reasons or [])[:_PRIOR_VERDICT_MAX_REASONS]],
+            "sha": sha,
+            "at": _now_iso(),
+            "source": source,
+            "branch": branch,
+        }
+        return True
+    if verdict == "merge" and "priorVerdict" in ctx:
+        del ctx["priorVerdict"]
+        return True
+    return False
+
+
+def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source, sha=None):
     """Append a history event to each owning task and to its hub, shaped like src/task-history.js's
     appendHistoryEvent ({stage, at, detail}). `task_ids` is one id or a list (see resolve_owner). Silent
-    no-op for an id with no task file. Returns the count of records written."""
+    no-op for an id with no task file. Returns the count of records written.
+
+    Also stamps promptContext.priorVerdict on each owning TASK (never the hub) -- see apply_prior_verdict."""
     if not queue_dir:
         return 0
     if isinstance(task_ids, str):
@@ -307,6 +346,8 @@ def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source
             history = rec.get("history") if isinstance(rec.get("history"), list) else []
             history.append({"stage": "branch-verdict", "at": _now_iso(), "detail": detail})
             rec["history"] = history
+            if tid != hub_id:
+                apply_prior_verdict(rec, branch, verdict, reasons, source, sha)
             _atomic_write_json(path, rec)
             written += 1
         except (OSError, ValueError) as exc:
@@ -356,7 +397,7 @@ def enrich_branches_with_verdicts(queue_dir, repo_root, branches, run_git, hub_l
                         if written:
                             task_ids, hub_id = resolve_owner(repo_root, b.get("mainBranch") or "master", branch, run_git,
                                                              queue_dir, hub_lookup, b.get("taskId"))
-                            write_task_log(queue_dir, task_ids, hub_id or (b.get("hub") or {}).get("id"), branch, verdict, reasons, "deterministic")
+                            write_task_log(queue_dir, task_ids, hub_id or (b.get("hub") or {}).get("id"), branch, verdict, reasons, "deterministic", sha)
                         verdicts = load_verdicts(queue_dir)
                 elif existing is not None:
                     clear_verdict(queue_dir, branch, sha)

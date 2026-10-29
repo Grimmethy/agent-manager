@@ -99,6 +99,8 @@ cat > "$PIPELINE_DIR/task-domains.json" <<'JSONEOF'
   }
 }
 JSONEOF
+# the file above lists only "default"; add the rest of the standard domains (adhoc, research, ...)
+"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ensure-task-domains.sh" "$PIPELINE_DIR"
 cat > "$PIPELINE_DIR/.env" <<EOF
 export AGENT_MANAGER_REPO_ROOT=$REPO_DIR
 export AGENT_MANAGER_PIPELINE_DIR=$PIPELINE_DIR

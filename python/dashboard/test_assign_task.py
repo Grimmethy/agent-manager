@@ -334,5 +334,57 @@ class ApiAssignableTasksRouteTest(AssignTaskTestBase):
         self.assertEqual(by_id["pinned-one"]["pinnedTo"], "worker-reasoning")
 
 
+
+# 2026-10-18 (brain-dump 1903): a worker-* heartbeat with `"assignable": false` (an external
+# runner that only shows its job on the Workers tab, e.g. worker-kaggle-p40) is not an
+# assignable lane -- both routes refuse it with the reason, and assign-task kills nothing.
+class NonAssignableHeartbeatTest(AssignTaskTestBase):
+    RUNNER = "worker-kaggle-p40"
+
+    def _hb_with(self, lane, pid, **extra):
+        hb = {"instanceId": lane, "pid": pid, "status": "working", "currentPass": "eval 4/12",
+              "currentTaskId": "KAG-x", "lastHeartbeat": "2026-01-01T00:00:00Z", "stateSince": "2026-01-01T00:00:00Z"}
+        hb.update(extra)
+        (self.inst / f"{lane}.json").write_text(json.dumps(hb), encoding="utf-8")
+
+    def test_assign_task_refuses_with_the_reason_and_kills_nothing(self):
+        pr = self._spawn()
+        self._hb_with(self.RUNNER, pr.pid, assignable=False)
+        self._pending_task("t-new")
+
+        resp = self.client.post(f"/api/instances/{self.RUNNER}/assign-task",
+                                data=json.dumps({"taskId": "t-new"}), content_type="application/json")
+
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("assignable: false", resp.get_data(as_text=True))
+        self.assertIsNone(pr.poll(), "the runner process must not be killed")
+        pending = json.loads((self.queue / "pending" / "t-new.json").read_text())
+        self.assertNotIn("pinnedWorker", pending)
+
+    def test_assignable_tasks_refuses_with_the_reason(self):
+        self._hb_with(self.RUNNER, None, assignable=False)
+        resp = self.client.get(f"/api/instances/{self.RUNNER}/assignable-tasks")
+        self.assertEqual(resp.status_code, 404)
+        self.assertIn("opts out of task assignment", resp.get_data(as_text=True))
+
+    def test_missing_true_or_null_field_keeps_todays_behaviour(self):
+        for extra in ({}, {"assignable": True}, {"assignable": None}):
+            self._hb_with("worker-1", None, **extra)
+            self.assertTrue(app._is_live_worker_instance("worker-1"), extra)
+            self.assertIsNone(app._worker_lane_refusal("worker-1"), extra)
+        self._hb_with("worker-1", None, assignable=False)
+        self.assertFalse(app._is_live_worker_instance("worker-1"))
+        self.assertFalse(app._is_live_worker_instance("reviewer"))
+        self.assertFalse(app._is_live_worker_instance("worker-does-not-exist"))
+
+    def test_api_instances_still_lists_the_opted_out_card(self):
+        self._hb_with(self.RUNNER, None, assignable=False)
+        with mock.patch.object(app, "_expected_instance_ids", return_value=[]):
+            resp = self.client.get("/api/instances")
+        self.assertEqual(resp.status_code, 200)
+        cards = {c.get("instanceId"): c for c in resp.get_json()}
+        self.assertIn(self.RUNNER, cards)
+        self.assertIs(cards[self.RUNNER].get("assignable"), False)
+
 if __name__ == "__main__":
     unittest.main()
