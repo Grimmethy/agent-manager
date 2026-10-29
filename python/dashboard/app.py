@@ -1948,13 +1948,43 @@ def _worker_project_info(hb: dict, active_label, active_qdir):
     return project, borrowed, qdir
 
 
+_HUB_LABEL_RE = re.compile(r"^HUB\d{4}$")
+
+
 def _find_task_record_anywhere(qdir, task_id):
     """(data, state) for a task id across every queue location a branch's task could be
     sitting in -- the QUEUE_STATES dirs, the manual + dated + superseded archives, and the
     per-worker drafting subfolders -- or (None, None). Same coverage as _task_state_index,
-    plus queue/done/_superseded/ (file-decompose re-file supersessions)."""
+    plus queue/done/_superseded/ (file-decompose re-file supersessions).
+
+    Hub-label resolution (HUB0251): when task_id matches /^HUB\\d{4}$/, resolve the label
+    via _hub_label_index scoped to the project (qdir). One hub with that label -> return
+    its record; zero -> fall through to the existing "task not found" path; two or more
+    hubs claiming the same label -> raise (defensive, labels should be unique). Exact-task-id
+    resolution is unchanged for non-hub ids."""
     if not qdir or not task_id:
         return None, None
+    if _HUB_LABEL_RE.match(task_id):
+        index = _hub_label_index(qdir)
+        # Deduplicate: the index maps id/formerId -> hub, so the same hub can appear
+        # multiple times in index.values() if it has formerIds. Only count each hub
+        # once by its canonical id.
+        seen_ids = set()
+        matching = []
+        for hub in index.values():
+            hid = hub.get("id")
+            if hub.get("hubLabel") == task_id and hid not in seen_ids:
+                matching.append(hub)
+                seen_ids.add(hid)
+        if len(matching) == 0:
+            return None, None
+        if len(matching) == 1:
+            return matching[0], "coordinating"
+        ids = [m.get("id") or "unknown" for m in matching]
+        raise ValueError(
+            f"Ambiguous hub label {task_id!r}: matches {len(matching)} hubs "
+            f"({', '.join(str(i) for i in ids)})"
+        )
     for state in QUEUE_STATES:
         d = read_json_safe(qdir / state / f"{task_id}.json")
         if d:

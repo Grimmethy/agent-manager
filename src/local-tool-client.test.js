@@ -280,6 +280,16 @@ test('readTaskTool with no section returns a task_summary-shaped overview, exclu
   });
 });
 
+test('read_task tool description mentions hub labels in addition to exact task id', () => {
+  withFixtureRepo((mod) => {
+    const def = mod.TOOLS.find((t) => t.function.name === 'read_task').function;
+    assert.match(def.description, /hub label/);
+    assert.match(def.description, /HUB\\d\{4\}/);
+    assert.match(def.parameters.properties.taskId.description, /hub label/);
+    assert.match(def.parameters.properties.taskId.description, /HUB\\d\{4\}/);
+  });
+});
+
 test('readTaskTool with section: "plan" returns just the plan text, windowed', () => {
   withFixtureRepo((mod, dir) => {
     const plan = Array.from({ length: 10 }, (_, i) => `plan line ${i + 1}`).join('\n');

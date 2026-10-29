@@ -99,7 +99,7 @@ async function listUnverifiedBranchesTool({ project, limit } = {}, opts = {}) {
     branch: r.branch,
     headSha: r.headSha,
     subject: r.subject,
-    hub: r.hub ? { id: r.hub.id, progress: r.hub.progress } : null,
+    hub: r.hub ? { id: r.hub.id, hubId: r.hub.id, progress: r.hub.progress } : null,
     ahead: r.ahead,
     behind: r.behind,
     willConflict: !!r.willConflict,
