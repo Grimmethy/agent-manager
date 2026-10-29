@@ -37,6 +37,7 @@ const { queueAdhocTask } = require('./queue-adhoc-task.js');
 const { listProjects, pipelineFor } = require('./chat-projects.js');
 const { proposeCommand, proposalsFromToolLog } = require('./chat-command-allowlist.js');
 const { listUnverifiedBranchesTool, recordBranchVerdictTool } = require('./chat-branch-verdict.js');
+const { checkBranchTool } = require('./chat-branch-check.js');
 const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
 } = require('./chat-task-requeue.js');
@@ -401,7 +402,7 @@ const CHAT_TOOLS = [
     type: 'function',
     function: {
       name: 'list_unverified_branches',
-      description: 'List the unmerged agent/* branches (across every registered project) that have no verdict yet or only a stale one -- the work list for verifying branches. Each row has the project, branch, headSha, subject, hub progress, ahead/behind and willConflict. Read-only. Verify a branch (diff, hub siblings, covering tests where you can run them) BEFORE recording a verdict for it.',
+      description: 'List the unmerged agent/* branches (across every registered project) that have no verdict yet or only a stale one -- the work list for verifying branches. Each row has the project, branch, headSha, subject, hub progress, ahead/behind and willConflict. Read-only. Work through each branch in this order: check_branch (it runs the project\'s covering tests in a scratch copy and tells you what it could not run), then read the diff and the hub\'s siblings, then record_branch_verdict.',
       parameters: {
         type: 'object',
         properties: {
@@ -416,7 +417,7 @@ const CHAT_TOOLS = [
     type: 'function',
     function: {
       name: 'record_branch_verdict',
-      description: 'Record your verdict on ONE verified unmerged branch so its card changes colour in the Unmerged Branches tab (merge = green, needs-work = yellow, discard = red). It records the verdict only: it never merges, discards or edits anything. Allowed verdicts are exactly merge, needs-work, discard (HOLD and unverified do not exist; use needs-work for a branch that is not ready). The reasons must be specific evidence of what you actually ran or read and what it showed; never write a check you did not run (for example "no conflicts" or "tests pass") and say plainly which checks you could not run. sha must be the headSha from list_unverified_branches; if the head moved the call is refused.',
+      description: 'Record your verdict on ONE verified unmerged branch so its card changes colour in the Unmerged Branches tab (merge = green, needs-work = yellow, discard = red). It records the verdict only: it never merges, discards or edits anything. Allowed verdicts are exactly merge, needs-work, discard (HOLD and unverified do not exist; use needs-work for a branch that is not ready). The reasons must be specific evidence of what you actually ran or read and what it showed; never write a check you did not run (for example "no conflicts" or "tests pass") and say plainly which checks you could not run. sha must be the headSha from list_unverified_branches; if the head moved the call is refused. Call check_branch for the branch first and base your reasons on its result: a merge verdict needs a current check of this exact head that ran the covering tests green (a branch that changes only documentation is exempt); needs-work and discard never need one.',
       parameters: {
         type: 'object',
         properties: {
@@ -427,6 +428,21 @@ const CHAT_TOOLS = [
           project: { type: 'string', description: 'Label or repo root of the branch\'s project (as listed by list_unverified_branches); required only when the same branch name is listed in more than one project.' },
         },
         required: ['branch', 'sha', 'verdict', 'reasons'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'check_branch',
+      description: 'Check ONE unmerged branch before you record a verdict for it: it makes a scratch copy of the branch head, lists what the branch changes, runs the project\'s own covering tests and two static scans (an undefined logger name, a missing local require) and tells you exactly what ran, what passed or went red, and what it could not run. It can take several minutes. run_bash cannot do this: its sandbox is read-only and a command is limited to 30 seconds. It never merges, pushes or edits the project. Pass the branch name exactly as list_unverified_branches gave it (and project when the name is listed in more than one).',
+      parameters: {
+        type: 'object',
+        properties: {
+          branch: { type: 'string', description: 'The full branch name, e.g. agent/decompose-adhoc-...' },
+          project: { type: 'string', description: 'Label or repo root of the branch\'s project (as listed by list_unverified_branches); required only when the same branch name is listed in more than one project.' },
+        },
+        required: ['branch'],
       },
     },
   },
@@ -680,6 +696,7 @@ function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
     propose_command: (args) => proposeCommand({ repo: args.repo, argv: args.argv, why: args.why }, { pipelineDir }),
     list_unverified_branches: (args) => listUnverifiedBranchesTool({ project: args.project, limit: args.limit }),
     record_branch_verdict: (args) => recordBranchVerdictTool({ project: args.project, branch: args.branch, sha: args.sha, verdict: args.verdict, reasons: args.reasons }),
+    check_branch: (args) => checkBranchTool({ project: args.project, branch: args.branch }),
   };
 }
 

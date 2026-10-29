@@ -166,4 +166,4 @@ async function recordBranchVerdictTool(args = {}, opts = {}) {
   return { ok: false, status: res.status, error: `the dashboard refused the verdict: ${why}`, ...(json && json.headSha ? { headSha: json.headSha } : {}) };
 }
 
-module.exports = { listUnverifiedBranchesTool, recordBranchVerdictTool, VERDICTS };
+module.exports = { listUnverifiedBranchesTool, recordBranchVerdictTool, VERDICTS, fetchRows, projectMatches, httpRequest };
