@@ -130,9 +130,24 @@ function renderRunLogList(runs) {
 // time produces identical HTML for this section so the replace is invisible.
 const COMPLETED_TASKS_OUTCOME_OK_RE = /^(approved|merged|applied-direct|pending-merge)$/;
 
+// Project chip for a completed-task row (mirrors branchProjectChipHtml in branch-projects.js).
+// Each row from /api/tasks/completed?projects=all carries a `project` field: {label, repoRoot}.
+// Returns '' when the row has no project tag (should not happen with ?projects=all, but the
+// backend still emits one for the active project's own rows when no other is set).
+function taskProjectChipHtml(t) {
+  const p = (t && t.project) || null;
+  if (!p) return '';
+  let h = 0;
+  for (const ch of String(p.label || '')) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  const active = p.active ? ' ● active' : '';
+  return `<span class="badge" data-project-chip="${escapeAttr(p.label)}" style="background:hsl(${h} 55% 32%);color:#fff;font-weight:600"`
+    + ` title="Project: ${escapeAttr(p.label)}${active}\n${escapeAttr(p.repoRoot)}">${escapeHtml(p.label)}${active}</span>`;
+}
+
 function renderCompletedTasksSection() {
   const rows = completedTasksLog.map(t => `
     <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtmlBright(t.title || t.taskId)}</a>
+      ${taskProjectChipHtml(t)}
       <span class="meta">${t.outcome ? `<strong style="color:var(${COMPLETED_TASKS_OUTCOME_OK_RE.test(t.outcome || '') ? '--ok' : '--bad'})">${escapeHtml(t.outcome)}</strong> · ` : ''}${t.source ? escapeHtml(t.source) + ' · ' : ''}${t.instanceId ? escapeHtml(t.instanceId) + ' · ' : ''}${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
     </li>`).join('');
   const footer = completedTasksExhausted
@@ -165,7 +180,7 @@ async function loadMoreCompletedTasks() {
   if (completedTasksLoading || completedTasksExhausted) return;
   completedTasksLoading = true;
   try {
-    const url = '/api/tasks/completed?limit=25' + (completedTasksNextCursor ? `&before=${encodeURIComponent(completedTasksNextCursor)}` : '');
+    const url = '/api/tasks/completed?projects=all&limit=25' + (completedTasksNextCursor ? `&before=${encodeURIComponent(completedTasksNextCursor)}` : '');
     const data = await fetchJson(url);
     const rows = data.tasks || [];
     completedTasksLog = completedTasksLog.concat(rows);
@@ -198,7 +213,7 @@ async function loadMoreCompletedTasks() {
 // (renderWorkers(isPoll===true) below), not on every action-triggered re-render.
 async function refreshNewestCompletedTasks() {
   try {
-    const data = await fetchJson('/api/tasks/completed?limit=25');
+    const data = await fetchJson('/api/tasks/completed?projects=all&limit=25');
     const rows = data.tasks || [];
     if (!rows.length) return;
     const known = new Set(completedTasksLog.map((t) => t.taskId));
