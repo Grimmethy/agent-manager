@@ -16,6 +16,7 @@ const assert = require('node:assert/strict');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { spawnSync: spawnSyncTop } = require('child_process');
 
 const { pickClaimableTasks, pickNextPendingTask, listAssignableTasks, effectivePriority, BOT_ADHOC_PRIORITY_PENALTY } = require('./next-claimable-task.js');
 const { resolveSourceName } = require('./task-source-registry.js');
@@ -1054,5 +1055,133 @@ test('an unwritable cache root changes nothing in the claim list', () => {
 test('a missing or empty pending directory gives an empty list', () => {
   assert.deepEqual(pickFor(path.join(os.tmpdir(), `no-such-pending-${process.pid}-${Date.now()}`), 'worker-p40'), []);
   assert.deepEqual(pickFor(setupPending(), 'worker-p40'), []);
+});
+
+// --- one scan per tick: `--with-premium` and the claim loop in scripts/local-worker.sh ---
+
+// A small pending directory with one premium task, no pins and no hub, so the result does not depend on the machine's lane configuration.
+function buildPremiumFixture() {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'n-trouble', { source: 'trouble_log' });
+  writeTask(pendingDir, 'p-premium', { source: 'adhoc', humanQueued: true, premiumPriority: true });
+  writeTask(pendingDir, 'n-human', { source: 'adhoc', humanQueued: true });
+  writeTask(pendingDir, 'not-premium-string', { source: 'adhoc', humanQueued: true, premiumPriority: 'true' });
+  fs.writeFileSync(path.join(pendingDir, 'corrupt.json'), '{ not json');
+  return pendingDir;
+}
+
+// The ranker treats any truthy premiumPriority as premium, while the flag (like the shell filter it replaces) is a strict === true: the string 'true' therefore ranks second but is flagged 0.
+const PREMIUM_FIXTURE_ORDER = ['p-premium.json', 'not-premium-string.json', 'n-human.json', 'n-trouble.json', 'corrupt.json'];
+
+function runCli(pendingDir, lane, ...extra) {
+  const r = spawnSyncTop(process.execPath, [path.join(__dirname, 'next-claimable-task.js'), pendingDir, lane, ...extra], { encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  return r.stdout.split('\n').filter(Boolean);
+}
+
+test('withPremium rows have the same names in the same order as the plain list, and the flag is exactly premiumPriority === true', () => {
+  const pendingDir = buildPremiumFixture();
+  const plain = pickClaimableTasks(pendingDir, 'worker-p40');
+  const rows = pickClaimableTasks(pendingDir, 'worker-p40', { withPremium: true });
+  assert.deepEqual(plain, PREMIUM_FIXTURE_ORDER);
+  assert.deepEqual(rows.map((r) => r.name), plain);
+  assert.deepEqual(rows.filter((r) => r.premium).map((r) => r.name), ['p-premium.json']);
+  assert.ok(rows.every((r) => typeof r.premium === 'boolean'));
+});
+
+test('a pinned premium task carries its flag too', () => {
+  const pendingDir = setupPending();
+  writeTask(pendingDir, 'pinned-premium', { source: 'adhoc', humanQueued: true, premiumPriority: true, pinnedWorker: 'worker-p40' });
+  writeTask(pendingDir, 'pinned-plain', { source: 'adhoc', humanQueued: true, pinnedWorker: 'worker-p40' });
+  const rows = pickClaimableTasks(pendingDir, 'worker-p40', { withPremium: true });
+  assert.deepEqual(rows.map((r) => [r.name, r.premium]).sort(), [['pinned-plain.json', false], ['pinned-premium.json', true]]);
+});
+
+test('the command line: --with-premium prints name<TAB>flag per line in the plain order, and without it the output is the plain names', () => {
+  const pendingDir = buildPremiumFixture();
+  assert.deepEqual(runCli(pendingDir, 'worker-p40'), PREMIUM_FIXTURE_ORDER);
+  const withFlag = runCli(pendingDir, 'worker-p40', '--with-premium');
+  assert.deepEqual(withFlag.map((l) => l.split('\t')[0]), PREMIUM_FIXTURE_ORDER);
+  assert.deepEqual(withFlag.map((l) => l.split('\t')[1]), ['1', '0', '0', '0', '0']);
+  assert.deepEqual(runCli(pendingDir, '--with-premium', 'worker-p40'), withFlag, 'the flag may come before the lane');
+});
+
+test('with premium rows each task file is read at most once on a cold cache and not at all on a cached call', (t) => {
+  const pendingDir = buildPremiumFixture();
+  ageDir(pendingDir);
+  const reads = [];
+  const realRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', function (p, ...rest) {
+    if (String(p).startsWith(pendingDir + path.sep)) reads.push(path.basename(String(p)));
+    return realRead.call(fs, p, ...rest);
+  });
+  pickClaimableTasks(pendingDir, 'worker-p40', { withPremium: true });
+  assert.equal(reads.length, PREMIUM_FIXTURE_ORDER.length);
+  assert.equal(new Set(reads).size, reads.length, 'no file read twice');
+  reads.length = 0;
+  pickClaimableTasks(pendingDir, 'worker-p40', { withPremium: true });
+  assert.deepEqual(reads, []);
+});
+
+// The real claim loop, cut out of scripts/local-worker.sh and run in bash against a fixture.
+function claimLoopFromScript() {
+  const text = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'local-worker.sh'), 'utf8');
+  const start = text.indexOf("    while IFS=$'\\t' read -r name premium_flag; do");
+  const endMarker = '--with-premium 2>/dev/null)';
+  const end = text.indexOf(endMarker, start) + endMarker.length;
+  assert.ok(start > 0 && end > start, 'the claim loop was not found in scripts/local-worker.sh');
+  return text.slice(start, end);
+}
+
+function runClaimLoop(pendingDir, lane, premiumOnly) {
+  const script = `items=()\n${claimLoopFromScript()}\nfor i in "\${items[@]}"; do printf '%s\\n' "$i"; done`;
+  const r = spawnSyncTop('bash', ['-c', script], {
+    env: { ...process.env, PACKAGE_SRC_DIR: __dirname, pdir: pendingDir, INSTANCE_ID: lane, PREMIUM_ONLY: premiumOnly ? 'true' : 'false' },
+    encoding: 'utf8',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  return r.stdout.split('\n').filter(Boolean);
+}
+
+test('local-worker.sh claim loop: a normal tick gets every name in ranked order, a premium-only tick only the premium ones', () => {
+  const pendingDir = buildPremiumFixture();
+  assert.deepEqual(runClaimLoop(pendingDir, 'worker-p40', false), PREMIUM_FIXTURE_ORDER);
+  assert.deepEqual(runClaimLoop(pendingDir, 'worker-p40', true), ['p-premium.json']);
+});
+
+test('local-worker.sh reads the pending queue once per tick: one ranking call, no second pass over every file', () => {
+  const text = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'local-worker.sh'), 'utf8');
+  assert.equal((text.match(/next-claimable-task\.js" "\$pdir"/g) || []).length, 1);
+  assert.ok(!text.includes('filter_premium_names'));
+  assert.ok(text.includes('--with-premium'));
+});
+
+test('the lane is read correctly whichever side of it --with-premium sits: a task pinned to the lane is offered either way', () => {
+  const pendingDir = buildPremiumFixture();
+  writeTask(pendingDir, 'pinned-p40', { source: 'adhoc', humanQueued: true, pinnedWorker: 'worker-p40' });
+  writeTask(pendingDir, 'pinned-3090', { source: 'adhoc', humanQueued: true, pinnedWorker: 'worker-3090' });
+  const after = runCli(pendingDir, 'worker-p40', '--with-premium');
+  const before = runCli(pendingDir, '--with-premium', 'worker-p40');
+  assert.deepEqual(before, after);
+  assert.equal(after[0].split('\t')[0], 'pinned-p40.json');
+  assert.ok(!after.some((l) => l.startsWith('pinned-3090.json')));
+});
+
+test('local-worker.sh claim loop: a blank line is skipped and a line without a flag is a normal, non-premium task', () => {
+  const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'claim-loop-stub-'));
+  fs.writeFileSync(path.join(stubDir, 'next-claimable-task.js'),
+    "console.log('');\nconsole.log('a.json\\t1');\nconsole.log('b.json\\t0');\nconsole.log('c.json');\n");
+  const run = (premiumOnly) => {
+    const script = `items=()\n${claimLoopFromScript()}\nfor i in "\${items[@]}"; do printf '%s\\n' "$i"; done`;
+    const r = spawnSyncTop('bash', ['-c', script], {
+      env: { ...process.env, PACKAGE_SRC_DIR: stubDir, pdir: '/unused', INSTANCE_ID: 'worker-p40', PREMIUM_ONLY: premiumOnly ? 'true' : 'false' },
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0, r.stderr);
+    return r.stdout.split('\n');
+  };
+  assert.deepEqual(run(false), ['a.json', 'b.json', 'c.json', '']);
+  assert.deepEqual(run(true), ['a.json', '']);
+  fs.rmSync(stubDir, { recursive: true, force: true });
 });
 
