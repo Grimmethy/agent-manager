@@ -36,6 +36,7 @@ const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptB
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
 const { listProjects, pipelineFor } = require('./chat-projects.js');
 const { proposeCommand, proposalsFromToolLog } = require('./chat-command-allowlist.js');
+const { listUnverifiedBranchesTool, recordBranchVerdictTool } = require('./chat-branch-verdict.js');
 const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
 } = require('./chat-task-requeue.js');
@@ -396,6 +397,39 @@ const CHAT_TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'list_unverified_branches',
+      description: 'List the unmerged agent/* branches (across every registered project) that have no verdict yet or only a stale one -- the work list for verifying branches. Each row has the project, branch, headSha, subject, hub progress, ahead/behind and willConflict. Read-only. Verify a branch (diff, hub siblings, covering tests where you can run them) BEFORE recording a verdict for it.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project: { type: 'string', description: 'Optional label or repo root to list one project only (from list_projects).' },
+          limit: { type: 'integer', description: 'Max rows to return (default 40, max 200).' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'record_branch_verdict',
+      description: 'Record your verdict on ONE verified unmerged branch so its card changes colour in the Unmerged Branches tab (merge = green, needs-work = yellow, discard = red). It records the verdict only: it never merges, discards or edits anything. Allowed verdicts are exactly merge, needs-work, discard (HOLD and unverified do not exist; use needs-work for a branch that is not ready). The reasons must be specific evidence of what you actually ran or read and what it showed; never write a check you did not run (for example "no conflicts" or "tests pass") and say plainly which checks you could not run. sha must be the headSha from list_unverified_branches; if the head moved the call is refused.',
+      parameters: {
+        type: 'object',
+        properties: {
+          branch: { type: 'string', description: 'The full branch name, e.g. agent/decompose-adhoc-...' },
+          sha: { type: 'string', description: 'The branch headSha (or a unique prefix of at least 7 characters) you verified.' },
+          verdict: { type: 'string', enum: ['merge', 'needs-work', 'discard'], description: 'merge = ready to merge, needs-work = defects to fix first, discard = redundant or wrong.' },
+          reasons: { type: 'array', items: { type: 'string' }, description: 'One or more specific evidence lines (what was checked and the result).' },
+          project: { type: 'string', description: 'Label or repo root of the branch\'s project (as listed by list_unverified_branches); required only when the same branch name is listed in more than one project.' },
+        },
+        required: ['branch', 'sha', 'verdict', 'reasons'],
+      },
+    },
+  },
 ];
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -644,6 +678,8 @@ function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
     requeue_blocked_task: (args) => withProject(args, (t) => requeueBlockedTask(t.pipelineDir, t.repoRoot, args.taskId, { state: args.state, force: !!args.force })),
     withdraw_task: (args) => withProject(args, (t) => withdrawTask(t.pipelineDir, args.taskId, args.reason)),
     propose_command: (args) => proposeCommand({ repo: args.repo, argv: args.argv, why: args.why }, { pipelineDir }),
+    list_unverified_branches: (args) => listUnverifiedBranchesTool({ project: args.project, limit: args.limit }),
+    record_branch_verdict: (args) => recordBranchVerdictTool({ project: args.project, branch: args.branch, sha: args.sha, verdict: args.verdict, reasons: args.reasons }),
   };
 }
 
