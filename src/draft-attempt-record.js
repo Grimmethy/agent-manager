@@ -47,6 +47,12 @@ const PLAN_TEXT_CAP = 6000;
 const RESPONSE_TEXT_CAP = 4000;
 const DIFF_TEXT_CAP = 8000;
 const TOOLCALL_LIST_CAP = 40;
+// Per-call preview / error text kept on a tool-call summary (see summariseToolCalls): short on purpose, 40 calls x (120 + 160) characters at worst.
+const PREVIEW_CAP = 120;
+const ERROR_TEXT_CAP = 160;
+const REDACTED = '[redacted]';
+// Argument names that carry a file body or replacement text: never previewed, whatever the tool.
+const BODY_ARGS = new Set(['content', 'replace']);
 const MAX_FULL_ATTEMPTS = 6;
 // Cap on how many fact-check warnings a single attempt record keeps (the full list
 // also lives on task.preFilterFlags for the live pass -- this is the durable copy).
@@ -58,11 +64,47 @@ function cap(text, max) {
   return `${s.slice(0, max)}\n... [truncated ${s.length - max} more chars]`;
 }
 
+// Replaces the value part of anything that looks like a credential with [redacted]: Authorization / Bearer headers, token= password= passwd= secret= api_key=
+// assignments, a value after --password or --token, sk- keys, and any run of 40 or more hex / base64url characters (long task slugs are caught by that last rule too,
+// which is an accepted loss). Run BEFORE a cut, so a secret that straddles the cut point cannot survive as an unrecognisable fragment.
+function scrubPreview(text) {
+  let s = typeof text === 'string' ? text : String(text == null ? '' : text);
+  s = s.replace(/(authorization\s*[:=]\s*)(?:bearer\s+|basic\s+)?[^\s'"]+/gi, `$1${REDACTED}`);
+  s = s.replace(/(bearer\s+)[^\s'"]+/gi, `$1${REDACTED}`);
+  s = s.replace(/((?:token|password|passwd|secret|api[_-]?key)\s*[=:]\s*)[^\s'"&]+/gi, `$1${REDACTED}`);
+  s = s.replace(/(--(?:password|token)(?:\s+|=))[^\s'"]+/gi, `$1${REDACTED}`);
+  s = s.replace(/\bsk-[A-Za-z0-9_-]{16,}/g, REDACTED);
+  return s.replace(/[A-Za-z0-9_-]{40,}/g, REDACTED);
+}
+
+// Collapse whitespace, scrub, then cut (ellipsis last). Returns undefined for non-text; an empty result is '' and callers keep only a truthy one.
+function boundedText(text, max) {
+  if (typeof text !== 'string') return undefined;
+  const s = scrubPreview(text.replace(/\s+/g, ' ').trim());
+  return s.length <= max ? s : `${s.slice(0, max - 1)}\u2026`;
+}
+
+// What a call was aimed at, from the argument NAMES the tools really use (src/local-tool-client.js): a path, a command, a search query, an edit's path and the start of
+// its find text (read_file, write_file and any other tool fall to the first text argument that is not a body). Never an edit's replace text or a written file's content.
+function previewFor(tool, args) {
+  if (!args || typeof args !== 'object') return undefined;
+  const str = (v) => (typeof v === 'string' ? v : undefined);
+  let text;
+  if (tool === 'run_bash') text = str(args.command);
+  else if (tool === 'grep_codebase') text = str(args.query) && (str(args.dir) ? `${args.query} in ${args.dir}` : args.query);
+  else if (tool === 'edit_file') text = [str(args.path), str(args.find)].filter(Boolean).join(' :: ') || undefined;
+  else if (tool === 'list_directory') text = str(args.path); // its optional prefix can come first
+  else text = Object.entries(args).filter(([k]) => !BODY_ARGS.has(k)).map(([, v]) => str(v)).find(Boolean);
+  return boundedText(text, PREVIEW_CAP);
+}
+
 // Reduces a runPlanWithTools() toolCallLog ([{ tool, args, result }]) to counts + a
-// per-call skeleton -- tool name, which arg KEYS were passed (never their values, which
-// hold file paths / edit bodies / shell commands), the byte size of the result, and
-// whether the result was an error. Enough to see "spent 8 turns re-reading the same file
-// and never edited anything" without carrying kilobytes of file contents.
+// per-call skeleton -- tool name, which arg KEYS were passed, a short scrubbed preview of
+// what the call was aimed at (a path, a command, a query, an edit's find-snippet; never
+// an edit's replace text or a file body), the byte size of the result, whether the result
+// was an error and, for an error, its message (cut, scrubbed). Enough to see "spent 8 turns
+// re-reading the same file and never edited anything" or why an edit keeps failing, without
+// carrying kilobytes of file contents.
 function summariseToolCalls(toolCallLog) {
   if (!Array.isArray(toolCallLog) || toolCallLog.length === 0) return undefined;
   const byTool = {};
@@ -80,7 +122,13 @@ function summariseToolCalls(toolCallLog) {
       let bytes = 0;
       try { bytes = JSON.stringify(result == null ? '' : result).length; } catch { bytes = -1; }
       const call = { n, tool, argKeys: entry && entry.args ? Object.keys(entry.args) : [], bytes };
-      if (isError) call.error = true;
+      const preview = previewFor(tool, entry && entry.args);
+      if (preview) call.preview = preview;
+      if (isError) {
+        call.error = true;
+        const errorText = boundedText(result.error, ERROR_TEXT_CAP);
+        if (errorText) call.errorText = errorText;
+      }
       calls.push(call);
     }
   }
@@ -328,6 +376,9 @@ module.exports = {
   finalizeDraftAttempt,
   collapseOldAttempts,
   summariseToolCalls,
+  scrubPreview,
+  PREVIEW_CAP,
+  ERROR_TEXT_CAP,
   PLAN_TEXT_CAP,
   RESPONSE_TEXT_CAP,
   DIFF_TEXT_CAP,
