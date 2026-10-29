@@ -29,6 +29,8 @@ const HEALTH_AUDIT_RE = new RegExp(`^\\s*FALSE POSITIVE\\s*${SEP}\\s*([\\s\\S]{$
 // A LINE of the report (the drafts put it after the WHAT / SO WHAT sections), justification on the same line.
 const DEBRIEF_LINE_RE = new RegExp(`^[ \\t]*NO CONFIDENT INEFFICIENCY[ \\t]*${SEP}[ \\t]*(\\S[^\\n]{${MIN_JUSTIFICATION_CHARS - 1},})$`, 'm');
 // A numbered NOW WHAT list means the report DID flag something -- the null line would contradict it.
+// capability_debrief: the honest null is a line `NOT SHRINKABLE AT THIS TIER -- <reason>` (a recorded verdict, not a failure).
+const CAPABILITY_LINE_RE = new RegExp(`^[ \\t]*NOT SHRINKABLE AT THIS TIER[ \\t]*${SEP}[ \\t]*(\\S[^\\n]{${MIN_JUSTIFICATION_CHARS - 1},})$`, 'm');
 const DEBRIEF_HAS_ITEMS_RE = /^\s*NOW WHAT\s*\n\s*1[.)]/m;
 
 function isEnabled() {
@@ -49,6 +51,11 @@ function classifyNullOutcome(source, text) {
     if (DEBRIEF_HAS_ITEMS_RE.test(t)) return null;
     const m = DEBRIEF_LINE_RE.exec(t);
     return m ? { kind: 'no-confident-inefficiency', justification: m[1].trim() } : null;
+  }
+  if (source === 'capability_debrief') {
+    if (DEBRIEF_HAS_ITEMS_RE.test(t)) return null;
+    const m = CAPABILITY_LINE_RE.exec(t);
+    return m ? { kind: 'not-shrinkable', justification: m[1].trim() } : null;
   }
   if (source === 'pipeline_health_audit') {
     if (/```/.test(t) || /"mode"\s*:/.test(t)) return null; // a file-change JSON, not a plain verdict

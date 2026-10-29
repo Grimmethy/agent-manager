@@ -147,3 +147,15 @@ test('writeHeartbeatFile never leaves a partial heartbeat when the write dies be
     assert.equal(JSON.parse(before).status, 'working');
   });
 });
+
+// 2026-10-18 (brain-dump 1905): reader-side opt-out for a worker-* heartbeat that never claims.
+test('isNonAssignableHeartbeat is true only for assignable === false', () => {
+  const { isNonAssignableHeartbeat } = require('./heartbeat.js');
+  assert.equal(isNonAssignableHeartbeat({ instanceId: 'worker-kaggle-p40', assignable: false }), true);
+  assert.equal(isNonAssignableHeartbeat({ instanceId: 'worker-3090' }), false);
+  assert.equal(isNonAssignableHeartbeat({ instanceId: 'worker-3090', assignable: true }), false);
+  assert.equal(isNonAssignableHeartbeat({ instanceId: 'worker-3090', assignable: null }), false);
+  assert.equal(isNonAssignableHeartbeat({ instanceId: 'worker-3090', assignable: 'false' }), false, 'only the boolean opts out');
+  assert.equal(isNonAssignableHeartbeat(null), false);
+  assert.equal(isNonAssignableHeartbeat('worker-3090'), false);
+});

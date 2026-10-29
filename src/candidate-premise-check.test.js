@@ -46,12 +46,55 @@ test('checkPrerequisiteClaim: does NOT flag a claim that IS backed by real fetch
 
 test('checkPrerequisiteClaim: no prerequisite-claim phrase in the body -> never looks at fetched content', () => {
   const t = task({ promptContext: { body: 'Problem: this file is too long.', fetchedFiles: [{ path: 'src/x.js', content: 'x' }] } });
-  assert.deepEqual(checkPrerequisiteClaim(t, t.promptContext.body), []);
+  const { contradictions, dismissed } = checkPrerequisiteClaim(t, t.promptContext.body);
+  assert.deepEqual(contradictions, []);
+  assert.deepEqual(dismissed, []);
 });
 
 test('checkPrerequisiteClaim: no fetched files at all -> nothing to check, no false flag', () => {
   const t = task({ promptContext: { body: 'Problem: the existing `foo` gate handles this.', fetchedFiles: [] } });
-  assert.deepEqual(checkPrerequisiteClaim(t, t.promptContext.body), []);
+  const { contradictions, dismissed } = checkPrerequisiteClaim(t, t.promptContext.body);
+  assert.deepEqual(contradictions, []);
+  assert.deepEqual(dismissed, []);
+});
+
+test('checkPrerequisiteClaim: does not flag an Add-style candidate (real AC-18 shape)', () => {
+  const t = task({
+    promptContext: {
+      title: 'Add AC4_DIVERGENCE structured logging and operational note to api_chat_reserve',
+      body: `Problem: api_chat_reserve.js needs structured logging for the new \`AC4_DIVERGENCE\` event so operators can alert on reservation failures instead of watching print-to-stderr.\n\nSolution: Add the \`AC4_DIVERGENCE\` structured logging tag and an operational note to api_chat_reserve. The existing print-to-stderr pattern used elsewhere in this file provides the template for the new log format.`,
+      fetchedFiles: [{ path: 'src/api_chat_reserve.js', content: 'function reserve() {\n  console.log("reserved");\n}\n' }],
+    },
+  });
+  const ev = computePremiseEvidence(t);
+  assert.deepEqual(ev.contradictions, [], 'AC-18 shape must not produce a false contradiction');
+  assert.ok(ev.dismissed.includes('AC4_DIVERGENCE'), 'the introduced symbol must be recorded as dismissed');
+});
+
+test('checkPrerequisiteClaim: still flags a Problem-only claim when the symbol is absent from fetched content', () => {
+  const t = task({
+    promptContext: {
+      body: 'Problem: the existing `foo_hook` hook runs before the guard, but it is not wired up.',
+      fetchedFiles: [{ path: 'src/reject-retry-check.js', content: 'function isReviewRejection(task) { return task.blockedStage === "review"; }\n' }],
+    },
+  });
+  const ev = computePremiseEvidence(t);
+  assert.equal(ev.contradictions.length, 1, 'absent symbol in Problem must still be a contradiction');
+  assert.equal(ev.contradictions[0].kind, 'unverified-prerequisite');
+  assert.match(ev.contradictions[0].detail, /foo_hook/);
+});
+
+test('checkPrerequisiteClaim: Solution says "the existing X" while adding Y -> no contradiction', () => {
+  const t = task({
+    promptContext: {
+      title: 'Integrate the new `ZETA_STREAM` tag with the existing BETA_LOG pattern',
+      body: `Problem: we need a new structured-logging tag for the \`ZETA_STREAM\` event.\n\nSolution: Introduce the \`ZETA_STREAM\` tag and wire it alongside the existing \`BETA_LOG\` pattern already in api_chat_reserve. The existing \`BETA_LOG\` constants define the shape we should mirror for the new tag.`,
+      fetchedFiles: [{ path: 'src/api_chat_reserve.js', content: 'const BETA_LOG = "beta";\nfunction reserve() {}\n' }],
+    },
+  });
+  const ev = computePremiseEvidence(t);
+  assert.deepEqual(ev.contradictions, [], 'introduced symbol referenced in Solution must not be flagged');
+  assert.ok(ev.dismissed.includes('ZETA_STREAM'), 'ZETA_STREAM must be recorded as dismissed');
 });
 
 // --- checkCitations (same shape as the hygiene plugin's own arch-import-premise-check.js) ---
@@ -252,7 +295,9 @@ test('checkPrerequisiteClaim: a prerequisite present in the real file but outsid
         fetchedFiles: [{ path: 'src/app.py', content: TRUNCATED }],
       },
     });
-    assert.deepEqual(checkPrerequisiteClaim(t, t.promptContext.body, { repoRoots: [root] }), []);
+    const { contradictions, dismissed } = checkPrerequisiteClaim(t, t.promptContext.body, { repoRoots: [root] });
+    assert.deepEqual(contradictions, []);
+    assert.deepEqual(dismissed, []);
   });
 });
 
@@ -264,7 +309,9 @@ test('checkPrerequisiteClaim: truncated snapshot + nothing verifiable on disk ->
         fetchedFiles: [{ path: 'src/app.py', content: TRUNCATED }],
       },
     });
-    assert.deepEqual(checkPrerequisiteClaim(t, t.promptContext.body, { repoRoots: [root] }), []);
+    const { contradictions, dismissed } = checkPrerequisiteClaim(t, t.promptContext.body, { repoRoots: [root] });
+    assert.deepEqual(contradictions, []);
+    assert.deepEqual(dismissed, []);
   });
 });
 

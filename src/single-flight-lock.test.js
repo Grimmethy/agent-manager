@@ -9,7 +9,7 @@ const { spawnSync } = require('child_process');
 const {
   acquire, release, withLock, lockFilePath, queueDirPath,
   someoneIsWaiting, dropPriorityMarker, refreshPriorityMarker, removePriorityMarker,
-  withTaskMoveLock, taskMoveLockKey,
+  discussPriorityMaxWaitMs, withTaskMoveLock, taskMoveLockKey,
 } = require('./single-flight-lock.js');
 
 function makeInstancesDir() {
@@ -124,6 +124,83 @@ test('acquire() with AGENT_MANAGER_PRIORITY_HOLDER set does NOT back off even wi
   return new Promise((resolve) => {
     child.on('exit', () => {
       assert.ok(Number(out) < 800, `the priority holder must not back off against a marker, took ${out}ms`);
+      resolve();
+    });
+  });
+});
+
+// discussPriorityMaxWaitMs(): the ceiling is an OVERALL BACKSTOP only -- the real gate is
+// marker freshness (DISCUSS_MARKER_FRESH_MS). These pin the backstop itself: the 900000ms
+// (15-minute) default, the DISCUSS_PRIORITY_MAX_WAIT_SEC override (the same env var the
+// agent-manager-common.sh bash twin reads), and the freshness-gated behavior of the loop.
+test('discussPriorityMaxWaitMs() defaults to the 900000ms (15-minute) safety valve', () => {
+  const prev = process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC;
+  delete process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC;
+  try {
+    assert.equal(discussPriorityMaxWaitMs(), 900000);
+  } finally {
+    if (prev === undefined) delete process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC;
+    else process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC = prev;
+  }
+});
+
+test('discussPriorityMaxWaitMs() honors DISCUSS_PRIORITY_MAX_WAIT_SEC and falls back on bad values', () => {
+  const prev = process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC;
+  try {
+    process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC = '60';
+    assert.equal(discussPriorityMaxWaitMs(), 60000, '60s must resolve to 60000ms');
+    process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC = 'not-a-number';
+    assert.equal(discussPriorityMaxWaitMs(), 900000, 'a non-numeric value must fall back to the default');
+    process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC = '-5';
+    assert.equal(discussPriorityMaxWaitMs(), 900000, 'a non-positive value must fall back to the default');
+  } finally {
+    if (prev === undefined) delete process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC;
+    else process.env.DISCUSS_PRIORITY_MAX_WAIT_SEC = prev;
+  }
+});
+
+test('freshness-gated: a FRESH marker holds the lane off until the ceiling, then lets it proceed', () => {
+  const dir = makeInstancesDir();
+  fs.mkdirSync(path.join(dir, '.discuss-waiting'));
+  fs.writeFileSync(path.join(dir, '.discuss-waiting', 'active-session'), ''); // fresh mtime
+  const child = require('child_process').spawn('node', ['-e', `
+    const { acquire, release } = require(${JSON.stringify(require.resolve('./single-flight-lock.js'))});
+    const start = Date.now();
+    const fd = acquire(${JSON.stringify(dir)});
+    process.stdout.write(String(Date.now() - start));
+    release(fd);
+  `], { env: { ...process.env, DISCUSS_PRIORITY_MAX_WAIT_SEC: '1' } });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  return new Promise((resolve) => {
+    child.on('exit', () => {
+      const elapsedMs = Number(out);
+      assert.ok(elapsedMs >= 850, `expected a ~1s backoff while the marker stays fresh, took ${elapsedMs}ms`);
+      assert.ok(elapsedMs < 5000, `expected the child to proceed soon after the ceiling, took ${elapsedMs}ms`);
+      resolve();
+    });
+  });
+});
+
+test('freshness-gated: a STALE marker (past DISCUSS_MARKER_FRESH_MS) never backs the lane off, even with a 10s ceiling', () => {
+  const dir = makeInstancesDir();
+  fs.mkdirSync(path.join(dir, '.discuss-waiting'));
+  const stale = path.join(dir, '.discuss-waiting', 'abandoned-session');
+  fs.writeFileSync(stale, '');
+  const t = Date.now() - 60_000; // 60s old: past fresh (15s), not yet sweep-age (5min)
+  fs.utimesSync(stale, new Date(t), new Date(t));
+  const child = require('child_process').spawn('node', ['-e', `
+    const { acquire, release } = require(${JSON.stringify(require.resolve('./single-flight-lock.js'))});
+    const start = Date.now();
+    const fd = acquire(${JSON.stringify(dir)});
+    process.stdout.write(String(Date.now() - start));
+    release(fd);
+  `], { env: { ...process.env, DISCUSS_PRIORITY_MAX_WAIT_SEC: '10' } });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  return new Promise((resolve) => {
+    child.on('exit', () => {
+      assert.ok(Number(out) < 800, `a stale marker must not hold the lane back, took ${out}ms`);
       resolve();
     });
   });

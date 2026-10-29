@@ -69,6 +69,23 @@ test('a path in a Group-B find string that does not exist is still flagged', () 
   assert.equal(missingFileCheck(draft, repo, ['src']).blocked, true);
 });
 
+// arch-review-ac-19 (2026-10-04): a find string that quotes real source calling r.json() / res.json(...) was blocked as "missing-file: r.json".
+test('a Group-B find string that calls r.json() or res.json({...}) is NOT blocked as a missing file', () => {
+  const repo = tmpRepo();
+  const pyDraft = JSON.stringify({ mode: 'edit', file: 'src/real.js', find: 'r = requests.get(u)\n    feats = (r.json() or {}).get("features")', replace: 'z' });
+  assert.equal(missingFileCheck(pyDraft, repo, ['src']).blocked, false);
+  const jsDraft = JSON.stringify([{ file: 'src/real.js', mode: 'edit', find: 'res.json({ ok: true });', replace: 'z' }]);
+  assert.equal(missingFileCheck(jsDraft, repo, ['src']).blocked, false);
+});
+
+test('a genuinely missing path in a find string is still blocked next to a res.json() call, and only that path is listed', () => {
+  const repo = tmpRepo();
+  const draft = JSON.stringify([{ file: 'src/real.js', mode: 'edit', find: "require('./ghost.js'); res.json({ ok: true });", replace: 'z' }]);
+  const r = missingFileCheck(draft, repo, ['src']);
+  assert.equal(r.blocked, true);
+  assert.deepEqual(r.missing, ['./ghost.js']);
+});
+
 test('non-Group-B JSON is checked unchanged', () => {
   const repo = tmpRepo();
   assert.equal(missingFileCheck(JSON.stringify({ note: 'see src/phantom.js' }), repo, ['src']).blocked, true);

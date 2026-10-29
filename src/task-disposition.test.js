@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { resolveDisposition, TERMINAL_STAGES, lastAppliedEvent } = require('./task-disposition.js');
+const { resolveDisposition, TERMINAL_STAGES, lastAppliedEvent, isNoopApplyDetail } = require('./task-disposition.js');
 
 // A fake buildShipContext() result.
 function ctx({ onMain = {}, branches = {} } = {}) {
@@ -446,4 +446,89 @@ test('resolveDisposition: a stacked sub-task looks the removal up under record.s
   const out = resolveDisposition(r, { ctx: ctx(), pipelineDir: d });
   assert.equal(out.stage, 'abandoned');
   assert.match(out.detail, /by hub-retire \(hub-retired: hub retired\)/);
+});
+
+// 2026-10-08: a stacked sibling's shared branch exists and is ahead, but is THIS task's change still on it? (HUB0018-01 was destroyed by another hub child's
+// requeue and kept reading pending-merge once the branch name was recreated.)
+const { diffPresence, stackedSiblingLost } = require('./task-disposition.js');
+const SIB_LINES = [
+  'export function StartPage({ onLogin }: { onLogin?: (token: string) => void }) {',
+  'const data = await r2.json(); if (data?.token && mounted) { onLogin?.(data.token); }',
+  'const handleRegisterSuccess = (token: string) => { onLogin?.(token); toast({ title: "ok" }); };',
+  'const handleGoogleSuccess = async (cred: string) => { const r = await googleLogin(cred); onLogin?.(r.token); };',
+  'const handleLoginSubmit = async () => { const res = await login(email, pass); onLogin?.(res.token); };',
+  'const handleDemo = () => { onLogin?.(localStorage.getItem("token") || ""); };',
+];
+const sibDiff = (lines = SIB_LINES) => `diff --git a/src/StartPage.tsx b/src/StartPage.tsx\n--- a/src/StartPage.tsx\n+++ b/src/StartPage.tsx\n@@ -1,1 +1,${lines.length} @@\n${lines.map((l) => `+${l}`).join('\n')}\n`;
+// A fake git: `log origin/master..origin/<b>` returns `branchBodies`; `show origin/<ref>:<file>` returns that ref's file text.
+function fakeGit({ branchBodies = 'HUB0022-01 body\n\nTask: HUB0022-01 (adhoc/manual)\n', files = {} } = {}) {
+  return (_repo, args) => {
+    if (args[0] === 'log') return branchBodies;
+    if (args[0] === 'show') return files[args[1]] || '';
+    return '';
+  };
+}
+const stackedRec = (over = {}) => ({
+  id: 'HUB0018-01', stacked: { branch: 'agent/decompose-hub', seq: 1, total: 2 }, rawDiff: sibDiff(),
+  history: [{ stage: 'created' }, { stage: 'applied', detail: 'agent/decompose-hub' }], ...over,
+});
+const stackedCtx = () => ctx({ branches: { 'decompose-hub': 1 } });
+const resolveStacked = (rec, git) => resolveDisposition(rec, { ctx: stackedCtx(), repoRoot: '/r', git });
+
+test('stacked sibling: its Task trailer on the branch -> still pending-merge', () => {
+  const git = fakeGit({ branchBodies: 'x\n\nTask: HUB0018-01 (adhoc/manual)\n\ny\n\nTask: HUB0022-01 (adhoc/manual)\n' });
+  assert.equal(resolveStacked(stackedRec(), git).stage, 'pending-merge');
+});
+
+test('stacked sibling: no trailer and none of its lines on the branch or main -> abandoned, naming the lost commit', () => {
+  const out = resolveStacked(stackedRec(), fakeGit({ files: { 'origin/agent/decompose-hub:src/StartPage.tsx': 'export function StartPage({ onLogin }: { onLogin?: () => void }) {\n  onLogin?.();\n}\n' } }));
+  assert.equal(out.stage, 'abandoned');
+  assert.match(out.detail, /exists but carries none of this task's change \(0 of 6/);
+});
+
+test('stacked sibling: absent from the branch but already on main -> superseded, not lost', () => {
+  const onMain = SIB_LINES.join('\n');
+  const out = resolveStacked(stackedRec(), fakeGit({ files: { 'origin/master:src/StartPage.tsx': onMain, 'origin/agent/decompose-hub:src/StartPage.tsx': 'unrelated\n' } }));
+  assert.equal(out.stage, 'superseded');
+  assert.match(out.detail, /already on master/);
+});
+
+test('stacked sibling: a later sibling rewrote SOME lines (>= half still present), too small a diff, an unreadable branch log and a non-stacked record all stay pending-merge', () => {
+  const half = SIB_LINES.slice(0, 4).join('\n');
+  assert.equal(resolveStacked(stackedRec(), fakeGit({ branchBodies: 'no trailer here\n', files: { 'origin/agent/decompose-hub:src/StartPage.tsx': half } })).stage, 'pending-merge', '4 of 6 present');
+  assert.equal(resolveStacked(stackedRec({ rawDiff: sibDiff(SIB_LINES.slice(0, 3)) }), fakeGit({ branchBodies: 'no trailer\n' })).stage, 'pending-merge', 'only 3 distinctive lines: no verdict');
+  assert.equal(resolveStacked(stackedRec(), fakeGit({ branchBodies: '' })).stage, 'pending-merge', 'could not read the branch log');
+  const plain = { id: 'plain', rawDiff: sibDiff(), history: [{ stage: 'applied', detail: 'agent/plain' }] };
+  assert.equal(resolveDisposition(plain, { ctx: ctx({ branches: { plain: 1 } }), repoRoot: '/r', git: fakeGit({ branchBodies: 'no trailer\n' }) }).stage, 'pending-merge', 'no stacked branch: unchanged behaviour');
+});
+
+test('diffPresence counts distinctive added lines at a ref and returns null without evidence; stackedSiblingLost needs a repo, a diff and a stacked branch', () => {
+  const git = fakeGit({ files: { 'origin/x:src/StartPage.tsx': SIB_LINES.slice(0, 2).join('\n') } });
+  assert.deepEqual(diffPresence(git, '/r', 'x', sibDiff()), { present: 2, checked: 6, files: 1 });
+  assert.equal(diffPresence(git, '/r', 'x', 'not a diff'), null);
+  assert.equal(diffPresence(git, '', 'x', sibDiff()), null);
+  assert.equal(stackedSiblingLost(git, '', 'master', 'x', stackedRec()), null);
+  assert.equal(stackedSiblingLost(git, '/r', 'master', 'x', { id: 'a', rawDiff: sibDiff() }), null);
+  assert.equal(stackedSiblingLost(git, '/r', 'master', 'x', stackedRec({ rawDiff: '' })), null);
+});
+
+// A real apply's detail is the branch name, built from the task title -- a title word that NOOP_RE knows must not turn shipped work into a noop (2026-10-15).
+const NOOP_WORD_BRANCH = 'agent/adhoc-premium-head-of-line-starvation-rotate-repeatedly-blocked-premium-tasks-behind-fresh-ones-and-avoid-lanes-a-task-degenerated-on-1792061032268';
+test('isNoopApplyDetail: an agent/ branch name is never a no-op, whatever words the title put in it', () => {
+  assert.equal(isNoopApplyDetail(NOOP_WORD_BRANCH), false);
+  for (const word of ['skipped', 'no-op', 'false positive', 'nothing to do', 'no candidates', 'empty implement']) {
+    assert.equal(isNoopApplyDetail(`agent/adhoc-handle-${word}-1792061032268`), false, word);
+  }
+  assert.equal(isNoopApplyDetail('no candidates in implement response -- nothing to apply'), true);
+  assert.equal(isNoopApplyDetail('False positive. The catch block is not silent.'), true);
+});
+
+test('resolveDisposition: a branch apply whose name contains a no-op word is classified by its branch, never noop', () => {
+  const id = 'adhoc-premium-head-of-line-starvation-a-task-degenerated-on-1792061032268';
+  const rec = { id, ...applied(NOOP_WORD_BRANCH) };
+  assert.equal(resolveDisposition(rec, { ctx: ctx({ onMain: { [id]: 'abc123def456' } }) }).stage, 'merged');
+  assert.equal(resolveDisposition(rec, { ctx: ctx({ branches: { [NOOP_WORD_BRANCH.replace(/^agent\//, '')]: 2 } }) }).stage, 'pending-merge');
+  const gone = resolveDisposition(rec, { ctx: ctx() });
+  assert.notEqual(gone.stage, 'noop');
+  assert.equal(gone.stage, 'abandoned');
 });

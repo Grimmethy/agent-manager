@@ -326,3 +326,37 @@ test('resolveRequestTimeoutMs on the P40 endpoint is calibrated per MODEL, not j
     assert.ok(msBigModel > mod.PER_CALL_TIMEOUT_CEILING_MS, `the big model's timeout must not be sped up by the small model's sample on the same endpoint, got ${msBigModel}`);
   });
 });
+
+// --- think-unsupported fallback (2026-10-17) ---------------------------------------------------
+test('postGenerate: a model that rejects think:true is retried WITHOUT the think field, learned per (endpoint, model), and later calls skip the failing request', async () => {
+  const { postGenerate, isThinkUnsupportedError } = require('./local-client.js');
+  const err = Object.assign(new Error('Ollama HTTP 400: {"error":"\\"m8b\\" does not support thinking"}'), { statusCode: 400 });
+  assert.equal(isThinkUnsupportedError(err), true);
+  const unsupported = new Set();
+  const seen = [];
+  const post = async (url, body) => { seen.push({ url, think: body.think, hasThink: 'think' in body }); if (body.think) throw err; return { response: 'ok' }; };
+  const req = () => ({ url: 'http://g:11434', body: { model: 'm8b', prompt: 'p', think: true, options: {} }, timeoutMs: 1000, headers: {}, post, unsupported });
+  assert.deepEqual(await postGenerate(req()), { response: 'ok' });
+  assert.deepEqual(seen.map((s) => s.hasThink), [true, false], 'first call: tried with think, retried without it');
+  assert.equal(unsupported.has('http://g:11434|m8b'), true);
+  seen.length = 0;
+  assert.deepEqual(await postGenerate(req()), { response: 'ok' });
+  assert.deepEqual(seen.map((s) => s.hasThink), [false], 'second call: no failing request, think omitted up front');
+});
+
+test('postGenerate: other errors and think:false requests are untouched, and a different model is not affected by what another learned', async () => {
+  const { postGenerate } = require('./local-client.js');
+  const other = Object.assign(new Error('Ollama HTTP 400: {"error":"bad request"}'), { statusCode: 400 });
+  const unsupported = new Set(['http://g:11434|m8b']);
+  await assert.rejects(postGenerate({ url: 'http://g:11434', body: { model: 'x', think: true }, post: async () => { throw other; }, unsupported }), /bad request/);
+  const calls = [];
+  await postGenerate({ url: 'http://g:11434', body: { model: 'x', think: true }, post: async (u, b) => { calls.push(b); return {}; }, unsupported });
+  assert.equal(calls[0].think, true, 'model x never failed: think is still sent');
+  const noThink = Object.assign(new Error('Ollama HTTP 400: does not support thinking'), { statusCode: 400 });
+  let n = 0;
+  await assert.rejects(postGenerate({ url: 'http://g:11434', body: { model: 'y', think: false }, post: async () => { n++; throw noThink; }, unsupported }), /does not support thinking/);
+  assert.equal(n, 1, 'a request that did not ask for thinking is not retried');
+  const timeout = Object.assign(new Error('Ollama HTTP 500: does not support thinking'), { statusCode: 500 });
+  await assert.rejects(postGenerate({ url: 'http://g:11434', body: { model: 'z', think: true }, post: async () => { throw timeout; }, unsupported }), /500/);
+  assert.equal(unsupported.has('http://g:11434|z'), false, 'only a 400 teaches the cache');
+});

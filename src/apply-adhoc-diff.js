@@ -22,6 +22,9 @@ const { allocateHubSerial, formatHubLabel, memberId, memberTitle } = require('./
 const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
+const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
+const { ownerGateFor } = require('./owner-gates.js');
+const { validProposalFiles } = require('./proposal-files.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -123,6 +126,24 @@ function inferMissingAfterLinks(subTasks) {
 const CODE_CHANGE_VERB_RE = /\b(add|modify|change|fix|implement|create|write|remove|refactor|update|replace|wire|extract|rename|delete|insert|adjust|tighten|expand|introduce|migrate|split|merge|patch|restructure|drop|disable|enable)\b/i;
 const VERIFICATION_LEAD_RE = /^(run|confirm|verify|check|validate|ensure|audit|test)\b/i;
 
+// 2026-09-27 (HUB0119 2/4): a sub-task proposal whose title/description DISPOSES a
+// brain-dump entry (file/route/classify/archive/reject/approve/triage it) is a
+// brain_dump_disposition task, not adhoc work -- apply-task.js's brain_dump_disposition
+// branch (HUB0119 3/4) owns it. Same high-precision discipline as CREATED_FILE_RE and
+// VERIFICATION_LEAD_RE above: a disposition verb must stand close before the entry ID
+// (bounded `[^.\n]` window -- never crosses a sentence boundary, so a passing mention of
+// "bd-..." elsewhere in the text never fires), and the ID must carry the brain-dump
+// entry format ("bd-" + 13-digit ms epoch, cf. `adhoc-brain-dump-<id>-<ts>` in
+// apply-group-a-brain-dump.js -- 6+ digits would also accept unrelated hex strings).
+// Capture group 1 is the entryId.
+// 2026-10-26 follow-up (verified by executing the old pattern): the first version (a disposition verb followed by ANY text within 60 characters
+// of the id) missed the very wording the hub was filed for ('Mark brain-dump entry bd-... resolved with this evidence', 'Record verification on
+// brain dump bd-...', 'Close bd-... as actioned') and matched real code work ('File the fix for the bug reported in bd-... in src/x.js',
+// 'Route the GPU lease through arbiter; see bd-...'), which then reached closeBrainDumpEntryResolved with no code change. Now the proposal must
+// START a line with the disposition verb and reach the id through nothing but filler words (the, this, entry, brain-dump, on, for, of, as,
+// verification, evidence, note), so any other noun between the verb and the id means it is work, not a disposition.
+const BRAIN_DUMP_DISPOSITION_RE = /^\s*(?:please\s+)?(?:file|route|classify|archive|reject|approve|triage|mark|record|close|resolve|dismiss)\b(?:\s+(?:the|this|a|an|on|for|of|as|brain-dump|brain\s+dump|entry|note|verification|evidence))*\s+bd-(\d{13})\b/im;
+
 function isVerificationOnlySubTask(sub) {
   const title = String((sub && sub.title) || '').trim();
   if (!title) return false;
@@ -198,8 +219,29 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
 
   const carriedDiff = parentTask && typeof parentTask.carriedPartialDiff === 'string' && parentTask.carriedPartialDiff.trim() ? parentTask.carriedPartialDiff : null;
   const queued = [];
+  const ownerGates = []; // pieces that wait on the owner (owner-gates.js)
   subTasks.forEach((sub, i) => {
     if (foldTargets.has(i)) return; // folded into a sibling's acceptanceCriteria instead of becoming its own no-diff-possible task
+    // HUB0119 2/4: a brain-dump DISPOSITION proposal (BRAIN_DUMP_DISPOSITION_RE above) is
+    // routed to domain 'brain_dump_disposition' (apply-task.js owns that branch) INSTEAD
+    // of becoming an adhoc/decompose sub-task -- it disposes an entry, it has no code diff
+    // of its own. Checked BEFORE any adhoc record is built, so a matching proposal never
+    // lands on the adhoc/decompose queue as domain 'adhoc'.
+    const brainDumpDisposal = BRAIN_DUMP_DISPOSITION_RE.exec(`${sub.title || ''}\n${sub.rawText || ''}`);
+    if (brainDumpDisposal) {
+      const routed = {
+        id: ids[i],
+        domain: 'brain_dump_disposition',
+        source: 'manual',
+        title: sub.title,
+        payload: { entryId: brainDumpDisposal[1], evidenceText: String(sub.rawText || sub.title || '').trim() },
+        promptContext: { rawText: sub.rawText, decomposedFrom: parentTaskId },
+      };
+      if (parentTask && parentTask.premiumPriority) routed.premiumPriority = true;
+      fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(routed, null, 2) + '\n');
+      queued.push({ id: ids[i], title: sub.title });
+      return;
+    }
     const record = {
       id: ids[i],
       domain: 'adhoc',
@@ -217,12 +259,20 @@ function queueSubTasks(rawSubTasks, pipelineDir, parentTaskId, parentTask) {
       record.priorPartialDiff = carriedDiff;
       record.promptContext.rawText = `PRIOR WORK ALREADY APPLIED: an earlier pass of the parent task made some of this change. Those edits are applied to your worktree as uncommitted changes -- run git diff to see them, and do NOT redo them. Your job is the part below, on top of them.\n\n${sub.rawText}`;
     }
+    // The piece's declared scope as the gate-readable `Files:` line (proposal-files.js); never added when the text already has one.
+    const declared = validProposalFiles(sub.files);
+    if (declared && !/^Files:/im.test(record.promptContext.rawText)) record.promptContext.rawText += `\nFiles: ${declared.join(', ')}`;
     const extra = extraCriteria.get(i);
     if (extra && extra.length) record.acceptanceCriteria = extra;
     if (parentTask && parentTask.premiumPriority) record.premiumPriority = true;
+    const prereq = validPrerequisiteHubs(sub.prerequisiteHubs); // hubs whose MERGE this piece waits for (hub-prerequisites.js)
+    if (prereq) record.prerequisiteHubs = prereq;
     fs.writeFileSync(path.join(adhocDir, `${ids[i]}.json`), JSON.stringify(record, null, 2) + '\n');
     queued.push({ id: ids[i], title: record.title });
+    const gate = ownerGateFor({ id: ids[i], title: record.title, rawText: record.promptContext.rawText });
+    if (gate) ownerGates.push(gate);
   });
+  queued.ownerGates = ownerGates;
   queued.hubSerial = hubSerial;
   queued.hubLabel = hubLabel;
   return queued;
@@ -254,6 +304,7 @@ function buildDecomposedPlan(task, pipelineDir) {
     subTasks: queued.map((t) => ({ id: t.id, title: t.title, status: 'pending' })),
     hubSerial: queued.hubSerial,
     hubLabel: queued.hubLabel,
+    ownerGates: queued.ownerGates,
   };
 }
 
@@ -382,4 +433,4 @@ function applyAdhocDiff({ task, repoRoot, pipelineDir, exec }) {
   }
 }
 
-module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask };
+module.exports = { applyAdhocDiff, queueSubTasks, inferMissingAfterLinks, isVerificationOnlySubTask, BRAIN_DUMP_DISPOSITION_RE };

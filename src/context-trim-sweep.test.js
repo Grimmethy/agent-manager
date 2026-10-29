@@ -8,7 +8,8 @@ const path = require('path');
 
 const { execFileSync } = require('child_process');
 const { sweep, reAnchorFile } = require('./context-trim-sweep.js');
-const { windowFetchedFileContent } = require('./sdk/candidate-fulfillment.js');
+const candidateFulfillment = require('./sdk/candidate-fulfillment.js');
+const { windowFetchedFileContent } = candidateFulfillment;
 const { registerTaskSource, getRegisteredSource } = require('./task-source-registry.js');
 // Use test-namespaced source names, not real ones (arch_review etc. are registered by the
 // out-of-tree hygiene plugin the moment local-draft.js loads it, so re-registering the
@@ -222,4 +223,136 @@ test('reAnchorFile falls back to null (unreadable) for a NON-stacked task when t
   const repoRoot = makeGitRepoWithStackedBranch();
   const result = reAnchorFile(repoRoot, { path: 'realTarget.js', anchorConfidence: 'none' }, 'Problem:\nThe `realTarget` function has a bug.', { id: 't-plain' });
   assert.equal(result, null, 'a non-stacked task must not see a file that only exists on some other branch');
+});
+
+// --- AC-111: pre-filing citation gate (HUB0154) ---------------------------------------
+// A review candidate's Snippet: is REAL code read at scan time. If it is no longer at any
+// cited path it MOVED (gate CORRECTED -> re-point, requeue, do NOT archive) or it is GONE
+// (gate REJECTED -> archive with a recorded reason). validateCitationBeforeFiling is the
+// single verdict function; these tests drive it directly AND through the sweep's re-point
+// path (the same relocateStaleAnchor primitive), reusing the synthetic-repo setup above.
+
+const gateBlock =
+  'function computePremiseEvidence(section, fetchedFiles) {\n' +
+  '  const evidence = [];\n' +
+  '  for (const f of fetchedFiles) { if (f.content.includes(section.symbol)) evidence.push(f.path); }\n' +
+  '  return evidence;\n' +
+  '}';
+const gateSection =
+  'Problem:\nThe `computePremiseEvidence` helper has a bug.\n\n' +
+  'Snippet:\n```\n' + gateBlock + '\n```\n\n' +
+  'Solution:\nFix it.';
+
+test('AC-111 re-point: sweep re-points a stale citation to its unique new home and requeues, flagging nothing', async () => {
+  const dir = tmpPipeline();
+  fs.mkdirSync(path.join(dir, 'repo', 'src'), { recursive: true });
+  const oldContent = `${padding}\n${padding}`;
+  fs.writeFileSync(path.join(dir, 'repo', 'src', 'old.js'), oldContent);
+  fs.writeFileSync(path.join(dir, 'repo', 'src', 'moved.js'), `${padding}\n${gateBlock}\n${padding}`);
+  const frozen = windowFetchedFileContent(oldContent, gateSection);
+  writeTask(dir, 'blocked', baseTask('ac-111-repoint', {
+    promptContext: {
+      body: gateSection,
+      fetchedFiles: [{ path: 'src/old.js', content: frozen.text, anchorConfidence: frozen.confidence, usedSnippetFuzzyMatch: frozen.usedSnippetFuzzyMatch }],
+    },
+  }));
+
+  const s = await sweep({ pipelineDir: dir, repoRoot: path.join(dir, 'repo'), now: Date.now() });
+
+  assert.equal(s.requeued, 1, 'a fixable stale citation must be re-pointed and requeued, not flagged');
+  assert.equal(s.flagged, 0, 'a fixable stale citation must NOT be flagged stale-grounding-unrecoverable');
+  assert.equal(exists(dir, 'blocked', 'ac-111-repoint'), false, 'must be moved out of blocked');
+  const fresh = readTask(dir, 'pending', 'ac-111-repoint');
+  assert.equal(fresh.status, 'pending');
+  assert.equal(fresh.promptContext.fetchedFiles[0].path, 'src/moved.js', 'citation must re-point to the unique new home');
+  assert.equal(fresh.promptContext.fetchedFiles[0].anchorConfidence, 'strong');
+  assert.equal(fresh.history[0].stage, 'pending');
+  // The fresh record's single pending event carries the improvement list, which must
+  // name the new home (the sweep's "cited Files: path corrected to ..." improvement).
+  assert.match(fresh.history[0].detail, /auto-requeued by context-trim-sweep/);
+  assert.match(fresh.history[0].detail, /moved\.js/, 'the requeue event must record the correction to the new home');
+});
+
+function tmpRepoRoot() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ac111-gate-'));
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  return dir;
+}
+
+// Direct-verdict helpers -- these are the neuter-discriminating asserts: with the gate
+// reduced to a pass-through (always null) the CORRECTED and REJECTED verdicts never
+// materialize and both throw; the PASS case is a null either way, so only A/B discriminate.
+function expectGateA(repoRoot) {
+  const verdict = candidateFulfillment.validateCitationBeforeFiling({
+    sourceName: 'observability_fix', section: gateSection, files: ['src/old.js'], repoRoot,
+  });
+  assert.ok(verdict, 'a stale citation with a unique new home must produce a CORRECTED verdict, not a pass-through null');
+  assert.equal(verdict.correctedFrom, 'src/old.js');
+  assert.equal(verdict.correctedTo, 'src/moved.js');
+  assert.ok(verdict.files.includes('src/moved.js'), 'Files: list must gain the new home');
+  assert.ok(!verdict.files.includes('src/old.js'), 'Files: list must drop the stale path');
+  assert.ok(!verdict.archiveReason, 'a CORRECTED citation is re-pointed, NOT archived');
+  return verdict;
+}
+
+function expectGateB(repoRoot) {
+  const verdict = candidateFulfillment.validateCitationBeforeFiling({
+    sourceName: 'observability_fix', section: gateSection, files: ['src/gone.js'], repoRoot,
+  });
+  assert.ok(verdict, 'an unfixable citation must produce a REJECTED verdict, not a pass-through null');
+  assert.match(String(verdict.archiveReason), /Snippet is absent from every cited path/);
+  assert.ok(!verdict.correctedTo, 'a GONE snippet must not be re-pointed anywhere');
+  return verdict;
+}
+
+function expectGateC(repoRoot) {
+  const verdict = candidateFulfillment.validateCitationBeforeFiling({
+    sourceName: 'observability_fix', section: gateSection, files: ['src/handler.js'], repoRoot,
+  });
+  assert.equal(verdict, null, 'a valid citation at its cited path must pass untouched (PASS -> null)');
+  return verdict;
+}
+
+test('AC-111 gate A: a stale citation is CORRECTED to its unique new home and the candidate is NOT archived', () => {
+  const repoRoot = tmpRepoRoot();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'old.js'), `${padding}\n${padding}`);
+  fs.writeFileSync(path.join(repoRoot, 'src', 'moved.js'), `${padding}\n${gateBlock}\n${padding}`);
+  expectGateA(repoRoot);
+});
+
+test('AC-111 gate B: an unfixable citation is REJECTED and archived with a recorded reason', () => {
+  const repoRoot = tmpRepoRoot();
+  // src/gone.js deliberately ABSENT; the snippet is nowhere else in the repo.
+  fs.writeFileSync(path.join(repoRoot, 'src', 'unrelated.js'), `${padding}\n${padding}`);
+  expectGateB(repoRoot);
+});
+
+test('AC-111 gate C: a valid citation at its cited path passes untouched (PASS -> no correction, no rejection)', () => {
+  const repoRoot = tmpRepoRoot();
+  fs.writeFileSync(path.join(repoRoot, 'src', 'handler.js'), `${padding}\n${gateBlock}\n${padding}`);
+  expectGateC(repoRoot);
+});
+
+test('AC-111 gate discrimination: neutering the gate to a pass-through makes A and B fail while C still passes', () => {
+  const repoA = tmpRepoRoot();
+  fs.writeFileSync(path.join(repoA, 'src', 'old.js'), `${padding}\n${padding}`);
+  fs.writeFileSync(path.join(repoA, 'src', 'moved.js'), `${padding}\n${gateBlock}\n${padding}`);
+  const repoB = tmpRepoRoot();
+  const repoC = tmpRepoRoot();
+  fs.writeFileSync(path.join(repoC, 'src', 'handler.js'), `${padding}\n${gateBlock}\n${padding}`);
+
+  // Live gate: A and B's verdicts materialize, so their helpers pass (no throw); C passes too.
+  assert.doesNotThrow(() => expectGateA(repoA), 'with a live gate, gate A asserts a CORRECTED verdict and must NOT throw');
+  assert.doesNotThrow(() => expectGateB(repoB), 'with a live gate, gate B asserts a REJECTED verdict and must NOT throw');
+  assert.doesNotThrow(() => expectGateC(repoC));
+
+  const original = candidateFulfillment.validateCitationBeforeFiling;
+  candidateFulfillment.validateCitationBeforeFiling = () => null; // neuter to a pass-through
+  try {
+    assert.throws(() => expectGateA(repoA), 'a pass-through gate returns null, so gate A must FAIL when the gate is neutered');
+    assert.throws(() => expectGateB(repoB), 'a pass-through gate returns null, so gate B must FAIL when the gate is neutered');
+    assert.doesNotThrow(() => expectGateC(repoC), 'gate C is a null verdict either way -- it must NOT regress');
+  } finally {
+    candidateFulfillment.validateCitationBeforeFiling = original;
+  }
 });

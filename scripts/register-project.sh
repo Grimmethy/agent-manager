@@ -21,6 +21,9 @@ PACKAGE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 PROJECTS_JSON="$PACKAGE_ROOT/projects.json"
 SECOND_BRAIN_DIR="${SECOND_BRAIN_DIR:-/media/wok/model-cache/SecondBrain}"
 
+echo "[register-project] making sure the pipeline lists every standard task domain"
+"$SCRIPT_DIR/ensure-task-domains.sh" "$PIPELINE_DIR"
+
 echo "[register-project] registering in projects.json"
 python3 - "$PROJECTS_JSON" "$REPO_DIR" "$PIPELINE_DIR" "$NAME" <<'PYEOF'
 import json, sys, os

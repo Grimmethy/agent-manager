@@ -228,6 +228,103 @@ class TaskLog(unittest.TestCase):
         self.assertEqual(bv.write_task_log(self.q, "ghost", None, "agent/ghost", "merge", [], "manual"), 0)
 
 
+class PriorVerdictOnTask(unittest.TestCase):
+    """write_task_log stamps promptContext.priorVerdict on the owning TASK so a redraft is shown a human
+    needs-work verdict (both requeue paths carry promptContext over verbatim)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.q = Path(self.tmp.name)
+        for d in ("done", "coordinating", "adhoc"):
+            (self.q / d).mkdir()
+
+    def _task(self, d="done", tid="t1", **extra):
+        rec = {"id": tid, "history": [], "promptContext": {"rawText": "the ask"}, **extra}
+        (self.q / d / f"{tid}.json").write_text(json.dumps(rec))
+
+    def _read(self, d="done", tid="t1"):
+        return json.loads((self.q / d / f"{tid}.json").read_text())
+
+    def test_chat_needs_work_stamps_full_reasons_beyond_the_400_char_history_detail(self):
+        self._task()
+        long_reason = "pick(obj: Record<string, unknown>, keys) returns unknown -> 6 new TS errors; " + "x" * 450
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", [long_reason, "second"], "chat", "abc123")
+        t = self._read()
+        pv = t["promptContext"]["priorVerdict"]
+        self.assertEqual(pv["verdict"], "needs-work")
+        self.assertEqual(pv["source"], "chat")
+        self.assertEqual(pv["sha"], "abc123")
+        self.assertEqual(pv["branch"], "agent/t1")
+        self.assertEqual(pv["reasons"], [long_reason, "second"])
+        self.assertGreater(len(pv["reasons"][0]), 400)  # the history event's detail is cut at 400; this is not
+        self.assertEqual(t["promptContext"]["rawText"], "the ask")  # the rest of promptContext is untouched
+
+    def test_manual_needs_work_also_stamps(self):
+        self._task()
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["fix it"], "manual", "s")
+        self.assertEqual(self._read()["promptContext"]["priorVerdict"]["source"], "manual")
+
+    def test_hub_record_never_gets_a_prior_verdict(self):
+        self._task()
+        (self.q / "coordinating" / "HUB1.json").write_text(json.dumps({"id": "HUB1", "promptContext": {"rawText": "hub"}}))
+        n = bv.write_task_log(self.q, "t1", "HUB1", "agent/t1", "needs-work", ["fix it"], "chat", "s")
+        self.assertEqual(n, 2)
+        self.assertIn("priorVerdict", self._read()["promptContext"])
+        self.assertNotIn("priorVerdict", json.loads((self.q / "coordinating" / "HUB1.json").read_text())["promptContext"])
+
+    def test_deterministic_and_discard_verdicts_do_not_stamp(self):
+        self._task()
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["conflicts with main"], "deterministic", "s")
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "discard", ["already on master"], "deterministic", "s")
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "discard", ["superseded by X"], "chat", "s")
+        self.assertNotIn("priorVerdict", self._read()["promptContext"])
+        self.assertEqual(len(self._read()["history"]), 3)  # the history events are still written
+
+    def test_deterministic_needs_work_does_not_replace_a_chat_one(self):
+        self._task()
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["the human reason"], "chat", "s1")
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["stale vs master"], "deterministic", "s2")
+        self.assertEqual(self._read()["promptContext"]["priorVerdict"]["reasons"], ["the human reason"])
+
+    def test_later_chat_merge_clears_it_and_a_newer_needs_work_replaces_it(self):
+        self._task()
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["first"], "chat", "s1")
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", ["second"], "chat", "s2")
+        self.assertEqual(self._read()["promptContext"]["priorVerdict"]["reasons"], ["second"])
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "merge", ["good now"], "chat", "s3")
+        self.assertNotIn("priorVerdict", self._read()["promptContext"])
+
+    def test_caps_reason_count_and_length(self):
+        self._task()
+        reasons = [("r%d-" % i) + "y" * 2000 for i in range(12)]
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", reasons, "chat", "s")
+        got = self._read()["promptContext"]["priorVerdict"]["reasons"]
+        self.assertEqual(len(got), bv._PRIOR_VERDICT_MAX_REASONS)
+        self.assertTrue(all(len(r) == bv._PRIOR_VERDICT_REASON_CHARS for r in got))
+
+    def test_a_long_reason_keeps_its_tail_where_the_fix_usually_is(self):
+        self._task()
+        reason = "x" * 880 + " keep the return type `any`"  # the shape of the real 887-char arch-review-ac-50 verdict
+        bv.write_task_log(self.q, "t1", None, "agent/t1", "needs-work", [reason], "chat", "s")
+        self.assertEqual(self._read()["promptContext"]["priorVerdict"]["reasons"], [reason])
+
+    def test_task_without_a_dict_prompt_context_is_logged_but_not_stamped_or_broken(self):
+        (self.q / "done" / "t2.json").write_text(json.dumps({"id": "t2", "history": [], "promptContext": "text"}))
+        (self.q / "done" / "t3.json").write_text(json.dumps({"id": "t3", "history": []}))
+        n = bv.write_task_log(self.q, ["t2", "t3"], None, "agent/t", "needs-work", ["r"], "chat", "s")
+        self.assertEqual(n, 2)
+        self.assertEqual(self._read(tid="t2")["promptContext"], "text")
+        self.assertNotIn("promptContext", self._read(tid="t3"))
+
+    def test_apply_prior_verdict_reports_whether_it_changed_the_record(self):
+        rec = {"promptContext": {}}
+        self.assertFalse(bv.apply_prior_verdict(rec, "b", "merge", ["x"], "chat"))  # nothing to clear
+        self.assertTrue(bv.apply_prior_verdict(rec, "b", "needs-work", ["x"], "chat", "s"))
+        self.assertFalse(bv.apply_prior_verdict(rec, "b", "needs-work", ["y"], "deterministic", "s"))
+        self.assertEqual(rec["promptContext"]["priorVerdict"]["reasons"], ["x"])
+
+
 class ResolveOwner(unittest.TestCase):
     def setUp(self):
         self.fx = Fixture()

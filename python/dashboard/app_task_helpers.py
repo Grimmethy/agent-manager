@@ -76,6 +76,9 @@ _LANE_IDS_CACHE: dict = {"at": 0.0, "ids": []}
 _LANE_IDS_TTL_S = 60.0
 
 
+_LANE_DEFS_CACHE: dict = {"at": 0.0, "lanes": []}
+
+
 def _zero_stats_model_row(model: str) -> dict:
     """A placeholder row for a model api_models() knows is available but has never been
     called -- same field shape as a real row, with every stat null/zero rather than the

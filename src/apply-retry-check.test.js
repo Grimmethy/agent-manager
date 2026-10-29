@@ -363,3 +363,45 @@ test('applyRetryCheck: after APPLY_TIMEOUT_MAX_RELEASES timeouts the failure is 
   assert.equal(isInfraApplyFailure({ blockedStage: 'review', blockedReason: TIMEOUT_REASON }), false);
   assert.equal(isInfraApplyFailure({ blockedStage: 'apply', blockedReason: 'git apply failed: patch does not apply' }), false);
 });
+
+// 2026-10-08 (TaxHarvest AC-271): a find-string miss redrafts with the REAL nearby lines, not just the bare reason.
+test('applyRetryCheck: a find-string miss is requeued with the failing edit and the real file lines as priorRejectionFeedback (once)', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-retry-repo-'));
+  fs.writeFileSync(path.join(repoRoot, 'a.py'), 'import os\n\ndef run(x):\n    return x + 1\n');
+  writeBlockedTask(blockedDir, 'ac-271', {
+    blockedReason: 'find string not found in a.py',
+    implementResponse: JSON.stringify([{ mode: 'edit', file: 'a.py', find: 'def run(x, y):', replace: 'def run(x):' }]),
+  });
+  const summary = applyRetryCheck({ blockedDir, pendingDir, repoRoot, recordModelOutcome: () => {}, decideResolved: () => false });
+  assert.equal(summary.requeued, 1);
+  const t = JSON.parse(fs.readFileSync(path.join(pendingDir, 'ac-271.json'), 'utf8'));
+  assert.equal(t.priorRejectionFeedback.length, 1);
+  assert.match(t.priorRejectionFeedback[0], /find string not found in a\.py/);
+  assert.match(t.priorRejectionFeedback[0], /3\| def run\(x\):/);
+});
+
+test('applyRetryCheck: a non-find apply failure gets no find feedback; an unparsable edit set does not break the requeue', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'other-fail', { implementResponse: JSON.stringify([{ mode: 'edit', file: 'a.py', find: 'zz', replace: 'y' }]) });
+  writeBlockedTask(blockedDir, 'junk', { blockedReason: 'find string not found in a.py', implementResponse: 'not json at all' });
+  const summary = applyRetryCheck({ blockedDir, pendingDir, repoRoot: os.tmpdir(), recordModelOutcome: () => {}, decideResolved: () => false });
+  assert.equal(summary.requeued, 2);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(pendingDir, 'other-fail.json'), 'utf8')).priorRejectionFeedback, undefined);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(pendingDir, 'junk.json'), 'utf8')).priorRejectionFeedback, undefined);
+});
+
+test('applyRetryCheck: the find feedback is not appended twice for the same failing edit set', () => {
+  const { blockedDir, pendingDir } = setupDirs();
+  const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-retry-repo-'));
+  fs.writeFileSync(path.join(repoRoot, 'a.py'), 'import os\n\ndef run(x):\n    return x + 1\n');
+  const implementResponse = JSON.stringify([{ mode: 'edit', file: 'a.py', find: 'def run(x, y):', replace: 'def run(x):' }]);
+  writeBlockedTask(blockedDir, 'dup', { blockedReason: 'find string not found in a.py', implementResponse });
+  applyRetryCheck({ blockedDir, pendingDir, repoRoot, recordModelOutcome: () => {}, decideResolved: () => false });
+  const first = JSON.parse(fs.readFileSync(path.join(pendingDir, 'dup.json'), 'utf8'));
+  fs.unlinkSync(path.join(pendingDir, 'dup.json'));
+  fs.writeFileSync(path.join(blockedDir, 'dup.json'), JSON.stringify({ ...first, blockedStage: 'apply', blockedReason: 'find string not found in a.py' }));
+  applyRetryCheck({ blockedDir, pendingDir, repoRoot, recordModelOutcome: () => {}, decideResolved: () => false });
+  const second = JSON.parse(fs.readFileSync(path.join(pendingDir, 'dup.json'), 'utf8'));
+  assert.equal(second.priorRejectionFeedback.length, 1);
+});

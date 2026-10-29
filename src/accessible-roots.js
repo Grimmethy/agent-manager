@@ -72,4 +72,26 @@ function resolveAccessibleRoots({ repoRoot } = {}) {
   return out.length ? out : [path.resolve(root)];
 }
 
-module.exports = { resolveAccessibleRoots, isCoreRepo };
+// Sibling repos the implement pass may READ but never write (2026-10-16: the GPU broker verification tasks could not see /media/model-cache/github/videoforge
+// or promptforge-manual -- their worktree was the only root -- and concluded the repos were not on this machine). Same plugin set as resolveAccessibleRoots,
+// minus every root the pass must not touch or read: its own worktree, the live checkout, the core package root and the apply clone. A non-core active project
+// yields [] (resolveAccessibleRoots only adds plugins for the core repo). Never throws.
+function resolveReadOnlySiblingRoots({ repoRoot, worktreeDir, applyRepoRoot } = {}) {
+  let candidates;
+  try { candidates = resolveAccessibleRoots({ repoRoot }).slice(1); } catch { return []; }
+  const apply = applyRepoRoot || process.env.AGENT_MANAGER_APPLY_REPO_ROOT;
+  const forbidden = [worktreeDir, repoRoot, PACKAGE_ROOT, process.env.AGENT_MANAGER_CORE_REPO_ROOT, apply].filter(Boolean).map(realOrResolved);
+  const overlaps = (a, b) => a === b || a.startsWith(b + path.sep) || b.startsWith(a + path.sep);
+  return candidates.filter((c) => !forbidden.some((f) => overlaps(realOrResolved(c), f)));
+}
+
+// A path that looks like a credential, so the read tools refuse it inside a read-only sibling repo (the pass's output is committed and pushed and nothing scans
+// diffs for secrets). run_bash cannot be filtered per file; the implement prompt tells the model not to cat these.
+const SECRET_BASENAME_RE = /^(?:\.env(?:\..*)?|.*\.(?:pem|key|pfx|p12)|id_(?:rsa|dsa|ecdsa|ed25519).*|pf-db\.env|.*(?:credential|secret|token).*)$/i;
+function isSecretLookingPath(p) {
+  const norm = String(p || '').replace(/\\/g, '/');
+  if (/(?:^|\/)\.(?:ssh|gnupg)(?:\/|$)/.test(norm)) return true;
+  return SECRET_BASENAME_RE.test(path.basename(norm));
+}
+
+module.exports = { resolveAccessibleRoots, resolveReadOnlySiblingRoots, isSecretLookingPath, isCoreRepo };

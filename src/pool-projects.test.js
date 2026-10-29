@@ -114,6 +114,7 @@ test('CLI: --list prints the pool as JSON, --env-args prints one env token per l
   const dir = path.join(fx.root, 'pkg');
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.copyFileSync(script, path.join(dir, 'src', 'pool-projects.js'));
+  fs.copyFileSync(path.join(__dirname, 'hub-prerequisites.js'), path.join(dir, 'src', 'hub-prerequisites.js'));   // pool-projects.js requires it
   fs.copyFileSync(fx.projectsPath, path.join(dir, 'projects.json'));
   const run = (...args) => execFileSync('node', [path.join(dir, 'src', 'pool-projects.js'), ...args], { env, encoding: 'utf8' });
   const list = JSON.parse(run('--list'));
@@ -153,4 +154,259 @@ test('borrowing is tracked per role: a worker finding a project empty does not h
   markBorrowed(fx.list[1].pipelineDir, { now: t0, file: fx.stateFile, role: 'reviewer' });
   assert.deepEqual(list('reviewer'), ['b', 'a']);
   assert.deepEqual(list('worker'), ['b'], 'the worker ordering/backoff is untouched by reviewer borrows');
+});
+
+// --- premium reach (2026-10-18): every registered project, premium work only -----------------------------------------------------------
+
+const { registeredProjects, hasPremium, premiumTaskClaimable, dependencyReleased, premiumProjects, markPremiumBorrowed, markPremiumEmpty, premiumReachEnabled } = require('./pool-projects.js');
+
+const writeTask = (pipelineDir, stage, name, task, compact = false) => {
+  const dir = path.join(pipelineDir, 'queue', stage);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${name}.json`), compact ? JSON.stringify(task) : JSON.stringify(task, null, 2));
+};
+
+test('registeredProjects includes non-pool projects with the same dedupe / active / missing-dir rules; poolProjects still needs pool:true', () => {
+  const fx = fixture([
+    { name: 'active', pool: true }, { name: 'a', pool: true }, { name: 'plain' }, { name: 'off', pool: false },
+    { name: 'norepo', repo: false }, { name: 'noqueue', queue: false },
+  ]);
+  const dup = { ...fx.list[2], repoRoot: path.join(fx.root, 'plain-mirror-repo'), label: 'plain-dup' };
+  fs.mkdirSync(dup.repoRoot);
+  fs.writeFileSync(fx.projectsPath, JSON.stringify([...fx.list, dup]));
+  const active = { repoRoot: fx.list[0].repoRoot, pipelineDir: fx.list[0].pipelineDir };
+  assert.deepEqual(registeredProjects({ projectsPath: fx.projectsPath, active }).map((p) => p.label), ['a', 'plain', 'off']);
+  assert.deepEqual(poolProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active }).map((p) => p.label), ['a']);
+  const plain = registeredProjects({ projectsPath: fx.projectsPath, active }).find((p) => p.label === 'plain');
+  assert.deepEqual(Object.keys(plain).sort(), ['applyRepoRoot', 'domainsPath', 'grepDirs', 'label', 'pipelineDir', 'repoRoot']);
+});
+
+test('hasPremium looks only at the stages a role works from, and only at this lane\'s drafting dir', () => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  const has = (role, lane) => hasPremium(pipe, { role, lane });
+  assert.equal(has('worker', 'worker-a'), false, 'empty queue');
+  writeTask(pipe, 'pending', 'plain', { id: 'plain', premiumPriority: false });
+  writeTask(pipe, 'pending', 'nested', { id: 'nested', promptContext: { premiumPriority: true }, premiumPriority: 'true' });
+  writeTask(pipe, 'blocked', 'stuck', { id: 'stuck', premiumPriority: true });
+  fs.writeFileSync(path.join(pipe, 'queue', 'pending', 'partial.json'), '{"id":"partial","premiumPriority":tr');
+  assert.equal(has('worker', 'worker-a'), false, 'premiumPriority:false, a nested or string flag, a corrupt file and a premium task in blocked/ do not count');
+  writeTask(pipe, 'drafting/worker-b', 'theirs', { id: 'theirs', premiumPriority: true });
+  assert.equal(has('worker', 'worker-a'), false, 'another lane\'s drafting dir is not this lane\'s');
+  assert.equal(has('worker', 'worker-b'), true, 'the lane\'s own drafting dir counts');
+  assert.equal(has('worker', '../x'), false, 'a malformed lane is ignored, not joined into a path');
+  writeTask(pipe, 'derived', 'child', { id: 'child', premiumPriority: true });
+  assert.equal(has('worker', 'worker-a'), true, 'derived/ counts for the worker');
+  fs.rmSync(path.join(pipe, 'queue', 'derived', 'child.json'));
+  writeTask(pipe, 'adhoc', 'waiting', { id: 'waiting', premiumPriority: true }, true);
+  assert.equal(has('worker', 'worker-a'), true, 'adhoc/ counts for the worker (compact JSON too)');
+  assert.equal(has('reviewer'), false);
+  assert.equal(has('apply'), false);
+  writeTask(pipe, 'review', 'r', { id: 'r', premiumPriority: true });
+  writeTask(pipe, 'approved', 'ap', { id: 'ap', premiumPriority: true });
+  assert.equal(has('reviewer'), true);
+  assert.equal(has('apply'), true);
+  assert.equal(has('worker-seed'), true, 'worker-seed sees the premium adhoc/ task');
+  fs.rmSync(path.join(pipe, 'queue', 'adhoc', 'waiting.json'));
+  writeTask(pipe, 'pending', 'queued', { id: 'queued', premiumPriority: true });
+  assert.equal(has('worker', 'worker-a'), true, 'pending/ counts for the worker');
+  assert.equal(has('worker-seed'), false, 'but worker-seed looks only at adhoc/ and derived/');
+  writeTask(pipe, 'derived', 'child2', { id: 'child2', premiumPriority: true });
+  assert.equal(has('worker-seed'), true, 'derived/ counts for worker-seed');
+  assert.equal(has('nobody'), false, 'unknown role has no stages');
+  assert.equal(hasPremium(path.join(fx.root, 'missing')), false, 'a missing pipeline dir is not an error');
+});
+
+test('premiumProjects: premium-holding registered projects only, least-recently-premium-borrowed first, per-lane backoff, kill switch, separate from idle borrowing', () => {
+  const fx = fixture([{ name: 'active' }, { name: 'a', pool: true }, { name: 'b' }, { name: 'c' }]);
+  const [act, a, b, c] = fx.list;
+  const active = { repoRoot: act.repoRoot, pipelineDir: act.pipelineDir };
+  writeTask(act.pipelineDir, 'pending', 'home', { id: 'home', premiumPriority: true });
+  writeTask(a.pipelineDir, 'pending', 'pa', { id: 'pa', premiumPriority: true });
+  writeTask(b.pipelineDir, 'adhoc', 'pb', { id: 'pb', premiumPriority: true });
+  writeTask(c.pipelineDir, 'pending', 'pc', { id: 'pc' });
+  const t0 = new Date('2026-10-18T09:00:00Z');
+  const list = (lane = 'worker-x', now = new Date(t0.getTime() + 1000), role = 'worker') => premiumProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active, role, lane, now }).map((p) => p.label);
+  assert.deepEqual(list(), ['a', 'b'], 'the active project and the premium-free c are excluded');
+  markPremiumBorrowed(a.pipelineDir, { lane: 'worker-x', now: t0, file: fx.stateFile, projectsPath: fx.projectsPath });
+  assert.deepEqual(list(), ['b', 'a'], 'a borrow moves the project to the back');
+  assert.deepEqual(list('worker-y'), ['a', 'b'], 'another lane has its own order');
+  markPremiumEmpty(b.pipelineDir, { lane: 'worker-x', now: t0, file: fx.stateFile, ttlMs: 300000 });
+  assert.deepEqual(list(), ['a'], 'b is backed off for worker-x');
+  assert.deepEqual(list('worker-y'), ['a', 'b'], 'but not for worker-y');
+  assert.deepEqual(list('worker-x', new Date(t0.getTime() + 301000)), ['b', 'a'], 'the backoff expires');
+  const pooled = poolProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active }).map((p) => p.label);
+  assert.deepEqual(pooled, ['a'], 'idle borrowing still sees only the pool project and its order is untouched by premium borrows');
+  const state = JSON.parse(fs.readFileSync(fx.stateFile, 'utf8'));
+  assert.equal(state.lastBorrowedAt[fs.realpathSync(a.pipelineDir)], undefined, 'no idle-borrowing (worker) key was written');
+  writeTask(a.pipelineDir, 'review', 'ra', { id: 'ra', premiumPriority: true });
+  assert.deepEqual(list(null, undefined, 'reviewer'), ['a'], 'the reviewer role looks at review/');
+  process.env.AGENT_MANAGER_PREMIUM_REACH = 'false';
+  try {
+    assert.equal(premiumReachEnabled(), false);
+    assert.deepEqual(list(), []);
+    assert.deepEqual(poolProjects({ projectsPath: fx.projectsPath, stateFile: fx.stateFile, active }).map((p) => p.label), ['a'], 'idle borrowing is not affected by the premium switch');
+  } finally { delete process.env.AGENT_MANAGER_PREMIUM_REACH; }
+});
+
+test('CLI: --env-args resolves a non-pool project, --has-premium exits 0/1, --premium-projects lists, --mark-premium writes one home history event', () => {
+  const fx = fixture([{ name: 'active' }, { name: 'plain', grepDirs: 'src' }]);
+  const [act, plain] = fx.list;
+  writeTask(plain.pipelineDir, 'pending', 'p1', { id: 'p1', premiumPriority: true });
+  const env = { ...process.env, AGENT_MANAGER_REPO_ROOT: act.repoRoot, AGENT_MANAGER_PIPELINE_DIR: act.pipelineDir, AGENT_MANAGER_POOL_STATE_PATH: fx.stateFile };
+  delete env.AGENT_MANAGER_PREMIUM_REACH;
+  const dir = path.join(fx.root, 'pkg');
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  for (const f of ['pool-projects.js', 'pipeline-history.js', 'hub-prerequisites.js']) fs.copyFileSync(path.join(__dirname, f), path.join(dir, 'src', f));
+  fs.copyFileSync(fx.projectsPath, path.join(dir, 'projects.json'));
+  const cli = path.join(dir, 'src', 'pool-projects.js');
+  const run = (...args) => execFileSync('node', [cli, ...args], { env, encoding: 'utf8' });
+  const status = (...args) => spawnSyncStatus(cli, args, env);
+  const tokens = run('--env-args', 'plain', '/home/instances').trim().split('\n');
+  assert.ok(tokens.includes(`AGENT_MANAGER_PIPELINE_DIR=${plain.pipelineDir}`) && tokens.includes('AGENT_MANAGER_GREP_DIRS=src'));
+  assert.throws(() => run('--env-args', 'nope'), /no pool project/);
+  assert.equal(status('--has-premium', plain.pipelineDir, 'worker', 'worker-x'), 0);
+  assert.equal(status('--has-premium', plain.pipelineDir, 'reviewer'), 1);
+  assert.deepEqual(run('--premium-projects', 'worker', 'worker-x').trim().split('\n'), [plain.pipelineDir]);
+  assert.equal(run('--premium-projects', 'reviewer').trim(), '');
+  run('--mark-premium', plain.pipelineDir, 'worker', act.pipelineDir, 'worker-x');
+  const log = path.join(act.pipelineDir, 'instances', 'pipeline-history.log');
+  const lines = fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].type, 'premium-borrow');
+  assert.equal(lines[0].role, 'worker');
+  assert.equal(lines[0].lane, 'worker-x');
+  assert.equal(lines[0].project, 'plain');
+  assert.ok(!fs.existsSync(path.join(plain.pipelineDir, 'instances')), 'the event goes to the HOME project, not the borrowed one');
+  assert.ok(JSON.parse(fs.readFileSync(fx.stateFile, 'utf8')).lastBorrowedAt[`premium-worker:worker-x|${fs.realpathSync(plain.pipelineDir)}`]);
+});
+
+function spawnSyncStatus(cli, args, env) {
+  return require('child_process').spawnSync('node', [cli, ...args], { env, encoding: 'utf8' }).status;
+}
+
+// --- premium reach counts only premium tasks a lane could actually claim (2026-10-25) ---------------------------------------------------------------
+// Six premium stacked hub children in the home adhoc/ were held by unmet dependsOn for 66-69 h, hasPremium counted them, every lane answered "home has
+// premium work" and none borrowed another repo's premium task. hasPremium now mirrors the dependsOn / softDependsOn / prerequisiteHubs gates of adhoc/ and derived/.
+
+const premiumFixture = () => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  return { fx, pipe, counts: () => hasPremium(pipe, { role: 'worker', lane: 'worker-a' }) };
+};
+
+test('a premium adhoc task held by an unmet dependsOn does not count, whatever state its dependency is stuck in', () => {
+  const { pipe, counts } = premiumFixture();
+  writeTask(pipe, 'adhoc', 'child', { id: 'child', premiumPriority: true, dependsOn: ['dep'] });
+  assert.equal(counts(), false, 'a dependency with no record at all is unreleased');
+  for (const stage of ['needs-clarification', 'blocked', 'adhoc', 'pending', 'review', 'approved', 'drafting/worker-b']) {
+    writeTask(pipe, stage, 'dep', { id: 'dep' });
+    assert.equal(counts(), false, `a dependency still in ${stage} holds the task`);
+    fs.rmSync(path.join(pipe, 'queue', stage, 'dep.json'));
+  }
+  writeTask(pipe, 'coordinating', 'dep', { id: 'dep', subTasks: [{ status: 'pending-merge' }] });
+  assert.equal(counts(), false, 'a coordinating record without a stacked branch is not a built nested hub');
+  writeTask(pipe, 'coordinating', 'dep', { id: 'dep', stacked: { branch: 'agent/x' }, subTasks: [{ status: 'done' }, { status: 'drafting' }] });
+  assert.equal(counts(), false, 'a nested hub with one open piece is not built');
+  writeTask(pipe, 'coordinating', 'dep', { id: 'dep', stacked: { branch: 'agent/x' }, subTasks: [] });
+  assert.equal(counts(), false, 'a nested hub with no pieces is not built (fail closed)');
+});
+
+test('the same task counts once its dependency is released, by any of the signals the claim path accepts', () => {
+  const { pipe, counts } = premiumFixture();
+  writeTask(pipe, 'adhoc', 'child', { id: 'child', premiumPriority: true, dependsOn: ['dep'] });
+  writeTask(pipe, 'done', 'dep', { id: 'dep', terminalDisposition: 'pending-merge' });
+  assert.equal(counts(), false, 'a done record that is not merged, not stacked and not a no-code outcome is unreleased (fail closed, no git fallback)');
+  const released = [
+    ['mergedAt', { mergedAt: '2026-10-25T00:00:00Z' }],
+    ['applied-direct', { terminalDisposition: 'applied-direct' }],
+    ['a no-code disposition', { terminalDisposition: 'noop' }],
+    ['a stacked branch', { stacked: { branch: 'agent/decompose-x', seq: 1, total: 3 } }],
+  ];
+  for (const [label, extra] of released) {
+    writeTask(pipe, 'done', 'dep', { id: 'dep', ...extra });
+    assert.equal(counts(), true, `released by ${label}`);
+  }
+  fs.rmSync(path.join(pipe, 'queue', 'done', 'dep.json'));
+  writeTask(pipe, 'done/_archived_no_action', 'dep', { id: 'dep', mergedAt: '2026-10-25T00:00:00Z' });
+  assert.equal(counts(), true, 'released from the archived-no-action dir too');
+  fs.rmSync(path.join(pipe, 'queue', 'done', '_archived_no_action', 'dep.json'));
+  writeTask(pipe, 'coordinating', 'dep', { id: 'dep', stacked: { branch: 'agent/x' }, subTasks: [{ status: 'pending-merge' }, { status: 'done' }, { status: 'noop' }] });
+  assert.equal(counts(), true, 'released by a nested hub whose pieces are all finished');
+});
+
+test('dependsOn needs EVERY dependency released; blank entries block nothing; a non-array dependsOn is ignored', () => {
+  const { pipe, counts } = premiumFixture();
+  writeTask(pipe, 'done', 'a', { id: 'a', mergedAt: 'x' });
+  writeTask(pipe, 'adhoc', 'child', { id: 'child', premiumPriority: true, dependsOn: ['a', 'b'] });
+  assert.equal(counts(), false, 'one released and one missing dependency still holds the task');
+  writeTask(pipe, 'done', 'b', { id: 'b', mergedAt: 'x' });
+  assert.equal(counts(), true, 'all released');
+  writeTask(pipe, 'adhoc', 'child', { id: 'child', premiumPriority: true, dependsOn: ['', '   ', null] });
+  assert.equal(counts(), true, 'blank or malformed entries are released');
+  writeTask(pipe, 'adhoc', 'child', { id: 'child', premiumPriority: true, dependsOn: 'not-an-array' });
+  assert.equal(counts(), true, 'a malformed field falls back to counting the task, as before');
+  assert.equal(dependencyReleased(pipe, 'a'), true);
+  assert.equal(dependencyReleased(pipe, 'zzz'), false);
+});
+
+test('softDependsOn is released by any done record, and prerequisiteHubs holds while the hub is open', () => {
+  const { pipe, counts } = premiumFixture();
+  writeTask(pipe, 'adhoc', 'child', { id: 'child', premiumPriority: true, softDependsOn: ['s'] });
+  assert.equal(counts(), false, 'no record');
+  writeTask(pipe, 'pending', 's', { id: 's' });
+  assert.equal(counts(), false, 'still pending');
+  writeTask(pipe, 'done', 's', { id: 's' });
+  assert.equal(counts(), true, 'reaching done/ at all releases a soft dependency');
+  writeTask(pipe, 'adhoc', 'child', { id: 'child', premiumPriority: true, prerequisiteHubs: ['HUB0006'] });
+  assert.equal(counts(), true, 'no open hub with that label');
+  writeTask(pipe, 'coordinating', 'hub6', { id: 'hub6', hubLabel: 'HUB0006' });
+  assert.equal(counts(), false, 'the prerequisite hub is still open');
+  fs.rmSync(path.join(pipe, 'queue', 'coordinating', 'hub6.json'));
+  assert.equal(counts(), true, 'the prerequisite hub merged');
+});
+
+test('the gates apply to adhoc/ and derived/ only; pending/, drafting/<lane>, review/ and approved/ keep counting on the flag alone', () => {
+  const { pipe, fx } = premiumFixture();
+  const gated = { premiumPriority: true, dependsOn: ['missing'] };
+  const has = (role, lane) => hasPremium(pipe, { role, lane });
+  writeTask(pipe, 'derived', 'd', { id: 'd', ...gated });
+  assert.equal(has('worker', 'worker-a'), false, 'derived/ is gated too');
+  assert.equal(has('worker-seed'), false, 'and worker-seed sees the same filter');
+  writeTask(pipe, 'pending', 'pend', { id: 'pend', ...gated });
+  assert.equal(has('worker', 'worker-a'), true, 'pending/ has no dependency gate in its claim path');
+  fs.rmSync(path.join(pipe, 'queue', 'pending', 'pend.json'));
+  writeTask(pipe, 'drafting/worker-a', 'mine', { id: 'mine', ...gated });
+  assert.equal(has('worker', 'worker-a'), true, 'a resume of this lane\'s own drafting file always counts');
+  writeTask(pipe, 'review', 'r', { id: 'r', ...gated });
+  writeTask(pipe, 'approved', 'ap', { id: 'ap', ...gated });
+  assert.equal(has('reviewer'), true);
+  assert.equal(has('apply'), true);
+  writeTask(pipe, 'adhoc', 'free', { id: 'free', premiumPriority: true });
+  assert.equal(has('worker-seed'), true, 'a gate-free premium adhoc task still counts');
+  assert.equal(premiumTaskClaimable(pipe, { dependsOn: ['missing'] }), false);
+  assert.equal(premiumTaskClaimable(pipe, {}), true);
+  assert.ok(fx.root);
+});
+
+test('premiumProjects: gated home premium tasks no longer hide other repos\' claimable premium work (the 2026-10-22 to 10-25 stall)', () => {
+  const fx = fixture([{ name: 'home' }, { name: 'core', pool: true }, { name: 'gatedonly', pool: true }]);
+  const [home, core, gatedonly] = fx.list;
+  const active = { repoRoot: home.repoRoot, pipelineDir: home.pipelineDir };
+  // the six real shapes in the home queue: premium stacked hub children whose dependency is stuck elsewhere
+  const stuck = [['HUB0006-06', 'needs-clarification'], ['HUB0009-10', 'coordinating'], ['HUB0024-03', 'blocked']];
+  for (const [dep, stage] of stuck) writeTask(home.pipelineDir, stage, dep, { id: dep });
+  writeTask(home.pipelineDir, 'adhoc', 'HUB0006-07', { id: 'HUB0006-07', premiumPriority: true, stacked: { branch: 'agent/h', seq: 7, total: 7 }, dependsOn: ['HUB0006-06'] });
+  writeTask(home.pipelineDir, 'adhoc', 'HUB0009-11', { id: 'HUB0009-11', premiumPriority: true, stacked: { branch: 'agent/h', seq: 11, total: 13 }, dependsOn: ['HUB0009-10'] });
+  writeTask(home.pipelineDir, 'adhoc', 'HUB0009-12', { id: 'HUB0009-12', premiumPriority: true, stacked: { branch: 'agent/h', seq: 12, total: 13 }, dependsOn: ['HUB0009-11'] });
+  writeTask(home.pipelineDir, 'adhoc', 'HUB0024-04', { id: 'HUB0024-04', premiumPriority: true, stacked: { branch: 'agent/i', seq: 4, total: 5 }, dependsOn: ['HUB0024-03'] });
+  assert.equal(hasPremium(home.pipelineDir, { role: 'worker', lane: 'worker-3090' }), false, 'the home project holds no CLAIMABLE premium work, so it does not win the tie');
+  writeTask(core.pipelineDir, 'pending', 'fix', { id: 'fix', premiumPriority: true });
+  writeTask(gatedonly.pipelineDir, 'adhoc', 'waiting', { id: 'waiting', premiumPriority: true, dependsOn: ['nobody'] });
+  const labels = premiumProjects({ role: 'worker', lane: 'worker-3090', projectsPath: fx.projectsPath, active, stateFile: fx.stateFile }).map((p) => p.label);
+  assert.deepEqual(labels, ['core'], 'the foreign project with claimable premium work is reached; the one whose only premium task is gated is not');
+  // and a CLAIMABLE home premium task still wins the tie
+  writeTask(home.pipelineDir, 'done', 'HUB0024-03', { id: 'HUB0024-03', mergedAt: '2026-10-25T00:00:00Z' });
+  fs.rmSync(path.join(home.pipelineDir, 'queue', 'blocked', 'HUB0024-03.json'));
+  assert.equal(hasPremium(home.pipelineDir, { role: 'worker', lane: 'worker-3090' }), true, 'once HUB0024-04 is claimable the home project wins the tie again');
 });

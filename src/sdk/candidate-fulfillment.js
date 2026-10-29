@@ -25,8 +25,8 @@ const { signatureForClarificationTask } = require('../pipeline-forensics.js');
 const { appendHistoryEvent } = require('../task-history.js');
 const { readIfExists, quotedSymbolsFromSection, snippetFromSection } = require('./lib/candidate-doc-parsing.js');
 const { findFuzzyMatch, windowAroundIndex } = require('./lib/fuzzy-matching.js');
-const { collectAnchorHits, windowFetchedFileContent } = require('./lib/file-grounding.js');
-const { extractCandidateSignatures, liveSignatureCount, staleSignatureReason, archiveStaleCandidate, nextCandidateFulfillmentTask, SIGNATURE_RE, MAX_ARCH_REVIEW_TASK_CHARS } = require('./lib/candidate-lifecycle.js');
+const { collectAnchorHits, windowFetchedFileContent, relocateStaleAnchor, snippetMissingFrom } = require('./lib/file-grounding.js');
+const { extractCandidateSignatures, liveSignatureCount, staleSignatureReason, archiveStaleCandidate, nextCandidateFulfillmentTask: rawNextCandidateFulfillmentTask, SIGNATURE_RE, MAX_ARCH_REVIEW_TASK_CHARS } = require('./lib/candidate-lifecycle.js');
 
 const MAX_FETCHED_FILE_CHARS = 8000;
 
@@ -192,9 +192,74 @@ const LOW_CONFIDENCE_GROUNDING_NOTE = '[LOW-CONFIDENCE GROUNDING: no reliable an
 // determined (no needs-clarification/ dir), is never flagged by this check -- it has
 // nothing to disprove, same "no real claim, no verdict" discipline computePremiseEvidence
 // applies to citations.
+// Pre-filing citation gate (2026-09-24, HUB0154): a review-style candidate
+// (observability_fix / performance_fix) carries a `Snippet:` field that is REAL code the
+// scanner read at review time (see the SNIPPET_FIELD_RE comment above) -- so if that
+// snippet is no longer at ANY of the candidate's cited paths, the citation is stale.
+// Exactly one of two things can be true: the code it points at MOVED (relocateStaleAnchor
+// finds the ONE unique new home -- same primitive context-trim-sweep.js uses post-filing
+// on the identical two-primitive check) or it is GONE (archive before a full draft cycle
+// burns on a target that no longer exists). snippetMissingFrom keeps the same discipline
+// as every other consumer: no Snippet field, or a diff-shaped Snippet, says nothing about
+// code moving -> PASS, never a verdict.
+//
+// Return contract (candidate-lifecycle.js's preFilingGate hook dispatches on it):
+//   PASS       -> null                                   (snippet still at a cited path, or nothing to validate)
+//   CORRECTED  -> { files, correctedFrom, correctedTo } (unique new home; the lifecycle
+//                swaps the cited path in the Files: list and re-windows against it)
+//   REJECTED   -> { archiveReason }                      (snippet nowhere; the lifecycle
+//                files the candidate straight to done/_archived_no_action/ and moves on)
+function validateCitationBeforeFiling(ctx) {
+  const sourceName = ctx && ctx.sourceName;
+  if (sourceName !== 'observability_fix' && sourceName !== 'performance_fix') return null; // gates ONLY these two sources
+  const section = ctx && ctx.section;
+  const listed = ((ctx && ctx.files) || []).filter((p) => typeof p === 'string' && p.length);
+  if (!listed.length) return null; // no cited path to validate against
+  const snippet = snippetFromSection(section);
+  if (!snippet) return null; // no Snippet field: nothing this gate can say (snippetMissingFrom agrees)
+  const root = ctx.repoRoot ? path.resolve(ctx.repoRoot) : null;
+  const readLive = (relPath) => {
+    if (!root) return null;
+    const full = path.resolve(root, relPath);
+    if (full !== root && !full.startsWith(root + path.sep)) return null;
+    try { return fs.readFileSync(full, 'utf8'); } catch { return null; }
+  };
+  // PASS: the snippet is still at a cited path. (snippetMissingFrom is false -- which also
+  // covers a diff-shaped Snippet: nothing to validate.)
+  for (const relPath of listed) {
+    const liveText = readLive(relPath);
+    if (liveText !== null && !snippetMissingFrom(liveText, section)) return null;
+  }
+  // Not at any cited path: does it have exactly ONE unique new home?
+  for (const relPath of listed) {
+    const hit = relocateStaleAnchor(root, relPath, section);
+    if (hit && hit.path && hit.path !== relPath) {
+      return {
+        files: [...listed.filter((p) => p !== relPath), hit.path],
+        correctedFrom: relPath,
+        correctedTo: hit.path,
+      };
+    }
+  }
+  // Nowhere: ambiguous, short, or simply gone -- never guess, fail closed.
+  return {
+    archiveReason: `pre-filing citation gate: the candidate's Snippet is absent from every cited path (${listed.join(', ')}) and relocateStaleAnchor found no unique new home -- the code it points at is no longer in the repo`,
+  };
+}
+
+// Public wrapper: apply the pre-filing citation gate to every candidate the raw lifecycle
+// function would file, without changing the public name or signature (existing callers
+// still pass just candidatesPath/sourceName). Note: this wrapper's gate takes
+// precedence over any preFilingGate a caller passed in opts (same hook slot).
+function nextCandidateFulfillmentTask(candidatesPath, sourceName, opts = {}) {
+  return rawNextCandidateFulfillmentTask(candidatesPath, sourceName, { ...opts, preFilingGate: validateCitationBeforeFiling });
+}
+
 module.exports = {
   ...candidateDocs,
   nextCandidateFulfillmentTask,
+  validateCitationBeforeFiling,
+  snippetMissingFrom,
   windowFetchedFileContent,
   // lower-level helpers, exported for the plugin's own grounding tests
   findFuzzyMatch,
