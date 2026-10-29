@@ -591,17 +591,17 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the eleven chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the twelve chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
+      'answer_task_clarification', 'check_branch', 'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
       'record_branch_verdict', 'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
 });
 
-test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all eleven chat tools', () => {
+test('buildChatToolHandlers has no write_file/edit_file handler even if called directly, and has all twelve chat tools', () => {
   withFixtureRepo((mod, dir) => {
     const handlers = mod.buildChatToolHandlers([dir], dir, dir);
     assert.equal(handlers.write_file, undefined);
@@ -609,7 +609,7 @@ test('buildChatToolHandlers has no write_file/edit_file handler even if called d
     for (const name of [
       'run_bash', 'queue_reviewed_task', 'answer_task_clarification',
       'resolve_task_clarification', 'mark_task_clarification_done', 'requeue_blocked_task', 'withdraw_task', 'propose_command',
-      'list_unverified_branches', 'record_branch_verdict',
+      'list_unverified_branches', 'record_branch_verdict', 'check_branch',
     ]) {
       assert.equal(typeof handlers[name], 'function', `expected a handler for ${name}`);
     }
@@ -2545,3 +2545,36 @@ test('a turn with no proposals has no commandProposals field', async () => {
     assert.equal(result.commandProposals, undefined);
   });
 });
+
+test('the check_branch chat tool: its handler delegates to checkBranchTool, and the list, record and check descriptions tell the chat the order and the limits', async () => {
+  let handlers; let tools;
+  withFixtureRepo((mod, dir) => { handlers = mod.buildChatToolHandlers([dir], dir, dir); tools = mod.CHAT_TOOLS; });
+  const refused = await handlers.check_branch({});
+  assert.equal(refused.ok, false);
+  assert.match(refused.error, /check_branch requires a non-empty "branch"/, 'the handler reaches checkBranchTool, which validates its own arguments');
+
+  // and it passes branch and project through the right way round: a stand-in dashboard that lists nothing makes the not-listed message name both
+  const http = require('node:http');
+  const stub = http.createServer((req, res) => { res.setHeader('Content-Type', 'application/json'); res.end('[]'); });
+  const port = await new Promise((resolve) => stub.listen(0, '127.0.0.1', () => resolve(stub.address().port)));
+  const prevPort = process.env.AGENT_MANAGER_DASHBOARD_PORT;
+  process.env.AGENT_MANAGER_DASHBOARD_PORT = String(port);
+  try {
+    const notListed = await handlers.check_branch({ branch: 'agent/zzz', project: 'some-project' });
+    assert.equal(notListed.ok, false);
+    assert.match(notListed.error, /^"agent\/zzz" in project "some-project" is not a currently listed unmerged branch/);
+  } finally {
+    if (prevPort === undefined) delete process.env.AGENT_MANAGER_DASHBOARD_PORT; else process.env.AGENT_MANAGER_DASHBOARD_PORT = prevPort;
+    await new Promise((resolve) => stub.close(resolve));
+  }
+
+  const byName = (n) => tools.find((t) => t.function.name === n).function;
+  assert.match(byName('list_unverified_branches').description, /check_branch .* then read the diff .* then record_branch_verdict/);
+  assert.match(byName('record_branch_verdict').description, /Call check_branch for the branch first/);
+  const check = byName('check_branch');
+  assert.match(check.description, /several minutes/);
+  assert.match(check.description, /run_bash cannot do this: its sandbox is read-only and a command is limited to 30 seconds/);
+  assert.deepEqual(check.parameters.required, ['branch']);
+  assert.deepEqual(Object.keys(check.parameters.properties).sort(), ['branch', 'project']);
+});
+
