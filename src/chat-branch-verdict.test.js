@@ -39,6 +39,16 @@ test('list_unverified_branches returns only branches with no verdict or a stale 
   assert.deepEqual(d.calls.map((c) => c.url), ['/api/git/unmerged-branches?projects=all']);
 });
 
+test('list_unverified_branches includes hubId alongside hub id and progress when the hub has a record id', async () => {
+  const hubbed = row({ branch: 'agent/hubbed', hub: { id: 'adhoc-abc123def456', label: 'HUB0251', progress: 'pending-merge' } });
+  const d = fakeDashboard({ rows: [hubbed] });
+  const out = await listUnverifiedBranchesTool({}, { request: d.request });
+  assert.equal(out.ok, true);
+  assert.equal(out.branches.length, 1);
+  const hub = out.branches[0].hub;
+  assert.deepEqual(hub, { id: 'adhoc-abc123def456', hubId: 'adhoc-abc123def456', progress: 'pending-merge' });
+});
+
 test('list_unverified_branches filters by project label or root, honours the limit, and names the known projects for an unknown one', async () => {
   const other = { label: 'sparforge', repoRoot: '/repos/sparforge', active: false };
   const d = fakeDashboard({ rows: [row({ branch: 'a' }), row({ branch: 'b' }), row({ branch: 's', project: other })] });
