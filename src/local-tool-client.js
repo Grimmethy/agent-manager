@@ -541,11 +541,11 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'read_task',
-      description: 'Look up one pipeline task by its exact ID (searches every queue state: drafting, pending, review, blocked, done, needs-clarification, awaiting-confirm, coordinating, approved, adhoc, and archived). With no "section", returns a summary (title, source, status, blockedReason, etc.) -- cheap, use this first. Pass "section" to pull one specific piece of the full content on demand instead of everything at once.',
+      description: 'Look up one pipeline task by its exact ID or a hub label of the form HUB\\d{4} (searches every queue state: drafting, pending, review, blocked, done, needs-clarification, awaiting-confirm, coordinating, approved, adhoc, and archived). With no "section", returns a summary (title, source, status, blockedReason, etc.) -- cheap, use this first. Pass "section" to pull one specific piece of the full content on demand instead of everything at once.',
       parameters: {
         type: 'object',
         properties: {
-          taskId: { type: 'string', description: 'The exact task id.' },
+          taskId: { type: 'string', description: 'The exact task id or a hub label of the form HUB\\d{4}.' },
           project: PROJECT_ARG,
           section: { type: 'string', description: 'Optional: one of "plan", "implement", "history", "blockedReason" to pull just that piece of the task\'s full content instead of the summary.' },
           offset: { type: 'integer', description: 'With "section": first line to return (1-indexed). Default 1.' },
