@@ -37,7 +37,7 @@ prefix(es) the tab's own JS calls, plus the `app.py` line range those handlers l
 | Workers | `workers-tab.js` — `renderWorkers(isPoll)` | `/api/instances`, `/api/instances/<id>/recent-tasks`, `/run-log`, `/assignable-tasks`, `/assign-task`, `/api/worker-models*` (`app.py:1298-1352, 1647-1985, 2029-2073`) | Also owns `setWorkerModel`/`setWorkerTask`/`toggleWorkerExpand` helpers in the same file. Moved out of `core-ui.js` 2026-10-01; `python/dashboard/static/js/index-script-order.test.js` guards that index.html loads it above the inline script. |
 | Hardware | `branches-joblist-hardware-tabs.js` — `renderHardwareTab()` (L703), `renderSparkline()` (L670) | `/api/hardware/stats` (`app.py:8149-8172`) | Shares its file with Job List and Unmerged Branches. |
 | Job List | `branches-joblist-hardware-tabs.js` — `renderJobListTab()` (L243) | `/api/queue/<state>` (`app.py:2374-2756`), `/api/job-types*`, `/api/job-log/<source>` (`app.py:7083-7433`), `/api/pipeline-map` (`app.py:6680-7082`) | Same file as Hardware/Unmerged Branches. Task detail is a shared modal, see `task-detail-modal.js` below. |
-| Plugins | `plugins-tab.js` — `renderPluginsTab()` | `/api/plugins`, `/toggle`, `/add`, `/install`, `/select-slot` (`app.py:7434-7745, 8173-8287`); marketplace browse/update (`app.py:7746-8096`) | Moved out of `core-ui.js` 2026-10-01 (with the Workers tab, the sidebar/Claude panels and the Queue tab). `core-ui.js` keeps nav, tab merging and plugin-tab dispatch. |
+| Plugins | `plugins-tab.js` — `renderPluginsTab()` | `/api/plugins`, `/toggle`, `/add`, `/install`, `/select-slot` (`app.py:7434-7745, 8173-8287`); marketplace browse/update (`app.py:7746-8096`) | Moved out of `core-ui.js` 2026-10-01 (with the Workers tab, the sidebar/Claude panels and the Queue tab). `core-ui.js` keeps nav, tab merging and plugin-tab dispatch. `plugins.json` (host-local, gitignored) wires plugin entries into the dashboard; see [PLUGIN_API.md "plugins.json is host-local"](../PLUGIN_API.md#pluginsjson-is-host-local) for the provisioning checklist and why the file is not tracked. |
 | Scouted Repos | `analytics-and-discovery.js` — `renderDeepDiveTab()` (L449), `openDeepDiveDetail()` (L563) | `/api/deep-dive/projects`, `/<slug>/hotlist`, `/<slug>` (`app.py:5272-5389`) | Internal `activeTab` key is `deepdive`, not `scoutedrepos`. Lists the ACTIVE project's leads only (cloned + `queued`); each row shows its "Relevant to" tag and reason; `?scope=all` adds other projects' leads. `parse_strong_leads` in `python/dashboard/routes/deep_dive.py` mirrors `parseStrongLeadsFromIndex` (task-sources.js). |
 | Discovery | `analytics-and-discovery.js` — `renderDiscoveryTab()` (L584) | `/api/discovery` (`app.py:3909-4009`) | Scanner-found candidates awaiting triage. |
 | Brain Dump | `brain-dump-and-second-brain.js` — `enterBrainDumpTab()` (L955), `renderBrainDumpShell()` (L1) | see `/api/brain-dump*` (grep the file for the exact route list — not yet itemized here) | Also implements the Second Brain browser (`loadSecondBrainBrowser`, L512) and the global "+ Brain Dump" modal. Human-captured notes only (no `raisedBy`) since 2026-09-14 — see Filed Findings below. |
@@ -151,6 +151,12 @@ about," verified to still exist as of this writing.
 **Concept tracking**
 - `src/concepts.js` — the Concept Chart registry (`createConcept`, `recordConceptResearch`, `getConceptTimeline`), backed by concepts.json (gitignored pipeline-generated state, present on a live host, not in the repo — same category as `queue/`).
 - `SecondBrain/Research/*.md` — the human-readable writeup a concept's row points at.
+
+## CLI tools
+
+One-line entries for scripts that are entry points in their own right, not just called from elsewhere.
+
+- `scripts/mutation-check.js` — deterministic mutation-testing CLI: apply each mutation from a JSON manifest to a source file, run a test command, and report which mutations survived; every file is restored byte-for-byte before the next mutation runs. Tests at `scripts/mutation-check.test.js`. See [docs/agents/mutation-check.md](docs/agents/mutation-check.md).
 
 ## Recurring work processes
 

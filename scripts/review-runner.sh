@@ -99,10 +99,9 @@ review_lock_key() {
   printf '%s' "${key:-${LOCAL_MODEL:-}}"
 }
 
+capture_base_local_model
 refresh_active_model() {
-  local override
-  override="$(get_model_override "$INSTANCE_ID")"
-  [[ -n "$override" ]] && LOCAL_MODEL="$override"
+  LOCAL_MODEL="$(effective_local_model "$INSTANCE_ID")"       # the dashboard override, else the launch model: removing an override puts the reviewer back
   export LOCAL_MODEL
 }
 
@@ -292,6 +291,27 @@ while :; do                                                                     
       # stays in review/ and is picked up again once the lease clears; the next ticks yield at the top while it holds. Mirrors the
       # matching branch in local-worker.sh; the pattern is the FORGE_PAUSE_MESSAGE text, pinned by src/local-client-forge-pause.test.js.
       printf '[review-%s] review paused for a Forge GPU session -- not counted as a failure; %s stays in review/\n' "$INSTANCE_ID" "$task_id" >&2
+    elif grep -qE "Unknown task domain:" <<< "$review_result"; then
+      # Config failure (2026-10-26): the pipeline's task-domains.json lacks this task's domain. Three new project pipelines were provisioned with
+      # only "default", so every adhoc review failed here 5-7 times, was blocked as "review call failed N times in a row", and was finally
+      # flagged retries-exhausted / capability-ceiling although the implementation was complete. This is neither a model failure nor an infra
+      # outage, and retrying cannot fix it: NO reviewFailureCount increment, NO infra-requeue round, NO block. The task stays in review/ (the
+      # failure happens before any model call, so a tick costs nothing) and ONE history note says what to run; the fix is
+      # scripts/ensure-task-domains.sh <pipeline dir>, after which the next tick reviews it normally. Pinned by src/review-config-failure.test.js.
+      printf '[review-%s] cannot review %s: %s -- a configuration problem, not counted as a failure; it stays in review/ (run scripts/ensure-task-domains.sh on this pipeline)\n' "$INSTANCE_ID" "$task_id" "$review_result" >&2
+      node -e '
+        const fs = require("fs");
+        const p = process.argv[1];
+        try {
+          const o = JSON.parse(fs.readFileSync(p, "utf8"));
+          o.history = o.history || [];
+          const last = o.history[o.history.length - 1];
+          if (!last || last.stage !== "config-error") {
+            o.history.push({ stage: "config-error", at: new Date().toISOString(), detail: "review cannot run: the pipeline task-domains.json does not list this task domain -- run scripts/ensure-task-domains.sh <pipeline dir>; not counted as a failure" });
+            fs.writeFileSync(p, JSON.stringify(o, null, 2));
+          }
+        } catch (e) { /* leave the file as it is */ }
+      ' "$file"
     else
       # Review call itself failed (unknown domain, Ollama unreachable, etc.) -- leave the
       # file in review/ rather than lose it; it's picked up again next tick. Matches

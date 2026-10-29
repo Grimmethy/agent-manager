@@ -56,6 +56,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { tierFromModel } = require('./capability-ledger.js');
+const { readWorkerModelOverrides } = require('./worker-model-override.js');
 
 const REPO = path.resolve(__dirname, '..');
 const LANE_ID_RE = /^worker-[a-z0-9]+$/;
@@ -194,7 +195,7 @@ function laneFromEntry(raw, index) {
 
 // -> [{ id, gpu, env, local, slow, numCtx, preempt, taskClasses, model, tier, reserve }]. `env` is the per-lane environment launch.sh / the watchdog must apply
 // when spawning the lane ({} = inherit, i.e. the host's own Ollama). `taskClasses` null = claims any task.
-function getLanes(env = process.env) {
+function getLanes(env = process.env, overrides = undefined) {
   const local = slug(env.AGENT_MANAGER_LOCAL_GPU) || detectLocalGpu() || 'local';
   // The host lane's model is the base LOCAL_MODEL, which launch.sh also exports as AGENT_MANAGER_HOST_LOCAL_MODEL because a remote lane's
   // worker overrides LOCAL_MODEL in its own process. Without either signal the tier is unknown (null) and capability routing leaves it alone.
@@ -237,12 +238,25 @@ function getLanes(env = process.env) {
   // A lane's Ollama endpoint is what the GPU arbiter serializes on (src/lib/ollama-lock-key.js): two lanes on one endpoint would
   // share one lock and one GPU, so refuse the later one rather than silently double-booking a card.
   const seen = new Map();
-  return lanes.filter((l) => {
+  const distinct = lanes.filter((l) => {
     const url = l.env.OLLAMA_URL;
     if (!url) return true;
     if (seen.has(url)) { warnOnce(`lane ${l.id} shares its Ollama endpoint ${url} with ${seen.get(url)}; skipped`); return false; }
     seen.set(url, l.id);
     return true;
+  });
+  return applyWorkerModelOverrides(distinct, overrides === undefined ? (env === process.env ? readWorkerModelOverrides() : {}) : overrides);
+}
+
+// A dashboard model override (workerModelOverrides) changes the model the lane's worker really calls, so the lane's model and tier follow it: the health
+// probe, capability routing and the tier lookups must see the model that is actually resident. Only the process environment reads the live settings file
+// by default; a caller that passes its own env (tests, dry-runs) gets the registered models unless it passes `overrides` too.
+function applyWorkerModelOverrides(lanes, overrides) {
+  if (!overrides || !Object.keys(overrides).length) return lanes;
+  return lanes.map((l) => {
+    const m = overrides[l.id];
+    if (!m || m === l.model) return l;
+    return { ...l, model: m, registeredModel: l.model, tier: tierFromModel(m) };
   });
 }
 

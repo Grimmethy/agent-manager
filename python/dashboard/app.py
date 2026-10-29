@@ -2232,6 +2232,17 @@ def _store_branch_list(branches):
     with _branch_cache_lock:
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
+    # Apply any pending verdicts for branches that are now in the listing
+    try:
+        import branch_verdicts_pending as bvp
+        import branch_verdicts as bv
+        qdir = queue_dir()
+        if qdir:
+            repo_root = get_active_repo_root()
+            if repo_root:
+                bvp.apply_pending_verdicts(qdir, repo_root, list_unmerged_branches, _run_git, bv)
+    except Exception as exc:
+        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
 
 
 def _refresh_branch_list_in_background():
@@ -2302,14 +2313,48 @@ def _sync_live_checkout(main_branch):
     to fast-forward safely. Never force/reset here -- a dirty PACKAGE_ROOT (e.g. a
     developer's own in-progress manual edit, confirmed to happen during this same
     incident) is left alone and reported, not silently discarded; that mirrors this
-    codebase's own git-safety norms elsewhere (never auto-discard uncommitted work)."""
+    codebase's own git-safety norms elsewhere (never auto-discard uncommitted work).
+
+    Untracked files (e.g. bak backups of env/plugin files) no longer block the
+    fast-forward -- they are not tracked by git, so an incoming commit cannot
+    overwrite them. However, if an incoming commit ADDS a file at a path that
+    already exists as an untracked file, the fast-forward would fail (git refuses
+    to overwrite a working-tree file with a commit that adds the same path), so
+    we pre-check for that collision and report the offending paths."""
+    # Only check tracked modifications -- untracked files do not block a fast-forward
+    # because they are not in any commit and therefore cannot collide with incoming
+    # content (unless the incoming commit itself adds a file at that path, handled
+    # below).
     status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
     )
     if status.returncode != 0:
         return {"synced": False, "reason": "PACKAGE_ROOT is not a git repo or git status failed"}
     if status.stdout.strip():
         return {"synced": False, "reason": "PACKAGE_ROOT has uncommitted local changes -- left untouched, sync it by hand"}
+
+    # Pre-check: if the incoming commits add any file that already exists as an
+    # untracked file in the working tree, git pull --ff-only will refuse to
+    # overwrite it. Report those paths so the user can resolve them.
+    head = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
+    _run_git(["fetch", "origin"], PACKAGE_ROOT)
+    remote_ref = f"origin/{main_branch}"
+    try:
+        # name-status: lists paths with status codes (A=added, M=modified, D=deleted).
+        diff_out = _run_git(["diff", "--name-status", "--diff-filter=A", f"{head}..{remote_ref}"], PACKAGE_ROOT)
+        added_paths = {line.split(None, 1)[1].strip() for line in diff_out.strip().splitlines() if line.strip()}
+    except RuntimeError:
+        added_paths = set()
+
+    if added_paths:
+        untracked_out = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
+        )
+        untracked = {p for p in untracked_out.stdout.strip().splitlines() if p.strip()} if untracked_out.stdout.strip() else set()
+        collisions = sorted(added_paths & untracked)
+        if collisions:
+            return {"synced": False, "reason": f"untracked files block fast-forward: {', '.join(collisions)}"}
 
     try:
         before = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
