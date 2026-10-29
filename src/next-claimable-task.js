@@ -5,6 +5,7 @@ const { sharedInstancesDir } = require('./instances-dir.js');
 const path = require('path');
 const { HUB_TIER_PRIORITY, isHubTierTask, hubIdForTask } = require('./hub-priority.js');
 const { ROTATION_DEMOTED_PRIORITY, rotationDemoted, laneAvoided } = require('./premium-rotation.js');
+const { openQueueCache, readTaskCached } = require('./queue-cache.js');
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
@@ -208,12 +209,11 @@ function recordHubTierAudit(rankable, instancesDir) {
 // (local-worker.sh) iterates this list attempting an atomic claim (mv -n) on each in
 // turn, same as it did with the old inline script's output.
 function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
-  let names;
-  try {
-    names = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
-  } catch (_) {
-    return [];
-  }
+  // The task files come through the RAM cache (queue-cache.js): a tick that finds the directory unchanged reads no task file. names() is [] for an
+  // unreadable directory, like the readdir it replaces; with nothing listed nothing below could be returned or recorded, so stop here (this early return is an optimisation: the result is [] either way).
+  const cache = openQueueCache(pendingDir);
+  const names = cache.names();
+  if (names.length === 0) return [];
 
   // Side-effect requires: task-sources.js's registerTaskSource() calls populate
   // task-source-registry.js's registry as a load-time side effect -- must be required
@@ -254,7 +254,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   const pinned = [];
   const rankable = [];
   for (const name of names) {
-    const { task, mtimeMs } = readTaskSafe(path.join(pendingDir, name));
+    const { task, mtimeMs } = readTaskCached(cache, path.join(pendingDir, name));
     const pinnedWorker = task && task.pinnedWorker;
     if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
     if (pinnedWorker === instanceId) {
@@ -376,6 +376,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     if (!lanes) { try { lanes = require('./lanes.js').getLanes(); } catch (_) { lanes = []; } }
     if (preferredLaneIsIdle({ instanceId, instancesDir, lanes, now })) rankable.shift();
   }
+  cache.save();
   return [...pinned.map((r) => r.name), ...rankable.map((r) => r.name)];
 }
 

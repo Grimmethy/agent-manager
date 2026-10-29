@@ -20,6 +20,11 @@ const os = require('os');
 const { pickClaimableTasks, pickNextPendingTask, listAssignableTasks, effectivePriority, BOT_ADHOC_PRIORITY_PENALTY } = require('./next-claimable-task.js');
 const { resolveSourceName } = require('./task-source-registry.js');
 
+// The claim path reads its task files through the RAM cache (queue-cache.js). Keep this file's cache files out of the real /dev/shm location.
+const CACHE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'next-claimable-task-cache-'));
+process.env.AGENT_MANAGER_QUEUE_CACHE_DIR = CACHE_ROOT;
+process.on('exit', () => { try { fs.rmSync(CACHE_ROOT, { recursive: true, force: true }); } catch (_) { /* best-effort */ } });
+
 function setupPending() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'next-claimable-task-test-'));
   const pendingDir = path.join(root, 'queue', 'pending');
@@ -925,3 +930,129 @@ test('lane avoidance never strands a task on a switched-off lane: with the only 
   assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-p40', { lanes, graceMs: 0, instancesDir }), [], 'with worker-3090 alive the avoiding lane skips it, as before');
   assert.deepEqual(pickClaimableTasks(pendingDir, 'worker-3090', { lanes, graceMs: 0, instancesDir }), ['a-avoided.json']);
 });
+
+// --- the claim path reads its task files through the RAM cache (queue-cache.js) ---
+
+const CACHE_LANES = [{ id: 'worker-3090' }, { id: 'worker-p40' }];
+
+function withEnv(name, value, fn) {
+  const prev = process.env[name];
+  process.env[name] = value;
+  try { return fn(); } finally { if (prev === undefined) delete process.env[name]; else process.env[name] = prev; }
+}
+
+function pickFor(pendingDir, lane) {
+  return pickClaimableTasks(pendingDir, lane, { lanes: CACHE_LANES, graceMs: 0, instancesDir: path.join(pendingDir, '..', 'instances') });
+}
+
+function pickUncached(pendingDir, lane) {
+  return withEnv('AGENT_MANAGER_QUEUE_CACHE', 'false', () => pickFor(pendingDir, lane));
+}
+
+// One pending directory holding every shape the ranking looks at.
+function buildCacheFixture() {
+  const pendingDir = setupPending();
+  const coordDir = path.join(pendingDir, '..', 'coordinating');
+  fs.mkdirSync(coordDir, { recursive: true });
+  fs.writeFileSync(path.join(coordDir, 'hub-a.json'), JSON.stringify({ id: 'hub-a', status: 'coordinating', hubPriority: 5, createdAt: '2026-09-01T00:00:00Z' }));
+  writeTask(pendingDir, 'pinned-here', { source: 'adhoc', pinnedWorker: 'worker-p40' });
+  writeTask(pendingDir, 'pinned-elsewhere', { source: 'adhoc', pinnedWorker: 'worker-3090' });
+  writeTask(pendingDir, 'avoids-p40', { source: 'adhoc', humanQueued: true, avoidLanes: ['worker-p40'] });
+  writeTask(pendingDir, 'premium', { source: 'adhoc', humanQueued: true, premiumPriority: true });
+  writeTask(pendingDir, 'hub-child', { source: 'adhoc', parentHub: 'hub-a' });
+  writeTask(pendingDir, 'human-adhoc', { source: 'adhoc', humanQueued: true });
+  writeTask(pendingDir, 'bot-adhoc', { source: 'adhoc' });
+  writeTask(pendingDir, 'trouble', { source: 'trouble_log' });
+  fs.writeFileSync(path.join(pendingDir, 'corrupt.json'), '{ not json');
+  fs.writeFileSync(path.join(pendingDir, 'empty.json'), '');
+  fs.writeFileSync(path.join(pendingDir, 'notes.txt'), 'not a task');
+  return pendingDir;
+}
+
+// A directory whose mtime is an hour old: the cache's fast path applies from the second call on (a freshly changed directory is "racy" and is always re-scanned).
+function ageDir(dir) {
+  const old = new Date(Date.now() - 3600 * 1000);
+  fs.utimesSync(dir, old, old);
+}
+
+// What the ranking must say for the fixture, written out: a pin first, premium next, the hub child, then human adhoc, trouble and bot adhoc, and the
+// unreadable files last; worker-p40 never sees the task that degenerated on it nor the one pinned to the other lane. Comparing the cached path with
+// the uncached one cannot catch a change that hits both, so the expected lists are explicit.
+const CACHE_FIXTURE_CLAIMS = {
+  'worker-p40': ['pinned-here.json', 'premium.json', 'hub-child.json', 'human-adhoc.json', 'trouble.json', 'bot-adhoc.json', 'corrupt.json', 'empty.json'],
+  'worker-3090': ['pinned-elsewhere.json', 'premium.json', 'hub-child.json', 'avoids-p40.json', 'human-adhoc.json', 'trouble.json', 'bot-adhoc.json', 'corrupt.json', 'empty.json'],
+};
+
+test('cache on or off, cold or cached, the claim list is identical for every lane and is the expected one', () => {
+  const pendingDir = buildCacheFixture();
+  for (const lane of ['worker-p40', 'worker-3090']) {
+    const want = pickUncached(pendingDir, lane);
+    assert.deepEqual(want, CACHE_FIXTURE_CLAIMS[lane], `uncached list for ${lane}`);
+    assert.deepEqual(pickFor(pendingDir, lane), want, `cold call for ${lane}`);
+    assert.deepEqual(pickFor(pendingDir, lane), want, `cached call for ${lane}`);
+  }
+});
+
+test('after an edit to a task file the cached claim list still equals the uncached one', () => {
+  const pendingDir = buildCacheFixture();
+  pickFor(pendingDir, 'worker-p40');
+  writeTask(pendingDir, 'bot-adhoc', { source: 'adhoc', humanQueued: true, premiumPriority: true, note: 'edited in place, longer than before' });
+  const bumped = new Date(Date.now() + 5000);
+  fs.utimesSync(pendingDir, bumped, bumped); // a directory change makes the next call re-validate at once
+  for (const lane of ['worker-p40', 'worker-3090']) assert.deepEqual(pickFor(pendingDir, lane), pickUncached(pendingDir, lane));
+  const afterEdit = pickFor(pendingDir, 'worker-3090');
+  assert.ok(afterEdit.indexOf('bot-adhoc.json') < afterEdit.indexOf('human-adhoc.json'), 'the edit (now premium) must change the order');
+});
+
+test('a cached call reads no task file and stats none', (t) => {
+  const pendingDir = buildCacheFixture();
+  ageDir(pendingDir);
+  const want = pickFor(pendingDir, 'worker-p40');
+  const touched = [];
+  const realRead = fs.readFileSync;
+  const realStat = fs.statSync;
+  t.mock.method(fs, 'readFileSync', function (p, ...rest) {
+    if (String(p).startsWith(pendingDir + path.sep)) touched.push(`read ${path.basename(String(p))}`);
+    return realRead.call(fs, p, ...rest);
+  });
+  t.mock.method(fs, 'statSync', function (p, ...rest) {
+    if (String(p).startsWith(pendingDir + path.sep)) touched.push(`stat ${path.basename(String(p))}`);
+    return realStat.call(fs, p, ...rest);
+  });
+  assert.deepEqual(pickFor(pendingDir, 'worker-p40'), CACHE_FIXTURE_CLAIMS['worker-p40']);
+  assert.deepEqual(want, CACHE_FIXTURE_CLAIMS['worker-p40']);
+  assert.deepEqual(touched, []);
+});
+
+test('a task added after a cached call is offered by the next call, and a task claimed away is not', () => {
+  const pendingDir = buildCacheFixture();
+  ageDir(pendingDir);
+  const before = pickFor(pendingDir, 'worker-3090');
+  assert.ok(before.includes('trouble.json'));
+  writeTask(pendingDir, 'late-arrival', { source: 'adhoc', humanQueued: true, premiumPriority: true });
+  const added = pickFor(pendingDir, 'worker-3090');
+  assert.ok(added.includes('late-arrival.json'));
+  assert.deepEqual(added, pickUncached(pendingDir, 'worker-3090'));
+  const claimedAway = path.join(os.tmpdir(), `claimed-away-${process.pid}-${Date.now()}.json`);
+  fs.renameSync(path.join(pendingDir, 'trouble.json'), claimedAway);
+  const removed = pickFor(pendingDir, 'worker-3090');
+  fs.rmSync(claimedAway, { force: true });
+  assert.ok(!removed.includes('trouble.json'));
+  assert.deepEqual(removed, pickUncached(pendingDir, 'worker-3090'));
+});
+
+test('an unwritable cache root changes nothing in the claim list', () => {
+  const pendingDir = buildCacheFixture();
+  const blocker = path.join(pendingDir, '..', 'blocker');
+  fs.writeFileSync(blocker, 'a file where the cache directory should be');
+  const want = pickUncached(pendingDir, 'worker-p40');
+  const got = withEnv('AGENT_MANAGER_QUEUE_CACHE_DIR', path.join(blocker, 'cache'), () => [pickFor(pendingDir, 'worker-p40'), pickFor(pendingDir, 'worker-p40')]);
+  assert.deepEqual(got[0], want);
+  assert.deepEqual(got[1], want);
+});
+
+test('a missing or empty pending directory gives an empty list', () => {
+  assert.deepEqual(pickFor(path.join(os.tmpdir(), `no-such-pending-${process.pid}-${Date.now()}`), 'worker-p40'), []);
+  assert.deepEqual(pickFor(setupPending(), 'worker-p40'), []);
+});
+
