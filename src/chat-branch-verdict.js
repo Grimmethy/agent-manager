@@ -21,6 +21,8 @@
 
 const http = require('http');
 
+const { loadBranchCheck } = require('./branch-check-store.js');
+
 const VERDICTS = ['merge', 'needs-work', 'discard'];
 const MAX_REASONS = 10;
 const MAX_REASON_CHARS = 600;
@@ -121,6 +123,27 @@ function validateArgs({ branch, sha, verdict, reasons }) {
   return null;
 }
 
+// A merge verdict has to rest on evidence: the stored result of check_branch for this exact head must be docs-only, or have run the covering tests with
+// every entry green. Returns null when the merge may be recorded, else the relayable reason it may not. needs-work and discard never come here.
+function mergeRefusal(check) {
+  const allowed = 'needs-work and discard can be recorded without a check';
+  if (!check) {
+    return `merge refused: there is no current check for this exact head. Call check_branch for this branch first (it runs the project's covering tests in a scratch copy), then record the verdict; ${allowed}.`;
+  }
+  if (check.docsOnly === true) return null;
+  const checked = Array.isArray(check.checked) ? check.checked : [];
+  const red = checked.filter((c) => !c.ok);
+  if (red.length) {
+    return `merge refused: the check of this head has ${red.length} red entr${red.length === 1 ? 'y' : 'ies'}: ${red.map((c) => `${c.what} (${String(c.summary || '').slice(0, 200)})`).join('; ')}. Record needs-work with that evidence, or fix the branch and run check_branch again; ${allowed}.`;
+  }
+  // testsRun alone is not enough: a stored result with the flag and no tests entry (hand-made, damaged) is not evidence that anything ran.
+  if (check.testsRun !== true || !checked.some((c) => c.kind === 'tests')) {
+    const why = (Array.isArray(check.notRun) && check.notRun.length ? check.notRun.join('; ') : 'no reason given');
+    return `merge refused: the check of this head ran no tests (${why}). A merge verdict needs the covering tests to have run green; record needs-work and say what could not be run; ${allowed}.`;
+  }
+  return null;
+}
+
 async function recordBranchVerdictTool(args = {}, opts = {}) {
   const invalid = validateArgs(args);
   if (invalid) return { ok: false, error: invalid };
@@ -145,6 +168,12 @@ async function recordBranchVerdictTool(args = {}, opts = {}) {
   }
 
   const repoRoot = row.project && row.project.repoRoot;
+  if (args.verdict === 'merge') {
+    let check = null;
+    try { check = (opts.loadBranchCheck || loadBranchCheck)(repoRoot, row.headSha); } catch (_) { check = null; }
+    const refusal = mergeRefusal(check);
+    if (refusal) return { ok: false, error: refusal, headSha: row.headSha };
+  }
   const route = `/api/git/branches/${branch.split('/').map(encodeURIComponent).join('/')}/verdict${repoRoot ? `?project=${encodeURIComponent(repoRoot)}` : ''}`;
   let res;
   try {
