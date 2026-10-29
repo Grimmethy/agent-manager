@@ -24,11 +24,6 @@ if "$ONCE" && [[ "${AGENT_MANAGER_PREMIUM_ONLY_TICK:-}" == "true" ]]; then PREMI
 is_premium_file() {
   node -e 'try{process.exit(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).premiumPriority===true?0:1)}catch(e){process.exit(1)}' "$1" 2>/dev/null
 }
-# Reads file names (one per line) on stdin and prints, in the same order, those in dir $1 whose task is premium. One node process for a
-# whole ranked pending/ list, instead of one per file.
-filter_premium_names() {
-  node -e 'const fs=require("fs"),path=require("path"),d=process.argv[1];for(const n of fs.readFileSync(0,"utf8").split("\n")){if(!n)continue;try{if(JSON.parse(fs.readFileSync(path.join(d,n),"utf8")).premiumPriority===true)console.log(n)}catch(e){}}' "$1" 2>/dev/null
-}
 
 # Worker lanes are one per GPU, named for the GPU (src/lanes.js: worker-3090, worker-p40). Every
 # lane claims ANY pending task by priority -- there is no reasoning/worker split (2026-09-19).
@@ -787,9 +782,13 @@ while :; do                                                                     
   # failure was already seen, means this tick backs off from Ollama entirely rather than
   # only half-backing-off -- the backlog can no longer outgrow its own drain rate.
   if [[ -r "$pdir" ]] && ! "$TICK_HAD_INFRA_FAILURE" && ! { "$ONCE" && "$did_work"; }; then   # a borrowed tick that already resumed its one leftover item claims nothing more. check readability before attempting readdir (same safety pattern as PowerShell's Test-Path before foreach — user might have permissions-restricted dir that should be skipped not crash-the-loop).
-    while IFS= read -r name; do
-      [[ -n "$name" ]] && items+=("$name")
-    done < <(if "$PREMIUM_ONLY"; then node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" 2>/dev/null | filter_premium_names "$pdir"; else node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" 2>/dev/null; fi)
+    # ONE read of the pending queue per tick: the ranking call also says which tasks are premium (name<TAB>1 or 0), so a premium-only tick no longer
+    # re-reads and re-parses every ranked file to pick them out.
+    while IFS=$'\t' read -r name premium_flag; do
+      [[ -n "$name" ]] || continue
+      if "$PREMIUM_ONLY" && [[ "$premium_flag" != 1 ]]; then continue; fi
+      items+=("$name")
+    done < <(node "${PACKAGE_SRC_DIR}/next-claimable-task.js" "$pdir" "$INSTANCE_ID" --with-premium 2>/dev/null)
 
     # Iterate each pending draft, process if ready:
     for name in "${items[@]}"; do                                             # loop over collected filenames one at a time — bash array iteration via `${array[@]}` syntax (each element becomes separate word when quoted). Equivalent of PowerShell's `foreach ($item in $drafts)` which we're mirroring here since both languages use the same conceptual model for "do this to every X in collection".

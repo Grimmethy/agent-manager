@@ -10,6 +10,12 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
+// hasPremium reads its stage directories through the RAM cache (queue-cache.js). Keep this file's cache files, and those of the CLI processes it spawns,
+// out of the real /dev/shm location.
+const CACHE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'pool-projects-cache-'));
+process.env.AGENT_MANAGER_QUEUE_CACHE_DIR = CACHE_ROOT;
+process.on('exit', () => { try { fs.rmSync(CACHE_ROOT, { recursive: true, force: true }); } catch (_) { /* best-effort */ } });
+
 const { poolProjects, poolEnvFor, poolEnvArgs, markBorrowed, enabled } = require('./pool-projects.js');
 const { sharedInstancesDir } = require('./instances-dir.js');
 
@@ -115,6 +121,7 @@ test('CLI: --list prints the pool as JSON, --env-args prints one env token per l
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
   fs.copyFileSync(script, path.join(dir, 'src', 'pool-projects.js'));
   fs.copyFileSync(path.join(__dirname, 'hub-prerequisites.js'), path.join(dir, 'src', 'hub-prerequisites.js'));   // pool-projects.js requires it
+  fs.copyFileSync(path.join(__dirname, 'queue-cache.js'), path.join(dir, 'src', 'queue-cache.js'));   // and so does hasPremium's cache
   fs.copyFileSync(fx.projectsPath, path.join(dir, 'projects.json'));
   const run = (...args) => execFileSync('node', [path.join(dir, 'src', 'pool-projects.js'), ...args], { env, encoding: 'utf8' });
   const list = JSON.parse(run('--list'));
@@ -257,7 +264,7 @@ test('CLI: --env-args resolves a non-pool project, --has-premium exits 0/1, --pr
   delete env.AGENT_MANAGER_PREMIUM_REACH;
   const dir = path.join(fx.root, 'pkg');
   fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
-  for (const f of ['pool-projects.js', 'pipeline-history.js', 'hub-prerequisites.js']) fs.copyFileSync(path.join(__dirname, f), path.join(dir, 'src', f));
+  for (const f of ['pool-projects.js', 'pipeline-history.js', 'hub-prerequisites.js', 'queue-cache.js']) fs.copyFileSync(path.join(__dirname, f), path.join(dir, 'src', f));
   fs.copyFileSync(fx.projectsPath, path.join(dir, 'projects.json'));
   const cli = path.join(dir, 'src', 'pool-projects.js');
   const run = (...args) => execFileSync('node', [cli, ...args], { env, encoding: 'utf8' });
@@ -410,3 +417,117 @@ test('premiumProjects: gated home premium tasks no longer hide other repos\' cla
   fs.rmSync(path.join(home.pipelineDir, 'queue', 'blocked', 'HUB0024-03.json'));
   assert.equal(hasPremium(home.pipelineDir, { role: 'worker', lane: 'worker-3090' }), true, 'once HUB0024-04 is claimable the home project wins the tie again');
 });
+
+// --- hasPremium reads its stage directories through the RAM cache (queue-cache.js) ---------------------------------------------------------------
+
+const withCacheEnv = (name, value, fn) => {
+  const prev = process.env[name];
+  process.env[name] = value;
+  try { return fn(); } finally { if (prev === undefined) delete process.env[name]; else process.env[name] = prev; }
+};
+
+// Every directory under queue/ made an hour old: a directory untouched for a while is what lets the cache's fast path apply from the second call on
+// (a freshly changed directory is always re-scanned).
+const ageQueueDirs = (pipelineDir) => {
+  const old = new Date(Date.now() - 3600 * 1000);
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) if (e.isDirectory()) walk(path.join(dir, e.name));
+    fs.utimesSync(dir, old, old);
+  };
+  walk(path.join(pipelineDir, 'queue'));
+};
+
+const askBoth = (pipe, role = 'worker', lane = 'worker-a') => [
+  hasPremium(pipe, { role, lane }),
+  withCacheEnv('AGENT_MANAGER_QUEUE_CACHE', 'false', () => hasPremium(pipe, { role, lane })),
+  hasPremium(pipe, { role, lane }),
+];
+
+test('hasPremium gives the expected answer, with the cache on (cold and cached) and off, for each shape of queue', () => {
+  const cases = [];
+  const fresh = () => { const fx = fixture([{ name: 'p' }]); return fx.list[0].pipelineDir; };
+  { const pipe = fresh(); cases.push(['an empty queue', pipe, false]); }
+  { const pipe = fresh(); writeTask(pipe, 'pending', 'plain', { id: 'plain', premiumPriority: false }); cases.push(['only non-premium tasks', pipe, false]); }
+  { const pipe = fresh(); writeTask(pipe, 'pending', 'hot', { id: 'hot', premiumPriority: true }); cases.push(['a premium task in pending', pipe, true]); }
+  { const pipe = fresh(); writeTask(pipe, 'adhoc', 'held', { id: 'held', premiumPriority: true, dependsOn: ['missing-dep'] }); cases.push(['a premium adhoc task held by an unmet dependency', pipe, false]); }
+  { const pipe = fresh(); fs.mkdirSync(path.join(pipe, 'queue', 'pending'), { recursive: true }); fs.writeFileSync(path.join(pipe, 'queue', 'pending', 'bad.json'), '{ not json'); cases.push(['a corrupt file only', pipe, false]); }
+  { const pipe = fresh(); fs.mkdirSync(path.join(pipe, 'queue', 'pending'), { recursive: true }); fs.writeFileSync(path.join(pipe, 'queue', 'pending', 'bad.json'), '{ not json'); writeTask(pipe, 'pending', 'later', { id: 'later', premiumPriority: true }); cases.push(['a corrupt file next to a premium task', pipe, true]); }
+  { const pipe = fresh(); writeTask(pipe, 'pending', 'str', { id: 'str', premiumPriority: 'true' }); cases.push(['a string flag', pipe, false]); }
+  cases.push(['a pipeline directory that does not exist', path.join(os.tmpdir(), `no-such-pipeline-${process.pid}-${Date.now()}`), false]);
+  for (const [label, pipe, want] of cases) assert.deepEqual(askBoth(pipe), [want, want, want], label);
+});
+
+test('a cached hasPremium call reads and stats no task file', (t) => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  for (let i = 0; i < 25; i++) writeTask(pipe, 'pending', `plain-${i}`, { id: `plain-${i}`, premiumPriority: false });
+  writeTask(pipe, 'adhoc', 'other', { id: 'other' });
+  ageQueueDirs(pipe);
+  assert.equal(hasPremium(pipe, { role: 'worker', lane: 'worker-a' }), false);
+  const touched = [];
+  const realRead = fs.readFileSync;
+  const realStat = fs.statSync;
+  t.mock.method(fs, 'readFileSync', function (p, ...rest) {
+    if (String(p).startsWith(pipe) && String(p).endsWith('.json')) touched.push(`read ${path.basename(String(p))}`);
+    return realRead.call(fs, p, ...rest);
+  });
+  t.mock.method(fs, 'statSync', function (p, ...rest) {
+    if (String(p).startsWith(pipe) && String(p).endsWith('.json')) touched.push(`stat ${path.basename(String(p))}`);
+    return realStat.call(fs, p, ...rest);
+  });
+  assert.equal(hasPremium(pipe, { role: 'worker', lane: 'worker-a' }), false);
+  assert.deepEqual(touched, []);
+});
+
+test('a premium task added after a cached call is found by the next call, and found no more once it is gone', () => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  writeTask(pipe, 'pending', 'plain', { id: 'plain' });
+  ageQueueDirs(pipe);
+  const counts = () => hasPremium(pipe, { role: 'worker', lane: 'worker-a' });
+  assert.equal(counts(), false);
+  assert.equal(counts(), false);
+  writeTask(pipe, 'pending', 'late', { id: 'late', premiumPriority: true });
+  assert.equal(counts(), true, 'added after the cache was filled');
+  fs.rmSync(path.join(pipe, 'queue', 'pending', 'late.json'));
+  assert.equal(counts(), false, 'removed again');
+});
+
+test('a task edited in place is re-read once its directory is re-validated', () => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  writeTask(pipe, 'pending', 'edited', { id: 'edited', premiumPriority: false });
+  ageQueueDirs(pipe);
+  const counts = () => hasPremium(pipe, { role: 'worker', lane: 'worker-a' });
+  assert.equal(counts(), false);
+  writeTask(pipe, 'pending', 'edited', { id: 'edited', premiumPriority: true, note: 'made premium in place' });
+  const bumped = new Date(Date.now() + 5000);
+  fs.utimesSync(path.join(pipe, 'queue', 'pending'), bumped, bumped);
+  assert.equal(counts(), true);
+});
+
+test('the dependency gate is judged afresh on every call even while the premium task itself is served from the cache', () => {
+  const { pipe, counts } = premiumFixture();
+  writeTask(pipe, 'adhoc', 'child', { id: 'child', premiumPriority: true, dependsOn: ['dep'] });
+  ageQueueDirs(pipe);
+  assert.equal(counts(), false, 'its dependency has no record yet');
+  assert.equal(counts(), false, 'still held, now from the cache');
+  writeTask(pipe, 'done', 'dep', { id: 'dep', mergedAt: '2026-10-25T00:00:00Z' });
+  assert.equal(counts(), true, 'the dependency was released without the adhoc/ directory or the task file changing');
+});
+
+test('if the cache layer itself breaks, hasPremium reads the stage directly and still answers correctly', (t) => {
+  const fx = fixture([{ name: 'p' }]);
+  const pipe = fx.list[0].pipelineDir;
+  writeTask(pipe, 'pending', 'plain', { id: 'plain' });
+  const counts = () => hasPremium(pipe, { role: 'worker', lane: 'worker-a' });
+  t.mock.method(require('crypto'), 'createHash', () => { throw new Error('the cache layer cannot name its file'); });
+  assert.equal(counts(), false);
+  writeTask(pipe, 'pending', 'hot', { id: 'hot', premiumPriority: true });
+  assert.equal(counts(), true, 'a premium task is still found when the cache layer throws');
+  writeTask(pipe, 'adhoc', 'held', { id: 'held', premiumPriority: true, dependsOn: ['missing-dep'] });
+  fs.rmSync(path.join(pipe, 'queue', 'pending', 'hot.json'));
+  assert.equal(counts(), false, 'the dependency gate still applies on the direct path');
+  assert.equal(hasPremium(path.join(os.tmpdir(), `no-such-pipeline-${process.pid}-${Date.now()}`), { role: 'worker' }), false);
+});
+
