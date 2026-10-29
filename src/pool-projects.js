@@ -26,6 +26,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { openQueueCache, readTaskCached } = require('./queue-cache.js');   // node built-ins only: safe to load from the bash-called CLI too
 const { unmetPrerequisiteHubs } = require('./hub-prerequisites.js');   // fs + path only: safe to load from the bash-called CLI
 
 const PROJECTS_PATH = process.env.AGENT_MANAGER_PROJECTS_PATH || path.join(__dirname, '..', 'projects.json');
@@ -230,29 +231,40 @@ function premiumTaskClaimable(pipelineDir, task) {
   return true;
 }
 
+// Is there a task in `dir` (one stage directory) with a top-level premiumPriority === true that a lane could claim? `names` are its .json files and `read`
+// turns a full path into { task }: the cached reader normally, a direct read when the cache layer itself broke.
+function stageHasPremium(pipelineDir, stage, dir, names, read) {
+  for (const name of names) {
+    const { task } = read(path.join(dir, name));
+    if (!task || task.premiumPriority !== true) continue;
+    if (GATED_PREMIUM_STAGES.has(stage) && !premiumTaskClaimable(pipelineDir, task)) continue;   // gated premium work does not hold the tie
+    return true;
+  }
+  return false;
+}
+
 // True when a task in one of the role's stages has a top-level premiumPriority === true -- the same test as lib/task-selection.js
 // hasPremiumPriorityInQueue (not required from there: that module loads the config and source registry, and this one is called from
-// bash every tick). Unreadable dirs and corrupt/partial files are skipped; never throws. A file whose text never mentions the field is not
-// parsed at all: measured on wok 2026-10-18 over 2213 worker-stage files (32 MB, 17 projects), warm cache, read+parse every file took
-// 232-275 ms and read+substring prefilter 157-173 ms (cold cache 2.7 s either way -- the read dominates). The parse still decides.
+// bash every tick). Unreadable dirs and corrupt/partial files are skipped; never throws. Each stage directory is read through the RAM cache
+// (queue-cache.js): a tick that finds the directory unchanged reads no task file. Measured on wok 2026-10-28: pending/ held 3576 files / 58 MB and a
+// cold-cache pass over them took 44 s. A task edited in place (rather than added or removed) is noticed within the cache's REVALIDATE_MS. If the cache
+// layer itself throws, that stage is read directly, as it was before the cache existed.
 function hasPremium(pipelineDir, { role = 'worker', lane = null } = {}) {
   if (!pipelineDir) return false;
   for (const stage of premiumStageDirs(role, lane)) {
     const dir = path.join(pipelineDir, 'queue', stage);
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
-    for (const e of entries) {
-      if (!e.isFile() || !e.name.endsWith('.json')) continue;
+    let found = false;
+    try {
+      const cache = openQueueCache(dir);
+      found = stageHasPremium(pipelineDir, stage, dir, cache.names(), (full) => readTaskCached(cache, full));
+      cache.save();
+    } catch {
       try {
-        const text = fs.readFileSync(path.join(dir, e.name), 'utf8');
-        if (!text.includes('"premiumPriority"')) continue;
-        const task = JSON.parse(text);
-        if (task && task.premiumPriority === true) {
-          if (GATED_PREMIUM_STAGES.has(stage) && !premiumTaskClaimable(pipelineDir, task)) continue;   // gated premium work does not hold the tie
-          return true;
-        }
-      } catch { /* corrupt or partial write: not a premium flag */ }
+        const names = fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+        found = stageHasPremium(pipelineDir, stage, dir, names, (full) => readTaskCached(null, full));
+      } catch { found = false; }   // an unreadable stage holds no premium work
     }
+    if (found) return true;
   }
   return false;
 }
