@@ -16,6 +16,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
+const { DEFAULT_HARNESSES } = require('./branch-check-harness.js');
 
 const DEFAULT_TIMEOUT_MS = 240000;
 const DEFAULT_BUDGET_MS = 600000;
@@ -39,6 +40,11 @@ function defaultExec(file, args, { cwd, env, timeoutMs } = {}) {
 function childEnv(dir) {
   return { PATH: process.env.PATH || '', LANG: process.env.LANG || 'C.UTF-8', TMPDIR: dir, HOME: dir };
 }
+
+// The lines of a test run's output that name what broke (TAP `not ok`, the spec reporter's cross, unittest's FAIL and ERROR lines), first, because the tail of a
+// run is usually a stack trace or a duration and the broken test's name is near the top.
+const FAILURE_LINE = /^\s*(?:not ok\b.*|\u2716 .*|FAIL: .*|ERROR: .*|# fail \d+)\s*$/;
+const failureLines = (text) => String(text || '').split('\n').filter((l) => FAILURE_LINE.test(l)).map((l) => l.trim()).slice(0, 5);
 
 const tail = (text, n = SUMMARY_TAIL_CHARS) => {
   const t = String(text || '').trim();
@@ -78,6 +84,13 @@ const REQUIRE_RELATIVE = /require\(\s*(['"])(\.{1,2}\/[^'"]+)\1\s*\)/g;
 function localRequireExists(worktreeDir, fromFile, target) {
   const base = path.resolve(worktreeDir, path.dirname(fromFile), target);
   return ['', '.js', '.json', '.cjs', '.mjs', '/index.js'].some((ext) => fs.existsSync(base + ext) && !(ext === '' && fs.statSync(base).isDirectory()));
+}
+
+function exitSummary(run) {
+  const output = `${run.stdout || ''}\n${run.stderr || ''}`;
+  const broke = failureLines(output);
+  const end = tail(output);
+  return `exit ${run.code}${run.code !== 0 && broke.length ? `: ${broke.join('; ')}` : ''}${end ? ` | ${end}` : ''}`;
 }
 
 async function runBranchCheck(opts = {}) {
@@ -154,11 +167,12 @@ async function runBranchCheck(opts = {}) {
       });
     }
 
-    // Tests: the first harness that recognises this checkout. The harness list comes from the caller (an empty list means none).
-    const harnesses = Array.isArray(opts.harnesses) ? opts.harnesses : [];
+    // Tests: the first harness that recognises this checkout. The list is opts.harnesses when given (an empty list means none), else the default harnesses.
+    // A harness is also told the project's own checkout (a fresh worktree has no node_modules or virtualenv) and what the branch changed.
+    const harnesses = Array.isArray(opts.harnesses) ? opts.harnesses : DEFAULT_HARNESSES;
     let chosen = null;
     for (const h of harnesses) {
-      try { if (h && h.detect(dir, fs)) { chosen = h; break; } } catch (_) { /* a harness that cannot tell does not match */ }
+      try { if (h && h.detect(dir, fs, { repoRoot, changedFiles: result.changedFiles })) { chosen = h; break; } } catch (_) { /* a harness that cannot tell does not match */ }
     }
     if (!chosen) {
       result.notRun.push('no test harness recognised for this repo');
@@ -168,7 +182,7 @@ async function runBranchCheck(opts = {}) {
         const r = await git(['grep', '-l', '-F', '-e', pattern, '--', pathspec]);
         return r.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
       };
-      const plan = await chosen.plan({ worktreeDir: dir, changedFiles: result.changedFiles, maxTestFiles, grep });
+      const plan = await chosen.plan({ worktreeDir: dir, changedFiles: result.changedFiles, maxTestFiles, grep, repoRoot });
       for (const line of (plan && plan.notRun) || []) result.notRun.push(line);
       for (const c of (plan && plan.commands) || []) {
         const remaining = budgetMs - (clock() - started);
@@ -177,7 +191,7 @@ async function runBranchCheck(opts = {}) {
         const command = [c.file, ...(c.args || [])].join(' ');
         result.checked.push({
           kind: 'tests', what: c.what, command, ok: run.code === 0 && !run.timedOut,
-          summary: run.timedOut ? `timed out after ${Math.round(timeoutMs / 1000)} s` : `exit ${run.code}${tail(run.stdout || run.stderr) ? `: ${tail(run.stdout || run.stderr)}` : ''}`,
+          summary: run.timedOut ? `timed out after ${Math.round(timeoutMs / 1000)} s` : exitSummary(run),
         });
       }
     }
