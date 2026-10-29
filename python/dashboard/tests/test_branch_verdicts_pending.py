@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Add the dashboard dir to path so we can import the modules under test
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -277,6 +278,119 @@ class TestPendingVerdicts(unittest.TestCase):
         pending = bvp.get_pending_verdict(str(self.fx.queue), "agent/feature-x")
         self.assertIsNotNone(pending)
         self.assertEqual(pending["branch"], "agent/feature-x")
+
+
+class TestPendingVerdictRoute(unittest.TestCase):
+    """Route-level tests for POST /api/git/branches/<branch>/verdict with unlisted-but-pushed branches.
+
+    These tests use the Flask test client with mocks to cover:
+    - Valid body for unlisted-but-pushed branch → 200 pending
+    - Bad body (missing verdict) → 400
+    - Bad body (invalid verdict) → 400
+    - Unknown branch (not on origin) → 404
+    - SHA mismatch → 409
+    """
+
+    def setUp(self):
+        import app
+        self.app = app
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.q = Path(self.tmp.name)
+        self.client = app.app.test_client()
+        # Mock list_unmerged_branches to return empty (no branches listed)
+        # Mock _run_git to succeed for origin/agent/feature-x (branch exists on origin)
+        self.patches = [
+            mock.patch.object(app, "get_active_repo_root", return_value="/repo"),
+            mock.patch.object(app, "queue_dir", return_value=self.q),
+            mock.patch.object(app, "list_unmerged_branches", return_value=[]),
+            mock.patch.object(app, "_invalidate_branch_cache"),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _mock_run_git_for_pending(self, sha="abc123def456"):
+        """Mock _run_git to simulate a branch that exists on origin but not in listing."""
+        def mock_run_git(args, repo_root):
+            if args[0] == "rev-parse":
+                # Check if this is a --verify call for origin/agent/feature-x
+                if "--verify" in args and len(args) > 2 and "origin/agent/feature-x" in args[2]:
+                    return ""  # --verify succeeds
+                # Check if this is a rev-parse for origin/agent/feature-x
+                if "origin/agent/feature-x" in args[1]:
+                    return sha + "\n"
+            raise RuntimeError(f"git {' '.join(args)} failed")
+        return mock.patch.object(self.app, "_run_git", side_effect=mock_run_git)
+
+    def test_valid_body_unlisted_but_pushed_branch_returns_200_pending(self):
+        """Unlisted-but-pushed branch with valid body → 200 with pending:true and pending file written."""
+        with self._mock_run_git_for_pending(sha="sha-pending"):
+            r = self.client.post(
+                "/api/git/branches/agent/feature-x/verdict",
+                json={"verdict": "merge", "reasons": ["looks good"], "source": "manual"},
+            )
+        self.assertEqual(r.status_code, 200)
+        body = r.get_json()
+        self.assertTrue(body["succeeded"])
+        self.assertTrue(body["pending"])
+        self.assertEqual(body["headSha"], "sha-pending")
+        # Verify pending file was written
+        pending = bvp.get_pending_verdict(str(self.q), "agent/feature-x")
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["verdict"], "merge")
+        self.assertEqual(pending["headSha"], "sha-pending")
+
+    def test_bad_body_missing_verdict_returns_400(self):
+        """Unlisted-but-pushed branch with missing verdict field → 400, no pending file."""
+        with self._mock_run_git_for_pending():
+            r = self.client.post(
+                "/api/git/branches/agent/feature-x/verdict",
+                json={"reasons": ["no verdict"]},
+            )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("reason", r.get_json())
+        # Verify no pending file was written
+        pending = bvp.get_pending_verdict(str(self.q), "agent/feature-x")
+        self.assertIsNone(pending)
+
+    def test_bad_body_invalid_verdict_returns_400(self):
+        """Unlisted-but-pushed branch with invalid verdict → 400, no pending file."""
+        with self._mock_run_git_for_pending():
+            r = self.client.post(
+                "/api/git/branches/agent/feature-x/verdict",
+                json={"verdict": "ship-it", "reasons": [], "source": "manual"},
+            )
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("reason", r.get_json())
+        # Verify no pending file was written
+        pending = bvp.get_pending_verdict(str(self.q), "agent/feature-x")
+        self.assertIsNone(pending)
+
+    def test_unknown_branch_returns_404(self):
+        """Branch not on origin → 404."""
+        def mock_run_git_raises(args, repo_root):
+            raise RuntimeError("git rev-parse failed")
+        with mock.patch.object(self.app, "_run_git", side_effect=mock_run_git_raises):
+            r = self.client.post(
+                "/api/git/branches/agent/nonexistent",
+                json={"verdict": "merge", "reasons": [], "source": "manual"},
+            )
+        self.assertEqual(r.status_code, 404)
+
+    def test_sha_mismatch_returns_409(self):
+        """Unlisted-but-pushed branch with sha in body that differs from origin → 409."""
+        with self._mock_run_git_for_pending(sha="sha-actual"):
+            r = self.client.post(
+                "/api/git/branches/agent/feature-x/verdict",
+                json={"verdict": "merge", "reasons": [], "source": "manual", "sha": "sha-old"},
+            )
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("reason", r.get_json())
+        self.assertEqual(r.get_json()["headSha"], "sha-actual")
+        # Verify no pending file was written
+        pending = bvp.get_pending_verdict(str(self.q), "agent/feature-x")
+        self.assertIsNone(pending)
 
 
 if __name__ == "__main__":
