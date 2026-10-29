@@ -1,5 +1,6 @@
 from flask import Blueprint, abort, jsonify, request
 
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -407,7 +408,11 @@ def api_git_unmerged_branches():
     resp = jsonify(branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
-    return resp
+    # The tab polls this every 15 s and the ~140 KB list is almost always unchanged: tag it so an unchanged list is answered with a body-less 304 (the browser revalidates by itself
+    # under no-cache). The pending header is part of the tag because the tab reads it (branchProjectsPending); the cache-age header changes every call and is left out.
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode()).hexdigest())
+    return resp.make_conditional(request)
 
 
 @pipeline_1_more_bp.route("/api/git/held-hub-branches")
