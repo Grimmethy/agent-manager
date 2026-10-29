@@ -24,4 +24,11 @@ function queryVram() {
   }
 }
 
+// NOTE: Any per-token or per-context VRAM constant derived from this module's output
+// assumes OLLAMA_KV_CACHE_TYPE is unset (default f16). When OLLAMA_KV_CACHE_TYPE is set,
+// the actual KV cache VRAM footprint scales down:
+//   - OLLAMA_KV_CACHE_TYPE=q8_0  → ~0.5× the default assumption
+//   - OLLAMA_KV_CACHE_TYPE=q4_0  → ~0.25× the default assumption
+// Consumers that size context windows should account for this when the env var is set.
+
 module.exports = { queryVram };
