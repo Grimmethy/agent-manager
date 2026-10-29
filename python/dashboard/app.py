@@ -848,7 +848,10 @@ def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
     """Scans queue/done/'s own top level (mtime-sorted, most-recent-first; NOT the dated
     queue/done/_archived/<YYYY-MM>/ or _archived_no_action/ buckets -- those hold work
     already aged out of the "recent" window this is for) for completed tasks, reading
-    each one's own real history/terminalDisposition -- NOT model_calls.
+    each one's own real history/terminalDisposition -- NOT model_calls. Also folds in
+    chat sessions (chat_sessions.py's session store, keyed by instance_id='chat') so the
+    Workers tab's completed log shows the full picture of what the pipeline has finished
+    this session, regardless of whether it was a task or a chat turn.
 
     2026-09-08, Grimmethy: "Under reviewer they're all showing approved and 5 hours ago.
     I don't think it's updating properly." Root-caused live: model_calls is the ONLY
@@ -928,7 +931,111 @@ def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
         if len(results) >= limit:
             next_cursor = mtime_iso
             break
+
+    # Chat sessions (instance_id='chat') -- also folded into the completed log so the
+    # Workers tab shows every piece of pipeline work, not just tasks. Chat sessions live
+    # in the agent-manager repo's .agent-manager-chat-sessions.json (see chat_sessions.py),
+    # keyed by session id. Each session carries startedAt/endedAt/transcript; we use the
+    # latest of those as the session's "mtime" for ordering and cursor purposes, and
+    # filter out sessions whose last activity is within the last 30s to avoid racing
+    # with an in-flight turn (a session actively being written to would show a stale
+    # snapshot and confuse the frontend).
+    _add_chat_completed_rows(results, before_ts, limit - len(results))
+
+    if len(results) >= limit and not next_cursor:
+        # Chat rows pushed us past the limit; the cursor is the oldest mtime we kept.
+        next_cursor = results[-1].get("completedAt")
     return results, next_cursor
+
+
+def _add_chat_completed_rows(results: list, before_ts, remaining_budget: int):
+    """Append chat session rows to `results`, respecting `before_ts` and `remaining_budget`.
+    Chat sessions live in the agent-manager repo's .agent-manager-chat-sessions.json
+    (see chat_sessions.py). Each session is a dict keyed by session id; we iterate every
+    session, compute a synthetic "mtime" from its latest activity, and emit a row shaped
+    like the existing done/ rows (taskId, title, source='chat', outcome='chat turn') so
+    the frontend renders them uniformly.
+
+    Sessions with last activity within the past 30s are skipped -- the chat panel is
+    still writing to them right now and a half-finished snapshot would show stale
+    content. This matches the same "don't race with active work" principle the cursor
+    rule already encodes for tasks."""
+    if remaining_budget <= 0:
+        return
+    storage_dir = PACKAGE_ROOT
+    sessions_path = storage_dir / ".agent-manager-chat-sessions.json"
+    if not sessions_path.is_file():
+        return
+    data = read_json_safe(sessions_path)
+    if not isinstance(data, dict):
+        return
+    now_ts = time.time()
+    cutoff_ts = now_ts - 30.0
+    for session_id, session in data.items():
+        if not isinstance(session, dict):
+            continue
+        # Compute the session's "last activity" timestamp.
+        last_activity = None
+        ended_at = session.get("endedAt")
+        if ended_at:
+            last_activity = _iso_to_ts(ended_at)
+        if last_activity is None:
+            started_at = session.get("startedAt")
+            if started_at:
+                last_activity = _iso_to_ts(started_at)
+        if last_activity is None:
+            continue
+        # Skip sessions still actively being written to (last activity within 30s).
+        if last_activity > cutoff_ts:
+            continue
+        if before_ts is not None and last_activity >= before_ts:
+            continue
+        transcript = session.get("transcript") or []
+        turns_used = sum(1 for t in transcript if isinstance(t, dict) and t.get("role") == "assistant")
+        # Title: first user message in the transcript, or the session id if empty.
+        title = None
+        for t in transcript:
+            if isinstance(t, dict) and t.get("role") == "user":
+                text = t.get("text") or ""
+                if text.strip():
+                    title = text.strip()[:120]
+                    break
+        if not title:
+            title = session_id
+        duration_s = None
+        started = _iso_to_ts(session.get("startedAt"))
+        ended = _iso_to_ts(session.get("endedAt"))
+        if started and ended:
+            duration_s = int(ended - started)
+        row = {
+            "taskId": session_id,
+            "title": title,
+            "source": "chat",
+            "model": session.get("model"),
+            "instanceId": "chat",
+            "completedAt": datetime.fromtimestamp(last_activity, tz=timezone.utc).isoformat(),
+            "outcome": "chat turn",
+            "session_id": session_id,
+            "duration": duration_s,
+            "turns_used": turns_used,
+        }
+        results.append(row)
+        remaining_budget -= 1
+        if remaining_budget <= 0:
+            break
+
+
+def _iso_to_ts(iso: str | None):
+    """Parse an ISO-8601 timestamp (with optional 'Z') into a float unix timestamp, or
+    None on any failure. Used to compare chat session timestamps against the mtime-based
+    cursor without round-tripping through isoformat() and losing precision."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except (ValueError, TypeError, OSError):
+        return None
 
 
 def _relocate_task_to_pending(qdir: Path, task_id: str, target_instance_id: str) -> dict:

@@ -131,8 +131,16 @@ function renderRunLogList(runs) {
 const COMPLETED_TASKS_OUTCOME_OK_RE = /^(approved|merged|applied-direct|pending-merge)$/;
 
 function renderCompletedTasksSection() {
+  // Chat badge (HUB0252): rows whose outcome is 'chat turn' (or whose source is 'chat')
+  // originate from the chat plugin (session_id == taskId) -- render a distinct 💬 badge
+  // so the operator can tell them apart from normal completed tasks at a glance.
+  const chatBadge = (t) => {
+    const isChat = (t.outcome === 'chat turn') || (t.source === 'chat');
+    if (!isChat) return '';
+    return `<span class="chat-badge" title="Chat session" style="margin-right:0.4em;font-size:0.95em;cursor:default" aria-label="Chat session">💬</span>`;
+  };
   const rows = completedTasksLog.map(t => `
-    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${escapeHtmlBright(t.title || t.taskId)}</a>
+    <li><a href="#" data-open-task-anywhere="${escapeAttr(t.taskId)}">${chatBadge(t)}${escapeHtmlBright(t.title || t.taskId)}</a>
       <span class="meta">${t.outcome ? `<strong style="color:var(${COMPLETED_TASKS_OUTCOME_OK_RE.test(t.outcome || '') ? '--ok' : '--bad'})">${escapeHtml(t.outcome)}</strong> · ` : ''}${t.source ? escapeHtml(t.source) + ' · ' : ''}${t.instanceId ? escapeHtml(t.instanceId) + ' · ' : ''}${t.model ? escapeHtml(t.model) + ' · ' : ''}${t.completedAt ? fmtAge((Date.now() - new Date(t.completedAt).getTime()) / 1000) + ' ago' : ''}</span>
     </li>`).join('');
   const footer = completedTasksExhausted
