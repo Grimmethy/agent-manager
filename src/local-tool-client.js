@@ -254,6 +254,14 @@ const WRITE_TOOLS = [
 // The optional `project` argument every chat task tool takes (label or repo root from list_projects); omitted = the process's own project.
 const PROJECT_ARG = { type: 'string', description: 'Label or repo root of the project whose task queue to use (from list_projects); omit for agent-manager itself.' };
 
+// 2026-09-23 (HUB0268 · 2/3, Grimmethy): disable GitHub tool registration entirely when
+// AGENT_MANAGER_CHAT_GITHUB=off. Exact string match so values like 'OFF', 'off-', or
+// 'offboard' do not accidentally gate the feature.
+if (process.env.AGENT_MANAGER_CHAT_GITHUB === 'off') {
+  console.info('[tool-client] GitHub tools disabled: AGENT_MANAGER_CHAT_GITHUB=off');
+  return;
+}
+
 const CHAT_TOOLS = [
   {
     type: 'function',
