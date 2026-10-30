@@ -907,7 +907,7 @@ function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
     return t.error ? { ok: false, error: t.error } : run(t);
   };
   const enableGitHub = process.env.AGENT_MANAGER_CHAT_GITHUB !== 'off';
-  const githubClient = enableGitHub ? createGithubClient() : null;
+  const githubClient = enableGitHub ? createGithubClient({ fetch: globalThis.fetch }) : null;
   return {
     run_bash: (args) => runBashTool(allowedRoots, { command: args.command, readOnly: true }),
     list_projects: () => ({ projects: listProjects({ activeRepoRoot: repoRoot }) }),

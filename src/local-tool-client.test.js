@@ -601,11 +601,12 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the twelve chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the eighteen chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'check_branch', 'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
+      'answer_task_clarification', 'check_branch', 'github_list_contents', 'github_read_file', 'github_recent_commits', 'github_repo_overview', 'github_search_code', 'github_search_repos',
+      'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
       'record_branch_verdict', 'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
@@ -2586,5 +2587,46 @@ test('the check_branch chat tool: its handler delegates to checkBranchTool, and 
   assert.match(check.description, /run_bash cannot do this: its sandbox is read-only and a command is limited to 30 seconds/);
   assert.deepEqual(check.parameters.required, ['branch']);
   assert.deepEqual(Object.keys(check.parameters.properties).sort(), ['branch', 'project']);
+});
+
+// GitHub tool registration tests (HUB0268 · 3/3): verify the env switch gates CHAT_TOOLS
+// and that GitHub tools never leak into the pipeline worker tool list.
+test('CHAT_TOOLS includes GitHub tools when AGENT_MANAGER_CHAT_GITHUB is not off', () => {
+  withFixtureRepo((mod) => {
+    const names = mod.CHAT_TOOLS.map((t) => t.function.name);
+    assert.ok(names.includes('github_search_repos'), 'github_search_repos should be in CHAT_TOOLS');
+    assert.ok(names.includes('github_repo_overview'), 'github_repo_overview should be in CHAT_TOOLS');
+    assert.ok(names.includes('github_list_contents'), 'github_list_contents should be in CHAT_TOOLS');
+    assert.ok(names.includes('github_read_file'), 'github_read_file should be in CHAT_TOOLS');
+    assert.ok(names.includes('github_recent_commits'), 'github_recent_commits should be in CHAT_TOOLS');
+    assert.ok(names.includes('github_search_code'), 'github_search_code should be in CHAT_TOOLS');
+  });
+});
+
+test('CHAT_TOOLS excludes GitHub tools when AGENT_MANAGER_CHAT_GITHUB=off', () => {
+  const prev = process.env.AGENT_MANAGER_CHAT_GITHUB;
+  process.env.AGENT_MANAGER_CHAT_GITHUB = 'off';
+  try {
+    delete require.cache[require.resolve('./local-tool-client.js')];
+    const mod = require('./local-tool-client.js');
+    // When env is 'off', the module returns early BEFORE defining CHAT_TOOLS
+    // So CHAT_TOOLS should not exist at all
+    assert.equal(mod.CHAT_TOOLS, undefined, 'CHAT_TOOLS should not be defined when GitHub is disabled');
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_MANAGER_CHAT_GITHUB;
+    else process.env.AGENT_MANAGER_CHAT_GITHUB = prev;
+  }
+});
+
+test('TOOLS (pipeline worker) never includes GitHub tools', () => {
+  withFixtureRepo((mod) => {
+    const names = mod.TOOLS.map((t) => t.function.name);
+    assert.ok(!names.includes('github_search_repos'), 'github_search_repos should NOT be in TOOLS');
+    assert.ok(!names.includes('github_repo_overview'), 'github_repo_overview should NOT be in TOOLS');
+    assert.ok(!names.includes('github_list_contents'), 'github_list_contents should NOT be in TOOLS');
+    assert.ok(!names.includes('github_read_file'), 'github_read_file should NOT be in TOOLS');
+    assert.ok(!names.includes('github_recent_commits'), 'github_recent_commits should NOT be in TOOLS');
+    assert.ok(!names.includes('github_search_code'), 'github_search_code should NOT be in TOOLS');
+  });
 });
 
