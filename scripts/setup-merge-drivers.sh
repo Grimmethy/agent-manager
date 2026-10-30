@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Registers the candidates-doc merge driver (scripts/candidates-doc-merge-driver.js) in a
+# Registers the candidate-doc merge driver (scripts/candidates-doc-merge-driver.js) in a
 # repo's LOCAL git config, and tells git WHICH files use it. The driver COMMAND lives in local config
 # (an executable driver command must not be something a cloned repo can silently inject). The attribute
 # line goes in $GIT_DIR/info/attributes -- also local, never versioned -- and NOT in the working-tree
@@ -7,6 +7,11 @@
 # uncommitted change (PF-Client-Portal) that made the apply clone read "dirty" forever, and in a repo
 # with no .gitattributes (TaxHarvest) it created an untracked file the apply resets swept away, so the
 # driver was never active. A repo that COMMITS the line itself (this one) needs nothing added.
+#
+# Driver line format (gitattributes):
+#   *.doc merge=candidate-doc
+# This is the canonical format: <file-pattern> merge=<driver-name>. The pattern *.doc matches all
+# .doc files; the driver name candidate-doc must match the git config keys below (merge.candidate-doc.*).
 # Idempotent -- safe to run every launch.sh, same as the rest of this pipeline's "consistency is baked
 # into the process, not a one-off manual step" pattern.
 set -euo pipefail
@@ -15,10 +20,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${1:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 DRIVER="node ${SCRIPT_DIR}/candidates-doc-merge-driver.js %O %A %B"
 
-git -C "$REPO_ROOT" config merge.candidates-doc.name "structural merge for Docs/*_CANDIDATES.md" 2>/dev/null || true
-git -C "$REPO_ROOT" config merge.candidates-doc.driver "$DRIVER"
+git -C "$REPO_ROOT" config merge.candidate-doc.name "structural merge for *.doc files" 2>/dev/null || true
+git -C "$REPO_ROOT" config merge.candidate-doc.driver "$DRIVER"
 
-LINE="Docs/*_CANDIDATES.md merge=candidates-doc"
+# Driver line format: <file-pattern> merge=<driver-name>
+LINE="*.doc merge=candidate-doc"
 ATTRS_FILE="${REPO_ROOT}/.gitattributes"
 
 # 1. Undo what earlier versions of this script did to the working-tree .gitattributes -- but ONLY when the
