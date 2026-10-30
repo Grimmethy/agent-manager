@@ -123,8 +123,8 @@ function buildTurnEndEntry(ctx, { message, usage, doneReason }) {
 // One entry per BLANK sample (brain-dump 1891): a turn that came back with no tool calls and no content is treated as a
 // flake and resampled inside chatTurnWithFlakeRecovery before turn-end is ever logged -- which is exactly what a thought cut
 // off at the token limit looks like, so the audit was blind to it. info: { attempt (1-based), message, usage, doneReason }.
-function buildEmptyAttemptEntry(ctx, { attempt, message, usage, doneReason }) {
-  return { ...buildTurnEndEntry(ctx, { message, usage, doneReason }), attempt: attempt == null ? null : attempt };
+function buildEmptyAttemptEntry(ctx, { attempt, message, usage, doneReason, profile, retryThink }) {
+  return { ...buildTurnEndEntry(ctx, { message, usage, doneReason }), attempt: attempt == null ? null : attempt, profile: profile || null, retryThink: retryThink || null };
 }
 
 // One entry per edit_file/write_file call in `calls` (a slice of runPlanWithTools'
@@ -213,8 +213,12 @@ function readSummary(pipelineDir, { windowDays = DEFAULT_WINDOW_DAYS, now = Date
   return buildSummary(readToolLoopAudit(pipelineDir, { since }));
 }
 
+function logForcedSummaryOutcome(pipelineDir, { attempts, finalEmpty, salvaged, profile }) {
+  try { logToolLoopEvent(pipelineDir, 'forced-summary-outcome', { attempts, finalEmpty, salvaged, profile }); } catch { /* best-effort */ }
+}
+
 module.exports = {
-  AUDIT_FILENAME, CUT_OFF_TOOL_CALL_RE, isAuditEnabled, auditPath, logToolLoopEvent,
+  AUDIT_FILENAME, CUT_OFF_TOOL_CALL_RE, isAuditEnabled, auditPath, logToolLoopEvent, logForcedSummaryOutcome,
   classifyTurnEnd, classifyToolOutcome, buildTurnEndEntry, buildEmptyAttemptEntry, buildToolOutcomeEntries,
   readToolLoopAudit, buildSummary, readSummary,
 };
