@@ -28,6 +28,7 @@ const { execFileSync } = require('child_process');
 const { classifyRequeue } = require('./requeue-attribution.js');
 const { recordBranchRemoval } = require('./branch-removal-ledger.js');
 const { liveSiblingsOnBranch } = require('./lib/shared-branch.js');
+const { findTaskAnywhere } = require('./task-anywhere.js');
 
 function readJsonSafe(fullPath) {
   try {
@@ -108,6 +109,23 @@ async function classifyBestEffort(task, opts) {
   }
 }
 
+// Pure: the LAST `Files:` line of an answer replaces the FIRST `Files:` line of the task text (the one the guards read). Returns
+// { rawText, replaced: { old, new } | null }. An answer with no `Files:` line, or a task with no earlier one, changes nothing.
+function replaceFilesLine(rawText, answer) {
+  const text = String(rawText || '');
+  const answers = [...String(answer || '').matchAll(/^Files:[ \t]*(\S.*)$/gim)];
+  if (!answers.length) return { rawText: text, replaced: null };
+  const next = answers[answers.length - 1][1].trim();
+  const earlier = /^Files:[ \t]*(\S.*)$/im.exec(text);
+  if (!earlier) return { rawText: text, replaced: null };
+  const old = earlier[1].trim();
+  if (old === next) return { rawText: text, replaced: null };
+  return {
+    rawText: text.slice(0, earlier.index) + `Files: ${next}` + text.slice(earlier.index + earlier[0].length),
+    replaced: { old, new: next },
+  };
+}
+
 // Mirrors api_task_answer_clarification, python/dashboard/routes/task.py:406-454.
 async function answerNeedsClarification(pipelineDir, taskId, answer) {
   if (typeof taskId !== 'string' || !taskId.trim()) {
@@ -122,12 +140,21 @@ async function answerNeedsClarification(pipelineDir, taskId, answer) {
   const { path: srcPath, data } = found;
 
   data.promptContext = data.promptContext || {};
-  const prior = data.promptContext.rawText || '';
+  // 2026-10-30 (HUB0088-02 was blocked six times on a stale `Files:` line): a `Files:` line in the answer REPLACES the task's earlier one,
+  // because extractDeclaredFiles (adhoc-diff-sanity.js) reads only the FIRST `Files:` line and every guard trusts it.
+  const swapped = replaceFilesLine(data.promptContext.rawText || '', trimmed);
+  const prior = swapped.rawText;
   data.promptContext.rawText = prior
     + `\n\nHUMAN DESIGN DECISION (answered directly from Chat, ${nowIso()}):\n${trimmed}\n`
     + 'This answer resolves the open question(s) above -- implement against it directly rather than re-asking for clarification.';
   delete data.needsClarification;
   data.history = data.history || [];
+  if (swapped.replaced) {
+    data.history.push({
+      stage: 'files-line-replaced', at: nowIso(),
+      detail: `Files line replaced by the answer: "${swapped.replaced.old}" -> "${swapped.replaced.new}"`,
+    });
+  }
   data.history.push({
     stage: 'needs-clarification-resolved', at: nowIso(),
     detail: 'Answered via Chat -- requeued to adhoc/ for a fresh draft pass.',
@@ -247,7 +274,9 @@ function repeatedBlockerMatch(task) {
 // Mirrors api_task_requeue, task.py:188-367 (state ∈ blocked/done/archived -> pending),
 // the most complex of the four -- repeated-blocker guard, superseded-branch abandonment,
 // and the exact fresh-record field allowlist, all ported.
-async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force = false } = {}) {
+// keepPriority (2026-10-30, branch-defect-readmit-sweep.js): also carry humanQueued / premiumPriority / premiumSetBy / premiumSetAt over to the fresh
+// record. Off by default so the Chat tool and the dashboard-mirroring callers behave as before; the sweep sets it so a re-admitted premium task stays premium.
+async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force = false, keepPriority = false } = {}) {
   if (typeof taskId !== 'string' || !taskId.trim()) {
     return { ok: false, error: 'taskId is required' };
   }
@@ -331,8 +360,13 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
   // Coordination fields -- never part of the drafting/review/apply history this reset
   // clears, always carried over verbatim when present (see task.py's own docstring on
   // two real incidents this allowlist protects against).
-  for (const key of ['stacked', 'dependsOn', 'atomic', 'noDecompose']) {
+  for (const key of ['stacked', 'dependsOn', 'prerequisiteHubs', 'atomic', 'noDecompose']) {
     if (key in data) fresh[key] = data[key];
+  }
+  if (keepPriority) {
+    for (const key of ['humanQueued', 'premiumPriority', 'premiumSetBy', 'premiumSetAt']) {
+      if (key in data) fresh[key] = data[key];
+    }
   }
 
   writeAndUnlink(destPath, fresh, srcPath);
@@ -340,7 +374,43 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
   return { ok: true, id: taskId };
 }
 
+// Retires a task that is waiting in adhoc/ or pending/ and is not being worked on (2026-10-25: Chat filed two tasks into the wrong queue and could not retire
+// them -- its four tools only act on stuck tasks, and the dashboard's archive route refuses pending ones too). The record is stamped exactly as the dashboard's
+// manual archive stamps a give-up (python/dashboard/app.py _stamp_manual_archive: terminalDisposition 'abandoned', manualArchive {at, from, reason}) with a
+// 'withdrawn' history entry, then moved to done/_archived_no_action/, never deleted: requeueBlockedTask(state: 'archived') brings it back. Every other location
+// is refused with its name and the file is left untouched (pulling a record out from under a worker or reviewer corrupts it). No classifyRequeue: this is a
+// give-up, not a requeue.
+function withdrawTask(pipelineDir, taskId, reason) {
+  if (typeof taskId !== 'string' || !taskId.trim()) return { ok: false, error: 'taskId is required' };
+  const why = typeof reason === 'string' ? reason.trim() : '';
+  if (!why) return { ok: false, error: 'reason is required and must be non-empty' };
+  let from = 'adhoc';
+  let found = findAt(pipelineDir, 'adhoc', taskId);
+  if (!found) { from = 'pending'; found = findAt(pipelineDir, 'pending', taskId); }
+  if (!found) {
+    const where = findTaskAnywhere(pipelineDir, taskId);
+    if (!where) return notFoundError(taskId, 'adhoc or pending');
+    const place = where.foundState === 'archived' ? 'the archive' : `${where.foundState}/`;
+    return {
+      ok: false,
+      error: `Task '${taskId}' is in ${place}, not in adhoc/ or pending/ -- withdraw_task only retires tasks that are waiting and not being worked on. `
+        + 'Use requeue_blocked_task or the other task tools for stuck tasks; in-flight work cannot be withdrawn.',
+    };
+  }
+  const { path: srcPath, data } = found;
+  const destPath = path.join(pipelineDir, 'queue', 'done', '_archived_no_action', `${taskId}.json`);
+  if (fs.existsSync(destPath)) return collisionError(taskId, 'done/_archived_no_action');
+
+  const at = nowIso();
+  data.history = Array.isArray(data.history) ? data.history : [];
+  data.history.push({ stage: 'withdrawn', at, detail: why });
+  if (!data.terminalDisposition) data.terminalDisposition = 'abandoned';
+  data.manualArchive = { at, from, reason: why };
+  writeAndUnlink(destPath, data, srcPath);
+  return { ok: true, id: taskId, from };
+}
+
 module.exports = {
-  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask,
+  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask, replaceFilesLine,
   repeatedBlockerMatch, // exported for direct unit testing
 };

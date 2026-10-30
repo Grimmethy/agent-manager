@@ -140,3 +140,134 @@ test('the CLI entrypoint still writes the identical record shape as the extracte
   assert.equal(record.source, 'manual');
   assert.deepEqual(record.promptContext, { rawText: 'do it' });
 });
+
+// --- scratch flag tests ---
+
+test('scratch run writes only under the scratch dir, not the live pipeline', () => {
+  // The live pipeline must list 'adhoc' as a valid domain -- the scratch path forces
+  // domain='adhoc', and validation runs against the (copied) task-domains.json in the
+  // scratch dir, which is a copy of the live one.
+  const liveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-test-'));
+  fs.writeFileSync(path.join(liveDir, 'task-domains.json'), JSON.stringify({ default: {}, adhoc: {}, other_domain: {} }));
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-scratch-'));
+  const promptContextFile = path.join(scratchDir, 'ctx.json');
+  fs.writeFileSync(promptContextFile, JSON.stringify({ rawText: 'scratch task' }));
+
+  execFileSync('node', [
+    path.join(__dirname, 'queue-adhoc-task.js'),
+    '--scratch', scratchDir,
+    '--repo-root', liveDir,
+    '--title', 'Scratch task',
+    '--prompt-context-file', promptContextFile,
+  ], {
+    env: { ...process.env, AGENT_MANAGER_PIPELINE_DIR: liveDir, AGENT_MANAGER_REPO_ROOT: liveDir },
+  });
+
+  // The scratch dir has the task and the copied task-domains.json
+  assert.ok(fs.existsSync(path.join(scratchDir, 'task-domains.json')), 'task-domains.json copied into scratch dir');
+  const scratchAdhocFiles = fs.readdirSync(path.join(scratchDir, 'queue', 'adhoc'));
+  assert.equal(scratchAdhocFiles.length, 1);
+  const record = JSON.parse(fs.readFileSync(path.join(scratchDir, 'queue', 'adhoc', scratchAdhocFiles[0]), 'utf8'));
+  assert.equal(record.title, 'Scratch task');
+  assert.equal(record.domain, 'adhoc', 'domain forced to adhoc for scratch runs');
+  assert.equal(record.generatedForRepoRoot, liveDir, 'generatedForRepoRoot stamped from --repo-root');
+
+  // The live pipeline is untouched -- no new adhoc files. Create the live adhoc dir
+  // first (it may not exist since this is a fresh pipeline dir) so we can check it's empty.
+  fs.mkdirSync(path.join(liveDir, 'queue', 'adhoc'), { recursive: true });
+  const liveAdhocFiles = fs.readdirSync(path.join(liveDir, 'queue', 'adhoc'));
+  assert.equal(liveAdhocFiles.length, 0, 'live queue directory is untouched by scratch run');
+});
+
+test('scratch run with missing --repo-root exits non-zero and writes nothing', () => {
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-scratch-'));
+  const promptContextFile = path.join(scratchDir, 'ctx.json');
+  fs.writeFileSync(promptContextFile, JSON.stringify({ rawText: 'no repo' }));
+
+  let exited = false;
+  try {
+    execFileSync('node', [
+      path.join(__dirname, 'queue-adhoc-task.js'),
+      '--scratch', scratchDir,
+      '--title', 'No repo task',
+      '--prompt-context-file', promptContextFile,
+    ], {
+      env: { ...process.env, AGENT_MANAGER_PIPELINE_DIR: scratchDir, AGENT_MANAGER_REPO_ROOT: scratchDir },
+    });
+  } catch (e) {
+    exited = true;
+    assert.ok(e.status !== 0, 'expected non-zero exit');
+  }
+  assert.ok(exited, 'must exit non-zero when --repo-root is missing with --scratch');
+
+  // Nothing written under the scratch dir (no queue/adhoc/, no task-domains.json)
+  assert.equal(fs.existsSync(path.join(scratchDir, 'queue')), false, 'no queue/ dir created');
+  assert.equal(fs.existsSync(path.join(scratchDir, 'task-domains.json')), false, 'no task-domains.json copied');
+});
+
+test('run without --scratch is unchanged (no generatedForRepoRoot, writes to pipeline dir)', () => {
+  const dir = tmpPipeline();
+  const promptContextFile = path.join(dir, 'ctx.json');
+  fs.writeFileSync(promptContextFile, JSON.stringify({ rawText: 'plain cli' }));
+
+  execFileSync('node', [
+    path.join(__dirname, 'queue-adhoc-task.js'),
+    '--title', 'Plain CLI task',
+    '--prompt-context-file', promptContextFile,
+  ], {
+    env: { ...process.env, AGENT_MANAGER_PIPELINE_DIR: dir, AGENT_MANAGER_REPO_ROOT: dir },
+  });
+
+  const files = fs.readdirSync(path.join(dir, 'queue', 'adhoc'));
+  assert.equal(files.length, 1);
+  const record = JSON.parse(fs.readFileSync(path.join(dir, 'queue', 'adhoc', files[0]), 'utf8'));
+  assert.equal(record.title, 'Plain CLI task');
+  assert.equal('generatedForRepoRoot' in record, false, 'no generatedForRepoRoot without --scratch');
+  assert.equal(record.domain, 'default', 'domain uses defaultTaskDomain, not forced to adhoc');
+});
+
+test('scratch run does not overwrite task-domains.json if it already exists', () => {
+  // The live pipeline must list 'adhoc' so the forced domain='adhoc' passes validation.
+  const liveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-task-test-'));
+  fs.writeFileSync(path.join(liveDir, 'task-domains.json'), JSON.stringify({ default: {}, adhoc: {}, other_domain: {} }));
+  const scratchDir = fs.mkdtempSync(path.join(os.tmpdir(), 'queue-adhoc-scratch-'));
+  // Pre-populate task-domains.json in the scratch dir with different content (still lists 'adhoc'
+  // so the forced domain passes validation, but the non-adhoc entries differ from the live copy).
+  const customDomains = { custom_domain: {}, adhoc: {}, another: {} };
+  fs.writeFileSync(path.join(scratchDir, 'task-domains.json'), JSON.stringify(customDomains));
+
+  const promptContextFile = path.join(scratchDir, 'ctx.json');
+  fs.writeFileSync(promptContextFile, JSON.stringify({ rawText: 'idempotent copy' }));
+
+  execFileSync('node', [
+    path.join(__dirname, 'queue-adhoc-task.js'),
+    '--scratch', scratchDir,
+    '--repo-root', liveDir,
+    '--title', 'Idempotent',
+    '--prompt-context-file', promptContextFile,
+  ], {
+    env: { ...process.env, AGENT_MANAGER_PIPELINE_DIR: liveDir, AGENT_MANAGER_REPO_ROOT: liveDir },
+  });
+
+  // The pre-existing file must NOT have been overwritten
+  const onDisk = JSON.parse(fs.readFileSync(path.join(scratchDir, 'task-domains.json'), 'utf8'));
+  assert.deepEqual(onDisk, customDomains, 'pre-existing task-domains.json is not clobbered');
+});
+
+test('queueAdhocTask stamps generatedForRepoRoot when provided', () => {
+  const dir = tmpPipeline();
+  const { record } = queueAdhocTask(
+    { title: 'Stamped', promptContext: { rawText: 'x' }, generatedForRepoRoot: '/some/repo' },
+    { pipelineDir: dir, domainsPath: path.join(dir, 'task-domains.json') },
+  );
+  assert.equal(record.generatedForRepoRoot, '/some/repo');
+});
+
+test('queueAdhocTask omits generatedForRepoRoot when not provided', () => {
+  const dir = tmpPipeline();
+  const { record } = queueAdhocTask(
+    { title: 'No stamp', promptContext: { rawText: 'x' } },
+    { pipelineDir: dir, domainsPath: path.join(dir, 'task-domains.json') },
+  );
+  assert.equal('generatedForRepoRoot' in record, false);
+});

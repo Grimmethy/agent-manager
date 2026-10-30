@@ -16,13 +16,15 @@ const { execFileSync } = require('child_process');
 const { getConfig } = require('./config.js');
 const { detectDefaultBranch } = require('./git-runner.js');
 const { resolveGroundingRef } = require('./stacked-grounding.js');
-const { copyNodeModules } = require('./lib/draft-sandbox.js');
+const { copyNodeModules, copyPythonVenv } = require('./lib/draft-sandbox.js');
 const { normalizeDiffOutput } = require('./group-b-worktree-diff.js');
 const { stageDraftChanges } = require('./lib/draft-side-effects.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { adhocDiffSubstanceProblem, adhocNoChangesClaimProblem } = require('./adhoc-diff-sanity.js');
 const { checkLeftoverReferences, makeGrepBase } = require('./lib/leftover-references.js');
 const { writeSideFindingInbox } = require('./side-finding.js');
+const { validPrerequisiteHubs } = require('./hub-prerequisites.js');
+const { validProposalFiles } = require('./proposal-files.js');
 
 const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' };
 const GIT_TIMEOUT_MS = 60_000;
@@ -110,6 +112,48 @@ function fileSelfDeclaredPartialScopeFollowUp(task, summary) {
 // turns... a fresh pass can complete it in a few edits from the state I left").
 const MAX_AGENTIC_CONTINUATIONS = Number(process.env.AGENT_MANAGER_MAX_AGENTIC_CONTINUATIONS) || 2;
 const RERUN_NOT_A_QUESTION_RE = /\bno (?:open |real |actual )?(?:design )?(?:question|decision)\b|\b(?:ran |run )out of turns\b|\bexhausted (?:my|its|the|this) turn(?: budget)?\b|\bre-?run (?:this|the|it|me)\b|\bfresh pass (?:can|could|will) (?:complete|finish)\b|\bwhat (?:did |does )not(?: yet)? land\b/i;
+
+// 2026-10-28 (HUB0008-03): when the agentic pass's final text contains the piece's own
+// stop instruction being followed (a sentence naming 'needs-clarification' or beginning
+// 'STOP', or a line starting 'PREREQUISITE'), treat the block as a prerequisite stop:
+// do not spend redraft retries, move the task to needs-clarification at once with
+// blockedReason set to that sentence (trimmed to 600 chars), and add a history event
+// 'prerequisite-stop' carrying it. The agentic implement pass had stopped on its own
+// prerequisite check (e.g. "accounts hub (HUB0006) must be merged to master first")
+// but the record only showed 'Agentic implement pass tagged BLOCKER-TYPE: infra-error'
+// -- a generic infra-error line -- and was retried twice for nothing, then escalated
+// with 'escalated to a human after exhausting redraft retries' (reject-retry-check.js)
+// with no sign of the real reason. The BLOCKER-TYPE line is written by the local model
+// (BLOCKER_TYPE_RE below: design-question | budget-exhausted | infra-error).
+//
+// A sentence that merely mentions 'needs-clarification' inside quoted task text is NOT
+// a stop -- strip quoted sections first to avoid false positives.
+//
+// Returns the detected sentence (trimmed to 600 chars) or null if no stop detected.
+// Caller (resolveNeedsHuman) is responsible for the side effects: setting blockedStage,
+// blockedReason, and appending the history event.
+function detectPrerequisiteStop(text) {
+  if (!text || typeof text !== 'string') return null;
+
+  const lines = text.split('\n');
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // Check for lines starting with 'STOP' or 'PREREQUISITE' (case-insensitive)
+    if (/^(?:STOP|PREREQUISITE)\b/i.test(trimmed)) {
+      return trimmed.slice(0, 600);
+    }
+
+    // Check for 'needs-clarification' outside quotes
+    // Remove quoted sections first to avoid false positives
+    const unquoted = trimmed.replace(/"[^"]*"/g, '').replace(/'[^']*'/g, '');
+    if (/needs-clarification\b/i.test(unquoted)) {
+      return trimmed.slice(0, 600);
+    }
+  }
+
+  return null;
+}
 
 // 2026-09-08, root-caused live (autodecomp-...-04-system-and-project-js): the model's own
 // summary said plainly "not a design question -- a pass-budget overrun," but it neither
@@ -213,6 +257,10 @@ function parseSubTaskProposals(text) {
     .map((t) => {
       const out = { title: t.title.trim(), rawText: t.rawText.trim() };
       if (Number.isInteger(t.after) && t.after >= 0) out.after = t.after;
+      const prereq = validPrerequisiteHubs(t.prerequisiteHubs);
+      if (prereq) out.prerequisiteHubs = prereq;
+      const files = validProposalFiles(t.files);
+      if (files) out.files = files;
       return out;
     });
   return cleaned.length ? cleaned : null;
@@ -237,7 +285,8 @@ function formatSubTaskProposalsForReview(subTasks) {
   return subTasks
     .map((t, i) => {
       const dep = Number.isInteger(t.after) ? ` (after piece ${t.after + 1})` : '';
-      return `${i + 1}. ${t.title}${dep}\n   ${t.rawText}`;
+      const files = Array.isArray(t.files) && t.files.length ? `\n   Files: ${t.files.join(', ')}` : '';
+      return `${i + 1}. ${t.title}${dep}\n   ${t.rawText}${files}`;
     })
     .join('\n');
 }
@@ -313,6 +362,9 @@ function prepareAdhocWorktree(resolvedRepoRoot, mainBranch, worktreeDir, branchN
   // A private copy of the repo's installed node_modules, so a JS/TS draft can really run tsc / build / tests (see lib/draft-sandbox.js). Never
   // fails the worktree: without it the draft simply has no toolchain, exactly as before.
   const nodeModules = copyNodeModules(resolvedRepoRoot, worktreeDir);
+  // A Python repo's private .venv copy, so a draft can import its dependencies and really run its tests (see copyPythonVenv). Never fails the worktree.
+  const venv = copyPythonVenv(resolvedRepoRoot, worktreeDir);
+  if (venv.copied && !venv.already) console.error(`[draft-sandbox] copied .venv into ${path.basename(worktreeDir)} (${venv.sizeMb ?? '?'} MB, ${venv.ms} ms)`);
   // STDERR, never stdout: local-draft.js's stdout is a machine channel (ONE JSON result line the worker JSON.parses). These two lines were console.log
   // in #420 and made every successful PF draft read as "draft call failed" (58 wasted drafts, 4 tasks sent to needs-clarification, 2026-09-20).
   if (nodeModules.copied) console.error(`[draft-sandbox] copied node_modules into ${path.basename(worktreeDir)} (${nodeModules.sizeMb ?? '?'} MB, ${nodeModules.ms} ms)`);
@@ -570,6 +622,31 @@ function resolveNeedsHuman(ctx) {
   const resolution = 'needs-human-decision';
   const capturedDiff = bestEffortDiff();
   const continuations = Number(task.agenticContinuationCount) || 0;
+
+  // 2026-10-28 (HUB0008-03): prerequisite-stop check. If the model's own text
+  // contains a stop instruction (a sentence naming 'needs-clarification' or beginning
+  // 'STOP', or a line starting 'PREREQUISITE'), treat it as a prerequisite stop and
+  // escalate immediately without retrying. This is checked BEFORE BLOCKER_TYPE_RE so
+  // it takes priority -- the model was already telling us the real reason it stopped,
+  // we just weren't listening. reject-retry-check.js bounds retries by MAX_LOCAL_REJECT_RETRIES;
+  // a prerequisite stop bypasses that entirely because retrying would just reproduce
+  // the same stop (the prerequisite hasn't been satisfied).
+  const prereqStop = detectPrerequisiteStop(summary);
+  if (prereqStop) {
+    task.blockedStage = 'needs-clarification';
+    task.blockedReason = prereqStop;
+    appendHistoryEvent(task, 'prerequisite-stop', { reason: prereqStop });
+    return {
+      succeeded: true,
+      blocked: true,
+      blockedStage: 'needs-clarification',
+      blockedReason: prereqStop,
+      ...meta,
+      capturedDiff: undefined,
+      needsClarification: true,
+    };
+  }
+
   const blockerTypeMatch = BLOCKER_TYPE_RE.exec(summary);
   const blockerType = blockerTypeMatch ? blockerTypeMatch[1].toLowerCase() : null;
 
@@ -994,4 +1071,5 @@ module.exports = {
   summariseInvestigation,
   BLOCKER_TYPE_RE,
   SELF_DECLARED_PARTIAL_SCOPE_RE, fileSelfDeclaredPartialScopeFollowUp,
+  detectPrerequisiteStop,
 };

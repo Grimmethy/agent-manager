@@ -165,6 +165,58 @@ test('detectExternalDependency ignores the plan echo and code spans/fences (clas
   assert.equal(classifyExternalDependency({ title: 'add the API key to config' }).severity, 'soft');
 });
 
+// 2026-10-30: a task that WRITES FILES may describe what a guide should say. The exact sentence that blocked the questforge deploy kit twice.
+const DEPLOY_KIT_TEXT = [
+  'REPO RULES: ES modules.',
+  'WHAT: create deploy/install.sh, deploy/healthcheck.sh, Docs/DEPLOY.md and test/deploy.test.js ONLY.',
+  '4. env.example: the QUESTFORGE_* variables with comments and safe defaults.',
+  "5. Docs/DEPLOY.md: what the service is, prerequisites, step by step: copy the app (git clone or rsync of bin/ server/ src/ is the owner's choice), dry run, apply.",
+  'DO NOT: run systemctl or ssh in tests.',
+].join('\n');
+
+test('detectExternalDependency does NOT block on a git clone that only describes what a guide the task writes should say', () => {
+  const { detectExternalDependency, classifyExternalDependency } = freshModule();
+  const task = { title: 'Deploy kit for a private Linux host', promptContext: { rawText: DEPLOY_KIT_TEXT } };
+  assert.equal(detectExternalDependency(task, { mode: 'block' }), null);
+  assert.equal(detectExternalDependency(task, { mode: 'advisory' }), null);
+  assert.equal(classifyExternalDependency(task), null);
+});
+
+test('detectExternalDependency still blocks a real git push in a task that also writes files', () => {
+  const { detectExternalDependency } = freshModule();
+  const task = { title: 'Edit the loader', promptContext: { rawText: 'Files: src/loader.js\nEdit src/loader.js, then git push origin main after the edit.' } };
+  assert.equal(detectExternalDependency(task, { mode: 'advisory' }), 'a git remote operation');
+});
+
+test('detectExternalDependency still blocks creating a new repo even when the task declares files to create', () => {
+  const { detectExternalDependency } = freshModule();
+  const task = { title: 'Set up the plugin', promptContext: { rawText: 'WHAT: create src/a.js ONLY.\nAlso create a new repo for the plugin.' } };
+  assert.equal(detectExternalDependency(task, { mode: 'advisory' }), 'creating a new repo');
+});
+
+test('detectExternalDependency behaves as before when the task declares no files to create', () => {
+  const { detectExternalDependency } = freshModule();
+  const task = { promptContext: { rawText: '5. Docs/DEPLOY.md: step by step: copy the app (git clone or rsync).' } };
+  assert.equal(detectExternalDependency(task, { mode: 'advisory' }), 'a git remote operation');
+});
+
+test('detectExternalDependency still blocks a genuine git push that comes AFTER a guide-content mention', () => {
+  const { detectExternalDependency } = freshModule();
+  const rawText = 'WHAT: create Docs/DEPLOY.md ONLY.\n5. Docs/DEPLOY.md: step by step: copy the app (git clone or rsync).\nFinally git push the branch to the remote.';
+  assert.equal(detectExternalDependency({ title: 'Deploy guide', promptContext: { rawText } }, { mode: 'advisory' }), 'a git remote operation');
+});
+
+test('isDocContentMention needs both a files-to-create declaration and a document-description line', () => {
+  const { isDocContentMention, taskDeclaresFilesToCreate } = freshModule();
+  const line = '5. Docs/DEPLOY.md: step by step: git clone it';
+  assert.equal(taskDeclaresFilesToCreate('Files: a.js'), true);
+  assert.equal(taskDeclaresFilesToCreate('nothing declared'), false);
+  assert.equal(isDocContentMention('WHAT: create Docs/DEPLOY.md ONLY.\n' + line, ('WHAT: create Docs/DEPLOY.md ONLY.\n' + line).indexOf('git clone')), true);
+  assert.equal(isDocContentMention(line, line.indexOf('git clone')), false);
+  const plain = 'Files: a.js\nRun git clone now.';
+  assert.equal(isDocContentMention(plain, plain.indexOf('git clone')), false);
+});
+
 test('detectExternalDependency modes: hard markers block unless off; soft markers block only in block mode', () => {
   const { detectExternalDependency, externalDependencyAdvisory } = freshModule();
   const hard = { title: 'Create a new repo for the plugin' };
@@ -681,4 +733,178 @@ test('partialDiffFallbackPrompt: an applied prior diff leaves the prompt unchang
   assert.match(out, /^P\n\nCORRECTION:/);
   assert.match(out, /do NOT hold for this run|does NOT hold for this run/);
   assert.match(out, /diff --git a\/x b\/x/);
+});
+
+// --- read-only sibling repos (2026-10-16) ---------------------------------------------------------------------------------------------------------
+// The GPU broker verification tasks needed to read videoforge / promptforge-manual, but the pass's only tool root was its worktree.
+test('write tier: the implement pass hands the registered plugin repos to the tool loop as READ-ONLY roots, never the live checkout, apply clone or worktree', async () => {
+  // Own temp repo (not withRepo): withRepo removes its dir as soon as an async body first yields, and the draft resolves roots after its awaits.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'law-ro-core-'));
+  fs.mkdirSync(path.join(dir, 'queue'), { recursive: true });
+  const sibling = fs.mkdtempSync(path.join(os.tmpdir(), 'law-sibling-'));
+  const worktree = fs.mkdtempSync(path.join(os.tmpdir(), 'law-worktree-'));
+  const manifest = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'law-manifest-')), 'plugins.json');
+  fs.writeFileSync(manifest, JSON.stringify([
+    { name: 'sib', registerPath: path.join(sibling, 'register.js'), enabled: true },
+    { name: 'wt', registerPath: path.join(worktree, 'register.js'), enabled: true },
+  ]));
+  // Pin the apply clone to its own dir: a harness that points AGENT_MANAGER_APPLY_REPO_ROOT at the tmpdir (the review sandbox does) would otherwise contain the sibling, and a repo inside the apply clone is rightly excluded.
+  const applyClone = fs.mkdtempSync(path.join(os.tmpdir(), 'law-apply-'));
+  const keys = ['AGENT_MANAGER_REPO_ROOT', 'AGENT_MANAGER_PIPELINE_DIR', 'LOCAL_MODEL', 'AGENT_MANAGER_LOCAL_AGENTIC_WRITE', 'AGENT_MANAGER_PLUGINS_MANIFEST', 'AGENT_MANAGER_CORE_REPO_ROOT', 'AGENT_MANAGER_APPLY_REPO_ROOT'];
+  const prev = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  Object.assign(process.env, { AGENT_MANAGER_REPO_ROOT: dir, AGENT_MANAGER_PIPELINE_DIR: dir, LOCAL_MODEL: 'qwen-test', AGENT_MANAGER_PLUGINS_MANIFEST: manifest, AGENT_MANAGER_CORE_REPO_ROOT: dir, AGENT_MANAGER_APPLY_REPO_ROOT: applyClone });
+  delete process.env.AGENT_MANAGER_LOCAL_AGENTIC_WRITE;
+  for (const m of ['./plugins-manifest.js', './accessible-roots.js', './agentic-draft-common.js']) delete require.cache[require.resolve(m)];
+  const adc = require('./agentic-draft-common.js');
+  const realRun = adc.runAgenticDraftInWorktree;
+  adc.runAgenticDraftInWorktree = async (_t, { runInWorktree }) => { await runInWorktree(worktree, {}); return { succeeded: true, blocked: false, response: 'RESOLUTION: implemented' }; };
+  try {
+    const { draftAdhocViaLocalAgenticWrite } = freshModule();
+    const calls = [];
+    const task = { id: 'ro-sib', source: 'manual', title: 'verify', promptContext: { rawText: 'read the sibling repo and write the findings doc' } };
+    await draftAdhocViaLocalAgenticWrite(task, { runPlan: async (opts) => { calls.push(opts); return { response: 'RESOLUTION: implemented' }; } });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].primaryRoot, worktree);
+    assert.deepEqual(calls[0].readOnlyRoots, [fs.realpathSync(sibling)]);
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(dir)), 'the live checkout is not exposed');
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(worktree)), 'the worktree is not listed twice');
+    assert.ok(!calls[0].readOnlyRoots.includes(fs.realpathSync(applyClone)), 'the apply clone is not exposed');
+    assert.equal(calls[0].extraRoots, undefined, 'extraRoots keeps its Chat-only meaning');
+  } finally {
+    adc.runAgenticDraftInWorktree = realRun;
+    for (const k of keys) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; }
+    for (const m of ['./plugins-manifest.js', './accessible-roots.js']) delete require.cache[require.resolve(m)];
+    for (const d of [dir, sibling, worktree, applyClone, path.dirname(manifest)]) fs.rmSync(d, { recursive: true, force: true });
+  }
+});
+
+test('write tier: the implement prompt says other registered repos are readable read-only and not to conclude a repo is absent', () => {
+  withRepo(() => {
+    const { buildWriteAgenticPrompt } = freshModule();
+    const prompt = buildWriteAgenticPrompt({ id: 'p', title: 't', promptContext: { rawText: 'verify against videoforge' } });
+    assert.match(prompt, /Other registered repos on this machine \(plugins and projects\) are READ-ONLY/);
+    assert.match(prompt, /never conclude a repo is absent from this machine without calling list_roots first/);
+    assert.match(prompt, /Do not cat \.env, key, token or credential files/);
+  });
+});
+
+// task-shape.js: the post-exhaustion / repeated-decompose backstop must not split a one-file-fix on a model "decompose" answer, but a REAL turn-budget exhaustion
+// (evidence the shape guess was wrong) still may -- same as a confirmed-atomic leaf.
+async function backstopRun(taskOverrides, { shapeEnv } = {}) {
+  return withRepo(async () => {
+    delete require.cache[require.resolve('./agentic-draft-common.js')];
+    const adc = require('./agentic-draft-common.js');
+    const { setDecomposePassRunner } = require('./decompose-pass-route.js');
+    const realRun = adc.runAgenticDraftInWorktree;
+    const prevEnv = process.env.AGENT_MANAGER_TASK_SHAPE;
+    if (shapeEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = shapeEnv;
+    adc.runAgenticDraftInWorktree = async () => ({ succeeded: true, blocked: false, needsClarification: true, response: 'ran out of turns' });
+    let splitCalls = 0;
+    setDecomposePassRunner({ runDecomposePass: async () => { splitCalls += 1; return { subTasks: [{ title: 'a', rawText: 'aa' }, { title: 'b', rawText: 'bb' }] }; } });
+    try {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const task = { id: 'shape-bk', source: 'manual', title: 'Fix clamp', decomposeBlockCount: 2, needsClarification: { reason: 'x' }, promptContext: { rawText: 'In src/foo.js fix clamp and add a case to src/foo.test.js.' }, ...taskOverrides };
+      const res = await draftAdhocViaLocalAgenticWrite(task, { runInWorktree: async () => ({ response: 'x' }) });
+      return { res, task, splitCalls };
+    } finally {
+      adc.runAgenticDraftInWorktree = realRun;
+      setDecomposePassRunner(null);
+      if (prevEnv === undefined) delete process.env.AGENT_MANAGER_TASK_SHAPE; else process.env.AGENT_MANAGER_TASK_SHAPE = prevEnv;
+    }
+  });
+}
+
+test('task-shape backstop: a one-file-fix that keeps answering "decompose" is NOT split', async () => {
+  const { res, task, splitCalls } = await backstopRun({});
+  assert.equal(task.shape.class, 'one-file-fix');
+  assert.equal(splitCalls, 0, 'the decompose pass is never asked');
+  assert.notEqual(res.resolution, 'decompose');
+  assert.equal(task.autoDecomposeCount, undefined);
+});
+
+test('task-shape backstop: a one-file-fix that really exhausted its turn budget may still be split', async () => {
+  const { res, splitCalls } = await backstopRun({ turnBudgetExhausted: true });
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
+});
+
+test('task-shape backstop: with AGENT_MANAGER_TASK_SHAPE=off the same task is split exactly as before', async () => {
+  const { res, task, splitCalls } = await backstopRun({}, { shapeEnv: 'off' });
+  assert.equal(task.shape, undefined);
+  assert.equal(splitCalls, 1);
+  assert.equal(res.resolution, 'decompose');
+});
+
+// --- TIME BUDGET prompt line (2026-10-19, brain-dump 1895) -------------------------------------------------
+// Behind AGENT_MANAGER_PROMPT_BUDGET_BLOCK (default off): states the lane's per-call ceiling and the keep-turns-short instruction.
+
+function withBudgetSwitch(value, fn) {
+  const prev = process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK;
+  if (value === undefined) delete process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK; else process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK = value;
+  try { return fn(); } finally { if (prev === undefined) delete process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK; else process.env.AGENT_MANAGER_PROMPT_BUDGET_BLOCK = prev; }
+}
+
+test('TIME BUDGET line: buildTimeBudgetLine states the ceiling in seconds for 240 s, 900 s (slow endpoint) and a custom value', () => {
+  const { buildTimeBudgetLine } = freshModule();
+  assert.match(buildTimeBudgetLine(240000), /cut off after about 240 seconds/);
+  assert.match(buildTimeBudgetLine(900000), /cut off after about 900 seconds/);
+  assert.match(buildTimeBudgetLine(90000), /cut off after about 90 seconds/);
+  const line = buildTimeBudgetLine(240000);
+  assert.match(line, /Keep your thinking to a few sentences/);
+  assert.match(line, /several small edit_file calls/);
+  assert.match(line, /~30 s/);
+});
+
+test('TIME BUDGET line: with the switch on the prompt gains exactly that line, after the TURN BUDGET line, using the lane ceiling', async () => {
+  await withRepo(async () => {
+    const task = { title: 'T', promptContext: { rawText: 'the ask' } };
+    const { REQUEST_TIMEOUT_MS } = require('./local-tool-client.js');
+    const off = withBudgetSwitch(undefined, () => freshModule().buildWriteAgenticPrompt(task));
+    for (const v of ['on', '1', 'true', 'ON']) {
+      const m = freshModule();
+      const on = withBudgetSwitch(v, () => m.buildWriteAgenticPrompt(task));
+      assert.ok(on.includes(`cut off after about ${Math.round(REQUEST_TIMEOUT_MS / 1000)} seconds`), v);
+      assert.equal(on.replace(`${m.buildTimeBudgetLine()}\n`, ''), off, `${v}: the only difference is the inserted line`);
+      assert.ok(on.indexOf('TURN BUDGET:') < on.indexOf('TIME BUDGET:') && on.indexOf('TIME BUDGET:') < on.indexOf('Title: T'), 'placed between the turn budget and the task');
+    }
+  });
+});
+
+test('TIME BUDGET line: switch off (unset, off, 0, false) leaves the prompt without it', async () => {
+  await withRepo(async () => {
+    const task = { title: 'T', promptContext: { rawText: 'the ask' } };
+    for (const v of [undefined, 'off', '0', 'false', '']) {
+      const p = withBudgetSwitch(v, () => freshModule().buildWriteAgenticPrompt(task));
+      assert.ok(!p.includes('TIME BUDGET'), String(v));
+      assert.match(p, /TURN BUDGET: you have about/);
+    }
+  });
+});
+
+// A Forge GPU pause thrown from inside the pass (local-tool-client.js refuses a turn under a fresh lease) must reach local-draft.js and local-worker.sh as a pause
+// -- no failed attempt counted, the task resumes when the lease clears -- instead of being flattened into an ordinary failed draft. The seam is the call the
+// final catch of draftAdhocViaLocalAgenticWrite wraps (runAgenticDraftInWorktree), stubbed to throw.
+test('write tier: a Forge pause thrown from the pass is rethrown, an ordinary error still returns a failed draft', async () => {
+  const { ForgePauseError, isForgePause } = require('./gpu-guard.js');
+  const adc = require('./agentic-draft-common.js');
+  const realRun = adc.runAgenticDraftInWorktree;
+  const task = () => ({ id: 'w-pause', source: 'manual', promptContext: { rawText: 'do it' } });
+  try {
+    // one call per withRepo block: withRepo restores the environment as soon as its async callback first yields
+    adc.runAgenticDraftInWorktree = async () => { throw new ForgePauseError(); };
+    await withRepo(async () => {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      await assert.rejects(draftAdhocViaLocalAgenticWrite(task()), (e) => isForgePause(e));
+    });
+    adc.runAgenticDraftInWorktree = async () => { throw new Error('boom'); };
+    await withRepo(async () => {
+      const { draftAdhocViaLocalAgenticWrite } = freshModule();
+      const failed = await draftAdhocViaLocalAgenticWrite(task());
+      assert.equal(failed.succeeded, false);
+      assert.match(failed.reason, /local write-agentic draft failed: boom/);
+    });
+  } finally {
+    adc.runAgenticDraftInWorktree = realRun;
+    delete require.cache[require.resolve('./local-agentic-write-draft.js')];
+  }
 });

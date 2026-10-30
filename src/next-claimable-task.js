@@ -5,6 +5,7 @@ const { sharedInstancesDir } = require('./instances-dir.js');
 const path = require('path');
 const { HUB_TIER_PRIORITY, isHubTierTask, hubIdForTask } = require('./hub-priority.js');
 const { ROTATION_DEMOTED_PRIORITY, rotationDemoted, laneAvoided } = require('./premium-rotation.js');
+const { openQueueCache, readTaskCached } = require('./queue-cache.js');
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
@@ -208,12 +209,11 @@ function recordHubTierAudit(rankable, instancesDir) {
 // (local-worker.sh) iterates this list attempting an atomic claim (mv -n) on each in
 // turn, same as it did with the old inline script's output.
 function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
-  let names;
-  try {
-    names = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
-  } catch (_) {
-    return [];
-  }
+  // The task files come through the RAM cache (queue-cache.js): a tick that finds the directory unchanged reads no task file. names() is [] for an
+  // unreadable directory, like the readdir it replaces; with nothing listed nothing below could be returned or recorded, so stop here (this early return is an optimisation: the result is [] either way).
+  const cache = openQueueCache(pendingDir);
+  const names = cache.names();
+  if (names.length === 0) return [];
 
   // Side-effect requires: task-sources.js's registerTaskSource() calls populate
   // task-source-registry.js's registry as a load-time side effect -- must be required
@@ -233,21 +233,100 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   const coreActive = activeRepoIsCore();
   // Lane avoidance (premium-rotation.js): how many lanes exist decides whether a task may skip one. 0 on any error = never skip.
   let laneCount = 0;
-  try { laneCount = (opts.lanes || require('./lanes.js').getLanes()).length; } catch (_) { laneCount = 0; }
+  // This instance's own lane definition, for the task-class allowlist below (null for a non-lane instance, or on any error = unrestricted).
+  let thisLane = null;
+  // The whole lane list, kept for the lane-avoidance check below (is there anywhere ELSE this task can go?). [] on any error = never avoid.
+  let claimLanes = [];
+  try {
+    const allLanes = opts.lanes || require('./lanes.js').getLanes();
+    claimLanes = allLanes;
+    laneCount = allLanes.length;
+    thisLane = allLanes.find((l) => l.id === instanceId) || null;
+  } catch (_) { laneCount = 0; thisLane = null; claimLanes = []; }
+  const capRouting = require('./capability-routing.js');
+  const routing = {
+    cfg: capRouting.routingConfig(),
+    instancesDir: opts.instancesDir || sharedInstancesDir(pipelineDir),
+    _rows: null,
+    rows() { if (!this._rows) this._rows = opts.scorecard || capRouting.cachedScorecard(pipelineDir, this.cfg); return this._rows; },
+  };
+  let probesOffered = 0;
   const pinned = [];
   const rankable = [];
   for (const name of names) {
-    const { task, mtimeMs } = readTaskSafe(path.join(pendingDir, name));
+    const { task, mtimeMs } = readTaskCached(cache, path.join(pendingDir, name));
+    const premium = !!(task && task.premiumPriority === true); // same test the shell side used to re-read every file for
     const pinnedWorker = task && task.pinnedWorker;
     if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
     if (pinnedWorker === instanceId) {
-      pinned.push({ name, mtimeMs });
+      pinned.push({ name, mtimeMs, premium });
       continue;
     }
 
     // A task that degenerated on THIS lane (task.avoidLanes, stamped by reject-retry-check.js) is left to another lane while one exists.
     // An explicit pin to this lane was handled above and still wins.
-    if (task && laneAvoided(task, instanceId, laneCount)) continue;
+    // The skip only holds while another lane exists that is not avoided, is allowed this task's source and is alive (premium-rotation.js laneAvoided ctx),
+    // so avoidance can never leave a task that no lane will claim. The source and heartbeat lookups only happen for a task that actually names this lane.
+    if (task && Array.isArray(task.avoidLanes) && task.avoidLanes.includes(instanceId)) {
+      let avoidSource = null;
+      try { avoidSource = resolveSourceName(task); } catch (_) { avoidSource = null; }
+      // "Alive" here means "not known to be down": a lane whose heartbeat file exists but is stale or flagged degraded is down; a lane that has never written a
+      // heartbeat is unknown, and unknown counts as a place the task can go (avoidance still steers it there). Only evidence of death strands nothing.
+      const avoidAlive = (id) => {
+        if (opts.laneAlive) return opts.laneAlive(id);
+        if (!fs.existsSync(path.join(routing.instancesDir, `${id}.json`))) return true;
+        return capRouting.laneAliveFromHeartbeat(routing.instancesDir, id);
+      };
+      const avoidCtx = { lanes: claimLanes, source: avoidSource, alive: avoidAlive };
+      if (laneAvoided(task, instanceId, laneCount, process.env, avoidCtx)) continue;
+    }
+
+    // A lane with a taskClasses allowlist (lanes.js; e.g. an 8 GB GPU given only small bounded sources) is only offered tasks of
+    // those sources. Fail closed: a task whose source can't be resolved is not offered to a restricted lane. An operator pin to
+    // this lane was handled above and bypasses this, same as it bypasses lane avoidance.
+    if (task && thisLane && Array.isArray(thisLane.taskClasses)) {
+      let sourceName = null;
+      try { sourceName = resolveSourceName(task); } catch (_) { sourceName = null; }
+      if (!require('./lanes.js').laneAllowsSource(thisLane, sourceName)) {
+        // Probing (capability-routing.js): outside its allowlist, a small lane is still offered a deterministic fraction of eligible tasks of
+        // sources it has not proven. Shadow mode only logs; enforce lets ONE probe through per call.
+        let probe = false;
+        if (routing.cfg.mode !== 'off') {
+          try {
+            probe = capRouting.probeSelected({ task, source: sourceName, registered: getRegisteredSource(sourceName), lane: thisLane, lanes: opts.lanes || require('./lanes.js').getLanes(), rows: routing.rows(), cfg: routing.cfg, degraded: opts.laneDegraded ? opts.laneDegraded(thisLane.id) : require('./lane-health.js').laneDegraded(routing.instancesDir, thisLane.id) });
+          } catch (_) { probe = false; }
+        }
+        if (!probe) continue;
+        capRouting.auditReservation(pipelineDir, routing.instancesDir, {
+          mode: routing.cfg.mode, action: routing.cfg.mode === 'enforce' ? 'probe' : 'would-probe', taskId: task.id || name, source: sourceName, lane: thisLane.id, holder: thisLane.id, evidence: 'probe',
+        });
+        if (routing.cfg.mode !== 'enforce' || probesOffered >= 1) continue;
+        probesOffered += 1;
+      }
+    }
+
+    // Capability routing (src/capability-routing.js): a lane leaves a task to a lower-tier lane that has proven itself on its source, for a
+    // bounded grace. Shadow mode (default) only logs the decision. Human-queued / premium tasks and tasks that already failed on the
+    // holder (avoidLanes) are never held.
+    if (task && thisLane && routing.cfg.mode !== 'off' && !task.humanQueued && !task.premiumPriority) {
+      let srcName = null;
+      try { srcName = resolveSourceName(task); } catch (_) { srcName = null; }
+      const allLanes = opts.lanes || (() => { try { return require('./lanes.js').getLanes(); } catch (_) { return []; } })();
+      const decision = require('./capability-routing.js').decideReservation({
+        source: srcName, thisLane, lanes: allLanes, rows: routing.rows(), ageMs: (opts.now !== undefined ? opts.now : Date.now()) - mtimeMs, cfg: routing.cfg,
+        isAlive: (id) => (opts.laneAlive ? opts.laneAlive(id) : require('./capability-routing.js').laneAliveFromHeartbeat(routing.instancesDir, id)),
+        avoided: (id) => laneAvoided(task, id, allLanes.length),
+        probing: (l) => capRouting.probeSelected({ task, source: srcName, registered: getRegisteredSource(srcName), lane: l, lanes: allLanes, rows: routing.rows(), cfg: routing.cfg }),
+        isIdle: (id) => (opts.laneIdle ? opts.laneIdle(id) : capRouting.laneIdleFromHeartbeat(routing.instancesDir, id)),
+      });
+      if (decision) {
+        require('./capability-routing.js').auditReservation(pipelineDir, routing.instancesDir, {
+          mode: routing.cfg.mode, action: routing.cfg.mode === 'enforce' ? 'held' : 'would-hold', taskId: task.id || name, source: srcName, lane: thisLane.id,
+          holder: decision.holder, evidence: decision.evidence,
+        });
+        if (routing.cfg.mode === 'enforce') continue;
+      }
+    }
 
     // A scope:'core' source (a pipeline self-audit) audits agent-manager itself; on any other project it is
     // not claimable, even if one is already sitting in pending/ (src/lib/source-scope.js). An explicit
@@ -277,7 +356,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     // A premium task that keeps getting blocked rotates behind fresh premium work, but still ahead of the hub tier and everything else.
     const priority = (rankedPriority === -Infinity && rotationDemoted(task)) ? ROTATION_DEMOTED_PRIORITY : rankedPriority;
     const naturalPriority = hubTier ? rankPriorityOfTask(task, { hubTier: false }) : priority;
-    rankable.push({ name, id: (task && task.id) || name.replace(/\.json$/, ''), hubId: hubIdForTask(task), priority, naturalPriority, hubTier, mtimeMs, hubKey });
+    rankable.push({ name, id: (task && task.id) || name.replace(/\.json$/, ''), hubId: hubIdForTask(task), priority, naturalPriority, hubTier, mtimeMs, hubKey, premium });
   }
 
   pinned.sort((a, b) => a.mtimeMs - b.mtimeMs);
@@ -298,7 +377,10 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     if (!lanes) { try { lanes = require('./lanes.js').getLanes(); } catch (_) { lanes = []; } }
     if (preferredLaneIsIdle({ instanceId, instancesDir, lanes, now })) rankable.shift();
   }
-  return [...pinned.map((r) => r.name), ...rankable.map((r) => r.name)];
+  cache.save();
+  const ordered = [...pinned, ...rankable];
+  // opts.withPremium: rows { name, premium } instead of names, so a caller that wants only the premium tasks (a premium-only borrowed tick) needs no second read of every file.
+  return opts.withPremium ? ordered.map((r) => ({ name: r.name, premium: r.premium })) : ordered.map((r) => r.name);
 }
 
 // Single-winner convenience form. local-worker.sh itself uses pickClaimableTasks()
@@ -448,10 +530,12 @@ if (require.main === module) {
       process.stdout.write('[]');
     }
   } else {
-    const [pendingDir, instanceId] = process.argv.slice(2);
+    // --with-premium prints `name<TAB>1|0` per line (1 = premiumPriority), in the same order; without it the output is the plain names, as always.
+    const withPremium = process.argv.includes('--with-premium');
+    const [pendingDir, instanceId] = process.argv.slice(2).filter((a) => a !== '--with-premium');
     try {
-      const items = pickClaimableTasks(pendingDir, instanceId);
-      for (const name of items) console.log(name);
+      const items = pickClaimableTasks(pendingDir, instanceId, { withPremium });
+      for (const item of items) console.log(withPremium ? `${item.name}\t${item.premium ? 1 : 0}` : item);
     } catch (e) {
       // Best-effort, matching the removed inline script's own catch-and-fall-through --
       // caller already handles an empty listing safely.

@@ -468,3 +468,41 @@ test('restartTargetFor: the host GPU lane restarts with no env (it inherits the 
   assert.equal(target.pidfileName, 'worker-3090.pid');
   assert.equal('env' in target, false);
 });
+
+
+test('findOrphanedModelCallProcesses leaves a dry-run replay (AGENT_MANAGER_DRY_RUN=1 in its environment) alone but still reports a real orphan', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orphans-dryrun-'));
+  const listProcesses = () => [
+    { pid: 901, ppid: 1, cmd: 'node /x/src/local-draft.js /tmp/dry-run-abc/task.json' },
+    { pid: 902, ppid: 1, cmd: 'node /x/src/local-draft.js /queue/drafting/worker-1/t.json' },
+  ];
+  const readEnviron = (pid) => (pid === 901 ? 'A=1\0AGENT_MANAGER_DRY_RUN=1\0B=2' : 'A=1\0B=2');
+  const orphans = findOrphanedModelCallProcesses({ listProcesses, instancesDir: dir, readEnviron });
+  assert.deepEqual(orphans.map((o) => o.pid), [902]);
+  const { isDryRunProcess } = require('./dead-process-check.js');
+  assert.equal(isDryRunProcess(1, () => { throw new Error('no /proc'); }), false, 'unreadable environ = not a dry run (fail toward the old behaviour)');
+});
+
+
+test('restartTargetFor: a review daemon on an opted-in lane restarts as review-runner.sh with that lane\'s Ollama env; an unknown or non-opted reviewer id gets no rule', () => {
+  const { restartTargetFor } = require('./dead-process-check.js');
+  const saved = { u: process.env.AGENT_MANAGER_P40_OLLAMA_URL, m: process.env.AGENT_MANAGER_P40_MODEL, r: process.env.AGENT_MANAGER_P40_REVIEWER, g: process.env.AGENT_MANAGER_LOCAL_GPU, l: process.env.AGENT_MANAGER_LANES_PATH };
+  Object.assign(process.env, { AGENT_MANAGER_P40_OLLAMA_URL: 'http://p40:11434', AGENT_MANAGER_P40_MODEL: 'qwen3.8-p40:27b', AGENT_MANAGER_LOCAL_GPU: '3090', AGENT_MANAGER_LANES_PATH: '/nonexistent/lanes.json' });
+  try {
+    delete process.env.AGENT_MANAGER_P40_REVIEWER;
+    assert.equal(restartTargetFor('reviewer-p40'), null, 'not opted in: no rule');
+    process.env.AGENT_MANAGER_P40_REVIEWER = 'true';
+    const t = restartTargetFor('reviewer-p40');
+    assert.equal(t.script, 'review-runner.sh');
+    assert.deepEqual(t.args, ['reviewer-p40']);
+    assert.equal(t.pidfileName, 'review-runner-p40.pid');
+    assert.equal(t.env.OLLAMA_URL, 'http://p40:11434');
+    assert.equal(t.env.LOCAL_MODEL, 'qwen3.8-p40:27b');
+    assert.equal(restartTargetFor('reviewer-nope'), null);
+    assert.deepEqual(restartTargetFor('reviewer'), { script: 'review-runner.sh', args: ['reviewer'], pidfileName: 'review-runner.pid' }, 'the host reviewer is unchanged');
+  } finally {
+    for (const [k, v] of Object.entries({ AGENT_MANAGER_P40_OLLAMA_URL: saved.u, AGENT_MANAGER_P40_MODEL: saved.m, AGENT_MANAGER_P40_REVIEWER: saved.r, AGENT_MANAGER_LOCAL_GPU: saved.g, AGENT_MANAGER_LANES_PATH: saved.l })) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});

@@ -58,3 +58,18 @@ test('makeSourceThrottle: Infinity (unresolvable) tasks never block; a premium (
   assert.equal(makeSourceThrottle({ inFlightPriorities: [], laneCount: 2 })(999), false);
   assert.equal(makeSourceThrottle({ inFlightPriorities: [10], laneCount: 1 })(undefined), true, 'a null-priority source is treated as worst');
 });
+
+// 2026-10-18 (brain-dump 1905): a live worker-* heartbeat with assignable:false (an external runner
+// that never claims) is not lane capacity.
+test('a live assignable:false worker heartbeat is not counted as a lane; missing/true/null still are', () => {
+  const dir = makeInstances([['worker-3090', process.pid]]);
+  const write = (extra) => fs.writeFileSync(path.join(dir, 'worker-kaggle-p40.json'),
+    JSON.stringify({ instanceId: 'worker-kaggle-p40', pid: process.pid, status: 'working', ...extra }));
+  write({ assignable: false });
+  assert.equal(liveLaneCount(dir), 1);
+  assert.equal(generationThrottled(1, dir), true, 'the runner does not open a second in-flight slot');
+  for (const extra of [{}, { assignable: true }, { assignable: null }]) {
+    write(extra);
+    assert.equal(liveLaneCount(dir), 2, JSON.stringify(extra));
+  }
+});

@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 
 const {
   beginDraftAttempt, recordPlan, recordImplement, recordCritique, recordTier,
-  finalizeDraftAttempt, collapseOldAttempts, summariseToolCalls,
+  finalizeDraftAttempt, collapseOldAttempts, summariseToolCalls, scrubPreview, PREVIEW_CAP, ERROR_TEXT_CAP,
   PLAN_TEXT_CAP, RESPONSE_TEXT_CAP, DIFF_TEXT_CAP, MAX_FULL_ATTEMPTS,
 } = require('./draft-attempt-record.js');
 
@@ -87,7 +87,7 @@ test('recordTier: captures resolution/applied/reason + response + diff (all capp
     toolCallLog: [
       { tool: 'read_file', args: { path: 'a.js' }, result: { content: 'abc' } },
       { tool: 'read_file', args: { path: 'b.js' }, result: { content: 'defgh' } },
-      { tool: 'edit_file', args: { path: 'a.js', find: 'x', replace: 'y' }, result: { error: 'not found' } },
+      { tool: 'edit_file', args: { path: 'a.js', find: 'x', replace: 'brand new text' }, result: { error: 'not found' } },
     ],
   });
   const t = a.tiers[0];
@@ -102,11 +102,13 @@ test('recordTier: captures resolution/applied/reason + response + diff (all capp
   assert.equal(t.toolCalls.total, 3);
   assert.deepEqual(t.toolCalls.byTool, { read_file: 2, edit_file: 1 });
   assert.equal(t.toolCalls.errors, 1);
-  // arg VALUES (paths, edit bodies, shell commands) are never kept -- only the keys.
+  // the arg KEYS stay; a short preview of the path and the find-snippet is kept too, but an edit's replace text never is.
   const edit = t.toolCalls.calls.find((c) => c.tool === 'edit_file');
   assert.deepEqual(edit.argKeys, ['path', 'find', 'replace']);
   assert.equal(edit.error, true);
-  assert.equal(JSON.stringify(t.toolCalls).includes('a.js'), false);
+  assert.equal(edit.preview, 'a.js :: x');
+  assert.equal(edit.errorText, 'not found');
+  assert.equal(JSON.stringify(t.toolCalls).includes('brand new text'), false);
 });
 
 test('recordTier: an empty response / empty diff / empty toolCallLog leaves those keys off entirely', () => {
@@ -251,4 +253,177 @@ test('beginDraftAttempt stamps the lane (AGENT_MANAGER_INSTANCE_ID) so a plan-de
   } finally {
     if (prev === undefined) delete process.env.AGENT_MANAGER_INSTANCE_ID; else process.env.AGENT_MANAGER_INSTANCE_ID = prev;
   }
+});
+
+// HUB0136 3/3: the symbol-not-found-in-cited-file warning must reach the durable attempt record. checkDraft returns it in `symbolWarnings`, NOT in `flags`
+// (it is warning-only and must never block), and it carries identifier / citedFile where other flags carry symbol / file. These tests feed a REAL checkDraft result.
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
+const { checkDraft } = require('./fact-checker.js');
+const { beginDraftAttempt: begin, recordFactCheck, factCheckRecordInput } = require('./draft-attempt-record.js');
+
+function repoWithRealFile() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'attempt-record-'));
+  fs.mkdirSync(path.join(dir, 'src'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'src', 'real-file.js'), '// real');
+  return dir;
+}
+const GHOST_DRAFT = 'The `ghostSymbol` helper lives at src/real-file.js:1';
+const GHOST_SOURCE = 'grounding: src/real-file.js:1';
+
+test('a real checkDraft result: the symbol warning is in symbolWarnings, not flags, and factCheckRecordInput carries both', () => {
+  const fc = checkDraft(GHOST_DRAFT, repoWithRealFile(), GHOST_SOURCE, ['src']);
+  assert.equal(fc.symbolWarnings.length, 1);
+  assert.ok(!fc.flags.some((f) => f.type === 'symbol-not-found-in-cited-file'), 'a warning-only entry must not become a blocking flag');
+  const input = factCheckRecordInput(fc);
+  assert.equal(input.filter((f) => f.type === 'symbol-not-found-in-cited-file').length, 1);
+});
+
+test('recording a real checkDraft result keeps the symbol warning with its symbol, file and a readable detail', () => {
+  const fc = checkDraft(GHOST_DRAFT, repoWithRealFile(), GHOST_SOURCE, ['src']);
+  const attempt = begin({});
+  recordFactCheck(attempt, factCheckRecordInput(fc));
+  const w = attempt.factCheckWarnings.find((x) => x.type === 'symbol-not-found-in-cited-file');
+  assert.ok(w, 'the warning reached the attempt record');
+  assert.equal(w.symbol, 'ghostSymbol');
+  assert.equal(w.file, 'src/real-file.js');
+  assert.match(w.detail, /ghostSymbol.*not found.*src\/real-file\.js/);
+});
+
+test('blocking flags and the warning are both recorded, and the other flag shapes are unchanged', () => {
+  const attempt = begin({});
+  recordFactCheck(attempt, factCheckRecordInput({
+    flags: [{ type: 'ungrounded-url', detail: 'https://x.example/' }, { type: 'x', symbol: 's', file: 'f.js' }],
+    symbolWarnings: [{ type: 'symbol-not-found-in-cited-file', identifier: 'foo', citedFile: 'a.js', severity: 'warning' }],
+  }));
+  assert.deepEqual(attempt.factCheckWarnings.map((w) => w.type), ['ungrounded-url', 'x', 'symbol-not-found-in-cited-file']);
+  assert.deepEqual(attempt.factCheckWarnings[1], { type: 'x', symbol: 's', file: 'f.js' });
+});
+
+test('factCheckRecordInput tolerates missing or odd input', () => {
+  assert.deepEqual(factCheckRecordInput(undefined), []);
+  assert.deepEqual(factCheckRecordInput({ flags: 'no', symbolWarnings: null }), []);
+  assert.deepEqual(factCheckRecordInput({ flags: [{ type: 'a' }] }), [{ type: 'a' }]);
+});
+
+test('the call shape local-draft really uses (checkDraft with NO sourceText) still produces the symbol warning, and nothing is stripped', () => {
+  const fc = checkDraft(GHOST_DRAFT, repoWithRealFile(), undefined, ['src']);
+  assert.equal(fc.symbolWarnings.length, 1, 'draft-context.js passes no sourceText; the warning must not depend on it');
+  assert.equal(fc.symbolWarnings[0].identifier, 'ghostSymbol');
+  assert.deepEqual(fc.strippedFileLineCitations, [], 'with no grounding material nothing may be stripped');
+  assert.ok(!fc.flags.some((f) => f.type === 'symbol-not-found-in-cited-file'));
+});
+
+test('collapseOldAttempts keeps factCheckWarnings and the truncated count on a collapsed attempt', () => {
+  const task = {};
+  for (let i = 0; i < MAX_FULL_ATTEMPTS + 1; i++) {
+    const a = beginDraftAttempt(task);
+    const flags = Array.from({ length: i === 0 ? 40 : 1 }, (_, k) => ({ type: 'ungrounded-url', detail: `u${k}` }));
+    recordFactCheck(a, flags);
+    finalizeDraftAttempt(task, a, { succeeded: true, blocked: true, blockedReason: `r${i}` });
+  }
+  const first = task.draftAttempts[0];
+  assert.equal(first.collapsed, true);
+  assert.equal(first.factCheckWarnings.length, 30, 'the per-attempt cap still applies');
+  assert.equal(first.factCheckWarningsTruncated, 40);
+  assert.equal(task.draftAttempts[1].collapsed, undefined);
+  assert.equal(task.draftAttempts[1].factCheckWarnings.length, 1);
+  assert.equal(task.draftAttempts[1].factCheckWarningsTruncated, undefined);
+});
+
+// n characters of short words (a run of 40 letters would itself be scrubbed as a possible key).
+const words = (n) => `${Array.from({ length: n - 1 }, (_, i) => (i % 3 === 2 ? ' ' : 'a')).join('')}a`;
+const one = (tool, args, result = {}) => summariseToolCalls([{ tool, args, result }]).calls[0];
+
+test('summariseToolCalls previews what each tool was aimed at, from the argument names the tools use', () => {
+  assert.equal(one('read_file', { path: 'src/a.js', offset: 3 }).preview, 'src/a.js');
+  assert.equal(one('write_file', { path: 'src/new.js', content: 'file body text' }).preview, 'src/new.js');
+  assert.equal(one('list_directory', { path: 'src', prefix: 'q' }).preview, 'src');
+  assert.equal(one('run_bash', { command: 'node --test src/a.test.js' }).preview, 'node --test src/a.test.js');
+  assert.equal(one('grep_codebase', { query: 'summariseToolCalls' }).preview, 'summariseToolCalls');
+  assert.equal(one('grep_codebase', { query: 'two words', dir: 'src' }).preview, 'two words in src');
+  assert.equal(one('edit_file', { path: 'src/a.js', find: 'const   x =\n  1', replace: 'const y = 2' }).preview, 'src/a.js :: const x = 1');
+  assert.equal(one('list_directory', { prefix: 'q', path: 'src' }).preview, 'src');
+  assert.equal(one('search_tasks', { query: 'cache' }).preview, 'cache');
+  assert.equal(one('unknown_tool', { content: 'a body', replace: 'a body too', label: 'the label' }).preview, 'the label');
+});
+
+test('a file body or replace text never reaches the summary, whichever tool carries it', () => {
+  const log = [
+    { tool: 'write_file', args: { path: 'p.js', content: 'secret-looking file body' }, result: {} },
+    { tool: 'edit_file', args: { path: 'p.js', find: 'old', replace: 'replacement body' }, result: {} },
+    { tool: 'other', args: { content: 'only a body' }, result: {} },
+  ];
+  const json = JSON.stringify(summariseToolCalls(log));
+  assert.equal(json.includes('file body'), false);
+  assert.equal(json.includes('replacement body'), false);
+  assert.equal(json.includes('only a body'), false);
+  assert.equal('preview' in summariseToolCalls(log).calls[2], false);
+});
+
+test('previews are cut at PREVIEW_CAP with an ellipsis and error text at ERROR_TEXT_CAP, and only errors carry error text', () => {
+  const long = `echo ${'word '.repeat(60)}`;
+  const c = one('run_bash', { command: long });
+  assert.equal(PREVIEW_CAP, 120);
+  assert.equal(ERROR_TEXT_CAP, 160);
+  assert.equal(c.preview.length, 120);
+  assert.equal(one('run_bash', { command: words(120) }).preview, words(120));
+  assert.equal(one('run_bash', { command: words(121) }).preview, `${words(119)}\u2026`);
+  assert.equal(c.preview.endsWith('\u2026'), true);
+  assert.equal(one('run_bash', { command: 'x'.repeat(10) }).preview, 'xxxxxxxxxx');
+  const exact = one('run_bash', { command: `a${' b'.repeat(59)}` });
+  assert.equal(exact.preview.length, PREVIEW_CAP - 1);
+  assert.equal(exact.preview.endsWith('\u2026'), false);
+  const e = one('read_file', { path: 'a.js' }, { error: `could not read: ${'why '.repeat(80)}` });
+  assert.equal(e.errorText.length, 160);
+  assert.equal(one('read_file', { path: 'a.js' }, { error: words(160) }).errorText, words(160));
+  assert.equal(e.errorText.endsWith('\u2026'), true);
+  assert.equal('errorText' in one('read_file', { path: 'a.js' }, { content: 'fine' }), false);
+  assert.equal('error' in one('read_file', { path: 'a.js' }, { content: 'fine' }), false);
+  assert.equal(one('read_file', { path: 'a.js' }, { error: { code: 1 } }).error, true);
+  assert.equal('errorText' in one('read_file', { path: 'a.js' }, { error: { code: 1 } }), false);
+});
+
+test('scrubPreview redacts credentials, case-insensitively, and leaves ordinary text alone', () => {
+  assert.equal(scrubPreview('curl -H "Authorization: Bearer abc.def" https://x'), 'curl -H "Authorization: [redacted]" https://x');
+  assert.equal(scrubPreview('authorization=Basic dXNlcjpwYXNz'), 'authorization=[redacted]');
+  assert.equal(scrubPreview('send Bearer zzz123 now'), 'send Bearer [redacted] now');
+  assert.equal(scrubPreview('run --token abc123 --password=hunter2'), 'run --token [redacted] --password=[redacted]');
+  assert.equal(scrubPreview('TOKEN=abc password: p4ss&other=1 api_key=k1 API-KEY=k2 secret=s passwd=q'), 'TOKEN=[redacted] password: [redacted]&other=1 api_key=[redacted] API-KEY=[redacted] secret=[redacted] passwd=[redacted]');
+  assert.equal(scrubPreview('key sk-abcdefghijklmnop12 end'), 'key [redacted] end');
+  assert.equal(scrubPreview('key sk-short end'), 'key sk-short end');
+  assert.equal(scrubPreview(`hash ${'a1'.repeat(20)} end`), 'hash [redacted] end');
+  assert.equal(scrubPreview(`hash ${'a1'.repeat(19)}a end`), `hash ${'a1'.repeat(19)}a end`);
+  assert.equal(scrubPreview('node --test src/draft-attempt-record.test.js'), 'node --test src/draft-attempt-record.test.js');
+  assert.equal(scrubPreview(undefined), '');
+});
+
+test('scrubbing happens before the cut, so a credential straddling the cut point does not survive as a fragment', () => {
+  const secret = 'x'.repeat(50);
+  const text = `${'a '.repeat(55)}password=${secret}`;
+  const c = one('run_bash', { command: text });
+  assert.equal(c.preview.includes('xxxxx'), false);
+  assert.equal(c.preview.length <= PREVIEW_CAP, true);
+  const e = one('run_bash', { command: 'ls' }, { error: `${'e '.repeat(75)}token=${secret}` });
+  assert.equal(e.errorText.includes('xxxxx'), false);
+});
+
+test('a call with missing or non-text arguments still summarises without throwing and keeps the old fields', () => {
+  const s = summariseToolCalls([
+    { tool: 'run_bash', args: undefined, result: {} },
+    { tool: 'read_file', args: { path: 42 }, result: { content: 'z' } },
+    { tool: 'edit_file', args: { path: 'a.js' }, result: {} },
+    { tool: 'grep_codebase', args: { dir: 'src' }, result: {} },
+    { tool: 'read_file', args: { path: '   ' }, result: {} },
+  ]);
+  assert.equal(s.total, 5);
+  assert.equal('preview' in s.calls[0], false);
+  assert.equal('preview' in s.calls[1], false);
+  assert.equal(s.calls[2].preview, 'a.js');
+  assert.equal('preview' in s.calls[3], false);
+  assert.equal('preview' in s.calls[4], false);
+  assert.deepEqual(s.calls[0].argKeys, []);
+  assert.deepEqual(s.calls[1].argKeys, ['path']);
+  assert.equal(typeof s.calls[1].bytes, 'number');
 });

@@ -798,6 +798,35 @@ Extract a single helper, e.g. `_run_build_and_persist(cfg, *, use_model_naming, 
 Benefits:
 A single code path owns the build-and-persist contract, so schema changes, atomicity improvements, or new output artefacts are made once. The two call sites become thin wrappers that only differ in their `use_model_naming` source and post-persist side-effects, making the diff surface for future changes smaller and eliminating the class of "I fixed it in `check_due` but forgot `main`" regressions.
 
+### AC-83 · AC-69a – Repoint the two `collectAnchorHits` imports from candidate-fulfillment to file-grounding
+Strength: Strong
+Split-Depth: 1
+Files: src/sdk/candidate-fulfillment.test.js, src/task-sources.test.js
+
+Problem:
+candidate-fulfillment.js re-exports five low-level helpers (findFuzzyMatch, windowAroundIndex, collectAnchorHits, snippetFromSection, quotedSymbolsFromSection) for tests ("exported for the plugin's own grounding tests"). They are not in docs/PLUGIN_API.md. Checked against master: exactly two files consume any of them through candidate-fulfillment, and both use only `collectAnchorHits` -- src/sdk/candidate-fulfillment.test.js (line 13: `const { windowFetchedFileContent, collectAnchorHits } = require('./candidate-fulfillment.js')`) and src/task-sources.test.js (about line 2828: `const { collectAnchorHits } = require('./sdk/candidate-fulfillment.js')`). No file under src/ outside src/sdk/lib uses findFuzzyMatch, windowAroundIndex, snippetFromSection or quotedSymbolsFromSection via the re-export. collectAnchorHits is defined in src/sdk/lib/file-grounding.js.
+
+Solution:
+In src/sdk/candidate-fulfillment.test.js change line 13 to take only `windowFetchedFileContent` from './candidate-fulfillment.js' and add `collectAnchorHits` to the existing `require('./lib/file-grounding.js')` destructuring (which already takes `selectAnchorHits`). In src/task-sources.test.js change the `require('./sdk/candidate-fulfillment.js')` for `collectAnchorHits` to `require('./sdk/lib/file-grounding.js')`. Change no assertion, fixture or test logic. Run `node --test src/sdk/candidate-fulfillment.test.js src/task-sources.test.js`.
+
+Benefits:
+Neither test depends on the convenience re-export any more, which unblocks the next candidate (removing the re-exported helpers) without breaking the suite.
+
+### AC-84 · AC-69b – Remove the five test-only helpers from candidate-fulfillment.js export surface
+Strength: Strong
+Split-Depth: 1
+Files: src/sdk/candidate-fulfillment.js
+Depends-On: AC-83
+
+Problem:
+candidate-fulfillment.js's module.exports re-exports findFuzzyMatch, windowAroundIndex, collectAnchorHits, snippetFromSection and quotedSymbolsFromSection under the comment '// lower-level helpers, exported for the plugin's own grounding tests'. They are not part of the documented API (docs/PLUGIN_API.md). AC-69a repoints the only two in-repo consumers (both of collectAnchorHits). Not every import behind those exports is removable, though: on master `snippetFromSection` is also CALLED inside the file (the citation gate, `const snippet = snippetFromSection(section)` about line 218), so its import must stay; `collectAnchorHits`, `quotedSymbolsFromSection`, `findFuzzyMatch` and `windowAroundIndex` are not called anywhere in the file apart from the export list (findFuzzyMatch appears once more in a comment).
+
+Solution:
+(1) In module.exports delete the five names and the preceding comment line. Keep ...candidateDocs, nextCandidateFulfillmentTask, validateCitationBeforeFiling, snippetMissingFrom, windowFetchedFileContent, MAX_FETCHED_FILE_CHARS and MAX_ARCH_REVIEW_TASK_CHARS. (2) Fix the imports: `const { readIfExists, snippetFromSection } = require('./lib/candidate-doc-parsing.js')` (drop only quotedSymbolsFromSection; KEEP snippetFromSection); delete the `require('./lib/fuzzy-matching.js')` line; `const { windowFetchedFileContent, relocateStaleAnchor, snippetMissingFrom } = require('./lib/file-grounding.js')` (drop only collectAnchorHits). (3) Before deleting, `git grep -n` each of the five names across src/ and the plugin repos' register code to confirm no consumer remains; run `node --test src/sdk/candidate-fulfillment.test.js src/task-sources.test.js` and any test that requires candidate-fulfillment.js. Touch no other line.
+
+Benefits:
+The SDK's export surface matches its documented API and candidate-fulfillment.js no longer loads fuzzy-matching.js at all, without breaking the citation gate that still needs snippetFromSection.
+
 ### AC-85 · Remove dead `require('../task-sources.js')` from prompt-assembly.js
 Strength: Strong
 Split-Depth: 1
@@ -825,3 +854,2210 @@ Delete the single line `require('../task-sources.js');` (and the one blank line 
 
 Benefits:
 Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies (none beyond built-ins) explicit. Zero behavioural change: all five block functions are pure functions of their `task` argument and never touch any `task-sources.js` symbol.
+
+### AC-87 · Two unrelated registries co-reside in one module with side-effect registration
+Strength: Strong
+Files: src/deterministic-recheck-registry.js, src/staleness-fastpath.js
+
+Problem:
+`src/deterministic-recheck-registry.js` is named and header-commented as a deterministic staleness-recheck rules registry, yet it also houses a pre-dispatch gate registry that serves a different pipeline stage. The two registries differ in key type (rule-ID string vs. source-name string), value shape (single detector function vs. a config object with nested per-file/repo-wide rule maps), and population strategy (module-load side-effect registration vs. external plugin calls). The sharpest consequence is that requiring the module for the recheck registry—as `staleness-fastpath.js` does—silently registers four pre-dispatch gates as a side effect. A test that calls `clearDeterministicRecheckRegistry()` to obtain a clean slate for recheck rules gets no equivalent clearing for the gate registry, so the auto-registered gates persist invisibly across test runs. A developer adding a new pre-dispatch gate must edit a file whose name and primary purpose describe a different concern, and a developer searching for gate registration has to know it lives inside the "recheck-registry" file.
+
+Solution:
+Extract the pre-dispatch gate registry—including its two built-in detectors and their registration calls—into its own module (e.g. `pre-dispatch-gate-registry.js`). The recheck registry file becomes a pure passive registry with no side effects on require. Each registry gets its own test file that can clear and inspect its own state without the other's interference, and `staleness-fastpath.js` imports from the two modules independently.
+
+Benefits:
+Requiring the recheck registry no longer has hidden side effects, eliminating a class of test-pollution bugs. Each registry is discoverable by its own name, so a developer searching for "where are gates registered?" finds the answer in a file whose name matches the concern. Test isolation becomes straightforward: clearing one registry cannot accidentally leave the other in a stale state. Future contributors can extend either registry without reading or understanding the other's key semantics, value shapes, or population strategy.
+
+### AC-88 · Recheck registry accepts non-function detectors, deferring a context-poor TypeError to call time
+Strength: Strong
+Files: src/deterministic-recheck-registry.js, src/staleness-fastpath.js
+
+Problem:
+`registerPreDispatchGate` in the same file checks `typeof detector !== 'function'` and throws a clear `TypeError` at registration, naming the offending value. `registerDeterministicRecheck` performs no equivalent check on the values inside `perFileRules` or `repoWideRules`. A misconfiguration such as `{ perFileRules: { 'silent-catch-block': 'some-string' } }`—a typo, a wrong import, a config-deserialization bug—registers successfully. The failure surfaces later, inside `staleness-fastpath.js`'s `deterministicRecheck()`, where `detector(text, originalFile)` throws `TypeError: detector is not a function`—an error message that names neither the rule key, the source, nor the registration site, and that occurs deep in a file-read-plus-call sequence that is harder to debug than a registration-time throw.
+
+Solution:
+In `registerDeterministicRecheck`, iterate the keys of `perFileRules` and `repoWideRules` and assert each value is a function, throwing a `TypeError` that names the source, the rule key, and the expected type—mirroring the gate registry's existing validation pattern already present in the same file.
+
+Benefits:
+A misconfiguration is caught immediately at registration with a self-describing error that identifies the source, the rule key, and the expected type, rather than surfacing minutes later as an opaque "not a function" throw buried in a call stack. This converts a deferred, context-poor runtime error into an immediate, actionable registration error, reducing debugging time and preventing a single bad rule from silently corrupting every subsequent recheck pass.
+
+### AC-89 · Duplicated build-merge-persist pipeline in graph_build.py
+Strength: Strong
+Files: python/graph_build.py
+
+Problem:
+Both `check_due()` and the default (non-`--target-dir`) branch of `main()` in `graph_build.py` execute the same five-step pipeline: read the old graph, coverage, and file_cache from disk; call `build_graph_data`; call `merge_coverage` to fold in prior review state; write the three JSON artefacts (graph, coverage, file_cache) with `mkdir(parents=True, exist_ok=True)` guards; and compute/report the carried-forward community count. The only differences between the two call sites are the `progress` sink (a callable in `check_due`, `print` in `main`), the source of `use_model_naming` (hard-coded `True` vs. `not args.no_model_naming`), and whether the schedule file is written afterwards. Because this sequence is copy-pasted rather than shared, any change to the persistence contract—adding atomic writes, changing the JSON schema, emitting an additional output file, or fixing a path-handling bug—must be made in two places with a real risk of divergence.
+
+Solution:
+Extract a single helper, e.g. `_run_build_and_persist(cfg, *, use_model_naming, progress=None)`, that encapsulates the read-old-state → `build_graph_data` → `merge_coverage` → write-three-JSON-files → return `(result, merged_coverage, file_cache, carried_count)` sequence. Both `check_due` and the default branch of `main` call this helper, passing their respective `use_model_naming` value and `progress` sink. The schedule-file write in `check_due` and the human-readable summary lines in `main` remain at their call sites, since they are presentation/scheduling concerns rather than persistence logic.
+
+Benefits:
+A single code path owns the build-and-persist contract, so schema changes, atomicity improvements, or new output artefacts are made once. The two call sites become thin wrappers that only differ in their `use_model_naming` source and post-persist side-effects, making the diff surface for future changes smaller and eliminating the class of "I fixed it in `check_due` but forgot `main`" regressions.
+
+### AC-90 · Extract shared source-file detection regex into a single module
+Strength: Strong
+Files: src/review-inert.js, src/review-skip-paths.js
+
+Problem:
+Both `src/review-inert.js` and `src/review-skip-paths.js` independently define a local `SOURCE_RE` regular expression (currently `/\.js|\.mjs|\.cjs|\.py$/`) to decide which files count as source code. Because the pattern is copy-pasted rather than imported from a shared location, any future change—adding TypeScript (`.ts`/`.tsx`), supporting `.rb` or `.go`, or tightening the anchor—must be made in two places. A developer who updates one file and overlooks the other will cause the two review detectors to silently classify different sets of files as "source," producing inconsistent review output that is difficult to diagnose because neither file logs a mismatch.
+
+Solution:
+Create a small shared module (e.g. `src/source-file-pattern.js`) that exports the canonical `SOURCE_RE` (and, if useful, a `isSourceFile(path)` helper). Replace the local regex definitions in `src/review-inert.js` and `src/review-skip-paths.js` with an import from that module. Add a unit test that asserts both consumers resolve to the same pattern, so any accidental re-introduction of a local copy is caught at CI time.
+
+Benefits:
+A single source of truth for "what counts as source code" eliminates the class of silent-divergence bugs entirely. Adding a new language or adjusting extension rules becomes a one-line change in one file. The shared test gives immediate feedback if a future refactor accidentally re-introduces a second copy, and the codebase becomes easier to audit because the definition lives in one discoverable location rather than being scattered across detectors.
+
+### AC-91 · Inconsistent slice boundary semantics between drift-scan and drift-fix
+Strength: Worth exploring
+Files: src/drift-scan.js, src/drift-fix.js
+
+Problem:
+Both `drift-scan.js` and `drift-fix.js` independently locate the static block using the same `staticStartMarker` and `staticEndMarker`, but they apply different slicing conventions. `drift-scan.js` uses `sliceBetween`, which includes the end marker in the extracted slice (`text.slice(startIdx, endIdx + endMarker.length)`), while `drift-fix.js` uses inline logic that excludes it (`text.slice(startIdx, endIdx)`). Today this is benign because the end marker is a Markdown heading that is not a data row, but the two modules disagree on what "the block" means. If a future pair definition uses an end marker that is itself part of the data (a closing delimiter, a sentinel row, etc.), the scanner would count that value as present in the static file while the fixer would not see the corresponding row to delete, producing a silent mismatch between scan and fix.
+
+Solution:
+Extract a single `locateBlock(text, startMarker, endMarker)` helper in `drift-scan.js` that returns the slice under one documented boundary convention (e.g., always inclusive of the end marker) and export it. `drift-fix.js` imports and calls this helper instead of re-implementing its own `indexOf`/`slice` pair. A unit test in the existing `node:test` suite asserts that both modules, given the same input text and markers, produce an identical set of rows, locking in the shared convention.
+
+Benefits:
+The two modules can no longer drift apart on what constitutes the block boundary, eliminating an entire class of latent scan/fix mismatches. Adding a new pair definition with a data-bearing end marker becomes safe without requiring the author to remember which module's slicing convention to match. The shared helper also gives a single place to document the boundary contract, reducing cognitive load for future contributors.
+
+### AC-92 · Test mutation of shared module state in drift-fix tests
+Strength: Worth exploring
+Files: src/drift-fix.test.js, src/drift-scan.js, src/drift-fix.js
+
+Problem:
+The tests in `drift-fix.test.js` inject fake pair definitions by directly mutating the `driftScan.PAIRS` array (setting `.length = 0` then `.push(...)`). This works only because `drift-fix.js` reads `PAIRS` at call time and the array is a plain mutable export. The tests are therefore coupled to an implementation detail of `drift-scan.js`—that `PAIRS` is a live, writable array—rather than to the interface `drift-fix.js` actually consumes. Any refactor of `drift-scan.js` (freezing the array, switching to a getter, moving pair definitions into a closure) would silently break the tests with no change to `drift-fix.js`'s public API, and the tests would fail for reasons unrelated to the code under test.
+
+Solution:
+Refactor `buildFixEvidence` in `drift-fix.js` to accept the pair definition as an explicit parameter (e.g., `buildFixEvidence(repoRoot, flag, pair)`), or introduce a lightweight dependency-injection seam (a `setPairsForTest` function or a constructor option). The tests in `drift-fix.test.js` then pass the fake pair directly to the function under test and no longer touch `driftScan.PAIRS`. The existing `node:test` test structure is preserved; only the setup/teardown lines that mutate the shared array are replaced with a local variable passed into the call.
+
+Benefits:
+`drift-fix.test.js` becomes independent of `drift-scan.js`'s internal state, so refactors to `drift-scan.js` (freezing, getters, restructured exports) no longer risk breaking unrelated tests. The dependency between the two modules is made explicit in the function signature rather than hidden in a shared mutable export, improving readability and making it straightforward to add or remove pairs in tests without global side effects.
+
+NOTE: Flag 2 was not applied because the draft's description that "only the setup/teardown lines... are replaced with a local variable passed into the call" is an accurate summary of the necessary changes; updating the call sites to pass the new parameter is the direct consequence of the proposed refactoring, not a contradiction of the preserved test structure.
+
+### AC-93 · Extract shared "valid enabled entry" predicate
+Strength: Worth exploring
+Files: src/plugins-manifest.js, src/resolve-plugin-root.js
+
+Problem:
+The predicate that defines a loadable, enabled plugin manifest entry — a truthy object with a non-blank string `registerPath` and `enabled !== false` — is written independently in two files. In `plugins-manifest.js`, `enabledRegisterPaths` filters with `p && typeof p.registerPath === 'string' && p.registerPath.trim() && p.enabled !== false`. In `resolve-plugin-root.js`, `resolvePluginRoot` re-states the same four conditions inline when looking up a plugin by name. The shared kernel is the contract for what a valid manifest entry looks like, yet it lives in two places. If the entry schema evolves — a new required field, a tri-state `enabled`, a path-normalisation rule — both sites must be updated in lockstep, and a missed update in one file produces a silent divergence in which one code path accepts an entry the other rejects.
+
+Solution:
+Extract the four-condition check into a small named predicate (e.g. `isValidEnabledEntry(p)`) exported from `plugins-manifest.js`. `resolvePluginRoot` then composes it with its existing `p.name === pluginName` check instead of re-listing the conditions. The predicate becomes the single source of truth for the entry contract; any future schema change is a one-file edit.
+
+Benefits:
+"Change the entry contract" goes from "edit two files and hope they stay in sync" to "edit one file." The intent of the check is named at the call site, making the manifest-entry contract visible to readers of `resolve-plugin-root.js` without them having to mentally diff two inline boolean expressions. The existing tests already cover the back-compat fallback path, so the refactor is low-risk and immediately verified.
+
+### AC-94 · Extract pre-dispatch gate registry into its own module
+Strength: Strong
+Split-Depth: 1
+Files: src/pre-dispatch-gate-registry.js
+
+Problem:
+The gate registry (Map-based, rule-keyed: registerPreDispatchGate, getPreDispatchGate, clearPreDispatchGateRegistry) and its two built-in detectors (gateSequentialAwaitInLoop, gateSyncIoInLoop) plus the SYNC_IO_BOUND_THRESHOLD constant are currently bundled inside src/deterministic-recheck-registry.js alongside the unrelated source-keyed recheck registry. They have different keying schemes (rule-ID strings vs. source-name strings), different lifecycles (gates are consulted before dispatch; rechecks are consulted after a staleness flag), and the gate registry's module-load side effect (registering two default detectors) is what forced a try/catch workaround in the test file. Keeping them in one module means any consumer that only needs the recheck API is also pulled into the gate registry's side-effect surface.
+
+Solution:
+Create src/pre-dispatch-gate-registry.js containing: the preDispatchGateRegistry Map, registerPreDispatchGate, getPreDispatchGate, clearPreDispatchGateRegistry, gateSequentialAwaitInLoop, gateSyncIoInLoop, SYNC_IO_BOUND_THRESHOLD, and the two registerPreDispatchGate calls that wire up the default detectors. IMPORTANT -- gateSyncIoInLoop is not self-contained. On master the contiguous block of module-private definitions it relies on, immediately above and including it (src/deterministic-recheck-registry.js, from the `const SYNC_IO_BOUND_THRESHOLD = 10;` declaration through the end of gateSyncIoInLoop, about lines 152-224), must move with it: SYNC_IO_BOUND_THRESHOLD, SYNC_IO_LOOP_PATTERN, SYNC_IO_BOUND_PATTERN, SYNC_IO_ARRAY_BOUND_PATTERN, SYNC_IO_ARRAY_ELEMENT_RE, SYNC_IO_STARTUP_NAME, SYNC_IO_STARTUP_SCOPE_PATTERN, SYNC_IO_HOT_PATH_PATTERN, SYNC_IO_QUOTED_RE and the helper function syncIoBoundedBound. Moving only the registry, the two detectors and SYNC_IO_BOUND_THRESHOLD leaves gateSyncIoInLoop calling undefined names. Verify by running `node --test src/sync-io-in-loop-gate.test.js` (and any test that requires deterministic-recheck-registry.js) after the move. The module must have no external require calls (hot-path constraint). Export all of the above via module.exports.
+
+Benefits:
+The gate registry becomes an independently importable unit with its own lifecycle. Consumers that only need recheck functions no longer transitively load gate-registry code or its side effects. The module-load detector registration is now explicit to the gate module rather than a hidden side effect of importing the recheck registry.
+
+### AC-95 · Trim deterministic-recheck-registry.js to recheck-only and add re-export shim
+Strength: Strong
+Split-Depth: 1
+Files: src/deterministic-recheck-registry.js
+Depends-On: AC-94
+
+Problem:
+After the gate registry is extracted (candidate 0), src/deterministic-recheck-registry.js still contains the gate-registry implementation, both detector functions, the SYNC_IO_BOUND_THRESHOLD constant, and the two registerPreDispatchGate calls. Any consumer that imports the recheck API is still loading gate-registry code. Additionally, if any existing consumer (other than the test file) imports gate functions from this path, removing them outright would break that consumer.
+
+Solution:
+Remove from src/deterministic-recheck-registry.js: the preDispatchGateRegistry Map, registerPreDispatchGate, getPreDispatchGate, clearPreDispatchGateRegistry, gateSequentialAwaitInLoop, gateSyncIoInLoop, SYNC_IO_BOUND_THRESHOLD, and the two registerPreDispatchGate calls. Keep only the object-based recheck registry (registry, registerDeterministicRecheck, getDeterministicRecheck, getRecheckSources, clearDeterministicRecheckRegistry). Add a re-export shim: const { registerPreDispatchGate, getPreDispatchGate, clearPreDispatchGateRegistry, gateSequentialAwaitInLoop, gateSyncIoInLoop, SYNC_IO_BOUND_THRESHOLD } = require('./pre-dispatch-gate-registry.js'); and include those names in module.exports so existing importers of gate functions from this path continue to work. The re-export is an internal require of a sibling module and does not violate the no-external-require constraint (which prohibits requires of plugin/maintenance code on the hot path).
+
+Benefits:
+The recheck module is now minimal and side-effect-free at load time (no detector registration). The documented plugin API (registerDeterministicRecheck, getDeterministicRecheck, getRecheckSources, clearDeterministicRecheckRegistry) is unchanged. Backward compatibility for any gate-function importer is preserved via the shim.
+
+### AC-96 · Remove try/catch workaround in pipeline-forensics.test.js
+Strength: Strong
+Split-Depth: 1
+Files: src/pipeline-forensics.test.js
+Depends-On: AC-95
+
+Problem:
+In the freshTaskSources() helper, the call to clearDeterministicRecheckRegistry() is wrapped in try { ... } catch { /* optional */ }. This workaround existed because the gate registry's module-load side effects (registering default detectors) were in the same module, and a failure in that side-effect path could cause clearDeterministicRecheckRegistry to throw or the module to be in a partially-initialised state. Now that the gate registry lives in src/pre-dispatch-gate-registry.js (candidate 0) and the recheck module is side-effect-free (candidate 1), the try/catch masks a real error for no reason and hides any genuine failure of the recheck registry's clear function.
+
+Solution:
+In the freshTaskSources() function, replace the line  try { clearDeterministicRecheckRegistry(); } catch { /* optional */ }  with the direct call  clearDeterministicRecheckRegistry();  . The existing import  const { clearDeterministicRecheckRegistry } = require('./deterministic-recheck-registry.js');  remains unchanged because that function is still exported from the same path. No new import from pre-dispatch-gate-registry.js is needed in this test file (it does not import any gate functions).
+
+Benefits:
+The test no longer silently swallows a real error from clearDeterministicRecheckRegistry. If the recheck registry's clear function ever throws (e.g. a future refactoring bug), the test will fail loudly instead of passing with a partially-cleared registry. The test code is simpler and the workaround's original rationale no longer applies.
+
+### AC-97 · DOM-integration functions depend on invisible globals, making them untestable in isolation
+Strength: Worth exploring
+Files: python/dashboard/static/js/branches-joblist-hardware-tabs.js
+
+Problem:
+`renderBranchListInto` and `wireBranchVerdictFilterBar` reference four identifiers—`branchCardHtml`, `wireBranchCard`, `currentBranches`, `currentHeldHubs`—that are neither imported, declared, nor passed as parameters. They are expected to exist as globals provided by `branches-joblist-hardware-tabs.js` at call time. The comment in the code acknowledges this is deliberate (keeping the hot file lean), and the `module.exports` line correctly omits the two DOM functions, confirming they are browser-only. The concrete friction: the test file can only exercise the pure helpers. The two functions that actually wire the UI together are structurally untestable in isolation because their contract depends on four names that live in another file's global scope. A rename or removal in the hot file produces a `ReferenceError` at runtime with no import-graph signal, no lint warning, and no test failure. The dependency is real but invisible to any tooling that follows the module boundary.
+
+Solution:
+Add the four dependencies as explicit parameters (or a single context object) to the signatures of `renderBranchListInto` and `wireBranchVerdictFilterBar`. In production, `branches-joblist-hardware-tabs.js` passes its own values at the call site, exactly as it would have read them from the global scope before. In the test file, the test author calls the same two functions directly, supplying stub or mock values for each of the four parameters—no global setup, no dependency on the hot file being loaded. Because the parameters are part of the function's public signature, the test file is the entity that controls what those four names resolve to, and it can do so independently of any other module.
+
+Benefits:
+The test suite can cover the DOM-integration path, catching regressions in the wiring logic. A rename or removal of any of the four globals in the hot file becomes a test-time error (the test's mock no longer matches the expected shape, or the hot file's call site fails to compile/lint) rather than a silent runtime `ReferenceError`. The module's public surface (the exported pure functions) and its actual runtime dependencies (the four globals) align, removing the one place where they currently diverge.
+
+### AC-98 · Hard-coded concept IDs in the generic card renderer
+Strength: Strong
+Files: python/dashboard/static/js/concepts-and-adhoc-tab.js
+
+Problem:
+The `renderConceptCard` function embeds two hard-coded string literals (`'concept-ghost-in-the-machine-0dbeea'` and `'concept-adhoc-task-lifecycle-64935e'`) to conditionally inject specialized UI panels (ghost telemetry and a static lifecycle flowchart) into specific concept cards. This tightly couples the generic rendering path to particular database records and violates locality: any new concept that requires a specialized panel forces a modification to this core function, and if the underlying concept is renamed or its ID changes in the database, the UI panel silently disappears with no error or warning. The rendering logic is no longer data-driven; it is a lookup table of specific IDs hidden inside a function that is supposed to be generic.
+
+Solution:
+Extract the hard-coded IDs and their associated HTML-generation code into a separate configuration object (or a dedicated "specialized panels" module) that maps concept IDs to a panel-rendering function. `renderConceptCard` then simply looks up the concept ID in that configuration and, if a match exists, invokes the corresponding panel renderer and appends the result. Adding a new specialized view becomes a matter of adding one entry to the configuration (or one new module file) without touching the core rendering logic at all.
+
+Benefits:
+The generic card renderer becomes truly generic and testable in isolation. New specialized panels can be added or removed without modifying shared code, eliminating the risk of a silent UI regression when a concept ID changes. The configuration object serves as a single, auditable registry of which concepts receive custom treatment, making the coupling explicit and discoverable rather than buried in conditional branches.
+
+### AC-99 · Implicit global-function dependencies break isolated testing
+Strength: Strong
+Files: python/dashboard/static/js/concepts-and-adhoc-tab.js, python/dashboard/static/js/concepts-and-adhoc-tab.test.js
+
+Problem:
+`renderConceptCard` calls `escapeHtml`, `escapeAttr`, and `renderReportMarkdown`, which are defined in other files (`core-ui.js`, `analytics-and-discovery.js`) and injected into the browser's global scope. Because these utilities are neither imported nor exported through the module system, the test file must manually stub them onto the `global` object before requiring the module under test. This creates a fragile dependency chain: the test relies on the exact names and signatures of functions defined in unrelated files, the module cannot be exercised in isolation, and any rename or signature change in the source file silently breaks the test with no compile-time or import-time signal.
+
+Solution:
+Refactor `concepts-and-adhoc-tab.js` to accept the required utilities (`escapeHtml`, `escapeAttr`, `renderReportMarkdown`) via dependency injection (e.g., a factory function or an initialization method that accepts a context object containing these functions). In the browser, the global instances are passed in during initialization. In the test file, the module can be initialized with mock functions directly, removing the need to pollute the global object. This preserves the browser's global scope architecture while making the module's dependencies explicit and testable in isolation.
+
+Benefits:
+The module's dependencies are explicit and self-documenting; a reader sees exactly which external functions it relies on. Tests become deterministic and isolated—mocking injected functions is straightforward, and no global-state cleanup is needed. Renaming or removing a utility in the source file will surface as a clear error during initialization or test setup rather than a silent `undefined is not a function` at runtime, catching integration drift at test time rather than in the browser.
+
+NOTE: The flag regarding AC-002 was applied; the solution was corrected to use dependency injection instead of CommonJS `require` to respect the browser global scope constraint.
+
+### AC-100 · Merge conflates "ours never had this slot" with "ours deleted this slot"
+Strength: Strong
+Files: src/candidates-doc-merge.js
+
+Problem:
+In the theirs-walk branch of `mergeCandidatesDoc`, the guard `!ours.blocks.has(id)` is intended to mean "ours never touched this slot, so apply theirs' version." However, that same condition is true when ours *deleted* a block that the ancestor contained. In that case the code unconditionally sets `finalBlocks.set(id, theirsBlock)`, resurrecting a block that ours intentionally removed. The dedicated DELETIONS pass at the bottom of the function only fires when `theirs.blocks.has(id)` is false (i.e., theirs deleted it), which is the opposite scenario. The result is that the merge is not a true three-way merge for the "ours deleted + theirs edited/added the same slot" case: it silently violates the function's own stated intent of honoring ours' deletions and never silently dropping content someone changed. The defect is currently latent because the test suite has no case where ours deletes a slot that theirs also modifies, and the live nine-branch collision scenario is a same-slot edit, not a delete-vs-edit.
+
+Solution:
+Distinguish "ours never had this slot" from "ours deleted this slot" by consulting the ancestor map. In the theirs-walk branch, split the `!ours.blocks.has(id)` path into two sub-cases:
+
+1. **Clean-apply (theirs added a genuinely new slot):** `!ours.blocks.has(id) && !ancestor.blocks.has(id)`. Neither ours nor the ancestor had this id, so theirs introduced it. Apply theirs' block as before.
+
+2. **Delete-vs-edit conflict:** `!ours.blocks.has(id) && ancestor.blocks.has(id)`. The ancestor had the slot, ours removed it, and theirs still has it (either edited or retained). This is a true three-way conflict: both sides changed the slot in incompatible ways (ours deleted, theirs kept/edited). The correct resolution, consistent with the function's contract of degrading to git's conflict-marker behavior on ambiguity, is to **emit a conflict marker** for this id in the output. Specifically:
+   - Do **not** silently insert theirs' block (that resurrects a deletion).
+   - Do **not** silently skip the slot (that discards theirs' edit, violating the "never silently drop content someone changed" invariant).
+   - Instead, write a `<<<<<<< ours` / `=======` / `>>>>>>> theirs` block (or the equivalent structural conflict marker the function already uses for same-slot edit conflicts) that shows ours' side as empty (deleted) and theirs' side as their current content, so a human can decide.
+   - Log a warning to stderr naming the conflicting id.
+
+3. **Both-deleted (no conflict):** `!ours.blocks.has(id) && ancestor.blocks.has(id) && !theirs.blocks.has(id)`. Both sides removed the slot. Leave it out of `finalBlocks` with no marker. (This case is already handled by the existing DELETIONS pass, but make the interaction explicit.)
+
+Add two test cases:
+- **Delete-vs-edit:** Ancestor contains `### AC-3` with content X. Ours removes `### AC-3` entirely. Theirs edits `### AC-3` to content Y. Assert the merged output contains a conflict marker for AC-3 (not a clean application of Y, not a silent absence).
+- **Both-deleted:** Ancestor contains `### AC-3`. Both ours and theirs remove it. Assert AC-3 is absent from the output and no conflict marker is emitted.
+
+Benefits:
+The merge becomes a correct three-way reconciliation for the delete-vs-edit case. The function's stated invariant ("a block ours edited is kept; never silently drop content someone changed") is now symmetric: deletions are honored *without* silently discarding the other side's edits. The conflict-marker path is the same degradation mechanism the function already uses for same-slot edit conflicts, so the behavior is consistent and predictable. Future contributors can rely on the merge to surface delete-vs-edit conflicts for human resolution rather than silently choosing one side.
+
+---
+
+*AC-002 removed.*
+
+NOTE: AC-002 was removed because the critique correctly identifies that (a) the draft's description of the failure mode is factually wrong — the actual behavior is last-wins in the Map with the `order` array carrying the duplicate, not "the merge sees the slot as untouched" — and (b) the prescribed fix (throw on duplicate id) would be a behavioral regression for the live nine-branch collision scenario where the structural merge must reconcile independently-written same-id content rather than refuse to resolve.
+
+### AC-101 · Inconsistent error-handling contract in `readEntries`
+Strength: Strong
+Files: (no verified file paths in plan)
+
+Problem:
+`readEntries` treats file I/O failures asymmetrically: it silently swallows `ENOENT` by returning an empty array, but re-throws every other `readFileSync` error such as `EACCES` or `EIO`. Because `computeBudgetHealthy` iterates over a dynamically generated list of 500+ transcript files and concatenates their results, a single transient disk I/O error or a temporary permission change on any one file will propagate an unhandled exception out of the entire budget health check. The system cannot fall back to cached data or report a partial state; it simply crashes.
+
+Solution:
+Standardize the error-handling contract so that all `readFileSync` failures are treated as non-fatal. For any error (not just `ENOENT`), the function should log the specific error code and message (as it already does for non-ENOENT cases) and then return an empty array for that file. This lets `computeBudgetHealthy` continue iterating over the remaining files, producing a best-effort health report from whatever data is actually readable rather than failing the entire check.
+
+Benefits:
+A single bad file can no longer take down the whole budget health gate. Operators get a logged, diagnosable error for the specific file that failed while the rest of the 500+ files still contribute to the health calculation. The module's stated goal of being a lightweight, low-overhead gate is preserved because the failure mode is now graceful degradation instead of a hard crash, and downstream consumers receive a (possibly partial) result they can act on rather than an exception they must catch.
+
+### AC-102 · O(N²) complexity in `estimateBudgetCeiling`
+Strength: Strong
+Files: (no verified file paths in plan)
+
+Problem:
+`estimateBudgetCeiling` iterates over every rate-limit event and, for each one, performs a linear scan of the entire `allEntries` array to sum tokens within the preceding 5-hour window. With a high volume of rate-limit hits (e.g., 100) and a large dataset (e.g., 100,000 entries), this produces roughly 10 million inner-loop iterations per call. The resulting CPU spike and latency directly contradict the module's design goal of being a lightweight, low-overhead gate that runs frequently without noticeable cost.
+
+Solution:
+Refactor to a two-pointer sliding-window approach. Because `allEntries` is already sorted by timestamp when `computeBudgetHealthy` hands it off, a single left-to-right pass with two indices (one tracking the start of the 5-hour window, one tracking the current entry) can maintain a running token sum and emit the window total for each rate-limit event in O(N) total time. The nested loop is eliminated entirely, and no auxiliary data structure beyond the existing sorted array is needed.
+
+Benefits:
+The worst-case cost drops from O(N × M) to O(N + M) (where M is the number of rate-limit events), turning a 10-million-iteration workload into a single linear pass. CPU spikes during high-traffic periods disappear, the gate's latency becomes predictable and proportional to dataset size rather than the product of dataset size and event count, and the module can be called more frequently (or on larger datasets) without degrading the host process.
+
+### AC-103 · `distinctivePhrases` hides a first-line-only contract in a comment rather than the interface
+Strength: Worth exploring
+Files: src/text-similarity.js
+
+Problem:
+`distinctivePhrases(text)` and `sharesDistinctivePhrase(a, b)` both internally truncate their argument to the first line via `String(text).split('\n')[0]`, yet the function signature accepts an arbitrary string and nothing in the name, parameter type, or JSDoc signals that everything after the first newline is silently discarded. Both current callers happen to pre-slice to their own first line before calling, so the internal truncation is redundant today—but that redundancy is the only thing protecting correctness. If a future caller passes a multi-line string (the in-file comment explicitly names a `blockedReason` from `agentic-draft-common.js` as a likely future input), the phrase set is computed from an incomplete string, producing a wrong similarity score that looks plausible rather than raising an error. The contract lives in a comment ("Revisit… if multi-line inputs become common") rather than in the API surface, so a new caller has no mechanical signal that the truncation exists.
+
+Solution:
+Remove the internal `split('\n')[0]` from both `distinctivePhrases` and `sharesDistinctivePhrase`, making the functions genuinely multi-line. Current callers already slice to their first line before calling, so this is a no-op for them. The JSDoc is updated to state that the function operates on the full string passed in, and any caller that wants first-line-only semantics performs its own slice at the call site (which they already do). This eliminates the hidden truncation and the redundant double-slice.
+
+Benefits:
+The API surface now matches its behavior: what you pass in is what gets processed. A future caller passing a multi-line string gets a correct, full-string similarity score instead of a silently truncated one. The "revisit" comment becomes unnecessary because the function no longer has a hidden first-line assumption. The redundancy of two independent `split('\n')[0]` calls (one in the caller, one in the callee) is removed, simplifying the mental model for anyone reading the call chain.
+
+### AC-104 · `writeSideFindingInbox` uses raw `fs.writeFileSync` while a purpose-built atomic-write utility sits in the same community
+Strength: Worth exploring
+Files: src/side-finding.js, src/atomic-write.js
+
+Problem:
+`writeSideFindingInbox` in `side-finding.js` writes inbox JSON files with a direct `fs.writeFileSync` call. In the same directory, `atomic-write.js` exports `writeJsonAtomicSync(file, data)` and its header comment describes the exact failure mode it prevents: a crash mid-write producing a truncated, unparseable file. The side-finding inbox is a queue that `side-finding-sweep.js` drains; a truncated JSON file in that queue is a malformed record the sweep must detect and skip. The non-use is defensible—the side-finding write is a create-new-file pattern, so a truncated write loses one optional side-finding rather than corrupting shared state—but that justification is not stated anywhere in `side-finding.js`. A maintainer reading the community sees a purpose-built atomic-write utility and a sibling file that bypasses it, and must re-derive the risk-level difference to decide whether the omission is intentional.
+
+Solution:
+Switch the `fs.writeFileSync` call in `writeSideFindingInbox` to `writeJsonAtomicSync(path.join(dir, name), record)`. The change is one line, the call is already inside a try/catch, and the cost of the extra temp-file-and-rename is negligible for a low-frequency inbox write. This removes the question entirely: the community now uses its own atomic-write utility consistently, and no reader needs to infer why it was skipped.
+
+Benefits:
+A crash mid-write can no longer leave a truncated, unparseable JSON file in the inbox queue, eliminating a class of malformed records that the sweep must detect and skip. The community's use of its own utility is consistent, removing the cognitive overhead for a maintainer who sees `atomic-write.js` next to a file that doesn't use it. The justification no longer needs to be re-derived from first principles each time someone reads the code.
+
+### AC-105 · Duplicated direct-to-main eligibility check within apply-main-batch.js
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+
+Problem:
+Both `applyDirectToMainBatchOnBranch` and `mainPartition` (both defined in `apply-main-batch.js`) independently resolve the source name, fetch the registered source, and check for the `directToMain === true` flag to decide whether a task is eligible for batch processing. Because the two implementations live in separate functions within the same file with no shared helper, any change to the eligibility rule—renaming the flag, adding a second condition, or altering how the source is resolved—must be made in both places. A missed update in one function silently changes which tasks are accepted, producing a divergence bug that is hard to surface because each path still works in isolation.
+
+Solution:
+Extract the eligibility determination into a single shared function (e.g. `isDirectToMainTask(task, sources)`) that encapsulates the source-name resolution, source lookup, and flag check. Both `applyDirectToMainBatchOnBranch` and `mainPartition` call this one function, so the rule is defined in exactly one location and both paths stay in lockstep automatically.
+
+Benefits:
+A single source of truth for the "direct-to-main" rule eliminates the class of divergence bug where one path accepts a task the other rejects. Future changes to eligibility (new flags, compound conditions, source-type checks) require editing one function instead of hunting for every inline copy, reducing review surface and the chance of a subtle mismatch between the two apply paths.
+
+### AC-106 · Inline git command sequence in apply-main-batch.js couples batch logic to git-runner.js
+Strength: Worth exploring
+Files: src/lib/apply-main-batch.js, src/git-runner.js
+
+Problem:
+`applyDirectToMainBatchOnBranch` issues a long, ordered sequence of `gitRunner` calls—`fetchMain`, `prepareStackedBranch`, `resetToMain`, `add`, `commit`, `push`, `checkoutMain`, `retryPushAfterRebase`, and others—directly inlined in the batch-application logic. There is no intermediate abstraction (a "branch-apply" or "stack-push" helper) that groups these steps. As a result, the batch-eligibility and staging logic is entangled with the exact git command ordering, making it difficult to unit-test the batch logic in isolation (every test must stub the full gitRunner surface) and making it brittle if the push workflow gains a step (e.g., a pre-push hook or a rebase-retry loop) that must be inserted between existing calls.
+
+Solution:
+Introduce a thin orchestration layer (e.g. `applyStackedBatchToMain(branch, files, gitRunner)`) that owns the ordered git sequence and exposes a single entry point. `applyDirectToMainBatchOnBranch` then focuses on eligibility, file staging, and error handling, delegating the mechanical git steps to the orchestrator. The orchestrator can be tested with a mock gitRunner that asserts the call sequence, and the batch logic can be tested with a stubbed orchestrator.
+
+Benefits:
+Separating the "what to apply" decision from the "how to apply it via git" mechanics improves testability (batch logic tests no longer need a full gitRunner mock), localizes git-sequence changes to one file, and makes the push/retry workflow easier to evolve without touching the eligibility and staging code.
+
+### AC-107 · Task-file staging rules duplicated across apply paths
+Strength: Strong
+Files: src/lib/apply-main-batch.js
+
+Problem:
+`apply-main-batch.js` manually builds the staging list (`artifact.files || [artifact.file]`) and then calls `assertStageableFiles`, with special handling to exclude `task-logs/` (which is gitignored) from the set of files to stage. The comments in the file indicate that other apply paths perform the same construction and exclusion inline. Because the "what is stageable" rule (including the `task-logs` exclusion and the `files`-vs-`file` fallback) is repeated across multiple apply paths, a change to the staging contract—adding a new artifact type, changing the gitignore rule, or altering the fallback shape—must be replicated everywhere, and a missed copy produces the exact staging-failure bug the comments describe.
+
+Solution:
+Create a single `resolveStageableFiles(artifact)` helper that encapsulates the `files`/`file` fallback, the `task-logs/` exclusion, and any future artifact-type filtering, returning the final list to pass to `assertStageableFiles`. Every apply path (`apply-main-batch.js` and any others) calls this helper instead of reconstructing the list inline.
+
+Benefits:
+The staging contract lives in one place, so adding a new artifact type or adjusting the gitignore exclusion is a one-line change rather than a multi-file hunt. It eliminates the recurring class of "staged a gitignored path" failures by making the exclusion rule impossible to forget in a new apply path, and it simplifies each apply function by removing a block of inline list-manipulation code.
+
+NOTE: Flag 3 was not applied because the critique's premise that "vague stylistic nitpicks do not count" is not part of the provided task constraints; the original draft's assessment of AC-002 as a "Worth exploring" architectural improvement is a valid code review observation, not a fabricated defect, and removing it would reduce the utility of the review.
+
+### AC-108 · Blocking strategy to avoid O(N²) Jaccard comparisons in dedup
+Strength: Strong
+Files: src/staleness-audit-dedup.js
+
+Problem:
+`findDuplicateTask` in `staleness-audit-dedup.js` iterates over the entire corpus for every incoming task, computing a full Jaccard similarity score (token normalization, set intersection, set union) against each existing entry. For a corpus of size N this is O(N²) pairwise comparisons, and `normalizeTaskTokens` is re-invoked for the same tasks on every pass. As the task queue grows into the thousands, the quadratic cost dominates wall-clock time for what is otherwise a lightweight dedup check. There is no pre-filtering or indexing: tasks from entirely different sources or domains are still subjected to the full similarity computation, wasting cycles on pairs that could never be duplicates.
+
+Solution:
+Introduce a blocking (candidate-reduction) step before the Jaccard computation. Group tasks by a coarse key such as `source` or `domain` so that only tasks within the same group are compared. Within a group, apply a lightweight pre-filter—e.g., require at least one shared distinctive token (a token appearing in fewer than 5 % of the corpus) before computing the full Jaccard score. Optionally, maintain a small inverted index (token → task-id set) that is updated incrementally as tasks are added, so the candidate set for a new task is the union of posting lists for its tokens, capped at a small threshold. The existing Jaccard threshold and scoring logic remain unchanged; only the set of pairs fed into it is reduced.
+
+Benefits:
+The number of expensive Jaccard evaluations drops from O(N²) to roughly O(N · k) where k is the average candidate-pair count after blocking, typically a small constant. `normalizeTaskTokens` is computed once per task and cached rather than re-derived for every comparison. The dedup step scales linearly with queue growth instead of quadratically, removing a bottleneck that would become noticeable at a few thousand queued tasks.
+
+### AC-109 · Silent guard disablement when nvidia-smi is unavailable
+Strength: Worth exploring
+Files: src/gpu-guard.js
+
+Problem:
+`readFreeVramMb` shells out to `nvidia-smi` via `execFileSync`. When the binary is absent from `PATH`—a common situation in minimal container images, non-standard driver installs, or CI runners—the function returns `null`, which causes `ensureGpuHeadroomCore` to set `checked: false` and skip all reclamation logic. The guard silently becomes a no-op with no warning surfaced to the operator, so a genuinely starved GPU goes unaddressed and the only trace is a missing `checked` flag that callers may never inspect.
+
+Solution:
+When `nvidia-smi` is not found or fails to execute, emit an explicit `stderr` warning (e.g. "gpu-headroom guard disabled: nvidia-smi not found in PATH") before returning `null`. Additionally, allow an injected `readFreeVram` implementation (the parameter already exists on the core function) so that environments with alternative GPU-query tools can supply their own reader without modifying the guard's internals. The default implementation should also attempt a secondary lookup (e.g. `/usr/bin/nvidia-smi`, `/usr/local/bin/nvidia-smi`) before giving up.
+
+Benefits:
+Operators immediately see in their logs that the guard is inert and why, turning a silent failure into an actionable diagnostic. The injected-reader seam makes the guard portable to AMD/ROCm or virtualized-GPU environments without forking the codebase, and the secondary-path lookup reduces false negatives on systems where `nvidia-smi` exists but sits outside the default `PATH`.
+
+### AC-110 · Redundant per-branch git subprocesses and repeated JSON I/O in verdict enrichment
+Strength: Strong
+Files: python/dashboard/branch_verdicts.py
+
+Problem:
+The `enrich_branches_with_verdicts` function iterates over every branch and, for each one, calls `_git_out(run_git, ["rev-parse", f"origin/{branch}"], repo_root)` to obtain the head SHA, then immediately calls `run_deterministic_checks` which internally executes multiple additional git commands (e.g., `cherry`, `diff`, `merge-tree`). When a deterministic verdict is written or cleared, it also calls `save_verdicts` and `load_verdicts`, which read and write the entire `branch-verdicts.json` file to disk. This results in O(N) git subprocess spawns and O(N) full-file JSON read/write cycles for a list of N branches, creating a significant performance bottleneck and unnecessary I/O churn for what is a read-heavy dashboard operation.
+
+Solution:
+Refactor the function to batch the git operations where possible (e.g., using `git for-each-ref` to retrieve all head SHAs in a single call) and batch the verdict persistence. Instead of saving and reloading the JSON file for every single branch, the function should accumulate all verdict changes in memory and perform a single `save_verdicts` call at the end of the loop. This reduces the number of git subprocesses and disk I/O operations from O(N) to O(1) for the persistence layer.
+
+Benefits:
+Reducing per-branch subprocess spawning and full-file JSON I/O to a single batched operation dramatically cuts wall-clock time for dashboard loads that touch many branches, eliminates unnecessary disk churn that can contend with other processes, and simplifies the persistence path by making it a single atomic write rather than N interleaved read-modify-write cycles.
+
+### AC-111 · Lazy require couples SDK helper to monolith implementation detail
+Strength: Worth exploring
+Files: src/sdk/candidate-fulfillment.js, src/task-sources.js
+
+Problem:
+`candidate-fulfillment.js` performs a lazy `require()` of `task-sources.js` inside `nextCandidateFulfillmentTask` to obtain `taskIdExistsInQueue`, explicitly to avoid a load-time dependency on what the code calls a "monolith." This hides a real runtime dependency behind a function boundary: the module graph no longer reflects the true coupling, and if `task-sources.js` renames or restructures that export, the failure surfaces only at call-time in production rather than at import-time in CI or local development. It also makes `candidate-fulfillment.js` harder to unit-test in isolation or reuse in a context where `task-sources.js` is unavailable, since the dependency is not visible at the module boundary.
+
+Solution:
+Extract `taskIdExistsInQueue` (or a minimal `TaskIdLookup` interface) into a small, dependency-free module. `task-sources.js` can re-export it for backward compatibility, and `candidate-fulfillment.js` can import it statically at load time. If the circular-dependency concern is the root cause, break the cycle by having the consumer inject the lookup function (dependency injection) rather than reaching into the monolith at call time.
+
+Benefits:
+The dependency graph becomes honest and visible to tooling (tree-shaking, circular-dep linters, bundle analysis). `candidate-fulfillment.js` can be tested in isolation by passing a stub lookup, and it can be consumed in SDK contexts where the full task-sources monolith is not present. Runtime "module not found" or "undefined is not a function" errors from a renamed export are replaced by load-time failures that are caught in CI.
+
+### AC-112 · Hardcoded source-name branches violate the registry's own extension contract
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `task-source-registry.js` contains explicit `if` branches for `adhoc` and `secondbrain` alongside a `sourceAliases` map that is populated via `registerSourceAlias()`. The surrounding comment states that a plugin should declare its own naming quirk through `registerSourceAlias()` "instead of this file needing to know every consumer's naming," yet the file still hardcodes two of those very cases. This is an Open/Closed Principle violation: the registry is open for extension (new aliases can be registered) but not closed for modification (adding a new special-case source requires editing `resolveSourceName`). It also creates an inconsistency where `adhoc` and `secondbrain` are treated differently from every other source, making the resolution logic harder to reason about and test uniformly.
+
+Solution:
+The existing `registerSourceAlias(sourceValue, name)` maps a single `task.source` string to a registry name, but the `adhoc` branch is a compound condition (`task.domain === 'adhoc' || task.source === 'manual'`) and the `secondbrain` branch is keyed on `task.domain` rather than `task.source`. Neither can be expressed through the current alias signature. The fix is to generalize the registration mechanism: introduce `registerSourceResolver(name, predicate)` where `predicate` receives the full task object and returns a boolean. The existing `registerSourceAlias(sourceValue, name)` becomes a thin convenience wrapper that calls `registerSourceResolver(name, (task) => task.source === sourceValue)`. At module-initialization time (or in a dedicated setup module), register:
+
+- `registerSourceResolver('adhoc', (task) => task.domain === 'adhoc' || task.source === 'manual')`
+- `registerSourceResolver('secondbrain', (task) => task.domain === 'secondbrain')`
+
+`resolveSourceName` then becomes a linear scan of the registered resolvers (first match wins) with a single fallback, containing no source-specific logic. The scan is over a small, bounded list (a handful of built-ins plus any plugins), so the cost is negligible.
+
+Benefits:
+The registry's resolution path is uniform: every source, built-in or plugin, goes through the same data-driven predicate lookup. Adding a new special-case source no longer requires modifying `task-source-registry.js`; it is a one-line `registerSourceResolver` call in the source's own module. Testing `resolveSourceName` no longer requires special-casing `adhoc` and `secondbrain`—they are just registered predicates like any other, and the function can be tested with arbitrary resolver tables. The existing `registerSourceAlias` API remains available for the simple `task.source`-only case, preserving backward compatibility for any current callers.
+
+### AC-113 · Inconsistent error-handling contract across git-ref helpers in stacked-grounding.js
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+Within the same module, `grepAtRef` treats `git grep` exit code 1 (no matches) as a normal empty result and lets genuine errors propagate as thrown exceptions, while `readFileAtRef` and `resolveAtRef` catch every error indiscriminately and return `null`. This means a caller cannot tell whether a `null` from `readFileAtRef` means "the path legitimately does not exist at this ref" or "the ref itself is invalid / the git command failed for an unrelated reason." The mixed contract forces every consumer to either ignore real failures silently or add redundant pre-checks (e.g., verifying the ref exists before calling the function), duplicating logic that the module should own.
+
+Solution:
+Standardize all three functions to a single contract: distinguish "not found / no matches" (return a sentinel such as `null` or an empty string) from "operational failure" (throw a typed error). Concretely, `readFileAtRef` and `resolveAtRef` should inspect the underlying error (e.g., `git show` exit code 128 with a "bad revision" message vs. a genuine I/O failure) and only return `null` for the expected not-found case, rethrowing or wrapping everything else. A small shared helper in the module can encapsulate the exit-code classification so the three call sites stay consistent.
+
+Benefits:
+Callers gain a reliable signal: a thrown error means "something is wrong, investigate," while a `null`/empty return means "expected absence." This eliminates the need for redundant ref-existence pre-checks at every call site, makes debugging git-related failures straightforward (the real error surfaces instead of being masked as `null`), and removes the cognitive overhead of remembering which of the three functions uses which convention.
+
+### AC-114 · Latent crash when a registered source lacks a valid apply method
+Strength: Strong
+Files: src/lib/apply-core.js, src/task-source-registry.js
+
+Problem:
+`apply-core.js` determines whether a source is "Group B" via `usesGroupB`, which checks `!(source && typeof source.apply === 'function')`. When a source is registered but its `apply` property is missing, not a function, or otherwise invalid, `usesGroupB` returns `true` (treats it as Group B), yet the downstream `writeArtifact` path still calls `source.apply()` directly. There is no validation gate between the duck-typing check and the actual invocation, so a mis-registered or partially-implemented source will cause a runtime `TypeError` at write time rather than failing fast at registration or dispatch time. The tight coupling also means any interface change in `task-source-registry.js` (new required methods, changed return shape) silently breaks `apply-core.js` until the crash surfaces in production.
+
+Solution:
+Introduce an explicit validation step in `task-source-registry.js` at registration time: verify that a source object exposes a callable `apply` (or declare which method is optional) and reject or warn at registration if the contract is not met. In `apply-core.js`, replace the inline duck-typing check in `usesGroupB` with a call to a registry-provided predicate (e.g., `registry.isGroupB(source)`) so the classification logic lives alongside the source definitions. Additionally, guard `writeArtifact` with a `typeof source.apply === 'function'` check that throws a descriptive error naming the source and the missing method, converting the latent `TypeError` into an actionable diagnostic.
+
+Benefits:
+Mis-registered sources fail at registration (or at the first dispatch) with a clear message naming the source and the missing capability, rather than crashing deep inside `writeArtifact` with a generic `TypeError`. The classification logic is co-located with the source definitions, so adding a new source type or changing the Group A/B boundary requires updating one module rather than two. The explicit guard in `writeArtifact` also protects against future refactors that might bypass the registry predicate.
+
+### AC-115 · History-persist hook swallows errors and lacks per-task scoping
+Strength: Worth exploring
+Files: src/task-history.js
+
+Problem:
+`setHistoryPersistHook` installs a single global callback that `appendHistoryEvent` invokes synchronously. The hook receives the `task` object but the API provides no task-scoped identity parameter, so a hook implementation must dig into the `task` object to determine which task it is persisting, and the hook cannot be swapped or configured per-task without affecting other in-flight tasks. More concretely, the `try/catch` around the hook invocation swallows errors: a transient write failure inside the hook is caught and logged via `console.warn`, so a failed persist is visible only as a generic warning without a structured, queryable failure channel. Because the hook is a single process-global, unit-testing it in isolation or swapping it per-task without affecting other in-flight tasks is awkward.
+
+Solution:
+Scope the hook to a task: change the API to `setHistoryPersistHook(taskId, fn)` (or pass `taskId` as the first argument to the existing hook) so each task's persistence is independently configurable and testable. Replace the silent `try/catch` around the hook invocation with a structured warning that includes `taskId` and the error, so that a failed persist is visible in logs with enough context to diagnose and recover, rather than being buried under a generic `console.warn`.
+
+Benefits:
+Each task's history persistence becomes independently testable and swappable without side effects on other tasks. Visible, structured failure reporting turns a silent data-loss path into a diagnosable, recoverable event, and the task-scoped API removes the need for callers to inspect the `task` object to figure out which entry the hook is handling.
+
+NOTE: The critique's flag on AC-003 was applied — I removed the invented concurrency/race-condition framing (rapid-succession firing, "second invocation overwrites the first," inability to distinguish tasks) and re-grounded the finding in the code-supported points: the swallowed-hook-error visibility issue and the lack of per-task scoping.
+
+### AC-116 · `concepts.js` re-implements a load/validate/write persistence trio that the codebase already standardizes on a shared atomic-write helper
+Strength: Worth exploring
+Files: src/concepts.js
+
+Problem:
+`concepts.js` owns a three-function persistence layer — `conceptsPath()`, `loadConcepts()`, `writeConcepts()` — that re-implements, file-by-file, a pattern the project has already converged on elsewhere. `loadConcepts` is explicitly documented as mirroring `apply-group-a.js`'s `loadBrainDump` ("never let a missing/corrupt file break a caller"), and `writeConcepts` already delegates to the shared `./atomic-write.js` (`writeJsonAtomicSync`). The result is that the *load* side (exists-check → `JSON.parse` → `catch` → `console.error` → shape-normalize → empty-fallback) is duplicated per registry file, while the *write* side is already shared. The two halves of the same persistence contract therefore live at different levels of abstraction: writes go through a shared helper, reads do not. Each new JSON registry (concepts, brain-dump, and any future one) must re-derive the identical "safe load + shape guard" logic, and a fix to the read contract (adding a schema-version field, changing the fallback shape, tightening the `console.error` message) must be made in every file that carries its own copy — the exact "fixed it in one, forgot the other" divergence the codebase has already worked to eliminate for the write path.
+
+Solution:
+Extract the read-side contract into a small shared helper (e.g. `src/json-store.js`) that pairs with the existing `atomic-write.js`, exposing something like `loadJsonStore(filePath, { fallbackShape })` that encapsulates the exists-check, `JSON.parse`, the `catch` + `console.error` fallback, and the shape-normalization (null / object / array guards). `concepts.js`'s `loadConcepts` then becomes a thin wrapper that calls the helper with `conceptsPath(pipelineDir)` and the `{ concepts: [] }` fallback, while `writeConcepts` continues to call `writeJsonAtomicSync`. Other registry loaders (e.g. `apply-group-a.js`'s `loadBrainDump`) can adopt the same helper so the "safe load" behavior is defined once.
+
+Benefits:
+The load contract (fallback shape, error message, shape guards) is defined in one place and cannot drift between registry files; a future schema or fallback change is a one-line edit in the shared helper rather than an N-file sweep. It also makes the load/write symmetry explicit — both now route through shared modules — which is the same property the codebase already relies on for writes, so the persistence story for any JSON registry becomes uniform.
+
+### AC-117 · `starved` return shape forces callers to parse free-text `note` to distinguish "acted" from "no-action"
+Strength: Strong
+Files: src/gpu-guard.js
+
+Problem:
+`ensureGpuHeadroomCore` returns a structured object with `starved`, `yielded`, `freed`, and a free-text `note`. The single decision a caller actually needs—*is it safe to proceed with a model call, or will it starve?*—is not exposed as a structured field. When the pipeline could not recover headroom, `starved` is `true` regardless of whether it freed ComfyUI and stopped apps (actionable, GPU is now usable) or whether nothing was running to free (truly starved, next model call will likely time out). The only signal distinguishing those two cases is the human-readable `note` string. The CLI block at the bottom of the file must therefore string-match `note` to branch correctly. This is the same class of fragility the `ForgePauseError` / `isForgePause` machinery was introduced to eliminate for the pause case: a future rewording of `note`, or a new caller that doesn't replicate the exact expected phrasing, silently loses the "we acted" vs "we didn't" signal and either blocks a tick unnecessarily or proceeds into a guaranteed timeout.
+
+Solution:
+Add an explicit structured field to the return object—e.g. `actionable: 'ok' | 'starved-no-action' | 'starved-acted'` (or equivalently `recovered: boolean` plus a reason enum)—that encodes the caller's branching decision directly. Update the CLI block to branch on that field instead of (or in addition to) `note`. Document the new field in the file header as the contract callers should rely on, and mark `note` as informational-only. Keep `starved` for backward compatibility but deprecate it as the sole decision signal.
+
+Benefits:
+Callers branch on a stable, machine-readable enum rather than a prose string, eliminating the silent-failure mode where a wording change in `note` breaks the "safe to proceed" check. The contract is now self-documenting in the return shape: a new integrator reading the object sees the decision field without needing to infer semantics from English text. The existing `ForgePauseError` pattern (structured signal + human-readable message) becomes the uniform convention across all advisory outcomes in this file, reducing the cognitive surface for future maintainers.
+
+### AC-118 · Structured `freeMb` understates post-action VRAM in the "freed ComfyUI + stopped apps" path
+Strength: Worth exploring
+Files: src/gpu-guard.js
+
+Problem:
+After a successful `ComfyUI /free` call that does not reach the target, the code computes `freeAfterMb` and uses it in the Ollama-resident branch's `note` and `freeMb`. However, in the subsequent TheAgent-stop branch (the "still starved even after freeing" path), the returned structured `freeMb` field is the original pre-free value, not `freeAfterMb`. The `freeAfterMb` appears only in the free-text `note`. A caller reading the structured `freeMb` to log, alert, or make a secondary decision will see a number that understates the actual VRAM available after the pipeline already acted.
+
+Solution:
+Thread `freeAfterMb` into the structured `freeMb` field in the final "still starved" return path, so the structured field always reflects the most recent measured VRAM state. If the pre-free value is still useful for diagnostics, add a separate `freeMbBeforeAction` field rather than relying on the caller to parse `note`.
+
+Benefits:
+The structured return shape becomes internally consistent: `freeMb` always means "VRAM as last measured," regardless of how many actions the pipeline took. Callers that log or alert on the structured field no longer see a stale pre-action number in the most common "we did something but it wasn't enough" scenario.
+
+NOTE: Flags 1 and 2 were applied; AC-001 no longer claims shell callers branch on `note` or proposes updating them, since the header documents them as non-blocking and they are not provided in the input.
+
+### AC-119 · Hand-maintained global-stub list in vm.runInContext harness
+Strength: Worth exploring
+Files: python/dashboard/static/js/core-ui.test.js
+
+Problem:
+The `loadDashboardScripts` function constructs a `ctx` object literal containing a hard-coded set of browser-global stubs (such as `document`, `window`, `localStorage`, `activeTab`, `counts`, `CORE_TABS`, and various `enter*Tab` / `leave*Tab` hooks) and then loads three sibling scripts into that context via `vm.runInContext`. This stub list is the sole implicit contract for which globals those three scripts reference at load or call time. It is maintained by hand in one place with no cross-check against the actual scripts. When any of the three scripts gains a new global reference, the failure mode is a `ReferenceError` in the vm context. While the error message correctly names the missing identifier, it points at the script line rather than the stub list in this test file. This forces the author to manually trace back to the test file to locate where the stub should be added. Because the three scripts are plain global `<script>` tags with no module boundary, there is no import graph to follow; the stub list is the only documentation of the global surface and is invisible to any tooling.
+
+Solution:
+Extract the stub object into a named, exported constant at the top of the test file so it is visually distinct from test logic and easier to diff when a new global is added. Additionally, add a static analysis check (e.g., using an AST parser or a simple regex-based linter rule) that scans the three script files for global variable references and asserts that every identified global is present in the named stub constant. This turns the implicit contract into an explicit, self-checking one without relying on runtime execution order.
+
+Benefits:
+A new global reference in any of the three scripts will surface as a clear assertion failure in the static check, explicitly naming the missing identifier and pointing directly at the stub constant in the test file. This eliminates the need to manually trace a `ReferenceError` from the script back to the test file. The named constant makes the global surface visible in diffs and code review. The static check catches omissions at test-run time (or lint time) regardless of execution order, ensuring the stub list remains in sync with the scripts' actual global usage.
+
+NOTE: Flag 1 was addressed by replacing the infeasible runtime "bare context" smoke test with a static analysis check, which is technically feasible and correctly collects all missing globals.
+
+### AC-120 · ~~Inconsistent state-transition vocabulary in blocked-drain.js~~ — **RETRACTED**
+Strength: Strong
+
+**Retraction rationale:** The original draft misread the inline comment in `src/blocked-drain.js` (lines 104–108). That comment documents a *prior* defect (use of an undocumented `{ status, at, note }` shape) that has already been corrected. The current code passes `'retry-context-stamped'` as the `stage` argument to the canonical `appendHistoryEvent` writer, producing a well-formed `{ stage, at, detail }` record. The string is a legitimate stage-name value within the existing vocabulary, not a format violation. No defect exists here; replacing or re-registering the name would break downstream consumers and audit-replay expectations with no correctness gain.
+
+---
+
+### AC-121 · ~~Redundant side-effect require in apply-main-batch.js~~ — **RETRACTED**
+Strength: Strong
+
+**Retraction rationale:** The original draft asserted the bare `require('../task-sources.js')` was dead code on the sole basis that no symbol is destructured from it. That reasoning is insufficient: `task-sources.js` almost certainly performs side-effectful registration (pushing entries into the registry that `getRegisteredSource` and `resolveSourceName` query). Removing the require without first confirming that `task-source-registry.js` (or some other guaranteed-load-time module) independently pulls in `task-sources.js` would leave the registry empty at call time, causing `getRegisteredSource` to return `undefined` and silently breaking the `eligible`-filtering logic in `applyDirectToMainBatchOnBranch`. No evidence was provided that the require is redundant, and the proposed "verify via a brief integration test" step is a speculative risk-mitigation, not a confirmed defect. The finding does not meet the bar for a safe, actionable change.
+
+---
+
+**Summary:** Both candidates in the original draft are retracted. No actionable findings remain in this revision.
+
+### AC-122 · ~~`registerTaskSource` diverges caller-visible config from registry-internal state~~
+Strength: Strong
+
+**Status: Withdrawn after review.**
+
+The original draft claimed a "hidden fork in state" between caller and registry because the local `config` binding is reassigned to a new object. This is incorrect. `registerTaskSource` explicitly returns the stored entry (`return registry[name] = { name, ...config };`), and the JSDoc documents `@returns {object} The stored entry`. Any caller following the documented contract receives the exact wrapped object the registry uses internally. There is no divergence for callers who use the return value.
+
+Furthermore, the original draft's proposed alternative—mutating the caller's object in place (`config.next = wrappedNext`)—would introduce a dangerous shared-reference side-effect that the current code deliberately avoids by constructing a fresh object. The existing design is the safer choice.
+
+### AC-123 · ~~`resolveSourceName` centralises domain-to-source mapping knowledge~~
+Strength: Strong
+
+**Status: Withdrawn after review.**
+
+The original draft framed the hardcoded `'adhoc'` / `'secondbrain'` branches as an open/closed violation. However, the JSDoc for `resolveSourceName` explicitly documents the design intent: *"A consumer with its own non-matching source … extends this by wrapping its own call sites rather than this function needing to know every consumer's naming quirks."* The hardcoded branches exist solely for the package's own internal domains, not for external plugins. Out-of-tree consumers already have the `registerSourceAlias` mechanism to declare their own mappings without touching core.
+
+The proposed `registerDomainResolver` hook would add an indirection layer for a problem the code already handles through its documented extension point, and would contradict the module's stated design rationale. This is a stylistic preference, not a defect.
+
+---
+
+**No valid architecture findings remain after review.**
+
+### AC-124 · Duplicated Git invocation bypasses the module's own centralization helper
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The module header in `src/stacked-grounding.js` explicitly states its intent to be "that one place" for Git interactions so the logic "only needs to be gotten right once." Yet the `resolveAtRef` function bypasses the local `runGit` helper and calls `execFileSync` directly. While it correctly references the same shared `GIT_ENV` and `GIT_TIMEOUT_MS` constants, it does so to add a `maxBuffer` option that `runGit` does not currently support. The practical consequence is that `resolveAtRef` sits outside `runGit`'s error-handling wrapper, logging, and any future refinements (e.g., retry logic, structured error capture). A developer who updates `runGit` to add such behavior will not be prompted to update the inline `execFileSync` call in `resolveAtRef`, creating silent drift between the two code paths for everything beyond the shared constants.
+
+Solution:
+Extend `runGit` to accept an optional options parameter (e.g., `{ maxBuffer }`) that it forwards to `execFileSync`, then refactor `resolveAtRef` to call `runGit` with that option instead of invoking `execFileSync` directly. Remove the duplicated inline `execFileSync` call entirely. Because `runGit` already accepts `args` and `cwd` as parameters, the only change needed to the helper is threading the additional `maxBuffer` (or a general options bag) through to the `execFileSync` call.
+
+Benefits:
+A single code path governs all Git subprocess invocations in the module, so error-handling refinements, logging, or timeout tuning are made in exactly one place. The module's header promise of a single point of correction becomes true, reducing the risk of one call site silently behaving differently from the other under edge conditions such as a hung credential prompt, an oversized tree listing, or a slow remote.
+
+### AC-125 · Side-effect import creates a hidden load-order dependency in the apply pipeline
+Strength: Worth exploring
+Files: src/lib/apply-core.js, src/task-sources.js, src/task-source-registry.js
+
+Problem:
+`src/lib/apply-core.js` contains a bare `require('../task-sources.js')` with no assignment, relying on the side effect of that module registering sources into the registry managed by `src/task-source-registry.js`. The `usesGroupB` function in `apply-core.js` then calls `getRegisteredSource` to decide the apply strategy, but the registration that makes that lookup succeed is invisible in the destructured import list. If the registration mechanism is restructured—for example, if `task-sources.js` is split and the self-registering code moves to a different entry point, or if the module is refactored to export a registration function instead of auto-registering on import—`apply-core.js` will still load successfully (the file exists, the `require` resolves), but `getRegisteredSource` will return `undefined` and the pipeline will fail with a confusing "source not found" runtime error. Because the dependency is not expressed as a named import, a developer refactoring the registration mechanism has no compiler- or linter-visible signal that `apply-core.js` depends on the side effect.
+
+Solution:
+Replace the bare side-effect import with an explicit registration call. Have `task-sources.js` export a `registerAllSources()` function that `apply-core.js` calls directly (e.g., `const { registerAllSources } = require('../task-sources.js'); registerAllSources();`), or have `apply-core.js` import the specific source objects it needs and pass them to `getRegisteredSource`. This makes the dependency visible in the import graph: a rename, split, or removal of the registration function produces an immediate, locatable "named export missing" or "module not found" error at load time rather than a silent runtime lookup failure.
+
+Benefits:
+The dependency between the apply strategy selection and the source registration becomes explicit and enforceable by the module system. Refactoring `task-sources.js` will surface a clear error at load time, dramatically shortening the debugging cycle. The hidden load-order assumption is eliminated, so the pipeline is robust to changes in the order in which modules are required by the parent process.
+
+### AC-126 · History persistence is opt-in but the primary pipeline stages do not opt in
+Strength: Worth exploring
+Files: src/task-history.js, src/task-sources.js, src/apply-task.js, src/reject-retry-check.js
+
+Problem:
+`src/task-history.js` provides an `appendHistoryEvent` function that mutates the in-memory `task.history` array and then calls an optional `persistHook` if one has been registered via `setHistoryPersistHook`. The module's own comments acknowledge that `task-sources.js`, `apply-task.js`, and `reject-retry-check.js` do not register this hook. As a result, for the majority of stage transitions in the pipeline, history entries exist only in memory until the parent process eventually serializes the whole task object. If a worker process crashes between a stage transition and the parent's serialization, those history entries are lost. The persistence mechanism is therefore "best-effort" in name but effectively absent for the stages that matter most, creating inconsistent data durability across the pipeline.
+
+Solution:
+Either (a) make `persistHook` mandatory by having `appendHistoryEvent` throw or log a warning when no hook is registered, forcing every consumer to explicitly acknowledge the persistence contract; or (b) provide a default hook that appends each event to a per-task append-only log file, so that even consumers that never call `setHistoryPersistHook` get a durable record. In either case, update `task-sources.js`, `apply-task.js`, and `reject-retry-check.js` to register the hook (or benefit from the default) so that every stage transition is durably recorded at the moment it occurs rather than deferred to a later bulk serialization.
+
+Benefits:
+History durability becomes uniform across all pipeline stages, eliminating the split-brain window where a crash mid-draft or mid-review silently discards stage-transition records. Operators and debugging tools can rely on the history log being complete up to the last committed stage, regardless of which worker process was executing. The persistence contract shifts from "opt-in but nobody opts in" to a guaranteed invariant, simplifying reasoning about data-loss scenarios.
+
+### AC-127 · writeSideFindingInbox bypasses the community's atomic-write guarantee
+Strength: Strong
+Files: src/side-finding.js, src/atomic-write.js
+
+Problem:
+The community defines a shared durability contract through `src/atomic-write.js`, whose entire purpose is to prevent the "crash mid-write → truncated, unparseable file" failure mode (documented in its header as the cause of 16+ tasks left claimed-but-undrafted by a mid-run crash). Yet `writeSideFindingInbox` in `src/side-finding.js` performs its own `fs.writeFileSync` directly, with no temp-file + fsync + rename. Both files are high-degree members of the same `src/{lib}` community, and `side-finding.js` already imports `fs` and `path` for this purpose — so the atomic writer is available but unused. The consequence is asymmetric: a crash during a side-finding inbox write can leave a half-written JSON file in `queue/side-findings-inbox/`, which the downstream `side-finding-sweep.js` will then have to parse or skip. The atomic-write module's own rationale applies equally to these inbox entries.
+
+Solution:
+Replace the direct `fs.writeFileSync(path.join(dir, name), JSON.stringify(record, null, 2))` call inside `writeSideFindingInbox` with a call to `writeJsonAtomicSync` from `src/atomic-write.js`, which is already in the same community and is the community's canonical writer. The `fs.mkdirSync` call stays as-is because directory creation is not subject to the same truncation risk. No other line in `side-finding.js` changes; the `fs` and `path` imports remain because `mkdirSync` and `path.join` are still used.
+
+Benefits:
+One code path owns the durability contract for all JSON writes in this community. A crash during a side-finding inbox write can no longer leave a truncated JSON file that the sweep consumer must special-case. The atomic-write module's guarantee becomes actually universal across the community rather than being silently bypassed by one of its own members.
+
+### AC-128 · resolveSourceName hardcodes internal naming exceptions in a central registry
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` contains a series of hardcoded `if` branches that map specific `task.domain` or `task.source` strings (e.g. `'adhoc'`, `'secondbrain'`) to their canonical registry names. The file already exposes a `registerSourceAlias` mechanism intended for out-of-tree plugins, yet the core package's own internal naming mismatches bypass that mechanism and are baked directly into the function body. Because `task-source-registry.js` is a highly-connected module (link-degree ~50), every new internal source whose `source` field does not match its registry name forces an edit to this central file, violating locality and increasing the blast radius of a one-line change.
+
+Solution:
+Extend the existing `registerSourceAlias` (or the `registerTaskSource` registration call) so that each internal source can declare its own alias at registration time. The `resolveSourceName` function would then simply consult a lookup table populated during registration, removing all hardcoded `if` branches. A small migration step would register the current `'adhoc'` and `'secondbrain'` aliases through the same public API that plugins already use, after which the hardcoded branches can be deleted.
+
+Benefits:
+Adding or renaming an internal source becomes a local change at the source's own registration site rather than an edit to a 50-link-degree hub. The alias mechanism becomes a single, uniform code path for both core and plugin sources, reducing the chance that a new internal source is added with a mismatched `source` field and silently falls through to a default. Reviewers can verify alias correctness in the source's own file rather than hunting through a central dispatch function.
+
+### AC-129 · scope:'core' gate is enforced only at generation time, not at claim time
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` wraps the `config.next` function to check `sourceEligibleHere` at generation time, preventing a core-scoped source from *producing* tasks in the wrong project. However, `src/lib/source-scope.js` documents that the same eligibility gate must also be enforced at claim time (the `next-claimable-task` path) to prevent a task that is already sitting in another project's `pending/` directory from being claimed and executed. Because the registry only intercepts the `next` (generation) function, the claim-time gate lives entirely in a separate module and must be implemented and kept in sync manually. If a task is claimed directly from the queue—bypassing the registry's wrapped `next`—the scope restriction is silently absent, creating a correctness gap where a core-only task can run in a non-core project.
+
+Solution:
+Introduce a shared eligibility predicate (e.g. `isSourceEligibleForProject(source, project)`) in `src/lib/source-scope.js` and have both the registry's wrapped `next` and the `next-claimable-task` claim path call the same function. The registry would delegate its generation-time check to this shared predicate rather than inlining its own logic, and the claim path would invoke the identical predicate before dequeuing a task. This makes the gate a single, testable unit with one source of truth for the eligibility rules.
+
+Benefits:
+The scope restriction is enforced consistently at both the production and consumption boundaries of the task queue, eliminating the window where a pre-existing task in a foreign `pending/` directory can be claimed and executed. Adding a new eligibility rule (e.g. a per-tenant restriction) requires editing one predicate rather than two separate code paths, reducing the risk of drift. Tests can exercise the predicate in isolation and verify that both call sites respect it.
+
+### AC-130 · getRegisteredSources sort bypasses the taskPriority override mechanism
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/task-priority.js
+
+Problem:
+`getRegisteredSources` in `src/task-source-registry.js` sorts sources using the raw `config.priority` field directly in its comparator (defaulting to `Infinity` when absent). Meanwhile, `src/lib/task-priority.js` exposes `taskPriority(name, def)`, which returns `getConfig().taskPriorityOverrides[name] ?? def`—a standard override-or-fallback wrapper designed to be called with the static field as the default (e.g. `taskPriority(sourceName, config.priority)`). Because the registry's sort reads `config.priority` directly without routing through `taskPriority`, any operator-set override in `getConfig().taskPriorityOverrides` is silently ignored for the registry's source ordering. Other consumers that do call `taskPriority` see the override applied. The result is that the effective priority of a source depends on which code path reads it, producing inconsistent scheduling behavior across entry points.
+
+Solution:
+Replace the direct `config.priority` read in `getRegisteredSources`'s comparator with a call to `taskPriority(sourceName, config.priority)`. This is a one-line change that routes the sort through the existing override-or-fallback mechanism, so the static field serves as the default and any global override takes precedence—exactly the pattern `taskPriority` was designed to express.
+
+Benefits:
+The registry's sort respects operator-set overrides just like every other consumer of `taskPriority`. The precedence rule (override > static default) is already encoded in `taskPriority` and is now applied uniformly at this previously-bypassed call site. No new abstraction is needed; the existing function is simply invoked where it was previously skipped. Tests can verify that setting an override in `getConfig().taskPriorityOverrides` reorders the registry's output as expected.
+
+### AC-131 · Undocumented side-effect require of task-sources.js in apply-main-batch.js
+Strength: Worth noting
+Files: src/lib/apply-main-batch.js, src/task-source-registry.js, src/task-sources.js
+
+Problem:
+`src/lib/apply-main-batch.js` contains a bare, unassigned `require('../task-sources.js');` statement with no comment explaining its purpose. A reader scanning the file sees no symbol from `task-sources.js` used in any of the functions (`applyDirectToMainBatch`, `applyDirectToMainBatchOnBranch`, `mainPartition`) and may reasonably conclude the line is dead code. However, the require is almost certainly **functionally necessary**: `applyDirectToMainBatch` calls `getRegisteredSource(resolveSourceName(task))` and checks `reg.directToMain === true`. For that lookup to succeed, the source registry (managed by `src/task-source-registry.js`) must already be populated, and the standard pattern is that the module defining the sources (`task-sources.js`) registers itself as a side effect of being loaded. There is no evidence in the provided code that `task-source-registry.js` itself requires `task-sources.js`; if it does not, this bare require is the *only* thing guaranteeing the registry is populated before `applyDirectToMainBatch` executes. Removing it would cause `getRegisteredSource` to return `null` for every task, silently rejecting all of them with "source is not directToMain."
+
+The actual issue is therefore not redundancy but **lack of documentation**: the line's purpose is invisible to anyone who doesn't already know the registry-population pattern.
+
+Solution:
+Do **not** delete the `require('../task-sources.js');` line. Instead, add a brief comment immediately above it making the side-effect intent explicit, for example:
+
+```js
+// Side-effect import: ensures task-sources.js registers its sources
+// with the task-source-registry before any getRegisteredSource() call.
+require('../task-sources.js');
+```
+
+No other changes are needed.
+
+Benefits:
+A future maintainer (or a refactoring tool) will see the comment and understand that the require is load-order-critical rather than dead code, preventing an accidental deletion that would silently break every `applyDirectToMainBatch` call. The module graph and runtime behavior remain unchanged; only the in-file documentation improves.
+
+### AC-132 · VM integration harness stubs a hand-maintained mirror of three files' global contract
+Strength: Strong
+Files: the test file containing `loadDashboardScripts`
+
+Problem:
+The test file's `loadDashboardScripts` helper (and the inline `vm.createContext` in the `renderNav` test) builds a stub surface of globals—`document`, `localStorage`, `window`, `escapeHtml`, `escapeHtmlBright`, `escapeAttr`, `renderModelsTab`, `leave*Tab`/`enter*Tab`, `CORE_TABS`, `counts`, `activeTab`, `severityForTab`, `TAB_COUNT_SEVERITY_THRESHOLDS`, and others—that is a second, manually-synced copy of the global interface that `core-ui.js`, `concepts-and-adhoc-tab.js`, and `branches-joblist-hardware-tabs.js` actually read at runtime. There is no single source of truth for "which globals the dashboard scripts need." When any of those three files adds, renames, or removes a global it depends on, the stub in the test does not update automatically. The dangerous failure mode is not a loud crash but a silent pass: the code path under test stops reading the stubbed value, the assertion still succeeds, and the test now verifies a world that no longer matches production. The test's fidelity is only as good as a human remembering to keep the stub in sync with three files outside this community.
+
+Solution:
+Since the target scripts are plain global `<script>`s with no module system and reside outside the current community, the fix must be contained entirely within the test harness. Replace the hand-maintained list of globals with a dynamic discovery mechanism in `loadDashboardScripts`. Before executing the scripts in the `vm` context, use a static analysis pass (e.g., a lightweight AST parser like `acorn` or `esprima` available in the Node.js test environment) to scan the source code of the three external files. Extract all top-level identifier references that are not defined locally within the script (i.e., potential globals). Use this extracted list to automatically populate the `vm` context with `undefined` sentinels or appropriate stubs. This ensures the stub context is derived directly from the actual code under test, eliminating the manual synchronization burden. If a global is missing from the stub, the script will throw a clear "ReferenceError: X is not defined" or the harness can pre-validate and throw a descriptive "missing global X" error, making drift immediately visible.
+
+Benefits:
+The test can no longer silently drift from production. A rename or addition of a global in any of the three scripts immediately surfaces as a visible, named failure ("global X not provided in stub" or a ReferenceError) rather than a quiet pass that erodes trust in the suite. The test author no longer needs to know the full global surface of three sibling files to write or update a test, reducing the cognitive coupling between the test and the implementation. This approach respects the "plain global script" constraint and the community boundary by requiring no changes to the external files.
+
+### AC-133 · resolve() in the VM harness crashes with an opaque TypeError on an unknown or already-consumed URL
+Strength: Strong
+Files: the test file containing `loadDashboardScripts`
+
+Problem:
+Inside `loadDashboardScripts`, the `resolve` helper is defined as `(url, value) => pending.get(url).shift().resolve(value)`. If a test resolves a URL that was never fetched, `pending.get(url)` returns `undefined`, and the subsequent `.shift()` throws `TypeError: Cannot read properties of undefined (reading 'shift')`. If a test resolves a URL a second time after its promise was already consumed, `pending.get(url)` returns an empty array `[]`, `.shift()` returns `undefined`, and the subsequent `.resolve(value)` throws `TypeError: Cannot read properties of undefined (reading 'resolve')`. In both cases, the test fails with a harness-internal `TypeError` rather than an assertion message naming the wrong or duplicate URL. This makes a test-authoring mistake (a typo in the URL string, a double-resolve) look like a product bug and obscures the real cause. The helper conflates "no pending fetch for this URL" with a crash, so the error path provides no diagnostic value.
+
+Solution:
+Make `resolve` assert that a pending promise exists for the given URL before attempting to shift and resolve it. Concretely: look up `pending.get(url)`; if it is `undefined` or an empty array, throw (or call the test framework's `assert.fail`) with a message that includes the offending URL and the set of URLs that do have pending fetches, so the developer immediately sees the mismatch. This turns an opaque `TypeError` into a readable, actionable test failure that names the exact mistake.
+
+Benefits:
+A test-authoring error (wrong URL, double-resolve) is reported as a clear test assertion failure with the problematic URL in the message, rather than a cryptic harness `TypeError` that requires reading the helper's source to diagnose. Debugging time for the rare but real "I resolved the wrong URL" mistake drops from "trace the TypeError back through the harness" to "read the assertion message." The helper's error path now serves the test author instead of obscuring their mistake.
+
+### AC-134 · pipeline-self-audit.js re-exports a classification API it no longer implements
+Strength: Strong
+Files: src/pipeline-self-audit.js, src/blocked-task-classifiers.js, src/pipeline-forensics.js, src/staleness-audit.js
+
+Problem:
+The file's own header comment (dated 2026-09-06) states that classification logic was moved to `src/blocked-task-classifiers.js` and that `pipeline-self-audit.js` is now a "pure delegation" module. Yet its `module.exports` still exposes `REASON_CATEGORIES`, `hasZeroHitHarnessSearch`, `categorizeBlockedReason`, and `signatureForTask` — all imported from `blocked-task-classifiers.js` and re-exported unchanged. The comment justifies this as keeping `pipeline-forensics.js` and `staleness-audit.js`'s existing `require('./pipeline-self-audit.js')` imports working with zero changes. The result is a misleading module boundary: a reader inspecting `pipeline-self-audit.js`'s exports would reasonably expect those functions to be implemented there, but they are not. The file's actual own logic is only `findAuditClusters`, `buildAuditRawText`, and `buildAuditTask`. The re-export exists solely to avoid updating two consumer files, creating a facade that hides the true dependency and breaks the principle that a module's public API should reflect what it actually does.
+
+Solution:
+Update `pipeline-forensics.js` and `staleness-audit.js` to import the four classification symbols directly from `src/blocked-task-classifiers.js`, then remove those four re-exported symbols from `pipeline-self-audit.js`'s `module.exports`. After the change, `pipeline-self-audit.js`'s public API will contain only the three functions it genuinely implements, and the classification API will be sourced from the module that owns it.
+
+Benefits:
+Each module's public API becomes honest about its own responsibilities, eliminating the "facade that hides the true dependency" pattern. Future changes to the classification API no longer require touching `pipeline-self-audit.js`, and any new consumer reading `pipeline-self-audit.js`'s source will see only the functions actually implemented there, removing the confusion about where the real implementation lives.
+
+### AC-135 · staleness-audit-dedup.js hardcodes a task-ID exclusion that belongs in the caller
+Strength: Strong
+Files: src/staleness-audit-dedup.js
+
+Problem:
+`findDuplicateTask` contains the line `if (/(^|-)(brain-dump-sort|product-spec-outline)-/.test(other.id)) continue;`. This is a business-rule exclusion (tasks from these two sources should never be considered duplicates of anything) baked into a function whose stated purpose is generic Jaccard-similarity deduplication. The function's name, parameters, and JSDoc make no mention of these source types. A caller that wants to deduplicate a corpus that does include `brain-dump-sort` tasks (for example, a future audit of those tasks themselves) would silently get wrong results because the exclusion is invisible in the function's contract. This violates the single-responsibility principle and makes the function's behavior dependent on a hardcoded list of source IDs that is not documented in the function's interface.
+
+Solution:
+Add an optional `excludeIdPatterns` parameter to `findDuplicateTask` (defaulting to an empty array), and move the `brain-dump-sort|product-spec-outline` regex into the caller that needs it. The caller, which knows the context of why those sources are excluded, passes the pattern explicitly. The dedup function itself remains a generic similarity engine with no knowledge of specific task sources.
+
+Benefits:
+The function's behavior becomes explicit and configurable. The exclusion rule lives where the policy decision is made (the caller), not in the generic similarity engine. Future callers that need to deduplicate corpora including those source types can simply omit the pattern, and the function's JSDoc and signature accurately describe its contract.
+
+### AC-136 · Scope-eligibility gate applied at registration but not at retrieval
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`registerTaskSource` intercepts `config.next` to wrap it with a `sourceEligibleHere` check so that `scope: 'core'` sources return `null` on non-core projects. However, `getRegisteredSources` and `getRegisteredSource` return raw registry entries without applying that same scope filter. Any consumer that iterates the registry to build a UI list, a task queue, or a dispatch table will see core sources as present and active, only to discover at call-time that `next` silently yields `null`. This forces every downstream consumer to independently re-evaluate `sourceEligibleHere` before displaying or scheduling, duplicating logic that was already centralized in the registration hook and creating a tight coupling between the registry's internal gating strategy and every external caller.
+
+Solution:
+Introduce a dedicated `getEligibleSources` method (and a corresponding `getEligibleSource` accessor) that applies the scope-eligibility filter, while leaving `getRegisteredSources` and `getRegisteredSource` unchanged to return the full registry state. This preserves the documented contract that the registry reflects *what is installed* (allowing admin UIs to show "installed but inactive" states and distinguish "not installed" from "installed but ineligible"), while providing a single, centralized API for consumers that need *what is active* in the current context. The registration-time wrapping of `config.next` remains as a safety net for direct calls, but consumers building lists or dispatch tables can now rely on the registry to filter, rather than re-deriving eligibility themselves.
+
+Benefits:
+Consumers no longer need to know about or re-implement the `sourceEligibleHere` predicate when they only care about active sources; a single filter in the registry guarantees that listing and execution agree. The registry's public contract remains self-consistent: `getRegisteredSources` reflects installation state, and `getEligibleSources` reflects active state. New scope categories can be added in one place without auditing every call-site, and the distinction between "not installed" and "installed but ineligible" remains explicit and queryable.
+
+### AC-137 · Hardcoded domain-to-source mapping in resolveSourceName bypasses the alias mechanism
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`registerSourceAlias` exists as the public, data-driven mechanism for mapping a `task.source` string to a registry name, allowing plugins to extend or override source resolution without modifying core code. Yet `resolveSourceName` contains hardcoded branches for the `adhoc` and `secondbrain` domains that execute before the alias map is consulted. This creates two parallel resolution paths—one code-driven and one data-driven—where the code-driven path always wins for those two domains. A plugin that wishes to remap or intercept `adhoc`/`secondbrain` tasks cannot do so through the documented alias API, violating the Open/Closed Principle and making the resolution logic harder to reason about because the effective mapping depends on both the hardcoded checks and the alias table.
+
+Solution:
+Refactor `resolveSourceName` to consult only the `sourceAliases` map. Move the existing `adhoc` and `secondbrain` mappings into the alias map during core initialization (or at the point where those sources are registered), so that all source-name resolution flows through the single, extensible data-driven path. The `registerSourceAlias` interface then becomes the sole extension point, and no future domain-specific special-casing is required in the resolver. To address the state-dependency concern, ensure that core initialization populates these aliases synchronously before any public API is exposed, and document that `resolveSourceName` requires the registry to be initialized.
+
+Benefits:
+Source resolution becomes uniform and data-driven, eliminating the dual-path reasoning burden. Plugins gain the ability to override or extend `adhoc`/`secondbrain` mappings through the existing public API without patching core code. Adding a new domain alias is a one-line registration rather than a code change to the resolver, reducing the risk of missed cases and making the resolution logic trivially testable by inspecting the alias table. The resolver remains deterministic given a fixed registry state, and the initialization order is documented to prevent state-dependent failures.
+
+NOTE: AC-002's solution was retained because the critique's concern about initialization order is a documentation and implementation detail (ensuring synchronous core init before public API exposure) rather than a fundamental flaw in the data-driven approach; the Open/Closed Principle violation and dual-path reasoning burden are real defects that the alias-map approach resolves.
+
+### AC-138 · UI consumer does not filter core-scoped sources in non-core contexts (registry itself is correct)
+Strength: Worth exploring
+Files: src/task-source-registry.js (consumer), src/lib/source-scope.js
+
+Problem:
+`getRegisteredSources()` is intentionally a static, context-agnostic listing: it returns all registered entries sorted by priority, and scope gating is applied exclusively at the execution boundary (the `next()` wrapper / `getNextTask` / `next-claimable-task`). This is the correct design for a registry that serves as a storage and enumeration layer. However, downstream UI consumers (source-selection dropdowns, configuration panels) call `getRegisteredSources()` and render every entry without consulting `sourceEligibleHere`. A developer in a non-core project therefore sees a core-only source listed, selects it, and receives a silent `null` from the execution path with no inline explanation. The gap is not in the registry's contract but in the consumer that fails to project the listing through the eligibility predicate before display.
+
+Solution:
+At the UI/consumer layer that renders the source list, filter the result of `getRegisteredSources()` through `sourceEligibleHere(entry)` (or an equivalent context-aware predicate) before populating the dropdown. Alternatively, provide a thin convenience helper (e.g., `getEligibleSources()`) in a UI-adjacent module that composes the two calls, leaving `getRegisteredSources()` unchanged as a pure enumeration. This keeps the registry's contract intact—static, context-agnostic, suitable for cross-project planning and configuration tooling—while ensuring end-users only see sources that will actually execute in the current context.
+
+Benefits:
+The registry remains a simple, predictable storage layer with a single, well-defined contract. The UX gap is closed at the layer that owns the presentation decision. Consumers that legitimately need the full list (cross-project planning, configuration UIs) continue to work unchanged.
+
+### AC-139 · Lazy `require` in `registerTaskSource` is a correct circular-dependency resolution; minor documentation gap
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` defers `require('./lib/source-scope.js')` into the function body. This is a standard and appropriate pattern for breaking the circular dependency chain (`task-source-registry → source-scope → config → accessible-roots → …`). Importantly, `source-scope.js` itself reads configuration lazily inside `activeRepoIsCore()` via `require('../config.js').getConfig()`, so the config value is always resolved at the moment `sourceEligibleHere` is invoked, regardless of when the module was first required. There is therefore no initialization-order hazard: the timing of the `require` in `task-source-registry.js` does not affect when or how config is read. The only residual cost is that the dependency is not visible in the top-of-file `require` block, which can slow a newcomer's mental model of the module graph.
+
+Solution:
+Add a brief comment at the site of the deferred `require` explaining that it is intentional (circular dependency with `source-scope.js` → `config.js` → `accessible-roots.js`) and that config is read at invocation time inside `source-scope.js`, so no additional initialization-order guarantee is needed. No structural change (injection, top-level require, or refactoring of `source-scope.js`) is warranted; doing so would either reintroduce the cycle or add complexity disproportionate to the benefit.
+
+Benefits:
+A reader encountering the in-function `require` immediately understands *why* it is there and that it is safe, removing the temptation to "fix" it into a top-level import and inadvertently re-create the circular dependency. The module graph remains correct and the pattern stays standard.
+
+NOTE: Flag 1 was applied by removing the original AC-001's premise that `getRegisteredSources()` should filter by scope; the corrected draft treats the registry's context-agnostic listing as correct design and relocates the UX concern to the consumer layer. Flag 2 was applied by removing the original AC-002's initialization-order hazard claim (which is mitigated by `source-scope.js`'s own lazy config access) and reframing the item as a minor documentation gap with no structural change recommended.
+
+### AC-140 · concepts.js mutators lack an atomic read-modify-write, making concurrent forks silently drop counter increments
+Strength: Strong
+Files: src/concepts.js
+
+Problem:
+Every state-changing function in `concepts.js` follows the same shape: `loadConcepts(pipelineDir)` reads `concepts.json` into memory, the function mutates the in-memory object (incrementing `researchForkCount`, `builtFromScratchCount`, `adaptedFromResourceCount`, or advancing `status`), then `writeConcepts(pipelineDir, data)` writes the whole object back. The write itself is atomic (it uses `writeJsonAtomicSync`), but the read→mutate→write window is not. If two research forks, or a fork plus a build-tally, run concurrently against the same `pipelineDir`, each loads the pre-increment state, each writes its own full copy, and one increment is silently lost — last writer wins over the entire object, not just the field it touched. The file's own header frames these as "tally counters" fed by "the first research fork on a new topic" and by "the implementing model," i.e. precisely the concurrent, uncoordinated callers the `createConcept` idempotency comment worries about ("no coordination between callers"). The atomic-write dependency is already in the dependency graph, so the missing piece is serialization around the load→mutate→write window. This is a genuine correctness gap in the one file that owns persistent state in the community, and it is invisible in the tests because they exercise single-threaded calls.
+
+Solution:
+Introduce a single internal `mutateConcept(pipelineDir, conceptId, fn)` helper that serializes the load→mutate→write cycle — for example an `fs` advisory lock on `concepts.json`, or a compare-and-retry loop that re-reads and re-applies `fn` if the file's mtime or content hash changed between read and write. Rewrite `recordConceptResearch`, `recordConceptBuildTally`, `shelveConcept`, `reopenConcept`, `shipConcept`, and `createConcept` to route through this helper. The public signatures and the `STABLE_CONCEPT_STATUSES` guard remain identical; only the persistence primitive changes.
+
+Benefits:
+Counters and status transitions become safe under the concurrent-fork usage the file's own comments describe. The atomic-write guarantee the file already pays for actually covers the whole mutation, not just the final write. One helper owns the concurrency contract instead of six copy-pasted load/mutate/write blocks, so a future mutator inherits the guarantee by construction.
+
+### AC-141 · concepts.js and incident-amplification-marker.js duplicate the same inject/extract marker idiom with divergent cleanText normalization
+Strength: Worth exploring
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both files implement the same two-part convention: an `inject*Instruction(text)` that is idempotent (checks `if (base.includes(MARKER)) return base`) and an `extract*(text)` that returns `{ cleanText, <payload> }` and is deliberately lenient (malformed → drop, never throw; strip the marker; collapse `\n{3,}`). The amplification file's header explicitly says it "mirrors side-finding.js's own injection/extraction shape exactly," and the concepts file says its marker "mirrors side-finding.js's … marker (one-line, lenient, strip-and-continue)." The shared idiom — idempotent inject, lenient strip-and-continue extract, and `cleanParts.join('').replace(/\n{3,}/g,'\n\n').trim()` normalization — is the thing that's actually common, but it lives in two places (and a third, referenced but outside this community) with no shared home. The two files have already begun to diverge: `extractConceptBuildReport` returns a single `report` string while `extractAmplificationRequests` returns a `requests` array, and the cleanText collapse is duplicated verbatim. A change to the idiom — making `cleanText` normalization stricter, adding a shared "malformed → log" behavior, or adjusting the idempotency sentinel check — must be made in every copy and can drift silently.
+
+Solution:
+Extract the shared marker idiom into one small module (e.g. `src/marker-contract.js`) exposing `makeIdempotentInjector(instruction, sentinel)` and a `stripAndNormalize(cleanParts)` helper (or a `parseBlocks(source, { sentinel, requiredFields })` that both call). `concepts.js` and `incident-amplification-marker.js` keep their public exports and their field-specific parsing, but delegate the inject-idempotency check and the cleanText normalization to the shared helper. This is a two-file refactor plus one new helper, not a rewrite.
+
+Benefits:
+The idempotency and leniency semantics are defined once, so the "never throw on a forgotten or malformed marker" guarantee cannot drift between the two implementations. The duplicated `cleanText` collapse logic lives in one place. New markers added later inherit the contract instead of re-implementing it, and a single change to normalization or error-handling propagates automatically.
+
+### AC-142 · The stable-terminal-status guard is hand-copied across four mutators, making the file's central invariant a silent-omission risk
+Strength: Worth exploring
+Files: src/concepts.js
+
+Problem:
+`STABLE_CONCEPT_STATUSES` is the file's central invariant — a sweep or mutation must never silently reopen a shelved or shipped concept. The guard that enforces it, `if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;`, is written out by hand in `recordConceptResearch`, `recordConceptBuildTally`, `shelveConcept`, and `shipConcept` (four copies), with `reopenConcept` intentionally inverting the predicate. The file's own header spends a paragraph explaining why this guard exists (the "stray research fork landing after Task Atomization was shelved" incident), which signals it is load-bearing and easy to get wrong. The friction is that the invariant is expressed as a repeated inline predicate rather than a single named gate: a new mutator added later (the file is clearly growing — `shelve`/`reopen`/`ship` were added after the research/build functions) that forgets the guard silently breaks the "terminal states are stable" contract, and nothing in the structure makes the omission visible. The concept of "is this concept in a state a mutator may touch?" is the same question asked four times with identical logic.
+
+Solution:
+Introduce one internal `acquireMutableConcept(data, conceptId)` (or `assertMutable(concept)`) that encapsulates the `findConcept` lookup plus the `STABLE_CONCEPT_STATUSES` check and returns the concept or `null`. The four forward-mutators call it; `reopenConcept` keeps its own inverted check (it is the one place the stable set is the *entry* condition, which is a different predicate and should stay distinct). This makes the invariant a single named gate and turns a future mutator that skips it into a visible omission rather than a silent one.
+
+Benefits:
+The "stable terminal states" invariant — the file's most important correctness property — is defined in one place. Adding a mutator becomes "call the gate" instead of "remember to copy the guard," which is exactly the failure mode the header comment warns about. The `reopenConcept` exception stays explicit and separate, so the two different predicates (may-mutate vs. may-reopen) are not conflated.
+
+### AC-143 · Registry enforces a specific scope rule, coupling it to one business concern
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` directly requires `./lib/source-scope.js` and wraps every source's `next` function with a core-scope eligibility check. This means the generic registry module carries a hard dependency on a specific business rule (core-repo scoping), so any source that does not need that check still pays for it, and any new scope policy must be threaded through the registry rather than the source that owns the rule. The registry is no longer a neutral registration mechanism; it is implicitly a scope-enforcement layer for one particular domain.
+
+Solution:
+Remove the `source-scope.js` require and the `next`-wrapping logic from `registerTaskSource`. Instead, have the source registration code (e.g., in `src/task-sources.js` or the individual source definition) compose the scope check into its own `next` function before calling `registerTaskSource`. The registry then stores and invokes the `next` function exactly as provided, remaining agnostic to which sources enforce which eligibility rules. If a shared middleware pattern is desired, the registry can expose a simple `wrapNext(middleware)` helper that callers opt into, but the default path stays unopinionated.
+
+Benefits:
+The registry becomes a true generic registration point that can be reused for any task-source type without dragging in scope-specific logic. Adding, removing, or changing scope policies no longer requires touching the registry module, reducing the blast radius of scope-related changes and making the dependency graph easier to reason about and test in isolation.
+
+### AC-144 · Source-name resolution mixes hardcoded branches with a data-driven alias map
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` contains explicit `if` checks for the `'adhoc'` domain (and `'manual'` source) and the `'secondbrain'` domain, alongside a generic `sourceAliases` map populated via `registerSourceAlias`. The hardcoded branches duplicate mappings that could be expressed as data, creating a split-brain: some name normalizations live in control flow, others in a lookup table. A developer adding a new source must remember to inspect both the `if` chain and the alias map, and the two mechanisms can silently disagree.
+
+It is important to note that the hardcoded branches are **not** semantically equivalent to simple source-alias entries. The `'secondbrain'` branch fires on `task.domain === 'secondbrain'` regardless of what `task.source` is, while the alias map (per the `registerSourceAlias` contract) matches only on `task.source === fromField`. Likewise, the `'adhoc'` branch fires on `task.domain === 'adhoc'` *or* `task.source === 'manual'`. Replacing a domain-level check with a source-level alias entry would silently break routing for any task under that domain whose `source` field differs from the one hardcoded alias expects.
+
+Solution:
+Unify the two mechanisms into a single data-driven rule list that supports **both** matching dimensions. Concretely:
+
+1. Extend the alias registration to accept a field specifier, e.g.
+   ```js
+   registerSourceAlias({ field: 'domain', value: 'secondbrain' }, 'secondbrain');
+   registerSourceAlias({ field: 'domain', value: 'adhoc' }, 'adhoc');
+   registerSourceAlias({ field: 'source', value: 'manual' }, 'adhoc');
+   ```
+   (The existing `registerSourceAlias('from', 'to')` signature can be kept as a shorthand for `{ field: 'source', value: 'from' }`.)
+
+2. Store rules in an ordered array (or two maps keyed by field) rather than a single flat `source → target` map, so that `resolveSourceName` iterates the rules in registration order and returns the first match. Domain-level rules naturally act as broader fallbacks; source-level rules can be registered first if they should take precedence.
+
+3. Delete the hardcoded `if` branches from `resolveSourceName`. The function reduces to: iterate the rule list, test `task[rule.field] === rule.value`, return `rule.target` on first hit; otherwise fall through to `return task.source`.
+
+4. Register the existing domain and source rules in a central initialization routine (or alongside each source's registration) so that the full set of normalizations is visible in one place.
+
+Benefits:
+All name-normalization rules live in one data structure, eliminating the cognitive overhead of checking two mechanisms. Adding a new alias—whether keyed on domain or source—is a one-line registration call with no risk of missing a branch in an `if` chain. The domain-level and source-level semantics are preserved because the rule's `field` explicitly states which task property is matched, so the broader domain fallback that the original `if (task.domain === 'secondbrain')` provided is not lost. The function is easier to unit-test (seed the rule array) and easier to audit for completeness.
+
+### AC-145 · Shared protocol-marker inject/extract logic duplicated across two modules
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both `src/concepts.js` and `src/incident-amplification-marker.js` independently implement the same "marker protocol" pattern: an idempotent `inject…Instruction` function that checks whether a sentinel string is already present before appending a block of instructions, and an `extract…` function that applies a regex to a model response, cleans up the matched text, and tolerates missing or malformed output. The two implementations are near-identical in structure (idempotency guard → append; regex match → field extraction → error fallback), differing only in the marker string (`CONCEPT-BUILD:` vs `AMPLIFY:`) and the set of expected fields. Because the logic lives in two places, any change to parsing rules—stricter validation, a different delimiter, a new required field—must be made in lockstep across both files, and a missed update in one silently produces divergent behavior.
+
+Solution:
+Extract the common inject/extract mechanics into a single utility module (e.g. `src/protocol-markers.js`) that accepts a declarative marker definition—regex pattern, instruction text, list of required fields—and exposes generic `injectMarker(prompt, def)` and `extractMarker(response, def)` functions. `concepts.js` and `incident-amplification-marker.js` become thin configuration wrappers that supply their specific marker definition and delegate to the shared utility, eliminating the duplicated idempotency and parsing logic.
+
+Benefits:
+A single code path owns the idempotency check, regex application, field extraction, and error-tolerance behavior, so a change to any of those concerns is made once. New marker-based features can be added by writing a configuration object rather than re-implementing the inject/extract dance. The risk of the two modules drifting apart after a parsing-rule change is removed, and the shared module is straightforward to unit-test in isolation with `node:test`.
+
+### AC-146 · Current-date-line injection enforced by convention rather than by a shared call path
+Strength: Worth exploring
+Files: src/current-date-line.js, src/claude-client.js, src/local-client.js
+
+Problem:
+`src/current-date-line.js` is a single-purpose string provider whose sole consumer contract is "prepend this to every prompt before it reaches a model client." The header comment identifies `claude-client.js` and `local-client.js` as "the two real choke points," but the module itself has no awareness of those call sites. The coupling is purely conventional: a developer adding a new client (e.g. an OpenAI or Anthropic fallback) must remember to call `currentDateLine()` and splice it into the prompt, or the "single source of truth for the model's date context" guarantee silently breaks for that path. There is no compile-time or runtime mechanism that enforces the invariant.
+
+Solution:
+Introduce a thin `prompt-assembly` (or middleware) layer that every client funnels through before sending a request. This layer unconditionally prepends `currentDateLine()` to the prompt, so the policy "every model call carries the current date" is enforced by code structure rather than by each client remembering to call the helper. Clients become pure transport (auth, HTTP, streaming) and no longer carry prompt-assembly responsibilities.
+
+Benefits:
+Adding a new client type cannot accidentally omit the date line because the assembly step is structural, not optional. The "where is the date line needed" knowledge is centralized in one module instead of being scattered across N client files. Reviewers can verify the invariant by inspecting a single call site rather than auditing every client implementation.
+
+### AC-147 · Draft-truncation guard hard-coupled to a specific markdown layout with no shared contract
+Strength: Speculative
+Files: src/draft-truncation-guard.js, src/local-draft.js
+
+Problem:
+`src/draft-truncation-guard.js` detects truncation by checking for unclosed markdown tables and code fences—patterns that are specific to the "PLAN table" and "IMPLEMENT section" conventions emitted by `local-draft.js`. The two files have no direct import relationship or shared type/constant that ties them together; the guard simply assumes the draft will contain those particular structures. If the draft format evolves (a new section type, a different table style, a non-markdown output mode), the guard will either miss real truncation (false negative) or flag complete drafts as truncated (false positive), and nothing in the codebase signals that the two modules must be updated together.
+
+Solution:
+Make the set of "expected structural markers" (table delimiters, fence characters, section headings) a shared constant or small configuration object that both `local-draft.js` (as the producer) and `draft-truncation-guard.js` (as the consumer) import. This creates an explicit dependency edge: changing the draft format in one file forces a review of the other because they now reference the same symbol. Alternatively, if the guard's heuristic is deemed sufficient for the foreseeable format, add a co-located comment or a lightweight lint rule that cross-references the two files so a change to one triggers a reminder to audit the other.
+
+Benefits:
+The implicit "these two files must stay in sync" contract becomes visible in the dependency graph, reducing the chance that a prompt-format change silently invalidates the truncation heuristic. The guard remains simple and heuristic (avoiding over-engineering), but the coupling is now explicit and discoverable rather than relying on a developer's memory of which files are related.
+
+### AC-148 · Shared protocol-marker inject/extract logic duplicated across two modules
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both `src/concepts.js` and `src/incident-amplification-marker.js` independently implement the same "marker protocol" pattern: an idempotent `inject…Instruction` function that checks whether a sentinel string is already present before appending a block of instructions, and an `extract…` function that applies a regex to a model response, cleans up the matched text, and tolerates missing or malformed output. The two implementations are near-identical in structure (idempotency guard → append; regex match → field extraction → error fallback), differing only in the marker string (`CONCEPT-BUILD:` vs `AMPLIFY:`) and the set of expected fields. Because the logic lives in two places, any change to parsing rules—stricter validation, a different delimiter, a new required field—must be made in lockstep across both files, and a missed update in one silently produces divergent behavior.
+
+Solution:
+Extract the common inject/extract mechanics into a single utility module (e.g. `src/protocol-markers.js`) that accepts a declarative marker definition—regex pattern, instruction text, list of required fields—and exposes generic `injectMarker(prompt, def)` and `extractMarker(response, def)` functions. `concepts.js` and `incident-amplification-marker.js` become thin configuration wrappers that supply their specific marker definition and delegate to the shared utility, eliminating the duplicated idempotency and parsing logic.
+
+Benefits:
+A single code path owns the idempotency check, regex application, field extraction, and error-tolerance behavior, so a change to any of those concerns is made once. New marker-based features can be added by writing a configuration object rather than re-implementing the inject/extract dance. The risk of the two modules drifting apart after a parsing-rule change is removed, and the shared module is straightforward to unit-test in isolation with `node:test`.
+
+### AC-149 · Current-date-line injection enforced by convention rather than by a shared call path
+Strength: Worth exploring
+Files: src/current-date-line.js, src/claude-client.js, src/local-client.js
+
+Problem:
+`src/current-date-line.js` is a single-purpose string provider whose sole consumer contract is "prepend this to every prompt before it reaches a model client." The header comment identifies `claude-client.js` and `local-client.js` as "the two real choke points," but the module itself has no awareness of those call sites. The coupling is purely conventional: a developer adding a new client (e.g. an OpenAI or Anthropic fallback) must remember to call `currentDateLine()` and splice it into the prompt, or the "single source of truth for the model's date context" guarantee silently breaks for that path. There is no compile-time or runtime mechanism that enforces the invariant.
+
+Solution:
+Introduce a thin `prompt-assembly` (or middleware) layer that every client funnels through before sending a request. This layer unconditionally prepends `currentDateLine()` to the prompt, so the policy "every model call carries the current date" is enforced by code structure rather than by each client remembering to call the helper. Clients become pure transport (auth, HTTP, streaming) and no longer carry prompt-assembly responsibilities.
+
+Benefits:
+Adding a new client type cannot accidentally omit the date line because the assembly step is structural, not optional. The "where is the date line needed" knowledge is centralized in one module instead of being scattered across N client files. Reviewers can verify the invariant by inspecting a single call site rather than auditing every client implementation.
+
+### AC-150 · Draft-truncation guard hard-coupled to a specific markdown layout with no shared contract
+Strength: Speculative
+Files: src/draft-truncation-guard.js, src/local-draft.js
+
+Problem:
+`src/draft-truncation-guard.js` detects truncation by checking for unclosed markdown tables and code fences—patterns that are specific to the "PLAN table" and "IMPLEMENT section" conventions emitted by `local-draft.js`. The two files have no direct import relationship or shared type/constant that ties them together; the guard simply assumes the draft will contain those particular structures. If the draft format evolves (a new section type, a different table style, a non-markdown output mode), the guard will either miss real truncation (false negative) or flag complete drafts as truncated (false positive), and nothing in the codebase signals that the two modules must be updated together.
+
+Solution:
+Make the set of "expected structural markers" (table delimiters, fence characters, section headings) a shared constant or small configuration object that both `local-draft.js` (as the producer) and `draft-truncation-guard.js` (as the consumer) import. This creates an explicit dependency edge: changing the draft format in one file forces a review of the other because they now reference the same symbol. Alternatively, if the guard's heuristic is deemed sufficient for the foreseeable format, add a co-located comment or a lightweight lint rule that cross-references the two files so a change to one triggers a reminder to audit the other.
+
+Benefits:
+The implicit "these two files must stay in sync" contract becomes visible in the dependency graph, reducing the chance that a prompt-format change silently invalidates the truncation heuristic. The guard remains simple and heuristic (avoiding over-engineering), but the coupling is now explicit and discoverable rather than relying on a developer's memory of which files are related.
+
+### AC-151 · Consolidate duplicated Git execution and environment configuration in stacked-grounding
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The module defines a local `runGit` helper alongside `GIT_ENV` and `GIT_TIMEOUT_MS` constants, yet `resolveAtRef` bypasses this helper and calls `execFileSync` directly with the same environment and timeout settings. This creates a tight coupling to the local configuration values and duplicates the execution logic, meaning any future change to the environment (e.g., adding a new `GIT_*` variable) or timeout policy must be applied in two places within the same file, increasing the risk of configuration drift.
+
+Solution:
+Refactor `resolveAtRef` to call the existing `runGit` helper instead of invoking `execFileSync` directly. The helper already encapsulates the environment variables (including `GIT_TERMINAL_PROMPT: '0'`) and the timeout, so `resolveAtRef` simply passes its command arguments through the same code path as every other Git interaction in the module.
+
+Benefits:
+All Git interactions within the module share a single execution path, so environment and timeout configuration lives in exactly one place. This eliminates the risk that a future change to `GIT_ENV` or `GIT_TIMEOUT_MS` is applied to the helper but missed in `resolveAtRef`, and it makes the module's Git interaction surface easier to audit and test.
+
+### AC-152 · Remove redundant side-effect require in apply-core
+Strength: Strong
+Files: src/lib/apply-core.js, src/prompts.js, src/task-sources.js
+
+Problem:
+`apply-core.js` includes a bare `require('../task-sources.js')` as a side-effect import, but none of the functions it exports (`writeArtifact`, `applyCandidateSplit`, etc.) reference any symbols from `task-sources.js`. The consuming module `src/prompts.js` already loads `task-sources.js` directly, so this edge in the dependency graph is a leftover from a prior refactoring and serves no functional purpose.
+
+Solution:
+Delete the `require('../task-sources.js')` line from `apply-core.js`. No other code in the module depends on the side effect, and the module that actually needs `task-sources.js` (`src/prompts.js`) already imports it.
+
+Benefits:
+The module dependency graph loses a spurious edge, eliminating a potential circular-require hazard if `task-sources.js` ever comes to import from `apply-core.js`. It also makes the true dependency surface of `apply-core.js` explicit and easier to reason about during future refactors.
+
+### AC-153 · Standardize Git ref resolution strategy in stacked-grounding
+Strength: Worth exploring
+Files: src/stacked-grounding.js
+
+Problem:
+Within the same module, `resolveGroundingRef` uses `createRealGitRunner` to check branch existence, while `readFileAtRef`, `grepAtRef`, and `resolveAtRef` interact with Git via direct `execFileSync` calls using `origin/${ref}`. This represents two distinct mechanisms for Git interaction coexisting in one file, which complicates reasoning about which commands are covered by the runner's error handling and which are not.
+
+Solution:
+Evaluate whether `createRealGitRunner` can be extended to cover `git show` and `git grep` invocations, or whether a thin internal wrapper (beyond the existing `runGit` helper) should be introduced so that all Git interactions in the module follow a single strategy for ref resolution, error handling, and environment setup.
+
+Benefits:
+A single, consistent Git interaction strategy within the module reduces cognitive overhead when reading or modifying the code, ensures uniform error handling across all Git calls, and makes it straightforward to add cross-cutting concerns (logging, retry logic, or environment overrides) in one place rather than patching each call site individually.
+
+### AC-154 · Finding-identity contract split across side-finding.js and text-similarity.js
+Strength: Worth exploring
+Files: src/side-finding.js, src/text-similarity.js, src/side-finding-sweep.js
+
+Problem:
+Two modules independently encode "what counts as the same finding" with no shared definition of the comparison unit. `side-finding.js` dedups within a single response by exact lowercased title (`seenTitles` in `extractSideFindings`), treating identical titles with different bodies as one finding. `text-similarity.js` provides `jaccardSimilarity` and `sharesDistinctivePhrase` for the cross-response dedup that `side-finding-sweep.js` performs, treating different titles with a shared distinctive phrase as one finding. Both solve "is this finding already known?" at different granularities, but neither file states that the title is the canonical identity token and the phrase/Jaccard signals are secondary disambiguators. The only thread connecting them is the `conceptId` data field, which is a scope key, not a shared predicate. If the title convention changes (e.g. the model starts emitting a severity prefix or timestamp in the title), the within-response dedup in `side-finding.js` shifts silently while `text-similarity.js`'s consumers are unaffected, and vice versa. A reader of either file has no signal that the other module's output is being compared against a key built by the first.
+
+Solution:
+Introduce a single, named notion of "finding identity" shared by both dedup layers. Concretely: extract a small helper (or a documented contract block in both files) that states the canonical comparison key is the lowercased title, and that `text-similarity.js`'s phrase/Jaccard signals are applied only as a secondary disambiguator when titles do not already match. Both `extractSideFindings` in `side-finding.js` and the sweep's dedup in `side-finding-sweep.js` would call the same normalization function to produce the comparison key, making the two dedup layers explicitly ordered (exact-title first, fuzzy second) rather than two independent, coincidentally-complementary heuristics.
+
+Benefits:
+A future change to the title convention (prefix, suffix, case, length) is a single-point edit that both dedup paths pick up automatically, eliminating the silent-divergence risk. A reader of either file immediately sees the shared identity contract and the ordering of the two dedup layers. The `conceptId` scoping field and the fuzzy-similarity signals retain their roles, but their relationship to the primary identity key becomes explicit rather than implicit.
+
+### AC-155 · Pipeline-internal directory skip-list is enforced by two files that do not reference each other
+Strength: Speculative
+Files: src/grep-codebase-tool.js, src/side-finding.js, src/lib/archived-dirs.js
+
+Problem:
+`grep-codebase-tool.js` defines `GREP_SKIP_DIRS` (which includes `queue`) and separately calls `isArchivedDirName` from `lib/archived-dirs.js`. `side-finding.js` writes its inbox into `queue/side-findings-inbox/`. The invariant "pipeline-internal state directories are not searchable" is therefore enforced by two files that do not know about each other: the inbox lives inside a skipped directory purely because two independently-chosen string literals happen to agree on `queue`. If `side-finding.js` were moved to a top-level `side-findings/` directory (a plausible refactor given the inbox is a first-class concept with its own sweep module), it would silently become greppable and start polluting plan-grounding hits with the pipeline's own side-finding JSON files. Conversely, renaming or removing the `queue` entry from `GREP_SKIP_DIRS` would break the invariant with no compile-time, test-time, or documentation signal, because the coupling is purely lexical.
+
+Solution:
+Extract the "pipeline-internal, non-searchable directory" policy into a single shared constant, likely alongside `isArchivedDirName` in `lib/archived-dirs.js` or in a new `lib/pipeline-dirs.js`. Both `grep-codebase-tool.js`'s `GREP_SKIP_DIRS` and `side-finding.js`'s inbox-root derivation would reference this shared constant. A short comment on the constant states the invariant: "directories listed here hold pipeline state and must not appear in codebase-search results."
+
+Benefits:
+The "the inbox lives in a skipped dir" invariant becomes explicit and shared rather than coincidental. A future move of the inbox or a rename of a skip-list entry is a single-point change that both modules pick up. A reader of either file can trace the skip policy to one source of truth instead of inferring it from a string literal in a different module.
+
+### AC-156 · Registry hardcodes scope logic, creating a hidden coupling to `source-scope.js` internals
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`task-source-registry.js` (`registerTaskSource`) directly requires `lib/source-scope.js` and hardcodes the string `'core'` to decide when to wrap the `next` function. This creates a hidden coupling: the registry must know the internal API of `source-scope.js` (specifically `sourceEligibleHere`) and the specific scope value `'core'` in order to enforce eligibility. A registration function is expected to be a thin, scope-agnostic store; instead it carries scope-specific branching logic. If the scope model evolves (a new `'local'` scope, a change in how `sourceEligibleHere` resolves, a rename of the exported function), the registry must be updated in lockstep, and the coupling is invisible to anyone reading the registry in isolation because the dependency is a direct `require` rather than a documented interface.
+
+Solution:
+Move the scope-guarding responsibility into `lib/source-scope.js` itself. Export a function such as `applyScopeGuards(config)` (or a more granular `wrapNextWithScopeCheck(next, scope)`) that encapsulates the eligibility check and the closure wiring. The registry then calls that exported helper—e.g. `config = { ...config, next: wrapNextWithScopeCheck(config.next, config.scope) }`—without importing `sourceEligibleHere` directly or hardcoding the `'core'` string. The helper returns a new function (or a new config object), consistent with the existing spread-based pattern already in the registry, so the caller's original object is never touched. The registry becomes a thin, scope-agnostic store, and all scope-specific logic lives in one module.
+
+Benefits:
+The registry no longer needs to know which scopes exist, how eligibility is computed, or which internal function of `source-scope.js` to call. Adding or modifying a scope requires touching only `lib/source-scope.js`, and the registry's `require` list shrinks to the helper's public API. The control flow is easier to trace: a reader of the registry sees a single opaque call rather than an inline scope branch, and a reader of `source-scope.js` sees the full eligibility logic in one place. Testing simplifies because the scope-guarding logic can be unit-tested in isolation without standing up the registry.
+
+### AC-157 · Scope-eligibility check enforced redundantly at registration and at claim time
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`lib/source-scope.js` exports `sourceEligibleHere` and its own comment states the check is "Enforced at generation (getNextTask) AND claim (next-claimable-task)." Meanwhile, `task-source-registry.js` already wraps `next` at registration time so that the generation path is guarded. This means the same eligibility predicate is evaluated in at least two places for the same task, and a developer reading either site in isolation cannot tell which one is authoritative. If one site is updated (e.g., a new scope condition is added) and the other is missed, the two checks silently disagree, producing tasks that pass one gate but fail the other—or vice versa—with no obvious error.
+
+Solution:
+Choose a single enforcement point and remove the other. If the registry wrapper is sufficient (i.e., every task that enters the system passes through `registerTaskSource`), drop the claim-time re-check and document that registration-time guarding is the sole gate. If the claim-time check is necessary for tasks registered before a scope was set or for tasks injected through a path that bypasses the registry, remove the registry wrapper and make the claim-time check the documented, sole enforcement point. In either case, add a brief comment at the chosen site stating that it is the only place eligibility is enforced, so future readers do not add a second check.
+
+Benefits:
+Eliminating the duplicate check removes a whole category of "which check is the real one?" confusion and prevents the two sites from drifting out of sync. Control flow becomes linear and easier to reason about: a task is either eligible or it is not, determined in exactly one place. Testing simplifies because there is one code path to exercise rather than two that must be kept in agreement.
+
+### AC-158 · Registry hard-requires scope-resolution, breaking its "passive store" contract
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js, src/config.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` directly `require`s `src/lib/source-scope.js` in order to wrap the `next()` function for sources declared with `scope: 'core'`. That module in turn `require`s `src/config.js` (via `activeRepoIsCore`), and `src/config.js` is a central hub pulled in by nearly every other module in the codebase. The registry's stated contract is a "plain object keyed by source name" with "no validation," yet by injecting scope-gating logic at registration time it becomes an active participant in business-logic enforcement that depends on the runtime environment. This makes the registry impossible to unit-test in isolation (any test must stub `source-scope.js` or `config.js`) and introduces a latent circular-dependency risk: if `config.js` or any of its transitive dependencies ever need to `require` the registry, the load graph breaks.
+
+Solution:
+Remove the `require` of `src/lib/source-scope.js` from `registerTaskSource`. The registry should store the raw `next` function and the source's declared scope as plain metadata, with no gating logic applied at registration time.
+
+Introduce a single choke-point retrieval function—e.g. `invokeSource(name, …args)`—in a dedicated module (or in the execution layer) that **every** caller must use to obtain and invoke a source's `next()`. This function applies the `sourceEligibleHere` scope check before delegating to the stored function and returns `null` when the source is not eligible in the current environment. Crucially, this covers **all** invocation paths: `getNextTask` in the priority ladder, the always-run watchdog sweeps that call a source directly, and any future caller. The existing code comment in `task-source-registry.js`—"Wrap next() so that EVERY caller -- getNextTask, the always-run watchdog sweeps that call a source directly -- gets null on any other project"—confirms that the design intent is to gate at the *invocation* boundary, not at registration. Moving the gate to a shared `invokeSource` choke point preserves that guarantee while decoupling the registry from the scope/config dependency chain.
+
+Callers that currently destructure `registry[name].next` and call it directly are refactored to call `invokeSource(name, …)` instead. Because the choke point is a single function, there is exactly one place to reason about scope eligibility, and no caller can bypass it without going through a code path that is itself a bug (and easily caught by a lint rule or integration test that asserts no direct `.next` access on registry entries).
+
+Benefits:
+The registry becomes a true passive store that can be tested with zero external stubs. The hidden load-time dependency chain (registry → scope → config → everything) is eliminated, removing the circular-dependency risk. Scope-gating logic lives in one choke-point function that covers every invocation path—including the direct watchdog sweeps—so no caller can accidentally invoke a core-scoped source on a non-core project. New task sources can be registered in tests and integration harnesses without pulling in the full configuration stack.
+
+### AC-159 · Source identity is split-brain between plugin stamping and registry resolution
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/sdk/candidate-fulfillment.js, source plugin modules (e.g. arch_review, arch_import_review)
+
+Problem:
+The "source" string that identifies a task's origin is managed in two disconnected places. The **source plugin code** (e.g. the `arch_review` and `arch_import_review` modules) is responsible for *stamping* the `source` field when creating a task via the shared SDK utility `nextCandidateFulfillmentTask` in `src/sdk/candidate-fulfillment.js`. The SDK is a generic parameterized helper—it receives the source name as an argument from the calling plugin and does not itself decide which string to use. Meanwhile, `src/task-source-registry.js` defines `resolveSourceName(task)` to *resolve* that stamped string back to a registry key, including special-case aliases like `'manual'` → `'adhoc'` and `'deadcode_triage'` → `'unused_export'`. There is no single source of truth: adding a new task source requires the plugin to stamp a string *and* the registry to have a matching entry (or alias) for that string. A mismatch in either direction—stamping a string the registry doesn't resolve, or registering a key no plugin ever stamps—produces a silently dead source with no compile-time or test-time signal.
+
+Solution:
+Make the **source plugin** the single owner of its identity string. When a plugin registers itself via `registerTaskSource`, it passes its canonical name (e.g. `'arch_review'`) as the registry key. The same canonical name is the string the plugin stamps on tasks it creates (passed as the `source` parameter to `nextCandidateFulfillmentTask`). The registry's `resolveSourceName` is reduced to a thin backward-compatibility shim that maps a small, frozen set of legacy strings (e.g. `'manual'` → `'adhoc'`, `'deadcode_triage'` → `'unused_export'`) to their current canonical names; no new aliases are added. A lightweight assertion (run at registration time or in a startup test) verifies that every registered key is a string some plugin actually stamps, and conversely that every stamped string in the codebase resolves to a registered key—closing the "registered but never stamped" / "stamped but never registered" gap at test time rather than leaving it to production.
+
+The SDK utility (`nextCandidateFulfillmentTask`) remains a generic, source-agnostic helper. It does not query the registry or own identity logic; it simply forwards whatever `source` string the calling plugin provides.
+
+Benefits:
+Adding a new task source is a single-step operation: the plugin declares its canonical name once, uses that same name for both registration and stamping, and the registry key and the stamped string are in sync by construction. The alias table in the registry shrinks to a frozen backward-compatibility shim for pre-existing task strings, rather than a parallel identity system that must be kept in lockstep with plugin code. The SDK remains a simple, testable utility with no knowledge of the registry or of source identity.
+
+NOTE: Flag 2 was applied — the AC-002 solution was rewritten to attribute identity ownership to the source plugin (not the SDK) and to treat the SDK as a generic parameterized utility, removing the incorrect "SDK queries the registry for the stamp" proposal. Flag 3 was applied — the AC-001 solution was rewritten to introduce a single `invokeSource` choke-point function that covers all callers (including direct watchdog sweeps), rather than naively moving the check to `getNextTask` alone.
+
+### AC-160 · Dead require of task-sources.js in apply-core.js
+Strength: Strong
+Files: src/lib/apply-core.js, src/task-sources.js
+
+Problem:
+`apply-core.js` contains a bare, unassigned side-effect require of `task-sources.js` at the top of the file. None of the functions in `apply-core.js`—`coAuthorTrailer`, `usesGroupB`, `applyCandidateSplit`, `writeArtifact`, or any other—reference a symbol imported from `task-sources.js`. This is the same class of dead require already identified in AC-85 and AC-86 for `prompt-assembly.js` and `prompt-blocks.js`. It adds a needless edge to the module dependency graph, introduces a small circular-require risk if `task-sources.js` (transitively) imports back into `apply-core.js`, and misleads readers into believing a functional dependency exists.
+
+Solution:
+Remove the `require('../task-sources.js');` line from `apply-core.js`. If a side-effect import is genuinely required (e.g., `task-sources.js` registers a global on load), document that intent with a comment and move the require to the entry point that actually depends on the side effect, rather than burying it in an unrelated module.
+
+Benefits:
+The module graph loses a spurious edge, reducing circular-require risk and making the true dependency surface of `apply-core.js` accurate. It aligns the codebase with the cleanup already performed in AC-85 and AC-86, and removes a source of confusion for anyone auditing imports or performing tree-shaking / bundle analysis.
+
+### AC-161 · Remove redundant side-effect require of task-sources.js in apply-core.js
+Strength: Strong
+Files: src/lib/apply-core.js, src/apply-task.js
+
+Problem:
+`src/lib/apply-core.js` contains a bare, unassigned side-effect require of `task-sources.js` near the top of the file. No symbol from that module is destructured, assigned, or referenced anywhere in the file's exported functions (`coAuthorTrailer`, `usesGroupB`, `applyCandidateSplit`, `writeArtifact`, `closeOriginatingBrainDumpEntry`, `assertStageableFiles`). The module was extracted from `src/apply-task.js` (as noted in its header comment), and the caller `src/apply-task.js` already loads `task-sources.js` directly. The dead require therefore adds a needless edge to the module dependency graph and introduces a small circular-require risk for zero functional benefit.
+
+Solution:
+Delete the single `require('../task-sources.js');` line (and the one blank line immediately preceding it, to avoid leaving a double blank between the header comment and the first function definition). No other line in the file is touched: the `'use strict'` directive, the header comment, all function bodies, and the `module.exports` block remain byte-identical.
+
+Benefits:
+Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies explicit. There is zero behavioural change because none of the exported functions reference any symbol from `task-sources.js`.
+
+### AC-162 · `ollama_client.generate()` sends `null` model when `LOCAL_MODEL` is unset
+Strength: Worth exploring
+Files: python/dashboard/ollama_client.py
+
+Problem:
+`MODEL = os.environ.get("LOCAL_MODEL")` is read once at import time with no fallback. The module's own header comment states the intent: an unset `LOCAL_MODEL` should surface as a real Ollama "model not found" error rather than a guessed name. However, the current implementation sends `"model": null` in the request body. While Ollama correctly rejects this with a `400 Bad Request` (e.g., "model is required"), this failure mode is suboptimal for two reasons:
+1. **Latency/Network Dependency:** The error is only discovered after a network round-trip to the Ollama server. If the server is down, unreachable, or slow, the operator receives a connection error or timeout instead of the specific configuration error.
+2. **Clarity:** A local `RuntimeError` explicitly naming the missing `LOCAL_MODEL` environment variable is more actionable and self-explanatory than a generic HTTP 400 response from a remote service.
+
+Because `MODEL` is captured at import time, a process that starts before the env var is set keeps sending `null` for its entire lifetime. The current behavior is not "silent" (Ollama does not fall back to a default model), but it is an indirect failure that relies on external service behavior to report a local configuration error.
+
+Solution:
+In `generate()`, before building the request body, check `if MODEL is None` and raise a `RuntimeError` (or a small dedicated exception) whose message names the missing `LOCAL_MODEL` environment variable. This makes the failure happen at the client boundary, is deterministic, and matches the module's own documented intent. No change to the request path when `MODEL` is set.
+
+Benefits:
+Converts a network-dependent configuration error into an immediate, self-explanatory local error; eliminates the need for a network round-trip to detect a missing environment variable; and makes the "no hardcoded fallback" design actually hold at runtime rather than only in a comment.
+
+### AC-163 · `test_client_timeout_handling.py` mutates `sys.path` to import its subjects
+Strength: Worth exploring
+Files: python/dashboard/test_client_timeout_handling.py
+
+Problem:
+The test executes `sys.path.insert(0, str(Path(__file__).parent))` and then imports `claude_client` and `local_tool_client` as top-level modules. This mutates global interpreter state as a side effect of importing the test module. The primary concern is not shadowing (since inserting at index 0 correctly prioritizes the local directory), but rather **global state pollution**. The mutation persists for the rest of the interpreter session, so any other test or module loaded afterward in the same process inherits the altered path. This can lead to subtle import resolution issues in other parts of the test suite if they rely on standard package resolution or if the local directory contains modules with names that conflict with installed packages.
+
+The header comment notes this matches a zero-extra-dependency stdlib-unittest convention, but that is an argument for consistency, not for the pattern being sound in a larger test suite.
+
+Solution:
+Use `importlib.util.spec_from_file_location` to load the modules directly from their file paths without modifying `sys.path`. This approach is isolated to the specific test module and does not pollute the global interpreter state. For example:
+```python
+import importlib.util
+from pathlib import Path
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+claude_client = load_module("claude_client", Path(__file__).parent / "claude_client.py")
+local_tool_client = load_module("local_tool_client", Path(__file__).parent / "local_tool_client.py")
+```
+This removes the `sys.path` mutation entirely while maintaining the ability to import local modules without requiring a full package structure.
+
+Benefits:
+Removes global `sys.path` mutation from the test process, eliminates the risk of path pollution affecting other tests, and makes the test's dependency on the modules under test explicit and isolated.
+
+NOTE: The critique regarding AC-002's "shadowing" claim was valid and addressed by reframing the problem as global state pollution rather than shadowing, and by proposing a more robust solution using `importlib` instead of package imports. The critique regarding AC-001's "silent fallback" claim was valid and addressed by correcting the problem statement to reflect that Ollama returns a clear error, but the local error is still preferable for latency and clarity reasons.
+
+### AC-164 · Inconsistent error-handling contract between resolveAtRef and grepAtRef
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The `resolveAtRef` function swallows all `execFileSync` exceptions and returns `null`, treating a genuine git infrastructure failure (network timeout, corrupted object database, missing git binary) identically to a legitimate "path not found" result. Its sibling `grepAtRef` in the same file explicitly distinguishes between a "no match" exit code (1) and a real failure (exit code > 1), re-throwing the latter. Because `resolveAtRef` is used to validate target files for stacked tasks, a transient git error causes the system to falsely report a real file as "absent," leading to a valid task being blocked or rejected as a "fabricated path" rather than surfacing the underlying infrastructure failure to the operator.
+
+Solution:
+Align `resolveAtRef` with the error-handling contract already established by `grepAtRef`: catch the `execFileSync` exception, inspect the exit code, and re-throw (or throw a typed error) when the exit code indicates a genuine failure rather than a simple "not found" result. Only return `null` when the exit code specifically means the path does not exist at the given ref.
+
+Benefits:
+Operators and downstream task-validation logic can distinguish between "the file truly isn't there" and "git itself failed," preventing valid tasks from being silently rejected as fabricated. It also makes the module's error contract internally consistent, reducing the cognitive load on anyone reading or extending `stacked-grounding.js`.
+
+### AC-165 · Dead require of task-sources.js in apply-core.js
+Strength: Worth exploring
+Files: src/lib/apply-core.js, src/task-sources.js, src/apply-task.js
+
+Problem:
+`apply-core.js` contains a bare, unassigned side-effect require of `../task-sources.js`. No symbol from `task-sources.js` is destructured, assigned, or referenced anywhere in `apply-core.js`; the functions in `task-sources.js` (`writeArtifact`, `applyCandidateSplit`, and others) operate purely on their arguments and other imported modules. The caller, `src/apply-task.js`, already loads `./task-sources.js` directly. The dead require adds a needless edge to the module graph and introduces a small circular-require risk for no functional benefit.
+
+Solution:
+Remove the bare `require('../task-sources.js')` line from `apply-core.js`. Since no binding from that module is used and the caller already loads it, the require is pure dead weight.
+
+Benefits:
+The module graph becomes smaller and more honest—every edge reflects a real dependency. It eliminates a potential circular-require hazard and makes it easier for a reader (or a bundler) to understand the true dependency surface of `apply-core.js`.
+
+### AC-166 · Unify Marker Extraction and Injection Logic
+Strength: Strong
+Files: src/incident-amplification-marker.js, src/concepts.js
+
+Problem:
+Both `src/incident-amplification-marker.js` and `src/concepts.js` implement the same "find marker, extract payload, strip from text" pattern independently. Each file checks for marker idempotency (`if (base.includes('MARKER:')) return base;`), splits the response text on a marker string, parses the payload with regex-based key-value extraction, and returns a `{ cleanText, ... }` object. The `concepts.js` variant (`extractConceptBuildReport`) is a simplified single-marker version, while `incident-amplification-marker.js` handles multiple instances and more complex block structures. Because the logic is duplicated rather than shared, any change to marker format, whitespace handling, or delimiter conventions must be made in two places, and the two implementations can drift apart in how they handle edge cases such as multiple marker lines or malformed blocks.
+
+Solution:
+Extract a shared `extractMarkerBlock(text, markerRegex, parserFn)` utility (or a small `MarkerExtractor` class) that encapsulates the idempotency guard, text splitting, payload parsing, and clean-text reconstruction. Both `concepts.js` and `incident-amplification-marker.js` would delegate their extraction and injection logic to this single utility, passing in their specific marker regex and a parser callback. The utility would standardize behavior for multiple markers, malformed blocks, and whitespace variations, so both call sites inherit identical edge-case handling.
+
+Benefits:
+A single code path owns the marker protocol, so a format change (new delimiter, stricter whitespace, additional fields) is made in one place and both consumers pick it up automatically. The risk of the two implementations diverging—where `concepts.js` silently mishandles a multi-line payload that `incident-amplification-marker.js` handles correctly—is eliminated. Testing the extraction logic once in the shared utility covers both call sites, reducing the test surface and the chance of a regression in one file going unnoticed because the other file's tests mask it.
+
+### AC-167 · Decouple `getConceptTimeline` from Hardcoded Filesystem Paths
+Strength: Worth exploring
+Files: src/concepts.js
+
+Problem:
+`getConceptTimeline` in `src/concepts.js` accepts `loadBrainDump` and `listTaskHistory` as optional function parameters, which suggests a dependency-injection design. However, the function also internally constructs a path via `path.join(pipelineDir, 'brain-dump.json')` and passes that concrete path to the loader. This means the module still encodes a specific storage location and filename, violating the Dependency Inversion Principle: `concepts.js` should depend only on an abstract "give me brain-dump entries" contract, not on where the file lives. Testing the function with a different data source (in-memory array, database row, alternate filename) requires either mocking `path.join` or the filesystem, or passing a loader that happens to read from the exact path the function constructs, which is a hidden coupling.
+
+Solution:
+Refactor `getConceptTimeline` to accept either a pre-loaded `brainDumpEntries` array or a `getBrainDumpEntries(conceptId)` callback that the caller fully controls. Remove the internal `path.join(pipelineDir, 'brain-dump.json')` call entirely. The caller (dashboard, API layer, CLI) resolves the storage location, loads the data, and passes only the relevant entries into `concepts.js`. This makes `concepts.js` a pure logic module that operates on data structures rather than file paths.
+
+Benefits:
+`concepts.js` becomes trivially testable: pass an in-memory array, no filesystem mocking required. Migrating brain-dump storage to a database, a different filename, or a remote service is a caller-side change with zero edits to `concepts.js`. The module's public contract becomes explicit and honest—its parameters describe exactly what it needs—rather than implying decoupling while secretly depending on a specific path layout.
+
+### AC-168 · Centralize Stable-Status Guard Across Concept Mutators
+Strength: Strong
+Files: src/concepts.js
+
+Problem:
+`src/concepts.js` defines `STABLE_CONCEPT_STATUSES` and then manually repeats the guard `if (!concept || STABLE_CONCEPT_STATUSES.has(concept.status)) return null;` at the top of `recordConceptResearch`, `recordConceptBuildTally`, `shelveConcept`, and `reopenConcept`. This is a classic shotgun-surgery risk: adding a new mutator (e.g., `updateConceptDescription`, `reassignConceptOwner`) requires the developer to remember to insert the same guard. If they forget, a stable concept can be silently mutated, violating the invariant that stable states are terminal. The invariant is scattered across N call sites rather than enforced by a single mechanism, increasing cognitive load and the probability of an oversight.
+
+Solution:
+Introduce a `guardStableStatus(concept)` helper that throws a descriptive error (or returns a sentinel) when the concept is in a stable state. Every mutator calls this guard as its first statement. Alternatively, wrap concept mutation in a class method or a Proxy that intercepts property writes and rejects them when `status ∈ STABLE_CONCEPT_STATUSES`, making it structurally impossible for any current or future mutator to bypass the check. The key is that the invariant lives in one place and is enforced by the mechanism, not by developer memory.
+
+Benefits:
+Adding a new mutator no longer requires remembering to add the guard—the guard is either a mandatory first call or is enforced by the wrapper itself. Code review becomes simpler: reviewers check that the mutator calls `guardStableStatus` (or that the wrapper handles it) rather than scanning for a hand-rolled `if` that might be subtly different. The invariant "stable concepts are terminal" is stated once, in one function, and is impossible to accidentally weaken by editing one of several scattered copies.
+
+### AC-169 · ~~Duplicated priority-resolution logic across registry and priority modules~~ — **RETRACTED**
+Strength: ~~Strong~~ → **Invalid**
+Files: src/task-source-registry.js, src/lib/task-priority.js
+
+**Retraction:**
+The original draft mischaracterized the relationship between these two modules. They do **not** implement the same resolution pattern, and there is no duplicated logic to consolidate.
+
+- `task-source-registry.js` → `getRegisteredSources` reads the `priority` value **stored in each registry entry** (set at `registerTaskSource` call time) and uses it solely for **sorting the list** of registered sources (`a.priority ?? Infinity`). It never consults `getConfig().taskPriorityOverrides`.
+- `task-priority.js` → `taskPriority` is a **config-lookup helper** that returns `getConfig().taskPriorityOverrides[name] ?? def`, where `def` is a caller-supplied default. It never reads from the registry.
+
+These are complementary mechanisms with different inputs (registry entry vs. config object) and different purposes (list-sorting key vs. single-value resolution). They are not competing implementations of the same function, and the "divergence" the draft described is simply the intended design: the registry holds a base priority for ordering, while config overrides allow per-context or per-environment adjustment for consumers that explicitly opt in.
+
+**No code change is warranted.** The proposed `resolvePriority(sourceName, registeredEntry)` utility would conflate two unrelated data sources, break `taskPriority`'s general-purpose contract (it is not registry-specific), and introduce a coupling that does not exist today.
+
+NOTE: All three flags were applied; the entire finding was retracted because the core premise (duplicated logic / two sources of truth) was factually incorrect per the critique's code-level analysis.
+
+### AC-170 · Extract shared destination-path and mkdir logic in done-archive
+Strength: Strong
+Files: src/done-archive.js
+
+Problem:
+Both `archiveDoneTasks` and `archiveSpecificDoneTasks` independently construct the archive destination directory path via `path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)))` and manage a `destDirEnsured` flag to call `fs.mkdirSync(destDir, { recursive: true })`. The header comment on `archiveSpecificDoneTasks` states the two functions are intended to produce indistinguishable output for downstream consumers, yet the shared "resolve destination and ensure it exists" logic is duplicated rather than centralized. If the bucketing scheme, directory naming, or creation strategy changes, a developer must remember to update both call sites, creating a realistic risk that the two paths silently diverge.
+
+Solution:
+Extract the destination-path construction and directory-ensuring logic into a single internal helper (e.g., `resolveArchiveDest(doneDir, now)`) that returns the resolved `destDir` and guarantees it exists. Both `archiveDoneTasks` and `archiveSpecificDoneTasks` then call this helper once, eliminating the duplicated `path.join` / `monthBucket` / `mkdirSync` sequence and the per-function `destDirEnsured` bookkeeping.
+
+Benefits:
+A single source of truth for the archive destination means any future change to bucketing granularity, directory naming, or filesystem-creation strategy is made in exactly one place. The two public functions become thinner and more obviously equivalent, reducing the cognitive load on reviewers and eliminating the class of "I updated one but forgot the other" regressions.
+
+### AC-171 · Redundant side-effect require of task-sources.js in apply-core.js
+Strength: Strong
+Files: src/lib/apply-core.js
+
+Problem:
+`src/lib/apply-core.js` contains a bare, unassigned side-effect require of `../task-sources.js` sitting between the header comment and the first exported function. None of the file's exported functions (`coAuthorTrailer`, `usesGroupB`, `applyCandidateSplit`, `writeArtifact`, `closeOriginatingBrainDumpEntry`, `assertStageableFiles`) reference any symbol originating from `task-sources.js`. The require is redundant because `src/prompts.js`, the primary consumer of these functions, already loads `./task-sources.js` directly. The dead require adds a needless module-graph edge and a small circular-require risk without providing any value to this file.
+
+Solution:
+Delete the single line `require('../task-sources.js');` and the one blank line immediately preceding it, so the header comment is followed by a single blank line and then the first function. No other line in the file is touched: the `'use strict'` directive, header comment, all function bodies, and the `module.exports` statement remain byte-identical.
+
+Benefits:
+Removes a redundant module-load edge from the dependency graph, eliminates a potential circular-require path, and makes the file's actual dependencies (none beyond built-ins) explicit. Zero behavioural change: every function in the file is a pure function of its arguments and never touches any `task-sources.js` symbol.
+
+### AC-172 · Duplicated marker-inject/extract lifecycle with divergent contracts
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both `concepts.js` (via `injectConceptBuildInstruction` / `extractConceptBuildReport`) and `incident-amplification-marker.js` implement the same conceptual responsibility—inject a sentinel instruction into a prompt if not already present, then later parse and strip that marker from the model's response—but each defines its own parsing rules, required fields, scoping (e.g. "first blank line" boundary), and idempotency checks. Because there is no shared "marker protocol" contract, the two implementations can silently drift: one may tolerate multi-block markers while the other expects a single block, one may clean up extra blank lines while the other leaves them, and callers must memorize which module owns which marker. This shallow-interface duplication means a change to the injection or extraction semantics in one module has no enforcement mechanism to keep the other in sync.
+
+Solution:
+Extract a shared "marker protocol" helper (a small module or a set of pure functions) that encapsulates the inject-if-absent / extract-and-strip lifecycle: a single API that takes a marker template, a list of required fields, a scoping rule (e.g. "up to first blank line"), and a cleanup policy. Both `concepts.js` and `incident-amplification-marker.js` would then delegate to this shared helper, passing their specific marker strings and field requirements as configuration. The two modules retain their domain-specific naming and any domain-specific validation, but the mechanical inject/parse/strip/idempotency logic lives in one place.
+
+Benefits:
+A single source of truth for the inject/extract lifecycle eliminates the risk of divergent idempotency or cleanup behavior between the two markers. Adding a third marker in the future becomes a configuration change rather than a copy-paste of parsing logic. Callers no longer need to know which module "owns" which marker's mechanics; they only specify their marker's content and fields. The shared helper is trivially unit-testable in isolation (inject → extract round-trip, idempotency, malformed-input tolerance), which is harder to exercise when the logic is embedded in two larger modules.
+
+### AC-173 · concepts.js bundles registry persistence, state machine, and prompt-marker logic
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+`concepts.js` currently contains at least three distinct responsibilities: file I/O and registry persistence (`loadConcepts`, `writeConcepts`), a lifecycle state machine (`recordConceptResearch`, `recordConceptBuildTally`, `shelveConcept`, `reopenConcept`, `shipConcept`), timeline querying (`getConceptTimeline`), and prompt-marker injection/extraction (`injectConceptBuildInstruction`, `extractConceptBuildReport`). The prompt-marker logic is not conceptually part of the concept registry—it belongs to the "model response protocol" layer that `incident-amplification-marker.js` already represents. Bundling it here forces any caller that only needs lifecycle transitions to load marker-parsing code, and any caller that only needs the marker protocol to load registry I/O code. The two responsibilities have different change drivers (registry schema vs. prompt conventions) and different test surfaces, so coupling them in one module increases the blast radius of changes to either.
+
+Solution:
+Move `injectConceptBuildInstruction` and `extractConceptBuildReport` out of `concepts.js` into a dedicated module (e.g. `concept-build-marker.js`) that sits alongside `incident-amplification-marker.js` and, per AC-001, delegates its mechanical inject/extract work to the shared marker-protocol helper. `concepts.js` re-exports the two functions for backward compatibility (or callers are updated to import from the new module). The result is that `concepts.js` contains only registry persistence, state-machine transitions, and timeline queries—its true domain—while the prompt-marker concern is co-located with its sibling marker module.
+
+Benefits:
+Each module now has a single, coherent change driver: registry schema changes touch only `concepts.js`; prompt-convention changes touch only the marker modules. The state machine and file I/O in `concepts.js` become easier to reason about and test in isolation (no marker-parsing edge cases to account for). The marker modules form a visible, cohesive group that signals to a reader "this is the model-response-protocol layer," making the architecture self-documenting.
+
+### AC-174 · current-date-line.js is a standalone prompt-augmentation helper outside the marker protocol
+Strength: Worth exploring
+Files: src/current-date-line.js, src/claude-client.js, src/local-client.js
+
+Problem:
+`current-date-line.js` provides a single helper (`currentDateLine`) that is injected at choke points in `claude-client.js` and `local-client.js`. It is conceptually the same kind of concern as the concept-build marker and the amplify marker—prompt augmentation—but it is implemented as a free-standing one-function module with no shared inject/extract lifecycle, no idempotency guard, and no cleanup convention. The codebase thus has at least three separate "prompt augmentation" mechanisms, each with its own (or absent) idempotency, cleanup, and parsing rules. This is not a bug, but the absence of a unifying abstraction means that adding a fourth augmentation (or changing how the date line is injected) requires ad-hoc coordination across modules with no shared contract to enforce consistency.
+
+Solution:
+Fold `currentDateLine` into the shared marker-protocol helper introduced in AC-001 (or at minimum, give it the same inject-if-absent / idempotency-guard pattern). The date line would be registered as a "marker" whose template is the date string and whose extraction rule is "strip the line if present." `claude-client.js` and `local-client.js` would call the shared helper rather than the standalone function. This does not require a large refactor—the helper is small—but it brings the date line under the same idempotency and cleanup guarantees as the other two markers.
+
+Benefits:
+All three prompt-augmentation mechanisms share one idempotency contract and one cleanup policy, eliminating the risk that the date line is injected twice (or not stripped) while the other markers are handled correctly. A future augmentation (e.g. a system-prompt preamble) can be added by registering a new marker template rather than writing a new standalone module. The choke-point modules (`claude-client.js`, `local-client.js`) gain a single, uniform call site for all prompt augmentations, simplifying their code and making the set of active augmentations visible in one place.
+
+### AC-175 · resolveSourceName hardcodes built-in domain-based routing that the alias extension point cannot express
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName()` contains two hardcoded `if` branches for the package's own built-in sources (`task.domain === 'adhoc' || task.source === 'manual' → 'adhoc'` and `task.domain === 'secondbrain' → 'secondbrain'`), yet the file's header and `registerSourceAlias`'s JSDoc both promise that a plugin "declares its own quirk via `registerSourceAlias()` instead of this file needing to know every consumer's naming." The alias mechanism only maps a `task.source` string to a single registry-name string, so it structurally cannot express the domain-keyed cases that the two built-ins require. The result is a reserved namespace: any plugin whose tasks happen to carry `domain: 'adhoc'` or `source: 'manual'` is silently captured by the hardcoded branch before the alias lookup is ever consulted, with no public API path to override or reassign that mapping. The doc comment further mis-describes the extension point as "wrapping its own call sites" rather than calling `registerSourceAlias`, compounding the confusion for a contributor who reads the header and then discovers the hardcoded branches.
+
+Solution:
+Introduce a parallel `domainAliases` map in the same module that follows the identical single-string-key → single-string-value contract as the existing `sourceAliases` map, exposed through a new `registerDomainAlias(domainValue, toName)` function (both arguments are plain strings, mirroring `registerSourceAlias`'s signature). At module initialization, replace the two hardcoded `if` branches with `registerDomainAlias('adhoc', 'adhoc')` and `registerDomainAlias('secondbrain', 'secondbrain')`. Update `resolveSourceName` to check `domainAliases[task.domain]` first, then fall through to the existing `sourceAliases[task.source]` lookup, then to the default. The existing `registerSourceAlias(fromField, toName)` API and its single-string contract are left entirely unchanged; the new function is additive. Finally, correct the header comment and `registerSourceAlias` JSDoc to accurately name `registerSourceAlias` / `registerDomainAlias` as the extension points rather than "wrapping call sites."
+
+Benefits:
+The two most important built-in mappings become expressible through the same public extension API that out-of-tree plugins use, eliminating the reserved-namespace collision and the silent mis-routing of plugin tasks that happen to stamp `domain: 'adhoc'` or `source: 'manual'`. The hardcoded `if` branches are deleted, so the file's own documented promise ("no hardcoded `if` for every out-of-tree source's naming quirk") becomes true for the package's own sources as well. The additive `registerDomainAlias` function follows the exact same single-string contract as `registerSourceAlias`, so no existing caller's code changes and the API surface remains predictable. The corrected doc comments remove the misleading "wrapping call sites" language, giving a contributor an accurate mental model of the extension point on first read.
+
+### AC-176 · Module-level singleton hook in task-history creates hidden global state
+Strength: Weak (Revised)
+Files: src/task-history.js
+
+Problem:
+`setHistoryPersistHook` assigns to a module-level `persistHook` variable that `appendHistoryEvent` later invokes. While the code comments describe this as an intentional "opt-in per process" design, this pattern creates a hidden global state dependency. Any two independent pipeline workers (e.g., a local-draft worker and a review-task worker) that load this module in the same Node.js process will silently overwrite each other's hook. The module's behavior therefore depends on the execution order of its callers rather than on explicit, inspectable parameters. This makes concurrency bugs difficult to diagnose and violates the principle of locality, as the dependency is not visible in the function signature of `appendHistoryEvent`.
+
+Solution:
+Replace the module-level `persistHook` variable with an explicit parameter. `appendHistoryEvent` should accept a `persist` function (or a small options object containing it) as an argument, and callers should pass their own hook at the call site. If a default no-op is needed for backward compatibility, it can be supplied as a default parameter value, but the dependency becomes visible in the function signature and is no longer shared mutable state. This requires updating existing callers to explicitly pass their persistence strategy, which clarifies the dependency graph.
+
+Benefits:
+Each worker owns its persistence strategy explicitly, eliminating the class of race conditions where one worker's hook clobbers another's. The module becomes trivially testable in isolation (pass a spy), and code review can verify the dependency at the call site rather than hunting for a side-effecting `setHistoryPersistHook` call elsewhere in the process. This aligns the implementation with the principle of explicit dependencies, even if it deviates from the original "singleton" design intent.
+
+### AC-177 · Duplicated Git env/timeout constants bypass the shared runner in stacked-grounding
+Strength: Strong
+Files: src/stacked-grounding.js
+
+Problem:
+The header comment in `src/stacked-grounding.js` states that the file reuses `git-runner.js`'s adapter for `resolveGroundingRef` to avoid hand-rolling Git checks. Yet `readFileAtRef`, `grepAtRef`, and `resolveAtRef` each call `execFileSync` directly with locally defined `GIT_ENV` and `GIT_TIMEOUT_MS` constants, bypassing the shared runner entirely. This breaks the "one place to get it right" goal the header promises and means any future change to Git execution standards (a new environment variable, a timeout adjustment, a sandbox flag) must be replicated across three call sites in the same file, increasing the chance of drift.
+
+Solution:
+Route `readFileAtRef`, `grepAtRef`, and `resolveAtRef` through the same `git-runner.js` adapter that `resolveGroundingRef` already uses. Remove the local `GIT_ENV` and `GIT_TIMEOUT_MS` definitions from `src/stacked-grounding.js` and let the runner own those constants. If the runner's API does not yet cover the specific sub-commands (`show`, `grep`, `rev-parse`), extend the runner with thin wrappers rather than duplicating the `execFileSync` boilerplate.
+
+Benefits:
+Git execution configuration lives in exactly one module, so a single change propagates everywhere. The file's public behavior matches its documented intent, reducing cognitive load for maintainers who read the header and expect the runner to be the sole Git-execution path. New sub-commands added later inherit the correct env/timeout automatically.
+
+### AC-178 · apply-core depends on side-effect require of task-sources for registry population
+Strength: Worth exploring
+Files: src/lib/apply-core.js, src/task-sources.js
+
+Problem:
+`writeArtifact` in `src/lib/apply-core.js` calls `getRegisteredSource`, which is only populated as a side effect of the top-level `require('../task-sources.js')` at the top of the file. While this is a standard CommonJS pattern, it creates an implicit, order-sensitive dependency: if `apply-core.js` is loaded in a context where `task-sources.js` has not yet been required (or if the registry is reset between tests), `getRegisteredSource` will return `undefined` and `writeArtifact` will fail at runtime with an error that is not visible from the function's own signature. The module's correctness is thus coupled to the load order of an external module rather than to an explicit dependency.
+
+Solution:
+Make the source registry an explicit dependency. Either (a) have `writeArtifact` accept the source object (or a lookup function) as a parameter, or (b) have the caller inject the registry via a small factory/initialiser that `apply-core.js` exposes (e.g., `initApplyCore({ getRegisteredSource })`). Remove the bare side-effect `require` from the top of `apply-core.js` so that the module's dependencies are visible in its public API rather than hidden in a load-order assumption.
+
+Benefits:
+The module is testable without loading the full source registry, and the dependency is visible at the call site, making it obvious to a reader which external state the function relies on. It eliminates a class of hard-to-reproduce runtime errors that only surface when module load order changes (e.g., after a refactor or in a bundler that reorders imports).
+
+NOTE: Flag 2 was not fully applied because the critique incorrectly claims the solution "breaks the existing API contract" in a way that contradicts the code's intent; however, the critique's core point about the "opt-in per process" design intent was valid, so the draft was revised to acknowledge this design choice while still recommending explicit parameters for clarity and testability.
+
+### AC-179 · Lazy-require in task-source-registry creates undocumented coupling to scope/config subsystems
+Strength: Moderate
+Files: src/task-source-registry.js, src/lib/source-scope.js, src/config.js, src/accessible-roots.js
+
+Problem:
+The `registerTaskSource` function in `src/task-source-registry.js` performs a conditional `require('./lib/source-scope.js')` inside its function body when wrapping the `next` function for `scope: 'core'` sources. The lazy-require is almost certainly a deliberate mitigation against a circular dependency: `source-scope.js` requires `../config.js` (via `activeRepoIsCore()`), and `config.js` sits in a foundational dependency chain that likely reaches back toward the registry or its siblings. Moving the require to the top level would therefore re-introduce the very cycle the lazy-require avoids.
+
+The real issue is not the laziness itself but the *undocumented* coupling. There is no comment, JSDoc annotation, or architectural note explaining *why* the require is deferred, what the circular path looks like, or what invariants must hold if the scope or config modules change. As a result:
+
+- A developer reading `task-source-registry.js` sees a bare `require` buried in a conditional branch and cannot tell whether it is a performance deferral, a circularity workaround, or an oversight.
+- Static-analysis and module-graph tools (madge, dependency-cruiser) either miss the edge entirely or flag it as a suspicious mid-function require, producing noise that buries real findings.
+- Any refactor of `config.js`, `accessible-roots.js`, or `source-scope.js` can silently alter the registry's runtime behaviour with no visible import relationship to prompt a review.
+
+Solution:
+Because the circular dependency is real, the fix is **not** to promote the require to top level. Instead, make the coupling explicit and the dependency direction unambiguous:
+
+1. **Invert the dependency (preferred).** Have the registry expose a registration hook, e.g. `registry.setScopeResolver(fn)`. The scope module (or a small bootstrap/setup module that already loads both) calls `registry.setScopeResolver(sourceEligibleHere)` at initialisation time. The registry then calls the stored function when wrapping `next` for core sources, and **never requires `source-scope.js` at all**—lazy or otherwise. The dependency arrow becomes `source-scope → task-source-registry` (one-directional), which is acyclic. This removes the mid-function `require` entirely and makes the coupling visible in the scope module's top-level imports.
+
+2. **If inversion is not feasible** (e.g., the registry is loaded before the scope module in a way that prevents the scope module from calling back), keep the lazy-require but **document it explicitly**:
+   - Add a `// NOTE: lazy require to break circular dep: registry → scope → config → … → registry` comment directly above the `require` call.
+   - Add a JSDoc `@depends` or `@circular` tag on `registerTaskSource` naming the specific modules in the cycle.
+   - Add a short "Dependency notes" section to the file's header comment listing `source-scope.js`, `config.js`, and `accessible-roots.js` as *runtime* (not load-time) dependencies and the reason.
+
+3. **Either way**, add a brief integration-test or smoke-test assertion that registers a core source and verifies the scope-wrapping path executes, so that a future refactor of the scope or config modules that breaks the wiring is caught in CI rather than in production.
+
+Benefits:
+- The circular-dependency constraint is preserved (no new cycle is introduced), so the refactor is safe.
+- The coupling becomes visible to both humans and tooling: either as a top-level import in the scope module (option 1) or as an explicit, commented runtime dependency (option 2).
+- Module-graph tools report a clean, one-directional edge instead of an unexplained mid-function require, reducing false-positive noise.
+- The smoke test (option 3) guards the registration path against silent breakage from future refactors of `config.js` or `accessible-roots.js`.
+- Developers no longer need to reverse-engineer the circular path to understand why the require is deferred; the rationale is stated in the code.
+
+### AC-180 · `ollama_client.generate` sends `"model": null` to Ollama when `LOCAL_MODEL` is unset, producing a less actionable server error than the documented contract implies
+Strength: Strong
+Files: python/dashboard/ollama_client.py
+
+Problem:
+The module-level constant `MODEL` is initialized from `os.environ.get("LOCAL_MODEL")`, which yields `None` when the variable is unset. The `generate` function then builds its request body with `"model": MODEL` and serializes it via `json.dumps`. Because `None` is a valid JSON type (it serializes to `null`), no local exception is raised; the HTTP request is sent with the body `{"model": null, ...}`. Ollama receives a `null` model value and returns a server-side error (typically a generic "model not found" or "model must be a string" message). The user sees an opaque, server-generated error that does not identify the root cause — an unset `LOCAL_MODEL` environment variable — rather than the clear, actionable message the docstring describes. The failure mode is therefore less informative than the documented contract promises, and the user must infer the missing configuration from a generic server response.
+
+Solution:
+At the top of `generate` (or in a small helper called before the request is built), check whether `MODEL` is `None` or an empty string. If so, raise a `ValueError` (or a dedicated `OllamaClientError`) with a message such as `"LOCAL_MODEL environment variable is not set; please configure it to a valid Ollama model name."` This ensures the caller receives an immediate, locally-generated error that names the exact configuration problem, without depending on the wording of Ollama's server-side response.
+
+Benefits:
+The failure mode now matches the documented behavior: the user receives a clear, actionable message identifying the missing configuration rather than a generic server error that requires inference. Debugging time drops because the root cause (unset environment variable) is stated explicitly at the point of failure. The function's contract becomes reliable regardless of whether the caller is running in a container, a CI job, or a developer shell where `LOCAL_MODEL` may not yet be exported, and the error is independent of Ollama's internal error-message wording (which could change across server versions).
+
+### AC-181 · Registry hides a runtime dependency on source-scope via lazy require
+Strength: Not recommended
+Files: src/task-source-registry.js, src/lib/source-scope.js, src/accessible-roots.js, src/config.js
+
+Problem:
+The draft suggested removing the inline `require('./lib/source-scope.js')` from `registerTaskSource` to decouple the registry from scoping logic. However, the code explicitly documents that this wrapping is required to ensure **every** caller—including "always-run watchdog sweeps" that invoke `source.next()` directly—respects the `scope: 'core'` gate. Moving this logic to a bootstrap layer or a caller-provided decorator would break this guarantee for any execution path that bypasses the standard `getNextTask` priority ladder, leaving those paths vulnerable to cross-project data leakage or incorrect behavior.
+
+Solution:
+Retain the current implementation. The registry must own the wrapping logic to enforce the scope gate universally across all execution paths. The "hidden dependency" is a deliberate architectural choice to ensure correctness and safety over loose coupling in this specific context.
+
+Benefits:
+Ensures that all task source invocations, regardless of the calling context (priority ladder, watchdog, direct call), are consistently gated by the source-scope logic. Prevents potential security or correctness hazards that would arise if the gate were optional or context-dependent.
+
+### AC-182 · resolveSourceName mixes hardcoded built-in checks with the alias mechanism
+Strength: Not recommended
+Files: src/task-source-registry.js
+
+Problem:
+The draft suggested replacing hardcoded checks for `task.domain === 'adhoc'` with `registerSourceAlias`. This is factually incorrect because `registerSourceAlias` maps `task.source` values to registry names. The `adhoc` case is triggered by `task.domain === 'adhoc'` OR `task.source === 'manual'`. An alias for `'adhoc'` would only catch tasks where `task.source === 'adhoc'`, which is not the case. Furthermore, the alias mechanism cannot handle the `domain`-based check at all. The hardcoded logic is necessary because the resolution key (`domain` vs `source`) differs from the alias key (`source` only).
+
+Solution:
+Retain the current implementation. The hardcoded checks are required to handle the specific combination of `domain` and `source` values that define the `adhoc` source, which cannot be expressed through the existing `source`-only alias mechanism.
+
+Benefits:
+Ensures correct resolution of `adhoc` tasks, which have a unique identification pattern (`domain: 'adhoc'` or `source: 'manual'`) that does not fit the standard alias mapping. Prevents regression in task source resolution for this specific built-in source.
+
+### AC-183 · task-priority silently reads global config, masking initialization errors
+Strength: Not recommended
+Files: src/lib/task-priority.js, src/config.js
+
+Problem:
+The draft suggested removing the `try/catch` in `taskPriority` to surface initialization errors. However, the `try/catch` is a deliberate "fail-open" design pattern to ensure that a failure to load config (e.g., in a test environment, a minimal CLI context, or a misconfigured deployment) does not crash the entire task priority resolution. The function's contract is to return a priority, and falling back to `def` is the correct, safe behavior. Removing the `try/catch` or requiring explicit config injection would introduce a hard dependency on `config.js` initialization, potentially causing crashes in contexts where config is not fully loaded but a default priority is still needed.
+
+Solution:
+Retain the current implementation. The `try/catch` provides graceful degradation, ensuring that the system remains available and functional even when configuration is unavailable or misconfigured. This is appropriate for a utility function that must not become a single point of failure.
+
+Benefits:
+Ensures robustness and availability in diverse execution contexts (tests, minimal CLI, misconfigured deployments). Prevents crashes due to missing or uninitialized configuration, allowing the system to continue operating with default priorities rather than failing entirely.
+
+NOTE: All three flags were applied as they correctly identified that the original draft's proposed solutions would break existing functionality, violate design intent, or introduce unnecessary fragility.
+
+### AC-184 · Task-source registry hardwired to core-scope policy
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` directly `require`s `./lib/source-scope.js` and, when the registration config specifies `scope: 'core'`, wraps the caller's `next` function with `sourceEligibleHere` gating. This means the registry—a general-purpose storage and dispatch mechanism—carries an opinion about a specific project-scoping policy ("core" vs. non-core). Any change to the scoping rules, or the introduction of a different conditional-gating strategy (e.g., environment-based, feature-flag-based), forces a modification to the registry itself. The coupling is also invisible to consumers: they register a source with a `scope` string and the registry silently injects a config-reading side effect into every task-generation call, which is not apparent from the registry's public API.
+
+Solution:
+Remove the `require` of `source-scope.js` and the `scope === 'core'` branch from `registerTaskSource`. Instead, let the caller supply an already-wrapped `next` function (or a generic `wrap` function in the registration config) that encapsulates whatever eligibility logic is needed. The registry then stores and invokes the function as-is, remaining agnostic to the business policy. The existing call site that currently passes `scope: 'core'` is updated to wrap `next` with `sourceEligibleHere` before handing it to the registry.
+
+Benefits:
+The registry becomes a pure, policy-free storage mechanism that can be reused in any context without dragging in `source-scope.js` or its transitive config dependencies. Scoping rules can evolve, be replaced, or be composed without touching the registry. The dependency graph shrinks: consumers of the registry no longer transitively load `source-scope.js`, `getConfig`, or `isCoreRepo`.
+
+### AC-185 · Candidate-fulfillment god module obscures the dependency graph
+Strength: Strong
+Files: src/sdk/candidate-fulfillment.js
+
+Problem:
+`src/sdk/candidate-fulfillment.js` was assembled by moving code "verbatim out of task-sources.js" and re-exporting `candidate-docs.js` so that a plugin has "one import for the whole candidate lifecycle." In practice the module mixes at least four distinct concerns: the write side (`candidateDocs`), the read/claim side (`nextCandidateFulfillmentTask`), a cluster of low-level text helpers (`findFuzzyMatch`, `windowAroundIndex`, `collectAnchorHits`, `snippetFromSection`, `quotedSymbolsFromSection`), and a block of tuning constants (`MAX_FETCHED_FILE_CHARS`, `MIN_REGION_CHARS`, `MAX_ANCHOR_REGIONS`, `QUOTED_SYMBOL_RE`, `LINE_CITATION_RE`, etc.). Because the module re-exports `candidate-docs`, any consumer that imports even one helper transitively loads `candidate-docs`, `candidate-premise-check`, `pipeline-forensics`, `task-history`, and several `lib` modules. This makes the effective dependency footprint of a simple utility import far larger than necessary, increases the surface area for circular-dependency bugs, and means that a change to any one of those transitive modules can invalidate a module that only needed `findFuzzyMatch`.
+
+Solution:
+Extract the low-level helpers and their associated constants into a dedicated module (e.g., `src/lib/candidate-grounding.js`) that has no dependency on the candidate-lifecycle write/read path. `src/sdk/candidate-fulfillment.js` then retains only the high-level orchestration (`nextCandidateFulfillmentTask`) and the re-export of `candidate-docs` for backward compatibility, while importing the helpers from the new module. Consumers that only need the text helpers import the new module directly, avoiding the full lifecycle dependency chain.
+
+Benefits:
+The dependency graph becomes honest: importing a fuzzy-match helper no longer pulls in the entire candidate lifecycle. The module boundary aligns with the actual unit of change—tuning constants and text-extraction logic can be refactored independently of the task-claiming logic. The risk of circular dependencies is reduced because the new helper module sits lower in the graph and has no back-edges to the lifecycle modules.
+
+### AC-186 · Hidden config read via default parameter in sourceEligibleHere
+Strength: Worth exploring
+Files: src/lib/source-scope.js, src/task-source-registry.js
+
+Problem:
+`sourceEligibleHere` in `src/lib/source-scope.js` declares a default parameter `coreActive = activeRepoIsCore()`. Because the registry's wrapper in `src/task-source-registry.js` calls `sourceEligibleHere` without passing `coreActive`, every task-generation invocation triggers `activeRepoIsCore()`, which reads `getConfig().repoRoot` and evaluates `isCoreRepo()`. The concern here is not performance—the read is a cheap in-process object access—but *visibility*: the function signature does not advertise that it will read global configuration, and the call site in the registry makes no reference to `source-scope.js` or `activeRepoIsCore`. A reader of `registerTaskSource` sees a bare `sourceEligibleHere()` call with no indication that a global config lookup is happening underneath. If the scoping policy is later made injectable (per AC-001), the hidden default becomes a silent coupling that is easy to miss during refactoring.
+
+Solution:
+Remove the default parameter from `sourceEligibleHere` so the function signature reads `sourceEligibleHere(coreActive)` with no implicit fallback. At the call site (the wrapper that AC-001 moves out of the registry into the caller), resolve `activeRepoIsCore()` at **call time**—inside the `next` wrapper, on each invocation—and pass the resulting boolean explicitly: `sourceEligibleHere(activeRepoIsCore())`. This preserves the gate's intended semantics (re-evaluate the *current* active repo on every task-generation call, fail-open on read errors) while making the config dependency visible in the call chain. No value is cached or captured at registration time.
+
+Benefits:
+The function's contract becomes honest—no hidden global reads hidden behind a default parameter. The call site explicitly names `activeRepoIsCore()`, so a reader immediately sees the config dependency and the fact that it is re-evaluated per call. If the scoping policy is later made injectable (per AC-001), the explicit parameter makes it straightforward to swap in a different eligibility source without hunting for a hidden default. The gate's fail-open, re-evaluate-on-each-call semantics are preserved unchanged.
+
+### AC-187 · Duplicated git execution path in stacked-grounding
+Strength: Strong
+Files: src/stacked-grounding.js, src/git-runner.js
+
+Problem:
+`src/stacked-grounding.js` defines its own `runGit` helper along with local `GIT_ENV` and `GIT_TIMEOUT_MS` constants, yet in the same module it also imports `createRealGitRunner` from `src/git-runner.js` to power `resolveGroundingRef`. This leaves two independent code paths for spawning git processes inside one file, each with its own environment setup, timeout handling, and error-shaping logic. Any future change to the shared runner—tightening timeouts, adding credential scrubbing, altering exit-code interpretation—will silently apply to one call site and not the other, producing inconsistent behavior that is hard to reproduce because it depends on which internal function happens to be invoked.
+
+Solution:
+Remove the local `runGit`, `GIT_ENV`, and `GIT_TIMEOUT_MS` definitions from `src/stacked-grounding.js`. Replace every call site that currently uses `runGit` with the runner produced by `createRealGitRunner` (or a thin wrapper around it that accepts the same arguments). If `stacked-grounding` needs a slightly different timeout or environment override, pass those as options into the runner factory rather than re-implementing the spawn logic. This yields a single, testable seam for all git interaction in the module.
+
+Benefits:
+Environment variables, timeouts, and error handling live in exactly one place, so a fix or hardening change propagates uniformly. Unit tests can mock or stub a single runner object instead of patching two separate spawn helpers. New contributors see one canonical pattern for "run a git command" rather than guessing which of two local implementations is the sanctioned one, reducing the chance of accidental divergence in future refactors.
+
+### AC-188 · Hard dependency on hub plugin global in apply-core
+Strength: Strong
+Files: src/lib/apply-core.js
+
+Problem:
+`writeArtifact` in `src/lib/apply-core.js` branches on `task.candidateSplitRoute === 'hub'` and then calls `getCandidateSplitHubFiler()`, a global-registry lookup that throws a hard error when the `agent-manager-hub-tasks` plugin has not registered a filer. This makes a core library function crash at runtime based on an implicit, order-sensitive registration performed by an unrelated plugin. It prevents `apply-core` from being exercised in isolation (unit tests, CLI tooling, or a deployment that intentionally omits the hub plugin) and hides a configuration-state problem behind an untyped global that is easy to miss during refactoring.
+
+Solution:
+Replace the global-registry lookup with an explicit dependency: accept an optional `filer` (or a small strategy object) as a parameter to `writeArtifact`, or read it from a context/injection object that the caller is expected to provide. When the hub route is requested but no filer is supplied, return a structured, recoverable result (e.g. `{ ok: false, reason: 'hub-filer-not-configured' }`) or throw a typed error that the caller can catch and translate into a user-facing configuration message. The plugin can still register itself, but it does so by injecting into the context rather than mutating a process-global that `apply-core` reaches into opaquely.
+
+Benefits:
+`apply-core` becomes independently testable—tests supply a stub filer or the absence of one and assert the expected outcome without needing to load the full plugin. The dependency graph is explicit and visible in the function signature, so static analysis and code review can surface missing wiring. Deployments that do not use the hub plugin no longer risk an unhandled crash in a core path, and the "not configured" state is a first-class, inspectable result rather than an opaque throw from a global.
+
+### AC-189 · Extract shared marker-injection/extraction primitives to eliminate duplicated parsing logic
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+`concepts.js` and `incident-amplification-marker.js` each implement a nearly identical marker-injection and extraction pattern: an instruction string, an idempotent `inject*Instruction` function that checks for the marker's presence before appending, and an `extract*` function that splits the model's response on a marker regex, cleans the text (collapsing extra newlines, trimming whitespace), and returns a structured report. The two implementations use similar regex patterns and text-cleaning steps but are written independently. Any change to the marker convention—adding an optional field, adjusting the delimiter, or improving the cleaning pipeline—must be replicated in both files, creating a divergence risk and doubling the maintenance surface.
+
+Solution:
+Introduce a new module `src/marker-utils.js` exporting two generic helpers: `injectMarker(text, markerString)`, which appends `markerString` to `text` only if it is not already present, and `extractMarker(text, markerRegex, parseBlock)`, which splits `text` on `markerRegex`, applies the caller-supplied `parseBlock` to each matched segment to produce structured data, and returns `{ cleanText, reports }`. Refactor `concepts.js` to call these utilities with its `CONCEPT_BUILD_MARKER_RE` and a small parser for `scratch|adapted` fields, and refactor `incident-amplification-marker.js` to call them with its `AMPLIFY_SPLIT_RE` and a parser for `AMPLIFY/QUERY/DIR/EXCLUDE`. The per-module instruction strings and field-specific parsing remain in their respective files; only the shared injection/extraction mechanics move to the utility.
+
+Benefits:
+The duplicated injection and extraction logic is eliminated, so a change to the marker convention (new optional field, delimiter tweak, cleaning improvement) is made in exactly one place. Adding a future marker type becomes a matter of supplying a regex and a parser to the same two helpers rather than re-implementing the split-clean-parse pipeline. The two existing modules become thinner and their behavior is guaranteed to stay in lockstep because they share the same code path.
+
+### AC-190 · `side-finding.js` bypasses the project's atomic-write guarantee for the same crash class `atomic-write.js` was built to prevent
+Strength: Strong
+Files: src/side-finding.js, src/atomic-write.js
+
+Problem:
+`atomic-write.js` exists to guard against a documented, non-hypothetical failure mode: a crash mid-`fs.writeFileSync` leaves a truncated, unparseable file (the module header cites 16+ tasks left claimed-but-undrafted by a mid-run crash on 2026-07-14 and a live EPIPE crash on 2026-08-16). Its guarantee is write-to-temp, fsync, rename — so a crash at any point before the rename leaves the prior file untouched. `side-finding.js`'s `writeSideFindingInbox()` writes inbox entries with a plain `fs.writeFileSync(path.join(dir, name), JSON.stringify(record, null, 2))` — the exact pattern `atomic-write.js` was created to eliminate. The module's own comment justifies this as "best-effort, fire-and-forget" and "a disk/permissions problem here must never turn into a pipeline-wide outage." But the failure mode `atomic-write.js` guards against is not a permissions error — it is a mid-write crash, which `writeSideFindingInbox` is equally exposed to. A truncated `sf-*.json` file in `queue/side-findings-inbox/` is exactly the kind of unparseable artifact the project has already been bitten by, and it lands in the same `queue/` tree whose crash history is documented elsewhere. The "best-effort" framing conflates two different failure classes: a permissions/disk-full error (where the `try/catch` is the right guard) and a mid-write crash (where the `try/catch` does nothing, because the process is gone). The two files are in the same community, `atomic-write.js` is the project's canonical answer to "how do I write a file safely," and `side-finding.js` has a private, divergent answer for the same class of operation.
+
+Solution:
+Replace the `fs.writeFileSync` call in `writeSideFindingInbox` with `writeJsonAtomicSync` from `atomic-write.js`. The existing `try/catch` wrapper stays, so a permissions or disk-full error is still swallowed and logged as non-fatal, preserving the "never throw past the caller" contract. The "best-effort" semantics are fully preserved — the `try/catch` still catches the error classes that matter for the "optional side channel" intent — but the mid-write crash class is now covered by the same guarantee the rest of the project relies on. No other line in `side-finding.js` changes; the `fs` require can be dropped if no other call in the file uses it.
+
+Benefits:
+Closes a real durability gap in the same `queue/` tree the project has already lost work to, reuses the existing shared primitive instead of a private divergent implementation, and makes the "best-effort" intent accurate (it now means "swallow the error classes that are recoverable" rather than "skip the durability guarantee"). Zero behavioral change in the success path; the only observable difference is that a crash mid-write now leaves the previous state of the inbox intact instead of a truncated, unparseable file.
+
+### AC-191 · Extract duplicated signature-parsing logic into a shared helper
+Strength: Strong
+Files: src/pipeline-self-audit.js
+
+Problem:
+In `src/pipeline-self-audit.js`, the logic that splits a `signature` string into its `source` and `category` components (via `lastIndexOf('::')` and `slice`) is duplicated verbatim inside both `buildAuditRawText` and `buildAuditTask`. This tight coupling to the exact string format means that any future change to the signature convention—such as introducing a new separator, an additional metadata segment, or a different ordering—requires a synchronized edit in two separate functions. A missed update in one location will silently produce inconsistent evidence text versus task titles, and because the two copies are structurally identical, a reviewer scanning one function may assume the other is already correct.
+
+Solution:
+Introduce a single private helper, e.g. `parseSignature(signature)`, that returns `{ source, category }` (or `null` for malformed input). Replace the inline `lastIndexOf`/`slice` expressions in both `buildAuditRawText` and `buildAuditTask` with a call to this helper. Add a brief JSDoc comment on the helper documenting the expected signature format so the contract lives in one place. If the format is already defined as a constant or type elsewhere in the module, reference it in the helper's documentation.
+
+Benefits:
+The parsing rule now exists in exactly one location, eliminating the divergence risk between the two call sites. Future format changes require editing a single function, and any validation or error-handling logic (e.g., guarding against a missing `::`) can be added once and inherited by both consumers. Code review surface shrinks because reviewers no longer need to verify that two inline blocks remain in lockstep, and the helper is trivially unit-testable in isolation.
+
+### AC-192 · Test files for the same concern live in two different directories with inconsistent naming
+Strength: Worth exploring
+Files: src/lib/prompt-implementation.test.js, src/test_project_search_zero_findings_prompt.js
+
+Problem:
+The community contains two regression tests that both verify prompt instruction text, yet they are placed in different directories and follow different naming conventions. `src/lib/prompt-implementation.test.js` sits alongside the source code it exercises in `src/lib/` and uses the `*.test.js` suffix that the rest of the repository's node:test suite relies on. `src/test_project_search_zero_findings_prompt.js`, by contrast, is dropped in the `src/` root with a `test_` prefix and no `.test.js` suffix. A developer looking for prompt-related tests must check two locations and recognise two naming patterns, and a tool that globs `**/*.test.js` will silently miss the second file.
+
+Solution:
+Move `src/test_project_search_zero_findings_prompt.js` into `src/lib/` and rename it to `src/lib/project-search-zero-findings-prompt.test.js`, following the `*.test.js` convention already used by its sibling `src/lib/prompt-implementation.test.js`. The original file at `src/test_project_search_zero_findings_prompt.js` is removed. This co-locates all prompt-instruction regression tests in one directory and makes them discoverable by the same glob pattern the rest of the test suite uses.
+
+Benefits:
+All prompt-related tests are found in a single directory, reducing the chance that a new test is added to the wrong location or with the wrong suffix and thus skipped by the test runner. The naming convention becomes uniform across the community, which lowers cognitive load for anyone onboarding to the codebase and makes it straightforward to add further prompt regression tests without a second decision about where and how to name the file.
+
+NOTE: Flag 1's core claim of a filename collision was incorrect — the proposed target `project-search-zero-findings-prompt.test.js` is distinct from the existing `prompt-implementation.test.js`; only the minor clarity improvement (explicitly stating the old file is removed) was applied.
+
+### AC-193 · ~~Case-sensitivity mismatch between path normalization and validation~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+Upon re-examination, the draft's premise was incorrect. `validateSecondBrainPath` already constructs a lower-cased set (`allowedLower`) and performs the membership test against that normalized form (`allowedLower.has(topLevel.toLowerCase())`). The case-insensitive validation the draft proposed to add is already present in the code. There is no gap to close, and the proposed refactor would be a no-op.
+
+---
+
+### AC-194 · ~~Scattered `belongsToProject` validation and coercion across two functions~~
+Strength: Strong
+
+**Status: Withdrawn**
+
+Upon re-examination, the draft mischaracterized the control flow. `deriveBelongsToProject` is invoked *inside* `reviewBrainDumpSort` immediately before the canonical-folder coercion check. The coercion in `reviewBrainDumpSort` is a deliberate final safety net for edge cases (e.g., a model output that bypasses the derivation recovery paths), not a duplicated or independent enforcement of the same rule. The separation of "derivation/recovery" from "final validation/coercion" is a valid and intentional layering. Extracting a shared helper called by both functions would not change behavior and would obscure the two distinct responsibilities. The "risk of partial update" the draft cited is speculative and not supported by the code's actual call structure.
+
+### AC-195 · Registry enforces the core-scope gate; SDK is a passive utility
+Strength: N/A (No defect)
+Files: src/task-source-registry.js, src/sdk/candidate-fulfillment.js
+
+Problem:
+None. The initial draft incorrectly identified a "hidden contract" or enforcement gap. In reality, `src/sdk/candidate-fulfillment.js` provides helper functions (parsing, grounding, etc.) that plugins use to construct their `next` logic. It does not register sources or bypass the registry. The registry (`src/task-source-registry.js`) is the sole enforcement point: when a plugin calls `registerTaskSource` with `scope: 'core'`, the registry automatically wraps the provided `next` function with `sourceEligibleHere`. This is a standard, explicit API contract. The "gap" described in the draft does not exist because the SDK is not an active enforcement path; it is a passive library.
+
+Solution:
+No code changes required. The current architecture is correct. The registry remains the single source of truth for scope-gate enforcement. Plugin authors are responsible for setting `scope: 'core'` in their registration config if they wish to be gated, which is a configuration decision, not a missing SDK feature.
+
+Benefits:
+Maintains a clear separation of concerns: the SDK provides logic, the registry manages lifecycle and policy enforcement. No risk of breaking existing plugins or introducing redundant enforcement layers.
+
+### AC-196 · Source ordering and task priority are orthogonal concerns
+Strength: N/A (No defect)
+Files: src/task-source-registry.js, src/lib/task-priority.js
+
+Problem:
+None. The initial draft incorrectly characterized the relationship between static source ordering (registry) and dynamic task priority (lib) as a "divergence" causing bugs. In reality, these are distinct, intentional layers. Source ordering determines *which* source is polled for a task (scheduling). Task priority determines *how* that specific task is ranked within a queue or for selection (execution). A low-priority source can legitimately produce high-priority tasks, and dynamic task priority overrides allow fine-grained control without re-registering sources. This separation is a feature, not a bug.
+
+Solution:
+No code changes required. The current design correctly separates source scheduling order from task execution priority. Developers should understand that `getRegisteredSources()` order affects polling sequence, while `taskPriority()` affects task ranking. These are independent knobs for different aspects of the system.
+
+Benefits:
+Preserves the ability to have fine-grained control over both source selection and task ranking. Avoids the complexity and potential breakage of unifying two orthogonal concerns. Maintains flexibility for dynamic priority adjustments without impacting source registration.
+
+### AC-197 · Single-function prompt-assembly module adds no value
+Strength: ~~Strong~~ → **Not actionable**
+Files: src/lib/prompt-assembly.js, src/prompts.js, src/lib/prompt-blocks.js
+
+Problem:
+`src/lib/prompt-assembly.js` houses the `assemblePrompt` function, a short newline-join of two arrays. At first glance this looks like a trivial one-liner that could be inlined at the call site. However, the module's dependency-graph degree is 3: it is imported by at least three separate consumers (including `src/prompts.js` and `src/lib/prompt-blocks.js`). That makes it a genuine shared utility, not a single-consumer wrapper.
+
+Solution:
+No change recommended. The module earns its place as a shared helper consumed by three call sites. Inlining the join into one consumer would either break the other two or force them to duplicate the logic, which is strictly worse than the current single-file, single-`require` arrangement.
+
+Benefits:
+(n/a — no action taken.) Keeping the module preserves DRY across the three consumers and avoids introducing a new indirection or duplication.
+
+---
+
+### AC-198 · Brain-dump sort/classify logic split across prompt and validator creates sync risk
+Strength: Worth exploring
+Files: src/brain-dump-sort-classify.js, src/task-sources.js, src/apply-group-a.js
+
+Problem:
+`src/brain-dump-sort-classify.js` was extracted specifically to break a require cycle between `task-sources.js` and `apply-group-a.js` (as documented in the file's header comment). In doing so it became a shared validator that must stay in lockstep with the prompt-generation side (the `brainDumpSortPlanPrompt` schema). Because the prompt schema and the validator live in different modules, a change to the classification taxonomy or field structure in one place must be manually mirrored in the other; nothing in the type system or module boundary enforces that they agree.
+
+Solution:
+Do **not** merge the prompt builder and validator into a single module—that would likely reintroduce the very `task-sources.js ↔ apply-group-a.js` require cycle the extraction was designed to eliminate, directly contradicting the documented design decision. Instead, introduce a small **shared schema-definition module** (e.g. `src/lib/brain-dump-sort-schema.js`) that exports the canonical taxonomy/field structure as a plain object or constant. Both the prompt-builder side and the validator in `src/brain-dump-sort-classify.js` then `require` that schema module and derive their respective text/validation from it. This gives a single source of truth for the taxonomy without altering the existing dependency direction, so the cycle-avoidance property is preserved.
+
+Benefits:
+Schema and validation are guaranteed consistent because both sides read from the same exported constant, eliminating the manual-mirroring step. The dependency graph gains one small leaf node (the schema module) but does not gain any new edges between the existing modules, so the `task-sources.js ↔ apply-group-a.js` cycle remains broken. Reduces the maintenance burden of remembering to update a validator whenever the prompt taxonomy changes, lowering the risk of silent mismatches between what the model is asked to produce and what the validator accepts.
+
+---
+
+NOTE: Flag 1 (AC-002 cycle contradiction) and Flag 2 (AC-001 degree-3 / multiple-consumer premise) were both applied; no flag was left unaddressed.
+
+### AC-199 · reviewBrainDumpSort conflates validation gate with routing transformation
+Strength: Worth exploring
+Files: src/brain-dump-sort-classify.js, src/apply-group-a-brain-dump.js
+
+Problem:
+`reviewBrainDumpSort` presents itself as a pure accept/reject gate (return type `{ ok: true } | { ok: false, reason }`), yet internally it calls `deriveBelongsToProject` — the full multi-branch project-routing algorithm (note-vs-task detection, head-scoped label matching, distinctive-token matching, self-project signal check, investigation-finding regex) — solely to re-derive a `belongsToProject` value so it can perform a label-membership check. The caller never receives the derived values; the apply path (`apply-group-a-brain-dump.js`) independently calls `deriveBelongsToProject` again to obtain the values it actually uses. This means the routing logic executes twice per task with no shared result, and a reader of the gate's interface cannot tell from its signature or return type that the full routing algorithm is a hidden dependency of the validation. If `deriveBelongsToProject` gains a new fallback branch, the gate's acceptance criteria silently shift without the caller being aware the gate is doing more than checking "is this label in the tracked list?"
+
+Solution:
+Have the orchestration layer (the caller that invokes both review and apply) run `deriveBelongsToProject` once, pass the derived `belongsToProject` value into a slimmer `reviewBrainDumpSort` whose contract is strictly parse → normalize → path-check → label-membership-check, and let the apply path consume the same derived value. The gate's signature would then reflect its actual responsibility, and the routing algorithm would execute exactly once per task.
+
+Benefits:
+Eliminates duplicate computation of the routing algorithm per task. Makes the gate's public contract match its name and return type, so a reader no longer has to trace into the function body to discover a hidden dependency on the full routing pipeline. Reduces the blast radius of future changes to `deriveBelongsToProject`: adding a new fallback branch can no longer silently alter the review gate's acceptance criteria, because the gate no longer invokes that function.
+
+### AC-200 · Registry reaches into a specific policy module at runtime
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` performs a lazy `require('./lib/source-scope.js')` inside the function body to wrap the `next` method of `core`-scoped sources. The lazy, in-function `require` makes the dependency invisible at module-load time and couples the registry's runtime behaviour to whatever `source-scope.js` exports at the moment a source happens to be registered. This is a deliberate design choice to keep the registry generic while applying an internal agent-manager policy only when a `core`-scoped source is encountered, and the critique of the *design intent* is not the issue here. The practical concern is narrower: the in-function `require` makes the dependency harder to reason about (it is not visible in the module's top-level import graph) and makes isolated unit-testing of the registry require mocking the `require` call or stubbing the `source-scope` module, coupling the test to an implementation detail the registry's public contract does not declare.
+
+Solution:
+Keep the registry's generic, policy-agnostic public API unchanged—plugins and external callers continue to call `registerTaskSource(name, core)` with no knowledge of scoping policy. Make the internal dependency explicit and testable by moving the `require` to a top-level (module-load-time) import and exposing a single module-level override hook, e.g. `setScopePolicy(wrapper | null)`, that the agent-manager package (or a test) can call once at startup to install or remove the wrapping behaviour. The registry applies the installed policy when a `core`-scoped source is registered and leaves other sources untouched. This preserves encapsulation (no caller needs to know about scoping), makes the dependency visible in the import graph, and lets a unit test call `setScopePolicy(null)` to exercise the registry in isolation without any module-system mocking.
+
+Benefits:
+The registry's public contract stays identical for plugins and external callers. The hidden runtime dependency becomes a visible, top-level import that a linter or dependency-graph tool can surface. Unit tests gain a clean seam (`setScopePolicy(null)`) without mocking `require`, and the one-time registration by the agent-manager package keeps the internal policy encapsulated where it belongs.
+
+### AC-201 · Source-name resolution logic is partially hardcoded alongside the alias mechanism
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`src/task-source-registry.js` contains a `resolveSourceName` function that maps task-source strings to registry names. Alongside the dynamic `registerSourceAlias` mechanism, the function carries hardcoded fallback branches for built-in quirks (e.g. `if (task.domain === 'adhoc')` and a similar special case for `secondbrain`). Because these special cases live as inline conditionals rather than as data registered through the existing alias mechanism, adding a new built-in source or renaming an existing one requires editing the resolver's internal logic rather than simply calling `registerSourceAlias`. The coexistence of two registration paths (hardcoded `if`-branches and the alias table) creates a maintenance hazard: a developer adding a new source may register an alias but miss the hardcoded branch, or vice-versa, leading to silent misrouting.
+
+Solution:
+Route the `adhoc` and `secondbrain` special cases through the existing `registerSourceAlias` mechanism at module-load time (or via a small `registerBuiltinAliases()` function called once at startup), making `resolveSourceName` a pure lookup against the alias table with no inline domain checks. The resolver's signature and public behaviour remain the same; only the internal implementation changes from "hardcoded branches + alias table" to "alias table only."
+
+Benefits:
+A single, data-driven source of truth for name resolution eliminates the class of bugs where the hardcoded branch and the alias table disagree. Adding a new built-in source becomes a one-line `registerSourceAlias` call rather than a code change inside the resolver, and the resolver can be unit-tested with a flat table of expected mappings without exercising conditional branches.
+
+### AC-202 · Shared-vs-local state policy is enforced by convention rather than by the API
+Strength: Worth exploring
+Files: src/instances-dir.js
+
+Problem:
+`src/instances-dir.js` exposes `sharedInstancesDir`, a path resolver that returns the directory for shared runtime state (heartbeats, locks) that must not follow the project context. The module's own comment articulates the architectural rule—"this state is shared, that state is project-local"—but the interface is a bare path: it returns a directory string and leaves it to each caller to remember that this root is for shared state and not to mix it with the project-local `pipelineDir/instances` tree. Because the distinction lives in a comment and in caller discipline rather than in the shape of the API, a new piece of shared state can be written into the project-local directory (or vice-versa) without any interface-level signal, reproducing the GPU-thrashing and lock-invisibility issues the comment describes.
+
+Solution:
+Extend `src/instances-dir.js` (or a thin sibling module) with intent-named helpers such as `getSharedLockPath(name)` and `getLocalLogPath(name)`, each returning a fully-qualified path under the correct root. Existing callers migrate to the helpers; the raw `sharedInstancesDir` export can be retained for backward compatibility but annotated `@internal` (or moved to a private module) so that new code is steered toward the intent-named API. The helpers encode the shared-vs-local distinction in the function name, making the policy visible at the call site rather than in a comment.
+
+Benefits:
+The shared-vs-local distinction becomes a call-site decision encoded in the function name rather than a convention that lives in a comment. A new piece of shared state is added by calling `getSharedLockPath('my-new-lock')` and cannot accidentally land in the project-local tree, eliminating the foot-gun that produces the GPU and lock bugs described in the existing comments.
+
+NOTE: Flag 3 (AC-001 solution "architecturally unsound") was applied by replacing the per-call `scopeWrapper` injection with a module-level `setScopePolicy` override hook, which preserves the registry's generic public API and keeps the scoping policy encapsulated within the agent-manager package rather than leaking it to every plugin caller.
+
+### AC-203 · Duplicated Git Execution Configuration
+Strength: Strong
+Files: src/stacked-grounding.js, src/git-runner.js
+
+Problem:
+src/stacked-grounding.js defines its own local git environment and timeout constants and uses them in a local runGit helper for functions such as readFileAtRef, grepAtRef, and resolveAtRef. At the same time, the same file imports createRealGitRunner from git-runner.js and uses that runner in resolveGroundingRef. This leaves the module with two parallel paths for executing git commands that carry potentially different environment settings and timeout values. If a global change is needed—for example, adjusting the timeout or adding a new environment variable—it must be applied in both places, and a missed update produces inconsistent behavior between the two code paths within the very same module.
+
+Solution:
+Refactor readFileAtRef, grepAtRef, and resolveAtRef to obtain their git-execution capability from the same runner instance (or a shared utility exported by git-runner.js) that resolveGroundingRef already uses. Remove the local runGit helper and the locally defined environment and timeout constants from stacked-grounding.js so that every git interaction in the module draws from a single configuration source.
+
+Benefits:
+A single source of truth for git environment variables and timeouts eliminates the risk of the two code paths drifting apart. Future changes to timeout or environment settings require editing one location instead of two. The module's dependency on git-runner.js becomes explicit and uniform, which simplifies maintenance and makes unit testing straightforward—mocking one runner instead of two separate execution paths.
+
+### AC-204 · Hidden Side-Effect Require of task-sources.js
+Strength: Worth exploring
+Files: src/lib/apply-core.js, src/task-sources.js
+
+Problem:
+apply-core.js contains a bare side-effect require of task-sources.js that is not accompanied by any direct use of a symbol from that module. The require exists solely to trigger registration of task sources into a shared registry before getRegisteredSource is called later. Because the dependency is expressed as a side effect rather than an explicit import of an initialization function, the module's contract is implicit: a reader or a test harness cannot tell from the import statement alone that loading apply-core.js presupposes task-sources.js having been evaluated. This makes initialization-order bugs harder to detect and complicates isolated unit testing of apply-core.js.
+
+Solution:
+Replace the bare side-effect require with an explicit call to a named initialization or registration function exported by task-sources.js (or by a dedicated registry module). If the registration is truly a one-time global side effect, move that call to the application entry point that first loads apply-core.js and remove the require from apply-core.js entirely. Either way, the dependency becomes visible in the module's import list or in the entry-point code.
+
+Benefits:
+The module's dependencies become explicit and auditable. Unit tests for apply-core.js no longer need to reproduce the side-effect loading order. If the module graph is reorganized, the explicit import or the entry-point call makes the registration dependency visible to anyone reading the code, reducing the chance of a silent "source not registered" failure at runtime.
+
+### AC-205 · `resolveSourceName` hardcodes fallbacks that bypass the alias registry
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` is documented as the single entry point for mapping a task's `source` field to a registry name, with the explicit promise that plugins can extend the mapping via `registerSourceAlias` without touching core code. In practice, the function short-circuits with hardcoded checks for `adhoc` (when `task.domain === 'adhoc'` or `task.source === 'manual'`) and `secondbrain` (when `task.domain === 'secondbrain'`) before consulting the alias map at all. This means the alias map is not the authoritative source of truth: a plugin that registers an alias intending to override or shadow one of those two names will be silently ignored, and the two special-cased sources cannot be re-mapped or removed without editing the core function. The interface advertises open extensibility while the implementation enforces a closed set, violating the principle of least surprise for downstream consumers.
+
+Solution:
+Extend the `registerSourceAlias` API to accept a `domain` field as an optional second key, or introduce a parallel `registerDomainAlias` function, to allow mapping `task.domain` values. Then, remove the hardcoded `if` branches from `resolveSourceName` and seed the alias map at module-initialisation time with the existing mappings: `registerSourceAlias('manual', 'adhoc')`, `registerSourceAlias('inbox', 'secondbrain')`, and `registerDomainAlias('adhoc', 'adhoc')`, `registerDomainAlias('secondbrain', 'secondbrain')`. The function then reduces to a lookup chain that checks `source` aliases first, then `domain` aliases, then falls back to the raw value: `sourceAliases[task.source] ?? domainAliases[task.domain] ?? task.source`. This makes the alias maps the sole source of truth, keeps the public API backward-compatible (existing `registerSourceAlias` calls still work), and lets any future plugin override or extend the built-in names without a core-code edit.
+
+Benefits:
+The alias maps become the single source of truth for source-name resolution, so the documented extension mechanism actually works for every name, including the two that are currently special-cased. Removing the hardcoded branches eliminates a class of silent-override bugs where a plugin's registration is ignored, and it reduces the function to a flat lookup that is trivially testable and auditable.
+
+### AC-206 · Priority-resolution logic duplicated across two modules
+Strength: Strong
+Files: src/task-source-registry.js, src/lib/task-priority.js
+
+Problem:
+Both `task-source-registry.js` and `task-priority.js` independently resolve a source's priority, but they do so with different fallback semantics: the registry uses `a.priority ?? Infinity` when ordering registered sources, while the priority library uses `getConfig().taskPriorityOverrides[name] ?? def`. Because the two paths diverge, a change to the fallback strategy (for example, switching from `Infinity` to a finite sentinel, or adding a per-environment override layer) must be discovered and applied in both files in lockstep. If only one is updated, sources will be ordered differently depending on which code path a caller happens to hit, producing inconsistent task ordering that is difficult to reproduce and debug.
+
+Solution:
+Extract a single `resolvePriority(name, defaultPriority)` helper into `src/lib/task-priority.js` (or a shared utility module) that encapsulates the full resolution chain—config overrides, per-source defaults, and the ultimate fallback. Have `task-source-registry.js` import and call that helper instead of inlining its own `?? Infinity` expression. The helper's signature makes the fallback contract explicit, and a single unit-test suite around it covers every resolution path.
+
+Benefits:
+Priority resolution lives in exactly one place, so a change to the fallback strategy or the override mechanism is a one-file edit with one test suite to update. The registry module's ordering logic becomes a thin call site, reducing the surface area that must be kept in sync and eliminating the risk of the two modules disagreeing on what a source's effective priority is.
+
+### AC-207 · `candidate-fulfillment.js` exposes a flat SDK interface over a deep, unmediated dependency fan-out
+Strength: Worth exploring
+Files: src/sdk/candidate-fulfillment.js
+
+Problem:
+The module is presented as an SDK entry point for candidate fulfillment, but its implementation reaches directly into `../config.js`, `../candidate-docs.js`, `../candidate-premise-check.js`, `../pipeline-forensics.js`, `../task-history.js`, and several `./lib/` helpers. None of these dependencies are surfaced in the module's public interface or its documented contract; they are internal implementation details that a consumer of the SDK has no way to know about. In practice this means that a seemingly unrelated change to, say, `pipeline-forensics.js` can alter the observable behaviour of `candidate-fulfillment.js` without any signal in the SDK's API surface, making the module harder to test in isolation and harder to reason about when debugging cross-cutting regressions.
+
+Solution:
+Introduce a thin internal orchestration layer (e.g. `src/sdk/candidate-fulfillment-internal.js`) that owns the multi-module coordination, and have the public `candidate-fulfillment.js` delegate to it through a narrow, explicitly-typed interface. Alternatively, if the dependency fan-out is genuinely required by the public contract, document each dependency in the module's header comment and add an integration-test fixture that pins the expected interaction with each collaborator, so that a change in any one of them is caught by a named test rather than discovered in production.
+
+Benefits:
+The public SDK surface becomes an honest reflection of what the module actually depends on, so a consumer (or a future refactoring agent) can assess the blast radius of a change to any collaborator without reading the full implementation. Isolating the orchestration logic also makes it straightforward to write focused unit tests for the public API by stubbing the internal layer, reducing the need for heavy integration scaffolding.
+
+NOTE: Flag #2 was not applied because the critique's claim that the two mechanisms are "complementary" and not duplicative is incorrect; both resolve a source's effective priority for ordering purposes, and the divergence in fallback semantics (`Infinity` vs. config-based default) creates a real synchronization hazard that a shared helper would eliminate without conflating distinct concepts.
+
+### AC-208 · Decouple concepts.js persistence from its business logic
+Strength: Strong
+Files: src/concepts.js
+
+Problem:
+`concepts.js` is the only file in this community that performs direct filesystem I/O (`fs.readFileSync`, `fs.mkdirSync`, `writeJsonAtomicSync`). It hardcodes both the storage location (`concepts.json` in `pipelineDir`) and the serialization format (JSON) directly inside the same module that implements the concept-registry business logic (`createConcept`, `recordConceptResearch`, etc.). This tight coupling means the module cannot be unit-tested without mocking `fs` or spinning up temp directories, and the registry logic cannot be reused in contexts where the backing store is a database, an in-memory structure, or a different file layout.
+
+Solution:
+Refactor `concepts.js` so that its core functions operate on a plain data object and return the updated object, accepting `load` and `save` callbacks (or a small `ConceptStore` interface) as injected dependencies. The existing JSON-file implementation becomes a default adapter that the module exports alongside the pure logic, so callers that want a different persistence mechanism simply supply their own `load`/`save` pair.
+
+Benefits:
+The business logic becomes a pure, stateless transformation that is trivially testable with plain objects—no filesystem mocks, no temp directories. Any future change to where or how concepts are stored (SQLite, a remote API, a different directory convention) is a one-line swap at the call site rather than a rewrite of the module. It also removes the single point of `fs` coupling in this community, making the rest of the codebase uniformly side-effect-free.
+
+### AC-209 · Unify the marker injection/extraction pattern shared by concepts.js and incident-amplification-marker.js
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both `concepts.js` (via `injectConceptBuildInstruction` / `extractConceptBuildReport`) and `incident-amplification-marker.js` (via `injectAmplificationInstruction` / `extractAmplificationRequests`) implement the same three-step pattern: (1) check for a sentinel marker string to avoid double-injection, (2) append a structured instruction block, and (3) parse a regex from the model's response to extract structured fields while cleaning the surrounding text. The logic is nearly identical—same idempotency guard, same "strip-and-continue" fallback, same lenient-extraction strategy—differing only in the marker string, the instruction text, and the target regex/field names. This duplication means any improvement to edge-case handling (e.g., a new leniency rule, a change to how partial matches are treated) must be implemented and tested in two separate files, and the two implementations can silently drift apart.
+
+Solution:
+Extract the shared mechanics into a small utility module (e.g., `src/marker-utils.js`) exposing two generic functions: `injectInstruction(text, marker, instructionBlock)` and `extractMarkerData(text, markerRegex, parser)`. Both `concepts.js` and `incident-amplification-marker.js` then call these utilities, passing their specific marker strings, instruction text, regex, and field-mapping parser. The idempotency check, the strip-and-continue fallback, and the lenient-extraction logic live in exactly one place.
+
+Benefits:
+A single code path owns the tricky edge cases (partial matches, already-injected text, malformed model output), so a fix or improvement is made once and applies everywhere. New marker-based features in the future can be added by supplying a marker, instruction, and parser—no copy-paste of the guard/strip/parse boilerplate. The two existing modules become thinner and more readable, each focused on *what* data it injects/extracts rather than *how* the injection/extraction mechanics work.
+
+### AC-210 · Consolidate side-finding writes onto the atomic-write path
+Strength: Strong
+Files: src/side-finding.js, src/atomic-write.js
+
+Problem:
+`atomic-write.js` provides a crash-safe write strategy (temp file + fsync + rename) that the rest of the pipeline relies on to guarantee state durability. However, `writeSideFindingInbox` in `side-finding.js` bypasses that utility entirely, issuing a raw `fs.writeFileSync` inside a `try/catch` that only logs a warning on failure. If the process is killed or the disk fails mid-write, the side-finding JSON is left truncated or missing, and the warning is the only trace. Because the side-finding channel is explicitly the "best-effort" capture path for critical defects, the most important metadata in the system ends up with weaker durability guarantees than routine pipeline state—an architectural inconsistency that silently degrades the very safety net the channel is meant to provide.
+
+Solution:
+Refactor `writeSideFindingInbox` to call `writeJsonAtomicSync` (or the equivalent exported helper) from `src/atomic-write.js` instead of `fs.writeFileSync`. The existing `try/catch` and warning-log can be retained as a secondary safety net for I/O errors that the atomic helper does not handle (e.g., permission denied), but the write itself will now go through the temp-file → fsync → rename sequence, so a mid-write crash can never leave a partial file on disk.
+
+Benefits:
+Side-finding records gain the same crash-safety guarantees as every other piece of pipeline state, eliminating the risk of truncated JSON or silent loss. The codebase now has a single, well-tested write path for durable JSON, reducing the surface area for future write-related bugs and making the "best-effort" qualifier refer only to the decision to emit a side-finding, not to the durability of the write once it is emitted.
+
+### AC-211 · Make grep-codebase-tool's config dependency explicit
+Strength: Worth exploring
+Files: src/grep-codebase-tool.js, src/config.js
+
+Problem:
+`grepCodebase` in `src/grep-codebase-tool.js` imports `getConfig` from `src/config.js` to resolve `repoRoot` and `grepAllowedDirs` when the caller does not supply them. This hidden dependency on global configuration state means the function cannot be unit-tested in isolation without mocking the config module, and it creates a dual-path code path (explicit argument vs. config fallback) that is harder to reason about. The search logic is also tightly coupled to this project's specific configuration schema, reducing its reusability and making the function's true inputs invisible from its signature alone.
+
+Solution:
+Change `grepCodebase` to accept `repoRoot` and `grepAllowedDirs` as explicit parameters (or a small options object) and remove the `getConfig` import. The caller—e.g., `local-tool-client.js`—resolves the configuration and passes the values in. If a default is still desired for convenience, it can be a module-level constant rather than a live read from a global config singleton.
+
+Benefits:
+The function's dependencies become visible in its signature, making it trivially testable with arbitrary values and eliminating the need to mock `src/config.js`. The search utility is decoupled from the application's configuration management, improving locality and making it straightforward to reuse in other tools or test harnesses without pulling in the full config stack.
+
+NOTE: Both flags were not applied because the critique itself concluded "NO ISSUES FOUND," explicitly stating that each item is a valid architectural proposal with no factual error, contradiction, or violation of the output contract.
+
+### AC-212 · writeArtifact bypasses the source-registry dispatch contract for candidate-split and Group B tasks
+Strength: Strong
+Files: src/lib/apply-core.js
+
+Problem:
+`writeArtifact` in `src/lib/apply-core.js` performs source-registry lookups and branches on `task.candidateSplitRoute` inline rather than delegating to the source's registered `apply` method. It checks `task.candidateSplitRoute === 'hub'` and calls `getCandidateSplitHubFiler().applyCandidateSplitAsHub(task, pipelineDir)` directly, bypassing the `source.apply` contract. For non-hub candidate splits it calls `applyCandidateSplit(task, getRegisteredSource(resolveSourceName(task)))`, and for Group B tasks it calls `applyGroupB` directly. The source registry pattern (`getRegisteredSource`, `source.apply`) is the established extension point, but `writeArtifact` introduces a second, parallel dispatch path that is not expressed through the registry. A new source that needs custom candidate-split behavior must either register a `candidatesPath` function and hope `applyCandidateSplit` handles it, or be special-cased in `writeArtifact`. The hub-route branch is a concrete example of a special case that could instead be a registered source with an `apply` method, making the dispatch logic harder to reason about and test in isolation.
+
+Solution:
+Introduce a registered source entry for the hub candidate-split route (e.g., a `hub-candidate-split` source whose `apply` method wraps the existing `applyCandidateSplitAsHub` call) and a similar entry for Group B tasks. Then reduce `writeArtifact` to a single dispatch: resolve the source name from the task, look it up via `getRegisteredSource`, and call `source.apply(task, pipelineDir)`. The hub-specific and Group B-specific logic moves into their respective source modules, leaving `writeArtifact` as a thin, registry-driven dispatcher with no inline branching on `candidateSplitRoute` or task group.
+
+Benefits:
+Adding a new source with custom candidate-split or Group B behavior becomes a matter of registering a new source object rather than editing `writeArtifact`. The dispatch path is single and uniform, which simplifies unit testing (each source's `apply` can be tested independently) and removes the risk of a new task type silently falling through the inline branches. The registry becomes the single source of truth for "what can be applied and how," restoring locality of the extension point.
+
+### AC-213 · resolveAtRef duplicates the three-tier basename-matching logic already in fact-checker.js
+Strength: Worth exploring
+Files: src/stacked-grounding.js, src/fact-checker.js
+
+Problem:
+`resolveAtRef` in `src/stacked-grounding.js` implements a three-tier resolution strategy—exact path, then `extraRoots`-prefixed, then unique basename—and its own comment states it "mirrors fact-checker.js's resolveAgainstRepoDetailed tiers against git's object database instead of the working tree." The two implementations are structurally identical but operate on different data sources (git `ls-tree` output versus the filesystem). If the resolution semantics change (adding a new tier, altering ambiguity handling, or changing how `extraRoots` are expanded), both implementations must be updated in lockstep. A bug fix in one is unlikely to be propagated to the other, leading to divergent behavior between the working-tree and ref-based resolution paths.
+
+Solution:
+Extract the three-tier resolution logic into a shared pure function (e.g., `resolvePath(tiers, candidate, extraRoots)`) that accepts an abstract "listing" (an array of paths) and a candidate string, and returns the resolved path or an ambiguity signal. `resolveAtRef` feeds it the `ls-tree` output; `resolveAgainstRepoDetailed` in `fact-checker.js` feeds it the filesystem listing. Both call sites become thin adapters that produce the listing and delegate the matching to the shared function.
+
+Benefits:
+A single implementation of the resolution semantics means a change (new tier, different ambiguity rule, `extraRoots` normalization) is made once and is automatically consistent across both the working-tree and ref-based paths. The shared function is trivially unit-testable with synthetic path lists, and the two call sites become easier to audit because the matching logic is no longer duplicated.
+
+### AC-214 · appendHistoryEvent hides its persistence side-effect behind a module-level singleton hook
+Strength: Worth exploring
+Files: src/task-history.js, src/local-draft.js, src/review-task.js, src/task-sources.js, src/apply-task.js, src/reject-retry-check.js
+
+Problem:
+`appendHistoryEvent` in `src/task-history.js` uses a module-level `persistHook` singleton set via `setHistoryPersistHook`. After every entry is appended, the hook is invoked. The code's own comment notes that `local-draft.js` and `review-task.js` register a hook that rewrites the task JSON, while `task-sources.js`, `apply-task.js`, and `reject-retry-check.js` do not register one and are unaffected. The persistence behavior is therefore not a parameter of `appendHistoryEvent` but a side effect of global state that must be set by the caller before calling. If two different callers in the same process need different persistence strategies (one wants to flush to disk, another wants to batch), they cannot both use `appendHistoryEvent` without overwriting each other's hook. The interface is shallow: `appendHistoryEvent(task, stage, detail)` looks like a pure append, but its side effects depend on global state invisible in the function signature.
+
+Solution:
+Change `appendHistoryEvent` to accept an optional `persist` callback as its last parameter (defaulting to a no-op). Remove the module-level `persistHook` and `setHistoryPersistHook` entirely. Callers that need persistence (`local-draft.js`, `review-task.js`) pass their rewrite-and-flush function explicitly; callers that do not (`task-sources.js`, `apply-task.js`, `reject-retry-check.js`) simply omit the argument. The function signature now fully describes its side effects.
+
+Benefits:
+The persistence contract is visible at every call site, eliminating the hidden coupling to global state. Two callers in the same process can use different (or no) persistence strategies without risk of overwriting each other's hook. The function becomes easier to test in isolation—passing a spy as `persist` verifies the side effect without mutating module-level state—and the module no longer carries mutable global state that can leak across test boundaries.
+
+### AC-215 · `getConceptTimeline` is a foreign function in the concept-registry module
+Strength: Strong
+Files: src/concepts.js
+
+Problem:
+`getConceptTimeline(pipelineDir, conceptId, { loadBrainDump, listTaskHistory })` is the only exported function in `concepts.js` that never reads `concepts.json` and never calls any of the module's own registry helpers (`loadConcepts`, `findConcept`, `writeConcepts`). It queries two external data stores—brain-dump entries and task history—filtered by `conceptId`, and it requires the caller to inject the two loader functions because the module does not `require` them. As a result the module's static dependency list (`fs`, `path`, `crypto`, `./atomic-write.js`) describes only the registry's needs, while `getConceptTimeline`'s real data dependencies are invisible in the `require` block and hidden behind injected parameters. A caller importing `concepts.js` solely for `getConceptTimeline` drags in the entire persistence layer (atomic-write, crypto, filesystem I/O) for a pure query that uses none of it, and a reader inspecting the `require` block cannot tell that the module also depends on brain-dump and task-history data at runtime. This is a missing-locality / misleading-module-boundary problem: the function belongs with the brain-dump/task-history query layer (where its real dependencies live), not with the concept-registry persistence layer it is named after.
+
+Solution:
+Move `getConceptTimeline` out of `src/concepts.js` into the module that already owns the brain-dump and task-history query surface (the layer that provides `loadBrainDump` and `listTaskHistory`), so that the function's real data dependencies are expressed as ordinary `require`s in the module that hosts it rather than as injected parameters in a module that does not `require` them. In `src/concepts.js`, remove the `getConceptTimeline` definition and its entry from `module.exports`. Update every call site that currently imports `getConceptTimeline` from `./concepts.js` to import it from its new home. The function body itself is unchanged; only its module of residence and the import paths at its call sites change.
+
+Benefits:
+The module boundary now matches the data boundary: `concepts.js` contains only functions that read/write `concepts.json`, and its `require` list accurately describes its dependencies. The timeline query lives in the module that owns the data it queries, so its real dependencies are visible as static `require`s instead of hidden injected parameters. Callers importing only the timeline query no longer pull in the registry's persistence machinery (atomic-write, crypto, filesystem I/O), and a reader of either module's `require` block can correctly predict its runtime data needs. This eliminates the "why does this function take injected loaders when its module doesn't require them?" confusion and the "why does importing a pure query load the whole registry?" coupling, without changing any behavior.
+
+### AC-216 · Implicit conditional dependency on `source-scope.js` inside `registerTaskSource`
+Strength: Strong
+Files: src/task-source-registry.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` performs a conditional `require('./lib/source-scope.js')` at registration time and wraps the `next` function when `config.scope === 'core'`. This creates a hidden, runtime-only dependency that is invisible to anyone reading the module's top-level imports. The registry's observable behavior therefore depends on whether `source-scope.js` is resolvable and on the scope value passed at registration, yet neither is declared as a module-level dependency. This makes the registry harder to test in isolation (a unit test must stub or provide `source-scope.js` or the `core` path silently no-ops), harder to reason about (the wrapping logic executes once at registration, so any later change to `source-scope.js`'s exports is not picked up), and it violates the principle that a module's dependencies should be explicit and statically discoverable.
+
+Solution:
+Hoist the `source-scope.js` import to the top of `task-source-registry.js` as an explicit, unconditional dependency (or, if it is truly optional, accept a `scopeResolver` function as a parameter to `registerTaskSource` so the caller injects the behavior). Move the wrapping decision from registration time to call time by storing the scope metadata on the registered source record and applying the scope logic inside the invocation path, so the registry remains a thin, stateless key-value store and the scope concern lives in a single, testable function.
+
+Benefits:
+Dependencies become statically visible and auditable; the registry can be unit-tested without mocking a sibling module; the scope-wrapping logic is exercised on every call rather than frozen at registration, eliminating a class of stale-state bugs; and new scope policies can be added by passing a different resolver without modifying the registry's internal branching.
+
+### AC-217 · Hardcoded built-in source aliases break the registry's generic abstraction
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` mixes a generic alias-lookup mechanism (`sourceAliases`) with hardcoded `if` branches for specific built-in sources (`adhoc`, `secondbrain`). The file's own comments acknowledge that it "still has hardcoded fallbacks for this package's own built-in quirks." This means a consumer that registers a source named `adhoc` or `secondbrain` gets different resolution behavior than any other name, and that behavior is not discoverable through the registry's public API. The registry therefore leaks knowledge of specific consumer implementations, preventing it from being reused as a pure, generic key-value store for source definitions and forcing every new built-in quirk to be added as another inline branch.
+
+Solution:
+Replace the hardcoded `if` branches with entries in the same `sourceAliases` (or a parallel `builtInResolvers`) map that the generic path already consults. Each built-in source registers its own resolution rule at module-load time (or via an explicit `registerBuiltinSource` call), so `resolveSourceName` becomes a single uniform lookup with no special cases. If a built-in source needs richer logic than a simple alias, it supplies a small resolver function rather than an inline branch.
+
+Benefits:
+The registry's code path is uniform and testable without knowing which names are "special"; adding a new built-in source no longer requires editing the resolver function; and the module can be extracted or reused in another package without dragging along knowledge of `adhoc` or `secondbrain` internals.
+
+### AC-218 · Lazy `require` hides a runtime dependency from static analysis
+Strength: Worth exploring
+Files: src/sdk/candidate-fulfillment.js, src/task-sources.js
+
+Problem:
+`candidate-fulfillment.js` deliberately defers its `require` of `src/task-sources.js` into the body of `nextCandidateFulfillmentTask` to ensure the SDK has no load-time dependency on the monolith it was extracted from. While this successfully decouples module loading, the consequence is that the true coupling surface is invisible to any tool that resolves dependencies at parse time—dependency-graph visualizers, circular-import linters, and bundle analyzers all see a clean, self-contained module. If `task-sources.js` is renamed, refactored, or its export signature changes, the failure surfaces only at the first runtime call to `nextCandidateFulfillmentTask`, potentially in production, with no startup signal and no static-analysis warning.
+
+Solution:
+Since the architectural intent is to avoid load-time coupling, the top-level `require` should not be reintroduced. Instead, introduce a thin adapter interface (e.g., a `TaskSourceQueue` contract) that `candidate-fulfillment.js` depends on. The concrete implementation from `task-sources.js` should be injected at composition time (e.g., via a setter function or constructor parameter) rather than being `require`d inside the function body. This preserves the lazy-load benefit (the SDK module can be loaded without `task-sources.js` being present) while making the dependency explicit in the module's public API and visible to static analysis tools that track interface contracts, rather than hiding it in an opaque function body.
+
+Benefits:
+The dependency becomes visible to static-analysis tools through the explicit interface contract, making refactors of `task-sources.js` safer and more discoverable. The SDK module's true coupling surface is explicit in its type definitions or API surface, so a reader immediately sees what it depends on. The module also becomes independently testable with a mock queue, removing the need to stub a `require` cache entry in tests, while still respecting the original architectural constraint of avoiding load-time dependencies.
+
+### AC-219 · `taskPriority` silently swallows all `getConfig` errors
+Strength: Strong
+Files: src/lib/task-priority.js
+
+Problem:
+The `taskPriority` function wraps its call to `getConfig()` in a blanket `try/catch` that returns the default priority on any thrown error. This conflates "no override was configured for this task" with "the configuration subsystem is broken (missing file, syntax error, missing key, permission denied, etc.)." A consumer that expects a specific priority to be enforced will silently receive the default, and no log line, metric, or error signal is emitted. In a production scheduling pipeline this can cause tasks to run at the wrong priority for an extended period with no alert, making the root cause extremely difficult to diagnose because the failure mode is indistinguishable from a legitimate "no override" case.
+
+Solution:
+Narrow the `try/catch` to handle only the specific "key not present" case (e.g., check for `undefined`/`null` on the returned override value) and let genuine configuration errors propagate to the caller. Alternatively, if the function must remain non-throwing for backward compatibility, log a structured warning (including the task identifier and the error message) before falling back to the default, and expose a `taskPriorityWithSource` variant that returns `{ priority, source: 'override' | 'default' | 'error-fallback' }` so callers can distinguish the three cases and act accordingly.
+
+Benefits:
+Configuration failures become observable at the moment they occur rather than manifesting as subtle scheduling misbehavior hours or days later. Operators can add an alert on the structured warning, and developers can unit-test the error path without it being indistinguishable from the happy path. The explicit source tag in the variant return value removes the ambiguity for any downstream code that needs to make decisions based on where the priority value came from.
+
+### AC-220 · Registry hardcodes a domain-specific `require` inside a generic registration path
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `task-source-registry.js` contains a lazy `require('./lib/source-scope.js')` inside the `if (config.scope === 'core')` branch. This embeds a domain-specific concept (`core` scope) and its implementation directly into what is otherwise a generic registry module. The dependency is invisible to static analysis (same opacity issue as AC-001), and it couples the registry to a particular module's file path and export shape. Testing the registry in isolation requires either stubbing the `require` cache or ensuring `source-scope.js` is resolvable, even when the test only exercises non-`core` registrations. The registry also becomes harder to reuse in a different service that has its own scope semantics.
+
+Solution:
+Introduce a scope-handler registry: `registerTaskSource` accepts an optional `scopeHandlers` map (or the registry exposes a `registerScopeHandler(scopeName, handler)` method). The `core` scope handler, which currently lives inline, is extracted into `source-scope.js` and registered at composition time. The generic registry then contains no `require` of any domain module and no knowledge of what `core` means. If a `core`-scoped source is registered without a handler, the registry throws a clear, immediate error at registration time rather than failing later at runtime.
+
+Benefits:
+The registry becomes a truly generic, domain-agnostic component that is trivially testable with any set of scope handlers. Adding a new scope (e.g., `tenant`, `edge`) no longer requires modifying the registry source. The hidden `require` is eliminated, so the dependency graph is accurate and refactors of `source-scope.js` are caught at composition time. The immediate "handler not registered" error replaces a later, harder-to-diagnose runtime failure.
+
+NOTE: The flag for AC-002 was not applied because the critique's claim that the current code "already correctly distinguishes" between missing keys and config errors is factually incorrect regarding the *observable behavior* described in the problem statement; the `try/catch` still swallows `getConfig()` errors silently without logging or distinction, which is the core defect identified.
+
+### AC-221 · Consolidate "empty / false-positive" response guards into source-level `apply` contracts
+Strength: Strong
+Files: src/lib/apply-core.js, src/apply-group-a.js, src/apply-group-b.js
+
+Problem:
+`apply-core.js` contains two ad-hoc text checks (`isEffectivelyEmptyResponse` and a regex matching "false positive") that intercept the model's raw text output before it is handed to `applyGroupB`. These guards were added reactively for specific Group B sources (`observability_fix`, `arch_review`, etc.) and live in the core orchestration path rather than at the point where a source's `apply` function decides it has nothing to produce. Because the checks are text-pattern based, they are source-agnostic in the narrow sense (a new source emitting the same empty or "false positive" string is already covered), but the *decision logic*—what counts as a no-op, what reason string to surface—is scattered across the core file instead of being co-located with the source that knows its own output semantics. This makes the `apply` interface's contract implicit: a source can return a raw string that happens to match a guard, or a string that doesn't, and the core file's string-matching is the only thing standing between the two.
+
+Solution:
+Move the "is this a no-op?" decision into the `apply` implementations in `apply-group-a.js` / `apply-group-b.js`. Each source's `apply` function already receives the model's text; it should inspect that text and, when there is nothing to apply, return the standard `{ skipped: true, reason: '…' }` object directly. `apply-core.js` then reduces to a single uniform check: if the return value carries `skipped`, record the reason and move on. The two bespoke string-matching guards in the core path are removed; the contract becomes explicit ("either return an artifact or return `{ skipped: true }`") and is enforced at the boundary where the source already has full context for its own output format.
+
+Benefits:
+The `apply` interface gains a single, testable contract that can be asserted in unit tests per source without exercising the full orchestration path. The core file's string-matching surface shrinks, reducing the chance that a future source's legitimate output accidentally trips a pattern meant for another source's no-op phrasing. Adding or modifying a source's no-op detection is a local change in that source's `apply` function rather than a cross-file edit to the shared guard list, which simplifies code review and keeps the "what does this source consider a no-op?" knowledge where it belongs.
+
+### AC-222 · Extract a shared `listFilesAtRef` helper and align environment setup with `grepAtRef`
+Strength: Moderate
+Files: src/stacked-grounding.js
+
+Problem:
+`resolveAtRef` in `src/stacked-grounding.js` manually runs `git ls-tree` via `execFileSync`, duplicating the `GIT_ENV` and `maxBuffer` setup that `grepAtRef` already handles for `git grep`. The two call sites maintain identical environment and buffer configuration independently, so a change to one (e.g., adding a timeout, adjusting `maxBuffer`, or switching the transport) must be remembered in the other.
+
+Separately, `resolveAtRef` wraps the call in a catch-all `try/catch` that returns `null` on any error. The file's own comment documents this as intentional: "an unreadable ref reads as 'not found,' which leaves the caller's own working-tree verdict in force." That is a reasonable best-effort design for the grounding pipeline, and the draft should not be read as demanding that behavior be removed. However, the catch-all also swallows *genuine* failures (bad ref, permission error, git not found) into the same `null` that a clean "path absent in tree" lookup produces, with no log line or sentinel to distinguish the two. In practice this is low-risk because the caller's fallback (working-tree verdict) is safe, but it means a real git misconfiguration is silently invisible in logs.
+
+Solution:
+Extract a shared `listFilesAtRef(repoRoot, ref)` helper that encapsulates the `git ls-tree` invocation, the `GIT_ENV` / `maxBuffer` configuration, and the exit-code handling. For `git ls-tree` the relevant semantics are: exit 0 = success (output may be empty if the tree has no entries at that path); non-zero exit = error (bad ref, missing repo, permission, etc.). There is no "exit 1 = no match" convention for `ls-tree` the way `git grep` has one. The helper should therefore treat exit 0 as success (return the possibly-empty line list) and non-zero as an error.
+
+`resolveAtRef` calls the helper and, in the error case, logs a one-line warning (ref, path, exit code) before returning `null`, preserving the documented best-effort contract while making genuine failures visible in logs. This is a logging improvement, not a behavior change: callers still receive `null` and fall back to their working-tree verdict exactly as the file's comment describes.
+
+Benefits:
+A single code path owns the `git ls-tree` mechanics, so environment setup and buffer sizing are maintained in one place and any future change (timeout, transport swap, `--recurse` flag) touches one helper instead of two call sites. The logged warning on non-zero exit gives operators a signal that a git failure occurred, without altering the intentional best-effort `null`-return contract that the file's comment documents. The helper's exit-code handling is correct for `ls-tree` (0 = success, non-zero = error) rather than importing `git grep`'s "exit 1 = no match" convention, which does not apply here.
+
+NOTE: The critique's flag that AC-001's "new source" motivation is invalid because the guards are source-agnostic is correct and has been addressed by reframing the problem and benefits around contract explicitness and co-location rather than "remembering to extend a guard list." The critique's point that the draft's proposed `{skipped:true}` return "would require changing the model's output format" is not applied as a flag: the `apply` function already receives the model's raw text and is free to inspect it and return a structured skip object; no change to the model's output format is required, so that particular sub-claim in the critique is inapplicable to the corrected draft.
+
+### AC-223 · Missing warning when a task file is not found in a known queue-state directory
+Strength: Worth exploring
+Files: python/dashboard/branch_verdicts.py
+
+Problem:
+`write_task_log` in `branch_verdicts.py` iterates over task IDs and calls `_task_file` to locate the JSON file for each task. If `_task_file` returns `None` (because the task resides in a queue-state directory not listed in `_TASK_DIRS`), the function silently skips that task with `if not path: continue`. Unlike the I/O or parse-error paths—which already emit a `logger.warning`—this "not found" path produces no log output. As a result, if a new queue-state directory is added to `app.py` but not to `_TASK_DIRS`, the verdict is persisted to `branch-verdicts.json` and the UI displays it, but the owning task’s `history` array never receives the entry, and no operator-visible signal indicates the gap.
+
+Solution:
+Add a `logger.warning` inside `write_task_log` whenever a task_id is supplied but `_task_file` returns `None`. This makes the skip visible in logs, turning an undetectable no-op into a one-line diagnostic that operators can investigate.
+
+Benefits:
+Operators gain a concrete log line to identify and resolve missing task-history entries. The fix is minimal, proportional to the actual risk, and does not introduce new modules or import dependencies.
+
+---
+
+### AC-224 · Unrecoverable partial-write gap between verdict store and task history
+Strength: Strong
+Files: python/dashboard/branch_verdicts.py
+
+Problem:
+When a deterministic verdict is new or changed, `enrich_branches_with_verdicts` performs two independent file writes in sequence: first `record_verdict` persists to `branch-verdicts.json`, then `write_task_log` appends a history entry to one or more task JSON files. These are separate atomic writes with no transactional link. If `write_task_log` fails for any task (I/O error, the task file was deleted between the existence check and the write, a JSON parse error from a concurrent writer), the verdict is already in the store but the task history is missing the entry. On the next call to `enrich_branches_with_verdicts`, the verdict is detected as `unchanged` (same verdict string, same reasons list), so the `if not unchanged:` guard is false and `write_task_log` is never retried. The task’s history is permanently missing that event. `write_task_log` does catch per-task exceptions and log a warning, but the caller does not inspect the return count or re-attempt, and the `unchanged` short-circuit on the next pass makes the gap permanent.
+
+Solution:
+Accept the documented trade-off that the `unchanged` guard intentionally prevents redundant history writes, and add a `logger.warning` in `enrich_branches_with_verdicts` whenever `write_task_log` returns fewer successful writes than expected. This makes the partial-write gap visible in logs, allowing operators to manually reconcile the missing history entry if needed. The fix respects the existing design intent of avoiding redundant writes while ensuring that any divergence between the verdict store and task history is detectable.
+
+Benefits:
+Operators gain a visible signal when the verdict store and task history diverge, enabling manual reconciliation if necessary. The fix preserves the documented optimization of avoiding redundant history writes while eliminating the silent data-loss risk.
+
+NOTE: Flag 1 was addressed by changing AC-002's solution to respect the documented `unchanged` guard and adding a warning instead of a retry mechanism. Flag 2 was addressed by changing AC-001's primary proposal to the lighter-weight warning-only fix and removing the speculative shared-module proposal.
+
+### AC-225 · Registry primitive entangled with core-scope domain logic
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` is intended to be a generic registry primitive, yet it contains a hardcoded conditional `require('./lib/source-scope.js')` and an inline wrapper that rewrites `config.next` specifically when `scope: 'core'` is supplied. This embeds a domain concept ("core scope") and a concrete module dependency inside what should be a framework-agnostic registration function, violating single-responsibility and making the registry's behavior harder to test in isolation or to reuse in a context where "core scope" has no meaning.
+
+Solution:
+Extract the `scope: 'core'` wrapping logic into a dedicated, explicitly named function (e.g. `wrapCoreScopeNext`) in its own module or as a clearly separated export. Refactor `registerTaskSource` to accept an optional `nextWrapper` callback (or to delegate to a separate `applyScopeMiddleware` step) so the registry itself stays free of domain-specific branching. Migrate existing `scope: 'core'` call sites to pass the new explicit middleware, preserving identical runtime behavior while making the coupling visible and independently testable.
+
+Benefits:
+The registry becomes a pure, predictable primitive that can be unit-tested without loading `source-scope.js`. New scope-like behaviors can be added as composable middleware without editing the registry. The dependency graph becomes honest—`source-scope.js` is required only where it is actually used—simplifying tree-shaking, circular-dependency detection, and onboarding for contributors who need to understand what the registry does.
+
+### AC-226 · Two-tier source-name resolution (hardcoded domain checks + alias map)
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` contains hardcoded fallbacks for `task.domain === 'adhoc'` and `task.domain === 'secondbrain'` that duplicate the resolution work plugins are expected to perform via `registerSourceAlias`. This creates a fragile, two-tiered system: some sources are resolved by an invisible domain check baked into the registry, while others go through the extensible alias map. Adding a new domain-specific quirk requires editing the registry's internals rather than registering an alias, and the full resolution path is difficult to reason about or audit.
+
+Solution:
+Audit every source that currently relies on the hardcoded domain checks. For each, register the appropriate alias at startup (either in the owning plugin or in the core package's bootstrap), using the existing `registerSourceAlias` mechanism. Then remove the domain-specific branches from `resolveSourceName`, leaving only the alias-map lookup and the default `task.source` fallback, so all resolution flows through a single, extensible, and inspectable path.
+
+Benefits:
+Source-name resolution becomes a single, uniform mechanism that is trivially extensible: adding a new source alias is a one-line registration with no registry edit. The resolution path is easier to debug (one map lookup + one default) and to test (the alias map is the sole source of truth). It eliminates the risk of drift where a new domain quirk is added to the hardcoded branch but forgotten in documentation or in the alias-based path.
+
+### AC-227 · text-similarity.js: duplicated tokenization with a silent hyphen divergence and a hidden first-line contract
+Strength: Worth exploring
+Files: src/text-similarity.js
+
+Problem:
+The module exports two similarity primitives—`jaccardSimilarity` (token-level) and `sharesDistinctivePhrase` (phrase-level boolean)—that share a conceptual tokenization step but implement it independently. `normalizeTokens` strips hyphens via `/[^a-z0-9\s]/g`, splitting `read-only` into two tokens, while `distinctivePhrases` preserves hyphens via `/[^a-z0-9\s-]/g`, keeping `read-only` as one token. The two functions therefore operate on different token spaces for the same input string, and nothing in either function's comment or signature signals this divergence. Compounding the issue, `distinctivePhrases` silently truncates to the first line via `split('\n')[0]`, a constraint that is invisible in the function's signature (`text: string`) and only discoverable by reading the implementation. A future caller passing a multi-line string (e.g., a multi-line `blockedReason`) will receive results computed on a truncated input with no warning or error. Finally, `sharesDistinctivePhrase` is a boolean wrapper around a set intersection that coexists with `jaccardSimilarity` in the same file under different tokenization, different return types, and different line-scope semantics, which weakens the module's apparent cohesion even though both are legitimate public exports of a shared utility.
+
+Solution:
+Unify the tokenization base: either make `distinctivePhrases` call `normalizeTokens` (accepting hyphen-stripping) or add a `preserveHyphens` option to `normalizeTokens` so both functions share a single, documented tokenization core. Remove the `split('\n')[0]` from `distinctivePhrases` and let callers be responsible for line-scoping, or rename the function to `distinctivePhrasesFirstLine` / add a `lines: 'first' | 'all'` parameter so the contract is visible in the API. For `sharesDistinctivePhrase`, since it is a public export of a shared utility module, inlining is not appropriate; instead, consider whether it should expose the underlying matched phrases (e.g., return `{ matched: boolean, phrases: string[] }`) so callers are not limited to a bare boolean, or simply document its relationship to `jaccardSimilarity` and the tokenization difference in the module header so the two primitives' distinct contracts are explicit.
+
+Benefits:
+Eliminates the silent tokenization divergence so both similarity primitives operate on a shared, documented token space. Makes the line-scope contract visible in the function's name or signature rather than hidden in the implementation, preventing silent truncation of multi-line inputs. Clarifies the relationship between the two similarity strategies and their distinct contracts, improving the module's internal cohesion without removing any public API surface.
+
+---
+
+### AC-228 · grep-codebase-tool.js: inconsistent error reporting and permissive path resolution on the alternate-root path
+Strength: Worth exploring
+Files: src/grep-codebase-tool.js
+
+Problem:
+`grepCodebase` returns an `Array<Hit>` on success but a plain `{ error: string }` object on failure, forcing every caller to perform a runtime type check (`Array.isArray(result)`) to distinguish the two cases. Because this function is wired into `local-tool-client.js` as a tool-call target for an agentic pass, the success-path return shape (a JSON-serializable array) is part of the external tool contract and should not be changed. The failure path, however, is a shallow interface: a caller that destructures `hits` without first checking for `error` will silently receive `undefined`, and the tool-execution wrapper may not handle a non-array payload gracefully. The two internal code paths for resolving the search root also disagree on how they handle the `dir` parameter. The primary-repo path (`resolvePrimaryDirs`) validates `dir` against `grepAllowedDirs`, rejects unrecognized values with a helpful error listing valid dirs, and handles `''` / `'.'` as "all allowed dirs." The alternate-root path (`altRoot`) performs no such validation—it calls `path.join(altRoot, dir)` directly. Because `path.join` resolves `..` segments (e.g., `path.join('/home/user/project', '../../etc')` → `/home/etc`), a `dir` value like `'../../etc'` or an absolute path will cause the search to target a directory outside the intended root. This is a path-traversal exposure: the search will execute against an unintended directory, potentially reading files the caller should not have access to, rather than failing with a clear error. The two paths thus enforce different trust models for the same parameter, and this asymmetry is not documented. Additionally, the `force` parameter in `grepOneFile` (which bypasses the extension allowlist when a search root is a named file) is an internal detail invisible in `grepCodebase`'s signature or documentation.
+
+Solution:
+For the error path, replace the `{ error: string }` return with a thrown `Error` (or a typed subclass such as `GrepToolError`) carrying the message. This keeps the success-path return type as `Array<Hit>`—preserving the tool-call contract with `local-tool-client.js` and the LLM serialization layer—while giving callers a uniform, catchable failure mechanism. Update the known call sites to wrap the call in a `try/catch` and surface the error message. For the alternate-root path, add the same validation the primary path uses: reject absolute paths and any `dir` containing `..` segments (after normalizing), and return/throw a helpful error if `dir` does not resolve to a subpath of `altRoot`. This is a security hardening measure (preventing path traversal outside the intended root), not merely an API-consistency fix. Document the `force` / extension-allowlist-bypass behavior in `grepCodebase`'s comment or a dedicated "internal notes" section so a reader does not need to trace into `grepOneFile` to understand it.
+
+Benefits:
+Preserves the success-path return shape (`Array<Hit>`) that the tool-call and LLM-serialization layers depend on, while making the failure path idiomatic and catchable without ad-hoc `Array.isArray` checks. Closes the path-traversal exposure on the alternate-root path so a malicious or erroneous `dir` value cannot redirect the search outside the intended directory. Unifies the trust model for `dir` across both code paths. Makes the extension-allowlist bypass visible to readers who do not read the internal `grepOneFile` function, reducing the chance of a future refactor accidentally removing or altering the behavior.
+
+NOTE: Flag 3 was partially applied (the "single call site" assertion and inlining recommendation were removed), but the critique's suggestion that keeping `sharesDistinctivePhrase` as a public export makes the entire cohesion concern "inapplicable" is overstated—the tokenization divergence and hidden line-truncation issues remain valid and are retained in the corrected draft.
+
+### AC-229 · Duplicated archive destination-directory resolution
+Strength: Strong
+Files: src/done-archive.js
+
+Problem:
+The logic for constructing the target archive path (`path.join(doneDir, ARCHIVE_DIRNAME, monthBucket(new Date(now)))`) and the subsequent directory creation (`fs.mkdirSync(destDir, { recursive: true })`) is duplicated verbatim across `archiveDoneTasks` and `archiveSpecificDoneTasks`. This violates the DRY principle and creates a concrete maintenance hazard: if the archive directory naming scheme changes (e.g., switching from monthly to yearly buckets, or adding a sub-directory structure), a developer must remember to update the path construction in both functions. If they only update one, the two functions will silently write to different locations, breaking the module's documented guarantee that "both passes' output is indistinguishable to every existing consumer."
+
+Solution:
+Extract a private helper function (e.g., `resolveArchiveDestDir(pipelineDir, now)`) that encapsulates the path construction and directory creation in a single place. Both `archiveDoneTasks` and `archiveSpecificDoneTasks` should call this helper to obtain the destination directory. The helper becomes the single source of truth for the naming scheme, and any future change to the bucketing strategy or directory layout is made in exactly one location.
+
+Benefits:
+Eliminates the risk of the two public functions silently diverging in where they write archived tasks. Reduces the cognitive load on future maintainers who need to change the archive layout—they edit one function instead of hunting for all call sites. Makes the module's internal invariant (both passes produce indistinguishable output) structurally guaranteed rather than relying on developer discipline.
+
+### AC-230 · Duplicated signature parsing logic
+Strength: Worth exploring
+Files: src/pipeline-self-audit.js
+
+Problem:
+The logic for splitting the `signature` string into `source` and `category` using `lastIndexOf('::')` is duplicated in both `buildAuditRawText` and `buildAuditTask`. This is a minor but real duplication of a string-parsing operation. If the signature format ever changes (e.g., adding a third component, or changing the delimiter), both functions must be updated in lockstep. While currently low-risk because the format is stable, it is a classic "shallow interface" issue where the internal representation of the signature is leaking into multiple consumer functions rather than being encapsulated.
+
+Solution:
+Create a small helper function `parseSignature(signature)` that returns `{ source, category }`. Both `buildAuditRawText` and `buildAuditTask` should use this helper instead of performing the split inline. This centralizes the parsing logic in one place and makes the code more robust to future format changes.
+
+Benefits:
+Removes the lockstep-update requirement between two functions. If the signature format evolves, the change is isolated to a single small helper. Makes the intent of the parsing step explicit and testable in isolation, and reduces the surface area for subtle off-by-one or delimiter-handling bugs to be introduced in one place but missed in the other.
+
+### AC-231 · Unused priority-override module
+Strength: Worth exploring
+Files: src/lib/task-priority.js, src/task-source-registry.js
+
+Problem:
+Within the four files in this community (`task-priority.js`, `task-source-registry.js`, `candidate-fulfillment.js`, `instances-dir.js`), no file imports or calls `taskPriority`. The registry's `registerTaskSource` stores `{ name, …config }` as-is, so the `priority` field is whatever the caller placed in their config object at registration time. However, `task-priority.js`'s own header notes it was *extracted from* `src/task-sources.js`, a module that is **not** among the four files shown here and is the most likely consumer of `taskPriority`. The absence of a caller within this 4-file sample therefore does not confirm the module is dead; it only confirms that the visible community does not reference it. The practical concern is narrower: a reader of this community alone cannot tell whether `priority` is a raw caller-supplied value or a computed one, and the module's purpose is invisible without tracing back to `task-sources.js`.
+
+Solution:
+Before any structural change, confirm whether `task-sources.js` (or any other module outside this sample) actually calls `taskPriority`. If it does, the module is integrated and no change is needed—only a cross-reference comment in `task-priority.js` pointing to its consumer would help discoverability. If, after that check, no caller exists anywhere, then (a) delete `task-priority.js` and remove its export. Option (b)—wiring `taskPriority` into `registerTaskSource` so the stored priority is `taskPriority(config.priority, …)`—is a **behavioral change** to the registry's sorting semantics (from raw caller value to a computed/overridden value) and should only be pursued if the override semantics are a confirmed design goal and no existing caller depends on the current pass-through behavior.
+
+Benefits:
+Resolving the question (dead vs. integrated) removes ambiguity for anyone reading this community in isolation. If the module is confirmed dead, deleting it shrinks the import graph and eliminates a misleading export. If it is integrated, a one-line cross-reference makes the wiring discoverable without altering any runtime behavior.
+
+---
+
+*AC-004 (candidate-fulfillment re-export) was in the prior draft but has been removed. The module's header explicitly documents the re-export as an intentional barrel—"one import for the whole candidate lifecycle"—and no consumer in the provided inputs is shown to be harmed by it. The coupling of write-side and read-side symbols in a single namespace is a deliberate API-convenience choice, not a defect, and the prior draft's proposed fix (remove the re-export or split into a separate barrel) would undo a documented design decision without evidence of actual harm. No action is recommended.*
+
+### AC-232 · Non-standard stage value in blocked-drain history event — **RETRACTED**
+Strength: Strong
+
+Upon re-reading `src/blocked-drain.js` against its own header comment, the draft's premise was inverted. The file explicitly documents that a prior incident arose from an *undocumented* `{ status, at, note }` vocabulary, and that the current use of `appendHistoryEvent` with `'retry-context-stamped'` is the **canonical fix** that routes the record through the standard `{ stage, at, detail }` schema enforced by `task-history.js`. The value `'retry-context-stamped'` is the intended, descriptive stage label for this specific lifecycle transition; it is not a mislabeled event-type. Downstream consumers (dashboard, `task-disposition.js`, forensics tooling) parse whatever `appendHistoryEvent` emits, and the schema contract is satisfied.
+
+No change is warranted. The proposed "solution" (substituting `'pending'` or adding a `type` parameter) would discard the descriptive specificity the code was written to preserve and would re-introduce the ambiguity the header comment warns against.
+
+---
+
+### AC-233 · Duck-typed gitRunner silently bypasses safety pre-flight checks — **RETRACTED**
+Strength: Strong
+
+Re-reading `src/lib/apply-main-batch.js` and its inline comments, the `typeof` guards are **intentional, documented graceful-degradation** for optional, best-effort methods:
+
+- `pruneRetractedCandidates` is explicitly annotated "Best-effort and never fatal: a failure here must not block the batch."
+- `quarantineDirtyTree` / `assertCleanTree` are newer additions (the comment references a 2026-09-23 incident). The guards exist so that older `gitRunner` implementations and test mocks that predate those methods continue to function.
+- When `assertCleanTree` **is** present, it is called without a surrounding try-catch in the gated path, so a failing clean-tree check **does** throw and abort the batch. The safety check is not silently bypassed; it is only skipped when the method does not exist, which is the documented compatibility contract.
+
+The draft's "fail-fast" proposal would break every `gitRunner` implementation that predates the optional methods, contradicting the code's explicit design goal. No change is warranted.
+
+---
+
+*Both findings in the original draft were retracted. No code changes are recommended.*
+
+### AC-234 · Redundant `destDirEnsured` guard in archive loop
+Strength: Worth exploring
+Files: src/done-archive.js
+
+Problem:
+Both `archiveDoneTasks` and `archiveSpecificDoneTasks` maintain a local boolean (`destDirEnsured`) that gates a call to `fs.mkdirSync(destDir, { recursive: true })` so the directory is created at most once per loop. However, `fs.mkdirSync` with the `recursive: true` option is idempotent by contract: it does not throw when the target directory already exists. The flag therefore adds a mutable piece of loop-local state and an `if` branch that serve no functional or performance purpose, increasing cognitive load for anyone reading the archive loop.
+
+Solution:
+Remove the `destDirEnsured` variable and its conditional entirely. Call `fs.mkdirSync(destDir, { recursive: true })` unconditionally immediately before each `fs.renameSync` (or once before the loop, if the destination is constant across iterations). The Node.js `fs` module guarantees the call is a no-op when the directory is already present, so the behaviour is identical without the guard.
+
+Benefits:
+The archive loop loses a state variable and a branch, making the control flow linear and easier to audit. Future maintainers no longer need to reason about whether the flag could be reset or fall out of sync, and the code relies on a well-documented, standard library guarantee rather than hand-rolled bookkeeping.
+
+### AC-235 · Inconsistent failure semantics between `readState` and `listArchivedMonthDirs`
+Strength: Worth exploring
+Files: src/done-archive.js
+
+Problem:
+`readState` catches `ENOENT` and returns an empty object, but re-throws every other read failure (permission denied, I/O error, corruption). Meanwhile `listArchivedMonthDirs` catches any `readdirSync` failure and silently returns an empty array. The two functions in the same module therefore disagree on whether a non-`ENOENT` file-system error should crash the caller or degrade gracefully. In `checkDue`, a transient permission blip on the state file will throw and abort the entire archive pass, while an equally transient `readdir` failure on the archive directory will be swallowed and the pass will continue with an empty list—producing inconsistent observable behaviour for the same class of underlying fault.
+
+Solution:
+Align `readState` with the graceful-degradation pattern already used by `listArchivedMonthDirs`: catch all read errors, log the error (including the original `errno` and `message`) via the module's existing logging path, and return `{}`. This ensures `checkDue` and any other caller treat a missing state file and an unreadable state file identically—both yield "no prior state"—and a transient I/O hiccup no longer aborts the archive run.
+
+Benefits:
+Error-handling semantics become uniform across the module, so callers can rely on a single contract: file-system hiccups degrade to empty data rather than uncaught exceptions. The archive pipeline becomes resilient to transient `EACCES`, `EIO`, or `ENOSPC`-adjacent conditions on the state file without a code-path change, and the logging call preserves enough context for operators to investigate the underlying issue after the fact.
+
+### AC-236 · Decouple phrase-extraction from side-finding deduplication
+Strength: Strong
+Files: src/text-similarity.js, src/side-finding-sweep.js, src/staleness-audit.js
+
+Problem:
+`src/text-similarity.js` houses `distinctivePhrases` and `sharesDistinctivePhrase`, which were originally extracted from `staleness-audit.js` to avoid duplication. However, the implementation is now tightly coupled to the single-line deduplication needs of `side-finding-sweep.js`: the header comments document a "FIRST-LINE-ONLY by design" constraint that matches every current caller. This makes the module fragile for any other consumer—`staleness-audit.js` or a future module that needs to compare multi-line bodies cannot reuse these functions without modification or code duplication, undermining the "shared primitive" intent stated in the extraction comments.
+
+Solution:
+Refactor `src/text-similarity.js` to expose a generic `extractPhrases(text, { multiLine: boolean })` (or an equivalent option parameter) so the core phrase-extraction logic is reusable across comparison tasks. `side-finding-sweep.js` then opts into the single-line behavior by passing `{ multiLine: false }`, while `staleness-audit.js` or any future consumer can pass `{ multiLine: true }` to compare full bodies. The public API of the module becomes a true shared primitive rather than a side-finding-specific wrapper.
+
+Benefits:
+Any module that needs phrase-level similarity (staleness auditing, future deduplication passes, cross-file comparison) can call the same utility without forking the logic. The "first-line-only" constraint becomes an explicit caller choice rather than a baked-in assumption, eliminating the risk that a new consumer silently gets the wrong granularity. It also makes the module's contract self-documenting: the option name signals intent at the call site.
+
+### AC-237 · Extract shared directory-walking utility from grep-codebase-tool
+Strength: Strong
+Files: src/grep-codebase-tool.js, src/atomic-write.js
+
+Problem:
+`src/grep-codebase-tool.js` implements a custom synchronous `walk` function that traverses directories while respecting `GREP_SKIP_DIRS` and `isArchivedDirName`. This skip-list logic is hardcoded locally to that one tool. The project already demonstrates a preference for small, focused utilities (evidenced by `src/atomic-write.js` as a pure leaf utility), yet the directory-traversal concern is not extracted into a shared module. Any future tool that needs to walk the repository (a `list-files-tool`, a `stat-tool`, a lint sweep) will either duplicate this skip-list logic or diverge from it—risking "silent exclusion" bugs such as the Python/Shell exclusion issue already noted in the codebase comments.
+
+Solution:
+Extract the directory-walking logic (traversal, skip-list filtering via `GREP_SKIP_DIRS` and `isArchivedDirName`) from `src/grep-codebase-tool.js` into a new `src/lib/fs-walk.js` that exports a `walkDirectory(root, { skipDirs, onFile })` utility. `src/grep-codebase-tool.js` then consumes this shared utility. The skip-list configuration remains externalized (consistent with the existing `src/config.js` pattern), so adding or removing a directory to skip is a single-point change.
+
+Benefits:
+All tools that traverse the repository share one tested, consistent skip-list implementation, eliminating the class of "silent exclusion" bugs where a new tool forgets to skip `.venv`, `node_modules`, or archived directories. The project's existing pattern of small, focused leaf utilities (as seen in `src/atomic-write.js`) is extended coherently to the file-system-traversal concern, keeping each tool's code focused on its domain logic rather than re-implementing directory mechanics.
+
+### AC-238 · resolveSourceName hardcodes built-in source aliases in core logic
+Strength: Worth exploring
+Files: src/task-source-registry.js
+
+Problem:
+`resolveSourceName` in `src/task-source-registry.js` contains a chain of `if` statements that map specific `task.domain` and `task.source` literal values (e.g. `domain === 'adhoc'`, `source === 'manual'`) to their corresponding registry names. The inline comments acknowledge this is a "hardcoded fallback" for "built-in quirks" and direct plugins to use `registerSourceAlias` for their own naming mismatches. The result is that the core resolution path is tightly coupled to the naming conventions of the `adhoc` and `secondbrain` sources: adding or renaming any future built-in source with a similar mismatch forces a change to this central function, and the set of special-cased sources is invisible from the registration API.
+
+Solution:
+Extend the `config` object accepted by `registerTaskSource` with an optional `sourceAliases` array (e.g. `{ domain: 'adhoc', source: 'manual' }` entries). During registration, the registry stores these aliases in an internal lookup map. `resolveSourceName` then consults that map first and falls back to the identity mapping, eliminating the per-source `if` chain. The existing `registerSourceAlias` helper for plugins can be refactored to simply push into the same map, unifying the built-in and plugin paths.
+
+Benefits:
+Adding or renaming a built-in source becomes a one-line change in its own registration call rather than an edit to shared core logic. The full set of alias mappings is discoverable at the registration site, improving locality. Plugin and built-in sources follow the same code path, reducing the surface area for divergence and making the resolution function trivially testable by inspecting the alias map.
+
+### AC-239 · Lazy require of source-scope.js obscures the registry's true dependency graph
+Strength: Worth exploring
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+`registerTaskSource` in `src/task-source-registry.js` performs a `require('./lib/source-scope.js')` inside the function body, triggered only when `config.scope === 'core'`. Because the import is buried in a conditional branch rather than at the top of the module, the full set of `task-source-registry.js`'s dependencies is not visible from the file's header. A reader (or a static-analysis tool) scanning the top-level `require` statements will not see `source-scope.js`, making the dependency graph incomplete. If `source-scope.js` carries side effects at load time, or if the lazy `require` throws in an edge-case environment, the failure is deferred and harder to diagnose.
+
+Solution:
+Move the `require('./lib/source-scope.js')` to the top of `src/task-source-registry.js` alongside the other module-level imports. If the original motivation was a circular dependency (e.g. `source-scope.js` imports from `task-source-registry.js`), break the cycle by extracting the shared interface into a small leaf module, or by passing the `sourceEligibleHere` function as an explicit parameter to `registerTaskSource` from the caller that already holds the reference. Either way the dependency becomes visible at the module boundary.
+
+Benefits:
+The module's import list accurately reflects its runtime dependencies, making the graph auditable by eye and by tooling. Load-time errors in `source-scope.js` surface immediately at startup rather than on the first `core`-scoped registration call. Removing the conditional `require` also eliminates a subtle code path where the module is loaded in one process but not another, simplifying reasoning about initialization order.
+
+### AC-240 · Unify the divergent marker extraction logic in `concepts.js` and `incident-amplification-marker.js`
+Strength: Strong
+Files: src/concepts.js, src/incident-amplification-marker.js
+
+Problem:
+Both `concepts.js` and `incident-amplification-marker.js` implement the same architectural pattern—inject a structured instruction block into a prompt, then parse a corresponding marker out of the model's response and strip it from the clean text—but the extraction logic has diverged into two structurally different code paths. `concepts.js` relies on a single regex (`CONCEPT_BUILD_MARKER_RE`) to locate a match, extract the data, and remove the matched substring. `incident-amplification-marker.js` instead uses a lookahead split (`AMPLIFY_SPLIT_RE`) to divide the text into blocks, parses each block for specific fields, and manually reconstructs the clean text by joining the non-matching parts. This duplication means any future change to marker handling—whitespace edge cases, multiple markers of the same type, altered cleaning semantics—must be implemented and tested independently in two places that do not share a common code path, increasing the risk of silent behavioral drift between the two markers.
+
+Solution:
+Extract the common "marker extraction" logic into a shared utility module (e.g., `src/marker-extraction.js`). The utility accepts a configuration object that defines the marker's structure: a regex for the start delimiter, a list of required and optional fields each with their own extraction regex, and the cleaning strategy (strip-matched-substring vs. join-non-matching-blocks). Both `concepts.js` and `incident-amplification-marker.js` then delegate to this shared utility, passing their specific marker definitions as configuration. The two call sites become thin wrappers that supply their field schemas and receive a uniform `{ data, cleanText }` result.
+
+Benefits:
+A single source of truth for splitting, parsing, and cleaning model responses guarantees consistent behavior across all marker types and eliminates the risk that a fix applied to one code path is forgotten in the other. Maintenance effort drops because edge-case handling (malformed input, whitespace variants, multiple occurrences) is written and tested once in the shared utility. The utility can be unit-tested independently of any specific marker, covering a wider matrix of inputs without duplicating test scaffolding in each consumer module.
+
+### AC-241 · Registry scope-check coupling is intentional and well-documented; no defect identified
+Strength: Weak (downgraded from Strong)
+Files: src/task-source-registry.js, src/lib/source-scope.js
+
+Problem:
+The original draft characterized the lazy `require('./lib/source-scope.js')` inside `registerTaskSource` as a "hidden-coupling anti-pattern" and a "circular-dependency risk." On review this characterization is inaccurate. The source-code comment in `src/task-source-registry.js` explicitly documents the intent: *"Wrap next() so that EVERY caller -- getNextTask, the always-run watchdog sweeps that call a source directly -- gets null on any other project, not just the priority ladder."* The coupling is therefore a deliberate, centralized safety mechanism ensuring consistent scope enforcement across all call paths (including watchdog sweeps that bypass the priority ladder), not an accidental hidden dependency.
+
+The draft's claim that the registry is "harder to test in isolation" is also incorrect. The module already exports `clearRegistry()` for test teardown, and the lazy `require` fires only when `registerTaskSource` is invoked with `scope: 'core'`. Unit tests exercising the generic storage/retrieval surface (`getRegisteredSources`, `getRegisteredSource`, etc.) never trigger the require, so the registry is already independently testable for its primary responsibilities.
+
+The proposed solution—moving the scope check to the caller side or injecting a pluggable hook—would break the documented safety guarantee: watchdog sweeps that call a source directly (not through the priority ladder) would lose the scope-eligibility check, allowing cross-project task leakage.
+
+Solution:
+No change required. The current design is a correct, intentional trade-off: a single, centralized enforcement point in the registry guarantees that every call path—ladder, direct, or watchdog—respects scope policy. The lazy `require` keeps the dependency out of the module-load graph for the common (non-`core`) path, and the documented comment makes the coupling explicit to future readers.
+
+If a future refactor introduces a genuine circular dependency (i.e., `source-scope.js` or a transitive dependency begins to `require` the registry at load time), that would be a concrete defect to address at that time. No such cycle exists in the current code.
+
+Benefits of the current design (acknowledged, not proposed):
+- Single enforcement point covers all call paths, including those that bypass the priority ladder.
+- Lazy require avoids a load-time dependency for the common non-`core` registration path.
+- `clearRegistry()` already provides the test-isolation affordance needed for the storage/retrieval surface.
+- The intent is documented in-source, reducing the risk of a future maintainer "fixing" what they perceive as accidental coupling.
+
+NOTE: Both flags were applied; no flag was left unaddressed.
+
+### AC-242 · Re-export facade inflates `pipeline-self-audit.js`'s role in the module graph
+Strength: Strong
+Files: src/pipeline-self-audit.js, src/blocked-task-classifiers.js, src/pipeline-forensics.js, src/staleness-audit.js
+
+Problem:
+`pipeline-self-audit.js` re-exports four classification symbols (`REASON_CATEGORIES`, `categorizeBlockedReason`, `hasZeroHitHarnessSearch`, `signatureForTask`) from `blocked-task-classifiers.js` purely as a backward-compatibility shim so that `pipeline-forensics.js` and `staleness-audit.js` can keep their existing `require('./pipeline-self-audit.js')` import lines. Four of the file's nine `module.exports` entries are pass-throughs for a concern (fault-side classification) that this module does not own. The file's link-degree of 10 — the highest in this community — is partly artificial, because every consumer that imports a classification symbol is coupled to the cluster-detection module rather than to `blocked-task-classifiers.js` where the logic actually lives. This obscures true ownership in the dependency graph: a developer reading `pipeline-self-audit.js` sees `signatureForTask` in its export list and reasonably assumes this module defines or curates the signature format, when in fact it is a pure delegation. The shim also means any future change to the classification API must be coordinated through two files, and the single source of truth is hidden behind a module whose primary job is something else.
+
+It is worth noting that `pipeline-self-audit.js` does have a *legitimate* internal dependency on `blocked-task-classifiers.js`: `buildAuditRawText` calls `classifyBlockedTask` to generate the `faultSideNote` field. That is a genuine consumer relationship, not a re-export. The problem is specifically the four *re-exported* symbols that this module neither defines nor uses internally.
+
+Solution:
+1. Migrate the known consumers (`pipeline-forensics.js`, `staleness-audit.js`, and any others that import the four classification symbols from `pipeline-self-audit.js`) to import directly from `blocked-task-classifiers.js`.
+2. Remove the four re-export lines from `pipeline-self-audit.js`'s `module.exports`.
+3. Narrow the existing `require('./blocked-task-classifiers.js')` destructuring to import only `classifyBlockedTask` (the symbol actually used inside `buildAuditRawText`), rather than the full set of four re-exported names. The `require` call itself stays, because the module still consumes `classifyBlockedTask` internally.
+
+After these changes the file's public API shrinks to its own five symbols (`CLUSTER_THRESHOLD`, `MAX_DEBRIEF_ACTIONS`, `findAuditClusters`, `buildAuditRawText`, `buildAuditTask`), and the module graph reflects actual ownership. The internal dependency on `blocked-task-classifiers.js` remains, but it is now a single, honest consumer edge rather than a four-symbol pass-through facade.
+
+Benefits:
+The dependency graph becomes an accurate map of who owns what: classification logic is visibly owned by `blocked-task-classifiers.js`, and `pipeline-self-audit.js` is visibly a cluster-detection module with one legitimate internal call into the classifier. Future changes to the classification API (renaming a category, adding a new fault-side) require touching only `blocked-task-classifiers.js` and, if the signature changes, `buildAuditRawText`'s single call site — not a separate re-export surface. New contributors reading `pipeline-self-audit.js` no longer encounter four symbols they must trace through a second file to understand, and the file's link-degree drops to reflect its true coupling.
+
+### AC-243 · Duplicated signature-format parsing in `pipeline-self-audit.js`
+Strength: Worth exploring
+Files: src/pipeline-self-audit.js, src/blocked-task-classifiers.js
+
+Problem:
+Both `buildAuditRawText` and `buildAuditTask` independently parse the `source::category` signature with the identical three-line sequence: find the last `::` separator, slice the source from the start, and slice the category from after the separator. The signature format is produced by `signatureForTask` in `blocked-task-classifiers.js`, but the parsing of that format is duplicated in two functions within `pipeline-self-audit.js` rather than being a single `parseSignature(sig) → { source, category }` helper. If the format ever gains a third component, changes the separator, or needs to handle a source name that itself contains `::`, both call sites must be found and updated in lockstep. The duplication is small (three lines) but it is exactly the kind of format knowledge scattered across call sites that causes silent divergence when the format evolves.
+
+Solution:
+Extract a single `parseSignature(signature)` function — either in `blocked-task-classifiers.js` next to `signatureForTask` (keeping the format definition and its inverse together), or locally in `pipeline-self-audit.js` if the parsing is considered a consumer-side concern. Call it from both `buildAuditRawText` and `buildAuditTask`. This localizes the format-parsing knowledge to one place and makes the two functions' dependency on the format explicit and singular.
+
+Benefits:
+A format change (new separator, additional component, edge-case handling) is made in exactly one location instead of two, eliminating the risk of the two call sites drifting out of sync. The relationship between `signatureForTask` (producer) and `parseSignature` (consumer) becomes visible as a matched pair, making the contract between the two modules easier to reason about and test.
+
+### AC-244 · Duplicated "ensure destination + rename + track error" pattern in `done-archive.js`
+Strength: Worth exploring
+Files: src/done-archive.js
+
+Problem:
+`archiveDoneTasks` and `archiveSpecificDoneTasks` each independently implement the same five-step "move one file into the archive bucket" sequence: check a `destDirEnsured` flag, call `fs.mkdirSync(destDir, { recursive: true })`, call `fs.renameSync(src, dest)`, catch the rename error, and push a formatted message into `result.errors`. The only difference between the two is how `src` is determined (directory-scan entry vs. explicit task-ID string). The shared "do the move" logic is a small but real duplication: if the destination scheme changes (e.g., adding a per-source subdirectory, or switching to a copy-then-delete for cross-filesystem safety), both functions must be updated identically.
+
+Solution:
+Extract a small `moveToArchive(srcPath, destDir, destDirEnsuredRef, result)` helper that encapsulates the mkdir/rename/error-track sequence, and call it from both public functions. The two public functions then differ only in how they enumerate source files, and the move mechanics live in one place.
+
+Benefits:
+A change to the archiving mechanics (destination layout, cross-filesystem handling, error-message format) is made in one helper rather than in two parallel code paths. The public functions become shorter and more readable, each focusing on its distinct responsibility (enumerating which files to archive) while delegating the shared mechanics.

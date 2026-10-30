@@ -64,6 +64,27 @@ get_model_override() {
   ' "$settings_path" "$instance_id"
 }
 
+# The model this process was LAUNCHED with, remembered across ticks and inherited by the --once children a daemon spawns (they see the daemon's
+# exported LOCAL_MODEL, which may by then be a dashboard override, so LOCAL_MODEL itself cannot be the base). Set once, from whatever LOCAL_MODEL is at
+# the first call; `-` (not `:-`) keeps a value that is set but empty. 2026-10-27: clearing a worker-model override left the lane on the overridden
+# model because nothing remembered the launch value to go back to (a failed ornith:35b trial kept requesting a model that took ~8 min to load).
+capture_base_local_model() {
+  export AGENT_MANAGER_BASE_LOCAL_MODEL="${AGENT_MANAGER_BASE_LOCAL_MODEL-${LOCAL_MODEL:-}}"
+}
+
+# The model this instance should use THIS tick: its dashboard override when one is set (a legacy "ollama:" prefix is tolerated), else the launch-time
+# model. A "claude:" override is a Claude lane choice, not a local model, so the local model stays the launch one. Prints the name (nothing when both
+# are empty); callers assign it to LOCAL_MODEL so that REMOVING an override puts the lane back instead of leaving the last override in place.
+effective_local_model() {
+  local override
+  override="$(get_model_override "$1")"
+  case "$override" in
+    ollama:*) printf '%s' "${override#ollama:}" ;;
+    claude:*|'') printf '%s' "${AGENT_MANAGER_BASE_LOCAL_MODEL-}" ;;
+    *) printf '%s' "$override" ;;
+  esac
+}
+
 # Manual "pause Claude" kill switch (2026-08-25 -- see src/claude-pause.js's own header
 # for the full rationale: a checkbox in the Workers tab, distinct from budget-monitor.js's
 # real rate-limit detection, so a human can proactively stop Claude spend before actually
@@ -81,6 +102,24 @@ get_claude_paused() {
   ' "$settings_path"
 }
 
+# gpu_broker_url -> prints the base URL of the service that answers POST /api/gpu/yield (no trailing slash). First non-empty wins:
+# AGENT_MANAGER_GPU_BROKER_URL, AGENT_MANAGER_PROMPTFORGE_URL, PROMPTFORGE_URL, then http://localhost:7430 (PromptForge's own default).
+# Shell twin of gpuBrokerUrl() in src/gpu-guard.js; scripts/gpu-broker-url.test.js pins that the two agree. Used by scripts/launch.sh.
+gpu_broker_url() {
+  local url="${AGENT_MANAGER_GPU_BROKER_URL:-${AGENT_MANAGER_PROMPTFORGE_URL:-${PROMPTFORGE_URL:-http://localhost:7430}}}"
+  printf '%s\n' "${url%/}"
+}
+
+# ollama_endpoint_reachable [endpoint_url] -> exit 0 if the Ollama endpoint answers HTTP at all within a few seconds (any status code), 1 if the
+# connection is refused, times out or the host is unreachable. A lane worker asks this once per tick (local-worker.sh) BEFORE it claims or resumes
+# anything: with the endpoint down every draft fails the same way, burns the task's retry rounds and parks it in blocked/ (2026-10-23: grimm hard-reset,
+# its Ollama stayed down for 12 h, 540 failed ticks, six tasks parked). Seconds: AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S (default 3).
+ollama_endpoint_reachable() {
+  local url="${1:-http://localhost:11434}" code
+  code="$(curl -s -m "${AGENT_MANAGER_ENDPOINT_PROBE_TIMEOUT_S:-3}" -o /dev/null -w '%{http_code}' "${url%/}/api/version" 2>/dev/null)" || true
+  [[ -n "$code" && "$code" != "000" ]]
+}
+
 # ComfyUI GPU lease (2026-08-30, Grimmethy: "If I run a generation, prompt forge should
 # set up the comfui if it's down" + "make sure the eviction only happens if there isn't
 # enough space to run both" + "It needs to go both ways"). PromptForge writes this file
@@ -94,10 +133,40 @@ get_claude_paused() {
 # stuck/runaway generation can never starve this pipeline indefinitely. Fails open --
 # any parse error / missing file -> not held.
 #
-# comfyui_lease_held -> exit 0 if held, 1 otherwise.
+# comfyui_lease_held [endpoint_url] -> exit 0 if held, 1 otherwise.
+#
+# Endpoint-scoped leases (2026-10-18): a lease may carry an `endpoints` array of Ollama URLs (a plugin reserving ONE card, e.g. a KaggleForge eval on the
+# P40). Given an endpoint_url, a scoped lease counts as held only when it lists that endpoint; an unscoped lease (no `endpoints`, PromptForge's) is held
+# for every endpoint. Called with no argument it keeps the old meaning (any fresh lease = held). The rule lives once, in src/gpu-guard.js leaseHeldFor.
+# worker_switched_off <instance_id> -> exit 0 when the operator switched this worker off (Workers tab toggle; src/worker-switch.js, marker files in a global state
+# directory), 1 otherwise. The rule lives once, in worker-switch.js, which the dashboard also uses. Any failure of node counts as NOT switched off: a broken
+# switch must never stall the pipeline.
+worker_switched_off() {
+  local id="${1:-}"
+  [[ -n "$id" ]] || return 1
+  local switch_js
+  switch_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/worker-switch.js"
+  [[ -f "$switch_js" ]] || return 1
+  node "$switch_js" is-disabled "$id" 2>/dev/null
+}
+
 comfyui_lease_held() {
+  local endpoint="${1:-}"
   local lease_path="${AGENT_MANAGER_COMFY_LEASE_PATH:-${HOME}/.local/state/agent-manager/comfyui-lease.json}"
   [[ -f "$lease_path" ]] || return 1
+  if [[ -n "$endpoint" ]]; then
+    local guard_js
+    guard_js="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../src/gpu-guard.js"
+    if [[ -f "$guard_js" ]]; then
+      node -e '
+        try {
+          const g = require(process.argv[1]);
+          process.exit(g.leaseHeldFor(process.argv[2], process.argv[3]) ? 0 : 1);
+        } catch (e) { process.exit(1); }
+      ' "$guard_js" "$endpoint" "$lease_path"
+      return $?
+    fi
+  fi
   local ttl="${AGENT_MANAGER_COMFY_LEASE_TTL_S:-90}"
   local max_s="${AGENT_MANAGER_COMFY_LEASE_MAX_S:-900}"
   local verdict
@@ -186,6 +255,7 @@ acquire_single_flight_lock() {
   # that identity is the entire mechanism; a bash `sed` step that drifted from the JS
   # regex even slightly would silently recreate this exact bug.
   local key="${1:-}"
+  local skip="${2:-}"
   local lockfile queue_dir
   if [[ -n "$key" ]]; then
     local safe_key
@@ -204,8 +274,8 @@ acquire_single_flight_lock() {
   # yield the GPU until the newest marker's mtime goes stale (>15s) or it is removed. Was a
   # flat 8s wall -- far too short for a multi-turn chat turn (2026-09-02). AGENT_MANAGER_
   # PRIORITY_HOLDER (set on the chat turn's own node child) skips this entirely.
-  if [[ -z "${AGENT_MANAGER_PRIORITY_HOLDER:-}" ]]; then
-    local waited=0 fresh_secs=15 max_wait="${DISCUSS_PRIORITY_MAX_WAIT_SEC:-120}"
+  if [[ -z "${AGENT_MANAGER_PRIORITY_HOLDER:-}" && -z "$skip" ]]; then
+    local waited=0 fresh_secs=15 max_wait="${DISCUSS_PRIORITY_MAX_WAIT_SEC:-900}"
     while (( waited < max_wait )); do
       local newest_age=99999 now_s f mt
       now_s="$(date +%s)"

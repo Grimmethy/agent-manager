@@ -86,8 +86,40 @@ def api_instances():
             if key not in hub_indexes:
                 hub_indexes[key] = _hub_label_index(task_qdir)
             r["hub"] = get_hub_data_provider().hub_info_for_task(r["currentTaskId"], index=hub_indexes[key], qdir=task_qdir)
+    # Operator on/off switch (src/worker-switch.js): worker lanes carry `switchable` and `disabled` so the Workers tab can draw the toggle. A switched-off worker
+    # that is still finishing a task shows status working with disabled true ("turning off after this task"); once idle its heartbeat status is disabled.
+    from worker_switch import disabled_workers, is_switchable
+    off = disabled_workers()
+    for r in results:
+        if is_switchable(r.get("instanceId")):
+            r["switchable"] = True
+            r["disabled"] = r["instanceId"] in off
     results.sort(key=lambda r: r.get("instanceId") or "")
     return jsonify(results)
+
+
+@instances_bp.route("/api/instances/<instance_id>/enabled", methods=["POST"])
+def api_instance_set_enabled(instance_id):
+    """Operator switch for one worker lane (Workers tab toggle): body {"enabled": true|false}. Off means the worker keeps running but claims, resumes and
+    borrows nothing from its next tick (a task already in flight finishes first); on undoes it. Only worker lanes have a switch. Switching a worker OFF requires it
+    to be a defined lane (src/lanes.js), so a typo cannot leave a stray marker; switching ON is always allowed, which also clears a stale marker. This route never
+    touches the pipeline: it only writes or removes a marker file (src/worker-switch.js)."""
+    from app import worker_lane_ids
+    from worker_switch import disabled_workers, is_switchable, set_worker_enabled
+    body = request.get_json(silent=True) or {}
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        abort(400, description="body must be {\"enabled\": true|false}")
+    if not is_switchable(instance_id):
+        abort(400, description=f"'{instance_id}' is not a worker lane that can be switched")
+    if not enabled:
+        lanes = worker_lane_ids()
+        if lanes and instance_id not in lanes:
+            abort(404, description=f"'{instance_id}' is not a defined worker lane")
+    ok, error = set_worker_enabled(instance_id, enabled)
+    if not ok:
+        abort(500, description=error)
+    return jsonify({"instanceId": instance_id, "enabled": enabled, "disabled": instance_id in disabled_workers()})
 
 
 @instances_bp.route("/api/instances/<instance_id>/recent-tasks")
@@ -177,9 +209,13 @@ def api_instance_run_log(instance_id):
         state during the 2026-09-08 GPU-contention incident was dozens of back-to-back
         OLLAMA_TIMEOUTs that the terminal-state-only recent-tasks view had no way to
         show at all -- it just looked stale.
+      - every chat session this instance ran (only when instance_id='chat'), surfaced
+        as stage='chat' rows so the chat instance's own run log shows what it actually
+        did. Worker instances never see chat rows -- the chat instance is a dedicated
+        system instance, not a worker lane.
 
     Merged and sorted by timestamp, newest first."""
-    from app import _find_task_record_anywhere, _has_instance_id_column, _read_pipeline_history_events, instances_dir, model_stats_db_path, queue_dir
+    from app import _find_task_record_anywhere, _has_instance_id_column, _read_pipeline_history_events, CHAT_STORAGE_DIR, instances_dir, model_stats_db_path, queue_dir
     limit = min(max(request.args.get("limit", 30, type=int) or 30, 1), 100)
     qdir = queue_dir()
     db_path = model_stats_db_path()
@@ -217,6 +253,62 @@ def api_instance_run_log(instance_id):
             "model": ev.get("model"), "kind": "failed", "outcome": ev.get("code") or "error",
             "detail": ev.get("message"),
         })
+    # Chat sessions (instance_id='chat'): surface each chat session as a run-log row so
+    # the chat instance's own run log shows what it actually did, not just the
+    # model_calls rows (which record_call writes per-turn but don't group per-session).
+    # Worker instances never see chat rows -- the chat instance is a dedicated system
+    # instance, not a worker lane, so filtering on instance_id='chat' keeps the Workers
+    # tab clean.
+    if instance_id == "chat":
+        from datetime import datetime, timezone
+        from pathlib import Path
+        import chat_sessions
+        storage_dir = CHAT_STORAGE_DIR if isinstance(CHAT_STORAGE_DIR, Path) else Path(CHAT_STORAGE_DIR)
+        if storage_dir.is_dir():
+            sessions_file = chat_sessions.chat_sessions_path(storage_dir)
+            if sessions_file.is_file():
+                try:
+                    sessions = json.loads(sessions_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    sessions = {}
+                for sid, session in sessions.items():
+                    if session.get("status") not in ("active", "ended"):
+                        continue
+                    started_at = session.get("startedAt") or ""
+                    ended_at = session.get("endedAt")
+                    transcript = session.get("transcript") or []
+                    turns_used = len(transcript)
+                    duration_ms = None
+                    if started_at and ended_at:
+                        try:
+                            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                            end_dt = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                            duration_ms = int((end_dt - start_dt).total_seconds() * 1000)
+                        except (ValueError, TypeError):
+                            pass
+                    elif started_at:
+                        try:
+                            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                            duration_ms = int((datetime.now(timezone.utc) - start_dt).total_seconds() * 1000)
+                        except (ValueError, TypeError):
+                            pass
+                    title = None
+                    for turn in transcript:
+                        if turn.get("role") == "user" and turn.get("text"):
+                            title = turn["text"][:100]
+                            break
+                    runs.append({
+                        "at": started_at,
+                        "taskId": sid,
+                        "stage": "chat",
+                        "model": session.get("model"),
+                        "kind": "chat",
+                        "outcome": "chat turn",
+                        "session_id": sid,
+                        "duration": duration_ms,
+                        "turns_used": turns_used,
+                        "title": title,
+                    })
     runs.sort(key=lambda r: r.get("at") or "", reverse=True)
     return jsonify({"runs": runs[:limit]})
 
@@ -236,9 +328,10 @@ def api_instance_assignable_tasks(instance_id):
     to scripts/gpu-arbiter-cli.js: source resolution depends on the real registered
     task sources + config overrides and must never be re-derived in Python, where it could silently drift from the Node source of truth that
     local-worker.sh's actual claim loop uses."""
-    from app import ENV_FILE_PATH, PACKAGE_ROOT, _is_live_worker_instance, queue_dir, read_env_file
-    if not _is_live_worker_instance(instance_id):
-        abort(404, description=f"'{instance_id}' is not a worker lane that claims tasks from pending/")
+    from app import ENV_FILE_PATH, PACKAGE_ROOT, _worker_lane_refusal, queue_dir, read_env_file
+    refusal = _worker_lane_refusal(instance_id)
+    if refusal:
+        abort(404, description=refusal)
     qdir = queue_dir()
     if not qdir:
         return jsonify({"items": []})
@@ -287,9 +380,11 @@ def api_instance_assign_task(instance_id):
     or just relocating it if it's merely sitting in that lane's own drafting/ backlog)
     and moves it into pending/ first, so everything below operates on it the same way
     either way."""
-    from app import _is_live_worker_instance, _kill_and_requeue_instance, _relocate_task_to_pending, instances_dir, queue_dir, read_json_safe
-    if not _is_live_worker_instance(instance_id):
-        abort(404, description=f"'{instance_id}' is not a worker lane that claims tasks from pending/")
+    from app import _kill_and_requeue_instance, _relocate_task_to_pending, _worker_lane_refusal, instances_dir, queue_dir, read_json_safe
+    # Checked before any relocate/kill: an opted-out heartbeat (assignable: false) is refused here, so its process is never killed.
+    refusal = _worker_lane_refusal(instance_id)
+    if refusal:
+        abort(404, description=refusal)
 
     body = request.get_json(silent=True) or {}
     task_id = body.get("taskId")

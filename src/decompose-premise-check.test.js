@@ -228,3 +228,191 @@ test('resolveCitedFile: wide cap, normalised input, never throws', () => {
   assert.deepEqual(resolveCitedFile('/r', 'src/routes/x.js', { findFn: () => { throw new Error('disk gone'); } }), { status: 'none' });
   assert.deepEqual(resolveCitedFile('/nonexistent-root-for-premise-test', 'src/a.js'), { status: 'none' });
 });
+
+// --- create-verb guard + bare-filename attribution (HUB0161, 2026-10-08) ---
+
+test('a create-verb-introduced file is suppressed while a genuinely-missing file in the same sentence is still flagged', () => {
+  const text = 'Create src/routes/counties.js at ~line 10. Then update src/routes/legacy.js (1) ~line 42.';
+  const result = detectStaleDecomposePremise(citing(text), {
+    repoRoot: '/r',
+    lineCountFn: () => null,
+    resolveFn: () => ({ status: 'none' }),
+  });
+  assert.ok(result, 'the genuinely-missing legacy.js must still block');
+  assert.equal(result.stale, true);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'src/routes/legacy.js');
+  const s = result.suppressions.find((x) => x.path === 'src/routes/counties.js');
+  assert.ok(s, 'the create-verb-introduced counties.js must appear in the suppressions audit trail');
+  assert.equal(s.reason, 'create-verb-introduced');
+  assert.equal(s.lineRef, 10);
+  assert.ok(typeof s.sentence === 'string' && s.sentence.length > 0);
+});
+
+test('a bare filename that resolves uniquely is judged via the resolved file', () => {
+  const result = detectStaleDecomposePremise(
+    citing('In counties.js at line 900, fix the handler.'),
+    {
+      repoRoot: '/r',
+      lineCountFn: (root, p) => (p === 'src/routes/counties.js' ? 100 : null),
+      resolveFn: () => ({ status: 'unique', relPath: 'src/routes/counties.js' }),
+    },
+  );
+  assert.ok(result);
+  assert.equal(result.findings[0].kind, 'line-overshoot');
+  assert.equal(result.findings[0].relPath, 'counties.js');
+  assert.equal(result.findings[0].resolvedPath, 'src/routes/counties.js');
+  assert.equal(result.findings[0].realLineCount, 100);
+});
+
+test('a bare filename that resolves to several real files is not flagged and is recorded as ambiguous', () => {
+  const result = detectStaleDecomposePremise(
+    citing('In counties.js at line 900, fix the handler.'),
+    {
+      repoRoot: '/r',
+      lineCountFn: () => 100,
+      resolveFn: () => ({ status: 'ambiguous', matches: ['a/counties.js', 'b/counties.js'] }),
+    },
+  );
+  assert.ok(result, 'dismissals only must still return an audit-only result');
+  assert.equal(result.stale, false);
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.suppressions.length, 1);
+  assert.equal(result.suppressions[0].path, 'counties.js');
+  assert.equal(result.suppressions[0].reason, 'ambiguous-bare-filename');
+});
+
+test('a bare filename that resolves nowhere in a non-create sentence is dropped and recorded, not flagged', () => {
+  const result = detectStaleDecomposePremise(
+    citing('In counties.js at line 900, fix the handler.'),
+    { repoRoot: '/r', lineCountFn: () => null, resolveFn: () => ({ status: 'none' }) },
+  );
+  assert.ok(result);
+  assert.equal(result.stale, false);
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.suppressions[0].path, 'counties.js');
+  assert.equal(result.suppressions[0].reason, 'unresolved-bare-filename');
+});
+
+test('a line-overshoot finding on a resolved file still fires even when the same sentence contains a create verb', () => {
+  // The create-verb guard must not blanket-mute the sentence: src/real-file.js exists
+  // (10 lines) and the citation "line 5000" is impossible regardless of the "Create"
+  // verb earlier in the sentence, so the line-overshoot finding must survive.
+  const result = detectStaleDecomposePremise(
+    citing('Create src/routes/counties.js with a handler, then wire it in src/real-file.js at line 5000.'),
+    {
+      repoRoot: '/r',
+      lineCountFn: (root, p) => (p === 'src/real-file.js' ? 10 : null),
+      resolveFn: () => ({ status: 'none' }),
+    },
+  );
+  assert.ok(result, 'the impossible line 5000 citation must still block despite the create verb');
+  assert.equal(result.stale, true);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].kind, 'line-overshoot');
+  assert.equal(result.findings[0].relPath, 'src/real-file.js');
+  assert.equal(result.findings[0].citedLine, 5000);
+  assert.equal(result.findings[0].realLineCount, 10);
+});
+
+test('a bare filename introduced by a create verb is suppressed with the create-verb reason', () => {
+  const result = detectStaleDecomposePremise(
+    citing('Create counties.js with a handler at line 20.'),
+    { repoRoot: '/r', lineCountFn: () => null, resolveFn: () => ({ status: 'none' }) },
+  );
+  assert.ok(result);
+  assert.equal(result.stale, false);
+  assert.deepEqual(result.findings, []);
+  assert.equal(result.suppressions[0].path, 'counties.js');
+  assert.equal(result.suppressions[0].reason, 'create-verb-introduced');
+});
+
+// --- sibling-piece suppression (HUB0001-01, 2026-10-26): a piece citing a file that a
+// later sibling piece creates must NOT be flagged stale-premise. The gate must be aware of
+// sibling pieces and their "Files:" scope lines. ---
+
+test('a piece citing a file created by a later sibling is NOT stale (suppressed with sibling-creates)', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        hubId: 'HUB0001',
+        pieces: [
+          {
+            id: 'HUB0001-03',
+            scopeLines: ['Files: src/services/callLog.js', 'Read: src/services/auth.js'],
+          },
+        ],
+      },
+      rawText: 'In src/services/callLog.js line 50, add the ClientCall model.',
+    },
+  };
+  const result = detectStaleDecomposePremise(task, {
+    repoRoot: '/r',
+    lineCountFn: () => null,
+    resolveFn: () => ({ status: 'none' }),
+  });
+  assert.ok(result, 'must return a result (suppressions only)');
+  assert.equal(result.stale, false, 'file exists in sibling scope: not stale');
+  assert.deepEqual(result.findings, [], 'no findings when sibling creates the file');
+  assert.equal(result.suppressions.length, 1);
+  assert.equal(result.suppressions[0].path, 'src/services/callLog.js');
+  assert.equal(result.suppressions[0].reason, 'sibling-creates');
+  assert.equal(result.suppressions[0].pieceId, 'HUB0001-03');
+  assert.equal(result.suppressions[0].source, 'sibling-scopeFiles');
+});
+
+test('a piece citing a missing file that no sibling creates IS stale', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        hubId: 'HUB0001',
+        pieces: [
+          {
+            id: 'HUB0001-03',
+            scopeLines: ['Files: src/services/auth.js'],
+          },
+        ],
+      },
+      rawText: 'In src/services/callLog.js line 50, add the ClientCall model.',
+    },
+  };
+  const result = detectStaleDecomposePremise(task, {
+    repoRoot: '/r',
+    lineCountFn: () => null,
+    resolveFn: () => ({ status: 'none' }),
+  });
+  assert.ok(result, 'must detect the stale premise');
+  assert.equal(result.stale, true);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'src/services/callLog.js');
+});
+
+test('a sibling listed EARLIER whose file is still missing (no sibling creates it) is still stale', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        hubId: 'HUB0001',
+        pieces: [
+          {
+            id: 'HUB0001-02',
+            // This sibling does NOT list the file -- it was supposed to create it but didn't
+            scopeLines: ['Files: src/services/auth.js'],
+          },
+        ],
+      },
+      rawText: 'In src/services/callLog.js line 50, add the ClientCall model.',
+    },
+  };
+  const result = detectStaleDecomposePremise(task, {
+    repoRoot: '/r',
+    lineCountFn: () => null,
+    resolveFn: () => ({ status: 'none' }),
+  });
+  assert.ok(result, 'must detect the stale premise when no sibling creates the file');
+  assert.equal(result.stale, true);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'src/services/callLog.js');
+});

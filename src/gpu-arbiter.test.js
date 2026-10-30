@@ -163,6 +163,27 @@ test('status: reports the holder and the waiting queue', async () => {
   await Promise.all([waitExit(holder), waitExit(waiter)]);
 });
 
+test('status: lists a place ticket under reserved (with ownerPid) -- holder and waiting unchanged', () => {
+  const inst = tmpInst();
+  const place = arb.holdPlace(inst, { cls: 'review', model: 'm', lockKey: 'ollama-h-1', taskId: 'job-1', phase: 'reservation', ownerPid: process.pid });
+  try {
+    const st = arb.status(inst, 'ollama-h-1');
+    assert.equal(st.holder, null);
+    assert.deepEqual(st.waiting, []);
+    assert.equal(st.reserved.length, 1);
+    const r = st.reserved[0];
+    assert.equal(r.cls, 'review');
+    assert.equal(r.pid, process.pid);
+    assert.equal(r.ownerPid, process.pid);
+    assert.equal(r.taskId, 'job-1');
+    assert.equal(r.phase, 'reservation');
+    assert.equal(arb.status(inst, 'some-other-key').reserved.length, 0, 'keyed like every other ticket');
+  } finally {
+    place.release();
+  }
+  assert.deepEqual(arb.status(inst, 'ollama-h-1').reserved, [], 'gone once released');
+});
+
 test('liveTickets sweeps a ticket whose pid is dead', async () => {
   const inst = tmpInst();
   const dir = arb.ticketsDir(inst, 'm');

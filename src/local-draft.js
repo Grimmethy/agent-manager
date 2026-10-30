@@ -40,7 +40,7 @@ const path = require('path');
 const { buildPlanPrompt, buildImplementPrompt, buildCritiquePrompt, buildRevisionPrompt } = require('./prompts.js');
 const { buildPlanGrounding } = require('./plan-grounding.js');
 const { buildHubStatusGrounding } = require('./hub-status-grounding.js');
-const { resolveAcceptanceCriteria } = require('./acceptance-criteria.js');
+const { resolveAcceptanceCriteria, parseCriteriaBlock } = require('./acceptance-criteria.js');
 const { filterCriteriaForSandbox } = require('./lib/draft-sandbox.js');
 const { runOrientPass } = require('./orient-pass.js');
 const { runPlanCritique } = require('./plan-critique.js');
@@ -58,6 +58,7 @@ const { providerFor, labelFor, resolveModelProfile } = require('./model-provider
 const { isForgePause } = require('./gpu-guard.js');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { missingFileCheck } = require('./draft-file-guard.js');
+const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');
 const { planTargetGuard } = require('./plan-target-guard.js');
 const { withLock: defaultWithLock } = require('./single-flight-lock.js');
 const gpuArbiter = require('./gpu-arbiter.js');
@@ -78,6 +79,8 @@ const { PINNED_NUM_CTX } = require('./gpu-capacity.js');
 const { postJson } = require('./ollama-http.js');
 const { checkOllamaReachable } = require('./ollama-health.js');
 const { logPipelineEvent } = require('./pipeline-history.js');
+const { recordAttempt: recordLedgerAttempt } = require('./capability-ledger.js');
+const { recordAvoidedLane } = require('./premium-rotation.js');
 const { PER_CALL_TIMEOUT_CEILING_MS } = require('./local-client.js');
 const { getModelProfile } = require('./model-profile-registry.js');
 const { localOllamaLockKey, writeTaskJson, researchClaudeStatus, isResearchDomainTask, draftDoneDetail, concludeDraft } = require('./lib/draft-lifecycle.js');
@@ -749,10 +752,43 @@ async function handlePlanResult(task, attempt, { planResult, totalAttempts, reRo
   return { planResult: seedReroll.planResult, totalAttempts: seedReroll.totalAttempts, reRolled: seedReroll.reRolled, stillThin: seedReroll.stillThin, seededFromPrior: seedReroll.seededFromPrior };
 }
 
+// The acceptance-criteria step of runPlanPass, unchanged, as its own function so the plan-reuse path below applies exactly the same rules.
+function applyPlanAcceptanceCriteria(task) {
+  const ac = resolveAcceptanceCriteria(task);
+  // A plan-derived criterion that needs a JS toolchain (tsc, build, tests) is dropped when the draft sandbox will have none (lib/draft-sandbox.js):
+  // the draft cannot run it, and review rejects an unverified criterion (PF HUB0005-01).
+  const sandboxFiltered = filterCriteriaForSandbox({ criteria: ac.criteria, source: ac.source, repoRoot: getConfig().repoRoot });
+  if (sandboxFiltered.dropped.length) {
+    appendHistoryEvent(task, 'advisory', `dropped ${sandboxFiltered.dropped.length} plan-derived acceptance criterion(s) that need a JS toolchain the draft sandbox does not have: ${sandboxFiltered.dropped.map((c) => c.slice(0, 90)).join(' | ')}`);
+  }
+  task.acceptanceCriteria = sandboxFiltered.criteria;
+  task.acceptanceCriteriaSource = ac.source;
+}
+
+// Agentic-continuation plan reuse (2026-10-16): an adhoc task that already ran an agentic implement pass and was requeued as a continuation
+// (isAgenticContinuation, priorPartialDiff) keeps its plan (lastGoodPlan survives the requeue) and its orientNotes, yet the plan pass ran again
+// on every attempt -- and kept ending in 'Plan pass degenerate: truncated' (the extend-the-merged-doc task: six blocked attempts, ~33k-char prompt,
+// reasoning ate the whole numPredict). The plan already exists, so no orient pass and no plan call are made. Only a plan this task's own earlier
+// attempt wrote counts (bestPriorPlan), and only one that carries a CRITERIA: block, so the acceptance criteria the review holds the diff to
+// are still derivable. The plan-critique re-plan (_planCritiqueRevised) is a deliberate second plan and is never short-circuited. Returns true
+// when the plan was reused.
+function reusePriorPlanForContinuation(task, attempt) {
+  if (resolveSourceName(task) !== 'adhoc' || task.isAgenticContinuation !== true || task._planCritiqueRevised) return false;
+  const plan = bestPriorPlan(task);
+  if (!plan || parseCriteriaBlock(plan).length === 0) return false;
+  task.planResponse = plan;
+  task.lastGoodPlan = plan;
+  if (process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') applyPlanAcceptanceCriteria(task);
+  recordPlan(attempt, { text: plan, seededFromPrior: true });
+  appendHistoryEvent(task, 'plan-done', 'reused the prior plan for an agentic continuation -- no model call');
+  return true;
+}
+
 async function runPlanPass(task, {
   maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink, projectSearchFetch, attempt,
   runOrientPassFn = runOrientPass, recordModelCall,
 }) {
+  if (reusePriorPlanForContinuation(task, attempt)) return { blocked: false };
   // 2026-08-25, root-caused live via a real blocked research_task (Toregem BioPharma
   // trial lookup): researchPlanPrompt's own header used to call the research plan pass
   // "intentionally throwaway" and never gave it tool access -- so it could (and did)
@@ -864,21 +900,41 @@ async function runPlanPass(task, {
   const stillThin = handled.stillThin;
   const seededFromPrior = handled.seededFromPrior;
 
+  // Import-binding cap (HUB0159 · 2/3): a plan whose wiring step shows no verbatim
+  // require/import line -- or that spreads bindings across multiple steps -- is a
+  // wiring plan, not a feature plan. Exactly ONE re-plan: re-roll at RETRY_TEMPERATURE
+  // and take that roll; if the second roll ALSO trips the cap, accept it. The guard on
+  // task._importBindingReplanned (set BEFORE the re-roll) means a legitimate plan is
+  // accepted on the second attempt and never dropped forever, and no second re-plan can
+  // ever happen even if runPlanPass re-enters for the same task. When the check finds
+  // no problem (null -- including every non-adhoc source), control falls through to the
+  // acceptance-criteria step below with no side effects.
+  const bindingProblem = planImportBindingProblem(task);
+  if (bindingProblem && !task._importBindingReplanned) {
+    task._importBindingReplanned = true;
+    appendHistoryEvent(task, 'plan-rejected', `import-binding cap: ${bindingProblem.code}`);
+    const startedAt = new Date().toISOString();
+    const startMs = Date.now();
+    const reRoll = await callPlan(RETRY_TEMPERATURE);
+    if (recordModelCall) {
+      recordModelCall({ taskId: task.id, model: labelFor(task), startedAt, latencyMs: Date.now() - startMs, result: reRoll, source: task.source, stage: 'plan' });
+    }
+    // A degenerate re-roll carries no usable plan -- keep the previous one.
+    if (!reRoll.degenerate) {
+      task.planResponse = reRoll.response;
+      // Keep the seed source (lastGoodPlan) consistent with the plan we now accept.
+      if (!planIsThin(reRoll.response)) task.lastGoodPlan = reRoll.response;
+    }
+    if (planImportBindingProblem(task)) {
+      appendHistoryEvent(task, 'plan-accepted-after-rejection', `import-binding cap: ${bindingProblem.code}`);
+    }
+  }
+
   // Acceptance criteria (2026-09-04): a "definition of done" the implement + review are
   // held to. From promptContext.acceptanceCriteria if the caller gave one, else the
   // trailing CRITERIA: block the plan pass was asked to write. Kill switch
   // AGENT_MANAGER_ADHOC_ACCEPTANCE=false.
-  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') {
-    const ac = resolveAcceptanceCriteria(task);
-    // A plan-derived criterion that needs a JS toolchain (tsc, build, tests) is dropped when the draft sandbox will have none (lib/draft-sandbox.js):
-    // the draft cannot run it, and review rejects an unverified criterion (PF HUB0005-01).
-    const sandboxFiltered = filterCriteriaForSandbox({ criteria: ac.criteria, source: ac.source, repoRoot: getConfig().repoRoot });
-    if (sandboxFiltered.dropped.length) {
-      appendHistoryEvent(task, 'advisory', `dropped ${sandboxFiltered.dropped.length} plan-derived acceptance criterion(s) that need a JS toolchain the draft sandbox does not have: ${sandboxFiltered.dropped.map((c) => c.slice(0, 90)).join(' | ')}`);
-    }
-    task.acceptanceCriteria = sandboxFiltered.criteria;
-    task.acceptanceCriteriaSource = ac.source;
-  }
+  if (substanceGated && process.env.AGENT_MANAGER_ADHOC_ACCEPTANCE !== 'false') applyPlanAcceptanceCriteria(task);
 
   // Harness-search grounding step (HUB0079 2/3): extracted from this function into
   // runHarnessSearchStep above -- same behavior, now unit-testable in isolation (which
@@ -1160,6 +1216,8 @@ async function finalizeCandidateFulfillment(task, {
 // draftModel, ...) and emits its own history events. Returns { done: true, result } when
 // a terminal outcome was reached (deterministic empty, degenerate block, or a candidate
 // split), else { done: false } so draftTask continues to critique + revision.
+const NO_REAL_FILE_STUB_RE = /^\s*no real file to adapt\.?\s*$/i;
+
 async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
   const { maybeLocked, resolvedCallIsLocal, resolvedLocalCall, profileSupportsThink } = ctx;
 
@@ -1239,6 +1297,19 @@ async function runImplementPass(task, ctx, { recordModelCall, attempt }) {
       implLatencyMs = retryLatencyMs;
       task.implementResponse = retryResult.response;
     }
+  }
+
+  // Terminal no-op stub: archImportImplementPrompt tells the model to answer exactly "no real file to adapt" when no file in the
+  // harness Real matches list fits (the old "output the empty string" instruction was routinely ignored in favour of an invented
+  // file). Resolve it like the zero-hit skip above -- implementResponse '' so the emptyApproval source auto-approves -- before
+  // post-implement checks, critique or requeue can treat a compliant answer as a fabrication. Only sources that opt in via
+  // skipImplementWhenNoHarnessHits (arch_import) get this; any other response text is left untouched.
+  if (skipImplementOnNoHits && NO_REAL_FILE_STUB_RE.test(String(task.implementResponse || ''))) {
+    task.implementResponse = '';
+    recordImplement(attempt, { note: 'model answered the "no real file to adapt" stub' });
+    appendHistoryEvent(task, 'implement-done', 'model answered "no real file to adapt" -- terminal no-op, empty implementResponse, no critique or requeue');
+    concludeDraft(task);
+    return { done: true, result: { succeeded: true, blocked: false } };
   }
 
   // A source can register a `postImplementCheck(task, implementResponse, {call,
@@ -1545,6 +1616,21 @@ async function draftTask(task, deps = {}) {
   // (a blocked network_unavailable task must not consume a draft-attempt slot).
   if (!(result && result.blocked && result.blockedReason === 'network_unavailable')) {
     finalizeDraftAttempt(task, attempt, result, { emitHistory: appendHistoryEvent });
+    // Escalation: a timeout / degenerate / error on a lane with a bigger tier above it sends the retry up a tier (avoidLanes).
+    try {
+      const lanes = require('./lanes.js').getLanes();
+      if (require('./capability-routing.js').escalationLane(attempt, lanes)) {
+        const avoided = recordAvoidedLane(task, lanes.length, process.env, lanes);
+        if (avoided) appendHistoryEvent(task, 'lane-escalated', `${attempt.reason || attempt.blockedReason || attempt.outcome} on ${avoided}; a larger lane gets the retry`);
+      }
+    } catch (_) { /* escalation is best-effort */ }
+    // Capability ledger (docs/design-notes/capability-routing-and-benchmarking.md): one line per attempt, recording only.
+    const repoRoot = process.env.AGENT_MANAGER_REPO_ROOT;
+    if (repoRoot) {
+      let sourceName = null;
+      try { sourceName = resolveSourceName(task); } catch (_) { sourceName = task && task.source || null; }
+      recordLedgerAttempt(process.env.AGENT_MANAGER_PIPELINE_DIR || repoRoot, attempt, { source: sourceName, taskId: task && task.id, throughput: require('./local-throughput.js').takeAttemptThroughput() });
+    }
   }
   return result;
 }
@@ -2052,7 +2138,7 @@ function tryGroundingRefreshFallback(task) {
   }
 }
 
-module.exports = { draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
+module.exports = { reusePriorPlanForContinuation, draftTask, tryPreDispatchGate, selectDraftStrategy, resolveCallOpts, findUnverifiedEdit, extractCandidateSnippet, parseCandidateSplit, concludeDraft, draftDoneDetail, computeImplementBudget, computePlanNumPredict, planIsThin, bestPriorPlan, refreshCandidateFetchedFiles, isCandidateFulfillmentSource, RETRY_TEMPERATURE, localOllamaLockKey, callImplementModel, installStdoutEpipeGuard, tryGroundingRefreshFallback };
 
 // 2026-09-17, pipeline hardening: process.stdout is an EventEmitter -- a write that hits a
 // broken pipe (the parent shell/Python reader already exited, e.g. because IT crashed on

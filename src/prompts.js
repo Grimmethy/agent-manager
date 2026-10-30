@@ -603,7 +603,9 @@ function archImportImplementPrompt(task, planText) {
     '',
     filesText,
     '',
-    'Now write ONE architecture-import candidate grounded in the REAL agent-manager files above -- name real files the search actually found, not guessed or invented ones. If the searches found nothing that makes this finding concretely applicable to agent-manager\'s real code, output the empty string and nothing else; do not force a candidate onto files that do not actually fit.',
+    'Now write ONE architecture-import candidate grounded in the REAL agent-manager files above. HARD RULE: you MUST NOT name, reference, create, or import any file path that does not appear verbatim in the Real matches file list above -- the files listed there are the ONLY files you may reference, and naming a file outside that list is a hard violation that will be rejected outright. If no file in that list is a valid adaptation target for this finding, respond with exactly the single line:',
+    'no real file to adapt',
+    'and nothing else -- no other text, no partial implementation, no placeholder path, no fabricated filename. That line is a terminal, successful no-op: do not force a candidate onto files that do not actually fit.',
     '',
     'The candidate MUST use exactly this format (this must match the parser exactly or it cannot be consumed downstream):',
     '',
@@ -1020,6 +1022,85 @@ function driftFixImplementPrompt(task, planText) {
 // and the implement pass writes the report. debrief-bundle.js's evidence (a bounded window
 // of queue/done/ tasks that SHIPPED with their per-stage model-call profile, plus a contrast set of still-stuck
 // siblings) is already in ctx.evidenceText.
+// capability_debrief (2026-10-17, design note section 5a): same two-call harness shape as pipelineDebrief* -- the plan pass proposes greps that locate the
+// CURRENT pipeline code for the failing source (its prompt builder, its definition, where its context is assembled), the harness runs them, and the
+// implement pass writes the report from the bundle plus that code. capability-debrief-bundle.js's evidence is already in ctx.evidenceText.
+function capabilityDebriefPlanPrompt(task) {
+  const ctx = task.promptContext || {};
+  return [
+    'A deterministic scan found a task source that keeps FAILING on a small-tier model lane while a larger lane finishes the same work. The evidence bundle is below. Your eventual job is a CAUSE / EVIDENCE / NOW WHAT report: why the task does not fit the small model, and how to break it into smaller scoped work.',
+    '',
+    ctx.evidenceText || '(no evidence text)',
+    '',
+    `Propose 1 to 3 SHORT search terms (a function name, a file name, a config key, or a few-word phrase) that would let you read the CURRENT code that builds the prompt and context for the source "${ctx.clusterSource || 'the failing source'}" (its prompt builder, its source registration, where its input is assembled or windowed). Prefer names that appear in the evidence over guesses.`,
+    '',
+    'Output EXACTLY this format, one query per line, nothing else:',
+    'QUERY: <search terms>',
+    'QUERY: <search terms>',
+  ].join('\n');
+}
+
+function capabilityDebriefImplementPrompt(task, planText) {
+  const ctx = task.promptContext || {};
+  const hits = ctx.harnessHits || [];
+  const files = ctx.harnessFiles || [];
+  const hitsText = hits.length > 0
+    ? hits.map((h) => `- ${h.file}:${h.line} (query "${h.query}"): ${h.text}`).join('\n')
+    : '(no matches -- work from the evidence alone)';
+  const filesText = files.length > 0 ? formatFileContents(files) : '(no file content fetched)';
+  const availablePaths = files.map((f) => f.path).filter(Boolean);
+  const availablePathsText = availablePaths.length
+    ? availablePaths.map((p) => `- ${p}`).join('\n')
+    : '(none -- no real file content was fetched; a NOW WHAT item must not include a Files: line)';
+  const stable = [
+    'You are debriefing a FAILING task class: a source that keeps timing out, degenerating or erroring on a SMALL model lane while a larger lane finishes the same tasks. Goal: find the smallest change to THIS PIPELINE that lets the work fit the small model. The deliverable is a change to the pipeline (prompts, source definitions, splitting, trimming), never a re-attempt of the failed task.',
+    '',
+    'METHOD:',
+    '1. CAUSE: name exactly ONE of: (a) PROMPT/CONTEXT TOO LARGE for the lane (compare prompt size and numCtx in the evidence), (b) SEVERAL JOBS IN ONE CALL, (c) MECHANICALLY DECIDABLE CALL (a deterministic check or transform could do it), (d) NEEDS REASONING DEPTH THE TIER LACKS. Say why that class and not the others, using the paired larger-lane result and the small-lane successes as contrast.',
+    '2. EVIDENCE: cite specific task ids, attempts, wall times, numCtx, prompt sizes and scorecard numbers FROM THE BUNDLE. Do not invent any number, file, function or task id. If the bundle warns the lane was degraded, say the failures may be a hardware/server fault and propose nothing about the task.',
+    '3. NOW WHAT: at most 2-3 concrete, BOUNDED proposals. Each names the exact stage or prompt to split, trim or make deterministic, the mechanism, and how the capability scorecard would show it worked (for example "the small-lane pass rate for this source rises above 85%"). Cite a Files: path only if copied verbatim from AVAILABLE FILES.',
+    '',
+    'End your report with EXACTLY these sections (prose, no JSON, no code fence):',
+    '',
+    'CAUSE',
+    '<one class and why>',
+    '',
+    'EVIDENCE',
+    '<cited facts from the bundle>',
+    '',
+    'NOW WHAT',
+    '1. <title: the change> -- <mechanism, stage/prompt affected, how the scorecard shows it worked>. Files: <copied verbatim from AVAILABLE FILES, or omit>',
+    '2. <...>',
+    '',
+    'If instead the work genuinely cannot be shrunk for this tier (class d, or the evidence cannot support a smaller scoped change), output ONLY:',
+    'NOT SHRINKABLE AT THIS TIER -- <the reason, grounded in the evidence>',
+  ];
+  const volatile = [
+    'Earlier you proposed search terms to locate the implicated pipeline code:',
+    '',
+    planText,
+    '',
+    'CAPABILITY EVIDENCE:',
+    ctx.evidenceText || '(none)',
+    '',
+    `Failed small-lane tasks: ${(ctx.taskIds || []).join(', ') || '(see evidence)'}`,
+    `Small-lane successes (contrast): ${(ctx.contrastIds || []).join(', ') || '(none)'}`,
+    '',
+    'The harness ran your searches against THIS repo\'s CURRENT src/. Real matches:',
+    '',
+    hitsText,
+    '',
+    'Full content of the matched file(s):',
+    '',
+    filesText,
+    '',
+    'AVAILABLE FILES -- the ONLY real file paths you may cite in a NOW WHAT Files: line (copy verbatim; if empty, cite none):',
+    '',
+    availablePathsText,
+  ];
+  return assemblePrompt(stable, volatile);
+}
+
 function pipelineDebriefPlanPrompt(task) {
   const ctx = task.promptContext || {};
   return [
@@ -1538,6 +1619,7 @@ updateTaskSource('ui_visibility_audit', { buildPlanPrompt: uiVisibilityAuditPlan
 updateTaskSource('staleness_audit', { buildPlanPrompt: stalenessAuditPlanPrompt, buildImplementPrompt: stalenessAuditImplementPrompt });
 updateTaskSource('second_brain_opportunities', { buildPlanPrompt: secondBrainOpportunitiesPlanPrompt, buildImplementPrompt: secondBrainOpportunitiesImplementPrompt });
 updateTaskSource('pipeline_forensics', { buildPlanPrompt: pipelineForensicsPlanPrompt, buildImplementPrompt: pipelineForensicsImplementPrompt });
+updateTaskSource('capability_debrief', { buildPlanPrompt: capabilityDebriefPlanPrompt, buildImplementPrompt: capabilityDebriefImplementPrompt });
 updateTaskSource('pipeline_debrief', { buildPlanPrompt: pipelineDebriefPlanPrompt, buildImplementPrompt: pipelineDebriefImplementPrompt });
 updateTaskSource('doc_drift_fix', { buildPlanPrompt: driftFixPlanPrompt, buildImplementPrompt: driftFixImplementPrompt });
 updateTaskSource('product_spec', { buildPlanPrompt: productSpecPlanPrompt, buildImplementPrompt: productSpecImplementPrompt });
@@ -1650,6 +1732,7 @@ module.exports = {
   pipelineForensicsPlanPrompt, pipelineForensicsImplementPrompt,
   secondBrainOpportunitiesPlanPrompt, secondBrainOpportunitiesImplementPrompt,
   pipelineDebriefPlanPrompt, pipelineDebriefImplementPrompt,
+  capabilityDebriefPlanPrompt, capabilityDebriefImplementPrompt,
   driftFixPlanPrompt, driftFixImplementPrompt,
   // Exported for the out-of-tree hygiene plugin (agent-manager-hygiene), which owns the
   // arch_* / unused_export task sources and does their updateTaskSource() wiring itself.

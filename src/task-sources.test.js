@@ -355,6 +355,80 @@ test('nextBrainDumpSortTask stops offering an entry once sortAttempt hits MAX_SO
   assert.equal(nextBrainDumpSortTask(), null);
 });
 
+// --- A finished sort task must not make a still-captured entry invisible (2026-10-22) --------------
+// Measured on the live agent-manager brain dump: 17 captured entries with sortAttempt 0 whose first sort task had FINISHED (11 apply-rejected as a
+// 'noop' before rejections bumped the counter; 5 sorted, then edited, which resets status to 'captured' but not the id). Their spent id blocked
+// regeneration forever and worker-rx580 logged "no eligible task found" with 45 entries waiting.
+
+function sortFixture(entry) {
+  const dir = makeBrainDumpFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({ entries: [{ id: 'bd-1', rawText: 'x', status: 'captured', ...entry }] }));
+  const put = (sub, name) => {
+    const d = path.join(dir, 'queue', ...sub);
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, `${name}.json`), '{}');
+  };
+  return { dir, put, ts: freshTaskSources(dir), stored: () => JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, 'utf8')).entries[0] };
+}
+
+test('a captured entry whose attempt-0 sort task finished in done/ is offered under the next id and the counter is advanced', () => {
+  const f = sortFixture({});
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  const task = f.ts.nextBrainDumpSortTask();
+  assert.ok(task, 'a spent done/ record must not bury a still-captured entry');
+  assert.equal(task.id, 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.stored().sortAttempt, 1, 'the stored counter follows the emitted id, so a later exhaustion bump moves on to a2');
+});
+
+test('a finished sort task in a done-archive month bucket or _archived_no_action/ also frees the next attempt', () => {
+  for (const sub of [['done', '_archived', '2026-09'], ['done', '_archived_no_action']]) {
+    const f = sortFixture({});
+    f.put(sub, 'brain-dump-sort-bd-1');
+    const task = f.ts.nextBrainDumpSortTask();
+    assert.ok(task, `${sub.join('/')} must not bury the entry`);
+    assert.equal(task.id, 'brain-dump-sort-bd-1-a1');
+  }
+});
+
+test('the walk steps past several finished attempts and stops at MAX_SORT_ATTEMPTS', () => {
+  const f = sortFixture({});
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  f.put(['done'], 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.ts.nextBrainDumpSortTask().id, 'brain-dump-sort-bd-1-a2');
+  const g = sortFixture({});
+  for (const id of ['brain-dump-sort-bd-1', 'brain-dump-sort-bd-1-a1', 'brain-dump-sort-bd-1-a2']) g.put(['done'], id);
+  assert.equal(g.ts.nextBrainDumpSortTask(), null, 'three spent attempts exhaust the entry: a task that finishes without result cannot loop');
+  assert.equal(g.stored().sortAttempt, undefined, 'an exhausted entry is not written to');
+});
+
+test('an attempt id held by a live, blocked or held task still blocks the entry (no duplicate)', () => {
+  for (const state of ['pending', 'blocked', 'needs-clarification', 'review']) {
+    const f = sortFixture({});
+    f.put(['done'], 'brain-dump-sort-bd-1');
+    f.put([state], 'brain-dump-sort-bd-1-a1');
+    assert.equal(f.ts.nextBrainDumpSortTask(), null, `a1 sitting in ${state}/ must block`);
+    assert.equal(f.stored().sortAttempt, undefined, 'nothing is written when nothing is emitted');
+  }
+});
+
+test('after the counter was advanced, an exhaustion bump lands on the next id even though the blocked task holds the previous one', () => {
+  const f = sortFixture({ sortAttempt: 2 });
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  f.put(['blocked'], 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.ts.nextBrainDumpSortTask().id, 'brain-dump-sort-bd-1-a2');
+});
+
+test('isBrainDumpEntrySortable agrees with the generator: the throttle exemption uses it, so a spent id does not leave pending/ throttled with nothing to add', () => {
+  const f = sortFixture({});
+  f.put(['done'], 'brain-dump-sort-bd-1');
+  const entry = f.stored();
+  assert.equal(f.ts.isBrainDumpEntrySortable(entry), true);
+  assert.equal(f.ts.isBrainDumpEntrySortable({ ...entry, suppressed: true }), false);
+  assert.equal(f.ts.isBrainDumpEntrySortable({ ...entry, status: 'sorted' }), false);
+  f.put(['pending'], 'brain-dump-sort-bd-1-a1');
+  assert.equal(f.ts.isBrainDumpEntrySortable(entry), false);
+});
+
 // --- nextBrainDumpSortTask's selfProjectLabel (2026-08-16) ------------------------------
 // Confirmed live: a real self-referential note ("brain dump entries should track an
 // interaction count") was classified actionable:false, belongsToProject:null despite
@@ -1897,7 +1971,11 @@ function writeStaleBlockedTask(dir, id, extra = {}) {
   fs.mkdirSync(blockedDir, { recursive: true });
   fs.writeFileSync(path.join(blockedDir, `${id}.json`), JSON.stringify({
     id,
-    title: `stale task ${id}`,
+    // Title must name a concrete file:line -- staleness-audit.js's titleHasFileLineRef
+    // gate makes buildStalenessAuditTask() return null (and nextStalenessAuditTask()
+    // mark the candidate skipped) for titles without one, so a gate-less title like the
+    // old "stale task <id>" could never produce the audit task these tests assert on.
+    title: `stale task ${id} (src/example.js:42)`,
     source: 'manual',
     history: [{ stage: 'blocked', at: '2020-01-01T00:00:00.000Z' }], // far enough in the past to always be stale
     ...extra,
@@ -1947,6 +2025,50 @@ test('nextStalenessAuditTask returns null when nothing in queue/blocked or queue
   }));
 
   const { nextStalenessAuditTask } = freshTaskSources(dir);
+  assert.equal(nextStalenessAuditTask(), null);
+});
+
+// Acceptance, 2026-09-09 (HUB0158 4/4): the live bug this closes -- a stale/likely-fabricated
+// task whose TITLE has no file:line ref (this one: 60 days blocked, "AC-34 - Add a metrics
+// counter") made buildStalenessAuditTask() return null, and that null used to flow straight
+// into taskIdExistsInQueue(task.id) below it, throwing a TypeError on EVERY staleness_audit
+// tick while the same candidate got re-picked forever. The guard in nextStalenessAuditTask()
+// (HUB0158 3/4) marks such a candidate skipped in the same coverage file a real report uses
+// (markStalenessAuditReported()'s own comment names this exact path) and moves on -- so for a
+// gate-less title the ONLY observable outcome is that coverage stamp plus a null return, and
+// this test asserts both. Remove the `if (task === null)` branch in task-sources.js and this
+// test dies with a TypeError on the call itself.
+test('nextStalenessAuditTask handles a 60-day-old blocked task whose title has no file:line ref without throwing, marking it skipped/reported', () => {
+  const dir = makeBlockedFixtureRepo();
+  const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString();
+  const blockedDir = path.join(dir, 'queue', 'blocked');
+  fs.mkdirSync(blockedDir, { recursive: true });
+  fs.writeFileSync(path.join(blockedDir, 'ac-34.json'), JSON.stringify({
+    id: 'ac-34',
+    title: 'AC-34 - Add a metrics counter', // no "word:digits" ref -- titleHasFileLineRef()'s gate declines this candidate
+    source: 'manual',
+    createdAt: sixtyDaysAgo,
+    history: [{ stage: 'blocked', at: sixtyDaysAgo }], // 60 days of no forward progress -- comfortably past the staleness threshold
+  }));
+
+  const { nextStalenessAuditTask } = freshTaskSources(dir);
+
+  // Must not throw: without the null-guard in task-sources.js this call is a TypeError
+  // (buildStalenessAuditTask() declined, so task.id was read on null).
+  assert.doesNotThrow(() => nextStalenessAuditTask());
+
+  // Candidate marked skipped in the same coverage file a real report uses -- this is the
+  // ONLY record of the decision, since no real staleness_audit task was ever filed.
+  const coveragePath = path.join(dir, 'staleness-audit-coverage.json');
+  assert.ok(fs.existsSync(coveragePath), 'the skipped candidate must be stamped into the staleness coverage file');
+  const coverage = JSON.parse(fs.readFileSync(coveragePath, 'utf8'));
+  assert.ok(coverage['ac-34'], 'coverage is keyed by the ORIGINAL task id, as markStalenessAuditReported() does');
+  assert.ok(coverage['ac-34'].reason, 'the coverage entry records WHY the candidate was skipped');
+  assert.equal(coverage['ac-34'].taskId, null, 'no real task was filed for a skipped candidate');
+
+  // Skipped candidates are suppressed by the same coverage key a normal report uses, so the
+  // next tick does not re-offer them (and does not loop on the same null again) until the
+  // cooldown window passes.
   assert.equal(nextStalenessAuditTask(), null);
 });
 
@@ -3333,4 +3455,293 @@ test('the hold applies to the derived source only: an adhoc task is never held b
   }
   const { nextAdhocTask } = freshTaskSources(dir);
   assert.ok(nextAdhocTask(), 'overlapping adhoc tasks still run');
+});
+
+// capability_debrief (2026-10-17, design note section 5a) -------------------------------
+
+function writeCapabilityLedger(dir, rows) {
+  const { logPipelineEvent } = require('./pipeline-history.js');
+  for (const r of rows) logPipelineEvent(dir, 'attempt', r);
+}
+
+const CAP_SMALL = { source: 'change_review', model: 'qwen3-vl:8b-instruct', tier: 8, lane: 'worker-rx580', numCtx: 16384, wallMs: 300000, reason: 'Ollama request timed out after 300000ms' };
+const CAP_BIG = { source: 'change_review', model: 'qwen3.8:27b', tier: 27, lane: 'worker-3090', outcome: 'ok', wallMs: 90000 };
+
+test('nextCapabilityDebriefTask: null with no failure cluster; one deterministic task per cluster once 3 small-lane failures sit beside a larger tier', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief-test-'));
+  let { nextCapabilityDebriefTask } = freshTaskSources(dir);
+  assert.equal(nextCapabilityDebriefTask(), null);
+
+  writeCapabilityLedger(dir, [{ ...CAP_SMALL, taskId: 'a1', outcome: 'timeout' }, { ...CAP_SMALL, taskId: 'a2', outcome: 'timeout' }, CAP_BIG]);
+  ({ nextCapabilityDebriefTask } = freshTaskSources(dir));
+  assert.equal(nextCapabilityDebriefTask(), null, 'two failures is below the cluster threshold');
+
+  writeCapabilityLedger(dir, [{ ...CAP_SMALL, taskId: 'a3', outcome: 'timeout' }]);
+  ({ nextCapabilityDebriefTask } = freshTaskSources(dir));
+  const task = nextCapabilityDebriefTask();
+  assert.ok(task);
+  assert.equal(task.source, 'capability_debrief');
+  assert.match(task.id, /^capability-debrief-[0-9a-f]{12}$/);
+  assert.equal(task.promptContext.clusterSource, 'change_review');
+  assert.ok(task.promptContext.evidenceText.includes('CAPABILITY DEBRIEF BUNDLE'));
+  assert.equal(nextCapabilityDebriefTask().id, task.id, 'same id on a second call: two workers must collide on it');
+});
+
+test('nextCapabilityDebriefTask: a debriefed cluster is not offered again, and a cluster on a degraded lane is skipped as a hardware suspect', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief2-test-'));
+  const rows = ['a1', 'a2', 'a3'].map((taskId) => ({ ...CAP_SMALL, taskId, outcome: 'timeout' }));
+  writeCapabilityLedger(dir, [...rows, CAP_BIG]);
+  const { nextCapabilityDebriefTask } = freshTaskSources(dir);
+  const task = nextCapabilityDebriefTask();
+  assert.ok(task);
+  const { markDebriefedByKey } = require('./capability-debrief-bundle.js');
+  markDebriefedByKey(path.join(dir, 'instances'), task.promptContext.clusterKey, { verdict: 'queued' });
+  assert.equal(nextCapabilityDebriefTask(), null);
+
+  const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief3-test-'));
+  writeCapabilityLedger(dir2, [...rows, CAP_BIG]);
+  const now = Date.now();
+  const sample = (tps, ago) => ({ at: new Date(now - ago).toISOString(), ok: true, tps, totalMs: 1, error: null });
+  fs.mkdirSync(path.join(dir2, 'instances'), { recursive: true });
+  fs.writeFileSync(path.join(dir2, 'instances', 'lane-health.worker-rx580.json'), JSON.stringify({ samples: [sample(26, 9e5), sample(27, 8e5), sample(25, 7e5), sample(0.6, 1e3)] }));
+  const fresh = freshTaskSources(dir2);
+  assert.equal(fresh.nextCapabilityDebriefTask(), null);
+});
+
+test('capability_debrief is registered as a core, advisory-prose source at priority 96 that probing must never offer to a small lane', () => {
+  freshTaskSources(fs.mkdtempSync(path.join(os.tmpdir(), 'task-sources-capdebrief4-test-')));
+  const reg = require('./task-source-registry.js').getRegisteredSource('capability_debrief');
+  assert.equal(reg.priority, 96);
+  assert.equal(reg.scope, 'core');
+  assert.equal(reg.advisoryProse, true);
+  assert.equal(reg.probe, false);
+  assert.equal(typeof reg.apply, 'function');
+});
+
+// 2026-10-18: an entry whose work already exists as a task is linked to it, not sorted again (brain-dump-existing-work.js).
+test('nextBrainDumpSortTask links an entry whose work already exists, keeps a concurrent edit, and returns the next entry', () => {
+  const dir = makeBrainDumpFixtureRepo();
+  const entries = [
+    { id: 'bd-done-work', serial: 1903, rawText: 'already carried by hand', status: 'captured', capturedAt: '2026-10-18T03:00:00.000Z' },
+    { id: 'bd-fresh', serial: 1904, rawText: 'not started', status: 'captured', capturedAt: '2026-10-18T03:00:00.000Z' },
+  ];
+  fs.writeFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, JSON.stringify({ entries }));
+  fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'done', 'adhoc-carried-1.json'), JSON.stringify({ id: 'adhoc-carried-1', promptContext: { raisedFrom: 'brain-dump-1903' } }));
+  const { nextBrainDumpSortTask } = freshTaskSources(dir);
+
+  // A dashboard capture lands between the generator's read and its write: the write must keep it.
+  const realRead = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function patched(p, ...rest) {
+    const out = realRead.call(fs, p, ...rest);
+    if (p === process.env.AGENT_MANAGER_BRAIN_DUMP_PATH && ++reads === 1) {
+      const d = JSON.parse(String(out));
+      d.entries.push({ id: 'bd-new-capture', rawText: 'captured meanwhile', status: 'captured' });
+      fs.writeFileSync(p, JSON.stringify(d));
+    }
+    return out;
+  };
+  let task;
+  try { task = nextBrainDumpSortTask(); } finally { fs.readFileSync = realRead; }
+
+  assert.equal(task.id, 'brain-dump-sort-bd-fresh', 'the entry with existing work is skipped');
+  const saved = JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_BRAIN_DUMP_PATH, 'utf8')).entries;
+  const linked = saved.find((e) => e.id === 'bd-done-work');
+  assert.equal(linked.status, 'actioned');
+  assert.equal(linked.queuedTaskId, 'adhoc-carried-1');
+  assert.equal(linked.linkedExistingWork.how, 'raisedFrom');
+  assert.equal(linked.linkedExistingWork.by, 'generator');
+  assert.equal(saved.find((e) => e.id === 'bd-fresh').status, 'captured');
+  assert.ok(saved.find((e) => e.id === 'bd-new-capture'), 'the concurrent capture survived the link write');
+  const hist = fs.readFileSync(path.join(dir, 'instances', 'pipeline-history.log'), 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    .filter((e) => e.type === 'brain-dump-existing-work');
+  assert.equal(hist.length, 1);
+  assert.equal(hist[0].entryId, 'bd-done-work');
+  assert.equal(hist[0].taskId, 'adhoc-carried-1');
+});
+
+// --- nextDeepDiveTask: a community that already has a task must not cost any file reads (2026-10-22) --------
+// Measured on the live agent-manager queue: the generation tick every lane runs between tasks took 71-77 s (45 s in this function) because each of
+// ~2,000 onboarded communities re-parsed the repo's graph JSON and read its source files BEFORE the "already has a task" check. These pin the
+// cheap exact skip, the once-per-project graph parse, and every behaviour the old loop had around it (slices, the stale-counter reset, no-node
+// communities), so the speed-up cannot change which task is emitted.
+
+// One onboarded fake clone for THIS project. spec.communities: [{ id, files, consumedSlices?, task?: 'unsliced' | 's<N>' }]. A file's degree is its
+// index + 1, so the highest-index file ranks first.
+function deepDiveWorld(communities, { slug = 'lead-repo' } = {}) {
+  const dir = makeDeepDiveFixtureRepo();
+  fs.writeFileSync(process.env.AGENT_MANAGER_PROJECT_SEARCH_INDEX_PATH, fixtureIndexMd([]));
+  const clone = path.join(dir, 'clones', slug);
+  fs.mkdirSync(clone, { recursive: true });
+  const nodes = [];
+  const links = [];
+  for (const c of communities) {
+    for (let k = 0; k < c.files; k += 1) {
+      const file = `c${c.id}_f${k}.js`;
+      fs.writeFileSync(path.join(clone, file), `// community ${c.id} file ${k}\n` + 'x'.repeat(100));
+      nodes.push({ id: `${c.id}:${k}`, community: c.id, source_file: file });
+      for (let d = 0; d <= k; d += 1) links.push({ source: `${c.id}:${k}`, target: `sink-${c.id}-${k}-${d}` });
+    }
+    if (c.task) {
+      const id = c.task === 'unsliced' ? `deep-dive-${slug}-${c.id}` : `deep-dive-${slug}-${c.id}-${c.task}`;
+      fs.mkdirSync(path.join(dir, 'queue', 'done'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'queue', 'done', `${id}.json`), '{}');
+    }
+  }
+  fs.writeFileSync(path.join(clone, '.deep-dive-graph.json'), JSON.stringify({ nodes, links }));
+  const coverage = {
+    projects: {
+      [slug]: {
+        sourceUrl: `https://github.com/x/${slug}`,
+        clonePath: clone,
+        relevantToProject: path.basename(dir),
+        communities: communities.map((c) => ({ id: c.id, name: `community ${c.id}`, lastReviewedAt: null, ...(c.consumedSlices ? { consumedSlices: c.consumedSlices } : {}) })),
+      },
+    },
+  };
+  fs.writeFileSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH, JSON.stringify(coverage, null, 2));
+  return { dir, clone, readCoverage: () => JSON.parse(fs.readFileSync(process.env.AGENT_MANAGER_DEEP_DIVE_COVERAGE_PATH, 'utf8')) };
+}
+
+// Runs fn with fs.readFileSync counting reads of the graph file and of source files inside the clone.
+function countReads(clone, fn) {
+  const real = fs.readFileSync;
+  const reads = { graph: 0, source: 0 };
+  fs.readFileSync = function patched(p, ...rest) {
+    const s = String(p);
+    if (s.endsWith('.deep-dive-graph.json')) reads.graph += 1;
+    else if (s.startsWith(clone) && s.endsWith('.js')) reads.source += 1;
+    return real.call(this, p, ...rest);
+  };
+  try { return { result: fn(), reads }; } finally { fs.readFileSync = real; }
+}
+
+test('deep_dive emits the one community without a task and reads the graph once and only that community\'s files', () => {
+  const comms = [];
+  for (let id = 0; id < 40; id += 1) comms.push({ id, files: 3, task: id === 17 ? undefined : 'unsliced' });
+  const w = deepDiveWorld(comms);
+  const { nextDeepDiveTask } = freshTaskSources(w.dir);
+  const { result, reads } = countReads(w.clone, () => nextDeepDiveTask());
+  assert.ok(result, 'the one community without a task must be emitted');
+  assert.equal(result.id, 'deep-dive-lead-repo-17');
+  assert.deepEqual(result.promptContext.files.map((f) => f.path), ['c17_f2.js', 'c17_f1.js', 'c17_f0.js'], 'highest-degree file first, as before');
+  assert.equal(reads.graph, 1, 'one parse of the project graph per call, not one per community');
+  assert.equal(reads.source, 3, 'source files are read only for the community that emits');
+});
+
+test('deep_dive with every community already tasked returns null and reads no source file at all', () => {
+  const w = deepDiveWorld(Array.from({ length: 60 }, (_, id) => ({ id, files: 4, task: 'unsliced' })));
+  const { nextDeepDiveTask } = freshTaskSources(w.dir);
+  const { result, reads } = countReads(w.clone, () => nextDeepDiveTask());
+  assert.equal(result, null);
+  assert.equal(reads.source, 0);
+  assert.equal(reads.graph, 1);
+});
+
+test('deep_dive still slices a community over the cap: s0 first (coverage advanced), then s1 once s0 has a task', () => {
+  const w = deepDiveWorld([{ id: 5, files: 13 }]);
+  const { nextDeepDiveTask } = freshTaskSources(w.dir);
+  const first = nextDeepDiveTask();
+  assert.equal(first.id, 'deep-dive-lead-repo-5-s0');
+  assert.equal(first.promptContext.files.length, 12);
+  assert.equal(w.readCoverage().projects['lead-repo'].communities[0].consumedSlices, 1);
+  fs.mkdirSync(path.join(w.dir, 'queue', 'done'), { recursive: true });
+  fs.writeFileSync(path.join(w.dir, 'queue', 'done', 'deep-dive-lead-repo-5-s0.json'), '{}');
+  const second = freshTaskSources(w.dir).nextDeepDiveTask();
+  assert.equal(second.id, 'deep-dive-lead-repo-5-s1');
+  assert.deepEqual(second.promptContext.files.map((f) => f.path), ['c5_f0.js']);
+});
+
+test('deep_dive: a community that grew past the cap after its unsliced task finished is NOT skipped by the cheap check', () => {
+  // 13 ranked files > 12, an unsliced task exists, no slice counter: the old loop emitted s0, so must this one.
+  const w = deepDiveWorld([{ id: 9, files: 13, task: 'unsliced' }]);
+  const t = freshTaskSources(w.dir).nextDeepDiveTask();
+  assert.ok(t, 'a grown community must still emit');
+  assert.equal(t.id, 'deep-dive-lead-repo-9-s0');
+});
+
+test('deep_dive: a stale slice counter on a now-small community is still reset and saved (the cheap skip must not bypass it)', () => {
+  const w = deepDiveWorld([{ id: 3, files: 4, consumedSlices: 2, task: 'unsliced' }]);
+  assert.equal(freshTaskSources(w.dir).nextDeepDiveTask(), null);
+  assert.ok(!w.readCoverage().projects['lead-repo'].communities[0].consumedSlices, 'consumedSlices must be reset to 0 exactly as before');
+});
+
+test('deep_dive: a community with no graph nodes is skipped and the next one still emits', () => {
+  const w = deepDiveWorld([{ id: 1, files: 0 }, { id: 2, files: 2 }]);
+  const t = freshTaskSources(w.dir).nextDeepDiveTask();
+  assert.equal(t.id, 'deep-dive-lead-repo-2');
+});
+
+test('deep_dive: a community exactly at the cap with a finished task is skipped, one file over is not', () => {
+  const at = deepDiveWorld([{ id: 1, files: 12, task: 'unsliced' }]);
+  assert.equal(freshTaskSources(at.dir).nextDeepDiveTask(), null);
+  const over = deepDiveWorld([{ id: 1, files: 13, task: 'unsliced' }]);
+  assert.equal(freshTaskSources(over.dir).nextDeepDiveTask().id, 'deep-dive-lead-repo-1-s0');
+});
+
+
+// isDependencySatisfied: a fully built NESTED hub (2026-10-23, chat plugin HUB0003). Its record stays in queue/coordinating/ until the stacked branch merges, so it
+// never reaches done/ and the dependents of "piece 1" waited for ever.
+function writeCoordinatingFile(dir, id, content) {
+  const d = path.join(dir, 'queue', 'coordinating'); fs.mkdirSync(d, { recursive: true });
+  fs.writeFileSync(path.join(d, `${id}.json`), JSON.stringify(content));
+}
+const subHub = (statuses, stacked = { branch: 'agent/decompose-parent', seq: 1, total: 3 }) => ({
+  id: 'sub-hub-1', stacked, subTasks: statuses.map((status, i) => ({ id: `p${i}`, status })),
+});
+
+test('nextAdhocTask: a dependency on a nested hub whose pieces are all built on the shared stacked branch is satisfied', () => {
+  const dir = makeAdhocFixtureRepo();
+  writeCoordinatingFile(dir, 'sub-hub-1', subHub(['pending-merge', 'pending-merge', 'merged']));
+  writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['sub-hub-1'] });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  const task = nextAdhocTask();
+  assert.ok(task, 'the sub-hub is built; its dependent must not wait for a merge of the whole branch');
+  assert.equal(task.id, 'adhoc-dependent-1');
+});
+
+test('nextAdhocTask: a nested hub with an open or blocked piece, no pieces, no stacked branch, or no record still holds its dependent', () => {
+  const cases = {
+    'one piece in progress': subHub(['pending-merge', 'in-progress']),
+    'one piece blocked': subHub(['pending-merge', 'blocked']),
+    'no pieces': subHub([]),
+    'no stacked branch': subHub(['pending-merge'], undefined),
+  };
+  for (const [label, rec] of Object.entries(cases)) {
+    const dir = makeAdhocFixtureRepo();
+    if (label === 'no stacked branch') delete rec.stacked;
+    writeCoordinatingFile(dir, 'sub-hub-1', rec);
+    writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['sub-hub-1'] });
+    const { nextAdhocTask } = freshTaskSources(dir);
+    assert.equal(nextAdhocTask(), null, label);
+  }
+  const dir = makeAdhocFixtureRepo();
+  writeAdhocFile(dir, 'dependent.json', { id: 'adhoc-dependent-1', title: 'x', dependsOn: ['no-such-record'] });
+  assert.equal(freshTaskSources(dir).nextAdhocTask(), null, 'no record at all');
+});
+
+// prerequisiteHubs (hub-prerequisites.js, 2026-10-23): a piece that needs files only another open hub's unmerged branch has waits for that hub's MERGE.
+test('nextAdhocTask holds a piece whose prerequisite hub is still coordinating, and claims it once that hub has left coordinating/', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'coordinating'), { recursive: true });
+  const hubFile = path.join(dir, 'queue', 'coordinating', 'adhoc-hub6.json');
+  fs.writeFileSync(hubFile, JSON.stringify({ id: 'adhoc-hub6', hubLabel: 'HUB0006', subTasks: [] }));
+  writeAdhocFile(dir, 'piece.json', { id: 'adhoc-piece-1', title: 'Needs accounts.py from HUB0006', createdAt: new Date().toISOString(), prerequisiteHubs: ['HUB0006'] });
+  const { nextAdhocTask } = freshTaskSources(dir);
+  assert.equal(nextAdhocTask(), null, 'held while HUB0006 is still open');
+  fs.unlinkSync(hubFile);
+  const task = freshTaskSources(dir).nextAdhocTask();
+  assert.ok(task);
+  assert.equal(task.id, 'adhoc-piece-1');
+  assert.deepEqual(task.prerequisiteHubs, ['HUB0006'], 'the field survives the claim');
+});
+
+test('nextAdhocTask is unchanged for a task with no prerequisiteHubs even while hubs are open', () => {
+  const dir = makeAdhocFixtureRepo();
+  fs.mkdirSync(path.join(dir, 'queue', 'coordinating'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'queue', 'coordinating', 'adhoc-hub6.json'), JSON.stringify({ id: 'adhoc-hub6', hubLabel: 'HUB0006', subTasks: [] }));
+  writeAdhocFile(dir, 'plain.json', { id: 'adhoc-plain-1', title: 'Ordinary task' });
+  const task = freshTaskSources(dir).nextAdhocTask();
+  assert.equal(task && task.id, 'adhoc-plain-1');
 });

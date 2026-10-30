@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   adhocDiffSubstanceProblem, adhocNoChangesClaimProblem, parseChangedFiles, extractForbiddenPaths,
-  extractDeclaredTargets,
+  extractDeclaredTargets, planImportBindingProblem,
 } = require('./adhoc-diff-sanity.js');
 
 // Stubs arch-import-fetch.js's fetchForQueries for the duration of fn(), via require-cache
@@ -627,4 +627,191 @@ test('read-only doc tasks: descriptive and question sentences about code do not 
   const text = 'Create docs/x.md. Questions: which functions in a.py would move with the extraction; where is the new route registered in server/app.py. RULES: read-only on the code; nothing else touched.';
   assert.equal(taskWantsCodeChange(adhocTask(text)), false);
   assert.equal(taskWantsCodeChange(adhocTask(text.replace('read-only on the code; nothing else touched', 'be thorough'))), true, 'the same text without the read-only statement is unchanged');
+});
+
+// --- 2026-10-16: read-only design / findings docs whose "Ground it in the code ..." / "Read the real history ..." sentences read as imperatives (initiative record, tuning-loops catalogue) ---
+// The text, title and failure text below are copied verbatim from the stuck queue/needs-clarification/ records.
+const REAL_INITIATIVE_RECORD_TEXT = "WHY (owner 2026-10-15: \"the system is our greatest asset and needs to be capable of swiftly, easily and gracefully handling these kinds of tasks\"). Evidence from 2026-10-15, live: (a) a read-only 'verify the map against three repos' task finished orient (2.5 min) and plan (2.2 min), spent ~5 min in the agentic implement pass, answered RESOLUTION: decompose with NO valid JSON array, was blocked (src/agentic-draft-common.js:494), sat 17 min, was requeued to repeat the same stages -- a retry loop that cannot succeed. (b) A one-line bug (brain-dump capture: max() over string serials, python/dashboard/routes/brain_dump.py:132) was approved and decomposed into SEVEN sub-tasks (HUB0148). (c) Owner builds goals made of pieces across several repos by hand, and the pipeline serves one project at a time. This task is one of three from the 'systematic fix' (shape-aware intake, decompose repair, an Initiative record). SCOPE RULE: this is ONE task, do not decompose it; do the smallest first PR described. TASK: write ONE file, Docs/initiative-record-design.md, and change nothing else. Design an 'Initiative' record: a goal made of pieces, each piece a task, with the dependencies between them, the repo each piece belongs to, a status derived from the pieces, and a hook that files the NEXT piece automatically when its dependency merges, so follow-through is a property of the system and not of a person. Ground it in the current code with path:line (confirmed vs unconfirmed): the five existing cross-reference mechanisms (see the Task Linking concept: hub parent/child, dependsOn, brainDumpEntryId, raisedFrom, derived-task links), nextAdhocTask()/isDependencySatisfied() in src/task-sources.js (dependsOn is satisfied only once the dependency is MERGED), hubs and coordinating/ (queue/coordinating), the hub-priority and premiumPriority ordering in src/next-claimable-task.js, and queue-adhoc-task.js. The doc must contain: the record shape (JSON example); how it differs from a hub (hubs are decompositions of ONE task; an initiative spans tasks, projects and time); which existing mechanism it should reuse so it does not become a sixth; how a piece names its target repo (the pipeline works one active project at a time today -- say what this requires of the scheduler, referencing the project-rotation findings if Docs/project-rotation-and-expiry-aging-findings.md exists); the dashboard view (one row per initiative: pieces done/in-flight/blocked, next piece, age by attention); how premium priority is inherited by pieces; failure modes and the smallest first PR (an initiative file plus a read-only dashboard list, no auto-filing yet); and an open-decisions list with a recommended default for each. Worked example: the GPU broker extraction (Docs/gpu-broker-extraction-map.md pieces G0-G7) expressed as an initiative.";
+const REAL_INITIATIVE_RECORD_TITLE = "Initiative record: design doc (read-only, one file)";
+const REAL_TUNING_LOOPS_TEXT = "WHY (owner 2026-10-15): the owner has had Claude do system management and streamlining of Agent Manager by hand across many sessions and wants that fine-tuning broken into a set of repeatable tasks that run passively through the pipeline. A first, memory-and-skim pass (NOT evidence-backed) found nine recurring loops: (1) stalled-bucket drain (blocked / needs-clarification: find the one shared cause, fix it, release the bucket), (2) incident -> root cause -> sweep siblings (the Incident Amplification concept, never built), (3) unmerged-branch review (read the whole hub, verdict merge / needs-work / discard; docs/agents/unmerged-branch-review.md), (4) scanner precision tuning (measure false positives, cut them, confidence tiers, 'dismissed'), (5) policy-change follow-up (after a change, read a week of data, tighten, flip env switches; nothing currently remembers to do it), (6) triage candidate sifts (100-200 candidates into keep / drop / hold), (7) code-health and history analysis (a daily health ledger was proposed, not built), (8) brain-dump / memory / docs hygiene, (9) environment drift (env switches, lanes, P40, plugin env vs the intended state). The first pass saw 2,799 commits on origin/master since 2026-08-01, ~220 of them 'Triage batch' commits and several hundred fixes. SCOPE RULE: this is ONE task, write the single file named below, change nothing else, do not decompose. TASK: write ONE file, Docs/tuning-loops-catalogue.md. Read the real history, not the nine-item guess: git log of origin/master since 2026-08-01 (group commits and PR titles by theme; count them), queue/done and queue/done/_archived* task records and their history stages (which sources and job types recur, which tasks were retried, blocked or requeued and why), brain-dump.json entries (group by theme; note which were machine-raised vs session-raised), the memory notes under /home/wok/.claude/projects/-home-wok/memory/ whose name starts project-agent-manager-* (they record what each hand-run session found; read the index file MEMORY.md first), and docs/agents/, Docs/ and the existing task sources in src/task-sources.js and /media/model-cache/github/agent-manager-hygiene/src. Produce: (a) a table of the recurring loops actually found (correct, merge, split or drop the nine above with evidence), each with: how many times it ran (count and dates), what triggered it, the evidence a human or Claude looked at, the decision made, the artefact produced (PR, task, doc, env change), and whether any of it is ALREADY automated (name the source/sweep and path:line, or say none); (b) for each loop, a verdict: automate fully / automate evidence-gathering and keep a human gate / keep manual, with the reason; (c) the five most valuable gaps ranked by (frequency x cost of forgetting), with the evidence; (d) every claim marked confirmed (with path or commit) or unconfirmed. Do not run any live pipeline command, sweep, or task-sources.js. If a data source cannot be read, say so and continue with the rest. Keep under 300 lines.\n\nADDITIONAL EVIDENCE FROM A HAND-RUN SESSION (2026-10-14/15, Claude session 015TvzBxsPvNeXXdPbh273DP; session-raised, not yet checked against the repo history -- verify or correct each in the catalogue, and include them as loops or as members of the nine above): (A) LAND-AND-DEPLOY after every merge: fast-forward the live checkout, restart the plugin via kill pid + remove ~/.local/state/agent-manager/pids/plugin-<name>.pid + POST /api/plugins/<name>/ensure-started, confirm the running process serves the merged commit (done ~10 times that day for promptforge, storyforge, sceneforge, the dashboard); candidate loop: deploy-drift sweep. (B) PRE-FLIGHT before a pipeline start or project switch: an uncommitted edit in the target repo's checkout (e.g. storyforge stories/enough.json) is at risk because apply self-heal rescues/resets dirt (see the rescue branch agent/rescued-master-20261014193855 and PR #467 / #474); candidate: a start guard. (C) STATE CHECKS done by hand: P40 VM up (virsh), workers per lane, plugin pids and zombie pidfiles, host RAM vs the mem-guard 2048 MB threshold, whether the live PromptForge has CHARACTERFORGE_ROOT, which commit is live; candidate: the environment-drift loop. (D) STATUS DIGESTS: 'what is the queue doing' answered by reading queue/ directories, task histories and worker logs; candidate: a generated, phone-readable digest. (E) CONTACT SHEETS: building a labelled image sheet after a render job so a human can review it; candidate: automatic sheet per render job. (F) FILING FINDINGS: turning an incident into a well-formed brain dump or premium task with evidence and a 'do not decompose' scope rule; candidate: a file-this-finding helper. (G) MEMORY UPKEEP: writing/updating memory notes and the index after each stretch of work; candidate: a debrief task that proposes the changes for approval. (H) SECRET HYGIENE: a grep of agent-manager.env printed the dashboard token into a session transcript; candidate: a redacting read wrapper. (I) PRIOR-ART SCOUTING: gh/web search, vet by stars/recency/size (<150 MB), add a row + notes subsection to UsefulProjectIndex/INDEX.md; candidate: a scout step attached to every design task. Count these in the catalogue's table with the evidence you can find (git, task records, memory notes) and mark each confirmed or unconfirmed.";
+const REAL_TUNING_LOOPS_TITLE = "Catalogue of recurring tuning loops from the history of Agent Manager development (read-only findings doc)";
+
+test('read-only doc tasks: the real initiative-record and tuning-loops texts do not want code, and their docs-only diff passes', () => {
+  for (const [text, title, file] of [[REAL_INITIATIVE_RECORD_TEXT, REAL_INITIATIVE_RECORD_TITLE, 'Docs/initiative-record-design.md'], [REAL_TUNING_LOOPS_TEXT, REAL_TUNING_LOOPS_TITLE, 'Docs/tuning-loops-catalogue.md']]) {
+    assert.equal(taskWantsCodeChange(adhocTask(text, { title })), false, file);
+    assert.equal(adhocDiffSubstanceProblem(adhocTask(text, { title }), createDiff(file)), null, file);
+  }
+});
+
+test('reading verbs: a sentence that opens with Read / Ground / Check and names a file to read is not a request, but an edit verb in the same sentence or a plain imperative still is', () => {
+  const head = 'Create docs/x.md with the findings. RULES: read-only on the code; nothing else touched. ';
+  for (const s of ['Read the real history of the task sources in src/task-sources.js.', 'Ground it in the current code: the five mechanisms in src/task-sources.js.', 'Check the retry handling in src/a.js and report what you find.']) {
+    assert.equal(taskWantsCodeChange(adhocTask(head + s)), false, s);
+  }
+  for (const s of ['Read the helper and rename it in src/a.js.', 'Check the timeout and change it in src/a.js.', 'Rename the helper in src/a.js.']) {
+    assert.equal(taskWantsCodeChange(adhocTask(head + s)), true, s);
+  }
+});
+
+test('reading verbs: without a read-only statement a doc task\'s reading sentence is not an imperative either, but a phrase signal or an edit verb still counts', () => {
+  const head = 'Create docs/x.md with the findings. ';
+  assert.equal(taskWantsCodeChange(adhocTask(head + 'Read the retry handling in src/a.js.')), false);
+  assert.equal(taskWantsCodeChange(adhocTask(head + 'Read the retry handling in src/a.js and add an endpoint in src/a.js.')), true);
+  assert.equal(taskWantsCodeChange(adhocTask(head + 'Read the retry handling in src/a.js. Also delete the lease in src/a.js.')), true);
+});
+
+// --- planImportBindingProblem (HUB0159 · 1/3) ---------------------------------
+// A binding token only counts INSIDE a fenced code block; a verbatim anchor is the
+// complete require('...') / import ... from '...' statement the implementer can find.
+
+test('planImportBindingProblem: no import-binding step at all passes', () => {
+  const t = adhoc(
+    'Wire the new helper into the plan pass.',
+    '1. Edit src/local-draft.js to call the new helper. No new bindings needed.',
+  );
+  assert.equal(planImportBindingProblem(t, 'Done.'), null);
+});
+
+test('planImportBindingProblem: one import step WITH a verbatim fenced anchor passes', () => {
+  const t = adhoc(
+    'Wire planImportBindingProblem into runPlanPass.',
+    [
+      '# PLAN',
+      '1. Add the import binding, verbatim, after the existing bindings:',
+      '```js',
+      "const { planImportBindingProblem } = require('./adhoc-diff-sanity.js');",
+      '```',
+    ].join('\n'),
+  );
+  assert.equal(planImportBindingProblem(t, 'Done.'), null);
+});
+
+test('planImportBindingProblem: one import step with NO verbatim anchor is flagged (the protected case)', () => {
+  // Exactly one fenced import step, but the binding is only shown in shorthand --
+  // no quoted module specifier, so the implementer has nothing verbatim to find. This
+  // genuine finding must NOT be swallowed by the no-import-step or prose-only branches.
+  const t = adhoc(
+    'Wire the new binding into the plan pass.',
+    [
+      '# PLAN',
+      '1. Add a require for the new module near the other bindings:',
+      '```js',
+      'require(planImportBindingProblem) // wire it in',
+      '```',
+    ].join('\n'),
+  );
+  const p = planImportBindingProblem(t, '');
+  assert.equal(p.code, 'missing-verbatim-find-anchor');
+  assert.ok(typeof p.reason === 'string' && p.reason.length > 0, 'reason must be a non-empty string');
+  assert.match(p.retryFeedback, /verbatim/i);
+});
+
+test('planImportBindingProblem: two import steps are flagged too-many', () => {
+  const t = adhoc(
+    'Wire both bindings into the plan pass.',
+    [
+      '# PLAN',
+      '1.',
+      '```js',
+      "const a = require('./a.js');",
+      '```',
+      '2.',
+      '```js',
+      "const b = require('./b.js');",
+      '```',
+    ].join('\n'),
+  );
+  const p = planImportBindingProblem(t, '');
+  assert.equal(p.code, 'too-many-import-binding-steps');
+  assert.ok(typeof p.reason === 'string' && p.reason.length > 0);
+});
+
+test('planImportBindingProblem: a prose-only mention of require( is NOT an import step (false-positive guard)', () => {
+  // The binding is talked about in plain prose -- even quoted -- but never shown inside a
+  // fenced code block, so per the tightened heuristic it is not an import-binding step.
+  const t = adhoc(
+    'Wire it in.',
+    'Step 1: the plan should mention adding "a require(\'./adhoc-diff-sanity.js\')" line -- in prose only, no snippet.',
+  );
+  assert.equal(planImportBindingProblem(t, "the summary also only says the plan will add a require('./x.js') line"), null);
+});
+
+// 2026-10-25 (adhoc-clear-pidfile-...-1792936771585, blocked on `diff touches server/core/comfy_proc.py (matches forbidden "comfy_proc.py")`):
+// "In the <repo> repo, modify `<path>`'s `fn()`" names the target but is not the "In `<path>`," shape, so the task's own "Do not change anything else in
+// <file>" sentence forbade the file it had just been told to edit. extractDeclaredTargets rule 6: a verb whose direct object is a backticked file path.
+const CLEAR_PIDFILE_TEXT = [
+  'In the gpu-broker repo, modify `server/core/comfy_proc.py`\'s `_clear_pidfile()` (defined at line ~318): catch FileNotFoundError separately and silently.',
+  'Do not change anything else in comfy_proc.py, gpu_session.py, or any other production code.',
+].join('\n');
+
+test('extractDeclaredTargets: "modify `<path>`" names the target even when the sentence starts with "In the <repo> repo,"', () => {
+  const t = adhoc(CLEAR_PIDFILE_TEXT);
+  assert.ok(extractDeclaredTargets(t).includes('server/core/comfy_proc.py'));
+  assert.deepEqual(extractForbiddenPaths(CLEAR_PIDFILE_TEXT), ['comfy_proc.py', 'gpu_session.py']);
+});
+
+test('forbidden-path: the file a task says to modify is not forbidden by its own "do not change anything else in <file>" sentence; the sibling still is', () => {
+  const t = adhoc(CLEAR_PIDFILE_TEXT);
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('server/core/comfy_proc.py')), null);
+  const p = adhocDiffSubstanceProblem(t, editDiff('server/core/comfy_proc.py') + editDiff('server/core/gpu_session.py'));
+  assert.equal(p && p.code, 'forbidden-path');
+  assert.match(p.detail || p.message || JSON.stringify(p), /gpu_session\.py/);
+});
+
+test('extractDeclaredTargets: rule 6 stays narrow -- a restricted file, a merely cited path and a call are not targets', () => {
+  const targets = extractDeclaredTargets(adhoc([
+    'Do not modify `src/b.js`.',
+    'Never edit `src/c.js` or `src/d.js`.',
+    'Prepend a note stating the rule is enforced by `scripts/check-doc-link.sh`.',
+    'Then fix res.json() handling, and update the docs if needed.',
+    'Mention the stale text in `Docs/cited.md` carefully.',
+    'Replace `Docs/a.md` with the new wording.',
+  ].join('\n')));
+  for (const bad of ['src/b.js', 'src/c.js', 'src/d.js', 'scripts/check-doc-link.sh']) assert.ok(!targets.includes(bad), bad);
+  assert.ok(!targets.includes('Docs/cited.md'));
+  assert.ok(targets.includes('Docs/a.md'));
+});
+
+// --- three false blocks found on stalled hub pieces (2026-10-26) ---------------------------------------------------------------------------------
+// HUB0040 2/3: "Does not touch any file other than `x`" names the file that MAY change; it was extracted as forbidden.
+test('forbidden-path: "does not touch any file other than <x>" exempts x instead of forbidding it', () => {
+  const raw = 'In src/decompose-premise-check.js, locate the PATH_RE capture loop. Replace the raw captured path value with resolveExistingPath(raw, repoRoot, lineCountFn).';
+  const plan = 'Target file: `src/decompose-premise-check.js`.\n- Does not touch any file other than `src/decompose-premise-check.js`.';
+  const t = adhoc(raw, plan);
+  assert.deepEqual(extractForbiddenPaths(`${raw}\n${plan}`), []);
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('src/decompose-premise-check.js'), 'wired it'), null);
+  // a real restriction in the same text is still forbidden, and an "except" exemption only covers what follows it
+  assert.deepEqual(extractForbiddenPaths('Do not touch src/a.js. Do not modify anything except src/b.js.'), ['src/a.js']);
+  assert.equal(adhocDiffSubstanceProblem(adhoc('Edit src/b.js. Do not touch src/a.js.'), editDiff('src/a.js'), '').code, 'forbidden-path');
+});
+
+// HUB0125 1/2: the task creates one doc; its own scope sentences name that file and the neighbouring docs/audit/ directory.
+test('forbidden-path: a file the task says to create is not forbidden by its own "exactly one new file" scope sentences', () => {
+  const raw = 'Create docs/audit-batch-write-bypass-2026-10-02.md. It must contain a markdown table with the exact columns file, function, write target.';
+  const plan = 'The deliverable is exactly one file, `docs/audit-batch-write-bypass-2026-10-02.md`, created in the working tree.\n'
+    + 'No other file is created, edited, moved, or deleted. Do not touch `docs/audit/` and do not also modify `docs/audit-batch-write-bypass-2026-10-02.md` as a side effect.';
+  const t = adhoc(raw, plan);
+  assert.ok(extractDeclaredTargets(t, plan).includes('docs/audit-batch-write-bypass-2026-10-02.md'));
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md'), 'created the audit doc'), null);
+  // the neighbouring directory the task forbids is still forbidden
+  assert.equal(adhocDiffSubstanceProblem(t, createDiff('docs/audit-batch-write-bypass-2026-10-02.md') + editDiff('docs/audit/local-provider-dispatch-paths.md'), '').code, 'forbidden-path');
+});
+
+// HUB0117 3/4: a documentation task that cites code paths as evidence.
+test('docs-only: every declared edit target is documentation -> a docs diff is the deliverable, however many code paths the text cites', () => {
+  const raw = 'Edit `docs/local-delegation.md` to add a subsection explaining `OLLAMA_KV_CACHE_TYPE`. State that it is not yet enabled, and point to `agent-manager.env.example` for the configuration knob. Add a note about src/gpu-vram.js.';
+  const t = adhoc(raw, 'Edit `docs/local-delegation.md`.');
+  assert.ok(extractDeclaredTargets(t, 'Edit `docs/local-delegation.md`.').includes('docs/local-delegation.md'));
+  assert.equal(adhocDiffSubstanceProblem(t, editDiff('docs/local-delegation.md'), 'documented it'), null);
+  // a created doc alone does not exempt a task that also asks for a code edit in another sentence (the existing rule)
+  assert.equal(adhocDiffSubstanceProblem(adhoc('Create docs/audit/paths.md listing the routes. Then update the timeout handling in src/local-tool-client.js.'), createDiff('docs/audit/paths.md'), '').code, 'docs-only');
+});
+
+test('extractDeclaredTargets: a file named as the deliverable or created in the PLAN is a declared target; a merely cited or restricted file is not', () => {
+  const t = adhoc('Write the research note (the deliverable).');
+  const plan = 'The deliverable is the note file `notes/hub0002-bits-ai-research-note.txt`.\n3. Create the deliverable as a single plain-text file at `notes/hub0002-bits-ai-research-note.txt`.\n4. Create `scratch/extra.txt` first.';
+  assert.ok(extractDeclaredTargets(t, 'The deliverable is the note file `notes/a.txt`.').includes('notes/a.txt'), 'deliverable-is sentence');
+  assert.ok(extractDeclaredTargets(t, '3. Create the deliverable as a single plain-text file at `notes/b.txt` (create the directory if needed).').includes('notes/b.txt'), 'plan "create ... file at" sentence');
+  assert.ok(extractDeclaredTargets(t, plan).includes('scratch/extra.txt'));
+  assert.ok(!extractDeclaredTargets(adhoc('Read src/a.js for context. Do not create src/b.js.'), '').some((p) => /src\/[ab]\.js/.test(p)), 'cited or prohibited files are not targets');
 });

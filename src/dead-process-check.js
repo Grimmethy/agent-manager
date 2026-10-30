@@ -35,7 +35,7 @@
 
 const fs = require('fs');
 const { sharedInstancesDir } = require('./instances-dir.js');
-const { laneById } = require('./lanes.js');
+const { laneById, isSlowLane, reviewerLanes } = require('./lanes.js');
 const path = require('path');
 const { getConfig } = require('./config.js');
 const { STALE_HEARTBEAT_SECONDS, WORKER_ZOMBIE_THRESHOLD_SECONDS } = require('./heartbeat-thresholds.js');
@@ -49,8 +49,8 @@ const { STALE_HEARTBEAT_SECONDS, WORKER_ZOMBIE_THRESHOLD_SECONDS } = require('./
 // 3600s worst case, well past the general 1680s threshold, so the watchdog would kill a
 // legitimately still-generating P40 worker mid-call. Same slack-margin discipline as the
 // general value (+240s), applied only to the two P40 instanceIds.
-const WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 = 3840; // 64 min -- 4*900s draft chain (3600s) + 240s slack, mirrors the general value's own margin.
-const P40_INSTANCE_IDS = new Set(['worker-p40']);
+const WORKER_ZOMBIE_THRESHOLD_SECONDS_SLOW = 3840; // 64 min -- 4*900s draft chain (3600s) + 240s slack, mirrors the general value's own margin.
+// 2026-10-17: the long threshold now applies to every lane marked `slow` in src/lanes.js (isSlowLane; worker-p40 always counts), not just worker-p40.
 const RESTART_COOLDOWN_SECONDS = 120; // don't re-restart the same instanceId again this soon -- a fresh replacement's own first heartbeat can take a moment to land.
 
 // instanceId -> { script, args, pidfileName, env? }. A worker lane restarts EXACTLY as launch.sh
@@ -70,6 +70,13 @@ function restartTargetFor(instanceId) {
   }
   if (instanceId === 'reviewer') {
     return { script: 'review-runner.sh', args: ['reviewer'], pidfileName: 'review-runner.pid' };
+  }
+  if (instanceId.startsWith('reviewer-')) {
+    // An extra review daemon on a lane that opted in (src/lanes.js `reviewer`): restarts with that lane's Ollama env, exactly as launch.sh starts it.
+    const found = reviewerLanes().find((r) => r.reviewerId === instanceId);
+    if (!found) return null;
+    const hasEnv = Object.keys(found.lane.env).length > 0;
+    return { script: 'review-runner.sh', args: [instanceId], pidfileName: `review-runner-${instanceId.slice('reviewer-'.length)}.pid`, ...(hasEnv ? { env: found.lane.env } : {}) };
   }
   return null; // no rule -- e.g. 'watchdog' (never restarts itself) or an unrecognized instanceId.
 }
@@ -174,7 +181,7 @@ async function deadProcessCheck({ instancesDir, cooldownPath, now = Date.now() }
       const ownerPid = hb.daemonPid != null ? hb.daemonPid : hb.pid;
       const pidAlive = isProcessAlive(ownerPid);
       const isWorker = hb.instanceId.startsWith('worker-');
-      const zombieThreshold = P40_INSTANCE_IDS.has(hb.instanceId) ? WORKER_ZOMBIE_THRESHOLD_SECONDS_P40 : WORKER_ZOMBIE_THRESHOLD_SECONDS;
+      const zombieThreshold = isSlowLane(hb.instanceId) ? WORKER_ZOMBIE_THRESHOLD_SECONDS_SLOW : WORKER_ZOMBIE_THRESHOLD_SECONDS;
       const isZombie = pidAlive && isWorker && ageSeconds >= zombieThreshold;
 
       if (pidAlive && !isZombie) continue; // still alive, just a slow single call (or a non-worker instance, which keeps the strict PID-gate).
@@ -336,7 +343,13 @@ function hasLiveWorkerAncestor(pid, pidToPpid, liveWorkerPids) {
 // pid (the common case once local-draft.js's own heartbeat write has fired) OR any
 // ancestor is (the brief window between bash's pre-spawn heartbeat write, using the
 // daemon's real pid, and local-draft.js's first internal heartbeat write).
-function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid, instancesDir } = {}) {
+// A model-call process started by src/dry-run.js (the task-atomization replay lab) has no worker ancestor on purpose: it is a supported replay, not an
+// orphan, and the watchdog SIGKILLed the first one ~95 s in. dry-run.js sets AGENT_MANAGER_DRY_RUN=1 in the child's environment; that is the marker.
+function isDryRunProcess(pid, readEnviron = (p) => fs.readFileSync(`/proc/${p}/environ`, 'utf8')) {
+  try { return readEnviron(pid).split('\0').includes('AGENT_MANAGER_DRY_RUN=1'); } catch (_) { return false; }
+}
+
+function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid, instancesDir, readEnviron } = {}) {
   let processes;
   try {
     processes = listProcesses();
@@ -347,7 +360,8 @@ function findOrphanedModelCallProcesses({ listProcesses = listProcessesWithPpid,
   const pidToPpid = new Map(processes.map((p) => [p.pid, p.ppid]));
   return processes.filter((p) => MODEL_CALL_SCRIPT_RE.test(p.cmd)
     && !liveWorkerPids.has(p.pid)
-    && !hasLiveWorkerAncestor(p.ppid, pidToPpid, liveWorkerPids));
+    && !hasLiveWorkerAncestor(p.ppid, pidToPpid, liveWorkerPids)
+    && !isDryRunProcess(p.pid, readEnviron));
 }
 
 async function main() {
@@ -368,7 +382,7 @@ async function main() {
 }
 
 module.exports = {
-  deadProcessCheck, restartTargetFor, isProcessAlive, findOrphanedModelCallProcesses,
+  deadProcessCheck, restartTargetFor, isProcessAlive, findOrphanedModelCallProcesses, isDryRunProcess,
   // Exported for pipeline-health-audit.js's checkDaemonCounts, which needs the exact same
   // "walk the ancestor chain through bash's own subshell forks" logic -- see this
   // function's own header for the full incident history. Generic in its target set (any

@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -46,16 +47,41 @@ def _read_pid(name: str) -> int | None:
         return None
 
 
+def _is_zombie(pid: int) -> bool:
+    """True when /proc/<pid>/stat says the process has exited but not been waited on (state Z) or is dead (X).
+    Where /proc is unreadable (non-Linux, or the pid vanished) this is False and the caller keeps the signal-0 answer."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        return raw.rsplit(")", 1)[1].split()[0] in ("Z", "X")
+    except (OSError, IndexError):
+        return False
+
+
+def _reap(pid: int) -> None:
+    """Collect an exited child of this process so it does not stay a zombie. Never raises: not our child
+    (ChildProcessError) or already collected is fine."""
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+
+
 def is_running(name: str) -> bool:
-    """Same signal-0 liveness check as launch.sh's is_running() (`kill -0`)."""
+    """Same signal-0 liveness check as launch.sh's is_running() (`kill -0`), except that a zombie counts as NOT running.
+    2026-10-24: a plugin that exited was never wait()ed on by the dashboard that spawned it, so it stayed `<defunct>`;
+    os.kill(pid, 0) succeeds for a zombie, so ensure-started kept answering alreadyRunning and never relaunched it.
+    A zombie child of this process is reaped here."""
     pid = _read_pid(name)
     if pid is None:
         return False
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
+    if _is_zombie(pid):
+        _reap(pid)
+        return False
+    return True
 
 
 def _port_from_url(url: str) -> int | None:
@@ -207,3 +233,93 @@ def stop(name: str, wait_s: float = 3.0) -> bool:
     except OSError:
         pass
     return not is_running(name)
+
+
+class PluginProcessManager:
+    """Manager for plugin process lifecycle operations, including behind-checkout detection."""
+
+    def behind_checkout(self, entry: dict) -> dict:
+        """Check if a plugin process is running from a stale checkout (behind HEAD).
+
+        Returns a dict with:
+            - behind (bool): True if the process started before the current HEAD commit
+            - startedAt (str): ISO timestamp when the process started
+            - headCommittedAt (str): ISO timestamp of the HEAD commit
+            - files (list): Up to 10 changed files since the process started (empty if unavailable)
+
+        Never raises. Falls back to safe defaults when git info or pidfile is unavailable.
+        """
+        key = process_key(entry)
+        pid = _read_pid(key)
+
+        if pid is None or not is_running(key):
+            return {
+                "behind": False,
+                "startedAt": None,
+                "headCommittedAt": None,
+                "files": [],
+            }
+
+        # Read start time from pidfile modification time
+        pidfile_path = _pidfile(key)
+        try:
+            start_mtime = pidfile_path.stat().st_mtime
+            started_at = datetime.fromtimestamp(start_mtime, tz=timezone.utc).isoformat()
+        except (OSError, AttributeError):
+            return {
+                "behind": False,
+                "startedAt": None,
+                "headCommittedAt": None,
+                "files": [],
+            }
+
+        # Get HEAD commit time from git
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--format=%ct"],
+                cwd=entry.get("cwd") or os.getcwd(),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                head_timestamp = int(result.stdout.strip())
+                head_committed_at = datetime.fromtimestamp(head_timestamp, tz=timezone.utc).isoformat()
+                behind = start_mtime < head_timestamp
+            else:
+                return {
+                    "behind": False,
+                    "startedAt": started_at,
+                    "headCommittedAt": None,
+                    "files": [],
+                }
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return {
+                "behind": False,
+                "startedAt": started_at,
+                "headCommittedAt": None,
+                "files": [],
+            }
+
+        # Get changed files since start
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only", f"@{started_at}"],
+                cwd=entry.get("cwd") or os.getcwd(),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                files = [f for f in result.stdout.strip().split("\n") if f][:10]
+            else:
+                files = []
+        except (subprocess.TimeoutExpired, OSError):
+            files = []
+
+        return {
+            "behind": behind,
+            "startedAt": started_at,
+            "headCommittedAt": head_committed_at,
+            "files": files,
+        }

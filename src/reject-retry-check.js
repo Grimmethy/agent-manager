@@ -30,12 +30,14 @@ const crypto = require('crypto');
 const { getConfig, ensureRegistered } = require('./config.js');
 const { recordOutcome: defaultRecordModelOutcome } = require('./model-stats-client.js');
 const { appendHistoryEvent } = require('./task-history.js');
-const { classifyBlockedTask, findClassifier, hasInvalidPremise } = require('./blocked-task-classifiers.js');
+const { classifyBlockedTask, findClassifier, hasInvalidPremise, isInfraError } = require('./blocked-task-classifiers.js');
+const { writeJsonAtomicSync } = require('./atomic-write.js');
 const { extractDeclaredTargets, pathsRefEqual } = require('./adhoc-diff-sanity.js');
 const { fileGhostDebt } = require('./ghost-debt.js');
 const { acquire, release, taskMoveLockKey } = require('./single-flight-lock.js');
 const { sharedInstancesDir } = require('./instances-dir.js');
-const { recordAvoidedLane } = require('./premium-rotation.js');
+const { recordAvoidedLane, describeTopTierFailure } = require('./premium-rotation.js');
+const { writeSideFindingInbox } = require('./side-finding.js');
 
 // Task-move lock (2026-09-27): every requeue/escalation below used to be a plain,
 // unguarded write-then-unlink -- no atomic rename, no check for whether a file for this
@@ -74,6 +76,7 @@ require('./task-sources.js');
 try { ensureRegistered(); } catch { /* no live config (e.g. a unit test) -- fine, nothing to register */ }
 
 const MAX_LOCAL_REJECT_RETRIES = 2;
+const MAX_INFRA_SORT_ATTEMPTS = 10;
 
 // Fields wiped when a task is re-admitted with a CLEAN SLATE (not a blind redraft, which
 // keeps priorRejectionFeedback + increments localRejectCount). Kept deliberately in sync
@@ -156,6 +159,11 @@ function isAdhocTask(task) {
 // entry's sortAttempt -- so nextBrainDumpSortTask regenerates the sort under a fresh id
 // (…-aN) instead of the entry being stuck 'captured' forever behind this blocked record.
 // Mirrors stampDeepDiveExhausted's "advance the source's own cursor" role.
+// HUB0196 2/3: infra-attributed failures (isInfraError) do NOT consume the content
+// sort-attempt budget (entry.sortAttempt) -- they get their own tracked counter
+// (entry.infraSortAttemptCount) bounded by MAX_INFRA_SORT_ATTEMPTS. Once that counter
+// exceeds the cap the entry is marked infraSortExhausted and becomes ineligible for
+// further sort attempts regardless of its content sortAttempt value.
 function stampBrainDumpSortExhausted(task, brainDumpPath) {
   if (task.source !== 'brain_dump_sort') return;
   const entryId = task.promptContext && task.promptContext.brainDumpEntryId;
@@ -163,10 +171,82 @@ function stampBrainDumpSortExhausted(task, brainDumpPath) {
   try {
     const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
     const entry = Array.isArray(data.entries) && data.entries.find((e) => e && e.id === entryId);
-    if (entry) {
-      entry.sortAttempt = (entry.sortAttempt || 0) + 1;
-      fs.writeFileSync(brainDumpPath, JSON.stringify(data, null, 2));
+    if (!entry) return;
+
+    const ts = new Date().toISOString();
+    const blockedReason = task.blockedReason || '';
+    const endpoint = task.endpoint || null;
+    const sortAttemptBefore = entry.sortAttempt || 0;
+    if (!Array.isArray(data.sortBudgetEvents)) data.sortBudgetEvents = [];
+
+    if (isInfraError(task)) {
+      // Infra path: do NOT touch entry.sortAttempt.
+      if (!Array.isArray(entry.infraSortAttempts)) entry.infraSortAttempts = [];
+      entry.infraSortAttempts.push({ ts, endpoint, blockedReason, category: 'infra-error' });
+      entry.infraSortAttemptCount = (entry.infraSortAttemptCount || 0) + 1;
+      const capHit = entry.infraSortAttemptCount > MAX_INFRA_SORT_ATTEMPTS;
+      // Explicit boolean so the field is well-defined even on the non-cap-hit path
+      // (an infra-skip leaves it false, not undefined -- consumers can rely on
+      // entry.infraSortExhausted === true as the sole eligibility gate either way).
+      entry.infraSortExhausted = capHit;
+      const sortAttemptAfter = entry.sortAttempt || 0; // unchanged: before === after
+      data.sortBudgetEvents.push({
+        ts,
+        action: capHit ? 'infra-cap-hit' : 'infra-skip',
+        endpoint,
+        blockedReason,
+        entryId,
+        sortAttemptBefore,
+        sortAttemptAfter,
+        category: 'infra-error',
+      });
+    } else {
+      // Content path: increment sortAttempt exactly as before.
+      // Eligibility: only bump if the entry is still eligible (not already exhausted
+      // via content attempts or infra exhaustion).
+      if (sortAttemptBefore >= 3) {
+        // Already ineligible on content budget -- record the event but do not bump further.
+        data.sortBudgetEvents.push({
+          ts,
+          action: 'content-cap-hit',
+          endpoint,
+          blockedReason,
+          entryId,
+          sortAttemptBefore,
+          sortAttemptAfter: sortAttemptBefore,
+          category: 'content-error',
+        });
+        writeJsonAtomicSync(brainDumpPath, data);
+        return;
+      }
+      if (entry.infraSortExhausted === true) {
+        // Ineligible due to infra exhaustion -- no further content bumps.
+        data.sortBudgetEvents.push({
+          ts,
+          action: 'content-skip-infra-exhausted',
+          endpoint,
+          blockedReason,
+          entryId,
+          sortAttemptBefore,
+          sortAttemptAfter: sortAttemptBefore,
+          category: 'content-error',
+        });
+        writeJsonAtomicSync(brainDumpPath, data);
+        return;
+      }
+      entry.sortAttempt = sortAttemptBefore + 1;
+      data.sortBudgetEvents.push({
+        ts,
+        action: 'content-skip',
+        endpoint,
+        blockedReason,
+        entryId,
+        sortAttemptBefore,
+        sortAttemptAfter: entry.sortAttempt,
+        category: 'content-error',
+      });
     }
+    writeJsonAtomicSync(brainDumpPath, data);
   } catch (e) {
     console.warn('[reject-retry-check] brain-dump sortAttempt bump failed:', e.message);
   }
@@ -239,7 +319,7 @@ function buildExhaustedFulfillmentQuestion(task) {
 // usually already moot by the time they exhaust (a later window supersedes it), not
 // something a human needs to individually triage -- see this session's own manual
 // retirement of 24 exhausted pipeline_debrief tasks for exactly that reasoning.
-const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief']);
+const REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED = new Set(['pipeline_forensics', 'pipeline_debrief', 'capability_debrief']);
 
 function isReviewVerdictAdvisoryProseSource(source) {
   return isAdvisoryProseSource(source) && !REVIEW_VERDICT_ADVISORY_PROSE_EXCLUDED.has(source);
@@ -475,7 +555,7 @@ function buildFeedbackString(ctx) {
   }
 }
 
-function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, repoRoot: repoRootOverride, recordModelOutcome = defaultRecordModelOutcome }) {
+function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsClarificationDir, deepDiveCoveragePath, brainDumpPath, pipelineDir, approvedDir, repoRoot: repoRootOverride, lanes: lanesOverride = null, recordModelOutcome = defaultRecordModelOutcome }) {
   const summary = { checked: 0, requeued: 0, exhausted: 0, recovered: 0, errors: 0 };
   // blockedDir is always <pipelineDir>/queue/blocked in every real caller -- this fallback
   // only matters for tests that don't bother passing pipelineDir explicitly (it was never
@@ -935,10 +1015,20 @@ function rejectRetryCheck({ blockedDir, pendingDir, adhocDir, derivedDir, needsC
         appendHistoryEvent(task, 'requeued', 'plan-pass degenerate -- cleared stale plan state for a fresh plan pass');
         // Steer the task away from the lane it degenerated on while another lane exists (premium-rotation.js): the P40 lane
         // kept re-claiming the same task and blocking it on a truncated plan, starving every task behind it.
-        let laneCount = 0;
-        try { laneCount = require('./lanes.js').getLanes().length; } catch (_) { laneCount = 0; }
-        const avoided = recordAvoidedLane(task, laneCount);
-        if (avoided) appendHistoryEvent(task, 'lane-avoided', `plan degenerated on ${avoided}; other lanes get first claim`);
+        // Tier rule (premium-rotation.js recordAvoidedLane): only a lane with a bigger lane above it is recorded. A degenerate plan on the BIGGEST lane records
+        // nothing (a block there would leave the task nowhere to go -- the stranded extend-the-doc premium task, 2026-10-17) and files a systemic side finding.
+        let lanes = [];
+        try { lanes = lanesOverride || require('./lanes.js').getLanes(); } catch (_) { lanes = []; }
+        const avoided = recordAvoidedLane(task, lanes.length, process.env, lanes);
+        if (avoided) {
+          appendHistoryEvent(task, 'lane-avoided', `plan degenerated on ${avoided}; other lanes get first claim`);
+        } else {
+          const finding = describeTopTierFailure(task, lanes);
+          if (finding) {
+            writeSideFindingInbox(finding, { source: 'lane_avoidance', taskId: task.id, stage: 'plan', pipelineDir });
+            appendHistoryEvent(task, 'advisory', `plan degenerated on the biggest lane; no lane avoidance recorded (nowhere bigger to go) -- filed a systemic side finding instead: ${finding.title}`);
+          }
+        }
       } else if (implementDegenerateBlock) {
         // The plan completed and is kept; only the unusable (empty / truncated) implement output is dropped.
         delete task.implementResponse;
@@ -984,7 +1074,7 @@ function main() {
   process.stdout.write(JSON.stringify(summary));
 }
 
-module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
+module.exports = { selectFeedbackBranch, buildFeedbackString, isCritiqueDegenerateBlock, rejectRetryCheck, stampBrainDumpSortExhausted, invalidPremiseBeforeCheckExisted, isReviewRejection, isPreCritiqueBlock, isPreImplementBlock, isDraftFailureBlock, isStructurallyOversizedDraftFailure, isPlanDegenerateBlock, isImplementDegenerateBlock, alreadyEscalatedSinceLastReadmission, computeBlockSignature, isReviewVerdictAdvisoryProseSource, buildExhaustedReviewVerdictQuestion };
 
 if (require.main === module) {
   main();

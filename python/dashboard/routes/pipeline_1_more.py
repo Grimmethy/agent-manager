@@ -1,5 +1,7 @@
 from flask import Blueprint, abort, jsonify, request
 
+import hashlib
+import os
 import time
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -14,6 +16,321 @@ import subprocess
 # pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)
 
 pipeline_1_more_bp = Blueprint("pipeline-1-more-bp", __name__)
+
+
+def _get_project_tests_command(repo_root: Path) -> str | None:
+    """Read the 'testsCommand' field from projects.json for the given repo root.
+    
+    Returns the command string if configured, None otherwise.
+    Each project keeps its own projects.json at its repo root (or one directory up).
+    """
+    import json
+    
+    # Check both repo_root and its parent for projects.json
+    candidates = [repo_root / "projects.json", (repo_root.parent) / "projects.json"]
+    projects_path = None
+    for candidate in candidates:
+        if candidate.is_file():
+            projects_path = candidate
+            break
+    
+    if not projects_path:
+        return None
+    
+    try:
+        projects = json.loads(projects_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    
+    if not isinstance(projects, list):
+        return None
+    
+    # Find the project matching this repo root
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        repo_path = project.get("repoRoot") or project.get("path")
+        if not repo_path:
+            continue
+        # Normalize paths for comparison
+        try:
+            if Path(repo_path).resolve() == repo_root.resolve():
+                return project.get("testsCommand")
+        except (OSError, ValueError):
+            # If resolve fails (e.g., path doesn't exist), do a simple string compare
+            if str(repo_path) == str(repo_root):
+                return project.get("testsCommand")
+    
+    return None
+
+
+def _run_project_tests(worktree_path: str, tests_command: str) -> dict:
+    """Run the project's tests command in the given worktree.
+    
+    Returns a dict with:
+    - passed: bool
+    - output: str (stdout+stderr combined)
+    - returncode: int
+    """
+    import subprocess
+    
+    try:
+        result = subprocess.run(
+            tests_command,
+            shell=True,
+            cwd=worktree_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300,  # 5 minute timeout
+        )
+        combined = (result.stdout or "") + (result.stderr or "")
+        return {
+            "passed": result.returncode == 0,
+            "output": combined,
+            "returncode": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "passed": False,
+            "output": "Tests timed out after 5 minutes",
+            "returncode": -1,
+        }
+    except Exception as e:
+        return {
+            "passed": False,
+            "output": f"Test execution failed: {str(e)}",
+            "returncode": -1,
+        }
+
+
+def _record_held_merge_history(repo_root: Path, branch: str, main_branch: str):
+    """Record a history line on the owning hub for this early merge.
+    
+    Best-effort: if we can't find the hub or write the history, silently continue.
+    No logging to avoid circular import with app.
+    """
+    import json
+    from datetime import datetime, timezone
+    
+    # Try to find the hub task by looking at the branch's trailers
+    hub_task_id = None
+    try:
+        log_output = subprocess.run(
+            ["git", "log", f"origin/{main_branch}..origin/{branch}", "--format=%b"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if log_output.returncode == 0:
+            # Extract Task: trailers from commit messages
+            import re
+            task_re = re.compile(r"^Task:\s*(\S+)", re.MULTILINE)
+            trailers = task_re.findall(log_output.stdout)
+            if trailers:
+                hub_task_id = trailers[0]
+    except Exception:
+        pass
+    
+    # Fallback: if no trailers found, look for any task file in done/
+    if not hub_task_id:
+        done_dir = repo_root / "queue" / "done"
+        if done_dir.is_dir():
+            task_files = list(done_dir.glob("*.json"))
+            if task_files:
+                # Use the first task file found
+                hub_task_id = task_files[0].stem
+    
+    if not hub_task_id:
+        return
+    
+    hub_path = repo_root / "queue" / "done" / f"{hub_task_id}.json"
+    
+    if not hub_path.is_file():
+        return
+    
+    try:
+        data = json.loads(hub_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        
+        history = data.get("history")
+        if not isinstance(history, list):
+            history = data["history"] = []
+        
+        history.append({
+            "stage": "earlyMerge",
+            "at": datetime.now(timezone.utc).isoformat(),
+            "detail": f"held branch {branch} merged early into {main_branch}",
+        })
+        
+        hub_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+@pipeline_1_more_bp.route("/api/git/held-hub-branches/<path:branch>/merge-early", methods=["POST"])
+def api_git_merge_held_hub_branch_early(branch):
+    """Merge a held hub branch into master early, optionally bringing downstream held branches up to date.
+
+    Used when a held hub branch needs files from another hub's held branch (e.g. HUB0008-03 needed
+    accounts.py from HUB0006's branch). Unlike the regular merge route, this:
+    - Verifies the branch is a held hub branch (not just any unmerged branch)
+    - Requires a testsCommand to be configured on the project
+    - Runs tests on a scratch worktree before pushing
+    - Optionally merges the new master into other held hub branches (alsoUpdate)
+    - Never uses force push for downstream branches (fast-forward only)
+
+    Returns {merged: bool, updated: [str], testsRun: bool} on success, 409 on refusal.
+    """
+    from app import (
+        _acquire_apply_lock,
+        _release_apply_lock,
+        _run_git,
+        get_active_repo_root,
+        list_unmerged_branches,
+        logger,
+        partition_held_hub_branches,
+    )
+    import shutil
+    import tempfile
+
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+
+    body = request.get_json(silent=True) or {}
+    also_update = body.get("alsoUpdate", []) or []
+    if not isinstance(also_update, list):
+        abort(400, description="alsoUpdate must be an array")
+
+    # Acquire the apply lock (same as api_git_merge_branch)
+    try:
+        lock_fd = _acquire_apply_lock()
+    except RuntimeError as e:
+        abort(409, description=f"the pipeline is mid-apply right now -- try again in a few seconds")
+
+    try:
+        # Verify branch is a held hub branch
+        branches = list_unmerged_branches(force=True)
+        listed, held_groups = partition_held_hub_branches(branches)
+        held_branches = []
+        for g in held_groups:
+            held_branches.extend(g["branches"])
+        
+        if branch not in held_branches:
+            return jsonify({
+                "succeeded": False,
+                "reason": f"'{branch}' is not a currently-listed held hub branch"
+            }), 409
+
+        # Check if testsCommand is configured
+        tests_command = _get_project_tests_command(repo_root)
+        if not tests_command:
+            return jsonify({
+                "succeeded": False,
+                "reason": "no tests command configured for this project -- set 'testsCommand' in projects.json"
+            }), 409
+
+        # Merge into master on a scratch worktree
+        tmp_dir = tempfile.mkdtemp(prefix="am-merge-early-")
+        scratch_wt = os.path.join(tmp_dir, "scratch")
+        main_branch = _detect_main_branch(repo_root)
+        
+        try:
+            # Create scratch worktree from origin/main
+            _run_git(["worktree", "add", "--detach", scratch_wt, f"origin/{main_branch}"], repo_root)
+            
+            # Merge the held branch
+            try:
+                _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {branch} (early merge via dashboard)"], scratch_wt)
+            except RuntimeError as e:
+                # Abort the merge and clean up
+                subprocess.run(["git", "merge", "--abort"], cwd=scratch_wt, capture_output=True, timeout=15)
+                return jsonify({
+                    "succeeded": False,
+                    "reason": f"merge conflict: {str(e)}"
+                }), 409
+
+            # Run tests on the merged result
+            test_output = _run_project_tests(scratch_wt, tests_command)
+            if not test_output.get("passed"):
+                return jsonify({
+                    "succeeded": False,
+                    "reason": f"tests failed: {test_output.get('output', '')[:500]}",
+                    "testsRun": True,
+                    "testsOutput": test_output.get("output", "")
+                }), 400
+
+            # Push merged result to origin/main
+            _run_git(["push", "origin", f"HEAD:{main_branch}"], scratch_wt)
+            
+            updated = []
+            tests_run = True
+
+            # For each alsoUpdate branch, merge new master into it
+            for update_branch in also_update:
+                if update_branch not in held_branches:
+                    logger.warning("alsoUpdate branch %r is not a held hub branch, skipping", update_branch)
+                    continue
+                
+                update_tmp_dir = tempfile.mkdtemp(prefix="am-update-")
+                update_wt = os.path.join(update_tmp_dir, "wt")
+                try:
+                    # Create scratch worktree from the update branch
+                    _run_git(["worktree", "add", "--detach", update_wt, f"origin/{update_branch}"], repo_root)
+                    
+                    # Merge main into it (fast-forward only, never force)
+                    try:
+                        _run_git(["merge", "--ff-only", f"origin/{main_branch}"], update_wt)
+                    except RuntimeError as e:
+                        logger.warning("Could not fast-forward %r with main: %s", update_branch, e)
+                        continue
+                    
+                    # Run tests on the updated branch
+                    update_test_output = _run_project_tests(update_wt, tests_command)
+                    if not update_test_output.get("passed"):
+                        logger.warning("Tests failed on %r after updating with main, not pushing", update_branch)
+                        continue
+                    
+                    # Push (fast-forward only)
+                    _run_git(["push", "origin", f"HEAD:{update_branch}"], update_wt)
+                    updated.append(update_branch)
+                finally:
+                    # Clean up scratch worktree
+                    try:
+                        _run_git(["worktree", "remove", "--force", update_wt], repo_root)
+                    except RuntimeError:
+                        pass
+                    shutil.rmtree(update_tmp_dir, ignore_errors=True)
+
+            # Record history on the owning hub
+            _record_held_merge_history(repo_root, branch, main_branch)
+
+            return jsonify({
+                "succeeded": True,
+                "merged": True,
+                "updated": updated,
+                "testsRun": tests_run,
+                "branch": branch,
+                "mainBranch": main_branch
+            })
+        finally:
+            # Clean up the main scratch worktree
+            try:
+                _run_git(["worktree", "remove", "--force", scratch_wt], repo_root)
+            except RuntimeError:
+                pass
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            try:
+                _run_git(["worktree", "prune"], repo_root)
+            except RuntimeError:
+                pass
+    finally:
+        _release_apply_lock(lock_fd)
+
 
 @pipeline_1_more_bp.route("/api/pipeline/status")
 def api_pipeline_status():
@@ -81,9 +398,21 @@ def api_git_unmerged_branches():
     branches = list_unmerged_branches(force=False)
     with _branch_cache_lock:
         filled = _branch_cache["at"]
+    pending = []
+    if request.args.get("projects") == "all":
+        # Every registered project, active first, each row tagged with its `project`. The default (no param) stays the active project's bare list: the verdict/merge
+        # tooling and the verify-unmerged-branches skill read it and act on the active repo only.
+        import branch_projects
+        from app import get_active_repo_root
+        branches, pending = branch_projects.combined_branches(branches, get_active_repo_root())
     resp = jsonify(branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
-    return resp
+    resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
+    # The tab polls this every 15 s and the ~140 KB list is almost always unchanged: tag it so an unchanged list is answered with a body-less 304 (the browser revalidates by itself
+    # under no-cache). The pending header is part of the tag because the tab reads it (branchProjectsPending); the cache-age header changes every call and is left out.
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode()).hexdigest())
+    return resp.make_conditional(request)
 
 
 @pipeline_1_more_bp.route("/api/git/held-hub-branches")
@@ -104,14 +433,26 @@ def api_git_branch_commits(branch):
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
     repo_root = Path(repo_root)
+    pipeline_dir = get_pipeline_dir()
 
     # Same "only act on what we ourselves already offered" gate api_git_merge_branch
     # uses -- never trust a caller-supplied branch string as a raw git ref beyond what
     # this process already enumerated itself.
-    branches = list_unmerged_branches(force=False)
-    match = next((b for b in branches if b["branch"] == branch), None)
-    if not match:
-        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
+    other_root = request.args.get("project")
+    if other_root and os.path.realpath(other_root) != os.path.realpath(str(repo_root)):
+        # A branch of another registered project (the tab's all-projects view): same gate against THAT project's cached list, read from its own repo and queue.
+        import branch_projects
+        real, match = branch_projects.find_other_project_branch(other_root, branch)
+        if not match:
+            abort(404, description=f"'{branch}' is not a currently-listed branch of project '{other_root}'")
+        repo_root = Path(real)
+        project = next((p for p in branch_projects.registered_projects(str(repo_root)) if p["repoRoot"] == real), None)
+        pipeline_dir = Path(project["pipelineDir"]) if project else repo_root
+    else:
+        branches = list_unmerged_branches(force=False)
+        match = next((b for b in branches if b["branch"] == branch), None)
+        if not match:
+            abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 
     main_branch = match["mainBranch"]
     fmt = _COMMIT_LOG_FIELD_SEP.join(["%H", "%an", "%aI", "%s", "%b"]) + _COMMIT_LOG_RECORD_SEP
@@ -143,8 +484,7 @@ def api_git_branch_commits(branch):
     # `Task: <id>` trailer -- the commit body alone is just the final message, not the
     # plan / draft tiers / review votes / disposition the operator actually wants when
     # deciding whether to merge. Plus the owning coordinator hub, if any.
-    pd = get_pipeline_dir()
-    qdir = (pd / "queue") if pd else None
+    qdir = (pipeline_dir / "queue") if pipeline_dir else None
     commit_task_ids = []
     for c in commits:
         m = _TASK_TRAILER_RE.search(c["body"] or "")
@@ -180,7 +520,7 @@ class MergeLockBusy(Exception):
 # import; by the time a helper runs, app.py is fully initialised and the import is a dict
 # lookup (and tests patch these names on `app`). ---
 
-def _validate_and_authorize_merge(repo_root, branch, force):
+def _validate_and_authorize_merge(repo_root, branch, force, scope=None):
     """Step 1: prove this branch is one THIS process itself offered, then run the two
     409 gates (unmerged hub sibling that would conflict, then a hub that is not finished).
 
@@ -193,7 +533,11 @@ def _validate_and_authorize_merge(repo_root, branch, force):
     # process already enumerated itself -- re-derive the current list (cheap: cached
     # unless stale) and require an exact match, the same "only act on what we ourselves
     # already offered" gate api_task_archive/api_task_requeue's state allowlists use.
-    branches = list_unmerged_branches(force=True)
+    if scope:
+        import branch_projects
+        branches = branch_projects.refresh_branches(scope)  # another project: gate on ITS list as it is right now
+    else:
+        branches = list_unmerged_branches(force=True)
     match = next((b for b in branches if b["branch"] == branch), None)
     if not match:
         raise LookupError(f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
@@ -233,7 +577,52 @@ def _validate_and_authorize_merge(repo_root, branch, force):
             '{"force": true} only if you have verified the branch is actually complete.'
         )
 
-    return {"match": match, "main_branch": match["mainBranch"], "repo_root": repo_root}
+    return {"match": match, "main_branch": match["mainBranch"], "repo_root": repo_root, "scope": scope}
+
+
+def _merge_conflict_error(match, main_branch, merge_err):
+    """The error to raise when `git merge` failed. match['willConflict']/['conflictFiles'] came from list_unmerged_branches's own merge-tree preview a moment
+    ago (same request, force-refreshed above) -- if it already predicted this exact outcome, say so plainly instead of surfacing raw git stderr. Confirmed live
+    2026-08-18: an add/add conflict between two independently-drafted candidate docs produced exactly this kind of opaque failure with no indication of WHICH
+    files or WHY. Returns the exception to raise (the original when the preview did not predict it)."""
+    if match.get("willConflict") and match.get("conflictFiles"):
+        files = ", ".join(match["conflictFiles"])
+        err = RuntimeError(
+            f"conflicts with {main_branch} on: {files} -- this was flagged before you clicked merge; "
+            f"resolve by hand (e.g. combine both versions) rather than retrying, retrying will fail the same way"
+        )
+        err.__cause__ = merge_err
+        return err
+    return merge_err
+
+
+def _merge_in_temp_worktree(repo_root, main_branch, match):
+    """Merge origin/<branch> into origin/<main> and push, WITHOUT touching repo_root's working tree, current branch or index: a detached worktree under the
+    system temp dir is cut from origin/<main>, the merge commit is made there and pushed as HEAD:<main>, and the worktree is removed on every path."""
+    import shutil
+    import tempfile
+    from app import _run_git, logger
+
+    tmp = tempfile.mkdtemp(prefix="am-merge-")
+    wt = os.path.join(tmp, "wt")
+    try:
+        _run_git(["worktree", "add", "--detach", wt, f"origin/{main_branch}"], repo_root)
+        try:
+            _run_git(["merge", "--no-ff", f"origin/{match['branch']}", "-m", f"Merge {match['title']} (via dashboard)"], wt)
+        except RuntimeError as merge_err:
+            subprocess.run(["git", "merge", "--abort"], cwd=wt, capture_output=True, timeout=15)
+            raise _merge_conflict_error(match, main_branch, merge_err)
+        _run_git(["push", "origin", f"HEAD:{main_branch}"], wt)
+    finally:
+        try:
+            _run_git(["worktree", "remove", "--force", wt], repo_root)
+        except RuntimeError as e:
+            logger.warning("Non-fatal: could not remove the temp merge worktree %s: %s", wt, e)
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            _run_git(["worktree", "prune"], repo_root)
+        except RuntimeError:
+            pass
 
 
 def _execute_git_merge(context):
@@ -249,9 +638,11 @@ def _execute_git_merge(context):
     match = context["match"]
     main_branch = context["main_branch"]
     branch = match["branch"]
+    scope = context.get("scope")
+    qdir = scope["qdir"] if scope else queue_dir()  # another project's merge records into THAT project's queue
 
     try:
-        lock_fd = _acquire_apply_lock()
+        lock_fd = _acquire_apply_lock()  # the one global apply lock: apply-task.sh flocks the same file for every project
     except RuntimeError as exc:
         raise MergeLockBusy(str(exc)) from exc
     try:
@@ -261,33 +652,26 @@ def _execute_git_merge(context):
         snapshot = {}
         try:
             from branch_removals import snapshot_branch
-            snapshot = snapshot_branch(_run_git, repo_root, main_branch, branch, None, queue_dir(), keep_ref=False)
+            snapshot = snapshot_branch(_run_git, repo_root, main_branch, branch, None, qdir, keep_ref=False)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Non-fatal: could not snapshot %r before merging it: %s", branch, exc)
-        _run_git(["checkout", main_branch], repo_root)
-        _run_git(["reset", "--hard", f"origin/{main_branch}"], repo_root)
-        try:
-            _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {match['title']} (via dashboard)"], repo_root)
-        except RuntimeError as merge_err:
-            subprocess.run(["git", "merge", "--abort"], cwd=str(repo_root), capture_output=True, timeout=15)
-            # match['willConflict']/['conflictFiles'] came from list_unmerged_branches's
-            # own merge-tree preview a moment ago (same request, force-refreshed above) --
-            # if it already predicted this exact outcome, say so plainly instead of
-            # surfacing raw git stderr. Confirmed live 2026-08-18: an add/add conflict
-            # between two independently-drafted candidate docs produced exactly this kind
-            # of opaque failure with no indication of WHICH files or WHY.
-            if match.get("willConflict") and match.get("conflictFiles"):
-                files = ", ".join(match["conflictFiles"])
-                raise RuntimeError(
-                    f"conflicts with {main_branch} on: {files} -- this was flagged before you clicked merge; "
-                    f"resolve by hand (e.g. combine both versions) rather than retrying, retrying will fail the same way"
-                ) from merge_err
-            raise merge_err
-        _run_git(["push", "origin", main_branch], repo_root)
+        if scope:
+            # Another project's merge never runs checkout or reset --hard in that project's own working tree (it may hold uncommitted work): it merges in a
+            # throwaway worktree cut from origin/<main> and pushes that.
+            _merge_in_temp_worktree(repo_root, main_branch, match)
+        else:
+            _run_git(["checkout", main_branch], repo_root)
+            _run_git(["reset", "--hard", f"origin/{main_branch}"], repo_root)
+            try:
+                _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {match['title']} (via dashboard)"], repo_root)
+            except RuntimeError as merge_err:
+                subprocess.run(["git", "merge", "--abort"], cwd=str(repo_root), capture_output=True, timeout=15)
+                raise _merge_conflict_error(match, main_branch, merge_err)
+            _run_git(["push", "origin", main_branch], repo_root)
         try:
             _run_git(["push", "origin", "--delete", branch], repo_root)
             from branch_removals import record_branch_removal
-            record_branch_removal(queue_dir(), branch, "merged", task_id=branch.removeprefix("agent/"),
+            record_branch_removal(qdir, branch, "merged", task_id=branch.removeprefix("agent/"),
                                   detail=f"merged into {main_branch} via the dashboard", actor="dashboard-merge",
                                   snapshot=snapshot or None)
         except RuntimeError as e:
@@ -304,19 +688,28 @@ def _apply_post_merge_side_effects(context):
     """Step 3: drop the now-stale unmerged-branch list cache and fast-forward the
     dashboard's own checkout to the new main tip (see app.py's _sync_live_checkout for
     the safety rules around a dirty PACKAGE_ROOT). Returns the live-sync result."""
-    from app import _invalidate_branch_cache, _sync_live_checkout
+    from app import PACKAGE_ROOT, _invalidate_branch_cache, _sync_live_checkout
 
+    scope = context.get("scope")
+    if scope:
+        import branch_projects
+        branch_projects.after_action(scope)
+        # Only the dashboard's OWN repo is fast-forwarded (and may restart the dashboard); another project's checkout is left exactly as it is.
+        if os.path.realpath(str(scope["repoPath"])) != os.path.realpath(str(PACKAGE_ROOT)):
+            return {"skipped": "not the dashboard's own repo"}
+        return _sync_live_checkout(context["main_branch"])
     _invalidate_branch_cache()
     return _sync_live_checkout(context["main_branch"])
 
 
-def _record_merge_in_task_file(branch, main_branch):
+def _record_merge_in_task_file(branch, main_branch, qdir=None):
     """Step 4a: stamp mergedAt + a terminal `merged` history/disposition on the task's
     queue record, in whichever done/ location it sits. No-op without a queue dir or a
     record; re-raises OSError if the write-back fails (the merge itself already succeeded,
     but losing the record is a real, reportable failure)."""
     from app import logger, queue_dir, read_json_safe
 
+    # `qdir` is another project's queue dir (a merge from that project's card); None = the active project's.
     # Stamp mergedAt on the task record once its branch is actually merged (2026-08-22,
     # Grimmethy: "some way to prioritize what order adhoc tasks get completed in. Those
     # with dependencies on new adhoc tasks are absolutely going to need to be done after
@@ -326,7 +719,7 @@ def _record_merge_in_task_file(branch, main_branch):
     # OWN branch, not merged, and every adhoc draft's git worktree starts from
     # origin/<mainBranch>. Best-effort when no record exists (already archived, or this
     # merge came from some source other than the normal apply flow).
-    qdir = queue_dir()
+    qdir = qdir or queue_dir()
     if not qdir:
         return
     task_id = branch.removeprefix("agent/")
@@ -358,7 +751,7 @@ def _record_merge_in_task_file(branch, main_branch):
             break
 
 
-def _record_merge_in_task_log(repo_root, branch, main_branch):
+def _record_merge_in_task_log(repo_root, branch, main_branch, qdir=None):
     """Step 4b: close out the LOCAL task-logs/<id>.json snapshot (src/task-log-store.js),
     not just the queue/ working copy -- that file is gitignored and gets archived/pruned,
     while task-logs/<id>.json is a durable local snapshot that survives it, and this is the
@@ -371,7 +764,7 @@ def _record_merge_in_task_log(repo_root, branch, main_branch):
     Skipped, like step 4a, when there is no queue dir."""
     from app import logger, queue_dir, read_json_safe
 
-    if not queue_dir():
+    if not (qdir or queue_dir()):
         return
     task_id = branch.removeprefix("agent/")
     task_log_path = repo_root / "task-logs" / f"{task_id}.json"
@@ -403,10 +796,19 @@ def api_git_merge_branch(branch):
     if not repo_root:
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
     repo_root = Path(repo_root)
-    force = bool((request.get_json(silent=True) or {}).get("force"))
+    body = request.get_json(silent=True) or {}
+    force = bool(body.get("force"))
+    # Optional project (the card's repoRoot): act on THAT project. Absent = the active project, exactly as before; unknown = 404, never a fallback.
+    import branch_projects
+    try:
+        scope = branch_projects.resolve_scope(request.args.get("project") or body.get("project"), str(repo_root))
+    except LookupError as e:
+        abort(404, description=str(e))
+    if scope:
+        repo_root = scope["repoPath"]
 
     try:
-        context = _validate_and_authorize_merge(repo_root, branch, force)
+        context = _validate_and_authorize_merge(repo_root, branch, force, scope)
     except LookupError as e:
         abort(404, description=str(e))
     except PermissionError as e:
@@ -420,10 +822,35 @@ def api_git_merge_branch(branch):
         return jsonify({"succeeded": False, "reason": str(e)}), 500
 
     live_sync = _apply_post_merge_side_effects(context)
-    _record_merge_in_task_file(branch, context["main_branch"])
-    _record_merge_in_task_log(repo_root, branch, context["main_branch"])
+    qdir = scope["qdir"] if scope else None
+    _record_merge_in_task_file(branch, context["main_branch"], qdir)
+    _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir)
 
-    return jsonify({"succeeded": True, "branch": branch, "mainBranch": context["main_branch"], "liveSync": live_sync})
+    # Check which plugins are behind after merge (if the merged repo is a plugin's repo).
+    # Mirrors the pattern in routes/plugins.py: iterate manifest, call behind_checkout,
+    # set restartNeeded field on each plugin entry.
+    restart_needed = []
+    try:
+        from app import _read_plugins_manifest
+        import plugin_process_manager
+        manifest = _read_plugins_manifest()
+        pm = plugin_process_manager.PluginProcessManager()
+        for p in manifest:
+            if p.get("slot") or p.get("processName"):
+                behind_info = pm.behind_checkout(p)
+                p["restartNeeded"] = bool(behind_info.get("behind"))
+                if behind_info.get("behind"):
+                    restart_needed.append(p.get("name") or p.get("slot") or str(p))
+    except Exception:
+        logger.warning("Non-fatal: could not check plugin behind-status after merge", exc_info=True)
+
+    return jsonify({
+        "succeeded": True,
+        "branch": branch,
+        "mainBranch": context["main_branch"],
+        "liveSync": live_sync,
+        "restartNeeded": restart_needed,
+    })
 
 
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/discard", methods=["POST"])
@@ -447,9 +874,21 @@ def api_git_discard_branch(branch):
         abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
     repo_root = Path(repo_root)
 
+    # Optional project (the card's repoRoot): act on THAT project's repo, queue and remote. Absent = the active project, exactly as before; unknown = 404.
+    import branch_projects
+    body_in = request.get_json(silent=True)
+    body_in = body_in if isinstance(body_in, dict) else {}
+    try:
+        scope = branch_projects.resolve_scope(request.args.get("project") or body_in.get("project"), str(repo_root))
+    except LookupError as e:
+        abort(404, description=str(e))
+    if scope:
+        repo_root = scope["repoPath"]
+    qdir_for = (lambda: scope["qdir"]) if scope else queue_dir
+
     # Same "only act on what we ourselves already offered" gate api_git_merge_branch/
-    # api_task_archive/api_task_requeue all already use.
-    branches = list_unmerged_branches(force=True)
+    # api_task_archive/api_task_requeue all already use (another project: ITS list, recomputed now).
+    branches = branch_projects.refresh_branches(scope) if scope else list_unmerged_branches(force=True)
     match = next((b for b in branches if b["branch"] == branch), None)
     if not match:
         abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
@@ -467,7 +906,7 @@ def api_git_discard_branch(branch):
     snapshot, reason = {}, ""
     try:
         from branch_removals import snapshot_branch
-        snapshot = snapshot_branch(_run_git, repo_root, match.get("mainBranch") or "main", branch, match.get("headSha"), queue_dir(), keep_ref=True)
+        snapshot = snapshot_branch(_run_git, repo_root, match.get("mainBranch") or "main", branch, match.get("headSha"), qdir_for(), keep_ref=True)
         body = request.get_json(silent=True)
         reason = str(body.get("reason") or "").strip() if isinstance(body, dict) else ""
         if not reason:
@@ -488,7 +927,7 @@ def api_git_discard_branch(branch):
             if "remote ref does not exist" not in str(e) and "unable to delete" not in str(e).lower():
                 raise
         from branch_removals import record_branch_removal
-        record_branch_removal(queue_dir(), branch, "discarded", task_id=branch.removeprefix("agent/"),
+        record_branch_removal(qdir_for(), branch, "discarded", task_id=branch.removeprefix("agent/"),
                               detail="discarded via the dashboard Unmerged Branches tab", actor="dashboard-discard",
                               reason=reason or None, snapshot=snapshot or None)
         # Also drop the LOCAL copy (only reached when the remote delete succeeded or the ref was
@@ -505,7 +944,7 @@ def api_git_discard_branch(branch):
     # already-archived (a human archived it by hand first, or a duplicate click) is a
     # silent no-op, not a 409 -- the branch delete above is the part that mattered.
     task_archived = False
-    qdir = queue_dir()
+    qdir = qdir_for()
     if qdir:
         task_id = branch.removeprefix("agent/")
         done_path = qdir / "done" / f"{task_id}.json"
@@ -537,6 +976,9 @@ def api_git_discard_branch(branch):
         elif archived_path.is_file():
             task_archived = True  # already archived (e.g. by hand) -- nothing more to do
 
-    _invalidate_branch_cache()
+    if scope:
+        branch_projects.after_action(scope)
+    else:
+        _invalidate_branch_cache()
     return jsonify({"succeeded": True, "branch": branch, "taskArchived": task_archived, "localBranch": local_branch,
                     "snapshotRef": (snapshot or {}).get("snapshotRef")})

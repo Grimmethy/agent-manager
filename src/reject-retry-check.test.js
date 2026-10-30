@@ -1785,3 +1785,165 @@ test('a too-few split block is NOT re-admitted when the draft retry already ran,
     assert.ok(fs.existsSync(path.join(d.blockedDir, `${id}.json`)));
   }
 });
+
+test('rejectRetryCheck: a plan-degenerate block on the BIGGEST lane records no avoidLanes and files one deterministic systemic side finding', () => {
+  const lanes = [
+    { id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', tier: 27, taskClasses: null },
+    { id: 'worker-rx580', model: 'qwen3-vl:8b-instruct', tier: 8, taskClasses: ['brain_dump_sort'] },
+  ];
+  const { root, blockedDir, pendingDir } = setupDirs();
+  for (const id of ['top-a', 'top-b']) {
+    writeBlockedTask(blockedDir, id, {
+      status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+      planResponse: 'a truncated, unusable plan',
+      draftAttempts: [{ outcome: 'blocked', lane: 'worker-3090', finishedAt: new Date().toISOString() }],
+    });
+  }
+  rejectRetryCheck({ blockedDir, pendingDir, pipelineDir: root, lanes, recordModelOutcome: () => {} });
+  const a = JSON.parse(fs.readFileSync(path.join(pendingDir, 'top-a.json'), 'utf8'));
+  assert.equal(a.avoidLanes, undefined, 'the biggest lane must never be recorded');
+  assert.ok(a.history.some((h) => h.stage === 'advisory' && /filed a systemic side finding/.test(h.detail || '')));
+  assert.ok(!a.history.some((h) => h.stage === 'lane-avoided'));
+  const inbox = path.join(root, 'queue', 'side-findings-inbox');
+  const files = fs.readdirSync(inbox).filter((f) => f.endsWith('.json'));
+  assert.equal(files.length, 2, 'one inbox entry per blocked task...');
+  const recs = files.map((f) => JSON.parse(fs.readFileSync(path.join(inbox, f), 'utf8')));
+  assert.equal(recs[0].title, recs[1].title, '...with identical text, so the side-finding sweep merges them into one entry');
+  assert.equal(recs[0].body, recs[1].body);
+  assert.deepEqual(recs.map((r) => r.taskId).sort(), ['top-a', 'top-b'], 'the task id lives in the metadata, not the text');
+  assert.equal(recs[0].source, 'lane_avoidance');
+});
+
+test('rejectRetryCheck: the same block on a lower-tier lane records avoidLanes and files no side finding', () => {
+  const lanes = [
+    { id: 'worker-3090', model: 'qwen3.8:27b-q4_K_M', tier: 27, taskClasses: null },
+    { id: 'worker-rx580', model: 'qwen3-vl:8b-instruct', tier: 8, taskClasses: ['brain_dump_sort'] },
+  ];
+  const { root, blockedDir, pendingDir } = setupDirs();
+  writeBlockedTask(blockedDir, 'low-a', {
+    status: 'pending', blockedStage: 'plan', blockedReason: 'Plan pass degenerate: truncated', localRejectCount: 0,
+    draftAttempts: [{ outcome: 'blocked', lane: 'worker-rx580', finishedAt: new Date().toISOString() }],
+  });
+  rejectRetryCheck({ blockedDir, pendingDir, pipelineDir: root, lanes, recordModelOutcome: () => {} });
+  const a = JSON.parse(fs.readFileSync(path.join(pendingDir, 'low-a.json'), 'utf8'));
+  assert.deepEqual(a.avoidLanes, ['worker-rx580']);
+  assert.ok(!fs.existsSync(path.join(root, 'queue', 'side-findings-inbox')) || fs.readdirSync(path.join(root, 'queue', 'side-findings-inbox')).length === 0);
+});
+
+// --- HUB0198 1/3: the infra-skip path of stampBrainDumpSortExhausted ----------------
+// An infra-attributed draft failure must NOT consume the content sort-attempt budget
+// (entry.sortAttempt). It gets its own counter (entry.infraSortAttemptCount) bounded by
+// MAX_INFRA_SORT_ATTEMPTS, records an 'infra-skip' sortBudgetEvent, and only marks
+// infraSortExhausted once that counter EXCEEDS the cap. isInfraError is stubbed to true
+// via a require.cache injection of blocked-task-classifiers.js (the exact predicate
+// stampBrainDumpSortExhausted's gate keys on), and the real classifier module is restored
+// in t.after so no later test sees the stub.
+test('stampBrainDumpSortExhausted: an infra-attributed exhaustion is an infra-skip (sortAttempt untouched, infraSortAttemptCount 1, not exhausted)', (t) => {
+  const classifiersPath = require.resolve('./blocked-task-classifiers.js');
+  const checkPath = require.resolve('./reject-retry-check.js');
+
+  const realClassifierExports = require(classifiersPath);
+  const brainDumpPath = path.join(os.tmpdir(), 'brain-dump.json');
+
+  // A fresh brain dump with one captured entry -- sortAttempt 0, id 'e1'.
+  fs.writeFileSync(brainDumpPath, JSON.stringify({ entries: [{ id: 'e1', sortAttempt: 0 }] }));
+
+  // Stub isInfraError -> true. reject-retry-check.js DESTRUCTURES isInfraError at load time
+  // (const { isInfraError } = require(...)), so the stub only reaches it after we force that
+  // module to re-require: inject the stub, drop the cached module, pull a fresh instance
+  // whose gate now consults the stub.
+  const stubbed = { ...realClassifierExports, isInfraError: () => true };
+  require.cache[classifiersPath].exports = stubbed;
+  delete require.cache[checkPath];
+  const { stampBrainDumpSortExhausted } = require(checkPath);
+
+  t.after(() => {
+    // Restore the real classifier and a real reject-retry-check instance in the cache so no
+    // later test sees the stub, and drop the temp brain-dump.json so it does not leak.
+    require.cache[classifiersPath].exports = realClassifierExports;
+    delete require.cache[checkPath];
+    require(checkPath);
+    if (fs.existsSync(brainDumpPath)) fs.rmSync(brainDumpPath, { force: true });
+  });
+
+  const task = {
+    source: 'brain_dump_sort',
+    promptContext: { brainDumpEntryId: 'e1' },
+    blockedReason: 'ECONNRESET mid-draft',
+  };
+  stampBrainDumpSortExhausted(task, brainDumpPath);
+
+  const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+  const entry = data.entries.find((e) => e && e.id === 'e1');
+  assert.ok(entry, 'the brain-dump entry e1 is still present');
+  assert.equal(entry.sortAttempt, 0, 'an infra-skip must not consume the content sort-attempt budget');
+  assert.equal(entry.infraSortAttemptCount, 1, 'the infra counter advances by exactly one');
+  assert.equal(entry.infraSortExhausted, false, 'a single infra-skip must not exhaust the infra budget');
+  assert.ok(Array.isArray(data.sortBudgetEvents) && data.sortBudgetEvents.length >= 1, 'a sortBudgetEvents record is written');
+  const ev = data.sortBudgetEvents.find((e) => e.entryId === 'e1');
+  assert.ok(ev, 'the sortBudgetEvents record names entry id e1');
+  assert.equal(ev.action, 'infra-skip');
+  assert.equal(ev.category, 'infra-error');
+  assert.equal(ev.sortAttemptBefore, 0);
+  assert.equal(ev.sortAttemptAfter, 0, 'sortAttempt is unchanged before and after the infra-skip');
+});
+
+// --- HUB0198 2/3: the content path of stampBrainDumpSortExhausted ----------------
+// When isInfraError is FALSE the failure is a CONTENT failure and it consumes the content
+// sort-attempt budget (entry.sortAttempt): each call bumps sortAttempt 0 -> 1 -> 2 -> 3
+// (recording a 'content-skip' event), leaving the entry ineligible (sortAttempt >= 3).
+// No infra counter (infraSortAttemptCount) and no 'infra-skip' / 'infra-cap-hit'
+// sortBudgetEvent may be recorded for it. isInfraError is stubbed to false via a
+// require.cache injection of blocked-task-classifiers.js (the exact predicate
+// stampBrainDumpSortExhausted's gate keys on), and the real classifier module is
+// restored in t.after so no later test sees the stub.
+test('stampBrainDumpSortExhausted: a content failure drives sort-attempt exhaustion (sortAttempt reaches 3, no infra counters/events)', (t) => {
+  const classifiersPath = require.resolve('./blocked-task-classifiers.js');
+  const checkPath = require.resolve('./reject-retry-check.js');
+
+  const realClassifierExports = require(classifiersPath);
+  const brainDumpPath = path.join(os.tmpdir(), 'brain-dump.json');
+
+  // A fresh brain dump with one captured entry -- sortAttempt 0, id 'e2'.
+  fs.writeFileSync(brainDumpPath, JSON.stringify({ entries: [{ id: 'e2', sortAttempt: 0 }] }));
+
+  // Stub isInfraError -> false. reject-retry-check.js DESTRUCTURES isInfraError at load
+  // time (const { isInfraError } = require(...)), so the stub only reaches it after we
+  // force that module to re-require: inject the stub, drop the cached module, pull a
+  // fresh instance whose gate now consults the stub.
+  const stubbed = { ...realClassifierExports, isInfraError: () => false };
+  require.cache[classifiersPath].exports = stubbed;
+  delete require.cache[checkPath];
+  const { stampBrainDumpSortExhausted } = require(checkPath);
+
+  t.after(() => {
+    // Restore the real classifier and a real reject-retry-check instance in the cache so
+    // no later test sees the stub, and drop the temp brain-dump.json so it does not leak.
+    require.cache[classifiersPath].exports = realClassifierExports;
+    delete require.cache[checkPath];
+    require(checkPath);
+    if (fs.existsSync(brainDumpPath)) fs.rmSync(brainDumpPath, { force: true });
+  });
+
+  const task = {
+    source: 'brain_dump_sort',
+    promptContext: { brainDumpEntryId: 'e2' },
+    blockedReason: 'content draft rejected by critique',
+  };
+  // Three content failures: sortAttempt 0 -> 1 -> 2 -> 3.
+  stampBrainDumpSortExhausted(task, brainDumpPath);
+  stampBrainDumpSortExhausted(task, brainDumpPath);
+  stampBrainDumpSortExhausted(task, brainDumpPath);
+
+  const data = JSON.parse(fs.readFileSync(brainDumpPath, 'utf8'));
+  const entry = data.entries.find((e) => e && e.id === 'e2');
+  assert.ok(entry, 'the brain-dump entry e2 is still present');
+  assert.equal(entry.sortAttempt, 3, 'three content failures each consume one sort-attempt');
+  assert.ok(entry.sortAttempt >= 3, 'the entry is now ineligible on the content sort-attempt budget');
+  assert.ok(entry.infraSortAttemptCount === 0 || entry.infraSortAttemptCount === undefined, 'no infra counter is touched on the content path');
+  assert.ok(entry.infraSortExhausted !== true, 'the entry is not marked infra-exhausted');
+  assert.ok(Array.isArray(data.sortBudgetEvents) && data.sortBudgetEvents.length >= 1, 'a sortBudgetEvents record is written');
+  const evs = data.sortBudgetEvents.filter((e) => e.entryId === 'e2');
+  assert.ok(evs.length >= 1, 'the sortBudgetEvents records name entry id e2');
+  assert.ok(evs.every((e) => e.action !== 'infra-skip' && e.action !== 'infra-cap-hit'), 'no infra-skip or infra-cap-hit event is recorded for a content failure');
+});

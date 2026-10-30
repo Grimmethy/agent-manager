@@ -17,6 +17,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -40,6 +41,8 @@ from werkzeug.exceptions import HTTPException
 # this whole project's no-build-step, run-from-source philosophy.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import graph_build  # noqa: E402
+from app_proactive_sweep import proactive_sweep_argv, proactive_sweep_lock_path  # noqa: E402
+from response_compression import compress_response  # noqa: E402
 import visualize_graph  # noqa: E402
 
 import plugin_process_manager
@@ -140,6 +143,7 @@ from app_task_helpers import (  # noqa: F401
     _DIFF_GIT_HEADER_RE,
     _FENCED_JSON_RE,
     _GIVE_UP_ARCHIVE_STATES,
+    _LANE_DEFS_CACHE,
     _LANE_IDS_CACHE,
     _LANE_IDS_TTL_S,
     _QUOTED_SYMBOL_RE,
@@ -227,6 +231,8 @@ app = Flask(__name__)
 # here ever restarted the process. Independent of the reloader below (this one's Jinja2's
 # own cache, not Werkzeug's process-restart-on-.py-change).
 app.config["TEMPLATES_AUTO_RELOAD"] = True
+# gzip for text responses (page, static scripts, JSON, plugin proxy) -- see response_compression.py.
+app.after_request(compress_response)
 
 
 @app.errorhandler(HTTPException)
@@ -749,12 +755,50 @@ def worker_lane_ids() -> list[str]:
     return list(_LANE_IDS_CACHE["ids"]) or ["worker-local"]
 
 
+def worker_lane_defs() -> list[dict]:
+    """The pipeline's lanes as full definitions ({id, gpu, local, preempt, taskClasses, env}), in lane order.
+    Same single source as worker_lane_ids() (src/lanes.js: the host lane, the legacy P40 lane, and the lanes registry file), shelled out to
+    so the two languages cannot drift, and cached briefly. Returns the last good answer, or [] when node/lanes.js is unavailable --
+    callers must treat [] as "unknown" and fall back, never as "no lanes"."""
+    now = time.monotonic()
+    if _LANE_DEFS_CACHE["lanes"] and now - _LANE_DEFS_CACHE["at"] < _LANE_IDS_TTL_S:
+        return list(_LANE_DEFS_CACHE["lanes"])
+    lanes: list[dict] = []
+    try:
+        cp = subprocess.run(
+            ["node", str(SRC_DIR / "lanes.js")],
+            capture_output=True, text=True, timeout=5,
+            env={**os.environ, **read_env_file(ENV_FILE_PATH)},
+        )
+        parsed = json.loads(cp.stdout)
+        if isinstance(parsed, list):
+            lanes = [l for l in parsed if isinstance(l, dict) and l.get("id")]
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        logger.warning("could not read worker lane definitions from src/lanes.js: %s", exc)
+    if lanes:
+        _LANE_DEFS_CACHE.update(at=now, lanes=lanes)
+        return list(lanes)
+    return list(_LANE_DEFS_CACHE["lanes"])
+
+
+def reviewer_instance_ids() -> list[str]:
+    """Every review daemon the pipeline runs: the plain `reviewer` (host lane) plus one `reviewer-<gpu>` per lane that opted in
+    (src/lanes.js `reviewer`; AGENT_MANAGER_P40_REVIEWER=true for the legacy P40 lane). Read from the same lane definitions as
+    worker_lane_ids(); falls back to just ["reviewer"] when the definitions are unavailable."""
+    ids = ["reviewer"]
+    for lane in worker_lane_defs():
+        rid = lane.get("reviewerId")
+        if lane.get("reviewer") and rid and rid not in ids:
+            ids.append(rid)
+    return ids
+
+
 def _expected_instance_ids() -> list[str]:
     """Every daemon scripts/launch.sh starts: one worker lane per GPU (worker_lane_ids()), the
-    reviewer, and the queue-watchdog. apply-task-loop is deliberately excluded -- it's a single-shot
+    review daemons (reviewer_instance_ids()), and the queue-watchdog. apply-task-loop is deliberately excluded -- it's a single-shot
     pass with no heartbeat file of its own (see launch.sh's own comment), so it never has a slot to
     be "offline" in."""
-    return [*worker_lane_ids(), "reviewer", "watchdog"]
+    return [*worker_lane_ids(), *reviewer_instance_ids(), "watchdog"]
 
 
 def _is_live_worker_instance(instance_id: str) -> bool:
@@ -770,18 +814,44 @@ def _is_live_worker_instance(instance_id: str) -> bool:
     lane actually IS, not what launch.sh would have started under some other env -- is
     both simpler and correct. _expected_instance_ids() itself is unaffected: its one
     remaining caller (api_instances' offline-placeholder logic) has a different, correct
-    use for "would launch.sh have started this," not "is this assignable right now."""
+    use for "would launch.sh have started this," not "is this assignable right now."
+
+    2026-10-18 (brain-dump 1903, owner decision): a heartbeat may carry `"assignable": false`.
+    A process that writes a worker-* heartbeat so it shows on the Workers tab (with the run-log
+    expander) but does NOT claim from pending/ -- the first one is an external eval runner,
+    worker-kaggle-p40 -- opts out that way. It must never be offered or pinned a task: the
+    assign-task route would kill its process to make it "pick up" the pinned task. Only the
+    boolean false opts out; a missing field, null or true keep the old behaviour. See
+    _worker_lane_refusal for the reason text the routes return."""
+    return _worker_lane_refusal(instance_id) is None
+
+
+def _worker_lane_refusal(instance_id: str) -> str | None:
+    """Why `instance_id` is NOT an assignable worker lane, or None when it is (the single
+    rule behind _is_live_worker_instance, returned as text so the assign routes can tell the
+    operator why they refused)."""
+    not_a_lane = f"'{instance_id}' is not a worker lane that claims tasks from pending/"
     if not instance_id.startswith("worker"):
-        return False
+        return not_a_lane
     inst_dir = instances_dir()
-    return bool(inst_dir and (inst_dir / f"{instance_id}.json").is_file())
+    hb_path = (inst_dir / f"{instance_id}.json") if inst_dir else None
+    if not (hb_path and hb_path.is_file()):
+        return not_a_lane
+    hb = read_json_safe(hb_path) or {}
+    if hb.get("assignable") is False:
+        return (f"'{instance_id}' opts out of task assignment (assignable: false in its heartbeat) "
+                "-- it shows on the Workers tab but does not claim from pending/")
+    return None
 
 
 def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
     """Scans queue/done/'s own top level (mtime-sorted, most-recent-first; NOT the dated
     queue/done/_archived/<YYYY-MM>/ or _archived_no_action/ buckets -- those hold work
     already aged out of the "recent" window this is for) for completed tasks, reading
-    each one's own real history/terminalDisposition -- NOT model_calls.
+    each one's own real history/terminalDisposition -- NOT model_calls. Also folds in
+    chat sessions (chat_sessions.py's session store, keyed by instance_id='chat') so the
+    Workers tab's completed log shows the full picture of what the pipeline has finished
+    this session, regardless of whether it was a task or a chat turn.
 
     2026-09-08, Grimmethy: "Under reviewer they're all showing approved and 5 hours ago.
     I don't think it's updating properly." Root-caused live: model_calls is the ONLY
@@ -861,7 +931,111 @@ def _scan_recently_completed_tasks(limit, before_iso=None, reviewed_only=False):
         if len(results) >= limit:
             next_cursor = mtime_iso
             break
+
+    # Chat sessions (instance_id='chat') -- also folded into the completed log so the
+    # Workers tab shows every piece of pipeline work, not just tasks. Chat sessions live
+    # in the agent-manager repo's .agent-manager-chat-sessions.json (see chat_sessions.py),
+    # keyed by session id. Each session carries startedAt/endedAt/transcript; we use the
+    # latest of those as the session's "mtime" for ordering and cursor purposes, and
+    # filter out sessions whose last activity is within the last 30s to avoid racing
+    # with an in-flight turn (a session actively being written to would show a stale
+    # snapshot and confuse the frontend).
+    _add_chat_completed_rows(results, before_ts, limit - len(results))
+
+    if len(results) >= limit and not next_cursor:
+        # Chat rows pushed us past the limit; the cursor is the oldest mtime we kept.
+        next_cursor = results[-1].get("completedAt")
     return results, next_cursor
+
+
+def _add_chat_completed_rows(results: list, before_ts, remaining_budget: int):
+    """Append chat session rows to `results`, respecting `before_ts` and `remaining_budget`.
+    Chat sessions live in the agent-manager repo's .agent-manager-chat-sessions.json
+    (see chat_sessions.py). Each session is a dict keyed by session id; we iterate every
+    session, compute a synthetic "mtime" from its latest activity, and emit a row shaped
+    like the existing done/ rows (taskId, title, source='chat', outcome='chat turn') so
+    the frontend renders them uniformly.
+
+    Sessions with last activity within the past 30s are skipped -- the chat panel is
+    still writing to them right now and a half-finished snapshot would show stale
+    content. This matches the same "don't race with active work" principle the cursor
+    rule already encodes for tasks."""
+    if remaining_budget <= 0:
+        return
+    storage_dir = PACKAGE_ROOT
+    sessions_path = storage_dir / ".agent-manager-chat-sessions.json"
+    if not sessions_path.is_file():
+        return
+    data = read_json_safe(sessions_path)
+    if not isinstance(data, dict):
+        return
+    now_ts = time.time()
+    cutoff_ts = now_ts - 30.0
+    for session_id, session in data.items():
+        if not isinstance(session, dict):
+            continue
+        # Compute the session's "last activity" timestamp.
+        last_activity = None
+        ended_at = session.get("endedAt")
+        if ended_at:
+            last_activity = _iso_to_ts(ended_at)
+        if last_activity is None:
+            started_at = session.get("startedAt")
+            if started_at:
+                last_activity = _iso_to_ts(started_at)
+        if last_activity is None:
+            continue
+        # Skip sessions still actively being written to (last activity within 30s).
+        if last_activity > cutoff_ts:
+            continue
+        if before_ts is not None and last_activity >= before_ts:
+            continue
+        transcript = session.get("transcript") or []
+        turns_used = sum(1 for t in transcript if isinstance(t, dict) and t.get("role") == "assistant")
+        # Title: first user message in the transcript, or the session id if empty.
+        title = None
+        for t in transcript:
+            if isinstance(t, dict) and t.get("role") == "user":
+                text = t.get("text") or ""
+                if text.strip():
+                    title = text.strip()[:120]
+                    break
+        if not title:
+            title = session_id
+        duration_s = None
+        started = _iso_to_ts(session.get("startedAt"))
+        ended = _iso_to_ts(session.get("endedAt"))
+        if started and ended:
+            duration_s = int(ended - started)
+        row = {
+            "taskId": session_id,
+            "title": title,
+            "source": "chat",
+            "model": session.get("model"),
+            "instanceId": "chat",
+            "completedAt": datetime.fromtimestamp(last_activity, tz=timezone.utc).isoformat(),
+            "outcome": "chat turn",
+            "session_id": session_id,
+            "duration": duration_s,
+            "turns_used": turns_used,
+        }
+        results.append(row)
+        remaining_budget -= 1
+        if remaining_budget <= 0:
+            break
+
+
+def _iso_to_ts(iso: str | None):
+    """Parse an ISO-8601 timestamp (with optional 'Z') into a float unix timestamp, or
+    None on any failure. Used to compare chat session timestamps against the mtime-based
+    cursor without round-tripping through isoformat() and losing precision."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except (ValueError, TypeError, OSError):
+        return None
 
 
 def _relocate_task_to_pending(qdir: Path, task_id: str, target_instance_id: str) -> dict:
@@ -1304,6 +1478,32 @@ def community_coverage_path() -> Path | None:
     return (d / "community-coverage.json") if d else None
 
 
+def _coerce_serial(val) -> int:
+    """Coerce a brain-dump serial value to a non-negative int.
+
+    Returns 0 for None, booleans, negative numbers, non-numeric strings, or any
+    other non-integral type. Safe to call on raw JSON values (the capture path
+    and manual edits can emit string serials like '1792047142094' or junk like
+    ''/null) without prior type-checking; it never raises.
+    """
+    if val is None or isinstance(val, bool):
+        return 0
+    if isinstance(val, int):
+        return val if val >= 0 else 0
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            return 0  # NaN/Infinity: int() would raise ValueError/OverflowError
+        iv = int(val)
+        return iv if iv >= 0 else 0
+    if isinstance(val, str):
+        try:
+            iv = int(val.strip())
+        except (ValueError, TypeError):
+            return 0
+        return iv if iv >= 0 else 0
+    return 0
+
+
 def read_brain_dump_entries() -> list:
     path = brain_dump_path()
     if not path:
@@ -1674,7 +1874,7 @@ def _pipeline_stoppable() -> bool:
         return True
     inst_dir = instances_dir()
     if inst_dir and inst_dir.is_dir():
-        for name in (*worker_lane_ids(), "reviewer", "watchdog"):
+        for name in (*worker_lane_ids(), *reviewer_instance_ids(), "watchdog"):
             data = read_json_safe(inst_dir / f"{name}.json")
             if data and data.get("pid") and _pid_alive(data["pid"]):
                 return True
@@ -1718,7 +1918,7 @@ def _pipeline_running() -> bool:
                     return True
 
     # Stale, unparseable, or ownerless heartbeat -- believe a live process over a timestamp.
-    for name in (*lane_ids, "reviewer"):
+    for name in (*lane_ids, *reviewer_instance_ids()):
         d = read_json_safe(inst_dir / f"{name}.json")
         if d and any(d.get(k) and _pid_alive(d[k]) for k in ("daemonPid", "pid")):
             return True
@@ -1855,13 +2055,43 @@ def _worker_project_info(hb: dict, active_label, active_qdir):
     return project, borrowed, qdir
 
 
+_HUB_LABEL_RE = re.compile(r"^HUB\d{4}$")
+
+
 def _find_task_record_anywhere(qdir, task_id):
     """(data, state) for a task id across every queue location a branch's task could be
     sitting in -- the QUEUE_STATES dirs, the manual + dated + superseded archives, and the
     per-worker drafting subfolders -- or (None, None). Same coverage as _task_state_index,
-    plus queue/done/_superseded/ (file-decompose re-file supersessions)."""
+    plus queue/done/_superseded/ (file-decompose re-file supersessions).
+
+    Hub-label resolution (HUB0251): when task_id matches /^HUB\\d{4}$/, resolve the label
+    via _hub_label_index scoped to the project (qdir). One hub with that label -> return
+    its record; zero -> fall through to the existing "task not found" path; two or more
+    hubs claiming the same label -> raise (defensive, labels should be unique). Exact-task-id
+    resolution is unchanged for non-hub ids."""
     if not qdir or not task_id:
         return None, None
+    if _HUB_LABEL_RE.match(task_id):
+        index = _hub_label_index(qdir)
+        # Deduplicate: the index maps id/formerId -> hub, so the same hub can appear
+        # multiple times in index.values() if it has formerIds. Only count each hub
+        # once by its canonical id.
+        seen_ids = set()
+        matching = []
+        for hub in index.values():
+            hid = hub.get("id")
+            if hub.get("hubLabel") == task_id and hid not in seen_ids:
+                matching.append(hub)
+                seen_ids.add(hid)
+        if len(matching) == 0:
+            return None, None
+        if len(matching) == 1:
+            return matching[0], "coordinating"
+        ids = [m.get("id") or "unknown" for m in matching]
+        raise ValueError(
+            f"Ambiguous hub label {task_id!r}: matches {len(matching)} hubs "
+            f"({', '.join(str(i) for i in ids)})"
+        )
     for state in QUEUE_STATES:
         d = read_json_safe(qdir / state / f"{task_id}.json")
         if d:
@@ -2040,21 +2270,29 @@ def _branch_content_already_on_main(repo_root, main_branch, full_ref):
         return False
 
 
-def _list_unmerged_branches_uncached(force_fetch=True):
-    repo_root = get_active_repo_root()
+def _list_unmerged_branches_uncached(force_fetch=True, repo_root=None, pipeline_dir=None):
+    """The ACTIVE project's list by default. repo_root/pipeline_dir name another registered project (branch_projects.py): it always fetches (the caller owns that
+    project's timer) and leaves the active project's held-hub cache and fetch timer alone."""
+    other = repo_root is not None
+    if not other:
+        repo_root = get_active_repo_root()
+        pipeline_dir = get_pipeline_dir()
     if not repo_root:
         return []
     repo_root = Path(repo_root)
-    pipeline_dir = get_pipeline_dir()
+    if other:
+        pipeline_dir = Path(pipeline_dir) if pipeline_dir else repo_root
 
     # The fetch is the single slowest step (14-16 s measured at load 13) and moves no state a recompute depends on within a minute, so it has its own timer.
     with _branch_cache_lock:
-        fetch_due = force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
+        fetch_due = other or force_fetch or (time.time() - _branch_fetch_state["at"]) >= _BRANCH_FETCH_TTL_SECONDS
     if fetch_due:
         _run_git(["fetch", "origin", "--prune"], repo_root, timeout=30)
-        with _branch_cache_lock:
-            _branch_fetch_state["at"] = time.time()
+        if not other:
+            with _branch_cache_lock:
+                _branch_fetch_state["at"] = time.time()
     main_branch = _detect_main_branch(repo_root)
+    qdir = (pipeline_dir / "queue") if pipeline_dir else None
 
     raw = _run_git(
         ["for-each-ref", "--format=%(refname:short)%09%(committerdate:iso-strict)%09%(subject)", "refs/remotes/origin/agent/"],
@@ -2095,7 +2333,6 @@ def _list_unmerged_branches_uncached(force_fetch=True):
 
         label = _label_for_branch(task_id, pipeline_dir, subject.strip(), repo_root=repo_root)
         candidate_count = _triage_candidate_count(repo_root, main_branch, full_ref, subject, label)
-        qdir = (pipeline_dir / "queue") if pipeline_dir else None
         hub = get_hub_data_provider().hub_for_branch(qdir, branch, branch_task_ids(_run_git, repo_root, main_branch, full_ref, task_id))
         branches.append({
             "branch": branch,
@@ -2121,11 +2358,12 @@ def _list_unmerged_branches_uncached(force_fetch=True):
         })
 
     branches, held = partition_held_hub_branches(branches)
-    with _branch_cache_lock:
-        _branch_cache["held"] = held
+    if not other:
+        with _branch_cache_lock:
+            _branch_cache["held"] = held
     _annotate_hub_sibling_conflicts(repo_root, branches)
     import branch_verdicts  # lazy: keeps app.py's import block untouched
-    branch_verdicts.enrich_branches_with_verdicts(queue_dir(), repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
+    branch_verdicts.enrich_branches_with_verdicts(qdir, repo_root, branches, _run_git, hub_lookup=get_hub_data_provider().hub_for_branch)
     branches.sort(key=lambda b: b["pushedAt"])
     return branches
 
@@ -2134,6 +2372,17 @@ def _store_branch_list(branches):
     with _branch_cache_lock:
         _branch_cache["at"] = time.time()
         _branch_cache["branches"] = branches
+    # Apply any pending verdicts for branches that are now in the listing
+    try:
+        import branch_verdicts_pending as bvp
+        import branch_verdicts as bv
+        qdir = queue_dir()
+        if qdir:
+            repo_root = get_active_repo_root()
+            if repo_root:
+                bvp.apply_pending_verdicts(qdir, repo_root, list_unmerged_branches, _run_git, bv)
+    except Exception as exc:
+        print(f"[branches] pending verdict apply failed (non-fatal): {exc}", file=sys.stderr)
 
 
 def _refresh_branch_list_in_background():
@@ -2204,14 +2453,48 @@ def _sync_live_checkout(main_branch):
     to fast-forward safely. Never force/reset here -- a dirty PACKAGE_ROOT (e.g. a
     developer's own in-progress manual edit, confirmed to happen during this same
     incident) is left alone and reported, not silently discarded; that mirrors this
-    codebase's own git-safety norms elsewhere (never auto-discard uncommitted work)."""
+    codebase's own git-safety norms elsewhere (never auto-discard uncommitted work).
+
+    Untracked files (e.g. bak backups of env/plugin files) no longer block the
+    fast-forward -- they are not tracked by git, so an incoming commit cannot
+    overwrite them. However, if an incoming commit ADDS a file at a path that
+    already exists as an untracked file, the fast-forward would fail (git refuses
+    to overwrite a working-tree file with a commit that adds the same path), so
+    we pre-check for that collision and report the offending paths."""
+    # Only check tracked modifications -- untracked files do not block a fast-forward
+    # because they are not in any commit and therefore cannot collide with incoming
+    # content (unless the incoming commit itself adds a file at that path, handled
+    # below).
     status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
     )
     if status.returncode != 0:
         return {"synced": False, "reason": "PACKAGE_ROOT is not a git repo or git status failed"}
     if status.stdout.strip():
         return {"synced": False, "reason": "PACKAGE_ROOT has uncommitted local changes -- left untouched, sync it by hand"}
+
+    # Pre-check: if the incoming commits add any file that already exists as an
+    # untracked file in the working tree, git pull --ff-only will refuse to
+    # overwrite it. Report those paths so the user can resolve them.
+    head = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
+    _run_git(["fetch", "origin"], PACKAGE_ROOT)
+    remote_ref = f"origin/{main_branch}"
+    try:
+        # name-status: lists paths with status codes (A=added, M=modified, D=deleted).
+        diff_out = _run_git(["diff", "--name-status", "--diff-filter=A", f"{head}..{remote_ref}"], PACKAGE_ROOT)
+        added_paths = {line.split(None, 1)[1].strip() for line in diff_out.strip().splitlines() if line.strip()}
+    except RuntimeError:
+        added_paths = set()
+
+    if added_paths:
+        untracked_out = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=str(PACKAGE_ROOT), capture_output=True, text=True, timeout=15,
+        )
+        untracked = {p for p in untracked_out.stdout.strip().splitlines() if p.strip()} if untracked_out.stdout.strip() else set()
+        collisions = sorted(added_paths & untracked)
+        if collisions:
+            return {"synced": False, "reason": f"untracked files block fast-forward: {', '.join(collisions)}"}
 
     try:
         before = _run_git(["rev-parse", "HEAD"], PACKAGE_ROOT).strip()
@@ -2746,9 +3029,10 @@ def _launch_pipeline_subprocess(child_env: dict, raw_path: str, include_apply: b
     # never blocks this response: the sweep can make a real local-model call (Tier B/C of
     # runFileDecomposePlanPass) if the file has no comment-banner structure to group
     # deterministically, and this route's own caller (the Project tab) should not wait on
-    # that. --force bypasses the sweep's own 24h internal gate for this one on-demand
-    # trigger; the periodic queue-watchdog tick still runs it every 24h regardless of
-    # whether a project switch happens to trigger it in between.
+    # that. --force bypasses the sweep's own time floor (5 minutes) for this one on-demand
+    # trigger; the periodic queue-watchdog tick still starts it on its own. Both go through the
+    # same flock lock (app_proactive_sweep.py / scripts/lib/start-singleton-bg.sh), so a copy
+    # that is already running makes this start a no-op instead of a second concurrent run.
     try:
         # S4a of the hub-tasks extraction (2026-09-24): proactive-file-decompose-sweep.js
         # moved to agent-manager-hygiene. Resolved BY NAME via _resolve_plugin_root (S5a,
@@ -2760,7 +3044,7 @@ def _launch_pipeline_subprocess(child_env: dict, raw_path: str, include_apply: b
             _decompose_log_dir = Path(os.environ.get("HOME") or "~").expanduser() / ".local/state/agent-manager/logs"
             _decompose_log_dir.mkdir(parents=True, exist_ok=True)
             subprocess.Popen(
-                ["node", str(_proactive_sweep), "--force"],
+                proactive_sweep_argv(_proactive_sweep, proactive_sweep_lock_path()),
                 env=child_env,
                 cwd=str(_proactive_sweep.parent),
                 stdout=(_decompose_log_dir / "proactive-file-decompose-sweep.log").open("a"),
@@ -2861,6 +3145,8 @@ from routes.concepts import concepts_bp  # noqa: E402
 from routes.second_brain import second_brain_bp  # noqa: E402
 from routes.brain_dump import brain_dump_bp  # noqa: E402
 from routes.benchmark import benchmark_bp  # noqa: E402
+from routes.trajectories import trajectories_bp  # noqa: E402
+from routes.capability import capability_bp  # noqa: E402
 from routes.embedded_tools import embedded_tools_bp  # noqa: E402
 from routes.hardware import hardware_bp  # noqa: E402
 from routes.claude_settings import claude_settings_bp  # noqa: E402
@@ -2880,12 +3166,15 @@ from routes.branch_verdicts import branch_verdicts_bp  # noqa: E402
 from routes.plugins import plugins_bp  # noqa: E402
 from routes.task import task_bp  # noqa: E402
 from routes.shared_misc import shared_misc_bp  # noqa: E402
+from routes.cloud_meter import cloud_meter_bp  # noqa: E402
 
 app.register_blueprint(reports_bp)
 app.register_blueprint(concepts_bp)
 app.register_blueprint(second_brain_bp)
 app.register_blueprint(brain_dump_bp)
 app.register_blueprint(benchmark_bp)
+app.register_blueprint(trajectories_bp)
+app.register_blueprint(capability_bp)
 app.register_blueprint(embedded_tools_bp)
 app.register_blueprint(hardware_bp)
 app.register_blueprint(claude_settings_bp)
@@ -2903,6 +3192,7 @@ app.register_blueprint(task_anywhere_1_more_bp)
 app.register_blueprint(pipeline_1_more_bp)
 app.register_blueprint(branch_verdicts_bp)
 app.register_blueprint(plugins_bp)
+app.register_blueprint(cloud_meter_bp)
 app.register_blueprint(task_bp)
 app.register_blueprint(shared_misc_bp)
 
