@@ -38,6 +38,7 @@ const { listProjects, pipelineFor } = require('./chat-projects.js');
 const { proposeCommand, proposalsFromToolLog } = require('./chat-command-allowlist.js');
 const { listUnverifiedBranchesTool, recordBranchVerdictTool } = require('./chat-branch-verdict.js');
 const { checkBranchTool } = require('./chat-branch-check.js');
+const { chatStatus } = require('./chat-status.js');
 const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
 } = require('./chat-task-requeue.js');
@@ -446,6 +447,21 @@ const CHAT_TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'chat_status',
+      description: 'Report the chat\'s own tool/gate configuration for the current call -- which of the eight chat-status-expected tools are present and whether mergeVerdictNeedsCheck is enabled (true only when both record_branch_verdict and check_branch are present).',
+      parameters: {
+        type: 'object',
+        properties: {
+          repoRoot: { type: 'string', description: 'Absolute path of the repo the chat is operating in.' },
+          toolNames: { type: 'array', items: { type: 'string' }, description: 'The names of the tools available in this call.' },
+        },
+        required: ['repoRoot', 'toolNames'],
+      },
+    },
+  },
 ];
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -697,6 +713,7 @@ function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
     list_unverified_branches: (args) => listUnverifiedBranchesTool({ project: args.project, limit: args.limit }),
     record_branch_verdict: (args) => recordBranchVerdictTool({ project: args.project, branch: args.branch, sha: args.sha, verdict: args.verdict, reasons: args.reasons }),
     check_branch: (args) => checkBranchTool({ project: args.project, branch: args.branch }),
+    chat_status: (args) => chatStatus({ repoRoot: args.repoRoot, toolNames: args.toolNames, gates: { mergeVerdictNeedsCheck: args.toolNames.includes('record_branch_verdict') && args.toolNames.includes('check_branch') } }),
   };
 }
 
