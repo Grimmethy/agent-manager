@@ -296,16 +296,27 @@ def build_import_graph(repo_root: Path, grep_dirs: list[str], file_cache: dict =
             continue
 
         cached = cache_entries.get(rel_from) if cache_entries is not None else None
-        if cached and cached.get("mtime") == stat.st_mtime and cached.get("size") == stat.st_size:
+        # An entry written before 'unresolved_specs' existed (old format) is treated as a cache miss: the file is re-read,
+        # re-extracted and the entry rewritten in the new format, a one-time transparent migration with no version field.
+        if (cached and cached.get("mtime") == stat.st_mtime and cached.get("size") == stat.st_size
+                and "unresolved_specs" in cached):
             edges = cached["edges"]
+            # The cached edges only hold targets that were in file_set when this file was last parsed, so a file ADDED
+            # since then would never be linked (AC-64, introduced in dc8d59a). Re-resolve the stored raw specs against
+            # the CURRENT file_set (no file read, no regex) and merge in anything newly resolvable, deduplicated.
+            newly = _resolve_specs_to_edges(cached["unresolved_specs"], f, repo_root, file_set)
+            edges = list(dict.fromkeys(list(edges) + newly))
         else:
             try:
                 text = f.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            edges = _extract_edges_for_file(f, repo_root, file_set, text)
+            specs = _extract_specs_for_file(f, repo_root, text)
+            edges = _resolve_specs_to_edges(specs, f, repo_root, file_set)
             if cache_entries is not None:
-                cache_entries[rel_from] = {"mtime": stat.st_mtime, "size": stat.st_size, "edges": edges}
+                cache_entries[rel_from] = {
+                    "mtime": stat.st_mtime, "size": stat.st_size, "edges": edges, "unresolved_specs": specs,
+                }
 
         for rel_to in edges:
             # A cached edge's target might no longer be in the CURRENT file_set (the

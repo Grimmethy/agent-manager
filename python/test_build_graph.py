@@ -72,6 +72,10 @@ class BuildImportGraphFileCacheTest(unittest.TestCase):
             # genuinely trusted (mtime/size unchanged), this wrong edge survives into the
             # next build's graph -- proof the file's real text was never re-scanned.
             file_cache["files"]["src/a.js"]["edges"] = ["src/c.js"]
+            # The entry also stores the file's raw specs (re-resolved against the current file_set on a cache hit so files ADDED since
+            # the last parse are still discovered, AC-64). Make those deliberately wrong too ("imports nothing"): the real b.js edge can
+            # then only come back by re-reading the file's text, which a cache hit must never do.
+            file_cache["files"]["src/a.js"]["unresolved_specs"] = []
 
             graph = graph_build.build_import_graph(repo, ["src"], file_cache=file_cache)
             self.assertTrue(graph.has_edge("src/a.js", "src/c.js"), "cached (even if stale) edges must be trusted when mtime/size are unchanged")
