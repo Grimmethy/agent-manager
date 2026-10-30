@@ -55,13 +55,53 @@ const PROFILES = [
       salvageThinkingOnEmpty: true,
     },
   },
+  // Claude/Anthropic models: retry with same thinking setting, salvage thinking on empty
+  // (Claude tends to produce useful thinking even when final answer is empty)
+  {
+    id: 'claude',
+    match: /^(anthropic|claude)/i,
+    quirks: {
+      forcedSummaryRetryThink: 'same',
+      salvageThinkingOnEmpty: true,
+    },
+  },
+  // Gemini models: retry with same thinking setting, don't salvage (Gemini's thinking
+  // is less reliable as a standalone answer)
+  {
+    id: 'gemini',
+    match: /^(google|gemini)/i,
+    quirks: {
+      forcedSummaryRetryThink: 'same',
+      salvageThinkingOnEmpty: false,
+    },
+  },
+  // OpenAI/GPT models: don't retry with thinking (GPT handles retries differently),
+  // don't salvage (GPT rarely produces thinking-only responses)
+  {
+    id: 'openai',
+    match: /^(openai|gpt)/i,
+    quirks: {
+      forcedSummaryRetryThink: 'off',
+      salvageThinkingOnEmpty: false,
+    },
+  },
+  // Local models (Ollama, Llama, etc.): don't retry with thinking (local models often
+  // have shorter context and thinking wastes the remaining budget), don't salvage
+  {
+    id: 'local',
+    match: /^(local|ollama|llama|llamacpp)/i,
+    quirks: {
+      forcedSummaryRetryThink: 'off',
+      salvageThinkingOnEmpty: false,
+    },
+  },
 ];
 
 // Default quirks applied to any model not matched by a profile. These are the safe
 // defaults: retry thinking the same way, don't salvage (the model might be genuinely
 // empty and resampling is better than trusting its reasoning trace).
 const DEFAULTS = {
-  forcedSummaryRetryThink: 'same',
+  forcedSummaryRetryThink: 'off',
   salvageThinkingOnEmpty: false,
 };
 
