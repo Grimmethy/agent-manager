@@ -601,11 +601,11 @@ test('WRITE_TOOLS declares exactly write_file, edit_file, run_bash, and queue_re
 // all for Chat, queue_reviewed_task is the only way to make a real change), not a
 // prompt-level "please prefer queuing" ask.
 
-test('CHAT_TOOLS declares exactly the twelve chat-safe tools -- no write_file/edit_file', () => {
+test('CHAT_TOOLS declares exactly the thirteen chat-safe tools -- no write_file/edit_file', () => {
   withFixtureRepo((mod) => {
     const names = mod.CHAT_TOOLS.map((t) => t.function.name).sort();
     assert.deepEqual(names, [
-      'answer_task_clarification', 'check_branch', 'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
+      'answer_task_clarification', 'chat_status', 'check_branch', 'list_projects', 'list_unverified_branches', 'mark_task_clarification_done', 'propose_command', 'queue_reviewed_task',
       'record_branch_verdict', 'requeue_blocked_task', 'resolve_task_clarification', 'run_bash', 'withdraw_task',
     ]);
   });
@@ -669,6 +669,66 @@ test('runPlanWithTools with a non-chat source still sends the full WRITE_TOOLS s
     const sentToolNames = sentBodies[0].tools.map((t) => t.function.name).sort();
     assert.ok(sentToolNames.includes('write_file'));
     assert.ok(sentToolNames.includes('edit_file'));
+  });
+});
+
+// --- chat_status tool (2026-10-29, post-incident hardening) ----------------------------
+// The earlier defect: chat_status was added to TOOLS/buildToolHandlers (shared), so it
+// reported only the 7 shared tools (omitting CHAT_TOOLS) and gates.mergeVerdictNeedsCheck
+// was always false (it looked in TOOLS where record_branch_verdict/list_unverified_branches
+// never are). This test suite asserts the fix: chat_status is in CHAT_TOOLS only, reports
+// the union of TOOLS+CHAT_TOOLS, and derives the gate from CHAT_TOOLS.
+
+test('chat_status is NOT in shared TOOLS (only in CHAT_TOOLS)', () => {
+  withFixtureRepo((mod) => {
+    const toolNames = mod.TOOLS.map((t) => t.function.name);
+    assert.ok(!toolNames.includes('chat_status'), 'chat_status must not be in shared TOOLS (it is a chat-only tool)');
+    assert.equal(mod.TOOLS.length, 6, 'shared TOOLS must have exactly 6 entries (not 7 with chat_status)');
+    const chatToolNames = mod.CHAT_TOOLS.map((t) => t.function.name);
+    assert.ok(chatToolNames.includes('chat_status'), 'chat_status must be in CHAT_TOOLS');
+  });
+});
+
+test('chat_status handler reports the union of TOOLS + CHAT_TOOLS (not just TOOLS)', () => {
+  withFixtureRepo((mod, dir) => {
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = handlers.chat_status({});
+    const toolNames = result.tools.sort();
+    // Must include shared tools
+    assert.ok(toolNames.includes('grep_codebase'), 'must include grep_codebase');
+    assert.ok(toolNames.includes('read_file'), 'must include read_file');
+    assert.ok(toolNames.includes('list_directory'), 'must include list_directory');
+    assert.ok(toolNames.includes('list_roots'), 'must include list_roots');
+    assert.ok(toolNames.includes('read_task'), 'must include read_task');
+    assert.ok(toolNames.includes('search_tasks'), 'must include search_tasks');
+    // Must include chat tools (the earlier defect was that these were missing)
+    assert.ok(toolNames.includes('record_branch_verdict'), 'must include record_branch_verdict from CHAT_TOOLS');
+    assert.ok(toolNames.includes('list_unverified_branches'), 'must include list_unverified_branches from CHAT_TOOLS');
+    assert.ok(toolNames.includes('run_bash'), 'must include run_bash from CHAT_TOOLS');
+    assert.ok(toolNames.includes('queue_reviewed_task'), 'must include queue_reviewed_task from CHAT_TOOLS');
+    // Must include chat_status itself
+    assert.ok(toolNames.includes('chat_status'), 'must include chat_status');
+    // Total: 6 (TOOLS) + 13 (CHAT_TOOLS) = 19
+    assert.equal(result.tools.length, 19, 'must report all 19 tools (6 shared + 13 chat)');
+  });
+});
+
+test('chat_status handler derives gates.mergeVerdictNeedsCheck from CHAT_TOOLS (not TOOLS)', () => {
+  withFixtureRepo((mod, dir) => {
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = handlers.chat_status({});
+    // CHAT_TOOLS includes record_branch_verdict and list_unverified_branches, so the gate must be true
+    assert.equal(result.gates.mergeVerdictNeedsCheck, true, 'gates.mergeVerdictNeedsCheck must be true when CHAT_TOOLS includes record_branch_verdict/list_unverified_branches');
+  });
+});
+
+test('chat_status handler includes a stale-checkout warning when behind origin', () => {
+  withFixtureRepo((mod, dir) => {
+    const handlers = mod.buildChatToolHandlers([dir], dir, dir);
+    const result = handlers.chat_status({});
+    // The warning is included (may be null if not behind, but the field must exist)
+    assert.ok('warning' in result, 'chat_status must include a warning field');
+    assert.ok(typeof result.warning === 'string' || result.warning === null, 'warning must be a string or null');
   });
 });
 
