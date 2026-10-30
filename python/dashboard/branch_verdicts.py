@@ -319,6 +319,72 @@ def apply_prior_verdict(rec, branch, verdict, reasons, source, sha=None):
     return False
 
 
+def _apply_verdicts_batch(queue_dir, repo_root, main_branch, branches, run_git,
+                          verdict, reasons, source, hub_lookup=None, fallback_task_ids=None):
+    """Transactional wrapper for applying the same verdict to multiple branches.
+
+    Validates every branch up front (conflict check + input validation). If any branch fails the
+    conflict check, the whole batch is rejected with no side effects. If every branch passes, the
+    verdict is recorded and task logs are updated for every branch -- if a failure happens mid-batch
+    (e.g. a task file write fails on one branch), the ones that succeeded stay written; the wrapper
+    cannot undo a persisted record, but the upfront conflict check prevents partial-application of a
+    bad batch.
+
+    Args:
+        queue_dir: pipeline queue directory.
+        repo_root: active repository root.
+        main_branch: the main branch name (usually 'master').
+        branches: list of branch name strings.
+        run_git: app.py's _run_git callable.
+        verdict, reasons, source: the verdict to apply to every branch.
+        hub_lookup: optional hub lookup callable (same signature as app.py's hub_for_branch).
+        fallback_task_ids: optional per-branch fallback task id (same length as branches).
+
+    Returns:
+        (results, error) where results is a list of per-branch outcome dicts and error is None on
+        success or a string on rejection (conflict / validation failure).
+    """
+    # 1. Validate the verdict body once -- same contract as record_verdict.
+    err = validate_verdict_body(verdict, reasons, source)
+    if err:
+        return [], err
+    if not branches:
+        return [], "branches must be a non-empty list"
+    if not all(isinstance(b, str) and b for b in branches):
+        return [], "every branch must be a non-empty string"
+    if fallback_task_ids and len(fallback_task_ids) != len(branches):
+        return [], "fallback_task_ids must match branches in length"
+
+    # 2. Conflict check every branch BEFORE writing anything. Any conflict -> reject the whole batch.
+    for branch in branches:
+        hit = _check_conflicts(run_git, repo_root, main_branch, branch)
+        if hit:
+            return [], hit[1][0]  # first reason string is the human-readable error
+
+    # 3. Apply to every branch. Upfront checks passed; a write failure on one branch is logged but
+    #    does not abort the rest (we cannot roll back a persisted record).
+    results = []
+    for i, branch in enumerate(branches):
+        try:
+            ok, sha = _git_out(run_git, ["rev-parse", f"origin/{branch}"], repo_root)
+            head_sha = sha.strip() if ok else ""
+            if not head_sha:
+                results.append({"branch": branch, "succeeded": False, "reason": "could not resolve head SHA"})
+                continue
+            record, written = record_verdict(queue_dir, branch, head_sha, verdict, reasons, source)
+            if written:
+                fb = fallback_task_ids[i] if fallback_task_ids else None
+                task_ids, hub_id = resolve_owner(repo_root, main_branch, branch, run_git, queue_dir,
+                                                 hub_lookup, fb)
+                write_task_log(queue_dir, task_ids, hub_id or None, branch, verdict, reasons, source, head_sha)
+            results.append({"branch": branch, "succeeded": True, "written": written, "headSha": head_sha,
+                            **get_verdict(queue_dir, branch, head_sha)})
+        except (ValueError, OSError, RuntimeError) as exc:
+            logger.warning("Batch apply failed for %s: %s", branch, exc)
+            results.append({"branch": branch, "succeeded": False, "reason": str(exc)})
+    return results, None
+
+
 def write_task_log(queue_dir, task_ids, hub_id, branch, verdict, reasons, source, sha=None):
     """Append a history event to each owning task and to its hub, shaped like src/task-history.js's
     appendHistoryEvent ({stage, at, detail}). `task_ids` is one id or a list (see resolve_owner). Silent

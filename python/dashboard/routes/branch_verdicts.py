@@ -79,3 +79,63 @@ def api_git_record_branch_verdict(branch):
     else:
         _invalidate_branch_cache(refetch=False)  # a verdict moves no remote ref: drop the cached cards (they carry the verdict) but skip the fetch
     return jsonify({"succeeded": True, "written": written, "headSha": head_sha, **bv.get_verdict(qdir, branch, head_sha)})
+
+
+@branch_verdicts_bp.route("/api/git/branches/batch", methods=["POST"])
+def api_git_batch_branch_verdicts():
+    """Apply the same verdict to a list of branches atomically.
+
+    Accepts {"branches": [...], "verdict": "...", "reasons": [...], "source": "..."} in the body.
+    Every branch is conflict-checked up front; any conflict rejects the whole batch with no side
+    effects. On success, returns per-branch outcomes with all-pass/all-fail semantics (the 'all' part
+    is that every branch in the request got an outcome; a partial failure mid-apply is logged but the
+    batch itself still returns 200 with individual succeeded flags).
+    """
+    from app import _invalidate_branch_cache, _run_git, get_active_repo_root, get_hub_data_provider, list_unmerged_branches, queue_dir
+    import branch_verdicts as bv
+
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    qdir = queue_dir()
+    if not qdir:
+        abort(404, description="no pipeline queue directory resolvable")
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"succeeded": False, "reason": "body must be a JSON object"}), 400
+    branches = body.get("branches")
+    verdict = body.get("verdict")
+    reasons = body.get("reasons", [])
+    source = body.get("source", "manual")
+    if not isinstance(branches, list) or not branches:
+        return jsonify({"succeeded": False, "reason": "branches must be a non-empty list"}), 400
+    if not all(isinstance(b, str) and b for b in branches):
+        return jsonify({"succeeded": False, "reason": "every branch must be a non-empty string"}), 400
+
+    # Validate the verdict/reasons/source once up front (same as the single-branch route).
+    err = bv.validate_verdict_body(verdict, reasons, source)
+    if err:
+        return jsonify({"succeeded": False, "reason": err}), 400
+
+    # Gate: every branch must be one this process lists (same rule as the single-branch route).
+    listed = list_unmerged_branches(force=False)
+    unlisted = [b for b in branches if not any(x["branch"] == b for x in listed)]
+    if unlisted:
+        return jsonify({"succeeded": False, "reason": f"unlisted branch(es): {', '.join(unlisted)}"}), 404
+
+    # Resolve mainBranch from the first listed branch (all branches in a batch share the same main).
+    main_branch = (next(x for x in listed if x["branch"] == branches[0]).get("mainBranch") or "master")
+
+    # Run the transactional wrapper.
+    results, error = bv._apply_verdicts_batch(
+        qdir, repo_root, main_branch, branches, _run_git,
+        verdict, reasons, source,
+        hub_lookup=get_hub_data_provider().hub_for_branch,
+    )
+    if error:
+        return jsonify({"succeeded": False, "reason": error}), 409
+
+    # Invalidate the branch list cache once (all branches changed, no remote ref moved).
+    _invalidate_branch_cache(refetch=False)
+    return jsonify({"succeeded": True, "results": results}), 200
