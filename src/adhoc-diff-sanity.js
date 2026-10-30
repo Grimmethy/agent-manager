@@ -464,6 +464,12 @@ const PLAN_TARGETS_HINT = 'Implement the actual change in the file(s) the plan/t
 const ALL_N_TESTS_RE = /\ball\s+(\d+)\s+tests?\b/i;
 const N_TESTS_CLAIM_RE = /\b(\d+)\s+tests?\s+(?:pass(?:es|ed|ing)?|added)\b/i;
 
+// Whole-suite run phrases: when the summary or task text mentions one of these, a STATUS
+// claim like "All 14 tests pass" is about the ENTIRE test suite (not just the diff's
+// added tests), so the check must skip -- comparing the status count to the diff's added
+// test defs would always fail spuriously.
+const WHOLE_SUITE_RUN_RE = /\b(?:test\/\*\.test\.js|npm test|full suite|whole suite|all tests|node --test|unittest discover|pytest)\b/i;
+
 // `kind` separates a QUANTITY claim about the diff ("12 tests added") from a STATUS report
 // ("All 14 tests pass" -- the N tests in the file, which can far exceed what this diff adds
 // when it extends an existing test file; change_review AC-72 caught the 1054f01 regression
@@ -590,7 +596,16 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
   // A status claim ("All N tests pass") equals the diff's added tests only when the diff
   // CREATES every file it touches (a brand-new test file); against an edited existing file the
   // two are different numbers, so only an explicit "N tests added" claim is comparable there.
-  const comparable = claimed !== null && (claimed.kind === 'added' || files.every((f) => f.kind === 'create'));
+  // For a STATUS claim, also skip when the summary or task text mentions a whole-suite run
+  // phrase (e.g. "npm test", "full suite", "test/*.test.js", "node --test", "pytest") --
+  // that signals the count is about the WHOLE suite, not just the diff's added tests, so
+  // comparing it to the diff's added test defs would always fail spuriously.
+  const statusIsWholeSuite = claimed && claimed.kind === 'status' && (
+    WHOLE_SUITE_RUN_RE.test(summary) || WHOLE_SUITE_RUN_RE.test(rawText)
+  );
+  const comparable = claimed !== null && !statusIsWholeSuite && (
+    claimed.kind === 'added' || files.every((f) => f.kind === 'create')
+  );
   if (comparable) {
     const claimedTests = claimed.count;
     const actualTests = countAddedTestDefs(rawDiff);
@@ -598,7 +613,7 @@ function adhocDiffSubstanceProblem(task, rawDiff, summary = '') {
       return {
         code: 'false-test-count-claim',
         reason: `summary claims ${claimedTests} tests but the diff only adds ${actualTests} test definition(s)`,
-        retryFeedback: `Your summary claims ${claimedTests} tests, but the diff you produced only adds ${actualTests} test definition(s). Either write the tests you claimed, or correct the summary to match what the diff actually contains -- do not report a count you didn't verify against your own diff.`,
+        retryFeedback: `Your summary claims ${claimedTests} tests, but the diff you produced only adds ${actualTests} test definition(s). If you added tests to the diff, state the count as "N tests added" to match what the diff actually contains. If you are reporting the whole-suite total, phrase it as "suite total N" (e.g. "suite total 42 after this change") rather than implying the diff itself contains that many tests.`,
       };
     }
   }
