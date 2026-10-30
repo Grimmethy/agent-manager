@@ -199,6 +199,25 @@ test('requeueBlockedTask: coordination fields (stacked/dependsOn/atomic/noDecomp
   assert.equal(moved.dependsOn, undefined);
 });
 
+test('requeueBlockedTask: priority fields are dropped by default and carried only with keepPriority', async () => {
+  const prio = { humanQueued: true, premiumPriority: true, premiumSetBy: 'chat', premiumSetAt: '2026-10-30T00:00:00Z' };
+  const dir = makePipeline();
+  write(dir, 'done', { id: 'p1', domain: 'core', source: 'manual', title: 'x', promptContext: {}, createdAt: 'x', terminalDisposition: 'merged', ...prio });
+  assert.equal((await requeueBlockedTask(dir, dir, 'p1', { state: 'done' })).ok, true);
+  const dropped = read(at(dir, 'pending', 'p1.json'));
+  for (const k of Object.keys(prio)) assert.equal(dropped[k], undefined, `default must drop ${k}`);
+  const dir2 = makePipeline();
+  write(dir2, 'done', { id: 'p2', domain: 'core', source: 'manual', title: 'x', promptContext: {}, createdAt: 'x', terminalDisposition: 'merged', ...prio });
+  assert.equal((await requeueBlockedTask(dir2, dir2, 'p2', { state: 'done', keepPriority: true })).ok, true);
+  const kept = read(at(dir2, 'pending', 'p2.json'));
+  for (const [k, v] of Object.entries(prio)) assert.equal(kept[k], v, `keepPriority must carry ${k}`);
+  const dir3 = makePipeline();
+  write(dir3, 'done', { id: 'p3', domain: 'core', source: 'manual', title: 'x', promptContext: {}, createdAt: 'x', terminalDisposition: 'merged' });
+  await requeueBlockedTask(dir3, dir3, 'p3', { state: 'done', keepPriority: true });
+  const plain = read(at(dir3, 'pending', 'p3.json'));
+  assert.equal('premiumPriority' in plain, false, 'keepPriority adds nothing a task did not have');
+});
+
 test('requeueBlockedTask: repeated-blocker match without force refuses; with force proceeds', async () => {
   const dir = makePipeline();
   const task = {
