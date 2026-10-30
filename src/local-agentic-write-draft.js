@@ -183,13 +183,37 @@ function stripCodeForGate(text) {
   return String(text || '').replace(/```[\s\S]*?(?:```|$)/g, ' ').replace(/`[^`\n]*`/g, ' ');
 }
 
+// 2026-10-30 (questforge deploy-kit task, blocked twice as 'a git remote operation'): a task whose deliverables are FILES TO WRITE can describe
+// what a guide or script should SAY ("5. Docs/DEPLOY.md: ... step by step: copy the app (git clone or rsync ...)"). That is content for a file,
+// not an operation the task performs. Two signals must both hold, so a genuine instruction is never exempted: (1) the task declares files to
+// create (a `Files:` line, `WHAT: create ...`, or `create ... ONLY`), and (2) the match sits on a line that is the description of one named
+// document ("<path>.md: ..." or "guide:" at the start of the line, optionally after a list marker).
+function taskDeclaresFilesToCreate(text) {
+  return /^\s*Files:\s*\S/m.test(text) || /\bWHAT:\s*create\b/i.test(text) || /\bcreate\b[^\n]{0,300}\bONLY\b/i.test(text);
+}
+
+const DOC_DESCRIPTION_LINE_RE = /^\s*(?:[-*]\s+|\d+[.)]\s+)?(?:[`'"]?[\w./-]*\.(?:md|txt|rst|sh|service|template|example|ya?ml|json)[`'"]?|(?:the\s+)?(?:deploy\s+)?(?:guide|readme|runbook|docs?|documentation))\s*:/i;
+
+function isDocContentMention(text, matchIndex) {
+  if (!taskDeclaresFilesToCreate(text)) return false;
+  const lineStart = text.lastIndexOf('\n', matchIndex) + 1;
+  return DOC_DESCRIPTION_LINE_RE.test(text.slice(lineStart, matchIndex));
+}
+
+function firstGenuineMatch(marker, text) {
+  const re = new RegExp(marker.re.source, marker.re.flags.includes('g') ? marker.re.flags : marker.re.flags + 'g');
+  const matches = [...text.matchAll(re)];
+  if (!matches.length || isNegatedMatch(text, matches[0].index)) return null;
+  if (!isDocContentMention(text, matches[0].index)) return matches[0];
+  return matches.slice(1).find((m) => !isNegatedMatch(text, m.index) && !isDocContentMention(text, m.index)) || null;
+}
+
 // Pure classifier: the first non-negated marker hit in the task's own ask, or null.
 function classifyExternalDependency(task) {
   const ctx = (task && task.promptContext) || {};
   const text = stripCodeForGate([task && task.title, ctx.rawText].filter(Boolean).join(' '));
   for (const marker of EXTERNAL_DEP_MARKERS) {
-    const match = marker.re.exec(text);
-    if (match && !isNegatedMatch(text, match.index)) return { label: marker.label, severity: marker.severity };
+    if (firstGenuineMatch(marker, text)) return { label: marker.label, severity: marker.severity };
   }
   return null;
 }
@@ -799,4 +823,5 @@ module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS, budgetBlockEnabled, buildTimeBudgetLine,
   isLeafTask, leafDecomposeLocked, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
   detectExternalDependency, classifyExternalDependency, externalDependencyAdvisory, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
+  isDocContentMention, taskDeclaresFilesToCreate,
 };
