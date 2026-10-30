@@ -148,3 +148,23 @@ test('guard: note must be string if provided', () => {
     `expected error about note type, got: ${JSON.stringify(result.errors)}`
   );
 });
+
+test('guard: each items bucket must be an array (non-array bucket is rejected)', () => {
+  for (const bucket of ['released', 'held', 'filed']) {
+    const row = makeValidRow();
+    row.items[bucket] = { item_id: 'x', cause: 'ok' };
+    const result = validateRow(row);
+    assert.equal(result.ok, false, bucket);
+    assert.ok(result.errors.some((e) => e === `items.${bucket} must be an array`), `${bucket}: ${JSON.stringify(result.errors)}`);
+  }
+});
+
+test('guard: each entry inside an items bucket must be an object (non-object entry is rejected)', () => {
+  for (const bad of ['x', 7, null, ['x', 'ok']]) {
+    const row = makeValidRow();
+    row.items.held = [bad];
+    const result = validateRow(row);
+    assert.equal(result.ok, false, JSON.stringify(bad));
+    assert.ok(result.errors.some((e) => e === 'items.held[0] must be an object'), `${JSON.stringify(bad)}: ${JSON.stringify(result.errors)}`);
+  }
+});
