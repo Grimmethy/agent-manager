@@ -9,8 +9,10 @@ const { execFileSync } = require('child_process');
 
 const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone,
-  requeueBlockedTask, repeatedBlockerMatch, withdrawTask,
+  requeueBlockedTask, repeatedBlockerMatch, withdrawTask, replaceFilesLine,
 } = require('./chat-task-requeue.js');
+const { extractDeclaredTargets } = require('./adhoc-diff-sanity.js');
+const declaredOf = (task) => extractDeclaredTargets(task, '');
 
 function makePipeline() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-task-requeue-test-'));
@@ -44,6 +46,75 @@ test('answerNeedsClarification: happy path -- appends answer, strips needsClarif
   assert.equal(moved.needsClarification, undefined);
   assert.equal(moved.history.length, 2);
   assert.equal(moved.history[1].stage, 'needs-clarification-resolved');
+});
+
+// --- Files: line in an answer replaces the task's stale Files: line (HUB0088-02, 2026-10-30) -------
+
+test('answerNeedsClarification: an answer with a Files: line replaces the earlier single Files: line and logs both values', async () => {
+  const dir = makePipeline();
+  write(dir, 'needs-clarification', {
+    id: 't1', needsClarification: { reason: 'design-decision' },
+    promptContext: { rawText: 'Part 2 of 3.\nFiles: python/build_graph.py\n\nTHIS PART: store specs.' }, history: [],
+  });
+  const result = await answerNeedsClarification(dir, 't1', 'The file moved.\nFiles: python/graph_edge_resolution.py, python/graph_build.py');
+  assert.equal(result.ok, true);
+  const moved = read(at(dir, 'adhoc', 't1.json'));
+  assert.match(moved.promptContext.rawText, /^Files: python\/graph_edge_resolution\.py, python\/graph_build\.py$/m);
+  assert.doesNotMatch(moved.promptContext.rawText, /python\/build_graph\.py/);
+  const entry = moved.history.find((h) => h.stage === 'files-line-replaced');
+  assert.ok(entry, 'a files-line-replaced history entry is written');
+  assert.match(entry.detail, /python\/build_graph\.py/);
+  assert.match(entry.detail, /python\/graph_edge_resolution\.py, python\/graph_build\.py/);
+  assert.match(moved.promptContext.rawText, /HUMAN DESIGN DECISION/);
+});
+
+test('answerNeedsClarification: an answer with two Files: lines uses the last one', async () => {
+  const dir = makePipeline();
+  write(dir, 'needs-clarification', { id: 't1', promptContext: { rawText: 'ask\nFiles: old.py' }, history: [] });
+  await answerNeedsClarification(dir, 't1', 'first try\nFiles: a.py\nthen\nFiles: b.py, c.py');
+  const moved = read(at(dir, 'adhoc', 't1.json'));
+  const targets = declaredOf(moved);
+  assert.ok(targets.includes('b.py') && targets.includes('c.py'));
+  assert.equal(targets.includes('old.py'), false);
+  assert.equal(targets.includes('a.py'), false);
+});
+
+test('answerNeedsClarification: an answer with no Files: line leaves the task Files: line untouched and writes no files-line-replaced entry', async () => {
+  const dir = makePipeline();
+  write(dir, 'needs-clarification', { id: 't1', promptContext: { rawText: 'ask\nFiles: old.py' }, history: [] });
+  await answerNeedsClarification(dir, 't1', 'go with option B; the Files discussion is in prose only');
+  const moved = read(at(dir, 'adhoc', 't1.json'));
+  assert.ok(declaredOf(moved).includes('old.py'));
+  assert.equal(moved.history.some((h) => h.stage === 'files-line-replaced'), false);
+});
+
+test('answerNeedsClarification: a task with no earlier Files: line gets none added to its own text', async () => {
+  const dir = makePipeline();
+  write(dir, 'needs-clarification', { id: 't1', promptContext: { rawText: 'ask without a files line' }, history: [] });
+  await answerNeedsClarification(dir, 't1', 'Files: new.py');
+  const moved = read(at(dir, 'adhoc', 't1.json'));
+  assert.doesNotMatch(moved.promptContext.rawText.split('HUMAN DESIGN DECISION')[0], /Files:/);
+  assert.equal(moved.history.some((h) => h.stage === 'files-line-replaced'), false);
+});
+
+test('extractDeclaredTargets on an answered task returns the corrected paths and the stale path is gone', async () => {
+  const dir = makePipeline();
+  write(dir, 'needs-clarification', {
+    id: 't1', title: 'Store unresolved specs', promptContext: { rawText: 'Part 2 of 3.\nFiles: python/build_graph.py\n\nTHIS PART: store specs.' }, history: [],
+  });
+  await answerNeedsClarification(dir, 't1', 'Files: python/graph_edge_resolution.py');
+  const moved = read(at(dir, 'adhoc', 't1.json'));
+  const targets = extractDeclaredTargets(moved, '');
+  assert.ok(targets.includes('python/graph_edge_resolution.py'));
+  assert.equal(targets.includes('python/build_graph.py'), false);
+});
+
+test('replaceFilesLine: pure cases (same value, mid-line Files: text, case-insensitive label)', () => {
+  assert.deepEqual(replaceFilesLine('a\nFiles: x.js\nb', 'Files: x.js'), { rawText: 'a\nFiles: x.js\nb', replaced: null });
+  assert.equal(replaceFilesLine('a\nFiles: x.js\nb', 'see Files: y.js in prose').replaced, null);
+  const r = replaceFilesLine('a\nfiles: x.js\nb', 'FILES: y.js');
+  assert.equal(r.rawText, 'a\nFiles: y.js\nb');
+  assert.deepEqual(r.replaced, { old: 'x.js', new: 'y.js' });
 });
 
 test('answerNeedsClarification: empty/whitespace-only answer is rejected, nothing touched', async () => {
