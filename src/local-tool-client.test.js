@@ -524,6 +524,8 @@ test('buildWriteToolHandlers.queue_reviewed_task writes a real adhoc task and re
     assert.equal(record.promptContext.rawText, 'AC-57 is clean, no conflicts -- add the re-admission path in src/decompose.js.');
     assert.equal(record.promptContext.raisedFrom, 'chat');
     assert.equal(record.premiumPriority, true, 'every task Chat queues is something a human is actively watching it work on right now');
+    assert.equal(record.premiumSetBy, 'chat-queue', 'provenance shown in the task modal');
+    assert.ok(Number.isFinite(Date.parse(record.premiumSetAt)), 'premiumSetAt is an ISO timestamp');
     assert.match(result.message, /premium priority/);
   });
 });

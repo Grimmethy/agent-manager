@@ -83,10 +83,19 @@ def api_task_set_premium_priority(task_id):
     drafting, adhoc, ...) -- an operator flagging a task that's mid-retry-cycle (like the
     file-decompose move this feature was built for, which was cycling blocked <-> pending
     for hours) needs to be able to set this BEFORE it's back in pending/, not only once
-    it happens to be there. Body: {"enabled": true|false}, defaults to true."""
+    it happens to be there. Body: {"enabled": true|false}, defaults to true.
+
+    Provenance (display only, claim order never reads it): setting records premiumSetBy
+    ("operator-ui" by default; the body may say "by": "operator-bulk") and premiumSetAt (ISO)
+    and drops any stale premiumClearedAt/By; clearing records premiumClearedAt/By and keeps
+    the last premiumSetBy/At. There is no bulk-premium route on master yet: when one lands it
+    must post here with "by": "operator-bulk"."""
     from app import _find_live_task_file, get_active_repo_root, queue_dir, read_json_safe
     body = request.get_json(silent=True) or {}
     enabled = bool(body.get("enabled", True))
+    by = body.get("by", "operator-ui")
+    if by not in ("operator-ui", "operator-bulk"):
+        abort(400, description='"by" must be "operator-ui" or "operator-bulk"')
 
     # Optional project (a registered repoRoot, query or body): look only in THAT project's queue. Absent = the active project, as before; unknown = 404, never a fallback.
     import branch_projects
@@ -105,13 +114,20 @@ def api_task_set_premium_priority(task_id):
     if not data:
         abort(500, description="could not read the task file")
 
+    now_iso = datetime.now(timezone.utc).isoformat()
     if enabled:
         data["premiumPriority"] = True
+        data["premiumSetBy"] = by
+        data["premiumSetAt"] = now_iso
+        data.pop("premiumClearedAt", None)
+        data.pop("premiumClearedBy", None)
     else:
         data.pop("premiumPriority", None)
+        data["premiumClearedAt"] = now_iso
+        data["premiumClearedBy"] = by
     data.setdefault("history", []).append({
-        "stage": "advisory", "at": datetime.now(timezone.utc).isoformat(),
-        "detail": f"premium priority {'set' if enabled else 'cleared'} by operator override",
+        "stage": "advisory", "at": now_iso,
+        "detail": f"premium priority {'set' if enabled else 'cleared'} by operator override ({by})",
     })
     target.write_text(json.dumps(data, indent=2), encoding="utf-8")
     return jsonify({"id": task_id, "premiumPriority": enabled})
