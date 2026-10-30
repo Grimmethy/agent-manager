@@ -47,3 +47,11 @@ if [[ ! -f "$INFO_ATTRS" ]] || ! grep -qxF "$LINE" "$INFO_ATTRS"; then
   printf '%s\n' "$LINE" >> "$INFO_ATTRS"
   printf '[setup-merge-drivers] added "%s" to %s\n' "$LINE" "$INFO_ATTRS"
 fi
+
+# 3. Remove untracked .gitattributes files that contain only the driver line (leftover from earlier script versions).
+if [[ -f "$ATTRS_FILE" ]] && ! git -C "$REPO_ROOT" ls-files --error-unmatch .gitattributes >/dev/null 2>&1; then
+  if [[ "$(grep -cvE '^[[:space:]]*$' "$ATTRS_FILE")" == "1" ]]; then
+    rm -f "$ATTRS_FILE"
+    printf '[setup-merge-drivers] removed untracked %s created by an earlier version\n' "$ATTRS_FILE"
+  fi
+fi
