@@ -49,6 +49,19 @@ def _check_merge_conflict(repo_root, main_branch, branch):
     timeout, OSErrors) is reported as ``willConflict: None`` rather than crashing or
     silently saying "no conflict". A conflict check that lies on its own failure is
     worse than no check at all.
+
+    Returns:
+        dict with keys:
+            willConflict (bool | None): True if the merge would produce a conflict,
+                False if it would succeed without conflicts, None if the check itself
+                failed (best-effort failure, not a "no conflict" verdict). This is the
+                source of truth for the preview's conflict detection -- callers should
+                treat None as "unknown" rather than "safe".
+            conflictFiles (list[str]): File paths that would conflict if merged.
+                Empty when willConflict is False or None. Populated only when
+                willConflict is True.
+            checked (bool): True if the check completed successfully (willConflict
+                is a real bool, not None), False if the check itself failed.
     """
     import shutil
     import tempfile
