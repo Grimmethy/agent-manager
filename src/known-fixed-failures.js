@@ -278,6 +278,47 @@ const KNOWN_FIXED = [
     },
   },
   {
+    // 2026-10-24, HUB0270 2/4: check 4 now skips status claims (e.g. "All 42 tests pass") when the
+    // summary or task text contains a whole-suite run phrase ('test/*.test.js', 'npm test', 'full suite',
+    // 'whole suite', 'all tests', 'node --test', 'unittest discover', 'pytest'), because such a claim is
+    // about the ENTIRE test suite, not the diff's added test definitions -- comparing the status count to
+    // the diff's added test defs would always fail spuriously. This entry re-runs that same check against
+    // the parked task's stored summary and rawText to determine if the fix genuinely unblocks it.
+    id: 'false-test-count-claim-whole-suite',
+    failureClass: 'false-test-count-claim on a status claim that reported a whole-suite total',
+    fixedIn: 'agent-manager (adhoc-diff-sanity check 4: skip status claims when a whole-suite run phrase is present, HUB0270 2/4)',
+    description: "check 4 rejected a CORRECT status claim ('All 42 tests pass') because the summary did not contain a whole-suite run phrase, and the check compared the whole-suite count (42) against the diff's added test defs (3) -- the claim was about the entire suite, not the diff's additions, so the comparison was always going to fail spuriously",
+    dirs: ['blocked', 'needs-clarification'],
+    applies: (task) => {
+      const t = failureText(task);
+      // The recorded failure is the check-4 false-completion-claim reason.
+      if (!/summary claims \d+ tests but the diff only adds \d+ test definition/.test(t)) return false;
+      try {
+        // Inline the check-4 logic: extractClaimedTestCount + WHOLE_SUITE_RUN_RE check.
+        // `extractClaimedTestCount` is not exported from adhoc-diff-sanity.js, so we replicate
+        // the relevant portion here for the known-fixed-failures registry.
+        const ALL_N_TESTS_RE = /\ball\s+(\d+)\s+tests?\b/i;
+        const N_TESTS_CLAIM_RE = /\b(\d+)\s+tests?\s+(?:pass(?:es|ed|ing)?|added)\b/i;
+        const WHOLE_SUITE_RUN_RE = /\b(?:test\/\*\.test\.js|npm test|full suite|whole suite|all tests|node --test|unittest discover|pytest)\b/i;
+        const summary = (task && task.promptContext && task.promptContext.body) || '';
+        const rawText = (task && task.promptContext && task.promptContext.rawText) || '';
+        const combined = `${summary}\n${rawText}`;
+        const all = ALL_N_TESTS_RE.exec(summary);
+        if (all) {
+          // "all N tests" -> kind 'status'
+          return !!WHOLE_SUITE_RUN_RE.test(combined);
+        }
+        const m = N_TESTS_CLAIM_RE.exec(summary);
+        if (!m) return false;
+        const kind = /added/i.test(m[0]) ? 'added' : 'status';
+        if (kind !== 'status') return false;
+        // The fix: a whole-suite run phrase in the summary or rawText means the status claim is
+        // about the entire suite, so check 4 should skip (not compare against the diff).
+        return !!WHOLE_SUITE_RUN_RE.test(combined);
+      } catch { return false; }
+    },
+  },
+  {
     // 2026-10-19: the same gate flagged an ALL_CAPS dummy string that exists only in a test file the draft itself adds (brain-dump 1891's
     // SENTINEL_THOUGHT). fact-checker.js now exempts those, as it already did for URLs; this re-runs that same extraction on the parked
     // task's own diff and re-admits it only when EVERY flagged name qualifies (a name production code also uses stays flagged).
