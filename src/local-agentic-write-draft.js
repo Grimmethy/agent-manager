@@ -200,12 +200,26 @@ function isDocContentMention(text, matchIndex) {
   return DOC_DESCRIPTION_LINE_RE.test(text.slice(lineStart, matchIndex));
 }
 
+// 2026-10-30 (HUB0256-01, 'map git push --delete errors containing "denied"'): a marker followed by a noun that names the RESULT of the command
+// (errors, output, failures, ...) describes handling that result, not performing the operation. After the match the text may carry flags
+// (--delete, -f) and up to 3 plain words before that noun. Genuine instructions ('git push origin main after the edit', 'git push --force')
+// have no such noun and keep blocking.
+const RESULT_NOUN_RE = /^(?:\s+-{1,2}[\w-]+)*(?:\s+[\w'"-]+){0,3}?\s+(?:errors?|failures?|output|messages?|exit codes?|stderr|responses?)\b/i;
+
+function isResultHandlingMention(text, matchIndex, matchLength) {
+  return RESULT_NOUN_RE.test(text.slice(matchIndex + matchLength, matchIndex + matchLength + 80));
+}
+
+function isIgnorableMention(text, m) {
+  return isDocContentMention(text, m.index) || isResultHandlingMention(text, m.index, m[0].length);
+}
+
 function firstGenuineMatch(marker, text) {
   const re = new RegExp(marker.re.source, marker.re.flags.includes('g') ? marker.re.flags : marker.re.flags + 'g');
   const matches = [...text.matchAll(re)];
   if (!matches.length || isNegatedMatch(text, matches[0].index)) return null;
-  if (!isDocContentMention(text, matches[0].index)) return matches[0];
-  return matches.slice(1).find((m) => !isNegatedMatch(text, m.index) && !isDocContentMention(text, m.index)) || null;
+  if (!isIgnorableMention(text, matches[0])) return matches[0];
+  return matches.slice(1).find((m) => !isNegatedMatch(text, m.index) && !isIgnorableMention(text, m)) || null;
 }
 
 // Pure classifier: the first non-negated marker hit in the task's own ask, or null.
@@ -823,5 +837,5 @@ module.exports = {
   draftAdhocViaLocalAgenticWrite, isEnabled, buildWriteAgenticPrompt, LOCAL_AGENTIC_WRITE_MAX_TURNS, budgetBlockEnabled, buildTimeBudgetLine,
   isLeafTask, leafDecomposeLocked, priorAttemptAnalysisBlock, acceptanceCriteriaBlock,
   detectExternalDependency, classifyExternalDependency, externalDependencyAdvisory, scopeComplexityGate, EXTERNAL_DEP_MARKERS, partialDiffFallbackPrompt,
-  isDocContentMention, taskDeclaresFilesToCreate,
+  isDocContentMention, taskDeclaresFilesToCreate, isResultHandlingMention,
 };
