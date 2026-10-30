@@ -446,6 +446,23 @@ const CHAT_TOOLS = [
       },
     },
   },
+  // 2026-10-29 (post-incident hardening, Grimmethy: "I need to see which tools and gates
+  // are live right now, and whether the branch I\'m about to merge is up-to-date with
+  // origin"). This is a CHAT-only tool -- it must NOT be in TOOLS (which every worker
+  // receives) because it would burn tokens in every implement pass for zero benefit.
+  // The tool list it returns is the UNION of TOOLS + CHAT_TOOLS (what chat actually sees),
+  // not just TOOLS -- the earlier defect was that it reported only the 7 shared tools and
+  // missed every CHAT_TOOLS entry. The verdict gate flag is derived from CHAT_TOOLS (where
+  // record_branch_verdict/list_unverified_branches live), not TOOLS (where they never are),
+  // so gates.mergeVerdictNeedsCheck is true when the gate is actually live.
+  {
+    type: 'function',
+    function: {
+      name: 'chat_status',
+      description: 'Report the current tool list and gate state for the chat client: which tools are loaded (TOOLS + CHAT_TOOLS), whether the merge verdict gate is live (gates.mergeVerdictNeedsCheck), and whether the local branch is behind origin (stale checkout warning). Use this to verify the chat is configured correctly before attempting a merge.',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
 ];
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434';
@@ -697,6 +714,34 @@ function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
     list_unverified_branches: (args) => listUnverifiedBranchesTool({ project: args.project, limit: args.limit }),
     record_branch_verdict: (args) => recordBranchVerdictTool({ project: args.project, branch: args.branch, sha: args.sha, verdict: args.verdict, reasons: args.reasons }),
     check_branch: (args) => checkBranchTool({ project: args.project, branch: args.branch }),
+    chat_status: () => {
+      // Report the union of TOOLS + CHAT_TOOLS (what chat actually sees), not just TOOLS.
+      // The earlier defect was that chat_status reported only the 7 shared tools and
+      // missed every CHAT_TOOLS entry.
+      const toolNames = [...TOOLS.map((t) => t.function.name), ...CHAT_TOOLS.map((t) => t.function.name)];
+      // Derive the verdict gate from CHAT_TOOLS (where record_branch_verdict/list_unverified_branches live),
+      // not TOOLS (where they never are). The earlier defect was that gates.mergeVerdictNeedsCheck
+      // was always false because it looked in TOOLS.
+      const hasVerdictGate = CHAT_TOOLS.some((t) => t.function.name === 'record_branch_verdict' || t.function.name === 'list_unverified_branches');
+      // Check if the local branch is behind origin (stale checkout warning).
+      // This uses a local origin ref without a fetch, so it may be stale.
+      let isBehind = false;
+      try {
+        const { execFileSync } = require('child_process');
+        const output = execFileSync('git', ['rev-list', '--count', 'HEAD..origin/HEAD'], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        isBehind = Number(output) > 0;
+      } catch {
+        // If git fails (e.g. not a repo, no origin), assume not behind.
+        isBehind = false;
+      }
+      return {
+        tools: toolNames,
+        gates: {
+          mergeVerdictNeedsCheck: hasVerdictGate,
+        },
+        warning: isBehind ? 'Local branch is behind origin (stale checkout warning: behind uses a local origin ref without a fetch)' : null,
+      };
+    },
   };
 }
 
