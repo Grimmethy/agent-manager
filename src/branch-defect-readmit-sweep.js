@@ -11,9 +11,10 @@
 // rules and requeues through the same code path (chat-task-requeue.js requeueBlockedTask: it deletes the superseded branch, records the removal and
 // marks the old attempt abandoned).
 //
-// Scope, deliberately narrow (the same limits as the conflict sweep):
+// Scope, deliberately narrow (the same limits as the conflict sweep, except for human-prioritised tasks, see below):
 //   - only a task in done/ with terminalDisposition 'pending-merge' whose latest `applied` event names an agent/* branch that still exists on origin
-//     and is ahead of <main>; never a hub child or stacked task, never a branch with a live sibling on it, never a human-prioritised task;
+//     and is ahead of <main>; never a hub child or stacked task, never a pinned task, never a branch with a live sibling on it. A human-queued or
+//     premium task IS eligible (owner decision 2026-10-30: the trigger here is a human verdict) and is requeued with its priority kept;
 //   - only a verdict that is current: priorVerdict.verdict 'needs-work', source 'chat' or 'manual', not kind 'main-moved', and priorVerdict.sha equal
 //     to the branch's CURRENT origin head. A verdict for an older commit is stale (the branch moved) and is ignored;
 //   - the same verdict on the same head must be seen on two runs at least SETTLE_MS apart (a merge, apply or re-verification may be in flight);
@@ -94,7 +95,7 @@ async function sweepBranchDefects({
   for (const name of names) {
     const filePath = path.join(doneDir, name);
     const task = readJson(filePath);
-    if (!eligibleTask(task)) continue;
+    if (!eligibleTask(task, { allowHumanPrioritised: true })) continue;   // the trigger is a human verdict (defectVerdict below)
     const pv = defectVerdict(task);
     if (!pv) continue;
     const branch = appliedBranch(task);
@@ -126,7 +127,7 @@ async function sweepBranchDefects({
       task.history = Array.isArray(task.history) ? task.history : [];
       task.history.push({ stage: READMIT_STAGE, at: nowIso, detail: `${branch} had a needs-work verdict (${first}); requeued once for a redraft with the reviewer's reasons` });
       writeJson(filePath, task);
-      const res = await requeue(pipelineDir, repoRoot, task.id, { state: 'done', force: true });
+      const res = await requeue(pipelineDir, repoRoot, task.id, { state: 'done', force: true, keepPriority: true });
       if (!res || res.ok !== true) {
         summary.errors += 1;
         console.error(`[branch-defect-readmit] ${task.id}: requeue failed: ${res && res.error}`);
