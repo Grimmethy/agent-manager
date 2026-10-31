@@ -134,10 +134,11 @@ function reconcileBrainDumpEntries(options) {
 
     // 5. Otherwise, check targets -- log and skip on throw
     let isSuspect = false;
+    let targetCheck = null;
     try {
       const repoRoot = pipelineDirs.length > 0 ? pipelineDirs[0] : process.cwd();
-      const result = checkEntryTargets(entryText, { repoRoot });
-      if (result && result.verdict === 'suspect') {
+      targetCheck = checkEntryTargets(entryText, { repoRoot });
+      if (targetCheck && targetCheck.verdict === 'suspect') {
         isSuspect = true;
       }
     } catch (err) {
@@ -152,7 +153,7 @@ function reconcileBrainDumpEntries(options) {
       }
       counts.possiblyResolved++;
       // Include the first cited path as the "symbol" that doesn't exist, or the entry text if none cited
-      const cited = (result && result.cited && result.cited.length > 0) ? result.cited[0] : entryText;
+      const cited = (targetCheck && targetCheck.cited && targetCheck.cited.length > 0) ? targetCheck.cited[0] : entryText;
       changes.push({ entryId, action: 'possibly-resolved', symbol: cited });
     }
   }
