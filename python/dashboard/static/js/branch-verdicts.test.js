@@ -9,6 +9,18 @@ const { branchVerdictKey, branchVerdictBorderStyle, branchVerdictBadgeHtml, bran
 
 const B = (verdict, extra = {}) => ({ branch: 'agent/x', verdict, reasons: ['r1', 'r2'], source: 'manual', stale: false, ...extra });
 
+test('hold: its own blue border, badge and filter bucket, distinct from needs-work', () => {
+  assert.equal(branchVerdictKey(B('hold')), 'hold');
+  assert.match(branchVerdictBorderStyle(B('hold')), /var\(--accent\)/);
+  assert.doesNotMatch(branchVerdictBorderStyle(B('hold')), /var\(--warn\)/);
+  assert.match(branchVerdictBadgeHtml(B('hold')), /class="badge hold" data-verdict="hold"/);
+  assert.equal(branchVerdictKey(B('hold', { stale: true })), 'unverified');
+  const list = [B('needs-work'), B('hold'), B('hold'), B('merge')];
+  assert.equal(filterBranchesByVerdict(list, 'hold').length, 2);
+  assert.equal(filterBranchesByVerdict(list, 'needs-work').length, 1);
+  assert.match(branchVerdictFilterBarHtml(list, 'all'), /Hold \(2\)/);
+});
+
 test('border color: green merge, yellow needs-work, red discard, grey unverified', () => {
   assert.match(branchVerdictBorderStyle(B('merge')), /var\(--ok\)/);
   assert.match(branchVerdictBorderStyle(B('needs-work')), /var\(--warn\)/);

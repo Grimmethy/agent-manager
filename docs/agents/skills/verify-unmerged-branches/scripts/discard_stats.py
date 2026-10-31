@@ -5,6 +5,7 @@ usage: discard_stats.py [--since YYYY-MM-DD] [--root /media/model-cache/github] 
 
 Reads <root>/*-pipeline/queue/branch-verdicts.json plus the core pipeline's (/media/wok/model-cache/agent-manager/queue). Only the LATEST chat/manual
 verdict per branch counts (deterministic verdicts are ignored, so automatic triage-queue discards do not inflate the numbers).
+A "hold" verdict (a sound piece waiting on its hub or a sibling) is its own column, never folded into needs-work, so the needs-work rate stays the defect rate.
 Families: brain-dump adhoc, other adhoc, decompose, arch-review, obs/perf-fix, other. For brain-dump adhoc it also splits by executedVerification
 status of the done record. --causes buckets the discard reasons (false premise, duplicate/superseded, inert, wrong repo/retired, other).
 --compute joins each counted branch to the model_calls rows of its task (<pipeline>/model-stats.db, task_id = the branch name without 'agent/', and for
@@ -111,7 +112,7 @@ def main():
             text = " ".join(v.get("reasons") or [])
             causes[next((k for k, rx in CAUSES.items() if re.search(rx, text, re.I)), "other")] += 1
     def row(c):
-        t = sum(c.values()); return {"n": t, **{k: round(c[k] / t, 3) for k in ("discard", "merge", "needs-work")}}
+        t = sum(c.values()); return {"n": t, **{k: round(c[k] / t, 3) for k in ("discard", "merge", "needs-work", "hold")}}
     out["families"] = {k: row(v) for k, v in fam.items()}
     out["brain_dump_by_exec_status"] = {k: row(v) for k, v in ev.items()}
     out["discard_causes"] = dict(causes)
@@ -119,10 +120,10 @@ def main():
     if a.json: print(json.dumps(out, indent=1)); return
     print(f"verdicts counted: {sum(sum(c.values()) for c in fam.values())}" + (f" (since {a.since})" if a.since else ""))
     for k, r in sorted(out["families"].items(), key=lambda kv: -kv[1]["discard"]):
-        print(f"  {k:18} n={r['n']:4}  discard={r['discard']:.0%}  merge={r['merge']:.0%}  needs-work={r['needs-work']:.0%}")
+        print(f"  {k:18} n={r['n']:4}  discard={r['discard']:.0%}  merge={r['merge']:.0%}  needs-work={r['needs-work']:.0%}  hold={r['hold']:.0%}")
     if out["brain_dump_by_exec_status"]:
         print("brain-dump adhoc by executedVerification status:")
-        for k, r in out["brain_dump_by_exec_status"].items(): print(f"  {k:14} n={r['n']:4}  discard={r['discard']:.0%}  merge={r['merge']:.0%}")
+        for k, r in out["brain_dump_by_exec_status"].items(): print(f"  {k:14} n={r['n']:4}  discard={r['discard']:.0%}  merge={r['merge']:.0%}  hold={r['hold']:.0%}")
     if a.causes:
         print("discard causes (all families):")
         for k, c in causes.most_common(): print(f"  {c:4} {k}")

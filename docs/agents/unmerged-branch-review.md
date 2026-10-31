@@ -17,6 +17,9 @@ hub.** A hub's sub-tasks are frequently designed as a matched set, not independe
   named. That context changes what "done" or "mergeable" even means for the pieces you're
   looking at, and is easy to miss if you only look at the individual branch's own commit.
 
+**Verdicts (2026-10-31):** merge (green), needs-work (yellow: a defect to fix), hold (blue: the piece is sound but cannot merge yet, because its hub is
+unfinished or a sibling must merge first; it is never redrafted and never counted as a defect), discard (red). `discard_stats.py` reports hold in its own column.
+
 **Before analyzing a branch for value/completeness:**
 
 1. Find its hub: `grep -rl "<task-id-or-timestamp-fragment>" queue/` (a hub file lives in
