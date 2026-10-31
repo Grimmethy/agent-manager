@@ -63,3 +63,9 @@ test('appendRow throws when date is malformed', () => {
     { message: /appendRow: date must be YYYY-MM-DD/ }
   );
 });
+
+test('appendRow succeeds with valid YYYY-MM-DD date', () => {
+  const row = makeValidRow();
+  const result = appendRow(pipelineDir, '2026-10-27', row);
+  assert.ok(result);
+});
