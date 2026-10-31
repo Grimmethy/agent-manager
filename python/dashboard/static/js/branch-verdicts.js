@@ -4,13 +4,14 @@
 // Kept out of branches-joblist-hardware-tabs.js on purpose (hot file) -- that file only calls the helpers
 // below. Pure string/array functions, no DOM, so they are testable from Node.
 //
-// Border color per card: green = merge, yellow = needs-work, red = discard, grey = unverified or stale.
+// Border color per card: green = merge, yellow = needs-work, blue = hold (sound, waiting on its hub or a sibling), red = discard, grey = unverified or stale.
 
 const BRANCH_VERDICT_FILTERS = [
   { key: 'all', label: 'All' },
   { key: 'unverified', label: 'Unverified' },
   { key: 'merge', label: 'Ready to merge' },
   { key: 'needs-work', label: 'Needs work' },
+  { key: 'hold', label: 'Hold' },
   { key: 'discard', label: 'Discard' },
 ];
 
@@ -19,11 +20,11 @@ let branchVerdictFilter = 'all';
 // The bucket a branch falls in. A stale verdict is "unverified" -- it vouches for an older commit.
 function branchVerdictKey(b) {
   if (!b || b.stale || !b.verdict) return 'unverified';
-  return ['merge', 'needs-work', 'discard'].includes(b.verdict) ? b.verdict : 'unverified';
+  return ['merge', 'needs-work', 'hold', 'discard'].includes(b.verdict) ? b.verdict : 'unverified';
 }
 
 function branchVerdictColorVar(key) {
-  return { merge: 'var(--ok)', 'needs-work': 'var(--warn)', discard: 'var(--bad)' }[key] || 'var(--muted)';
+  return { merge: 'var(--ok)', 'needs-work': 'var(--warn)', hold: 'var(--accent)', discard: 'var(--bad)' }[key] || 'var(--muted)';
 }
 
 // Inline style for the card: a colored left border plus a thin outline in the same color.
@@ -36,8 +37,8 @@ function _bvEscape(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 }
 
-const _BV_BADGE_CLASS = { merge: 'ok', 'needs-work': 'warn', discard: 'bad' };
-const _BV_WORD = { merge: 'merge', 'needs-work': 'needs work', discard: 'discard' };
+const _BV_BADGE_CLASS = { merge: 'ok', 'needs-work': 'warn', hold: 'hold', discard: 'bad' };
+const _BV_WORD = { merge: 'merge', 'needs-work': 'needs work', hold: 'hold', discard: 'discard' };
 
 // Badge with the verdict word plus a one-line reason under the title.
 function branchVerdictBadgeHtml(b) {
