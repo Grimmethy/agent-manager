@@ -9,11 +9,14 @@
 // Ship an entry here in the same PR as the fix; fix-signature-sweep.js drains the matching stuck tasks once, when the code carrying the
 // entry first runs.
 //
-// An entry: { id, fixedIn, description, dirs, applies(task) }
-//   id       stable key (recorded on a requeued task so it is never requeued for the same fix twice)
-//   applies  a PRECISE test that this task's failure is the class the fix addresses -- text of the recorded failure, plus any structural
-//            precondition (e.g. the target file really contains the typographic characters). Over-matching costs a wasted draft, and the
-//            once-per-fix guard bounds it to one; under-matching just leaves the old "wait for a human".
+// An entry: { id, fixedIn, description, dirs, applies(task), appliesScope? }
+//   id             stable key (recorded on a requeued task so it is never requeued for the same fix twice)
+//   applies        a PRECISE test that this task's failure is the class the fix addresses -- text of the recorded failure, plus any structural
+//                  precondition (e.g. the target file really contains the typographic characters). Over-matching costs a wasted draft, and the
+//                  once-per-fix guard bounds it to one; under-matching just leaves the old "wait for a human".
+//   appliesScope   'parked' | 'done-unmerged-branch' | 'both' -- which queue states this entry re-queues for. Defaults to 'parked' when absent.
+//                  'parked' covers tasks stuck in the blocked or needs-clarification dirs; 'done-unmerged-branch' covers tasks whose review
+//                  produced a diff but whose branch has not yet been merged (so a separate sweep drains them); 'both' covers both.
 
 const TYPOGRAPHIC_RE = /[‘’“”–— ]/;
 
@@ -335,4 +338,13 @@ const KNOWN_FIXED = [
   },
 ];
 
-module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable, SIBLING_NOT_IN_TREE_RE, _setEndpointProbe };
+// Pure helper: does this entry apply to the given scope? Defaults to 'parked' when the entry has no appliesScope.
+// 'both' matches exactly the two known scopes ('parked' and 'done-unmerged-branch'); any other value matches only itself.
+function entryAppliesToScope(entry, scope) {
+  if (!entry || typeof scope !== 'string') return false;
+  const s = entry.appliesScope ?? 'parked';
+  if (s === 'both') return scope === 'parked' || scope === 'done-unmerged-branch';
+  return s === scope;
+}
+
+module.exports = { KNOWN_FIXED, failureText, siblingRepoWasUnreachable, SIBLING_NOT_IN_TREE_RE, _setEndpointProbe, entryAppliesToScope };

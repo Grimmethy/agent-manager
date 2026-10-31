@@ -5,7 +5,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { KNOWN_FIXED, _setEndpointProbe } = require('./known-fixed-failures.js');
+const { KNOWN_FIXED, _setEndpointProbe, entryAppliesToScope } = require('./known-fixed-failures.js');
 
 const entry = KNOWN_FIXED.find((e) => e.id === 'ungrounded-field-new-env-var');
 const BLOCK = (name) => `Deterministic gate: draft cites a value that appears nowhere in its real grounding source -- ungrounded-field: ${name}. This fact-check flag is high-precision`;
@@ -185,4 +185,48 @@ test('stacked-sibling-missing-from-tree: the failure pattern matches the wording
     'the sibling piece is not merged',
   ]) assert.equal(re.test(t), true, t);
   for (const t of ['expected 2 but got 1', 'the sibling merged cleanly and the tests pass', 'The draft claims `# pass 97` but the real output shows `# pass 96`']) assert.equal(re.test(t), false, t);
+});
+
+// --- entryAppliesToScope (2026-10-30, HUB0191 · 1/6) --------------------------------------------------------------
+// Infrastructure: the appliesScope field lets a registry entry declare whether it
+// drains parked tasks, done-but-not-yet-merged-branch tasks, or both. Default is
+// 'parked' so existing entries keep their prior behavior.
+
+test('entryAppliesToScope: absent appliesScope defaults to "parked"', () => {
+  const noScope = { id: 'ghost-entry' };
+  assert.equal(entryAppliesToScope(noScope, 'parked'), true);
+  assert.equal(entryAppliesToScope(noScope, 'done-unmerged-branch'), false);
+});
+
+test('entryAppliesToScope: appliesScope "both" matches either scope', () => {
+  const both = { id: 'dual-entry', appliesScope: 'both' };
+  assert.equal(entryAppliesToScope(both, 'parked'), true);
+  assert.equal(entryAppliesToScope(both, 'done-unmerged-branch'), true);
+  assert.equal(entryAppliesToScope(both, 'bogus'), false);
+});
+
+test('entryAppliesToScope: appliesScope "done-unmerged-branch" matches only that scope', () => {
+  const dunb = { id: 'dunb-entry', appliesScope: 'done-unmerged-branch' };
+  assert.equal(entryAppliesToScope(dunb, 'parked'), false);
+  assert.equal(entryAppliesToScope(dunb, 'done-unmerged-branch'), true);
+});
+
+test('entryAppliesToScope: undefined appliesScope is treated as "parked"', () => {
+  const undef = { id: 'undef-entry', appliesScope: undefined };
+  assert.equal(entryAppliesToScope(undef, 'parked'), true);
+  assert.equal(entryAppliesToScope(undef, 'done-unmerged-branch'), false);
+});
+
+test('entryAppliesToScope: existing entries without appliesScope behave as "parked" only', () => {
+  // Pick an entry known not to carry appliesScope (the first one is the canonical example).
+  const existing = KNOWN_FIXED[0];
+  assert.equal(entryAppliesToScope(existing, 'parked'), true);
+  assert.equal(entryAppliesToScope(existing, 'done-unmerged-branch'), false);
+});
+
+test('entryAppliesToScope: guards against null/undefined entry and non-string scope', () => {
+  assert.equal(entryAppliesToScope(null, 'parked'), false);
+  assert.equal(entryAppliesToScope(undefined, 'parked'), false);
+  assert.equal(entryAppliesToScope({}, null), false);
+  assert.equal(entryAppliesToScope({}, 42), false);
 });
