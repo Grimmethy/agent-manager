@@ -934,7 +934,15 @@ def api_git_discard_branch(branch):
         # already gone) -- see _delete_local_branch for why leaving it is a real hazard.
         local_branch = _delete_local_branch(repo_root, branch)
     except RuntimeError as e:
-        return jsonify({"succeeded": False, "reason": str(e)}), 500
+        err_text = str(e)
+        if any(m in err_text.lower() for m in ('permission', 'denied', '403', 'authentication failed')):
+            return jsonify({
+                "succeeded": False,
+                "reason": "Push permission denied",
+                "reasonCode": "no-push-access",
+            }), 403
+        trimmed = err_text[-300:] if len(err_text) > 300 else err_text
+        return jsonify({"succeeded": False, "reason": trimmed}), 500
     finally:
         _release_apply_lock(lock_fd)
 
