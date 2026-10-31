@@ -1506,6 +1506,13 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
           task.inertAdditions = summariseInertAdditions(r, isHubChildTask(task));
           if (r.inert.length) {
             appendHistoryEvent(task, 'advisory', `inert-addition check: ${r.inert.length} unreferenced addition(s) (${r.inert.slice(0, 4).map((i) => i.name).join(', ')}${r.inert.length > 4 ? ', ...' : ''})${task.inertAdditions.hubChild ? ' -- hub slice, a sibling may wire it' : ''}`);
+            if (process.env.AGENT_MANAGER_REVIEW_INERT_CHECK === 'block' && promptContext.brainDumpEntryId && !isHubChildTask(task)) {
+              const reason = summariseInertAdditions(r, isHubChildTask(task));
+              task.reviewProvider = 'deterministic-inert-check';
+              recordModelOutcome({ callId: task.abCallId, outcome: 'rejected', outcomeStage: 'review', outcomeReason: reason });
+              appendHistoryEvent(task, 'blocked', reason);
+              return { succeeded: true, verdict: 'blocked', blockedReason: reason, blockedStage: 'review', factCheckVerdict };
+            }
           }
         }
       }
