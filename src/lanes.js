@@ -313,7 +313,7 @@ if (require.main === module) {
     // (it carries endpoint URLs and is launch plumbing, not part of the contract); `endpoint` is the Ollama URL a lane's calls go to.
     console.log(JSON.stringify(lanes.map((l) => ({
       id: l.id, gpu: l.gpu, model: l.model || null, tier: l.tier ?? null, numCtx: l.numCtx ?? null, numBatch: l.numBatch ?? null,
-      slow: !!l.slow, local: !!l.local, reviewer: !!l.reviewer, reviewerId: l.reviewerId || null, preempt: l.preempt, taskClasses: l.taskClasses || null, reserve: l.reserve ?? 'auto',
+      slow: !!l.slow, local: !!l.local, preempt: l.preempt, taskClasses: l.taskClasses || null, reserve: l.reserve ?? 'auto',
       endpoint: (l.env && l.env.OLLAMA_URL) || null,
     })), null, 2));
   } else if (flag === '--env') {
