@@ -81,3 +81,12 @@ class TestBatchEndpointAtomicity(unittest.TestCase):
             self.assertTrue(result["succeeded"], f"Branch {result['branch']} failed: {result.get('reason')}")
             v = bv.get_verdict(self.q, result["branch"], result["headSha"])
             self.assertEqual(v["verdict"], "merge")
+
+    def test_docs_reference_batch_endpoint(self):
+        """The skill doc must reference the batch endpoint."""
+        import os
+        docs_path = Path(__file__).parent.parent / "docs" / "skills" / "dashboard.md"
+        self.assertTrue(docs_path.exists(), f"Skill doc not found at {docs_path}")
+        content = docs_path.read_text(encoding="utf-8")
+        self.assertIn("/api/git/branches/batch", content, "Skill doc must reference the batch endpoint path")
+        self.assertIn("batch", content.lower(), "Skill doc must mention 'batch'")
