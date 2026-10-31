@@ -25,7 +25,7 @@ const { createRealGitRunner } = require('./git-runner.js');
 const { ungatedMainPushAllowed } = require('./lib/main-push-policy.js');
 const { appendHistoryEvent } = require('./task-history.js');
 const { isNoopApplyDetail } = require('./task-disposition.js');
-const { writeTaskLogFile } = require('./task-log-store.js');
+const { writeTaskLogFile, taskComputeForLog } = require('./task-log-store.js');
 const { requeueBlockedTasksForSignature } = require('./blocked-drain.js');
 
 // Registers this package's 6 built-in sources FIRST (side effect of the require) -- the
@@ -447,7 +447,8 @@ function applyTask(task, { repoRoot, pipelineDir, secondBrainDir, projectSearchI
     // rawText/implementResponse/planResponse verbatim, which for a brain_dump-derived
     // task is the user's own free-typed personal/business note content -- no longer
     // staged/committed/pushed, written to disk only.
-    writeTaskLogFile(repoRoot, task);
+    // HUB0280-04: stamp the task's recorded model compute (tokens, model time) on the log; a missing database or any failure just leaves it off.
+    writeTaskLogFile(repoRoot, task, { compute: taskComputeForLog(pipelineDir, task.id) });
     gitRunner.add(filesToAdd);
 
     const msgPath = path.join(require('os').tmpdir(), `apply-commit-msg-${task.id}.txt`);

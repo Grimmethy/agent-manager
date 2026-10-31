@@ -1677,6 +1677,8 @@ async function runReview(task, { repoRoot, pipelineDir, secondBrainDir, domainsP
     minAgreeing: 2,
     temperature: 0.2,
     source: task.source,
+    taskId: task.id,
+    stage: 'review-vote', // HUB0280-02: local-client.js call() records these votes in model_calls
   });
 
   // 2026-08-24, Grimmethy: "are there any efficiency buffs you can think of" -- voteErrors
