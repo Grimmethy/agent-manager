@@ -327,3 +327,155 @@ def api_brain_dump_discuss_start(entry_id):
                              provider=provider, model=model, effort=effort, repo_root=get_active_repo_root(),
                              grep_dirs=get_active_grep_dirs(), instances_dir=instances_dir())
     return jsonify(session)
+
+
+# ---------------------------------------------------------------------------
+# Brain Dump Review: entries the sorter filed as notes but the detector flags
+# as request-shaped (feature requests / bug reports for Agent Manager).
+# ---------------------------------------------------------------------------
+
+_REQUEST_SHAPED_PATTERNS = [
+    r"(?i)would\s+be\s+nice\s+if",
+    r"(?i)it\s+would\s+help\s+if",
+    r"(?i)please\s+add",
+    r"(?i)can\s+you\s+add",
+    r"(?i)feature\s+request",
+    r"(?i)bug\s+(?:report|fix)",
+    r"(?i)should\s+support",
+    r"(?i)need\s+to\s+be\s+able\s+to",
+    r"(?i)it\s+would\s+be\s+great\s+to",
+    r"(?i)I\s+want\s+to\s+(?:be\s+)?able\s+to",
+]
+
+
+def _detector_flags_entry(entry) -> list[str]:
+    """Deterministic detector: returns a list of matched pattern descriptions, or [].
+    Reuses the same logic the companion task (brain-dump-sort) would apply -- a
+    human's captured note that the sorter dispositioned as a SecondBrain note but
+    that reads like a feature request or bug report for Agent Manager.
+
+    The detector is intentionally simple (regex-only, no LLM call) so it can run
+    synchronously inside a request without blocking. The owner reviews the list and
+    triages each entry with Keep/Dismiss/Make-task buttons.
+    """
+    text = (entry.get("rawText") or "").strip()
+    if not text:
+        return []
+    matched = []
+    for pattern in _REQUEST_SHAPED_PATTERNS:
+        if __import__("re").search(pattern, text):
+            # Extract a human-readable label from the pattern (strip regex syntax)
+            label = pattern.replace("(?i)", "").replace(r"\s+", " ").strip()
+            matched.append(label)
+    return matched
+
+
+def _is_flagged_for_review(entry) -> bool:
+    """True if the entry was sorted as a note (actionable:false) but the detector
+    still flags it as request-shaped. The sorter and the detector disagree, so a
+    human should look."""
+    sort = entry.get("sort") or {}
+    if sort.get("actionable") is not False:
+        return False
+    # Must have been sorted (status=sorted) and have a secondBrainPath (filed as note)
+    if entry.get("status") != "sorted":
+        return False
+    if not sort.get("secondBrainPath"):
+        return False
+    # Must have sortReview.resolved not set (not yet triaged)
+    sort_review = entry.get("sortReview") or {}
+    if sort_review.get("resolved"):
+        return False
+    # Must not be machine-raised (those go to Filed Findings, not Brain Dump)
+    if entry.get("raisedBy"):
+        return False
+    # Must not be suppressed
+    if entry.get("suppressed"):
+        return False
+    # Detector must flag it
+    return bool(_detector_flags_entry(entry))
+
+
+@brain_dump_bp.route("/api/brain-dump/review", methods=["GET"])
+def api_brain_dump_review():
+    """Review list: entries the detector flags as request-shaped despite being
+    sorted as notes. Excludes machine-raised entries, suppressed entries, and
+    entries already triaged (sortReview.resolved set).
+
+    ?projects=all returns entries from every registered project (uses
+    branch_projects.registered_projects); without it, only the active project.
+    """
+    from app import brain_dump_path, read_brain_dump_entries
+    from branch_projects import registered_projects
+
+    entries = read_brain_dump_entries()
+
+    # Filter to only flagged entries
+    flagged = [e for e in entries if _is_flagged_for_review(e)]
+
+    # Exclude machine-raised and suppressed (safety net -- _is_flagged_for_review
+    # already filters these, but be explicit)
+    flagged = [e for e in flagged if not e.get("raisedBy") and not e.get("suppressed")]
+
+    # Exclude journal/reference sources
+    flagged = [e for e in flagged if (e.get("source") or "").lower() not in ("journal", "reference")]
+
+    # Sort newest first
+    flagged = sorted(flagged, key=lambda e: e.get("capturedAt") or "", reverse=True)
+
+    # Enrich with detector rationale
+    result = []
+    for entry in flagged:
+        reasons = _detector_flags_entry(entry)
+        sort = entry.get("sort") or {}
+        result.append({
+            "id": entry["id"],
+            "serial": entry.get("serial"),
+            "capturedAt": entry.get("capturedAt"),
+            "rawText": entry.get("rawText"),
+            "rationale": sort.get("rationale", ""),
+            "project": sort.get("destination", sort.get("secondBrainPath", "")),
+            "flagReasons": reasons,
+        })
+
+    return jsonify(result)
+
+
+@brain_dump_bp.route("/api/brain-dump/<entry_id>/keep", methods=["POST"])
+def api_brain_dump_keep(entry_id):
+    """Keep this entry as a note: records sortReview.resolved='kept', no task created.
+    The entry leaves the review list."""
+    from app import read_brain_dump_entries, write_brain_dump_entries
+    entries = read_brain_dump_entries()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        abort(404)
+
+    if "sortReview" not in entry:
+        entry["sortReview"] = {}
+    entry["sortReview"]["resolved"] = "kept"
+    entry["sortReview"]["resolvedAt"] = datetime.now(timezone.utc).isoformat()
+
+    write_brain_dump_entries(entries)
+    return jsonify(entry)
+
+
+@brain_dump_bp.route("/api/brain-dump/<entry_id>/dismiss", methods=["POST"])
+def api_brain_dump_dismiss(entry_id):
+    """Dismiss this entry: records sortReview.resolved='dismissed' with a reason.
+    The entry leaves the review list."""
+    from app import read_brain_dump_entries, write_brain_dump_entries
+    body = request.get_json(silent=True) or {}
+    entries = read_brain_dump_entries()
+    entry = next((e for e in entries if e.get("id") == entry_id), None)
+    if not entry:
+        abort(404)
+
+    if "sortReview" not in entry:
+        entry["sortReview"] = {}
+    entry["sortReview"]["resolved"] = "dismissed"
+    entry["sortReview"]["resolvedAt"] = datetime.now(timezone.utc).isoformat()
+    entry["sortReview"]["reason"] = (body.get("reason") or "").strip() or "dismissed by owner"
+
+    write_brain_dump_entries(entries)
+    return jsonify(entry)
