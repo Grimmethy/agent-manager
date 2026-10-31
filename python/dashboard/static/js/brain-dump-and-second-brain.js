@@ -1,3 +1,24 @@
+// POST /api/brain-dump/<id>/prioritize. The server answers 409 (JSON {description}) for an entry the target check holds back unless the body carries
+// {force: true}; on a 409 the owner is asked and a yes re-POSTs once with force. prioritizeRefusal comes from brain-dump-chips.js, which index.html
+// loads as a plain script before this one (a global function, not a require: this file runs in the browser).
+// -> { queued, declined, status }
+async function prioritizeEntry(id, force = false) {
+  const url = '/api/brain-dump/' + encodeURIComponent(id) + '/prioritize';
+  const res = await fetch(url, force
+    ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force: true }) }
+    : { method: 'POST' });
+  if (res.status === 409 && !force) {
+    let text = '';
+    try { const body = await res.json(); text = (body && body.description) || ''; } catch (e) { /* not JSON: ask without the reason */ }
+    const refusal = prioritizeRefusal(res.status, text);
+    if (refusal.refused) {
+      if (!window.confirm(refusal.message + '\n\nQueue it anyway?')) return { queued: false, declined: true, status: 409 };
+      return prioritizeEntry(id, true);
+    }
+  }
+  return { queued: res.ok, declined: false, status: res.status };
+}
+
 function renderBrainDumpShell() {
   document.getElementById('main').innerHTML = `
     <div class="capture-row">
@@ -121,7 +142,8 @@ function wireBrainDumpCardHandlers(el) {
       btn.disabled = true;
       btn.textContent = 'Queuing...';
       try {
-        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.prioritize) + '/prioritize', { method: 'POST' });
+        const result = await prioritizeEntry(btn.dataset.prioritize);
+        if (result.declined) { btn.disabled = false; btn.textContent = 'Process now'; return; }
         await refreshBrainDumpEntries(true);
       } catch (e) {
         alert('Could not queue: ' + e.message);
@@ -467,7 +489,7 @@ function renderBrainDumpCard(entry) {
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
       <div class="row">
         <span class="text">${serialBadge}${escapeHtmlBright(entry.rawText)}${countChip}${raisedByBadge}</span>
-        ${statusBadge}
+        ${statusBadge}${brainDumpChipsHtml(entry, escapeHtml)}
       </div>
       <div class="row meta">
         <span>${meta}</span>
@@ -1064,7 +1086,8 @@ function wireFiledFindingsHandlers(el) {
       btn.disabled = true;
       btn.textContent = 'Queuing...';
       try {
-        await fetch('/api/brain-dump/' + encodeURIComponent(btn.dataset.prioritize) + '/prioritize', { method: 'POST' });
+        const result = await prioritizeEntry(btn.dataset.prioritize);
+        if (result.declined) { btn.disabled = false; btn.textContent = 'Process now'; return; }
         await refreshFiledFindingsEntries();
       } catch (e) {
         alert('Could not queue: ' + e.message);
