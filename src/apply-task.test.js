@@ -1522,6 +1522,7 @@ test('stacked seq 2 on a dirty apply clone: fails ONCE up front with the stable 
 
 test('a normal (non-stacked) apply on a dirty clone fails with a stable error message before any mutating git ops', () => {
   const { DIRTY_CLONE_ERROR_PREFIX } = require('./git-runner.js');
+  const { isInfraApplyFailure } = require('./apply-retry-check.js');
   const gitRunner = createFakeGitRunner({ dirtyTree: 'foo.js' });
   const result = applyTask(baseTask(), { repoRoot: '/tmp/dirty-clone-test', pipelineDir: PIPELINE_DIR, gitRunner });
   assert.equal(result.succeeded, false);
@@ -1536,6 +1537,8 @@ test('a normal (non-stacked) apply on a dirty clone fails with a stable error me
   for (const op of mutatingOps) {
     assert.ok(!names.includes(op), `expected no ${op} call, got: ${JSON.stringify(names)}`);
   }
+  // The message must land where apply-retry-check treats it as INFRASTRUCTURE (held, no retry burned, released once clean), not a draft failure.
+  assert.equal(isInfraApplyFailure({ blockedStage: 'apply', blockedReason: result.reason }), true);
 });
 
 test('a normal (non-stacked) apply is unchanged: resetToMain already clears stray content, so no extra pre-flight calls', () => {
