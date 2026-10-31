@@ -51,7 +51,7 @@ const OLLAMA_ERROR_CODES = {
   STREAM_ERROR: 'OLLAMA_STREAM_ERROR', // connection dropped mid-body (ECONNRESET/EPIPE/etc.)
   TIMEOUT: 'OLLAMA_TIMEOUT', // socket timeout -- the one with 3 confirmed different root causes this session
   CONNECTION_ERROR: 'OLLAMA_CONNECTION_ERROR', // request-level error before/without a response (ECONNREFUSED/DNS/etc.)
-  PREMATURE_CLOSE: 'Ollama closed the connection before the response finished',
+  PREMATURE_CLOSE: 'premature_close',
 };
 
 function taggedError(message, code, extra) {
