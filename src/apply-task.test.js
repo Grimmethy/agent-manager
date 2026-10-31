@@ -684,6 +684,59 @@ test('applyDirectToMainBatch: never stages task-logs/ (gitignored, disk-only) --
   assert.ok(gitRunner.calls.some((c) => c.name === 'commit'), 'the batch still commits');
 });
 
+// HUB0280-04: the log written at apply carries the task's recorded model compute (from model-stats.db in the pipeline dir); no database or no rows for
+// the task leaves the log without a `compute` key.
+test('applyTask (single-task path): the task log carries compute from model-stats.db when the task has recorded calls', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-compute-single-'));
+  const dbPath = path.join(dbDir, 'model-stats.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE model_calls (call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, stage TEXT, model TEXT, started_at TEXT, latency_ms INTEGER, prompt_eval_count INTEGER, eval_count INTEGER)');
+  db.prepare('INSERT INTO model_calls VALUES (?,?,?,?,?,?,?,?)').run('c1', 'single-compute-1', 'plan', 'm', 'x', 1200, 300, 40);
+  db.close();
+  const saved = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH;
+  process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = dbPath;
+  try {
+    const result = applyTask(baseTask({ id: 'single-compute-1' }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner: createFakeGitRunner() });
+    assert.equal(result.succeeded, true);
+    const log = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'task-logs', 'single-compute-1.json'), 'utf8'));
+    assert.equal(log.compute.calls, 1);
+    assert.equal(log.compute.promptTokens, 300);
+    fs.writeFileSync(path.join(REPO_ROOT, 'foo.js'), 'a'); // the first apply already edited it
+    const other = applyTask(baseTask({ id: 'single-compute-2' }), { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner: createFakeGitRunner() });
+    assert.equal(other.succeeded, true);
+    const log2 = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'task-logs', 'single-compute-2.json'), 'utf8'));
+    assert.equal('compute' in log2, false);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; else process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = saved;
+  }
+});
+
+test('applyDirectToMainBatch: the task log carries compute from model-stats.db, and omits it when the task has no recorded calls', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'apply-compute-'));
+  const dbPath = path.join(dbDir, 'model-stats.db');
+  const db = new DatabaseSync(dbPath);
+  db.exec('CREATE TABLE model_calls (call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, stage TEXT, model TEXT, started_at TEXT, latency_ms INTEGER, prompt_eval_count INTEGER, eval_count INTEGER)');
+  db.prepare('INSERT INTO model_calls VALUES (?,?,?,?,?,?,?,?)').run('c1', 'cp1', 'plan', 'm', 'x', 2500, 700, 60);
+  db.close();
+  const saved = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH;
+  process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = dbPath;
+  try {
+    const out = applyDirectToMainBatch([batchTriageTask('cp1'), batchTriageTask('cp2')], { repoRoot: REPO_ROOT, pipelineDir: PIPELINE_DIR, gitRunner: createFakeGitRunner() });
+    assert.equal(out.results.cp1.succeeded, true);
+    assert.equal(out.results.cp2.succeeded, true);
+    const log1 = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'task-logs', 'cp1.json'), 'utf8'));
+    const log2 = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'task-logs', 'cp2.json'), 'utf8'));
+    assert.equal(log1.compute.calls, 1);
+    assert.equal(log1.compute.promptTokens, 700);
+    assert.equal(log1.compute.modelMs, 2500);
+    assert.equal('compute' in log2, false);
+  } finally {
+    if (saved === undefined) delete process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; else process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = saved;
+  }
+});
+
 ungatedTest('applyDirectToMainBatch: refuses a non-directToMain source instead of batching it', () => {
   const gitRunner = createFakeGitRunner();
   const good = batchTriageTask('ok1');
