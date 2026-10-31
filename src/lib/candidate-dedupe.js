@@ -103,4 +103,76 @@ function findDuplicateCandidate(candidate, docTexts) {
   return null;
 }
 
-module.exports = { candidateKey, entriesIn, findDuplicateCandidate, normalizeFiles, titleIdentifier, fallbackTitleIdentifier };
+// Within-batch dedupe: compare candidates against each other in the same batch.
+//
+// Uses the same `candidateKey` (file paths + identifier) as cross-batch dedupe so the
+// two modes share their notion of "same thing" -- only the reference set changes
+// (existing doc text vs. other candidates in this batch). A candidate with no key
+// (unidentifiable) is never dropped: fail-open, same as cross-batch.
+function dedupeWithinBatch(candidates) {
+  const removals = [];
+  const seen = new Map(); // key -> originalCandidate
+  const kept = [];
+  for (const candidate of candidates || []) {
+    const key = candidateKey(candidate);
+    if (!key) {
+      kept.push(candidate);
+      continue;
+    }
+    const original = seen.get(key);
+    if (original) {
+      removals.push({
+        timestamp: new Date().toISOString(),
+        originalCandidate: original,
+        duplicateCandidate: candidate,
+        reason: `within-batch duplicate (file+identifier) of ${candidateKey(original)}`,
+      });
+      continue;
+    }
+    seen.set(key, candidate);
+    kept.push(candidate);
+  }
+  return { candidates: kept, removals };
+}
+
+// Main dedupe entry point.
+//
+// options.mode: 'within-batch' | 'cross-batch' (default: 'cross-batch' for backward compat).
+// options.withinBatch: boolean (if true, treated as mode='within-batch').
+// options.docTexts: [{ ref, text }] -- required for cross-batch mode, ignored otherwise.
+function dedupe(candidates, baseBranch, options) {
+  // Kill switch: AGENT_MANAGER_CANDIDATE_DEDUPE=false disables all dedupe.
+  if (process.env.AGENT_MANAGER_CANDIDATE_DEDUPE === 'false') {
+    return { candidates: candidates || [], removals: [] };
+  }
+
+  const opts = options || {};
+  const mode = opts.withinBatch ? 'within-batch' : (opts.mode || 'cross-batch');
+
+  if (mode === 'within-batch') {
+    return dedupeWithinBatch(candidates);
+  }
+
+  // cross-batch mode: compare against external doc texts
+  const docTexts = opts.docTexts || [];
+  const removals = [];
+  const kept = [];
+
+  for (const candidate of candidates || []) {
+    const dup = findDuplicateCandidate(candidate, docTexts);
+    if (dup) {
+      removals.push({
+        timestamp: new Date().toISOString(),
+        originalCandidate: dup.duplicateOf,
+        duplicateCandidate: candidate,
+        reason: `cross-batch duplicate found in ${dup.ref}`,
+      });
+      continue;
+    }
+    kept.push(candidate);
+  }
+
+  return { candidates: kept, removals };
+}
+
+module.exports = { candidateKey, entriesIn, findDuplicateCandidate, dedupe, dedupeWithinBatch, normalizeFiles, titleIdentifier, fallbackTitleIdentifier };
