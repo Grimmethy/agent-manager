@@ -5,7 +5,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { brainDumpChipsHtml } = require('../python/dashboard/static/js/brain-dump-chips.js');
+const { brainDumpChipsHtml, prioritizeRefusal } = require('../python/dashboard/static/js/brain-dump-chips.js');
 
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -48,4 +48,30 @@ test('both fields give both chips, and an overlong evidence line is clipped', ()
   assert.match(html, /one reason as a string/);
   assert.ok(!html.includes('e'.repeat(400)), 'evidence is clipped to 300 characters');
   assert.match(html, /\.\.\./);
+});
+
+// HUB0279-03: prioritizeRefusal(status, text) -- how the Process now handlers read the server's answer (409 = held back by the target check).
+test('prioritizeRefusal: a 409 with text is refused and carries the message', () => {
+  assert.deepEqual(prioritizeRefusal(409, 'Process now was not run: target missing'), { refused: true, message: 'Process now was not run: target missing' });
+});
+
+test('prioritizeRefusal: 200, 404 and 500 are not refusals', () => {
+  for (const status of [200, 404, 500]) assert.deepEqual(prioritizeRefusal(status, 'anything'), { refused: false });
+});
+
+test('prioritizeRefusal: only the number 409 counts (not other 4xx, not the string "409")', () => {
+  assert.deepEqual(prioritizeRefusal(400, 'x'), { refused: false });
+  assert.deepEqual(prioritizeRefusal(422, 'x'), { refused: false });
+  assert.deepEqual(prioritizeRefusal('409', 'x'), { refused: false });
+});
+
+test('prioritizeRefusal: an overlong message is trimmed to 400 characters and a 400-character one is kept whole', () => {
+  assert.equal(prioritizeRefusal(409, 'a'.repeat(1000)).message.length, 400);
+  assert.equal(prioritizeRefusal(409, 'b'.repeat(400)).message, 'b'.repeat(400));
+});
+
+test('prioritizeRefusal: undefined and null text give an empty message, a number is turned into text', () => {
+  assert.deepEqual(prioritizeRefusal(409, undefined), { refused: true, message: '' });
+  assert.deepEqual(prioritizeRefusal(409, null), { refused: true, message: '' });
+  assert.deepEqual(prioritizeRefusal(409, 12345), { refused: true, message: '12345' });
 });
