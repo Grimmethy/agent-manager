@@ -207,9 +207,16 @@ function searchTasksAllProjects(args, opts = {}) {
   return { results };
 }
 
-function queueReviewedTaskTool(pipelineDir, { title, description, project }, opts = {}) {
+function queueReviewedTaskTool(pipelineDir, { title, description, project, dependsOn }, opts = {}) {
   if (typeof title !== 'string' || !title.trim()) return { error: 'queue_reviewed_task requires a non-empty "title" argument' };
   if (typeof description !== 'string' || !description.trim()) return { error: 'queue_reviewed_task requires a non-empty "description" argument' };
+  // dependsOn validation: must be an array of strings if provided, each referencing a real task
+  if (dependsOn !== undefined && !Array.isArray(dependsOn)) return { error: 'queue_reviewed_task dependsOn must be an array of task ids (or omitted)' };
+  if (Array.isArray(dependsOn) && dependsOn.length > 0) {
+    if (!dependsOn.every((id) => typeof id === 'string' && id.trim())) {
+      return { error: 'queue_reviewed_task dependsOn entries must be non-empty strings (task ids)' };
+    }
+  }
   if (isGitWriteRequest({ title, description })) return { error: GIT_WRITE_REQUEST_REFUSAL };
   const projects = opts.projects || listProjects();
   let target = { pipelineDir, domainsPath: null, label: null }; // domainsPath null = the process default, looked up only when a task is really queued
@@ -223,6 +230,16 @@ function queueReviewedTaskTool(pipelineDir, { title, description, project }, opt
       return { error: `this task is about the project "${owner.label}" (paths under ${owner.repoRoot}) but would be queued to a different project's queue; call again with project: "${owner.label}"` };
     }
   }
+  // Validate dependsOn ids exist in the target project's queue/done/
+  if (Array.isArray(dependsOn) && dependsOn.length > 0) {
+    const unresolved = dependsOn.filter((depId) => {
+      const found = findTaskAnywhere(target.pipelineDir, depId);
+      return !found;
+    });
+    if (unresolved.length > 0) {
+      return { error: `queue_reviewed_task: dependsOn references unknown task id(s): ${unresolved.join(', ')} -- none of these exist in the target project's queue or done/` };
+    }
+  }
   try {
     // premiumPriority: true (2026-09-16, Grimmethy: "any tasks that chat is working on
     // directly should be labelled premium priority") -- every task Chat itself queues
@@ -230,7 +247,7 @@ function queueReviewedTaskTool(pipelineDir, { title, description, project }, opt
     // now, not a background-priority idea to triage eventually. See
     // queueAdhocTask()'s own header for what this field does.
     const { record } = queueAdhocTask(
-      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true, ...(target.label ? { project: target.label } : {}) },
+      { title, promptContext: { rawText: description, raisedFrom: 'chat' }, premiumPriority: true, premiumSetBy: 'chat-queue', dependsOn: Array.isArray(dependsOn) && dependsOn.length > 0 ? dependsOn : undefined, ...(target.label ? { project: target.label } : {}) },
       { pipelineDir: target.pipelineDir, domainsPath: target.domainsPath || opts.defaultDomainsPath || getConfig().domainsPath },
     );
     const where = target.label ? ` in project "${target.label}"` : '';

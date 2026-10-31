@@ -147,8 +147,52 @@ function findEntry(data, entryId) {
   return data.entries.find((e) => e && e.id === entryId) || null;
 }
 
-function recoverableSortSkip(data, entry, brainDumpPath, reason) {
-  entry.sortAttempt = (entry.sortAttempt || 0) + 1;
+const MAX_INFRA_SORT_ATTEMPTS = 3;
+
+// Detect infrastructure-attributed failures by inspecting the task's blockedReason and
+// the skip reason string. Infrastructure errors (network timeouts, connection refused,
+// rate limits, ECONNRESET, DNS failures, upstream 5xx) should not burn the entry's
+// MAX_SORT_ATTEMPTS budget because a fresh retry of the same classifier will hit the
+// same infra wall -- the 3-attempt sort budget is meant for content that might change
+// on re-read, not for a flaky dependency.
+function isInfraAttributed(task, reason) {
+  const blocked = String(task && task.blockedReason || '').toLowerCase();
+  const r = String(reason || '').toLowerCase();
+  const markers = [
+    'network timeout', 'connection refused', 'rate limit exceeded',
+    'econnreset', 'econnrefused', 'dns', 'timeout', '502', '503', '504',
+    'upstream', 'service unavailable', 'connection reset', 'socket hang up',
+    'enotfound', 'etimedout', 'eai-again',
+  ];
+  return markers.some((m) => blocked.includes(m) || r.includes(m));
+}
+
+function recoverableSortSkip(data, entry, brainDumpPath, reason, task) {
+  if (isInfraAttributed(task, reason)) {
+    // Infra skip: do NOT burn the entry's MAX_SORT_ATTEMPTS. Record on a separate
+    // infra-attributed counter so the 3-attempt sort budget is reserved for content
+    // that might actually change on re-read.
+    entry.infraSortAttempts = (entry.infraSortAttempts || 0) + 1;
+    entry.infraSortAttemptCount = (entry.infraSortAttemptCount || 0) + 1;
+    entry.sortBudgetEvents = entry.sortBudgetEvents || [];
+    entry.sortBudgetEvents.push({
+      type: 'infraSortSkip',
+      reason: reason,
+      infraSortAttempts: entry.infraSortAttempts,
+      timestamp: Date.now(),
+    });
+    if (entry.infraSortAttempts >= MAX_INFRA_SORT_ATTEMPTS) {
+      entry.sortExhausted = true;
+      entry.sortBudgetEvents.push({
+        type: 'infraSortExhausted',
+        reason: reason,
+        infraSortAttempts: entry.infraSortAttempts,
+        timestamp: Date.now(),
+      });
+    }
+  } else {
+    entry.sortAttempt = (entry.sortAttempt || 0) + 1;
+  }
   try {
     fs.mkdirSync(path.dirname(brainDumpPath), { recursive: true });
     writeJsonAtomicSync(brainDumpPath, data);
@@ -207,11 +251,11 @@ function loadAndValidateEntry({ implementResponse, task, brainDumpPath, secondBr
   const result = parseBrainDumpSortResult(implementResponse);
   if (!result) {
     return { done: recoverableSortSkip(data, entry, brainDumpPath,
-      'implement pass did not return a valid classification JSON') };
+      'implement pass did not return a valid classification JSON', task) };
   }
 
 
-  return { ctx: { data, entry, result, secondBrainDir, pipelineDir, brainDumpEntryId, rawText, existingQueuedTitles, brainDumpPath, promptContext: task.promptContext } };
+  return { ctx: { data, entry, result, secondBrainDir, pipelineDir, brainDumpEntryId, rawText, existingQueuedTitles, brainDumpPath, promptContext: task.promptContext, task } };
 }
 
 // Stage 2: normalise and validate the vault path, then recover the owning project (derive, origin routing, investigation-shaped findings).
@@ -251,7 +295,7 @@ function classifySortResult(ctx) {
   const namingError = validateSecondBrainPath(result.secondBrainPath, secondBrainDir, trackedLabels);
   if (namingError) {
     return { done: recoverableSortSkip(data, entry, brainDumpPath,
-      `rejected secondBrainPath "${result.secondBrainPath}": ${namingError}`) };
+      `rejected secondBrainPath "${result.secondBrainPath}": ${namingError}`, ctx.task) };
   }
 
   // Deterministic belongsToProject recovery -- the classifier routinely leaves this null
@@ -459,7 +503,7 @@ function applyDuplicateGate(ctx, matchedProject, built) {
       entry.duplicateGateAttempts = duplicateGateAttempts + 1;
       console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" (duplicateGateAttempts=${entry.duplicateGateAttempts}) -- retrying with a fresh classification pass instead of routing to needs-clarification`);
       return { skip: recoverableSortSkip(data, entry, brainDumpPath,
-        `possible duplicate of "${result.possibleDuplicateOf}" on the first flag -- retrying with a fresh classification pass`) };
+        `possible duplicate of "${result.possibleDuplicateOf}" on the first flag -- retrying with a fresh classification pass`, ctx.task) };
     }
     console.warn(`[apply-group-a-brain-dump] possible-duplicate gate: entry ${brainDumpEntryId} matched against "${result.possibleDuplicateOf}" again (duplicateGateAttempts=${duplicateGateAttempts}) -- routing to needs-clarification`);
     adhocDir = path.join(matchedProject.pipelineDir, 'queue', 'needs-clarification');
@@ -510,7 +554,7 @@ function queueProjectTask(ctx, matchedProject) {
   // Matched a real project but it has no 'adhoc' domain -- a config gap that needs a
   // human, not a silent downgrade to a passive note.
   return recoverableSortSkip(data, entry, brainDumpPath,
-    `matched project "${matchedProject.label}" has no 'adhoc' domain registered -- cannot queue work there`);
+    `matched project "${matchedProject.label}" has no 'adhoc' domain registered -- cannot queue work there`, ctx.task);
 }
 
 // Stage: the passive vault-note fallback for an entry not tied to any tracked project.
@@ -613,7 +657,7 @@ function applyBrainDumpSort({ implementResponse, task, brainDumpPath, secondBrai
     // reviewBrainDumpSort should have blocked a non-tracked label; if one slipped through,
     // don't silently downgrade it to a passive note -- that masks the misclassification.
     return recoverableSortSkip(data, entry, brainDumpPath,
-      `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`);
+      `belongsToProject "${result.belongsToProject}" does not match any registered project -- a corrected pass should name a tracked label or null`, task);
   }
 
   if (matchedProject) {

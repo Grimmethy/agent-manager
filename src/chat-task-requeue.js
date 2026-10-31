@@ -109,6 +109,23 @@ async function classifyBestEffort(task, opts) {
   }
 }
 
+// Pure: the LAST `Files:` line of an answer replaces the FIRST `Files:` line of the task text (the one the guards read). Returns
+// { rawText, replaced: { old, new } | null }. An answer with no `Files:` line, or a task with no earlier one, changes nothing.
+function replaceFilesLine(rawText, answer) {
+  const text = String(rawText || '');
+  const answers = [...String(answer || '').matchAll(/^Files:[ \t]*(\S.*)$/gim)];
+  if (!answers.length) return { rawText: text, replaced: null };
+  const next = answers[answers.length - 1][1].trim();
+  const earlier = /^Files:[ \t]*(\S.*)$/im.exec(text);
+  if (!earlier) return { rawText: text, replaced: null };
+  const old = earlier[1].trim();
+  if (old === next) return { rawText: text, replaced: null };
+  return {
+    rawText: text.slice(0, earlier.index) + `Files: ${next}` + text.slice(earlier.index + earlier[0].length),
+    replaced: { old, new: next },
+  };
+}
+
 // Mirrors api_task_answer_clarification, python/dashboard/routes/task.py:406-454.
 async function answerNeedsClarification(pipelineDir, taskId, answer) {
   if (typeof taskId !== 'string' || !taskId.trim()) {
@@ -123,12 +140,21 @@ async function answerNeedsClarification(pipelineDir, taskId, answer) {
   const { path: srcPath, data } = found;
 
   data.promptContext = data.promptContext || {};
-  const prior = data.promptContext.rawText || '';
+  // 2026-10-30 (HUB0088-02 was blocked six times on a stale `Files:` line): a `Files:` line in the answer REPLACES the task's earlier one,
+  // because extractDeclaredFiles (adhoc-diff-sanity.js) reads only the FIRST `Files:` line and every guard trusts it.
+  const swapped = replaceFilesLine(data.promptContext.rawText || '', trimmed);
+  const prior = swapped.rawText;
   data.promptContext.rawText = prior
     + `\n\nHUMAN DESIGN DECISION (answered directly from Chat, ${nowIso()}):\n${trimmed}\n`
     + 'This answer resolves the open question(s) above -- implement against it directly rather than re-asking for clarification.';
   delete data.needsClarification;
   data.history = data.history || [];
+  if (swapped.replaced) {
+    data.history.push({
+      stage: 'files-line-replaced', at: nowIso(),
+      detail: `Files line replaced by the answer: "${swapped.replaced.old}" -> "${swapped.replaced.new}"`,
+    });
+  }
   data.history.push({
     stage: 'needs-clarification-resolved', at: nowIso(),
     detail: 'Answered via Chat -- requeued to adhoc/ for a fresh draft pass.',
@@ -248,7 +274,9 @@ function repeatedBlockerMatch(task) {
 // Mirrors api_task_requeue, task.py:188-367 (state ∈ blocked/done/archived -> pending),
 // the most complex of the four -- repeated-blocker guard, superseded-branch abandonment,
 // and the exact fresh-record field allowlist, all ported.
-async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force = false } = {}) {
+// keepPriority (2026-10-30, branch-defect-readmit-sweep.js): also carry humanQueued / premiumPriority / premiumSetBy / premiumSetAt over to the fresh
+// record. Off by default so the Chat tool and the dashboard-mirroring callers behave as before; the sweep sets it so a re-admitted premium task stays premium.
+async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force = false, keepPriority = false } = {}) {
   if (typeof taskId !== 'string' || !taskId.trim()) {
     return { ok: false, error: 'taskId is required' };
   }
@@ -335,6 +363,11 @@ async function requeueBlockedTask(pipelineDir, repoRoot, taskId, { state, force 
   for (const key of ['stacked', 'dependsOn', 'prerequisiteHubs', 'atomic', 'noDecompose']) {
     if (key in data) fresh[key] = data[key];
   }
+  if (keepPriority) {
+    for (const key of ['humanQueued', 'premiumPriority', 'premiumSetBy', 'premiumSetAt']) {
+      if (key in data) fresh[key] = data[key];
+    }
+  }
 
   writeAndUnlink(destPath, fresh, srcPath);
   await classifyBestEffort(data, { reasonHint: `manually requeued from ${state}/ via Chat` });
@@ -378,6 +411,6 @@ function withdrawTask(pipelineDir, taskId, reason) {
 }
 
 module.exports = {
-  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
+  answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask, replaceFilesLine,
   repeatedBlockerMatch, // exported for direct unit testing
 };

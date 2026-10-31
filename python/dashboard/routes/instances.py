@@ -209,9 +209,13 @@ def api_instance_run_log(instance_id):
         state during the 2026-09-08 GPU-contention incident was dozens of back-to-back
         OLLAMA_TIMEOUTs that the terminal-state-only recent-tasks view had no way to
         show at all -- it just looked stale.
+      - every chat session this instance ran (only when instance_id='chat'), surfaced
+        as stage='chat' rows so the chat instance's own run log shows what it actually
+        did. Worker instances never see chat rows -- the chat instance is a dedicated
+        system instance, not a worker lane.
 
     Merged and sorted by timestamp, newest first."""
-    from app import _find_task_record_anywhere, _has_instance_id_column, _read_pipeline_history_events, instances_dir, model_stats_db_path, queue_dir
+    from app import _find_task_record_anywhere, _has_instance_id_column, _read_pipeline_history_events, CHAT_STORAGE_DIR, instances_dir, model_stats_db_path, queue_dir
     limit = min(max(request.args.get("limit", 30, type=int) or 30, 1), 100)
     qdir = queue_dir()
     db_path = model_stats_db_path()
@@ -249,6 +253,62 @@ def api_instance_run_log(instance_id):
             "model": ev.get("model"), "kind": "failed", "outcome": ev.get("code") or "error",
             "detail": ev.get("message"),
         })
+    # Chat sessions (instance_id='chat'): surface each chat session as a run-log row so
+    # the chat instance's own run log shows what it actually did, not just the
+    # model_calls rows (which record_call writes per-turn but don't group per-session).
+    # Worker instances never see chat rows -- the chat instance is a dedicated system
+    # instance, not a worker lane, so filtering on instance_id='chat' keeps the Workers
+    # tab clean.
+    if instance_id == "chat":
+        from datetime import datetime, timezone
+        from pathlib import Path
+        import chat_sessions
+        storage_dir = CHAT_STORAGE_DIR if isinstance(CHAT_STORAGE_DIR, Path) else Path(CHAT_STORAGE_DIR)
+        if storage_dir.is_dir():
+            sessions_file = chat_sessions.chat_sessions_path(storage_dir)
+            if sessions_file.is_file():
+                try:
+                    sessions = json.loads(sessions_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    sessions = {}
+                for sid, session in sessions.items():
+                    if session.get("status") not in ("active", "ended"):
+                        continue
+                    started_at = session.get("startedAt") or ""
+                    ended_at = session.get("endedAt")
+                    transcript = session.get("transcript") or []
+                    turns_used = len(transcript)
+                    duration_ms = None
+                    if started_at and ended_at:
+                        try:
+                            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                            end_dt = datetime.fromisoformat(ended_at.replace("Z", "+00:00"))
+                            duration_ms = int((end_dt - start_dt).total_seconds() * 1000)
+                        except (ValueError, TypeError):
+                            pass
+                    elif started_at:
+                        try:
+                            start_dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+                            duration_ms = int((datetime.now(timezone.utc) - start_dt).total_seconds() * 1000)
+                        except (ValueError, TypeError):
+                            pass
+                    title = None
+                    for turn in transcript:
+                        if turn.get("role") == "user" and turn.get("text"):
+                            title = turn["text"][:100]
+                            break
+                    runs.append({
+                        "at": started_at,
+                        "taskId": sid,
+                        "stage": "chat",
+                        "model": session.get("model"),
+                        "kind": "chat",
+                        "outcome": "chat turn",
+                        "session_id": sid,
+                        "duration": duration_ms,
+                        "turns_used": turns_used,
+                        "title": title,
+                    })
     runs.sort(key=lambda r: r.get("at") or "", reverse=True)
     return jsonify({"runs": runs[:limit]})
 

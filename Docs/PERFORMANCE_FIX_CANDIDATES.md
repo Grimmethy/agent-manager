@@ -306,3 +306,233 @@ Mark the enclosing sweep function as async and replace each fs.readdirSync(state
 
 Benefits:
 The event loop is no longer held hostage for the cumulative duration of all directory reads. Concurrent requests, socket handlers, and timer callbacks can interleave between individual readdir calls, eliminating the latency spike that scaled with entry count. Under load—especially on network-backed or slow filesystems where a single readdir can take several milliseconds—the server maintains responsive throughput instead of stalling. The change is a drop-in async refactor with no new dependencies, no API surface change, and no behavioral difference for the sweep's own logic.
+
+### AC-17 · Parallelize blocking health-check HTTP calls with ThreadPoolExecutor
+Strength: Strong
+Files: python/dashboard/app.py
+Snippet:
+```
+    health_path = (entry.get("process") or {}).get("healthPath", "/healthz")
+    url = f"{entry['url']}{health_path}"
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=1) as r:
+                if r.status == 200:
+```
+
+Problem:
+The health-check routine in `python/dashboard/app.py` calls `urllib.request.urlopen` (a fully blocking I/O call) inside a `while` retry loop bounded by a deadline. Because this is a synchronous dashboard backend (`app.py`), the call executes on the main thread. If the target service is slow or unreachable, each iteration blocks the thread for up to `timeout=1` second, and the loop can run for the full `timeout_s` window. When the outer context iterates over multiple `entry` records (the variable name implies a collection), the blocking times accumulate sequentially: ten services each timing out for 30 s would freeze the dashboard for 300 s, during which no other request, render, or user interaction can be serviced.
+
+Solution:
+Wrap the per-entry health-check body (the existing retry `while` loop plus `urllib.request.urlopen`) in a small function `check_health(entry, timeout_s)` and dispatch all entries concurrently through `concurrent.futures.ThreadPoolExecutor` (standard library, no new dependency). Submit every entry to the pool with `executor.submit(check_health, entry, timeout_s)`, then collect results with `concurrent.futures.as_completed` so the main thread is free to keep the dashboard responsive while up to `max_workers` (e.g. 8–10) HTTP checks proceed in parallel. The retry loop and timeout logic inside `check_health` remain unchanged; only the scheduling changes from sequential to concurrent.
+
+Benefits:
+Total wall-clock time for a batch of N health checks drops from the sum of individual timeouts to roughly the slowest single check (bounded by the pool size), so a ten-service batch that previously could block the UI for 300 s now completes in about 30 s. The main thread is never held hostage by a single slow or dead endpoint, keeping the dashboard responsive to user input and other requests. Because the fix uses only `concurrent.futures` from the standard library, no new dependency is introduced and the existing `urllib`-based retry logic is preserved as-is.
+
+### AC-18 · Replace sequential sync file writes with parallel async writes in batch-apply loop
+Strength: Strong
+Files: src/apply-task.js
+Snippet:
+```
+    for (const { task } of loaded) results[task.id] = batchOutcome;
+  }
+
+  for (const { task, path: p } of loaded) {
+    const r = results[task.id] || { succeeded: false, reason: 'no batch result produced for this task' };
+    recordApplyOutcome(task, r);
+    try { fs.writeFileSync(p, JSON.stringify(task, null, 2)); } catch { /* non-fatal, same as single path */ }
+```
+
+Problem:
+The batch-apply loop in `apply-task.js` iterates over `loaded` (the set of tasks in a batch) and calls `fs.writeFileSync(p, JSON.stringify(task, null, 2))` once per task, sequentially. Each call blocks the event loop for the duration of the disk write, and because the calls are serial the total blocking time is the sum across all iterations. For a batch of 50–200 tasks on a throttled or slow volume, this can freeze the event loop for several hundred milliseconds to several seconds, during which no other I/O callbacks, timers, or network events fire. The `catch { /* non-fatal */ }` swallows any error, so a stuck disk simply extends the freeze with no visible timeout.
+
+Solution:
+Replace the `for…of` loop with `await Promise.all(loaded.map(...))`. Inside the map callback, keep the synchronous `recordApplyOutcome(task, r)` call (pure in-memory bookkeeping keyed by `task.id`, safe in any order), then return `fs.promises.writeFile(p, JSON.stringify(task, null, 2)).catch(() => {})` to preserve the existing non-fatal error semantics. The enclosing function must be `async` (or the caller must `await` the returned promise). This uses only `fs.promises` (built-in Node) and `Promise.all` (built-in); no new dependency is introduced. Because each write targets a distinct file, the operations are independent and can proceed concurrently, reducing total wall-clock time from the sum of all writes to roughly the slowest single write.
+
+Benefits:
+The event loop is no longer frozen for the cumulative duration of all batch writes; concurrent writes overlap their I/O wait time, cutting total blocking time from O(n × write_time) to approximately O(max_write_time). Other I/O callbacks, timers, and network events can fire while writes are in flight, keeping the process responsive. The non-fatal error semantics are preserved exactly via the per-write `.catch(() => {})`, so no behavioral change is introduced for callers. No new dependency or API surface is added.
+
+### AC-19 · Parallelize independent LLM classification calls in majorityVote
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+The `majorityVote` function issues `n` (default 3) fully independent LLM classification calls—identical prompt, identical parameters, no data dependency between iterations—yet serializes them with `await` inside a `for` loop. Each iteration is a full model inference round-trip (typically 2–8 s), so the sequential pattern multiplies wall-clock latency to `n × single_call_latency` (6–24 s) when the calls could complete in roughly the time of one (2–8 s). The per-iteration `try/catch` and `voteErrors` array confirm the author already treats each call as an independent unit with its own failure mode, making the serialization purely an execution-ordering artifact with no functional benefit.
+
+Solution:
+Replace the sequential `for` loop with `Promise.allSettled` (a built-in JS primitive, no new dependency). Build an array of `n` promise values by calling `call(...)` `n` times up front, then await `Promise.allSettled` once. After settling, iterate the results: push `s.value` into `votes` for fulfilled entries and `s.reason` into `voteErrors` for rejected ones. The downstream majority-counting logic (`minAgreeing` threshold, tie-breaking, error reporting via `console.error`) remains unchanged. This preserves the existing per-call error tolerance—a single failing vote does not abort the others—while letting all `n` inferences execute concurrently.
+
+Benefits:
+Total wall-clock latency for the voting step drops from `n × single_call_latency` to approximately `1 × single_call_latency`, eliminating 2–3× redundant network and inference time on every classification call. Because the calls are truly independent (same immutable parameters, no shared mutable state, commutative voting), concurrency introduces no ordering hazard, no race condition, and no additional load beyond what the provider already permits for 3 simultaneous requests. The fix uses only a built-in language primitive and the `call` function the file already imports, so no new dependency, API surface, or configuration knob is introduced.
+
+### AC-20 · Parallelise majorityVote inference calls
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+`majorityVote` dispatches its N (default 3) LLM inference calls sequentially inside a `for` loop, `await`-ing each `call(…)` before issuing the next. Every call receives the same `prompt`, `model`, `temperature`, and parameter set, and no iteration reads or writes state that a later iteration depends on, so the sequential ordering is purely an artefact of the loop structure. For a typical 1–10 s inference the user waits roughly 2 × single-inference-latency (≈ 2–20 s) of pure round-trip overhead for no logical reason, and in an agent pipeline where `majorityVote` is invoked per stage the penalty compounds.
+
+Solution:
+Replace the sequential `for` loop with a concurrent dispatch: build an array of N promises up front (each wrapping the existing `call(…)` in a `.then`/`.catch` pair that tags the outcome as `{ ok: true, result }` or `{ ok: false, err }`), then `await Promise.all(tasks)` once. After the single `await`, iterate the settled array to partition into `votes` and `voteErrors` exactly as the original per-iteration try/catch did. `Promise.all` is a built-in global; no new dependency is introduced, and the per-call error semantics are preserved because each promise resolves to a tagged object rather than rejecting the outer `Promise.all`.
+
+Benefits:
+All N inferences are in flight simultaneously, so wall-clock time drops from ≈ N × single-latency to ≈ 1 × single-latency (plus any server-side queuing). Even when the local model server serialises inference internally, the fix eliminates N − 1 full HTTP/TCP request→response round-trips, lets the server's internal queue batch or pipeline the requests, and keeps the Node event loop free for logging and bookkeeping between inferences. In multi-stage agent pipelines the savings multiply across every `majorityVote` call.
+
+### AC-21 · majorityVote serializes independent LLM calls
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+The `majorityVote` function fires `n` (default 3) LLM inference calls in a sequential `for` loop, each `await`-ed before the next begins. Every iteration passes the identical `prompt`, `model`, `temperature`, `taskId`, and `stage` to `call()`; there is no data dependency between iterations and no cross-iteration state. Because each call is a network round-trip to a local inference server that typically takes 1–30 s depending on model size and prompt length, serializing three calls multiplies user-facing wall-clock latency by 3× (e.g. ~9 s instead of ~3 s for a 7B model, or ~90 s instead of ~30 s for a 70B model or long prompt). The per-iteration LLM inference is the dominant cost in the entire request path, so the serialization penalty is the bottleneck, not loop overhead.
+
+Solution:
+Replace the sequential `for`-loop with a concurrent fan-out using `Promise.all` over `Array.from({ length: n }, …)`. Each element invokes the same `call(…)` with identical arguments and wraps the promise in `.then(result => ({ result })).catch(err => ({ error: err }))` so that per-call failures are captured individually. After `await Promise.all(…)`, iterate the settled array once, pushing successes into `votes` and failures into `voteErrors`, preserving the original collection semantics. The downstream majority-voting / classification logic is unchanged. No new dependency is introduced—`Promise.all` and `Array.from` are Node built-ins already available in this file's runtime.
+
+Benefits:
+Wall-clock latency for the majority-vote step drops from n × T to ≈ T (where T is a single inference call's latency), because all n calls are in flight simultaneously and the caller waits only for the slowest one. For the default n = 3 this is roughly a 3× reduction in perceived response time. Even if the local inference backend internally serializes (e.g. a single-threaded llama.cpp server), the client still saves per-request HTTP connection setup and lets the server's internal scheduler order the queue optimally, yielding a smaller but still positive gain. No behavioral change to the voting result, error handling, or public API surface.
+
+### AC-22 · Parallelize independent majority-vote calls in local-client.js
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+`majorityVote` in `src/local-client.js` issues `n` (default 3) calls to `call()` in a sequential `for` loop, awaiting each one before starting the next. Every iteration passes the identical argument object—same `prompt`, `model`, `temperature`, `numCtx`, `numPredict`, `taskId`, `stage`—and the loop index is never used in the call, so there is zero data dependency between iterations. For a local LLM backend where a single inference can take 2–10 s of wall-clock time, the caller pays 3 T (or n T) of latency instead of roughly T, adding 4–20 s of avoidable delay per `majorityVote` invocation in an agent pipeline that may call this per stage.
+
+Solution:
+Replace the sequential `for` loop with `Promise.allSettled` over an array of `n` concurrently-started `call()` promises (built via `Array.from({ length: n }, () => call({...}, 1))`). After the single `await`, iterate the settled results: push fulfilled values into `votes` and rejected reasons into `voteErrors`, preserving the existing per-vote error-collection semantics. No new dependency is introduced—`Promise.allSettled` is an ES2020 built-in available in every Node version the project targets, and `Array.from` is a plain standard-library call. The downstream tally / majority logic is unchanged.
+
+Benefits:
+When the local model server can handle concurrent requests (multiple workers, batched KV-cache, or a queue that overlaps decode with prefill), wall-clock latency drops from n × T to approximately T, cutting the 4–20 s penalty to near zero. When the server serializes internally, the change is a no-op—`Promise.allSettled` simply awaits the same total work—so the fix is strictly non-inferior in every deployment configuration. The code also becomes more readable: the "fire n independent samples, collect results" intent is expressed in one statement rather than an imperative loop with per-iteration `await`.
+
+### AC-23 · Replace synchronous per-file reads in the claim loop with concurrent fs.promises calls
+Strength: Strong
+Files: src/next-claimable-task.js
+Snippet:
+```
+  let probesOffered = 0;
+  const pinned = [];
+  const rankable = [];
+  for (const name of names) {
+    const { task, mtimeMs } = readTaskSafe(path.join(pendingDir, name));
+    const pinnedWorker = task && task.pinnedWorker;
+    if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
+```
+
+Problem:
+`next-claimable-task.js` iterates over every entry returned by `readdir` on `pendingDir` and calls `readTaskSafe(path.join(pendingDir, name))` for each one. The "Safe" wrapper is a synchronous `fs.readFileSync` + `fs.statSync` pair (returning `{ task, mtimeMs }`), so each iteration blocks the event loop for the duration of two syscalls. Under a realistic backlog—hundreds or thousands of pending task files after a worker crash, a burst of enqueued work, or workers running slower than producers—this serialises into 0.5–5+ seconds of event-loop starvation. During that window no other I/O, timers, or network callbacks on the same process can execute, delaying health-check pings, heartbeat responses, and incoming task-submission requests. Because the `instanceId` / `pinnedWorker` logic implies a multi-instance deployment, every worker instance serialises its own reads concurrently, amplifying the stall across the cluster.
+
+Solution:
+Add a `readTaskSafeAsync` sibling in the same module that uses `fs.promises.readFile` and `fs.promises.stat` (or a single `fs.promises.stat` for `mtimeMs`), preserving the identical `{ task, mtimeMs }` return shape and the null-on-error contract (catch and return `{ task: null, mtimeMs: null }`). Convert the flagged `for…of` loop to `const results = await Promise.all(names.map(name => readTaskSafeAsync(path.join(pendingDir, name))))`, making the enclosing function `async` and propagating `async`/`await` up the call chain to the point where the result is consumed (wrapping the top-level entry in `main().catch(...)` if it is a CLI or one-shot script). Keep the original synchronous `readTaskSafe` available for any truly one-shot, non-loop callers (e.g. a CLI `--inspect` flag) so those code paths are not forced into an async refactor. No new dependency is introduced; `fs.promises` is part of the Node standard library.
+
+Benefits:
+The kernel pipelines the file reads concurrently (bounded by the OS I/O scheduler), so wall-clock time drops from the sum of all individual reads to roughly the slowest single read. The event loop is no longer blocked for the duration of the loop, so health-check pings, heartbeat timers, and incoming request handlers continue to fire within their expected windows even under a large backlog. Multi-instance deployments no longer each serialise their own reads on the same event loop, reducing cross-request latency for all workers in the cluster. Error handling semantics are unchanged: a missing file or permission error still yields `task: null` rather than throwing, so downstream claim-ordering logic is unaffected.
+
+### AC-24 · Parallelize independent LLM votes in majorityVote
+Strength: Strong
+Files: src/local-client.js
+Snippet:
+```
+async function majorityVote({ prompt, classify, n = 3, minAgreeing = 2, temperature = 0.2, source, model, numCtx, numPredict, taskId, stage }) {
+  const votes = [];
+  const voteErrors = [];
+  for (let i = 0; i < n; i++) {
+    let result;
+    try {
+      result = await call({ prompt, think: false, temperature, source, model, numCtx, numPredict, taskId, stage, allowSideFindings: false }, 1);
+```
+
+Problem:
+`majorityVote` issues `n` (default 3) identical LLM inference calls inside a `for` loop, each gated by `await call(…)`. Because every iteration blocks on the previous one's response before dispatching the next, total wall-clock is approximately `n × T` (where `T` is a single inference round-trip). With the default of three votes and a typical 2-second inference, the caller waits roughly 6 seconds for work that has zero data dependency between iterations—same prompt, same model, same temperature, same `taskId`/`stage`. There is no rate-limiting, backoff, or cross-iteration state that would require serialization, so the sequential ordering is pure latency waste.
+
+Solution:
+Replace the sequential `for` loop with `Promise.all` over an `Array.from({ length: n }, …)` array. Each element invokes the same `call(…)` with identical arguments and wraps the promise in `.then(r => ({ ok: true, result: r })).catch(e => ({ ok: false, error: e }))` so a single failed vote still lands in `voteErrors` without rejecting the whole batch—preserving the original per-call error isolation. After `Promise.all` resolves, partition the results into `votes` and `voteErrors` exactly as before, then run the existing majority-tally logic unchanged. No new dependency is introduced; `Promise.all` and `Array.from` are core JavaScript already available in the runtime.
+
+Benefits:
+All `n` inference requests are dispatched in the same event-loop tick and are in-flight simultaneously, reducing wall-clock from `n × T` to roughly `max(T)` (i.e., one inference round-trip plus minor scheduling overhead). With the default `n = 3` and a 2-second per-call latency, the user-visible wait drops from ~6 s to ~2 s. Even in the worst case where the backend (e.g., a single-slot local model server) serializes the requests internally, the fix eliminates the inter-call network round-trip and event-loop scheduling overhead, and it costs nothing in complexity or new dependencies.
+
+### AC-25 · Memoize sandboxUnresolvedDependency to Avoid Blocking I/O in Review Loop
+Strength: Strong
+Files: src/review-verify.js
+Snippet:
+```
+        for (const x of contradictedCmds) { x.entry.outcome = 'inconclusive'; unattributable.push(`\`${x.c.text}\` failed, but the diff could not be reversed to check it against the base`); }
+        if (result.tests && failedSuites.some((f) => !f.dependent)) result.tests.passed = null;
+      } else {
+        for (const f of failedSuites) {
+          const unresolved = f.s.label === 'js' ? sandboxUnresolvedDependency(f.missing, repoRoot) : null;
+          if (unresolved) {
+            unverifiedOrUnattributable(f, `covering ${f.s.label} tests (${f.s.files.join(', ')}) could not run: sandbox cannot resolve ${unresolved} (present on the host, missing in the review sandbox), so the failure says nothing about the diff`);
+```
+
+Problem:
+The loop over `failedSuites` calls `sandboxUnresolvedDependency` synchronously for each suite, potentially multiple times for the same dependency. Since this is a blocking I/O operation, each call halts the Node.js event loop until completion — causing delays in HTTP responses, timers, and UI updates. If 10 suites share the same missing dependency, 10 blocking calls may queue up, amplifying the delay. The scanner correctly flags this as a performance hazard.
+
+Solution:
+Memoize the result of `sandboxUnresolvedDependency` using a `Map` keyed by the `missing` dependency string. Before each call, check if the result is already cached. If not, compute and cache it. This ensures each unique dependency is resolved only once, eliminating redundant blocking I/O and keeping the loop non-blocking.
+
+Benefits:
+With memoization, the scanner’s performance cost is reduced from O(n) blocking I/O operations (where n is the number of failed suites) to O(k) where k is the number of unique missing dependencies. This prevents event loop stall and improves responsiveness, especially under high failure load. The behavior remains identical — only redundant I/O is eliminated.
+
+### AC-26 · Memoize File Existence Checks to Avoid Sync I/O in Loop
+Strength: Strong
+Files: src/review-verify.js
+Snippet:
+```
+              : `covering ${f.s.label} tests (${f.s.files.join(', ')}) already fail on ${mainBranch} in the review sandbox, so the failure is not caused by the diff`);
+          }
+        }
+        for (const x of contradictedCmds) {
+          // A command whose target does not exist on the base (a test file the diff itself adds) cannot fail there: the failure is the diff's.
+          const targets = commandTargets(x.c);
+          if (targets.some((t) => !fs.existsSync(path.join(worktreeDir, t)))) { failures.push(`\`${x.c.text}\` exited ${x.entry.exitCode} but the draft claimed PASS`); continue; }
+```
+
+Problem:  
+The loop iterates over `contradictedCmds`, and for each command, it calls `fs.existsSync` synchronously for each target path. Since `fs.existsSync` blocks the Node.js event loop, each call introduces latency — especially if the loop runs hundreds or thousands of times. This is a real performance bottleneck in hot paths like CI or frequent review verification, where blocking I/O can cause noticeable delays or timeouts.
+
+Solution:  
+Precompute a `Map` of target paths to their existence status before entering the loop. For each path, check if it’s already in the map; if not, compute and cache the result. Then use the cached value to avoid redundant I/O during iteration.
+
+Benefits:  
+Eliminates repeated synchronous I/O calls, reducing event loop blocking and improving overall responsiveness. The fix is minimal, safe, and uses only existing primitives (`Map`, `fs.existsSync`, `path.join`) — no new dependencies or async patterns required. Performance scales better with larger lists of commands.

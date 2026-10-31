@@ -68,11 +68,14 @@ function appliedBranch(task) {
   return null;
 }
 
-// Hub children, stacked tasks and human-prioritised tasks are never touched.
-function eligibleTask(task) {
+// Hub children, stacked tasks and pinned tasks are never touched. Human-prioritised tasks (humanQueued / premiumPriority) are skipped too unless the
+// caller's trigger is itself a human verdict (branch-defect-readmit-sweep.js passes allowHumanPrioritised: owner decision 2026-10-30, because a task a
+// person filed and a person then judged defective is exactly the one that should go back for a redraft).
+function eligibleTask(task, { allowHumanPrioritised = false } = {}) {
   if (!task || task.terminalDisposition !== 'pending-merge') return false;
   if (task.hubId || task.parentHub || task.stacked) return false;
-  if (task.humanQueued || task.premiumPriority || task.pinnedWorker) return false;
+  if (task.pinnedWorker) return false;
+  if (!allowHumanPrioritised && (task.humanQueued || task.premiumPriority)) return false;
   return true;
 }
 

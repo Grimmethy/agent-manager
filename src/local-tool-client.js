@@ -36,6 +36,8 @@ const { injectConceptBuildInstruction, extractConceptBuildReport, recordConceptB
 const { queueAdhocTask } = require('./queue-adhoc-task.js');
 const { listProjects, pipelineFor } = require('./chat-projects.js');
 const { proposeCommand, proposalsFromToolLog } = require('./chat-command-allowlist.js');
+const { listUnverifiedBranchesTool, recordBranchVerdictTool } = require('./chat-branch-verdict.js');
+const { checkBranchTool } = require('./chat-branch-check.js');
 const {
   answerNeedsClarification, resolveNeedsClarification, markNeedsClarificationDone, requeueBlockedTask, withdrawTask,
 } = require('./chat-task-requeue.js');
@@ -220,12 +222,13 @@ const WRITE_TOOLS = [
     type: 'function',
     function: {
       name: 'queue_reviewed_task',
-      description: 'File a task describing a code CHANGE (which files, what behavior) for the reviewed pipeline to implement. It goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as an unmerged branch for a human. Never queue a git operation (commit, merge, push, branch, PR): the pipeline cannot perform them, and this tool refuses them.',
+      description: 'File a task describing a code CHANGE (which files, what behavior) for the reviewed pipeline to implement. It goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as an unmerged branch for a human. Never queue a git operation (commit, merge, push, branch, PR): the pipeline cannot perform them, and this tool refuses them. Optional `dependsOn` (array of task ids) lets you order a batch: a task with dependsOn will not be drafted until every listed dependency is merged. The tool returns the new task id, which a later call can reference in its own dependsOn.',
       parameters: {
         type: 'object',
         properties: {
           title: { type: 'string', description: 'Short title for the queued task, e.g. "Merge agent/observability-fix-ac-57 into master".' },
           description: { type: 'string', description: 'What should be done and why -- include enough detail (branch names, the specific change, any known risks like a merge conflict) for the pipeline to act on without further back-and-forth.' },
+          dependsOn: { type: 'array', items: { type: 'string' }, description: 'Task ids this new task depends on -- it will not be drafted until every dependency is merged. Unknown ids are rejected with a clear error. Omit for independent tasks.' },
         },
         required: ['title', 'description'],
       },
@@ -277,13 +280,14 @@ const CHAT_TOOLS = [
     type: 'function',
     function: {
       name: 'queue_reviewed_task',
-      description: 'File a real task for the pipeline to implement -- the ONLY way to make a real code change from Chat (you have no direct write access). Use this for anything from a one-line fix to a whole new mechanism: investigate and design the change as normal, then call this tool with enough detail for the pipeline to implement it without further back-and-forth. The task goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as a real unmerged branch for a human to review -- never applied directly. Describe the CHANGE wanted (files, behavior), never a git operation: do not ask for a commit, merge, push, branch or PR -- the pipeline commits by itself and a human merges from the Unmerged Branches tab, and this tool refuses git-operation requests.',
+      description: 'File a real task for the pipeline to implement -- the ONLY way to make a real code change from Chat (you have no direct write access). Use this for anything from a one-line fix to a whole new mechanism: investigate and design the change as normal, then call this tool with enough detail for the pipeline to implement it without further back-and-forth. The task goes through the same implement/critique/review/majority-vote path every other pipeline change goes through and lands as a real unmerged branch for a human to review -- never applied directly. Describe the CHANGE wanted (files, behavior), never a git operation: do not ask for a commit, merge, push, branch or PR -- the pipeline commits by itself and a human merges from the Unmerged Branches tab, and this tool refuses git-operation requests. Optional `dependsOn` (array of task ids) orders a batch: a task with dependsOn will not be drafted until every listed dependency is merged. The tool returns the new task id so a later call can reference it in its own dependsOn.',
       parameters: {
         type: 'object',
         properties: {
           title: { type: 'string', description: 'Short title for the queued task, e.g. "Add re-admission path for symbol-still-referenced decompose rejections".' },
           description: { type: 'string', description: 'What should be built/changed and why -- include enough detail (files, the specific behavior, acceptance criteria) for the pipeline to act on without further back-and-forth.' },
           project: { type: 'string', description: 'Label or repo root of the project this task is for (from list_projects); omit only for agent-manager itself. A task about another project\'s files is refused without it.' },
+          dependsOn: { type: 'array', items: { type: 'string' }, description: 'Task ids this new task depends on -- it will not be drafted until every dependency is merged. Unknown ids are rejected with a clear error. Omit for independent tasks. Useful for ordering an ordered batch (C1, C2, C3...) so C2 waits for C1 to merge before it is drafted.' },
         },
         required: ['title', 'description'],
       },
@@ -392,6 +396,71 @@ const CHAT_TOOLS = [
         },
         required: ['repo', 'argv', 'why'],
       },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'list_unverified_branches',
+      description: 'List the unmerged agent/* branches (across every registered project) that have no verdict yet or only a stale one -- the work list for verifying branches. Each row has the project, branch, headSha, subject, hub progress, ahead/behind and willConflict. Read-only. Work through each branch in this order: check_branch (it runs the project\'s covering tests in a scratch copy and tells you what it could not run), then read the diff and the hub\'s siblings, then record_branch_verdict.',
+      parameters: {
+        type: 'object',
+        properties: {
+          project: { type: 'string', description: 'Optional label or repo root to list one project only (from list_projects).' },
+          limit: { type: 'integer', description: 'Max rows to return (default 40, max 200).' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'record_branch_verdict',
+      description: 'Record your verdict on ONE verified unmerged branch so its card changes colour in the Unmerged Branches tab (merge = green, needs-work = yellow, discard = red). It records the verdict only: it never merges, discards or edits anything. Allowed verdicts are exactly merge, needs-work, discard (HOLD and unverified do not exist; use needs-work for a branch that is not ready). The reasons must be specific evidence of what you actually ran or read and what it showed; never write a check you did not run (for example "no conflicts" or "tests pass") and say plainly which checks you could not run. sha must be the headSha from list_unverified_branches; if the head moved the call is refused. Call check_branch for the branch first and base your reasons on its result: a merge verdict needs a current check of this exact head that ran the covering tests green (a branch that changes only documentation is exempt); needs-work and discard never need one.',
+      parameters: {
+        type: 'object',
+        properties: {
+          branch: { type: 'string', description: 'The full branch name, e.g. agent/decompose-adhoc-...' },
+          sha: { type: 'string', description: 'The branch headSha (or a unique prefix of at least 7 characters) you verified.' },
+          verdict: { type: 'string', enum: ['merge', 'needs-work', 'discard'], description: 'merge = ready to merge, needs-work = defects to fix first, discard = redundant or wrong.' },
+          reasons: { type: 'array', items: { type: 'string' }, description: 'One or more specific evidence lines (what was checked and the result).' },
+          project: { type: 'string', description: 'Label or repo root of the branch\'s project (as listed by list_unverified_branches); required only when the same branch name is listed in more than one project.' },
+        },
+        required: ['branch', 'sha', 'verdict', 'reasons'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'check_branch',
+      description: 'Check ONE unmerged branch before you record a verdict for it: it makes a scratch copy of the branch head, lists what the branch changes, runs the project\'s own covering tests and two static scans (an undefined logger name, a missing local require) and tells you exactly what ran, what passed or went red, and what it could not run. It can take several minutes. run_bash cannot do this: its sandbox is read-only and a command is limited to 30 seconds. It never merges, pushes or edits the project. Pass the branch name exactly as list_unverified_branches gave it (and project when the name is listed in more than one).',
+      parameters: {
+        type: 'object',
+        properties: {
+          branch: { type: 'string', description: 'The full branch name, e.g. agent/decompose-adhoc-...' },
+          project: { type: 'string', description: 'Label or repo root of the branch\'s project (as listed by list_unverified_branches); required only when the same branch name is listed in more than one project.' },
+        },
+        required: ['branch'],
+      },
+    },
+  },
+  // 2026-10-29 (post-incident hardening, Grimmethy: "I need to see which tools and gates
+  // are live right now, and whether the branch I\'m about to merge is up-to-date with
+  // origin"). This is a CHAT-only tool -- it must NOT be in TOOLS (which every worker
+  // receives) because it would burn tokens in every implement pass for zero benefit.
+  // The tool list it returns is the UNION of TOOLS + CHAT_TOOLS (what chat actually sees),
+  // not just TOOLS -- the earlier defect was that it reported only the 7 shared tools and
+  // missed every CHAT_TOOLS entry. The verdict gate flag is derived from CHAT_TOOLS (where
+  // record_branch_verdict/list_unverified_branches live), not TOOLS (where they never are),
+  // so gates.mergeVerdictNeedsCheck is true when the gate is actually live.
+  {
+    type: 'function',
+    function: {
+      name: 'chat_status',
+      description: 'Report the current tool list and gate state for the chat client: which tools are loaded (TOOLS + CHAT_TOOLS), whether the merge verdict gate is live (gates.mergeVerdictNeedsCheck), and whether the local branch is behind origin (stale checkout warning). Use this to verify the chat is configured correctly before attempting a merge.',
+      parameters: { type: 'object', properties: {}, required: [] },
     },
   },
 ];
@@ -505,11 +574,11 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'read_task',
-      description: 'Look up one pipeline task by its exact ID (searches every queue state: drafting, pending, review, blocked, done, needs-clarification, awaiting-confirm, coordinating, approved, adhoc, and archived). With no "section", returns a summary (title, source, status, blockedReason, etc.) -- cheap, use this first. Pass "section" to pull one specific piece of the full content on demand instead of everything at once.',
+      description: 'Look up one pipeline task by its exact ID or a hub label of the form HUB\\d{4} (searches every queue state: drafting, pending, review, blocked, done, needs-clarification, awaiting-confirm, coordinating, approved, adhoc, and archived). With no "section", returns a summary (title, source, status, blockedReason, etc.) -- cheap, use this first. Pass "section" to pull one specific piece of the full content on demand instead of everything at once.',
       parameters: {
         type: 'object',
         properties: {
-          taskId: { type: 'string', description: 'The exact task id.' },
+          taskId: { type: 'string', description: 'The exact task id or a hub label of the form HUB\\d{4}.' },
           project: PROJECT_ARG,
           section: { type: 'string', description: 'Optional: one of "plan", "implement", "history", "blockedReason" to pull just that piece of the task\'s full content instead of the summary.' },
           offset: { type: 'integer', description: 'With "section": first line to return (1-indexed). Default 1.' },
@@ -642,6 +711,37 @@ function buildChatToolHandlers(allowedRoots, pipelineDir, repoRoot) {
     requeue_blocked_task: (args) => withProject(args, (t) => requeueBlockedTask(t.pipelineDir, t.repoRoot, args.taskId, { state: args.state, force: !!args.force })),
     withdraw_task: (args) => withProject(args, (t) => withdrawTask(t.pipelineDir, args.taskId, args.reason)),
     propose_command: (args) => proposeCommand({ repo: args.repo, argv: args.argv, why: args.why }, { pipelineDir }),
+    list_unverified_branches: (args) => listUnverifiedBranchesTool({ project: args.project, limit: args.limit }),
+    record_branch_verdict: (args) => recordBranchVerdictTool({ project: args.project, branch: args.branch, sha: args.sha, verdict: args.verdict, reasons: args.reasons }),
+    check_branch: (args) => checkBranchTool({ project: args.project, branch: args.branch }),
+    chat_status: () => {
+      // Report the union of TOOLS + CHAT_TOOLS (what chat actually sees), not just TOOLS.
+      // The earlier defect was that chat_status reported only the 7 shared tools and
+      // missed every CHAT_TOOLS entry.
+      const toolNames = [...TOOLS.map((t) => t.function.name), ...CHAT_TOOLS.map((t) => t.function.name)];
+      // Derive the verdict gate from CHAT_TOOLS (where record_branch_verdict/list_unverified_branches live),
+      // not TOOLS (where they never are). The earlier defect was that gates.mergeVerdictNeedsCheck
+      // was always false because it looked in TOOLS.
+      const hasVerdictGate = CHAT_TOOLS.some((t) => t.function.name === 'record_branch_verdict' || t.function.name === 'list_unverified_branches');
+      // Check if the local branch is behind origin (stale checkout warning).
+      // This uses a local origin ref without a fetch, so it may be stale.
+      let isBehind = false;
+      try {
+        const { execFileSync } = require('child_process');
+        const output = execFileSync('git', ['rev-list', '--count', 'HEAD..origin/HEAD'], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+        isBehind = Number(output) > 0;
+      } catch {
+        // If git fails (e.g. not a repo, no origin), assume not behind.
+        isBehind = false;
+      }
+      return {
+        tools: toolNames,
+        gates: {
+          mergeVerdictNeedsCheck: hasVerdictGate,
+        },
+        warning: isBehind ? 'Local branch is behind origin (stale checkout warning: behind uses a local origin ref without a fetch)' : null,
+      };
+    },
   };
 }
 
@@ -725,7 +825,18 @@ async function postChatTurn({ messages, tools, tokenFoldHeaders, onChunk }) {
     // its generation/context ceiling mid-response and got cut off. See below.
     if (obj.done) { usage = pickUsage(obj); doneReason = obj.done_reason || null; }
   });
-  if (streamError) throw new Error(streamError);
+  if (streamError) {
+    if (contentAcc) {
+      // Preserve partial streamed content on stream error instead of discarding it.
+      // See: task "Preserve partial streamed response on stream error in postChatTurn".
+      return {
+        message: { role: 'assistant', content: contentAcc + `\n\n*[Stream error: ${streamError}]*` },
+        usage,
+        doneReason: 'stream-error',
+      };
+    }
+    throw new Error(streamError);
+  }
   // 2026-09-05, Grimmethy: "I'd very much like to see that done_reason: 'length' show up
   // in the chat itself... handy debug tool" -- found live via the Chat panel's own
   // transcript: two real turns ended mid-word ("...and see whatI was mid-invest") with NO

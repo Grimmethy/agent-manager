@@ -158,27 +158,66 @@ function checkCitations(task, body, { repoRoots } = {}) {
 // as an existing prerequisite with no fetched file ever containing it.
 const PREREQUISITE_CLAIM_RE = /\b(the\s+existing|already\s+(?:exists?|built|implemented|wired|has)|the\s+AC-\d+[a-z]?\s+(?:gate|hook|check|fix))\b/gi;
 
+function splitProblemSolution(body) {
+  const lower = body.toLowerCase();
+  const idx = lower.indexOf('\nsolution:');
+  if (idx === -1) {
+    const idx2 = lower.indexOf('solution:');
+    if (idx2 === -1) return { problem: body, solution: '' };
+    return { problem: body.slice(0, idx2), solution: body.slice(idx2 + 'solution:'.length) };
+  }
+  return { problem: body.slice(0, idx), solution: body.slice(idx + '\nsolution:'.length) };
+}
+
+function identifyIntroducedSymbols(solution, title) {
+  const symbols = new Set();
+  const addVerbs = /\b(add|introduce|create|implement|establish|institute|roll\s*out)\b/i;
+  const newTag = /`([A-Za-z_][A-Za-z0-9_]{3,})`/g;
+  let m;
+  newTag.lastIndex = 0;
+  while ((m = newTag.exec(solution))) {
+    const symbol = m[1];
+    const before = solution.slice(Math.max(0, m.index - 80), m.index);
+    if (addVerbs.test(before)) symbols.add(symbol);
+  }
+  if (title) {
+    const titleVerbs = /\b(add|introduce|create|implement)\b/i;
+    if (titleVerbs.test(title)) {
+      const titleSymbols = /`([A-Za-z_][A-Za-z0-9_]{3,})`/g;
+      let tm;
+      titleSymbols.lastIndex = 0;
+      while ((tm = titleSymbols.exec(title))) {
+        symbols.add(tm[1]);
+      }
+    }
+  }
+  return Array.from(symbols);
+}
+
 function checkPrerequisiteClaim(task, body, { repoRoots } = {}) {
   const contradictions = [];
+  const dismissed = [];
   const roots = repoRoots || defaultRepoRoots();
   const files = fetchedFilesOf(task);
-  if (!files.length) return contradictions;
+  if (!files.length) return { contradictions, dismissed };
+  const { problem, solution } = splitProblemSolution(body);
+  const introducedSymbols = identifyIntroducedSymbols(solution, task.title);
+  for (const sym of introducedSymbols) {
+    if (!dismissed.includes(sym)) dismissed.push(sym);
+  }
+  const problemBody = problem || body;
   PREREQUISITE_CLAIM_RE.lastIndex = 0;
-  if (!PREREQUISITE_CLAIM_RE.test(body)) return contradictions;
-  // Named-entity extraction: a quoted identifier or backtick-quoted symbol near a
-  // prerequisite-claim phrase, checked against the UNION of all fetched file content --
-  // deliberately loose (any fetched file, not just one named alongside the claim), since
-  // a real prerequisite could legitimately live in a different file than the one this
-  // candidate's own Solution targets.
+  if (!PREREQUISITE_CLAIM_RE.test(problemBody)) return { contradictions, dismissed };
   const allContent = files.map((f) => String((f && f.content) || '')).join('\n');
   CITED_SYMBOL_RE.lastIndex = 0;
   let sm;
   const checked = new Set();
-  while ((sm = CITED_SYMBOL_RE.exec(body))) {
+  while ((sm = CITED_SYMBOL_RE.exec(problemBody))) {
     const symbol = sm[1].replace(/\($/, '');
     if (checked.has(symbol)) continue;
     checked.add(symbol);
-    const nearbyClaim = body.slice(Math.max(0, sm.index - CITATION_WINDOW_CHARS), sm.index).match(PREREQUISITE_CLAIM_RE);
+    if (introducedSymbols.includes(symbol)) continue;
+    const nearbyClaim = problemBody.slice(Math.max(0, sm.index - CITATION_WINDOW_CHARS), sm.index).match(PREREQUISITE_CLAIM_RE);
     if (nearbyClaim && !allContent.includes(symbol)) {
       if (symbolVerifiedOnDisk(files, symbol, roots)) continue;
       contradictions.push({
@@ -187,14 +226,18 @@ function checkPrerequisiteClaim(task, body, { repoRoots } = {}) {
       });
     }
   }
-  return contradictions;
+  return { contradictions, dismissed };
 }
 
 // { contradictions: [{kind, detail}] }. Pure, deterministic, no model, no I/O beyond
 // what's already in promptContext.fetchedFiles.
 function computePremiseEvidence(task, opts = {}) {
   const body = String((task.promptContext && task.promptContext.body) || '');
-  return { contradictions: [...checkCitations(task, body, opts), ...checkPrerequisiteClaim(task, body, opts)] };
+  const citationContradictions = checkCitations(task, body, opts);
+  const prereqResult = checkPrerequisiteClaim(task, body, opts);
+  const prereqContradictions = Array.isArray(prereqResult) ? prereqResult : prereqResult.contradictions || [];
+  const dismissed = Array.isArray(prereqResult) ? [] : prereqResult.dismissed || [];
+  return { contradictions: [...citationContradictions, ...prereqContradictions], dismissed };
 }
 
 // Whether the candidate makes ANY claim shape this module knows how to check at all --

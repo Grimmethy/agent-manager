@@ -15,6 +15,22 @@ import subprocess
 
 task_bp = Blueprint("task-bp", __name__)
 
+
+def _qdir_for_request(body=None):
+    """(queue dir, scope) for the project a request names (2026-10-30). `?project=<repoRoot>` (or "project" in a JSON body) selects another registered
+    project's queue exactly like the branch and premium routes do (branch_projects.resolve_scope); absent or equal to the active project = the active
+    project's queue as before, scope None. An unregistered project is a 404 and never falls back to the active one."""
+    from app import get_active_repo_root, queue_dir
+    project = request.args.get("project") or (body.get("project") if isinstance(body, dict) else None)
+    if not project:
+        return queue_dir(), None
+    import branch_projects
+    try:
+        scope = branch_projects.resolve_scope(project, get_active_repo_root())
+    except LookupError as e:
+        abort(404, description=str(e))
+    return (scope["qdir"], scope) if scope else (queue_dir(), None)
+
 # 2026-09-17, root-caused live: /resolve and /answer below both move a held task from
 # queue/needs-clarification/ into queue/adhoc/ for "a fresh draft pass", but neither ever
 # clears the STALE blockedReason/blockedStage/status/localRejectCount fields the task
@@ -168,15 +184,16 @@ def api_hub_retire(hub_id):
     or reviewer corrupts it), is itself a coordinating hub (retire that one first), or already has an archived copy. Children that already
     finished (done/archived/superseded) or whose record is gone are left as they are. Body: {"reason": "<why>"} (optional).
     Returns {"hub", "archived": [child ids], "left": {child id: why}}."""
-    from app import _archive_task_file, queue_dir, read_json_safe, logger
-    qdir = queue_dir()
+    from app import _archive_task_file, read_json_safe, logger
+    body = request.get_json(silent=True) or {}
+    qdir, _scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
     hub_file = qdir / "coordinating" / f"{hub_id}.json"
     hub = read_json_safe(hub_file)
     if not isinstance(hub, dict):
         abort(404, description=f"no coordinating hub '{hub_id}'")
-    reason = ((request.get_json(silent=True) or {}).get("reason") or "").strip() or None
+    reason = (body.get("reason") or "").strip() or None
     archive_dir = qdir / "done" / "_archived_no_action"
 
     to_retire, left, blockers = [], {}, []
@@ -609,8 +626,9 @@ def api_task_resolve_clarification(task_id):
     candidates, or hand-typed for a 'no-match' case) become promptContext.prefetchedPaths;
     an empty/omitted paths list means "proceed with no prefetch at all," a deliberate
     choice, not an error."""
-    from app import _record_manual_requeue, queue_dir, read_json_safe
-    qdir = queue_dir()
+    from app import _record_manual_requeue, read_json_safe
+    body = request.get_json(silent=True) or {}
+    qdir, scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
     src = qdir / "needs-clarification" / f"{task_id}.json"
@@ -618,7 +636,6 @@ def api_task_resolve_clarification(task_id):
     if not data:
         abort(404)
 
-    body = request.get_json(silent=True) or {}
     paths = body.get("paths")
     if paths and isinstance(paths, list):
         data.setdefault("promptContext", {})["prefetchedPaths"] = [str(p) for p in paths]
@@ -631,7 +648,7 @@ def api_task_resolve_clarification(task_id):
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
-    _record_manual_requeue(data, reason_hint="needs-clarification resolved via the file-path picker", requeue_writer="operator-manual")
+    _record_manual_requeue(data, reason_hint="needs-clarification resolved via the file-path picker", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
     return jsonify({"id": task_id, "resolved": True, "prefetchedPaths": data.get("promptContext", {}).get("prefetchedPaths")})
 
 
@@ -647,8 +664,9 @@ def api_task_answer_clarification(task_id):
     session's transcript already gets folded in as (see api_discuss_end's needs-
     clarification branch), just without ever opening a session.
     Body: {"answer": "<free text, or the clicked option's label+description>"}."""
-    from app import _record_manual_requeue, queue_dir, read_json_safe
-    qdir = queue_dir()
+    from app import _record_manual_requeue, read_json_safe
+    body = request.get_json(silent=True) or {}
+    qdir, scope = _qdir_for_request(body)
     if not qdir:
         abort(404)
     src = qdir / "needs-clarification" / f"{task_id}.json"
@@ -656,7 +674,6 @@ def api_task_answer_clarification(task_id):
     if not data:
         abort(404)
 
-    body = request.get_json(silent=True) or {}
     answer = (body.get("answer") or "").strip()
     if not answer:
         abort(400, description="answer is required")
@@ -682,7 +699,7 @@ def api_task_answer_clarification(task_id):
         abort(409, description=f"'{task_id}' already has a task in adhoc/")
     dest.write_text(json.dumps(data, indent=2), encoding="utf-8")
     src.unlink()
-    _record_manual_requeue(data, reason_hint=f"needs-clarification answered from the picker: {answer[:200]}", requeue_writer="operator-manual")
+    _record_manual_requeue(data, reason_hint=f"needs-clarification answered from the picker: {answer[:200]}", requeue_writer="operator-manual", pipeline_dir=scope["pipelineDir"] if scope else None)
     return jsonify({"id": task_id, "answered": True})
 
 
@@ -715,8 +732,8 @@ def api_task_mark_done_clarification(task_id):
     from this specific record, but the need is considered met" -- exactly what
     isDependencySatisfied's own new no-code-coming check now looks for (see its comment).
     """
-    from app import queue_dir, read_json_safe
-    qdir = queue_dir()
+    from app import read_json_safe
+    qdir, _scope = _qdir_for_request(request.get_json(silent=True) or {})
     if not qdir:
         abort(404)
     src = qdir / "needs-clarification" / f"{task_id}.json"

@@ -79,6 +79,26 @@ function isEnabled() {
   return process.env.AGENT_MANAGER_DECOMPOSE_PREMISE_CHECK !== 'false';
 }
 
+// Collect file paths declared in sibling pieces' "Files:" scope lines.
+// Used by the stale-premise gate to suppress false positives where a sibling
+// piece in the same hub branch declares it will create or edit the cited file.
+// The hub coordinator populates promptContext.decomposedFrom.pieces[] and each
+// piece carries scopeLines[] written by queueSubTasks (literal "Files:" prefix).
+function getSiblingScopeFiles(task) {
+  const siblings = task?.promptContext?.decomposedFrom?.pieces || [];
+  const files = new Set();
+  for (const sib of siblings) {
+    const scopeLines = sib?.scopeLines || [];
+    for (const line of scopeLines) {
+      if (typeof line === 'string' && line.startsWith('Files:')) {
+        const trimmed = line.slice('Files:'.length).trim();
+        if (trimmed) files.add(trimmed);
+      }
+    }
+  }
+  return files;
+}
+
 // Injectable for tests -- default reads the real file from disk.
 function realLineCount(repoRoot, relPath) {
   try {
@@ -339,6 +359,26 @@ function detectStaleDecomposePremise(task, { repoRoot, lineCountFn = realLineCou
       // keeps the genuinely-missing b.js flagged -- see createVerbFor.
       if (createVerbFor(rawText, p.index, allPaths)) {
         suppressions.push({ path: relPath, reason: 'create-verb-introduced', sentence: sentenceAround(rawText, p.index), lineRef: ref.line });
+        continue;
+      }
+      // Sibling-piece guard: if any sibling in the hub branch declares this file in its
+      // "Files:" scope line, the file is not truly missing -- a later/independent piece
+      // will create it. Suppress with an audit entry naming the sibling piece.
+      const siblingFiles = getSiblingScopeFiles(task);
+      if (siblingFiles.has(relPath)) {
+        const matchingSib = task?.promptContext?.decomposedFrom?.pieces?.find(
+          (s) => (s?.scopeLines || []).some(
+            (l) => typeof l === 'string' && l.startsWith('Files:') && l.includes(relPath),
+          ),
+        );
+        suppressions.push({
+          path: relPath,
+          reason: 'sibling-creates',
+          pieceId: matchingSib?.id || 'unknown',
+          source: 'sibling-scopeFiles',
+          sentence: sentenceAround(rawText, p.index),
+          lineRef: ref.line,
+        });
         continue;
       }
       findings.push({ kind: 'missing-file', relPath, detail: `cites \`${relPath}\`, but that file does not exist in the repo` });

@@ -1,5 +1,6 @@
 from flask import Blueprint, abort, jsonify, request
 
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -15,6 +16,321 @@ import subprocess
 # pattern as routes/concepts.py, routes/second_brain.py, routes/reports.py.)
 
 pipeline_1_more_bp = Blueprint("pipeline-1-more-bp", __name__)
+
+
+def _get_project_tests_command(repo_root: Path) -> str | None:
+    """Read the 'testsCommand' field from projects.json for the given repo root.
+    
+    Returns the command string if configured, None otherwise.
+    Each project keeps its own projects.json at its repo root (or one directory up).
+    """
+    import json
+    
+    # Check both repo_root and its parent for projects.json
+    candidates = [repo_root / "projects.json", (repo_root.parent) / "projects.json"]
+    projects_path = None
+    for candidate in candidates:
+        if candidate.is_file():
+            projects_path = candidate
+            break
+    
+    if not projects_path:
+        return None
+    
+    try:
+        projects = json.loads(projects_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    
+    if not isinstance(projects, list):
+        return None
+    
+    # Find the project matching this repo root
+    for project in projects:
+        if not isinstance(project, dict):
+            continue
+        repo_path = project.get("repoRoot") or project.get("path")
+        if not repo_path:
+            continue
+        # Normalize paths for comparison
+        try:
+            if Path(repo_path).resolve() == repo_root.resolve():
+                return project.get("testsCommand")
+        except (OSError, ValueError):
+            # If resolve fails (e.g., path doesn't exist), do a simple string compare
+            if str(repo_path) == str(repo_root):
+                return project.get("testsCommand")
+    
+    return None
+
+
+def _run_project_tests(worktree_path: str, tests_command: str) -> dict:
+    """Run the project's tests command in the given worktree.
+    
+    Returns a dict with:
+    - passed: bool
+    - output: str (stdout+stderr combined)
+    - returncode: int
+    """
+    import subprocess
+    
+    try:
+        result = subprocess.run(
+            tests_command,
+            shell=True,
+            cwd=worktree_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300,  # 5 minute timeout
+        )
+        combined = (result.stdout or "") + (result.stderr or "")
+        return {
+            "passed": result.returncode == 0,
+            "output": combined,
+            "returncode": result.returncode,
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "passed": False,
+            "output": "Tests timed out after 5 minutes",
+            "returncode": -1,
+        }
+    except Exception as e:
+        return {
+            "passed": False,
+            "output": f"Test execution failed: {str(e)}",
+            "returncode": -1,
+        }
+
+
+def _record_held_merge_history(repo_root: Path, branch: str, main_branch: str):
+    """Record a history line on the owning hub for this early merge.
+    
+    Best-effort: if we can't find the hub or write the history, silently continue.
+    No logging to avoid circular import with app.
+    """
+    import json
+    from datetime import datetime, timezone
+    
+    # Try to find the hub task by looking at the branch's trailers
+    hub_task_id = None
+    try:
+        log_output = subprocess.run(
+            ["git", "log", f"origin/{main_branch}..origin/{branch}", "--format=%b"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if log_output.returncode == 0:
+            # Extract Task: trailers from commit messages
+            import re
+            task_re = re.compile(r"^Task:\s*(\S+)", re.MULTILINE)
+            trailers = task_re.findall(log_output.stdout)
+            if trailers:
+                hub_task_id = trailers[0]
+    except Exception:
+        pass
+    
+    # Fallback: if no trailers found, look for any task file in done/
+    if not hub_task_id:
+        done_dir = repo_root / "queue" / "done"
+        if done_dir.is_dir():
+            task_files = list(done_dir.glob("*.json"))
+            if task_files:
+                # Use the first task file found
+                hub_task_id = task_files[0].stem
+    
+    if not hub_task_id:
+        return
+    
+    hub_path = repo_root / "queue" / "done" / f"{hub_task_id}.json"
+    
+    if not hub_path.is_file():
+        return
+    
+    try:
+        data = json.loads(hub_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        
+        history = data.get("history")
+        if not isinstance(history, list):
+            history = data["history"] = []
+        
+        history.append({
+            "stage": "earlyMerge",
+            "at": datetime.now(timezone.utc).isoformat(),
+            "detail": f"held branch {branch} merged early into {main_branch}",
+        })
+        
+        hub_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+@pipeline_1_more_bp.route("/api/git/held-hub-branches/<path:branch>/merge-early", methods=["POST"])
+def api_git_merge_held_hub_branch_early(branch):
+    """Merge a held hub branch into master early, optionally bringing downstream held branches up to date.
+
+    Used when a held hub branch needs files from another hub's held branch (e.g. HUB0008-03 needed
+    accounts.py from HUB0006's branch). Unlike the regular merge route, this:
+    - Verifies the branch is a held hub branch (not just any unmerged branch)
+    - Requires a testsCommand to be configured on the project
+    - Runs tests on a scratch worktree before pushing
+    - Optionally merges the new master into other held hub branches (alsoUpdate)
+    - Never uses force push for downstream branches (fast-forward only)
+
+    Returns {merged: bool, updated: [str], testsRun: bool} on success, 409 on refusal.
+    """
+    from app import (
+        _acquire_apply_lock,
+        _release_apply_lock,
+        _run_git,
+        get_active_repo_root,
+        list_unmerged_branches,
+        logger,
+        partition_held_hub_branches,
+    )
+    import shutil
+    import tempfile
+
+    repo_root = get_active_repo_root()
+    if not repo_root:
+        abort(404, description="no active project -- AGENT_MANAGER_REPO_ROOT is not resolvable")
+    repo_root = Path(repo_root)
+
+    body = request.get_json(silent=True) or {}
+    also_update = body.get("alsoUpdate", []) or []
+    if not isinstance(also_update, list):
+        abort(400, description="alsoUpdate must be an array")
+
+    # Acquire the apply lock (same as api_git_merge_branch)
+    try:
+        lock_fd = _acquire_apply_lock()
+    except RuntimeError as e:
+        abort(409, description=f"the pipeline is mid-apply right now -- try again in a few seconds")
+
+    try:
+        # Verify branch is a held hub branch
+        branches = list_unmerged_branches(force=True)
+        listed, held_groups = partition_held_hub_branches(branches)
+        held_branches = []
+        for g in held_groups:
+            held_branches.extend(g["branches"])
+        
+        if branch not in held_branches:
+            return jsonify({
+                "succeeded": False,
+                "reason": f"'{branch}' is not a currently-listed held hub branch"
+            }), 409
+
+        # Check if testsCommand is configured
+        tests_command = _get_project_tests_command(repo_root)
+        if not tests_command:
+            return jsonify({
+                "succeeded": False,
+                "reason": "no tests command configured for this project -- set 'testsCommand' in projects.json"
+            }), 409
+
+        # Merge into master on a scratch worktree
+        tmp_dir = tempfile.mkdtemp(prefix="am-merge-early-")
+        scratch_wt = os.path.join(tmp_dir, "scratch")
+        main_branch = _detect_main_branch(repo_root)
+        
+        try:
+            # Create scratch worktree from origin/main
+            _run_git(["worktree", "add", "--detach", scratch_wt, f"origin/{main_branch}"], repo_root)
+            
+            # Merge the held branch
+            try:
+                _run_git(["merge", "--no-ff", f"origin/{branch}", "-m", f"Merge {branch} (early merge via dashboard)"], scratch_wt)
+            except RuntimeError as e:
+                # Abort the merge and clean up
+                subprocess.run(["git", "merge", "--abort"], cwd=scratch_wt, capture_output=True, timeout=15)
+                return jsonify({
+                    "succeeded": False,
+                    "reason": f"merge conflict: {str(e)}"
+                }), 409
+
+            # Run tests on the merged result
+            test_output = _run_project_tests(scratch_wt, tests_command)
+            if not test_output.get("passed"):
+                return jsonify({
+                    "succeeded": False,
+                    "reason": f"tests failed: {test_output.get('output', '')[:500]}",
+                    "testsRun": True,
+                    "testsOutput": test_output.get("output", "")
+                }), 400
+
+            # Push merged result to origin/main
+            _run_git(["push", "origin", f"HEAD:{main_branch}"], scratch_wt)
+            
+            updated = []
+            tests_run = True
+
+            # For each alsoUpdate branch, merge new master into it
+            for update_branch in also_update:
+                if update_branch not in held_branches:
+                    logger.warning("alsoUpdate branch %r is not a held hub branch, skipping", update_branch)
+                    continue
+                
+                update_tmp_dir = tempfile.mkdtemp(prefix="am-update-")
+                update_wt = os.path.join(update_tmp_dir, "wt")
+                try:
+                    # Create scratch worktree from the update branch
+                    _run_git(["worktree", "add", "--detach", update_wt, f"origin/{update_branch}"], repo_root)
+                    
+                    # Merge main into it (fast-forward only, never force)
+                    try:
+                        _run_git(["merge", "--ff-only", f"origin/{main_branch}"], update_wt)
+                    except RuntimeError as e:
+                        logger.warning("Could not fast-forward %r with main: %s", update_branch, e)
+                        continue
+                    
+                    # Run tests on the updated branch
+                    update_test_output = _run_project_tests(update_wt, tests_command)
+                    if not update_test_output.get("passed"):
+                        logger.warning("Tests failed on %r after updating with main, not pushing", update_branch)
+                        continue
+                    
+                    # Push (fast-forward only)
+                    _run_git(["push", "origin", f"HEAD:{update_branch}"], update_wt)
+                    updated.append(update_branch)
+                finally:
+                    # Clean up scratch worktree
+                    try:
+                        _run_git(["worktree", "remove", "--force", update_wt], repo_root)
+                    except RuntimeError:
+                        pass
+                    shutil.rmtree(update_tmp_dir, ignore_errors=True)
+
+            # Record history on the owning hub
+            _record_held_merge_history(repo_root, branch, main_branch)
+
+            return jsonify({
+                "succeeded": True,
+                "merged": True,
+                "updated": updated,
+                "testsRun": tests_run,
+                "branch": branch,
+                "mainBranch": main_branch
+            })
+        finally:
+            # Clean up the main scratch worktree
+            try:
+                _run_git(["worktree", "remove", "--force", scratch_wt], repo_root)
+            except RuntimeError:
+                pass
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            try:
+                _run_git(["worktree", "prune"], repo_root)
+            except RuntimeError:
+                pass
+    finally:
+        _release_apply_lock(lock_fd)
+
 
 @pipeline_1_more_bp.route("/api/pipeline/status")
 def api_pipeline_status():
@@ -92,7 +408,11 @@ def api_git_unmerged_branches():
     resp = jsonify(branches)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
-    return resp
+    # The tab polls this every 15 s and the ~140 KB list is almost always unchanged: tag it so an unchanged list is answered with a body-less 304 (the browser revalidates by itself
+    # under no-cache). The pending header is part of the tag because the tab reads it (branchProjectsPending); the cache-age header changes every call and is left out.
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.set_etag(hashlib.sha256(resp.get_data() + b"\0" + resp.headers["X-Branch-Projects-Pending"].encode()).hexdigest())
+    return resp.make_conditional(request)
 
 
 @pipeline_1_more_bp.route("/api/git/held-hub-branches")
@@ -506,7 +826,31 @@ def api_git_merge_branch(branch):
     _record_merge_in_task_file(branch, context["main_branch"], qdir)
     _record_merge_in_task_log(repo_root, branch, context["main_branch"], qdir)
 
-    return jsonify({"succeeded": True, "branch": branch, "mainBranch": context["main_branch"], "liveSync": live_sync})
+    # Check which plugins are behind after merge (if the merged repo is a plugin's repo).
+    # Mirrors the pattern in routes/plugins.py: iterate manifest, call behind_checkout,
+    # set restartNeeded field on each plugin entry.
+    restart_needed = []
+    try:
+        from app import _read_plugins_manifest
+        import plugin_process_manager
+        manifest = _read_plugins_manifest()
+        pm = plugin_process_manager.PluginProcessManager()
+        for p in manifest:
+            if p.get("slot") or p.get("processName"):
+                behind_info = pm.behind_checkout(p)
+                p["restartNeeded"] = bool(behind_info.get("behind"))
+                if behind_info.get("behind"):
+                    restart_needed.append(p.get("name") or p.get("slot") or str(p))
+    except Exception:
+        logger.warning("Non-fatal: could not check plugin behind-status after merge", exc_info=True)
+
+    return jsonify({
+        "succeeded": True,
+        "branch": branch,
+        "mainBranch": context["main_branch"],
+        "liveSync": live_sync,
+        "restartNeeded": restart_needed,
+    })
 
 
 @pipeline_1_more_bp.route("/api/git/branches/<path:branch>/discard", methods=["POST"])
