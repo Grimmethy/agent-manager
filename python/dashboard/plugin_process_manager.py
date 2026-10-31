@@ -21,6 +21,7 @@ import signal
 import socket
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -232,3 +233,93 @@ def stop(name: str, wait_s: float = 3.0) -> bool:
     except OSError:
         pass
     return not is_running(name)
+
+
+class PluginProcessManager:
+    """Manager for plugin process lifecycle operations, including behind-checkout detection."""
+
+    def behind_checkout(self, entry: dict) -> dict:
+        """Check if a plugin process is running from a stale checkout (behind HEAD).
+
+        Returns a dict with:
+            - behind (bool): True if the process started before the current HEAD commit
+            - startedAt (str): ISO timestamp when the process started
+            - headCommittedAt (str): ISO timestamp of the HEAD commit
+            - files (list): Up to 10 changed files since the process started (empty if unavailable)
+
+        Never raises. Falls back to safe defaults when git info or pidfile is unavailable.
+        """
+        key = process_key(entry)
+        pid = _read_pid(key)
+
+        if pid is None or not is_running(key):
+            return {
+                "behind": False,
+                "startedAt": None,
+                "headCommittedAt": None,
+                "files": [],
+            }
+
+        # Read start time from pidfile modification time
+        pidfile_path = _pidfile(key)
+        try:
+            start_mtime = pidfile_path.stat().st_mtime
+            started_at = datetime.fromtimestamp(start_mtime, tz=timezone.utc).isoformat()
+        except (OSError, AttributeError):
+            return {
+                "behind": False,
+                "startedAt": None,
+                "headCommittedAt": None,
+                "files": [],
+            }
+
+        # Get HEAD commit time from git
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--format=%ct"],
+                cwd=entry.get("cwd") or os.getcwd(),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                head_timestamp = int(result.stdout.strip())
+                head_committed_at = datetime.fromtimestamp(head_timestamp, tz=timezone.utc).isoformat()
+                behind = start_mtime < head_timestamp
+            else:
+                return {
+                    "behind": False,
+                    "startedAt": started_at,
+                    "headCommittedAt": None,
+                    "files": [],
+                }
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            return {
+                "behind": False,
+                "startedAt": started_at,
+                "headCommittedAt": None,
+                "files": [],
+            }
+
+        # Get changed files since start
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--name-only", f"@{started_at}"],
+                cwd=entry.get("cwd") or os.getcwd(),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                files = [f for f in result.stdout.strip().split("\n") if f][:10]
+            else:
+                files = []
+        except (subprocess.TimeoutExpired, OSError):
+            files = []
+
+        return {
+            "behind": behind,
+            "startedAt": started_at,
+            "headCommittedAt": head_committed_at,
+            "files": files,
+        }

@@ -31,21 +31,36 @@ def api_git_record_branch_verdict(branch):
         from pathlib import Path
         qdir, repo_root = scope["qdir"], Path(scope["repoPath"])
 
+    # Parse and validate the body BEFORE the unlisted-branch check so the pending path has real values
+    # and bogus bodies get the normal 400 instead of an UnboundLocalError.
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"succeeded": False, "reason": "body must be a JSON object"}), 400
+    verdict, reasons, source = body.get("verdict"), body.get("reasons") or [], body.get("source", "manual")
+    err = bv.validate_verdict_body(verdict, reasons, source)
+    if err:
+        return jsonify({"succeeded": False, "reason": err}), 400
+
     # Only branches this process itself lists are accepted -- same gate as the merge/discard endpoints (another project: its cached list).
     if scope:
         real, match = branch_projects.find_other_project_branch(scope["repoRoot"], branch)
     else:
         match = next((b for b in list_unmerged_branches(force=False) if b["branch"] == branch), None)
     if not match:
-        abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
-
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
-        return jsonify({"succeeded": False, "reason": "body must be a JSON object"}), 400
-    verdict, reasons, source = body.get("verdict"), body.get("reasons", []), body.get("source", "manual")
-    err = bv.validate_verdict_body(verdict, reasons, source)
-    if err:
-        return jsonify({"succeeded": False, "reason": err}), 400
+        # Check if the branch exists on origin (held hub branch or listing hasn't caught up yet)
+        try:
+            _run_git(["rev-parse", "--verify", f"origin/{branch}"], repo_root)
+            # Branch exists on origin, store as pending
+            import branch_verdicts_pending as bvp
+            head_sha = _run_git(["rev-parse", f"origin/{branch}"], repo_root).strip()
+            claimed = body.get("sha")
+            if claimed and claimed != head_sha:
+                return jsonify({"succeeded": False, "reason": "verdict is for an older commit; the branch head has moved", "headSha": head_sha}), 409
+            bvp.store_pending_verdict(qdir, branch, head_sha, verdict, reasons, source)
+            return jsonify({"succeeded": True, "pending": True, "headSha": head_sha}), 200
+        except (RuntimeError, OSError):
+            # Branch doesn't exist on origin, 404 as before
+            abort(404, description=f"'{branch}' is not a currently-listed, pushed-but-unmerged agent/* branch")
 
     # A stale cached card can only make this a spurious 409 (re-verify) or bind the verdict to the older commit the caller named, which then reads back stale -- never a wrong
     # verdict for a commit nobody checked, so the cached headSha (with the rev-parse fallback) is kept.

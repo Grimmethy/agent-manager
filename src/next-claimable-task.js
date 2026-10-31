@@ -5,6 +5,7 @@ const { sharedInstancesDir } = require('./instances-dir.js');
 const path = require('path');
 const { HUB_TIER_PRIORITY, isHubTierTask, hubIdForTask } = require('./hub-priority.js');
 const { ROTATION_DEMOTED_PRIORITY, rotationDemoted, laneAvoided } = require('./premium-rotation.js');
+const { openQueueCache, readTaskCached } = require('./queue-cache.js');
 
 // Extracted from scripts/local-worker.sh's inline claim-ranking script (the 2026-08-22
 // priority+mtime fix) -- now one tested module instead of an untested `node -e` block in the
@@ -208,12 +209,11 @@ function recordHubTierAudit(rankable, instancesDir) {
 // (local-worker.sh) iterates this list attempting an atomic claim (mv -n) on each in
 // turn, same as it did with the old inline script's output.
 function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
-  let names;
-  try {
-    names = fs.readdirSync(pendingDir).filter((f) => f.endsWith('.json'));
-  } catch (_) {
-    return [];
-  }
+  // The task files come through the RAM cache (queue-cache.js): a tick that finds the directory unchanged reads no task file. names() is [] for an
+  // unreadable directory, like the readdir it replaces; with nothing listed nothing below could be returned or recorded, so stop here (this early return is an optimisation: the result is [] either way).
+  const cache = openQueueCache(pendingDir);
+  const names = cache.names();
+  if (names.length === 0) return [];
 
   // Side-effect requires: task-sources.js's registerTaskSource() calls populate
   // task-source-registry.js's registry as a load-time side effect -- must be required
@@ -254,11 +254,12 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
   const pinned = [];
   const rankable = [];
   for (const name of names) {
-    const { task, mtimeMs } = readTaskSafe(path.join(pendingDir, name));
+    const { task, mtimeMs } = readTaskCached(cache, path.join(pendingDir, name));
+    const premium = !!(task && task.premiumPriority === true); // same test the shell side used to re-read every file for
     const pinnedWorker = task && task.pinnedWorker;
     if (pinnedWorker && pinnedWorker !== instanceId) continue; // pinned to another instance -- not a candidate for this one
     if (pinnedWorker === instanceId) {
-      pinned.push({ name, mtimeMs });
+      pinned.push({ name, mtimeMs, premium });
       continue;
     }
 
@@ -355,7 +356,7 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     // A premium task that keeps getting blocked rotates behind fresh premium work, but still ahead of the hub tier and everything else.
     const priority = (rankedPriority === -Infinity && rotationDemoted(task)) ? ROTATION_DEMOTED_PRIORITY : rankedPriority;
     const naturalPriority = hubTier ? rankPriorityOfTask(task, { hubTier: false }) : priority;
-    rankable.push({ name, id: (task && task.id) || name.replace(/\.json$/, ''), hubId: hubIdForTask(task), priority, naturalPriority, hubTier, mtimeMs, hubKey });
+    rankable.push({ name, id: (task && task.id) || name.replace(/\.json$/, ''), hubId: hubIdForTask(task), priority, naturalPriority, hubTier, mtimeMs, hubKey, premium });
   }
 
   pinned.sort((a, b) => a.mtimeMs - b.mtimeMs);
@@ -376,7 +377,10 @@ function pickClaimableTasks(pendingDir, instanceId, opts = {}) {
     if (!lanes) { try { lanes = require('./lanes.js').getLanes(); } catch (_) { lanes = []; } }
     if (preferredLaneIsIdle({ instanceId, instancesDir, lanes, now })) rankable.shift();
   }
-  return [...pinned.map((r) => r.name), ...rankable.map((r) => r.name)];
+  cache.save();
+  const ordered = [...pinned, ...rankable];
+  // opts.withPremium: rows { name, premium } instead of names, so a caller that wants only the premium tasks (a premium-only borrowed tick) needs no second read of every file.
+  return opts.withPremium ? ordered.map((r) => ({ name: r.name, premium: r.premium })) : ordered.map((r) => r.name);
 }
 
 // Single-winner convenience form. local-worker.sh itself uses pickClaimableTasks()
@@ -526,10 +530,12 @@ if (require.main === module) {
       process.stdout.write('[]');
     }
   } else {
-    const [pendingDir, instanceId] = process.argv.slice(2);
+    // --with-premium prints `name<TAB>1|0` per line (1 = premiumPriority), in the same order; without it the output is the plain names, as always.
+    const withPremium = process.argv.includes('--with-premium');
+    const [pendingDir, instanceId] = process.argv.slice(2).filter((a) => a !== '--with-premium');
     try {
-      const items = pickClaimableTasks(pendingDir, instanceId);
-      for (const name of items) console.log(name);
+      const items = pickClaimableTasks(pendingDir, instanceId, { withPremium });
+      for (const item of items) console.log(withPremium ? `${item.name}\t${item.premium ? 1 : 0}` : item);
     } catch (e) {
       // Best-effort, matching the removed inline script's own catch-and-fall-through --
       // caller already handles an empty listing safely.

@@ -327,3 +327,92 @@ test('a bare filename introduced by a create verb is suppressed with the create-
   assert.equal(result.suppressions[0].path, 'counties.js');
   assert.equal(result.suppressions[0].reason, 'create-verb-introduced');
 });
+
+// --- sibling-piece suppression (HUB0001-01, 2026-10-26): a piece citing a file that a
+// later sibling piece creates must NOT be flagged stale-premise. The gate must be aware of
+// sibling pieces and their "Files:" scope lines. ---
+
+test('a piece citing a file created by a later sibling is NOT stale (suppressed with sibling-creates)', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        hubId: 'HUB0001',
+        pieces: [
+          {
+            id: 'HUB0001-03',
+            scopeLines: ['Files: src/services/callLog.js', 'Read: src/services/auth.js'],
+          },
+        ],
+      },
+      rawText: 'In src/services/callLog.js line 50, add the ClientCall model.',
+    },
+  };
+  const result = detectStaleDecomposePremise(task, {
+    repoRoot: '/r',
+    lineCountFn: () => null,
+    resolveFn: () => ({ status: 'none' }),
+  });
+  assert.ok(result, 'must return a result (suppressions only)');
+  assert.equal(result.stale, false, 'file exists in sibling scope: not stale');
+  assert.deepEqual(result.findings, [], 'no findings when sibling creates the file');
+  assert.equal(result.suppressions.length, 1);
+  assert.equal(result.suppressions[0].path, 'src/services/callLog.js');
+  assert.equal(result.suppressions[0].reason, 'sibling-creates');
+  assert.equal(result.suppressions[0].pieceId, 'HUB0001-03');
+  assert.equal(result.suppressions[0].source, 'sibling-scopeFiles');
+});
+
+test('a piece citing a missing file that no sibling creates IS stale', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        hubId: 'HUB0001',
+        pieces: [
+          {
+            id: 'HUB0001-03',
+            scopeLines: ['Files: src/services/auth.js'],
+          },
+        ],
+      },
+      rawText: 'In src/services/callLog.js line 50, add the ClientCall model.',
+    },
+  };
+  const result = detectStaleDecomposePremise(task, {
+    repoRoot: '/r',
+    lineCountFn: () => null,
+    resolveFn: () => ({ status: 'none' }),
+  });
+  assert.ok(result, 'must detect the stale premise');
+  assert.equal(result.stale, true);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'src/services/callLog.js');
+});
+
+test('a sibling listed EARLIER whose file is still missing (no sibling creates it) is still stale', () => {
+  const task = {
+    promptContext: {
+      decomposedFrom: {
+        hubId: 'HUB0001',
+        pieces: [
+          {
+            id: 'HUB0001-02',
+            // This sibling does NOT list the file -- it was supposed to create it but didn't
+            scopeLines: ['Files: src/services/auth.js'],
+          },
+        ],
+      },
+      rawText: 'In src/services/callLog.js line 50, add the ClientCall model.',
+    },
+  };
+  const result = detectStaleDecomposePremise(task, {
+    repoRoot: '/r',
+    lineCountFn: () => null,
+    resolveFn: () => ({ status: 'none' }),
+  });
+  assert.ok(result, 'must detect the stale premise when no sibling creates the file');
+  assert.equal(result.stale, true);
+  assert.equal(result.findings.length, 1);
+  assert.equal(result.findings[0].kind, 'missing-file');
+  assert.equal(result.findings[0].relPath, 'src/services/callLog.js');
+});

@@ -91,16 +91,14 @@ echo "[provision] creating GitHub repo $GH_OWNER/$NAME (private) and pushing"
 
 echo "[provision] setting up dedicated pipeline dir $PIPELINE_DIR"
 mkdir -p "$PIPELINE_DIR/queue/product-spec-requests"
-cat > "$PIPELINE_DIR/task-domains.json" <<'JSONEOF'
-{
-  "default": {
-    "workDirKind": "repoRoot",
-    "successCheck": "git-branch-diff"
-  }
-}
-JSONEOF
-# the file above lists only "default"; add the rest of the standard domains (adhoc, research, ...)
-"$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ensure-task-domains.sh" "$PIPELINE_DIR"
+# Write the full set of standard domains (derived from task-source-registry.js) to
+# task-domains.json. If a source is added later, every new pipeline gets it automatically.
+node -e '
+const { getStandardDomains } = require("'"$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"'/src/task-domains-registry.js");
+const fs = require("fs");
+const domains = getStandardDomains();
+fs.writeFileSync(process.argv[1], JSON.stringify(domains, null, 2) + "\n");
+' "$PIPELINE_DIR/task-domains.json"
 cat > "$PIPELINE_DIR/.env" <<EOF
 export AGENT_MANAGER_REPO_ROOT=$REPO_DIR
 export AGENT_MANAGER_PIPELINE_DIR=$PIPELINE_DIR

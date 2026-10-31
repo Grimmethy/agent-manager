@@ -3358,3 +3358,26 @@ Inside the existing `catch (e)` block, before the fallback assignment, emit a si
 
 Benefits:
 A developer or operator who opens DevTools on the dashboard can immediately see which instance(s) failed, the HTTP status or network error that caused it, and the timestamp, turning an invisible silent failure into a one-line diagnostic. During a bad deploy or a route rename, instead of every worker card quietly showing an empty task list, the console will list each affected instance and the underlying error, letting the operator distinguish "genuinely no work" from "API is down" in seconds rather than by process of elimination. The fix is a single added line, introduces no new dependency, and does not alter the existing graceful-degradation behaviour.
+
+### AC-182 · Silent swallow of git checkout failure in healGeneratedDirt
+Strength: Strong
+Files: src/lib/apply-clone-dirt.js
+Snippet:
+```
+  try {
+    run(['checkout', '--', ...generated]);
+    result.restored = generated;
+  } catch {
+    result.other = other.concat(generated.map((f) => ` M ${f}`));
+  }
+  return result;
+```
+
+Problem:
+In `healGeneratedDirt`, the `catch` block surrounding `run(['checkout', '--', ...generated])` discards the thrown error entirely. When the checkout fails—due to a pathspec mismatch, index lock, permission error, or disk fault—the code folds the generated files into `result.other` and returns a result indistinguishable from a successful "no generated dirt" pass. The caller cannot tell that the intended restore never happened, and the operator sees no signal on stderr. This is a genuine silent-swallow: a real background-task error is dropped with zero observability, leaving modified generated files in place and the failure invisible.
+
+Solution:
+Capture the error in the `catch` binding (`catch (err)`) and emit a single `console.error` line that names the failing command, the affected file list, and the error message (or stringified error), e.g. `[apply-clone-dirt] git checkout failed for generated files [a.js, b.js]: <msg>`. After logging, keep the existing fallback of folding the generated files into `result.other` so the caller's return-shape contract is preserved. No rethrow: the function's documented behavior is to return a structured `result` object, and the `mode === 'off'` / `!generated.length` paths already return early with that shape, so a throw would break callers that rely on the return. No new dependency is introduced; `console.error` is the project's existing stderr primitive.
+
+Benefits:
+An operator running `healGeneratedDirt` in `mode === 'on'` will now see, on stderr, an explicit, identifiable line the moment the checkout step fails, including which files were affected and why. The silent "pretend it's just other dirt" path is eliminated, so a real git failure (lock, permissions, pathspec) is no longer invisible. The caller's contract and return shape are unchanged, so no downstream code needs modification.
