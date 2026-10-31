@@ -123,6 +123,21 @@ def _recent_task_ids_for_instance(conn, instance_id, fetch_n):
 PIPELINE_HISTORY_LOG_FILENAME = "pipeline-history.log"
 
 
+def _write_pipeline_history(instances_d, record):
+    """Best-effort NDJSON append to <instancesDir>/pipeline-history.log, mirroring
+    src/pipeline-history.js's writer so the existing _read_pipeline_history_events()
+    reader can see entries from either side. Silently swallowed on any failure -- this
+    is observability-only, never blocking."""
+    if not instances_d:
+        return
+    path = instances_d / PIPELINE_HISTORY_LOG_FILENAME
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
 def _read_pipeline_history_events(instances_d, event_type, instance_id=None, limit=200):
     """Reads <instancesDir>/pipeline-history.log (src/pipeline-history.js's unified
     NDJSON writer -- see that file's own header for why the previously-separate

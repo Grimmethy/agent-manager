@@ -560,7 +560,38 @@ def api_task_requeue(state, task_id):
             # scope: it marks the queue/ record, it does not retroactively rescue a
             # never-merged branch's task-log onto main.
 
-    pending_dir = qdir / "pending"
+    # Determine destination project via resolve_task_project (HUB0278): the task may
+    # belong to a different project than the active one, and the requeue should land it
+    # in that project's queue, not the active project's. Falls back to the active
+    # project's queue if resolution fails (e.g., test environment with no registry).
+    from app import instances_dir, _queue_dir_for_project_label
+    dest_project = None
+    source_project = None
+    try:
+        from project_scope import resolve_task_project
+        dest_project = resolve_task_project(task_id)
+        # Source project is the active project's label (derived from registry)
+        active_root = get_active_repo_root()
+        if active_root:
+            from branch_projects import registered_projects
+            projects = registered_projects(active_root)
+            active_proj = next((p for p in projects if p.get("active")), None)
+            if active_proj:
+                source_project = active_proj.get("label")
+    except (ValueError, Exception):
+        # Resolution failed (e.g., no registry in test env) -- fall back to active project
+        pass
+
+    # Determine destination queue directory
+    if dest_project:
+        dest_qdir = _queue_dir_for_project_label(dest_project)
+        if not dest_qdir:
+            # Project label invalid -- fall back to active
+            dest_qdir = qdir
+    else:
+        dest_qdir = qdir
+
+    pending_dir = dest_qdir / "pending"
     pending_dir.mkdir(parents=True, exist_ok=True)
     dest = pending_dir / f"{task_id}.json"
     if dest.exists():
@@ -614,6 +645,20 @@ def api_task_requeue(state, task_id):
     dest.write_text(json.dumps(fresh, indent=2), encoding="utf-8")
     src.unlink()
     _record_manual_requeue(data, reason_hint=f"manually requeued from {state}/", requeue_writer="operator-manual")
+    
+    # Write pipeline_history record (best-effort, observability-only)
+    if dest_project:
+        try:
+            _write_pipeline_history(instances_dir(), {
+                "type": "requeue",
+                "taskId": task_id,
+                "sourceProject": source_project,
+                "destProject": dest_project,
+                "timestamp": now_iso,
+            })
+        except Exception:
+            pass
+    
     return jsonify({"id": task_id, "requeued": True})
 
 
