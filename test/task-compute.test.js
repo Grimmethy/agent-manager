@@ -10,6 +10,11 @@ const path = require('node:path');
 const { DatabaseSync } = require('node:sqlite');
 const { taskCompute, sumCompute, getTaskCompute } = require('../src/task-compute.js');
 
+// getTaskCompute prefers AGENT_MANAGER_MODEL_STATS_DB_PATH over <pipelineDir>/model-stats.db (a dry-run sandbox sets it), so these tests must not inherit it.
+let savedStatsPath;
+test.before(() => { savedStatsPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; delete process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; });
+test.after(() => { if (savedStatsPath === undefined) delete process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; else process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = savedStatsPath; });
+
 function tmpDir() { return fs.mkdtempSync(path.join(os.tmpdir(), 'task-compute-')); }
 
 const FULL_SCHEMA = `CREATE TABLE model_calls (call_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, stage TEXT, model TEXT, started_at TEXT, latency_ms INTEGER,

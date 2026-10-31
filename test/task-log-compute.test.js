@@ -11,6 +11,11 @@ const path = require('node:path');
 const { buildTaskLogRecord, writeTaskLogFile } = require('../src/task-log-store.js');
 const { taskCompute } = require('../src/task-compute.js');
 
+// getTaskCompute prefers AGENT_MANAGER_MODEL_STATS_DB_PATH over <pipelineDir>/model-stats.db (a dry-run sandbox sets it), so these tests must not inherit it.
+let savedStatsPath;
+test.before(() => { savedStatsPath = process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; delete process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; });
+test.after(() => { if (savedStatsPath === undefined) delete process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH; else process.env.AGENT_MANAGER_MODEL_STATS_DB_PATH = savedStatsPath; });
+
 const task = { id: 'tl-compute-1', title: 'T', domain: 'adhoc', source: 'manual', createdAt: '0', history: [{ stage: 'created', at: '0' }], blockedReason: 'x' };
 const compute = taskCompute([{ stage: 'plan', model: 'm', latency_ms: 1000, prompt_eval_count: 50, eval_count: 5 }]);
 
