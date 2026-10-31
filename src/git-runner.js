@@ -26,6 +26,11 @@ const GIT_TIMEOUT_MS = 60_000;
 // failure as INFRASTRUCTURE (a git-state problem, not a draft-quality one): no retry burned, no redraft.
 const DIRTY_CLONE_ERROR_PREFIX = 'apply clone is dirty';
 
+// Default threshold (in minutes) for considering a .git/*.lock file stale. Configurable via
+// AGENT_MANAGER_APPLY_STALE_LOCK_MINUTES; only the dedicated apply clone (never a live checkout)
+// is scanned -- see clearStaleLocks().
+const STALE_LOCK_DEFAULT_MINUTES = 30;
+
 /**
  * Detects the repo's real default branch instead of assuming "main" -- reproduced live
  * 2026-07-20: this package's own repo (agent-manager) defaults to "master", and every
@@ -61,6 +66,71 @@ function annotateGitTimeout(err, args, timeoutMs) {
     err.message = `git ${(args || []).slice(0, 4).join(' ')} timed out after ${timeoutMs}ms (ETIMEDOUT): ${err.message}`;
   }
   return err;
+}
+
+/**
+ * Scans the apply clone's .git directory for stale *.lock files (older than thresholdMinutes),
+ * verifies no git process is actively using the repo, and removes them. Only operates on the
+ * dedicated apply clone (never a live checkout) -- guarded by AGENT_MANAGER_APPLY_REPO_ROOT.
+ *
+ * Configurable via AGENT_MANAGER_APPLY_STALE_LOCK_MINUTES (default 30). Logs each removal with
+ * filename and age in minutes. Skips a lock file if a git process is actively using the repo
+ * (detected via pgrep for git processes with cwd/-C pointing to the apply repo).
+ *
+ * @param {string} applyRepoRoot - Absolute path to the apply clone to scan.
+ * @param {number} [thresholdMinutes] - Override threshold (minutes); defaults to
+ *   AGENT_MANAGER_APPLY_STALE_LOCK_MINUTES or STALE_LOCK_DEFAULT_MINUTES (30).
+ * @returns {void}
+ */
+function clearStaleLocks(applyRepoRoot, thresholdMinutes) {
+  const applyRepoEnv = process.env.AGENT_MANAGER_APPLY_REPO_ROOT;
+  if (!applyRepoEnv || path.resolve(applyRepoEnv) !== path.resolve(applyRepoRoot)) {
+    return; // Not the dedicated apply clone, skip
+  }
+  const threshold = thresholdMinutes ??
+    (parseInt(process.env.AGENT_MANAGER_APPLY_STALE_LOCK_MINUTES, 10) || STALE_LOCK_DEFAULT_MINUTES);
+  const gitDir = path.join(applyRepoRoot, '.git');
+  let lockFiles;
+  try {
+    lockFiles = fs.readdirSync(gitDir).filter((f) => f.endsWith('.lock'));
+  } catch (e) {
+    // .git dir missing or unreadable -- nothing to do
+    return;
+  }
+  if (!lockFiles.length) return;
+  // Check for active git processes using this repo (pgrep -f matches the full command line,
+  // so `git -C /abs/path` or `git` with cwd set to the apply repo both get caught).
+  let activePids = [];
+  try {
+    const out = execFileSync('pgrep', ['-f', `git.*${applyRepoRoot}`], {
+      stdio: 'pipe', encoding: 'utf8', timeout: 5_000,
+    });
+    activePids = out.trim().split('\n').filter(Boolean);
+  } catch {
+    activePids = []; // pgrep not found or no match: assume no active git
+  }
+  for (const file of lockFiles) {
+    const lockPath = path.join(gitDir, file);
+    let stat;
+    try {
+      stat = fs.statSync(lockPath);
+    } catch (e) {
+      if (e && e.code !== 'ENOENT') console.error(`[clearStaleLocks] could not stat ${file}: ${e.message}`);
+      continue;
+    }
+    const ageMinutes = (Date.now() - stat.mtimeMs) / (1000 * 60);
+    if (ageMinutes <= threshold) continue;
+    if (activePids.length) {
+      console.error(`[clearStaleLocks] skipping ${file} (age: ${Math.round(ageMinutes)} min) -- git process active (PIDs: ${activePids.join(', ')})`);
+      continue;
+    }
+    try {
+      fs.unlinkSync(lockPath);
+      console.log(`[clearStaleLocks] Removed stale lock: ${file} (age: ${Math.round(ageMinutes)} min)`);
+    } catch (e) {
+      console.error(`[clearStaleLocks] could not remove ${file}: ${e.message}`);
+    }
+  }
 }
 
 /**
@@ -571,4 +641,4 @@ function createFakeGitRunner(opts = {}) {
   };
 }
 
-module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch, annotateGitTimeout, DIRTY_CLONE_ERROR_PREFIX };
+module.exports = { createRealGitRunner, createFakeGitRunner, detectDefaultBranch, annotateGitTimeout, DIRTY_CLONE_ERROR_PREFIX, clearStaleLocks };
