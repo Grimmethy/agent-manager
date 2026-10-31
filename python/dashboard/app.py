@@ -1254,14 +1254,14 @@ def _delete_local_branch(repo_root, branch):
     return {"deleted": True, "sha": sha}
 
 
-def _record_manual_requeue(task: dict, *, reason_hint: str, requeue_writer: str, actor: str = "operator-manual"):
+def _record_manual_requeue(task: dict, *, reason_hint: str, requeue_writer: str, actor: str = "operator-manual", pipeline_dir=None):
     """Best-effort: record an operator-initiated requeue into requeue-attribution.db with
     actor='operator-manual', so the Ghost-in-the-Machine concept card can trend hand-fixes
     against pipeline-mechanism recoveries. Never raises -- a telemetry write must not turn
     a working requeue into a 500. See requeue_attribution_client.py."""
     try:
         import requeue_attribution_client
-        d = get_pipeline_dir()
+        d = Path(pipeline_dir) if pipeline_dir else get_pipeline_dir()
         requeue_attribution_client.classify_requeue(
             task,
             reason_hint=reason_hint,
