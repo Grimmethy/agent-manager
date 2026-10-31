@@ -467,7 +467,7 @@ function renderBrainDumpCard(entry) {
     <div class="bd-entry" data-id="${escapeAttr(entry.id)}">
       <div class="row">
         <span class="text">${serialBadge}${escapeHtmlBright(entry.rawText)}${countChip}${raisedByBadge}</span>
-        ${statusBadge}
+        ${statusBadge}${brainDumpChipsHtml(entry, escapeHtml)}
       </div>
       <div class="row meta">
         <span>${meta}</span>
