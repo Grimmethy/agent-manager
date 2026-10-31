@@ -395,6 +395,7 @@ def api_pipeline_stop():
 def api_git_unmerged_branches():
     # Served from the cache (stale-while-revalidate, see app.list_unmerged_branches): the forced full recompute took ~37 s under load, past the tab's 30 s timeout.
     from app import _branch_cache, _branch_cache_lock, list_unmerged_branches
+    from app_branch_helpers import groupBranchesByHub
     branches = list_unmerged_branches(force=False)
     with _branch_cache_lock:
         filled = _branch_cache["at"]
@@ -405,7 +406,9 @@ def api_git_unmerged_branches():
         import branch_projects
         from app import get_active_repo_root
         branches, pending = branch_projects.combined_branches(branches, get_active_repo_root())
-    resp = jsonify(branches)
+    # Group branches by hub for the Unmerged Branches tab
+    grouped = groupBranchesByHub(branches)
+    resp = jsonify(grouped)
     resp.headers["X-Branch-Cache-Age"] = str(max(0, int(time.time() - filled))) if filled else "0"
     resp.headers["X-Branch-Projects-Pending"] = ",".join(pending)
     # The tab polls this every 15 s and the ~140 KB list is almost always unchanged: tag it so an unchanged list is answered with a body-less 304 (the browser revalidates by itself

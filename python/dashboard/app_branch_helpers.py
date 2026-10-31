@@ -101,6 +101,63 @@ def _check_sibling_conflict(repo_root, branch_a, branch_b):
     return {"willConflict": None, "conflictFiles": [], "checked": False}
 
 
+def groupBranchesByHub(branches):
+    """Group unmerged branches by their coordinator hub ID, with position and aggregate status.
+
+    Returns a list of hub entries, each containing:
+    - hub_id: the coordinator hub ID (e.g., 'HUB0241')
+    - position: string like '1/3' indicating this hub's position among all hubs
+    - status: aggregate status ('in-progress' if any branch is active, 'done' if all done)
+    - branches: list of branch records belonging to this hub
+
+    Branches without a hub are placed in a special 'unassigned' group.
+    """
+    by_hub = {}
+    unassigned = []
+
+    for b in branches:
+        hub = b.get("hub")
+        if hub and hub.get("id"):
+            hub_id = hub["id"]
+            by_hub.setdefault(hub_id, []).append(b)
+        else:
+            unassigned.append(b)
+
+    # Sort hubs by ID for deterministic ordering
+    sorted_hub_ids = sorted(by_hub.keys())
+    total_hubs = len(sorted_hub_ids)
+
+    result = []
+    for idx, hub_id in enumerate(sorted_hub_ids, 1):
+        hub_branches = by_hub[hub_id]
+        # Determine aggregate status: 'in-progress' if any branch is active
+        status = "done"
+        for b in hub_branches:
+            if b.get("status") in ("in-progress", "pending", "review"):
+                status = "in-progress"
+                break
+            elif b.get("status") == "blocked":
+                status = "blocked"
+
+        result.append({
+            "hub_id": hub_id,
+            "position": f"{idx}/{total_hubs}",
+            "status": status,
+            "branches": hub_branches,
+        })
+
+    # Add unassigned branches as a special group if any exist
+    if unassigned:
+        result.append({
+            "hub_id": "unassigned",
+            "position": f"{len(result) + 1}/{len(result) + 1}",
+            "status": "unknown",
+            "branches": unassigned,
+        })
+
+    return result
+
+
 def _annotate_hub_sibling_conflicts(repo_root, branches):
     """Mutates `branches` in place, adding `hubSiblingConflicts: [branch, ...]` to any
     branch whose coordinator hub has another still-unmerged sibling it would conflict
