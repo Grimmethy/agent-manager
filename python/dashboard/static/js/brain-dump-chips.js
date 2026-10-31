@@ -38,4 +38,15 @@ function brainDumpChipsHtml(entry, escapeHtml) {
   return chips.join('');
 }
 
-if (typeof module !== 'undefined') module.exports = { brainDumpChipsHtml };
+// Returns {refused: true, message} for HTTP 409 (message = server response text trimmed to 400 chars),
+// or {refused: false} for any other status. Used by the /api/brain-dump/<id>/prioritize click handlers
+// (brain-dump-and-second-brain.js) to surface a "refused" response from the server.
+function prioritizeRefusal(status, text) {
+  if (status === 409) {
+    const message = String(text == null ? '' : text);
+    return { refused: true, message: message.slice(0, 400) };
+  }
+  return { refused: false };
+}
+
+if (typeof module !== 'undefined') module.exports = { bdChipEscape, bdChipClip, brainDumpChipsHtml, prioritizeRefusal };
