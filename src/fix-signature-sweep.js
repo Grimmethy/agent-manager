@@ -8,6 +8,12 @@
 //     way after that means the fix did not cure it; requeueing it again would just loop,
 //   - has not already been requeued for this entry (task.requeuedForFixes), and
 //   - was never applied to a branch (an applied task has real work on a branch a redraft would orphan; that is a human's call).
+//
+// A SECOND candidate set (done-unmerged-branch scope): for entries whose `appliesScope` includes 'done-unmerged-branch' (or is 'both'),
+// tasks in done/ whose branch is unmerged and whose branch-verdicts.json card carries a 'needs-work' verdict are requeued as a fresh draft
+// against current master. The old branch is NOT deleted or merged (human's call for that); the old card is marked 'replacement queued: <id>'.
+// Dedup uses the same requeuedForFixes field so a second sweep is a no-op.
+//
 // Requeue keeps the coordination fields the dashboard's own requeue keeps (stacked / dependsOn / atomic / ...) and puts the task where its
 // kind is claimed (pending/ for a normal task, adhoc/ or derived/ for adhoc-shaped ones).
 // Kill switch: AGENT_MANAGER_FIX_SIGNATURE_SWEEP=false. CLI: node fix-signature-sweep.js [--dry-run]
@@ -102,6 +108,64 @@ async function sweepKnownFixedFailures({ pipelineDir, entries = KNOWN_FIXED, now
         }
         summary.requeued.push({ id: task.id, entry: entry.id, from: dir });
       }
+    }
+
+    // SECOND CANDIDATE SET: done-unmerged-branch scope. Tasks in done/ whose branch is unmerged and has a needs-work verdict.
+    const appliesScope = entry.appliesScope || 'parked';
+    if (appliesScope !== 'done-unmerged-branch' && appliesScope !== 'both') continue;
+    const doneDir = path.join(queueDir, 'done');
+    let doneNames;
+    try { doneNames = (await fs.promises.readdir(doneDir)).filter((f) => f.endsWith('.json')); } catch { continue; }
+    // Bounded: limit to 50 candidates per entry per sweep to prevent runaway behavior.
+    let doneCount = 0;
+    const MAX_DONE_CANDIDATES = 50;
+    for (const name of doneNames) {
+      if (doneCount >= MAX_DONE_CANDIDATES) break;
+      const doneFilePath = path.join(doneDir, name);
+      const task = readJson(doneFilePath);
+      if (!task || typeof task !== 'object') continue;
+      // Check for needs-work verdict on the branch.
+      const priorVerdict = task.promptContext && task.promptContext.priorVerdict;
+      if (!priorVerdict || priorVerdict.verdict !== 'needs-work') continue;
+      // Get the applied branch from history.
+      let appliedBranch = null;
+      const history = Array.isArray(task.history) ? task.history : [];
+      for (let i = history.length - 1; i >= 0; i--) {
+        const ev = history[i];
+        if (ev && ev.stage === 'applied' && ev.detail) {
+          const first = String(ev.detail).split(/\s/)[0];
+          if (first.startsWith('agent/')) { appliedBranch = first; break; }
+        }
+      }
+      if (!appliedBranch) continue;
+      // Check if the branch is unmerged (exists on origin and ahead of main).
+      try {
+        const { execFileSync } = require('child_process');
+        const head = execFileSync('git', ['rev-parse', '--verify', `origin/${appliedBranch}`], { cwd: pipelineDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 });
+        if (head.code !== 0) continue;
+        const sha = String(head).trim();
+        const ahead = execFileSync('git', ['rev-list', '--count', `origin/main..origin/${appliedBranch}`], { cwd: pipelineDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 });
+        if (ahead.code !== 0 || !(parseInt(ahead, 10) > 0)) continue;
+      } catch { continue; }
+      // Dedup: check if already requeued for this entry.
+      const already = Array.isArray(task.requeuedForFixes) && task.requeuedForFixes.includes(entry.id);
+      if (already) { summary.skipped += 1; continue; }
+      doneCount += 1;
+      // Create a fresh draft using the existing freshShape helper, then add replacement-specific fields.
+      const fresh = freshShape(task, entry, 'done', nowIso);
+      fresh.premiumPriority = true;
+      fresh.priorRejectionFeedback = priorVerdict.reasons && priorVerdict.reasons.length
+        ? priorVerdict.reasons
+        : [`needs-work on ${appliedBranch}: ${priorVerdict.detail || 'branch has defects'}`];
+      fresh.replacementFor = task.id;
+      // Mark the old card with a history entry noting the replacement.
+      if (!dryRun) {
+        writeJson(doneFilePath, {
+          ...task,
+          history: [...history, { stage: 'replacement-queued', at: nowIso, detail: `replacement queued: ${task.id}` }],
+        });
+      }
+      summary.requeued.push({ id: task.id, entry: entry.id, from: 'done', branch: appliedBranch });
     }
   }
   if (!dryRun) writeJson(statePath, state);
