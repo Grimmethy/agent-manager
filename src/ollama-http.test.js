@@ -198,6 +198,99 @@ test('postJson tags a request-level connection error (nothing listening) with OL
   }
 });
 
+// Subtask 1 reproduction (HUB0282/3/3): three fake-server cases that expose the
+// root cause of the chat-and-lane hang on a closed connection. The current postJson()
+// uses Node's `http.request` `timeout` option -- a SOCKET IDLE timeout that RESETS
+// on any received byte. This is NOT a hard deadline from call start: a server that
+// keeps the socket "alive" by sending bytes (even one every 10s) prevents the timer
+// from ever firing, causing an unconditional hang. Cases (a) and (b) currently reject
+// (confirming the existing error paths work); case (c) hangs, reproducing the live
+// incident this task decompose was built from.
+//
+// Each test has a 5s node:test timeout so the hang case is observable (the test
+// framework reports "exceeded timeout" rather than passing silently).
+test('premature close: server sends headers + partial chunked body then closes TCP without final chunk → rejects (STREAM_ERROR or CONNECTION_ERROR)', { timeout: 5000 }, async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {});
+      req.on('end', () => {
+        // Send chunked headers + ONE chunk, then close without the terminating 0\r\n\r\n
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'Transfer-Encoding': 'chunked',
+        });
+        res.write('1a\r\n{"partial":'); // 0x1a = 26 bytes of payload
+        // Deliberately do NOT write the final '0\r\n\r\n' -- the socket just dies
+        res.destroy(new Error('simulated premature close after partial chunked body'));
+      });
+    },
+    async (base) => {
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 5000);
+        assert.fail('expected reject on premature close');
+      } catch (e) {
+        // Current behavior: Node routes a server-destroyed socket through either
+        // STREAM_ERROR (mid-body error on res) or CONNECTION_ERROR (socket error
+        // propagating via req); the point of this test is that it REJECTS, not hangs.
+        assert.ok(
+          [OLLAMA_ERROR_CODES.STREAM_ERROR, OLLAMA_ERROR_CODES.CONNECTION_ERROR].includes(e.code),
+          `expected reject with STREAM_ERROR or CONNECTION_ERROR on premature close, got code=${e.code} msg=${e.message}`,
+        );
+      }
+    }
+  );
+});
+
+test('silent server: server accepts TCP connection and sends nothing → rejects with OLLAMA_TIMEOUT via socket idle timeout', { timeout: 5000 }, async () => {
+  await withServer(
+    (req, res) => {
+      // Accept the connection but never write anything -- the socket sits idle.
+      // Node's http.request `timeout` (socket idle timeout) will fire after timeoutMs
+      // of inactivity and destroy the request.
+      req.on('data', () => {}); // consume the body so the request completes
+    },
+    async (base) => {
+      try {
+        await postJson(`${base}/api/generate`, { a: 1 }, 500);
+        assert.fail('expected reject on silent server');
+      } catch (e) {
+        assert.equal(e.code, OLLAMA_ERROR_CODES.TIMEOUT,
+          `expected OLLAMA_TIMEOUT on silent server, got code=${e.code} msg=${e.message}`);
+        assert.equal(e.timeoutMs, 500, 'timeoutMs metadata should be preserved');
+      }
+    }
+  );
+});
+
+// THIS IS THE KEY REPRODUCTION: Node's `http.request` `timeout` is a SOCKET IDLE
+// timeout, NOT a hard deadline. It resets on every byte received. A server sending
+// one byte every 10s keeps resetting the timer forever, so the request hangs
+// indefinitely -- this is exactly the live hang pattern observed in chat-and-lane.
+// The test-level 5s timeout causes node:test to report "exceeded timeout" rather
+// than the test passing, making the hang observable in CI.
+test('slow server (1 byte / 10s): socket idle timeout resets on activity → HANGS (test exceeds 5s timeout)', { timeout: 5000 }, async () => {
+  await withServer(
+    (req, res) => {
+      req.on('data', () => {}); // consume the body so request "completes" on the wire
+      // Send one byte every 10 seconds forever -- never enough to complete the response,
+      // but enough to reset Node's socket idle timer on every tick. This is the textbook
+      // hang pattern: the server is "alive" from the client's perspective but never
+      // produces a response.
+      const interval = setInterval(() => { res.write('x'); }, 10000);
+      // We never clear the interval and never end -- the server is intentionally
+      // designed to hang the client.
+    },
+    async (base) => {
+      // postJson's own timeoutMs (60000) is irrelevant here: the socket idle timer
+      // resets every 10s, so it will NEVER fire. The test-level 5s timeout is what
+      // catches this hang and reports it.
+      await postJson(`${base}/api/generate`, { a: 1 }, 60000);
+      // If we reach here, the test passed (unexpected -- the server should keep us hanging)
+      assert.fail('expected this test to hang -- the slow server keeps resetting the idle timeout');
+    }
+  );
+});
+
 test('postJson works with no extraHeaders (backward compatible)', async () => {
   let receivedHeaders = null;
   await withServer(
