@@ -87,10 +87,17 @@ function isAlreadyTagged(e) {
  *   session header, 273 real requests netted 0.27% total savings and 198/273 fell back to
  *   "original".
  */
-function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
+function postJson(urlString, bodyObj, timeoutMs, extraHeaders, deadlineMs) {
   const url = new URL(urlString);
   const payload = JSON.stringify(bodyObj);
   let endFired = false;
+  let deadlineTimer = null;
+  const clearDeadline = () => {
+    if (deadlineTimer) {
+      clearTimeout(deadlineTimer);
+      deadlineTimer = null;
+    }
+  };
   return new Promise((resolve, reject) => {
     const req = http.request({
       hostname: url.hostname,
@@ -124,6 +131,7 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
       let data = '';
       res.on('data', (c) => { data += c; });
       res.on('end', () => {
+        clearDeadline();
         endFired = true;
         if (res.statusCode !== 200) {
           reject(taggedError(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`, OLLAMA_ERROR_CODES.HTTP_ERROR, { statusCode: res.statusCode }));
@@ -142,16 +150,26 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
       // never matches local-worker.sh's INFRA_FAILURE_PATTERN regex either, so every one
       // of these permanently blocked instead of going through the bounded infra-requeue
       // path a real "ECONNRESET"-bearing Error would have qualified for.
-      res.on('error', (e) => reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })));
+      res.on('error', (e) => { clearDeadline(); reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })); });
       // Detect premature socket close: if 'end' hasn't fired yet, the connection
       // was closed before the full response body arrived. This catches cases where
       // the server drops the connection mid-stream without sending an error event.
       res.on('close', () => {
         if (!endFired) {
+          clearDeadline();
           reject(taggedError(OLLAMA_ERROR_CODES.PREMATURE_CLOSE, OLLAMA_ERROR_CODES.PREMATURE_CLOSE));
         }
       });
     });
+    // Deadline timer: if deadlineMs is provided, reject with TIMEOUT after that duration
+    if (typeof deadlineMs === 'number' && isFinite(deadlineMs)) {
+      deadlineTimer = setTimeout(() => {
+        clearDeadline();
+        req.destroy(taggedError(`Ollama request timed out after ${deadlineMs}ms (deadline)`, OLLAMA_ERROR_CODES.TIMEOUT, { deadlineMs }));
+      }, deadlineMs);
+      // Clear timer on response arrival to prevent leaks
+      req.on('response', clearDeadline);
+    }
     req.on('timeout', () => { req.destroy(taggedError(`Ollama request timed out after ${timeoutMs}ms`, OLLAMA_ERROR_CODES.TIMEOUT, { timeoutMs })); });
     req.on('error', (e) => reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })));
     req.write(payload);
@@ -171,10 +189,17 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
  * failure the proxy already turned into an {error, done_reason:"error"} NDJSON frame is
  * left for the caller to notice via onLine, same as any other line.
  */
-function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
+function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine, deadlineMs) {
   const url = new URL(urlString);
   const payload = JSON.stringify(Object.assign({}, bodyObj, { stream: true }));
   let endFired = false;
+  let deadlineTimer = null;
+  const clearDeadline = () => {
+    if (deadlineTimer) {
+      clearTimeout(deadlineTimer);
+      deadlineTimer = null;
+    }
+  };
   return new Promise((resolve, reject) => {
     const req = http.request({
       hostname: url.hostname,
@@ -191,8 +216,8 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
       if (res.statusCode !== 200) {
         let data = '';
         res.on('data', (c) => { data += c; });
-        res.on('end', () => reject(taggedError(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`, OLLAMA_ERROR_CODES.HTTP_ERROR, { statusCode: res.statusCode })));
-        res.on('error', (e) => reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })));
+        res.on('end', () => { clearDeadline(); reject(taggedError(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`, OLLAMA_ERROR_CODES.HTTP_ERROR, { statusCode: res.statusCode })); });
+        res.on('error', (e) => { clearDeadline(); reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })); });
         return;
       }
       let buf = '';
@@ -208,6 +233,7 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
         }
       });
       res.on('end', () => {
+        clearDeadline();
         endFired = true;
         const line = buf.trim();
         if (line) {
@@ -215,18 +241,28 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
         }
         resolve();
       });
-      res.on('error', (e) => reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })));
+      res.on('error', (e) => { clearDeadline(); reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })); });
       // Detect premature socket close: if 'end' hasn't fired yet, the connection
       // was closed before the full response body arrived. This catches cases where
       // the server drops the connection mid-stream without sending an error event.
       res.on('close', () => {
         if (!endFired) {
+          clearDeadline();
           reject(taggedError(OLLAMA_ERROR_CODES.PREMATURE_CLOSE, OLLAMA_ERROR_CODES.PREMATURE_CLOSE));
         }
       });
     });
+    // Deadline timer: if deadlineMs is provided, reject with TIMEOUT after that duration
+    if (typeof deadlineMs === 'number' && isFinite(deadlineMs)) {
+      deadlineTimer = setTimeout(() => {
+        clearDeadline();
+        req.destroy(taggedError(`Ollama request timed out after ${deadlineMs}ms (deadline)`, OLLAMA_ERROR_CODES.TIMEOUT, { deadlineMs }));
+      }, deadlineMs);
+      // Clear timer on response arrival to prevent leaks
+      req.on('response', clearDeadline);
+    }
     req.on('timeout', () => { req.destroy(taggedError(`Ollama request timed out after ${timeoutMs}ms`, OLLAMA_ERROR_CODES.TIMEOUT, { timeoutMs })); });
-    req.on('error', (e) => reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })));
+    req.on('error', (e) => { clearDeadline(); reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })); });
     req.write(payload);
     req.end();
   });
