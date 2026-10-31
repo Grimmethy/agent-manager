@@ -168,3 +168,111 @@ test('guard: each entry inside an items bucket must be an object (non-object ent
     assert.ok(result.errors.some((e) => e === 'items.held[0] must be an object'), `${JSON.stringify(bad)}: ${JSON.stringify(result.errors)}`);
   }
 });
+
+// ---------- Null acceptance / rejection tests ----------
+
+test('null is accepted for metric.before (allowNull: true)', () => {
+  const row = makeValidRow({ metric: { name: 'latency', before: null, after: 90 } });
+  const result = validateRow(row);
+  assert.equal(result.ok, true, `null for metric.before should be accepted, got errors: ${JSON.stringify(result.errors)}`);
+});
+
+test('null is accepted for metric.after (allowNull: true)', () => {
+  const row = makeValidRow({ metric: { name: 'latency', before: 100, after: null } });
+  const result = validateRow(row);
+  assert.equal(result.ok, true, `null for metric.after should be accepted, got errors: ${JSON.stringify(result.errors)}`);
+});
+
+test('null is accepted for cost.gpu_minutes (allowNull: true)', () => {
+  const row = makeValidRow({ cost: { gpu_minutes: null, peak_ram_mb: 2048, model_calls: 3 } });
+  const result = validateRow(row);
+  assert.equal(result.ok, true, `null for cost.gpu_minutes should be accepted, got errors: ${JSON.stringify(result.errors)}`);
+});
+
+test('null is accepted for cost.peak_ram_mb (allowNull: true)', () => {
+  const row = makeValidRow({ cost: { gpu_minutes: 5, peak_ram_mb: null, model_calls: 3 } });
+  const result = validateRow(row);
+  assert.equal(result.ok, true, `null for cost.peak_ram_mb should be accepted, got errors: ${JSON.stringify(result.errors)}`);
+});
+
+test('null is rejected for cost.model_calls (no allowNull flag)', () => {
+  const row = makeValidRow({ cost: { gpu_minutes: 5, peak_ram_mb: 2048, model_calls: null } });
+  const result = validateRow(row);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((e) => e.includes('cost.model_calls')),
+    `expected error mentioning "cost.model_calls", got: ${JSON.stringify(result.errors)}`
+  );
+});
+
+test('string is rejected for metric.before (must be number or null)', () => {
+  const row = makeValidRow({ metric: { name: 'latency', before: '100', after: 90 } });
+  const result = validateRow(row);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((e) => e.includes('metric.before')),
+    `expected error mentioning "metric.before", got: ${JSON.stringify(result.errors)}`
+  );
+});
+
+test('boolean is rejected for metric.before (must be number or null)', () => {
+  const row = makeValidRow({ metric: { name: 'latency', before: true, after: 90 } });
+  const result = validateRow(row);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((e) => e.includes('metric.before')),
+    `expected error mentioning "metric.before", got: ${JSON.stringify(result.errors)}`
+  );
+});
+
+test('undefined is rejected for metric.before (must be number or null)', () => {
+  const row = makeValidRow();
+  delete row.metric.before;
+  const result = validateRow(row);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((e) => e.includes('metric.before')),
+    `expected error mentioning "metric.before", got: ${JSON.stringify(result.errors)}`
+  );
+});
+
+test('string is rejected for metric.after (must be number or null)', () => {
+  const row = makeValidRow({ metric: { name: 'latency', before: 100, after: '90' } });
+  const result = validateRow(row);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((e) => e.includes('metric.after')),
+    `expected error mentioning "metric.after", got: ${JSON.stringify(result.errors)}`
+  );
+});
+
+test('boolean is rejected for metric.after (must be number or null)', () => {
+  const row = makeValidRow({ metric: { name: 'latency', before: 100, after: true } });
+  const result = validateRow(row);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((e) => e.includes('metric.after')),
+    `expected error mentioning "metric.after", got: ${JSON.stringify(result.errors)}`
+  );
+});
+
+test('undefined is rejected for metric.after (must be number or null)', () => {
+  const row = makeValidRow();
+  delete row.metric.after;
+  const result = validateRow(row);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((e) => e.includes('metric.after')),
+    `expected error mentioning "metric.after", got: ${JSON.stringify(result.errors)}`
+  );
+});
+
+test('string is rejected for cost.gpu_minutes (must be number or null)', () => {
+  const row = makeValidRow({ cost: { gpu_minutes: '5', peak_ram_mb: 2048, model_calls: 3 } });
+  const result = validateRow(row);
+  assert.equal(result.ok, false);
+  assert.ok(
+    result.errors.some((e) => e.includes('cost.gpu_minutes')),
+    `expected error mentioning "cost.gpu_minutes", got: ${JSON.stringify(result.errors)}`
+  );
+});
