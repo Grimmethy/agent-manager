@@ -90,6 +90,7 @@ function isAlreadyTagged(e) {
 function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
   const url = new URL(urlString);
   const payload = JSON.stringify(bodyObj);
+  let endFired = false;
   return new Promise((resolve, reject) => {
     const req = http.request({
       hostname: url.hostname,
@@ -123,6 +124,7 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
       let data = '';
       res.on('data', (c) => { data += c; });
       res.on('end', () => {
+        endFired = true;
         if (res.statusCode !== 200) {
           reject(taggedError(`Ollama HTTP ${res.statusCode}: ${data.slice(0, 500)}`, OLLAMA_ERROR_CODES.HTTP_ERROR, { statusCode: res.statusCode }));
           return;
@@ -141,6 +143,14 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
       // of these permanently blocked instead of going through the bounded infra-requeue
       // path a real "ECONNRESET"-bearing Error would have qualified for.
       res.on('error', (e) => reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })));
+      // Detect premature socket close: if 'end' hasn't fired yet, the connection
+      // was closed before the full response body arrived. This catches cases where
+      // the server drops the connection mid-stream without sending an error event.
+      res.on('close', () => {
+        if (!endFired) {
+          reject(taggedError(OLLAMA_ERROR_CODES.PREMATURE_CLOSE, OLLAMA_ERROR_CODES.PREMATURE_CLOSE));
+        }
+      });
     });
     req.on('timeout', () => { req.destroy(taggedError(`Ollama request timed out after ${timeoutMs}ms`, OLLAMA_ERROR_CODES.TIMEOUT, { timeoutMs })); });
     req.on('error', (e) => reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })));
@@ -164,6 +174,7 @@ function postJson(urlString, bodyObj, timeoutMs, extraHeaders) {
 function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
   const url = new URL(urlString);
   const payload = JSON.stringify(Object.assign({}, bodyObj, { stream: true }));
+  let endFired = false;
   return new Promise((resolve, reject) => {
     const req = http.request({
       hostname: url.hostname,
@@ -197,6 +208,7 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
         }
       });
       res.on('end', () => {
+        endFired = true;
         const line = buf.trim();
         if (line) {
           try { onLine(JSON.parse(line)); } catch (e) { reject(taggedError(`Ollama returned unparseable NDJSON line: ${e.message}`, OLLAMA_ERROR_CODES.BAD_JSON)); }
@@ -204,6 +216,14 @@ function postJsonStream(urlString, bodyObj, timeoutMs, extraHeaders, onLine) {
         resolve();
       });
       res.on('error', (e) => reject(taggedError(e.message, OLLAMA_ERROR_CODES.STREAM_ERROR, { nodeCode: e.code })));
+      // Detect premature socket close: if 'end' hasn't fired yet, the connection
+      // was closed before the full response body arrived. This catches cases where
+      // the server drops the connection mid-stream without sending an error event.
+      res.on('close', () => {
+        if (!endFired) {
+          reject(taggedError(OLLAMA_ERROR_CODES.PREMATURE_CLOSE, OLLAMA_ERROR_CODES.PREMATURE_CLOSE));
+        }
+      });
     });
     req.on('timeout', () => { req.destroy(taggedError(`Ollama request timed out after ${timeoutMs}ms`, OLLAMA_ERROR_CODES.TIMEOUT, { timeoutMs })); });
     req.on('error', (e) => reject(isAlreadyTagged(e) ? e : taggedError(e.message, OLLAMA_ERROR_CODES.CONNECTION_ERROR, { nodeCode: e.code })));
